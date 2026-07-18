@@ -1,0 +1,45 @@
+# Rust
+/target/
+**/target/
+
+# Node and Tauri
+/node_modules/
+**/node_modules/
+/src-tauri/target/
+
+# Supabase local state
+/supabase/.temp/
+/supabase/.branches/
+/supabase/.local/
+/.supabase/
+
+# IDE files
+/.idea/
+/.vscode/
+*.swp
+*~
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Signing material
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.mobileprovision
+
+# Local secrets
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+/secrets/
+
+# Local development workflow state
+/.superpowers/
