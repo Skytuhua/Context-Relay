@@ -5,7 +5,10 @@
 # Node and Tauri
 /node_modules/
 **/node_modules/
+/apps/desktop/dist/
 /src-tauri/target/
+/apps/desktop/src-tauri/gen/schemas/
+/.pnpm-store/
 
 # Supabase local state
 /supabase/.temp/

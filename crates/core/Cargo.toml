@@ -1,0 +1,11 @@
+[package]
+name = "context-relay-core"
+description = "Context Relay domain foundation"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+context-relay-protocol = { version = "0.1.0", path = "../protocol" }

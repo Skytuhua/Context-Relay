@@ -1,0 +1,12 @@
+[package]
+name = "context-relay-contextd"
+description = "Context Relay local daemon shell"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+context-relay-core = { version = "0.1.0", path = "../core" }
+context-relay-protocol = { version = "0.1.0", path = "../protocol" }

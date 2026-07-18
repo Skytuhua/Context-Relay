@@ -1,0 +1,21 @@
+[workspace]
+members = [
+  "crates/protocol",
+  "crates/core",
+  "crates/contextd",
+  "crates/context-mcp",
+  "apps/desktop/src-tauri",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Apache-2.0"
+repository = "https://github.com/Skytuhua/Context-Relay"
+rust-version = "1.97"
+
+[workspace.dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+ts-rs = { version = "11.1.0", features = ["serde-compat"] }

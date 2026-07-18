@@ -1,0 +1,15 @@
+[package]
+name = "context-relay-protocol"
+description = "Shared Context Relay protocol types"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+ts-rs.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

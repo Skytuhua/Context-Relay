@@ -1,0 +1,19 @@
+{
+  "name": "context-relay-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/Skytuhua/Context-Relay",
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "lint": "pnpm --filter @context-relay/desktop lint",
+    "typecheck": "pnpm --filter @context-relay/desktop typecheck",
+    "test": "pnpm --filter @context-relay/desktop test",
+    "build": "pnpm --filter @context-relay/desktop build",
+    "generate:bindings": "cargo run -p context-relay-protocol --bin export-bindings -- apps/desktop/src/bindings.ts",
+    "check:bindings": "node scripts/check-bindings.mjs",
+    "tauri:dev": "pnpm --filter @context-relay/desktop tauri dev",
+    "tauri:build": "pnpm --filter @context-relay/desktop tauri build",
+    "license:check": "node scripts/check-license-metadata.mjs"
+  }
+}
