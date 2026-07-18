@@ -8,6 +8,66 @@ use crate::{
     PlanId, ProjectId, Sha256Digest, ValidationError, decimal_u64, required_text,
 };
 
+pub const MAX_ADAPTER_COLLECTION_ITEMS: usize = 1024;
+pub const MAX_ADAPTER_TEXT_BYTES: usize = 16 * 1024;
+
+fn validate_adapter_collection(field: &'static str, length: usize) -> Result<(), ValidationError> {
+    if length > MAX_ADAPTER_COLLECTION_ITEMS {
+        return Err(ValidationError::TooLarge {
+            field,
+            limit: MAX_ADAPTER_COLLECTION_ITEMS,
+        });
+    }
+    Ok(())
+}
+
+fn validate_adapter_text(value: &str, field: &'static str) -> Result<(), ValidationError> {
+    if value.len() > MAX_ADAPTER_TEXT_BYTES {
+        return Err(ValidationError::TooLarge {
+            field,
+            limit: MAX_ADAPTER_TEXT_BYTES,
+        });
+    }
+    Ok(())
+}
+
+macro_rules! validated_adapter_dto {
+    ($name:ident, $wire:ident, $wire_ref:ident { $($field:ident: $type:ty),+ $(,)? }) => {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct $wire {
+            $($field: $type),+
+        }
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct $wire_ref<'a> {
+            $($field: &'a $type),+
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.validate().map_err(serde::ser::Error::custom)?;
+                $wire_ref {
+                    $($field: &self.$field),+
+                }
+                .serialize(serializer)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let wire = $wire::deserialize(deserializer)?;
+                let value = Self {
+                    $($field: wire.$field),+
+                };
+                value.validate().map_err(D::Error::custom)?;
+                Ok(value)
+            }
+        }
+    };
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum NativePlatform {
@@ -115,16 +175,32 @@ pub enum InstallationMethod {
     Unknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct ProbeContext {
     pub harness: HarnessId,
     pub requested_profile: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+impl ProbeContext {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if let Some(profile) = &self.requested_profile {
+            validate_adapter_text(profile, "probeContext.requestedProfile")?;
+        }
+        Ok(())
+    }
+}
+
+validated_adapter_dto!(
+    ProbeContext,
+    ProbeContextWire,
+    ProbeContextWireRef {
+        harness: HarnessId,
+        requested_profile: Option<String>,
+    }
+);
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct ProbeReport {
     pub executable: Option<WireNativeValue>,
@@ -136,6 +212,44 @@ pub struct ProbeReport {
     pub policy_conflicts: Vec<String>,
     pub capability: CapabilityLevel,
 }
+
+impl ProbeReport {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_adapter_collection("probeReport.configRoots", self.config_roots.len())?;
+        validate_adapter_collection("probeReport.policyConflicts", self.policy_conflicts.len())?;
+        if let Some(executable) = &self.executable {
+            executable.validate()?;
+        }
+        for root in &self.config_roots {
+            root.validate()?;
+        }
+        if let Some(version) = &self.harness_version {
+            validate_adapter_text(version, "probeReport.harnessVersion")?;
+        }
+        if let Some(profile) = &self.active_profile {
+            validate_adapter_text(profile, "probeReport.activeProfile")?;
+        }
+        for conflict in &self.policy_conflicts {
+            validate_adapter_text(conflict, "probeReport.policyConflicts.text")?;
+        }
+        Ok(())
+    }
+}
+
+validated_adapter_dto!(
+    ProbeReport,
+    ProbeReportWire,
+    ProbeReportWireRef {
+        executable: Option<WireNativeValue>,
+        executable_sha256: Option<Sha256Digest>,
+        harness_version: Option<String>,
+        installation_method: InstallationMethod,
+        config_roots: Vec<WireNativeValue>,
+        active_profile: Option<String>,
+        policy_conflicts: Vec<String>,
+        capability: CapabilityLevel,
+    }
+);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(
@@ -153,29 +267,97 @@ pub enum NativeScope {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+impl NativeScope {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        match self {
+            Self::Global => Ok(()),
+            Self::Project { root, .. } => root.validate(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct ImportRequest {
     pub scopes: Vec<NativeScope>,
     pub include_disabled: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+impl ImportRequest {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_adapter_collection("importRequest.scopes", self.scopes.len())?;
+        for scope in &self.scopes {
+            scope.validate()?;
+        }
+        Ok(())
+    }
+}
+
+validated_adapter_dto!(
+    ImportRequest,
+    ImportRequestWire,
+    ImportRequestWireRef {
+        scopes: Vec<NativeScope>,
+        include_disabled: bool,
+    }
+);
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct ImportedState {
     pub components: Vec<ComponentRecord>,
     pub source_digests: Vec<Sha256Digest>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+impl ImportedState {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_adapter_collection("importedState.components", self.components.len())?;
+        validate_adapter_collection("importedState.sourceDigests", self.source_digests.len())?;
+        for component in &self.components {
+            component.validate()?;
+        }
+        Ok(())
+    }
+}
+
+validated_adapter_dto!(
+    ImportedState,
+    ImportedStateWire,
+    ImportedStateWireRef {
+        components: Vec<ComponentRecord>,
+        source_digests: Vec<Sha256Digest>,
+    }
+);
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct DesiredState {
     pub components: Vec<ComponentRecord>,
     pub scopes: Vec<NativeScope>,
 }
+
+impl DesiredState {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_adapter_collection("desiredState.components", self.components.len())?;
+        validate_adapter_collection("desiredState.scopes", self.scopes.len())?;
+        for component in &self.components {
+            component.validate()?;
+        }
+        for scope in &self.scopes {
+            scope.validate()?;
+        }
+        Ok(())
+    }
+}
+
+validated_adapter_dto!(
+    DesiredState,
+    DesiredStateWire,
+    DesiredStateWireRef {
+        components: Vec<ComponentRecord>,
+        scopes: Vec<NativeScope>,
+    }
+);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

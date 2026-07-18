@@ -8,7 +8,7 @@ use crate::{
     BoundedBytes, CandidateId, ClientError, CompletionEvidenceInput, CreateHandoffInput, DeviceId,
     Ed25519PublicKeyBytes, ExportId, HandoffPayload, HarnessAccessPolicy, HarnessId,
     InstallationTokenProof, MAX_MARKDOWN_BYTES, MAX_TAG_BYTES, MAX_TAGS, MAX_TITLE_BYTES,
-    MemoryCandidate, MemoryId, MemoryKind, MemoryRecord, NativePlatform, OperationId,
+    MemoryCandidate, MemoryId, MemoryKind, MemoryRecord, NativePlatform, OperationId, PairingId,
     PairingRequestNonce, PlanId, ProbeReport, ProjectId, ProjectIdentity, ProtocolVersion,
     RecordId, ScopeRef, SetupPlan, Sha256Digest, StatusOutput, TaskId, TaskRecord, TaskStatus,
     ValidationError, WireNativeValue, X25519PublicKeyBytes, decimal_u64, required_text,
@@ -130,10 +130,10 @@ params!(PairingJoinParams {
     wrapping_public_key: X25519PublicKeyBytes
 });
 params!(PairingIdParams {
-    pairing_id: RecordId
+    pairing_id: PairingId
 });
 params!(PairingDecisionParams {
-    pairing_id: RecordId,
+    pairing_id: PairingId,
     request_digest: Sha256Digest,
     approve: bool
 });
@@ -206,7 +206,7 @@ impl<'de> Deserialize<'de> for PairingCode {
 }
 
 params!(PairingRequestInfo {
-    pairing_id: RecordId,
+    pairing_id: PairingId,
     code: PairingCode,
     device_name: String,
     platform: NativePlatform,
@@ -423,6 +423,9 @@ impl Serialize for JsonRpcRequestV1 {
 impl<'de> Deserialize<'de> for JsonRpcRequestV1 {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let wire = WireRequest::deserialize(d)?;
+        if wire.protocol.major != crate::PROTOCOL_MAJOR {
+            return Err(D::Error::custom("unsupported protocol major"));
+        }
         let request: LocalRequest =
             serde_json::from_value(serde_json::json!({"method":wire.method,"params":wire.params}))
                 .map_err(D::Error::custom)?;

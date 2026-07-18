@@ -20,7 +20,8 @@
                 "maxLength": 1048576,
                 "minLength": 1,
                 "pattern": ".*\\S.*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 1048576
               },
               "createdHlc": {
                 "additionalProperties": false,
@@ -198,7 +199,8 @@
                   "maxLength": 128,
                   "minLength": 1,
                   "pattern": ".*\\S.*",
-                  "type": "string"
+                  "type": "string",
+                  "x-utf8-maxBytes": 128
                 },
                 "maxItems": 64,
                 "type": "array",
@@ -208,7 +210,8 @@
                 "maxLength": 512,
                 "minLength": 1,
                 "pattern": ".*\\S.*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 512
               },
               "updatedHlc": {
                 "additionalProperties": false,
@@ -267,7 +270,8 @@
           "maxLength": 1048576,
           "minLength": 1,
           "pattern": ".*\\S.*",
-          "type": "string"
+          "type": "string",
+          "x-utf8-maxBytes": 1048576
         },
         "memories": {
           "items": {
@@ -280,7 +284,8 @@
                 "maxLength": 1048576,
                 "minLength": 1,
                 "pattern": ".*\\S.*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 1048576
               },
               "createdHlc": {
                 "additionalProperties": false,
@@ -465,7 +470,8 @@
                   "maxLength": 128,
                   "minLength": 1,
                   "pattern": ".*\\S.*",
-                  "type": "string"
+                  "type": "string",
+                  "x-utf8-maxBytes": 128
                 },
                 "maxItems": 64,
                 "type": "array",
@@ -475,7 +481,8 @@
                 "maxLength": 512,
                 "minLength": 1,
                 "pattern": ".*\\S.*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 512
               },
               "updatedHlc": {
                 "additionalProperties": false,
@@ -528,30 +535,6 @@
             },
             {
               "additionalProperties": false,
-              "anyOf": [
-                {
-                  "properties": {
-                    "githubRepositoryId": {
-                      "pattern": "^[1-9][0-9]*$",
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "githubRepositoryId"
-                  ]
-                },
-                {
-                  "properties": {
-                    "gitRemoteFingerprint": {
-                      "pattern": "^[0-9a-f]{64}$",
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "gitRemoteFingerprint"
-                  ]
-                }
-              ],
               "properties": {
                 "gitRemoteFingerprint": {
                   "oneOf": [
@@ -581,8 +564,10 @@
                       "type": "null"
                     },
                     {
+                      "maxLength": 512,
                       "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*[\\\\:\\x00-\\x1F]).+$",
-                      "type": "string"
+                      "type": "string",
+                      "x-utf8-maxBytes": 512
                     }
                   ]
                 },
@@ -590,7 +575,8 @@
                   "maxLength": 512,
                   "minLength": 1,
                   "pattern": ".*\\S.*",
-                  "type": "string"
+                  "type": "string",
+                  "x-utf8-maxBytes": 512
                 },
                 "projectId": {
                   "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
@@ -638,7 +624,8 @@
                 "maxLength": 1048576,
                 "minLength": 1,
                 "pattern": ".*\\S.*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 1048576
               },
               "evidence": {
                 "items": {
@@ -648,7 +635,8 @@
                       "maxLength": 128,
                       "minLength": 1,
                       "pattern": ".*\\S.*",
-                      "type": "string"
+                      "type": "string",
+                      "x-utf8-maxBytes": 128
                     },
                     "recordedHlc": {
                       "additionalProperties": false,
@@ -681,7 +669,8 @@
                         },
                         {
                           "maxLength": 16384,
-                          "type": "string"
+                          "type": "string",
+                          "x-utf8-maxBytes": 16384
                         }
                       ]
                     },
@@ -689,7 +678,8 @@
                       "maxLength": 16384,
                       "minLength": 1,
                       "pattern": ".*\\S.*",
-                      "type": "string"
+                      "type": "string",
+                      "x-utf8-maxBytes": 16384
                     }
                   },
                   "required": [
@@ -728,7 +718,8 @@
                 "maxLength": 512,
                 "minLength": 1,
                 "pattern": ".*\\S.*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 512
               }
             },
             "required": [

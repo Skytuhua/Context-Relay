@@ -1,0 +1,99 @@
+[
+  {
+    "name": "duplicate_map_key",
+    "expected": "map key",
+    "mutation": { "kind": "replace", "offset": 3, "delete": 1, "hex": "00" }
+  },
+  {
+    "name": "indefinite_map",
+    "expected": "map size",
+    "mutation": { "kind": "replace", "offset": 0, "delete": 1, "hex": "bf" }
+  },
+  {
+    "name": "non_preferred_integer",
+    "expected": "noncanonical encoding",
+    "mutation": { "kind": "replace", "offset": 2, "delete": 1, "hex": "1801" }
+  },
+  {
+    "name": "wrong_map_order",
+    "expected": "map key",
+    "mutation": { "kind": "replace", "offset": 1, "delete": 1, "hex": "01" }
+  },
+  {
+    "name": "tagged_operation",
+    "expected": "decode",
+    "mutation": { "kind": "prefix", "hex": "c0" }
+  },
+  {
+    "name": "floating_point_schema",
+    "expected": "decode",
+    "mutation": { "kind": "replace", "offset": 2, "delete": 1, "hex": "f90000" }
+  },
+  {
+    "name": "trailing_byte",
+    "expected": "trailing bytes",
+    "mutation": { "kind": "append", "hex": "00" }
+  },
+  {
+    "name": "operation_over_limit",
+    "expected": "operation too large",
+    "mutation": { "kind": "repeat", "hex": "00", "count": 5242881 }
+  },
+  {
+    "name": "unsupported_schema",
+    "expected": "unsupported schema",
+    "mutation": { "kind": "replace", "offset": 2, "delete": 1, "hex": "02" }
+  },
+  {
+    "name": "invalid_operation_uuid_length",
+    "expected": "operation id",
+    "mutation": { "kind": "replace", "offset": 11, "delete": 1, "hex": "4c" }
+  },
+  {
+    "name": "duplicate_frontier_device",
+    "expected": "invalid operation",
+    "mutation": {
+      "kind": "duplicate_range",
+      "find_hex": "0a818250",
+      "patch_offset_from_find": 1,
+      "patch_hex": "82",
+      "range_offset_from_find": 2,
+      "range_length": 19,
+      "insert_offset_from_find": 21
+    }
+  },
+  {
+    "name": "malformed_hlc_map",
+    "expected": "map size",
+    "mutation": {
+      "kind": "replace_found",
+      "find_hex": "12a3",
+      "offset_from_find": 1,
+      "delete": 1,
+      "hex": "a2"
+    }
+  },
+  {
+    "name": "oversized_ciphertext",
+    "expected": "ciphertext",
+    "mutation": {
+      "kind": "replace_with_byte_string",
+      "find_hex": "0f43030405",
+      "offset_from_find": 1,
+      "delete": 4,
+      "length": 4194305,
+      "fill": 0
+    }
+  },
+  {
+    "name": "oversized_blob_ciphertext_bytes",
+    "expected": "invalid operation",
+    "mutation": {
+      "kind": "replace_found",
+      "find_hex": "010902",
+      "offset_from_find": 1,
+      "delete": 1,
+      "hex": "1a1f400001"
+    }
+  }
+]

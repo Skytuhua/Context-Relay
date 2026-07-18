@@ -509,7 +509,7 @@ fn uuid() -> Value {
     json!({"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"})
 }
 fn text(min: usize, max: usize) -> Value {
-    json!({"type":"string","minLength":min,"maxLength":max,"pattern":r".*\S.*"})
+    json!({"type":"string","minLength":min,"maxLength":max,"x-utf8-maxBytes":max,"pattern":r".*\S.*"})
 }
 fn scope() -> Value {
     json!({"oneOf":[{"type":"object","properties":{"scope":{"const":"global"}},"required":["scope"],"additionalProperties":false},{"type":"object","properties":{"scope":{"const":"project"},"projectId":uuid()},"required":["scope","projectId"],"additionalProperties":false}]})
@@ -518,7 +518,7 @@ fn task_status() -> Value {
     json!({"enum":["open","in_progress","blocked","done","canceled"]})
 }
 fn evidence() -> Value {
-    json!({"type":"object","properties":{"summary":text(1,MAX_EVIDENCE_BYTES),"kind":text(1,128),"reference":{"oneOf":[{"type":"null"},{"type":"string","maxLength":MAX_EVIDENCE_BYTES}]}},"required":["summary","kind"],"additionalProperties":false})
+    json!({"type":"object","properties":{"summary":text(1,MAX_EVIDENCE_BYTES),"kind":text(1,128),"reference":{"oneOf":[{"type":"null"},{"type":"string","maxLength":MAX_EVIDENCE_BYTES,"x-utf8-maxBytes":MAX_EVIDENCE_BYTES}]}},"required":["summary","kind"],"additionalProperties":false})
 }
 fn memory() -> Value {
     json!({"type":"object","properties":{"id":uuid(),"scope":scope(),"kind":{"enum":["fact","decision","preference","pattern","procedure","note"]},"title":text(1,MAX_TITLE_BYTES),"bodyMarkdown":text(1,MAX_MARKDOWN_BYTES),"tags":{"type":"array","maxItems":crate::MAX_TAGS,"uniqueItems":true,"items":text(1,crate::MAX_TAG_BYTES)},"origin":{"enum":["explicit","inferred","native_import","package_import"]},"provenance":provenance(),"revision":uuid(),"createdHlc":hlc(),"updatedHlc":hlc(),"archived":{"type":"boolean"}},"required":["id","scope","kind","title","bodyMarkdown","tags","origin","provenance","revision","createdHlc","updatedHlc","archived"],"additionalProperties":false})
@@ -549,7 +549,7 @@ fn provenance() -> Value {
     json!({"type":"object","properties":{"originDevice":uuid(),"harness":{"oneOf":[{"type":"null"},{"enum":["claude_code","codex","hermes"]}]},"source":{"oneOf":[{"type":"null"},{"type":"object","properties":{"source":{"const":"record"},"recordId":uuid()},"required":["source","recordId"],"additionalProperties":false},{"type":"object","properties":{"source":{"const":"package"},"packageId":uuid()},"required":["source","packageId"],"additionalProperties":false}]},"createdHlc":hlc()},"required":["originDevice","harness","source","createdHlc"],"additionalProperties":false})
 }
 fn task_evidence() -> Value {
-    json!({"type":"object","properties":{"summary":text(1,MAX_EVIDENCE_BYTES),"evidenceKind":text(1,crate::MAX_TAG_BYTES),"reference":{"oneOf":[{"type":"null"},{"type":"string","maxLength":MAX_EVIDENCE_BYTES}]},"recordedHlc":hlc()},"required":["summary","evidenceKind","reference","recordedHlc"],"additionalProperties":false})
+    json!({"type":"object","properties":{"summary":text(1,MAX_EVIDENCE_BYTES),"evidenceKind":text(1,crate::MAX_TAG_BYTES),"reference":{"oneOf":[{"type":"null"},{"type":"string","maxLength":MAX_EVIDENCE_BYTES,"x-utf8-maxBytes":MAX_EVIDENCE_BYTES}]},"recordedHlc":hlc()},"required":["summary","evidenceKind","reference","recordedHlc"],"additionalProperties":false})
 }
 fn access_policy() -> Value {
     json!({"oneOf":[
@@ -570,5 +570,5 @@ fn handoff_payload() -> Value {
     json!({"type":"object","properties":{"project":{"oneOf":[{"type":"null"},project_identity()]},"markdown":text(1,MAX_MARKDOWN_BYTES),"memories":{"type":"array","maxItems":crate::MAX_EVIDENCE_ITEMS,"items":memory()},"decisions":{"type":"array","maxItems":crate::MAX_EVIDENCE_ITEMS,"items":decision_memory()},"tasks":{"type":"array","maxItems":crate::MAX_EVIDENCE_ITEMS,"items":task()},"instructionRefs":{"type":"array","maxItems":crate::MAX_EVIDENCE_ITEMS,"uniqueItems":true,"items":uuid()}},"required":["project","markdown","memories","decisions","tasks","instructionRefs"],"additionalProperties":false})
 }
 fn project_identity() -> Value {
-    json!({"type":"object","properties":{"projectId":uuid(),"githubRepositoryId":{"oneOf":[{"type":"null"},{"type":"string","pattern":"^[1-9][0-9]*$"}]},"gitRemoteFingerprint":{"oneOf":[{"type":"null"},{"type":"string","pattern":"^[0-9a-f]{64}$"}]},"monorepoSubdirectory":{"oneOf":[{"type":"null"},{"type":"string","pattern":r"^(?!/)(?!.*(?:^|/)\.\.?(?:/|$))(?!.*[\\:\x00-\x1F]).+$"}]},"name":text(1,MAX_TITLE_BYTES)},"required":["projectId","githubRepositoryId","gitRemoteFingerprint","monorepoSubdirectory","name"],"anyOf":[{"properties":{"githubRepositoryId":{"type":"string","pattern":"^[1-9][0-9]*$"}},"required":["githubRepositoryId"]},{"properties":{"gitRemoteFingerprint":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"required":["gitRemoteFingerprint"]}],"additionalProperties":false})
+    json!({"type":"object","properties":{"projectId":uuid(),"githubRepositoryId":{"oneOf":[{"type":"null"},{"type":"string","pattern":"^[1-9][0-9]*$"}]},"gitRemoteFingerprint":{"oneOf":[{"type":"null"},{"type":"string","pattern":"^[0-9a-f]{64}$"}]},"monorepoSubdirectory":{"oneOf":[{"type":"null"},{"type":"string","pattern":r"^(?!/)(?!.*(?:^|/)\.\.?(?:/|$))(?!.*[\\:\x00-\x1F]).+$","maxLength":MAX_TITLE_BYTES,"x-utf8-maxBytes":MAX_TITLE_BYTES}]},"name":text(1,MAX_TITLE_BYTES)},"required":["projectId","githubRepositoryId","gitRemoteFingerprint","monorepoSubdirectory","name"],"additionalProperties":false})
 }

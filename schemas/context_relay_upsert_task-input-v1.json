@@ -60,7 +60,8 @@
       "maxLength": 1048576,
       "minLength": 1,
       "pattern": ".*\\S.*",
-      "type": "string"
+      "type": "string",
+      "x-utf8-maxBytes": 1048576
     },
     "expectedRevision": {
       "oneOf": [
@@ -104,7 +105,8 @@
       "maxLength": 512,
       "minLength": 1,
       "pattern": ".*\\S.*",
-      "type": "string"
+      "type": "string",
+      "x-utf8-maxBytes": 512
     }
   },
   "required": [

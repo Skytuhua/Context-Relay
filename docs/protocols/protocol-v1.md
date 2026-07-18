@@ -21,13 +21,15 @@ Later synchronization behavior must follow these rules:
 
 Local JSON-RPC and MCP inputs reject unknown fields. The package manifest allows forward data only in a namespaced `extensions` field. Sync schema version 1 rejects unknown top-level operation and checkpoint keys.
 
+Rust enforces text limits in UTF-8 bytes. Every consumer of an exported JSON Schema must register the `x-utf8-maxBytes` keyword and reject a string whose UTF-8 encoding exceeds that value. JSON Schema `maxLength` remains a character-count portability hint and does not replace the byte check.
+
 Native paths and arguments carry a platform tag, lossless bytes, and optional sanitized display text. Windows bytes are original UTF-16 code units in little-endian order. macOS bytes are the original `OsStr` bytes. Display text is never authoritative.
 
 Task 4 defines DTOs and validation only. It does not implement storage, merging, transports, authorization, adapter behavior, an MCP server, or package installation.
 
 ## Setup and package contracts
 
-A setup plan records the exact executable path bytes and digest, adapter and harness versions, target scopes, expected native digests, semantic changes, CLI argument arrays, package artifacts, permission delta, typed network endpoint delta, scanner report hash, RuleSync version and hash, approval class, expiry, and batch hash. A later task computes the batch hash over every accepted field, resolved dependency closure, permission and network delta, scanner result, and version. Task 4 does not compute or approve that hash.
+A setup plan records the exact executable path bytes and digest, adapter and harness versions, target scopes, expected native digests, semantic changes, CLI argument arrays, package artifacts, permission delta, typed network endpoint delta, scanner report hash, RuleSync version and hash, approval class, expiry, and batch hash. A later task serializes the canonical approval preimage from every accepted plan field except `batchHash`, including the resolved dependency closure, permission and network delta, scanner result, and versions. `batchHash` is the SHA-256 digest of that canonical preimage. Task 4 does not compute or approve the hash.
 
 An expected native digest may be absent, which means the approved precondition is that the target does not yet exist. Package artifact entries bind an immutable source reference and resolved commit, archive digest, installed artifact path and digest, and the transitive dependency closure.
 

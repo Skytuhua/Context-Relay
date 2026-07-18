@@ -1,0 +1,115 @@
+{
+  "memory": {
+    "id": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+    "scope": {"scope": "global"},
+    "kind": "fact",
+    "title": "Title",
+    "bodyMarkdown": "Body",
+    "tags": ["tag"],
+    "origin": "explicit",
+    "provenance": {
+      "originDevice": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+      "harness": "codex",
+      "source": null,
+      "createdHlc": {
+        "physicalMs": "1700000000000",
+        "logical": 0,
+        "node": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f"
+      }
+    },
+    "revision": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+    "createdHlc": {
+      "physicalMs": "1700000000000",
+      "logical": 0,
+      "node": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f"
+    },
+    "updatedHlc": {
+      "physicalMs": "1700000000000",
+      "logical": 0,
+      "node": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f"
+    },
+    "archived": false
+  },
+  "task": {
+    "id": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+    "projectId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+    "title": "Task",
+    "bodyMarkdown": "Body",
+    "status": "open",
+    "evidence": [],
+    "revision": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f"
+  },
+  "setupPlan": {
+    "planId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+    "harness": "codex",
+    "adapterVersion": 1,
+    "executablePath": {"platform": "windows", "bytes": "YwA", "display": "c"},
+    "executableHash": "0101010101010101010101010101010101010101010101010101010101010101",
+    "harnessVersion": "1.0.0",
+    "targetScopes": [{"scope": "global"}],
+    "expectedNativeDigests": [],
+    "semanticChanges": [],
+    "cliOperations": [],
+    "packageArtifacts": [],
+    "permissionDelta": {"added": [], "removed": []},
+    "networkDelta": {"added": [], "removed": []},
+    "scannerReportHash": "0202020202020202020202020202020202020202020202020202020202020202",
+    "rulesyncVersion": "1",
+    "rulesyncHash": "0303030303030303030303030303030303030303030303030303030303030303",
+    "approvalClass": "passive",
+    "expiresAt": "1700000060000",
+    "batchHash": "0404040404040404040404040404040404040404040404040404040404040404"
+  },
+  "syncOperation": {
+    "schemaVersion": 1,
+    "operationId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+    "accountId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+    "workspaceId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+    "projectId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+    "recordId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+    "recordKind": "memory",
+    "mutationKind": "upsert",
+    "deviceId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+    "deviceSequence": "7",
+    "causalFrontier": [
+      {"deviceId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f", "sequence": "6"}
+    ],
+    "controlEpoch": 2,
+    "keyEpoch": 3,
+    "previousDeviceHash": "0101010101010101010101010101010101010101010101010101010101010101",
+    "nonce": "AgICAgICAgICAgICAgICAgICAgICAgIC",
+    "ciphertext": "AwQF",
+    "ciphertextHash": "0606060606060606060606060606060606060606060606060606060606060606",
+    "blobRefs": [
+      {
+        "digest": "0707070707070707070707070707070707070707070707070707070707070707",
+        "ciphertextBytes": "9",
+        "storageId": "blob-1"
+      }
+    ],
+    "createdHlc": {
+      "physicalMs": "1700000000000",
+      "logical": 0,
+      "node": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f"
+    },
+    "signature": "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
+  },
+  "canonicalCbor": {
+    "syncOperation": {
+      "file": "sync-operation-v1.hex",
+      "sha256": "dcc2bc452c5be8b463b31cb7ee3007d3a19dc5013292fd91ab8c80517614bb1d"
+    },
+    "syncOperationSigningPreimage": {
+      "file": "sync-operation-signing-preimage-v1.hex",
+      "sha256": "2296851ec7e26897c7a4282e436d8585eb4331aedc747316f60110c1314009cf"
+    },
+    "checkpoint": {
+      "file": "checkpoint-v1.hex",
+      "sha256": "596fa2bbc08e0697e50396b87e565db37b6fd9dfb7810ea1727b8398a9bb3284"
+    },
+    "checkpointSigningPreimage": {
+      "file": "checkpoint-signing-preimage-v1.hex",
+      "sha256": "2213731885c62a78e2e3a8972decc4091faa1296bf3abfeca9a8556f778eb192"
+    }
+  }
+}

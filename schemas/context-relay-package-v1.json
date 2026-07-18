@@ -11,7 +11,8 @@
               "bodyMarkdown": {
                 "maxLength": 1048576,
                 "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 1048576
               },
               "id": {
                 "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
@@ -56,7 +57,8 @@
               "title": {
                 "maxLength": 512,
                 "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 512
               }
             },
             "required": [
@@ -74,7 +76,8 @@
               "bodyMarkdown": {
                 "maxLength": 1048576,
                 "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 1048576
               },
               "id": {
                 "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
@@ -119,7 +122,8 @@
               "title": {
                 "maxLength": 512,
                 "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 512
               }
             },
             "required": [
@@ -137,7 +141,8 @@
               "bodyMarkdown": {
                 "maxLength": 1048576,
                 "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 1048576
               },
               "dependencies": {
                 "items": {
@@ -150,17 +155,20 @@
                     "immutableSourceRef": {
                       "maxLength": 1048576,
                       "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                      "type": "string"
+                      "type": "string",
+                      "x-utf8-maxBytes": 1048576
                     },
                     "name": {
                       "maxLength": 512,
                       "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                      "type": "string"
+                      "type": "string",
+                      "x-utf8-maxBytes": 512
                     },
                     "version": {
                       "maxLength": 512,
                       "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                      "type": "string"
+                      "type": "string",
+                      "x-utf8-maxBytes": 512
                     }
                   },
                   "required": [
@@ -184,7 +192,8 @@
               "name": {
                 "maxLength": 512,
                 "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 512
               },
               "scope": {
                 "oneOf": [
@@ -244,17 +253,20 @@
                     "immutableSourceRef": {
                       "maxLength": 1048576,
                       "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                      "type": "string"
+                      "type": "string",
+                      "x-utf8-maxBytes": 1048576
                     },
                     "name": {
                       "maxLength": 512,
                       "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                      "type": "string"
+                      "type": "string",
+                      "x-utf8-maxBytes": 512
                     },
                     "version": {
                       "maxLength": 512,
                       "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                      "type": "string"
+                      "type": "string",
+                      "x-utf8-maxBytes": 512
                     }
                   },
                   "required": [
@@ -278,7 +290,8 @@
               "name": {
                 "maxLength": 512,
                 "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 512
               },
               "scope": {
                 "oneOf": [
@@ -343,17 +356,20 @@
                   "immutableSourceRef": {
                     "maxLength": 1048576,
                     "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                    "type": "string"
+                    "type": "string",
+                    "x-utf8-maxBytes": 1048576
                   },
                   "name": {
                     "maxLength": 512,
                     "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                    "type": "string"
+                    "type": "string",
+                    "x-utf8-maxBytes": 512
                   },
                   "version": {
                     "maxLength": 512,
                     "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                    "type": "string"
+                    "type": "string",
+                    "x-utf8-maxBytes": 512
                   }
                 },
                 "required": [
@@ -400,7 +416,8 @@
               "serverName": {
                 "maxLength": 512,
                 "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 512
               }
             },
             "required": [
@@ -422,7 +439,8 @@
               "event": {
                 "maxLength": 512,
                 "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 512
               },
               "id": {
                 "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
@@ -494,7 +512,8 @@
                 "items": {
                   "maxLength": 512,
                   "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-                  "type": "string"
+                  "type": "string",
+                  "x-utf8-maxBytes": 512
                 },
                 "maxItems": 10000,
                 "minItems": 1,
@@ -557,7 +576,8 @@
           "namespace": {
             "maxLength": 255,
             "pattern": "^[a-z0-9-]+(\\.[a-z0-9-]+)+$",
-            "type": "string"
+            "type": "string",
+            "x-utf8-maxBytes": 255
           },
           "value": {
             "maxLength": 1398102,
@@ -605,12 +625,14 @@
           "name": {
             "maxLength": 512,
             "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-            "type": "string"
+            "type": "string",
+            "x-utf8-maxBytes": 512
           },
           "provider": {
             "maxLength": 512,
             "pattern": "[\\s\\S]*\\S[\\s\\S]*",
-            "type": "string"
+            "type": "string",
+            "x-utf8-maxBytes": 512
           },
           "requiredOnDevice": {
             "type": "boolean"

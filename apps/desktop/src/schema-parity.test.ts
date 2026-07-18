@@ -1,7 +1,8 @@
-import Ajv2020 from 'ajv/dist/2020.js';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { createProtocolSchemaValidator } from './protocol-validation';
 
 type ComponentSchema = {
   properties: Record<string, Record<string, unknown>> & { kind: { const: string } };
@@ -13,7 +14,7 @@ const loadWorkspace = (path: string) => JSON.parse(readFileSync(resolve(workspac
 const loadSchema = (name: string) => JSON.parse(readFileSync(resolve(schemaRoot, name), 'utf8'));
 const clone = <T>(value: T): T => structuredClone(value);
 
-const ajv = new Ajv2020({ allErrors: true, strict: true });
+const ajv = createProtocolSchemaValidator();
 const packageSchema = loadSchema('context-relay-package-v1.json');
 const exportSchema = loadSchema('context-relay-export-v1.json');
 const validatePackage = ajv.compile(packageSchema);
@@ -58,9 +59,25 @@ describe('package and export schema parity', () => {
     expect(permission.properties.permissions).toMatchObject({ maxItems: 10_000, uniqueItems: true });
     expect(skill.properties.dependencies.maxItems).toBe(10_000);
     expect(instruction.properties.title.maxLength).toBe(512);
+    expect(instruction.properties.title['x-utf8-maxBytes']).toBe(512);
     expect(instruction.properties.bodyMarkdown.maxLength).toBe(1_048_576);
     expect(exportSchema.properties.records.maxItems).toBe(10_000);
     expect(exportSchema.properties.operationOrder).toMatchObject({ maxItems: 10_000, uniqueItems: true });
+
+    const oversizedUtf8 = clone(validPackage);
+    oversizedUtf8.components[0].title = '\u00e9'.repeat(300);
+    expect(validatePackage(oversizedUtf8)).toBe(false);
+  });
+
+  it('verifies canonical CBOR fixture hash metadata', () => {
+    const fixture = loadWorkspace('crates/protocol/tests/fixtures/runtime-contracts-v1.json');
+    for (const [name, metadata] of Object.entries(fixture.canonicalCbor) as [
+      string,
+      { file: string; sha256: string },
+    ][]) {
+      const hex = readFileSync(resolve(workspace, 'crates/protocol/tests/fixtures', metadata.file), 'utf8').trim();
+      expect(createHash('sha256').update(Buffer.from(hex, 'hex')).digest('hex'), name).toBe(metadata.sha256);
+    }
   });
 
   it('rejects out-of-range HLC values and unknown nested fields', () => {

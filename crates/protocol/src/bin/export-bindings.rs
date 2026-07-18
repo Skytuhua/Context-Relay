@@ -31,6 +31,7 @@ export type TaskId = UuidV7 & {{ readonly __taskId: unique symbol }};\n\
 export type SecretRefId = UuidV7 & {{ readonly __secretRefId: unique symbol }};\n\
 export type OperationId = UuidV7 & {{ readonly __operationId: unique symbol }};\n\
 export type RecordId = UuidV7 & {{ readonly __recordId: unique symbol }};\n\
+export type PairingId = UuidV7 & {{ readonly __pairingId: unique symbol }};\n\
 export type DeviceId = UuidV7 & {{ readonly __deviceId: unique symbol }};\n\
 export type PlanId = UuidV7 & {{ readonly __planId: unique symbol }};\n\
 export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexport type ExportId = UuidV7 & {{ readonly __exportId: unique symbol }};\n\n"

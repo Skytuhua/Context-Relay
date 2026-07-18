@@ -334,13 +334,12 @@ pub struct ProjectIdentity {
 
 impl ProjectIdentity {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.github_repository_id == Some(0)
-            || (self.github_repository_id.is_none() && self.git_remote_fingerprint.is_none())
-        {
+        if self.github_repository_id == Some(0) {
             return Err(ValidationError::Invalid("repositoryIdentity"));
         }
         if let Some(path) = &self.monorepo_subdirectory
-            && (path.is_empty()
+            && (path.len() > MAX_TITLE_BYTES
+                || path.is_empty()
                 || path.starts_with('/')
                 || path.contains('\\')
                 || path.contains(':')

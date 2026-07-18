@@ -47,7 +47,7 @@ fn digest() -> Value {
     json!({"type":"string","pattern":"^[0-9a-f]{64}$"})
 }
 fn required_text(max: usize) -> Value {
-    json!({"type":"string","pattern":r"[\s\S]*\S[\s\S]*","maxLength":max})
+    json!({"type":"string","pattern":r"[\s\S]*\S[\s\S]*","maxLength":max,"x-utf8-maxBytes":max})
 }
 fn base64url(max_bytes: usize) -> Value {
     json!({
@@ -100,7 +100,7 @@ fn package_schema() -> Value {
     ]}});
     let secret = json!({"type":"object","properties":{"id":uuid(),"name":required_text(MAX_TITLE_BYTES),"provider":required_text(MAX_TITLE_BYTES),"requiredOnDevice":{"type":"boolean"}},"required":["id","name","provider","requiredOnDevice"],"additionalProperties":false});
     root(
-        json!({"format":{"const":"context-relay.package.v1"},"packageId":uuid(),"components":components,"secretRefs":{"type":"array","maxItems":MAX_BATCH_OPERATIONS,"items":secret},"harnessTargets":{"type":"array","minItems":1,"maxItems":3,"uniqueItems":true,"items":{"enum":["claude_code","codex","hermes"]}},"extensions":{"type":"array","maxItems":MAX_BATCH_OPERATIONS,"items":{"type":"object","properties":{"namespace":{"type":"string","pattern":r"^[a-z0-9-]+(\.[a-z0-9-]+)+$","maxLength":255},"value":base64url(MAX_ARBITRARY_BYTES)},"required":["namespace","value"],"additionalProperties":false}}}),
+        json!({"format":{"const":"context-relay.package.v1"},"packageId":uuid(),"components":components,"secretRefs":{"type":"array","maxItems":MAX_BATCH_OPERATIONS,"items":secret},"harnessTargets":{"type":"array","minItems":1,"maxItems":3,"uniqueItems":true,"items":{"enum":["claude_code","codex","hermes"]}},"extensions":{"type":"array","maxItems":MAX_BATCH_OPERATIONS,"items":{"type":"object","properties":{"namespace":{"type":"string","pattern":r"^[a-z0-9-]+(\.[a-z0-9-]+)+$","maxLength":255,"x-utf8-maxBytes":255},"value":base64url(MAX_ARBITRARY_BYTES)},"required":["namespace","value"],"additionalProperties":false}}}),
         vec![
             "format",
             "packageId",

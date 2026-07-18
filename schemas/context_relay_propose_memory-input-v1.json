@@ -6,7 +6,8 @@
       "maxLength": 16384,
       "minLength": 1,
       "pattern": ".*\\S.*",
-      "type": "string"
+      "type": "string",
+      "x-utf8-maxBytes": 16384
     },
     "kind": {
       "enum": [
@@ -22,7 +23,8 @@
       "maxLength": 1048576,
       "minLength": 1,
       "pattern": ".*\\S.*",
-      "type": "string"
+      "type": "string",
+      "x-utf8-maxBytes": 1048576
     },
     "operationId": {
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
@@ -66,7 +68,8 @@
         "maxLength": 128,
         "minLength": 1,
         "pattern": ".*\\S.*",
-        "type": "string"
+        "type": "string",
+        "x-utf8-maxBytes": 128
       },
       "maxItems": 64,
       "type": "array",
@@ -76,7 +79,8 @@
       "maxLength": 512,
       "minLength": 1,
       "pattern": ".*\\S.*",
-      "type": "string"
+      "type": "string",
+      "x-utf8-maxBytes": 512
     }
   },
   "required": [

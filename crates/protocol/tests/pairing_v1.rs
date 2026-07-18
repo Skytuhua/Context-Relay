@@ -3,9 +3,9 @@ mod support;
 use std::str::FromStr;
 
 use context_relay_protocol::{
-    DeviceId, Ed25519PublicKeyBytes, LocalRequest, NativePlatform, PairingCode,
-    PairingDecisionParams, PairingJoinParams, PairingRequestNonce, RecordId, Sha256Digest,
-    X25519PublicKeyBytes,
+    DecimalTimestamp, DeviceId, Ed25519PublicKeyBytes, LocalRequest, NativePlatform, PairingCode,
+    PairingDecisionParams, PairingId, PairingIdParams, PairingJoinParams, PairingRequestInfo,
+    PairingRequestNonce, Sha256Digest, X25519PublicKeyBytes,
 };
 
 #[test]
@@ -70,7 +70,7 @@ fn pairing_keys_cannot_be_substituted_across_algorithm_types() {
 #[test]
 fn pairing_decision_is_bound_to_request_digest() {
     let decision = PairingDecisionParams {
-        pairing_id: RecordId::from_str(support::ID).unwrap(),
+        pairing_id: PairingId::from_str(support::ID).unwrap(),
         request_digest: Sha256Digest([11; 32]),
         approve: true,
     };
@@ -80,4 +80,31 @@ fn pairing_decision_is_bound_to_request_digest() {
         serde_json::from_value::<PairingDecisionParams>(value).unwrap(),
         decision
     );
+}
+
+#[test]
+fn pairing_id_is_used_by_request_status_and_cancel_dtos() {
+    let pairing_id = PairingId::from_str(support::ID).unwrap();
+    let info = PairingRequestInfo {
+        pairing_id,
+        code: PairingCode::new("01234-ABCDE".into()).unwrap(),
+        device_name: "new laptop".into(),
+        platform: NativePlatform::Macos,
+        requested_at: DecimalTimestamp(7),
+        key_fingerprint: Sha256Digest([13; 32]),
+        request_digest: Sha256Digest([17; 32]),
+    };
+    assert_eq!(
+        serde_json::from_value::<PairingRequestInfo>(serde_json::to_value(&info).unwrap()).unwrap(),
+        info
+    );
+    for request in [
+        LocalRequest::PairingStatus(PairingIdParams { pairing_id }),
+        LocalRequest::PairingCancel(PairingIdParams { pairing_id }),
+    ] {
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["params"]["pairingId"],
+            support::ID
+        );
+    }
 }

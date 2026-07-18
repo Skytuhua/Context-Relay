@@ -67,6 +67,7 @@ id_type!(TaskId);
 id_type!(SecretRefId);
 id_type!(OperationId);
 id_type!(RecordId);
+id_type!(PairingId);
 id_type!(DeviceId);
 id_type!(PlanId);
 id_type!(PackageId);

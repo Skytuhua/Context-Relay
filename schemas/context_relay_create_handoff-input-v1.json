@@ -63,7 +63,8 @@
       "maxLength": 1048576,
       "minLength": 1,
       "pattern": ".*\\S.*",
-      "type": "string"
+      "type": "string",
+      "x-utf8-maxBytes": 1048576
     },
     "taskIds": {
       "items": {

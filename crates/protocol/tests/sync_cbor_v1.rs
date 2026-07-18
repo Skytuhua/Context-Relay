@@ -3,11 +3,12 @@ mod support;
 use std::str::FromStr;
 
 use context_relay_protocol::{
-    BoundedCiphertext, DeviceId, DeviceSequence, MAX_BATCH_OPERATIONS, MAX_BLOB_BYTES,
-    MAX_CBOR_OPERATION_BYTES, MAX_CIPHERTEXT_BYTES, ProtocolError, decode_checkpoint_v1,
-    decode_sync_operation_v1, encode_checkpoint_signing_preimage_v1, encode_checkpoint_v1,
+    BoundedCiphertext, DeviceId, DeviceSequence, MAX_BATCH_OPERATIONS, MAX_CIPHERTEXT_BYTES,
+    ProtocolError, decode_checkpoint_v1, decode_sync_operation_v1,
+    encode_checkpoint_signing_preimage_v1, encode_checkpoint_v1,
     encode_sync_operation_signing_preimage_v1, encode_sync_operation_v1,
 };
+use serde::Deserialize;
 
 #[test]
 fn operation_and_checkpoint_match_golden_bytes() {
@@ -35,100 +36,163 @@ fn operation_and_checkpoint_match_golden_bytes() {
     );
 }
 
+#[derive(Deserialize)]
+struct InvalidCborFixture {
+    name: String,
+    expected: String,
+    mutation: InvalidCborMutation,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum InvalidCborMutation {
+    Replace {
+        offset: usize,
+        delete: usize,
+        hex: String,
+    },
+    ReplaceFound {
+        find_hex: String,
+        offset_from_find: usize,
+        delete: usize,
+        hex: String,
+    },
+    Prefix {
+        hex: String,
+    },
+    Append {
+        hex: String,
+    },
+    DuplicateRange {
+        find_hex: String,
+        patch_offset_from_find: usize,
+        patch_hex: String,
+        range_offset_from_find: usize,
+        range_length: usize,
+        insert_offset_from_find: usize,
+    },
+    Repeat {
+        hex: String,
+        count: usize,
+    },
+    ReplaceWithByteString {
+        find_hex: String,
+        offset_from_find: usize,
+        delete: usize,
+        length: usize,
+        fill: u8,
+    },
+}
+
 #[test]
-fn invalid_cbor_forms_are_rejected_at_the_named_boundary() {
+fn invalid_cbor_corpus_is_rejected_at_the_named_boundary() {
     let canonical = encode_sync_operation_v1(&support::sync_operation()).unwrap();
+    let fixtures: Vec<InvalidCborFixture> =
+        serde_json::from_str(include_str!("fixtures/invalid-cbor-corpus-v1.json")).unwrap();
 
-    let mut duplicate_key = canonical.clone();
-    duplicate_key[3] = 0;
-    assert_eq!(
-        decode_sync_operation_v1(&duplicate_key),
-        Err(ProtocolError::InvalidCbor("map key"))
-    );
-    let mut indefinite = canonical.clone();
-    indefinite[0] = 0xbf;
-    assert_eq!(
-        decode_sync_operation_v1(&indefinite),
-        Err(ProtocolError::InvalidCbor("map size"))
-    );
-    let mut non_preferred = canonical.clone();
-    non_preferred.splice(2..3, [0x18, 0x01]);
-    assert_eq!(
-        decode_sync_operation_v1(&non_preferred),
-        Err(ProtocolError::InvalidCbor("noncanonical encoding"))
-    );
-    let mut wrong_order = canonical.clone();
-    wrong_order[1] = 1;
-    assert_eq!(
-        decode_sync_operation_v1(&wrong_order),
-        Err(ProtocolError::InvalidCbor("map key"))
-    );
-    let mut tagged = vec![0xc0];
-    tagged.extend_from_slice(&canonical);
-    assert_eq!(
-        decode_sync_operation_v1(&tagged),
-        Err(ProtocolError::InvalidCbor("decode"))
-    );
-    let mut float = canonical.clone();
-    float.splice(2..3, [0xf9, 0, 0]);
-    assert_eq!(
-        decode_sync_operation_v1(&float),
-        Err(ProtocolError::InvalidCbor("decode"))
-    );
-    let mut trailing = canonical.clone();
-    trailing.push(0);
-    assert_eq!(
-        decode_sync_operation_v1(&trailing),
-        Err(ProtocolError::InvalidCbor("trailing bytes"))
-    );
-    assert_eq!(
-        decode_sync_operation_v1(&vec![0; MAX_CBOR_OPERATION_BYTES + 1]),
-        Err(ProtocolError::InvalidCbor("operation too large"))
-    );
-    let mut unsupported = canonical.clone();
-    unsupported[2] = 2;
-    assert_eq!(
-        decode_sync_operation_v1(&unsupported),
-        Err(ProtocolError::InvalidCbor("unsupported schema"))
-    );
-    let mut bad_uuid = canonical.clone();
-    bad_uuid[11] = 0x4c;
-    assert_eq!(
-        decode_sync_operation_v1(&bad_uuid),
-        Err(ProtocolError::InvalidCbor("operation id"))
-    );
+    for fixture in fixtures {
+        let invalid = apply_mutation(&canonical, fixture.mutation);
+        match decode_sync_operation_v1(&invalid) {
+            Err(ProtocolError::InvalidCbor(actual)) => {
+                assert_eq!(actual, fixture.expected, "fixture {}", fixture.name);
+            }
+            result => panic!(
+                "fixture {}: expected invalid CBOR, got {result:?}",
+                fixture.name
+            ),
+        }
+    }
+}
 
-    let frontier = [0x0a, 0x81, 0x82, 0x50];
-    let frontier_at = canonical
-        .windows(frontier.len())
-        .position(|window| window == frontier)
-        .unwrap();
-    let entry_start = frontier_at + 2;
-    let entry_end = entry_start + 19;
-    let duplicate_entry = canonical[entry_start..entry_end].to_vec();
-    let mut duplicate_frontier = canonical.clone();
-    duplicate_frontier[frontier_at + 1] = 0x82;
-    duplicate_frontier.splice(entry_end..entry_end, duplicate_entry);
-    assert_eq!(
-        decode_sync_operation_v1(&duplicate_frontier),
-        Err(ProtocolError::InvalidCbor("invalid operation"))
-    );
-    let hlc_at = canonical
-        .windows(2)
-        .position(|window| window == [0x12, 0xa3])
-        .unwrap();
-    let mut malformed_hlc = canonical.clone();
-    malformed_hlc[hlc_at + 1] = 0xa2;
-    assert_eq!(
-        decode_sync_operation_v1(&malformed_hlc),
-        Err(ProtocolError::InvalidCbor("map size"))
-    );
-    let mut oversized_blob = support::sync_operation();
-    oversized_blob.blob_refs[0].ciphertext_bytes = MAX_BLOB_BYTES as u64 + 1;
-    assert_eq!(
-        encode_sync_operation_v1(&oversized_blob),
-        Err(ProtocolError::InvalidCbor("invalid operation"))
-    );
+fn apply_mutation(canonical: &[u8], mutation: InvalidCborMutation) -> Vec<u8> {
+    match mutation {
+        InvalidCborMutation::Replace {
+            offset,
+            delete,
+            hex,
+        } => replace(canonical.to_vec(), offset, delete, unhex(&hex)),
+        InvalidCborMutation::ReplaceFound {
+            find_hex,
+            offset_from_find,
+            delete,
+            hex,
+        } => {
+            let at = find(canonical, &unhex(&find_hex)) + offset_from_find;
+            replace(canonical.to_vec(), at, delete, unhex(&hex))
+        }
+        InvalidCborMutation::Prefix { hex } => {
+            let mut output = unhex(&hex);
+            output.extend_from_slice(canonical);
+            output
+        }
+        InvalidCborMutation::Append { hex } => {
+            let mut output = canonical.to_vec();
+            output.extend(unhex(&hex));
+            output
+        }
+        InvalidCborMutation::DuplicateRange {
+            find_hex,
+            patch_offset_from_find,
+            patch_hex,
+            range_offset_from_find,
+            range_length,
+            insert_offset_from_find,
+        } => {
+            let base = find(canonical, &unhex(&find_hex));
+            let mut output = canonical.to_vec();
+            let patch = unhex(&patch_hex);
+            output.splice(
+                base + patch_offset_from_find..base + patch_offset_from_find + patch.len(),
+                patch,
+            );
+            let duplicate = output
+                [base + range_offset_from_find..base + range_offset_from_find + range_length]
+                .to_vec();
+            output.splice(
+                base + insert_offset_from_find..base + insert_offset_from_find,
+                duplicate,
+            );
+            output
+        }
+        InvalidCborMutation::Repeat { hex, count } => {
+            let pattern = unhex(&hex);
+            assert_eq!(pattern.len(), 1);
+            vec![pattern[0]; count]
+        }
+        InvalidCborMutation::ReplaceWithByteString {
+            find_hex,
+            offset_from_find,
+            delete,
+            length,
+            fill,
+        } => {
+            let at = find(canonical, &unhex(&find_hex)) + offset_from_find;
+            let mut value = vec![0x5a];
+            value.extend_from_slice(&(length as u32).to_be_bytes());
+            value.resize(value.len() + length, fill);
+            replace(canonical.to_vec(), at, delete, value)
+        }
+    }
+}
+
+fn replace(mut source: Vec<u8>, offset: usize, delete: usize, value: Vec<u8>) -> Vec<u8> {
+    source.splice(offset..offset + delete, value);
+    source
+}
+
+fn find(source: &[u8], pattern: &[u8]) -> usize {
+    source
+        .windows(pattern.len())
+        .position(|window| window == pattern)
+        .expect("fixture pattern must be present")
+}
+
+fn unhex(value: &str) -> Vec<u8> {
+    assert_eq!(value.len() % 2, 0);
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+        .collect()
 }
 
 fn frontier(count: usize) -> Vec<DeviceSequence> {

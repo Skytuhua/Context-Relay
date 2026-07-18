@@ -31,7 +31,8 @@
           "maxLength": 1048576,
           "minLength": 1,
           "pattern": ".*\\S.*",
-          "type": "string"
+          "type": "string",
+          "x-utf8-maxBytes": 1048576
         },
         "evidence": {
           "items": {
@@ -41,7 +42,8 @@
                 "maxLength": 128,
                 "minLength": 1,
                 "pattern": ".*\\S.*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 128
               },
               "recordedHlc": {
                 "additionalProperties": false,
@@ -74,7 +76,8 @@
                   },
                   {
                     "maxLength": 16384,
-                    "type": "string"
+                    "type": "string",
+                    "x-utf8-maxBytes": 16384
                   }
                 ]
               },
@@ -82,7 +85,8 @@
                 "maxLength": 16384,
                 "minLength": 1,
                 "pattern": ".*\\S.*",
-                "type": "string"
+                "type": "string",
+                "x-utf8-maxBytes": 16384
               }
             },
             "required": [
@@ -121,7 +125,8 @@
           "maxLength": 512,
           "minLength": 1,
           "pattern": ".*\\S.*",
-          "type": "string"
+          "type": "string",
+          "x-utf8-maxBytes": 512
         }
       },
       "required": [

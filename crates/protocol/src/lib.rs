@@ -57,7 +57,8 @@ pub fn negotiate_version(
     local: ProtocolVersionRange,
     peer: ProtocolVersionRange,
 ) -> Result<ProtocolVersion, ProtocolError> {
-    if local.min.major != local.max.major
+    if local.min.major != PROTOCOL_MAJOR
+        || local.min.major != local.max.major
         || peer.min.major != peer.max.major
         || local.min.major != peer.min.major
     {

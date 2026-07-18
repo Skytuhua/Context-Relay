@@ -1,6 +1,6 @@
 use context_relay_protocol::{
-    AccountId, ClockError, DeviceId, HybridLogicalClock, ProtocolVersion, ProtocolVersionRange,
-    RecordId, negotiate_version,
+    AccountId, ClockError, DeviceId, HybridLogicalClock, JsonRpcRequestV1, ProtocolVersion,
+    ProtocolVersionRange, RecordId, negotiate_version,
 };
 use std::str::FromStr;
 
@@ -55,6 +55,25 @@ fn version_negotiation_uses_greatest_shared_minor() {
         )
         .is_err()
     );
+    let unsupported = ProtocolVersionRange {
+        min: ProtocolVersion { major: 2, minor: 0 },
+        max: ProtocolVersion { major: 2, minor: 3 },
+    };
+    assert!(negotiate_version(unsupported, unsupported).is_err());
     let _: AccountId = AccountId::from_str(DEVICE).unwrap();
     let _: RecordId = RecordId::from_str(DEVICE).unwrap();
+}
+
+#[test]
+fn v1_request_rejects_an_unsupported_protocol_major() {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": DEVICE,
+        "protocol": { "major": 2, "minor": 0 },
+        "daemonInstanceNonce": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+        "method": "health",
+        "params": {}
+    });
+
+    assert!(serde_json::from_value::<JsonRpcRequestV1>(request).is_err());
 }
