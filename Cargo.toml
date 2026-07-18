@@ -16,6 +16,10 @@ repository = "https://github.com/Skytuhua/Context-Relay"
 rust-version = "1.97"
 
 [workspace.dependencies]
+base64 = "0.22.1"
+minicbor = { version = "0.26.5", features = ["std"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-ts-rs = { version = "11.1.0", features = ["serde-compat"] }
+thiserror = "2.0.16"
+ts-rs = { version = "11.1.0", features = ["serde-compat", "no-serde-warnings"] }
+uuid = { version = "1.18.1", features = ["serde", "std", "v7"] }

@@ -12,6 +12,8 @@
     "build": "pnpm --filter @context-relay/desktop build",
     "generate:bindings": "cargo run -p context-relay-protocol --bin export-bindings -- apps/desktop/src/bindings.ts",
     "check:bindings": "node scripts/check-bindings.mjs",
+    "generate:schemas": "cargo run -p context-relay-protocol --bin export-schemas -- schemas",
+    "check:schemas": "node scripts/check-schemas.mjs",
     "tauri:dev": "pnpm --filter @context-relay/desktop tauri dev",
     "tauri:build": "pnpm --filter @context-relay/desktop tauri build",
     "license:check": "node scripts/check-license-metadata.mjs"

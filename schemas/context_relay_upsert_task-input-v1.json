@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "anyOf": [
+    {
+      "not": {
+        "anyOf": [
+          {
+            "properties": {
+              "taskId": {}
+            },
+            "required": [
+              "taskId"
+            ]
+          },
+          {
+            "properties": {
+              "expectedRevision": {}
+            },
+            "required": [
+              "expectedRevision"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "properties": {
+        "expectedRevision": {
+          "type": "null"
+        },
+        "taskId": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "taskId",
+        "expectedRevision"
+      ]
+    },
+    {
+      "properties": {
+        "expectedRevision": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        },
+        "taskId": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "taskId",
+        "expectedRevision"
+      ]
+    }
+  ],
+  "properties": {
+    "bodyMarkdown": {
+      "maxLength": 1048576,
+      "minLength": 1,
+      "pattern": ".*\\S.*",
+      "type": "string"
+    },
+    "expectedRevision": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        }
+      ]
+    },
+    "operationId": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "projectId": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "open",
+        "in_progress",
+        "blocked",
+        "canceled"
+      ]
+    },
+    "taskId": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        }
+      ]
+    },
+    "title": {
+      "maxLength": 512,
+      "minLength": 1,
+      "pattern": ".*\\S.*",
+      "type": "string"
+    }
+  },
+  "required": [
+    "operationId",
+    "projectId",
+    "title",
+    "bodyMarkdown",
+    "status"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,258 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "memory": {
+      "additionalProperties": false,
+      "properties": {
+        "archived": {
+          "type": "boolean"
+        },
+        "bodyMarkdown": {
+          "maxLength": 1048576,
+          "minLength": 1,
+          "pattern": ".*\\S.*",
+          "type": "string"
+        },
+        "createdHlc": {
+          "additionalProperties": false,
+          "properties": {
+            "logical": {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "node": {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            "physicalMs": {
+              "pattern": "^(0|[1-9][0-9]*)$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "physicalMs",
+            "logical",
+            "node"
+          ],
+          "type": "object"
+        },
+        "id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "fact",
+            "decision",
+            "preference",
+            "pattern",
+            "procedure",
+            "note"
+          ]
+        },
+        "origin": {
+          "enum": [
+            "explicit",
+            "inferred",
+            "native_import",
+            "package_import"
+          ]
+        },
+        "provenance": {
+          "additionalProperties": false,
+          "properties": {
+            "createdHlc": {
+              "additionalProperties": false,
+              "properties": {
+                "logical": {
+                  "maximum": 4294967295,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "node": {
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                  "type": "string"
+                },
+                "physicalMs": {
+                  "pattern": "^(0|[1-9][0-9]*)$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "physicalMs",
+                "logical",
+                "node"
+              ],
+              "type": "object"
+            },
+            "harness": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "enum": [
+                    "claude_code",
+                    "codex",
+                    "hermes"
+                  ]
+                }
+              ]
+            },
+            "originDevice": {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            "source": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "recordId": {
+                      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "source": {
+                      "const": "record"
+                    }
+                  },
+                  "required": [
+                    "source",
+                    "recordId"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "packageId": {
+                      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "source": {
+                      "const": "package"
+                    }
+                  },
+                  "required": [
+                    "source",
+                    "packageId"
+                  ],
+                  "type": "object"
+                }
+              ]
+            }
+          },
+          "required": [
+            "originDevice",
+            "harness",
+            "source",
+            "createdHlc"
+          ],
+          "type": "object"
+        },
+        "revision": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        },
+        "scope": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "scope": {
+                  "const": "global"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "projectId": {
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project"
+                }
+              },
+              "required": [
+                "scope",
+                "projectId"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "tags": {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": ".*\\S.*",
+            "type": "string"
+          },
+          "maxItems": 64,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "title": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": ".*\\S.*",
+          "type": "string"
+        },
+        "updatedHlc": {
+          "additionalProperties": false,
+          "properties": {
+            "logical": {
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "node": {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            "physicalMs": {
+              "pattern": "^(0|[1-9][0-9]*)$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "physicalMs",
+            "logical",
+            "node"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "scope",
+        "kind",
+        "title",
+        "bodyMarkdown",
+        "tags",
+        "origin",
+        "provenance",
+        "revision",
+        "createdHlc",
+        "updatedHlc",
+        "archived"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "memory"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,16 @@
+{
+  "format": "context-relay.package.v1",
+  "packageId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+  "components": [
+    {
+      "kind": "instruction",
+      "id": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+      "scope": {"scope": "global"},
+      "title": "Instruction",
+      "bodyMarkdown": "Use the project conventions."
+    }
+  ],
+  "secretRefs": [],
+  "harnessTargets": ["codex"],
+  "extensions": [{"namespace": "dev.context-relay.fixture", "value": "AQ"}]
+}

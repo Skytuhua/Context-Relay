@@ -26,8 +26,11 @@ jobs:
       - run: cargo test --workspace --all-features
       - run: pnpm install --frozen-lockfile
       - run: pnpm check:bindings
+      - run: pnpm check:schemas
+      - run: pnpm license:check
       - run: cargo install cargo-deny --version 0.20.2 --locked
       - run: cargo deny check
+      - run: git diff --check
 
   frontend:
     runs-on: ubuntu-latest
@@ -60,4 +63,5 @@ jobs:
       - run: npm install --global pnpm@11.9.0
       - run: rustup target add ${{ matrix.target }}
       - run: pnpm install --frozen-lockfile
+      - run: cargo test -p context-relay-protocol --all-features
       - run: pnpm --filter @context-relay/desktop tauri build --target ${{ matrix.target }}

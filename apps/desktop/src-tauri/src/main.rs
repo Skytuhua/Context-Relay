@@ -1,11 +1,11 @@
-use context_relay_protocol::PROTOCOL_VERSION;
+use context_relay_protocol::{PROTOCOL_VERSION, ProtocolVersion};
 use serde::Serialize;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApplicationInfo {
     application_version: &'static str,
-    protocol_version: u32,
+    protocol_version: ProtocolVersion,
 }
 
 #[tauri::command]

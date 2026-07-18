@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "kind": {
+      "enum": [
+        "fact",
+        "decision",
+        "preference",
+        "pattern",
+        "procedure",
+        "note"
+      ]
+    },
+    "markdown": {
+      "maxLength": 1048576,
+      "minLength": 1,
+      "pattern": ".*\\S.*",
+      "type": "string"
+    },
+    "operationId": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "scope": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "scope": {
+              "const": "global"
+            }
+          },
+          "required": [
+            "scope"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "projectId": {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            "scope": {
+              "const": "project"
+            }
+          },
+          "required": [
+            "scope",
+            "projectId"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "tags": {
+      "items": {
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": ".*\\S.*",
+        "type": "string"
+      },
+      "maxItems": 64,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "title": {
+      "maxLength": 512,
+      "minLength": 1,
+      "pattern": ".*\\S.*",
+      "type": "string"
+    }
+  },
+  "required": [
+    "operationId",
+    "kind",
+    "title",
+    "markdown",
+    "tags",
+    "scope"
+  ],
+  "type": "object"
+}

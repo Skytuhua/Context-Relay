@@ -4,12 +4,13 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const workspace = resolve(import.meta.dirname, '..');
+const cargo = process.env.CONTEXT_RELAY_CARGO ?? 'cargo';
 const temporaryDirectory = mkdtempSync(join(tmpdir(), 'context-relay-bindings-'));
 const generated = join(temporaryDirectory, 'bindings.ts');
 
 try {
   execFileSync(
-    'cargo',
+    cargo,
     ['run', '-p', 'context-relay-protocol', '--bin', 'export-bindings', '--', generated],
     { cwd: workspace, stdio: 'inherit' },
   );

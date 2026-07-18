@@ -8,8 +8,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64.workspace = true
+minicbor.workspace = true
 serde.workspace = true
-ts-rs.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+thiserror.workspace = true
+ts-rs.workspace = true
+uuid.workspace = true

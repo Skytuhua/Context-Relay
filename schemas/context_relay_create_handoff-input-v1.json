@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "anyOf": [
+    {
+      "properties": {
+        "memoryIds": {
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "memoryIds"
+      ]
+    },
+    {
+      "properties": {
+        "decisionIds": {
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "decisionIds"
+      ]
+    },
+    {
+      "properties": {
+        "taskIds": {
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "taskIds"
+      ]
+    }
+  ],
+  "properties": {
+    "decisionIds": {
+      "items": {
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        "type": "string"
+      },
+      "maxItems": 64,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "memoryIds": {
+      "items": {
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        "type": "string"
+      },
+      "maxItems": 64,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "operationId": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "summary": {
+      "maxLength": 1048576,
+      "minLength": 1,
+      "pattern": ".*\\S.*",
+      "type": "string"
+    },
+    "taskIds": {
+      "items": {
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        "type": "string"
+      },
+      "maxItems": 64,
+      "type": "array",
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "operationId",
+    "memoryIds",
+    "decisionIds",
+    "taskIds",
+    "summary"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,640 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "components": {
+      "items": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "bodyMarkdown": {
+                "maxLength": 1048576,
+                "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                "type": "string"
+              },
+              "id": {
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "kind": {
+                "const": "instruction"
+              },
+              "scope": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "scope": {
+                        "const": "global"
+                      }
+                    },
+                    "required": [
+                      "scope"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "projectId": {
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "scope": {
+                        "const": "project"
+                      }
+                    },
+                    "required": [
+                      "scope",
+                      "projectId"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              "title": {
+                "maxLength": 512,
+                "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "id",
+              "scope",
+              "title",
+              "bodyMarkdown"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "bodyMarkdown": {
+                "maxLength": 1048576,
+                "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                "type": "string"
+              },
+              "id": {
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "kind": {
+                "const": "rule"
+              },
+              "scope": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "scope": {
+                        "const": "global"
+                      }
+                    },
+                    "required": [
+                      "scope"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "projectId": {
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "scope": {
+                        "const": "project"
+                      }
+                    },
+                    "required": [
+                      "scope",
+                      "projectId"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              "title": {
+                "maxLength": 512,
+                "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "id",
+              "scope",
+              "title",
+              "bodyMarkdown"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "bodyMarkdown": {
+                "maxLength": 1048576,
+                "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                "type": "string"
+              },
+              "dependencies": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "digest": {
+                      "pattern": "^[0-9a-f]{64}$",
+                      "type": "string"
+                    },
+                    "immutableSourceRef": {
+                      "maxLength": 1048576,
+                      "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                      "type": "string"
+                    },
+                    "name": {
+                      "maxLength": 512,
+                      "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                      "type": "string"
+                    },
+                    "version": {
+                      "maxLength": 512,
+                      "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "version",
+                    "digest",
+                    "immutableSourceRef"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 10000,
+                "type": "array"
+              },
+              "id": {
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "kind": {
+                "const": "skill"
+              },
+              "name": {
+                "maxLength": 512,
+                "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                "type": "string"
+              },
+              "scope": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "scope": {
+                        "const": "global"
+                      }
+                    },
+                    "required": [
+                      "scope"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "projectId": {
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "scope": {
+                        "const": "project"
+                      }
+                    },
+                    "required": [
+                      "scope",
+                      "projectId"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "id",
+              "scope",
+              "name",
+              "bodyMarkdown",
+              "dependencies"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "dependencies": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "digest": {
+                      "pattern": "^[0-9a-f]{64}$",
+                      "type": "string"
+                    },
+                    "immutableSourceRef": {
+                      "maxLength": 1048576,
+                      "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                      "type": "string"
+                    },
+                    "name": {
+                      "maxLength": 512,
+                      "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                      "type": "string"
+                    },
+                    "version": {
+                      "maxLength": 512,
+                      "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "version",
+                    "digest",
+                    "immutableSourceRef"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 10000,
+                "type": "array"
+              },
+              "id": {
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "kind": {
+                "const": "plugin"
+              },
+              "name": {
+                "maxLength": 512,
+                "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                "type": "string"
+              },
+              "scope": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "scope": {
+                        "const": "global"
+                      }
+                    },
+                    "required": [
+                      "scope"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "projectId": {
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "scope": {
+                        "const": "project"
+                      }
+                    },
+                    "required": [
+                      "scope",
+                      "projectId"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "id",
+              "scope",
+              "name",
+              "dependencies"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "kind": {
+                "const": "mcp_server"
+              },
+              "package": {
+                "additionalProperties": false,
+                "properties": {
+                  "digest": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "immutableSourceRef": {
+                    "maxLength": 1048576,
+                    "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                    "type": "string"
+                  },
+                  "name": {
+                    "maxLength": 512,
+                    "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                    "type": "string"
+                  },
+                  "version": {
+                    "maxLength": 512,
+                    "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "version",
+                  "digest",
+                  "immutableSourceRef"
+                ],
+                "type": "object"
+              },
+              "scope": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "scope": {
+                        "const": "global"
+                      }
+                    },
+                    "required": [
+                      "scope"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "projectId": {
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "scope": {
+                        "const": "project"
+                      }
+                    },
+                    "required": [
+                      "scope",
+                      "projectId"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              "serverName": {
+                "maxLength": 512,
+                "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "id",
+              "scope",
+              "serverName",
+              "package"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "componentId": {
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "event": {
+                "maxLength": 512,
+                "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                "type": "string"
+              },
+              "id": {
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "kind": {
+                "const": "hook"
+              },
+              "scope": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "scope": {
+                        "const": "global"
+                      }
+                    },
+                    "required": [
+                      "scope"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "projectId": {
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "scope": {
+                        "const": "project"
+                      }
+                    },
+                    "required": [
+                      "scope",
+                      "projectId"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "id",
+              "scope",
+              "event",
+              "componentId"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "approvalClass": {
+                "enum": [
+                  "passive",
+                  "active"
+                ]
+              },
+              "id": {
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "kind": {
+                "const": "permission_declaration"
+              },
+              "permissions": {
+                "items": {
+                  "maxLength": 512,
+                  "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+                  "type": "string"
+                },
+                "maxItems": 10000,
+                "minItems": 1,
+                "type": "array",
+                "uniqueItems": true
+              },
+              "scope": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "scope": {
+                        "const": "global"
+                      }
+                    },
+                    "required": [
+                      "scope"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "projectId": {
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "scope": {
+                        "const": "project"
+                      }
+                    },
+                    "required": [
+                      "scope",
+                      "projectId"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "id",
+              "scope",
+              "permissions",
+              "approvalClass"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "maxItems": 10000,
+      "minItems": 1,
+      "type": "array"
+    },
+    "extensions": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "namespace": {
+            "maxLength": 255,
+            "pattern": "^[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+            "type": "string"
+          },
+          "value": {
+            "maxLength": 1398102,
+            "pattern": "^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-][AQgw]|[A-Za-z0-9_-]{2}[AEIMQUYcgkosw048])?$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "value"
+        ],
+        "type": "object"
+      },
+      "maxItems": 10000,
+      "type": "array"
+    },
+    "format": {
+      "const": "context-relay.package.v1"
+    },
+    "harnessTargets": {
+      "items": {
+        "enum": [
+          "claude_code",
+          "codex",
+          "hermes"
+        ]
+      },
+      "maxItems": 3,
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "packageId": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "secretRefs": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 512,
+            "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+            "type": "string"
+          },
+          "provider": {
+            "maxLength": 512,
+            "pattern": "[\\s\\S]*\\S[\\s\\S]*",
+            "type": "string"
+          },
+          "requiredOnDevice": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "provider",
+          "requiredOnDevice"
+        ],
+        "type": "object"
+      },
+      "maxItems": 10000,
+      "type": "array"
+    }
+  },
+  "required": [
+    "format",
+    "packageId",
+    "components",
+    "secretRefs",
+    "harnessTargets",
+    "extensions"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "access": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "default"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "read_only"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "active_project_only"
+            },
+            "readOnly": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "mode",
+            "readOnly"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "global_only"
+            },
+            "readOnly": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "mode",
+            "readOnly"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "selected_project"
+            },
+            "projectId": {
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            "readOnly": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "mode",
+            "projectId",
+            "readOnly"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "disabled"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "protocol": {
+      "additionalProperties": false,
+      "properties": {
+        "max": {
+          "additionalProperties": false,
+          "properties": {
+            "major": {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "minor": {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "major",
+            "minor"
+          ],
+          "type": "object"
+        },
+        "min": {
+          "additionalProperties": false,
+          "properties": {
+            "major": {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "minor": {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "major",
+            "minor"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "min",
+        "max"
+      ],
+      "type": "object"
+    },
+    "resolvedProject": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        }
+      ]
+    },
+    "sync": {
+      "enum": [
+        "idle",
+        "syncing",
+        "error"
+      ]
+    },
+    "vault": {
+      "enum": [
+        "locked",
+        "unlocked"
+      ]
+    }
+  },
+  "required": [
+    "protocol",
+    "vault",
+    "resolvedProject",
+    "sync",
+    "access"
+  ],
+  "type": "object"
+}

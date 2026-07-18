@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "tasks": {
+      "items": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "done"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "properties": {
+                "evidence": {
+                  "minItems": 1,
+                  "type": "array"
+                }
+              }
+            }
+          }
+        ],
+        "properties": {
+          "bodyMarkdown": {
+            "maxLength": 1048576,
+            "minLength": 1,
+            "pattern": ".*\\S.*",
+            "type": "string"
+          },
+          "evidence": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "evidenceKind": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": ".*\\S.*",
+                  "type": "string"
+                },
+                "recordedHlc": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "logical": {
+                      "maximum": 4294967295,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "node": {
+                      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "physicalMs": {
+                      "pattern": "^(0|[1-9][0-9]*)$",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "physicalMs",
+                    "logical",
+                    "node"
+                  ],
+                  "type": "object"
+                },
+                "reference": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "maxLength": 16384,
+                      "type": "string"
+                    }
+                  ]
+                },
+                "summary": {
+                  "maxLength": 16384,
+                  "minLength": 1,
+                  "pattern": ".*\\S.*",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "summary",
+                "evidenceKind",
+                "reference",
+                "recordedHlc"
+              ],
+              "type": "object"
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "id": {
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "projectId": {
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "revision": {
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "open",
+              "in_progress",
+              "blocked",
+              "done",
+              "canceled"
+            ]
+          },
+          "title": {
+            "maxLength": 512,
+            "minLength": 1,
+            "pattern": ".*\\S.*",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "projectId",
+          "title",
+          "bodyMarkdown",
+          "status",
+          "evidence",
+          "revision"
+        ],
+        "type": "object"
+      },
+      "maxItems": 10000,
+      "type": "array"
+    }
+  },
+  "required": [
+    "tasks"
+  ],
+  "type": "object"
+}

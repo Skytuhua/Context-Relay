@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "limit": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        }
+      ]
+    },
+    "query": {
+      "maxLength": 1048576,
+      "minLength": 1,
+      "pattern": ".*\\S.*",
+      "type": "string"
+    },
+    "scope": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "scope": {
+                  "const": "global"
+                }
+              },
+              "required": [
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "projectId": {
+                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                  "type": "string"
+                },
+                "scope": {
+                  "const": "project"
+                }
+              },
+              "required": [
+                "scope",
+                "projectId"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "required": [
+    "query"
+  ],
+  "type": "object"
+}

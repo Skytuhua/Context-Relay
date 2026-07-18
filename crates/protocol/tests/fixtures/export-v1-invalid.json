@@ -1,0 +1,17 @@
+{
+  "format": "context-relay.export.v1",
+  "exportId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+  "workspaceId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+  "createdHlc": {"physicalMs": "1", "logical": 0, "node": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f"},
+  "records": [
+    {
+      "recordId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+      "recordKind": "memory",
+      "revision": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+      "tombstone": false,
+      "provenance": {"originDevice":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","harness":null,"source":null,"createdHlc":{"physicalMs":"1","logical":0,"node":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f"}},
+      "encryptedPayload": "AB"
+    }
+  ],
+  "operationOrder": ["018f22e2-79b0-7cc8-98c4-dc0c0c07398f"]
+}
