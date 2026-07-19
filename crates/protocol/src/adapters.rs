@@ -4,12 +4,13 @@ use ts_rs::TS;
 
 use crate::{
     ApprovalClass, ComponentRecord, HarnessId, HybridLogicalClock, ImmutableDependency,
-    MAX_ARBITRARY_BYTES, MAX_BATCH_OPERATIONS, MAX_MARKDOWN_BYTES, MAX_TITLE_BYTES, PackageId,
-    PlanId, ProjectId, Sha256Digest, ValidationError, decimal_u64, required_text,
+    MAX_ARBITRARY_BYTES, MAX_MARKDOWN_BYTES, MAX_TITLE_BYTES, PackageId, PlanId, ProjectId,
+    Sha256Digest, ValidationError, decimal_u64, required_text,
 };
 
 pub const MAX_ADAPTER_COLLECTION_ITEMS: usize = 1024;
 pub const MAX_ADAPTER_TEXT_BYTES: usize = 16 * 1024;
+pub const MAX_NATIVE_DISPLAY_BYTES: usize = 1024;
 
 fn validate_adapter_collection(field: &'static str, length: usize) -> Result<(), ValidationError> {
     if length > MAX_ADAPTER_COLLECTION_ITEMS {
@@ -32,17 +33,17 @@ fn validate_adapter_text(value: &str, field: &'static str) -> Result<(), Validat
 }
 
 macro_rules! validated_adapter_dto {
-    ($name:ident, $wire:ident, $wire_ref:ident { $($field:ident: $type:ty),+ $(,)? }) => {
+    ($name:ident, $wire:ident, $wire_ref:ident { $($(#[$attr:meta])* $field:ident: $type:ty),+ $(,)? }) => {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct $wire {
-            $($field: $type),+
+            $($(#[$attr])* $field: $type),+
         }
 
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct $wire_ref<'a> {
-            $($field: &'a $type),+
+            $($(#[$attr])* $field: &'a $type),+
         }
 
         impl Serialize for $name {
@@ -61,6 +62,38 @@ macro_rules! validated_adapter_dto {
                 let value = Self {
                     $($field: wire.$field),+
                 };
+                value.validate().map_err(D::Error::custom)?;
+                Ok(value)
+            }
+        }
+    };
+}
+
+macro_rules! validated_adapter_vec {
+    ($name:ident, $item:ty, $field:literal) => {
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct $name(pub Vec<$item>);
+
+        impl $name {
+            pub fn validate(&self) -> Result<(), ValidationError> {
+                validate_adapter_collection($field, self.0.len())?;
+                for item in &self.0 {
+                    item.validate()?;
+                }
+                Ok(())
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.validate().map_err(serde::ser::Error::custom)?;
+                self.0.serialize(serializer)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let value = Self(Vec::deserialize(deserializer)?);
                 value.validate().map_err(D::Error::custom)?;
                 Ok(value)
             }
@@ -104,11 +137,11 @@ impl WireNativeValue {
         if self
             .display
             .as_ref()
-            .is_some_and(|display| display.len() > 1024)
+            .is_some_and(|display| display.len() > MAX_NATIVE_DISPLAY_BYTES)
         {
             return Err(ValidationError::TooLarge {
                 field: "nativeValue.display",
-                limit: 1024,
+                limit: MAX_NATIVE_DISPLAY_BYTES,
             });
         }
         if self.platform == NativePlatform::Windows && !self.bytes.len().is_multiple_of(2) {
@@ -359,24 +392,55 @@ validated_adapter_dto!(
     }
 );
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct RenderedState {
     pub files: Vec<RenderedFile>,
     pub cli_operations: Vec<CliOperation>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+impl RenderedState {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_adapter_collection("renderedState.files", self.files.len())?;
+        validate_adapter_collection("renderedState.cliOperations", self.cli_operations.len())?;
+        for file in &self.files {
+            file.validate()?;
+        }
+        for operation in &self.cli_operations {
+            operation.validate()?;
+        }
+        Ok(())
+    }
+}
+validated_adapter_dto!(RenderedState, RenderedStateWire, RenderedStateWireRef {
+    files: Vec<RenderedFile>,
+    cli_operations: Vec<CliOperation>,
+});
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct RenderedFile {
     pub path: WireNativeValue,
     pub bytes_sha256: Sha256Digest,
-    #[serde(with = "decimal_u64")]
     #[ts(type = "DecimalU64")]
     pub byte_length: u64,
 }
+
+impl RenderedFile {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        self.path.validate()
+    }
+}
+validated_adapter_dto!(
+    RenderedFile,
+    RenderedFileWire,
+    RenderedFileWireRef {
+        path: WireNativeValue,
+        bytes_sha256: Sha256Digest,
+        #[serde(with = "decimal_u64")]
+        byte_length: u64,
+    }
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -390,8 +454,7 @@ pub enum ChangeClass {
     Conflict,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct ClassifiedChange {
     pub class: ChangeClass,
@@ -399,16 +462,48 @@ pub struct ClassifiedChange {
     pub summary: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+impl ClassifiedChange {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_adapter_text(&self.target, "classifiedChange.target")?;
+        validate_adapter_text(&self.summary, "classifiedChange.summary")
+    }
+}
+validated_adapter_dto!(
+    ClassifiedChange,
+    ClassifiedChangeWire,
+    ClassifiedChangeWireRef {
+        class: ChangeClass,
+        target: String,
+        summary: String,
+    }
+);
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct SemanticDiff {
     pub changes: Vec<ClassifiedChange>,
     pub conflicts: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+impl SemanticDiff {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_adapter_collection("semanticDiff.changes", self.changes.len())?;
+        validate_adapter_collection("semanticDiff.conflicts", self.conflicts.len())?;
+        for change in &self.changes {
+            change.validate()?;
+        }
+        for conflict in &self.conflicts {
+            validate_adapter_text(conflict, "semanticDiff.conflicts.text")?;
+        }
+        Ok(())
+    }
+}
+validated_adapter_dto!(SemanticDiff, SemanticDiffWire, SemanticDiffWireRef {
+    changes: Vec<ClassifiedChange>,
+    conflicts: Vec<String>,
+});
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct CliOperation {
     pub executable: WireNativeValue,
@@ -416,8 +511,23 @@ pub struct CliOperation {
     pub timeout_ms: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+impl CliOperation {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_adapter_collection("cliOperation.arguments", self.arguments.len())?;
+        self.executable.validate()?;
+        for argument in &self.arguments {
+            argument.validate()?;
+        }
+        Ok(())
+    }
+}
+validated_adapter_dto!(CliOperation, CliOperationWire, CliOperationWireRef {
+    executable: WireNativeValue,
+    arguments: Vec<WireNativeValue>,
+    timeout_ms: u32,
+});
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct ApplyReceipt {
     pub plan_id: PlanId,
@@ -425,24 +535,59 @@ pub struct ApplyReceipt {
     pub resulting_digests: Vec<Sha256Digest>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+impl ApplyReceipt {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_adapter_collection(
+            "applyReceipt.resultingDigests",
+            self.resulting_digests.len(),
+        )
+    }
+}
+validated_adapter_dto!(ApplyReceipt, ApplyReceiptWire, ApplyReceiptWireRef {
+    plan_id: PlanId,
+    applied_hlc: HybridLogicalClock,
+    resulting_digests: Vec<Sha256Digest>,
+});
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct ValidationReport {
     pub valid: bool,
     pub findings: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+impl ValidationReport {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_adapter_collection("validationReport.findings", self.findings.len())?;
+        for finding in &self.findings {
+            validate_adapter_text(finding, "validationReport.findings.text")?;
+        }
+        Ok(())
+    }
+}
+validated_adapter_dto!(ValidationReport, ValidationReportWire, ValidationReportWireRef {
+    valid: bool,
+    findings: Vec<String>,
+});
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct ExpectedNativeDigest {
     pub target: WireNativeValue,
     pub expected_digest: Option<Sha256Digest>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+impl ExpectedNativeDigest {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        self.target.validate()
+    }
+}
+validated_adapter_dto!(ExpectedNativeDigest, ExpectedNativeDigestWire, ExpectedNativeDigestWireRef {
+    target: WireNativeValue,
+    expected_digest: Option<Sha256Digest>,
+});
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct PackageArtifact {
     pub package_id: PackageId,
@@ -459,7 +604,7 @@ impl PackageArtifact {
         required_text(
             &self.immutable_source_ref,
             "packageArtifact.immutableSourceRef",
-            MAX_MARKDOWN_BYTES,
+            MAX_ADAPTER_TEXT_BYTES,
         )?;
         if !matches!(self.resolved_commit.len(), 40 | 64)
             || !self
@@ -470,12 +615,7 @@ impl PackageArtifact {
             return Err(ValidationError::Invalid("packageArtifact.resolvedCommit"));
         }
         self.artifact_path.validate()?;
-        if self.dependencies.len() > MAX_BATCH_OPERATIONS {
-            return Err(ValidationError::TooLarge {
-                field: "packageArtifact.dependencies",
-                limit: MAX_BATCH_OPERATIONS,
-            });
-        }
+        validate_adapter_collection("packageArtifact.dependencies", self.dependencies.len())?;
         for dependency in &self.dependencies {
             dependency.validate()?;
         }
@@ -483,13 +623,37 @@ impl PackageArtifact {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+validated_adapter_dto!(PackageArtifact, PackageArtifactWire, PackageArtifactWireRef {
+    package_id: PackageId,
+    immutable_source_ref: String,
+    resolved_commit: String,
+    archive_digest: Sha256Digest,
+    artifact_path: WireNativeValue,
+    artifact_digest: Sha256Digest,
+    dependencies: Vec<ImmutableDependency>,
+});
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct PermissionDelta {
     pub added: Vec<String>,
     pub removed: Vec<String>,
 }
+
+impl PermissionDelta {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_adapter_collection("permissionDelta.added", self.added.len())?;
+        validate_adapter_collection("permissionDelta.removed", self.removed.len())?;
+        for permission in self.added.iter().chain(&self.removed) {
+            validate_adapter_text(permission, "permissionDelta.text")?;
+        }
+        Ok(())
+    }
+}
+validated_adapter_dto!(PermissionDelta, PermissionDeltaWire, PermissionDeltaWireRef {
+    added: Vec<String>,
+    removed: Vec<String>,
+});
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -498,8 +662,7 @@ pub enum NetworkScheme {
     Wss,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct NetworkEndpoint {
     pub scheme: NetworkScheme,
@@ -530,16 +693,39 @@ impl NetworkEndpoint {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+validated_adapter_dto!(
+    NetworkEndpoint,
+    NetworkEndpointWire,
+    NetworkEndpointWireRef {
+        scheme: NetworkScheme,
+        host: String,
+        port: u16,
+    }
+);
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct NetworkDelta {
     pub added: Vec<NetworkEndpoint>,
     pub removed: Vec<NetworkEndpoint>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
+impl NetworkDelta {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_adapter_collection("networkDelta.added", self.added.len())?;
+        validate_adapter_collection("networkDelta.removed", self.removed.len())?;
+        for endpoint in self.added.iter().chain(&self.removed) {
+            endpoint.validate()?;
+        }
+        Ok(())
+    }
+}
+validated_adapter_dto!(NetworkDelta, NetworkDeltaWire, NetworkDeltaWireRef {
+    added: Vec<NetworkEndpoint>,
+    removed: Vec<NetworkEndpoint>,
+});
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct SetupPlan {
     pub plan_id: PlanId,
@@ -559,13 +745,12 @@ pub struct SetupPlan {
     pub rulesync_version: String,
     pub rulesync_hash: Sha256Digest,
     pub approval_class: ApprovalClass,
-    #[serde(with = "decimal_u64")]
     #[ts(type = "DecimalU64")]
     pub expires_at: u64,
     pub batch_hash: Sha256Digest,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SetupPlanWire {
     plan_id: PlanId,
@@ -588,6 +773,34 @@ struct SetupPlanWire {
     #[serde(with = "decimal_u64")]
     expires_at: u64,
     batch_hash: Sha256Digest,
+}
+
+impl Serialize for SetupPlan {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        SetupPlanWire {
+            plan_id: self.plan_id,
+            harness: self.harness,
+            adapter_version: self.adapter_version,
+            executable_path: self.executable_path.clone(),
+            executable_hash: self.executable_hash,
+            harness_version: self.harness_version.clone(),
+            target_scopes: self.target_scopes.clone(),
+            expected_native_digests: self.expected_native_digests.clone(),
+            semantic_changes: self.semantic_changes.clone(),
+            cli_operations: self.cli_operations.clone(),
+            package_artifacts: self.package_artifacts.clone(),
+            permission_delta: self.permission_delta.clone(),
+            network_delta: self.network_delta.clone(),
+            scanner_report_hash: self.scanner_report_hash,
+            rulesync_version: self.rulesync_version.clone(),
+            rulesync_hash: self.rulesync_hash,
+            approval_class: self.approval_class,
+            expires_at: self.expires_at,
+            batch_hash: self.batch_hash,
+        }
+        .serialize(serializer)
+    }
 }
 
 impl TryFrom<SetupPlanWire> for SetupPlan {
@@ -643,10 +856,10 @@ impl SetupPlan {
             ("network.added", self.network_delta.added.len()),
             ("network.removed", self.network_delta.removed.len()),
         ] {
-            if length > MAX_BATCH_OPERATIONS {
+            if length > MAX_ADAPTER_COLLECTION_ITEMS {
                 return Err(ValidationError::TooLarge {
                     field,
-                    limit: MAX_BATCH_OPERATIONS,
+                    limit: MAX_ADAPTER_COLLECTION_ITEMS,
                 });
             }
         }
@@ -666,41 +879,39 @@ impl SetupPlan {
         {
             required_text(permission, "permission", MAX_TITLE_BYTES)?;
         }
+        for scope in &self.target_scopes {
+            scope.validate()?;
+        }
         for expected in &self.expected_native_digests {
-            expected.target.validate()?;
+            expected.validate()?;
         }
         for operation in &self.cli_operations {
-            operation.executable.validate()?;
-            for argument in &operation.arguments {
-                argument.validate()?;
-            }
+            operation.validate()?;
         }
         for artifact in &self.package_artifacts {
             artifact.validate()?;
         }
-        for endpoint in self
-            .network_delta
-            .added
-            .iter()
-            .chain(&self.network_delta.removed)
-        {
-            endpoint.validate()?;
-        }
+        self.permission_delta.validate()?;
+        self.network_delta.validate()?;
         Ok(())
     }
 }
 
+validated_adapter_vec!(DiscoveredScopes, NativeScope, "discoveredScopes");
+validated_adapter_vec!(ClassifiedChanges, ClassifiedChange, "classifiedChanges");
+validated_adapter_vec!(CliOperations, CliOperation, "cliOperations");
+
 pub trait HarnessAdapter {
     fn probe(&self, context: &ProbeContext) -> Result<ProbeReport, crate::ClientError>;
     fn discover_scopes(&self, report: &ProbeReport)
-    -> Result<Vec<NativeScope>, crate::ClientError>;
+    -> Result<DiscoveredScopes, crate::ClientError>;
     fn import(&self, request: &ImportRequest) -> Result<ImportedState, crate::ClientError>;
     fn render(&self, desired: &DesiredState) -> Result<RenderedState, crate::ClientError>;
-    fn classify(&self, diff: &SemanticDiff) -> Result<Vec<ClassifiedChange>, crate::ClientError>;
+    fn classify(&self, diff: &SemanticDiff) -> Result<ClassifiedChanges, crate::ClientError>;
     fn plan_cli_ops(
         &self,
-        changes: &[ClassifiedChange],
-    ) -> Result<Vec<CliOperation>, crate::ClientError>;
+        changes: &ClassifiedChanges,
+    ) -> Result<CliOperations, crate::ClientError>;
     fn validate_effective(
         &self,
         receipt: &ApplyReceipt,

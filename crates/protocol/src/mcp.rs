@@ -5,7 +5,7 @@ use ts_rs::TS;
 use crate::{
     HarnessAccessPolicy, InstructionRecord, MAX_EVIDENCE_BYTES, MAX_MARKDOWN_BYTES,
     MAX_TITLE_BYTES, MemoryCandidate, MemoryId, MemoryKind, MemoryRecord, OperationId, ProjectId,
-    ProjectIdentity, ProtocolVersionRange, RecordId, ScopeRef, TaskId, TaskRecord, TaskStatus,
+    ProjectIdentity, ProtocolVersionRange, RecordId, TaskId, TaskRecord, TaskStatus,
     ValidationError, required_text,
 };
 
@@ -32,7 +32,15 @@ macro_rules! dto {
     };
 }
 
-dto!(SearchInput { query: String, scope: Option<ScopeRef>, limit: Option<u16> });
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+#[ts(tag = "scope", rename_all = "snake_case")]
+pub enum McpScopeSelector {
+    Global,
+    ActiveProject,
+}
+
+dto!(SearchInput { query: String, scope: Option<McpScopeSelector>, limit: Option<u16> });
 dto!(SearchOutput { memories: Vec<MemoryRecord>, instructions: Vec<InstructionRecord> });
 dto!(GetInput {
     record_id: RecordId
@@ -52,11 +60,11 @@ pub enum ReadableRecord {
 }
 
 dto!(GetOutput { record: Option<ReadableRecord> });
-dto!(RememberInput { operation_id: OperationId, kind: MemoryKind, title: String, markdown: String, tags: Vec<String>, scope: ScopeRef });
+dto!(RememberInput { operation_id: OperationId, kind: MemoryKind, title: String, markdown: String, tags: Vec<String>, scope: McpScopeSelector });
 dto!(RememberOutput {
     memory: MemoryRecord
 });
-dto!(ProposeMemoryInput { operation_id: OperationId, kind: MemoryKind, title: String, markdown: String, tags: Vec<String>, evidence_summary: String, scope: ScopeRef });
+dto!(ProposeMemoryInput { operation_id: OperationId, kind: MemoryKind, title: String, markdown: String, tags: Vec<String>, evidence_summary: String, scope: McpScopeSelector });
 dto!(ProposeMemoryOutput {
     candidate: MemoryCandidate
 });
@@ -77,9 +85,9 @@ dto!(ArchiveMemoryInput {
 dto!(ArchiveMemoryOutput {
     memory: MemoryRecord
 });
-dto!(ListTasksInput { project_id: Option<ProjectId>, status: Option<TaskStatus> });
+dto!(ListTasksInput { status: Option<TaskStatus> });
 dto!(ListTasksOutput { tasks: Vec<TaskRecord> });
-dto!(UpsertTaskInput { operation_id: OperationId, task_id: Option<TaskId>, project_id: ProjectId, title: String, body_markdown: String, status: TaskStatus, expected_revision: Option<OperationId> });
+dto!(UpsertTaskInput { operation_id: OperationId, task_id: Option<TaskId>, title: String, body_markdown: String, status: TaskStatus, expected_revision: Option<OperationId> });
 dto!(UpsertTaskOutput { task: TaskRecord });
 dto!(CompletionEvidenceInput { summary: String, kind: String, reference: Option<String> });
 dto!(CompleteTaskInput { operation_id: OperationId, task_id: TaskId, expected_revision: OperationId, evidence: Vec<CompletionEvidenceInput> });
@@ -183,7 +191,7 @@ pub fn mcp_schema(name: &str) -> Option<McpToolSchema> {
     let (required, properties, output_required, output_properties) = match name {
         "context_relay_search" => (
             vec!["query"],
-            json!({"query":text(1,MAX_MARKDOWN_BYTES),"scope":{"oneOf":[{"type":"null"},scope()]},"limit":{"oneOf":[{"type":"null"},{"type":"integer","minimum":1,"maximum":100}]}}),
+            json!({"query":text(1,MAX_MARKDOWN_BYTES),"scope":{"oneOf":[{"type":"null"},mcp_scope_selector()]},"limit":{"oneOf":[{"type":"null"},{"type":"integer","minimum":1,"maximum":100}]}}),
             vec!["memories", "instructions"],
             json!({"memories":{"type":"array","maxItems":crate::MAX_BATCH_OPERATIONS,"items":memory()},"instructions":{"type":"array","maxItems":crate::MAX_BATCH_OPERATIONS,"items":instruction()}}),
         ),
@@ -197,7 +205,7 @@ pub fn mcp_schema(name: &str) -> Option<McpToolSchema> {
             let op = operation();
             (
                 vec![op.0, "kind", "title", "markdown", "tags", "scope"],
-                json!({op.0:op.1,"kind":{"enum":["fact","decision","preference","pattern","procedure","note"]},"title":text(1,MAX_TITLE_BYTES),"markdown":text(1,MAX_MARKDOWN_BYTES),"tags":{"type":"array","maxItems":crate::MAX_TAGS,"uniqueItems":true,"items":text(1,crate::MAX_TAG_BYTES)},"scope":scope()}),
+                json!({op.0:op.1,"kind":{"enum":["fact","decision","preference","pattern","procedure","note"]},"title":text(1,MAX_TITLE_BYTES),"markdown":text(1,MAX_MARKDOWN_BYTES),"tags":{"type":"array","maxItems":crate::MAX_TAGS,"uniqueItems":true,"items":text(1,crate::MAX_TAG_BYTES)},"scope":mcp_scope_selector()}),
                 vec!["memory"],
                 json!({"memory":memory()}),
             )
@@ -214,7 +222,7 @@ pub fn mcp_schema(name: &str) -> Option<McpToolSchema> {
                     "evidenceSummary",
                     "scope",
                 ],
-                json!({op.0:op.1,"kind":{"enum":["fact","decision","preference","pattern","procedure","note"]},"title":text(1,MAX_TITLE_BYTES),"markdown":text(1,MAX_MARKDOWN_BYTES),"tags":{"type":"array","maxItems":crate::MAX_TAGS,"uniqueItems":true,"items":text(1,crate::MAX_TAG_BYTES)},"evidenceSummary":text(1,MAX_EVIDENCE_BYTES),"scope":scope()}),
+                json!({op.0:op.1,"kind":{"enum":["fact","decision","preference","pattern","procedure","note"]},"title":text(1,MAX_TITLE_BYTES),"markdown":text(1,MAX_MARKDOWN_BYTES),"tags":{"type":"array","maxItems":crate::MAX_TAGS,"uniqueItems":true,"items":text(1,crate::MAX_TAG_BYTES)},"evidenceSummary":text(1,MAX_EVIDENCE_BYTES),"scope":mcp_scope_selector()}),
                 vec!["candidate"],
                 json!({"candidate":candidate()}),
             )
@@ -239,15 +247,15 @@ pub fn mcp_schema(name: &str) -> Option<McpToolSchema> {
         }
         "context_relay_list_tasks" => (
             vec![],
-            json!({"projectId":{"oneOf":[{"type":"null"},uuid()]},"status":{"oneOf":[{"type":"null"},task_status()]}}),
+            json!({"status":{"oneOf":[{"type":"null"},task_status()]}}),
             vec!["tasks"],
             json!({"tasks":{"type":"array","maxItems":crate::MAX_BATCH_OPERATIONS,"items":task()}}),
         ),
         "context_relay_upsert_task" => {
             let op = operation();
             (
-                vec![op.0, "projectId", "title", "bodyMarkdown", "status"],
-                json!({op.0:op.1,"taskId":{"oneOf":[{"type":"null"},uuid()]},"projectId":uuid(),"title":text(1,MAX_TITLE_BYTES),"bodyMarkdown":text(1,MAX_MARKDOWN_BYTES),"status":{"enum":["open","in_progress","blocked","canceled"]},"expectedRevision":{"oneOf":[{"type":"null"},uuid()]}}),
+                vec![op.0, "title", "bodyMarkdown", "status"],
+                json!({op.0:op.1,"taskId":{"oneOf":[{"type":"null"},uuid()]},"title":text(1,MAX_TITLE_BYTES),"bodyMarkdown":text(1,MAX_MARKDOWN_BYTES),"status":{"enum":["open","in_progress","blocked","canceled"]},"expectedRevision":{"oneOf":[{"type":"null"},uuid()]}}),
                 vec!["task"],
                 json!({"task":task()}),
             )
@@ -510,6 +518,9 @@ fn uuid() -> Value {
 }
 fn text(min: usize, max: usize) -> Value {
     json!({"type":"string","minLength":min,"maxLength":max,"x-utf8-maxBytes":max,"pattern":r".*\S.*"})
+}
+fn mcp_scope_selector() -> Value {
+    json!({"oneOf":[{"type":"object","properties":{"scope":{"const":"global"}},"required":["scope"],"additionalProperties":false},{"type":"object","properties":{"scope":{"const":"active_project"}},"required":["scope"],"additionalProperties":false}]})
 }
 fn scope() -> Value {
     json!({"oneOf":[{"type":"object","properties":{"scope":{"const":"global"}},"required":["scope"],"additionalProperties":false},{"type":"object","properties":{"scope":{"const":"project"},"projectId":uuid()},"required":["scope","projectId"],"additionalProperties":false}]})

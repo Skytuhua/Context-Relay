@@ -1,12 +1,12 @@
 {
-  "context_relay_search": {"query":""},
+  "context_relay_search": {"query":"needle","scope":{"scope":"project","projectId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f"}},
   "context_relay_get": {"recordId":"not-a-uuid"},
-  "context_relay_remember": {"operationId":"not-a-uuid","title":"","markdown":"Body","scope":{"scope":"global"}},
-  "context_relay_propose_memory": {"operationId":"not-a-uuid","title":"Title","markdown":"","evidenceSummary":"","sourceHarness":"codex","scope":{"scope":"global"}},
+  "context_relay_remember": {"operationId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","kind":"fact","title":"Title","markdown":"Body","tags":[],"scope":{"scope":"project","projectId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f"}},
+  "context_relay_propose_memory": {"operationId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","kind":"fact","title":"Title","markdown":"Body","tags":[],"evidenceSummary":"Observed","scope":{"scope":"project","projectId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f"}},
   "context_relay_update_memory": {"operationId":"not-a-uuid","memoryId":"not-a-uuid","expectedRevision":"not-a-uuid","markdown":"Body"},
   "context_relay_archive_memory": {"operationId":"not-a-uuid","memoryId":"not-a-uuid","expectedRevision":"not-a-uuid"},
-  "context_relay_list_tasks": {"unknown":true},
-  "context_relay_upsert_task": {"operationId":"not-a-uuid","projectId":"not-a-uuid","title":"","bodyMarkdown":"Body","status":"open"},
+  "context_relay_list_tasks": {"projectId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f"},
+  "context_relay_upsert_task": {"operationId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","projectId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","title":"Task","bodyMarkdown":"Body","status":"open"},
   "context_relay_complete_task": {"operationId":"not-a-uuid","taskId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","expectedRevision":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","evidence":[]},
   "context_relay_create_handoff": {"operationId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","memoryIds":[],"decisionIds":[],"taskIds":[],"summary":"Continue"},
   "context_relay_status": {"unknown":true}

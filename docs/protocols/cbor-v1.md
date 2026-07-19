@@ -60,4 +60,4 @@ Record kinds are assigned as memory 0, memory candidate 1, task 2, secret refere
 | 6 | creation HLC | fixed map |
 | 7 | signature | 64-byte string |
 
-The checkpoint signing preimage uses the same checkpoint map without signature key 7 and uses a 7-entry map. The operation fixture identifier is the SHA-256 digest of `tests/fixtures/sync-operation-v1.hex`, recorded in the Task 4 report after generation. User Markdown bytes are not normalized or rewritten.
+The checkpoint signing preimage uses the same checkpoint map without signature key 7 and uses a 7-entry map. The operation fixture identifier is the SHA-256 digest of the decoded hex bytes in `tests/fixtures/sync-operation-v1.hex`, recorded in the Task 4 report after generation. User Markdown bytes are not normalized or rewritten.

@@ -20,6 +20,8 @@ Later synchronization behavior must follow these rules:
 - Sequence conflicts and hash-chain breaks are quarantined.
 
 Local JSON-RPC and MCP inputs reject unknown fields. The package manifest allows forward data only in a namespaced `extensions` field. Sync schema version 1 rejects unknown top-level operation and checkpoint keys.
+MCP callers never submit project UUID selectors. Memory search defaults to every caller-allowed scope and may narrow to `global` or the caller-relative `active_project`; memory writes use one of those two selectors. Task listing and upserts always resolve the active project, while ID-based reads and updates remain subject to later authorization. Returned records keep stable scope and project identifiers.
+
 
 Rust enforces text limits in UTF-8 bytes. Every consumer of an exported JSON Schema must register the `x-utf8-maxBytes` keyword and reject a string whose UTF-8 encoding exceeds that value. JSON Schema `maxLength` remains a character-count portability hint and does not replace the byte check.
 

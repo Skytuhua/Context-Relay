@@ -1,10 +1,12 @@
 mod support;
 
 use context_relay_protocol::{
-    CapabilityLevel, ComponentKind, ComponentRecord, DesiredState, ImportRequest, ImportedState,
-    InstallationMethod, MAX_ADAPTER_COLLECTION_ITEMS, MAX_ADAPTER_TEXT_BYTES, NativePlatform,
-    NativeScope, ProbeContext, ProbeReport, ProjectId, Provenance, RecordId, ScopeRef,
-    Sha256Digest, ValidationError, WireNativeValue,
+    ApplyReceipt, CapabilityLevel, ChangeClass, ClassifiedChange, ClassifiedChanges, CliOperation,
+    CliOperations, ComponentKind, ComponentRecord, DesiredState, DiscoveredScopes, ImportRequest,
+    ImportedState, InstallationMethod, MAX_ADAPTER_COLLECTION_ITEMS, MAX_ADAPTER_TEXT_BYTES,
+    NativePlatform, NativeScope, NetworkDelta, NetworkEndpoint, NetworkScheme, PermissionDelta,
+    ProbeContext, ProbeReport, ProjectId, Provenance, RecordId, RenderedFile, RenderedState,
+    ScopeRef, SemanticDiff, Sha256Digest, ValidationError, ValidationReport, WireNativeValue,
 };
 use std::str::FromStr;
 
@@ -44,6 +46,30 @@ fn probe_report() -> ProbeReport {
         active_profile: Some("default".into()),
         policy_conflicts: vec!["conflict".into()],
         capability: CapabilityLevel::Full,
+    }
+}
+
+fn rendered_file() -> RenderedFile {
+    RenderedFile {
+        path: native_value(),
+        bytes_sha256: Sha256Digest([0; 32]),
+        byte_length: 1,
+    }
+}
+
+fn classified_change() -> ClassifiedChange {
+    ClassifiedChange {
+        class: ChangeClass::Update,
+        target: "target".into(),
+        summary: "summary".into(),
+    }
+}
+
+fn cli_operation() -> CliOperation {
+    CliOperation {
+        executable: native_value(),
+        arguments: vec![native_value()],
+        timeout_ms: 1,
     }
 }
 
@@ -256,4 +282,124 @@ fn probe_context_rejects_oversized_profile_at_serde_boundary() {
         "requestedProfile": "p".repeat(MAX_ADAPTER_TEXT_BYTES + 1),
     });
     assert!(serde_json::from_value::<ProbeContext>(json).is_err());
+}
+
+#[test]
+fn rendered_state_rejects_oversized_collections_at_serde_boundaries() {
+    let state = RenderedState {
+        files: vec![rendered_file(); MAX_ADAPTER_COLLECTION_ITEMS + 1],
+        cli_operations: vec![],
+    };
+    assert!(serde_json::to_value(&state).is_err());
+
+    let mut json = serde_json::to_value(RenderedState {
+        files: vec![],
+        cli_operations: vec![],
+    })
+    .unwrap();
+    json["cliOperations"] = serde_json::Value::Array(vec![
+        serde_json::to_value(cli_operation())
+            .unwrap();
+        MAX_ADAPTER_COLLECTION_ITEMS + 1
+    ]);
+    assert!(serde_json::from_value::<RenderedState>(json).is_err());
+}
+
+#[test]
+fn semantic_diff_rejects_oversized_text_and_collections_at_serde_boundaries() {
+    let change = ClassifiedChange {
+        target: "t".repeat(MAX_ADAPTER_TEXT_BYTES + 1),
+        ..classified_change()
+    };
+    assert!(serde_json::to_value(&change).is_err());
+
+    let diff = SemanticDiff {
+        changes: vec![classified_change(); MAX_ADAPTER_COLLECTION_ITEMS + 1],
+        conflicts: vec![],
+    };
+    assert!(serde_json::to_value(&diff).is_err());
+
+    let json = serde_json::json!({
+        "changes": [],
+        "conflicts": ["c".repeat(MAX_ADAPTER_TEXT_BYTES + 1)],
+    });
+    assert!(serde_json::from_value::<SemanticDiff>(json).is_err());
+}
+
+#[test]
+fn cli_operations_reject_oversized_arguments_at_serde_boundaries() {
+    let operation = CliOperation {
+        arguments: vec![native_value(); MAX_ADAPTER_COLLECTION_ITEMS + 1],
+        ..cli_operation()
+    };
+    assert!(serde_json::to_value(&operation).is_err());
+
+    let mut json = serde_json::to_value(cli_operation()).unwrap();
+    json["arguments"] = serde_json::Value::Array(vec![
+        serde_json::to_value(native_value()).unwrap();
+        MAX_ADAPTER_COLLECTION_ITEMS + 1
+    ]);
+    assert!(serde_json::from_value::<CliOperation>(json).is_err());
+}
+
+#[test]
+fn apply_receipts_and_validation_reports_reject_oversized_collections_and_text() {
+    let receipt = ApplyReceipt {
+        plan_id: support::setup_plan().plan_id,
+        applied_hlc: support::hlc(),
+        resulting_digests: vec![Sha256Digest([0; 32]); MAX_ADAPTER_COLLECTION_ITEMS + 1],
+    };
+    assert!(serde_json::to_value(&receipt).is_err());
+
+    let report = ValidationReport {
+        valid: false,
+        findings: vec!["f".repeat(MAX_ADAPTER_TEXT_BYTES + 1)],
+    };
+    assert!(serde_json::to_value(&report).is_err());
+
+    let json = serde_json::json!({
+        "valid": false,
+        "findings": vec!["finding"; MAX_ADAPTER_COLLECTION_ITEMS + 1],
+    });
+    assert!(serde_json::from_value::<ValidationReport>(json).is_err());
+}
+
+#[test]
+fn setup_plan_nested_adapter_values_are_checked_during_serialization() {
+    let mut plan = support::setup_plan();
+    plan.cli_operations = vec![CliOperation {
+        arguments: vec![native_value(); MAX_ADAPTER_COLLECTION_ITEMS + 1],
+        ..cli_operation()
+    }];
+    assert!(serde_json::to_value(&plan).is_err());
+
+    let mut plan = support::setup_plan();
+    plan.permission_delta = PermissionDelta {
+        added: vec!["permission".repeat(MAX_ADAPTER_TEXT_BYTES + 1)],
+        removed: vec![],
+    };
+    assert!(serde_json::to_value(&plan).is_err());
+
+    let mut plan = support::setup_plan();
+    plan.network_delta = NetworkDelta {
+        added: vec![NetworkEndpoint {
+            scheme: NetworkScheme::Https,
+            host: "-invalid.example".into(),
+            port: 443,
+        }],
+        removed: vec![],
+    };
+    assert!(serde_json::to_value(&plan).is_err());
+}
+
+#[test]
+fn adapter_trait_vector_wrappers_reject_oversized_wire_values() {
+    let scopes = DiscoveredScopes(vec![NativeScope::Global; MAX_ADAPTER_COLLECTION_ITEMS + 1]);
+    assert!(serde_json::to_value(&scopes).is_err());
+
+    let changes = ClassifiedChanges(vec![classified_change(); MAX_ADAPTER_COLLECTION_ITEMS + 1]);
+    assert!(serde_json::to_value(&changes).is_err());
+
+    let operations = CliOperations(vec![cli_operation(); MAX_ADAPTER_COLLECTION_ITEMS + 1]);
+    assert!(serde_json::to_value(&operations).is_err());
 }
