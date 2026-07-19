@@ -215,6 +215,12 @@ params!(PairingRequestInfo {
     request_digest: Sha256Digest
 });
 
+impl PairingRequestInfo {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        required_text(&self.device_name, "pairing.deviceName", MAX_TITLE_BYTES)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, TS)]
 #[ts(type = "DecimalU64")]
 pub struct DecimalTimestamp(pub u64);
@@ -243,6 +249,16 @@ pub struct ExportPayload {
     pub total_bytes: u64,
     pub record_count: u32,
 }
+
+impl ExportPayload {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.chunk_count == 0 || self.chunk_index >= self.chunk_count {
+            return Err(ValidationError::Invalid("export.chunkIndex"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientRole {
@@ -454,6 +470,13 @@ params!(DeviceSummary {
     state: DeviceState,
     is_current: bool
 });
+
+impl DeviceSummary {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        required_text(&self.name, "device.name", MAX_TITLE_BYTES)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryState {
@@ -468,13 +491,7 @@ pub enum AccountDeletionState {
     PendingDelete,
     Purged,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(
-    tag = "kind",
-    content = "data",
-    rename_all = "snake_case",
-    rename_all_fields = "camelCase"
-)]
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(
     tag = "kind",
     content = "data",
@@ -537,6 +554,147 @@ pub enum LocalResult {
     Access {
         policy: HarnessAccessPolicy,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(
+    remote = "LocalResult",
+    tag = "kind",
+    content = "data",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum LocalResultSerde {
+    Empty,
+    Health {
+        protocol: ProtocolVersion,
+        vault_locked: bool,
+    },
+    Projects {
+        projects: Vec<ProjectIdentity>,
+    },
+    Memory {
+        memory: Option<MemoryRecord>,
+    },
+    Memories {
+        memories: Vec<MemoryRecord>,
+    },
+    Candidates {
+        candidates: Vec<MemoryCandidate>,
+    },
+    Tasks {
+        tasks: Vec<TaskRecord>,
+    },
+    Handoff {
+        handoff_id: OperationId,
+        payload: HandoffPayload,
+    },
+    Probe {
+        report: ProbeReport,
+    },
+    Plan {
+        plan: Box<SetupPlan>,
+    },
+    Status {
+        status: StatusOutput,
+    },
+    Devices {
+        devices: Vec<DeviceSummary>,
+    },
+    Pairing {
+        request: PairingRequestInfo,
+        status: PairingState,
+    },
+    Recovery {
+        state: RecoveryState,
+        recovery_phrase_words: Option<RecoveryPhraseWords>,
+    },
+    Export {
+        payload: ExportPayload,
+    },
+    AccountDeletion {
+        state: AccountDeletionState,
+        purge_deadline: Option<DecimalTimestamp>,
+        export_available: bool,
+    },
+    Access {
+        policy: HarnessAccessPolicy,
+    },
+}
+
+impl LocalResult {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        match self {
+            Self::Empty
+            | Self::Recovery { .. }
+            | Self::AccountDeletion { .. }
+            | Self::Access { .. } => Ok(()),
+            Self::Health { protocol, .. } => {
+                if protocol.major != crate::PROTOCOL_MAJOR {
+                    return Err(ValidationError::Invalid("health.protocol"));
+                }
+                Ok(())
+            }
+            Self::Projects { projects } => {
+                for project in projects {
+                    project.validate()?;
+                }
+                Ok(())
+            }
+            Self::Memory { memory } => {
+                if let Some(memory) = memory {
+                    memory.validate()?;
+                }
+                Ok(())
+            }
+            Self::Memories { memories } => {
+                for memory in memories {
+                    memory.validate()?;
+                }
+                Ok(())
+            }
+            Self::Candidates { candidates } => {
+                for candidate in candidates {
+                    candidate.validate()?;
+                }
+                Ok(())
+            }
+            Self::Tasks { tasks } => {
+                for task in tasks {
+                    task.validate()?;
+                }
+                Ok(())
+            }
+            Self::Handoff { payload, .. } => payload.validate(),
+            Self::Probe { report } => report.validate(),
+            Self::Plan { plan } => plan.validate(),
+            Self::Status { status } => status.validate(),
+            Self::Devices { devices } => {
+                for device in devices {
+                    device.validate()?;
+                }
+                Ok(())
+            }
+            Self::Pairing { request, .. } => request.validate(),
+            Self::Export { payload } => payload.validate(),
+        }
+    }
+}
+
+impl Serialize for LocalResult {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        LocalResultSerde::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalResult {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = LocalResultSerde::deserialize(deserializer)?;
+        value.validate().map_err(D::Error::custom)?;
+        Ok(value)
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]

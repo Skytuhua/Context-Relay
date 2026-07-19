@@ -1,8 +1,8 @@
 use std::{env, fs, path::PathBuf};
 
 use context_relay_protocol::{
-    MAX_ARBITRARY_BYTES, MAX_BATCH_OPERATIONS, MAX_CIPHERTEXT_BYTES, MAX_MARKDOWN_BYTES,
-    MAX_TITLE_BYTES, MCP_TOOL_NAMES, mcp_schema,
+    MAX_BATCH_OPERATIONS, MAX_CIPHERTEXT_BYTES, MAX_EXTENSION_ITEMS, MAX_EXTENSION_KEY_BYTES,
+    MAX_EXTENSION_TEXT_BYTES, MAX_MARKDOWN_BYTES, MAX_TITLE_BYTES, MCP_TOOL_NAMES, mcp_schema,
 };
 use serde_json::{Value, json};
 
@@ -88,6 +88,85 @@ fn component(kind: &str, extra: Value, mut required: Vec<&str>) -> Value {
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
 
+fn extension_key() -> Value {
+    let forbidden = [
+        "password",
+        "secret",
+        "token",
+        "cookie",
+        "privatekey",
+        "credential",
+        "executable",
+        "binary",
+        "script",
+        "shell",
+        "command",
+        "hook",
+        "code",
+    ]
+    .map(|role| {
+        let pattern = role
+            .chars()
+            .map(|character| {
+                format!(
+                    "[{}{}]",
+                    character.to_ascii_lowercase(),
+                    character.to_ascii_uppercase()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("[._-]*");
+        json!({"pattern":pattern})
+    });
+    json!({
+        "type":"string",
+        "minLength":1,
+        "maxLength":MAX_EXTENSION_KEY_BYTES,
+        "x-utf8-maxBytes":MAX_EXTENSION_KEY_BYTES,
+        "pattern":r"^[A-Za-z0-9._-]+$",
+        "not":{"anyOf":forbidden}
+    })
+}
+
+fn extension_text() -> Value {
+    json!({
+        "type":"string",
+        "maxLength":MAX_EXTENSION_TEXT_BYTES,
+        "x-utf8-maxBytes":MAX_EXTENSION_TEXT_BYTES,
+        "not":{"anyOf":[
+            {"pattern":r"[\u0000-\u001F\u007F-\u009F]"},
+            {"pattern":r"-----[bB][eE][gG][iI][nN][^\r\n]*[pP][rR][iI][vV][aA][tT][eE] [kK][eE][yY]-----"}
+        ]}
+    })
+}
+
+fn extension_data() -> Value {
+    json!({
+        "type":"object",
+        "maxProperties":MAX_EXTENSION_ITEMS,
+        "propertyNames":extension_key(),
+        "additionalProperties":extension_text()
+    })
+}
+
+fn extension_namespace() -> Value {
+    json!({
+        "type":"string",
+        "pattern":r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$",
+        "maxLength":255,
+        "x-utf8-maxBytes":255
+    })
+}
+
+fn namespaced_extension() -> Value {
+    json!({
+        "type":"object",
+        "properties":{"data":extension_data()},
+        "required":["data"],
+        "additionalProperties":false
+    })
+}
+
 fn package_schema() -> Value {
     let components = json!({"type":"array","minItems":1,"maxItems":MAX_BATCH_OPERATIONS,"items":{"oneOf":[
         component("instruction",json!({"title":required_text(MAX_TITLE_BYTES),"bodyMarkdown":required_text(MAX_MARKDOWN_BYTES)}),vec!["title","bodyMarkdown"]),
@@ -100,14 +179,13 @@ fn package_schema() -> Value {
     ]}});
     let secret = json!({"type":"object","properties":{"id":uuid(),"name":required_text(MAX_TITLE_BYTES),"provider":required_text(MAX_TITLE_BYTES),"requiredOnDevice":{"type":"boolean"}},"required":["id","name","provider","requiredOnDevice"],"additionalProperties":false});
     root(
-        json!({"format":{"const":"context-relay.package.v1"},"packageId":uuid(),"components":components,"secretRefs":{"type":"array","maxItems":MAX_BATCH_OPERATIONS,"items":secret},"harnessTargets":{"type":"array","minItems":1,"maxItems":3,"uniqueItems":true,"items":{"enum":["claude_code","codex","hermes"]}},"extensions":{"type":"array","maxItems":MAX_BATCH_OPERATIONS,"items":{"type":"object","properties":{"namespace":{"type":"string","pattern":r"^[a-z0-9-]+(\.[a-z0-9-]+)+$","maxLength":255,"x-utf8-maxBytes":255},"value":base64url(MAX_ARBITRARY_BYTES)},"required":["namespace","value"],"additionalProperties":false}}}),
+        json!({"format":{"const":"context-relay.package.v1"},"packageId":uuid(),"components":components,"secretRefs":{"type":"array","maxItems":MAX_BATCH_OPERATIONS,"items":secret},"harnessTargets":{"type":"array","minItems":1,"maxItems":3,"uniqueItems":true,"items":{"enum":["claude_code","codex","hermes"]}},"extensions":{"type":"object","maxProperties":MAX_BATCH_OPERATIONS,"propertyNames":extension_namespace(),"additionalProperties":namespaced_extension()}}),
         vec![
             "format",
             "packageId",
             "components",
             "secretRefs",
             "harnessTargets",
-            "extensions",
         ],
     )
 }

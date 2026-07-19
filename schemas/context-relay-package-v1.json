@@ -570,29 +570,92 @@
       "type": "array"
     },
     "extensions": {
-      "items": {
+      "additionalProperties": {
         "additionalProperties": false,
         "properties": {
-          "namespace": {
-            "maxLength": 255,
-            "pattern": "^[a-z0-9-]+(\\.[a-z0-9-]+)+$",
-            "type": "string",
-            "x-utf8-maxBytes": 255
-          },
-          "value": {
-            "maxLength": 1398102,
-            "pattern": "^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-][AQgw]|[A-Za-z0-9_-]{2}[AEIMQUYcgkosw048])?$",
-            "type": "string"
+          "data": {
+            "additionalProperties": {
+              "maxLength": 16384,
+              "not": {
+                "anyOf": [
+                  {
+                    "pattern": "[\\u0000-\\u001F\\u007F-\\u009F]"
+                  },
+                  {
+                    "pattern": "-----[bB][eE][gG][iI][nN][^\\r\\n]*[pP][rR][iI][vV][aA][tT][eE] [kK][eE][yY]-----"
+                  }
+                ]
+              },
+              "type": "string",
+              "x-utf8-maxBytes": 16384
+            },
+            "maxProperties": 64,
+            "propertyNames": {
+              "maxLength": 128,
+              "minLength": 1,
+              "not": {
+                "anyOf": [
+                  {
+                    "pattern": "[pP][._-]*[aA][._-]*[sS][._-]*[sS][._-]*[wW][._-]*[oO][._-]*[rR][._-]*[dD]"
+                  },
+                  {
+                    "pattern": "[sS][._-]*[eE][._-]*[cC][._-]*[rR][._-]*[eE][._-]*[tT]"
+                  },
+                  {
+                    "pattern": "[tT][._-]*[oO][._-]*[kK][._-]*[eE][._-]*[nN]"
+                  },
+                  {
+                    "pattern": "[cC][._-]*[oO][._-]*[oO][._-]*[kK][._-]*[iI][._-]*[eE]"
+                  },
+                  {
+                    "pattern": "[pP][._-]*[rR][._-]*[iI][._-]*[vV][._-]*[aA][._-]*[tT][._-]*[eE][._-]*[kK][._-]*[eE][._-]*[yY]"
+                  },
+                  {
+                    "pattern": "[cC][._-]*[rR][._-]*[eE][._-]*[dD][._-]*[eE][._-]*[nN][._-]*[tT][._-]*[iI][._-]*[aA][._-]*[lL]"
+                  },
+                  {
+                    "pattern": "[eE][._-]*[xX][._-]*[eE][._-]*[cC][._-]*[uU][._-]*[tT][._-]*[aA][._-]*[bB][._-]*[lL][._-]*[eE]"
+                  },
+                  {
+                    "pattern": "[bB][._-]*[iI][._-]*[nN][._-]*[aA][._-]*[rR][._-]*[yY]"
+                  },
+                  {
+                    "pattern": "[sS][._-]*[cC][._-]*[rR][._-]*[iI][._-]*[pP][._-]*[tT]"
+                  },
+                  {
+                    "pattern": "[sS][._-]*[hH][._-]*[eE][._-]*[lL][._-]*[lL]"
+                  },
+                  {
+                    "pattern": "[cC][._-]*[oO][._-]*[mM][._-]*[mM][._-]*[aA][._-]*[nN][._-]*[dD]"
+                  },
+                  {
+                    "pattern": "[hH][._-]*[oO][._-]*[oO][._-]*[kK]"
+                  },
+                  {
+                    "pattern": "[cC][._-]*[oO][._-]*[dD][._-]*[eE]"
+                  }
+                ]
+              },
+              "pattern": "^[A-Za-z0-9._-]+$",
+              "type": "string",
+              "x-utf8-maxBytes": 128
+            },
+            "type": "object"
           }
         },
         "required": [
-          "namespace",
-          "value"
+          "data"
         ],
         "type": "object"
       },
-      "maxItems": 10000,
-      "type": "array"
+      "maxProperties": 10000,
+      "propertyNames": {
+        "maxLength": 255,
+        "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$",
+        "type": "string",
+        "x-utf8-maxBytes": 255
+      },
+      "type": "object"
     },
     "format": {
       "const": "context-relay.package.v1"
@@ -655,8 +718,7 @@
     "packageId",
     "components",
     "secretRefs",
-    "harnessTargets",
-    "extensions"
+    "harnessTargets"
   ],
   "type": "object"
 }

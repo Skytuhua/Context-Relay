@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use ts_rs::TS;
 
 use crate::{
@@ -319,17 +319,55 @@ impl HarnessAccessPolicy {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct ProjectIdentity {
     pub project_id: ProjectId,
-    #[serde(default, with = "optional_decimal_u64")]
     #[ts(type = "DecimalU64 | null")]
     pub github_repository_id: Option<u64>,
     pub git_remote_fingerprint: Option<Sha256Digest>,
     pub monorepo_subdirectory: Option<String>,
     pub name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectIdentityWire {
+    project_id: ProjectId,
+    #[serde(default, with = "optional_decimal_u64")]
+    github_repository_id: Option<u64>,
+    git_remote_fingerprint: Option<Sha256Digest>,
+    monorepo_subdirectory: Option<String>,
+    name: String,
+}
+
+impl Serialize for ProjectIdentity {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        ProjectIdentityWire {
+            project_id: self.project_id,
+            github_repository_id: self.github_repository_id,
+            git_remote_fingerprint: self.git_remote_fingerprint,
+            monorepo_subdirectory: self.monorepo_subdirectory.clone(),
+            name: self.name.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProjectIdentity {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ProjectIdentityWire::deserialize(deserializer)?;
+        let value = Self {
+            project_id: wire.project_id,
+            github_repository_id: wire.github_repository_id,
+            git_remote_fingerprint: wire.git_remote_fingerprint,
+            monorepo_subdirectory: wire.monorepo_subdirectory,
+            name: wire.name,
+        };
+        value.validate().map_err(D::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl ProjectIdentity {

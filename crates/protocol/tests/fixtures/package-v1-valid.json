@@ -12,5 +12,9 @@
   ],
   "secretRefs": [],
   "harnessTargets": ["codex"],
-  "extensions": [{"namespace": "dev.context-relay.fixture", "value": "AQ"}]
+  "extensions": {
+    "dev.context-relay.fixture": {
+      "data": {"displayName": "Fixture metadata", "stability": "stable"}
+    }
+  }
 }

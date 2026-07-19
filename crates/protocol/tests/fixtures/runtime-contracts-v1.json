@@ -94,6 +94,21 @@
     },
     "signature": "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA"
   },
+  "memoryCreateRequest": {
+    "jsonrpc": "2.0",
+    "id": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+    "protocol": {"major": 1, "minor": 0},
+    "daemonInstanceNonce": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+    "method": "memory_create",
+    "params": {
+      "operationId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
+      "scope": {"scope": "global"},
+      "kind": "fact",
+      "title": "Title",
+      "bodyMarkdown": "Body",
+      "tags": ["tag"]
+    }
+  },
   "canonicalCbor": {
     "syncOperation": {
       "file": "sync-operation-v1.hex",

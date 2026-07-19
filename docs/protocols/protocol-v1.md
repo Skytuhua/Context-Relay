@@ -19,7 +19,7 @@ Later synchronization behavior must follow these rules:
 - Duplicate operation IDs are accepted only when canonical bytes match.
 - Sequence conflicts and hash-chain breaks are quarantined.
 
-Local JSON-RPC and MCP inputs reject unknown fields. The package manifest allows forward data only in a namespaced `extensions` field. Sync schema version 1 rejects unknown top-level operation and checkpoint keys.
+Local JSON-RPC requests and success responses reject unknown fields and invalid nested domain content. MCP inputs reject unknown fields. The package manifest allows forward data only in an optional namespaced `extensions` field. Sync schema version 1 rejects unknown top-level operation and checkpoint keys.
 MCP callers never submit project UUID selectors. Memory search defaults to every caller-allowed scope and may narrow to `global` or the caller-relative `active_project`; memory writes use one of those two selectors. Task listing and upserts always resolve the active project, while ID-based reads and updates remain subject to later authorization. Returned records keep stable scope and project identifiers.
 
 
@@ -35,6 +35,6 @@ A setup plan records the exact executable path bytes and digest, adapter and har
 
 An expected native digest may be absent, which means the approved precondition is that the target does not yet exist. Package artifact entries bind an immutable source reference and resolved commit, archive digest, installed artifact path and digest, and the transitive dependency closure.
 
-Package dependency source and version fields are descriptive labels. The SHA-256 digest is the authoritative immutable identity. Core package fields do not designate secret or executable values. All package text and namespaced extension bytes remain untrusted input; Task 19 must scan and reject executable content, credentials, secret values, transcripts, native trust state, and other unsafe payloads before installation.
+Package dependency source and version fields are descriptive labels. The SHA-256 digest is the authoritative immutable identity. Core package fields do not designate secret or executable values. The optional `extensions` object is keyed by namespace, so namespace ordering is deterministic and duplicate namespaces are impossible after JSON parsing. Each namespace maps to a flat, deterministically ordered map of UTF-8 text. Extension maps are limited to 64 entries, keys to 128 UTF-8 bytes, and values to 16 KiB. Keys that normalize to secret-bearing or active-content roles, control-bearing values, and obvious PEM private-key blocks are rejected. Extension data remains untrusted input. Task 19 must still scan exact package bytes and reject executable content, credentials, secret values, transcripts, native trust state, and other unsafe payloads before installation.
 
 JSON-RPC errors use numeric JSON-RPC codes. Context Relay stable snake-case error codes, safe field paths, and retryability are carried in typed error data. Standard parse, request, method, parameter, and internal codes are reserved alongside the documented Context Relay application range.

@@ -117,6 +117,60 @@ pub enum SyncState {
 
 dto!(StatusOutput { protocol: ProtocolVersionRange, vault: VaultState, resolved_project: Option<ProjectId>, sync: SyncState, access: HarnessAccessPolicy });
 
+impl HandoffPayload {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.memories.len() > crate::MAX_EVIDENCE_ITEMS
+            || self.decisions.len() > crate::MAX_EVIDENCE_ITEMS
+            || self.tasks.len() > crate::MAX_EVIDENCE_ITEMS
+        {
+            return Err(ValidationError::TooLarge {
+                field: "payload records",
+                limit: crate::MAX_EVIDENCE_ITEMS,
+            });
+        }
+        required_text(&self.markdown, "payload.markdown", MAX_MARKDOWN_BYTES)?;
+        if let Some(project) = &self.project {
+            project.validate()?;
+        }
+        if self
+            .decisions
+            .iter()
+            .any(|item| item.kind != MemoryKind::Decision)
+        {
+            return Err(ValidationError::Invalid("payload.decisions"));
+        }
+        if self.instruction_refs.len() > crate::MAX_EVIDENCE_ITEMS
+            || self
+                .instruction_refs
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.instruction_refs.len()
+        {
+            return Err(ValidationError::Invalid("payload.instructionRefs"));
+        }
+        for memory in self.memories.iter().chain(&self.decisions) {
+            memory.validate()?;
+        }
+        for task in &self.tasks {
+            task.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl StatusOutput {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.protocol.min.major != crate::PROTOCOL_MAJOR
+            || self.protocol.max.major != crate::PROTOCOL_MAJOR
+            || self.protocol.min.minor > self.protocol.max.minor
+        {
+            return Err(ValidationError::Invalid("status.protocol"));
+        }
+        Ok(())
+    }
+}
+
 impl CompleteTaskInput {
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.evidence.is_empty() {
@@ -446,52 +500,9 @@ fn validate_output(name: &str, value: &Value) -> Result<(), ValidationError> {
         "context_relay_complete_task" => parse_value::<CompleteTaskOutput>(value, invalid)?
             .task
             .validate(),
-        "context_relay_create_handoff" => {
-            let dto: CreateHandoffOutput = parse_value(value, invalid)?;
-            if dto.payload.memories.len() > crate::MAX_EVIDENCE_ITEMS
-                || dto.payload.decisions.len() > crate::MAX_EVIDENCE_ITEMS
-                || dto.payload.tasks.len() > crate::MAX_EVIDENCE_ITEMS
-            {
-                return Err(ValidationError::TooLarge {
-                    field: "payload records",
-                    limit: crate::MAX_EVIDENCE_ITEMS,
-                });
-            }
-            required_text(
-                &dto.payload.markdown,
-                "payload.markdown",
-                MAX_MARKDOWN_BYTES,
-            )?;
-            if let Some(project) = &dto.payload.project {
-                project.validate()?;
-            }
-            if dto
-                .payload
-                .decisions
-                .iter()
-                .any(|item| item.kind != MemoryKind::Decision)
-            {
-                return Err(ValidationError::Invalid("payload.decisions"));
-            }
-            if dto.payload.instruction_refs.len() > crate::MAX_EVIDENCE_ITEMS
-                || dto
-                    .payload
-                    .instruction_refs
-                    .iter()
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-                    != dto.payload.instruction_refs.len()
-            {
-                return Err(ValidationError::Invalid("payload.instructionRefs"));
-            }
-            for item in dto.payload.memories.iter().chain(&dto.payload.decisions) {
-                item.validate()?;
-            }
-            for item in &dto.payload.tasks {
-                item.validate()?;
-            }
-            Ok(())
-        }
+        "context_relay_create_handoff" => parse_value::<CreateHandoffOutput>(value, invalid)?
+            .payload
+            .validate(),
         "context_relay_status" => parse::<StatusOutput>(value, invalid),
         _ => Err(invalid()),
     }

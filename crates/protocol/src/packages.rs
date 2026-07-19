@@ -1,8 +1,8 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use ts_rs::TS;
 
 use crate::{
-    ApprovalClass, BoundedBytes, BoundedCiphertext, ExportId, HarnessId, HybridLogicalClock,
+    ApprovalClass, BoundedCiphertext, ExportId, HarnessId, HybridLogicalClock,
     MAX_BATCH_OPERATIONS, MAX_MARKDOWN_BYTES, MAX_TITLE_BYTES, OperationId, PackageId, Provenance,
     RecordId, RecordKind, ScopeRef, SecretRef, Sha256Digest, ValidationError, WorkspaceId,
     required_text,
@@ -10,6 +10,9 @@ use crate::{
 
 pub const PACKAGE_FORMAT_V1: &str = "context-relay.package.v1";
 pub const EXPORT_FORMAT_V1: &str = "context-relay.export.v1";
+pub const MAX_EXTENSION_ITEMS: usize = 64;
+pub const MAX_EXTENSION_KEY_BYTES: usize = 128;
+pub const MAX_EXTENSION_TEXT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -101,33 +104,118 @@ impl PackageComponent {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct NamespacedExtension {
-    pub namespace: String,
-    pub value: BoundedBytes,
+    pub data: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NamespacedExtensionWire {
+    data: std::collections::BTreeMap<String, String>,
+}
+
+fn validate_extension_namespace(namespace: &str) -> Result<(), ValidationError> {
+    if namespace.len() > 255
+        || !namespace.contains('.')
+        || namespace.split('.').any(|part| {
+            part.is_empty()
+                || !part
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !part
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+    {
+        return Err(ValidationError::Invalid("extensions.namespace"));
+    }
+    Ok(())
 }
 
 impl NamespacedExtension {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.namespace.len() > 255
-            || !self.namespace.contains('.')
-            || self.namespace.split('.').any(|part| {
-                part.is_empty()
-                    || !part.bytes().all(|byte| {
-                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-                    })
-            })
-        {
-            return Err(ValidationError::Invalid("extensions.namespace"));
+        if self.data.len() > MAX_EXTENSION_ITEMS {
+            return Err(ValidationError::TooLarge {
+                field: "extensions.data",
+                limit: MAX_EXTENSION_ITEMS,
+            });
+        }
+        const FORBIDDEN_ROLES: [&str; 13] = [
+            "password",
+            "secret",
+            "token",
+            "cookie",
+            "privatekey",
+            "credential",
+            "executable",
+            "binary",
+            "script",
+            "shell",
+            "command",
+            "hook",
+            "code",
+        ];
+        for (key, value) in &self.data {
+            if key.is_empty()
+                || key.len() > MAX_EXTENSION_KEY_BYTES
+                || !key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                return Err(ValidationError::Invalid("extensions.data.key"));
+            }
+            let normalized: String = key
+                .bytes()
+                .filter(u8::is_ascii_alphanumeric)
+                .map(|byte| byte.to_ascii_lowercase() as char)
+                .collect();
+            if FORBIDDEN_ROLES.iter().any(|role| normalized.contains(role)) {
+                return Err(ValidationError::Invalid("extensions.data.keyRole"));
+            }
+            if value.len() > MAX_EXTENSION_TEXT_BYTES {
+                return Err(ValidationError::TooLarge {
+                    field: "extensions.data.text",
+                    limit: MAX_EXTENSION_TEXT_BYTES,
+                });
+            }
+            let uppercase = value.to_ascii_uppercase();
+            if value.chars().any(char::is_control)
+                || (uppercase.contains("-----BEGIN") && uppercase.contains("PRIVATE KEY-----"))
+            {
+                return Err(ValidationError::Invalid("extensions.data.text"));
+            }
         }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+impl Serialize for NamespacedExtension {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        NamespacedExtensionWire {
+            data: self.data.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for NamespacedExtension {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = NamespacedExtensionWire::deserialize(deserializer)?;
+        let value = Self { data: wire.data };
+        value.validate().map_err(D::Error::custom)?;
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct PackageManifestV1 {
     pub format: String,
@@ -135,7 +223,61 @@ pub struct PackageManifestV1 {
     pub components: Vec<PackageComponent>,
     pub secret_refs: Vec<SecretRef>,
     pub harness_targets: Vec<HarnessId>,
-    pub extensions: Vec<NamespacedExtension>,
+    #[ts(optional)]
+    pub extensions: Option<std::collections::BTreeMap<String, NamespacedExtension>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PackageManifestV1Wire {
+    format: String,
+    package_id: PackageId,
+    components: Vec<PackageComponent>,
+    secret_refs: Vec<SecretRef>,
+    harness_targets: Vec<HarnessId>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_extensions"
+    )]
+    extensions: Option<std::collections::BTreeMap<String, NamespacedExtension>>,
+}
+
+fn deserialize_optional_extensions<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<std::collections::BTreeMap<String, NamespacedExtension>>, D::Error> {
+    std::collections::BTreeMap::deserialize(deserializer).map(Some)
+}
+
+impl Serialize for PackageManifestV1 {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        PackageManifestV1Wire {
+            format: self.format.clone(),
+            package_id: self.package_id,
+            components: self.components.clone(),
+            secret_refs: self.secret_refs.clone(),
+            harness_targets: self.harness_targets.clone(),
+            extensions: self.extensions.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PackageManifestV1 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = PackageManifestV1Wire::deserialize(deserializer)?;
+        let value = Self {
+            format: wire.format,
+            package_id: wire.package_id,
+            components: wire.components,
+            secret_refs: wire.secret_refs,
+            harness_targets: wire.harness_targets,
+            extensions: wire.extensions,
+        };
+        value.validate().map_err(D::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl PackageManifestV1 {
@@ -145,7 +287,10 @@ impl PackageManifestV1 {
         }
         if self.components.len() > MAX_BATCH_OPERATIONS
             || self.secret_refs.len() > MAX_BATCH_OPERATIONS
-            || self.extensions.len() > MAX_BATCH_OPERATIONS
+            || self
+                .extensions
+                .as_ref()
+                .is_some_and(|extensions| extensions.len() > MAX_BATCH_OPERATIONS)
         {
             return Err(ValidationError::TooLarge {
                 field: "manifest collections",
@@ -161,11 +306,13 @@ impl PackageManifestV1 {
         for secret in &self.secret_refs {
             secret.validate()?;
         }
-        for extension in &self.extensions {
-            extension.validate()?;
+        if let Some(extensions) = &self.extensions {
+            for (namespace, extension) in extensions {
+                validate_extension_namespace(namespace)?;
+                extension.validate()?;
+            }
         }
         let mut component_ids = std::collections::BTreeSet::new();
-        let mut namespaces = std::collections::BTreeSet::new();
         let mut secret_ids = std::collections::BTreeSet::new();
         let mut harnesses = std::collections::BTreeSet::new();
         if self
@@ -181,13 +328,6 @@ impl PackageManifestV1 {
             .any(|secret| !secret_ids.insert(secret.id))
         {
             return Err(ValidationError::Invalid("duplicate secret ref id"));
-        }
-        if self
-            .extensions
-            .iter()
-            .any(|extension| !namespaces.insert(&extension.namespace))
-        {
-            return Err(ValidationError::Invalid("duplicate extension namespace"));
         }
         if self
             .harness_targets

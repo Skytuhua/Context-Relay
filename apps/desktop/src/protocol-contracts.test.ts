@@ -220,11 +220,7 @@ describe('protocol schemas', () => {
   });
 
   it('rejects unknown local JSON-RPC v1 fields', () => {
-    const request = {
-      jsonrpc: '2.0', id: '018f22e2-79b0-7cc8-98c4-dc0c0c07398f', protocol: { major: 1, minor: 0 },
-      daemonInstanceNonce: 'AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE', method: 'memory_create',
-      params: { operationId: '018f22e2-79b0-7cc8-98c4-dc0c0c07398f', scope: { scope: 'global' }, kind: 'fact', title: 'Title', bodyMarkdown: 'Body', tags: ['tag'] },
-    };
+    const request = load('crates/protocol/tests/fixtures/runtime-contracts-v1.json').memoryCreateRequest;
     expect(() => guards.assertMemoryCreateJsonRpcRequestV1(request)).not.toThrow();
     rejectsWith(protocolValidation.assertMemoryCreateJsonRpcRequestV1, { ...request, id: 'not-a-uuid' });
     rejectsWith(protocolValidation.assertMemoryCreateJsonRpcRequestV1, { ...request, daemonInstanceNonce: 'AQ' });

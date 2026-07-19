@@ -1,7 +1,8 @@
 mod support;
 
 use context_relay_protocol::{
-    MemoryRecord, ProjectIdentity, SetupPlan, SyncOperationV1, TaskRecord, mcp_schema,
+    JsonRpcRequestV1, MemoryRecord, ProjectIdentity, SetupPlan, SyncOperationV1, TaskRecord,
+    mcp_schema,
 };
 
 #[test]
@@ -46,9 +47,22 @@ fn shared_json_fixture_round_trips_through_rust() {
     )
     .unwrap();
 
-    for key in ["memory", "task", "setupPlan", "syncOperation"] {
+    for key in [
+        "memory",
+        "task",
+        "setupPlan",
+        "syncOperation",
+        "memoryCreateRequest",
+    ] {
         assert!(fixture.get(key).is_some(), "missing {key}");
     }
+
+    let request: JsonRpcRequestV1 =
+        serde_json::from_value(fixture["memoryCreateRequest"].clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(request).unwrap(),
+        fixture["memoryCreateRequest"]
+    );
 
     let memory: MemoryRecord = serde_json::from_value(fixture["memory"].clone()).unwrap();
     memory.validate().unwrap();
