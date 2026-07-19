@@ -11,6 +11,7 @@ use context_relay_protocol::{
     WorkspaceId, XChaChaNonce, encode_checkpoint_signing_preimage_v1,
     encode_sync_operation_signing_preimage_v1,
 };
+use zeroize::Zeroizing;
 
 const ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
 const OTHER_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07398e";
@@ -26,7 +27,7 @@ fn recovery_is_bip39_domain_separated_and_redacted() {
             .len(),
         24
     );
-    let phrase = RecoveryPhrase::from_entropy([0; 32]).unwrap();
+    let phrase = fixed_phrase();
     assert_eq!(
         phrase.to_words().as_words().join(" "),
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
@@ -39,9 +40,9 @@ fn recovery_is_bip39_domain_separated_and_redacted() {
         "stable HKDF labels must produce distinct recovery secrets"
     );
 
-    let mut wrong_words = phrase.to_words().into_words();
-    wrong_words[23] = "abandon".into();
-    let wrong = RecoveryPhraseWords::new(wrong_words).unwrap();
+    let consumed_words: Zeroizing<Vec<String>> = phrase.to_words().into_words();
+    assert_eq!(consumed_words.len(), 24);
+    let wrong = RecoveryPhraseWords::new(vec!["abandon".to_owned(); 24]).unwrap();
     assert!(RecoveryPhrase::from_words(wrong).is_err());
 
     let diagnostics = format!("{phrase:?} {keys:?}");
@@ -85,7 +86,7 @@ fn xchacha_and_x25519_bind_aad_and_redact_failures() {
         generated_device.signing_public_key().0,
         generated_device.wrapping_public_key().0
     );
-    let recipient = DeviceKeys::from_seeds([7; 32], [9; 32]);
+    let recipient = DeviceKeys::generate().unwrap();
     let wrapped = wrap_secret(recipient.wrapping_public_key(), PLAINTEXT_CANARY, aad).unwrap();
     assert_eq!(
         recipient.unwrap_secret(&wrapped, aad).unwrap().expose(),
@@ -97,7 +98,7 @@ fn xchacha_and_x25519_bind_aad_and_redact_failures() {
         assert!(recipient.unwrap_secret(&wrapped, &tampered).is_err());
     }
 
-    let recovery = RecoveryKeys::derive(&RecoveryPhrase::from_entropy([0; 32]).unwrap()).unwrap();
+    let recovery = RecoveryKeys::derive(&fixed_phrase()).unwrap();
     let recovery_wrapped =
         wrap_secret(recovery.wrapping_public_key(), PLAINTEXT_CANARY, aad).unwrap();
     assert_eq!(
@@ -107,8 +108,7 @@ fn xchacha_and_x25519_bind_aad_and_redact_failures() {
             .expose(),
         PLAINTEXT_CANARY
     );
-    let wrong_recovery =
-        RecoveryKeys::derive(&RecoveryPhrase::from_entropy([1; 32]).unwrap()).unwrap();
+    let wrong_recovery = RecoveryKeys::derive(&RecoveryPhrase::generate().unwrap()).unwrap();
     assert!(
         wrong_recovery
             .unwrap_secret(&recovery_wrapped, aad)
@@ -132,8 +132,8 @@ fn xchacha_and_x25519_bind_aad_and_redact_failures() {
 
 #[test]
 fn certificates_bind_every_field_and_declared_issuer() {
-    let recovery = RecoveryKeys::derive(&RecoveryPhrase::from_entropy([0; 32]).unwrap()).unwrap();
-    let device = DeviceKeys::from_seeds([1; 32], [2; 32]);
+    let recovery = RecoveryKeys::derive(&fixed_phrase()).unwrap();
+    let device = DeviceKeys::generate().unwrap();
     let fields = certificate_fields(&device);
     let certificate = DeviceCertificateV1::issue_genesis(fields.clone(), &recovery).unwrap();
     certificate
@@ -175,7 +175,7 @@ fn certificates_bind_every_field_and_declared_issuer() {
         assert!(value.verify_genesis(recovery.signing_public_key()).is_err());
     }
 
-    let issuer = DeviceKeys::from_seeds([3; 32], [4; 32]);
+    let issuer = DeviceKeys::generate().unwrap();
     let issuer_id = DeviceId::from_str(ID).unwrap();
     let device_certificate =
         DeviceCertificateV1::issue_by_device(fields, issuer_id, &issuer).unwrap();
@@ -218,7 +218,7 @@ fn certificates_bind_every_field_and_declared_issuer() {
 
 #[test]
 fn operation_and_checkpoint_use_protocol_signing_preimages() {
-    let keys = DeviceKeys::from_seeds([11; 32], [12; 32]);
+    let keys = DeviceKeys::generate().unwrap();
     let mut operation = sync_operation();
     keys.sign_sync_operation(&mut operation).unwrap();
     keys.verify_sync_operation(&operation).unwrap();
@@ -240,24 +240,6 @@ fn operation_and_checkpoint_use_protocol_signing_preimages() {
     );
     checkpoint.signature.0[0] ^= 1;
     assert!(keys.verify_checkpoint(&checkpoint).is_err());
-}
-
-#[test]
-fn fixed_vectors_are_platform_independent() {
-    let phrase = RecoveryPhrase::from_entropy([0; 32]).unwrap();
-    let recovery = RecoveryKeys::derive(&phrase).unwrap();
-    let device = DeviceKeys::from_seeds([1; 32], [2; 32]);
-    let certificate =
-        DeviceCertificateV1::issue_genesis(certificate_fields(&device), &recovery).unwrap();
-    let actual = format!(
-        "phrase={}\nrecovery_signing_public={}\nrecovery_wrapping_public={}\ncertificate_preimage={}\ncertificate_signature={}\n",
-        phrase.to_words().as_words().join(" "),
-        hex(&recovery.signing_public_key().0),
-        hex(&recovery.wrapping_public_key().0),
-        hex(&certificate.signing_preimage()),
-        hex(&certificate.signature.0),
-    );
-    assert_eq!(actual, include_str!("fixtures/crypto-v1.txt"));
 }
 
 fn assert_each_preimage_bit_is_signed(
@@ -282,6 +264,12 @@ fn certificate_fields(device: &DeviceKeys) -> CertificateFieldsV1 {
         signing_public_key: device.signing_public_key(),
         wrapping_public_key: device.wrapping_public_key(),
     }
+}
+
+fn fixed_phrase() -> RecoveryPhrase {
+    let mut words = vec!["abandon".to_owned(); 23];
+    words.push("art".to_owned());
+    RecoveryPhrase::from_words(RecoveryPhraseWords::new(words).unwrap()).unwrap()
 }
 
 fn sync_operation() -> SyncOperationV1 {
@@ -330,8 +318,4 @@ fn checkpoint() -> CheckpointV1 {
         created_hlc: HybridLogicalClock::new(1_700_000_000_000, 0, DeviceId::from_str(ID).unwrap()),
         signature: Ed25519SignatureBytes([0; 64]),
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

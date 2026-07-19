@@ -5,7 +5,7 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::SerializeMap as _,
 };
 use ts_rs::TS;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     BoundedBytes, CandidateId, ClientError, CompletionEvidenceInput, CreateHandoffInput, DeviceId,
@@ -209,8 +209,8 @@ impl RecoveryPhraseWords {
     pub fn as_words(&self) -> &[String] {
         &self.0
     }
-    pub fn into_words(mut self) -> Vec<String> {
-        std::mem::take(&mut self.0)
+    pub fn into_words(mut self) -> Zeroizing<Vec<String>> {
+        Zeroizing::new(std::mem::take(&mut self.0))
     }
 }
 impl Drop for RecoveryPhraseWords {

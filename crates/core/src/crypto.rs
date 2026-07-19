@@ -54,6 +54,12 @@ impl fmt::Display for CryptoError {
 
 impl Error for CryptoError {}
 
+/// Deterministic entropy construction is intentionally not a public API.
+///
+/// ```compile_fail
+/// use context_relay_core::crypto::RecoveryPhrase;
+/// let _ = RecoveryPhrase::from_entropy([0; 32]);
+/// ```
 pub struct RecoveryPhrase {
     sentence: Zeroizing<String>,
 }
@@ -67,7 +73,7 @@ impl RecoveryPhrase {
         Self::from_entropy(*entropy)
     }
 
-    pub fn from_entropy(mut entropy: [u8; 32]) -> Result<Self, CryptoError> {
+    fn from_entropy(mut entropy: [u8; 32]) -> Result<Self, CryptoError> {
         let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)
             .map_err(|_| CryptoError::InvalidPhrase);
         entropy.zeroize();
@@ -78,9 +84,8 @@ impl RecoveryPhrase {
     }
 
     pub fn from_words(words: RecoveryPhraseWords) -> Result<Self, CryptoError> {
-        let mut words = words.into_words();
+        let words = words.into_words();
         let sentence = Zeroizing::new(words.join(" "));
-        words.zeroize();
         let mnemonic = Mnemonic::parse_in(Language::English, sentence.as_str())
             .map_err(|_| CryptoError::InvalidPhrase)?;
         if mnemonic.word_count() != 24 {
@@ -151,6 +156,12 @@ impl fmt::Debug for RecoveryKeys {
     }
 }
 
+/// Deterministic device-key construction is intentionally not a public API.
+///
+/// ```compile_fail
+/// use context_relay_core::crypto::DeviceKeys;
+/// let _ = DeviceKeys::from_seeds([0; 32], [1; 32]);
+/// ```
 pub struct DeviceKeys {
     signing_secret: Zeroizing<[u8; 32]>,
     wrapping_secret: Zeroizing<[u8; 32]>,
@@ -167,7 +178,7 @@ impl DeviceKeys {
         Ok(Self::from_seeds(*signing, *wrapping))
     }
 
-    pub fn from_seeds(signing_secret: [u8; 32], wrapping_secret: [u8; 32]) -> Self {
+    fn from_seeds(signing_secret: [u8; 32], wrapping_secret: [u8; 32]) -> Self {
         Self {
             signing_secret: Zeroizing::new(signing_secret),
             wrapping_secret: Zeroizing::new(wrapping_secret),
@@ -318,15 +329,23 @@ pub fn wrap_secret(
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<WrappedKeyEnvelope, CryptoError> {
+    wrap_secret_with_rng(recipient_public_key, plaintext, aad, &mut OsRng)
+}
+
+fn wrap_secret_with_rng<R: CryptoRng + RngCore>(
+    recipient_public_key: X25519PublicKeyBytes,
+    plaintext: &[u8],
+    aad: &[u8],
+    rng: &mut R,
+) -> Result<WrappedKeyEnvelope, CryptoError> {
     let mut ephemeral_bytes = Zeroizing::new([0_u8; 32]);
-    OsRng
-        .try_fill_bytes(&mut *ephemeral_bytes)
+    rng.try_fill_bytes(&mut *ephemeral_bytes)
         .map_err(|_| CryptoError::RandomnessUnavailable)?;
     let ephemeral_secret = StaticSecret::from(*ephemeral_bytes);
     let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
     let recipient_public = X25519PublicKey::from(recipient_public_key.0);
     let shared = ephemeral_secret.diffie_hellman(&recipient_public);
-    if shared.as_bytes().iter().all(|byte| *byte == 0) {
+    if !shared.was_contributory() {
         return Err(CryptoError::InvalidKey);
     }
     let key = derive_wrap_key(
@@ -334,7 +353,7 @@ pub fn wrap_secret(
         ephemeral_public.as_bytes(),
         &recipient_public_key.0,
     )?;
-    let encrypted = encrypt_xchacha_with_rng(&key, plaintext, aad, &mut OsRng)?;
+    let encrypted = encrypt_xchacha_with_rng(&key, plaintext, aad, rng)?;
     Ok(WrappedKeyEnvelope {
         ephemeral_public_key: X25519PublicKeyBytes(*ephemeral_public.as_bytes()),
         nonce: encrypted.nonce,
@@ -476,10 +495,12 @@ impl DeviceCertificateV1 {
 }
 
 fn derive_recovery_secret(seed: &[u8], label: &[u8]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
-    let hkdf = Hkdf::<Sha256>::new(Some(RECOVERY_HKDF_SALT), seed);
     let mut output = Zeroizing::new([0_u8; 32]);
-    hkdf.expand(label, &mut *output)
-        .map_err(|_| CryptoError::InvalidKey)?;
+    {
+        let hkdf = Hkdf::<Sha256>::new(Some(RECOVERY_HKDF_SALT), seed);
+        hkdf.expand(label, &mut *output)
+            .map_err(|_| CryptoError::InvalidKey)?;
+    }
     Ok(output)
 }
 
@@ -505,7 +526,7 @@ fn unwrap_x25519(
     let recipient_public = X25519PublicKey::from(&recipient_secret);
     let ephemeral_public = X25519PublicKey::from(envelope.ephemeral_public_key.0);
     let shared = recipient_secret.diffie_hellman(&ephemeral_public);
-    if shared.as_bytes().iter().all(|byte| *byte == 0) {
+    if !shared.was_contributory() {
         return Err(CryptoError::InvalidKey);
     }
     let key = derive_wrap_key(
@@ -521,14 +542,16 @@ fn derive_wrap_key(
     ephemeral_public: &[u8; 32],
     recipient_public: &[u8; 32],
 ) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
-    let hkdf = Hkdf::<Sha256>::new(None, shared);
     let mut info = Vec::with_capacity(X25519_WRAP_LABEL.len() + 64);
     info.extend_from_slice(X25519_WRAP_LABEL);
     info.extend_from_slice(ephemeral_public);
     info.extend_from_slice(recipient_public);
     let mut output = Zeroizing::new([0_u8; 32]);
-    hkdf.expand(&info, &mut *output)
-        .map_err(|_| CryptoError::InvalidKey)?;
+    {
+        let hkdf = Hkdf::<Sha256>::new(None, shared);
+        hkdf.expand(&info, &mut *output)
+            .map_err(|_| CryptoError::InvalidKey)?;
+    }
     Ok(output)
 }
 
@@ -603,9 +626,18 @@ fn reserve_nonce(key: &[u8; 32], nonce: [u8; 24]) -> Result<(), CryptoError> {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
+    use context_relay_protocol::{
+        AccountId, DeviceId, PairingRequestNonce, WorkspaceId, X25519PublicKeyBytes, XChaChaNonce,
+    };
     use rand_core::{CryptoRng, RngCore};
 
-    use super::{ContentKey, CryptoError};
+    use super::{
+        CertificateFieldsV1, ContentKey, CryptoError, DeviceCertificateV1, DeviceKeys,
+        RecoveryKeys, RecoveryPhrase, WrappedKeyEnvelope, verify_signature, wrap_secret,
+        wrap_secret_with_rng,
+    };
 
     struct RepeatingRng;
 
@@ -640,5 +672,132 @@ mod tests {
                 .unwrap_err(),
             CryptoError::NonceReuse
         );
+    }
+
+    #[test]
+    fn rejects_non_contributory_x25519_public_keys() {
+        assert_eq!(
+            wrap_secret(X25519PublicKeyBytes([0; 32]), b"secret", b"aad",).unwrap_err(),
+            CryptoError::InvalidKey
+        );
+
+        let recipient = DeviceKeys::from_seeds([7; 32], [9; 32]);
+        let envelope = WrappedKeyEnvelope {
+            ephemeral_public_key: X25519PublicKeyBytes([0; 32]),
+            nonce: XChaChaNonce([0; 24]),
+            ciphertext: vec![0; 16],
+        };
+        assert_eq!(
+            recipient.unwrap_secret(&envelope, b"aad").unwrap_err(),
+            CryptoError::InvalidKey
+        );
+    }
+
+    #[test]
+    fn fixed_vectors_are_platform_independent() {
+        let phrase = RecoveryPhrase::from_entropy([0; 32]).unwrap();
+        let recovery = RecoveryKeys::derive(&phrase).unwrap();
+        let device = DeviceKeys::from_seeds([1; 32], [2; 32]);
+        let genesis_certificate =
+            DeviceCertificateV1::issue_genesis(certificate_fields(&device), &recovery).unwrap();
+        let content_key = ContentKey::from_bytes([41; 32]);
+        let mut content_rng = RepeatingRng;
+        let encrypted = content_key
+            .encrypt_with_rng(b"content-vector", b"content-aad", &mut content_rng)
+            .unwrap();
+        assert_eq!(
+            content_key
+                .decrypt(&encrypted, b"content-aad")
+                .unwrap()
+                .expose(),
+            b"content-vector"
+        );
+
+        let recipient = DeviceKeys::from_seeds([7; 32], [9; 32]);
+        let mut wrap_rng = RepeatingRng;
+        let wrapped = wrap_secret_with_rng(
+            recipient.wrapping_public_key(),
+            b"wrap-vector",
+            b"wrap-aad",
+            &mut wrap_rng,
+        )
+        .unwrap();
+        assert_eq!(
+            recipient
+                .unwrap_secret(&wrapped, b"wrap-aad")
+                .unwrap()
+                .expose(),
+            b"wrap-vector"
+        );
+
+        let signing_message = b"context-relay-device-signature-vector-v1";
+        let device_signature = device.sign(signing_message);
+        verify_signature(
+            device.signing_public_key(),
+            signing_message,
+            device_signature,
+        )
+        .unwrap();
+
+        let issuer = DeviceKeys::from_seeds([3; 32], [4; 32]);
+        let device_certificate = DeviceCertificateV1::issue_by_device(
+            certificate_fields(&device),
+            DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c07398f").unwrap(),
+            &issuer,
+        )
+        .unwrap();
+        device_certificate
+            .verify_issued_by(&device_certificate.issuer)
+            .unwrap();
+
+        let actual = format!(
+            concat!(
+                "phrase={}\n",
+                "recovery_signing_public={}\n",
+                "recovery_wrapping_public={}\n",
+                "genesis_preimage={}\n",
+                "genesis_signature={}\n",
+                "content_nonce={}\n",
+                "content_ciphertext={}\n",
+                "wrap_ephemeral_public={}\n",
+                "wrap_nonce={}\n",
+                "wrap_ciphertext={}\n",
+                "device_signing_public={}\n",
+                "device_signature={}\n",
+                "device_certificate_preimage={}\n",
+                "device_certificate_signature={}\n",
+            ),
+            phrase.to_words().as_words().join(" "),
+            hex(&recovery.signing_public_key().0),
+            hex(&recovery.wrapping_public_key().0),
+            hex(&genesis_certificate.signing_preimage()),
+            hex(&genesis_certificate.signature.0),
+            hex(&encrypted.nonce.0),
+            hex(&encrypted.ciphertext),
+            hex(&wrapped.ephemeral_public_key.0),
+            hex(&wrapped.nonce.0),
+            hex(&wrapped.ciphertext),
+            hex(&device.signing_public_key().0),
+            hex(&device_signature.0),
+            hex(&device_certificate.signing_preimage()),
+            hex(&device_certificate.signature.0),
+        );
+        assert_eq!(actual, include_str!("../tests/fixtures/crypto-v1.txt"));
+    }
+
+    fn certificate_fields(device: &DeviceKeys) -> CertificateFieldsV1 {
+        CertificateFieldsV1 {
+            account_id: AccountId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c07398f").unwrap(),
+            workspace_id: WorkspaceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c07398e").unwrap(),
+            control_epoch: 7,
+            request_nonce: PairingRequestNonce([5; 32]),
+            device_id: DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c07398e").unwrap(),
+            signing_public_key: device.signing_public_key(),
+            wrapping_public_key: device.wrapping_public_key(),
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }
