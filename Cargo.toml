@@ -20,9 +20,12 @@ base64 = "0.22.1"
 bip39 = { version = "2.2.0", features = ["zeroize"] }
 chacha20poly1305 = { version = "0.10.1", features = ["std"] }
 ed25519-dalek = { version = "2.2.0", features = ["zeroize"] }
+fastembed = { version = "=5.17.3", default-features = false, features = ["ort-load-dynamic"] }
 hkdf = "0.12.4"
+keyring = { version = "=4.1.5", default-features = false, features = ["v1"] }
 minicbor = { version = "0.26.5", features = ["std"] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
+rusqlite = { git = "https://github.com/rusqlite/rusqlite", rev = "62648175c23f84b45238f4a1fbb0133b75ce68f1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"

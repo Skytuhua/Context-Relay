@@ -12,8 +12,14 @@ bip39.workspace = true
 chacha20poly1305.workspace = true
 context-relay-protocol = { version = "0.1.0", path = "../protocol" }
 ed25519-dalek.workspace = true
+fastembed.workspace = true
 hkdf.workspace = true
+keyring.workspace = true
 rand_core.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
+thiserror.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true

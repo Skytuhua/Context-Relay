@@ -1,4 +1,6 @@
 pub mod crypto;
+pub mod search;
+pub mod vault;
 
 use context_relay_protocol::{PROTOCOL_VERSION, ProtocolVersion};
 
