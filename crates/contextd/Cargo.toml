@@ -9,4 +9,15 @@ rust-version.workspace = true
 
 [dependencies]
 context-relay-core = { version = "0.1.0", path = "../core" }
+context-relay-local-ipc = { version = "0.1.0", path = "../local-ipc" }
 context-relay-protocol = { version = "0.1.0", path = "../protocol" }
+dirs.workspace = true
+keyring.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+uuid.workspace = true
+zeroize.workspace = true

@@ -11,6 +11,9 @@ rust-version.workspace = true
 tauri-build = { version = "2.4.1", features = [] }
 
 [dependencies]
+context-relay-local-ipc = { version = "0.1.0", path = "../../../crates/local-ipc" }
 context-relay-protocol = { version = "0.1.0", path = "../../../crates/protocol" }
 serde.workspace = true
 tauri = { version = "2.8.5", features = [] }
+tokio.workspace = true
+uuid.workspace = true

@@ -8,4 +8,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+context-relay-local-ipc = { version = "0.1.0", path = "../local-ipc" }
 context-relay-protocol = { version = "0.1.0", path = "../protocol" }
+tokio.workspace = true

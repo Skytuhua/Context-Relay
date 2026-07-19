@@ -662,7 +662,9 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 name = "context-relay-context-mcp"
 version = "0.1.0"
 dependencies = [
+ "context-relay-local-ipc",
  "context-relay-protocol",
+ "tokio",
 ]
 
 [[package]]
@@ -670,7 +672,15 @@ name = "context-relay-contextd"
 version = "0.1.0"
 dependencies = [
  "context-relay-core",
+ "context-relay-local-ipc",
  "context-relay-protocol",
+ "dirs",
+ "keyring",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -698,10 +708,33 @@ dependencies = [
 name = "context-relay-desktop"
 version = "0.1.0"
 dependencies = [
+ "context-relay-local-ipc",
  "context-relay-protocol",
  "serde",
  "tauri",
  "tauri-build",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "context-relay-local-ipc"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "context-relay-protocol",
+ "dirs",
+ "hmac",
+ "keyring",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -4630,8 +4663,21 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
+ "tokio-macros",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6328af13490e73a9b4694030fafd93f8c8c6a9dede33e821c3fc63eddf8042ba"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
