@@ -17,6 +17,8 @@ allow = [
   "Apache-2.0",
   "BSD-3-Clause",
   "BlueOak-1.0.0",
+  "CC0-1.0",
+  "ISC",
   "MIT",
   "MPL-2.0",
   "Unicode-3.0",
@@ -32,3 +34,4 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/rusqlite/rusqlite"]
