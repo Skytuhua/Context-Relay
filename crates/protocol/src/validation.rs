@@ -1,4 +1,12 @@
 use crate::ValidationError;
+
+pub fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
+}
 pub const MAX_TITLE_BYTES: usize = 512;
 pub const MAX_MARKDOWN_BYTES: usize = 1024 * 1024;
 pub const MAX_TAGS: usize = 64;

@@ -59,6 +59,7 @@ pub enum ErrorCode {
 pub struct ClientError {
     pub code: ErrorCode,
     pub message: String,
+    #[serde(deserialize_with = "crate::required_nullable")]
     pub field_path: Option<String>,
     pub retryable: bool,
 }

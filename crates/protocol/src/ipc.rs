@@ -47,10 +47,10 @@ impl<'de> Deserialize<'de> for DaemonInstanceNonce {
     }
 }
 
-macro_rules! params { ($name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
+macro_rules! params { ($name:ident { $($(#[$field_attr:meta])* $field:ident : $ty:ty),* $(,)? }) => {
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
     #[serde(rename_all="camelCase",deny_unknown_fields)] #[ts(rename_all="camelCase")]
-    pub struct $name { $(pub $field:$ty),* }
+    pub struct $name { $($(#[$field_attr])* pub $field:$ty),* }
 }; }
 params!(EmptyParams {});
 params!(ProjectParams {
@@ -64,14 +64,31 @@ params!(MemoryParams {
     memory_id: MemoryId
 });
 params!(MemoryCreateParams { operation_id:OperationId,scope:ScopeRef,kind:MemoryKind,title:String,body_markdown:String,tags:Vec<String> });
-params!(MemoryUpdateParams { operation_id:OperationId,memory_id:MemoryId,expected_revision:OperationId,title:Option<String>,body_markdown:Option<String>,tags:Option<Vec<String>> });
+params!(MemoryUpdateParams {
+    operation_id: OperationId,
+    memory_id: MemoryId,
+    expected_revision: OperationId,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    title: Option<String>,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    body_markdown: Option<String>,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    tags: Option<Vec<String>>
+});
 params!(MemoryArchiveParams {
     operation_id: OperationId,
     memory_id: MemoryId,
     expected_revision: OperationId
 });
-params!(CandidateListParams { project_id:Option<ProjectId> });
-params!(SearchParams { query:String,project_id:Option<ProjectId> });
+params!(CandidateListParams {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    project_id: Option<ProjectId>
+});
+params!(SearchParams {
+    query: String,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    project_id: Option<ProjectId>
+});
 params!(CandidateReviewParams {
     candidate_id: CandidateId,
     accepted: bool,
@@ -85,9 +102,23 @@ params!(TaskTransitionParams {
     expected_revision: OperationId,
     status: TaskStatus
 });
-params!(TaskUpsertParams { operation_id:OperationId,task_id:Option<TaskId>,project_id:ProjectId,title:String,body_markdown:String,status:TaskStatus,expected_revision:Option<OperationId> });
+params!(TaskUpsertParams {
+    operation_id: OperationId,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    task_id: Option<TaskId>,
+    project_id: ProjectId,
+    title: String,
+    body_markdown: String,
+    status: TaskStatus,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    expected_revision: Option<OperationId>
+});
 params!(HandoffParams { operation_id:OperationId,memory_ids:Vec<MemoryId>,decision_ids:Vec<MemoryId>,task_ids:Vec<TaskId>,summary:String });
-params!(HarnessParams { harness:HarnessId,project_id:Option<ProjectId> });
+params!(HarnessParams {
+    harness: HarnessId,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    project_id: Option<ProjectId>
+});
 params!(PlanParams { plan_id: PlanId });
 params!(PackageParams {
     package_base64url: BoundedBytes,
@@ -96,7 +127,11 @@ params!(PackageParams {
 params!(RetryParams {
     operation_id: OperationId
 });
-params!(ExportParams { project_id:Option<ProjectId>,include_archived:bool });
+params!(ExportParams {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    project_id: Option<ProjectId>,
+    include_archived: bool
+});
 params!(ExportChunkParams {
     export_id: ExportId,
     chunk_index: u32
@@ -575,6 +610,7 @@ enum LocalResultSerde {
         projects: Vec<ProjectIdentity>,
     },
     Memory {
+        #[serde(deserialize_with = "crate::required_nullable")]
         memory: Option<MemoryRecord>,
     },
     Memories {
@@ -608,6 +644,7 @@ enum LocalResultSerde {
     },
     Recovery {
         state: RecoveryState,
+        #[serde(deserialize_with = "crate::required_nullable")]
         recovery_phrase_words: Option<RecoveryPhraseWords>,
     },
     Export {
@@ -615,6 +652,7 @@ enum LocalResultSerde {
     },
     AccountDeletion {
         state: AccountDeletionState,
+        #[serde(deserialize_with = "crate::required_nullable")]
         purge_deadline: Option<DecimalTimestamp>,
         export_available: bool,
     },
@@ -714,7 +752,12 @@ params!(JsonRpcErrorObject {
     message: String,
     data: ClientError
 });
-params!(JsonRpcErrorV1 { jsonrpc:JsonRpcVersion,id:Option<RecordId>,error:JsonRpcErrorObject });
+params!(JsonRpcErrorV1 {
+    jsonrpc: JsonRpcVersion,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    id: Option<RecordId>,
+    error: JsonRpcErrorObject
+});
 pub const JSON_RPC_PARSE_ERROR: i32 = -32700;
 pub const JSON_RPC_INVALID_REQUEST: i32 = -32600;
 pub const JSON_RPC_METHOD_NOT_FOUND: i32 = -32601;

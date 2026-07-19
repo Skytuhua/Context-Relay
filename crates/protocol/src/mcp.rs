@@ -24,11 +24,11 @@ pub const MCP_TOOL_NAMES: [&str; 11] = [
 ];
 
 macro_rules! dto {
-    ($name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
+    ($name:ident { $($(#[$field_attr:meta])* $field:ident : $ty:ty),* $(,)? }) => {
         #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         #[ts(rename_all = "camelCase")]
-        pub struct $name { $(pub $field: $ty),* }
+        pub struct $name { $($(#[$field_attr])* pub $field: $ty),* }
     };
 }
 
@@ -40,7 +40,15 @@ pub enum McpScopeSelector {
     ActiveProject,
 }
 
-dto!(SearchInput { query: String, scope: Option<McpScopeSelector>, limit: Option<u16> });
+dto!(SearchInput {
+    query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "McpScopeSelector | null")]
+    scope: Option<McpScopeSelector>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number | null")]
+    limit: Option<u16>
+});
 dto!(SearchOutput { memories: Vec<MemoryRecord>, instructions: Vec<InstructionRecord> });
 dto!(GetInput {
     record_id: RecordId
@@ -59,7 +67,10 @@ pub enum ReadableRecord {
     Instruction(InstructionRecord),
 }
 
-dto!(GetOutput { record: Option<ReadableRecord> });
+dto!(GetOutput {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    record: Option<ReadableRecord>
+});
 dto!(RememberInput { operation_id: OperationId, kind: MemoryKind, title: String, markdown: String, tags: Vec<String>, scope: McpScopeSelector });
 dto!(RememberOutput {
     memory: MemoryRecord
@@ -85,15 +96,44 @@ dto!(ArchiveMemoryInput {
 dto!(ArchiveMemoryOutput {
     memory: MemoryRecord
 });
-dto!(ListTasksInput { status: Option<TaskStatus> });
+dto!(ListTasksInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "TaskStatus | null")]
+    status: Option<TaskStatus>
+});
 dto!(ListTasksOutput { tasks: Vec<TaskRecord> });
-dto!(UpsertTaskInput { operation_id: OperationId, task_id: Option<TaskId>, title: String, body_markdown: String, status: TaskStatus, expected_revision: Option<OperationId> });
+dto!(UpsertTaskInput {
+    operation_id: OperationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "TaskId | null")]
+    task_id: Option<TaskId>,
+    title: String,
+    body_markdown: String,
+    status: TaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "OperationId | null")]
+    expected_revision: Option<OperationId>
+});
 dto!(UpsertTaskOutput { task: TaskRecord });
-dto!(CompletionEvidenceInput { summary: String, kind: String, reference: Option<String> });
+dto!(CompletionEvidenceInput {
+    summary: String,
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "string | null")]
+    reference: Option<String>
+});
 dto!(CompleteTaskInput { operation_id: OperationId, task_id: TaskId, expected_revision: OperationId, evidence: Vec<CompletionEvidenceInput> });
 dto!(CompleteTaskOutput { task: TaskRecord });
 dto!(CreateHandoffInput { operation_id: OperationId, memory_ids: Vec<MemoryId>, decision_ids: Vec<MemoryId>, task_ids: Vec<TaskId>, summary: String });
-dto!(HandoffPayload { project: Option<ProjectIdentity>, markdown: String, memories: Vec<MemoryRecord>, decisions: Vec<MemoryRecord>, tasks: Vec<TaskRecord>, instruction_refs: Vec<RecordId> });
+dto!(HandoffPayload {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    project: Option<ProjectIdentity>,
+    markdown: String,
+    memories: Vec<MemoryRecord>,
+    decisions: Vec<MemoryRecord>,
+    tasks: Vec<TaskRecord>,
+    instruction_refs: Vec<RecordId>
+});
 dto!(CreateHandoffOutput {
     handoff_id: OperationId,
     payload: HandoffPayload
@@ -115,7 +155,14 @@ pub enum SyncState {
     Error,
 }
 
-dto!(StatusOutput { protocol: ProtocolVersionRange, vault: VaultState, resolved_project: Option<ProjectId>, sync: SyncState, access: HarnessAccessPolicy });
+dto!(StatusOutput {
+    protocol: ProtocolVersionRange,
+    vault: VaultState,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    resolved_project: Option<ProjectId>,
+    sync: SyncState,
+    access: HarnessAccessPolicy
+});
 
 impl HandoffPayload {
     pub fn validate(&self) -> Result<(), ValidationError> {
@@ -342,7 +389,13 @@ pub fn mcp_schema(name: &str) -> Option<McpToolSchema> {
     };
     let mut input = strict(required, properties);
     if name == "context_relay_upsert_task" {
-        input.as_object_mut().expect("schema object").insert("anyOf".into(),json!([{"not":{"anyOf":[{"properties":{"taskId":{}},"required":["taskId"]},{"properties":{"expectedRevision":{}},"required":["expectedRevision"]}]}},{"properties":{"taskId":{"type":"null"},"expectedRevision":{"type":"null"}},"required":["taskId","expectedRevision"]},{"properties":{"taskId":uuid(),"expectedRevision":uuid()},"required":["taskId","expectedRevision"]}]));
+        input.as_object_mut().expect("schema object").insert(
+            "anyOf".into(),
+            json!([
+                {"properties":{"taskId":{"type":"null"},"expectedRevision":{"type":"null"}}},
+                {"properties":{"taskId":uuid(),"expectedRevision":uuid()},"required":["taskId","expectedRevision"]}
+            ]),
+        );
     }
     if name == "context_relay_create_handoff" {
         input.as_object_mut().expect("schema object").insert(
@@ -605,5 +658,5 @@ fn handoff_payload() -> Value {
     json!({"type":"object","properties":{"project":{"oneOf":[{"type":"null"},project_identity()]},"markdown":text(1,MAX_MARKDOWN_BYTES),"memories":{"type":"array","maxItems":crate::MAX_EVIDENCE_ITEMS,"items":memory()},"decisions":{"type":"array","maxItems":crate::MAX_EVIDENCE_ITEMS,"items":decision_memory()},"tasks":{"type":"array","maxItems":crate::MAX_EVIDENCE_ITEMS,"items":task()},"instructionRefs":{"type":"array","maxItems":crate::MAX_EVIDENCE_ITEMS,"uniqueItems":true,"items":uuid()}},"required":["project","markdown","memories","decisions","tasks","instructionRefs"],"additionalProperties":false})
 }
 fn project_identity() -> Value {
-    json!({"type":"object","properties":{"projectId":uuid(),"githubRepositoryId":{"oneOf":[{"type":"null"},positive_decimal_u64()]},"gitRemoteFingerprint":{"oneOf":[{"type":"null"},{"type":"string","pattern":"^[0-9a-f]{64}$"}]},"monorepoSubdirectory":{"oneOf":[{"type":"null"},{"type":"string","pattern":r"^(?!/)(?!.*(?:^|/)\.\.?(?:/|$))(?!.*[\\:\x00-\x1F]).+$","maxLength":MAX_TITLE_BYTES,"x-utf8-maxBytes":MAX_TITLE_BYTES}]},"name":text(1,MAX_TITLE_BYTES)},"required":["projectId","githubRepositoryId","gitRemoteFingerprint","monorepoSubdirectory","name"],"additionalProperties":false})
+    json!({"type":"object","properties":{"projectId":uuid(),"githubRepositoryId":{"oneOf":[{"type":"null"},positive_decimal_u64()]},"gitRemoteFingerprint":{"oneOf":[{"type":"null"},{"type":"string","pattern":"^[0-9a-f]{64}$"}]},"monorepoSubdirectory":{"oneOf":[{"type":"null"},{"type":"string","pattern":r"^(?!/)(?!.*//)(?!.*\/$)(?!.*(?:^|/)\.\.?(?:/|$))(?!.*[\\:\x00-\x1F\x7F-\x9F\u2028\u2029]).+$","maxLength":MAX_TITLE_BYTES,"x-utf8-maxBytes":MAX_TITLE_BYTES}]},"name":text(1,MAX_TITLE_BYTES)},"required":["projectId","githubRepositoryId","gitRemoteFingerprint","monorepoSubdirectory","name"],"additionalProperties":false})
 }

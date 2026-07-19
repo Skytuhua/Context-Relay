@@ -1,4 +1,4 @@
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{Engine as _, display::Base64Display, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use ts_rs::TS;
 
@@ -105,8 +105,7 @@ fixed_bytes!(
 
 macro_rules! bounded_bytes {
     ($name:ident, $limit:expr) => {
-        #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-        #[serde(try_from = "String", into = "String")]
+        #[derive(Clone, Debug, Eq, PartialEq, TS)]
         #[ts(type = "Base64Url")]
         pub struct $name(Vec<u8>);
         impl $name {
@@ -121,6 +120,16 @@ macro_rules! bounded_bytes {
             }
             pub fn as_slice(&self) -> &[u8] {
                 &self.0
+            }
+        }
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_str(&Base64Display::new(&self.0, &URL_SAFE_NO_PAD))
+            }
+        }
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                Self::try_from(String::deserialize(deserializer)?).map_err(D::Error::custom)
             }
         }
         impl TryFrom<String> for $name {

@@ -3,28 +3,6 @@
   "additionalProperties": false,
   "anyOf": [
     {
-      "not": {
-        "anyOf": [
-          {
-            "properties": {
-              "taskId": {}
-            },
-            "required": [
-              "taskId"
-            ]
-          },
-          {
-            "properties": {
-              "expectedRevision": {}
-            },
-            "required": [
-              "expectedRevision"
-            ]
-          }
-        ]
-      }
-    },
-    {
       "properties": {
         "expectedRevision": {
           "type": "null"
@@ -32,11 +10,7 @@
         "taskId": {
           "type": "null"
         }
-      },
-      "required": [
-        "taskId",
-        "expectedRevision"
-      ]
+      }
     },
     {
       "properties": {

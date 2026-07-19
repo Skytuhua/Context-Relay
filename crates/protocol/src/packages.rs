@@ -110,10 +110,16 @@ pub struct NamespacedExtension {
     pub data: std::collections::BTreeMap<String, String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NamespacedExtensionWire {
     data: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NamespacedExtensionWireRef<'a> {
+    data: &'a std::collections::BTreeMap<String, String>,
 }
 
 fn validate_extension_namespace(namespace: &str) -> Result<(), ValidationError> {
@@ -199,10 +205,7 @@ impl NamespacedExtension {
 impl Serialize for NamespacedExtension {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
-        NamespacedExtensionWire {
-            data: self.data.clone(),
-        }
-        .serialize(serializer)
+        NamespacedExtensionWireRef { data: &self.data }.serialize(serializer)
     }
 }
 
@@ -227,7 +230,7 @@ pub struct PackageManifestV1 {
     pub extensions: Option<std::collections::BTreeMap<String, NamespacedExtension>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PackageManifestV1Wire {
     format: String,
@@ -235,12 +238,20 @@ struct PackageManifestV1Wire {
     components: Vec<PackageComponent>,
     secret_refs: Vec<SecretRef>,
     harness_targets: Vec<HarnessId>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_optional_extensions"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_extensions")]
     extensions: Option<std::collections::BTreeMap<String, NamespacedExtension>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PackageManifestV1WireRef<'a> {
+    format: &'a str,
+    package_id: &'a PackageId,
+    components: &'a [PackageComponent],
+    secret_refs: &'a [SecretRef],
+    harness_targets: &'a [HarnessId],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extensions: Option<&'a std::collections::BTreeMap<String, NamespacedExtension>>,
 }
 
 fn deserialize_optional_extensions<'de, D: Deserializer<'de>>(
@@ -252,13 +263,13 @@ fn deserialize_optional_extensions<'de, D: Deserializer<'de>>(
 impl Serialize for PackageManifestV1 {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
-        PackageManifestV1Wire {
-            format: self.format.clone(),
-            package_id: self.package_id,
-            components: self.components.clone(),
-            secret_refs: self.secret_refs.clone(),
-            harness_targets: self.harness_targets.clone(),
-            extensions: self.extensions.clone(),
+        PackageManifestV1WireRef {
+            format: &self.format,
+            package_id: &self.package_id,
+            components: &self.components,
+            secret_refs: &self.secret_refs,
+            harness_targets: &self.harness_targets,
+            extensions: self.extensions.as_ref(),
         }
         .serialize(serializer)
     }
@@ -450,7 +461,7 @@ pub struct ExportEnvelopeV1 {
     pub operation_order: Vec<OperationId>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ExportEnvelopeV1Wire {
     format: String,
@@ -461,16 +472,27 @@ struct ExportEnvelopeV1Wire {
     operation_order: Vec<OperationId>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportEnvelopeV1WireRef<'a> {
+    format: &'a str,
+    export_id: &'a ExportId,
+    workspace_id: &'a WorkspaceId,
+    created_hlc: &'a HybridLogicalClock,
+    records: &'a [ExportedRecordV1],
+    operation_order: &'a [OperationId],
+}
+
 impl Serialize for ExportEnvelopeV1 {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
-        ExportEnvelopeV1Wire {
-            format: self.format.clone(),
-            export_id: self.export_id,
-            workspace_id: self.workspace_id,
-            created_hlc: self.created_hlc,
-            records: self.records.clone(),
-            operation_order: self.operation_order.clone(),
+        ExportEnvelopeV1WireRef {
+            format: &self.format,
+            export_id: &self.export_id,
+            workspace_id: &self.workspace_id,
+            created_hlc: &self.created_hlc,
+            records: &self.records,
+            operation_order: &self.operation_order,
         }
         .serialize(serializer)
     }

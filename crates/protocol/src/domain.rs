@@ -89,7 +89,9 @@ pub enum ProvenanceSource {
 #[ts(rename_all = "camelCase")]
 pub struct Provenance {
     pub origin_device: DeviceId,
+    #[serde(deserialize_with = "crate::required_nullable")]
     pub harness: Option<HarnessId>,
+    #[serde(deserialize_with = "crate::required_nullable")]
     pub source: Option<ProvenanceSource>,
     pub created_hlc: HybridLogicalClock,
 }
@@ -161,6 +163,7 @@ impl MemoryCandidate {
 pub struct TaskEvidence {
     pub summary: String,
     pub evidence_kind: String,
+    #[serde(deserialize_with = "crate::required_nullable")]
     pub reference: Option<String>,
     pub recorded_hlc: HybridLogicalClock,
 }
@@ -334,9 +337,11 @@ pub struct ProjectIdentity {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProjectIdentityWire {
     project_id: ProjectId,
-    #[serde(default, with = "optional_decimal_u64")]
+    #[serde(with = "optional_decimal_u64")]
     github_repository_id: Option<u64>,
+    #[serde(deserialize_with = "crate::required_nullable")]
     git_remote_fingerprint: Option<Sha256Digest>,
+    #[serde(deserialize_with = "crate::required_nullable")]
     monorepo_subdirectory: Option<String>,
     name: String,
 }
@@ -381,7 +386,9 @@ impl ProjectIdentity {
                 || path.starts_with('/')
                 || path.contains('\\')
                 || path.contains(':')
-                || path.chars().any(char::is_control)
+                || path.chars().any(|character| {
+                    character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
+                })
                 || path
                     .split('/')
                     .any(|part| part.is_empty() || part == "." || part == ".."))

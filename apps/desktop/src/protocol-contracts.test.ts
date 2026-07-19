@@ -4,16 +4,24 @@ import { describe, expect, it } from 'vitest';
 
 import type {
   Base64Url,
+  CompletionEvidenceInput,
   DecimalU64,
   Ed25519PublicKeyBytes,
+  GetOutput,
+  HandoffPayload,
+  ListTasksInput,
   MemoryRecord,
   OperationId,
   PairingId,
   RecordId,
+  SearchInput,
   SetupPlan,
   Sha256Hex,
+  StatusOutput,
   SyncOperationV1,
   TaskRecord,
+  UpsertTaskInput,
+  WireNativeValue,
   X25519PublicKeyBytes,
 } from './bindings';
 import * as protocolValidation from './protocol-validation';
@@ -26,6 +34,41 @@ type BytesBrandIsPreserved = Assert<Base64Url extends SyncOperationV1['ciphertex
 type DecimalBrandIsPreserved = Assert<DecimalU64 extends SyncOperationV1['deviceSequence'] ? true : false>;
 const bindingBrandAssertions: [OperationBrandIsPreserved, DigestBrandIsPreserved, BytesBrandIsPreserved, DecimalBrandIsPreserved] = [true, true, true, true];
 void bindingBrandAssertions;
+type IsOptional<T, K extends keyof T> = Pick<T, never> extends Pick<T, K> ? true : false;
+type IsRequired<T, K extends keyof T> = IsOptional<T, K> extends true ? false : true;
+const optionalBindingAssertions: [
+  Assert<IsOptional<SearchInput, 'scope'>>,
+  Assert<IsOptional<SearchInput, 'limit'>>,
+  Assert<IsOptional<ListTasksInput, 'status'>>,
+  Assert<IsOptional<UpsertTaskInput, 'taskId'>>,
+  Assert<IsOptional<UpsertTaskInput, 'expectedRevision'>>,
+  Assert<IsOptional<CompletionEvidenceInput, 'reference'>>,
+  Assert<IsOptional<WireNativeValue, 'display'>>,
+] = [true, true, true, true, true, true, true];
+const requiredNullableBindingAssertions: [
+  Assert<IsRequired<GetOutput, 'record'>>,
+  Assert<IsRequired<HandoffPayload, 'project'>>,
+  Assert<IsRequired<StatusOutput, 'resolvedProject'>>,
+  Assert<IsRequired<SyncOperationV1, 'projectId'>>,
+] = [true, true, true, true];
+void optionalBindingAssertions;
+void requiredNullableBindingAssertions;
+function assertExplicitNullOptionalBindings(operationId: OperationId, bytesValue: Base64Url) {
+  const search: SearchInput = { query: 'needle', scope: null, limit: null };
+  const list: ListTasksInput = { status: null };
+  const upsert: UpsertTaskInput = {
+    operationId,
+    taskId: null,
+    title: 'Task',
+    bodyMarkdown: 'Body',
+    status: 'open',
+    expectedRevision: null,
+  };
+  const evidence: CompletionEvidenceInput = { summary: 'Done', kind: 'result', reference: null };
+  const nativeValue: WireNativeValue = { platform: 'macos', bytes: bytesValue, display: null };
+  void [search, list, upsert, evidence, nativeValue];
+}
+void assertExplicitNullOptionalBindings;
 // @ts-expect-error UUID fields reject plain strings.
 const invalidUuid: SyncOperationV1['operationId'] = '018f22e2-79b0-7cc8-98c4-dc0c0c07398f';
 void invalidUuid;
@@ -56,6 +99,21 @@ const rejectsWith = (guard: (value: unknown) => void, value: unknown) => expect(
 const rejects = (name: GuardName, value: unknown) => rejectsWith(guards[name], value);
 const mutate = <T>(value: T, change: (copy: T) => void) => { const copy = structuredClone(value); change(copy); return copy; };
 const without = (value: object, field: string) => { const copy = structuredClone(value) as Record<string, unknown>; delete copy[field]; return copy; };
+const parentAtPath = (value: unknown, path: readonly PropertyKey[]) => {
+  let parent = value as Record<PropertyKey, unknown>;
+  for (const key of path.slice(0, -1)) parent = parent[key] as Record<PropertyKey, unknown>;
+  return parent;
+};
+const withoutPath = (value: unknown, path: readonly PropertyKey[]) => {
+  const copy = structuredClone(value);
+  delete parentAtPath(copy, path)[path.at(-1)!];
+  return copy;
+};
+const nullAtPath = (value: unknown, path: readonly PropertyKey[]) => {
+  const copy = structuredClone(value);
+  parentAtPath(copy, path)[path.at(-1)!] = null;
+  return copy;
+};
 
 describe('protocol schemas', () => {
   it('validates every MCP input and output fixture with Draft 2020-12', () => {
@@ -81,9 +139,33 @@ describe('protocol schemas', () => {
     const id = '018f22e2-79b0-7cc8-98c4-dc0c0c07398f';
     expect(validate(base)).toBe(true);
     expect(validate({ ...base, taskId: null, expectedRevision: null })).toBe(true);
+    expect(validate({ ...base, taskId: null })).toBe(true);
+    expect(validate({ ...base, expectedRevision: null })).toBe(true);
     expect(validate({ ...base, taskId: id, expectedRevision: id })).toBe(true);
     expect(validate({ ...base, taskId: id, expectedRevision: null })).toBe(false);
     expect(validate({ ...base, taskId: null, expectedRevision: id })).toBe(false);
+  });
+
+  it('accepts omitted or explicit null optional MCP input fields', () => {
+    const ajv = createProtocolSchemaValidator();
+    const inputs = load('crates/protocol/tests/fixtures/mcp-valid.json');
+    const cases = [
+      ['context_relay_search', { query: 'needle' }, { query: 'needle', scope: null, limit: null }],
+      ['context_relay_list_tasks', {}, { status: null }],
+      [
+        'context_relay_complete_task',
+        inputs.context_relay_complete_task,
+        {
+          ...inputs.context_relay_complete_task,
+          evidence: [{ ...inputs.context_relay_complete_task.evidence[0], reference: null }],
+        },
+      ],
+    ] as const;
+    for (const [name, omitted, explicitNull] of cases) {
+      const validate = ajv.compile(load(`schemas/${name}-input-v1.json`));
+      expect(validate(omitted), `${name} omitted: ${ajv.errorsText(validate.errors)}`).toBe(true);
+      expect(validate(explicitNull), `${name} null: ${ajv.errorsText(validate.errors)}`).toBe(true);
+    }
   });
 
   it('applies non-whitespace text patterns and Rust UTF-8 byte limits', () => {
@@ -99,13 +181,51 @@ describe('protocol schemas', () => {
 
   it('accepts Context Relay projects without repository metadata', () => {
     const ajv = createProtocolSchemaValidator();
-    const validate = ajv.compile(load('schemas/context_relay_create_handoff-output-v1.json'));
+    const schema = load('schemas/context_relay_create_handoff-output-v1.json');
+    const pathPattern = schema.properties.payload.properties.project.oneOf[1].properties.monorepoSubdirectory.oneOf[1].pattern;
+    expect(pathPattern).toContain('\\u2028\\u2029');
+    const validate = ajv.compile(schema);
     const fixture = load('crates/protocol/tests/fixtures/mcp-output-valid.json').context_relay_create_handoff;
     fixture.payload.project = { projectId: '018f22e2-79b0-7cc8-98c4-dc0c0c07398f', githubRepositoryId: null, gitRemoteFingerprint: null, monorepoSubdirectory: null, name: 'Relay project' };
     expect(validate(fixture)).toBe(true);
     fixture.payload.project.githubRepositoryId = '0'; expect(validate(fixture)).toBe(false);
     fixture.payload.project.githubRepositoryId = null; fixture.payload.project.gitRemoteFingerprint = '00'; expect(validate(fixture)).toBe(false);
     fixture.payload.project.gitRemoteFingerprint = null; fixture.payload.project.monorepoSubdirectory = '\u00e9'.repeat(300); expect(validate(fixture)).toBe(false);
+    for (const path of ['a//b', 'a/', 'a\u007fb', 'a\u0085b', 'a\u009fb', 'a\u2028b', 'a\u2029b']) {
+      fixture.payload.project.monorepoSubdirectory = path;
+      expect(validate(fixture), `accepted ${JSON.stringify(path)}`).toBe(false);
+    }
+    const nullableProject = {
+      projectId: '018f22e2-79b0-7cc8-98c4-dc0c0c07398f',
+      githubRepositoryId: null,
+      gitRemoteFingerprint: null,
+      monorepoSubdirectory: null,
+      name: 'Relay project',
+    };
+    for (const field of ['githubRepositoryId', 'gitRemoteFingerprint', 'monorepoSubdirectory'] as const) {
+      fixture.payload.project = structuredClone(nullableProject);
+      expect(validate(fixture), `explicit null ${field}: ${ajv.errorsText(validate.errors)}`).toBe(true);
+      delete fixture.payload.project[field];
+      expect(validate(fixture), `omitted ${field}`).toBe(false);
+    }
+  });
+
+  it('requires nullable output keys while accepting explicit null', () => {
+    const ajv = createProtocolSchemaValidator();
+    const outputs = load('crates/protocol/tests/fixtures/mcp-output-valid.json');
+    for (const [name, path] of [
+      ['context_relay_get', ['record']],
+      ['context_relay_create_handoff', ['payload', 'project']],
+      ['context_relay_status', ['resolvedProject']],
+      ['context_relay_remember', ['memory', 'provenance', 'harness']],
+      ['context_relay_remember', ['memory', 'provenance', 'source']],
+      ['context_relay_complete_task', ['task', 'evidence', 0, 'reference']],
+    ] as const) {
+      const validate = ajv.compile(load(`schemas/${name}-output-v1.json`));
+      const explicitNull = nullAtPath(outputs[name], path);
+      expect(validate(explicitNull), `${name} explicit null: ${ajv.errorsText(validate.errors)}`).toBe(true);
+      expect(validate(withoutPath(outputs[name], path)), `${name} omitted ${path.join('.')}`).toBe(false);
+    }
   });
 
   it('accepts only status protocol ranges containing v1.0', () => {
@@ -156,6 +276,14 @@ describe('protocol schemas', () => {
         mutate(plan, (copy) => Object.assign(copy.executablePath, { display })),
       );
     }
+  });
+
+  it('accepts omitted or explicit null native display text', () => {
+    const plan = load('crates/protocol/tests/fixtures/runtime-contracts-v1.json').setupPlan as SetupPlan;
+    const omitted = mutate(plan, (copy) => { delete copy.executablePath.display; });
+    const explicitNull = mutate(plan, (copy) => { copy.executablePath.display = null; });
+    expect(() => protocolValidation.assertSetupPlan(omitted)).not.toThrow();
+    expect(() => protocolValidation.assertSetupPlan(explicitNull)).not.toThrow();
   });
 
   it('matches Rust setup-plan adapter bounds', () => {
@@ -285,6 +413,14 @@ describe('protocol schemas', () => {
       const validate = ajv.compile(load(`schemas/context-relay-${contract}-v1.json`));
       expect(validate(load(`crates/protocol/tests/fixtures/${contract}-v1-valid.json`))).toBe(true);
       expect(validate(load(`crates/protocol/tests/fixtures/${contract}-v1-invalid.json`))).toBe(false);
+    }
+    const validateExport = ajv.compile(load('schemas/context-relay-export-v1.json'));
+    const exportFixture = load('crates/protocol/tests/fixtures/export-v1-valid.json');
+    for (const field of ['harness', 'source']) {
+      expect(validateExport(exportFixture), `explicit null ${field}`).toBe(true);
+      const omitted = structuredClone(exportFixture);
+      delete omitted.records[0].provenance[field];
+      expect(validateExport(omitted), `omitted export provenance ${field}`).toBe(false);
     }
   });
 });

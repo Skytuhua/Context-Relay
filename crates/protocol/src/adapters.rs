@@ -128,6 +128,7 @@ pub struct WireNativeValue {
     pub platform: NativePlatform,
     #[ts(type = "Base64Url")]
     pub bytes: Vec<u8>,
+    #[ts(optional, type = "string | null")]
     pub display: Option<String>,
 }
 
@@ -137,6 +138,7 @@ struct WireNativeValueDto {
     platform: NativePlatform,
     #[serde(with = "base64url_bytes")]
     bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     display: Option<String>,
 }
 
@@ -244,6 +246,7 @@ validated_adapter_dto!(
     ProbeContextWire,
     ProbeContextWireRef {
         harness: HarnessId,
+        #[serde(deserialize_with = "crate::required_nullable")]
         requested_profile: Option<String>,
     }
 );
@@ -288,11 +291,15 @@ validated_adapter_dto!(
     ProbeReport,
     ProbeReportWire,
     ProbeReportWireRef {
+        #[serde(deserialize_with = "crate::required_nullable")]
         executable: Option<WireNativeValue>,
+        #[serde(deserialize_with = "crate::required_nullable")]
         executable_sha256: Option<Sha256Digest>,
+        #[serde(deserialize_with = "crate::required_nullable")]
         harness_version: Option<String>,
         installation_method: InstallationMethod,
         config_roots: Vec<WireNativeValue>,
+        #[serde(deserialize_with = "crate::required_nullable")]
         active_profile: Option<String>,
         policy_conflicts: Vec<String>,
         capability: CapabilityLevel,
@@ -599,6 +606,7 @@ impl ExpectedNativeDigest {
 }
 validated_adapter_dto!(ExpectedNativeDigest, ExpectedNativeDigestWire, ExpectedNativeDigestWireRef {
     target: WireNativeValue,
+    #[serde(deserialize_with = "crate::required_nullable")]
     expected_digest: Option<Sha256Digest>,
 });
 

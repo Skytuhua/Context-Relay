@@ -119,12 +119,17 @@ export const assertTaskRecord = (value: unknown): asserts value is TaskRecord =>
 };
 
 const native = (value: unknown, field: string) => {
-  const item = object(value, ['platform', 'bytes', 'display'], field);
+  const hasDisplay = typeof value === 'object'
+    && value !== null
+    && Object.prototype.hasOwnProperty.call(value, 'display');
+  const item = object(value, hasDisplay ? ['platform', 'bytes', 'display'] : ['platform', 'bytes'], field);
   choice(item.platform, ['windows', 'macos'], `${field}.platform`);
   const length = bytes(item.bytes, `${field}.bytes`);
   if (length > 1024 * 1024 || (item.platform === 'windows' && length % 2)) fail(`${field}.bytes`);
-  optionalText(item.display, 1024, `${field}.display`);
-  if (typeof item.display === 'string' && unsafeNativeDisplay(item.display)) fail(`${field}.display`);
+  if (hasDisplay) {
+    optionalText(item.display, 1024, `${field}.display`);
+    if (typeof item.display === 'string' && unsafeNativeDisplay(item.display)) fail(`${field}.display`);
+  }
 };
 const nativeScope = (value: unknown, field: string) => {
   const project = value && (value as Record<string, unknown>).scope === 'project';

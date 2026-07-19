@@ -55,6 +55,7 @@ pub struct SyncOperationV1 {
     pub operation_id: OperationId,
     pub account_id: AccountId,
     pub workspace_id: WorkspaceId,
+    #[serde(deserialize_with = "crate::required_nullable")]
     pub project_id: Option<ProjectId>,
     pub record_id: RecordId,
     pub record_kind: RecordKind,
