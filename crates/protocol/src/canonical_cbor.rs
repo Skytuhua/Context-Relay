@@ -3,9 +3,9 @@ use minicbor::{Decoder, Encoder};
 use crate::{
     AccountId, BlobRef, BoundedCiphertext, CheckpointV1, DeviceId, DeviceSequence,
     Ed25519SignatureBytes, HybridLogicalClock, MAX_BATCH_OPERATIONS, MAX_CBOR_OPERATION_BYTES,
-    MAX_TITLE_BYTES, MutationKind, OperationId, ProjectId, ProtocolError, RecordId, RecordKind,
-    SYNC_SCHEMA_VERSION, Sha256Digest, SyncOperationV1, WorkspaceId, XChaChaNonce,
-    uuid_v7_from_bytes,
+    MAX_CIPHERTEXT_BYTES, MAX_TITLE_BYTES, MutationKind, OperationId, ProjectId, ProtocolError,
+    RecordId, RecordKind, SYNC_SCHEMA_VERSION, Sha256Digest, SyncOperationV1, WorkspaceId,
+    XChaChaNonce, uuid_v7_from_bytes,
 };
 
 pub fn encode_sync_operation_signing_preimage_v1(
@@ -147,8 +147,12 @@ pub fn decode_sync_operation_v1(input: &[u8]) -> Result<SyncOperationV1, Protoco
     expect_key(&mut decoder, 14)?;
     let nonce = XChaChaNonce(read_fixed::<24>(&mut decoder)?);
     expect_key(&mut decoder, 15)?;
-    let ciphertext = BoundedCiphertext::new(decoder.bytes().map_err(dec)?.to_vec())
-        .map_err(|_| bad("ciphertext"))?;
+    let ciphertext_bytes = decoder.bytes().map_err(dec)?;
+    if ciphertext_bytes.len() > MAX_CIPHERTEXT_BYTES {
+        return Err(bad("ciphertext"));
+    }
+    let ciphertext =
+        BoundedCiphertext::new(ciphertext_bytes.to_vec()).map_err(|_| bad("ciphertext"))?;
     expect_key(&mut decoder, 16)?;
     let ciphertext_hash = Sha256Digest(read_fixed::<32>(&mut decoder)?);
     expect_key(&mut decoder, 17)?;

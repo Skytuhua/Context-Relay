@@ -163,7 +163,7 @@ impl StatusOutput {
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.protocol.min.major != crate::PROTOCOL_MAJOR
             || self.protocol.max.major != crate::PROTOCOL_MAJOR
-            || self.protocol.min.minor > self.protocol.max.minor
+            || !(self.protocol.min.minor..=self.protocol.max.minor).contains(&crate::PROTOCOL_MINOR)
         {
             return Err(ValidationError::Invalid("status.protocol"));
         }
@@ -503,7 +503,7 @@ fn validate_output(name: &str, value: &Value) -> Result<(), ValidationError> {
         "context_relay_create_handoff" => parse_value::<CreateHandoffOutput>(value, invalid)?
             .payload
             .validate(),
-        "context_relay_status" => parse::<StatusOutput>(value, invalid),
+        "context_relay_status" => parse_value::<StatusOutput>(value, invalid)?.validate(),
         _ => Err(invalid()),
     }
 }
@@ -557,15 +557,28 @@ fn task() -> Value {
 fn readable_record() -> Value {
     json!({"oneOf":[{"type":"object","properties":{"kind":{"const":"memory"},"record":memory()},"required":["kind","record"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"instruction"},"record":instruction()},"required":["kind","record"],"additionalProperties":false}]})
 }
-fn version() -> Value {
-    json!({"type":"object","properties":{"major":{"type":"integer","minimum":0,"maximum":65535},"minor":{"type":"integer","minimum":0,"maximum":65535}},"required":["major","minor"],"additionalProperties":false})
-}
 fn protocol_range() -> Value {
-    json!({"type":"object","properties":{"min":version(),"max":version()},"required":["min","max"],"additionalProperties":false})
+    let min = json!({"type":"object","properties":{"major":{"const":crate::PROTOCOL_MAJOR},"minor":{"type":"integer","minimum":0,"maximum":crate::PROTOCOL_MINOR}},"required":["major","minor"],"additionalProperties":false});
+    let max = json!({"type":"object","properties":{"major":{"const":crate::PROTOCOL_MAJOR},"minor":{"type":"integer","minimum":crate::PROTOCOL_MINOR,"maximum":65535}},"required":["major","minor"],"additionalProperties":false});
+    json!({"type":"object","properties":{"min":min,"max":max},"required":["min","max"],"additionalProperties":false})
 }
 
+fn decimal_u64() -> Value {
+    json!({
+        "type":"string",
+        "pattern":crate::DECIMAL_U64_SCHEMA_PATTERN
+    })
+}
+fn positive_decimal_u64() -> Value {
+    let mut schema = decimal_u64();
+    schema
+        .as_object_mut()
+        .expect("decimal schema object")
+        .insert("not".into(), json!({"const":"0"}));
+    schema
+}
 fn hlc() -> Value {
-    json!({"type":"object","properties":{"physicalMs":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"},"logical":{"type":"integer","minimum":0,"maximum":4294967295u64},"node":uuid()},"required":["physicalMs","logical","node"],"additionalProperties":false})
+    json!({"type":"object","properties":{"physicalMs":decimal_u64(),"logical":{"type":"integer","minimum":0,"maximum":4294967295u64},"node":uuid()},"required":["physicalMs","logical","node"],"additionalProperties":false})
 }
 fn provenance() -> Value {
     json!({"type":"object","properties":{"originDevice":uuid(),"harness":{"oneOf":[{"type":"null"},{"enum":["claude_code","codex","hermes"]}]},"source":{"oneOf":[{"type":"null"},{"type":"object","properties":{"source":{"const":"record"},"recordId":uuid()},"required":["source","recordId"],"additionalProperties":false},{"type":"object","properties":{"source":{"const":"package"},"packageId":uuid()},"required":["source","packageId"],"additionalProperties":false}]},"createdHlc":hlc()},"required":["originDevice","harness","source","createdHlc"],"additionalProperties":false})
@@ -592,5 +605,5 @@ fn handoff_payload() -> Value {
     json!({"type":"object","properties":{"project":{"oneOf":[{"type":"null"},project_identity()]},"markdown":text(1,MAX_MARKDOWN_BYTES),"memories":{"type":"array","maxItems":crate::MAX_EVIDENCE_ITEMS,"items":memory()},"decisions":{"type":"array","maxItems":crate::MAX_EVIDENCE_ITEMS,"items":decision_memory()},"tasks":{"type":"array","maxItems":crate::MAX_EVIDENCE_ITEMS,"items":task()},"instructionRefs":{"type":"array","maxItems":crate::MAX_EVIDENCE_ITEMS,"uniqueItems":true,"items":uuid()}},"required":["project","markdown","memories","decisions","tasks","instructionRefs"],"additionalProperties":false})
 }
 fn project_identity() -> Value {
-    json!({"type":"object","properties":{"projectId":uuid(),"githubRepositoryId":{"oneOf":[{"type":"null"},{"type":"string","pattern":"^[1-9][0-9]*$"}]},"gitRemoteFingerprint":{"oneOf":[{"type":"null"},{"type":"string","pattern":"^[0-9a-f]{64}$"}]},"monorepoSubdirectory":{"oneOf":[{"type":"null"},{"type":"string","pattern":r"^(?!/)(?!.*(?:^|/)\.\.?(?:/|$))(?!.*[\\:\x00-\x1F]).+$","maxLength":MAX_TITLE_BYTES,"x-utf8-maxBytes":MAX_TITLE_BYTES}]},"name":text(1,MAX_TITLE_BYTES)},"required":["projectId","githubRepositoryId","gitRemoteFingerprint","monorepoSubdirectory","name"],"additionalProperties":false})
+    json!({"type":"object","properties":{"projectId":uuid(),"githubRepositoryId":{"oneOf":[{"type":"null"},positive_decimal_u64()]},"gitRemoteFingerprint":{"oneOf":[{"type":"null"},{"type":"string","pattern":"^[0-9a-f]{64}$"}]},"monorepoSubdirectory":{"oneOf":[{"type":"null"},{"type":"string","pattern":r"^(?!/)(?!.*(?:^|/)\.\.?(?:/|$))(?!.*[\\:\x00-\x1F]).+$","maxLength":MAX_TITLE_BYTES,"x-utf8-maxBytes":MAX_TITLE_BYTES}]},"name":text(1,MAX_TITLE_BYTES)},"required":["projectId","githubRepositoryId","gitRemoteFingerprint","monorepoSubdirectory","name"],"additionalProperties":false})
 }

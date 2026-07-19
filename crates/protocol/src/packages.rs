@@ -439,8 +439,7 @@ pub struct ExportedRecordV1 {
     pub encrypted_payload: BoundedCiphertext,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct ExportEnvelopeV1 {
     pub format: String,
@@ -449,6 +448,48 @@ pub struct ExportEnvelopeV1 {
     pub created_hlc: HybridLogicalClock,
     pub records: Vec<ExportedRecordV1>,
     pub operation_order: Vec<OperationId>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExportEnvelopeV1Wire {
+    format: String,
+    export_id: ExportId,
+    workspace_id: WorkspaceId,
+    created_hlc: HybridLogicalClock,
+    records: Vec<ExportedRecordV1>,
+    operation_order: Vec<OperationId>,
+}
+
+impl Serialize for ExportEnvelopeV1 {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        ExportEnvelopeV1Wire {
+            format: self.format.clone(),
+            export_id: self.export_id,
+            workspace_id: self.workspace_id,
+            created_hlc: self.created_hlc,
+            records: self.records.clone(),
+            operation_order: self.operation_order.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExportEnvelopeV1 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ExportEnvelopeV1Wire::deserialize(deserializer)?;
+        let value = Self {
+            format: wire.format,
+            export_id: wire.export_id,
+            workspace_id: wire.workspace_id,
+            created_hlc: wire.created_hlc,
+            records: wire.records,
+            operation_order: wire.operation_order,
+        };
+        value.validate().map_err(D::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl ExportEnvelopeV1 {

@@ -108,6 +108,56 @@ describe('protocol schemas', () => {
     fixture.payload.project.gitRemoteFingerprint = null; fixture.payload.project.monorepoSubdirectory = '\u00e9'.repeat(300); expect(validate(fixture)).toBe(false);
   });
 
+  it('accepts only status protocol ranges containing v1.0', () => {
+    const ajv = createProtocolSchemaValidator();
+    const validate = ajv.compile(load('schemas/context_relay_status-output-v1.json'));
+    const fixture = load('crates/protocol/tests/fixtures/mcp-output-valid.json').context_relay_status;
+    expect(validate(fixture), ajv.errorsText(validate.errors)).toBe(true);
+    for (const protocol of [
+      { min: { major: 2, minor: 0 }, max: { major: 2, minor: 0 } },
+      { min: { major: 1, minor: 1 }, max: { major: 1, minor: 2 } },
+      { min: { major: 1, minor: 1 }, max: { major: 1, minor: 0 } },
+    ]) {
+      expect(validate({ ...fixture, protocol }), JSON.stringify(protocol)).toBe(false);
+    }
+  });
+
+  it('bounds MCP HLC physical milliseconds to canonical u64 text', () => {
+    const ajv = createProtocolSchemaValidator();
+    const validate = ajv.compile(load('schemas/context_relay_remember-output-v1.json'));
+    const fixture = load('crates/protocol/tests/fixtures/mcp-output-valid.json').context_relay_remember;
+    fixture.memory.createdHlc.physicalMs = '18446744073709551615';
+    expect(validate(fixture), ajv.errorsText(validate.errors)).toBe(true);
+    fixture.memory.createdHlc.physicalMs = '18446744073709551616';
+    expect(validate(fixture)).toBe(false);
+  });
+
+  it('bounds MCP GitHub repository IDs to positive canonical u64 text', () => {
+    const ajv = createProtocolSchemaValidator();
+    const validate = ajv.compile(load('schemas/context_relay_create_handoff-output-v1.json'));
+    const fixture = load('crates/protocol/tests/fixtures/mcp-output-valid.json').context_relay_create_handoff;
+    fixture.payload.project = {
+      projectId: '018f22e2-79b0-7cc8-98c4-dc0c0c07398f',
+      githubRepositoryId: '18446744073709551615',
+      gitRemoteFingerprint: null,
+      monorepoSubdirectory: null,
+      name: 'Relay project',
+    };
+    expect(validate(fixture), ajv.errorsText(validate.errors)).toBe(true);
+    fixture.payload.project.githubRepositoryId = '18446744073709551616';
+    expect(validate(fixture)).toBe(false);
+  });
+
+  it('rejects terminal, newline, and bidi controls in native display text', () => {
+    const plan = load('crates/protocol/tests/fixtures/runtime-contracts-v1.json').setupPlan as SetupPlan;
+    for (const display of ['line\nbreak', '\u001b[31m', 'safe\u202etext']) {
+      rejectsWith(
+        protocolValidation.assertSetupPlan,
+        mutate(plan, (copy) => Object.assign(copy.executablePath, { display })),
+      );
+    }
+  });
+
   it('matches Rust setup-plan adapter bounds', () => {
     const plan = load('crates/protocol/tests/fixtures/runtime-contracts-v1.json').setupPlan as SetupPlan;
     const native = { platform: 'macos', bytes: 'YQ', display: 'a' };

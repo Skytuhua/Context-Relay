@@ -4,13 +4,27 @@ use ts_rs::TS;
 
 use crate::{
     ApprovalClass, ComponentRecord, HarnessId, HybridLogicalClock, ImmutableDependency,
-    MAX_ARBITRARY_BYTES, MAX_MARKDOWN_BYTES, MAX_TITLE_BYTES, PackageId, PlanId, ProjectId,
-    Sha256Digest, ValidationError, decimal_u64, required_text,
+    MAX_ARBITRARY_BYTES, MAX_TITLE_BYTES, PackageId, PlanId, ProjectId, Sha256Digest,
+    ValidationError, decimal_u64, required_text,
 };
 
 pub const MAX_ADAPTER_COLLECTION_ITEMS: usize = 1024;
 pub const MAX_ADAPTER_TEXT_BYTES: usize = 16 * 1024;
 pub const MAX_NATIVE_DISPLAY_BYTES: usize = 1024;
+
+fn unsafe_native_display(display: &str) -> bool {
+    display.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+    })
+}
 
 fn validate_adapter_collection(field: &'static str, length: usize) -> Result<(), ValidationError> {
     if length > MAX_ADAPTER_COLLECTION_ITEMS {
@@ -134,15 +148,16 @@ impl WireNativeValue {
                 limit: MAX_ARBITRARY_BYTES,
             });
         }
-        if self
-            .display
-            .as_ref()
-            .is_some_and(|display| display.len() > MAX_NATIVE_DISPLAY_BYTES)
-        {
-            return Err(ValidationError::TooLarge {
-                field: "nativeValue.display",
-                limit: MAX_NATIVE_DISPLAY_BYTES,
-            });
+        if let Some(display) = &self.display {
+            if display.len() > MAX_NATIVE_DISPLAY_BYTES {
+                return Err(ValidationError::TooLarge {
+                    field: "nativeValue.display",
+                    limit: MAX_NATIVE_DISPLAY_BYTES,
+                });
+            }
+            if unsafe_native_display(display) {
+                return Err(ValidationError::Invalid("nativeValue.display"));
+            }
         }
         if self.platform == NativePlatform::Windows && !self.bytes.len().is_multiple_of(2) {
             return Err(ValidationError::Invalid("windowsUtf16Le"));
@@ -864,11 +879,15 @@ impl SetupPlan {
             }
         }
         for change in &self.semantic_changes {
-            required_text(&change.target, "semanticChange.target", MAX_MARKDOWN_BYTES)?;
+            required_text(
+                &change.target,
+                "semanticChange.target",
+                MAX_ADAPTER_TEXT_BYTES,
+            )?;
             required_text(
                 &change.summary,
                 "semanticChange.summary",
-                MAX_MARKDOWN_BYTES,
+                MAX_ADAPTER_TEXT_BYTES,
             )?;
         }
         for permission in self

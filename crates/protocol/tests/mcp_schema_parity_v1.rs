@@ -3,6 +3,43 @@ use context_relay_protocol::{
 };
 
 #[test]
+fn status_output_requires_a_range_containing_supported_v1() {
+    let mut output = serde_json::json!({
+        "protocol": {
+            "min": { "major": 1, "minor": 0 },
+            "max": { "major": 1, "minor": 0 }
+        },
+        "vault": "unlocked",
+        "resolvedProject": null,
+        "sync": "idle",
+        "access": { "mode": "default" }
+    });
+    assert!(validate_mcp_fixture("context_relay_status", false, &output).is_ok());
+
+    for protocol in [
+        serde_json::json!({
+            "min": { "major": 2, "minor": 0 },
+            "max": { "major": 2, "minor": 0 }
+        }),
+        serde_json::json!({
+            "min": { "major": 1, "minor": 1 },
+            "max": { "major": 1, "minor": 2 }
+        }),
+        serde_json::json!({
+            "min": { "major": 1, "minor": 1 },
+            "max": { "major": 1, "minor": 0 }
+        }),
+    ] {
+        output["protocol"] = protocol;
+        assert!(
+            validate_mcp_fixture("context_relay_status", false, &output).is_err(),
+            "invalid status protocol range was accepted: {}",
+            output["protocol"]
+        );
+    }
+}
+
+#[test]
 fn upsert_option_pairing_and_tag_uniqueness_are_frozen() {
     let upsert = mcp_schema("context_relay_upsert_task").unwrap().input;
     assert!(upsert.get("anyOf").is_some());

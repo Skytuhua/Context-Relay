@@ -102,9 +102,7 @@
           "additionalProperties": false,
           "properties": {
             "major": {
-              "maximum": 65535,
-              "minimum": 0,
-              "type": "integer"
+              "const": 1
             },
             "minor": {
               "maximum": 65535,
@@ -122,12 +120,10 @@
           "additionalProperties": false,
           "properties": {
             "major": {
-              "maximum": 65535,
-              "minimum": 0,
-              "type": "integer"
+              "const": 1
             },
             "minor": {
-              "maximum": 65535,
+              "maximum": 0,
               "minimum": 0,
               "type": "integer"
             }

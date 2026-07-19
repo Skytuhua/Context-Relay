@@ -7,6 +7,19 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 const digest = /^[0-9a-f]{64}$/;
 const decimal = /^(?:0|[1-9][0-9]*)$/;
 const base64url = /^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-][AQgw]|[A-Za-z0-9_-]{2}[AEIMQUYcgkosw048])?$/;
+const unsafeNativeDisplay = (value: string) =>
+  Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0) as number;
+    return (
+      codePoint <= 0x1f ||
+      (codePoint >= 0x7f && codePoint <= 0x9f) ||
+      codePoint === 0x061c ||
+      codePoint === 0x200e ||
+      codePoint === 0x200f ||
+      (codePoint >= 0x202a && codePoint <= 0x202e) ||
+      (codePoint >= 0x2066 && codePoint <= 0x2069)
+    );
+  });
 const u64Max = 18_446_744_073_709_551_615n;
 const adapterCollectionLimit = 1024;
 const adapterTextLimit = 16 * 1024;
@@ -111,6 +124,7 @@ const native = (value: unknown, field: string) => {
   const length = bytes(item.bytes, `${field}.bytes`);
   if (length > 1024 * 1024 || (item.platform === 'windows' && length % 2)) fail(`${field}.bytes`);
   optionalText(item.display, 1024, `${field}.display`);
+  if (typeof item.display === 'string' && unsafeNativeDisplay(item.display)) fail(`${field}.display`);
 };
 const nativeScope = (value: unknown, field: string) => {
   const project = value && (value as Record<string, unknown>).scope === 'project';

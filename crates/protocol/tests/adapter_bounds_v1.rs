@@ -403,3 +403,45 @@ fn adapter_trait_vector_wrappers_reject_oversized_wire_values() {
     let operations = CliOperations(vec![cli_operation(); MAX_ADAPTER_COLLECTION_ITEMS + 1]);
     assert!(serde_json::to_value(&operations).is_err());
 }
+
+#[test]
+fn native_display_rejects_terminal_newline_and_bidi_controls() {
+    for display in ["line\nbreak", "\u{1b}[31m", "safe\u{202e}text"] {
+        let mut value = native_value();
+        value.display = Some(display.into());
+        assert_eq!(
+            value.validate(),
+            Err(ValidationError::Invalid("nativeValue.display"))
+        );
+    }
+}
+
+#[test]
+fn setup_plan_direct_validation_rejects_oversized_semantic_change_text() {
+    for (target, summary, field) in [
+        (
+            "t".repeat(MAX_ADAPTER_TEXT_BYTES + 1),
+            "summary".into(),
+            "semanticChange.target",
+        ),
+        (
+            "target".into(),
+            "s".repeat(MAX_ADAPTER_TEXT_BYTES + 1),
+            "semanticChange.summary",
+        ),
+    ] {
+        let mut plan = support::setup_plan();
+        plan.semantic_changes = vec![ClassifiedChange {
+            class: ChangeClass::Update,
+            target,
+            summary,
+        }];
+        assert_eq!(
+            plan.validate(),
+            Err(ValidationError::TooLarge {
+                field,
+                limit: MAX_ADAPTER_TEXT_BYTES,
+            })
+        );
+    }
+}

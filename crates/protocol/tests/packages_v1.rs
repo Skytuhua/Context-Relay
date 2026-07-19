@@ -1,4 +1,4 @@
-use context_relay_protocol::{ExportEnvelopeV1, PackageManifestV1};
+use context_relay_protocol::{ExportEnvelopeV1, MAX_BATCH_OPERATIONS, PackageManifestV1};
 
 const EXTENSION_NAMESPACE: &str = "dev.context-relay.fixture";
 
@@ -15,10 +15,81 @@ fn package_and_export_fixtures_cross_serde_and_semantic_validation() {
     let export: ExportEnvelopeV1 =
         serde_json::from_str(include_str!("fixtures/export-v1-valid.json")).unwrap();
     export.validate().unwrap();
+    assert_eq!(serde_json::to_value(&export).unwrap(), valid_export_json());
     assert!(
         serde_json::from_str::<ExportEnvelopeV1>(include_str!("fixtures/export-v1-invalid.json"))
             .is_err()
     );
+}
+
+#[test]
+fn export_serde_rejects_semantically_invalid_envelopes() {
+    let valid = valid_export_json();
+
+    let mut wrong_format = valid.clone();
+    wrong_format["format"] = "context-relay.export.v2".into();
+    assert!(serde_json::from_value::<ExportEnvelopeV1>(wrong_format).is_err());
+
+    let mut duplicate_record = valid.clone();
+    duplicate_record["records"]
+        .as_array_mut()
+        .unwrap()
+        .push(valid["records"][0].clone());
+    assert!(serde_json::from_value::<ExportEnvelopeV1>(duplicate_record).is_err());
+
+    let mut missing_revision = valid;
+    missing_revision["operationOrder"] = serde_json::json!([]);
+    assert!(serde_json::from_value::<ExportEnvelopeV1>(missing_revision).is_err());
+}
+
+#[test]
+fn export_serde_rejects_collection_overflow() {
+    let valid = valid_export_json();
+
+    let mut records = valid.clone();
+    records["records"] =
+        serde_json::Value::Array(vec![valid["records"][0].clone(); MAX_BATCH_OPERATIONS + 1]);
+    assert!(serde_json::from_value::<ExportEnvelopeV1>(records).is_err());
+
+    let mut operation_order = valid.clone();
+    operation_order["operationOrder"] = serde_json::Value::Array(vec![
+        valid["operationOrder"][0]
+            .clone();
+        MAX_BATCH_OPERATIONS + 1
+    ]);
+    assert!(serde_json::from_value::<ExportEnvelopeV1>(operation_order).is_err());
+}
+
+#[test]
+fn export_serde_rejects_invalid_nested_ids() {
+    let mut invalid_record_id = valid_export_json();
+    invalid_record_id["records"][0]["recordId"] = "018f22e2-79b0-6cc8-98c4-dc0c0c07398f".into();
+    assert!(serde_json::from_value::<ExportEnvelopeV1>(invalid_record_id).is_err());
+
+    let mut invalid_revision = valid_export_json();
+    invalid_revision["records"][0]["revision"] = "018f22e2-79b0-6cc8-98c4-dc0c0c07398f".into();
+    assert!(serde_json::from_value::<ExportEnvelopeV1>(invalid_revision).is_err());
+}
+
+#[test]
+fn export_serialization_rejects_invalid_in_memory_envelopes() {
+    let mut wrong_format = valid_export();
+    wrong_format.format = "context-relay.export.v2".into();
+    assert!(serde_json::to_value(wrong_format).is_err());
+
+    let mut duplicate_record = valid_export();
+    duplicate_record
+        .records
+        .push(duplicate_record.records[0].clone());
+    assert!(serde_json::to_value(duplicate_record).is_err());
+
+    let mut missing_revision = valid_export();
+    missing_revision.operation_order.clear();
+    assert!(serde_json::to_value(missing_revision).is_err());
+
+    let mut too_many_records = valid_export();
+    too_many_records.records = vec![too_many_records.records[0].clone(); MAX_BATCH_OPERATIONS + 1];
+    assert!(serde_json::to_value(too_many_records).is_err());
 }
 
 #[test]
@@ -27,6 +98,14 @@ fn export_validation_rejects_duplicate_operation_order() {
         serde_json::from_str(include_str!("fixtures/export-v1-valid.json")).unwrap();
     export.operation_order.push(export.operation_order[0]);
     assert!(export.validate().is_err());
+}
+
+fn valid_export_json() -> serde_json::Value {
+    serde_json::from_str(include_str!("fixtures/export-v1-valid.json")).unwrap()
+}
+
+fn valid_export() -> ExportEnvelopeV1 {
+    serde_json::from_value(valid_export_json()).unwrap()
 }
 
 fn valid_package_json() -> serde_json::Value {
