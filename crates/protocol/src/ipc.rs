@@ -1,8 +1,11 @@
+use std::fmt;
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::SerializeMap as _,
 };
 use ts_rs::TS;
+use zeroize::Zeroize;
 
 use crate::{
     BoundedBytes, CandidateId, ClientError, CompletionEvidenceInput, CreateHandoffInput, DeviceId,
@@ -181,11 +184,16 @@ params!(AccountDeletionParams {
     confirmation: String
 });
 
-#[derive(Clone, Debug, Eq, PartialEq, TS)]
+#[derive(Clone, Eq, PartialEq, TS)]
 #[ts(type = "Array<string>")]
 pub struct RecoveryPhraseWords(Vec<String>);
+impl fmt::Debug for RecoveryPhraseWords {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RecoveryPhraseWords([REDACTED])")
+    }
+}
 impl RecoveryPhraseWords {
-    pub fn new(words: Vec<String>) -> Result<Self, &'static str> {
+    pub fn new(mut words: Vec<String>) -> Result<Self, &'static str> {
         if words.len() != 24
             || words.iter().any(|word| {
                 word.is_empty()
@@ -193,6 +201,7 @@ impl RecoveryPhraseWords {
                     || !word.bytes().all(|byte| byte.is_ascii_lowercase())
             })
         {
+            words.zeroize();
             return Err("recovery phrase must contain 24 lowercase words");
         }
         Ok(Self(words))
@@ -200,8 +209,13 @@ impl RecoveryPhraseWords {
     pub fn as_words(&self) -> &[String] {
         &self.0
     }
-    pub fn into_words(self) -> Vec<String> {
-        self.0
+    pub fn into_words(mut self) -> Vec<String> {
+        std::mem::take(&mut self.0)
+    }
+}
+impl Drop for RecoveryPhraseWords {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 impl Serialize for RecoveryPhraseWords {

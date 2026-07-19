@@ -1,3 +1,5 @@
+pub mod crypto;
+
 use context_relay_protocol::{PROTOCOL_VERSION, ProtocolVersion};
 
 #[derive(Debug, PartialEq, Eq)]
