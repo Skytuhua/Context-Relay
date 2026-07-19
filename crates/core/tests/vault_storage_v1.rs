@@ -140,6 +140,79 @@ fn migrations_run_once_reject_future_versions_and_roll_back_failure() {
 }
 
 #[test]
+fn version_one_vault_upgrades_before_images_without_data_loss() {
+    let path = TempVault::new("migration-v1-to-v2");
+    let keys = MemoryKeyStore::default();
+    let key = [12; 32];
+    keys.insert(CREDENTIAL, key);
+
+    let raw = open_keyed(path.path(), &key);
+    raw.execute_batch(include_str!("../migrations/0001_vault.sql"))
+        .unwrap();
+    raw.pragma_update(None, "user_version", 1).unwrap();
+    let legacy_receipt = receipt(ID_1, 10);
+    raw.execute(
+        "INSERT INTO receipts(plan_id, successful, resolved, applied_ms, payload_json)
+         VALUES (?1, 1, 1, 10, ?2)",
+        params![
+            legacy_receipt.plan_id.to_string(),
+            serde_json::to_vec(&legacy_receipt).unwrap()
+        ],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO before_images(id, receipt_id, created_ms, payload)
+         VALUES ('legacy', ?1, 10, X'01')",
+        [legacy_receipt.plan_id.to_string()],
+    )
+    .unwrap();
+    raw.execute("CREATE TABLE before_images_v2(blocker INTEGER)", [])
+        .unwrap();
+    drop(raw);
+
+    assert!(matches!(
+        Vault::open(path.path(), CREDENTIAL, &keys),
+        Err(VaultError::Migration(_))
+    ));
+    let raw = open_keyed(path.path(), &key);
+    assert_eq!(
+        raw.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM before_images", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        1
+    );
+    raw.execute("DROP TABLE before_images_v2", []).unwrap();
+    drop(raw);
+
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+    assert!(vault.has_before_image("legacy").unwrap());
+    assert_eq!(
+        vault.receipt(&legacy_receipt.plan_id).unwrap(),
+        Some(legacy_receipt)
+    );
+
+    let pending_receipt = receipt(ID_2, 20);
+    vault
+        .put_before_image(
+            "pending",
+            Some(&pending_receipt.plan_id),
+            &[2],
+            20,
+            BeforeImagePolicy::new(10, 100),
+        )
+        .unwrap();
+    vault.put_receipt(&pending_receipt, true, true).unwrap();
+    assert!(vault.has_before_image("pending").unwrap());
+}
+
+#[test]
 fn every_required_table_round_trips_validated_protocol_payloads() {
     let path = TempVault::new("round-trip");
     let keys = MemoryKeyStore::default();
@@ -242,16 +315,29 @@ fn operation_ids_are_immutable_and_live_writes_require_upserts() {
     vault
         .put_memory(&first, &first_operation, &basis(0))
         .unwrap();
+    let anchor = memory(ID_2, ScopeRef::Global, "Anchor", "semantic anchor");
+    let anchor_operation = operation(ID_7, ID_2, RecordKind::Memory);
     vault
-        .put_memory(&first, &first_operation, &basis(0))
+        .put_memory(&anchor, &anchor_operation, &basis(3))
         .unwrap();
+    let mut altered_retry = first.clone();
+    altered_retry.title = "Altered retry".to_owned();
+    vault
+        .put_memory(&altered_retry, &first_operation, &basis(3))
+        .unwrap();
+    assert_eq!(vault.memory(&first.id).unwrap(), Some(first.clone()));
+    let scope = AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, None).unwrap();
+    assert_eq!(
+        vault.search("", &scope, &basis(3), 2).unwrap()[0].record_id(),
+        ID_2
+    );
     assert_eq!(
         vault.outbox_operations().unwrap(),
-        vec![first_operation.clone()]
+        vec![first_operation.clone(), anchor_operation]
     );
 
-    let second = memory(ID_2, ScopeRef::Global, "Second", "reused operation");
-    let reused_operation = operation(ID_4, ID_2, RecordKind::Memory);
+    let second = memory(ID_3, ScopeRef::Global, "Second", "reused operation");
+    let reused_operation = operation(ID_4, ID_3, RecordKind::Memory);
     assert!(
         vault
             .put_memory(&second, &reused_operation, &basis(1))
@@ -259,10 +345,10 @@ fn operation_ids_are_immutable_and_live_writes_require_upserts() {
     );
     assert_eq!(vault.memory(&first.id).unwrap(), Some(first));
     assert_eq!(vault.memory(&second.id).unwrap(), None);
-    assert_eq!(vault.outbox_operations().unwrap(), vec![first_operation]);
+    assert_eq!(vault.outbox_operations().unwrap()[0], first_operation);
 
-    let tombstoned = memory(ID_3, ScopeRef::Global, "Tombstone", "must roll back");
-    let mut tombstone_operation = operation(ID_5, ID_3, RecordKind::Memory);
+    let tombstoned = memory(ID_5, ScopeRef::Global, "Tombstone", "must roll back");
+    let mut tombstone_operation = operation(ID_6, ID_5, RecordKind::Memory);
     tombstone_operation.mutation_kind = MutationKind::Tombstone;
     assert!(
         vault
@@ -297,7 +383,6 @@ fn operation_ids_are_immutable_and_live_writes_require_upserts() {
     assert_eq!(batch_vault.memory(&batch[0].0.id).unwrap(), None);
     assert_eq!(batch_vault.memory(&batch[1].0.id).unwrap(), None);
     assert!(batch_vault.outbox_operations().unwrap().is_empty());
-    let scope = AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, None).unwrap();
     assert!(
         batch_vault
             .search("Batch", &scope, &basis(0), 10)

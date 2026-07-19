@@ -16,7 +16,7 @@ use crate::search::{
     AllowedSearchScope, Embedding384, SearchHit, quote_fts_query, reciprocal_rank_fusion,
 };
 
-pub const LATEST_SCHEMA_VERSION: u32 = 1;
+pub const LATEST_SCHEMA_VERSION: u32 = 2;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
 const DEFAULT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
@@ -932,6 +932,16 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }
+    if found < 2 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0002_before_image_plans.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 2))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
     Ok(())
 }
 
@@ -989,12 +999,15 @@ fn put_searchable_record(
         .map_err(|error| VaultError::Validation(error.to_string()))?;
     let existing_operation = transaction
         .query_row(
-            "SELECT record_id, canonical_cbor FROM operations WHERE id = ?1",
+            "SELECT record_id, payload_json FROM operations WHERE id = ?1",
             [&operation_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
-    if let Some((existing_record_id, existing_canonical)) = existing_operation {
+    if let Some((existing_record_id, existing_payload)) = existing_operation {
+        let existing_operation: SyncOperationV1 = from_json(&existing_payload)?;
+        let existing_canonical = encode_sync_operation_v1(&existing_operation)
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
         if existing_record_id == id && existing_canonical == operation_canonical {
             return Ok(false);
         }
@@ -1025,9 +1038,8 @@ fn put_searchable_record(
         params![id, to_json(provenance)?],
     )?;
     transaction.execute(
-        "INSERT INTO operations(id, record_id, payload_json, canonical_cbor)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![&operation_id, id, &operation_payload, &operation_canonical],
+        "INSERT INTO operations(id, record_id, payload_json) VALUES (?1, ?2, ?3)",
+        params![&operation_id, id, &operation_payload],
     )?;
     transaction.execute(
         "INSERT INTO outbox(operation_id) VALUES (?1)",

@@ -32,8 +32,7 @@ CREATE TABLE instructions (
 CREATE TABLE operations (
     id TEXT PRIMARY KEY,
     record_id TEXT NOT NULL,
-    payload_json BLOB NOT NULL,
-    canonical_cbor BLOB NOT NULL
+    payload_json BLOB NOT NULL
 );
 
 CREATE TABLE outbox (
@@ -72,7 +71,7 @@ CREATE TABLE provenance (
 
 CREATE TABLE before_images (
     id TEXT PRIMARY KEY,
-    plan_id TEXT,
+    receipt_id TEXT REFERENCES receipts(plan_id) ON DELETE RESTRICT,
     created_ms INTEGER NOT NULL,
     payload BLOB NOT NULL
 );
@@ -101,8 +100,8 @@ CREATE INDEX records_scope_idx
     ON records(scope_kind, project_id, archived);
 CREATE INDEX search_documents_scope_idx
     ON search_documents(scope_kind, project_id, archived, approved);
-CREATE INDEX before_images_plan_idx
-    ON before_images(plan_id, created_ms);
+CREATE INDEX before_images_receipt_idx
+    ON before_images(receipt_id, created_ms);
 
 CREATE VIRTUAL TABLE search_fts USING fts5(
     record_id UNINDEXED,
