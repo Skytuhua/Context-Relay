@@ -3,7 +3,7 @@
   "model": "Qdrant/bge-small-en-v1.5-onnx-Q",
   "revision": "52398278842ec682c6f32300af41344b1c0b0bb2",
   "dimensions": 384,
-  "license": "MIT",
+  "license": "apache-2.0",
   "artifacts": [
     {
       "file": "model_optimized.onnx",

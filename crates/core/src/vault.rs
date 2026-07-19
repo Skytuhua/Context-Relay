@@ -2,8 +2,9 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use context_relay_protocol::{
     ApplyReceipt, CandidateId, CandidateState, CheckpointV1, InstructionRecord, MemoryCandidate,
-    MemoryId, MemoryRecord, PlanId, ProjectId, Provenance, RecordId, RecordKind, ScopeRef,
-    Sha256Digest, SyncOperationV1, TaskId, TaskRecord, TaskStatus, WireNativeValue,
+    MemoryId, MemoryRecord, MutationKind, PlanId, ProjectId, Provenance, RecordId, RecordKind,
+    ScopeRef, Sha256Digest, SyncOperationV1, TaskId, TaskRecord, TaskStatus, WireNativeValue,
+    encode_sync_operation_v1,
 };
 use keyring::Entry;
 use rand_core::{OsRng, RngCore};
@@ -300,12 +301,14 @@ impl Vault {
             .map_err(|error| VaultError::Validation(error.to_string()))?;
         validate_operation_for(operation, &memory.id.to_string(), RecordKind::Memory)?;
         let transaction = self.connection.transaction()?;
-        put_memory_tx(&transaction, memory, operation, embedding)?;
+        let inserted = put_memory_tx(&transaction, memory, operation, embedding)?;
         transaction.commit()?;
-        self.embedding_cache.insert(
-            memory.id.to_string(),
-            cached_embedding(&memory.scope, memory.archived, embedding),
-        );
+        if inserted {
+            self.embedding_cache.insert(
+                memory.id.to_string(),
+                cached_embedding(&memory.scope, memory.archived, embedding),
+            );
+        }
         Ok(())
     }
 
@@ -320,15 +323,18 @@ impl Vault {
             validate_operation_for(operation, &memory.id.to_string(), RecordKind::Memory)?;
         }
         let transaction = self.connection.transaction()?;
+        let mut inserted = Vec::with_capacity(values.len());
         for (memory, operation, embedding) in values {
-            put_memory_tx(&transaction, memory, operation, embedding)?;
+            inserted.push(put_memory_tx(&transaction, memory, operation, embedding)?);
         }
         transaction.commit()?;
-        for (memory, _, embedding) in values {
-            self.embedding_cache.insert(
-                memory.id.to_string(),
-                cached_embedding(&memory.scope, memory.archived, embedding),
-            );
+        for ((memory, _, embedding), inserted) in values.iter().zip(inserted) {
+            if inserted {
+                self.embedding_cache.insert(
+                    memory.id.to_string(),
+                    cached_embedding(&memory.scope, memory.archived, embedding),
+                );
+            }
         }
         Ok(())
     }
@@ -356,7 +362,7 @@ impl Vault {
             RecordKind::Instruction,
         )?;
         let transaction = self.connection.transaction()?;
-        put_searchable_record(
+        let inserted = put_searchable_record(
             &transaction,
             &instruction.id.to_string(),
             "instruction",
@@ -369,16 +375,20 @@ impl Vault {
             operation,
             embedding,
         )?;
-        transaction.execute(
-            "INSERT INTO instructions(id, payload_json) VALUES (?1, ?2)
-             ON CONFLICT(id) DO UPDATE SET payload_json = excluded.payload_json",
-            params![instruction.id.to_string(), to_json(instruction)?],
-        )?;
+        if inserted {
+            transaction.execute(
+                "INSERT INTO instructions(id, payload_json) VALUES (?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET payload_json = excluded.payload_json",
+                params![instruction.id.to_string(), to_json(instruction)?],
+            )?;
+        }
         transaction.commit()?;
-        self.embedding_cache.insert(
-            instruction.id.to_string(),
-            cached_embedding(&instruction.scope, instruction.archived, embedding),
-        );
+        if inserted {
+            self.embedding_cache.insert(
+                instruction.id.to_string(),
+                cached_embedding(&instruction.scope, instruction.archived, embedding),
+            );
+        }
         Ok(())
     }
 
@@ -591,7 +601,7 @@ impl Vault {
     pub fn put_before_image(
         &mut self,
         id: &str,
-        receipt_id: Option<&PlanId>,
+        plan_id: Option<&PlanId>,
         payload: &[u8],
         created_ms: u64,
         policy: BeforeImagePolicy,
@@ -620,10 +630,10 @@ impl Vault {
             let cutoff = created_ms.saturating_sub(policy.retention_ms);
             let candidates = {
                 let mut statement = transaction.prepare(
-                    "SELECT before_images.id, before_images.receipt_id,
+                    "SELECT before_images.id, before_images.plan_id,
                             length(before_images.payload)
                      FROM before_images
-                     JOIN receipts ON receipts.plan_id = before_images.receipt_id
+                     JOIN receipts ON receipts.plan_id = before_images.plan_id
                      WHERE before_images.id != ?1
                        AND receipts.successful = 1
                        AND receipts.resolved = 1
@@ -651,7 +661,7 @@ impl Vault {
                     "DELETE FROM receipts
                      WHERE plan_id = ?1
                        AND NOT EXISTS (
-                         SELECT 1 FROM before_images WHERE receipt_id = ?1
+                         SELECT 1 FROM before_images WHERE plan_id = ?1
                        )",
                     [&candidate_receipt],
                 )?;
@@ -661,13 +671,13 @@ impl Vault {
             return Err(VaultError::BudgetExceeded);
         }
         transaction.execute(
-            "INSERT INTO before_images(id, receipt_id, created_ms, payload)
+            "INSERT INTO before_images(id, plan_id, created_ms, payload)
              VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET receipt_id = excluded.receipt_id,
+             ON CONFLICT(id) DO UPDATE SET plan_id = excluded.plan_id,
                 created_ms = excluded.created_ms, payload = excluded.payload",
             params![
                 id,
-                receipt_id.map(ToString::to_string),
+                plan_id.map(ToString::to_string),
                 to_i64(created_ms)?,
                 payload,
             ],
@@ -930,7 +940,7 @@ fn put_memory_tx(
     memory: &MemoryRecord,
     operation: &SyncOperationV1,
     embedding: &Embedding384,
-) -> Result<(), VaultError> {
+) -> Result<bool, VaultError> {
     put_searchable_record(
         transaction,
         &memory.id.to_string(),
@@ -959,7 +969,40 @@ fn put_searchable_record(
     provenance: &Provenance,
     operation: &SyncOperationV1,
     embedding: &Embedding384,
-) -> Result<(), VaultError> {
+) -> Result<bool, VaultError> {
+    let existing_kind = transaction
+        .query_row("SELECT kind FROM records WHERE id = ?1", [id], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?;
+    if let Some(existing_kind) = existing_kind
+        && existing_kind != kind
+    {
+        return Err(VaultError::Validation(
+            "record kind cannot change".to_owned(),
+        ));
+    }
+
+    let operation_id = operation.operation_id.to_string();
+    let operation_payload = to_json(operation)?;
+    let operation_canonical = encode_sync_operation_v1(operation)
+        .map_err(|error| VaultError::Validation(error.to_string()))?;
+    let existing_operation = transaction
+        .query_row(
+            "SELECT record_id, canonical_cbor FROM operations WHERE id = ?1",
+            [&operation_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+    if let Some((existing_record_id, existing_canonical)) = existing_operation {
+        if existing_record_id == id && existing_canonical == operation_canonical {
+            return Ok(false);
+        }
+        return Err(VaultError::Validation(
+            "operation id cannot be reused with different bytes".to_owned(),
+        ));
+    }
+
     let (scope_kind, project_id) = scope_columns(scope);
     transaction.execute(
         "INSERT INTO records(id, kind, scope_kind, project_id, archived, payload_json)
@@ -982,15 +1025,13 @@ fn put_searchable_record(
         params![id, to_json(provenance)?],
     )?;
     transaction.execute(
-        "INSERT INTO operations(id, record_id, payload_json) VALUES (?1, ?2, ?3)
-         ON CONFLICT(id) DO UPDATE SET record_id = excluded.record_id,
-            payload_json = excluded.payload_json",
-        params![operation.operation_id.to_string(), id, to_json(operation)?],
+        "INSERT INTO operations(id, record_id, payload_json, canonical_cbor)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![&operation_id, id, &operation_payload, &operation_canonical],
     )?;
     transaction.execute(
-        "INSERT INTO outbox(operation_id) VALUES (?1)
-         ON CONFLICT(operation_id) DO NOTHING",
-        [operation.operation_id.to_string()],
+        "INSERT INTO outbox(operation_id) VALUES (?1)",
+        [operation_id],
     )?;
     transaction.execute(
         "INSERT INTO search_documents(
@@ -1020,7 +1061,7 @@ fn put_searchable_record(
         "INSERT INTO search_fts(record_id, title, body) VALUES (?1, ?2, ?3)",
         params![id, title, body],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn validate_operation_for(
@@ -1034,6 +1075,11 @@ fn validate_operation_for(
     if operation.record_id.to_string() != record_id || operation.record_kind != kind {
         return Err(VaultError::Validation(
             "operation record identity does not match payload".to_owned(),
+        ));
+    }
+    if operation.mutation_kind != MutationKind::Upsert {
+        return Err(VaultError::Validation(
+            "live record writes require an upsert operation".to_owned(),
         ));
     }
     Ok(())

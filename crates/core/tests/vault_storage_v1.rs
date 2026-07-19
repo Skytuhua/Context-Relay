@@ -6,7 +6,9 @@ use context_relay_core::{
     search::AllowedSearchScope,
     vault::{BeforeImagePolicy, LATEST_SCHEMA_VERSION, Vault, VaultError},
 };
-use context_relay_protocol::{HarnessAccessPolicy, RecordKind, ScopeRef, Sha256Digest};
+use context_relay_protocol::{
+    HarnessAccessPolicy, MutationKind, RecordKind, ScopeRef, Sha256Digest,
+};
 use rusqlite::{Connection, params};
 
 use support::{
@@ -230,6 +232,109 @@ fn every_required_table_round_trips_validated_protocol_payloads() {
 }
 
 #[test]
+fn operation_ids_are_immutable_and_live_writes_require_upserts() {
+    let path = TempVault::new("operation-idempotency");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let first = memory(ID_1, ScopeRef::Global, "First", "first operation");
+    let first_operation = operation(ID_4, ID_1, RecordKind::Memory);
+
+    vault
+        .put_memory(&first, &first_operation, &basis(0))
+        .unwrap();
+    vault
+        .put_memory(&first, &first_operation, &basis(0))
+        .unwrap();
+    assert_eq!(
+        vault.outbox_operations().unwrap(),
+        vec![first_operation.clone()]
+    );
+
+    let second = memory(ID_2, ScopeRef::Global, "Second", "reused operation");
+    let reused_operation = operation(ID_4, ID_2, RecordKind::Memory);
+    assert!(
+        vault
+            .put_memory(&second, &reused_operation, &basis(1))
+            .is_err()
+    );
+    assert_eq!(vault.memory(&first.id).unwrap(), Some(first));
+    assert_eq!(vault.memory(&second.id).unwrap(), None);
+    assert_eq!(vault.outbox_operations().unwrap(), vec![first_operation]);
+
+    let tombstoned = memory(ID_3, ScopeRef::Global, "Tombstone", "must roll back");
+    let mut tombstone_operation = operation(ID_5, ID_3, RecordKind::Memory);
+    tombstone_operation.mutation_kind = MutationKind::Tombstone;
+    assert!(
+        vault
+            .put_memory(&tombstoned, &tombstone_operation, &basis(2))
+            .is_err()
+    );
+    assert_eq!(vault.memory(&tombstoned.id).unwrap(), None);
+    assert!(
+        vault
+            .outbox_operations()
+            .unwrap()
+            .iter()
+            .all(|operation| { operation.operation_id != tombstone_operation.operation_id })
+    );
+
+    let batch_path = TempVault::new("batch-operation-idempotency");
+    let batch_keys = MemoryKeyStore::default();
+    let mut batch_vault = Vault::open(batch_path.path(), CREDENTIAL, &batch_keys).unwrap();
+    let batch = vec![
+        (
+            memory(ID_1, ScopeRef::Global, "Batch one", "first"),
+            operation(ID_6, ID_1, RecordKind::Memory),
+            basis(0),
+        ),
+        (
+            memory(ID_2, ScopeRef::Global, "Batch two", "second"),
+            operation(ID_6, ID_2, RecordKind::Memory),
+            basis(1),
+        ),
+    ];
+    assert!(batch_vault.put_memories_batch(&batch).is_err());
+    assert_eq!(batch_vault.memory(&batch[0].0.id).unwrap(), None);
+    assert_eq!(batch_vault.memory(&batch[1].0.id).unwrap(), None);
+    assert!(batch_vault.outbox_operations().unwrap().is_empty());
+    let scope = AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, None).unwrap();
+    assert!(
+        batch_vault
+            .search("Batch", &scope, &basis(0), 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn record_ids_cannot_change_kind() {
+    let path = TempVault::new("record-kind-immutable");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let stored = memory(ID_1, ScopeRef::Global, "Memory", "stable kind");
+    vault
+        .put_memory(
+            &stored,
+            &operation(ID_4, ID_1, RecordKind::Memory),
+            &basis(0),
+        )
+        .unwrap();
+
+    let replacement = instruction(ID_1, ScopeRef::Global, "Instruction", "wrong kind");
+    assert!(
+        vault
+            .put_instruction(
+                &replacement,
+                &operation(ID_5, ID_1, RecordKind::Instruction),
+                &basis(1),
+            )
+            .is_err()
+    );
+    assert_eq!(vault.memory(&stored.id).unwrap(), Some(stored));
+    assert_eq!(vault.instruction(&replacement.id).unwrap(), None);
+}
+
+#[test]
 fn before_image_budget_is_exact_and_prunes_only_old_successful_resolved_receipts() {
     const DAY: u64 = 24 * 60 * 60 * 1000;
     let path = TempVault::new("before-images");
@@ -251,9 +356,6 @@ fn before_image_budget_is_exact_and_prunes_only_old_successful_resolved_receipts
     let old_success = receipt(ID_1, now - 31 * DAY);
     let cutoff_success = receipt(ID_2, now - 30 * DAY);
     let old_failed = receipt(ID_3, now - 40 * DAY);
-    vault.put_receipt(&old_success, true, true).unwrap();
-    vault.put_receipt(&cutoff_success, true, true).unwrap();
-    vault.put_receipt(&old_failed, false, true).unwrap();
     vault
         .put_before_image(
             "old-success",
@@ -281,6 +383,9 @@ fn before_image_budget_is_exact_and_prunes_only_old_successful_resolved_receipts
             policy,
         )
         .unwrap();
+    vault.put_receipt(&old_success, true, true).unwrap();
+    vault.put_receipt(&cutoff_success, true, true).unwrap();
+    vault.put_receipt(&old_failed, false, true).unwrap();
 
     vault
         .put_before_image("replacement", None, &[6; 6], now, policy)

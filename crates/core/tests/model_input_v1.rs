@@ -17,3 +17,11 @@ fn bge_adapter_prefixes_only_queries_with_the_model_card_instruction() {
         "Represent this sentence for searching relevant passages: "
     );
 }
+
+#[test]
+fn pinned_qdrant_model_manifest_uses_apache_2_0_license() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../models/bge-small-en-v1.5/manifest.json")).unwrap();
+    assert_eq!(manifest["model"], "Qdrant/bge-small-en-v1.5-onnx-Q");
+    assert_eq!(manifest["license"], "apache-2.0");
+}
