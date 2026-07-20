@@ -339,6 +339,14 @@ test('public-source build scripts consume the verified bundle through closed nat
     assert.doesNotMatch(script, /--inplace-build/);
     assert.doesNotMatch(script, /dev[\\/]required\.opam/);
     assert.doesNotMatch(script, /pypi|pysemgrep|dumpbin|cl\.exe|visual studio/i);
+    const treeSitterPatch = script.indexOf('0001-Makefile-backports.patch');
+    const treeSitterConfigure = script.indexOf('./configure');
+    const treeSitterInstall = script.indexOf('install-tree-sitter-lib');
+    assert.ok(
+      treeSitterPatch >= 0
+        && treeSitterPatch < treeSitterConfigure
+        && treeSitterConfigure < treeSitterInstall,
+    );
   }
   assert.match(mac, /Darwin/);
   assert.match(mac, /arm64/);
@@ -371,6 +379,7 @@ test('public-source build scripts consume the verified bundle through closed nat
   assert.match(mac, /LIBRARY_PATH="\$\(brew --prefix\)\/lib:\$\{LIBRARY_PATH:-\}"/);
   assert.equal((mac.match(/PATH="\/usr\/bin:\/bin"/g) ?? []).length, 2);
   assert.doesNotMatch(mac, /PATH="\$CURRENT\/empty-path"/);
+  assert.match(mac, /"\$DESTINATION\/osemgrep" --experimental --version/);
   assert.match(
     mac,
     /opam install --locked --update-invariant --assume-depexts --deps-only \.\/semgrep\.opam/,
@@ -400,6 +409,7 @@ test('public-source build scripts consume the verified bundle through closed nat
     /& \$Bash '-c' 'cd libs\/ocaml-tree-sitter-core && \.\/configure && \.\/scripts\/install-tree-sitter-lib'/,
   );
   assert.doesNotMatch(windows, /& \$Bash '-lc'/);
+  assert.match(windows, /& \$RuntimeExecutable --experimental --version/);
   assert.match(windows, /git init --bare "\$1"/);
   assert.match(windows, /\$GitDirForward = \[IO\.Path\]::GetFullPath\(\$GitDir\)\.Replace\('\\', '\/'\)/);
   assert.match(windows, /\$env:GIT_DIR = \$CompilerGitDirForward/);

@@ -272,6 +272,7 @@ function Build-Once([string]$Label) {
   Push-Location $Project
   try {
     Invoke-Checked { & $Bash './scripts/pick-lockfile.sh' '--strict' 'semgrep.opam' } 'lockfile selection'
+    Invoke-Checked { & $Bash '-c' 'cd libs/ocaml-tree-sitter-core && patch -N -b -i patch/tree-sitter-0.22.6/0001-Makefile-backports.patch downloads/tree-sitter-0.22.6/Makefile' } 'tree-sitter source patch'
     Invoke-Checked { & $Bash '-c' 'cd libs/ocaml-tree-sitter-core && ./configure && ./scripts/install-tree-sitter-lib' } 'tree-sitter build'
     $env:OPAMIGNOREPINDEPENDS = 'true'
     Invoke-Checked { & $Opam install --locked --update-invariant --deps-only '.\semgrep.opam' } 'dependency installation'
@@ -403,7 +404,7 @@ function Build-Once([string]$Label) {
     Push-Location -LiteralPath $SmokeFixtures
     $SmokeLocationPushed = $true
     $RuntimeExecutable = Join-Path $Destination 'osemgrep.exe'
-    $VersionOutput = [string[]]@(& $RuntimeExecutable --version)
+    $VersionOutput = [string[]]@(& $RuntimeExecutable --experimental --version)
     if ($LASTEXITCODE -ne 0) { Fail "no-Python version smoke failed with exit code $LASTEXITCODE" }
     [IO.File]::WriteAllLines((Join-Path $Evidence 'version.txt'), $VersionOutput, [Text.Encoding]::ASCII)
 

@@ -242,6 +242,8 @@ build_once() {
   ./scripts/pick-lockfile.sh --strict semgrep.opam
   (
     cd libs/ocaml-tree-sitter-core
+    /usr/bin/patch -N -b -i patch/tree-sitter-0.22.6/0001-Makefile-backports.patch \
+      downloads/tree-sitter-0.22.6/Makefile
     ./configure
     ./scripts/install-tree-sitter-lib
   )
@@ -287,7 +289,7 @@ build_once() {
   printf '%s\n' 'clean target' > "$SMOKE_FIXTURES/clean.txt"
   printf '%s\n' 'context-relay-finding' > "$SMOKE_FIXTURES/finding.txt"
   env -i HOME="$CURRENT/smoke-home" TMPDIR="$CURRENT/smoke-tmp" PATH="/usr/bin:/bin" \
-    "$DESTINATION/osemgrep" --version > "$EVIDENCE/version.txt"
+    "$DESTINATION/osemgrep" --experimental --version > "$EVIDENCE/version.txt"
   if ! (cd "$SMOKE_FIXTURES" && run_closed_scan "$DESTINATION/osemgrep" rule.yml clean.txt \
       "$EVIDENCE/clean.json" "$EVIDENCE/clean.stderr"); then
     die "closed clean scan failed"
