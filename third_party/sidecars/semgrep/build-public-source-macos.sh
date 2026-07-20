@@ -168,7 +168,7 @@ run_closed_scan() {
   target=$3
   stdout=$4
   stderr=$5
-  env -i HOME="$CURRENT/smoke-home" TMPDIR="$CURRENT/smoke-tmp" PATH="$CURRENT/empty-path" LC_ALL=C TZ=UTC \
+  env -i HOME="$CURRENT/smoke-home" TMPDIR="$CURRENT/smoke-tmp" PATH="/usr/bin:/bin" LC_ALL=C TZ=UTC \
     "$executable" scan \
       --experimental \
       --oss-only \
@@ -275,7 +275,7 @@ build_once() {
     esac
   done < "$EVIDENCE/runtime-dependencies.txt"
   SMOKE_FIXTURES="$CURRENT/smoke-fixtures"
-  mkdir -p "$CURRENT/empty-path" "$CURRENT/smoke-home" "$CURRENT/smoke-tmp" "$SMOKE_FIXTURES"
+  mkdir -p "$CURRENT/smoke-home" "$CURRENT/smoke-tmp" "$SMOKE_FIXTURES"
   printf '%s\n' \
     'rules:' \
     '  - id: context-relay-smoke' \
@@ -286,7 +286,7 @@ build_once() {
   printf '%s\n' 'rules: [' > "$SMOKE_FIXTURES/invalid-rule.yml"
   printf '%s\n' 'clean target' > "$SMOKE_FIXTURES/clean.txt"
   printf '%s\n' 'context-relay-finding' > "$SMOKE_FIXTURES/finding.txt"
-  env -i HOME="$CURRENT/smoke-home" TMPDIR="$CURRENT/smoke-tmp" PATH="$CURRENT/empty-path" \
+  env -i HOME="$CURRENT/smoke-home" TMPDIR="$CURRENT/smoke-tmp" PATH="/usr/bin:/bin" \
     "$DESTINATION/osemgrep" --version > "$EVIDENCE/version.txt"
   if ! (cd "$SMOKE_FIXTURES" && run_closed_scan "$DESTINATION/osemgrep" rule.yml clean.txt \
       "$EVIDENCE/clean.json" "$EVIDENCE/clean.stderr"); then

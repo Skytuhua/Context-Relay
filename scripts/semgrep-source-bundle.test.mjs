@@ -79,6 +79,16 @@ test('locked compiler identity can be supplied without modifying source', async 
   assert.deepEqual(await readdir(source), []);
 });
 
+test('the manifest-bound Windows builder has checkout-stable LF bytes', async () => {
+  const path = 'third_party/sidecars/semgrep/build-public-source-windows.ps1';
+  const bytes = await readFile(new URL(`../${path}`, import.meta.url));
+  assert.equal(bytes.includes(Buffer.from('\r\n')), false);
+  assert.equal(
+    execFileSync('git', ['check-attr', 'eol', '--', path], { encoding: 'utf8' }).trim(),
+    `${path}: eol: lf`,
+  );
+});
+
 test('deterministic source tar is byte-identical and contains no link members', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'context-relay-semgrep-bundle-'));
   t.after(() => rm(root, { force: true, recursive: true }));
@@ -359,6 +369,8 @@ test('public-source build scripts consume the verified bundle through closed nat
     /LWT_DISCOVER_ARGUMENTS='--use-libev true'/,
   );
   assert.match(mac, /LIBRARY_PATH="\$\(brew --prefix\)\/lib:\$\{LIBRARY_PATH:-\}"/);
+  assert.equal((mac.match(/PATH="\/usr\/bin:\/bin"/g) ?? []).length, 2);
+  assert.doesNotMatch(mac, /PATH="\$CURRENT\/empty-path"/);
   assert.match(
     mac,
     /opam install --locked --update-invariant --assume-depexts --deps-only \.\/semgrep\.opam/,
@@ -383,6 +395,11 @@ test('public-source build scripts consume the verified bundle through closed nat
   );
   assert.match(windows, /\$CacheUri = "file:\/\/\$CachePath"/);
   assert.doesNotMatch(windows, /\$CacheUri = \(\[Uri\]/);
+  assert.match(
+    windows,
+    /& \$Bash '-c' 'cd libs\/ocaml-tree-sitter-core && \.\/configure && \.\/scripts\/install-tree-sitter-lib'/,
+  );
+  assert.doesNotMatch(windows, /& \$Bash '-lc'/);
   assert.match(windows, /git init --bare "\$1"/);
   assert.match(windows, /\$GitDirForward = \[IO\.Path\]::GetFullPath\(\$GitDir\)\.Replace\('\\', '\/'\)/);
   assert.match(windows, /\$env:GIT_DIR = \$CompilerGitDirForward/);

@@ -272,7 +272,7 @@ function Build-Once([string]$Label) {
   Push-Location $Project
   try {
     Invoke-Checked { & $Bash './scripts/pick-lockfile.sh' '--strict' 'semgrep.opam' } 'lockfile selection'
-    Invoke-Checked { & $Bash '-lc' 'cd libs/ocaml-tree-sitter-core && ./configure && ./scripts/install-tree-sitter-lib' } 'tree-sitter build'
+    Invoke-Checked { & $Bash '-c' 'cd libs/ocaml-tree-sitter-core && ./configure && ./scripts/install-tree-sitter-lib' } 'tree-sitter build'
     $env:OPAMIGNOREPINDEPENDS = 'true'
     Invoke-Checked { & $Opam install --locked --update-invariant --deps-only '.\semgrep.opam' } 'dependency installation'
     Assert-CompilerIdentity $CompilerRevision
