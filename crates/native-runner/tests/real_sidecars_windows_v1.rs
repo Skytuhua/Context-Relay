@@ -328,6 +328,15 @@ fn real_manifest_workspace(committed: &Path) -> Result<PathBuf, String> {
     validate_manifest_workspace(&PathBuf::from(root))
 }
 
+fn comparable_canonical_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if let Some(path) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{path}")
+    } else {
+        text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+    }
+}
+
 fn validate_manifest_workspace(root: &Path) -> Result<PathBuf, String> {
     let rendered = root.as_os_str().to_string_lossy();
     if !root.is_absolute()
@@ -344,15 +353,7 @@ fn validate_manifest_workspace(root: &Path) -> Result<PathBuf, String> {
         return Err("override must be an absolute normalized path".to_owned());
     }
     let canonical = fs::canonicalize(root).map_err(|_| "override root is missing".to_owned())?;
-    let canonical_text = canonical.to_string_lossy();
-    let comparable = if let Some(path) = canonical_text.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{path}")
-    } else {
-        canonical_text
-            .strip_prefix(r"\\?\")
-            .unwrap_or(&canonical_text)
-            .to_owned()
-    };
+    let comparable = comparable_canonical_path(&canonical);
     if !root
         .as_os_str()
         .to_string_lossy()
@@ -373,14 +374,18 @@ fn real_manifest_workspace_rejects_missing_and_noncanonical_overrides() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
+    let temp = fs::canonicalize(std::env::temp_dir()).unwrap();
+    let root = PathBuf::from(comparable_canonical_path(&temp)).join(format!(
         "context-relay-manifest-root-{}-{unique}",
         std::process::id()
     ));
     assert!(validate_manifest_workspace(&root).is_err());
     fs::create_dir_all(root.join("third_party/sidecars")).unwrap();
     fs::write(root.join("third_party/sidecars/manifest.v1.json"), b"{}").unwrap();
-    assert!(validate_manifest_workspace(&root).is_ok());
+    assert_eq!(
+        validate_manifest_workspace(&root),
+        fs::canonicalize(&root).map_err(|error| error.to_string())
+    );
     assert!(validate_manifest_workspace(&root.join(".")).is_err());
     fs::remove_dir_all(root).unwrap();
 }
