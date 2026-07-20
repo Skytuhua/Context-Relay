@@ -23,12 +23,16 @@ paths, and unrecorded objects are rejected. Git symlinks are represented in
 normalized to 0644 or 0755; uid, gid, and mtime are zero; reserved header fields
 and both trailing zero blocks are canonical.
 
-SHA-512-only opam archives have 128-hex filenames, which cannot fit USTAR's
-100-byte name field. The bundle stores each such digest as two 64-hex path
-components. `--materialize-links` creates a hard link at opam's official
-`sha512/<first-two>/<full-digest>` cache path after extraction. Both names
-address the same verified bytes; SHA-256 cache paths need no transformation.
-Source paths that cannot fit any USTAR name/prefix split are stored below
+Opam archive mirrors address an archive by its first declared checksum. The
+bundle stores each archive once at a verified canonical strong-checksum path
+and records every other declared checksum address in `SYMLINKS.v1.json`.
+`--materialize-links` restores those cache addresses as hard links, including
+MD5-first records, without duplicating archive bytes. SHA-512-only archives
+also have 128-hex filenames that cannot fit USTAR's 100-byte name field, so
+their canonical bytes are stored as two 64-hex path components and the same
+command restores opam's official `sha512/<first-two>/<full-digest>` hard link.
+Every cache name therefore addresses the same verified bytes. Source paths
+that cannot fit any USTAR name/prefix split are stored below
 `LONG_PATHS/<sha256-of-original-path>`. Canonical `LONG_PATHS.v1.json`
 maps them back, and the same materialization command restores the original
 path with a hard link before restoring Git symlinks.

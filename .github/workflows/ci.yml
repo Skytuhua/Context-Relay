@@ -135,8 +135,8 @@ jobs:
             '--root=C:\cygwin',
             '--site=https://mirrors.kernel.org/sourceware/cygwin/'
           )
-          & $cygwinSetup @arguments
-          if ($LASTEXITCODE -ne 0) { throw "Cygwin dependency provisioning failed with exit code $LASTEXITCODE" }
+          $process = Start-Process -FilePath $cygwinSetup -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw "Cygwin dependency provisioning failed with exit code $($process.ExitCode)" }
       - name: Verify exact Windows AMD64 builder and fetch pins
         shell: pwsh
         run: |

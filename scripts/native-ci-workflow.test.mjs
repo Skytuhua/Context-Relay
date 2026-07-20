@@ -159,6 +159,12 @@ test('native builders provision locked system dependencies before closed builds'
   assert.ok(windowsProvision >= 0 && windowsClosedBuild > windowsProvision);
   assert.match(windows, /C:\\cygwin\\setup-x86_64\.exe/);
   for (const name of cygwinPackages) assert.match(windows, new RegExp(`['\"]${name}['\"]`));
+  assert.match(
+    windows,
+    /Start-Process -FilePath \$cygwinSetup -ArgumentList \$arguments -Wait -PassThru -WindowStyle Hidden/,
+  );
+  assert.match(windows, /\$process\.ExitCode/);
+  assert.doesNotMatch(windows, /& \$cygwinSetup @arguments/);
   const lockedWindows = lock.toolchains.find(({ distributionTarget }) => distributionTarget === 'windows-x86_64');
   for (const name of cygwinPackages) assert.ok(lockedWindows.cygwinPackages.includes(name), name);
 

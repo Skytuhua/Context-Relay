@@ -583,6 +583,24 @@ function officialArchivePath({ algorithm, digest }) {
   return `opam-repository/cache/${algorithm}/${digest.slice(0, 2)}/${digest}`;
 }
 
+export function archiveCacheLinks(lock) {
+  const aliases = new Map();
+  for (const archive of flattenArchiveSources(lock)) {
+    const stored = bundledArchivePath(archive);
+    for (const [algorithm, digest] of requiredArchiveChecksums(archive)) {
+      if (algorithm === archive.algorithm && digest === archive.digest) continue;
+      const path = officialArchivePath({ algorithm, digest });
+      const target = posix.relative(posix.dirname(path), stored);
+      const previous = aliases.get(path);
+      if (previous !== undefined && previous !== target) fail('archive checksum alias is ambiguous');
+      aliases.set(path, target);
+    }
+  }
+  return [...aliases]
+    .map(([path, target]) => safeLink({ path, target }))
+    .sort((left, right) => compareUtf8(left.path, right.path));
+}
+
 function parseBundledArchivePath(path) {
   if (!path.startsWith('opam-repository/cache/')) return null;
   const sha256 = /^opam-repository\/cache\/sha256\/([0-9a-f]{2})\/([0-9a-f]{64})$/.exec(path);
@@ -1069,6 +1087,7 @@ export async function buildSemgrepSourceBundle({
   }
 
   state.entries.push(...await verifyArchiveCache(lock, archiveCacheRoot));
+  state.links.push(...archiveCacheLinks(lock));
   state.entries.push({ bytes: loaded.bytes, executable: false, path: 'metadata/source-lock.v1.json' });
   for (const path of [...supportPaths].sort(compareUtf8)) {
     safePath(path, 'support path');
@@ -1247,6 +1266,17 @@ export async function materializeBundleLinks(root) {
       if (error.code !== 'ENOENT') throw error;
     }
     const target = posix.normalize(posix.join(posix.dirname(item.path), item.target));
+    if (item.path.startsWith('opam-repository/cache/')) {
+      if (!target.startsWith('opam-repository/cache/')) fail('archive checksum alias target is unsafe');
+      await noLinkParent(root, target);
+      const source = join(resolve(root), ...target.split('/'));
+      const sourceInfo = await lstat(source);
+      if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()) {
+        fail('archive checksum alias source is unsafe');
+      }
+      await link(source, destination);
+      continue;
+    }
     let type = 'file';
     try {
       if ((await lstat(join(resolve(root), ...target.split('/')))).isDirectory()) type = 'dir';
@@ -1274,8 +1304,12 @@ export async function materializeBundleLinks(root) {
     if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()) fail('bundled SHA-512 archive is unsafe');
     const destination = join(resolve(root), ...official.split('/'));
     try {
-      await lstat(destination);
-      fail(`official SHA-512 cache path already exists: ${official}`);
+      const destinationInfo = await lstat(destination);
+      if (!destinationInfo.isFile() || destinationInfo.isSymbolicLink()
+          || destinationInfo.dev !== sourceInfo.dev || destinationInfo.ino !== sourceInfo.ino) {
+        fail(`official SHA-512 cache path already exists: ${official}`);
+      }
+      continue;
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
     }

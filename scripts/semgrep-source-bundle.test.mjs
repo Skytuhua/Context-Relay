@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
 import {
+  archiveCacheLinks,
   buildDeterministicTar,
   buildSemgrepSourceBundle,
   collectGitRepository,
@@ -218,6 +219,56 @@ test('verified materialization restores official long SHA-512 opam cache names',
 
   assert.equal(await materializeBundleLinks(root), 0);
   assert.deepEqual(await readFile(join(root, ...official.split('/'))), bytes);
+});
+
+test('verified materialization restores every declared opam checksum alias as a hard link', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'context-relay-semgrep-checksum-links-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const bytes = Buffer.from('mixed-checksum archive\n');
+  const md5 = digest('md5', bytes);
+  const sha256 = digest('sha256', bytes);
+  const links = archiveCacheLinks({
+    opam: {
+      resolvedSourceArchives: [{
+        package: 'fixture',
+        version: '1',
+        targets: ['aarch64-apple-darwin'],
+        opamPath: 'packages/fixture/fixture.1/opam',
+        opamSha256: '1'.repeat(64),
+        licenses: ['MIT'],
+        source: {
+          checksums: [
+            { algorithm: 'md5', digest: md5 },
+            { algorithm: 'sha256', digest: sha256 },
+          ],
+          supplementalChecksums: [],
+          mirrors: [],
+          url: 'https://example.invalid/fixture.tar.gz',
+        },
+        extraSources: [],
+      }],
+    },
+  });
+  const stored = `opam-repository/cache/sha256/${sha256.slice(0, 2)}/${sha256}`;
+  const alias = `opam-repository/cache/md5/${md5.slice(0, 2)}/${md5}`;
+  assert.deepEqual(links, [{
+    path: alias,
+    target: `../../sha256/${sha256.slice(0, 2)}/${sha256}`,
+  }]);
+  await mkdir(join(root, ...stored.split('/').slice(0, -1)), { recursive: true });
+  await writeFile(join(root, ...stored.split('/')), bytes);
+  await writeFile(join(root, 'SYMLINKS.v1.json'), `${JSON.stringify({ links, schemaVersion: 1 })}\n`);
+  await writeFile(join(root, 'MANIFEST.sha256'), `${sha256}  ${stored}\n`);
+
+  assert.equal(await materializeBundleLinks(root), 1);
+  assert.deepEqual(await readFile(join(root, ...alias.split('/'))), bytes);
+  const [storedInfo, aliasInfo] = await Promise.all([
+    lstat(join(root, ...stored.split('/'))),
+    lstat(join(root, ...alias.split('/'))),
+  ]);
+  assert.equal(aliasInfo.isSymbolicLink(), false);
+  assert.equal(aliasInfo.dev, storedInfo.dev);
+  assert.equal(aliasInfo.ino, storedInfo.ino);
 });
 
 test('verified materialization restores USTAR-unrepresentable source paths', async (t) => {

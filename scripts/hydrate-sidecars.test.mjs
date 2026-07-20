@@ -1090,7 +1090,7 @@ test('Semgrep records the complete recursive source inventory but remains disabl
   );
   assert.equal(lock.completeCorrespondingSource, false);
   assert.equal(lock.recursiveInventoryComplete, true);
-  assert.equal(sha256(lockBytes), '1cfaf00f47072f21d348d82860f7fda63f665e50c4ea348c0ddbd1726a5cde69');
+  assert.equal(sha256(lockBytes), 'aa5c056fb8c52de7aea359150bfaeef61e4a50fe4244eb563e17d7addebd76c8');
   assert.equal(lock.licenseMaterials.length, 12);
   assert.equal(lock.rootGitlinks.length, 36);
   assert.equal(lock.opam.resolvedSourceArchivesComplete, true);
@@ -1108,15 +1108,15 @@ test('Semgrep records the complete recursive source inventory but remains disabl
   );
   assert.equal('sourceAssetUrl' in lock, false);
   assert.equal('sourceBundleSha256' in lock, false);
-  assert.equal(bundleEvidence.bundle.sha256, '58963583801021bb7e266d93210bed998978e724ec19fa1558e31371b5143c61');
-  assert.equal(bundleEvidence.bundle.size, 1149574656);
+  assert.equal(bundleEvidence.bundle.sha256, 'c213d91e006a24430d07b5b9117c527cd04f281b70a50ebbcbb444d5a1fdb5ed');
+  assert.equal(bundleEvidence.bundle.size, 1149609472);
   assert.equal(bundleEvidence.bundle.payloadEntries, 39540);
-  assert.equal(bundleEvidence.bundle.recordedLinks, 85);
-  assert.equal(bundleEvidence.sourceLockSha256, '1cfaf00f47072f21d348d82860f7fda63f665e50c4ea348c0ddbd1726a5cde69');
-  assert.equal(bundleEvidence.bundleGeneratorSha256, '1a2615fe3849fc0ce4f01ec6a4b7d586d0160ceb3f7e13f8f964270b08ce1410');
+  assert.equal(bundleEvidence.bundle.recordedLinks, 222);
+  assert.equal(bundleEvidence.sourceLockSha256, 'aa5c056fb8c52de7aea359150bfaeef61e4a50fe4244eb563e17d7addebd76c8');
+  assert.equal(bundleEvidence.bundleGeneratorSha256, '7ac41edd64e0f1ccadb125b6baf508d5416e3f6ce96b6be4cdef68ae5de86049');
   assert.equal(
     sha256(await readFile(new URL('./semgrep-source-bundle.mjs', import.meta.url))),
-    '1a2615fe3849fc0ce4f01ec6a4b7d586d0160ceb3f7e13f8f964270b08ce1410',
+    '7ac41edd64e0f1ccadb125b6baf508d5416e3f6ce96b6be4cdef68ae5de86049',
   );
   assert.equal(lock.researchEvidence.usableForHydration, false);
   assert.equal(lock.researchEvidence.usableForPackaging, false);
