@@ -1,0 +1,86 @@
+name: Semgrep public-source Windows probe
+
+on:
+  push:
+    branches:
+      - codex/semgrep-ci-probe
+
+permissions:
+  contents: read
+
+jobs:
+  windows-public-source:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+        working-directory: semgrep-src
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: semgrep/semgrep
+          ref: bd614accba811b407ae5c9ec6f1eecd3bdc29911
+          path: semgrep-src
+          submodules: recursive
+          fetch-depth: 1
+
+      - uses: semgrep/setup-ocaml@3e4c6ff8c9a04c9ec8f6f87701cd4b661b0f1f18
+        with:
+          cache-prefix: context-relay-semgrep-1-170-probe
+          ocaml-compiler: 5.3.0
+          opam-pin: false
+          opam-repositories: |
+            default: https://github.com/ocaml/opam-repository.git#78d29aba187e8362b8ab86c189790c0af9153d4b
+          save-opam-post-run: false
+
+      - name: Verify immutable recursive checkout
+        run: |
+          test "$(git rev-parse HEAD)" = bd614accba811b407ae5c9ec6f1eecd3bdc29911
+          test "$(git rev-parse 'HEAD^{tree}')" = ad8e607874820dc7253d58997736463ed258ea34
+          test -z "$(git submodule status --recursive | grep '^[+-U]' || true)"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          uname -a
+          opam --version
+          ocamlc -version
+
+      - name: Install exact public dependencies
+        run: |
+          make install-deps
+          ./scripts/validate-compiler-sha.sh
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Build unmodified native osemgrep
+        run: |
+          export TREESITTER_INCDIR="$(pwd)/libs/ocaml-tree-sitter-core/tree-sitter/include"
+          export TREESITTER_LIBDIR="$(pwd)/libs/ocaml-tree-sitter-core/tree-sitter/lib"
+          export TREESITTER_BINDIR="$(pwd)/libs/ocaml-tree-sitter-core/tree-sitter/bin"
+          opam exec -- dune build _build/install/default/bin/osemgrep.exe
+          test -f _build/install/default/bin/osemgrep.exe
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Record executable and MinGW runtime closure
+        run: |
+          mkdir -p context-relay-closure
+          cp _build/install/default/bin/osemgrep.exe context-relay-closure/osemgrep.exe
+          SYS_ROOT_BIN="$(x86_64-w64-mingw32-gcc -print-sysroot)/mingw/bin"
+          TREESITTER_BIN="$(pwd)/libs/ocaml-tree-sitter-core/tree-sitter/bin"
+          DLL_PATHS="$SYS_ROOT_BIN:$TREESITTER_BIN"
+          PATH="$DLL_PATHS:$PATH" cygcheck _build/install/default/bin/osemgrep.exe > context-relay-closure/cygcheck.txt
+          grep '\(x86_64-w64-mingw32\|ocaml-tree-sitter-core\)' context-relay-closure/cygcheck.txt |
+            sed 's/^[[:space:]]*//' |
+            sort -u > context-relay-closure/dll-paths.txt
+          while IFS= read -r dll; do
+            test -z "$dll" || cp -p "$dll" context-relay-closure/
+          done < context-relay-closure/dll-paths.txt
+          find context-relay-closure -maxdepth 1 -type f -print0 |
+            sort -z |
+            xargs -0 sha256sum > context-relay-closure/SHA256SUMS
+          cat context-relay-closure/SHA256SUMS
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: semgrep-windows-public-source-probe
+          path: semgrep-src/context-relay-closure
+          if-no-files-found: error
+          retention-days: 7
