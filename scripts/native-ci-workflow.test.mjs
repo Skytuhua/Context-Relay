@@ -128,6 +128,57 @@ test('Windows native CI pins and records its exact AMD64 toolchain', async () =>
   }
 });
 
+test('native builders provision locked system dependencies before closed builds', async () => {
+  const [source, lockText, macosScript] = await Promise.all([
+    readFile(workflowUrl, 'utf8'),
+    readFile(sourceLockUrl, 'utf8'),
+    readFile(new URL('../third_party/sidecars/semgrep/build-public-source-macos.sh', import.meta.url), 'utf8'),
+  ]);
+  const lock = JSON.parse(lockText);
+  const windows = job(source, 'native-semgrep-windows-x64-builders', 'native-isolation-windows-x64');
+  const macos = job(source, 'native-semgrep-macos-arm64-builders', 'native-isolation-macos-arm64');
+  const cygwinPackages = [
+    'mingw64-x86_64-curl',
+    'mingw64-x86_64-gmp',
+    'mingw64-x86_64-pcre2',
+    'pkgconf',
+  ];
+  const homebrewFormulae = [
+    'curl',
+    'dwarfutils',
+    'gmp',
+    'libev',
+    'libunwind-headers',
+    'pcre2',
+    'pkgconf',
+    'zstd',
+  ];
+
+  const windowsProvision = windows.indexOf('$cygwinSetup');
+  const windowsClosedBuild = windows.indexOf('build-public-source-windows.ps1');
+  assert.ok(windowsProvision >= 0 && windowsClosedBuild > windowsProvision);
+  assert.match(windows, /C:\\cygwin\\setup-x86_64\.exe/);
+  for (const name of cygwinPackages) assert.match(windows, new RegExp(`['\"]${name}['\"]`));
+  const lockedWindows = lock.toolchains.find(({ distributionTarget }) => distributionTarget === 'windows-x86_64');
+  for (const name of cygwinPackages) assert.ok(lockedWindows.cygwinPackages.includes(name), name);
+
+  const macosProvision = macos.indexOf('brew install');
+  const macosClosedBuild = macos.indexOf('build-public-source-macos.sh');
+  assert.ok(macosProvision >= 0 && macosClosedBuild > macosProvision);
+  assert.match(macos, /HOMEBREW_NO_AUTO_UPDATE=1/);
+  for (const name of homebrewFormulae) {
+    assert.match(macos, new RegExp(`brew install[^\\n]*\\b${name.replace('-', '\\-')}\\b`));
+    assert.match(macosScript, new RegExp(`\\b${name.replace('-', '\\-')}\\b`));
+  }
+  const lockedMacos = lock.toolchains.find(({ distributionTarget }) => distributionTarget === 'aarch64-apple-darwin');
+  const provenance = JSON.parse(await readFile(provenanceUrl, 'utf8'));
+  const provenanceMacos = provenance.toolchains.find(({ distributionTarget }) => distributionTarget === 'aarch64-apple-darwin');
+  assert.deepEqual(lockedMacos.homebrewPackages, homebrewFormulae);
+  assert.deepEqual(provenanceMacos.homebrewPackages, homebrewFormulae);
+  assert.match(macosScript, /brew list --versions/);
+  assert.doesNotMatch(macosScript, /brew install/);
+});
+
 test('the shared Cygwin release policy accepts package-suffixed 3.6.10 builds', () => {
   for (const release of ['3.6.10', '3.6.10-1.x86_64', '3.6.10+patch', '3.6.10.1', '3.6.10(0.341/5/3)']) {
     assert.equal(acceptsCygwinRelease(release, '3.6.10'), true, release);
@@ -265,6 +316,15 @@ test('native builders consume authoritative CI provenance bound to the sealed so
     readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
   ]);
   const provenance = JSON.parse(provenanceText);
+  const sourceLock = JSON.parse(lockBytes);
+  const workflowBytes = Buffer.from(source);
+  const workflowGitBlob = createHash('sha1')
+    .update(`blob ${workflowBytes.length}\0`)
+    .update(workflowBytes)
+    .digest('hex');
+  for (const toolchain of sourceLock.toolchains) {
+    assert.equal(toolchain.workflowGitBlob, workflowGitBlob, `${toolchain.distributionTarget} workflow blob`);
+  }
   assert.equal(provenance.schemaVersion, 1);
   assert.equal(provenance.sourceLock.path, 'third_party/sidecars/semgrep/source-lock.v1.json');
   assert.equal(

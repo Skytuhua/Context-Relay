@@ -277,6 +277,7 @@ async function fixture() {
         nodeVersion: '24.14.0',
         setupNodeAction: 'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020',
         setupAction: 'semgrep/setup-ocaml@a739c5405d73c42ef15a9dc995efc0f87396cc36',
+        homebrewPackages: ['curl', 'dwarfutils', 'gmp', 'libev', 'libunwind-headers', 'pcre2', 'pkgconf', 'zstd'],
         workflowGitBlob: '4'.repeat(40),
       },
       {
@@ -342,6 +343,7 @@ async function fixture() {
         ocamlCompiler: 'ocaml-variants.5.3.0+options,ocaml-option-flambda', opamVersion: '2.5.0', nodeVersion: '24.14.0',
         setupNodeAction: 'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020',
         setupAction: 'semgrep/setup-ocaml@a739c5405d73c42ef15a9dc995efc0f87396cc36',
+        homebrewPackages: ['curl', 'dwarfutils', 'gmp', 'libev', 'libunwind-headers', 'pcre2', 'pkgconf', 'zstd'],
       },
       {
         distributionTarget: 'windows-x86_64', runner: 'windows-2022', ocamlCompiler: '5.3.0', opamVersion: '2.5.2', nodeVersion: '24.14.0', cygwinVersion: '3.6.10',

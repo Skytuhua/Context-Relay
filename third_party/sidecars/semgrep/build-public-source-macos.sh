@@ -16,6 +16,8 @@ UPLOAD_ACTION_SHA=043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
 DOWNLOAD_ACTION_SHA=37930b1c2abaa49bbe596cd826c3c89aef350131
 SOURCE_REVISION=bd614accba811b407ae5c9ec6f1eecd3bdc29911
 TREE_SITTER_SHA=e2b687f74358ab6404730b7fb1a1ced7ddb3780202d37595ecd7b20a8f41861f
+REQUIRED_HOMEBREW_FORMULAE='curl dwarfutils gmp libev libunwind-headers pcre2 pkgconf zstd'
+export HOMEBREW_NO_AUTO_UPDATE=1
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 WORKSPACE=$(CDPATH= cd -- "$SCRIPT_DIR/../../.." && pwd -P)
 CI_PROVENANCE=$SCRIPT_DIR/native-ci-provenance.v1.json
@@ -33,7 +35,7 @@ test "$(opam --version)" = 2.5.0 || die "opam 2.5.0 is required"
 "$NODE" -e '
   const fs = require("node:fs");
   const { createHash } = require("node:crypto");
-  const [path, sourceLockPath, checkout, setupNode, setupOcaml, upload, download] = process.argv.slice(1);
+  const [path, sourceLockPath, checkout, setupNode, setupOcaml, upload, download, formulae] = process.argv.slice(1);
   const provenance = JSON.parse(fs.readFileSync(path, "utf8"));
   const sourceLockHash = createHash("sha256").update(fs.readFileSync(sourceLockPath)).digest("hex");
   if (provenance.schemaVersion !== 1 || provenance.sourceLock?.sha256 !== sourceLockHash
@@ -59,13 +61,28 @@ test "$(opam --version)" = 2.5.0 || die "opam 2.5.0 is required"
   if (provenance.toolchains.length !== 2 || toolchains.size !== 2 || !value || value.runner !== "macos-15"
       || value.ocamlCompiler !== "ocaml-variants.5.3.0+options,ocaml-option-flambda"
       || value.opamVersion !== "2.5.0" || value.nodeVersion !== "24.14.0"
+      || JSON.stringify(value.homebrewPackages) !== JSON.stringify(formulae.split(" "))
       || value.setupNodeAction !== `actions/setup-node@${setupNode}`
       || value.setupAction !== `semgrep/setup-ocaml@${setupOcaml}`) {
     throw new Error("native CI toolchain provenance mismatch");
   }
-' "$CI_PROVENANCE" "$SOURCE_LOCK" "$CHECKOUT_ACTION_SHA" "$NODE_ACTION_SHA" "$ACTION_SHA" "$UPLOAD_ACTION_SHA" "$DOWNLOAD_ACTION_SHA"
+' "$CI_PROVENANCE" "$SOURCE_LOCK" "$CHECKOUT_ACTION_SHA" "$NODE_ACTION_SHA" "$ACTION_SHA" "$UPLOAD_ACTION_SHA" "$DOWNLOAD_ACTION_SHA" "$REQUIRED_HOMEBREW_FORMULAE"
 command -v otool >/dev/null
 command -v shasum >/dev/null
+command -v brew >/dev/null
+for formula in $REQUIRED_HOMEBREW_FORMULAE; do
+  brew list --versions "$formula" >/dev/null || die "required Homebrew formula is missing: $formula"
+done
+test -x /usr/bin/curl-config || die "the Apple system curl-config is required"
+/usr/bin/curl-config --libs >/dev/null || die "the Apple system libcurl configuration is unusable"
+for archive in \
+  "$(brew --prefix gmp)/lib/libgmp.a" \
+  "$(brew --prefix pcre2)/lib/libpcre2-8.a" \
+  "$(brew --prefix dwarfutils)/lib/libdwarf.a" \
+  "$(brew --prefix zstd)/lib/libzstd.a" \
+  "$(brew --prefix libev)/lib/libev.a"; do
+  test -f "$archive" || die "required static library is missing: $archive"
+done
 test -x /usr/bin/sandbox-exec || die "macOS sandbox-exec is required for an offline build"
 case "$WORK_ROOT" in /*) ;; *) die "WORK_ROOT must be absolute" ;; esac
 case "$OUTPUT_ROOT" in /*) ;; *) die "OUTPUT_ROOT must be absolute" ;; esac
@@ -196,7 +213,10 @@ build_once() {
     ./configure
     ./scripts/install-tree-sitter-lib
   )
-  OPAMIGNOREPINDEPENDS=true opam install --locked --update-invariant --deps-only ./semgrep.opam
+  LWT_DISCOVER_ARGUMENTS='--use-libev true' \
+    LIBRARY_PATH="$(brew --prefix)/lib:${LIBRARY_PATH:-}" \
+    OPAMIGNOREPINDEPENDS=true \
+    opam install --locked --update-invariant --assume-depexts --deps-only ./semgrep.opam
   ./scripts/validate-compiler-sha.sh
   opam exec -- make core
 

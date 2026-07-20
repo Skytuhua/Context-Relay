@@ -7007,7 +7007,17 @@
       "nodeVersion": "24.14.0",
       "setupNodeAction": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
       "setupAction": "semgrep/setup-ocaml@a739c5405d73c42ef15a9dc995efc0f87396cc36",
-      "workflowGitBlob": "d6e398649d02ee47f66cf23c83857283ba4255b5"
+      "homebrewPackages": [
+        "curl",
+        "dwarfutils",
+        "gmp",
+        "libev",
+        "libunwind-headers",
+        "pcre2",
+        "pkgconf",
+        "zstd"
+      ],
+      "workflowGitBlob": "4ba20129a74a13fd18f01ca17d5b23502ae71fd3"
     },
     {
       "distributionTarget": "windows-x86_64",
@@ -7024,10 +7034,14 @@
         "m4",
         "mingw64-i686-gcc-core",
         "mingw64-i686-gcc-g++",
+        "mingw64-x86_64-curl",
         "mingw64-x86_64-gcc-core",
         "mingw64-x86_64-gcc-g++",
+        "mingw64-x86_64-gmp",
+        "mingw64-x86_64-pcre2",
         "patch",
-        "perl"
+        "perl",
+        "pkgconf"
       ],
       "builderEvidence": {
         "artifactPath": "builder-evidence.windows-x86_64.v1.json",
@@ -7037,7 +7051,7 @@
         "sha256": null,
         "status": "pending_native_capture"
       },
-      "workflowGitBlob": null,
+      "workflowGitBlob": "4ba20129a74a13fd18f01ca17d5b23502ae71fd3",
       "note": "The action, Node version, package names, and builder-evidence schema are pinned; release enablement still requires a schema-valid native Cygwin package-version capture and two matching native builds."
     }
   ],

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "sourceLock": {
     "path": "third_party/sidecars/semgrep/source-lock.v1.json",
-    "sha256": "dd4a8a1176cb9ca4004af8e98f4de0a8a7af14e10b7aaada542e7d5610d6deb0",
+    "sha256": "1cfaf00f47072f21d348d82860f7fda63f665e50c4ea348c0ddbd1726a5cde69",
     "embeddedActionToolchainStatus": "sealed-historical-metadata-non-authoritative-for-native-ci"
   },
   "actions": [
@@ -41,7 +41,17 @@
       "opamVersion": "2.5.0",
       "nodeVersion": "24.14.0",
       "setupNodeAction": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
-      "setupAction": "semgrep/setup-ocaml@a739c5405d73c42ef15a9dc995efc0f87396cc36"
+      "setupAction": "semgrep/setup-ocaml@a739c5405d73c42ef15a9dc995efc0f87396cc36",
+      "homebrewPackages": [
+        "curl",
+        "dwarfutils",
+        "gmp",
+        "libev",
+        "libunwind-headers",
+        "pcre2",
+        "pkgconf",
+        "zstd"
+      ]
     },
     {
       "distributionTarget": "windows-x86_64",

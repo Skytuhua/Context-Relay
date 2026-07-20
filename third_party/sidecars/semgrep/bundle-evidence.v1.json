@@ -2,8 +2,8 @@
   "bundle": {
     "payloadEntries": 39540,
     "recordedLinks": 85,
-    "sha256": "50fbb2417fd499f368677a80c6794d9a9a22618af6443472ebf84278bfded6b4",
-    "size": 1149573120
+    "sha256": "58963583801021bb7e266d93210bed998978e724ec19fa1558e31371b5143c61",
+    "size": 1149574656
   },
   "bundleGeneratorSha256": "1a2615fe3849fc0ce4f01ec6a4b7d586d0160ceb3f7e13f8f964270b08ce1410",
   "byteIdentical": true,
@@ -11,6 +11,6 @@
   "independentBuilds": 2,
   "schemaVersion": 1,
   "sourceAssetUrl": "https://github.com/Skytuhua/Context-Relay/releases/download/sidecars-semgrep-1.170.0-source.1/semgrep-1.170.0-corresponding-source.tar",
-  "sourceLockSha256": "dd4a8a1176cb9ca4004af8e98f4de0a8a7af14e10b7aaada542e7d5610d6deb0",
+  "sourceLockSha256": "1cfaf00f47072f21d348d82860f7fda63f665e50c4ea348c0ddbd1726a5cde69",
   "status": "source_bundle_reproducible_native_builds_pending"
 }

@@ -46,6 +46,9 @@ const EVIDENCE_FILES = [
   'runtime-dependencies.txt',
   'version.txt',
 ];
+const MACOS_HOMEBREW_PACKAGES = [
+  'curl', 'dwarfutils', 'gmp', 'libev', 'libunwind-headers', 'pcre2', 'pkgconf', 'zstd',
+];
 const MISSING = [
   'two byte-identical executable and runtime-closure inventories per target',
   'schema-valid Windows builder evidence with the exact Cygwin package-version snapshot',
@@ -383,8 +386,11 @@ function validatePendingSource(lock, manifestSemgrep, sourceLockSha256, schemaSh
   }
   exact(macos[0], [
     'distributionTarget', 'runner', 'ocamlCompiler', 'opamVersion', 'nodeVersion',
-    'setupNodeAction', 'setupAction', 'workflowGitBlob',
+    'setupNodeAction', 'setupAction', 'homebrewPackages', 'workflowGitBlob',
   ], 'pending macOS toolchain');
+  if (JSON.stringify(macos[0].homebrewPackages) !== JSON.stringify(MACOS_HOMEBREW_PACKAGES)) {
+    fail('pending macOS Homebrew package provenance is invalid');
+  }
   exact(windows[0], [
     'distributionTarget', 'runner', 'status', 'opamVersion', 'nodeVersion',
     'setupNodeAction', 'setupAction', 'cygwinVersion', 'cygwinPackages',
@@ -432,10 +438,12 @@ function validateProvenance(value, bytes, sourceLockSha256, toolchains) {
   }
   const mac = byTarget.get('aarch64-apple-darwin');
   const win = byTarget.get('windows-x86_64');
-  exact(mac, ['distributionTarget', 'runner', 'ocamlCompiler', 'opamVersion', 'nodeVersion', 'setupNodeAction', 'setupAction'], 'macOS native CI toolchain');
+  exact(mac, ['distributionTarget', 'runner', 'ocamlCompiler', 'opamVersion', 'nodeVersion', 'setupNodeAction', 'setupAction', 'homebrewPackages'], 'macOS native CI toolchain');
   exact(win, ['distributionTarget', 'runner', 'ocamlCompiler', 'opamVersion', 'nodeVersion', 'cygwinVersion', 'setupNodeAction', 'setupAction'], 'Windows native CI toolchain');
   if (mac.runner !== 'macos-15' || mac.ocamlCompiler !== 'ocaml-variants.5.3.0+options,ocaml-option-flambda'
       || mac.opamVersion !== '2.5.0' || mac.nodeVersion !== '24.14.0'
+      || JSON.stringify(mac.homebrewPackages) !== JSON.stringify(MACOS_HOMEBREW_PACKAGES)
+      || JSON.stringify(mac.homebrewPackages) !== JSON.stringify(toolchains.macos.homebrewPackages)
       || mac.setupNodeAction !== toolchains.macos.setupNodeAction || mac.setupAction !== toolchains.macos.setupAction
       || win.runner !== 'windows-2022' || win.ocamlCompiler !== '5.3.0'
       || win.opamVersion !== '2.5.2' || win.nodeVersion !== '24.14.0' || win.cygwinVersion !== '3.6.10'

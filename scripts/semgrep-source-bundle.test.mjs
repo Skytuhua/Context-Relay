@@ -264,11 +264,23 @@ test('public-source build scripts consume the verified bundle through closed nat
   assert.doesNotMatch(mac, /archive-mirrors=\$ARCHIVE_MIRROR/);
   assert.match(mac, /cp -RL "\$CURRENT\/bundle\/pins" "\$CURRENT\/pins"/);
   assert.match(mac, /test -z "\$\(find "\$CURRENT\/pins" -type l -print -quit\)"/);
+  assert.match(mac, /HOMEBREW_NO_AUTO_UPDATE=1/);
+  assert.match(mac, /brew list --versions/);
+  assert.match(mac, /test -x \/usr\/bin\/curl-config/);
+  assert.match(mac, /\/usr\/bin\/curl-config --libs/);
+  for (const archive of ['libgmp.a', 'libpcre2-8.a', 'libdwarf.a', 'libzstd.a', 'libev.a']) {
+    assert.match(mac, new RegExp(archive.replace('.', '\\.')));
+  }
   assert.match(mac, /opam pin add --no-action "\$1" "\$CURRENT\/pins\/\$2"/);
   assert.doesNotMatch(mac, /opam pin add --no-action[^\n]+bundle\/pins/);
   assert.match(
     mac,
-    /OPAMIGNOREPINDEPENDS=true opam install --locked --update-invariant --deps-only \.\/semgrep\.opam/,
+    /LWT_DISCOVER_ARGUMENTS='--use-libev true'/,
+  );
+  assert.match(mac, /LIBRARY_PATH="\$\(brew --prefix\)\/lib:\$\{LIBRARY_PATH:-\}"/);
+  assert.match(
+    mac,
+    /opam install --locked --update-invariant --assume-depexts --deps-only \.\/semgrep\.opam/,
   );
   assert.match(mac, /otool/);
   assert.match(mac, /if ! otool -L[^\n]+>[^\n]+; then/);
@@ -283,6 +295,10 @@ test('public-source build scripts consume the verified bundle through closed nat
   assert.match(
     windows,
     /& \$Opam init --bare --no-setup --no-cygwin-setup default \$Repository/,
+  );
+  assert.match(
+    windows,
+    /& \$Opam switch create \$Switch --empty[^\r\n]*\r?\n\s*\$env:OPAMSWITCH = \$Switch/,
   );
   assert.match(
     windows,

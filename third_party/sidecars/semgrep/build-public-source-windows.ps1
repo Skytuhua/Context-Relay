@@ -211,7 +211,9 @@ function Build-Once([string]$Label) {
   $CacheUri = ([Uri]((Join-Path $Repository 'cache') + [IO.Path]::DirectorySeparatorChar)).AbsoluteUri.TrimEnd('/')
   $ArchiveMirrorsOption = 'archive-mirrors=["{0}"]' -f $CacheUri
   Invoke-Checked { & $Opam option --global $ArchiveMirrorsOption } 'offline archive mirror'
-  Invoke-Checked { & $Opam switch create (Join-Path $script:Current 'switch') --empty } 'empty switch creation'
+  $Switch = Join-Path $script:Current 'switch'
+  Invoke-Checked { & $Opam switch create $Switch --empty } 'empty switch creation'
+  $env:OPAMSWITCH = $Switch
 
   Add-Pin 'ocaml-variants.5.3.0' '3499e5708b0637c12d24d973dd103406a32b8fe8'
   Invoke-Checked { & $Opam install --update-invariant 'ocaml-variants.5.3.0' 'ocaml-option-flambda' } 'compiler installation'

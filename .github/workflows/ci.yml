@@ -114,6 +114,29 @@ jobs:
           opam-repositories: |
             default: https://github.com/ocaml/opam-repository.git#78d29aba187e8362b8ab86c189790c0af9153d4b
           save-opam-post-run: false
+      - name: Provision locked Cygwin MinGW system dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $cygwinSetup = 'C:\cygwin\setup-x86_64.exe'
+          if (-not (Test-Path -LiteralPath $cygwinSetup -PathType Leaf)) { throw 'the pinned setup-ocaml Cygwin installer is missing' }
+          $packages = @(
+            'mingw64-x86_64-curl',
+            'mingw64-x86_64-gmp',
+            'mingw64-x86_64-pcre2',
+            'pkgconf'
+          )
+          $arguments = @(
+            '--quiet-mode',
+            '--symlink-type=sys',
+            '--local-package-dir=C:\cygwin\packages',
+            "--packages=$($packages -join ',')",
+            '--root=C:\cygwin',
+            '--site=https://mirrors.kernel.org/sourceware/cygwin/'
+          )
+          & $cygwinSetup @arguments
+          if ($LASTEXITCODE -ne 0) { throw "Cygwin dependency provisioning failed with exit code $LASTEXITCODE" }
       - name: Verify exact Windows AMD64 builder and fetch pins
         shell: pwsh
         run: |
@@ -354,6 +377,11 @@ jobs:
           opam-repositories: |
             default: https://github.com/ocaml/opam-repository.git#78d29aba187e8362b8ab86c189790c0af9153d4b
           save-opam-post-run: false
+      - name: Provision locked Homebrew system dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install curl dwarfutils gmp libev libunwind-headers pcre2 pkgconf zstd
       - name: Verify exact native arm64 builder and fetch pins
         shell: bash
         run: |
