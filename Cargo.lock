@@ -673,6 +673,7 @@ version = "0.1.0"
 dependencies = [
  "context-relay-core",
  "context-relay-local-ipc",
+ "context-relay-native-runner",
  "context-relay-protocol",
  "dirs",
  "keyring",
@@ -689,17 +690,23 @@ version = "0.1.0"
 dependencies = [
  "bip39",
  "chacha20poly1305",
+ "context-relay-native-runner",
  "context-relay-protocol",
  "ed25519-dalek",
  "fastembed",
  "hkdf",
  "keyring",
+ "libc",
+ "minicbor",
  "rand_core 0.6.4",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
+ "unicode-casefold",
+ "unicode-normalization",
+ "windows-sys 0.61.2",
  "x25519-dalek",
  "zeroize",
 ]
@@ -735,6 +742,25 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "context-relay-native-runner"
+version = "0.1.0"
+dependencies = [
+ "core-foundation",
+ "core-foundation-sys",
+ "libc",
+ "minicbor",
+ "plist",
+ "rand_core 0.6.4",
+ "security-framework",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "unicode-normalization",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5002,6 +5028,12 @@ checksum = "96bd2f2237fe450fcd0a1d2f5f4e91711124f7857ba2e964247776ebeeb7b0c4"
 dependencies = [
  "unic-common",
 ]
+
+[[package]]
+name = "unicode-casefold"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f66b1c8f8caa2ab31dc6d3f35386f16efdab89668f93411e565ac368908e8f"
 
 [[package]]
 name = "unicode-ident"

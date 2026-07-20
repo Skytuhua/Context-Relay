@@ -10,16 +10,29 @@ rust-version.workspace = true
 [dependencies]
 bip39.workspace = true
 chacha20poly1305.workspace = true
+context-relay-native-runner = { version = "0.1.0", path = "../native-runner" }
 context-relay-protocol = { version = "0.1.0", path = "../protocol" }
 ed25519-dalek.workspace = true
 fastembed.workspace = true
 hkdf.workspace = true
 keyring.workspace = true
+minicbor.workspace = true
 rand_core.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+unicode-normalization.workspace = true
+unicode-casefold.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.186"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+] }

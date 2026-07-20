@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "project": "RuleSync",
+  "version": "14.0.1",
+  "tag": "v14.0.1",
+  "repository": "https://github.com/dyoshikawa/rulesync",
+  "sourceRevision": "4c5574fd2a2633f99c879c4a3cc386c4933d1caf",
+  "sourceTree": "deb1c8cbead9acfd5f01c9d4914d0535e155ecc2",
+  "license": "MIT",
+  "releaseEvidence": {
+    "checksumFileSha256": "ad17c6bc28ddeb6f9b47c4c2cc701e53a9285c529fee9e40d14ef2e405ed2175",
+    "assets": [
+      {
+        "target": "windows-x86_64",
+        "name": "rulesync-windows-x64.exe",
+        "size": 107349504,
+        "sha256": "b735108ff1a93f929f2d166054f7f35d46ab4dc275f51484f8ddac811dc59ff2"
+      },
+      {
+        "target": "macos-aarch64",
+        "name": "rulesync-darwin-arm64",
+        "size": 72379106,
+        "sha256": "8b1c7fb10b98d32bdb1c2f4a6a2b72f063c95d2cd0c93755697d2fe0f01e92e2"
+      },
+      {
+        "target": "macos-x86_64",
+        "name": "rulesync-darwin-x64",
+        "packagingEnabled": false,
+        "sha256": "47774a477172f6c1ffda2cdbfba8b9d13a353e8dad96bca520262a61d1b493cf"
+      }
+    ]
+  },
+  "commandTemplate": {
+    "format": "sha256-nul-argv-v1",
+    "argv": [
+      "rulesync",
+      "generate",
+      "--targets",
+      "<closed-target>",
+      "--features",
+      "<closed-features>",
+      "--output-roots",
+      "output",
+      "--config",
+      "rulesync.jsonc",
+      "--input-root",
+      "input",
+      "--silent"
+    ],
+    "sha256": "d502057d3caf57d342c26da57f05051f2f38b9c102185342fdd43c911a16298c"
+  }
+}

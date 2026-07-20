@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 context-relay-core = { version = "0.1.0", path = "../core" }
 context-relay-local-ipc = { version = "0.1.0", path = "../local-ipc" }
+context-relay-native-runner = { version = "0.1.0", path = "../native-runner" }
 context-relay-protocol = { version = "0.1.0", path = "../protocol" }
 dirs.workspace = true
 keyring.workspace = true

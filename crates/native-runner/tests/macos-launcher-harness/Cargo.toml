@@ -1,0 +1,45 @@
+[package]
+name = "context-relay-macos-launcher-harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+ci-candidate-sidecar-smoke = ["context-relay-native-runner/ci-candidate-sidecar-smoke"]
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "context-relay-native-helper"
+path = "src/bin/production_helper.rs"
+test = false
+
+[[bin]]
+name = "macos_adapter_bad_helper"
+path = "src/bin/macos_adapter_bad_helper.rs"
+test = false
+
+[[bin]]
+name = "macos_adapter_sidecar"
+path = "src/bin/macos_adapter_sidecar.rs"
+test = false
+
+[[bin]]
+name = "macos_replacement_probe"
+path = "src/bin/macos_replacement_probe.rs"
+test = false
+
+[target.'cfg(target_os = "macos")'.dependencies]
+context-relay-native-runner = { path = "../.." }
+core-foundation = "0.10.1"
+core-foundation-sys = "0.8.7"
+libc = "0.2.186"
+objc2-foundation = { version = "0.3.2", features = ["NSPathUtilities", "NSString"] }
+plist = "1.10.0"
+security-framework = { version = "3.7.0", default-features = false }
+serde_json = "1.0.145"
+sha2 = "0.10.9"

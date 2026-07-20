@@ -1,0 +1,54 @@
+[package]
+name = "context-relay-native-runner"
+description = "Closed, isolated sidecar execution boundary for Context Relay"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+ci-candidate-sidecar-smoke = []
+
+[[bin]]
+name = "context-relay-native-helper"
+path = "src/bin/context-relay-native-helper.rs"
+
+[[bin]]
+name = "context-relay-sidecar-installer"
+path = "src/bin/context-relay-sidecar-installer.rs"
+
+[dependencies]
+minicbor.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+core-foundation-sys = "0.8.7"
+libc = "0.2.186"
+plist = "1.10.0"
+rand_core.workspace = true
+security-framework = { version = "3.7.0", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+rand_core.workspace = true
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Globalization",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Security_Isolation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Console",
+  "Win32_System_JobObjects",
+  "Win32_System_Memory",
+  "Win32_System_Pipes",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+] }

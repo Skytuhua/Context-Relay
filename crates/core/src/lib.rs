@@ -1,4 +1,5 @@
 pub mod crypto;
+pub mod native_transaction;
 pub mod search;
 pub mod vault;
 

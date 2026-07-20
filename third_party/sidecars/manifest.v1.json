@@ -1,0 +1,393 @@
+{
+  "schemaVersion": 1,
+  "digestFormat": "sha256-nul-argv-v1",
+  "allowedReleaseHosts": [
+    "github.com",
+    "release-assets.githubusercontent.com"
+  ],
+  "tools": [
+    {
+      "id": "rulesync",
+      "version": "14.0.1",
+      "source": {
+        "repository": "https://github.com/dyoshikawa/rulesync",
+        "revision": "4c5574fd2a2633f99c879c4a3cc386c4933d1caf",
+        "tree": "deb1c8cbead9acfd5f01c9d4914d0535e155ecc2",
+        "materialPath": "third_party/sidecars/rulesync/source-lock.v1.json",
+        "materialSha256": "89eeb2b8c81384a7373450033b652ebdcc8e2282bfd20ac40348e2966b717063"
+      },
+      "license": {
+        "spdx": "MIT",
+        "path": "third_party/sidecars/licenses/rulesync-MIT.txt",
+        "sha256": "2c139f206073923dac718cac1e4500eb120d77733efc43a6b022ba59919e0593"
+      },
+      "relinking": null,
+      "materials": [],
+      "commandTemplate": {
+        "id": "rulesync-generate-v1",
+        "argv": [
+          "rulesync",
+          "generate",
+          "--targets",
+          "<closed-target>",
+          "--features",
+          "<closed-features>",
+          "--output-roots",
+          "output",
+          "--config",
+          "rulesync.jsonc",
+          "--input-root",
+          "input",
+          "--silent"
+        ],
+        "sha256": "d502057d3caf57d342c26da57f05051f2f38b9c102185342fdd43c911a16298c"
+      },
+      "targets": [
+        {
+          "target": "windows-x86_64",
+          "enabled": true,
+          "disabledReason": null,
+          "reproducibleBuilds": 1,
+          "correspondingSourceComplete": true,
+          "download": {
+            "url": "https://github.com/dyoshikawa/rulesync/releases/download/v14.0.1/rulesync-windows-x64.exe",
+            "format": "raw",
+            "size": 107349504,
+            "sha256": "b735108ff1a93f929f2d166054f7f35d46ab4dc275f51484f8ddac811dc59ff2",
+            "entries": [
+              {
+                "path": "rulesync-windows-x64.exe",
+                "type": "file",
+                "size": 107349504
+              }
+            ],
+            "extractPath": "rulesync-windows-x64.exe"
+          },
+          "executable": {
+            "path": "rulesync.exe",
+            "size": 107349504,
+            "sha256": "b735108ff1a93f929f2d166054f7f35d46ab4dc275f51484f8ddac811dc59ff2"
+          },
+          "closure": [
+            {
+              "path": "rulesync.exe",
+              "size": 107349504,
+              "sha256": "b735108ff1a93f929f2d166054f7f35d46ab4dc275f51484f8ddac811dc59ff2",
+              "executable": true
+            }
+          ]
+        },
+        {
+          "target": "macos-aarch64",
+          "enabled": true,
+          "disabledReason": null,
+          "reproducibleBuilds": 1,
+          "correspondingSourceComplete": true,
+          "download": {
+            "url": "https://github.com/dyoshikawa/rulesync/releases/download/v14.0.1/rulesync-darwin-arm64",
+            "format": "raw",
+            "size": 72379106,
+            "sha256": "8b1c7fb10b98d32bdb1c2f4a6a2b72f063c95d2cd0c93755697d2fe0f01e92e2",
+            "entries": [
+              {
+                "path": "rulesync-darwin-arm64",
+                "type": "file",
+                "size": 72379106
+              }
+            ],
+            "extractPath": "rulesync-darwin-arm64"
+          },
+          "executable": {
+            "path": "rulesync",
+            "size": 72379106,
+            "sha256": "8b1c7fb10b98d32bdb1c2f4a6a2b72f063c95d2cd0c93755697d2fe0f01e92e2"
+          },
+          "closure": [
+            {
+              "path": "rulesync",
+              "size": 72379106,
+              "sha256": "8b1c7fb10b98d32bdb1c2f4a6a2b72f063c95d2cd0c93755697d2fe0f01e92e2",
+              "executable": true
+            }
+          ]
+        },
+        {
+          "target": "macos-x86_64",
+          "enabled": false,
+          "disabledReason": "packaging_disabled_for_v1_target",
+          "reproducibleBuilds": 0,
+          "correspondingSourceComplete": true,
+          "download": null,
+          "executable": null,
+          "closure": []
+        }
+      ]
+    },
+    {
+      "id": "gitleaks",
+      "version": "8.30.1",
+      "source": {
+        "repository": "https://github.com/gitleaks/gitleaks",
+        "revision": "83d9cd684c87d95d656c1458ef04895a7f1cbd8e",
+        "tree": "18ffe9bab74b97087f58f56c9cfe0fe28ddc97a6",
+        "materialPath": "third_party/sidecars/gitleaks/source-lock.v1.json",
+        "materialSha256": "b29f95dc5b9a0d15f432849e099bd4c0015d7644f0f8baf7857199629e316f97"
+      },
+      "license": {
+        "spdx": "MIT",
+        "path": "third_party/sidecars/licenses/gitleaks-MIT.txt",
+        "sha256": "e3884b252b3bfc045e55be43a34d1e80da070bc6f804ac95bf4660e97d62ebc6"
+      },
+      "relinking": null,
+      "materials": [
+        {
+          "role": "policy",
+          "path": "third_party/sidecars/policies/gitleaks.toml",
+          "sha256": "554effdde4d972c52f1c267a26bd65821e2e4622784faadeb65d6d61a1ff76d5"
+        },
+        {
+          "role": "empty-ignore",
+          "path": "third_party/sidecars/policies/gitleaks.empty-ignore",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "commandTemplate": {
+        "id": "gitleaks-dir-v1",
+        "argv": [
+          "gitleaks",
+          "--no-banner",
+          "--no-color",
+          "--log-level=info",
+          "--redact=100",
+          "--exit-code=10",
+          "--report-format=json",
+          "--report-path=-",
+          "--config",
+          "<trusted-stage-config>",
+          "--gitleaks-ignore-path",
+          "<trusted-empty-ignore>",
+          "--ignore-gitleaks-allow",
+          "--max-target-megabytes=0",
+          "--max-archive-depth=0",
+          "--max-decode-depth=1",
+          "--timeout=30",
+          "--diagnostics=",
+          "dir",
+          "--follow-symlinks=false",
+          "<stage-scan-root>"
+        ],
+        "sha256": "b8ed2e8e04852337834b532efb53b0a7280204658bc10ab8c0a826fb32178c1e"
+      },
+      "targets": [
+        {
+          "target": "windows-x86_64",
+          "enabled": true,
+          "disabledReason": null,
+          "reproducibleBuilds": 1,
+          "correspondingSourceComplete": true,
+          "download": {
+            "url": "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_windows_x64.zip",
+            "format": "zip",
+            "size": 8438883,
+            "sha256": "d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e",
+            "entries": [
+              { "path": "LICENSE", "type": "file", "size": 1069 },
+              { "path": "README.md", "type": "file", "size": 29998 },
+              { "path": "gitleaks.exe", "type": "file", "size": 22575104 }
+            ],
+            "extractPath": "gitleaks.exe"
+          },
+          "executable": {
+            "path": "gitleaks.exe",
+            "size": 22575104,
+            "sha256": "17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c"
+          },
+          "closure": [
+            {
+              "path": "gitleaks.exe",
+              "size": 22575104,
+              "sha256": "17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c",
+              "executable": true
+            }
+          ]
+        },
+        {
+          "target": "macos-aarch64",
+          "enabled": true,
+          "disabledReason": null,
+          "reproducibleBuilds": 1,
+          "correspondingSourceComplete": true,
+          "download": {
+            "url": "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_darwin_arm64.tar.gz",
+            "format": "tar.gz",
+            "size": 7897593,
+            "sha256": "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5",
+            "entries": [
+              { "path": "LICENSE", "type": "file", "size": 1069 },
+              { "path": "README.md", "type": "file", "size": 29998 },
+              { "path": "gitleaks", "type": "file", "size": 21324882 }
+            ],
+            "extractPath": "gitleaks"
+          },
+          "executable": {
+            "path": "gitleaks",
+            "size": 21324882,
+            "sha256": "ba52fb1bfabbcde42f032afad3d6e0b19dff8ed105229a16e7caa338bbc0e84f"
+          },
+          "closure": [
+            {
+              "path": "gitleaks",
+              "size": 21324882,
+              "sha256": "ba52fb1bfabbcde42f032afad3d6e0b19dff8ed105229a16e7caa338bbc0e84f",
+              "executable": true
+            }
+          ]
+        },
+        {
+          "target": "macos-x86_64",
+          "enabled": false,
+          "disabledReason": "packaging_disabled_for_v1_target",
+          "reproducibleBuilds": 0,
+          "correspondingSourceComplete": true,
+          "download": null,
+          "executable": null,
+          "closure": []
+        }
+      ]
+    },
+    {
+      "id": "semgrep",
+      "version": "1.170.0",
+      "source": {
+        "repository": "https://github.com/semgrep/semgrep",
+        "revision": "bd614accba811b407ae5c9ec6f1eecd3bdc29911",
+        "tree": "ad8e607874820dc7253d58997736463ed258ea34",
+        "materialPath": "third_party/sidecars/semgrep/source-lock.v1.json",
+        "materialSha256": "dd4a8a1176cb9ca4004af8e98f4de0a8a7af14e10b7aaada542e7d5610d6deb0"
+      },
+      "license": {
+        "spdx": "LGPL-2.1-or-later",
+        "path": "third_party/sidecars/licenses/semgrep-LGPL-2.1-or-later.txt",
+        "sha256": "20c17d8b8c48a600800dfd14f95d5cb9ff47066a9641ddeab48dc54aec96e331"
+      },
+      "relinking": {
+        "path": "third_party/sidecars/semgrep/RELINKING.md",
+        "sha256": "aac857bc70fac3e3775dde65dddddbd472540107818ca1d4b3846e655443f170"
+      },
+      "materials": [
+        {
+          "role": "patch-inventory",
+          "path": "third_party/sidecars/semgrep/patches.v1.json",
+          "sha256": "0588726d0848cc67ddd23acf1dc3881415ac259154d75f862f6d0f9a2b4b9f25"
+        },
+        {
+          "role": "macos-build",
+          "path": "third_party/sidecars/semgrep/build-public-source-macos.sh",
+          "sha256": "d675126d8705b02b223e6e4b29b076db3270df75c1708bc9bf22d10a5ee27102"
+        },
+        {
+          "role": "windows-build",
+          "path": "third_party/sidecars/semgrep/build-public-source-windows.ps1",
+          "sha256": "629a71b9180efe2bd8cd87b6305a779e12855718f2eaee6b69473a9fea231c3e"
+        },
+        {
+          "role": "windows-builder-evidence-schema",
+          "path": "third_party/sidecars/semgrep/builder-evidence.windows-x86_64.v1.schema.json",
+          "sha256": "0a1a30e67488bd670e88d08f44d31abdc5bb828f163acefdd1c5d6bc37468e59"
+        },
+        {
+          "role": "transitive-license",
+          "path": "third_party/sidecars/licenses/tree-sitter-MIT.txt",
+          "sha256": "5f9cf9fb6acb1972b35ae29119ce563bb60ec097656bc4b69b9bac2d04c7a147"
+        },
+        {
+          "role": "native-ci-provenance",
+          "path": "third_party/sidecars/semgrep/native-ci-provenance.v1.json",
+          "sha256": "c3cc4a0373bd805a56527c5b9b9662be850b96297697a4aac7bba38feeca8f95"
+        },
+        {
+          "role": "source-inventory-generator",
+          "path": "scripts/semgrep-source-inventory.mjs",
+          "sha256": "03a1128e8238dbdd079320f9d0023b0d3e2512ea659c2e09f8b03f34a07f303f"
+        },
+        {
+          "role": "source-bundle-generator",
+          "path": "scripts/semgrep-source-bundle.mjs",
+          "sha256": "1a2615fe3849fc0ce4f01ec6a4b7d586d0160ceb3f7e13f8f964270b08ce1410"
+        },
+        {
+          "role": "source-bundle-evidence",
+          "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
+          "sha256": "ffaf01496d91988a8329b2b4e2d6620d9ae8619f480c498d36a8678ff9acc201"
+        },
+        {
+          "role": "manifest-rule",
+          "path": "third_party/sidecars/semgrep/MANIFEST.sha256.md",
+          "sha256": "e34d9f85a8c5854accac128823640e28b28f3fc9321d9d95f40b6830d36b0d29"
+        },
+        {
+          "role": "package-policy",
+          "path": "third_party/sidecars/policies/semgrep-package.yml",
+          "sha256": "f11b8cfb1143a66d1c21ebfd2d3ed4904da9f5026f355beabc9dcb286c4f5fec"
+        }
+      ],
+      "commandTemplate": {
+        "id": "osemgrep-scan-v1",
+        "argv": [
+          "osemgrep",
+          "scan",
+          "--experimental",
+          "--oss-only",
+          "--metrics=off",
+          "--disable-version-check",
+          "--strict",
+          "--error",
+          "--json",
+          "--quiet",
+          "--no-git-ignore",
+          "--x-ignore-semgrepignore-files",
+          "--jobs=1",
+          "--timeout=30",
+          "--timeout-threshold=1",
+          "--max-target-bytes=8388608",
+          "--config",
+          "<staged-rule>",
+          "<staged-target>"
+        ],
+        "sha256": "4b22d7b78a3ce42b7bcfa54cfd5fee1947afbac65776e2135d95e3a629285e49"
+      },
+      "targets": [
+        {
+          "target": "windows-x86_64",
+          "enabled": false,
+          "disabledReason": "pending_two_matching_public_source_builds_and_no_python_smoke",
+          "reproducibleBuilds": 0,
+          "correspondingSourceComplete": false,
+          "download": null,
+          "executable": null,
+          "closure": []
+        },
+        {
+          "target": "macos-aarch64",
+          "enabled": false,
+          "disabledReason": "pending_two_matching_public_source_builds_post_sign_inventory_and_sandbox_smoke",
+          "reproducibleBuilds": 0,
+          "correspondingSourceComplete": false,
+          "download": null,
+          "executable": null,
+          "closure": []
+        },
+        {
+          "target": "macos-x86_64",
+          "enabled": false,
+          "disabledReason": "unsupported_v1_distribution_target",
+          "reproducibleBuilds": 0,
+          "correspondingSourceComplete": false,
+          "download": null,
+          "executable": null,
+          "closure": []
+        }
+      ]
+    }
+  ]
+}

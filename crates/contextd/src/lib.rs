@@ -1,11 +1,20 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread::JoinHandle,
     time::Duration,
 };
 
-use context_relay_core::vault::{DatabaseKeyStore, PlatformKeyStore, Vault, VaultError};
+use context_relay_core::{
+    native_transaction::{
+        engine::BoundaryError,
+        recovery::{
+            OsNativeRecoveryIo, RecoveryCleanup, RecoveryOutcome, RecoverySandboxIdentity,
+            recover_native_transactions,
+        },
+    },
+    vault::{DatabaseKeyStore, PlatformKeyStore, Vault, VaultError},
+};
 use context_relay_local_ipc::{
     AuthenticatedConnection, AuthenticatedRequest, CONNECTION_LIMIT, ConnectedStream,
     INSTALLATION_TOKEN_CREDENTIAL_ACCOUNT, INSTALLATION_TOKEN_CREDENTIAL_SERVICE,
@@ -25,6 +34,7 @@ use tokio::{
 
 pub const VAULT_CREDENTIAL_ID: &str = "vault-key-v1";
 const WORK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(29);
+const NATIVE_SANDBOX_DIRECTORY: &str = "native-sandboxes";
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum DaemonError {
@@ -85,6 +95,9 @@ trait WorkerHook: Send + Sync {
     fn after_enqueue(&self) {}
 }
 
+#[cfg(test)]
+type StartupRecovery = Arc<dyn Fn(&mut Vault) -> Result<(), DaemonError> + Send + Sync + 'static>;
+
 #[derive(Default)]
 struct PlatformInstallationTokenProvider;
 
@@ -113,6 +126,8 @@ struct VaultConfig {
     credential_id: String,
     key_store: Arc<dyn DatabaseKeyStore>,
     worker_hook: Option<Arc<dyn WorkerHook>>,
+    #[cfg(test)]
+    startup_recovery: Option<StartupRecovery>,
 }
 
 impl VaultConfig {
@@ -126,6 +141,8 @@ impl VaultConfig {
             credential_id: credential_id.into(),
             key_store,
             worker_hook: None,
+            #[cfg(test)]
+            startup_recovery: None,
         }
     }
 
@@ -134,6 +151,121 @@ impl VaultConfig {
         self.worker_hook = Some(worker_hook);
         self
     }
+
+    #[cfg(test)]
+    fn with_startup_recovery(mut self, startup_recovery: StartupRecovery) -> Self {
+        self.startup_recovery = Some(startup_recovery);
+        self
+    }
+}
+
+fn recover_startup_native_transactions(
+    vault: &mut Vault,
+    vault_path: &Path,
+) -> Result<(), DaemonError> {
+    let private_root = vault_path
+        .parent()
+        .ok_or(DaemonError::Startup)?
+        .join(NATIVE_SANDBOX_DIRECTORY);
+    let mut io = OsNativeRecoveryIo::new(|identity, outcome| {
+        cleanup_recovered_sandbox(&private_root, &identity, outcome)
+    });
+    recover_native_transactions(vault, &mut io)
+        .map(|_| ())
+        .map_err(|_| DaemonError::Startup)
+}
+
+#[cfg(windows)]
+fn cleanup_recovered_sandbox(
+    _private_root: &Path,
+    identity: &RecoverySandboxIdentity,
+    _outcome: RecoveryOutcome,
+) -> Result<RecoveryCleanup, BoundaryError> {
+    let RecoverySandboxIdentity::Windows { moniker, sid } = identity else {
+        return Err(BoundaryError::new(
+            "sandbox identity does not match the current platform",
+        ));
+    };
+    context_relay_native_runner::windows::cleanup_recovered_profile(moniker, sid)
+        .map(|()| RecoveryCleanup::Cleaned)
+        .map_err(|error| BoundaryError::new(error.to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_recovered_sandbox(
+    private_root: &Path,
+    identity: &RecoverySandboxIdentity,
+    outcome: RecoveryOutcome,
+) -> Result<RecoveryCleanup, BoundaryError> {
+    use context_relay_core::vault::MacGenerationState;
+    use context_relay_native_runner::macos::{
+        GenerationState, MacRecoveryCleanup, MacRecoveryIdentity, MacRecoveryOutcome,
+        MacRootIdentity, cleanup_recovered_generation,
+    };
+
+    let RecoverySandboxIdentity::Macos {
+        generation_id,
+        bundle_id,
+        guardian_pgid,
+        bundle_root,
+        container_root,
+        state,
+        ..
+    } = identity
+    else {
+        return Err(BoundaryError::new(
+            "sandbox identity does not match the current platform",
+        ));
+    };
+    let state = match state {
+        MacGenerationState::Prepared => GenerationState::Prepared,
+        MacGenerationState::Active => GenerationState::Active,
+        MacGenerationState::Retired => GenerationState::Retired,
+        MacGenerationState::Poisoned => GenerationState::Poisoned,
+    };
+    let outcome = match outcome {
+        RecoveryOutcome::Committed => MacRecoveryOutcome::Committed,
+        RecoveryOutcome::Restored => MacRecoveryOutcome::Restored,
+        RecoveryOutcome::Conflict => MacRecoveryOutcome::Conflict,
+    };
+    let bundle_identity = bundle_root
+        .as_deref()
+        .map(MacRootIdentity::decode)
+        .transpose()
+        .map_err(|error| BoundaryError::new(error.to_string()))?;
+    let container_identity = container_root
+        .as_deref()
+        .map(MacRootIdentity::decode)
+        .transpose()
+        .map_err(|error| BoundaryError::new(error.to_string()))?;
+    cleanup_recovered_generation(
+        private_root,
+        &MacRecoveryIdentity::new(
+            generation_id,
+            bundle_id,
+            *guardian_pgid,
+            bundle_identity.as_ref(),
+            container_identity.as_ref(),
+        ),
+        state,
+        outcome,
+    )
+    .map(|cleanup| match cleanup {
+        MacRecoveryCleanup::Cleaned => RecoveryCleanup::Cleaned,
+        MacRecoveryCleanup::Conflict => RecoveryCleanup::Conflict,
+    })
+    .map_err(|error| BoundaryError::new(error.to_string()))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn cleanup_recovered_sandbox(
+    _private_root: &Path,
+    _identity: &RecoverySandboxIdentity,
+    _outcome: RecoveryOutcome,
+) -> Result<RecoveryCleanup, BoundaryError> {
+    Err(BoundaryError::new(
+        "native recovery is unavailable on this platform",
+    ))
 }
 
 pub struct DaemonConfig {
@@ -173,6 +305,12 @@ impl DaemonConfig {
     #[cfg(test)]
     fn with_worker_hook(mut self, worker_hook: Arc<dyn WorkerHook>) -> Self {
         self.vault = self.vault.with_worker_hook(worker_hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_startup_recovery(mut self, startup_recovery: StartupRecovery) -> Self {
+        self.vault = self.vault.with_startup_recovery(startup_recovery);
         self
     }
 }
@@ -648,6 +786,15 @@ impl VaultWorker {
                         )
                         .map_err(|_| DaemonError::Startup)
                     });
+                let opened = opened.and_then(|mut vault| {
+                    #[cfg(test)]
+                    if let Some(recovery) = &config.startup_recovery {
+                        recovery(&mut vault)?;
+                        return Ok(vault);
+                    }
+                    recover_startup_native_transactions(&mut vault, &config.path)?;
+                    Ok(vault)
+                });
                 match opened {
                     Ok(vault) => {
                         if ready_sender.send(Ok(())).is_err() {
@@ -825,13 +972,24 @@ mod tests {
         },
     };
 
+    #[cfg(target_os = "macos")]
+    use context_relay_core::vault::{
+        MacGenerationState, NativeSandboxCleanupState, NativeTransactionStatus,
+    };
+    use context_relay_core::{
+        native_transaction::recovery::{OsNativeRecoveryIo, recover_native_transactions},
+        vault::{NativePlanWrite, NativeSandboxIdentity},
+    };
     use context_relay_local_ipc::{
         AuthAcceptedV1, AuthTranscriptV1, ConnectedStream, InstallationToken, IpcError,
         ServerHelloV1, connect, create_proof, read_json, write_json,
     };
+    #[cfg(target_os = "macos")]
+    use context_relay_native_runner::MacRootIdentity;
     use context_relay_protocol::{
         CancelParams, ClientRole, EmptyParams, HelloParams, JsonRpcErrorV1, JsonRpcRequestV1,
-        JsonRpcSuccessV1, JsonRpcVersion, LocalRequest, PROTOCOL_VERSION, RecordId,
+        JsonRpcSuccessV1, JsonRpcVersion, LocalRequest, PROTOCOL_VERSION, PlanId, RecordId,
+        Sha256Digest,
     };
     use zeroize::Zeroizing;
 
@@ -875,6 +1033,164 @@ mod tests {
         };
         let (started, ()) = tokio::join!(Daemon::start(config), inspect);
         drop(started.unwrap());
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn endpoint_is_unpublished_while_startup_recovery_is_blocked() {
+        let runtime = test_runtime("recovery-before-bind");
+        let provider = Arc::new(FixedTokenProvider::default());
+        let keys = Arc::new(MemoryKeyStore::default());
+        let path = unique_temp_path("recovery-before-bind").join("vault.db");
+        let (entered, entered_rx) = oneshot::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let recovery_gate = gate.clone();
+        let entered = Mutex::new(Some(entered));
+        let recovery = Arc::new(move |_vault: &mut Vault| {
+            if let Some(entered) = entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            let (released, wake) = &*recovery_gate;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Ok(())
+        });
+        let config =
+            test_config(runtime.clone(), path, keys, provider).with_startup_recovery(recovery);
+
+        let inspect = async {
+            entered_rx.await.unwrap();
+            assert!(matches!(
+                connect(&runtime).await,
+                Err(IpcError::EndpointNotFound)
+            ));
+            let (released, wake) = &*gate;
+            *released.lock().unwrap() = true;
+            wake.notify_all();
+        };
+        let (started, ()) = tokio::join!(Daemon::start(config), inspect);
+        drop(started.unwrap());
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn startup_recovery_failure_releases_singleton_and_never_publishes_endpoint() {
+        let runtime = test_runtime("recovery-failure");
+        let provider = Arc::new(FixedTokenProvider::default());
+        let keys = Arc::new(MemoryKeyStore::default());
+        let path = unique_temp_path("recovery-failure").join("vault.db");
+        let recovery = Arc::new(|_vault: &mut Vault| Err(DaemonError::Startup));
+        let config =
+            test_config(runtime.clone(), path, keys, provider).with_startup_recovery(recovery);
+
+        assert!(matches!(
+            Daemon::start(config).await,
+            Err(DaemonError::Startup)
+        ));
+        assert!(matches!(
+            connect(&runtime).await,
+            Err(IpcError::EndpointNotFound)
+        ));
+        drop(InstanceGuard::acquire(&runtime).unwrap());
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn startup_recovery_processes_every_pending_transaction_before_listener_bind() {
+        let runtime = test_runtime("recover-all-before-bind");
+        let provider = Arc::new(FixedTokenProvider::default());
+        let keys = Arc::new(MemoryKeyStore::default());
+        let path = unique_temp_path("recover-all-before-bind").join("vault.db");
+        seed_pending_native_transactions(&path, keys.as_ref());
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let recovery_cleanups = cleanups.clone();
+        let recovery = Arc::new(move |vault: &mut Vault| {
+            let mut io = OsNativeRecoveryIo::new(|_, _| {
+                recovery_cleanups.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            recover_native_transactions(vault, &mut io)
+                .map(|_| ())
+                .map_err(|_| DaemonError::Startup)
+        });
+        let config = test_config(runtime.clone(), path.clone(), keys.clone(), provider)
+            .with_startup_recovery(recovery);
+
+        let daemon = Daemon::start(config).await.unwrap();
+
+        assert_eq!(cleanups.load(Ordering::SeqCst), 2);
+        drop(daemon);
+        let vault = Vault::open(&path, "test-vault-key", keys.as_ref()).unwrap();
+        assert!(vault.recoverable_native_transactions().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn production_macos_cleanup_conflict_publishes_and_restart_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let runtime = test_runtime("macos-cleanup-conflict");
+        let provider = Arc::new(FixedTokenProvider::default());
+        let keys = Arc::new(MemoryKeyStore::default());
+        let root = unique_temp_path("macos-cleanup-conflict");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let path = root.join("vault.db");
+        let private_root = root.join(NATIVE_SANDBOX_DIRECTORY);
+        std::fs::create_dir(&private_root).unwrap();
+        std::fs::set_permissions(&private_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let transaction_id = uuid::Uuid::now_v7().to_string();
+        let plan_id = uuid::Uuid::now_v7().to_string();
+        let generation_id = uuid::Uuid::now_v7().simple().to_string();
+        seed_terminal_macos_generation(
+            &path,
+            keys.as_ref(),
+            &transaction_id,
+            &plan_id,
+            &generation_id,
+        );
+
+        let daemon = Daemon::start(test_config(
+            runtime.clone(),
+            path.clone(),
+            keys.clone(),
+            provider.clone(),
+        ))
+        .await
+        .unwrap();
+        drop(connect(&runtime).await.unwrap());
+        drop(daemon);
+
+        let vault = Vault::open(&path, "test-vault-key", keys.as_ref()).unwrap();
+        let recovered = vault.native_transaction(&transaction_id).unwrap().unwrap();
+        assert_eq!(recovered.status, NativeTransactionStatus::Restored);
+        assert_eq!(
+            recovered.sandbox_cleanup_state,
+            NativeSandboxCleanupState::Conflict
+        );
+        assert_eq!((recovered.current_step, recovered.entered_step), (20, 20));
+        assert!(vault.recoverable_native_transactions().unwrap().is_empty());
+        drop(vault);
+
+        let daemon = Daemon::start(test_config(
+            runtime.clone(),
+            path.clone(),
+            keys.clone(),
+            provider,
+        ))
+        .await
+        .unwrap();
+        drop(connect(&runtime).await.unwrap());
+        drop(daemon);
+
+        let vault = Vault::open(&path, "test-vault-key", keys.as_ref()).unwrap();
+        assert_eq!(
+            vault.native_transaction(&transaction_id).unwrap().unwrap(),
+            recovered
+        );
+        assert!(vault.recoverable_native_transactions().unwrap().is_empty());
     }
 
     #[cfg(any(windows, target_os = "macos"))]
@@ -1838,6 +2154,115 @@ mod tests {
             VaultConfig::new(path, "test-vault-key", keys),
             provider,
         )
+    }
+
+    fn seed_pending_native_transactions(path: &std::path::Path, keys: &dyn DatabaseKeyStore) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut vault = Vault::open(path, "test-vault-key", keys).unwrap();
+        for (index, (transaction_id, plan_id)) in [
+            (
+                "018f22e2-79b0-7cc8-98c4-dc0c0c073980",
+                "018f22e2-79b0-7cc8-98c4-dc0c0c073981",
+            ),
+            (
+                "018f22e2-79b0-7cc8-98c4-dc0c0c073982",
+                "018f22e2-79b0-7cc8-98c4-dc0c0c073983",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let plan_id = plan_id.parse::<PlanId>().unwrap();
+            vault
+                .begin_native_transaction(
+                    transaction_id,
+                    NativePlanWrite {
+                        plan_id: &plan_id,
+                        approval_hash: &Sha256Digest([index as u8 + 1; 32]),
+                        payload: b"startup-recovery-plan",
+                        created_ms: index as u64 + 1,
+                        expires_ms: index as u64 + 2,
+                    },
+                    test_sandbox_identity(index as u8 + 1),
+                )
+                .unwrap();
+        }
+    }
+
+    fn test_sandbox_identity(sequence: u8) -> NativeSandboxIdentity {
+        #[cfg(windows)]
+        {
+            NativeSandboxIdentity::Windows {
+                moniker: format!("context-relay.native.{sequence:032x}"),
+                sid: format!("S-1-15-2-{sequence}-2-3-4-5-6-7").into_bytes(),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let generation_id = format!("{sequence:032x}");
+            let bundle_id = format!("com.contextrelay.native-runner.{generation_id}");
+            let mut container = b"context-relay/macos-container/v1\0".to_vec();
+            container.extend_from_slice(bundle_id.as_bytes());
+            NativeSandboxIdentity::reserved_macos(generation_id, bundle_id, container)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn seed_terminal_macos_generation(
+        path: &std::path::Path,
+        keys: &dyn DatabaseKeyStore,
+        transaction_id: &str,
+        plan_id: &str,
+        generation_id: &str,
+    ) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut vault = Vault::open(path, "test-vault-key", keys).unwrap();
+        let plan_id = plan_id.parse::<PlanId>().unwrap();
+        let bundle_id = format!("com.contextrelay.native-runner.{generation_id}");
+        let mut container = b"context-relay/macos-container/v1\0".to_vec();
+        container.extend_from_slice(bundle_id.as_bytes());
+        vault
+            .begin_native_transaction(
+                transaction_id,
+                NativePlanWrite {
+                    plan_id: &plan_id,
+                    approval_hash: &Sha256Digest([1; 32]),
+                    payload: b"macos-startup-cleanup-conflict",
+                    created_ms: 1,
+                    expires_ms: 2,
+                },
+                NativeSandboxIdentity::reserved_macos(
+                    generation_id.to_owned(),
+                    bundle_id,
+                    container,
+                ),
+            )
+            .unwrap();
+        vault.bind_macos_guardian(transaction_id, i32::MAX).unwrap();
+        vault
+            .bind_macos_bundle_root(
+                transaction_id,
+                &MacRootIdentity::new(1, 2, 3, 4, 5, 0o040700)
+                    .unwrap()
+                    .encode(),
+            )
+            .unwrap();
+        vault
+            .finalize_macos_generation(transaction_id, &Sha256Digest([2; 32]))
+            .unwrap();
+        vault
+            .bind_macos_container_root(
+                transaction_id,
+                &MacRootIdentity::new(6, 7, 8, 9, 10, 0o040700)
+                    .unwrap()
+                    .encode(),
+            )
+            .unwrap();
+        vault
+            .transition_macos_generation(transaction_id, MacGenerationState::Poisoned)
+            .unwrap();
+        vault.begin_native_recovery(transaction_id).unwrap();
+        vault.finish_native_recovery(transaction_id, false).unwrap();
     }
 
     #[derive(Default)]

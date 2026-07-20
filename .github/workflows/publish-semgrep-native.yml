@@ -1,0 +1,193 @@
+name: Publish Semgrep native release
+
+on:
+  repository_dispatch:
+    types: [semgrep-native-publication]
+
+permissions: {}
+
+concurrency:
+  group: semgrep-native-publication
+  cancel-in-progress: false
+
+jobs:
+  publish-semgrep-native:
+    if: ${{ github.actor == 'github-actions[bot]' && github.event.sender.login == 'github-actions[bot]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    environment: semgrep-sidecar-publication
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_COMMIT: ${{ github.event.client_payload.commit }}
+      SOURCE_RUN_ID: ${{ github.event.client_payload.runId }}
+      SOURCE_RUN_ATTEMPT: ${{ github.event.client_payload.runAttempt }}
+      SOURCE_WORKFLOW_REF: ${{ github.event.client_payload.workflowRef }}
+      SOURCE_WORKFLOW_SHA: ${{ github.event.client_payload.workflowSha }}
+      IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: ${{ github.event.client_payload.commit }}
+          persist-credentials: false
+
+      - name: Verify protected source run and repository policies
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+          printf '%s\n' "$SOURCE_WORKFLOW_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          printf '%s\n' "$SOURCE_RUN_ID" | grep -Eq '^[1-9][0-9]*$'
+          printf '%s\n' "$SOURCE_RUN_ATTEMPT" | grep -Eq '^[1-9][0-9]*$'
+          test "$SOURCE_WORKFLOW_SHA" = "$SOURCE_COMMIT"
+          test "$SOURCE_WORKFLOW_REF" = "$GITHUB_REPOSITORY/.github/workflows/ci.yml@refs/heads/main"
+          test -n "$IMMUTABLE_RELEASES_READ_TOKEN"
+
+          gh run watch "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status
+          run="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID")"
+          jobs="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs?filter=latest&per_page=100")"
+          branch="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/branches/main")"
+          node -e 'const r=JSON.parse(process.argv[1]); const b=JSON.parse(process.argv[2]); const [repo,commit,id,attempt]=process.argv.slice(3); if(r.id!==Number(id)||r.run_attempt!==Number(attempt)||r.event!=="push"||r.status!=="completed"||r.conclusion!=="success"||r.head_branch!=="main"||r.head_sha!==commit||r.path!==".github/workflows/ci.yml"||r.repository?.full_name!==repo||r.head_repository?.full_name!==repo||b.protected!==true||b.commit?.sha!==commit) process.exit(1)' "$run" "$branch" "$GITHUB_REPOSITORY" "$SOURCE_COMMIT" "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT"
+          node -e 'const j=JSON.parse(process.argv[1]).jobs; for(const name of ["native-isolation-windows-x64","native-isolation-macos-arm64"]){const matches=j.filter((x)=>x.name===name); if(matches.length!==1||matches[0].status!=="completed"||matches[0].conclusion!=="success") process.exit(1)}' "$jobs"
+
+          environment="$(GH_TOKEN="$IMMUTABLE_RELEASES_READ_TOKEN" gh api -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/environments/semgrep-sidecar-publication")"
+          node -e 'const e=JSON.parse(process.argv[1]); const reviewers=e.protection_rules?.find((r)=>r.type==="required_reviewers"); if(e.name!=="semgrep-sidecar-publication"||e.deployment_branch_policy?.protected_branches!==true||e.deployment_branch_policy?.custom_branch_policies!==false||reviewers?.prevent_self_review!==true||!Array.isArray(reviewers.reviewers)||reviewers.reviewers.length===0) process.exit(1)' "$environment"
+          immutable="$(GH_TOKEN="$IMMUTABLE_RELEASES_READ_TOKEN" gh api -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/immutable-releases")"
+          node -e 'const p=JSON.parse(process.argv[1]); if(p.enabled!==true) process.exit(1)' "$immutable"
+
+      - name: Download exact native artifacts from the source run
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/windows artifacts/macos
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "task9-semgrep-windows-$SOURCE_COMMIT-$SOURCE_RUN_ID-$SOURCE_RUN_ATTEMPT" --dir artifacts/windows
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "task9-semgrep-macos-$SOURCE_COMMIT-$SOURCE_RUN_ID-$SOURCE_RUN_ATTEMPT" --dir artifacts/macos
+
+      - name: Assemble final manifest, evidence, and corresponding source
+        env:
+          FINAL_OUTPUT: ${{ runner.temp }}/context-relay-semgrep-final
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/finalize-semgrep-native-release.mjs \
+            --workspace "$GITHUB_WORKSPACE" \
+            --windows-artifact "$GITHUB_WORKSPACE/artifacts/windows" \
+            --macos-artifact "$GITHUB_WORKSPACE/artifacts/macos" \
+            --bootstrap-source "$GITHUB_WORKSPACE/artifacts/windows/source-a.tar" \
+            --output "$FINAL_OUTPUT" \
+            --commit "$SOURCE_COMMIT" \
+            --run-id "$SOURCE_RUN_ID" \
+            --run-attempt "$SOURCE_RUN_ATTEMPT" \
+            --workflow-ref "$SOURCE_WORKFLOW_REF" \
+            --workflow-sha "$SOURCE_WORKFLOW_SHA"
+          node scripts/semgrep-source-bundle.mjs --verify-evidence \
+            "$FINAL_OUTPUT/patch/third_party/sidecars/semgrep/source-lock.v1.json" \
+            "$FINAL_OUTPUT/release/semgrep-1.170.0-corresponding-source.tar" \
+            "$FINAL_OUTPUT/patch/third_party/sidecars/semgrep/bundle-evidence.v1.json"
+
+      - name: Stage the exact immutable release assets
+        env:
+          FINAL_OUTPUT: ${{ runner.temp }}/context-relay-semgrep-final
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir release
+          cp "$FINAL_OUTPUT/release/semgrep-1.170.0-corresponding-source.tar" release/
+          cp artifacts/windows/semgrep-1.170.0-windows-x86_64.tar.gz release/
+          cp artifacts/macos/semgrep-1.170.0-macos-aarch64.tar.gz release/
+          cp artifacts/windows/semgrep-1.170.0-windows-x86_64-release-evidence.tar.gz release/
+          cp artifacts/macos/semgrep-1.170.0-macos-aarch64-release-evidence.tar.gz release/
+          cp "$FINAL_OUTPUT/patch/third_party/sidecars/semgrep/native-build-evidence.v1.json" release/
+          cp "$FINAL_OUTPUT/patch/third_party/sidecars/semgrep/source-lock.v1.json" release/
+          cp "$FINAL_OUTPUT/patch/third_party/sidecars/semgrep/bundle-evidence.v1.json" release/
+          for target in windows-x86_64 macos-aarch64; do
+            root=artifacts/windows
+            test "$target" = windows-x86_64 || root=artifacts/macos
+            cp "$root/runtime-closure.$target.v1.json" "release/semgrep-1.170.0-$target-runtime-closure.v1.json"
+            cp "$root/native-smoke.$target.v1.json" "release/semgrep-1.170.0-$target-native-smoke.v1.json"
+            for name in \
+              build-a.MANIFEST.sha256 build-b.MANIFEST.sha256 \
+              build-a-evidence.MANIFEST.sha256 build-b-evidence.MANIFEST.sha256 \
+              build-a.identity.v1.json build-b.identity.v1.json \
+              build-a.offline-egress.v1.json build-b.offline-egress.v1.json
+            do
+              cp "$root/$name" "release/semgrep-1.170.0-$target-$name"
+            done
+          done
+          cp artifacts/windows/builder-evidence.windows-x86_64.v1.json \
+            release/semgrep-1.170.0-windows-x86_64-builder-evidence.v1.json
+          cp artifacts/windows/builder-toolchain.windows-x86_64.v1.json \
+            release/semgrep-1.170.0-windows-x86_64-builder-toolchain.v1.json
+          cp artifacts/windows/builder-evidence.windows-x86_64.v1.schema.json \
+            release/semgrep-1.170.0-windows-x86_64-builder-evidence.v1.schema.json
+          (cd release && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' | LC_ALL=C sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" release/SHA256SUMS
+
+      - name: Publish or verify the fixed immutable release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=sidecars-semgrep-1.170.0-source.1
+          find release -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > expected-assets
+          if release_metadata="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,tagName,targetCommitish 2>/dev/null)"; then
+            state="$(node -e 'const m=JSON.parse(process.argv[1]); if(m.isPrerelease||m.tagName!==process.argv[2]||m.targetCommitish!==process.argv[3]) process.exit(1); process.stdout.write(m.isDraft?"draft":"published")' "$release_metadata" "$tag" "$SOURCE_COMMIT")"
+          else
+            if gh api -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+              echo 'fixed release tag exists without the expected immutable release' >&2
+              exit 1
+            fi
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_COMMIT" --draft --latest=false \
+              --title 'Semgrep 1.170.0 reproducible native runtimes and corresponding source' \
+              --notes 'Two independently reproduced native runtimes for Windows x64 and macOS arm64, their bounded build evidence, and the complete corresponding-source bundle.'
+            state=draft
+          fi
+
+          verify_tag_ref() {
+            tag_ref="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag")"
+            node -e 'const r=JSON.parse(process.argv[1]); if(r.ref!==`refs/tags/${process.argv[2]}`||r.object?.type!=="commit"||r.object?.sha!==process.argv[3]) process.exit(1)' "$tag_ref" "$tag" "$SOURCE_COMMIT"
+          }
+          verify_tag_ref
+
+          if test "$state" = published; then
+            metadata="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/releases/tags/$tag")"
+            node -e 'const m=JSON.parse(process.argv[1]); if(m.immutable!==true||m.draft||m.prerelease||m.tag_name!==process.argv[2]||m.target_commitish!==process.argv[3]) process.exit(1)' "$metadata" "$tag" "$SOURCE_COMMIT"
+            mkdir published
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir published
+            find published -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > published-assets
+            cmp expected-assets published-assets
+            while IFS= read -r asset; do cmp "release/$asset" "published/$asset"; done < expected-assets
+          else
+            test "$state" = draft
+            mkdir existing
+            gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | LC_ALL=C sort > existing-assets
+            comm -13 expected-assets existing-assets > unexpected-assets
+            test ! -s unexpected-assets
+            while IFS= read -r asset; do
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir existing
+              cmp "release/$asset" "existing/$asset"
+            done < existing-assets
+            comm -23 expected-assets existing-assets > missing-assets
+            while IFS= read -r asset; do
+              gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "release/$asset"
+            done < missing-assets
+            mkdir completed
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir completed
+            find completed -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > completed-assets
+            cmp expected-assets completed-assets
+            while IFS= read -r asset; do cmp "release/$asset" "completed/$asset"; done < expected-assets
+            verify_tag_ref
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=false --latest=false
+            metadata="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/releases/tags/$tag")"
+            node -e 'const m=JSON.parse(process.argv[1]); if(m.immutable!==true||m.draft||m.prerelease||m.tag_name!==process.argv[2]||m.target_commitish!==process.argv[3]) process.exit(1)' "$metadata" "$tag" "$SOURCE_COMMIT"
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: final-semgrep-native-patch-${{ env.SOURCE_COMMIT }}-${{ env.SOURCE_RUN_ID }}-${{ env.SOURCE_RUN_ATTEMPT }}
+          path: ${{ runner.temp }}/context-relay-semgrep-final/patch
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 30

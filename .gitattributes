@@ -25,3 +25,6 @@
 *.rar binary
 *.tar binary
 *.pdf binary
+
+# Upstream Gitleaks policy is byte-pinned with its published CRLF bytes.
+/third_party/sidecars/policies/gitleaks.toml -text whitespace=-trailing-space

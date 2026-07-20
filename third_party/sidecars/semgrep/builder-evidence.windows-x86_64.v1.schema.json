@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "builder-evidence.windows-x86_64.v1.schema.json",
+  "title": "Context Relay Semgrep Windows x86_64 native builder evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "target",
+    "commit",
+    "run",
+    "hostedImage",
+    "toolchain",
+    "cygwinPackages"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "target": {
+      "const": "windows-x86_64"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "attempt"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "hostedImage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runnerOs",
+        "runnerArch",
+        "imageOs",
+        "imageVersion",
+        "windowsVersion"
+      ],
+      "properties": {
+        "runnerOs": {
+          "const": "Windows"
+        },
+        "runnerArch": {
+          "const": "X64"
+        },
+        "imageOs": {
+          "type": "string",
+          "minLength": 1
+        },
+        "imageVersion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "windowsVersion": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "setupNodeActionSha",
+        "setupOcamlActionSha",
+        "nodeVersion",
+        "opamVersion",
+        "cygwinRelease",
+        "rustHost",
+        "rustRelease"
+      ],
+      "properties": {
+        "setupNodeActionSha": {
+          "const": "49933ea5288caeca8642d1e84afbd3f7d6820020"
+        },
+        "setupOcamlActionSha": {
+          "const": "3e4c6ff8c9a04c9ec8f6f87701cd4b661b0f1f18"
+        },
+        "nodeVersion": {
+          "const": "24.14.0"
+        },
+        "opamVersion": {
+          "const": "2.5.2"
+        },
+        "cygwinRelease": {
+          "type": "string",
+          "pattern": "^3\\.6\\.10"
+        },
+        "rustHost": {
+          "const": "x86_64-pc-windows-msvc"
+        },
+        "rustRelease": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "cygwinPackages": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "version"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[^\\s]+$"
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^[^\\s]+$"
+          }
+        }
+      }
+    }
+  },
+  "x-context-relay-normalization": {
+    "schemaVersion": 1,
+    "sourceCommand": "cygcheck -cd",
+    "inputRules": [
+      "Trim each line.",
+      "Discard blank lines and the Package/Version header.",
+      "Split each remaining line into exactly two ASCII-whitespace-delimited columns.",
+      "Reject duplicate package names."
+    ],
+    "packageOrder": "Unsigned UTF-8 byte order by name, then version.",
+    "topLevelKeyOrder": [
+      "schemaVersion",
+      "target",
+      "commit",
+      "run",
+      "hostedImage",
+      "toolchain",
+      "cygwinPackages"
+    ],
+    "runKeyOrder": [
+      "id",
+      "attempt"
+    ],
+    "hostedImageKeyOrder": [
+      "runnerOs",
+      "runnerArch",
+      "imageOs",
+      "imageVersion",
+      "windowsVersion"
+    ],
+    "toolchainKeyOrder": [
+      "setupNodeActionSha",
+      "setupOcamlActionSha",
+      "nodeVersion",
+      "opamVersion",
+      "cygwinRelease",
+      "rustHost",
+      "rustRelease"
+    ],
+    "cygwinPackageKeyOrder": [
+      "name",
+      "version"
+    ],
+    "serialization": "UTF-8 JSON with two-space indentation and one final LF.",
+    "digest": "SHA-256 over the exact serialized bytes."
+  }
+}

@@ -10,6 +10,10 @@ Context Relay keeps one encrypted memory and configuration workspace in sync acr
 - Windows 11 24H2 or newer on x64
 - macOS 14 or newer on Apple Silicon
 
+## Development
+
+Sidecar hydration is a developer/CI build-time command. Running `npm run hydrate:sidecars` requires the repository's pinned Rust toolchain and a trusted `cargo` executable on `PATH`; hydration invokes the fixed native installer from this workspace with Cargo.
+
 ## Security
 
 Please report security issues through [GitHub private vulnerability reporting](https://github.com/Skytuhua/Context-Relay/security/advisories/new). Do not open a public issue for a suspected vulnerability.

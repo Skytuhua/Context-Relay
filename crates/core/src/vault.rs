@@ -16,7 +16,10 @@ use crate::search::{
     AllowedSearchScope, Embedding384, SearchHit, quote_fts_query, reciprocal_rank_fusion,
 };
 
-pub const LATEST_SCHEMA_VERSION: u32 = 2;
+mod native_transactions;
+pub use native_transactions::*;
+
+pub const LATEST_SCHEMA_VERSION: u32 = 3;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
 const DEFAULT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
@@ -124,6 +127,7 @@ pub struct VaultRuntimeInfo {
     pub trusted_schema: bool,
     pub foreign_keys: bool,
     pub journal_mode: String,
+    pub synchronous: i64,
     pub temp_store: i64,
     pub secure_delete: bool,
 }
@@ -256,6 +260,9 @@ impl Vault {
             .connection
             .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))?
             .to_ascii_lowercase();
+        let synchronous = self
+            .connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))?;
         let temp_store = self
             .connection
             .query_row("PRAGMA temp_store", [], |row| row.get(0))?;
@@ -268,6 +275,7 @@ impl Vault {
             trusted_schema,
             foreign_keys,
             journal_mode,
+            synchronous,
             temp_store,
             secure_delete,
         })
@@ -606,84 +614,15 @@ impl Vault {
         created_ms: u64,
         policy: BeforeImagePolicy,
     ) -> Result<(), VaultError> {
-        if id.trim().is_empty() {
-            return Err(VaultError::Validation(
-                "before-image id cannot be empty".to_owned(),
-            ));
-        }
-        let payload_bytes = u64::try_from(payload.len()).map_err(|_| VaultError::BudgetExceeded)?;
-        if payload_bytes > policy.max_bytes {
-            return Err(VaultError::BudgetExceeded);
-        }
-
-        let transaction = self.connection.transaction()?;
-        let existing_bytes = sqlite_u64(
-            transaction.query_row(
-                "SELECT coalesce(sum(length(payload)), 0) FROM before_images WHERE id != ?1",
-                [id],
-                |row| row.get::<_, i64>(0),
-            )?,
-            "before-image byte total",
-        )?;
-        let mut required = existing_bytes.saturating_add(payload_bytes);
-        if required > policy.max_bytes {
-            let cutoff = created_ms.saturating_sub(policy.retention_ms);
-            let candidates = {
-                let mut statement = transaction.prepare(
-                    "SELECT before_images.id, before_images.plan_id,
-                            length(before_images.payload)
-                     FROM before_images
-                     JOIN receipts ON receipts.plan_id = before_images.plan_id
-                     WHERE before_images.id != ?1
-                       AND receipts.successful = 1
-                       AND receipts.resolved = 1
-                       AND receipts.applied_ms < ?2
-                     ORDER BY receipts.applied_ms, before_images.created_ms, before_images.id",
-                )?;
-                statement
-                    .query_map(params![id, to_i64(cutoff)?], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-            for (candidate_id, candidate_receipt, bytes) in candidates {
-                if required <= policy.max_bytes {
-                    break;
-                }
-                let bytes = sqlite_u64(bytes, "before-image length")?;
-                transaction.execute("DELETE FROM before_images WHERE id = ?1", [&candidate_id])?;
-                required = required.saturating_sub(bytes);
-                transaction.execute(
-                    "DELETE FROM receipts
-                     WHERE plan_id = ?1
-                       AND NOT EXISTS (
-                         SELECT 1 FROM before_images WHERE plan_id = ?1
-                       )",
-                    [&candidate_receipt],
-                )?;
-            }
-        }
-        if required > policy.max_bytes {
-            return Err(VaultError::BudgetExceeded);
-        }
-        transaction.execute(
-            "INSERT INTO before_images(id, plan_id, created_ms, payload)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET plan_id = excluded.plan_id,
-                created_ms = excluded.created_ms, payload = excluded.payload",
-            params![
+        self.put_before_images_batch(
+            &[BeforeImageWrite {
                 id,
-                plan_id.map(ToString::to_string),
-                to_i64(created_ms)?,
+                plan_id,
                 payload,
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(())
+                created_ms,
+            }],
+            policy,
+        )
     }
 
     pub fn delete_before_image(&mut self, id: &str) -> Result<(), VaultError> {
@@ -885,6 +824,7 @@ fn configure_connection(connection: &Connection) -> Result<(), VaultError> {
     connection.pragma_update(None, "secure_delete", true)?;
     connection.execute_batch("PRAGMA cipher_memory_security = ON;")?;
     connection.query_row("PRAGMA journal_mode = DELETE", [], |_| Ok(()))?;
+    connection.pragma_update(None, "synchronous", "FULL")?;
     connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     Ok(())
 }
@@ -914,6 +854,12 @@ fn verify_runtime(connection: &Connection) -> Result<(), VaultError> {
             "SQLite FTS5 is unavailable".to_owned(),
         ));
     }
+    let synchronous: i64 = connection.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+    if synchronous != 2 {
+        return Err(VaultError::Security(
+            "SQLite synchronous mode is not FULL".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -939,6 +885,16 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
         transaction
             .execute_batch(include_str!("../migrations/0002_before_image_plans.sql"))
             .and_then(|_| transaction.pragma_update(None, "user_version", 2))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 3 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0003_native_transactions.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 3))
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }

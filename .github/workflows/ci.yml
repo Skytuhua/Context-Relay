@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -22,8 +23,8 @@ jobs:
       - run: npm install --global pnpm@11.9.0
       - run: rustup show
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-features
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
       - run: node --test scripts/check-daemon-boundary.test.mjs
       - run: node scripts/check-daemon-boundary.mjs
       - run: pnpm install --frozen-lockfile
@@ -69,3 +70,469 @@ jobs:
       - run: cargo test -p context-relay-local-ipc --target ${{ matrix.target }} --all-features
       - run: cargo test -p context-relay-contextd --target ${{ matrix.target }} --all-features
       - run: pnpm --filter @context-relay/desktop tauri build --target ${{ matrix.target }}
+
+  native-semgrep-windows-x64-builders:
+    name: Native Semgrep Windows x64 build-${{ matrix.build }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [a, b]
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      CONTEXT_RELAY_BUILD_SLOT: ${{ matrix.build }}
+      CONTEXT_RELAY_RUNNER_IMAGE: windows-2022
+      CONTEXT_RELAY_SETUP_NODE_ACTION_SHA: 49933ea5288caeca8642d1e84afbd3f7d6820020
+      CONTEXT_RELAY_SETUP_OCAML_ACTION_SHA: 3e4c6ff8c9a04c9ec8f6f87701cd4b661b0f1f18
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .node-version
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: semgrep/semgrep
+          ref: bd614accba811b407ae5c9ec6f1eecd3bdc29911
+          path: task9-semgrep
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: ocaml/opam-repository
+          ref: 78d29aba187e8362b8ab86c189790c0af9153d4b
+          path: task9-opam-repository
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: semgrep/setup-ocaml@3e4c6ff8c9a04c9ec8f6f87701cd4b661b0f1f18
+        with:
+          cache-prefix: context-relay-task9-windows-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build }}
+          ocaml-compiler: 5.3.0
+          opam-pin: false
+          opam-repositories: |
+            default: https://github.com/ocaml/opam-repository.git#78d29aba187e8362b8ab86c189790c0af9153d4b
+          save-opam-post-run: false
+      - name: Verify exact Windows AMD64 builder and fetch pins
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -or $env:RUNNER_ARCH -ne 'X64') { throw 'native AMD64 runner is required' }
+          if ((node --version).Trim() -ne 'v24.14.0') { throw 'Node v24.14.0 is required' }
+          if ((opam --version).Trim() -ne '2.5.2') { throw 'opam 2.5.2 is required' }
+          $cygwinRelease = (uname.exe -r).Trim()
+          if ((uname.exe -o).Trim() -ne 'Cygwin') { throw 'Cygwin is required' }
+          node scripts/assert-cygwin-release.mjs $cygwinRelease 3.6.10
+          $rust = (& rustc -vV) -join [Environment]::NewLine
+          if ([regex]::Match($rust, '(?m)^host: (.+)$').Groups[1].Value.Trim() -ne 'x86_64-pc-windows-msvc') { throw 'Rust MSVC AMD64 host is required' }
+          $lock = Get-Content -Raw third_party/sidecars/semgrep/source-lock.v1.json | ConvertFrom-Json
+          $pins = Join-Path $env:RUNNER_TEMP "context-relay-semgrep-pins-windows-$env:CONTEXT_RELAY_BUILD_SLOT"
+          New-Item -ItemType Directory -Path $pins | Out-Null
+          foreach ($pin in @($lock.opam.compiler) + @($lock.opam.pinDepends)) {
+            $destination = Join-Path $pins $pin.revision
+            git init -q $destination
+            git -C $destination remote add origin $pin.url
+            git -C $destination fetch --depth=1 --filter=blob:none origin $pin.revision
+            git -C $destination checkout -q --detach FETCH_HEAD
+            git -C $destination submodule update --init --recursive --depth=1
+            if ((git -C $destination rev-parse HEAD).Trim() -ne $pin.revision) { throw "pin revision mismatch: $($pin.revision)" }
+          }
+          "CONTEXT_RELAY_SEMGREP_PINS_ROOT=$pins" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build one independently identified offline Windows runtime
+        shell: pwsh
+        env:
+          CONTEXT_RELAY_CHECK_RUN_ID: ${{ job.check_run_id }}
+          CONTEXT_RELAY_JOB_DEFINITION: ${{ github.job }}
+          CONTEXT_RELAY_JOB_INDEX: ${{ strategy.job-index }}
+          CONTEXT_RELAY_JOB_TOTAL: ${{ strategy.job-total }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $slot = $env:CONTEXT_RELAY_BUILD_SLOT
+          $label = "build-$slot"
+          $lock = (Resolve-Path third_party/sidecars/semgrep/source-lock.v1.json).Path
+          $evidence = (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path
+          $cache = Join-Path $env:RUNNER_TEMP "context-relay-semgrep-cache-windows-$slot"
+          $bundle = Join-Path $env:RUNNER_TEMP "context-relay-semgrep-source-$slot.tar"
+          $work = Join-Path $env:RUNNER_TEMP 'context-relay-semgrep-work-windows'
+          $output = Join-Path $env:RUNNER_TEMP "context-relay-semgrep-output-windows-$slot"
+          node scripts/semgrep-source-bundle.mjs --fetch $lock $cache
+          node scripts/semgrep-source-bundle.mjs --build $lock (Resolve-Path task9-semgrep).Path (Resolve-Path task9-opam-repository).Path $env:CONTEXT_RELAY_SEMGREP_PINS_ROOT $cache $bundle $env:GITHUB_WORKSPACE
+          node scripts/semgrep-source-bundle.mjs --verify-evidence $lock $bundle $evidence
+          ./third_party/sidecars/semgrep/build-public-source-windows.ps1 -SourceLock $lock -SourceBundle $bundle -WorkRoot $work -OutputRoot $output -BuildLabel $label
+          Copy-Item -LiteralPath $bundle -Destination (Join-Path $output "source-$slot.tar")
+          $identity = [ordered]@{
+            schemaVersion = 1
+            target = 'windows-x86_64'
+            build = $label
+            artifactName = "task9-semgrep-windows-build-$slot-$env:GITHUB_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+            commit = $env:GITHUB_SHA
+            runId = $env:GITHUB_RUN_ID
+            runAttempt = [int]$env:GITHUB_RUN_ATTEMPT
+            checkRunId = [long]$env:CONTEXT_RELAY_CHECK_RUN_ID
+            jobDefinition = $env:CONTEXT_RELAY_JOB_DEFINITION
+            jobIndex = [int]$env:CONTEXT_RELAY_JOB_INDEX
+            jobTotal = [int]$env:CONTEXT_RELAY_JOB_TOTAL
+            runnerName = $env:RUNNER_NAME
+            runnerOs = $env:RUNNER_OS
+            runnerArch = $env:RUNNER_ARCH
+            workflowRef = $env:GITHUB_WORKFLOW_REF
+            workflowSha = $env:GITHUB_WORKFLOW_SHA
+          }
+          [IO.File]::WriteAllText((Join-Path $output "$label.identity.v1.json"), ($identity | ConvertTo-Json -Compress) + "`n", [Text.UTF8Encoding]::new($false))
+          $rust = (& rustc -vV) -join [Environment]::NewLine
+          $facts = [ordered]@{
+            commit = $env:GITHUB_SHA
+            cygwinRelease = (uname.exe -r).Trim()
+            imageOs = $env:ImageOS
+            imageVersion = $env:ImageVersion
+            nodeVersion = (node --version).Trim()
+            opamVersion = (opam --version).Trim()
+            runAttempt = $env:GITHUB_RUN_ATTEMPT
+            runId = $env:GITHUB_RUN_ID
+            runnerArch = $env:RUNNER_ARCH
+            runnerOs = $env:RUNNER_OS
+            rustHost = [regex]::Match($rust, '(?m)^host: (.+)$').Groups[1].Value.Trim()
+            rustRelease = [regex]::Match($rust, '(?m)^release: (.+)$').Groups[1].Value.Trim()
+            setupNodeActionSha = $env:CONTEXT_RELAY_SETUP_NODE_ACTION_SHA
+            setupOcamlActionSha = $env:CONTEXT_RELAY_SETUP_OCAML_ACTION_SHA
+            windowsVersion = [Environment]::OSVersion.VersionString
+          }
+          $factsPath = Join-Path $env:RUNNER_TEMP "context-relay-windows-builder-facts-$slot.json"
+          $cygcheckPath = Join-Path $env:RUNNER_TEMP "context-relay-cygcheck-$slot.txt"
+          $builderEvidence = Join-Path $output "$label.builder-evidence.windows-x86_64.v1.json"
+          [IO.File]::WriteAllText($factsPath, ($facts | ConvertTo-Json -Compress) + "`n", [Text.UTF8Encoding]::new($false))
+          cygcheck.exe -cd | Set-Content -LiteralPath $cygcheckPath -Encoding utf8
+          node scripts/prepare-semgrep-runtime.mjs --windows-evidence $factsPath $cygcheckPath $builderEvidence
+          node scripts/prepare-semgrep-runtime.mjs --windows-stable-toolchain $builderEvidence (Join-Path $output "$label.builder-toolchain.windows-x86_64.v1.json")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: task9-semgrep-windows-build-${{ matrix.build }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/context-relay-semgrep-output-windows-${{ matrix.build }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+  native-isolation-windows-x64:
+    needs:
+      - native-semgrep-windows-x64-builders
+    outputs:
+      hydration_mode: ${{ steps.prepare.outputs.mode }}
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .node-version
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: task9-semgrep-windows-build-a-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/context-relay-semgrep-output-windows
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: task9-semgrep-windows-build-b-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/context-relay-semgrep-output-windows
+      - name: Verify independent Windows build identities and source evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $root = Join-Path $env:RUNNER_TEMP 'context-relay-semgrep-output-windows'
+          $aPath = Join-Path $root 'build-a.identity.v1.json'
+          $bPath = Join-Path $root 'build-b.identity.v1.json'
+          node scripts/verify-native-builder-identities.mjs $aPath $bPath windows-x86_64 $env:GITHUB_SHA $env:GITHUB_RUN_ID $env:GITHUB_RUN_ATTEMPT $env:GITHUB_WORKFLOW_REF $env:GITHUB_WORKFLOW_SHA native-semgrep-windows-x64-builders task9-semgrep-windows-build
+          if ((Get-FileHash -Algorithm SHA256 (Join-Path $root 'source-a.tar')).Hash -ne (Get-FileHash -Algorithm SHA256 (Join-Path $root 'source-b.tar')).Hash) { throw 'independent source bundles differ' }
+          node scripts/semgrep-source-bundle.mjs --verify-evidence (Resolve-Path third_party/sidecars/semgrep/source-lock.v1.json).Path (Join-Path $root 'source-a.tar') (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path
+          node scripts/semgrep-source-bundle.mjs --verify-evidence (Resolve-Path third_party/sidecars/semgrep/source-lock.v1.json).Path (Join-Path $root 'source-b.tar') (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path
+          foreach ($slot in @('a', 'b')) {
+            $offline = Get-Content -Raw (Join-Path $root "build-$slot.offline-egress.v1.json") | ConvertFrom-Json
+            if ($offline.schemaVersion -ne 1 -or $offline.mechanism -ne 'windows-firewall-default-outbound-block-runner-control-plane-allow' -or $offline.probe -ne 'hostile-outbound-tcp-denied') { throw 'invalid Windows offline evidence' }
+          }
+          if ((Get-FileHash -Algorithm SHA256 (Join-Path $root 'build-a.builder-toolchain.windows-x86_64.v1.json')).Hash -ne (Get-FileHash -Algorithm SHA256 (Join-Path $root 'build-b.builder-toolchain.windows-x86_64.v1.json')).Hash) { throw 'independent Windows toolchains differ' }
+      - name: Prepare strict Windows candidate
+        id: prepare
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $root = Join-Path $env:RUNNER_TEMP 'context-relay-semgrep-output-windows'
+          $candidate = Join-Path $env:RUNNER_TEMP 'context-relay-semgrep-candidate-windows'
+          $result = node scripts/prepare-semgrep-runtime.mjs --prepare --workspace $env:GITHUB_WORKSPACE --target windows-x86_64 --build-root $root --output-root $candidate --source-bundle (Join-Path $root 'source-a.tar') --bundle-evidence (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path | ConvertFrom-Json
+          if ($result.mode -eq 'candidate') {
+            if (-not $result.candidateWorkspace -or -not $result.candidateDocumentPath) { throw 'candidate verification workspace is missing' }
+            "CONTEXT_RELAY_REAL_SIDECAR_MANIFEST_ROOT=$($result.candidateWorkspace)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+            "CONTEXT_RELAY_CI_CANDIDATE_DOCUMENT=$($result.candidateDocumentPath)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          } elseif ($result.mode -ne 'enabled' -or $result.candidateWorkspace -or $result.candidateDocumentPath) { throw 'invalid hydration mode' }
+          "mode=$($result.mode)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "CONTEXT_RELAY_REAL_SIDECAR_ROOT=$($result.hydrationRoot)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CONTEXT_RELAY_RUNTIME_ARTIFACT_ROOT=$($result.artifactRoot)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          foreach ($slot in @('a', 'b')) {
+            Copy-Item (Join-Path $root "source-$slot.tar") (Join-Path $result.artifactRoot "source-$slot.tar")
+            Copy-Item (Join-Path $root "build-$slot.identity.v1.json") (Join-Path $result.artifactRoot "build-$slot.identity.v1.json")
+            Copy-Item (Join-Path $root "build-$slot.offline-egress.v1.json") (Join-Path $result.artifactRoot "build-$slot.offline-egress.v1.json")
+          }
+          Copy-Item third_party/sidecars/semgrep/bundle-evidence.v1.json (Join-Path $result.artifactRoot 'bundle-evidence.v1.json')
+          Copy-Item (Join-Path $root 'build-a.builder-evidence.windows-x86_64.v1.json') (Join-Path $result.artifactRoot 'builder-evidence.windows-x86_64.v1.json')
+          Copy-Item (Join-Path $root 'build-a.builder-toolchain.windows-x86_64.v1.json') (Join-Path $result.artifactRoot 'builder-toolchain.windows-x86_64.v1.json')
+          Copy-Item third_party/sidecars/semgrep/builder-evidence.windows-x86_64.v1.schema.json (Join-Path $result.artifactRoot 'builder-evidence.windows-x86_64.v1.schema.json')
+      - name: Run Windows native and exact registered real-sidecar gates
+        shell: pwsh
+        env:
+          CONTEXT_RELAY_CHECK_RUN_ID: ${{ job.check_run_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test -p context-relay-native-runner
+          cargo test -p context-relay-native-runner --test native_fs_windows_v1 -- --nocapture
+          cargo test -p context-relay-native-runner --test windows_launcher_v1 -- --nocapture
+          cargo test --manifest-path crates/native-runner/tests/windows-launcher-harness/Cargo.toml -- --nocapture
+          $registered = cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 -- --list
+          $tests = @('real_rulesync_generates_only_the_validated_output_inside_appcontainer','real_rulesync_rejects_malformed_frontmatter_and_cleans_up','real_gitleaks_distinguishes_clean_and_findings_and_ignores_attacker_ignore_file','real_semgrep_clean_and_finding_use_the_closed_policy')
+          foreach ($name in $tests) {
+            if ($registered -notcontains ('{0}: test' -f $name)) { throw "ignored real test is not registered: $name" }
+            if ($name -eq 'real_semgrep_clean_and_finding_use_the_closed_policy') {
+              cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 --features ci-candidate-sidecar-smoke $name -- --ignored --exact --nocapture
+            } else {
+              cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 $name -- --ignored --exact --nocapture
+            }
+          }
+          $smokeEvidence = Join-Path $env:CONTEXT_RELAY_RUNTIME_ARTIFACT_ROOT 'native-smoke.windows-x86_64.v1.json'
+          node scripts/native-smoke-evidence.mjs --write $smokeEvidence windows-x86_64 $env:GITHUB_SHA $env:GITHUB_RUN_ID $env:GITHUB_RUN_ATTEMPT $env:CONTEXT_RELAY_CHECK_RUN_ID native-isolation-windows-x64
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: task9-semgrep-windows-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/context-relay-semgrep-candidate-windows/artifact
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  native-semgrep-macos-arm64-builders:
+    name: Native Semgrep macOS arm64 build-${{ matrix.build }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [a, b]
+    runs-on: macos-15
+    timeout-minutes: 360
+    env:
+      CONTEXT_RELAY_BUILD_SLOT: ${{ matrix.build }}
+      CONTEXT_RELAY_RUNNER_IMAGE: macos-15
+      CONTEXT_RELAY_SETUP_NODE_ACTION_SHA: 49933ea5288caeca8642d1e84afbd3f7d6820020
+      CONTEXT_RELAY_SETUP_OCAML_ACTION_SHA: a739c5405d73c42ef15a9dc995efc0f87396cc36
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .node-version
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: semgrep/semgrep
+          ref: bd614accba811b407ae5c9ec6f1eecd3bdc29911
+          path: task9-semgrep
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: ocaml/opam-repository
+          ref: 78d29aba187e8362b8ab86c189790c0af9153d4b
+          path: task9-opam-repository
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: semgrep/setup-ocaml@a739c5405d73c42ef15a9dc995efc0f87396cc36
+        with:
+          cache-prefix: context-relay-task9-macos-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build }}
+          ocaml-compiler: ocaml-variants.5.3.0+options,ocaml-option-flambda
+          opam-pin: false
+          opam-repositories: |
+            default: https://github.com/ocaml/opam-repository.git#78d29aba187e8362b8ab86c189790c0af9153d4b
+          save-opam-post-run: false
+      - name: Verify exact native arm64 builder and fetch pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          test "$(node --version)" = v24.14.0
+          test "$(opam --version)" = 2.5.0
+          test "$(rustc -vV | sed -n 's/^host: //p')" = aarch64-apple-darwin
+          pins="$RUNNER_TEMP/context-relay-semgrep-pins-macos-$CONTEXT_RELAY_BUILD_SLOT"
+          mkdir "$pins"
+          node -e 'const l=require("./third_party/sidecars/semgrep/source-lock.v1.json"); for(const p of [l.opam.compiler,...l.opam.pinDepends]) console.log(p.url+"\t"+p.revision)' |
+          while IFS="$(printf '\t')" read -r url revision; do
+            destination="$pins/$revision"
+            git init -q "$destination"
+            git -C "$destination" remote add origin "$url"
+            git -C "$destination" fetch --depth=1 --filter=blob:none origin "$revision"
+            git -C "$destination" checkout -q --detach FETCH_HEAD
+            git -C "$destination" submodule update --init --recursive --depth=1
+            test "$(git -C "$destination" rev-parse HEAD)" = "$revision"
+          done
+          printf 'CONTEXT_RELAY_SEMGREP_PINS_ROOT=%s\n' "$pins" >> "$GITHUB_ENV"
+      - name: Build one independently identified offline macOS runtime
+        shell: bash
+        env:
+          CONTEXT_RELAY_CHECK_RUN_ID: ${{ job.check_run_id }}
+          CONTEXT_RELAY_JOB_DEFINITION: ${{ github.job }}
+          CONTEXT_RELAY_JOB_INDEX: ${{ strategy.job-index }}
+          CONTEXT_RELAY_JOB_TOTAL: ${{ strategy.job-total }}
+        run: |
+          set -euo pipefail
+          slot="$CONTEXT_RELAY_BUILD_SLOT"
+          label="build-$slot"
+          lock="$GITHUB_WORKSPACE/third_party/sidecars/semgrep/source-lock.v1.json"
+          evidence="$GITHUB_WORKSPACE/third_party/sidecars/semgrep/bundle-evidence.v1.json"
+          cache="$RUNNER_TEMP/context-relay-semgrep-cache-macos-$slot"
+          bundle="$RUNNER_TEMP/context-relay-semgrep-source-$slot.tar"
+          work="$RUNNER_TEMP/context-relay-semgrep-work-macos"
+          output="$RUNNER_TEMP/context-relay-semgrep-output-macos-$slot"
+          node scripts/semgrep-source-bundle.mjs --fetch "$lock" "$cache"
+          node scripts/semgrep-source-bundle.mjs --build "$lock" "$GITHUB_WORKSPACE/task9-semgrep" "$GITHUB_WORKSPACE/task9-opam-repository" "$CONTEXT_RELAY_SEMGREP_PINS_ROOT" "$cache" "$bundle" "$GITHUB_WORKSPACE"
+          node scripts/semgrep-source-bundle.mjs --verify-evidence "$lock" "$bundle" "$evidence"
+          /bin/sh third_party/sidecars/semgrep/build-public-source-macos.sh "$lock" "$bundle" "$work" "$output" "$label"
+          cp "$bundle" "$output/source-$slot.tar"
+          node -e 'const fs=require("node:fs"); const p=process.argv[1]; const slot=process.env.CONTEXT_RELAY_BUILD_SLOT; const value={schemaVersion:1,target:"macos-aarch64",build:`build-${slot}`,artifactName:`task9-semgrep-macos-build-${slot}-${process.env.GITHUB_SHA}-${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}`,commit:process.env.GITHUB_SHA,runId:process.env.GITHUB_RUN_ID,runAttempt:Number(process.env.GITHUB_RUN_ATTEMPT),checkRunId:Number(process.env.CONTEXT_RELAY_CHECK_RUN_ID),jobDefinition:process.env.CONTEXT_RELAY_JOB_DEFINITION,jobIndex:Number(process.env.CONTEXT_RELAY_JOB_INDEX),jobTotal:Number(process.env.CONTEXT_RELAY_JOB_TOTAL),runnerName:process.env.RUNNER_NAME,runnerOs:process.env.RUNNER_OS,runnerArch:process.env.RUNNER_ARCH,workflowRef:process.env.GITHUB_WORKFLOW_REF,workflowSha:process.env.GITHUB_WORKFLOW_SHA}; fs.writeFileSync(p,JSON.stringify(value)+"\n",{flag:"wx"});' "$output/$label.identity.v1.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: task9-semgrep-macos-build-${{ matrix.build }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/context-relay-semgrep-output-macos-${{ matrix.build }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+  native-isolation-macos-arm64:
+    needs:
+      - native-semgrep-macos-arm64-builders
+    outputs:
+      hydration_mode: ${{ steps.prepare.outputs.mode }}
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .node-version
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: task9-semgrep-macos-build-a-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/context-relay-semgrep-output-macos
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: task9-semgrep-macos-build-b-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/context-relay-semgrep-output-macos
+      - name: Verify independent macOS build identities and source evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/context-relay-semgrep-output-macos"
+          node scripts/verify-native-builder-identities.mjs "$root/build-a.identity.v1.json" "$root/build-b.identity.v1.json" macos-aarch64 "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_WORKFLOW_REF" "$GITHUB_WORKFLOW_SHA" native-semgrep-macos-arm64-builders task9-semgrep-macos-build
+          cmp "$root/source-a.tar" "$root/source-b.tar"
+          node scripts/semgrep-source-bundle.mjs --verify-evidence "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/source-lock.v1.json" "$root/source-a.tar" "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/bundle-evidence.v1.json"
+          node scripts/semgrep-source-bundle.mjs --verify-evidence "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/source-lock.v1.json" "$root/source-b.tar" "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/bundle-evidence.v1.json"
+          node -e 'const fs=require("node:fs"); for(const p of process.argv.slice(1)){const v=JSON.parse(fs.readFileSync(p)); if(v.schemaVersion!==1||v.mechanism!=="macos-sandbox-exec-network-deny"||v.probe!=="hostile-outbound-tcp-denied-with-eperm-or-eacces") process.exit(1)}' "$root/build-a.offline-egress.v1.json" "$root/build-b.offline-egress.v1.json"
+      - name: Prepare strict macOS candidate
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/context-relay-semgrep-output-macos"
+          candidate="$RUNNER_TEMP/context-relay-semgrep-candidate-macos"
+          result="$(node scripts/prepare-semgrep-runtime.mjs --prepare --workspace "$GITHUB_WORKSPACE" --target macos-aarch64 --build-root "$root" --output-root "$candidate" --source-bundle "$root/source-a.tar" --bundle-evidence "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/bundle-evidence.v1.json")"
+          mode="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).mode)' "$result")"
+          hydration_root="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).hydrationRoot)' "$result")"
+          artifact_root="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).artifactRoot)' "$result")"
+          manifest_root="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).candidateWorkspace || "")' "$result")"
+          candidate_document="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).candidateDocumentPath || "")' "$result")"
+          if test "$mode" = candidate; then
+            test -n "$manifest_root"
+            test -n "$candidate_document"
+            printf 'CONTEXT_RELAY_REAL_SIDECAR_MANIFEST_ROOT=%s\n' "$manifest_root" >> "$GITHUB_ENV"
+            printf 'CONTEXT_RELAY_CI_CANDIDATE_DOCUMENT=%s\n' "$candidate_document" >> "$GITHUB_ENV"
+          else
+            test "$mode" = enabled
+            test -z "$manifest_root"
+            test -z "$candidate_document"
+          fi
+          printf 'mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
+          printf 'CONTEXT_RELAY_REAL_SIDECAR_ROOT=%s\n' "$hydration_root" >> "$GITHUB_ENV"
+          printf 'CONTEXT_RELAY_RUNTIME_ARTIFACT_ROOT=%s\n' "$artifact_root" >> "$GITHUB_ENV"
+          for slot in a b; do
+            cp "$root/source-$slot.tar" "$artifact_root/source-$slot.tar"
+            cp "$root/build-$slot.identity.v1.json" "$artifact_root/build-$slot.identity.v1.json"
+            cp "$root/build-$slot.offline-egress.v1.json" "$artifact_root/build-$slot.offline-egress.v1.json"
+          done
+          cp third_party/sidecars/semgrep/bundle-evidence.v1.json "$artifact_root/bundle-evidence.v1.json"
+      - name: Mount canonical case-sensitive APFS root
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$RUNNER_TEMP/context-relay-case-sensitive.sparseimage"
+          mount="$RUNNER_TEMP/context-relay-case-sensitive"
+          mkdir "$mount"
+          hdiutil create -quiet -size 4g -fs APFSX -volname ContextRelayCaseSensitive -type SPARSE "$image"
+          hdiutil attach -quiet -nobrowse -owners on -mountpoint "$mount" "$image"
+          printf x > "$mount/CaseProbe"
+          printf y > "$mount/caseprobe"
+          test "$(find "$mount" -maxdepth 1 -type f -iname caseprobe | wc -l | tr -d ' ')" = 2
+          rm "$mount/CaseProbe" "$mount/caseprobe"
+          root="$(cd "$mount" && pwd -P)"
+          printf 'CONTEXT_RELAY_CASE_SENSITIVE_APFS_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
+      - name: Run macOS native and exact registered real-sidecar gates
+        shell: bash
+        env:
+          CONTEXT_RELAY_CHECK_RUN_ID: ${{ job.check_run_id }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          cargo test -p context-relay-native-runner
+          cargo test -p context-relay-core --test native_filesystem_macos_v1 --test native_recovery_v1 --test native_recovery_crash_v1 -- --nocapture
+          cargo test --manifest-path crates/native-runner/tests/macos-launcher-harness/Cargo.toml -- --nocapture
+          registered="$(cargo test --manifest-path crates/native-runner/tests/macos-launcher-harness/Cargo.toml --test adapter_native -- --list)"
+          for name in \
+            real_sidecar_rulesync_generates_only_the_validated_output \
+            real_sidecar_rulesync_rejects_malformed_frontmatter_and_cleans_up \
+            real_sidecar_gitleaks_clean_and_finding_ignore_attacker_gitleaksignore \
+            real_sidecar_semgrep_clean_and_finding_use_the_closed_policy
+          do
+            printf '%s\n' "$registered" | grep -Fqx "$name: test"
+            if test "$name" = real_sidecar_semgrep_clean_and_finding_use_the_closed_policy; then
+              cargo test --manifest-path crates/native-runner/tests/macos-launcher-harness/Cargo.toml --features ci-candidate-sidecar-smoke --test adapter_native "$name" -- --ignored --exact --nocapture
+            else
+              cargo test --manifest-path crates/native-runner/tests/macos-launcher-harness/Cargo.toml --test adapter_native "$name" -- --ignored --exact --nocapture
+            fi
+          done
+          node scripts/native-smoke-evidence.mjs --write "$CONTEXT_RELAY_RUNTIME_ARTIFACT_ROOT/native-smoke.macos-aarch64.v1.json" macos-aarch64 "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CONTEXT_RELAY_CHECK_RUN_ID" native-isolation-macos-arm64
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: task9-semgrep-macos-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/context-relay-semgrep-candidate-macos/artifact
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  request-native-sidecar-publication:
+    needs:
+      - native-isolation-windows-x64
+      - native-isolation-macos-arm64
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref_protected == true && needs.native-isolation-windows-x64.outputs.hydration_mode == 'candidate' && needs.native-isolation-macos-arm64.outputs.hydration_mode == 'candidate' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Dispatch the environment-protected finalizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e 'const value={event_type:"semgrep-native-publication",client_payload:{commit:process.env.GITHUB_SHA,runId:process.env.GITHUB_RUN_ID,runAttempt:Number(process.env.GITHUB_RUN_ATTEMPT),workflowRef:process.env.GITHUB_WORKFLOW_REF,workflowSha:process.env.GITHUB_WORKFLOW_SHA}}; process.stdout.write(JSON.stringify(value))' |
+            gh api --method POST -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$GITHUB_REPOSITORY/dispatches" --input -

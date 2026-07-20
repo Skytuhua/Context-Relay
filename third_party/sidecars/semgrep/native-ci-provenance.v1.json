@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "sourceLock": {
+    "path": "third_party/sidecars/semgrep/source-lock.v1.json",
+    "sha256": "dd4a8a1176cb9ca4004af8e98f4de0a8a7af14e10b7aaada542e7d5610d6deb0",
+    "embeddedActionToolchainStatus": "sealed-historical-metadata-non-authoritative-for-native-ci"
+  },
+  "actions": [
+    {
+      "action": "actions/checkout",
+      "revision": "df4cb1c069e1874edd31b4311f1884172cec0e10"
+    },
+    {
+      "action": "actions/setup-node",
+      "revision": "49933ea5288caeca8642d1e84afbd3f7d6820020"
+    },
+    {
+      "action": "semgrep/setup-ocaml",
+      "distributionTarget": "aarch64-apple-darwin",
+      "revision": "a739c5405d73c42ef15a9dc995efc0f87396cc36"
+    },
+    {
+      "action": "semgrep/setup-ocaml",
+      "distributionTarget": "windows-x86_64",
+      "revision": "3e4c6ff8c9a04c9ec8f6f87701cd4b661b0f1f18"
+    },
+    {
+      "action": "actions/upload-artifact",
+      "revision": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+    },
+    {
+      "action": "actions/download-artifact",
+      "revision": "37930b1c2abaa49bbe596cd826c3c89aef350131"
+    }
+  ],
+  "toolchains": [
+    {
+      "distributionTarget": "aarch64-apple-darwin",
+      "runner": "macos-15",
+      "ocamlCompiler": "ocaml-variants.5.3.0+options,ocaml-option-flambda",
+      "opamVersion": "2.5.0",
+      "nodeVersion": "24.14.0",
+      "setupNodeAction": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+      "setupAction": "semgrep/setup-ocaml@a739c5405d73c42ef15a9dc995efc0f87396cc36"
+    },
+    {
+      "distributionTarget": "windows-x86_64",
+      "runner": "windows-2022",
+      "ocamlCompiler": "5.3.0",
+      "opamVersion": "2.5.2",
+      "nodeVersion": "24.14.0",
+      "cygwinVersion": "3.6.10",
+      "setupNodeAction": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+      "setupAction": "semgrep/setup-ocaml@3e4c6ff8c9a04c9ec8f6f87701cd4b661b0f1f18"
+    }
+  ]
+}
