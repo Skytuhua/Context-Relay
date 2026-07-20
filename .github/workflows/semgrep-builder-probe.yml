@@ -84,3 +84,71 @@ jobs:
           path: semgrep-src/context-relay-closure
           if-no-files-found: error
           retention-days: 7
+
+  macos-public-source:
+    runs-on: macos-14
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+        working-directory: semgrep-src
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: semgrep/semgrep
+          ref: bd614accba811b407ae5c9ec6f1eecd3bdc29911
+          path: semgrep-src
+          submodules: recursive
+          fetch-depth: 1
+
+      - uses: semgrep/setup-ocaml@a739c5405d73c42ef15a9dc995efc0f87396cc36
+        with:
+          cache-prefix: context-relay-semgrep-1-170-macos-probe
+          ocaml-compiler: ocaml-variants.5.3.0+options,ocaml-option-flambda
+          opam-pin: false
+          opam-repositories: |
+            default: https://github.com/ocaml/opam-repository.git#78d29aba187e8362b8ab86c189790c0af9153d4b
+          save-opam-post-run: false
+
+      - name: Verify native immutable recursive checkout
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(git rev-parse HEAD)" = bd614accba811b407ae5c9ec6f1eecd3bdc29911
+          test "$(git rev-parse 'HEAD^{tree}')" = ad8e607874820dc7253d58997736463ed258ea34
+          test -z "$(git submodule status --recursive | grep '^[+-U]' || true)"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          sw_vers
+          opam --version
+          ocamlc -version
+
+      - name: Install exact public dependencies
+        run: |
+          opam exec -- make install-deps
+          ./scripts/validate-compiler-sha.sh
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Build unmodified native osemgrep
+        run: |
+          opam exec -- make core
+          test -f _build/install/default/bin/osemgrep
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Record executable and dynamic closure
+        run: |
+          mkdir -p context-relay-closure
+          cp _build/install/default/bin/osemgrep context-relay-closure/osemgrep
+          chmod 700 context-relay-closure/osemgrep
+          otool -L context-relay-closure/osemgrep > context-relay-closure/otool-L.txt
+          if grep -vE '^context-relay-closure/osemgrep:|^[[:space:]]+/usr/lib/|^[[:space:]]+/System/Library/' context-relay-closure/otool-L.txt; then
+            echo "non-system dynamic dependency detected" >&2
+            exit 1
+          fi
+          shasum -a 256 context-relay-closure/* > context-relay-closure/SHA256SUMS
+          cat context-relay-closure/SHA256SUMS
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: semgrep-macos-public-source-probe
+          path: semgrep-src/context-relay-closure
+          if-no-files-found: error
+          retention-days: 7
