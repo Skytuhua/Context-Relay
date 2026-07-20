@@ -1454,9 +1454,9 @@ mod macos_transport_tests {
             .create(unsafe_root.path())
             .unwrap();
         fs::set_permissions(unsafe_root.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        let (_, runtime) = runtime(&unsafe_root);
+        let (_, unsafe_runtime) = runtime(&unsafe_root);
         assert!(matches!(
-            InstanceGuard::acquire(&runtime),
+            InstanceGuard::acquire(&unsafe_runtime),
             Err(IpcError::InvalidRuntime)
         ));
 
