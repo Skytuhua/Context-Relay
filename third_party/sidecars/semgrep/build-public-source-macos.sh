@@ -112,7 +112,7 @@ export http_proxy=$HTTP_PROXY https_proxy=$HTTPS_PROXY all_proxy=$ALL_PROXY
 unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
 
 pin() {
-  opam pin add --no-action "$1" "$CURRENT/bundle/pins/$2"
+  opam pin add --no-action "$1" "$CURRENT/pins/$2"
 }
 
 run_closed_scan() {
@@ -160,6 +160,8 @@ build_once() {
   mkdir -p "$CURRENT/bundle" "$CURRENT/home" "$CURRENT/tmp"
   tar -xf "$SOURCE_BUNDLE" -C "$CURRENT/bundle"
   "$NODE" "$WORKSPACE/scripts/semgrep-source-bundle.mjs" --materialize-links "$CURRENT/bundle" >/dev/null
+  cp -RL "$CURRENT/bundle/pins" "$CURRENT/pins"
+  test -z "$(find "$CURRENT/pins" -type l -print -quit)" || die "flattened pin sources retain symbolic links"
   PROJECT="$CURRENT/bundle/sources/semgrep"
   test -f "$PROJECT/Makefile" || die "Semgrep source is missing"
   test "$SOURCE_REVISION" = bd614accba811b407ae5c9ec6f1eecd3bdc29911
@@ -194,7 +196,7 @@ build_once() {
     ./configure
     ./scripts/install-tree-sitter-lib
   )
-  OPAMIGNOREPINDEPENDS=true opam install --locked --update-invariant --deps-only ./semgrep.opam ./dev/required.opam
+  OPAMIGNOREPINDEPENDS=true opam install --locked --update-invariant --deps-only ./semgrep.opam
   ./scripts/validate-compiler-sha.sh
   opam exec -- make core
 

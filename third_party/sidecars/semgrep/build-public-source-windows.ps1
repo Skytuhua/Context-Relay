@@ -207,7 +207,7 @@ function Build-Once([string]$Label) {
   $env:TEMP = $env:TMP
   $env:OPAMROOT = Join-Path $script:Current 'opam'
   $Repository = Join-Path $Bundle 'opam-repository'
-  Invoke-Checked { & $Opam init --bare --no-setup default $Repository } 'opam init'
+  Invoke-Checked { & $Opam init --bare --no-setup --no-cygwin-setup default $Repository } 'opam init'
   $CacheUri = ([Uri]((Join-Path $Repository 'cache') + [IO.Path]::DirectorySeparatorChar)).AbsoluteUri.TrimEnd('/')
   $ArchiveMirrorsOption = 'archive-mirrors=["{0}"]' -f $CacheUri
   Invoke-Checked { & $Opam option --global $ArchiveMirrorsOption } 'offline archive mirror'
@@ -229,7 +229,7 @@ function Build-Once([string]$Label) {
     Invoke-Checked { & $Bash './scripts/pick-lockfile.sh' '--strict' 'semgrep.opam' } 'lockfile selection'
     Invoke-Checked { & $Bash '-lc' 'cd libs/ocaml-tree-sitter-core && ./configure && ./scripts/install-tree-sitter-lib' } 'tree-sitter build'
     $env:OPAMIGNOREPINDEPENDS = 'true'
-    Invoke-Checked { & $Opam install --locked --update-invariant --deps-only '.\semgrep.opam' '.\dev\required.opam' } 'dependency installation'
+    Invoke-Checked { & $Opam install --locked --update-invariant --deps-only '.\semgrep.opam' } 'dependency installation'
     Invoke-Checked { & $Bash './scripts/validate-compiler-sha.sh' } 'compiler validation'
     Invoke-Checked { & $Opam exec -- make core } 'osemgrep build'
   } finally {

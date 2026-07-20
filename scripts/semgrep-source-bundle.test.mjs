@@ -251,6 +251,7 @@ test('public-source build scripts consume the verified bundle through closed nat
     assert.match(script, /build-a/);
     assert.match(script, /build-b/);
     assert.match(script, /python/i);
+    assert.doesNotMatch(script, /dev[\\/]required\.opam/);
     assert.doesNotMatch(script, /pypi|pysemgrep|dumpbin|cl\.exe|visual studio/i);
   }
   assert.match(mac, /Darwin/);
@@ -261,6 +262,14 @@ test('public-source build scripts consume the verified bundle through closed nat
   assert.match(mac, /2\.5\.0/);
   assert.match(mac, /archive-mirrors=\[\\"\$ARCHIVE_MIRROR\\"\]/);
   assert.doesNotMatch(mac, /archive-mirrors=\$ARCHIVE_MIRROR/);
+  assert.match(mac, /cp -RL "\$CURRENT\/bundle\/pins" "\$CURRENT\/pins"/);
+  assert.match(mac, /test -z "\$\(find "\$CURRENT\/pins" -type l -print -quit\)"/);
+  assert.match(mac, /opam pin add --no-action "\$1" "\$CURRENT\/pins\/\$2"/);
+  assert.doesNotMatch(mac, /opam pin add --no-action[^\n]+bundle\/pins/);
+  assert.match(
+    mac,
+    /OPAMIGNOREPINDEPENDS=true opam install --locked --update-invariant --deps-only \.\/semgrep\.opam/,
+  );
   assert.match(mac, /otool/);
   assert.match(mac, /if ! otool -L[^\n]+>[^\n]+; then/);
   assert.doesNotMatch(mac, /otool -L[^\n]*\|/);
@@ -271,6 +280,14 @@ test('public-source build scripts consume the verified bundle through closed nat
   assert.match(windows, /2\.5\.2/);
   assert.match(windows, /archive-mirrors=\["\{0\}"\]/);
   assert.doesNotMatch(windows, /archive-mirrors=\$CacheUri/);
+  assert.match(
+    windows,
+    /& \$Opam init --bare --no-setup --no-cygwin-setup default \$Repository/,
+  );
+  assert.match(
+    windows,
+    /& \$Opam install --locked --update-invariant --deps-only '\.\\semgrep\.opam' \} 'dependency installation'/,
+  );
   assert.match(windows, /\[Environment\]::SystemDirectory/);
   assert.equal((windows.match(/& \$Tar /g) ?? []).length, 2);
   assert.doesNotMatch(windows, /& tar\.exe\b/i);

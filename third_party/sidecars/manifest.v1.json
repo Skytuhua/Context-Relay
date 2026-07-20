@@ -283,12 +283,12 @@
         {
           "role": "macos-build",
           "path": "third_party/sidecars/semgrep/build-public-source-macos.sh",
-          "sha256": "d5b9c68f5d17884a1fa29dc85d25dbb925a1b08131105fc4bc4caa914d60afa5"
+          "sha256": "a4aafd6fa61e240c008016d8a67002d810f35ac3d7542b66c358b168a726a14c"
         },
         {
           "role": "windows-build",
           "path": "third_party/sidecars/semgrep/build-public-source-windows.ps1",
-          "sha256": "9144a50368bc59b28cd5cf253bca8113c81f2c6dd7429d877c26155fa6b1d4b9"
+          "sha256": "3e88e82dfac81051ece7473f39599de54890d95bb4fb856f4298f1e736763d00"
         },
         {
           "role": "windows-builder-evidence-schema",
@@ -318,7 +318,7 @@
         {
           "role": "source-bundle-evidence",
           "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
-          "sha256": "a446f4228d066ca9a7363872d253f15860f1697ddd7481f3da28dd34c7438635"
+          "sha256": "d3db7d5a75d0bff68bef4f89d52d66c464a5e8112e8a19489125a317a22e7f72"
         },
         {
           "role": "manifest-rule",
