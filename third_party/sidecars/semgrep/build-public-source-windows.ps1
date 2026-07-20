@@ -20,6 +20,7 @@ $CheckoutActionSha = 'df4cb1c069e1874edd31b4311f1884172cec0e10'
 $UploadActionSha = '043fb46d1a93c77aae656e7c1c64a875d1fc6a0a'
 $DownloadActionSha = '37930b1c2abaa49bbe596cd826c3c89aef350131'
 $SourceRevision = 'bd614accba811b407ae5c9ec6f1eecd3bdc29911'
+$CompilerRevision = '3499e5708b0637c12d24d973dd103406a32b8fe8'
 $TreeSitterSha = 'e2b687f74358ab6404730b7fb1a1ced7ddb3780202d37595ecd7b20a8f41861f'
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Workspace = [IO.Path]::GetFullPath((Join-Path $ScriptRoot '..\..\..'))
@@ -69,11 +70,15 @@ Invoke-Checked {
   & $Node -e '
     const fs = require("node:fs");
     const { createHash } = require("node:crypto");
-    const [path, sourceLockPath, checkout, setupNode, setupOcaml, upload, download] = process.argv.slice(1);
+    const [path, sourceLockPath, checkout, setupNode, setupOcaml, upload, download, compilerRevision] = process.argv.slice(1);
     const provenance = JSON.parse(fs.readFileSync(path, "utf8"));
-    const sourceLockHash = createHash("sha256").update(fs.readFileSync(sourceLockPath)).digest("hex");
+    const sourceLockBytes = fs.readFileSync(sourceLockPath);
+    const sourceLock = JSON.parse(sourceLockBytes);
+    const sourceLockHash = createHash("sha256").update(sourceLockBytes).digest("hex");
     if (provenance.schemaVersion !== 1 || provenance.sourceLock?.sha256 !== sourceLockHash
-        || provenance.sourceLock?.embeddedActionToolchainStatus !== "sealed-historical-metadata-non-authoritative-for-native-ci") {
+        || provenance.sourceLock?.embeddedActionToolchainStatus !== "sealed-historical-metadata-non-authoritative-for-native-ci"
+        || sourceLock.opam?.compiler?.package !== "ocaml-variants.5.3.0"
+        || sourceLock.opam?.compiler?.revision !== compilerRevision) {
       throw new Error("native CI source lock identity mismatch");
     }
     const actionKey = ({ action, distributionTarget = "" }) => `${action}\0${distributionTarget}`;
@@ -100,7 +105,7 @@ Invoke-Checked {
         || value.setupAction !== "semgrep/setup-ocaml@" + setupOcaml) {
       throw new Error("native CI toolchain provenance mismatch");
     }
-  ' $CiProvenance $SourceLock $CheckoutActionSha $NodeActionSha $ActionSha $UploadActionSha $DownloadActionSha
+  ' $CiProvenance $SourceLock $CheckoutActionSha $NodeActionSha $ActionSha $UploadActionSha $DownloadActionSha $CompilerRevision
 } 'native CI action/toolchain provenance verification'
 if ((& uname.exe -o) -ne 'Cygwin') { Fail 'the public Windows route requires Cygwin' }
 $CygwinRelease = (& uname.exe -r).Trim()
@@ -111,7 +116,7 @@ if ($SourceRevision -ne 'bd614accba811b407ae5c9ec6f1eecd3bdc29911') { Fail 'sour
 $WorkRoot = [IO.Path]::GetFullPath($WorkRoot)
 $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 $forbidden = @([IO.Path]::GetPathRoot($WorkRoot), [Environment]::GetFolderPath('UserProfile'))
-if ($forbidden -contains $WorkRoot -or $WorkRoot -match '[\r\n]' -or $WorkRoot -match '\s') { Fail 'unsafe WorkRoot' }
+if ($forbidden -contains $WorkRoot -or $WorkRoot -match '[\r\n]' -or $WorkRoot -match '\s' -or $WorkRoot.Contains('#')) { Fail 'unsafe WorkRoot' }
 if (Test-Path -LiteralPath $WorkRoot) { Fail 'WorkRoot must not already exist' }
 if (Test-Path -LiteralPath $OutputRoot) { Fail 'OutputRoot must not already exist' }
 
@@ -131,6 +136,35 @@ $env:ALL_PROXY = 'http://127.0.0.1:9'
 $script:Current = $null
 function Add-Pin([string]$Package, [string]$Revision) {
   Invoke-Checked { & $Opam pin add --no-action $Package (Join-Path $script:Current "bundle\pins\$Revision") } "pin $Package"
+}
+
+function Initialize-CompilerGitIdentity([string]$GitDir, [string]$Revision) {
+  $GitDirForward = [IO.Path]::GetFullPath($GitDir).Replace('\', '/')
+  if ($GitDirForward -notmatch '^[A-Za-z]:/') { Fail 'compiler Git directory is not an absolute Windows drive path' }
+  # The verified local rsync pin has no VCS metadata, but the fork's configure
+  # script embeds `git rev-parse HEAD` in the compiler version.
+  Invoke-Checked {
+    & $Bash -c 'set -eu; git init --bare "$1" >/dev/null; printf "%s\n" "$2" > "$1/HEAD"; test "$(git --git-dir="$1" rev-parse HEAD)" = "$2"' _ $GitDirForward $Revision
+  } 'compiler Git identity preparation'
+  return $GitDirForward
+}
+
+function Assert-CompilerIdentity([string]$Revision) {
+  $ExpectedPinPath = [IO.Path]::GetFullPath((Join-Path $script:Current "bundle\pins\$Revision")).Replace('\', '/')
+  if ($ExpectedPinPath -notmatch '^[A-Za-z]:/') { Fail 'compiler pin path is not an absolute Windows drive path' }
+  $ExpectedPinUrl = "file://$ExpectedPinPath"
+  $PinOutput = @(& $Opam pin list --normalise)
+  if ($LASTEXITCODE -ne 0) { Fail 'compiler pin identity query failed' }
+  $CompilerPins = @($PinOutput | Where-Object { $_ -match '^ocaml-variants\.5\.3\.0\s+' })
+  if ($CompilerPins.Count -ne 1) { Fail 'compiler pin identity is missing or ambiguous' }
+  $PinFields = @($CompilerPins[0].Trim() -split '\s+')
+  if ($PinFields.Count -ne 3 -or $PinFields[1] -ne 'rsync') { Fail 'compiler pin transport mismatch' }
+  $PinUrl = $PinFields[2].Replace('\', '/')
+  if (-not $PinUrl.StartsWith('file://', [StringComparison]::Ordinal) -or
+      -not [string]::Equals($PinUrl, $ExpectedPinUrl, [StringComparison]::Ordinal)) { Fail 'compiler pin path mismatch' }
+  $CompilerVersion = (& $Opam exec -- ocamlc -version).Trim()
+  if ($LASTEXITCODE -ne 0) { Fail 'compiler embedded identity query failed' }
+  if ($CompilerVersion -ne "5.3.0+semgrep-fork@$Revision") { Fail 'compiler embedded identity mismatch' }
 }
 
 function Test-OutboundTcp([Net.IPAddress]$Address) {
@@ -208,15 +242,24 @@ function Build-Once([string]$Label) {
   $env:OPAMROOT = Join-Path $script:Current 'opam'
   $Repository = Join-Path $Bundle 'opam-repository'
   Invoke-Checked { & $Opam init --bare --no-setup --no-cygwin-setup default $Repository } 'opam init'
-  $CacheUri = ([Uri]((Join-Path $Repository 'cache') + [IO.Path]::DirectorySeparatorChar)).AbsoluteUri.TrimEnd('/')
+  $CachePath = (Join-Path $Repository 'cache').Replace('\', '/')
+  if ($CachePath -notmatch '^[A-Za-z]:/') { Fail 'offline archive mirror is not an absolute Windows drive path' }
+  $CacheUri = "file://$CachePath"
   $ArchiveMirrorsOption = 'archive-mirrors=["{0}"]' -f $CacheUri
   Invoke-Checked { & $Opam option --global $ArchiveMirrorsOption } 'offline archive mirror'
   $Switch = Join-Path $script:Current 'switch'
   Invoke-Checked { & $Opam switch create $Switch --empty } 'empty switch creation'
   $env:OPAMSWITCH = $Switch
 
-  Add-Pin 'ocaml-variants.5.3.0' '3499e5708b0637c12d24d973dd103406a32b8fe8'
-  Invoke-Checked { & $Opam install --update-invariant 'ocaml-variants.5.3.0' 'ocaml-option-flambda' } 'compiler installation'
+  $CompilerGitDirForward = Initialize-CompilerGitIdentity (Join-Path $script:Current 'compiler-git') $CompilerRevision
+  Add-Pin 'ocaml-variants.5.3.0' $CompilerRevision
+  if ($null -ne [Environment]::GetEnvironmentVariable('GIT_DIR', 'Process')) { Fail 'GIT_DIR must be unset before compiler installation' }
+  $env:GIT_DIR = $CompilerGitDirForward
+  try {
+    Invoke-Checked { & $Opam install --update-invariant 'ocaml-variants.5.3.0' 'ocaml-option-flambda' } 'compiler installation'
+  } finally {
+    Remove-Item Env:GIT_DIR -ErrorAction SilentlyContinue
+  }
   Add-Pin 'pcre2.dev' '4e0a44486bb518b7a24ca11286c4b03a8d51e17e'
   Add-Pin 'tree-sitter.dev' 'c4baff8d83b2e1f83f247acb11d0c9dafa5e48f7'
   foreach ($Package in @('testo.dev', 'testo-util.dev', 'testo-diff.dev', 'testo-lwt.dev')) { Add-Pin $Package 'df18ea541c75c9acf75923218586c5ffe8915a04' }
@@ -232,7 +275,7 @@ function Build-Once([string]$Label) {
     Invoke-Checked { & $Bash '-lc' 'cd libs/ocaml-tree-sitter-core && ./configure && ./scripts/install-tree-sitter-lib' } 'tree-sitter build'
     $env:OPAMIGNOREPINDEPENDS = 'true'
     Invoke-Checked { & $Opam install --locked --update-invariant --deps-only '.\semgrep.opam' } 'dependency installation'
-    Invoke-Checked { & $Bash './scripts/validate-compiler-sha.sh' } 'compiler validation'
+    Assert-CompilerIdentity $CompilerRevision
     Invoke-Checked { & $Opam exec -- make core } 'osemgrep build'
   } finally {
     Pop-Location

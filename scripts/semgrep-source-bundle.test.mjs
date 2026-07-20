@@ -61,6 +61,24 @@ test('writeAll retries partial FileHandle writes without dropping bytes', async 
   assert.deepEqual(Buffer.concat(written), expected);
 });
 
+test('locked compiler identity can be supplied without modifying source', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'context-relay-compiler-identity-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const gitDir = join(root, 'compiler-git');
+  const source = join(root, 'source');
+  const revision = '3499e5708b0637c12d24d973dd103406a32b8fe8';
+  await mkdir(source);
+  execFileSync('git', ['init', '--bare', gitDir], { stdio: 'ignore' });
+  await writeFile(join(gitDir, 'HEAD'), `${revision}\n`);
+  const actual = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: source,
+    encoding: 'utf8',
+    env: { ...process.env, GIT_DIR: gitDir },
+  });
+  assert.equal(actual.trim(), revision);
+  assert.deepEqual(await readdir(source), []);
+});
+
 test('deterministic source tar is byte-identical and contains no link members', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'context-relay-semgrep-bundle-'));
   t.after(() => rm(root, { force: true, recursive: true }));
@@ -302,6 +320,13 @@ test('public-source build scripts consume the verified bundle through closed nat
     assert.match(script, /build-a/);
     assert.match(script, /build-b/);
     assert.match(script, /python/i);
+    assert.match(script, /3499e5708b0637c12d24d973dd103406a32b8fe8/);
+    assert.match(script, /5\.3\.0\+semgrep-fork@/);
+    assert.match(script, /ocamlc -version/);
+    assert.match(script, /sourceLock\.opam\?\.compiler/);
+    assert.doesNotMatch(script, /scripts[\\/]validate-compiler-sha\.sh/);
+    assert.doesNotMatch(script, /(?:sed|patch)[^\r\n]*(?:configure|VERSION)/i);
+    assert.doesNotMatch(script, /--inplace-build/);
     assert.doesNotMatch(script, /dev[\\/]required\.opam/);
     assert.doesNotMatch(script, /pypi|pysemgrep|dumpbin|cl\.exe|visual studio/i);
   }
@@ -323,6 +348,11 @@ test('public-source build scripts consume the verified bundle through closed nat
     assert.match(mac, new RegExp(archive.replace('.', '\\.')));
   }
   assert.match(mac, /opam pin add --no-action "\$1" "\$CURRENT\/pins\/\$2"/);
+  assert.match(mac, /git init --bare "\$compiler_git_dir"/);
+  assert.match(mac, /prepare_compiler_identity "\$COMPILER_GIT_DIR" "\$COMPILER_REVISION"/);
+  assert.match(mac, /GIT_DIR="\$COMPILER_GIT_DIR" opam install --update-invariant/);
+  assert.equal((mac.match(/(?:^|\s)GIT_DIR=/g) ?? []).length, 1);
+  assert.match(mac, /rsync file:\/\/\$CURRENT\/pins\/\$revision/);
   assert.doesNotMatch(mac, /opam pin add --no-action[^\n]+bundle\/pins/);
   assert.match(
     mac,
@@ -332,6 +362,10 @@ test('public-source build scripts consume the verified bundle through closed nat
   assert.match(
     mac,
     /opam install --locked --update-invariant --assume-depexts --deps-only \.\/semgrep\.opam/,
+  );
+  assert.match(
+    mac,
+    /opam install --locked --update-invariant --assume-depexts --deps-only \.\/semgrep\.opam[\s\S]+validate_compiler_identity "\$COMPILER_REVISION"/,
   );
   assert.match(mac, /otool/);
   assert.match(mac, /if ! otool -L[^\n]+>[^\n]+; then/);
@@ -345,6 +379,19 @@ test('public-source build scripts consume the verified bundle through closed nat
   assert.doesNotMatch(windows, /archive-mirrors=\$CacheUri/);
   assert.match(
     windows,
+    /\$CachePath = \(Join-Path \$Repository 'cache'\)\.Replace\('\\', '\/'\)/,
+  );
+  assert.match(windows, /\$CacheUri = "file:\/\/\$CachePath"/);
+  assert.doesNotMatch(windows, /\$CacheUri = \(\[Uri\]/);
+  assert.match(windows, /git init --bare "\$1"/);
+  assert.match(windows, /\$GitDirForward = \[IO\.Path\]::GetFullPath\(\$GitDir\)\.Replace\('\\', '\/'\)/);
+  assert.match(windows, /\$env:GIT_DIR = \$CompilerGitDirForward/);
+  assert.doesNotMatch(windows, /\$GitDirPosix = \(& \$Cygpath -u/);
+  assert.match(windows, /Remove-Item Env:GIT_DIR -ErrorAction SilentlyContinue/);
+  assert.match(windows, /StartsWith\('file:\/\/'/);
+  assert.match(windows, /\$ExpectedPinUrl = "file:\/\/\$ExpectedPinPath"/);
+  assert.match(
+    windows,
     /& \$Opam init --bare --no-setup --no-cygwin-setup default \$Repository/,
   );
   assert.match(
@@ -354,6 +401,10 @@ test('public-source build scripts consume the verified bundle through closed nat
   assert.match(
     windows,
     /& \$Opam install --locked --update-invariant --deps-only '\.\\semgrep\.opam' \} 'dependency installation'/,
+  );
+  assert.match(
+    windows,
+    /'dependency installation'\r?\n\s+Assert-CompilerIdentity \$CompilerRevision/,
   );
   assert.match(windows, /\[Environment\]::SystemDirectory/);
   assert.equal((windows.match(/& \$Tar /g) ?? []).length, 2);
