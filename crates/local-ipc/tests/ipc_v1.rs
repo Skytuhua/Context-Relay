@@ -1387,7 +1387,8 @@ mod macos_transport_tests {
 
     impl TestRoot {
         fn new() -> Self {
-            Self(std::env::temp_dir().join(format!("context-relay-ipc-test-{}", Uuid::now_v7())))
+            let unique = Uuid::now_v7().simple().to_string();
+            Self(PathBuf::from("/tmp").join(format!("cr-ipc-{}", &unique[16..])))
         }
 
         fn path(&self) -> &Path {
@@ -1404,10 +1405,12 @@ mod macos_transport_tests {
 
     impl Drop for TestRoot {
         fn drop(&mut self) {
-            if self.0.file_name().is_some_and(|name| {
-                name.to_string_lossy()
-                    .starts_with("context-relay-ipc-test-")
-            }) {
+            if self.0.parent() == Some(Path::new("/tmp"))
+                && self
+                    .0
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("cr-ipc-"))
+            {
                 let _ = fs::remove_dir_all(&self.0);
             }
         }
