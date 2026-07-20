@@ -1,0 +1,16 @@
+name: Actions service smoke
+
+on:
+  push:
+    branches:
+      - codex/semgrep-ci-probe
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - run: Write-Output 'GitHub Actions runner started'
