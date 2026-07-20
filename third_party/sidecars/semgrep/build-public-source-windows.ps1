@@ -30,6 +30,7 @@ $Bash = (Get-Command bash.exe -ErrorAction Stop).Source
 $Objdump = (Get-Command x86_64-w64-mingw32-objdump.exe -ErrorAction Stop).Source
 $Gcc = (Get-Command x86_64-w64-mingw32-gcc.exe -ErrorAction Stop).Source
 $Cygpath = (Get-Command cygpath.exe -ErrorAction Stop).Source
+$Tar = (Resolve-Path -LiteralPath (Join-Path ([Environment]::SystemDirectory) 'tar.exe') -ErrorAction Stop).Path
 
 $ClosedScanArguments = @(
   'scan',
@@ -190,7 +191,7 @@ function Build-Once([string]$Label) {
   if (Test-Path -LiteralPath $script:Current) { Remove-Item -LiteralPath $script:Current -Recurse -Force }
   $Bundle = Join-Path $script:Current 'bundle'
   New-Item -ItemType Directory -Path $Bundle, (Join-Path $script:Current 'home'), (Join-Path $script:Current 'tmp') | Out-Null
-  Invoke-Checked { & tar.exe -xf $SourceBundle -C $Bundle } 'source bundle extraction'
+  Invoke-Checked { & $Tar -xf $SourceBundle -C $Bundle } 'source bundle extraction'
   Invoke-Checked { & $Node (Join-Path $Workspace 'scripts\semgrep-source-bundle.mjs') --materialize-links $Bundle | Out-Null } 'source link materialization'
   $Project = Join-Path $Bundle 'sources\semgrep'
   if (-not (Test-Path -LiteralPath (Join-Path $Project 'Makefile') -PathType Leaf)) { Fail 'Semgrep source is missing' }
@@ -198,7 +199,7 @@ function Build-Once([string]$Label) {
   $TreeSitterDownloads = Join-Path $Project 'libs\ocaml-tree-sitter-core\downloads'
   New-Item -ItemType Directory -Force -Path $TreeSitterDownloads | Out-Null
   $TreeArchive = Join-Path $Bundle "opam-repository\cache\sha256\$($TreeSitterSha.Substring(0, 2))\$TreeSitterSha"
-  Invoke-Checked { & tar.exe -xf $TreeArchive -C $TreeSitterDownloads } 'tree-sitter source extraction'
+  Invoke-Checked { & $Tar -xf $TreeArchive -C $TreeSitterDownloads } 'tree-sitter source extraction'
   if (-not (Test-Path -LiteralPath (Join-Path $TreeSitterDownloads 'tree-sitter-0.22.6') -PathType Container)) { Fail 'tree-sitter source did not unpack as expected' }
 
   $env:HOME = Join-Path $script:Current 'home'
@@ -208,7 +209,8 @@ function Build-Once([string]$Label) {
   $Repository = Join-Path $Bundle 'opam-repository'
   Invoke-Checked { & $Opam init --bare --no-setup default $Repository } 'opam init'
   $CacheUri = ([Uri]((Join-Path $Repository 'cache') + [IO.Path]::DirectorySeparatorChar)).AbsoluteUri.TrimEnd('/')
-  Invoke-Checked { & $Opam option --global "archive-mirrors=$CacheUri" } 'offline archive mirror'
+  $ArchiveMirrorsOption = 'archive-mirrors=["{0}"]' -f $CacheUri
+  Invoke-Checked { & $Opam option --global $ArchiveMirrorsOption } 'offline archive mirror'
   Invoke-Checked { & $Opam switch create (Join-Path $script:Current 'switch') --empty } 'empty switch creation'
 
   Add-Pin 'ocaml-variants.5.3.0' '3499e5708b0637c12d24d973dd103406a32b8fe8'

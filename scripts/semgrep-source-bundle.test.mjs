@@ -259,6 +259,8 @@ test('public-source build scripts consume the verified bundle through closed nat
   assert.doesNotMatch(mac, /macos-15-xlarge/);
   assert.match(mac, /a739c5405d73c42ef15a9dc995efc0f87396cc36/);
   assert.match(mac, /2\.5\.0/);
+  assert.match(mac, /archive-mirrors=\[\\"\$ARCHIVE_MIRROR\\"\]/);
+  assert.doesNotMatch(mac, /archive-mirrors=\$ARCHIVE_MIRROR/);
   assert.match(mac, /otool/);
   assert.match(mac, /if ! otool -L[^\n]+>[^\n]+; then/);
   assert.doesNotMatch(mac, /otool -L[^\n]*\|/);
@@ -267,6 +269,11 @@ test('public-source build scripts consume the verified bundle through closed nat
   assert.match(windows, /Cygwin/);
   assert.match(windows, /3e4c6ff8c9a04c9ec8f6f87701cd4b661b0f1f18/);
   assert.match(windows, /2\.5\.2/);
+  assert.match(windows, /archive-mirrors=\["\{0\}"\]/);
+  assert.doesNotMatch(windows, /archive-mirrors=\$CacheUri/);
+  assert.match(windows, /\[Environment\]::SystemDirectory/);
+  assert.equal((windows.match(/& \$Tar /g) ?? []).length, 2);
+  assert.doesNotMatch(windows, /& tar\.exe\b/i);
   assert.match(windows, /3\.6\.10/);
   assert.match(windows, /x86_64-w64-mingw32-(?:gcc|objdump)/);
 });

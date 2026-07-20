@@ -1025,11 +1025,9 @@ mod tests {
 
         let inspect = async {
             keys.wait_until_load_started().await;
-            assert!(matches!(
-                connect(&runtime).await,
-                Err(IpcError::EndpointNotFound)
-            ));
+            let connection = connect(&runtime).await;
             keys.release_load();
+            assert!(matches!(connection, Err(IpcError::EndpointNotFound)));
         };
         let (started, ()) = tokio::join!(Daemon::start(config), inspect);
         drop(started.unwrap());
@@ -1062,13 +1060,11 @@ mod tests {
 
         let inspect = async {
             entered_rx.await.unwrap();
-            assert!(matches!(
-                connect(&runtime).await,
-                Err(IpcError::EndpointNotFound)
-            ));
+            let connection = connect(&runtime).await;
             let (released, wake) = &*gate;
             *released.lock().unwrap() = true;
             wake.notify_all();
+            assert!(matches!(connection, Err(IpcError::EndpointNotFound)));
         };
         let (started, ()) = tokio::join!(Daemon::start(config), inspect);
         drop(started.unwrap());
@@ -1124,6 +1120,16 @@ mod tests {
         drop(daemon);
         let vault = Vault::open(&path, "test-vault-key", keys.as_ref()).unwrap();
         assert!(vault.recoverable_native_transactions().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_test_runtime_socket_path_stays_within_platform_limit() {
+        let endpoint = test_runtime("recover-all-before-bind")
+            .endpoint_name()
+            .unwrap();
+
+        assert!(endpoint.as_bytes().len() <= 103);
     }
 
     #[cfg(target_os = "macos")]
@@ -2129,11 +2135,24 @@ mod tests {
     }
 
     fn test_runtime(label: &str) -> RuntimeConfig {
-        RuntimeConfig::for_test(
-            format!("{label}-{}", uuid::Uuid::now_v7().simple()),
-            Some(unique_temp_path(label)),
-        )
-        .unwrap()
+        #[cfg(target_os = "macos")]
+        {
+            let unique = uuid::Uuid::now_v7().simple().to_string();
+            RuntimeConfig::for_test(
+                format!("{label}-{}", &unique[16..]),
+                Some(PathBuf::from("/tmp").join(format!("cr-ctx-{}", &unique[16..]))),
+            )
+            .unwrap()
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            RuntimeConfig::for_test(
+                format!("{label}-{}", uuid::Uuid::now_v7().simple()),
+                Some(unique_temp_path(label)),
+            )
+            .unwrap()
+        }
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

@@ -171,7 +171,8 @@ build_once() {
 
   export HOME="$CURRENT/home" TMPDIR="$CURRENT/tmp" OPAMROOT="$CURRENT/opam"
   opam init --bare --disable-sandboxing --no-setup default "$CURRENT/bundle/opam-repository"
-  opam option --global "archive-mirrors=file://$CURRENT/bundle/opam-repository/cache"
+  ARCHIVE_MIRROR="file://$CURRENT/bundle/opam-repository/cache"
+  opam option --global "archive-mirrors=[\"$ARCHIVE_MIRROR\"]"
   opam switch create "$CURRENT/switch" --empty
   eval "$(opam env --switch "$CURRENT/switch" --set-switch)"
 
