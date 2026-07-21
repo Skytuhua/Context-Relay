@@ -413,7 +413,12 @@ fn replace_regular_file(
     full_sync(&temporary)?;
 
     let staged = snapshot_named(&parent.directory, &cleanup.name)?;
-    if fingerprint_before_extra_parent_entry(&staged)? != intended_fingerprint {
+    let staged_fingerprint = if expected_present {
+        fingerprint_before_extra_parent_entry(&staged)?
+    } else {
+        *staged.fingerprint()
+    };
+    if staged_fingerprint != intended_fingerprint {
         return Err(RunnerError::ConcurrentChange);
     }
     let staged_token = staged
@@ -486,13 +491,22 @@ fn replace_regular_file(
     cleanup.armed = false;
     *installed_token = Some(staged_token.clone());
     if let Err(error) = flush_directory(&parent.directory).and_then(|()| {
-        validate_named_before_extra_parent_entry(
-            &parent.directory,
-            &parent.name,
-            Some(&staged_token),
-            &intended_fingerprint,
-        )
-        .map(|_| ())
+        let installed = if expected_present {
+            validate_named_before_extra_parent_entry(
+                &parent.directory,
+                &parent.name,
+                Some(&staged_token),
+                &intended_fingerprint,
+            )
+        } else {
+            validate_named(
+                &parent.directory,
+                &parent.name,
+                Some(&staged_token),
+                &intended_fingerprint,
+            )
+        };
+        installed.map(|_| ())
     }) {
         if backup.is_none()
             && rollback_created_target(parent, &cleanup.name, &staged_token, &intended_fingerprint)
@@ -537,21 +551,12 @@ fn replace_regular_file(
             },
         )?;
     }
-    if expected_present {
-        validate_named(
-            &parent.directory,
-            &parent.name,
-            Some(&staged_token),
-            &intended_fingerprint,
-        )?;
-    } else {
-        validate_named_before_extra_parent_entry(
-            &parent.directory,
-            &parent.name,
-            Some(&staged_token),
-            &intended_fingerprint,
-        )?;
-    }
+    validate_named(
+        &parent.directory,
+        &parent.name,
+        Some(&staged_token),
+        &intended_fingerprint,
+    )?;
     Ok(())
 }
 
@@ -1036,7 +1041,7 @@ fn rollback_created_target(
     staged_token: &NativeObjectToken,
     intended_fingerprint: &[u8; 32],
 ) -> Result<(), RunnerError> {
-    validate_named_before_extra_parent_entry(
+    validate_named(
         &parent.directory,
         &parent.name,
         Some(staged_token),
@@ -1046,7 +1051,7 @@ fn rollback_created_target(
     run_pre_rollback_move_test_hook();
     rename_exclusive(&parent.directory, &parent.name, temp_name)?;
     flush_directory(&parent.directory)?;
-    if validate_named_before_extra_parent_entry(
+    if validate_named(
         &parent.directory,
         temp_name,
         Some(staged_token),
@@ -2335,7 +2340,7 @@ mod guarded_mutation_tests {
         let parent = OpenParent::new(&path).unwrap();
         let installed = snapshot_named(&parent.directory, &parent.name).unwrap();
         let installed_token = installed.object_token().unwrap().clone();
-        let installed_fingerprint = fingerprint_before_extra_parent_entry(&installed).unwrap();
+        let installed_fingerprint = *installed.fingerprint();
         let temp = temp_name(&parent.name, &TEST_NONCE);
         *PRE_ROLLBACK_MOVE_TEST_HOOK.lock().unwrap() = Some(Box::new({
             let path = path.clone();
@@ -2506,6 +2511,32 @@ mod guarded_mutation_tests {
 
         assert_eq!(snapshot(&path), Err(RunnerError::ConcurrentChange));
         assert_eq!(fs::read(&path).unwrap(), b"created concurrently\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn absent_create_installs_an_exact_stable_state() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = test_root("absent-create");
+        let path = root.join("settings.json");
+        fs::write(&path, b"approved-secret\n").unwrap();
+        let native = OsNativeFileSystem::new();
+        let intended = native.snapshot(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let absent = native.snapshot(&path).unwrap();
+
+        let created = native
+            .compare_and_swap(&path, absent.fingerprint(), intended.state(), &TEST_NONCE)
+            .unwrap();
+
+        assert!(created.wrote());
+        assert_eq!(created.snapshot().fingerprint(), intended.fingerprint());
+        assert_eq!(
+            native.snapshot(&path).unwrap().fingerprint(),
+            intended.fingerprint()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

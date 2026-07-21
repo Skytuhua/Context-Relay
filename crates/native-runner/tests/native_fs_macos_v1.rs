@@ -27,10 +27,7 @@ fn scratch(parent: &Path, label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path = parent.join(format!(
-        "context-relay-native-fs-{label}-{}-{suffix}",
-        std::process::id()
-    ));
+    let path = parent.join(format!("crnf-{label}-{}-{suffix}", std::process::id()));
     fs::create_dir(&path).unwrap();
     path
 }
@@ -264,6 +261,7 @@ fn snapshot_and_compare_and_swap_restore_posix_metadata_and_xattrs() {
     let root = scratch(&default_root(), "snapshot");
     let path = root.join("settings.json");
     fs::write(&path, b"before\n").unwrap();
+    set_xattr(&path, b"preserve-me");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o440)).unwrap();
     let user = std::env::var("USER").expect("macOS native CI must expose USER");
     assert!(
@@ -275,7 +273,6 @@ fn snapshot_and_compare_and_swap_restore_posix_metadata_and_xattrs() {
             .success(),
         "macOS native CI must support a real file ACL"
     );
-    set_xattr(&path, b"preserve-me");
     let native = OsNativeFileSystem::new();
     let before = native.snapshot(&path).unwrap();
     let before_meta = fs::metadata(&path).unwrap();
@@ -364,6 +361,7 @@ fn compare_and_swap_create_delete_and_post_enumeration_swap_are_exact() {
     fs::write(&path, b"before\n").unwrap();
     let native = OsNativeFileSystem::new();
     let before = native.snapshot(&path).unwrap();
+    let before_token = before.object_token().unwrap().clone();
     let absent = before.absent_state();
 
     let deleted = native
@@ -371,10 +369,14 @@ fn compare_and_swap_create_delete_and_post_enumeration_swap_are_exact() {
         .unwrap();
     assert!(deleted.wrote());
     assert!(!path.exists());
+    native
+        .cleanup_committed_delete_observed(&path, before.fingerprint(), &TEST_NONCE, &before_token)
+        .unwrap();
+    let cleaned_absent = native.snapshot(&path).unwrap();
     let restored = native
         .compare_and_swap(
             &path,
-            deleted.snapshot().fingerprint(),
+            cleaned_absent.fingerprint(),
             before.state(),
             &TEST_NONCE,
         )
