@@ -395,6 +395,9 @@ fn replace_regular_file(
     {
         return Err(RunnerError::ConcurrentChange);
     }
+    if !expected_present {
+        validate_absent(parent, expected, expected_fingerprint)?;
+    }
     let (mut temporary, mut cleanup) = create_adjacent_temp(parent, transaction_nonce)?;
     use std::io::Write as _;
     temporary.write_all(bytes).map_err(|_| RunnerError::Io)?;
@@ -410,7 +413,7 @@ fn replace_regular_file(
     full_sync(&temporary)?;
 
     let staged = snapshot_named(&parent.directory, &cleanup.name)?;
-    if staged.fingerprint() != &intended_fingerprint {
+    if fingerprint_before_extra_parent_entry(&staged)? != intended_fingerprint {
         return Err(RunnerError::ConcurrentChange);
     }
     let staged_token = staged
@@ -423,7 +426,7 @@ fn replace_regular_file(
     let _expected_handle = if expected_present {
         verify_expected(parent, expected)?
     } else {
-        validate_absent(parent, expected, expected_fingerprint)?;
+        validate_absent_after_parent_entry_added(parent, expected_fingerprint)?;
         None
     };
 
@@ -439,7 +442,7 @@ fn replace_regular_file(
     if let (Some(expected), Some(backup)) = (expected, backup.as_ref()) {
         rename_exclusive(&parent.directory, &parent.name, backup)?;
         flush_directory(&parent.directory)?;
-        if validate_named(
+        if validate_named_before_extra_parent_entry(
             &parent.directory,
             backup,
             Some(expected),
@@ -451,7 +454,7 @@ fn replace_regular_file(
             return Err(RunnerError::ConcurrentChange);
         }
     } else {
-        validate_absent(parent, expected, expected_fingerprint)?;
+        validate_absent_after_parent_entry_added(parent, expected_fingerprint)?;
     }
 
     #[cfg(test)]
@@ -483,7 +486,7 @@ fn replace_regular_file(
     cleanup.armed = false;
     *installed_token = Some(staged_token.clone());
     if let Err(error) = flush_directory(&parent.directory).and_then(|()| {
-        validate_named(
+        validate_named_before_extra_parent_entry(
             &parent.directory,
             &parent.name,
             Some(&staged_token),
@@ -510,13 +513,13 @@ fn replace_regular_file(
     }
 
     if let (Some(expected), Some(backup)) = (expected, backup.as_ref()) {
-        validate_named(
+        validate_named_before_extra_parent_entry(
             &parent.directory,
             &parent.name,
             Some(&staged_token),
             &intended_fingerprint,
         )?;
-        validate_named(
+        validate_named_before_extra_parent_entry(
             &parent.directory,
             backup,
             Some(expected),
@@ -534,12 +537,21 @@ fn replace_regular_file(
             },
         )?;
     }
-    validate_named(
-        &parent.directory,
-        &parent.name,
-        Some(&staged_token),
-        &intended_fingerprint,
-    )?;
+    if expected_present {
+        validate_named(
+            &parent.directory,
+            &parent.name,
+            Some(&staged_token),
+            &intended_fingerprint,
+        )?;
+    } else {
+        validate_named_before_extra_parent_entry(
+            &parent.directory,
+            &parent.name,
+            Some(&staged_token),
+            &intended_fingerprint,
+        )?;
+    }
     Ok(())
 }
 
@@ -676,9 +688,6 @@ fn recover_interrupted_replace_held(
         Ok(snapshot) => snapshot,
         Err(_) => return Err(RunnerError::ConcurrentChange),
     };
-    if backup.fingerprint() != before_fingerprint {
-        return Err(RunnerError::ConcurrentChange);
-    }
     let backup_token = backup
         .object_token()
         .ok_or(RunnerError::ConcurrentChange)?
@@ -688,6 +697,9 @@ fn recover_interrupted_replace_held(
     }
     let target = snapshot_named(&parent.directory, &parent.name)?;
     if matches!(target.state(), NativeState::Absent { .. }) {
+        if backup.fingerprint() != before_fingerprint {
+            return Err(RunnerError::ConcurrentChange);
+        }
         if (target.fingerprint() == applied_fingerprint
             && !provenance.accepts_applied(target.object_token()))
             || (target.fingerprint() != applied_fingerprint
@@ -696,10 +708,20 @@ fn recover_interrupted_replace_held(
         {
             return Ok(super::NativeRecoveryDisposition::Abandoned);
         }
-        restore_backup(parent, &backup_name, &backup_token, before_fingerprint)?;
+        restore_backup(
+            parent,
+            &backup_name,
+            &backup_token,
+            before_fingerprint,
+            false,
+        )?;
         return Ok(super::NativeRecoveryDisposition::Restored);
     }
-    if target.fingerprint() == before_fingerprint {
+    if fingerprint_before_extra_parent_entry(&backup)? != *before_fingerprint {
+        return Err(RunnerError::ConcurrentChange);
+    }
+    let target_fingerprint = fingerprint_before_extra_parent_entry(&target)?;
+    if target_fingerprint == *before_fingerprint {
         let target_token = target
             .object_token()
             .ok_or(RunnerError::ConcurrentChange)?
@@ -717,7 +739,7 @@ fn recover_interrupted_replace_held(
         )?;
         return Ok(super::NativeRecoveryDisposition::Restored);
     }
-    if target.fingerprint() != applied_fingerprint {
+    if target_fingerprint != *applied_fingerprint {
         return Err(RunnerError::ConcurrentChange);
     }
     let target_token = target
@@ -733,7 +755,7 @@ fn recover_interrupted_replace_held(
     let temp_name = temp_name(&parent.name, transaction_nonce);
     rename_exclusive(&parent.directory, &parent.name, &temp_name)?;
     flush_directory(&parent.directory)?;
-    if validate_named(
+    if validate_named_before_extra_parent_entry(
         &parent.directory,
         &temp_name,
         Some(&target_token),
@@ -744,7 +766,13 @@ fn recover_interrupted_replace_held(
         let _ = restore_moved_name_to(parent, &temp_name, &parent.name);
         return Err(RunnerError::ConcurrentChange);
     }
-    if let Err(error) = restore_backup(parent, &backup_name, &backup_token, before_fingerprint) {
+    if let Err(error) = restore_backup(
+        parent,
+        &backup_name,
+        &backup_token,
+        before_fingerprint,
+        true,
+    ) {
         let _ = restore_moved_name_to(parent, &temp_name, &parent.name);
         return Err(error);
     }
@@ -833,6 +861,56 @@ fn validate_named(
     Ok(snapshot)
 }
 
+fn fingerprint_with_parent_links(
+    snapshot: &NativeSnapshot,
+    parent_links: u64,
+) -> Result<[u8; 32], RunnerError> {
+    let mut state = snapshot.state().clone();
+    let NativeState::RegularFile { metadata, .. } = &mut state else {
+        return Err(RunnerError::ConcurrentChange);
+    };
+    let mut security = PosixSecurity::decode(&metadata.security_descriptor)?;
+    security.parent_links = parent_links;
+    metadata.parent_link_count = parent_links;
+    metadata.parent_attributes = parent_marker_fields(
+        security.parent_mode,
+        security.parent_flags,
+        security.parent_uid,
+        security.parent_gid,
+        parent_links,
+    )
+    .0;
+    metadata.security_descriptor = security.encode()?;
+    Ok(fingerprint(&state))
+}
+
+fn fingerprint_before_extra_parent_entry(
+    snapshot: &NativeSnapshot,
+) -> Result<[u8; 32], RunnerError> {
+    let links = snapshot
+        .metadata()
+        .ok_or(RunnerError::ConcurrentChange)?
+        .parent_link_count
+        .checked_sub(1)
+        .ok_or(RunnerError::ConcurrentChange)?;
+    fingerprint_with_parent_links(snapshot, links)
+}
+
+fn validate_named_before_extra_parent_entry(
+    parent: &File,
+    name: &CStr,
+    expected_token: Option<&NativeObjectToken>,
+    expected_fingerprint: &[u8; 32],
+) -> Result<NativeSnapshot, RunnerError> {
+    let snapshot = snapshot_named(parent, name)?;
+    if fingerprint_before_extra_parent_entry(&snapshot)? != *expected_fingerprint
+        || expected_token.is_some_and(|expected| snapshot.object_token() != Some(expected))
+    {
+        return Err(RunnerError::ConcurrentChange);
+    }
+    Ok(snapshot)
+}
+
 fn validate_absent(
     parent: &OpenParent,
     expected_token: Option<&NativeObjectToken>,
@@ -843,6 +921,29 @@ fn validate_absent(
         || snapshot.fingerprint() != expected_fingerprint
         || expected_token.is_some_and(|expected| snapshot.object_token() != Some(expected))
     {
+        return Err(RunnerError::ConcurrentChange);
+    }
+    Ok(())
+}
+
+fn validate_absent_after_parent_entry_added(
+    parent: &OpenParent,
+    expected_fingerprint: &[u8; 32],
+) -> Result<(), RunnerError> {
+    if !matches!(
+        snapshot_named(&parent.directory, &parent.name)?.state(),
+        NativeState::Absent { .. }
+    ) {
+        return Err(RunnerError::ConcurrentChange);
+    }
+    let node = raw_node(&parent.directory)?;
+    let links = node
+        .links
+        .checked_sub(1)
+        .ok_or(RunnerError::ConcurrentChange)?;
+    let (attributes, links) =
+        parent_marker_fields(node.mode, node.flags, node.uid, node.gid, links);
+    if fingerprint(&NativeState::absent(attributes, links)) != *expected_fingerprint {
         return Err(RunnerError::ConcurrentChange);
     }
     Ok(())
@@ -882,16 +983,26 @@ fn restore_backup(
     backup_name: &CStr,
     backup_token: &NativeObjectToken,
     before_fingerprint: &[u8; 32],
+    extra_parent_entry: bool,
 ) -> Result<(), RunnerError> {
     if !identity_matches_path(&parent.directory, &parent.path)? {
         return Err(RunnerError::ConcurrentChange);
     }
-    validate_named(
-        &parent.directory,
-        backup_name,
-        Some(backup_token),
-        before_fingerprint,
-    )?;
+    if extra_parent_entry {
+        validate_named_before_extra_parent_entry(
+            &parent.directory,
+            backup_name,
+            Some(backup_token),
+            before_fingerprint,
+        )?;
+    } else {
+        validate_named(
+            &parent.directory,
+            backup_name,
+            Some(backup_token),
+            before_fingerprint,
+        )?;
+    }
     if !matches!(
         snapshot_named(&parent.directory, &parent.name)?.state(),
         NativeState::Absent { .. }
@@ -900,14 +1011,22 @@ fn restore_backup(
     }
     rename_exclusive(&parent.directory, backup_name, &parent.name)?;
     flush_directory(&parent.directory)?;
-    if validate_named(
-        &parent.directory,
-        &parent.name,
-        Some(backup_token),
-        before_fingerprint,
-    )
-    .is_err()
-    {
+    let restored = if extra_parent_entry {
+        validate_named_before_extra_parent_entry(
+            &parent.directory,
+            &parent.name,
+            Some(backup_token),
+            before_fingerprint,
+        )
+    } else {
+        validate_named(
+            &parent.directory,
+            &parent.name,
+            Some(backup_token),
+            before_fingerprint,
+        )
+    };
+    if restored.is_err() {
         let _ = restore_moved_name_to(parent, &parent.name, backup_name);
         return Err(RunnerError::ConcurrentChange);
     }
@@ -920,7 +1039,7 @@ fn rollback_created_target(
     staged_token: &NativeObjectToken,
     intended_fingerprint: &[u8; 32],
 ) -> Result<(), RunnerError> {
-    validate_named(
+    validate_named_before_extra_parent_entry(
         &parent.directory,
         &parent.name,
         Some(staged_token),
@@ -930,7 +1049,7 @@ fn rollback_created_target(
     run_pre_rollback_move_test_hook();
     rename_exclusive(&parent.directory, &parent.name, temp_name)?;
     flush_directory(&parent.directory)?;
-    if validate_named(
+    if validate_named_before_extra_parent_entry(
         &parent.directory,
         temp_name,
         Some(staged_token),
@@ -965,25 +1084,25 @@ fn remove_exact_named(
     if !identity_matches_path(&parent.directory, &parent.path)? {
         return Err(RunnerError::ConcurrentChange);
     }
-    let first = validate_named(
+    let first = validate_named_before_extra_parent_entry(
         &parent.directory,
         name,
         Some(expected_token),
         expected_fingerprint,
     )?;
-    validate_named(
+    validate_named_before_extra_parent_entry(
         &parent.directory,
         guard.name,
         Some(guard.token),
         guard.fingerprint,
     )?;
-    validate_named(
+    validate_named_before_extra_parent_entry(
         &parent.directory,
         name,
         first.object_token(),
         expected_fingerprint,
     )?;
-    validate_named(
+    validate_named_before_extra_parent_entry(
         &parent.directory,
         guard.name,
         Some(guard.token),
