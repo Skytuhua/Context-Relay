@@ -61,6 +61,41 @@ function Invoke-ClosedScan(
   return $LASTEXITCODE
 }
 
+function Normalize-SmokeEvidence(
+  [string]$CleanPath,
+  [string]$FindingPath,
+  [string]$CleanStderrPath,
+  [string]$FindingStderrPath,
+  [string]$InvalidStderrPath
+) {
+  Invoke-Checked {
+    & $Node -e '
+      const fs = require("node:fs");
+      const [cleanPath, findingPath, ...stderrPaths] = process.argv.slice(1);
+      for (const path of [cleanPath, findingPath]) {
+        const report = JSON.parse(fs.readFileSync(path, "utf8"));
+        if (!Object.hasOwn(report, "time") || !report.time
+            || typeof report.time !== "object" || Array.isArray(report.time)) {
+          throw new Error(`missing volatile Semgrep timing object: ${path}`);
+        }
+        delete report.time;
+        fs.writeFileSync(path, `${JSON.stringify(report)}\n`, { encoding: "utf8", flag: "w" });
+      }
+      const elapsedPrefix = /^\[\d+\.\d+\][ \t]*/gm;
+      for (const path of stderrPaths) {
+        const content = fs.readFileSync(path, "utf8");
+        const matches = content.match(elapsedPrefix) ?? [];
+        if (matches.length !== 1) throw new Error(`unexpected Semgrep elapsed-prefix count: ${path}`);
+        const normalized = content.replace(elapsedPrefix, "");
+        if (/^\[\d+\.\d+\]/m.test(normalized)) {
+          throw new Error(`volatile Semgrep elapsed prefix remains: ${path}`);
+        }
+        fs.writeFileSync(path, normalized, { encoding: "utf8", flag: "w" });
+      }
+    ' $CleanPath $FindingPath $CleanStderrPath $FindingStderrPath $InvalidStderrPath
+  } 'smoke evidence normalization'
+}
+
 if ($env:CONTEXT_RELAY_SETUP_OCAML_ACTION_SHA -ne $ActionSha) { Fail 'setup action identity mismatch' }
 if ($env:CONTEXT_RELAY_SETUP_NODE_ACTION_SHA -ne $NodeActionSha) { Fail 'setup-node action identity mismatch' }
 if ($env:CONTEXT_RELAY_RUNNER_IMAGE -ne 'windows-2022') { Fail 'runner image identity mismatch' }
@@ -425,6 +460,7 @@ function Build-Once([string]$Label) {
     if ($InvalidStatus -eq 0 -or $InvalidStatus -eq 1) { Fail 'invalid rule did not produce a distinct config failure' }
     $InvalidEvidence = [IO.File]::ReadAllText((Join-Path $Evidence 'invalid.json')) + [IO.File]::ReadAllText((Join-Path $Evidence 'invalid.stderr'))
     if ($InvalidEvidence -notmatch '(?i)invalid|error|parse|config|yaml') { Fail 'invalid rule evidence lacks a parse or config error' }
+    Normalize-SmokeEvidence $CleanJson $FindingJson (Join-Path $Evidence 'clean.stderr') (Join-Path $Evidence 'finding.stderr') (Join-Path $Evidence 'invalid.stderr')
   } finally {
     if ($SmokeLocationPushed) { Pop-Location }
     foreach ($Name in [string[]]@(Get-ChildItem Env: | ForEach-Object Name)) {

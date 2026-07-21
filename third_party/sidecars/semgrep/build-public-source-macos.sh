@@ -129,7 +129,7 @@ assert_network_denied
 "$NODE" "$WORKSPACE/scripts/semgrep-source-bundle.mjs" --verify "$SOURCE_LOCK" "$SOURCE_BUNDLE" >/dev/null
 mkdir -p "$WORK_ROOT" "$OUTPUT_ROOT"
 umask 022
-export LC_ALL=C TZ=UTC SOURCE_DATE_EPOCH=0 OPAMYES=1 OPAMCOLOR=never OPAMDOWNLOADJOBS=1 OPAMRETRIES=0
+export LC_ALL=C TZ=UTC SOURCE_DATE_EPOCH=0 ZERO_AR_DATE=1 OPAMYES=1 OPAMCOLOR=never OPAMDOWNLOADJOBS=1 OPAMRETRIES=0
 export HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9
 export http_proxy=$HTTP_PROXY https_proxy=$HTTPS_PROXY all_proxy=$ALL_PROXY
 unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_DIR
@@ -198,6 +198,35 @@ verify_smoke_results() {
     if (Array.isArray(report.errors) && report.errors.length !== 0) process.exit(1);
     if (expected === 1 && report.results[0].check_id !== "context-relay-smoke") process.exit(1);
   ' "$1" "$2" || die "closed scan result count mismatch"
+}
+
+normalize_smoke_evidence() {
+  "$NODE" -e '
+    const fs = require("node:fs");
+    const [cleanPath, findingPath, ...stderrPaths] = process.argv.slice(1);
+    for (const path of [cleanPath, findingPath]) {
+      const report = JSON.parse(fs.readFileSync(path, "utf8"));
+      if (!Object.hasOwn(report, "time") || !report.time
+          || typeof report.time !== "object" || Array.isArray(report.time)) {
+        throw new Error(`missing volatile Semgrep timing object: ${path}`);
+      }
+      delete report.time;
+      fs.writeFileSync(path, `${JSON.stringify(report)}\n`, { encoding: "utf8", flag: "w" });
+    }
+    const elapsedPrefix = /^\[\d+\.\d+\][ \t]*/gm;
+    for (const path of stderrPaths) {
+      const content = fs.readFileSync(path, "utf8");
+      const matches = content.match(elapsedPrefix) ?? [];
+      if (matches.length !== 1) throw new Error(`unexpected Semgrep elapsed-prefix count: ${path}`);
+      const normalized = content.replace(elapsedPrefix, "");
+      if (/^\[\d+\.\d+\]/m.test(normalized)) {
+        throw new Error(`volatile Semgrep elapsed prefix remains: ${path}`);
+      }
+      fs.writeFileSync(path, normalized, { encoding: "utf8", flag: "w" });
+    }
+  ' "$EVIDENCE/clean.json" "$EVIDENCE/finding.json" \
+    "$EVIDENCE/clean.stderr" "$EVIDENCE/finding.stderr" "$EVIDENCE/invalid.stderr" \
+    || die "smoke evidence normalization failed"
 }
 
 build_once() {
@@ -315,6 +344,7 @@ build_once() {
   if ! grep -Eiq 'invalid|error|parse|config|yaml' "$EVIDENCE/invalid.json" "$EVIDENCE/invalid.stderr"; then
     die "invalid rule evidence lacks a parse or config error"
   fi
+  normalize_smoke_evidence
   (
     cd "$DESTINATION"
     find . -type f ! -name MANIFEST.sha256 -print | sed 's#^\./##' | LC_ALL=C sort | while IFS= read -r file; do

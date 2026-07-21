@@ -379,6 +379,49 @@ test('public-source build scripts consume the verified bundle through closed nat
   assert.match(mac, /LIBRARY_PATH="\$\(brew --prefix\)\/lib:\$\{LIBRARY_PATH:-\}"/);
   assert.equal((mac.match(/PATH="\/usr\/bin:\/bin"/g) ?? []).length, 2);
   assert.doesNotMatch(mac, /PATH="\$CURRENT\/empty-path"/);
+  const zeroedDebugMapTime = mac.indexOf('ZERO_AR_DATE=1');
+  const nativeLink = mac.indexOf('opam exec -- make core');
+  assert.ok(
+    zeroedDebugMapTime >= 0 && zeroedDebugMapTime < nativeLink,
+    'macOS must zero N_OSO debug-map mtimes before the content-derived UUID and ad-hoc signature are linked',
+  );
+  assert.doesNotMatch(mac, /-no_uuid|strip\s+-S|codesign/);
+  const invalidEvidenceValidated = mac.indexOf('invalid rule evidence lacks a parse or config error');
+  const normalizedSmokeEvidence = mac.lastIndexOf('normalize_smoke_evidence');
+  const evidenceManifest = mac.indexOf('find . -type f ! -name MANIFEST.sha256', normalizedSmokeEvidence);
+  assert.ok(
+    invalidEvidenceValidated >= 0
+      && normalizedSmokeEvidence > invalidEvidenceValidated
+      && evidenceManifest > normalizedSmokeEvidence,
+    'volatile smoke fields must be normalized only after semantic validation and before evidence hashing',
+  );
+  assert.match(mac, /for \(const path of \[cleanPath, findingPath\]\)/);
+  assert.match(mac, /Object\.hasOwn\(report, "time"\)/);
+  assert.match(mac, /delete report\.time/);
+  assert.match(mac, /const elapsedPrefix = \/\^\\\[\\d\+\\\.\\d\+\\\]\[ \\t\]\*\/gm/);
+  assert.match(mac, /matches\.length !== 1/);
+  assert.match(mac, /content\.replace\(elapsedPrefix, ""\)/);
+  assert.match(
+    mac,
+    /"\$EVIDENCE\/clean\.json" "\$EVIDENCE\/finding\.json"[\s\\]+"\$EVIDENCE\/clean\.stderr" "\$EVIDENCE\/finding\.stderr" "\$EVIDENCE\/invalid\.stderr"/,
+  );
+  const windowsInvalidEvidenceValidated = windows.indexOf('invalid rule evidence lacks a parse or config error');
+  const windowsNormalizedSmokeEvidence = windows.lastIndexOf('Normalize-SmokeEvidence');
+  const windowsEvidenceManifest = windows.indexOf('$ManifestLines', windowsNormalizedSmokeEvidence);
+  assert.ok(
+    windowsInvalidEvidenceValidated >= 0
+      && windowsNormalizedSmokeEvidence > windowsInvalidEvidenceValidated
+      && windowsEvidenceManifest > windowsNormalizedSmokeEvidence,
+    'Windows volatile smoke fields must be normalized only after semantic validation and before evidence hashing',
+  );
+  for (const script of [mac, windows]) {
+    assert.match(script, /for \(const path of \[cleanPath, findingPath\]\)/);
+    assert.match(script, /Object\.hasOwn\(report, "time"\)/);
+    assert.match(script, /delete report\.time/);
+    assert.match(script, /const elapsedPrefix = \/\^\\\[\\d\+\\\.\\d\+\\\]\[ \\t\]\*\/gm/);
+    assert.match(script, /matches\.length !== 1/);
+    assert.match(script, /content\.replace\(elapsedPrefix, ""\)/);
+  }
   assert.match(mac, /"\$DESTINATION\/osemgrep" --experimental --version/);
   assert.match(
     mac,
