@@ -7017,7 +7017,7 @@
         "pkgconf",
         "zstd"
       ],
-      "workflowGitBlob": "43f2e1401c9da4a3f9568b76b4cfe634f5b59b28"
+      "workflowGitBlob": "0f0a15c698de58969d3cfec020ad3f3ce6aea795"
     },
     {
       "distributionTarget": "windows-x86_64",
@@ -7054,7 +7054,7 @@
         "sha256": null,
         "status": "pending_native_capture"
       },
-      "workflowGitBlob": "43f2e1401c9da4a3f9568b76b4cfe634f5b59b28",
+      "workflowGitBlob": "0f0a15c698de58969d3cfec020ad3f3ce6aea795",
       "note": "The action, Node version, package names, and builder-evidence schema are pinned; release enablement still requires a schema-valid native Cygwin package-version capture and two matching native builds."
     }
   ],

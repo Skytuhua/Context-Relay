@@ -552,6 +552,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
+          export TMPDIR="$(cd "${TMPDIR:-$RUNNER_TEMP}" && pwd -P)"
           cargo test -p context-relay-native-runner
           cargo test -p context-relay-core --test native_filesystem_macos_v1 --test native_recovery_v1 --test native_recovery_crash_v1 -- --nocapture
           cargo test --manifest-path crates/native-runner/tests/macos-launcher-harness/Cargo.toml -- --nocapture

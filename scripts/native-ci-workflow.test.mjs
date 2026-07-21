@@ -101,6 +101,12 @@ test('macOS native CI mounts a debuggable case-sensitive APFS image', async () =
   assert.match(mount, /printf x > "\$mount\/CaseProbe"/);
   assert.match(mount, /printf y > "\$mount\/caseprobe"/);
   assert.match(mount, /find "\$mount"[^\n]+-iname caseprobe[^\n]+wc -l/);
+
+  const gates = macos.slice(end);
+  const canonicalTempAt = gates.indexOf('export TMPDIR="$(cd "${TMPDIR:-$RUNNER_TEMP}" && pwd -P)"');
+  const cargoAt = gates.indexOf('cargo test -p context-relay-native-runner');
+  assert.ok(canonicalTempAt > 0 && canonicalTempAt < cargoAt, 'native tests require a canonical default temp root');
+  assert.doesNotMatch(gates, /export TMPDIR="\$CONTEXT_RELAY_CASE_SENSITIVE_APFS_ROOT"/);
 });
 
 test('the CI-only candidate verifier feature is scoped to the exact ignored Semgrep smokes', async () => {
