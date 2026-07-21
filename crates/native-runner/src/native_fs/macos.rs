@@ -2625,18 +2625,15 @@ mod guarded_mutation_tests {
         fs::write(&path, b"before\n").unwrap();
         let native = OsNativeFileSystem::new();
         let before = native.snapshot(&path).unwrap();
-        let desired =
-            NativeState::regular_file(b"after\n".to_vec(), before.metadata().unwrap().clone());
         let parent = OpenParent::new(&path).unwrap();
         let backup = backup_name(&parent.name);
         rename_exclusive(&parent.directory, &parent.name, &backup).unwrap();
         flush_directory(&parent.directory).unwrap();
 
-        let absent = native.snapshot(&path).unwrap();
-        let first = native
-            .compare_and_swap(&path, absent.fingerprint(), &desired, &TEST_NONCE)
-            .unwrap();
-        let installed_token = first.installed_token().unwrap().clone();
+        fs::write(&path, b"after\n").unwrap();
+        let first = native.snapshot(&path).unwrap();
+        let desired = first.state().clone();
+        let installed_token = first.object_token().unwrap().clone();
         fs::remove_file(&path).unwrap();
         let absent = native.snapshot(&path).unwrap();
         let concurrent = native
@@ -2676,17 +2673,14 @@ mod guarded_mutation_tests {
         fs::write(&path, b"before\n").unwrap();
         let native = OsNativeFileSystem::new();
         let before = native.snapshot(&path).unwrap();
-        let desired =
-            NativeState::regular_file(b"after\n".to_vec(), before.metadata().unwrap().clone());
         let parent = OpenParent::new(&path).unwrap();
         let backup = backup_name(&parent.name);
         rename_exclusive(&parent.directory, &parent.name, &backup).unwrap();
         flush_directory(&parent.directory).unwrap();
-        let absent = native.snapshot(&path).unwrap();
-        let installed = native
-            .compare_and_swap(&path, absent.fingerprint(), &desired, &TEST_NONCE)
-            .unwrap();
-        let installed_token = installed.installed_token().unwrap().clone();
+        fs::write(&path, b"after\n").unwrap();
+        let installed = native.snapshot(&path).unwrap();
+        let desired = installed.state().clone();
+        let installed_token = installed.object_token().unwrap().clone();
         fs::remove_file(&path).unwrap();
 
         assert_eq!(
@@ -2720,17 +2714,14 @@ mod guarded_mutation_tests {
         fs::write(&path, b"before\n").unwrap();
         let native = OsNativeFileSystem::new();
         let before = native.snapshot(&path).unwrap();
-        let desired =
-            NativeState::regular_file(b"after\n".to_vec(), before.metadata().unwrap().clone());
         let parent = OpenParent::new(&path).unwrap();
         let backup = backup_name(&parent.name);
         rename_exclusive(&parent.directory, &parent.name, &backup).unwrap();
         flush_directory(&parent.directory).unwrap();
-        let absent = native.snapshot(&path).unwrap();
-        let installed = native
-            .compare_and_swap(&path, absent.fingerprint(), &desired, &TEST_NONCE)
-            .unwrap();
-        let installed_token = installed.installed_token().unwrap().clone();
+        fs::write(&path, b"after\n").unwrap();
+        let installed = native.snapshot(&path).unwrap();
+        let desired = installed.state().clone();
+        let installed_token = installed.object_token().unwrap().clone();
 
         *RECOVERY_AFTER_PARENT_CHECK_TEST_HOOK.lock().unwrap() = Some(Box::new({
             let live = live.clone();
