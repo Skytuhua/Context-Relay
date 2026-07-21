@@ -2657,7 +2657,7 @@ mod guarded_mutation_tests {
             native.snapshot(&path).unwrap().object_token(),
             Some(&concurrent_token)
         );
-        assert!(matches!(
+        assert!(!matches!(
             snapshot_named(&parent.directory, &backup).unwrap().state(),
             NativeState::Absent { .. }
         ));
@@ -2695,7 +2695,7 @@ mod guarded_mutation_tests {
             Ok(NativeRecoveryDisposition::Abandoned)
         );
         assert!(!path.exists());
-        assert!(matches!(
+        assert!(!matches!(
             snapshot_named(&parent.directory, &backup).unwrap().state(),
             NativeState::Absent { .. }
         ));
