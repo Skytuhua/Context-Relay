@@ -461,15 +461,38 @@ pub fn spawn_suspended_verified(
         suspended: true,
         reaped: false,
     };
-    let actual = dynamic_code_identity(pid);
+    let identity = wait_for_dynamic_code_identity(pid, expected, dynamic_code_identity);
     let expected_pgid = process_group.map(|pgid| if pgid == 0 { pid } else { pgid });
-    if !matches!(actual, Ok(ref actual) if actual == expected)
-        || expected_pgid.is_some_and(|pgid| unsafe { libc::getpgid(pid) } != pgid)
-    {
+    if let Err(error) = identity {
+        child.kill_and_reap();
+        return Err(error);
+    }
+    if expected_pgid.is_some_and(|pgid| unsafe { libc::getpgid(pid) } != pgid) {
         child.kill_and_reap();
         return Err(MacPolicyError::IdentityMismatch);
     }
     Ok(child)
+}
+
+fn wait_for_dynamic_code_identity(
+    pid: libc::pid_t,
+    expected: &MacCodeIdentity,
+    mut inspect: impl FnMut(libc::pid_t) -> Result<MacCodeIdentity, MacPolicyError>,
+) -> Result<(), MacPolicyError> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match inspect(pid) {
+            Ok(actual) if &actual == expected => return Ok(()),
+            Ok(_) => return Err(MacPolicyError::IdentityMismatch),
+            Err(MacPolicyError::IdentityMismatch) if std::time::Instant::now() < deadline => {
+                if unsafe { libc::kill(pid, 0) } != 0 {
+                    return Err(MacPolicyError::IdentityMismatch);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn dynamic_code_identity(pid: libc::pid_t) -> Result<MacCodeIdentity, MacPolicyError> {
@@ -671,5 +694,43 @@ impl Drop for SpawnAttributes {
         unsafe {
             libc::posix_spawnattr_destroy(&mut self.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_code_identity_retries_transient_guest_registration() {
+        let expected = MacCodeIdentity::new(vec![0x11]).unwrap();
+        let mut attempts = 0;
+
+        wait_for_dynamic_code_identity(unsafe { libc::getpid() }, &expected, |_| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(MacPolicyError::IdentityMismatch)
+            } else {
+                Ok(expected.clone())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn dynamic_code_identity_rejects_an_observed_mismatch_without_retrying() {
+        let expected = MacCodeIdentity::new(vec![0x11]).unwrap();
+        let mut attempts = 0;
+
+        assert_eq!(
+            wait_for_dynamic_code_identity(unsafe { libc::getpid() }, &expected, |_| {
+                attempts += 1;
+                Ok(MacCodeIdentity::new(vec![0x22]).unwrap())
+            }),
+            Err(MacPolicyError::IdentityMismatch)
+        );
+        assert_eq!(attempts, 1);
     }
 }
