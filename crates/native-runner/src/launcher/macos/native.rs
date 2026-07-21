@@ -973,10 +973,20 @@ impl GenerationProcess for MacGenerationProcess {
             None,
             Some(pgid),
             &self.helper_code_identity,
-        )?;
-        guardian.ensure_alive()?;
+        )
+        .inspect_err(|_error| {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS suspended spawn verification failed: {_error:?}");
+        })?;
+        guardian.ensure_alive().inspect_err(|_error| {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS spawn guardian check failed: {_error:?}");
+        })?;
         self.child = Some(child);
-        self.capture_container()
+        self.capture_container().inspect_err(|_error| {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS suspended container capture failed: {_error:?}");
+        })
     }
 
     fn confirm_container_bound(&mut self) {
