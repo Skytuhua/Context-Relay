@@ -2380,16 +2380,8 @@ mod guarded_mutation_tests {
             }
         }));
 
-        native
-            .compare_and_swap(&path, before.fingerprint(), &absent, &TEST_NONCE)
-            .unwrap();
         assert_eq!(
-            native.cleanup_committed_delete_observed(
-                &path,
-                before.fingerprint(),
-                &TEST_NONCE,
-                before.object_token().unwrap(),
-            ),
+            native.compare_and_swap(&path, before.fingerprint(), &absent, &TEST_NONCE),
             Err(RunnerError::ConcurrentChange)
         );
         assert_eq!(fs::read(&path).unwrap(), b"attacker\n");
@@ -2483,8 +2475,16 @@ mod guarded_mutation_tests {
             move || fs::write(path, b"attacker\n").unwrap()
         }));
 
+        native
+            .compare_and_swap(&path, before.fingerprint(), &absent, &TEST_NONCE)
+            .unwrap();
         assert_eq!(
-            native.compare_and_swap(&path, before.fingerprint(), &absent, &TEST_NONCE,),
+            native.cleanup_committed_delete_observed(
+                &path,
+                before.fingerprint(),
+                &TEST_NONCE,
+                before.object_token().unwrap(),
+            ),
             Err(RunnerError::ConcurrentChange)
         );
         assert_eq!(fs::read(&path).unwrap(), b"attacker\n");
@@ -2526,7 +2526,7 @@ mod guarded_mutation_tests {
         let before = native.snapshot(&path).unwrap();
         let before_token = before.object_token().unwrap();
         assert_eq!(before_token.volume(), before_token.parent_volume());
-        assert_eq!(before_token.object(), before_token.parent_object());
+        assert_ne!(before_token.object(), before_token.parent_object());
         assert_ne!(before_token.object(), &[0; 16]);
         fs::rename(&live, &moved).unwrap();
         fs::create_dir(&live).unwrap();
@@ -2650,7 +2650,7 @@ mod guarded_mutation_tests {
             native.snapshot(&path).unwrap().fingerprint(),
             before.fingerprint()
         );
-        assert!(!matches!(
+        assert!(matches!(
             snapshot_named(&parent.directory, &backup).unwrap().state(),
             NativeState::Absent { .. }
         ));
@@ -2701,14 +2701,14 @@ mod guarded_mutation_tests {
         fs::write(&path, b"before\n").unwrap();
         let native = OsNativeFileSystem::new();
         let before = native.snapshot(&path).unwrap();
-        let absent = before.absent_state();
         fs::remove_file(&path).unwrap();
+        let absent = native.snapshot(&path).unwrap();
 
         native
             .recover_interrupted_replace(
                 &path,
                 before.fingerprint(),
-                &absent.fingerprint(),
+                absent.fingerprint(),
                 &TEST_NONCE,
             )
             .unwrap();
@@ -2724,10 +2724,17 @@ mod guarded_mutation_tests {
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
         let native = OsNativeFileSystem::new();
+        let parent = OpenParent::new(&path).unwrap();
+        let other_nonce = [0x7eu8; 16];
+        let other_temp = temp_name(&parent.name, &other_nonce);
+        fs::write(
+            root.join(OsStr::from_bytes(other_temp.to_bytes())),
+            b"other transaction\n",
+        )
+        .unwrap();
         let before = native.snapshot(&path).unwrap();
         let desired =
             NativeState::regular_file(b"after\n".to_vec(), before.metadata().unwrap().clone());
-        let parent = OpenParent::new(&path).unwrap();
         let backup = backup_name(&parent.name);
         rename_exclusive(&parent.directory, &parent.name, &backup).unwrap();
         flush_directory(&parent.directory).unwrap();
@@ -2749,14 +2756,6 @@ mod guarded_mutation_tests {
             &mut |_| Ok(()),
         )
         .unwrap();
-        let other_nonce = [0x7eu8; 16];
-        let other_temp = temp_name(&parent.name, &other_nonce);
-        fs::write(
-            root.join(OsStr::from_bytes(other_temp.to_bytes())),
-            b"other transaction\n",
-        )
-        .unwrap();
-
         native
             .recover_interrupted_replace(
                 &path,
