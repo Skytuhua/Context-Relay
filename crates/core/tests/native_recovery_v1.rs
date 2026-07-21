@@ -703,9 +703,11 @@ fn os_recovery_restores_an_absent_before_state_under_the_original_parent_on_maco
             &target,
             &token,
             Some(&applied_token),
+            None,
             MutationWalState::Applied,
             &expected_before,
             &expected_applied,
+            &expected_before,
         )
         .unwrap(),
         RecoveryProbe::Fingerprint(expected_applied.clone()),
@@ -719,6 +721,7 @@ fn os_recovery_restores_an_absent_before_state_under_the_original_parent_on_maco
             &expected_applied,
             &expected_before,
             &before.state().encode_v1().unwrap(),
+            &mut |_| Ok(()),
         )
         .unwrap(),
         RecoveryRestore::Restored,
