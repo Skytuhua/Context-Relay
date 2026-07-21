@@ -871,15 +871,13 @@ fn fingerprint_with_parent_links(
     };
     let mut security = PosixSecurity::decode(&metadata.security_descriptor)?;
     security.parent_links = parent_links;
-    metadata.parent_link_count = parent_links;
-    metadata.parent_attributes = parent_marker_fields(
+    (metadata.parent_attributes, metadata.parent_link_count) = parent_marker_fields(
         security.parent_mode,
         security.parent_flags,
         security.parent_uid,
         security.parent_gid,
         parent_links,
-    )
-    .0;
+    );
     metadata.security_descriptor = security.encode()?;
     Ok(fingerprint(&state))
 }
@@ -887,10 +885,9 @@ fn fingerprint_with_parent_links(
 fn fingerprint_before_extra_parent_entry(
     snapshot: &NativeSnapshot,
 ) -> Result<[u8; 32], RunnerError> {
-    let links = snapshot
-        .metadata()
-        .ok_or(RunnerError::ConcurrentChange)?
-        .parent_link_count
+    let metadata = snapshot.metadata().ok_or(RunnerError::ConcurrentChange)?;
+    let links = PosixSecurity::decode(&metadata.security_descriptor)?
+        .parent_links
         .checked_sub(1)
         .ok_or(RunnerError::ConcurrentChange)?;
     fingerprint_with_parent_links(snapshot, links)
