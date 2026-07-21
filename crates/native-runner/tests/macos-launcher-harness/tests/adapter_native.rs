@@ -21,8 +21,7 @@ use std::{
 
 use context_relay_native_runner::macos::{
     GenerationId, GenerationJournal, GenerationState, MacOsSandboxLauncher, MacPolicyError,
-    MacRecoveryCleanup, MacRecoveryIdentity, MacRecoveryOutcome, MacRootIdentity,
-    SignedGeneration,
+    MacRecoveryCleanup, MacRecoveryIdentity, MacRecoveryOutcome, MacRootIdentity, SignedGeneration,
     cleanup_recovered_generation,
 };
 use context_relay_native_runner::{
@@ -41,6 +40,19 @@ const CI_CANDIDATE_DOCUMENT: &str = "CONTEXT_RELAY_CI_CANDIDATE_DOCUMENT";
 const EXPECTED_PROOF: &[u8] =
     b"ARGV_EXACT=1\nENV_EXACT=1\nFAKE_HOME_WRITE=1\nREAL_HOME_DENIED=1\nLOOPBACK_DENIED=1\nCLOSURE_DENIED=1\n";
 static NATIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn native_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    NATIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn unwrap_run(
+    result: Result<RunResponse, context_relay_native_runner::RunnerError>,
+    journal: &TestJournal,
+) -> RunResponse {
+    result.unwrap_or_else(|error| panic!("{error:?}; lifecycle={:?}", journal.events()))
+}
 
 fn set_immutable(path: &Path, symlink: bool) {
     let encoded = CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -92,14 +104,15 @@ fn root_identity(path: &Path) -> MacRootIdentity {
 
 #[test]
 fn production_adapter_runs_one_bound_response_in_a_single_use_container() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = Fixture::new(Helper::Production);
     let journal = TestJournal::default();
     let launcher = fixture.launcher(journal.clone());
 
-    let response = launcher
-        .run(&fixture.closure, &fixture.request("SUCCESS"))
-        .unwrap();
+    let response = unwrap_run(
+        launcher.run(&fixture.closure, &fixture.request("SUCCESS")),
+        &journal,
+    );
     let RunResponse::Completed {
         disposition,
         outputs,
@@ -129,7 +142,7 @@ fn production_adapter_runs_one_bound_response_in_a_single_use_container() {
 
 #[test]
 fn recovered_generation_cleanup_clears_immutable_app_and_container_trees() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let parent = case_sensitive_apfs_root();
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -207,15 +220,15 @@ fn recovered_generation_cleanup_clears_immutable_app_and_container_trees() {
 
 #[test]
 fn valid_response_kills_closed_stdio_descendant_before_retiring() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = Fixture::new(Helper::ProtocolFault);
     let journal = TestJournal::default();
     let launcher = fixture.launcher(journal.clone());
 
-    let RunResponse::Completed { outputs, .. } = launcher
-        .run(&fixture.closure, &fixture.request("GUARDIAN_GROUP_CHILD"))
-        .unwrap()
-    else {
+    let RunResponse::Completed { outputs, .. } = unwrap_run(
+        launcher.run(&fixture.closure, &fixture.request("GUARDIAN_GROUP_CHILD")),
+        &journal,
+    ) else {
         panic!("fixture did not return its valid response");
     };
     assert_eq!(outputs.len(), 1);
@@ -236,18 +249,18 @@ fn valid_response_kills_closed_stdio_descendant_before_retiring() {
 
 #[test]
 fn production_sidecar_cannot_fork_or_posix_spawn_descendants() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = Fixture::new(Helper::Production);
     let journal = TestJournal::default();
     let launcher = fixture.launcher(journal.clone());
 
-    let RunResponse::Completed { outputs, .. } = launcher
-        .run(
+    let RunResponse::Completed { outputs, .. } = unwrap_run(
+        launcher.run(
             &fixture.closure,
             &fixture.request("PROCESS_CREATION_DENIED"),
-        )
-        .unwrap()
-    else {
+        ),
+        &journal,
+    ) else {
         panic!("process-creation probe did not return a valid response");
     };
     let proof = std::str::from_utf8(outputs[0].bytes()).unwrap();
@@ -263,16 +276,17 @@ fn production_sidecar_cannot_fork_or_posix_spawn_descendants() {
 
 #[test]
 fn production_adapter_poisoned_unbound_trailing_or_stderr_helper_output() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     for mode in ["WRONG_BINDING", "TRAILING", "STDERR"] {
         let fixture = Fixture::new(Helper::ProtocolFault);
         let journal = TestJournal::default();
         let launcher = fixture.launcher(journal.clone());
 
         assert_eq!(
-            launcher
-                .run(&fixture.closure, &fixture.request(mode))
-                .unwrap(),
+            unwrap_run(
+                launcher.run(&fixture.closure, &fixture.request(mode)),
+                &journal,
+            ),
             RunResponse::failed(FailureCode::ToolFailed),
             "mode {mode}"
         );
@@ -291,15 +305,16 @@ fn production_adapter_poisoned_unbound_trailing_or_stderr_helper_output() {
 
 #[test]
 fn production_adapter_poisoned_malformed_bound_helper_frame() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = Fixture::new(Helper::ProtocolFault);
     let journal = TestJournal::default();
     let launcher = fixture.launcher(journal.clone());
 
     assert_eq!(
-        launcher
-            .run(&fixture.closure, &fixture.request("MALFORMED"))
-            .unwrap(),
+        unwrap_run(
+            launcher.run(&fixture.closure, &fixture.request("MALFORMED")),
+            &journal,
+        ),
         RunResponse::failed(FailureCode::ToolFailed)
     );
     assert_eq!(
@@ -315,7 +330,7 @@ fn production_adapter_poisoned_malformed_bound_helper_frame() {
 
 #[test]
 fn production_helper_exact_kills_a_sidecar_that_escapes_the_original_group() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = Fixture::new(Helper::Production);
     let journal = TestJournal::default();
     let launcher = fixture.launcher(journal.clone());
@@ -357,7 +372,7 @@ fn production_helper_exact_kills_a_sidecar_that_escapes_the_original_group() {
 #[test]
 #[ignore = "requires exact hydrated sidecars and native arm64 App Sandbox"]
 fn real_sidecar_rulesync_generates_only_the_validated_output() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = RealFixture::new(SidecarId::RuleSync);
     let request = fixture.request(
         [0x51; 16],
@@ -391,7 +406,7 @@ fn real_sidecar_rulesync_generates_only_the_validated_output() {
 #[test]
 #[ignore = "requires exact hydrated sidecars and native arm64 App Sandbox"]
 fn real_sidecar_rulesync_rejects_malformed_frontmatter_and_cleans_up() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = RealFixture::new(SidecarId::RuleSync);
     let request = fixture.request(
         [0x52; 16],
@@ -415,7 +430,7 @@ fn real_sidecar_rulesync_rejects_malformed_frontmatter_and_cleans_up() {
 #[test]
 #[ignore = "requires exact hydrated sidecars and native arm64 App Sandbox"]
 fn real_sidecar_gitleaks_clean_and_finding_ignore_attacker_gitleaksignore() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = RealFixture::new(SidecarId::Gitleaks);
     let clean = fixture.request(
         [0x61; 16],
@@ -478,7 +493,7 @@ fn real_sidecar_gitleaks_clean_and_finding_ignore_attacker_gitleaksignore() {
 #[test]
 #[ignore = "requires exact hydrated sidecars and native arm64 App Sandbox"]
 fn real_sidecar_semgrep_clean_and_finding_use_the_closed_policy() {
-    let _serial = NATIVE_TEST_LOCK.lock().unwrap();
+    let _serial = native_test_lock();
     let fixture = RealFixture::new(SidecarId::Osemgrep);
     let clean = fixture.request(
         [0x71; 16],
@@ -879,9 +894,7 @@ impl GenerationJournal for TestJournal {
         if !state.seen.insert(id.clone()) {
             return Err(MacPolicyError::InvalidTransition);
         }
-        state
-            .states
-            .insert(id.clone(), GenerationState::Prepared);
+        state.states.insert(id.clone(), GenerationState::Prepared);
         state.last_id = Some(id.clone());
         state.events.push(GenerationState::Prepared);
         Ok(())
