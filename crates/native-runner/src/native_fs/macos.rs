@@ -2330,7 +2330,7 @@ mod guarded_mutation_tests {
         let parent = OpenParent::new(&path).unwrap();
         let installed = snapshot_named(&parent.directory, &parent.name).unwrap();
         let installed_token = installed.object_token().unwrap().clone();
-        let installed_fingerprint = *installed.fingerprint();
+        let installed_fingerprint = fingerprint_before_extra_parent_entry(&installed).unwrap();
         let temp = temp_name(&parent.name, &TEST_NONCE);
         *PRE_ROLLBACK_MOVE_TEST_HOOK.lock().unwrap() = Some(Box::new({
             let path = path.clone();
