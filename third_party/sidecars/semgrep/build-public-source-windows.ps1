@@ -270,28 +270,117 @@ function Get-RunnerControlPlaneHosts([string[]]$RunnerPrograms) {
   if ($RunnerDirectories.Count -ne 1) { Fail 'runner control-plane executables do not share one trusted directory' }
   $RunnerRoot = Split-Path -Parent $RunnerDirectories[0]
   $RunnerDiag = Join-Path $RunnerRoot '_diag'
-  $RunnerDiagItem = Get-Item -LiteralPath $RunnerDiag -Force -ErrorAction Stop
-  if (-not $RunnerDiagItem.PSIsContainer -or
-      (($RunnerDiagItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+  $AllLogs = @()
+  if (Test-Path -LiteralPath $RunnerDiag -PathType Container) {
+    $RunnerDiagItem = Get-Item -LiteralPath $RunnerDiag -Force -ErrorAction Stop
+    if (($RunnerDiagItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+      Fail 'runner diagnostic directory is not a regular directory'
+    }
+    $AllLogs = @(Get-ChildItem -LiteralPath $RunnerDiag -Filter '*.log' -File -Force -ErrorAction Stop)
+  } elseif (Test-Path -LiteralPath $RunnerDiag) {
     Fail 'runner diagnostic directory is not a regular directory'
   }
-  $AllLogs = @(Get-ChildItem -LiteralPath $RunnerDiag -Filter '*.log' -File -Force -ErrorAction Stop)
+  $Hosts = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+  $RunnerConfigActionHosts = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+  $PrimaryRunnerConfigPath = Join-Path $RunnerRoot '.runner'
+  if (-not (Test-Path -LiteralPath $PrimaryRunnerConfigPath -PathType Leaf)) {
+    Fail 'current runner configuration is missing'
+  }
+  $RunnerConfigPaths = @(
+    $PrimaryRunnerConfigPath,
+    (Join-Path $RunnerRoot '.runner_migrated')
+  )
+  foreach ($ConfigPath in $RunnerConfigPaths) {
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { continue }
+    $ConfigItem = Get-Item -LiteralPath $ConfigPath -Force -ErrorAction Stop
+    if (($ConfigItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $ConfigItem.Length -gt 1048576) {
+      Fail "runner configuration file is unsafe: $($ConfigItem.Name)"
+    }
+    try {
+      $Settings = Read-RunnerDiagnosticLog $ConfigItem.FullName | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+      Fail "runner configuration file is invalid: $($ConfigItem.Name)"
+    }
+    foreach ($Field in @('ServerUrl', 'ServerUrlV2')) {
+      $Property = $Settings.PSObject.Properties[$Field]
+      if ($null -eq $Property -or [string]::IsNullOrWhiteSpace([string]$Property.Value)) { continue }
+      try {
+        [Uri]$Endpoint = [string]$Property.Value
+      } catch {
+        Fail "runner configuration endpoint is invalid: $($ConfigItem.Name)/$Field"
+      }
+      if (-not $Endpoint.IsAbsoluteUri -or $Endpoint.Scheme -ne 'https' -or
+          $Endpoint.Port -ne 443 -or -not [string]::IsNullOrEmpty($Endpoint.UserInfo)) {
+        Fail "runner configuration endpoint is unsafe: $($ConfigItem.Name)/$Field"
+      }
+      $Hostname = $Endpoint.Host.TrimEnd('.').ToLowerInvariant()
+      if ($Hostname -notmatch '^(?:github\.com|api\.github\.com|(?:[a-z0-9-]+\.)+actions\.githubusercontent\.com)$') {
+        Fail "runner configuration endpoint is outside the control-plane allowlist: $($ConfigItem.Name)/$Field"
+      }
+      [void]$Hosts.Add($Hostname)
+      if ($Hostname -match '(?:^|\.)actions\.githubusercontent\.com$') {
+        [void]$RunnerConfigActionHosts.Add($Hostname)
+      }
+    }
+  }
+  if ($RunnerConfigActionHosts.Count -eq 0) {
+    Fail 'runner configuration has no Actions control-plane host'
+  }
+
+  # Current hosted jobs renew against a per-job run service every 60 seconds.
+  # Runner 2.335.1 receives that URL in the job message rather than persisting
+  # it in .runner, so validate the early workflow snapshot before optionally
+  # augmenting it with successful address records still present in the cache.
+  $RunServiceHosts = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+  $CapturedRunServiceHosts = [string]$env:CONTEXT_RELAY_RUN_SERVICE_HOSTS
+  if ([string]::IsNullOrWhiteSpace($CapturedRunServiceHosts) -or
+      $CapturedRunServiceHosts -ne $CapturedRunServiceHosts.Trim()) {
+    Fail 'captured Actions run-service hosts are missing or malformed'
+  }
+  $CapturedHostnames = @($CapturedRunServiceHosts -split ',')
+  if ($CapturedHostnames.Count -eq 0 -or $CapturedHostnames.Count -gt 8) {
+    Fail 'captured Actions run-service hosts are missing or unbounded'
+  }
+  foreach ($CapturedHostname in $CapturedHostnames) {
+    $Hostname = $CapturedHostname.ToLowerInvariant()
+    if ($CapturedHostname -cne $Hostname -or
+        $Hostname -notmatch '^run-actions(?:-[a-z0-9-]+(?:\.[a-z0-9-]+)*)?\.actions\.githubusercontent\.com$') {
+      Fail 'captured Actions run-service hostname is invalid'
+    }
+    if (-not $RunServiceHosts.Add($Hostname)) { Fail 'captured Actions run-service hostname is duplicated' }
+    [void]$Hosts.Add($Hostname)
+  }
+  $DnsRecords = @(Get-DnsClientCache -Type A,AAAA,CNAME -Status Success -ErrorAction Stop)
+  if ($DnsRecords.Count -gt 16384) { Fail 'DNS client cache is unexpectedly large' }
+  foreach ($Record in $DnsRecords) {
+    $EntryProperty = $Record.PSObject.Properties['Entry']
+    if ($null -eq $EntryProperty -or [string]::IsNullOrWhiteSpace([string]$EntryProperty.Value)) {
+      Fail 'DNS cache address record has no entry name'
+    }
+    $Hostname = ([string]$EntryProperty.Value).TrimEnd('.').ToLowerInvariant()
+    if ($Hostname -match '^run-actions(?:-[a-z0-9-]+(?:\.[a-z0-9-]+)*)?\.actions\.githubusercontent\.com$') {
+      [void]$RunServiceHosts.Add($Hostname)
+      [void]$Hosts.Add($Hostname)
+    }
+  }
+  if ($RunServiceHosts.Count -eq 0) {
+    Fail 'DNS cache has no active Actions run-service host'
+  }
+
   $DiagnosticLogs = [Collections.Generic.List[IO.FileInfo]]::new()
   foreach ($Prefix in @('Runner', 'Worker')) {
     $Log = $AllLogs |
       Where-Object { $_.Name -match "^${Prefix}_[0-9-]+-utc\.log$" } |
       Sort-Object LastWriteTimeUtc -Descending |
       Select-Object -First 1
-    if ($null -eq $Log) { Fail "current $Prefix diagnostic log is missing" }
+    if ($null -eq $Log) { continue }
     if (($Log.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $Log.Length -gt 67108864) {
       Fail "current $Prefix diagnostic log is unsafe"
     }
     $DiagnosticLogs.Add($Log)
   }
 
-  $Hosts = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
   foreach ($Log in $DiagnosticLogs) {
-    $LogActionHosts = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $Contents = Read-RunnerDiagnosticLog $Log.FullName
     foreach ($Match in [regex]::Matches($Contents, '(?im)\b(?:https|wss)://[a-z0-9.-]+(?::443)?(?=$|[/?#\s])')) {
       [Uri]$Endpoint = $Match.Value
@@ -301,14 +390,12 @@ function Get-RunnerControlPlaneHosts([string[]]$RunnerPrograms) {
         continue
       }
       [void]$Hosts.Add($Hostname)
-      if ($Hostname -match '(?:^|\.)actions\.githubusercontent\.com$') {
-        [void]$LogActionHosts.Add($Hostname)
-      }
-    }
-    if ($LogActionHosts.Count -eq 0) {
-      Fail "current runner diagnostic log has no Actions control-plane host: $($Log.Name)"
     }
   }
+  # GitHub documents this exact host for live logs and job results.
+  # Unlike the listener endpoints persisted in .runner[_migrated], runner
+  # 2.335.1 consumes the results endpoint without logging its URL.
+  [void]$Hosts.Add('results-receiver.actions.githubusercontent.com')
   $ActionHosts = @($Hosts | Where-Object { $_ -match '(?:^|\.)actions\.githubusercontent\.com$' })
   if ($ActionHosts.Count -eq 0 -or $Hosts.Count -gt 32) {
     Fail 'runner control-plane diagnostic hosts are missing or unbounded'

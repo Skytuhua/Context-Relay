@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import { acceptsCygwinRelease } from './assert-cygwin-release.mjs';
 import { validateIndependentBuilderIdentities } from './verify-native-builder-identities.mjs';
@@ -10,6 +15,7 @@ const workflowUrl = new URL('../.github/workflows/ci.yml', import.meta.url);
 const publicationWorkflowUrl = new URL('../.github/workflows/publish-semgrep-native.yml', import.meta.url);
 const sourceLockUrl = new URL('../third_party/sidecars/semgrep/source-lock.v1.json', import.meta.url);
 const provenanceUrl = new URL('../third_party/sidecars/semgrep/native-ci-provenance.v1.json', import.meta.url);
+const execFileAsync = promisify(execFile);
 
 function job(source, name, next) {
   const start = source.indexOf(`  ${name}:`);
@@ -349,17 +355,26 @@ test('native runtime builds prove OS-enforced offline execution', async () => {
   assert.match(windows, /offline-egress\.v1\.json/);
 });
 
-test('Windows offline build pins only observed runner control-plane hosts', async () => {
-  const windows = await readFile(
-    new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url),
-    'utf8',
-  );
+test('Windows offline build pins bounded runner-config and observed control-plane hosts', async () => {
+  const [windows, workflow] = await Promise.all([
+    readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
+    readFile(workflowUrl, 'utf8'),
+  ]);
+  const windowsBuilder = job(workflow, 'native-semgrep-windows-x64-builders', 'native-isolation-windows-x64');
+  const captureAt = windowsBuilder.indexOf('Capture active Actions run-service hosts');
+  const setupAt = windowsBuilder.indexOf('semgrep/setup-ocaml@');
+  assert.ok(captureAt > 0 && captureAt < setupAt, 'run-service hosts must be captured before setup-ocaml');
+  assert.match(windowsBuilder.slice(captureAt, setupAt), /Get-DnsClientCache[\s\S]+CONTEXT_RELAY_RUN_SERVICE_HOSTS[\s\S]+GITHUB_ENV/);
 
   assert.match(
     windows,
     /function Get-RunnerControlPlaneHosts[\s\S]{0,4000}\$RunnerPrograms[\s\S]{0,1000}Split-Path[\s\S]{0,1000}Join-Path[^\n]+['"]_diag['"]/,
   );
   assert.match(windows, /Get-ChildItem[^\n]+-LiteralPath\s+\$RunnerDiag[^\n]+-Filter\s+['"]\*\.log['"]/);
+  assert.match(
+    windows,
+    /if \(Test-Path -LiteralPath \$RunnerDiag -PathType Container\)[\s\S]{0,500}Get-ChildItem[^\n]+\$RunnerDiag/,
+  );
   assert.match(windows, /\[Uri\][^\n]+[\r\n]+[^\n]*\.Host/);
   assert.match(
     windows,
@@ -367,7 +382,32 @@ test('Windows offline build pins only observed runner control-plane hosts', asyn
   );
   assert.match(
     windows,
-    /foreach \(\$Log in \$DiagnosticLogs\)[\s\S]{0,2500}current runner diagnostic log has no Actions control-plane host/,
+    /Join-Path\s+\$RunnerRoot\s+['"]\.runner['"][\s\S]{0,1000}Join-Path\s+\$RunnerRoot\s+['"]\.runner_migrated['"]/,
+  );
+  assert.match(windows, /ServerUrlV2/);
+  assert.match(windows, /ServerUrl/);
+  assert.match(windows, /Get-Item[^\n]+\$ConfigPath[\s\S]{0,500}ReparsePoint[\s\S]{0,300}1048576/);
+  assert.match(windows, /Read-RunnerDiagnosticLog[^\n]+\$ConfigItem\.FullName[^\n]+ConvertFrom-Json/);
+  assert.match(windows, /\$Endpoint\.IsAbsoluteUri/);
+  assert.match(windows, /\$Endpoint\.Scheme\s+-ne\s+['"]https['"]/);
+  assert.match(windows, /\$Endpoint\.UserInfo/);
+  assert.match(
+    windows,
+    /\$RunnerConfigActionHosts\.Count\s+-eq\s+0[\s\S]{0,300}runner configuration has no Actions control-plane host/,
+  );
+  assert.match(windows, /Get-DnsClientCache[^\n]+-Type\s+A,AAAA,CNAME[^\n]+-Status\s+Success/);
+  assert.match(windows, /CONTEXT_RELAY_RUN_SERVICE_HOSTS/);
+  assert.match(
+    windows,
+    /\$RunServiceHosts\.Count\s+-eq\s+0[\s\S]{0,300}DNS cache has no active Actions run-service host/,
+  );
+  assert.doesNotMatch(windows, /current \$Prefix diagnostic log is missing/);
+  assert.doesNotMatch(windows, /current runner diagnostic log has no Actions control-plane host/);
+  assert.doesNotMatch(windows, /current Worker diagnostic log has no Actions control-plane host/);
+  assert.doesNotMatch(windows, /\[void\]\$Hosts\.Add\(['"]broker\.actions\.githubusercontent\.com['"]\)/);
+  assert.match(
+    windows,
+    /\[void\]\$Hosts\.Add\(['"]results-receiver\.actions\.githubusercontent\.com['"]\)/,
   );
   assert.match(windows, /['"]\{0\}\s+\{1\}['"]\s+-f\s+\$Address,\s*\$Hostname/);
   assert.doesNotMatch(windows, /WriteAll(?:Text|Lines|Bytes)\([^\n]*(?:Uri|Url|Diag|Log)/i);
@@ -388,6 +428,70 @@ test('Windows offline build pins only observed runner control-plane hosts', asyn
   );
 
   assert.doesNotMatch(windows, /New-NetFirewallRule[^\n]*(?:svchost(?:\.exe)?|Dnscache)/i);
+});
+
+test('Windows runner config supplies control-plane hosts when diagnostics contain no URLs', {
+  skip: process.platform !== 'win32',
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'context-relay-runner-config-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  await mkdir(join(root, 'bin'));
+  await writeFile(join(root, '.runner'), `${JSON.stringify({
+    ServerUrl: 'https://fixture.actions.githubusercontent.com/job',
+    ServerUrlV2: 'https://broker-fixture.actions.githubusercontent.com/message',
+  })}\n`);
+
+  const harness = String.raw`
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+  $env:CONTEXT_RELAY_TEST_WINDOWS_BUILDER,
+  [ref]$tokens,
+  [ref]$errors
+)
+if ($errors.Count -ne 0) { throw 'builder parse failed' }
+foreach ($name in @('Fail', 'Read-RunnerDiagnosticLog', 'Get-RunnerControlPlaneHosts')) {
+  $definition = $ast.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+  }, $true)
+  if ($null -eq $definition) { throw "missing function: $name" }
+  Invoke-Expression $definition.Extent.Text
+}
+function Get-DnsClientCache {
+  [CmdletBinding()]
+  param([object]$Type, [object]$Status)
+}
+$programs = @(
+  (Join-Path $env:CONTEXT_RELAY_TEST_RUNNER_ROOT 'bin\Runner.Worker.exe'),
+  (Join-Path $env:CONTEXT_RELAY_TEST_RUNNER_ROOT 'bin\Runner.Listener.exe')
+)
+@(Get-RunnerControlPlaneHosts $programs) | ConvertTo-Json -Compress
+`;
+  const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', harness], {
+    env: {
+      ...process.env,
+      CONTEXT_RELAY_TEST_RUNNER_ROOT: root,
+      CONTEXT_RELAY_TEST_WINDOWS_BUILDER: fileURLToPath(new URL(
+        '../third_party/sidecars/semgrep/build-public-source-windows.ps1',
+        import.meta.url,
+      )),
+      CONTEXT_RELAY_RUN_SERVICE_HOSTS: [
+        'run-actions.actions.githubusercontent.com',
+        'run-actions-1-azure-eastus.actions.githubusercontent.com',
+      ].join(','),
+    },
+    maxBuffer: 1024 * 1024,
+  });
+  assert.deepEqual(JSON.parse(stdout), [
+    'broker-fixture.actions.githubusercontent.com',
+    'fixture.actions.githubusercontent.com',
+    'results-receiver.actions.githubusercontent.com',
+    'run-actions-1-azure-eastus.actions.githubusercontent.com',
+    'run-actions.actions.githubusercontent.com',
+  ]);
 });
 
 test('Windows runtime DLL closure never searches ambient PATH', async () => {

@@ -1090,7 +1090,7 @@ test('Semgrep records the complete recursive source inventory but remains disabl
   );
   assert.equal(lock.completeCorrespondingSource, false);
   assert.equal(lock.recursiveInventoryComplete, true);
-  assert.equal(sha256(lockBytes), 'ba2014d82a17866833a30135ba125682e5d99e4f368dd8cd219bb99d73109efd');
+  assert.equal(sha256(lockBytes), '496fbc867370a6f27d8ffac95626e56fa956cd57da612173a6c3968ae77838ac');
   assert.equal(lock.licenseMaterials.length, 12);
   assert.equal(lock.rootGitlinks.length, 36);
   assert.equal(lock.opam.resolvedSourceArchivesComplete, true);
@@ -1108,11 +1108,11 @@ test('Semgrep records the complete recursive source inventory but remains disabl
   );
   assert.equal('sourceAssetUrl' in lock, false);
   assert.equal('sourceBundleSha256' in lock, false);
-  assert.equal(bundleEvidence.bundle.sha256, '5c24be91f458d2bc1beec19ab5093c0353b0e5e50d16694f17ee53ac8634aae8');
-  assert.equal(bundleEvidence.bundle.size, 1149624832);
+  assert.equal(bundleEvidence.bundle.sha256, '42c94fa3a651eac304d389d9cdf225fba499304f1de16afe39c7f343d5209095');
+  assert.equal(bundleEvidence.bundle.size, 1149629440);
   assert.equal(bundleEvidence.bundle.payloadEntries, 39540);
   assert.equal(bundleEvidence.bundle.recordedLinks, 222);
-  assert.equal(bundleEvidence.sourceLockSha256, 'ba2014d82a17866833a30135ba125682e5d99e4f368dd8cd219bb99d73109efd');
+  assert.equal(bundleEvidence.sourceLockSha256, '496fbc867370a6f27d8ffac95626e56fa956cd57da612173a6c3968ae77838ac');
   assert.equal(bundleEvidence.bundleGeneratorSha256, '7ac41edd64e0f1ccadb125b6baf508d5416e3f6ce96b6be4cdef68ae5de86049');
   assert.equal(
     sha256(await readFile(new URL('./semgrep-source-bundle.mjs', import.meta.url))),
