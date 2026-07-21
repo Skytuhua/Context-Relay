@@ -56,8 +56,9 @@ fn production_adapter_applies_and_restores_an_absent_target() {
     let template_path = root.join("template.json");
     fs::write(&template_path, b"template\n").unwrap();
     let native = OsNativeFileSystem::new();
-    let absent = native.snapshot(&path).unwrap();
     let template = native.snapshot(&template_path).unwrap();
+    fs::remove_file(&template_path).unwrap();
+    let absent = native.snapshot(&path).unwrap();
     let intended =
         NativeState::regular_file(b"created\n".to_vec(), template.metadata().unwrap().clone());
     let mutation = mutation(&path, *absent.fingerprint(), &intended);
@@ -176,8 +177,9 @@ fn absent_parent_symlink_swap_after_preflight_leaves_outside_canary_untouched() 
     let template_path = approved.join("template.json");
     fs::write(&template_path, b"template\n").unwrap();
     let native = OsNativeFileSystem::new();
-    let absent = native.snapshot(&path).unwrap();
     let template = native.snapshot(&template_path).unwrap();
+    fs::remove_file(&template_path).unwrap();
+    let absent = native.snapshot(&path).unwrap();
     let intended =
         NativeState::regular_file(b"approved\n".to_vec(), template.metadata().unwrap().clone());
     let mutation = mutation(&path, *absent.fingerprint(), &intended);
@@ -209,8 +211,9 @@ fn concurrent_identical_install_is_not_attributed_to_the_failed_transaction() {
     let template_path = root.join("template.json");
     fs::write(&template_path, b"template\n").unwrap();
     let native = OsNativeFileSystem::new();
-    let absent = native.snapshot(&path).unwrap();
     let template = native.snapshot(&template_path).unwrap();
+    fs::remove_file(&template_path).unwrap();
+    let absent = native.snapshot(&path).unwrap();
     let intended =
         NativeState::regular_file(b"intended\n".to_vec(), template.metadata().unwrap().clone());
     let mutation = mutation(&path, *absent.fingerprint(), &intended);
