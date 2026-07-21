@@ -515,8 +515,8 @@ jobs:
           image="$RUNNER_TEMP/context-relay-case-sensitive.sparseimage"
           mount="$RUNNER_TEMP/context-relay-case-sensitive"
           mkdir "$mount"
-          hdiutil create -quiet -size 4g -fs APFSX -volname ContextRelayCaseSensitive -type SPARSE "$image"
-          hdiutil attach -quiet -nobrowse -owners on -mountpoint "$mount" "$image"
+          hdiutil create -size 4g -fs 'Case-sensitive APFS' -volname ContextRelayCaseSensitive -type SPARSE "$image"
+          hdiutil attach -nobrowse -owners on -mountpoint "$mount" "$image"
           printf x > "$mount/CaseProbe"
           printf y > "$mount/caseprobe"
           test "$(find "$mount" -maxdepth 1 -type f -iname caseprobe | wc -l | tr -d ' ')" = 2

@@ -82,6 +82,21 @@ test('native CI independently builds, compares, candidate-smokes, then uploads e
   ]) assert.match(source, new RegExp(name));
 });
 
+test('macOS native CI mounts a debuggable case-sensitive APFS image', async () => {
+  const source = await readFile(workflowUrl, 'utf8');
+  const macos = job(source, 'native-isolation-macos-arm64', 'request-native-sidecar-publication');
+  const start = macos.indexOf('- name: Mount canonical case-sensitive APFS root');
+  const end = macos.indexOf('- name: Run macOS native and exact registered real-sidecar gates', start);
+  assert.ok(start >= 0 && end > start, 'missing case-sensitive APFS mount step');
+  const mount = macos.slice(start, end);
+
+  assert.match(mount, /hdiutil create[^\n]+-fs 'Case-sensitive APFS'/);
+  assert.doesNotMatch(mount, /-fs APFSX|hdiutil (?:create|attach) -quiet/);
+  assert.match(mount, /printf x > "\$mount\/CaseProbe"/);
+  assert.match(mount, /printf y > "\$mount\/caseprobe"/);
+  assert.match(mount, /find "\$mount"[^\n]+-iname caseprobe[^\n]+wc -l/);
+});
+
 test('the CI-only candidate verifier feature is scoped to the exact ignored Semgrep smokes', async () => {
   const source = await readFile(workflowUrl, 'utf8');
   const windows = job(source, 'native-isolation-windows-x64', 'native-semgrep-macos-arm64-builders');
@@ -332,6 +347,47 @@ test('native runtime builds prove OS-enforced offline execution', async () => {
   assert.match(windows, /finally\s*\{[\s\S]*Set-NetFirewallProfile[\s\S]*DefaultOutboundAction[\s\S]*Enable-NetFirewallRule[\s\S]*Remove-NetFirewallRule/);
   assert.doesNotMatch(windows, /New-NetFirewallRule[^\n]+-Action\s+Block/);
   assert.match(windows, /offline-egress\.v1\.json/);
+});
+
+test('Windows offline build pins only observed runner control-plane hosts', async () => {
+  const windows = await readFile(
+    new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url),
+    'utf8',
+  );
+
+  assert.match(
+    windows,
+    /function Get-RunnerControlPlaneHosts[\s\S]{0,4000}\$RunnerPrograms[\s\S]{0,1000}Split-Path[\s\S]{0,1000}Join-Path[^\n]+['"]_diag['"]/,
+  );
+  assert.match(windows, /Get-ChildItem[^\n]+-LiteralPath\s+\$RunnerDiag[^\n]+-Filter\s+['"]\*\.log['"]/);
+  assert.match(windows, /\[Uri\][^\n]+[\r\n]+[^\n]*\.Host/);
+  assert.match(
+    windows,
+    /\^\(\?:github\\\.com\|api\\\.github\\\.com\|\(\?:\[a-z0-9-\]\+\\\.\)\+actions\\\.githubusercontent\\\.com\)\$/,
+  );
+  assert.match(
+    windows,
+    /foreach \(\$Log in \$DiagnosticLogs\)[\s\S]{0,2500}current runner diagnostic log has no Actions control-plane host/,
+  );
+  assert.match(windows, /['"]\{0\}\s+\{1\}['"]\s+-f\s+\$Address,\s*\$Hostname/);
+  assert.doesNotMatch(windows, /WriteAll(?:Text|Lines|Bytes)\([^\n]*(?:Uri|Url|Diag|Log)/i);
+
+  assert.match(windows, /\$HostsSnapshot\s*=\s*\[IO\.File\]::ReadAllBytes\(\$HostsPath\)/);
+  assert.match(windows, /\[IO\.File\]::WriteAllBytes\(\$HostsPath,\s*\$HostsOverlayBytes\)/);
+  const blockAt = windows.search(/Set-NetFirewallProfile[^\n]+-DefaultOutboundAction\s+Block/);
+  const resolutions = [...windows.matchAll(/\[Net\.Dns\]::GetHostAddresses\(\$Hostname\)/g)].map(({ index }) => index);
+  assert.ok(resolutions.some((index) => index < blockAt), 'runner hosts must be resolved before outbound blocking');
+  assert.ok(resolutions.some((index) => index > blockAt), 'pinned runner hosts must resolve after outbound blocking');
+  assert.match(windows.slice(blockAt), /Clear-DnsClientCache\s+-ErrorAction\s+Stop/);
+  assert.match(windows.slice(blockAt), /pinned runner control-plane hostname resolution mismatch/);
+  assert.match(windows.slice(blockAt), /@\(Compare-Object[\s\S]{0,300}\)\.Count\s+-ne\s+0/);
+  assert.match(windows.slice(blockAt), /ReadAllBytes\(\$HostsPath\)[\s\S]{0,500}SequenceEqual\([^,]+,\s*\$HostsOverlayBytes\)/);
+  assert.match(
+    windows,
+    /finally\s*\{[\s\S]*\[IO\.File\]::WriteAllBytes\(\$HostsPath,\s*\$HostsSnapshot\)/,
+  );
+
+  assert.doesNotMatch(windows, /New-NetFirewallRule[^\n]*(?:svchost(?:\.exe)?|Dnscache)/i);
 });
 
 test('Windows runtime DLL closure never searches ambient PATH', async () => {
