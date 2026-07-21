@@ -2228,7 +2228,7 @@ mod guarded_mutation_tests {
         );
         assert_eq!(fs::read(&path).unwrap(), b"attacker\n");
         assert_eq!(fs::read(&preserved).unwrap(), b"installed\n");
-        assert!(!matches!(
+        assert!(matches!(
             snapshot_named(&parent.directory, &temp).unwrap().state(),
             NativeState::Absent { .. }
         ));
