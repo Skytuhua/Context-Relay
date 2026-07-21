@@ -1857,7 +1857,8 @@ fn acl_text(file: &File) -> Result<Vec<u8>, RunnerError> {
     }
     let pointer = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
     if pointer.is_null() {
-        return if last_errno() == 0 {
+        // acl_get_fd_np leaves ENOENT when FILESEC_ACL is absent.
+        return if matches!(last_errno(), 0 | libc::ENOENT) {
             Ok(Vec::new())
         } else {
             Err(RunnerError::Io)
