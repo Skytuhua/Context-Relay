@@ -2016,8 +2016,9 @@ fn acl_text(file: &File) -> Result<Vec<u8>, RunnerError> {
 }
 
 fn restore_security(file: &File, security: &PosixSecurity) -> Result<(), RunnerError> {
+    let final_mode = (security.mode & 0o7777) as libc::mode_t;
     if unsafe { libc::fchown(file.as_raw_fd(), security.uid, security.gid) } != 0
-        || unsafe { libc::fchmod(file.as_raw_fd(), (security.mode & 0o7777) as libc::mode_t) } != 0
+        || unsafe { libc::fchmod(file.as_raw_fd(), final_mode | 0o200) } != 0
     {
         return Err(RunnerError::Io);
     }
@@ -2043,7 +2044,11 @@ fn restore_security(file: &File, security: &PosixSecurity) -> Result<(), RunnerE
             return Err(RunnerError::Io);
         }
     }
-    restore_acl(file, &security.acl)
+    restore_acl(file, &security.acl)?;
+    if unsafe { libc::fchmod(file.as_raw_fd(), final_mode) } != 0 {
+        return Err(RunnerError::Io);
+    }
+    Ok(())
 }
 
 fn restore_acl(file: &File, text: &[u8]) -> Result<(), RunnerError> {
