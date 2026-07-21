@@ -2752,6 +2752,7 @@ mod guarded_mutation_tests {
         fs::write(&path, b"after\n").unwrap();
         let first = native.snapshot(&path).unwrap();
         let desired = first.state().clone();
+        let applied_fingerprint = fingerprint_before_extra_parent_entry(&first).unwrap();
         let installed_token = first.object_token().unwrap().clone();
         let concurrent_name = CString::new("concurrent.json").unwrap();
         assert_eq!(
@@ -2778,7 +2779,7 @@ mod guarded_mutation_tests {
             native.recover_interrupted_replace_observed_with_provenance(
                 &path,
                 before.fingerprint(),
-                &desired.fingerprint(),
+                &applied_fingerprint,
                 &TEST_NONCE,
                 before.object_token(),
                 Some(&installed_token),
