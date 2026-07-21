@@ -147,6 +147,7 @@ pub(super) fn compare_and_swap_with_provenance(
     let parent = OpenParent::new(path).map_err(super::NativeMutationFailure::from)?;
     let current = snapshot_named(&parent.directory, &parent.name)
         .map_err(super::NativeMutationFailure::from)?;
+    let intended_fingerprint = fingerprint(desired);
     if current.fingerprint() != expected
         || expected_token.is_some_and(|token| current.object_token() != Some(token))
         || !identity_matches_path(&parent.directory, &parent.path)
@@ -157,7 +158,7 @@ pub(super) fn compare_and_swap_with_provenance(
     if matches!(
         (current.state(), desired),
         (NativeState::Absent { .. }, NativeState::Absent { .. })
-    ) || current.fingerprint() == &fingerprint(desired)
+    ) || current.fingerprint() == &intended_fingerprint
     {
         return Ok(super::NativeMutationOutcome {
             wrote: false,
@@ -167,16 +168,22 @@ pub(super) fn compare_and_swap_with_provenance(
     }
     let mut installed_token = None;
     let write = match desired {
-        NativeState::Absent { .. } => delete_regular_file(
-            &parent,
-            current
-                .object_token()
-                .ok_or(RunnerError::ConcurrentChange)
-                .map_err(super::NativeMutationFailure::from)?,
-            expected,
-            &mut installed_token,
-            persist_candidate,
-        ),
+        NativeState::Absent { .. } => {
+            let retain_backup = delete_retains_backup(&current, &intended_fingerprint)
+                .map_err(super::NativeMutationFailure::from)?;
+            delete_regular_file(
+                &parent,
+                current
+                    .object_token()
+                    .ok_or(RunnerError::ConcurrentChange)
+                    .map_err(super::NativeMutationFailure::from)?,
+                expected,
+                &intended_fingerprint,
+                retain_backup,
+                &mut installed_token,
+                persist_candidate,
+            )
+        }
         NativeState::RegularFile { bytes, metadata } => replace_regular_file(
             &parent,
             current.object_token(),
@@ -185,7 +192,7 @@ pub(super) fn compare_and_swap_with_provenance(
             expected,
             bytes,
             metadata,
-            fingerprint(desired),
+            intended_fingerprint,
             transaction_nonce,
             &mut installed_token,
             persist_candidate,
@@ -203,10 +210,7 @@ pub(super) fn compare_and_swap_with_provenance(
         .map_err(|error| super::NativeMutationFailure::installed(error, installed_token.clone()))?;
     if !identity_matches_path(&parent.directory, &parent.path)
         .map_err(|error| super::NativeMutationFailure::installed(error, installed_token.clone()))?
-        || (!matches!(
-            (snapshot.state(), desired),
-            (NativeState::Absent { .. }, NativeState::Absent { .. })
-        ) && snapshot.fingerprint() != &fingerprint(desired))
+        || snapshot.fingerprint() != &intended_fingerprint
     {
         return Err(super::NativeMutationFailure::installed(
             RunnerError::ConcurrentChange,
@@ -570,6 +574,8 @@ fn delete_regular_file(
     parent: &OpenParent,
     expected: &NativeObjectToken,
     expected_fingerprint: &[u8; 32],
+    intended_fingerprint: &[u8; 32],
+    retain_backup: bool,
     installed_token: &mut Option<NativeObjectToken>,
     persist_candidate: &mut dyn FnMut(&NativeObjectToken) -> Result<(), RunnerError>,
 ) -> Result<(), RunnerError> {
@@ -597,6 +603,21 @@ fn delete_regular_file(
     {
         let _ = restore_moved_name(parent, &backup);
         return Err(RunnerError::ConcurrentChange);
+    }
+    if !retain_backup {
+        remove_exact_private_named(parent, &backup, expected, expected_fingerprint)?;
+        let absent = snapshot_named(&parent.directory, &parent.name)?;
+        let absent_token = absent
+            .object_token()
+            .filter(|_| matches!(absent.state(), NativeState::Absent { .. }))
+            .ok_or(RunnerError::ConcurrentChange)?
+            .clone();
+        *installed_token = Some(absent_token.clone());
+        if absent.fingerprint() != intended_fingerprint {
+            return Err(RunnerError::ConcurrentChange);
+        }
+        persist_candidate(&absent_token)?;
+        return Ok(());
     }
     let absent = snapshot_named(&parent.directory, &parent.name)?;
     let absent_token = absent
@@ -917,6 +938,35 @@ fn validate_named_before_extra_parent_entry(
         return Err(RunnerError::ConcurrentChange);
     }
     Ok(snapshot)
+}
+
+fn delete_retains_backup(
+    current: &NativeSnapshot,
+    intended_fingerprint: &[u8; 32],
+) -> Result<bool, RunnerError> {
+    if fingerprint(&current.absent_state()) == *intended_fingerprint {
+        return Ok(true);
+    }
+    let metadata = current.metadata().ok_or(RunnerError::ConcurrentChange)?;
+    let security = PosixSecurity::decode(&metadata.security_descriptor)?;
+    let links = security
+        .parent_links
+        .checked_sub(1)
+        .ok_or(RunnerError::ConcurrentChange)?;
+    let (parent_attributes, parent_link_count) = parent_marker_fields(
+        security.parent_mode,
+        security.parent_flags,
+        security.parent_uid,
+        security.parent_gid,
+        links,
+    );
+    if fingerprint(&NativeState::absent(parent_attributes, parent_link_count))
+        == *intended_fingerprint
+    {
+        Ok(false)
+    } else {
+        Err(RunnerError::ConcurrentChange)
+    }
 }
 
 fn validate_absent(
@@ -2538,7 +2588,7 @@ mod guarded_mutation_tests {
     }
 
     #[test]
-    fn absent_create_installs_an_exact_stable_state() {
+    fn absent_create_and_restore_install_exact_stable_states() {
         let _serial = SERIAL
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2560,6 +2610,18 @@ mod guarded_mutation_tests {
             native.snapshot(&path).unwrap().fingerprint(),
             intended.fingerprint()
         );
+        let restored = native
+            .compare_and_swap(
+                &path,
+                created.snapshot().fingerprint(),
+                absent.state(),
+                &TEST_NONCE,
+            )
+            .unwrap();
+        assert!(restored.wrote());
+        assert_eq!(restored.snapshot().fingerprint(), absent.fingerprint());
+        assert!(!path.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
     }
 
