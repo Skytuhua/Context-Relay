@@ -2266,7 +2266,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn replacement_preserves_an_unexpected_final_boundary_occupant() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("replace-boundary");
         let path = root.join("settings.json");
         let moved = root.join("observed.json");
@@ -2295,7 +2297,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn replacement_does_not_overwrite_a_target_reoccupied_before_install() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("replace-install-boundary");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
@@ -2321,7 +2325,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn absent_create_rollback_restores_a_late_unexpected_target_occupant() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("absent-rollback-boundary");
         let path = root.join("settings.json");
         let preserved = root.join("installed.json");
@@ -2355,7 +2361,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn deletion_preserves_an_unexpected_final_boundary_occupant() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("delete-boundary");
         let path = root.join("settings.json");
         let moved = root.join("observed.json");
@@ -2391,7 +2399,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn backup_removal_revalidates_before_unlinking() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("backup-removal-boundary");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
@@ -2423,7 +2433,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn replacement_keeps_the_backup_if_the_installed_target_changes_during_cleanup() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("replace-cleanup-target-boundary");
         let path = root.join("settings.json");
         let installed = root.join("installed.json");
@@ -2455,7 +2467,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn deletion_keeps_the_backup_if_the_empty_target_is_reoccupied_during_cleanup() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("delete-cleanup-target-boundary");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
@@ -2480,7 +2494,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn absent_snapshot_rechecks_the_name_before_returning() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("absent-snapshot-boundary");
         let path = root.join("settings.json");
         *POST_MISSING_SNAPSHOT_TEST_HOOK.lock().unwrap() = Some(Box::new({
@@ -2495,7 +2511,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn token_aware_create_rejects_a_parent_replaced_before_the_cas_call() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("absent-parent-pre-call-swap");
         let live = root.join("live");
         let moved = root.join("moved");
@@ -2537,7 +2555,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn token_aware_replace_rejects_the_wrong_present_object_token() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("present-token-mismatch");
         let path = root.join("settings.json");
         let other = root.join("other.json");
@@ -2565,7 +2585,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn absent_create_rejects_a_same_metadata_parent_swap_without_leaking_bytes() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("absent-parent-swap");
         let live = root.join("live");
         let moved = root.join("moved");
@@ -2601,7 +2623,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn recovery_restores_the_exact_backup_from_the_empty_target_phase() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("recover-empty-target");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
@@ -2643,7 +2667,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn recovery_rejects_an_absent_replacement_target_when_no_backup_exists() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("recover-unexpected-absent-replace");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
@@ -2667,7 +2693,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn recovery_accepts_an_absent_delete_target_when_no_backup_exists() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("recover-applied-delete");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
@@ -2689,7 +2717,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn recovery_rolls_back_an_installed_target_and_cleans_only_its_nonce() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("recover-installed-target");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
@@ -2745,7 +2775,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn attributed_recovery_preserves_an_identical_replacement_target() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("attributed-recovery-identical-replacement");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
@@ -2807,7 +2839,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn attributed_recovery_preserves_a_concurrently_deleted_target() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("attributed-recovery-concurrent-delete");
         let path = root.join("settings.json");
         fs::write(&path, b"before\n").unwrap();
@@ -2845,7 +2879,9 @@ mod guarded_mutation_tests {
 
     #[test]
     fn recovery_parent_swap_preserves_the_moved_and_replacement_trees() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_root("recovery-parent-swap");
         let live = root.join("live");
         let moved = root.join("moved");
