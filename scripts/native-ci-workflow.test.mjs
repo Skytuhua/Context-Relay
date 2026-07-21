@@ -138,6 +138,9 @@ test('native builders provision locked system dependencies before closed builds'
   const windows = job(source, 'native-semgrep-windows-x64-builders', 'native-isolation-windows-x64');
   const macos = job(source, 'native-semgrep-macos-arm64-builders', 'native-isolation-macos-arm64');
   const cygwinPackages = [
+    'mingw64-i686-curl',
+    'mingw64-i686-gmp',
+    'mingw64-i686-pcre2',
     'mingw64-x86_64-curl',
     'mingw64-x86_64-gmp',
     'mingw64-x86_64-pcre2',
@@ -192,6 +195,35 @@ test('the shared Cygwin release policy accepts package-suffixed 3.6.10 builds', 
   for (const release of ['3.6.1', '3.6.100', '3.6.10rc1', '3.7.0']) {
     assert.equal(acceptsCygwinRelease(release, '3.6.10'), false, release);
   }
+});
+
+test('macOS artifact transport restores only a proven executable mode', async () => {
+  const source = await readFile(workflowUrl, 'utf8');
+  const builder = job(source, 'native-semgrep-macos-arm64-builders', 'native-isolation-macos-arm64');
+  const comparator = job(source, 'native-isolation-macos-arm64', 'request-native-sidecar-publication');
+  const built = builder.indexOf('build-public-source-macos.sh');
+  const producerProof = builder.indexOf('macOS producer executable mode mismatch');
+  const uploaded = builder.indexOf('actions/upload-artifact@');
+  assert.ok(built >= 0 && producerProof > built && uploaded > producerProof, 'producer mode proof must follow the build and precede upload');
+  assert.match(builder, /O_NOFOLLOW/);
+  assert.match(builder, /fstatSync\(fd\)/);
+  assert.match(builder, /s\.nlink !== 1/);
+  assert.match(builder, /\(s\.mode & 0o777\) !== 0o755/);
+
+  const firstDownload = comparator.indexOf('actions/download-artifact@');
+  const verified = comparator.indexOf('verify-native-builder-identities.mjs');
+  const normalized = comparator.indexOf('macOS artifact transport mode mismatch');
+  const prepared = comparator.indexOf('prepare-semgrep-runtime.mjs --prepare');
+  assert.ok(firstDownload >= 0 && verified > firstDownload && normalized > verified && prepared > normalized);
+  assert.match(comparator, /"\$root\/build-a\/osemgrep" "\$root\/build-b\/osemgrep"/);
+  assert.match(comparator, /\(before\.mode & 0o777\) !== 0o644/);
+  assert.match(comparator, /fchmodSync\(fd, 0o755\)/);
+  assert.match(comparator, /\(after\.mode & 0o777\) !== 0o755/);
+  assert.match(comparator, /before\.nlink !== 1/);
+  assert.match(comparator, /after\.nlink !== 1/);
+  assert.doesNotMatch(comparator, /chmod\s+-R|chmod[^\n]*\*/);
+  const windows = job(source, 'native-isolation-windows-x64', 'native-semgrep-macos-arm64-builders');
+  assert.doesNotMatch(windows, /artifact transport mode|fchmodSync/);
 });
 
 test('each target uses two independent native builder jobs and a fail-closed comparator', async () => {

@@ -122,6 +122,9 @@ jobs:
           $cygwinSetup = 'C:\cygwin\setup-x86_64.exe'
           if (-not (Test-Path -LiteralPath $cygwinSetup -PathType Leaf)) { throw 'the pinned setup-ocaml Cygwin installer is missing' }
           $packages = @(
+            'mingw64-i686-curl',
+            'mingw64-i686-gmp',
+            'mingw64-i686-pcre2',
             'mingw64-x86_64-curl',
             'mingw64-x86_64-gmp',
             'mingw64-x86_64-pcre2',
@@ -426,6 +429,7 @@ jobs:
           /bin/sh third_party/sidecars/semgrep/build-public-source-macos.sh "$lock" "$bundle" "$work" "$output" "$label"
           cp "$bundle" "$output/source-$slot.tar"
           node -e 'const fs=require("node:fs"); const p=process.argv[1]; const slot=process.env.CONTEXT_RELAY_BUILD_SLOT; const value={schemaVersion:1,target:"macos-aarch64",build:`build-${slot}`,artifactName:`task9-semgrep-macos-build-${slot}-${process.env.GITHUB_SHA}-${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}`,commit:process.env.GITHUB_SHA,runId:process.env.GITHUB_RUN_ID,runAttempt:Number(process.env.GITHUB_RUN_ATTEMPT),checkRunId:Number(process.env.CONTEXT_RELAY_CHECK_RUN_ID),jobDefinition:process.env.CONTEXT_RELAY_JOB_DEFINITION,jobIndex:Number(process.env.CONTEXT_RELAY_JOB_INDEX),jobTotal:Number(process.env.CONTEXT_RELAY_JOB_TOTAL),runnerName:process.env.RUNNER_NAME,runnerOs:process.env.RUNNER_OS,runnerArch:process.env.RUNNER_ARCH,workflowRef:process.env.GITHUB_WORKFLOW_REF,workflowSha:process.env.GITHUB_WORKFLOW_SHA}; fs.writeFileSync(p,JSON.stringify(value)+"\n",{flag:"wx"});' "$output/$label.identity.v1.json"
+          node -e 'const fs=require("node:fs"); const p=process.argv[1]; let fd; try { fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW); const s=fs.fstatSync(fd); if(!s.isFile()||s.nlink !== 1||(s.mode & 0o777) !== 0o755) throw new Error("macOS producer executable mode mismatch"); } finally { if(fd !== undefined) fs.closeSync(fd); }' "$output/build-$slot/osemgrep"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: task9-semgrep-macos-build-${{ matrix.build }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -466,6 +470,12 @@ jobs:
           node scripts/semgrep-source-bundle.mjs --verify-evidence "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/source-lock.v1.json" "$root/source-a.tar" "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/bundle-evidence.v1.json"
           node scripts/semgrep-source-bundle.mjs --verify-evidence "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/source-lock.v1.json" "$root/source-b.tar" "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/bundle-evidence.v1.json"
           node -e 'const fs=require("node:fs"); for(const p of process.argv.slice(1)){const v=JSON.parse(fs.readFileSync(p)); if(v.schemaVersion!==1||v.mechanism!=="macos-sandbox-exec-network-deny"||v.probe!=="hostile-outbound-tcp-denied-with-eperm-or-eacces") process.exit(1)}' "$root/build-a.offline-egress.v1.json" "$root/build-b.offline-egress.v1.json"
+      - name: Restore exact macOS artifact transport modes
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/context-relay-semgrep-output-macos"
+          node -e 'const fs=require("node:fs"); for(const p of process.argv.slice(1)){let fd; try { fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW); const before=fs.fstatSync(fd); if(!before.isFile()||before.nlink !== 1||(before.mode & 0o777) !== 0o644) throw new Error(`macOS artifact transport mode mismatch: ${p}`); fs.fchmodSync(fd, 0o755); const after=fs.fstatSync(fd); if(!after.isFile()||after.nlink !== 1||(after.mode & 0o777) !== 0o755) throw new Error(`macOS artifact mode restoration failed: ${p}`); } finally { if(fd !== undefined) fs.closeSync(fd); }}' "$root/build-a/osemgrep" "$root/build-b/osemgrep"
       - name: Prepare strict macOS candidate
         id: prepare
         shell: bash

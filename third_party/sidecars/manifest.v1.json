@@ -263,7 +263,7 @@
         "revision": "bd614accba811b407ae5c9ec6f1eecd3bdc29911",
         "tree": "ad8e607874820dc7253d58997736463ed258ea34",
         "materialPath": "third_party/sidecars/semgrep/source-lock.v1.json",
-        "materialSha256": "aa5c056fb8c52de7aea359150bfaeef61e4a50fe4244eb563e17d7addebd76c8"
+        "materialSha256": "d2dc17da6428c8652333e0dca829808cda2ecd4fb698ed1a869c22d9b5200227"
       },
       "license": {
         "spdx": "LGPL-2.1-or-later",
@@ -303,7 +303,7 @@
         {
           "role": "native-ci-provenance",
           "path": "third_party/sidecars/semgrep/native-ci-provenance.v1.json",
-          "sha256": "79bbbefe60f9c7e7813ce5655cff386b5c135d705ff63306fe79320bd99d891b"
+          "sha256": "e8fb5068bd110462c98e6b995e93e8912cdd2632cd513016c9828f0f744c1b63"
         },
         {
           "role": "source-inventory-generator",
@@ -318,7 +318,7 @@
         {
           "role": "source-bundle-evidence",
           "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
-          "sha256": "1e06ffbed66183958dbcc52ee97a328e2873ac1937df695dadc08b7b435a7a5c"
+          "sha256": "3aef49d57774530dbbdf3754f28ccc3069666716bec9aba5d0667a17fd731e87"
         },
         {
           "role": "manifest-rule",
