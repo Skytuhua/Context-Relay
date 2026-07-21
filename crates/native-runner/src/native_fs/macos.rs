@@ -2634,12 +2634,25 @@ mod guarded_mutation_tests {
         let first = native.snapshot(&path).unwrap();
         let desired = first.state().clone();
         let installed_token = first.object_token().unwrap().clone();
+        let concurrent_name = CString::new("concurrent.json").unwrap();
+        assert_eq!(
+            unsafe {
+                libc::clonefileat(
+                    parent.directory.as_raw_fd(),
+                    parent.name.as_ptr(),
+                    parent.directory.as_raw_fd(),
+                    concurrent_name.as_ptr(),
+                    0,
+                )
+            },
+            0
+        );
         fs::remove_file(&path).unwrap();
-        let absent = native.snapshot(&path).unwrap();
-        let concurrent = native
-            .compare_and_swap(&path, absent.fingerprint(), &desired, &TEST_NONCE)
-            .unwrap();
-        let concurrent_token = concurrent.snapshot().object_token().unwrap().clone();
+        rename_exclusive(&parent.directory, &concurrent_name, &parent.name).unwrap();
+        flush_directory(&parent.directory).unwrap();
+        let concurrent = native.snapshot(&path).unwrap();
+        assert_eq!(concurrent.fingerprint(), &desired.fingerprint());
+        let concurrent_token = concurrent.object_token().unwrap().clone();
         assert_ne!(concurrent_token, installed_token);
 
         assert_eq!(
