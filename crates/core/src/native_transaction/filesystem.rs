@@ -455,16 +455,26 @@ impl NativeFileSystem for OsNativeTransactionFileSystem {
         transaction_nonce: &[u8; 16],
     ) -> Result<(), BoundaryError> {
         self.require_nonce(transaction_nonce)?;
+        let mut cleaned_deletes = Vec::<RunnerObjectToken>::new();
         for observation in &self.observations {
             if matches!(observation.intended, NativeState::Absent { .. }) {
+                let removed_parent_entries = u64::try_from(
+                    cleaned_deletes
+                        .iter()
+                        .filter(|token| token.has_same_parent_binding(&observation.token))
+                        .count(),
+                )
+                .map_err(|_| BoundaryError::new("native committed cleanup count exceeds u64"))?;
                 self.filesystem
-                    .cleanup_committed_delete_observed(
+                    .cleanup_committed_delete_observed_after_parent_entries_removed(
                         &observation.path,
                         &observation.mutation.expected.0.0,
                         transaction_nonce,
                         &observation.token,
+                        removed_parent_entries,
                     )
                     .map_err(runner_boundary)?;
+                cleaned_deletes.push(observation.token.clone());
             }
         }
         Ok(())

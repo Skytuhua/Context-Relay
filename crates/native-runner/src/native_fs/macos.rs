@@ -673,6 +673,7 @@ pub(super) fn cleanup_committed_delete(
     before_fingerprint: &[u8; 32],
     _transaction_nonce: &[u8; 16],
     original_token: &NativeObjectToken,
+    removed_parent_entries: u64,
 ) -> Result<(), RunnerError> {
     let parent = OpenParent::new(path)?;
     if !identity_matches_path(&parent.directory, &parent.path)? {
@@ -683,10 +684,17 @@ pub(super) fn cleanup_committed_delete(
     if matches!(backup.state(), NativeState::Absent { .. }) {
         return Ok(());
     }
-    if backup.object_token() != Some(original_token) || backup.fingerprint() != before_fingerprint {
+    let metadata = backup.metadata().ok_or(RunnerError::ConcurrentChange)?;
+    let parent_links = PosixSecurity::decode(&metadata.security_descriptor)?
+        .parent_links
+        .checked_add(removed_parent_entries)
+        .ok_or(RunnerError::ConcurrentChange)?;
+    if backup.object_token() != Some(original_token)
+        || fingerprint_with_parent_links(&backup, parent_links)? != *before_fingerprint
+    {
         return Err(RunnerError::ConcurrentChange);
     }
-    remove_exact_private_named(&parent, &name, original_token, before_fingerprint)
+    remove_exact_private_named(&parent, &name, original_token, backup.fingerprint())
 }
 
 fn recover_interrupted_replace_held(

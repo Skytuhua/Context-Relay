@@ -252,6 +252,7 @@ pub trait NativeRecoveryIo {
         target: &WireNativeValue,
         object_token: &NativeObjectToken,
         expected_before: &RestorableStateFingerprint,
+        removed_parent_entries: u64,
     ) -> Result<(), BoundaryError>;
 
     fn rebind_applied_absence(
@@ -539,13 +540,15 @@ where
         target: &WireNativeValue,
         object_token: &NativeObjectToken,
         expected_before: &RestorableStateFingerprint,
+        removed_parent_entries: u64,
     ) -> Result<(), BoundaryError> {
         self.filesystem
-            .cleanup_committed_delete_observed(
+            .cleanup_committed_delete_observed_after_parent_entries_removed(
                 &decode_native_path(target)?,
                 &expected_before.0.0,
                 transaction_nonce,
                 &decode_object_token(object_token)?,
+                removed_parent_entries,
             )
             .map_err(runner_boundary)
     }
@@ -920,13 +923,37 @@ pub fn recover_native_transactions_with_faults(
                 }
             }
         } else if transaction.status == NativeTransactionStatus::Committed {
+            let mut cleaned_deletes = Vec::<NativeObjectToken>::new();
             for mutation in vault.native_wal(&transaction.transaction_id)? {
+                let is_delete = mutation
+                    .applied_object_token
+                    .as_ref()
+                    .is_some_and(NativeObjectToken::is_absence_generation);
+                let removed_parent_entries = if is_delete {
+                    u64::try_from(
+                        cleaned_deletes
+                            .iter()
+                            .filter(|token| token.has_same_parent_binding(&mutation.object_token))
+                            .count(),
+                    )
+                    .map_err(|_| {
+                        VaultError::Validation(
+                            "native committed cleanup count exceeds u64".to_owned(),
+                        )
+                    })?
+                } else {
+                    0
+                };
                 io.cleanup_committed_mutation(
                     transaction.plan_id.as_bytes(),
                     &mutation.target,
                     &mutation.object_token,
                     &mutation.expected,
+                    removed_parent_entries,
                 )?;
+                if is_delete {
+                    cleaned_deletes.push(mutation.object_token);
+                }
             }
             RecoveryOutcome::Committed
         } else if matches!(

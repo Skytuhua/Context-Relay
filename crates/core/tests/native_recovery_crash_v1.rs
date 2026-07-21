@@ -104,7 +104,13 @@ impl ForwardFaultPoint {
 fn open_vault(root: &std::path::Path) -> Vault {
     let keys = MemoryKeyStore::default();
     keys.insert(CREDENTIAL, KEY);
-    Vault::open(&root.join("vault.db"), CREDENTIAL, &keys).unwrap()
+    let harness = root.join("harness");
+    fs::create_dir_all(&harness).unwrap();
+    Vault::open(&harness.join("vault.db"), CREDENTIAL, &keys).unwrap()
+}
+
+fn fault_hit_path(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("harness").join("fault-hit")
 }
 
 #[cfg(windows)]
@@ -221,6 +227,7 @@ fn commit_success(vault: &mut Vault) {
 
 fn applied_fixture(root: &std::path::Path) {
     fs::create_dir(root).unwrap();
+    let mut vault = open_vault(root);
     let target_path = root.join("target.txt");
     fs::write(&target_path, b"before").unwrap();
     let filesystem = OsNativeFileSystem::new();
@@ -230,7 +237,6 @@ fn applied_fixture(root: &std::path::Path) {
         NativeState::regular_file(b"applied".to_vec(), before.metadata().unwrap().clone());
     let target = wire_path(&target_path);
 
-    let mut vault = open_vault(root);
     let plan_id = ID_2.parse().unwrap();
     let approval = Sha256Digest([9; 32]);
     vault
@@ -509,7 +515,7 @@ fn guarded_gap_fixture(root: &std::path::Path) {
         0,
     );
     backup_file.sync_all().unwrap();
-    fs::write(root.join("fault-hit"), b"guarded-gap").unwrap();
+    fs::write(fault_hit_path(root), b"guarded-gap").unwrap();
     std::process::abort();
 }
 
@@ -541,7 +547,7 @@ fn forward_fixture(root: &std::path::Path) {
 
 fn forward_hit(root: &std::path::Path, expected: ForwardFaultPoint, actual: ForwardFaultPoint) {
     if actual == expected {
-        fs::write(root.join("fault-hit"), actual.encode()).unwrap();
+        fs::write(fault_hit_path(root), actual.encode()).unwrap();
         std::process::abort();
     }
 }
@@ -1188,7 +1194,7 @@ fn a_real_crash_in_the_guarded_replace_gap_is_recovered_before_wal_classificatio
         .unwrap();
     assert!(!status.success());
     assert_eq!(
-        fs::read(root.path().join("fault-hit")).unwrap(),
+        fs::read(fault_hit_path(root.path())).unwrap(),
         b"guarded-gap"
     );
     assert!(!root.path().join("target.txt").exists());
@@ -1521,7 +1527,7 @@ fn every_forward_durable_mutation_boundary_aborts_in_a_child_for_all_target_role
             .unwrap();
         assert!(!status.success(), "{encoded}");
         assert_eq!(
-            fs::read_to_string(root.path().join("fault-hit")).unwrap(),
+            fs::read_to_string(fault_hit_path(root.path())).unwrap(),
             encoded,
             "the child must reach the requested injection point",
         );

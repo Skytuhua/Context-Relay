@@ -902,6 +902,7 @@ pub(super) fn cleanup_committed_delete(
     before_fingerprint: &[u8; 32],
     _transaction_nonce: &[u8; 16],
     original_token: &NativeObjectToken,
+    _removed_parent_entries: u64,
 ) -> Result<(), RunnerError> {
     let held = HeldPath::new(path)?;
     let name = backup_name(&held.name);

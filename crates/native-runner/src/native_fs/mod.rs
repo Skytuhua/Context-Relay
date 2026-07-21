@@ -544,6 +544,23 @@ impl OsNativeFileSystem {
         transaction_nonce: &[u8; 16],
         original_token: &NativeObjectToken,
     ) -> Result<(), RunnerError> {
+        self.cleanup_committed_delete_observed_after_parent_entries_removed(
+            path,
+            before_fingerprint,
+            transaction_nonce,
+            original_token,
+            0,
+        )
+    }
+
+    pub fn cleanup_committed_delete_observed_after_parent_entries_removed(
+        &self,
+        path: &Path,
+        before_fingerprint: &[u8; 32],
+        transaction_nonce: &[u8; 16],
+        original_token: &NativeObjectToken,
+        removed_parent_entries: u64,
+    ) -> Result<(), RunnerError> {
         #[cfg(windows)]
         {
             windows::cleanup_committed_delete(
@@ -551,6 +568,7 @@ impl OsNativeFileSystem {
                 before_fingerprint,
                 transaction_nonce,
                 original_token,
+                removed_parent_entries,
             )
         }
         #[cfg(target_os = "macos")]
@@ -560,11 +578,18 @@ impl OsNativeFileSystem {
                 before_fingerprint,
                 transaction_nonce,
                 original_token,
+                removed_parent_entries,
             )
         }
         #[cfg(not(any(windows, target_os = "macos")))]
         {
-            let _ = (path, before_fingerprint, transaction_nonce, original_token);
+            let _ = (
+                path,
+                before_fingerprint,
+                transaction_nonce,
+                original_token,
+                removed_parent_entries,
+            );
             Err(RunnerError::UnsupportedTarget)
         }
     }

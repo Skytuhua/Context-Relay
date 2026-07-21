@@ -243,6 +243,7 @@ impl NativeRecoveryIo for RecoveryIo {
         _target: &context_relay_protocol::WireNativeValue,
         _object_token: &NativeObjectToken,
         _expected_before: &RestorableStateFingerprint,
+        _removed_parent_entries: u64,
     ) -> Result<(), BoundaryError> {
         Ok(())
     }
