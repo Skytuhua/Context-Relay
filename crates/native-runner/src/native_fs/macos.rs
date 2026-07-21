@@ -28,6 +28,8 @@ const MAX_SNAPSHOT_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_SECURITY_BYTES: usize = 1024 * 1024;
 const MAX_XATTRS: usize = 128;
 type ExtendedAttributes = Vec<(Vec<u8>, Vec<u8>)>;
+#[cfg(test)]
+type TestHook = Box<dyn FnOnce() + Send>;
 
 #[cfg(test)]
 static PRE_TARGET_MUTATION_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
@@ -49,63 +51,50 @@ static RECOVERY_AFTER_PARENT_CHECK_TEST_HOOK: std::sync::Mutex<Option<Box<dyn Fn
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
-fn run_pre_target_mutation_test_hook() {
-    if let Some(hook) = PRE_TARGET_MUTATION_TEST_HOOK
-        .lock()
-        .expect("test hook lock")
+fn take_test_hook(hook: &std::sync::Mutex<Option<TestHook>>) -> Option<TestHook> {
+    hook.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take()
-    {
+}
+
+#[cfg(test)]
+fn run_pre_target_mutation_test_hook() {
+    if let Some(hook) = take_test_hook(&PRE_TARGET_MUTATION_TEST_HOOK) {
         hook();
     }
 }
 
 #[cfg(test)]
 fn run_pre_backup_removal_test_hook() {
-    if let Some(hook) = PRE_BACKUP_REMOVAL_TEST_HOOK
-        .lock()
-        .expect("test hook lock")
-        .take()
-    {
+    if let Some(hook) = take_test_hook(&PRE_BACKUP_REMOVAL_TEST_HOOK) {
         hook();
     }
 }
 
 #[cfg(test)]
 fn run_pre_install_test_hook() {
-    if let Some(hook) = PRE_INSTALL_TEST_HOOK.lock().expect("test hook lock").take() {
+    if let Some(hook) = take_test_hook(&PRE_INSTALL_TEST_HOOK) {
         hook();
     }
 }
 
 #[cfg(test)]
 fn run_post_missing_snapshot_test_hook() {
-    if let Some(hook) = POST_MISSING_SNAPSHOT_TEST_HOOK
-        .lock()
-        .expect("test hook lock")
-        .take()
-    {
+    if let Some(hook) = take_test_hook(&POST_MISSING_SNAPSHOT_TEST_HOOK) {
         hook();
     }
 }
 
 #[cfg(test)]
 fn run_pre_rollback_move_test_hook() {
-    if let Some(hook) = PRE_ROLLBACK_MOVE_TEST_HOOK
-        .lock()
-        .expect("test hook lock")
-        .take()
-    {
+    if let Some(hook) = take_test_hook(&PRE_ROLLBACK_MOVE_TEST_HOOK) {
         hook();
     }
 }
 
 #[cfg(test)]
 fn run_recovery_after_parent_check_test_hook() {
-    if let Some(hook) = RECOVERY_AFTER_PARENT_CHECK_TEST_HOOK
-        .lock()
-        .expect("test hook lock")
-        .take()
-    {
+    if let Some(hook) = take_test_hook(&RECOVERY_AFTER_PARENT_CHECK_TEST_HOOK) {
         hook();
     }
 }
@@ -192,6 +181,7 @@ pub(super) fn compare_and_swap_with_provenance(
             &parent,
             current.object_token(),
             matches!(current.state(), NativeState::RegularFile { .. }),
+            false,
             expected,
             bytes,
             metadata,
@@ -380,6 +370,7 @@ fn replace_regular_file(
     parent: &OpenParent,
     expected: Option<&NativeObjectToken>,
     expected_present: bool,
+    retain_extra_parent_entry: bool,
     expected_fingerprint: &[u8; 32],
     bytes: &[u8],
     metadata: &NativeMetadata,
@@ -413,7 +404,7 @@ fn replace_regular_file(
     full_sync(&temporary)?;
 
     let staged = snapshot_named(&parent.directory, &cleanup.name)?;
-    let staged_fingerprint = if expected_present {
+    let staged_fingerprint = if expected_present || retain_extra_parent_entry {
         fingerprint_before_extra_parent_entry(&staged)?
     } else {
         *staged.fingerprint()
@@ -491,7 +482,7 @@ fn replace_regular_file(
     cleanup.armed = false;
     *installed_token = Some(staged_token.clone());
     if let Err(error) = flush_directory(&parent.directory).and_then(|()| {
-        let installed = if expected_present {
+        let installed = if expected_present || retain_extra_parent_entry {
             validate_named_before_extra_parent_entry(
                 &parent.directory,
                 &parent.name,
@@ -509,8 +500,14 @@ fn replace_regular_file(
         installed.map(|_| ())
     }) {
         if backup.is_none()
-            && rollback_created_target(parent, &cleanup.name, &staged_token, &intended_fingerprint)
-                .is_ok()
+            && rollback_created_target(
+                parent,
+                &cleanup.name,
+                &staged_token,
+                &intended_fingerprint,
+                retain_extra_parent_entry,
+            )
+            .is_ok()
         {
             cleanup.armed = true;
             return Err(error);
@@ -551,12 +548,21 @@ fn replace_regular_file(
             },
         )?;
     }
-    validate_named(
-        &parent.directory,
-        &parent.name,
-        Some(&staged_token),
-        &intended_fingerprint,
-    )?;
+    if retain_extra_parent_entry {
+        validate_named_before_extra_parent_entry(
+            &parent.directory,
+            &parent.name,
+            Some(&staged_token),
+            &intended_fingerprint,
+        )?;
+    } else {
+        validate_named(
+            &parent.directory,
+            &parent.name,
+            Some(&staged_token),
+            &intended_fingerprint,
+        )?;
+    }
     Ok(())
 }
 
@@ -1040,25 +1046,31 @@ fn rollback_created_target(
     temp_name: &CStr,
     staged_token: &NativeObjectToken,
     intended_fingerprint: &[u8; 32],
+    extra_parent_entry: bool,
 ) -> Result<(), RunnerError> {
-    validate_named(
-        &parent.directory,
-        &parent.name,
-        Some(staged_token),
-        intended_fingerprint,
-    )?;
+    let validate = |name: &CStr| {
+        if extra_parent_entry {
+            validate_named_before_extra_parent_entry(
+                &parent.directory,
+                name,
+                Some(staged_token),
+                intended_fingerprint,
+            )
+        } else {
+            validate_named(
+                &parent.directory,
+                name,
+                Some(staged_token),
+                intended_fingerprint,
+            )
+        }
+    };
+    validate(&parent.name)?;
     #[cfg(test)]
     run_pre_rollback_move_test_hook();
     rename_exclusive(&parent.directory, &parent.name, temp_name)?;
     flush_directory(&parent.directory)?;
-    if validate_named(
-        &parent.directory,
-        temp_name,
-        Some(staged_token),
-        intended_fingerprint,
-    )
-    .is_err()
-    {
+    if validate(temp_name).is_err() {
         let _ = restore_moved_name_to(parent, temp_name, &parent.name);
         return Err(RunnerError::ConcurrentChange);
     }
@@ -2352,7 +2364,13 @@ mod guarded_mutation_tests {
         }));
 
         assert_eq!(
-            rollback_created_target(&parent, &temp, &installed_token, &installed_fingerprint),
+            rollback_created_target(
+                &parent,
+                &temp,
+                &installed_token,
+                &installed_fingerprint,
+                false,
+            ),
             Err(RunnerError::ConcurrentChange)
         );
         assert_eq!(fs::read(&path).unwrap(), b"attacker\n");
@@ -2626,13 +2644,15 @@ mod guarded_mutation_tests {
         let template = live.join("template.json");
         let path = live.join("settings.json");
         fs::write(&template, b"template\n").unwrap();
+        fs::write(&path, b"placeholder\n").unwrap();
         let native = OsNativeFileSystem::new();
-        let template = native.snapshot(&template).unwrap();
+        let intended = native.snapshot(&path).unwrap();
+        fs::remove_file(&path).unwrap();
         let before = native.snapshot(&path).unwrap();
         assert!(before.object_token().is_some());
         let desired = NativeState::regular_file(
             b"approved-secret\n".to_vec(),
-            template.metadata().unwrap().clone(),
+            intended.metadata().unwrap().clone(),
         );
         *PRE_TARGET_MUTATION_TEST_HOOK.lock().unwrap() = Some(Box::new({
             let live = live.clone();
@@ -2778,6 +2798,7 @@ mod guarded_mutation_tests {
             &parent,
             absent.object_token(),
             false,
+            true,
             absent.fingerprint(),
             bytes,
             metadata,
