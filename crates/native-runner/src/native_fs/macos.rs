@@ -1124,6 +1124,8 @@ fn remove_exact_private_named(
     expected_token: &NativeObjectToken,
     expected_fingerprint: &[u8; 32],
 ) -> Result<(), RunnerError> {
+    #[cfg(test)]
+    run_pre_backup_removal_test_hook();
     if !identity_matches_path(&parent.directory, &parent.path)? {
         return Err(RunnerError::ConcurrentChange);
     }
@@ -2370,8 +2372,16 @@ mod guarded_mutation_tests {
             }
         }));
 
+        native
+            .compare_and_swap(&path, before.fingerprint(), &absent, &TEST_NONCE)
+            .unwrap();
         assert_eq!(
-            native.compare_and_swap(&path, before.fingerprint(), &absent, &TEST_NONCE,),
+            native.cleanup_committed_delete_observed(
+                &path,
+                before.fingerprint(),
+                &TEST_NONCE,
+                before.object_token().unwrap(),
+            ),
             Err(RunnerError::ConcurrentChange)
         );
         assert_eq!(fs::read(&path).unwrap(), b"attacker\n");
