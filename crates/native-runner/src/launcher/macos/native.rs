@@ -640,9 +640,10 @@ pub fn prepare_generation<J: GenerationJournal>(
         }
         let contents = bundle.join("Contents");
         let macos = contents.join("MacOS");
-        let helpers = contents.join("Helpers/runtime");
+        let helpers_root = contents.join("Helpers");
+        let helpers = helpers_root.join("runtime");
         let resources = contents.join("Resources");
-        for directory in [&contents, &macos, &helpers, &resources] {
+        for directory in [&contents, &macos, &helpers_root, &helpers, &resources] {
             create_private_directory(directory)?;
         }
 
