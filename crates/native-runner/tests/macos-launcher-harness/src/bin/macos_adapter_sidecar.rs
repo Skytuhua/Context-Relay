@@ -16,9 +16,6 @@ const PROBE_PORTS: [u16; 8] = [42831, 43197, 43921, 44777, 45263, 46183, 47221, 
 #[cfg(target_os = "macos")]
 const OUTSIDE_CLOSURE_CANARY: &str = ".context-relay-outside-closure-canary";
 #[cfg(target_os = "macos")]
-const EXPECTED_PROOF: &str = "ARGV_EXACT=1\nENV_EXACT=1\nFAKE_HOME_WRITE=1\nREAL_HOME_DENIED=1\nLOOPBACK_DENIED=1\nCLOSURE_DENIED=1\n";
-
-#[cfg(target_os = "macos")]
 #[allow(clippy::zombie_processes)] // The launcher under test must kill this inherited group child.
 fn main() {
     if env::args().nth(1).as_deref() == Some("--ordinary-child") {
@@ -112,9 +109,6 @@ fn main() {
         u8::from(loopback_denied),
         u8::from(closure_denied),
     );
-    if proof != EXPECTED_PROOF {
-        std::process::exit(3);
-    }
     let output_path = root.join("output/.claude/rules/probe.md");
     fs::create_dir_all(output_path.parent().unwrap()).unwrap();
     let output = creation_probe.map_or(proof.clone(), |creation_probe| {
