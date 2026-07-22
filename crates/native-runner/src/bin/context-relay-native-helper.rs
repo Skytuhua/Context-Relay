@@ -32,10 +32,22 @@ use context_relay_native_runner::{
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "helper-error-diagnostics")]
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicU8, Ordering},
+};
+
+#[cfg(all(target_os = "macos", feature = "helper-error-diagnostics"))]
+use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
 #[cfg(windows)]
-use context_relay_native_runner::{StageDirectory, StageLayout, validate_path_set};
+use context_relay_native_runner::{StageLayout, validate_path_set};
+
+#[cfg(any(
+    windows,
+    all(target_os = "macos", feature = "helper-error-diagnostics")
+))]
+use context_relay_native_runner::StageDirectory;
 
 #[cfg(not(windows))]
 use context_relay_native_runner::{
@@ -96,6 +108,8 @@ enum DiagnosticStage {
 
 #[cfg(feature = "helper-error-diagnostics")]
 static DIAGNOSTIC_STAGE: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "helper-error-diagnostics")]
+static DIAGNOSTIC_DETAIL: OnceLock<Mutex<String>> = OnceLock::new();
 
 macro_rules! diagnostic_stage {
     ($stage:ident) => {
@@ -138,8 +152,13 @@ fn diagnostic_response(request: &RunRequest, error: RunnerError) -> RunResponse 
     let output = ContentFrame::new(
         StagePath::try_from("output/.claude/rules/probe.md").expect("fixed diagnostic path"),
         format!(
-            "HELPER_ERROR={error:?}\nHELPER_STAGE={}\n",
-            diagnostic_stage_name(DIAGNOSTIC_STAGE.load(Ordering::Acquire))
+            "HELPER_ERROR={error:?}\nHELPER_STAGE={}\nHELPER_DETAIL={}\n",
+            diagnostic_stage_name(DIAGNOSTIC_STAGE.load(Ordering::Acquire)),
+            DIAGNOSTIC_DETAIL
+                .get_or_init(|| Mutex::new(String::from("none")))
+                .lock()
+                .map(|detail| detail.clone())
+                .unwrap_or_else(|_| String::from("poisoned"))
         )
         .into_bytes(),
     )
@@ -186,7 +205,14 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
     diagnostic_stage!(InstallConfig);
     let config_inventory = install_trusted_config(&mut stage, request.command(), target)?;
     diagnostic_stage!(WriteInputs);
-    let input_inventory = stage.write_and_seal_inputs(request.inputs())?;
+    let input_inventory = match stage.write_and_seal_inputs(request.inputs()) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            #[cfg(all(target_os = "macos", feature = "helper-error-diagnostics"))]
+            record_input_tree_detail(&stage.layout().path(StageDirectory::Input));
+            return Err(error);
+        }
+    };
     diagnostic_stage!(ValidateRequest);
     validate_pre_enumeration(request)?;
     let limits = RunLimits::for_command(request.command());
@@ -315,6 +341,95 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
             )
         }
     }
+}
+
+#[cfg(all(target_os = "macos", feature = "helper-error-diagnostics"))]
+fn record_input_tree_detail(root: &Path) {
+    const MAX_NODES: usize = 32;
+    const MAX_DETAIL_BYTES: usize = 2_048;
+
+    fn visit(root: &Path, path: &Path, nodes: &mut usize, detail: &mut String) {
+        if *nodes >= MAX_NODES || detail.len() >= MAX_DETAIL_BYTES {
+            return;
+        }
+        *nodes += 1;
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        let label = if relative.as_os_str().is_empty() {
+            "."
+        } else {
+            relative.to_str().unwrap_or("non-utf8")
+        };
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                detail.push_str(&format!("{label}:metadata-error;"));
+                return;
+            }
+        };
+        let kind = if metadata.is_dir() {
+            "dir"
+        } else if metadata.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        let names = diagnostic_xattr_names(path).unwrap_or_else(|| String::from("xattr-error"));
+        detail.push_str(&format!("{label}:{kind}:{names};"));
+        if metadata.is_dir()
+            && let Ok(entries) = fs::read_dir(path)
+        {
+            let mut paths = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>();
+            paths.sort();
+            for child in paths {
+                visit(root, &child, nodes, detail);
+            }
+        }
+    }
+
+    let mut nodes = 0;
+    let mut detail = String::new();
+    visit(root, root, &mut nodes, &mut detail);
+    detail.truncate(detail.len().min(MAX_DETAIL_BYTES));
+    if detail.is_empty() {
+        detail.push_str("empty");
+    }
+    if let Ok(mut destination) = DIAGNOSTIC_DETAIL
+        .get_or_init(|| Mutex::new(String::from("none")))
+        .lock()
+    {
+        *destination = detail;
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "helper-error-diagnostics"))]
+fn diagnostic_xattr_names(path: &Path) -> Option<String> {
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let size = unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0, 0) };
+    if !(0..=2_048).contains(&size) {
+        return None;
+    }
+    let mut bytes = vec![0_u8; size as usize];
+    if size != 0 {
+        let read =
+            unsafe { libc::listxattr(path.as_ptr(), bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+        if read != size {
+            return None;
+        }
+    }
+    let mut names = bytes
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| std::str::from_utf8(name).unwrap_or("non-utf8"))
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    Some(if names.is_empty() {
+        String::from("no-xattrs")
+    } else {
+        names.join(",")
+    })
 }
 
 #[cfg(any(target_os = "macos", test))]
