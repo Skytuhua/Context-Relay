@@ -601,6 +601,7 @@ pub fn prepare_generation<J: GenerationJournal>(
     let mut guardian = None;
     let mut bundle_cleanup = None;
     let mut bundle_bound = false;
+    let mut stage = "guardian start";
 
     let prepared = (|| {
         let guardian_directory = open_absolute_directory(&private_root)?;
@@ -610,9 +611,12 @@ pub fn prepare_generation<J: GenerationJournal>(
             &guardian_name,
         )?);
         let guardian_ref = guardian.as_mut().ok_or(MacPolicyError::InvalidTransition)?;
+        stage = "guardian bind";
         journal.bind_guardian(&spec.id, guardian_ref.pgid())?;
+        stage = "helper template verification";
         verify_template(&spec.helper_template, spec.helper_sha256, guardian_ref)?;
 
+        stage = "bundle layout";
         let bundle = private_root.join(format!("{}.app", spec.id.as_str()));
         fs::create_dir(&bundle).map_err(|_| MacPolicyError::BundleIo)?;
         let bundle_name = c_name(&format!("{}.app", spec.id.as_str()))?;
@@ -651,6 +655,7 @@ pub fn prepare_generation<J: GenerationJournal>(
         let entitlements = resources.join("helper.entitlements.plist");
         write_new(&entitlements, HELPER_ENTITLEMENTS)?;
 
+        stage = "sidecar material preparation";
         let mut sidecar_machos = Vec::new();
         for material in &spec.materials {
             let destination = helpers.join(&material.relative_path);
@@ -686,6 +691,7 @@ pub fn prepare_generation<J: GenerationJournal>(
                 .map_err(|_| MacPolicyError::BundleIo)?;
         }
 
+        stage = "generation signing";
         fs::set_permissions(&helper, fs::Permissions::from_mode(0o500))
             .map_err(|_| MacPolicyError::BundleIo)?;
         let command_paths = MacCommandPaths::new(
@@ -700,6 +706,7 @@ pub fn prepare_generation<J: GenerationJournal>(
         run_codesign(&MacCommand::verify_strict(&command_paths), guardian_ref)?;
         verify_identity_and_runtime(&command_paths, &spec.id, guardian_ref)?;
 
+        stage = "Mach-O closure validation";
         let mut actual_machos = enumerate_machos(&bundle)?;
         actual_machos.sort();
         let helper_relative = relative_text(&bundle, &helper)?;
@@ -734,16 +741,20 @@ pub fn prepare_generation<J: GenerationJournal>(
             });
         }
         validate_macho_closure(&helper_relative, &expected, &policy_inspections)?;
+        stage = "bundle freeze";
         freeze_tree(&bundle)?;
         let signed_sha256 = generation_digest(&bundle)?;
+        stage = "container preflight";
         let container_parent = open_user_containers_directory()?;
         let container_name = c_name(spec.id.as_str())?;
         if HeldDirectory::open_at(&container_parent, &container_name)?.is_some() {
             return Err(MacPolicyError::InvalidTransition);
         }
+        stage = "helper code identity";
         let helper_file = open_verified_executable(&helper)?;
         let helper_code_identity = capture_code_identity(&helper_file)?;
         let signed = SignedGeneration::new(spec.id.clone(), signed_sha256, bundle_identity);
+        stage = "journal finalize";
         journal.finalize(&signed)?;
 
         Ok(PreparedGeneration {
@@ -767,6 +778,8 @@ pub fn prepare_generation<J: GenerationJournal>(
     match prepared {
         Ok(prepared) => Ok(prepared),
         Err(original) => {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS generation preparation failed at {stage}: {original:?}");
             let poison = journal.transition(
                 &spec.id,
                 GenerationState::Prepared,
