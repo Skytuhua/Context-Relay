@@ -1,9 +1,9 @@
 use std::{
     ffi::{CStr, CString, OsStr, c_void},
-    fs::File,
+    fs::{File, OpenOptions},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::{ffi::OsStrExt, process::ExitStatusExt},
+        unix::{ffi::OsStrExt, fs::OpenOptionsExt, process::ExitStatusExt},
     },
     path::{Path, PathBuf},
     process::ExitStatus,
@@ -387,13 +387,72 @@ impl Drop for MacChild {
     }
 }
 
-pub fn capture_code_identity(file: &File) -> Result<MacCodeIdentity, MacPolicyError> {
-    let path = PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()));
-    let url = CFURL::from_path(path, false).ok_or(MacPolicyError::IdentityMismatch)?;
-    let code = SecStaticCode::from_path(&url, Flags::NONE)
+pub fn capture_code_identity(
+    file: &File,
+    executable: &Path,
+) -> Result<MacCodeIdentity, MacPolicyError> {
+    let descriptor_path = PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()));
+    let descriptor_url =
+        CFURL::from_path(descriptor_path, false).ok_or(MacPolicyError::IdentityMismatch)?;
+    let descriptor_code = SecStaticCode::from_path(&descriptor_url, Flags::NONE)
         .map_err(|_| MacPolicyError::IdentityMismatch)?;
-    validate_static_code(&code)?;
-    signing_identity(code.as_concrete_TypeRef().cast())
+    let descriptor_identity = signing_identity(descriptor_code.as_concrete_TypeRef().cast())?;
+
+    let _before = open_bound_executable(file, executable)?;
+    let executable_url =
+        CFURL::from_path(executable, false).ok_or(MacPolicyError::IdentityMismatch)?;
+    let executable_code = SecStaticCode::from_path(&executable_url, Flags::NONE)
+        .map_err(|_| MacPolicyError::IdentityMismatch)?;
+    validate_static_code(&executable_code)?;
+    let executable_identity = signing_identity(executable_code.as_concrete_TypeRef().cast())?;
+    let _after = open_bound_executable(file, executable)?;
+    if descriptor_identity != executable_identity {
+        return Err(MacPolicyError::IdentityMismatch);
+    }
+    Ok(descriptor_identity)
+}
+
+fn open_bound_executable(file: &File, path: &Path) -> Result<File, MacPolicyError> {
+    if !path.is_absolute() {
+        return Err(MacPolicyError::InvalidConfiguration);
+    }
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let reopened = options
+        .open(path)
+        .map_err(|_| MacPolicyError::IdentityMismatch)?;
+    let held = file_identity(file)?;
+    let observed = file_identity(&reopened)?;
+    if held != observed || held.links != 1 || held.kind != libc::S_IFREG as u32 {
+        return Err(MacPolicyError::IdentityMismatch);
+    }
+    Ok(reopened)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    generation: u32,
+    kind: u32,
+    links: u64,
+}
+
+fn file_identity(file: &File) -> Result<FileIdentity, MacPolicyError> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(MacPolicyError::IdentityMismatch);
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(FileIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino,
+        generation: stat.st_gen,
+        kind: u32::from(stat.st_mode) & libc::S_IFMT as u32,
+        links: u64::from(stat.st_nlink),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

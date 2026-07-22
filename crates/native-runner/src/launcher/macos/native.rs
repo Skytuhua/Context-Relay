@@ -753,7 +753,7 @@ pub fn prepare_generation<J: GenerationJournal>(
         }
         stage = "helper code identity";
         let helper_file = open_verified_executable(&helper)?;
-        let helper_code_identity = capture_code_identity(&helper_file)?;
+        let helper_code_identity = capture_code_identity(&helper_file, &helper)?;
         let signed = SignedGeneration::new(spec.id.clone(), signed_sha256, bundle_identity);
         stage = "journal finalize";
         journal.finalize(&signed)?;
