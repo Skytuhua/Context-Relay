@@ -5,8 +5,9 @@ edition = "2024"
 publish = false
 
 [features]
-default = []
+default = ["helper-error-diagnostics"]
 ci-candidate-sidecar-smoke = ["context-relay-native-runner/ci-candidate-sidecar-smoke"]
+helper-error-diagnostics = []
 
 [workspace]
 

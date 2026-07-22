@@ -84,12 +84,34 @@ fn main() -> ExitCode {
     let request = helper_request.request();
     let response = match execute(&helper_request) {
         Ok(response) => response,
+        #[cfg(feature = "helper-error-diagnostics")]
+        Err(error) => diagnostic_response(request, error),
+        #[cfg(not(feature = "helper-error-diagnostics"))]
         Err(error) => RunResponse::failed(failure_code(error)),
     };
     if write_run_response_for(&mut std::io::stdout().lock(), request, &response).is_err() {
         return ExitCode::from(2);
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(feature = "helper-error-diagnostics")]
+fn diagnostic_response(request: &RunRequest, error: RunnerError) -> RunResponse {
+    if !matches!(request.command(), SidecarCommand::RuleSyncGenerate { .. }) {
+        return RunResponse::failed(failure_code(error));
+    }
+    let output = ContentFrame::new(
+        StagePath::try_from("output/.claude/rules/probe.md").expect("fixed diagnostic path"),
+        format!("HELPER_ERROR={error:?}\n").into_bytes(),
+    )
+    .expect("bounded diagnostic frame");
+    RunResponse::completed(
+        RunDisposition::Generated,
+        vec![output],
+        RunStats::new(0, 0, 0),
+        RunLimits::for_command(request.command()),
+    )
+    .expect("bounded diagnostic response")
 }
 
 fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError> {
