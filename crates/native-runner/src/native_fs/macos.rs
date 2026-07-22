@@ -27,6 +27,7 @@ const MODE_SYMLINK: u32 = libc::S_IFLNK as u32;
 const MAX_SNAPSHOT_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_SECURITY_BYTES: usize = 1024 * 1024;
 const MAX_XATTRS: usize = 128;
+const QUARANTINE_XATTR: &[u8] = b"com.apple.quarantine";
 type ExtendedAttributes = Vec<(Vec<u8>, Vec<u8>)>;
 #[cfg(test)]
 type TestHook = Box<dyn FnOnce() + Send>;
@@ -327,7 +328,7 @@ pub(super) fn capture_node(path: &Path, forbid_xattrs: bool) -> Result<CapturedN
     let parent = open_path(parent_path, libc::O_RDONLY | libc::O_DIRECTORY)?;
     let parent_node = raw_node(&parent)?;
     let security = capture_security(&file, &before, &parent_node)?;
-    if forbid_xattrs && security.xattr_count != 0 {
+    if forbid_xattrs && security.has_forbidden_tree_xattrs {
         return Err(RunnerError::UnsafeTopology);
     }
     let mut hash = Sha256::new();
@@ -1828,7 +1829,7 @@ fn shared_lock(file: &File) -> Result<(), RunnerError> {
 
 struct CapturedSecurity {
     encoded: Vec<u8>,
-    xattr_count: usize,
+    has_forbidden_tree_xattrs: bool,
 }
 
 fn capture_security(
@@ -1837,7 +1838,9 @@ fn capture_security(
     parent: &RawNode,
 ) -> Result<CapturedSecurity, RunnerError> {
     let xattrs = xattrs(file)?;
-    let xattr_count = xattrs.len();
+    let has_forbidden_tree_xattrs = xattrs
+        .iter()
+        .any(|(name, _)| name.as_slice() != QUARANTINE_XATTR);
     let security = PosixSecurity {
         uid: node.uid,
         gid: node.gid,
@@ -1853,7 +1856,7 @@ fn capture_security(
     };
     Ok(CapturedSecurity {
         encoded: security.encode()?,
-        xattr_count,
+        has_forbidden_tree_xattrs,
     })
 }
 

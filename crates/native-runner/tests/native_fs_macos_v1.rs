@@ -21,6 +21,7 @@ use context_relay_native_runner::{
 const TEST_NONCE: [u8; 16] = [0x6d; 16];
 
 const XATTR_NAME: &str = "com.context-relay.native-test";
+const QUARANTINE_XATTR_NAME: &str = "com.apple.quarantine";
 
 fn scratch(parent: &Path, label: &str) -> PathBuf {
     let suffix = SystemTime::now()
@@ -118,8 +119,12 @@ fn c_path(path: &Path) -> CString {
 }
 
 fn set_xattr(path: &Path, bytes: &[u8]) {
+    set_named_xattr(path, XATTR_NAME, bytes);
+}
+
+fn set_named_xattr(path: &Path, name: &str, bytes: &[u8]) {
     let path = c_path(path);
-    let name = CString::new(XATTR_NAME).unwrap();
+    let name = CString::new(name).unwrap();
     assert_eq!(
         unsafe {
             libc::setxattr(
@@ -133,6 +138,34 @@ fn set_xattr(path: &Path, bytes: &[u8]) {
         },
         0
     );
+}
+
+#[test]
+fn native_tree_accepts_only_fingerprinted_macos_quarantine_metadata() {
+    let root = scratch(&default_case_insensitive_root(), "quarantine-xattr");
+    let nested = root.join("nested");
+    fs::create_dir(&nested).unwrap();
+    let file = nested.join("rules.md");
+    fs::write(&file, b"rules\n").unwrap();
+    set_named_xattr(
+        &nested,
+        QUARANTINE_XATTR_NAME,
+        b"0081;fixture;ContextRelay;",
+    );
+    set_named_xattr(&file, QUARANTINE_XATTR_NAME, b"0081;fixture;ContextRelay;");
+
+    let inventory = inspect_native_tree(&root, RuntimeTarget::MacosArm64).unwrap();
+    set_named_xattr(&file, QUARANTINE_XATTR_NAME, b"0081;changed;ContextRelay;");
+    assert_eq!(
+        inventory.verify_unchanged(),
+        Err(RunnerError::ConcurrentChange)
+    );
+    set_xattr(&file, b"unexpected-metadata");
+    assert_eq!(
+        inspect_native_tree(&root, RuntimeTarget::MacosArm64),
+        Err(RunnerError::UnsafeTopology)
+    );
+    cleanup(&root);
 }
 
 fn get_xattr(path: &Path) -> Vec<u8> {
