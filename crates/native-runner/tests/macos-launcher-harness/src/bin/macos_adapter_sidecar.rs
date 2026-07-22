@@ -43,14 +43,32 @@ fn main() {
     let root = env::current_dir().unwrap();
     let mode = fs::read_to_string(root.join("input/.rulesync/rules/probe.md")).unwrap();
     if mode == "ESCAPE_HANG" {
-        assert!(unsafe { libc::setsid() } > 0);
+        let session = unsafe { libc::setsid() };
+        let session_errno = if session <= 0 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        } else {
+            0
+        };
         let pid = unsafe { libc::getpid() };
         let pgid = unsafe { libc::getpgrp() };
-        fs::write(
+        let home_write = fs::write(
             PathBuf::from(env::var_os("HOME").unwrap()).join("ordinary-child.pid"),
             format!("{pid}\n{pgid}\n"),
         )
-        .unwrap();
+        .is_ok();
+        if session <= 0 || !home_write {
+            let output_path = root.join("output/.claude/rules/probe.md");
+            fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+            fs::write(
+                output_path,
+                format!(
+                    "ESCAPE_SETSID={session}\nESCAPE_ERRNO={session_errno}\nESCAPE_HOME_WRITE={}\n",
+                    u8::from(home_write)
+                ),
+            )
+            .unwrap();
+            return;
+        }
         loop {
             std::thread::sleep(Duration::from_secs(60));
         }

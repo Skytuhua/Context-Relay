@@ -346,6 +346,10 @@ fn production_helper_exact_kills_a_sidecar_that_escapes_the_original_group() {
             if let Some(identity) = recorded_group(&journal) {
                 break identity;
             }
+            if run.is_finished() {
+                let response = run.join().unwrap();
+                panic!("fixture exited before recording its child process group: {response:?}");
+            }
             assert!(
                 Instant::now() < deadline,
                 "fixture did not record its child process group"
