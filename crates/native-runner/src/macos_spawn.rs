@@ -237,16 +237,23 @@ fn guardian_descriptor_limit<const N: usize>(
     }
     let limit = unsafe { limit.assume_init() };
     let hard_limit = limit.rlim_max;
-    if hard_limit == libc::RLIM_INFINITY
-        || hard_limit < limit.rlim_cur
-        || hard_limit > MAX_GUARDIAN_DESCRIPTORS
+    let allocation_limit = if hard_limit == libc::RLIM_INFINITY {
+        limit.rlim_cur
+    } else {
+        hard_limit
+    };
+    if allocation_limit == libc::RLIM_INFINITY
+        || allocation_limit < limit.rlim_cur
+        || allocation_limit > MAX_GUARDIAN_DESCRIPTORS
     {
         return Err(MacPolicyError::ProcessFailed);
     }
 
-    // The hard limit closes the race with other threads: any descriptor opened between this
-    // snapshot and fork must be below it. A process can retain descriptors above a subsequently
-    // lowered hard limit, so the /dev/fd snapshot extends the ceiling over those as well.
+    // The finite hard limit closes the race with other threads: any descriptor opened between
+    // this snapshot and fork must be below it. macOS can report an infinite hard limit alongside
+    // a finite soft allocation limit, so use that kernel-enforced ceiling instead. A process can
+    // retain descriptors above its current allocation limit, and the /dev/fd snapshot extends the
+    // close ceiling over those as well.
     let highest_open = std::fs::read_dir("/dev/fd")
         .map_err(|_| MacPolicyError::ProcessFailed)?
         .try_fold(0_u64, |highest, entry| {
@@ -264,7 +271,7 @@ fn guardian_descriptor_limit<const N: usize>(
         .try_fold(0_u64, |highest, descriptor| {
             descriptor.map(|value| highest.max(value))
         })?;
-    let descriptor_limit = hard_limit
+    let descriptor_limit = allocation_limit
         .max(highest_open.saturating_add(1))
         .max(highest_new.saturating_add(1));
     if descriptor_limit > MAX_GUARDIAN_DESCRIPTORS {
