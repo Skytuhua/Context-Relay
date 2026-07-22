@@ -468,6 +468,13 @@ test('public-source build scripts consume the verified bundle through closed nat
     windows,
     /& \$Opam switch create \$Switch --empty[^\r\n]*\r?\n\s*\$env:OPAMSWITCH = \$Switch/,
   );
+  assert.match(windows, /\$env:OPAMJOBS = '1'/);
+  assert.match(windows, /\$env:DUNEJOBS = '1'/);
+  assert.match(windows, /\$env:MAKEFLAGS = '-j1'/);
+  assert.match(
+    windows,
+    /\$env:MAKEFLAGS = '-j1'[\s\S]+& \$Opam install --update-invariant 'ocaml-variants\.5\.3\.0'/,
+  );
   assert.match(
     windows,
     /& \$Opam install --locked --update-invariant --deps-only '\.\\semgrep\.opam' \} 'dependency installation'/,
