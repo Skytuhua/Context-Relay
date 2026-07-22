@@ -117,11 +117,11 @@ fn production_adapter_runs_one_bound_response_in_a_single_use_container() {
         disposition,
         outputs,
         ..
-    } = response
+    } = &response
     else {
-        panic!("production helper did not return its uniquely bound response");
+        panic!("production helper did not return its uniquely bound response: {response:?}");
     };
-    assert_eq!(disposition, RunDisposition::Generated);
+    assert_eq!(*disposition, RunDisposition::Generated);
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].path().as_str(), "output/.claude/rules/probe.md");
     assert_eq!(outputs[0].bytes(), EXPECTED_PROOF);
@@ -254,14 +254,15 @@ fn production_sidecar_cannot_fork_or_posix_spawn_descendants() {
     let journal = TestJournal::default();
     let launcher = fixture.launcher(journal.clone());
 
-    let RunResponse::Completed { outputs, .. } = unwrap_run(
+    let response = unwrap_run(
         launcher.run(
             &fixture.closure,
             &fixture.request("PROCESS_CREATION_DENIED"),
         ),
         &journal,
-    ) else {
-        panic!("process-creation probe did not return a valid response");
+    );
+    let RunResponse::Completed { outputs, .. } = &response else {
+        panic!("process-creation probe did not return a valid response: {response:?}");
     };
     let proof = std::str::from_utf8(outputs[0].bytes()).unwrap();
     assert!(proof.starts_with(std::str::from_utf8(EXPECTED_PROOF).unwrap()));
