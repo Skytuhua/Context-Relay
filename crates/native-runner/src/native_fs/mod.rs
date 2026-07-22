@@ -1055,7 +1055,11 @@ impl PrivateStage {
         if !parent.is_absolute() || !parent.is_dir() {
             return Err(RunnerError::InvalidStage);
         }
-        #[cfg(any(windows, target_os = "macos"))]
+        // The macOS cleanup capability validates the exact absolute parent with
+        // O_NOFOLLOW_ANY, holds it by descriptor, and rechecks its identity.
+        // A generic snapshot here would also open the sandbox home's parent,
+        // which is intentionally outside an App Sandbox container's reach.
+        #[cfg(windows)]
         if capture_node(parent, false)?.unsafe_topology() {
             return Err(RunnerError::UnsafeTopology);
         }

@@ -31,9 +31,6 @@ use context_relay_native_runner::{
 };
 use sha2::{Digest, Sha256};
 
-#[cfg(feature = "helper-error-diagnostics")]
-use std::sync::atomic::{AtomicU8, Ordering};
-
 #[cfg(windows)]
 use context_relay_native_runner::{StageDirectory, StageLayout, validate_path_set};
 
@@ -72,38 +69,6 @@ const SEMGREP_POLICY: &[u8] =
     include_bytes!("../../../../third_party/sidecars/policies/semgrep-package.yml");
 const DRAIN_LIMIT: usize = 8 * 1024 * 1024;
 
-#[cfg(feature = "helper-error-diagnostics")]
-#[derive(Clone, Copy)]
-#[repr(u8)]
-enum DiagnosticStage {
-    VerifiedExecutable = 1,
-    PrepareStage,
-    InstallConfig,
-    WriteInputs,
-    ValidateRequest,
-    Environment,
-    Spawn,
-    Wait,
-    Drain,
-    VerifyExecutable,
-    VerifyInputs,
-    VerifyConfig,
-    ExitStatus,
-    ReadOutputs,
-    ValidateExit,
-    ValidateOutputs,
-}
-
-#[cfg(feature = "helper-error-diagnostics")]
-static DIAGNOSTIC_STAGE: AtomicU8 = AtomicU8::new(0);
-
-macro_rules! diagnostic_stage {
-    ($stage:ident) => {
-        #[cfg(feature = "helper-error-diagnostics")]
-        DIAGNOSTIC_STAGE.store(DiagnosticStage::$stage as u8, Ordering::Release);
-    };
-}
-
 fn main() -> ExitCode {
     if std::env::args_os().len() != 1 {
         return ExitCode::from(2);
@@ -119,9 +84,6 @@ fn main() -> ExitCode {
     let request = helper_request.request();
     let response = match execute(&helper_request) {
         Ok(response) => response,
-        #[cfg(feature = "helper-error-diagnostics")]
-        Err(error) => diagnostic_response(request, error),
-        #[cfg(not(feature = "helper-error-diagnostics"))]
         Err(error) => RunResponse::failed(failure_code(error)),
     };
     if write_run_response_for(&mut std::io::stdout().lock(), request, &response).is_err() {
@@ -130,67 +92,15 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-#[cfg(feature = "helper-error-diagnostics")]
-fn diagnostic_response(request: &RunRequest, error: RunnerError) -> RunResponse {
-    if !matches!(request.command(), SidecarCommand::RuleSyncGenerate { .. }) {
-        return RunResponse::failed(failure_code(error));
-    }
-    let output = ContentFrame::new(
-        StagePath::try_from("output/.claude/rules/probe.md").expect("fixed diagnostic path"),
-        format!(
-            "HELPER_ERROR={error:?}\nHELPER_STAGE={}\n",
-            diagnostic_stage_name(DIAGNOSTIC_STAGE.load(Ordering::Acquire))
-        )
-        .into_bytes(),
-    )
-    .expect("bounded diagnostic frame");
-    RunResponse::completed(
-        RunDisposition::Generated,
-        vec![output],
-        RunStats::new(0, 0, 0),
-        RunLimits::for_command(request.command()),
-    )
-    .expect("bounded diagnostic response")
-}
-
-#[cfg(feature = "helper-error-diagnostics")]
-const fn diagnostic_stage_name(stage: u8) -> &'static str {
-    match stage {
-        1 => "verified-executable",
-        2 => "prepare-stage",
-        3 => "install-config",
-        4 => "write-inputs",
-        5 => "validate-request",
-        6 => "environment",
-        7 => "spawn",
-        8 => "wait",
-        9 => "drain",
-        10 => "verify-executable",
-        11 => "verify-inputs",
-        12 => "verify-config",
-        13 => "exit-status",
-        14 => "read-outputs",
-        15 => "validate-exit",
-        16 => "validate-outputs",
-        _ => "unknown",
-    }
-}
-
 fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError> {
     let request = helper_request.request();
     let target = RuntimeTarget::current()?;
-    diagnostic_stage!(VerifiedExecutable);
     let executable = verified_executable(helper_request, target)?;
-    diagnostic_stage!(PrepareStage);
     let mut stage = prepare_stage(request.nonce(), target)?;
-    diagnostic_stage!(InstallConfig);
     let config_inventory = install_trusted_config(&mut stage, request.command(), target)?;
-    diagnostic_stage!(WriteInputs);
     let input_inventory = stage.write_and_seal_inputs(request.inputs())?;
-    diagnostic_stage!(ValidateRequest);
     validate_pre_enumeration(request)?;
     let limits = RunLimits::for_command(request.command());
-    diagnostic_stage!(Environment);
     let environment = RestrictedEnvironment::for_stage(stage.layout(), target)?;
     let argv = request.command().argv();
     let started = Instant::now();
@@ -226,7 +136,6 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
             Ok(())
         });
     }
-    diagnostic_stage!(Spawn);
     let mut child = command
         .spawn()
         .map_err(|_| RunnerError::SidecarUnavailable)?;
@@ -234,7 +143,6 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
     let stderr = child.stderr.take().ok_or(RunnerError::Io)?;
     let stdout = thread::spawn(move || drain_bounded(stdout, DRAIN_LIMIT));
     let stderr = thread::spawn(move || drain_bounded(stderr, DRAIN_LIMIT));
-    diagnostic_stage!(Wait);
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|_| RunnerError::Io)? {
             break status;
@@ -248,17 +156,13 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
         }
         thread::sleep(Duration::from_millis(5));
     };
-    diagnostic_stage!(Drain);
     let stdout = stdout.join().map_err(|_| RunnerError::Io)??;
     let stderr = stderr.join().map_err(|_| RunnerError::Io)??;
-    diagnostic_stage!(VerifyExecutable);
     executable
         .verify_unchanged()
         .map_err(|_| RunnerError::ClosureMismatch)?;
-    diagnostic_stage!(VerifyInputs);
     input_inventory.verify_unchanged()?;
     if let Some(inventory) = config_inventory {
-        diagnostic_stage!(VerifyConfig);
         inventory.verify_unchanged()?;
     }
     let duration_ms =
@@ -271,20 +175,16 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
             .ok_or(RunnerError::LimitExceeded)
     })?;
     let stats = RunStats::new(scanned_files, scanned_bytes, duration_ms);
-    diagnostic_stage!(ExitStatus);
     let exit = status.code().ok_or(RunnerError::InvalidToolOutput)?;
     match request.command() {
         SidecarCommand::RuleSyncGenerate { .. } => {
-            diagnostic_stage!(ReadOutputs);
             let outputs = stage.read_outputs(limits)?;
-            diagnostic_stage!(ValidateExit);
             request.command().validate_rulesync_exit(
                 exit,
                 &stdout,
                 &stderr,
                 !outputs.is_empty(),
             )?;
-            diagnostic_stage!(ValidateOutputs);
             validate_rulesync_outputs(request.command(), request.inputs(), &outputs)?;
             RunResponse::completed(RunDisposition::Generated, outputs, stats, limits)
         }
