@@ -66,10 +66,19 @@ impl MacProcessGuardian {
         lease_name: &CStr,
         hook: impl FnOnce(),
     ) -> Result<Self, MacPolicyError> {
-        let (lease, guardian_wait) = guardian_lease(lease_directory, lease_name, hook)?;
+        let (lease, guardian_wait) = guardian_lease(lease_directory, lease_name, hook)
+            .inspect_err(|_error| {
+                #[cfg(debug_assertions)]
+                eprintln!("macOS guardian startup failed at lease creation: {_error:?}");
+            })?;
         let guardian_wait_fd = guardian_wait.as_raw_fd();
         let descriptor_limit =
-            guardian_descriptor_limit([lease.as_raw_fd(), guardian_wait.as_raw_fd()])?;
+            guardian_descriptor_limit([lease.as_raw_fd(), guardian_wait.as_raw_fd()]).inspect_err(
+                |_error| {
+                    #[cfg(debug_assertions)]
+                    eprintln!("macOS guardian startup failed at descriptor census: {_error:?}");
+                },
+            )?;
 
         let mut blocked_signals = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
         let mut previous_signals = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
@@ -82,6 +91,8 @@ impl MacProcessGuardian {
                 )
             } != 0
         {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS guardian startup failed while blocking signals");
             return Err(MacPolicyError::ProcessFailed);
         }
         let pid = unsafe { libc::fork() };
@@ -96,6 +107,15 @@ impl MacProcessGuardian {
             )
         } == 0;
         if pid == -1 || !restored {
+            #[cfg(debug_assertions)]
+            if pid == -1 {
+                eprintln!(
+                    "macOS guardian startup failed while forking: {:?}",
+                    std::io::Error::last_os_error()
+                );
+            } else {
+                eprintln!("macOS guardian startup failed while restoring signals");
+            }
             if pid > 0 {
                 kill_and_reap_exact(pid);
             }
@@ -107,7 +127,9 @@ impl MacProcessGuardian {
             lease: Some(lease),
             reaped: false,
         };
-        if wait_guardian_ready(&mut guardian).is_err() {
+        if let Err(_error) = wait_guardian_ready(&mut guardian) {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS guardian startup failed at readiness: {_error:?}");
             let _ = guardian.kill_group_and_reap();
             return Err(MacPolicyError::ProcessFailed);
         }
@@ -129,6 +151,8 @@ impl MacProcessGuardian {
         }
         if result == self.pid {
             self.reaped = true;
+            #[cfg(debug_assertions)]
+            eprintln!("macOS guardian exited unexpectedly with wait status {status}");
         }
         Err(MacPolicyError::ProcessFailed)
     }

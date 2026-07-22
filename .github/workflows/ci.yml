@@ -66,6 +66,8 @@ jobs:
       - run: npm install --global pnpm@11.9.0
       - run: rustup target add ${{ matrix.target }}
       - run: pnpm install --frozen-lockfile
+      - if: ${{ matrix.os == 'macos-14' }}
+        run: cargo test --manifest-path crates/native-runner/tests/macos-launcher-harness/Cargo.toml --test guardian_native -- --nocapture
       - run: cargo test -p context-relay-protocol --all-features
       - run: cargo test -p context-relay-local-ipc --target ${{ matrix.target }} --all-features
       - run: cargo test -p context-relay-contextd --target ${{ matrix.target }} --all-features
