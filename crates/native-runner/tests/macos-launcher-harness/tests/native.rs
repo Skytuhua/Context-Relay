@@ -10,7 +10,10 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -368,7 +371,6 @@ fn recovery_observes_a_live_or_reused_group_without_signaling_it() {
     let container_identity = root_identity(&container);
 
     let group = unsafe { libc::fork() };
-    assert!(group > 0);
     if group == 0 {
         unsafe {
             if libc::setpgid(0, 0) != 0 {
@@ -379,6 +381,7 @@ fn recovery_observes_a_live_or_reused_group_without_signaling_it() {
             }
         }
     }
+    assert!(group > 0);
     let ready_deadline = Instant::now() + Duration::from_secs(2);
     while unsafe { libc::getpgid(group) } != group {
         assert!(Instant::now() < ready_deadline);
@@ -910,8 +913,11 @@ impl GenerationJournal for MemoryJournal {
 }
 
 fn prove_case_sensitive(root: &Path) {
-    let lower = root.join(format!("case-check-{}", std::process::id()));
-    let upper = root.join(format!("CASE-CHECK-{}", std::process::id()));
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+
+    let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+    let lower = root.join(format!("case-check-{}-{nonce}", std::process::id()));
+    let upper = root.join(format!("CASE-CHECK-{}-{nonce}", std::process::id()));
     fs::write(&lower, b"lower").unwrap();
     fs::write(&upper, b"upper").unwrap();
     assert_eq!(fs::read(&lower).unwrap(), b"lower");
