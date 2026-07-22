@@ -238,7 +238,7 @@ pub(super) fn create_new_file(path: &Path) -> Result<File, RunnerError> {
 
 pub(super) fn identity_matches_path(file: &File, path: &Path) -> Result<bool, RunnerError> {
     let reopened = open_path(path, libc::O_RDONLY | libc::O_NONBLOCK)?;
-    Ok(raw_node(file)?.same_object(&raw_node(&reopened)?))
+    Ok(raw_node(file)?.same_path_identity(&raw_node(&reopened)?))
 }
 
 pub(super) fn capture_file(path: &Path) -> Result<CapturedFile, CaptureError> {
@@ -1706,6 +1706,10 @@ impl RawNode {
             && self.mode & MODE_MASK == other.mode & MODE_MASK
     }
 
+    const fn same_path_identity(self, other: &Self) -> bool {
+        self.same_identity(other) && (self.directory() || self.links == other.links)
+    }
+
     const fn same_snapshot(self, other: &Self) -> bool {
         self.same_object(other)
             && self.mode == other.mode
@@ -2342,6 +2346,42 @@ mod guarded_mutation_tests {
         let prior_collision = parent_marker_fields(libc::S_IFDIR as u32 | 0o500, 1, 501, 20, 2);
 
         assert_ne!(baseline, prior_collision);
+    }
+
+    #[test]
+    fn path_identity_ignores_directory_link_churn_but_not_file_link_churn() {
+        let directory = RawNode {
+            device: 1,
+            object: 2,
+            generation: 3,
+            mode: libc::S_IFDIR as u32 | 0o700,
+            links: 2,
+            uid: 501,
+            gid: 20,
+            size: 0,
+            flags: 0,
+            access_seconds: 0,
+            access_nanoseconds: 0,
+            write_seconds: 0,
+            write_nanoseconds: 0,
+            change_seconds: 0,
+            change_nanoseconds: 0,
+            birth_seconds: 0,
+            birth_nanoseconds: 0,
+        };
+        let mut changed_links = directory;
+        changed_links.links += 1;
+
+        assert!(directory.same_path_identity(&changed_links));
+
+        let file = RawNode {
+            mode: libc::S_IFREG as u32 | 0o600,
+            ..directory
+        };
+        let mut hardlinked = file;
+        hardlinked.links += 1;
+
+        assert!(!file.same_path_identity(&hardlinked));
     }
 
     #[test]
