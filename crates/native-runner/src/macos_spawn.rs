@@ -329,6 +329,37 @@ impl MacChild {
         Ok(())
     }
 
+    pub fn suspend_and_verify(&mut self, expected: &MacCodeIdentity) -> Result<(), MacPolicyError> {
+        if self.suspended || self.reaped {
+            return Err(MacPolicyError::InvalidTransition);
+        }
+        if unsafe { libc::kill(self.pid, libc::SIGSTOP) } != 0 {
+            return Err(MacPolicyError::ProcessFailed);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut status = 0;
+        loop {
+            let result =
+                unsafe { libc::waitpid(self.pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+            if result == self.pid {
+                if libc::WIFSTOPPED(status) {
+                    self.suspended = true;
+                    break;
+                }
+                self.reaped = libc::WIFEXITED(status) || libc::WIFSIGNALED(status);
+                return Err(MacPolicyError::ProcessFailed);
+            }
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return Err(MacPolicyError::ProcessFailed);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(MacPolicyError::ProcessFailed);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        wait_for_dynamic_code_identity(self.pid, expected, dynamic_code_identity)
+    }
+
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, MacPolicyError> {
         if self.reaped {
             return Err(MacPolicyError::InvalidTransition);

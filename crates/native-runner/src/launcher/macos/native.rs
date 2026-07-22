@@ -1010,10 +1010,31 @@ impl GenerationProcess for MacGenerationProcess {
             eprintln!("macOS spawn guardian check failed: {_error:?}");
         })?;
         self.child = Some(child);
-        self.capture_container().inspect_err(|_error| {
+        self.child
+            .as_mut()
+            .ok_or(MacPolicyError::ProcessFailed)?
+            .resume()?;
+        let container_identity = self.capture_container().inspect_err(|_error| {
             #[cfg(debug_assertions)]
             eprintln!("macOS suspended container capture failed: {_error:?}");
-        })
+        })?;
+        self.child
+            .as_mut()
+            .ok_or(MacPolicyError::ProcessFailed)?
+            .suspend_and_verify(&self.helper_code_identity)
+            .inspect_err(|_error| {
+                #[cfg(debug_assertions)]
+                eprintln!("macOS container bootstrap suspension failed: {_error:?}");
+            })?;
+        self.guardian
+            .as_mut()
+            .ok_or(MacPolicyError::InvalidTransition)?
+            .ensure_alive()
+            .inspect_err(|_error| {
+                #[cfg(debug_assertions)]
+                eprintln!("macOS container bootstrap guardian check failed: {_error:?}");
+            })?;
+        Ok(container_identity)
     }
 
     fn confirm_container_bound(&mut self) {
