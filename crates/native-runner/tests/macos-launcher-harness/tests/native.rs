@@ -86,7 +86,9 @@ fn launch_rejects_a_same_name_bundle_replacement_before_code_or_input() {
     let signed = prepared.signed_generation().clone();
     let bundle = prepared.bundle_path().to_path_buf();
     let moved = fixture.root.join("approved-moved.app");
+    fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
     fs::rename(&bundle, &moved).unwrap();
+    assert_eq!(root_identity(&moved), *signed.bundle_identity());
     let marker = bundle.join("replacement-ran");
 
     let replacement_helper = bundle.join("Contents/MacOS/context-relay-native-helper");
