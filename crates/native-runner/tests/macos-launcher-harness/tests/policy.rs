@@ -133,9 +133,11 @@ fn codesign_commands_are_closed_inside_out_and_never_use_deep_or_a_shell() {
             "/private/context/helper.app",
         ]
     );
-    let sidecar =
-        MacCommand::sign_sidecar("/private/context/helper.app/Contents/Helpers/runtime/osemgrep")
-            .unwrap();
+    let sidecar = MacCommand::sign_sidecar(
+        "/private/context/helper.app/Contents/Helpers/runtime/osemgrep",
+        "/private/context/sidecar.entitlements.plist",
+    )
+    .unwrap();
     assert_eq!(
         sidecar.arguments(),
         [
@@ -145,6 +147,8 @@ fn codesign_commands_are_closed_inside_out_and_never_use_deep_or_a_shell() {
             "--options",
             "runtime",
             "--timestamp=none",
+            "--entitlements",
+            "/private/context/sidecar.entitlements.plist",
             "/private/context/helper.app/Contents/Helpers/runtime/osemgrep",
         ]
     );
@@ -162,7 +166,7 @@ fn codesign_commands_are_closed_inside_out_and_never_use_deep_or_a_shell() {
 }
 
 #[test]
-fn helper_has_exactly_app_sandbox_and_every_sidecar_has_no_entitlements() {
+fn helper_and_sidecars_have_only_their_exact_sandbox_entitlements() {
     assert!(
         validate_entitlements(
             EntitlementSubject::Helper,
@@ -200,7 +204,18 @@ fn helper_has_exactly_app_sandbox_and_every_sidecar_has_no_entitlements() {
         )
         .is_err()
     );
-    assert!(validate_entitlements(EntitlementSubject::Sidecar, &[]).is_ok());
+    let inherited = [
+        (
+            "com.apple.security.app-sandbox",
+            EntitlementValue::Boolean(true),
+        ),
+        (
+            "com.apple.security.inherit",
+            EntitlementValue::Boolean(true),
+        ),
+    ];
+    assert!(validate_entitlements(EntitlementSubject::Sidecar, &inherited).is_ok());
+    assert!(validate_entitlements(EntitlementSubject::Sidecar, &[]).is_err());
     assert!(
         validate_entitlements(
             EntitlementSubject::Sidecar,
@@ -227,7 +242,16 @@ fn every_expected_macho_must_be_signed_and_inspected_without_extras() {
                     EntitlementValue::Boolean(true),
                 )]
             } else {
-                vec![]
+                vec![
+                    (
+                        "com.apple.security.app-sandbox".into(),
+                        EntitlementValue::Boolean(true),
+                    ),
+                    (
+                        "com.apple.security.inherit".into(),
+                        EntitlementValue::Boolean(true),
+                    ),
+                ]
             },
         })
         .collect::<Vec<_>>();

@@ -10,8 +10,9 @@ use rand_core::{OsRng, RngCore};
 
 use super::SandboxLauncher;
 use crate::{
-    FailureCode, HelperRunRequest, RunLimits, RunRequest, RunResponse, RunnerError, RuntimeTarget,
-    SidecarCommand, SidecarId, VerifiedClosure, read_run_response_for, write_helper_request,
+    ClosureMaterial, FailureCode, HelperRunRequest, RunLimits, RunRequest, RunResponse,
+    RunnerError, RuntimeTarget, SidecarCommand, SidecarId, StagePath, VerifiedClosure,
+    read_run_response_for, write_helper_request,
 };
 use native::{MacGenerationProcess, MacGenerationSpec, MacSourceMaterial, prepare_generation};
 use policy::{GenerationProcess, ProcessOutcome, execute_generation};
@@ -85,6 +86,7 @@ impl<J: GenerationJournal> SandboxLauncher for MacOsSandboxLauncher<J> {
                     closure.root().join(material.path().as_str()),
                     material.size(),
                     *material.sha256(),
+                    material.executable(),
                 )
             })
             .collect::<Result<Vec<_>, _>>()
@@ -105,10 +107,27 @@ impl<J: GenerationJournal> SandboxLauncher for MacOsSandboxLauncher<J> {
             helper_timeout,
         )
         .map_err(map_policy_error)?;
-        let prepared = prepare_generation(spec, &self.journal).map_err(map_policy_error)?;
+        let mut prepared = prepare_generation(spec, &self.journal).map_err(map_policy_error)?;
         if prepared.inspections().is_empty() || !prepared.bundle_path().is_absolute() {
             return Err(RunnerError::SidecarUnavailable);
         }
+        let runtime_materials = prepared
+            .runtime_materials()
+            .iter()
+            .map(|material| {
+                ClosureMaterial::new(
+                    StagePath::try_from(material.relative_path())?,
+                    material.size(),
+                    *material.sha256(),
+                    material.executable(),
+                )
+            })
+            .collect::<Result<Vec<_>, RunnerError>>()?;
+        let helper_request =
+            HelperRunRequest::for_resigned_runtime(request.clone(), runtime_materials)?;
+        let mut protocol = Vec::new();
+        write_helper_request(&mut protocol, &helper_request)?;
+        prepared.replace_input(protocol).map_err(map_policy_error)?;
         let signed = prepared.signed_generation().clone();
         let mut process = ProtocolProcess {
             process: prepared.into_process(),

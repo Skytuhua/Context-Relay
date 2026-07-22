@@ -109,7 +109,19 @@ pub fn validate_entitlements(
                     EntitlementValue::Boolean(true),
                 )]
         }
-        EntitlementSubject::Sidecar => entitlements.is_empty(),
+        EntitlementSubject::Sidecar => {
+            entitlements
+                == [
+                    (
+                        "com.apple.security.app-sandbox",
+                        EntitlementValue::Boolean(true),
+                    ),
+                    (
+                        "com.apple.security.inherit",
+                        EntitlementValue::Boolean(true),
+                    ),
+                ]
+        }
     };
     valid
         .then_some(())

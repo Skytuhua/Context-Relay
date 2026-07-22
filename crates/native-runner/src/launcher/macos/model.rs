@@ -114,8 +114,9 @@ impl MacCommand {
         }
     }
 
-    pub fn sign_sidecar(path: &str) -> Result<Self, MacPolicyError> {
+    pub fn sign_sidecar(path: &str, entitlements: &str) -> Result<Self, MacPolicyError> {
         validate_private_absolute_path(path)?;
+        validate_private_absolute_path(entitlements)?;
         Ok(Self {
             arguments: vec![
                 "--force".into(),
@@ -124,6 +125,8 @@ impl MacCommand {
                 "--options".into(),
                 "runtime".into(),
                 "--timestamp=none".into(),
+                "--entitlements".into(),
+                entitlements.into(),
                 path.into(),
             ],
         })

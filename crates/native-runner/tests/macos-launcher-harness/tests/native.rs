@@ -40,6 +40,16 @@ fn signed_generation_inspects_the_actual_inside_out_macho_closure() {
         &root_identity(prepared.bundle_path())
     );
     assert_eq!(prepared.inspections().len(), 2);
+    assert_eq!(prepared.runtime_materials().len(), 1);
+    let runtime_material = &prepared.runtime_materials()[0];
+    let runtime_child = prepared
+        .bundle_path()
+        .join("Contents/Helpers/runtime/probe-child");
+    assert_eq!(runtime_material.relative_path(), "probe-child");
+    assert_eq!(runtime_material.size(), fs::metadata(&runtime_child).unwrap().len());
+    assert_eq!(runtime_material.sha256(), &digest(&runtime_child));
+    assert_ne!(runtime_material.sha256(), &digest(&fixture.child));
+    assert!(runtime_material.executable());
     assert!(prepared.inspections().iter().any(|item| {
         item.subject == EntitlementSubject::Helper
             && item.entitlements
@@ -49,7 +59,18 @@ fn signed_generation_inspects_the_actual_inside_out_macho_closure() {
                 )]
     }));
     assert!(prepared.inspections().iter().any(|item| {
-        item.subject == EntitlementSubject::Sidecar && item.entitlements.is_empty()
+        item.subject == EntitlementSubject::Sidecar
+            && item.entitlements
+                == [
+                    (
+                        "com.apple.security.app-sandbox".into(),
+                        EntitlementValue::Boolean(true),
+                    ),
+                    (
+                        "com.apple.security.inherit".into(),
+                        EntitlementValue::Boolean(true),
+                    ),
+                ]
     }));
 }
 
@@ -771,6 +792,7 @@ impl Fixture {
             self.child.clone(),
             child_metadata.len(),
             digest(&self.child),
+            true,
         )
         .unwrap();
         MacGenerationSpec::new(

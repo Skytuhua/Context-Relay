@@ -175,18 +175,27 @@ impl ClosureMaterial {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HelperRunRequest {
     request: RunRequest,
+    runtime_closure_sha256: [u8; 32],
     closure: Vec<ClosureMaterial>,
 }
 
 impl HelperRunRequest {
-    pub fn new(
+    pub fn new(request: RunRequest, closure: Vec<ClosureMaterial>) -> Result<Self, RunnerError> {
+        let helper_request = Self::for_resigned_runtime(request, closure)?;
+        if &helper_request.runtime_closure_sha256
+            != helper_request.request.expected_closure_sha256()
+        {
+            return Err(RunnerError::ClosureMismatch);
+        }
+        Ok(helper_request)
+    }
+
+    pub fn for_resigned_runtime(
         request: RunRequest,
         mut closure: Vec<ClosureMaterial>,
     ) -> Result<Self, RunnerError> {
         normalize_closure_materials(&mut closure)?;
-        if &closure_material_digest(&closure)? != request.expected_closure_sha256() {
-            return Err(RunnerError::ClosureMismatch);
-        }
+        let runtime_closure_sha256 = closure_material_digest(&closure)?;
         let executable = closure
             .iter()
             .filter(|material| material.executable)
@@ -206,7 +215,11 @@ impl HelperRunRequest {
         {
             return Err(RunnerError::InvalidFrame);
         }
-        Ok(Self { request, closure })
+        Ok(Self {
+            request,
+            runtime_closure_sha256,
+            closure,
+        })
     }
 
     pub fn from_verified(
@@ -235,6 +248,10 @@ impl HelperRunRequest {
 
     pub const fn request(&self) -> &RunRequest {
         &self.request
+    }
+
+    pub const fn runtime_closure_sha256(&self) -> &[u8; 32] {
+        &self.runtime_closure_sha256
     }
 
     pub fn closure(&self) -> &[ClosureMaterial] {
@@ -610,7 +627,7 @@ fn decode_request_payload(payload: &[u8]) -> Result<RunRequest, RunnerError> {
 
 fn encode_helper_request_payload(request: &HelperRunRequest) -> Result<Vec<u8>, RunnerError> {
     let mut encoder = Encoder::new(Vec::new());
-    encoder.map(5).map_err(enc)?;
+    encoder.map(6).map_err(enc)?;
     key(&mut encoder, 0)?;
     encoder.bytes(request.request.nonce()).map_err(enc)?;
     key(&mut encoder, 1)?;
@@ -623,12 +640,16 @@ fn encode_helper_request_payload(request: &HelperRunRequest) -> Result<Vec<u8>, 
     encode_content_frames(&mut encoder, request.request.inputs())?;
     key(&mut encoder, 4)?;
     encode_closure_materials(&mut encoder, request.closure())?;
+    key(&mut encoder, 5)?;
+    encoder
+        .bytes(request.runtime_closure_sha256())
+        .map_err(enc)?;
     Ok(encoder.into_writer())
 }
 
 fn decode_helper_request_payload(payload: &[u8]) -> Result<HelperRunRequest, RunnerError> {
     let mut decoder = Decoder::new(payload);
-    require_map(&mut decoder, 5)?;
+    require_map(&mut decoder, 6)?;
     expect_key(&mut decoder, 0)?;
     let nonce = read_fixed::<16>(&mut decoder)?;
     expect_key(&mut decoder, 1)?;
@@ -639,13 +660,18 @@ fn decode_helper_request_payload(payload: &[u8]) -> Result<HelperRunRequest, Run
     let inputs = decode_content_frames(&mut decoder)?;
     expect_key(&mut decoder, 4)?;
     let closure = decode_closure_materials(&mut decoder)?;
+    expect_key(&mut decoder, 5)?;
+    let runtime_closure_sha256 = read_fixed::<32>(&mut decoder)?;
     if decoder.position() != payload.len() {
         return Err(RunnerError::InvalidFrame);
     }
-    let request = HelperRunRequest::new(
+    let request = HelperRunRequest::for_resigned_runtime(
         RunRequest::new(nonce, closure_sha256, command, inputs)?,
         closure,
     )?;
+    if request.runtime_closure_sha256 != runtime_closure_sha256 {
+        return Err(RunnerError::ClosureMismatch);
+    }
     if encode_helper_request_payload(&request)? != payload {
         return Err(RunnerError::InvalidFrame);
     }
