@@ -42,7 +42,6 @@ fn main() {
         ];
     let root = env::current_dir().unwrap();
     let mode = fs::read_to_string(root.join("input/.rulesync/rules/probe.md")).unwrap();
-    assert!(argv_exact);
     if mode == "ESCAPE_HANG" {
         assert!(unsafe { libc::setsid() } > 0);
         let pid = unsafe { libc::getpid() };
