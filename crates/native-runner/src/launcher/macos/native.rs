@@ -945,15 +945,28 @@ impl GenerationProcess for MacGenerationProcess {
 
     fn spawn_suspended(&mut self) -> Result<MacRootIdentity, MacPolicyError> {
         if self.spawn_attempted {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS suspended spawn preflight failed: repeated attempt");
             return Err(MacPolicyError::InvalidTransition);
         }
         self.spawn_attempted = true;
-        let container_parent = self
-            .container_parent
-            .as_ref()
-            .ok_or(MacPolicyError::InvalidTransition)?;
-        if HeldDirectory::open_at(container_parent, &self.container_name)?.is_some() {
+        let Some(container_parent) = self.container_parent.as_ref() else {
+            #[cfg(debug_assertions)]
+            eprintln!("macOS suspended spawn preflight failed: missing container parent");
             return Err(MacPolicyError::InvalidTransition);
+        };
+        match HeldDirectory::open_at(container_parent, &self.container_name) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                #[cfg(debug_assertions)]
+                eprintln!("macOS suspended spawn preflight failed: container already exists");
+                return Err(MacPolicyError::InvalidTransition);
+            }
+            Err(error) => {
+                #[cfg(debug_assertions)]
+                eprintln!("macOS suspended spawn preflight failed: container lookup: {error:?}");
+                return Err(error);
+            }
         }
         let runtime = self.bundle.join("Contents/Helpers/runtime");
         let environment = [
