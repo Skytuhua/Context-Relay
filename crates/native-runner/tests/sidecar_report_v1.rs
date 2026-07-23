@@ -1,3 +1,5 @@
+#[cfg(feature = "ci-candidate-sidecar-smoke")]
+use context_relay_native_runner::RunnerError;
 use context_relay_native_runner::{
     ContentFrame, RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RunDisposition,
     SidecarCommand, StagePath, validate_gitleaks_report, validate_rulesync_outputs,
@@ -352,6 +354,33 @@ fn semgrep_accepts_the_exact_native_clean_profile_shape() {
             .0,
         RunDisposition::Clean
     );
+}
+
+#[cfg(feature = "ci-candidate-sidecar-smoke")]
+#[test]
+fn semgrep_candidate_diagnostics_classify_only_pre_json_rejections() {
+    let inputs = vec![frame(
+        "input/semgrep-target/runtime-inventory.txt",
+        b"osemgrep\n",
+    )];
+    let report = serde_json::to_vec(&semgrep_report(
+        vec![],
+        vec!["input/semgrep-target/runtime-inventory.txt"],
+    ))
+    .unwrap();
+
+    for (exit, stderr, stage) in [
+        (2, semgrep_warning(), 0),
+        (0, b"".as_slice(), 1),
+        (0, b"unexpected\n".as_slice(), 2),
+        (0, b"[clock][WARNING]: warning\n".as_slice(), 3),
+        (0, b"[00.10][WARNING]: warning\n".as_slice(), 4),
+    ] {
+        assert_eq!(
+            validate_semgrep_report(exit, &report, stderr, &inputs),
+            Err(RunnerError::CiSemgrepValidation(stage))
+        );
+    }
 }
 
 #[test]

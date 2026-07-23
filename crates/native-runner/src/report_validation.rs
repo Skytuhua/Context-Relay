@@ -169,9 +169,10 @@ pub fn validate_semgrep_report(
     stderr: &[u8],
     inputs: &[ContentFrame],
 ) -> Result<(RunDisposition, Vec<u8>), RunnerError> {
-    if !matches!(exit, 0 | 1) || !valid_semgrep_warning(stderr) {
+    if !matches!(exit, 0 | 1) {
         return Err(semgrep_validation_error(0));
     }
+    validate_semgrep_warning(stderr).map_err(semgrep_validation_error)?;
     let report: Value = serde_json::from_slice(stdout).map_err(|_| semgrep_validation_error(1))?;
     let object = report
         .as_object()
@@ -470,27 +471,36 @@ fn valid_duration(value: &str) -> bool {
         && matches!(unit, "ns" | "us" | "µs" | "ms" | "s")
 }
 
-fn valid_semgrep_warning(stderr: &[u8]) -> bool {
+fn validate_semgrep_warning(stderr: &[u8]) -> Result<(), u8> {
+    if stderr.is_empty() {
+        return Err(1);
+    }
     let Ok(text) = std::str::from_utf8(stderr) else {
-        return false;
+        return Err(2);
     };
     let Some(line) = text.strip_suffix('\n') else {
-        return false;
+        return Err(2);
     };
     if line.contains('\n') || line.contains('\r') {
-        return false;
+        return Err(2);
     }
     let Some(rest) = line.strip_prefix('[') else {
-        return false;
+        return Err(2);
     };
     let Some((timing, message)) = rest.split_once("][WARNING]: ") else {
-        return false;
+        return Err(2);
     };
-    timing.matches('.').count() == 1
-        && timing
+    if timing.matches('.').count() != 1
+        || !timing
             .bytes()
             .all(|byte| byte.is_ascii_digit() || byte == b'.')
-        && message == SEMGREP_WARNING
+    {
+        return Err(3);
+    }
+    if message != SEMGREP_WARNING {
+        return Err(4);
+    }
+    Ok(())
 }
 
 fn validate_semgrep_result(
