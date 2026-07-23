@@ -278,7 +278,7 @@
         {
           "role": "patch-inventory",
           "path": "third_party/sidecars/semgrep/patches.v1.json",
-          "sha256": "9fc41458675495064765f1ef17bf52d5dc85cf599e84ce4a8220829d4d2bc162"
+          "sha256": "b5a47312a7737e407a48e5f4c35e8c5e5928737e97ac4f563a5821c2c9403ea2"
         },
         {
           "role": "source-patch-applicator",
@@ -323,7 +323,7 @@
         {
           "role": "source-bundle-evidence",
           "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
-          "sha256": "7f12b5c33888b199ce4554bc725621717363b4fbe4afc4c86d4ebf68d2e7c1e2"
+          "sha256": "b010cac31618d80e1bb790e8a41735b24290fb7d266aa4e8885a27abf3c95714"
         },
         {
           "role": "manifest-rule",

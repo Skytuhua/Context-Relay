@@ -37,6 +37,22 @@
         }
       ],
       "rationale": "Run explicitly single-job maps through one Eio fiber in the current domain so the closed runtime needs no worker domain without starving the scheduler."
+    },
+    {
+      "id": "semgrep-skip-empty-proxy-initialization",
+      "package": "semgrep",
+      "revision": "bd614accba811b407ae5c9ec6f1eecd3bdc29911",
+      "root": "semgrep",
+      "path": "libs/networking/proxy/proxy.ml",
+      "baseSha256": "e795513f3ca30d486507d3cded95ed426f189e46b8d94ef70f5c526c548289ca",
+      "patchedSha256": "e40282e2df303a73614c53612c525f4b27909221db6eec72b9505b2c4fb1c2a4",
+      "replacements": [
+        {
+          "before": "let configure_proxy settings =\n  let scheme_proxy = make_scheme_proxy settings in\n  let all_proxy = settings.all_proxy in\n  let proxy_headers = make_proxy_headers settings in\n  (* nosemgrep: no-logs-in-library *)\n  Logs.info (fun m -> m \"Proxy was configured with %a\" pp_settings settings);\n  Cohttp_lwt_unix.Client.set_cache\n    (Cohttp_lwt_unix.Connection_proxy.call\n       (Cohttp_lwt_unix.Connection_proxy.create ?all_proxy ~scheme_proxy\n          ?no_proxy:settings.no_proxy ?proxy_headers ()))\n",
+          "after": "let configure_proxy settings =\n  let scheme_proxy = make_scheme_proxy settings in\n  let all_proxy = settings.all_proxy in\n  let proxy_headers = make_proxy_headers settings in\n  if\n    scheme_proxy <> []\n    || Option.is_some all_proxy\n    || Option.is_some settings.no_proxy\n    || Option.is_some proxy_headers\n  then (\n    (* nosemgrep: no-logs-in-library *)\n    Logs.info (fun m -> m \"Proxy was configured with %a\" pp_settings settings);\n    Cohttp_lwt_unix.Client.set_cache\n      (Cohttp_lwt_unix.Connection_proxy.call\n         (Cohttp_lwt_unix.Connection_proxy.create ?all_proxy ~scheme_proxy\n            ?no_proxy:settings.no_proxy ?proxy_headers ())))\n"
+        }
+      ],
+      "rationale": "Leave the LWT proxy connection cache lazy when the closed runtime supplies no proxy settings, avoiding its otherwise eager ambient uname lookup while preserving configured-proxy behavior."
     }
   ]
 }

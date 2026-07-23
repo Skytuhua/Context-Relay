@@ -134,6 +134,32 @@ test('applies the exact pinned Semgrep project patch and verifies its production
   assert.equal(sha256(await readFile(target)), projectPatch.patchedSha256);
 });
 
+test('applies the exact pinned Semgrep empty-proxy patch and verifies its production hash', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'context-relay-semgrep-proxy-patch-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const target = join(root, 'sources', 'semgrep', 'libs', 'networking', 'proxy', 'proxy.ml');
+  await mkdir(join(root, 'sources', 'semgrep', 'libs', 'networking', 'proxy'), {
+    recursive: true,
+  });
+  const original = await readFile(
+    new URL('./fixtures/semgrep-1.170.0/proxy.ml', import.meta.url),
+  );
+  await writeFile(target, original);
+  const production = JSON.parse(
+    await readFile(new URL('../third_party/sidecars/semgrep/patches.v1.json', import.meta.url)),
+  );
+  const proxyPatch = production.patches.find(
+    ({ id }) => id === 'semgrep-skip-empty-proxy-initialization',
+  );
+  assert.ok(proxyPatch);
+  const value = { ...production, patches: [proxyPatch] };
+  const manifestPath = join(root, 'patches.v1.json');
+  await writeFile(manifestPath, `${JSON.stringify(value, null, 2)}\n`);
+  const result = await applySourcePatches({ bundleRoot: root, manifestPath });
+  assert.equal(result[0].root, 'semgrep');
+  assert.equal(sha256(await readFile(target)), proxyPatch.patchedSha256);
+});
+
 test('the single-job Semgrep patch keeps Eio scheduling without a worker domain', async () => {
   const inventory = JSON.parse(
     await readFile(new URL('../third_party/sidecars/semgrep/patches.v1.json', import.meta.url)),
@@ -147,6 +173,25 @@ test('the single-job Semgrep patch keeps Eio scheduling without a worker domain'
   );
   assert.match(singleJobBranch, /Eio\.Fiber\.List\.map ~max_fibers:1/);
   assert.doesNotMatch(singleJobBranch, /Executor_pool|domain_mgr|Domain/);
+});
+
+test('the closed-runtime Semgrep patch skips only empty proxy initialization', async () => {
+  const inventory = JSON.parse(
+    await readFile(new URL('../third_party/sidecars/semgrep/patches.v1.json', import.meta.url)),
+  );
+  const patch = inventory.patches.find(
+    ({ id }) => id === 'semgrep-skip-empty-proxy-initialization',
+  );
+  assert.ok(patch);
+  assert.equal(patch.path, 'libs/networking/proxy/proxy.ml');
+  const replacement = patch.replacements[0].after;
+  assert.match(replacement, /scheme_proxy <> \[\]/);
+  assert.match(replacement, /Option\.is_some all_proxy/);
+  assert.match(replacement, /Option\.is_some settings\.no_proxy/);
+  assert.match(replacement, /Option\.is_some proxy_headers/);
+  assert.ok(
+    replacement.indexOf('then (') < replacement.indexOf('Cohttp_lwt_unix.Client.set_cache'),
+  );
 });
 
 test('both public-source builders apply the bundle-carried patch inventory', async () => {
