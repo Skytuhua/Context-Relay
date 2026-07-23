@@ -54,7 +54,7 @@ fn semgrep_report(results: Vec<Value>, scanned: Vec<&str>) -> Value {
         "time": {
             "rules": ["context-relay-no-python-runtime"],
             "rules_parse_time": 0.0,
-            "profiling_times": [],
+            "profiling_times": {},
             "parsing_time": {
                 "total_time": 0.0,
                 "per_file_time": { "mean": 0.0, "std_dev": 0.0 },
@@ -285,7 +285,7 @@ fn semgrep_timing_binds_the_exact_rule_paths_and_input_sizes() {
 
     for poisoned in [
         ("rules", json!([])),
-        ("profiling_times", json!({})),
+        ("profiling_times", json!([])),
         ("total_bytes", json!(10)),
         (
             "targets",

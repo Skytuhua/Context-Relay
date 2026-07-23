@@ -7114,6 +7114,7 @@
       "--quiet",
       "--no-git-ignore",
       "--x-ignore-semgrepignore-files",
+      "--time",
       "--jobs=1",
       "--timeout=30",
       "--timeout-threshold=1",
@@ -7122,6 +7123,6 @@
       "<staged-rule>",
       "<staged-target>"
     ],
-    "sha256": "4b22d7b78a3ce42b7bcfa54cfd5fee1947afbac65776e2135d95e3a629285e49"
+    "sha256": "2ec1e7944e84d56222cf9717f82e429dfbceee6895041d898a08c7f20bfbd05d"
   }
 }

@@ -169,6 +169,7 @@ fn closed_commands_emit_only_the_frozen_argument_arrays() {
             "--quiet",
             "--no-git-ignore",
             "--x-ignore-semgrepignore-files",
+            "--time",
             "--jobs=1",
             "--timeout=30",
             "--timeout-threshold=1",
