@@ -339,6 +339,22 @@ fn semgrep_timing_binds_the_exact_rule_paths_and_input_sizes() {
 }
 
 #[test]
+fn semgrep_accepts_the_exact_native_clean_profile_shape() {
+    let inputs = vec![frame(
+        "input/semgrep-target/runtime-inventory.txt",
+        b"osemgrep\n",
+    )];
+    let report = br#"{"version":"1.170.0","results":[],"errors":[],"paths":{"scanned":["input/semgrep-target/runtime-inventory.txt"]},"time":{"rules":["config.semgrep.context-relay-no-python-runtime"],"rules_parse_time":0.000034809112548828125,"profiling_times":{},"parsing_time":{"total_time":0.0,"per_file_time":{"mean":0.0,"std_dev":0.0},"very_slow_stats":{"time_ratio":0.0,"count_ratio":0.0},"very_slow_files":[]},"scanning_time":{"total_time":0.0002048015594482422,"per_file_time":{"mean":0.0002048015594482422,"std_dev":0.0},"very_slow_stats":{"time_ratio":0.0,"count_ratio":0.0},"very_slow_files":[]},"matching_time":{"total_time":0.0,"per_file_and_rule_time":{"mean":0.0,"std_dev":0.0},"very_slow_stats":{"time_ratio":0.0,"count_ratio":0.0},"very_slow_rules_on_files":[]},"tainting_time":{"total_time":0.0,"per_def_and_rule_time":{"mean":0.0,"std_dev":0.0},"very_slow_stats":{"time_ratio":0.0,"count_ratio":0.0},"very_slow_rules_on_defs":[]},"fixpoint_timeouts":[],"prefiltering":{"project_level_time":0.0,"file_level_time":0.0,"rules_with_project_prefilters_ratio":0.0,"rules_with_file_prefilters_ratio":1.0,"rules_selected_ratio":0.0,"rules_matched_ratio":0.0},"targets":[{"path":"input/semgrep-target/runtime-inventory.txt","num_bytes":9,"match_times":[0.0],"parse_times":[0.0],"run_time":0.0002048015594482422}],"total_bytes":9,"max_memory_bytes":86793536},"engine_requested":"OSS","skipped_rules":[],"profiling_results":[]}"#;
+
+    assert_eq!(
+        validate_semgrep_report(0, report, semgrep_warning(), &inputs)
+            .unwrap()
+            .0,
+        RunDisposition::Clean
+    );
+}
+
+#[test]
 fn rulesync_outputs_match_the_exact_feature_semantic_manifest() {
     let command = SidecarCommand::RuleSyncGenerate {
         target: RuleSyncTarget::CodexCli,

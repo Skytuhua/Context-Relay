@@ -170,11 +170,12 @@ pub fn validate_semgrep_report(
     inputs: &[ContentFrame],
 ) -> Result<(RunDisposition, Vec<u8>), RunnerError> {
     if !matches!(exit, 0 | 1) || !valid_semgrep_warning(stderr) {
-        return invalid();
+        return Err(semgrep_validation_error(0));
     }
-    let report: Value =
-        serde_json::from_slice(stdout).map_err(|_| RunnerError::InvalidToolOutput)?;
-    let object = report.as_object().ok_or(RunnerError::InvalidToolOutput)?;
+    let report: Value = serde_json::from_slice(stdout).map_err(|_| semgrep_validation_error(1))?;
+    let object = report
+        .as_object()
+        .ok_or_else(|| semgrep_validation_error(1))?;
     if !exact_keys(object, &SEMGREP_KEYS)
         || object.get("version").and_then(Value::as_str) != Some("1.170.0")
         || object.get("engine_requested").and_then(Value::as_str) != Some("OSS")
@@ -182,7 +183,7 @@ pub fn validate_semgrep_report(
         || !empty_array(object.get("skipped_rules"))
         || !empty_array(object.get("profiling_results"))
     {
-        return invalid();
+        return Err(semgrep_validation_error(1));
     }
     let expected = inputs
         .iter()
@@ -192,51 +193,68 @@ pub fn validate_semgrep_report(
         object
             .get("time")
             .and_then(Value::as_object)
-            .ok_or(RunnerError::InvalidToolOutput)?,
+            .ok_or_else(|| semgrep_validation_error(2))?,
         inputs,
-    )?;
+    )
+    .map_err(|_| semgrep_validation_error(2))?;
     let paths = object
         .get("paths")
         .and_then(Value::as_object)
-        .ok_or(RunnerError::InvalidToolOutput)?;
+        .ok_or_else(|| semgrep_validation_error(3))?;
     if !(exact_keys(paths, &["scanned"])
         || (exact_keys(paths, &["scanned", "skipped"]) && empty_array(paths.get("skipped"))))
     {
-        return invalid();
+        return Err(semgrep_validation_error(3));
     }
     let scanned_values = paths
         .get("scanned")
         .and_then(Value::as_array)
-        .ok_or(RunnerError::InvalidToolOutput)?;
+        .ok_or_else(|| semgrep_validation_error(3))?;
     let mut scanned = BTreeSet::new();
     for value in scanned_values {
-        let path = scanner_path(value.as_str().ok_or(RunnerError::InvalidToolOutput)?)?;
+        let path = scanner_path(value.as_str().ok_or_else(|| semgrep_validation_error(3))?)
+            .map_err(|_| semgrep_validation_error(3))?;
         if !scanned.insert(path) {
-            return invalid();
+            return Err(semgrep_validation_error(3));
         }
     }
     if scanned != expected || scanned_values.len() != expected.len() {
-        return invalid();
+        return Err(semgrep_validation_error(3));
     }
     let results = object
         .get("results")
         .and_then(Value::as_array)
-        .ok_or(RunnerError::InvalidToolOutput)?;
+        .ok_or_else(|| semgrep_validation_error(4))?;
     let mut identities = BTreeSet::new();
     for result in results {
         validate_semgrep_result(
-            result.as_object().ok_or(RunnerError::InvalidToolOutput)?,
+            result
+                .as_object()
+                .ok_or_else(|| semgrep_validation_error(4))?,
             &expected,
             &mut identities,
-        )?;
+        )
+        .map_err(|_| semgrep_validation_error(4))?;
     }
-    let count = u32::try_from(results.len()).map_err(|_| RunnerError::LimitExceeded)?;
+    let count = u32::try_from(results.len()).map_err(|_| semgrep_validation_error(4))?;
     let disposition = match (exit, count) {
         (0, 0) => RunDisposition::Clean,
         (1, count) if count > 0 => RunDisposition::Findings(count),
-        _ => return invalid(),
+        _ => return Err(semgrep_validation_error(4)),
     };
     Ok((disposition, stdout.to_vec()))
+}
+
+const fn semgrep_validation_error(stage: u8) -> RunnerError {
+    #[cfg(feature = "ci-candidate-sidecar-smoke")]
+    {
+        RunnerError::CiSemgrepValidation(stage)
+    }
+    #[cfg(not(feature = "ci-candidate-sidecar-smoke"))]
+    {
+        let _ = stage;
+        RunnerError::InvalidToolOutput
+    }
 }
 
 pub fn validate_rulesync_outputs(

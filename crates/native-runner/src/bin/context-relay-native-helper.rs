@@ -1826,6 +1826,15 @@ fn kill_child_tree(child: &mut std::process::Child) {
 
 fn failure_code(error: RunnerError) -> FailureCode {
     match error {
+        #[cfg(feature = "ci-candidate-sidecar-smoke")]
+        RunnerError::CiSemgrepValidation(stage) => match stage {
+            0 => FailureCode::InvalidOutput,
+            1 => FailureCode::ToolFailed,
+            2 => FailureCode::TimedOut,
+            3 => FailureCode::LimitExceeded,
+            4 => FailureCode::ClosureMismatch,
+            _ => FailureCode::InvalidOutput,
+        },
         RunnerError::ClosureMismatch
         | RunnerError::MissingMaterial
         | RunnerError::SidecarUnavailable => FailureCode::ClosureMismatch,
