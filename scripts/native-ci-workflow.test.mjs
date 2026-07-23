@@ -416,13 +416,14 @@ test('Windows offline build pins bounded runner-config and observed control-plan
     /\[void\]\$Hosts\.Add\(['"]results-receiver\.actions\.githubusercontent\.com['"]\)/,
   );
   assert.match(windows, /New-NetFirewallDynamicKeywordAddress/);
-  assert.match(windows, /Get-MpComputerStatus/);
-  assert.match(windows, /AMProductVersion[\s\S]{0,500}4\.18\.2209\.7/);
-  assert.match(windows, /Set-MpPreference[^\n]+-EnableNetworkProtection\s+AuditMode/);
-  assert.match(windows, /['"]\*\.actions\.githubusercontent\.com['"]/);
-  assert.match(windows, /['"]\*\.blob\.core\.windows\.net['"]/);
-  assert.match(windows, /-AutoResolve\s+\$true/);
-  assert.match(windows, /Get-NetFirewallDynamicKeywordAddress[^\n]+[\s\S]{0,500}\.Addresses/);
+  assert.match(windows, /Resolve-RunnerControlPlaneAddresses/);
+  assert.match(windows, /New-NetFirewallDynamicKeywordAddress[^\n]+-Addresses\s+\$InitialRunnerAddressText[^\n]+-AutoResolve\s+\$false/);
+  assert.match(windows, /Update-NetFirewallDynamicKeywordAddress[^\n]+-Addresses\s+\$AddressText[^\n]+-Append\s+\$false/);
+  assert.match(windows, /Start-Job[^\n]+-ScriptBlock\s+\$RunnerAddressRefresherScript/);
+  assert.match(windows, /Start-Sleep\s+-Seconds\s+5/);
+  assert.match(windows, /Assert-RunnerAddressRefresherHealthy/);
+  assert.doesNotMatch(windows, /Get-MpComputerStatus|Set-MpPreference|-AutoResolve\s+\$true/);
+  assert.doesNotMatch(windows, /['"]\*\.actions\.githubusercontent\.com['"]|['"]\*\.blob\.core\.windows\.net['"]/);
   assert.match(windows, /New-NetFirewallRule[^\n]+-RemoteDynamicKeywordAddresses\s+\$RunnerKeywordIds/);
   assert.doesNotMatch(windows, /New-NetFirewallRule[^\n]+-Program\s+\$Program[^\n]+-RemoteAddress\s+Any/);
   assert.match(windows, /Get-DnsClientServerAddress/);
@@ -438,15 +439,13 @@ test('Windows offline build pins bounded runner-config and observed control-plan
   const resolutions = [...windows.matchAll(/\[Net\.Dns\]::GetHostAddresses\(\$Hostname\)/g)].map(({ index }) => index);
   assert.match(
     windows.slice(keywordAt, blockAt),
-    /Clear-DnsClientCache\s+-ErrorAction\s+Stop[\s\S]+\[Net\.Dns\]::GetHostAddresses\(\$Hostname\)/,
+    /Start-Job[\s\S]+Assert-RunnerAddressRefresherHealthy/,
   );
   assert.ok(resolutions.some((index) => index < blockAt), 'runner hosts must be resolved before outbound blocking');
-  assert.ok(resolutions.some((index) => index > blockAt), 'dynamic runner hosts must resolve after outbound blocking');
-  assert.match(windows.slice(blockAt), /Clear-DnsClientCache\s+-ErrorAction\s+Stop/);
-  assert.match(windows.slice(blockAt), /dynamic runner control-plane hostname resolution failed/);
+  assert.match(windows.slice(blockAt), /Assert-RunnerAddressRefresherHealthy[\s\S]+Build-Once[\s\S]+Assert-RunnerAddressRefresherHealthy/);
   assert.match(
     windows,
-    /finally\s*\{[\s\S]*Remove-NetFirewallRule[\s\S]*Remove-NetFirewallDynamicKeywordAddress[\s\S]*Set-NetworkProtectionMode\s+\$OriginalNetworkProtection/,
+    /finally\s*\{[\s\S]*Stop-Job[\s\S]*Remove-Job[\s\S]*Remove-NetFirewallRule[\s\S]*Remove-NetFirewallDynamicKeywordAddress/,
   );
 
   assert.doesNotMatch(windows, /New-NetFirewallRule[^\n]+-Service\s+Dnscache[^\n]+-RemoteAddress\s+Any/i);

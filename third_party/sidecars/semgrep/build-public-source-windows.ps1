@@ -424,36 +424,108 @@ function Test-RunnerControlPlaneAddress([Net.IPAddress]$Address) {
   return $true
 }
 
-function Wait-RunnerDynamicKeywordAddress([string]$Id, [string]$ExpectedKeyword) {
-  $Deadline = [DateTime]::UtcNow.AddSeconds(10)
+function Resolve-RunnerControlPlaneAddresses([string[]]$Hostnames) {
+  if ($Hostnames.Count -eq 0 -or $Hostnames.Count -gt 32) {
+    Fail 'runner control-plane hostname set is missing or unbounded'
+  }
+  $AddressSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+  foreach ($Hostname in $Hostnames) {
+    $Resolved = @([Net.Dns]::GetHostAddresses($Hostname) |
+      Where-Object { Test-RunnerControlPlaneAddress $_ } |
+      ForEach-Object { $_.ToString() } |
+      Sort-Object -Unique)
+    if ($Resolved.Count -eq 0 -or $Resolved.Count -gt 16) {
+      Fail "runner control-plane hostname has no bounded public address set: $Hostname"
+    }
+    foreach ($Address in $Resolved) { [void]$AddressSet.Add($Address) }
+  }
+  if ($AddressSet.Count -eq 0 -or $AddressSet.Count -gt 128) {
+    Fail 'runner control-plane address set is missing or unbounded'
+  }
+  $Sorted = [string[]]@($AddressSet)
+  [Array]::Sort($Sorted, [StringComparer]::Ordinal)
+  return $Sorted
+}
+
+function Assert-RunnerAddressRefresherHealthy(
+  [Management.Automation.Job]$Job,
+  [string]$HeartbeatPath,
+  [long]$AfterTicks = 0
+) {
+  $Deadline = [DateTime]::UtcNow.AddSeconds(20)
   do {
-    $Keyword = Get-NetFirewallDynamicKeywordAddress -Id $Id -ErrorAction Stop
-    $Addresses = @(([string]$Keyword.Addresses -split ',') |
-      ForEach-Object { $_.Trim() } |
-      Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    if ($Addresses.Count -gt 0 -and $Addresses.Count -le 128) {
-      $AllPublic = $true
-      foreach ($Text in $Addresses) {
-        [Net.IPAddress]$Address = $null
-        if (-not [Net.IPAddress]::TryParse($Text, [ref]$Address) -or
-            -not (Test-RunnerControlPlaneAddress $Address)) {
-          $AllPublic = $false
-          break
-        }
+    if ($Job.State -ne 'Running') {
+      Fail "runner control-plane address refresher stopped unexpectedly: $($Job.State)"
+    }
+    if (Test-Path -LiteralPath $HeartbeatPath -PathType Leaf) {
+      $Item = Get-Item -LiteralPath $HeartbeatPath -Force -ErrorAction Stop
+      if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $Item.Length -gt 64) {
+        Fail 'runner control-plane address refresher heartbeat is unsafe'
       }
-      if ($AllPublic) { return }
+      [long]$Ticks = 0
+      if ([long]::TryParse([IO.File]::ReadAllText($HeartbeatPath), [ref]$Ticks) -and
+          $Ticks -gt $AfterTicks -and
+          ([DateTime]::UtcNow - [DateTime]::new($Ticks, [DateTimeKind]::Utc)).TotalSeconds -le 20) {
+        return $Ticks
+      }
     }
     Start-Sleep -Milliseconds 200
   } while ([DateTime]::UtcNow -lt $Deadline)
-  Fail "runner dynamic FQDN keyword has no bounded public address set: $ExpectedKeyword"
+  Fail 'runner control-plane address refresher has no current heartbeat'
 }
 
-function Set-NetworkProtectionMode([int]$Mode) {
-  switch ($Mode) {
-    0 { Set-MpPreference -EnableNetworkProtection Disabled -ErrorAction Stop }
-    1 { Set-MpPreference -EnableNetworkProtection Enabled -ErrorAction Stop }
-    2 { Set-MpPreference -EnableNetworkProtection AuditMode -ErrorAction Stop }
-    default { Fail 'Microsoft Defender Network Protection mode is unsupported' }
+$RunnerAddressRefresherScript = {
+  param([string]$HostnameList, [string]$KeywordId, [string]$HeartbeatPath)
+  $ErrorActionPreference = 'Stop'
+  Set-StrictMode -Version Latest
+
+  function Test-PublicAddress([Net.IPAddress]$Address) {
+    if ($Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -and
+        $Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetworkV6) { return $false }
+    if ([Net.IPAddress]::IsLoopback($Address) -or $Address.Equals([Net.IPAddress]::Any) -or
+        $Address.Equals([Net.IPAddress]::IPv6Any) -or $Address.IsIPv6Multicast -or
+        $Address.IsIPv6LinkLocal -or $Address.IsIPv6SiteLocal) { return $false }
+    if ($Address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
+      $Bytes = $Address.GetAddressBytes()
+      if ($Bytes[0] -eq 10 -or $Bytes[0] -eq 127 -or
+          ($Bytes[0] -eq 169 -and $Bytes[1] -eq 254) -or
+          ($Bytes[0] -eq 172 -and $Bytes[1] -ge 16 -and $Bytes[1] -le 31) -or
+          ($Bytes[0] -eq 192 -and $Bytes[1] -eq 168) -or $Bytes[0] -ge 224) { return $false }
+    }
+    return $true
+  }
+
+  $Hostnames = @($HostnameList -split ',')
+  if ($Hostnames.Count -eq 0 -or $Hostnames.Count -gt 32 -or
+      @($Hostnames | Select-Object -Unique).Count -ne $Hostnames.Count -or
+      @($Hostnames | Where-Object { $_ -notmatch '^(?:github\.com|api\.github\.com|(?:[a-z0-9-]+\.)+actions\.githubusercontent\.com)$' }).Count -ne 0) {
+    throw 'runner control-plane address refresher hostname set is invalid'
+  }
+  while ($true) {
+    $AddressSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($Hostname in $Hostnames) {
+      $Resolved = @([Net.Dns]::GetHostAddresses($Hostname) |
+        Where-Object { Test-PublicAddress $_ } |
+        ForEach-Object { $_.ToString() } |
+        Sort-Object -Unique)
+      if ($Resolved.Count -eq 0 -or $Resolved.Count -gt 16) {
+        throw "runner control-plane address refresher resolution is missing or unbounded: $Hostname"
+      }
+      foreach ($Address in $Resolved) { [void]$AddressSet.Add($Address) }
+    }
+    if ($AddressSet.Count -eq 0 -or $AddressSet.Count -gt 128) {
+      throw 'runner control-plane address refresher result is missing or unbounded'
+    }
+    $Addresses = [string[]]@($AddressSet)
+    [Array]::Sort($Addresses, [StringComparer]::Ordinal)
+    $AddressText = $Addresses -join ','
+    Update-NetFirewallDynamicKeywordAddress -Id $KeywordId -Addresses $AddressText -Append $false -ErrorAction Stop | Out-Null
+    $Keyword = Get-NetFirewallDynamicKeywordAddress -Id $KeywordId -ErrorAction Stop
+    if ($Keyword.AutoResolve -or [string]$Keyword.Addresses -cne $AddressText) {
+      throw 'runner control-plane dynamic keyword update was not exact'
+    }
+    [IO.File]::WriteAllText($HeartbeatPath, [DateTime]::UtcNow.Ticks.ToString(), [Text.Encoding]::ASCII)
+    Start-Sleep -Seconds 5
   }
 }
 
@@ -710,26 +782,8 @@ foreach ($Program in $RunnerPrograms) {
   $RunnerProgramHashes[$Program] = (Get-FileHash -Algorithm SHA256 -LiteralPath $Program).Hash
 }
 $RunnerHostnames = @(Get-RunnerControlPlaneHosts $RunnerPrograms)
-$RunnerFqdns = [string[]]@(
-  $RunnerHostnames +
-  '*.actions.githubusercontent.com' +
-  '*.blob.core.windows.net'
-)
-if ($RunnerFqdns.Count -gt 34 -or @($RunnerFqdns | Select-Object -Unique).Count -ne $RunnerFqdns.Count) {
-  Fail 'runner FQDN allowlist is duplicated or unbounded'
-}
-$DefenderStatus = Get-MpComputerStatus -ErrorAction Stop
-[Version]$DefenderVersion = $null
-if (-not $DefenderStatus.AMServiceEnabled -or -not $DefenderStatus.AntivirusEnabled -or
-    -not [Version]::TryParse([string]$DefenderStatus.AMProductVersion, [ref]$DefenderVersion) -or
-    $DefenderVersion -lt [Version]'4.18.2209.7') {
-  Fail 'Microsoft Defender Antivirus does not meet the dynamic FQDN firewall requirement'
-}
-$OriginalNetworkProtection = [int](Get-MpPreference -ErrorAction Stop).EnableNetworkProtection
-if ($OriginalNetworkProtection -notin @(0, 1, 2)) {
-  Fail 'Microsoft Defender Network Protection has an unsupported initial mode'
-}
-$NetworkProtectionChanged = $OriginalNetworkProtection -eq 0
+$InitialRunnerAddresses = @(Resolve-RunnerControlPlaneAddresses $RunnerHostnames)
+$InitialRunnerAddressText = $InitialRunnerAddresses -join ','
 $ResolverSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($Resolver in @(Get-DnsClientServerAddress -ErrorAction Stop | ForEach-Object ServerAddresses)) {
   [Net.IPAddress]$Address = $null
@@ -754,35 +808,21 @@ $RunnerRuleNames = [Collections.Generic.List[string]]::new()
 $DnsRuleNames = [Collections.Generic.List[string]]::new()
 $DynamicKeywordIds = [Collections.Generic.List[string]]::new()
 $DisabledOutboundRuleNames = [Collections.Generic.List[string]]::new()
+$RunnerAddressRefresherJob = $null
+$RunnerAddressHeartbeat = Join-Path $WorkRoot 'runner-address-refresher.heartbeat'
 try {
-  if ($NetworkProtectionChanged) {
-    Set-NetworkProtectionMode 2
+  $RunnerKeywordId = '{' + [Guid]::NewGuid().ToString() + '}'
+  $DynamicKeywordIds.Add($RunnerKeywordId)
+  New-NetFirewallDynamicKeywordAddress -Id $RunnerKeywordId -Keyword 'ContextRelayRunnerControlPlane' -Addresses $InitialRunnerAddressText -AutoResolve $false -ErrorAction Stop | Out-Null
+  $Keyword = Get-NetFirewallDynamicKeywordAddress -Id $RunnerKeywordId -ErrorAction Stop
+  if ($Keyword.AutoResolve -or [string]$Keyword.Keyword -cne 'ContextRelayRunnerControlPlane' -or
+      [string]$Keyword.Addresses -cne $InitialRunnerAddressText) {
+    Fail 'runner control-plane dynamic keyword is not exact and active'
   }
-  $EffectiveNetworkProtection = [int](Get-MpPreference -ErrorAction Stop).EnableNetworkProtection
-  if ($EffectiveNetworkProtection -notin @(1, 2)) {
-    Fail 'Microsoft Defender Network Protection is not active for dynamic FQDN resolution'
-  }
-  $RunnerKeywordRecords = @($RunnerFqdns | ForEach-Object {
-    $KeywordId = '{' + [Guid]::NewGuid().ToString() + '}'
-    $DynamicKeywordIds.Add($KeywordId)
-    New-NetFirewallDynamicKeywordAddress -Id $KeywordId -Keyword $_ -AutoResolve $true -ErrorAction Stop | Out-Null
-    $Keyword = Get-NetFirewallDynamicKeywordAddress -Id $KeywordId -ErrorAction Stop
-    if (-not $Keyword.AutoResolve -or [string]$Keyword.Keyword -cne $_) {
-      Fail "runner dynamic FQDN keyword is not exact and active: $_"
-    }
-    [pscustomobject]@{ Id = $KeywordId; Keyword = $_ }
-  })
-  $RunnerKeywordIds = [string[]]@($RunnerKeywordRecords | ForEach-Object Id)
-  Clear-DnsClientCache -ErrorAction Stop
-  foreach ($Hostname in $RunnerHostnames) {
-    $Addresses = @([Net.Dns]::GetHostAddresses($Hostname) | Where-Object { Test-RunnerControlPlaneAddress $_ })
-    if ($Addresses.Count -eq 0 -or $Addresses.Count -gt 16) {
-      Fail "runner control-plane hostname has no bounded public address set: $Hostname"
-    }
-  }
-  foreach ($Record in @($RunnerKeywordRecords | Where-Object { $_.Keyword -match '(?:^|\.)actions\.githubusercontent\.com$' })) {
-    Wait-RunnerDynamicKeywordAddress $Record.Id $Record.Keyword
-  }
+  $RunnerKeywordIds = [string[]]@($RunnerKeywordId)
+  $RunnerHostnameList = $RunnerHostnames -join ','
+  $RunnerAddressRefresherJob = Start-Job -Name "$FirewallPrefix-AddressRefresher" -ScriptBlock $RunnerAddressRefresherScript -ArgumentList $RunnerHostnameList, $RunnerKeywordId, $RunnerAddressHeartbeat -ErrorAction Stop
+  $InitialRefreshTicks = Assert-RunnerAddressRefresherHealthy $RunnerAddressRefresherJob $RunnerAddressHeartbeat
   $RuleIndex = 0
   foreach ($Program in $RunnerPrograms) {
     $RuleIndex += 1
@@ -826,15 +866,10 @@ try {
     $Effective = Get-NetFirewallProfile -Profile $ProfileSnapshot.Name -ErrorAction Stop
     if ([string]$Effective.DefaultOutboundAction -ne 'Block') { Fail "offline default outbound policy is not active: $($ProfileSnapshot.Name)" }
   }
-  Clear-DnsClientCache -ErrorAction Stop
-  foreach ($Hostname in $RunnerHostnames) {
-    $ActualAddresses = @([Net.Dns]::GetHostAddresses($Hostname) | Where-Object { Test-RunnerControlPlaneAddress $_ })
-    if ($ActualAddresses.Count -eq 0 -or $ActualAddresses.Count -gt 16) {
-      Fail "dynamic runner control-plane hostname resolution failed: $Hostname"
-    }
-  }
+  $BlockedRefreshTicks = Assert-RunnerAddressRefresherHealthy $RunnerAddressRefresherJob $RunnerAddressHeartbeat $InitialRefreshTicks
   if (Test-OutboundTcp $ProbeAddress) { Fail 'hostile outbound TCP probe bypassed the offline firewall policy' }
   Build-Once $BuildLabel
+  [void](Assert-RunnerAddressRefresherHealthy $RunnerAddressRefresherJob $RunnerAddressHeartbeat $BlockedRefreshTicks)
   foreach ($Program in $RunnerPrograms) {
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $Program).Hash -ne $RunnerProgramHashes[$Program]) {
       Fail "runner control-plane executable changed during the native build: $Program"
@@ -847,11 +882,27 @@ try {
   if (Test-OutboundTcp $ProbeAddress) { Fail 'offline firewall policy was removed during the native build' }
   [IO.File]::WriteAllText(
     (Join-Path $OutputRoot "$BuildLabel.offline-egress.v1.json"),
-    '{"mechanism":"windows-firewall-default-outbound-block-defender-fqdn-runner-allow","probe":"hostile-outbound-tcp-denied","schemaVersion":1}' + "`n",
+    '{"mechanism":"windows-firewall-default-outbound-block-dns-refreshed-runner-address-allow","probe":"hostile-outbound-tcp-denied","schemaVersion":1}' + "`n",
     [Text.UTF8Encoding]::new($false)
   )
 } finally {
   $RestoreFailures = [Collections.Generic.List[string]]::new()
+  if ($null -ne $RunnerAddressRefresherJob) {
+    try {
+      Stop-Job -Job $RunnerAddressRefresherJob -ErrorAction Stop
+      Remove-Job -Job $RunnerAddressRefresherJob -Force -ErrorAction Stop
+      $RunnerAddressRefresherJob = $null
+    } catch {
+      $RestoreFailures.Add("runner address refresher: $($_.Exception.Message)")
+    }
+  }
+  if (Test-Path -LiteralPath $RunnerAddressHeartbeat) {
+    try {
+      Remove-Item -LiteralPath $RunnerAddressHeartbeat -Force -ErrorAction Stop
+    } catch {
+      $RestoreFailures.Add("runner address refresher heartbeat: $($_.Exception.Message)")
+    }
+  }
   foreach ($ProfileSnapshot in $ProfileSnapshots) {
     try {
       Set-NetFirewallProfile -Profile $ProfileSnapshot.Name -DefaultOutboundAction $ProfileSnapshot.DefaultOutboundAction -ErrorAction Stop
@@ -892,17 +943,6 @@ try {
       }
     } catch {
       $RestoreFailures.Add("dynamic keyword ${KeywordId}: $($_.Exception.Message)")
-    }
-  }
-  if ($NetworkProtectionChanged) {
-    try {
-      Set-NetworkProtectionMode $OriginalNetworkProtection
-      $RestoredNetworkProtection = [int](Get-MpPreference -ErrorAction Stop).EnableNetworkProtection
-      if ($RestoredNetworkProtection -ne $OriginalNetworkProtection) {
-        throw "restored value differs: $RestoredNetworkProtection"
-      }
-    } catch {
-      $RestoreFailures.Add("Microsoft Defender Network Protection: $($_.Exception.Message)")
     }
   }
   Clear-DnsClientCache -ErrorAction SilentlyContinue
