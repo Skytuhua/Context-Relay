@@ -263,7 +263,7 @@
         "revision": "bd614accba811b407ae5c9ec6f1eecd3bdc29911",
         "tree": "ad8e607874820dc7253d58997736463ed258ea34",
         "materialPath": "third_party/sidecars/semgrep/source-lock.v1.json",
-        "materialSha256": "2db57a4d26daa47612ec223f8941d4b95028153f49c0b45d51257a7fdedaffc9"
+        "materialSha256": "d07e0a688745e400c07b4ae19175e3ae777768f3b8312811542aa22dba4481f5"
       },
       "license": {
         "spdx": "LGPL-2.1-or-later",
@@ -288,7 +288,7 @@
         {
           "role": "windows-build",
           "path": "third_party/sidecars/semgrep/build-public-source-windows.ps1",
-          "sha256": "3423c5db2ed25f5b3828b2f7ddadd5f1a2ff37312949080f2f0b490a910aabc6"
+          "sha256": "43fc8ab487bd28214ce91507a40b67c2e892e000e130613ab79660bb9a6d84d1"
         },
         {
           "role": "windows-builder-evidence-schema",
@@ -303,7 +303,7 @@
         {
           "role": "native-ci-provenance",
           "path": "third_party/sidecars/semgrep/native-ci-provenance.v1.json",
-          "sha256": "12c0a9ed46da994315c374b915537d7e39c2fc0532377f2f0e22b6e2a3505b92"
+          "sha256": "8b63b5202a4fcc4424f9f3f6f77c438670b553dfbfcd8aaf83a8026c4a18b7dc"
         },
         {
           "role": "source-inventory-generator",
@@ -318,7 +318,7 @@
         {
           "role": "source-bundle-evidence",
           "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
-          "sha256": "f400adc8f7746fb8cf2c25b7c0f27e9c67aeee837c1487ca4ca1baa2c2b35fbf"
+          "sha256": "3a806000ea83ed6d87f02eb936a8b957da152c40c093ad76f6944546cbf1a27d"
         },
         {
           "role": "manifest-rule",

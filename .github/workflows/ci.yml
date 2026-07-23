@@ -87,28 +87,6 @@ jobs:
       CONTEXT_RELAY_SETUP_NODE_ACTION_SHA: 49933ea5288caeca8642d1e84afbd3f7d6820020
       CONTEXT_RELAY_SETUP_OCAML_ACTION_SHA: 3e4c6ff8c9a04c9ec8f6f87701cd4b661b0f1f18
     steps:
-      - name: Capture active Actions run-service hosts
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          $hosts = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-          $records = @(Get-DnsClientCache -Type A,AAAA,CNAME -Status Success -ErrorAction Stop)
-          if ($records.Count -gt 16384) { throw 'DNS client cache is unexpectedly large' }
-          foreach ($record in $records) {
-            $property = $record.PSObject.Properties['Entry']
-            if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
-              throw 'DNS cache address record has no entry name'
-            }
-            $hostname = ([string]$property.Value).TrimEnd('.').ToLowerInvariant()
-            if ($hostname -match '^run-actions(?:-[a-z0-9-]+(?:\.[a-z0-9-]+)*)?\.actions\.githubusercontent\.com$') {
-              [void]$hosts.Add($hostname)
-            }
-          }
-          if ($hosts.Count -eq 0 -or $hosts.Count -gt 8) { throw 'active Actions run-service hosts are missing or unbounded' }
-          $sorted = [string[]]@($hosts)
-          [Array]::Sort($sorted, [StringComparer]::Ordinal)
-          "CONTEXT_RELAY_RUN_SERVICE_HOSTS=$($sorted -join ',')" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           persist-credentials: false
@@ -301,7 +279,7 @@ jobs:
           node scripts/semgrep-source-bundle.mjs --verify-evidence (Resolve-Path third_party/sidecars/semgrep/source-lock.v1.json).Path (Join-Path $root 'source-b.tar') (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path
           foreach ($slot in @('a', 'b')) {
             $offline = Get-Content -Raw (Join-Path $root "build-$slot.offline-egress.v1.json") | ConvertFrom-Json
-            if ($offline.schemaVersion -ne 1 -or $offline.mechanism -ne 'windows-firewall-default-outbound-block-runner-control-plane-allow' -or $offline.probe -ne 'hostile-outbound-tcp-denied') { throw 'invalid Windows offline evidence' }
+            if ($offline.schemaVersion -ne 1 -or $offline.mechanism -ne 'windows-firewall-default-outbound-block-hash-pinned-runner-tcp443-allow' -or $offline.probe -ne 'hostile-outbound-tcp-denied') { throw 'invalid Windows offline evidence' }
           }
           if ((Get-FileHash -Algorithm SHA256 (Join-Path $root 'build-a.builder-toolchain.windows-x86_64.v1.json')).Hash -ne (Get-FileHash -Algorithm SHA256 (Join-Path $root 'build-b.builder-toolchain.windows-x86_64.v1.json')).Hash) { throw 'independent Windows toolchains differ' }
       - name: Prepare strict Windows candidate

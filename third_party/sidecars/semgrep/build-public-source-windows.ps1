@@ -249,407 +249,6 @@ function Get-RunnerControlPlanePrograms {
   return [string[]]@($RequiredNames | ForEach-Object { $Found[$_] })
 }
 
-function Get-RunnerControlPlaneProcessIds([string[]]$RunnerPrograms) {
-  if ($RunnerPrograms.Count -ne 2) { Fail 'runner control-plane executable set is incomplete' }
-  $Expected = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-  foreach ($Program in $RunnerPrograms) { [void]$Expected.Add([IO.Path]::GetFullPath($Program)) }
-  if ($Expected.Count -ne 2) { Fail 'runner control-plane executable set is duplicated' }
-  $Found = @{}
-  $Visited = [Collections.Generic.HashSet[uint32]]::new()
-  [uint32]$CurrentProcessId = $PID
-  while ($CurrentProcessId -ne 0 -and $Visited.Add($CurrentProcessId)) {
-    $Process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $CurrentProcessId" -ErrorAction Stop
-    if ($null -eq $Process) { break }
-    if (-not [string]::IsNullOrWhiteSpace([string]$Process.ExecutablePath)) {
-      $Program = [IO.Path]::GetFullPath([string]$Process.ExecutablePath)
-      if ($Expected.Contains($Program)) { $Found[$Program] = $CurrentProcessId }
-    }
-    [uint32]$ParentProcessId = $Process.ParentProcessId
-    if ($ParentProcessId -eq $CurrentProcessId) { break }
-    $CurrentProcessId = $ParentProcessId
-  }
-  if ($Found.Count -ne $Expected.Count) { Fail 'runner control-plane process ancestry is incomplete' }
-  return [uint32[]]@($RunnerPrograms | ForEach-Object { [uint32]$Found[[IO.Path]::GetFullPath($_)] })
-}
-
-function Read-RunnerDiagnosticLog([string]$Path) {
-  $Stream = [IO.File]::Open(
-    $Path,
-    [IO.FileMode]::Open,
-    [IO.FileAccess]::Read,
-    [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
-  )
-  try {
-    $Reader = [IO.StreamReader]::new($Stream, [Text.UTF8Encoding]::new($false, $true), $true)
-    try {
-      return $Reader.ReadToEnd()
-    } finally {
-      $Reader.Dispose()
-    }
-  } finally {
-    $Stream.Dispose()
-  }
-}
-
-function Get-RunnerControlPlaneHosts([string[]]$RunnerPrograms) {
-  $RunnerDirectories = @($RunnerPrograms | ForEach-Object { Split-Path -Parent $_ } | Select-Object -Unique)
-  if ($RunnerDirectories.Count -ne 1) { Fail 'runner control-plane executables do not share one trusted directory' }
-  $RunnerRoot = Split-Path -Parent $RunnerDirectories[0]
-  $RunnerDiag = Join-Path $RunnerRoot '_diag'
-  $AllLogs = @()
-  if (Test-Path -LiteralPath $RunnerDiag -PathType Container) {
-    $RunnerDiagItem = Get-Item -LiteralPath $RunnerDiag -Force -ErrorAction Stop
-    if (($RunnerDiagItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-      Fail 'runner diagnostic directory is not a regular directory'
-    }
-    $AllLogs = @(Get-ChildItem -LiteralPath $RunnerDiag -Filter '*.log' -File -Force -ErrorAction Stop)
-  } elseif (Test-Path -LiteralPath $RunnerDiag) {
-    Fail 'runner diagnostic directory is not a regular directory'
-  }
-  $Hosts = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-  $RunnerConfigActionHosts = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-  $PrimaryRunnerConfigPath = Join-Path $RunnerRoot '.runner'
-  if (-not (Test-Path -LiteralPath $PrimaryRunnerConfigPath -PathType Leaf)) {
-    Fail 'current runner configuration is missing'
-  }
-  $RunnerConfigPaths = @(
-    $PrimaryRunnerConfigPath,
-    (Join-Path $RunnerRoot '.runner_migrated')
-  )
-  foreach ($ConfigPath in $RunnerConfigPaths) {
-    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { continue }
-    $ConfigItem = Get-Item -LiteralPath $ConfigPath -Force -ErrorAction Stop
-    if (($ConfigItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $ConfigItem.Length -gt 1048576) {
-      Fail "runner configuration file is unsafe: $($ConfigItem.Name)"
-    }
-    try {
-      $Settings = Read-RunnerDiagnosticLog $ConfigItem.FullName | ConvertFrom-Json -ErrorAction Stop
-    } catch {
-      Fail "runner configuration file is invalid: $($ConfigItem.Name)"
-    }
-    foreach ($Field in @('ServerUrl', 'ServerUrlV2')) {
-      $Property = $Settings.PSObject.Properties[$Field]
-      if ($null -eq $Property -or [string]::IsNullOrWhiteSpace([string]$Property.Value)) { continue }
-      try {
-        [Uri]$Endpoint = [string]$Property.Value
-      } catch {
-        Fail "runner configuration endpoint is invalid: $($ConfigItem.Name)/$Field"
-      }
-      if (-not $Endpoint.IsAbsoluteUri -or $Endpoint.Scheme -ne 'https' -or
-          $Endpoint.Port -ne 443 -or -not [string]::IsNullOrEmpty($Endpoint.UserInfo)) {
-        Fail "runner configuration endpoint is unsafe: $($ConfigItem.Name)/$Field"
-      }
-      $Hostname = $Endpoint.Host.TrimEnd('.').ToLowerInvariant()
-      if ($Hostname -notmatch '^(?:github\.com|api\.github\.com|(?:[a-z0-9-]+\.)+actions\.githubusercontent\.com)$') {
-        Fail "runner configuration endpoint is outside the control-plane allowlist: $($ConfigItem.Name)/$Field"
-      }
-      [void]$Hosts.Add($Hostname)
-      if ($Hostname -match '(?:^|\.)actions\.githubusercontent\.com$') {
-        [void]$RunnerConfigActionHosts.Add($Hostname)
-      }
-    }
-  }
-  if ($RunnerConfigActionHosts.Count -eq 0) {
-    Fail 'runner configuration has no Actions control-plane host'
-  }
-
-  # Current hosted jobs renew against a per-job run service every 60 seconds.
-  # Runner 2.335.1 receives that URL in the job message rather than persisting
-  # it in .runner, so validate the early workflow snapshot before optionally
-  # augmenting it with successful address records still present in the cache.
-  $RunServiceHosts = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-  $CapturedRunServiceHosts = [string]$env:CONTEXT_RELAY_RUN_SERVICE_HOSTS
-  if ([string]::IsNullOrWhiteSpace($CapturedRunServiceHosts) -or
-      $CapturedRunServiceHosts -ne $CapturedRunServiceHosts.Trim()) {
-    Fail 'captured Actions run-service hosts are missing or malformed'
-  }
-  $CapturedHostnames = @($CapturedRunServiceHosts -split ',')
-  if ($CapturedHostnames.Count -eq 0 -or $CapturedHostnames.Count -gt 8) {
-    Fail 'captured Actions run-service hosts are missing or unbounded'
-  }
-  foreach ($CapturedHostname in $CapturedHostnames) {
-    $Hostname = $CapturedHostname.ToLowerInvariant()
-    if ($CapturedHostname -cne $Hostname -or
-        $Hostname -notmatch '^run-actions(?:-[a-z0-9-]+(?:\.[a-z0-9-]+)*)?\.actions\.githubusercontent\.com$') {
-      Fail 'captured Actions run-service hostname is invalid'
-    }
-    if (-not $RunServiceHosts.Add($Hostname)) { Fail 'captured Actions run-service hostname is duplicated' }
-    [void]$Hosts.Add($Hostname)
-  }
-  $DnsRecords = @(Get-DnsClientCache -Type A,AAAA,CNAME -Status Success -ErrorAction Stop)
-  if ($DnsRecords.Count -gt 16384) { Fail 'DNS client cache is unexpectedly large' }
-  foreach ($Record in $DnsRecords) {
-    $EntryProperty = $Record.PSObject.Properties['Entry']
-    if ($null -eq $EntryProperty -or [string]::IsNullOrWhiteSpace([string]$EntryProperty.Value)) {
-      Fail 'DNS cache address record has no entry name'
-    }
-    $Hostname = ([string]$EntryProperty.Value).TrimEnd('.').ToLowerInvariant()
-    if ($Hostname -match '^run-actions(?:-[a-z0-9-]+(?:\.[a-z0-9-]+)*)?\.actions\.githubusercontent\.com$') {
-      [void]$RunServiceHosts.Add($Hostname)
-      [void]$Hosts.Add($Hostname)
-    }
-  }
-  if ($RunServiceHosts.Count -eq 0) {
-    Fail 'DNS cache has no active Actions run-service host'
-  }
-
-  $DiagnosticLogs = [Collections.Generic.List[IO.FileInfo]]::new()
-  foreach ($Prefix in @('Runner', 'Worker')) {
-    $Log = $AllLogs |
-      Where-Object { $_.Name -match "^${Prefix}_[0-9-]+-utc\.log$" } |
-      Sort-Object LastWriteTimeUtc -Descending |
-      Select-Object -First 1
-    if ($null -eq $Log) { continue }
-    if (($Log.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $Log.Length -gt 67108864) {
-      Fail "current $Prefix diagnostic log is unsafe"
-    }
-    $DiagnosticLogs.Add($Log)
-  }
-
-  foreach ($Log in $DiagnosticLogs) {
-    $Contents = Read-RunnerDiagnosticLog $Log.FullName
-    foreach ($Match in [regex]::Matches($Contents, '(?im)\b(?:https|wss)://[a-z0-9.-]+(?::443)?(?=$|[/?#\s])')) {
-      [Uri]$Endpoint = $Match.Value
-      $Hostname = $Endpoint.Host.TrimEnd('.').ToLowerInvariant()
-      if ($Endpoint.Port -ne 443 -or
-          $Hostname -notmatch '^(?:github\.com|api\.github\.com|(?:[a-z0-9-]+\.)+actions\.githubusercontent\.com)$') {
-        continue
-      }
-      [void]$Hosts.Add($Hostname)
-    }
-  }
-  # GitHub documents this exact host for live logs and job results.
-  # Unlike the listener endpoints persisted in .runner[_migrated], runner
-  # 2.335.1 consumes the results endpoint without logging its URL.
-  [void]$Hosts.Add('results-receiver.actions.githubusercontent.com')
-  $ActionHosts = @($Hosts | Where-Object { $_ -match '(?:^|\.)actions\.githubusercontent\.com$' })
-  if ($ActionHosts.Count -eq 0 -or $Hosts.Count -gt 32) {
-    Fail 'runner control-plane diagnostic hosts are missing or unbounded'
-  }
-  $Sorted = [string[]]@($Hosts)
-  [Array]::Sort($Sorted, [StringComparer]::Ordinal)
-  return $Sorted
-}
-
-function Test-RunnerControlPlaneAddress([Net.IPAddress]$Address) {
-  if ($Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -and
-      $Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetworkV6) { return $false }
-  if ([Net.IPAddress]::IsLoopback($Address) -or $Address.Equals([Net.IPAddress]::Any) -or
-      $Address.Equals([Net.IPAddress]::IPv6Any) -or $Address.IsIPv6Multicast -or
-      $Address.IsIPv6LinkLocal -or $Address.IsIPv6SiteLocal) { return $false }
-  if ($Address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
-    $Bytes = $Address.GetAddressBytes()
-    if ($Bytes[0] -eq 10 -or $Bytes[0] -eq 127 -or
-        ($Bytes[0] -eq 169 -and $Bytes[1] -eq 254) -or
-        ($Bytes[0] -eq 172 -and $Bytes[1] -ge 16 -and $Bytes[1] -le 31) -or
-        ($Bytes[0] -eq 192 -and $Bytes[1] -eq 168) -or $Bytes[0] -ge 224) { return $false }
-  }
-  return $true
-}
-
-function Get-RunnerControlPlanePeerAddresses([uint32[]]$ProcessIds) {
-  if ($ProcessIds.Count -ne 2 -or @($ProcessIds | Select-Object -Unique).Count -ne 2) {
-    Fail 'runner control-plane process ID set is incomplete or duplicated'
-  }
-  $Connections = @(Get-NetTCPConnection -State Established -ErrorAction Stop)
-  if ($Connections.Count -gt 16384) { Fail 'established TCP connection set is unexpectedly large' }
-  $AddressSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-  foreach ($Connection in $Connections) {
-    if ($ProcessIds -notcontains [uint32]$Connection.OwningProcess -or $Connection.RemotePort -ne 443) {
-      continue
-    }
-    [Net.IPAddress]$Address = $null
-    if ([Net.IPAddress]::TryParse([string]$Connection.RemoteAddress, [ref]$Address) -and
-        (Test-RunnerControlPlaneAddress $Address)) {
-      [void]$AddressSet.Add($Address.ToString())
-    }
-  }
-  if ($AddressSet.Count -eq 0 -or $AddressSet.Count -gt 32) {
-    Fail 'runner control-plane established peer address set is missing or unbounded'
-  }
-  $Sorted = [string[]]@($AddressSet)
-  [Array]::Sort($Sorted, [StringComparer]::Ordinal)
-  return $Sorted
-}
-
-function Resolve-RunnerControlPlaneAddresses([string[]]$Hostnames) {
-  if ($Hostnames.Count -eq 0 -or $Hostnames.Count -gt 32) {
-    Fail 'runner control-plane hostname set is missing or unbounded'
-  }
-  $AddressSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-  foreach ($Hostname in $Hostnames) {
-    $Resolved = @([Net.Dns]::GetHostAddresses($Hostname) |
-      Where-Object { Test-RunnerControlPlaneAddress $_ } |
-      ForEach-Object { $_.ToString() } |
-      Sort-Object -Unique)
-    if ($Resolved.Count -eq 0 -or $Resolved.Count -gt 16) {
-      Fail "runner control-plane hostname has no bounded public address set: $Hostname"
-    }
-    foreach ($Address in $Resolved) { [void]$AddressSet.Add($Address) }
-  }
-  if ($AddressSet.Count -eq 0 -or $AddressSet.Count -gt 128) {
-    Fail 'runner control-plane address set is missing or unbounded'
-  }
-  $Sorted = [string[]]@($AddressSet)
-  [Array]::Sort($Sorted, [StringComparer]::Ordinal)
-  return $Sorted
-}
-
-function Test-RunnerDynamicKeywordAddresses([string]$Actual, [string[]]$Expected) {
-  $ActualTexts = @(($Actual -split ',') |
-    ForEach-Object { $_.Trim() } |
-    Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-  if ($ActualTexts.Count -ne $Expected.Count -or $ActualTexts.Count -eq 0 -or $ActualTexts.Count -gt 128) {
-    return $false
-  }
-  $ActualSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-  foreach ($Text in $ActualTexts) {
-    [Net.IPAddress]$Address = $null
-    if (-not [Net.IPAddress]::TryParse($Text, [ref]$Address) -or
-        -not (Test-RunnerControlPlaneAddress $Address) -or
-        -not $ActualSet.Add($Address.ToString())) {
-      return $false
-    }
-  }
-  foreach ($Text in $Expected) {
-    if (-not $ActualSet.Contains($Text)) { return $false }
-  }
-  return $true
-}
-
-function Assert-RunnerAddressRefresherHealthy(
-  [Management.Automation.Job]$Job,
-  [string]$HeartbeatPath,
-  [long]$AfterTicks = 0
-) {
-  $Deadline = [DateTime]::UtcNow.AddSeconds(20)
-  do {
-    if ($Job.State -ne 'Running') {
-      Fail "runner control-plane address refresher stopped unexpectedly: $($Job.State)"
-    }
-    if (Test-Path -LiteralPath $HeartbeatPath -PathType Leaf) {
-      $Item = Get-Item -LiteralPath $HeartbeatPath -Force -ErrorAction Stop
-      if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $Item.Length -gt 64) {
-        Fail 'runner control-plane address refresher heartbeat is unsafe'
-      }
-      [long]$Ticks = 0
-      if ([long]::TryParse([IO.File]::ReadAllText($HeartbeatPath), [ref]$Ticks) -and
-          $Ticks -gt $AfterTicks -and
-          ([DateTime]::UtcNow - [DateTime]::new($Ticks, [DateTimeKind]::Utc)).TotalSeconds -le 20) {
-        return $Ticks
-      }
-    }
-    Start-Sleep -Milliseconds 200
-  } while ([DateTime]::UtcNow -lt $Deadline)
-  Fail 'runner control-plane address refresher has no current heartbeat'
-}
-
-$RunnerAddressRefresherScript = {
-  param([string]$HostnameList, [string]$RunnerProcessIdList, [string]$KeywordId, [string]$HeartbeatPath)
-  $ErrorActionPreference = 'Stop'
-  Set-StrictMode -Version Latest
-
-  function Test-PublicAddress([Net.IPAddress]$Address) {
-    if ($Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -and
-        $Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetworkV6) { return $false }
-    if ([Net.IPAddress]::IsLoopback($Address) -or $Address.Equals([Net.IPAddress]::Any) -or
-        $Address.Equals([Net.IPAddress]::IPv6Any) -or $Address.IsIPv6Multicast -or
-        $Address.IsIPv6LinkLocal -or $Address.IsIPv6SiteLocal) { return $false }
-    if ($Address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
-      $Bytes = $Address.GetAddressBytes()
-      if ($Bytes[0] -eq 10 -or $Bytes[0] -eq 127 -or
-          ($Bytes[0] -eq 169 -and $Bytes[1] -eq 254) -or
-          ($Bytes[0] -eq 172 -and $Bytes[1] -ge 16 -and $Bytes[1] -le 31) -or
-          ($Bytes[0] -eq 192 -and $Bytes[1] -eq 168) -or $Bytes[0] -ge 224) { return $false }
-    }
-    return $true
-  }
-
-  function Test-RunnerDynamicKeywordAddresses([string]$Actual, [string[]]$Expected) {
-    $ActualTexts = @(($Actual -split ',') |
-      ForEach-Object { $_.Trim() } |
-      Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    if ($ActualTexts.Count -ne $Expected.Count -or $ActualTexts.Count -eq 0 -or $ActualTexts.Count -gt 128) {
-      return $false
-    }
-    $ActualSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($Text in $ActualTexts) {
-      [Net.IPAddress]$Address = $null
-      if (-not [Net.IPAddress]::TryParse($Text, [ref]$Address) -or
-          -not (Test-PublicAddress $Address) -or
-          -not $ActualSet.Add($Address.ToString())) {
-        return $false
-      }
-    }
-    foreach ($Text in $Expected) {
-      if (-not $ActualSet.Contains($Text)) { return $false }
-    }
-    return $true
-  }
-
-  $Hostnames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-  foreach ($Hostname in @($HostnameList -split ',')) { [void]$Hostnames.Add($Hostname) }
-  if ($Hostnames.Count -eq 0 -or $Hostnames.Count -gt 32 -or
-      @($Hostnames | Where-Object { $_ -notmatch '^(?:github\.com|api\.github\.com|(?:[a-z0-9-]+\.)+actions\.githubusercontent\.com)$' }).Count -ne 0) {
-    throw 'runner control-plane address refresher hostname set is invalid'
-  }
-  $RunnerProcessIds = @($RunnerProcessIdList -split ',' | ForEach-Object { [uint32]$_ })
-  if ($RunnerProcessIds.Count -ne 2 -or @($RunnerProcessIds | Select-Object -Unique).Count -ne 2 -or
-      @($RunnerProcessIds | Where-Object { $_ -eq 0 }).Count -ne 0) {
-    throw 'runner control-plane address refresher process ID set is invalid'
-  }
-  while ($true) {
-    $DnsRecords = @(Get-DnsClientCache -Type A,AAAA,CNAME -Status Success -ErrorAction Stop)
-    if ($DnsRecords.Count -gt 16384) { throw 'runner address refresher DNS cache is unexpectedly large' }
-    foreach ($Record in $DnsRecords) {
-      $Entry = $Record.PSObject.Properties['Entry']
-      if ($null -eq $Entry -or [string]::IsNullOrWhiteSpace([string]$Entry.Value)) { continue }
-      $ObservedHostname = ([string]$Entry.Value).TrimEnd('.').ToLowerInvariant()
-      if ($ObservedHostname -match '^(?:[a-z0-9-]+\.)+actions\.githubusercontent\.com$') {
-        [void]$Hostnames.Add($ObservedHostname)
-      }
-    }
-    if ($Hostnames.Count -gt 64) { throw 'runner address refresher observed hostname set is unbounded' }
-    $AddressSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($Hostname in $Hostnames) {
-      $Resolved = @([Net.Dns]::GetHostAddresses($Hostname) |
-        Where-Object { Test-PublicAddress $_ } |
-        ForEach-Object { $_.ToString() } |
-        Sort-Object -Unique)
-      if ($Resolved.Count -eq 0 -or $Resolved.Count -gt 16) {
-        throw "runner control-plane address refresher resolution is missing or unbounded: $Hostname"
-      }
-      foreach ($Address in $Resolved) { [void]$AddressSet.Add($Address) }
-    }
-    $Connections = @(Get-NetTCPConnection -State Established -ErrorAction Stop)
-    if ($Connections.Count -gt 16384) { throw 'runner address refresher TCP connection set is unexpectedly large' }
-    foreach ($Connection in $Connections) {
-      if ($RunnerProcessIds -notcontains [uint32]$Connection.OwningProcess -or $Connection.RemotePort -ne 443) {
-        continue
-      }
-      [Net.IPAddress]$PeerAddress = $null
-      if ([Net.IPAddress]::TryParse([string]$Connection.RemoteAddress, [ref]$PeerAddress) -and
-          (Test-PublicAddress $PeerAddress)) {
-        [void]$AddressSet.Add($PeerAddress.ToString())
-      }
-    }
-    if ($AddressSet.Count -eq 0 -or $AddressSet.Count -gt 128) {
-      throw 'runner control-plane address refresher result is missing or unbounded'
-    }
-    $Addresses = [string[]]@($AddressSet)
-    [Array]::Sort($Addresses, [StringComparer]::Ordinal)
-    $AddressText = $Addresses -join ','
-    Update-NetFirewallDynamicKeywordAddress -Id $KeywordId -Addresses $AddressText -Append $false -ErrorAction Stop | Out-Null
-    $Keyword = Get-NetFirewallDynamicKeywordAddress -Id $KeywordId -ErrorAction Stop
-    if ($Keyword.AutoResolve -or
-        -not (Test-RunnerDynamicKeywordAddresses ([string]$Keyword.Addresses) $Addresses)) {
-      throw 'runner control-plane dynamic keyword update was not exact'
-    }
-    [IO.File]::WriteAllText($HeartbeatPath, [DateTime]::UtcNow.Ticks.ToString(), [Text.Encoding]::ASCII)
-    Start-Sleep -Seconds 1
-  }
-}
-
 function Test-DnsResolverAddress([Net.IPAddress]$Address) {
   if ($Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -and
       $Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetworkV6) { return $false }
@@ -898,25 +497,10 @@ if ($null -eq $ProbeAddress -or -not (Test-OutboundTcp $ProbeAddress)) {
   Fail 'outbound TCP preflight failed before enabling offline firewall policy'
 }
 $RunnerPrograms = @(Get-RunnerControlPlanePrograms)
-$RunnerProcessIds = @(Get-RunnerControlPlaneProcessIds $RunnerPrograms)
 $RunnerProgramHashes = @{}
 foreach ($Program in $RunnerPrograms) {
   $RunnerProgramHashes[$Program] = (Get-FileHash -Algorithm SHA256 -LiteralPath $Program).Hash
 }
-$RunnerHostnames = @(Get-RunnerControlPlaneHosts $RunnerPrograms)
-$InitialRunnerAddressSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-foreach ($Address in @(Resolve-RunnerControlPlaneAddresses $RunnerHostnames)) {
-  [void]$InitialRunnerAddressSet.Add($Address)
-}
-foreach ($Address in @(Get-RunnerControlPlanePeerAddresses $RunnerProcessIds)) {
-  [void]$InitialRunnerAddressSet.Add($Address)
-}
-if ($InitialRunnerAddressSet.Count -eq 0 -or $InitialRunnerAddressSet.Count -gt 128) {
-  Fail 'initial runner control-plane address set is missing or unbounded'
-}
-$InitialRunnerAddresses = [string[]]@($InitialRunnerAddressSet)
-[Array]::Sort($InitialRunnerAddresses, [StringComparer]::Ordinal)
-$InitialRunnerAddressText = $InitialRunnerAddresses -join ','
 $ResolverSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($Resolver in @(Get-DnsClientServerAddress -ErrorAction Stop | ForEach-Object ServerAddresses)) {
   [Net.IPAddress]$Address = $null
@@ -939,36 +523,25 @@ $ProfileSnapshots = @(foreach ($ProfileName in @('Domain', 'Private', 'Public'))
 $FirewallPrefix = "ContextRelaySemgrepOffline-$PID-$([Guid]::NewGuid().ToString('N'))"
 $RunnerRuleNames = [Collections.Generic.List[string]]::new()
 $DnsRuleNames = [Collections.Generic.List[string]]::new()
-$DynamicKeywordIds = [Collections.Generic.List[string]]::new()
 $DisabledOutboundRuleNames = [Collections.Generic.List[string]]::new()
-$RunnerAddressRefresherJob = $null
-$RunnerAddressHeartbeat = Join-Path $WorkRoot 'runner-address-refresher.heartbeat'
 try {
-  $RunnerKeywordId = '{' + [Guid]::NewGuid().ToString() + '}'
-  $DynamicKeywordIds.Add($RunnerKeywordId)
-  New-NetFirewallDynamicKeywordAddress -Id $RunnerKeywordId -Keyword 'ContextRelayRunnerControlPlane' -Addresses $InitialRunnerAddressText -AutoResolve $false -ErrorAction Stop | Out-Null
-  $Keyword = Get-NetFirewallDynamicKeywordAddress -Id $RunnerKeywordId -ErrorAction Stop
-  if ($Keyword.AutoResolve -or [string]$Keyword.Keyword -cne 'ContextRelayRunnerControlPlane' -or
-      -not (Test-RunnerDynamicKeywordAddresses ([string]$Keyword.Addresses) $InitialRunnerAddresses)) {
-    Fail 'runner control-plane dynamic keyword is not exact and active'
-  }
-  $RunnerKeywordIds = [string[]]@($RunnerKeywordId)
-  $RunnerHostnameList = $RunnerHostnames -join ','
-  $RunnerProcessIdList = $RunnerProcessIds -join ','
-  $RunnerAddressRefresherJob = Start-Job -Name "$FirewallPrefix-AddressRefresher" -ScriptBlock $RunnerAddressRefresherScript -ArgumentList $RunnerHostnameList, $RunnerProcessIdList, $RunnerKeywordId, $RunnerAddressHeartbeat -ErrorAction Stop
-  $InitialRefreshTicks = Assert-RunnerAddressRefresherHealthy $RunnerAddressRefresherJob $RunnerAddressHeartbeat
   $RuleIndex = 0
   foreach ($Program in $RunnerPrograms) {
     $RuleIndex += 1
     $RuleName = "$FirewallPrefix-Runner-$RuleIndex"
     $RunnerRuleNames.Add($RuleName)
-    New-NetFirewallRule -Name $RuleName -DisplayName $RuleName -Direction Outbound -Program $Program -RemoteDynamicKeywordAddresses $RunnerKeywordIds -Protocol Any -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+    New-NetFirewallRule -Name $RuleName -DisplayName $RuleName -Direction Outbound -Program $Program -RemoteAddress Any -RemotePort 443 -Protocol TCP -Action Allow -Profile Any -ErrorAction Stop | Out-Null
     $Rule = Get-NetFirewallRule -Name $RuleName -PolicyStore ActiveStore -ErrorAction Stop
     $Application = $Rule | Get-NetFirewallApplicationFilter
+    $Address = $Rule | Get-NetFirewallAddressFilter
+    $Port = $Rule | Get-NetFirewallPortFilter
     if ($Rule.Enabled -ne 'True' -or
         $Rule.Direction -ne 'Outbound' -or
         $Rule.Action -ne 'Allow' -or
-        [IO.Path]::GetFullPath($Application.Program) -ne [IO.Path]::GetFullPath($Program)) {
+        [IO.Path]::GetFullPath($Application.Program) -ne [IO.Path]::GetFullPath($Program) -or
+        [string]$Address.RemoteAddress -cne 'Any' -or
+        [string]$Port.RemotePort -cne '443' -or
+        @('TCP', '6') -notcontains [string]$Port.Protocol) {
       Fail 'runner control-plane firewall allow rule is not exact and active'
     }
   }
@@ -1000,10 +573,8 @@ try {
     $Effective = Get-NetFirewallProfile -Profile $ProfileSnapshot.Name -ErrorAction Stop
     if ([string]$Effective.DefaultOutboundAction -ne 'Block') { Fail "offline default outbound policy is not active: $($ProfileSnapshot.Name)" }
   }
-  $BlockedRefreshTicks = Assert-RunnerAddressRefresherHealthy $RunnerAddressRefresherJob $RunnerAddressHeartbeat $InitialRefreshTicks
   if (Test-OutboundTcp $ProbeAddress) { Fail 'hostile outbound TCP probe bypassed the offline firewall policy' }
   Build-Once $BuildLabel
-  [void](Assert-RunnerAddressRefresherHealthy $RunnerAddressRefresherJob $RunnerAddressHeartbeat $BlockedRefreshTicks)
   foreach ($Program in $RunnerPrograms) {
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $Program).Hash -ne $RunnerProgramHashes[$Program]) {
       Fail "runner control-plane executable changed during the native build: $Program"
@@ -1016,27 +587,11 @@ try {
   if (Test-OutboundTcp $ProbeAddress) { Fail 'offline firewall policy was removed during the native build' }
   [IO.File]::WriteAllText(
     (Join-Path $OutputRoot "$BuildLabel.offline-egress.v1.json"),
-    '{"mechanism":"windows-firewall-default-outbound-block-active-peer-dns-refreshed-runner-address-allow","probe":"hostile-outbound-tcp-denied","schemaVersion":1}' + "`n",
+    '{"mechanism":"windows-firewall-default-outbound-block-hash-pinned-runner-tcp443-allow","probe":"hostile-outbound-tcp-denied","schemaVersion":1}' + "`n",
     [Text.UTF8Encoding]::new($false)
   )
 } finally {
   $RestoreFailures = [Collections.Generic.List[string]]::new()
-  if ($null -ne $RunnerAddressRefresherJob) {
-    try {
-      Stop-Job -Job $RunnerAddressRefresherJob -ErrorAction Stop
-      Remove-Job -Job $RunnerAddressRefresherJob -Force -ErrorAction Stop
-      $RunnerAddressRefresherJob = $null
-    } catch {
-      $RestoreFailures.Add("runner address refresher: $($_.Exception.Message)")
-    }
-  }
-  if (Test-Path -LiteralPath $RunnerAddressHeartbeat) {
-    try {
-      Remove-Item -LiteralPath $RunnerAddressHeartbeat -Force -ErrorAction Stop
-    } catch {
-      $RestoreFailures.Add("runner address refresher heartbeat: $($_.Exception.Message)")
-    }
-  }
   foreach ($ProfileSnapshot in $ProfileSnapshots) {
     try {
       Set-NetFirewallProfile -Profile $ProfileSnapshot.Name -DefaultOutboundAction $ProfileSnapshot.DefaultOutboundAction -ErrorAction Stop
@@ -1065,18 +620,6 @@ try {
       if (Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) { throw 'rule still exists' }
     } catch {
       $RestoreFailures.Add("isolation allow rule ${RuleName}: $($_.Exception.Message)")
-    }
-  }
-  foreach ($KeywordId in $DynamicKeywordIds) {
-    try {
-      if (Get-NetFirewallDynamicKeywordAddress -Id $KeywordId -ErrorAction SilentlyContinue) {
-        Remove-NetFirewallDynamicKeywordAddress -Id $KeywordId -ErrorAction Stop
-      }
-      if (Get-NetFirewallDynamicKeywordAddress -Id $KeywordId -ErrorAction SilentlyContinue) {
-        throw 'dynamic keyword still exists'
-      }
-    } catch {
-      $RestoreFailures.Add("dynamic keyword ${KeywordId}: $($_.Exception.Message)")
     }
   }
   Clear-DnsClientCache -ErrorAction SilentlyContinue

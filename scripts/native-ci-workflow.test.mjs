@@ -371,79 +371,27 @@ test('native runtime builds prove OS-enforced offline execution', async () => {
   assert.match(windows, /offline-egress\.v1\.json/);
 });
 
-test('Windows offline build pins bounded runner-config and observed control-plane hosts', async () => {
+test('Windows offline build grants only the hash-pinned runner executables outbound TCP 443', async () => {
   const [windows, workflow] = await Promise.all([
     readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
     readFile(workflowUrl, 'utf8'),
   ]);
   const windowsBuilder = job(workflow, 'native-semgrep-windows-x64-builders', 'native-isolation-windows-x64');
-  const captureAt = windowsBuilder.indexOf('Capture active Actions run-service hosts');
-  const setupAt = windowsBuilder.indexOf('semgrep/setup-ocaml@');
-  assert.ok(captureAt > 0 && captureAt < setupAt, 'run-service hosts must be captured before setup-ocaml');
-  assert.match(windowsBuilder.slice(captureAt, setupAt), /Get-DnsClientCache[\s\S]+CONTEXT_RELAY_RUN_SERVICE_HOSTS[\s\S]+GITHUB_ENV/);
-
+  assert.doesNotMatch(windowsBuilder, /Capture active Actions run-service hosts|CONTEXT_RELAY_RUN_SERVICE_HOSTS/);
+  assert.match(windows, /function Get-RunnerControlPlanePrograms/);
+  assert.match(windows, /Get-FileHash[^\n]+SHA256[^\n]+\$Program/);
   assert.match(
     windows,
-    /function Get-RunnerControlPlaneHosts[\s\S]{0,4000}\$RunnerPrograms[\s\S]{0,1000}Split-Path[\s\S]{0,1000}Join-Path[^\n]+['"]_diag['"]/,
+    /New-NetFirewallRule[^\n]+-Program\s+\$Program[^\n]+-RemoteAddress\s+Any[^\n]+-RemotePort\s+443[^\n]+-Protocol\s+TCP/,
   );
-  assert.match(windows, /Get-ChildItem[^\n]+-LiteralPath\s+\$RunnerDiag[^\n]+-Filter\s+['"]\*\.log['"]/);
-  assert.match(
-    windows,
-    /if \(Test-Path -LiteralPath \$RunnerDiag -PathType Container\)[\s\S]{0,500}Get-ChildItem[^\n]+\$RunnerDiag/,
-  );
-  assert.match(windows, /\[Uri\][^\n]+[\r\n]+[^\n]*\.Host/);
-  assert.match(
-    windows,
-    /\^\(\?:github\\\.com\|api\\\.github\\\.com\|\(\?:\[a-z0-9-\]\+\\\.\)\+actions\\\.githubusercontent\\\.com\)\$/,
-  );
-  assert.match(
-    windows,
-    /Join-Path\s+\$RunnerRoot\s+['"]\.runner['"][\s\S]{0,1000}Join-Path\s+\$RunnerRoot\s+['"]\.runner_migrated['"]/,
-  );
-  assert.match(windows, /ServerUrlV2/);
-  assert.match(windows, /ServerUrl/);
-  assert.match(windows, /Get-Item[^\n]+\$ConfigPath[\s\S]{0,500}ReparsePoint[\s\S]{0,300}1048576/);
-  assert.match(windows, /Read-RunnerDiagnosticLog[^\n]+\$ConfigItem\.FullName[^\n]+ConvertFrom-Json/);
-  assert.match(windows, /\$Endpoint\.IsAbsoluteUri/);
-  assert.match(windows, /\$Endpoint\.Scheme\s+-ne\s+['"]https['"]/);
-  assert.match(windows, /\$Endpoint\.UserInfo/);
-  assert.match(
-    windows,
-    /\$RunnerConfigActionHosts\.Count\s+-eq\s+0[\s\S]{0,300}runner configuration has no Actions control-plane host/,
-  );
-  assert.match(windows, /Get-DnsClientCache[^\n]+-Type\s+A,AAAA,CNAME[^\n]+-Status\s+Success/);
-  assert.match(windows, /CONTEXT_RELAY_RUN_SERVICE_HOSTS/);
-  assert.match(
-    windows,
-    /\$RunServiceHosts\.Count\s+-eq\s+0[\s\S]{0,300}DNS cache has no active Actions run-service host/,
-  );
-  assert.doesNotMatch(windows, /current \$Prefix diagnostic log is missing/);
-  assert.doesNotMatch(windows, /current runner diagnostic log has no Actions control-plane host/);
-  assert.doesNotMatch(windows, /current Worker diagnostic log has no Actions control-plane host/);
-  assert.doesNotMatch(windows, /\[void\]\$Hosts\.Add\(['"]broker\.actions\.githubusercontent\.com['"]\)/);
-  assert.match(
-    windows,
-    /\[void\]\$Hosts\.Add\(['"]results-receiver\.actions\.githubusercontent\.com['"]\)/,
-  );
-  assert.match(windows, /New-NetFirewallDynamicKeywordAddress/);
-  assert.match(windows, /Resolve-RunnerControlPlaneAddresses/);
-  assert.match(windows, /Get-RunnerControlPlaneProcessIds/);
-  assert.match(windows, /Get-RunnerControlPlanePeerAddresses/);
-  assert.match(windows, /Get-NetTCPConnection[^\n]+-State\s+Established/);
-  assert.match(windows, /RemotePort\s+-ne\s+443/);
-  assert.match(windows, /Test-RunnerDynamicKeywordAddresses/);
-  assert.match(windows, /New-NetFirewallDynamicKeywordAddress[^\n]+-Addresses\s+\$InitialRunnerAddressText[^\n]+-AutoResolve\s+\$false/);
-  assert.match(windows, /Update-NetFirewallDynamicKeywordAddress[^\n]+-Addresses\s+\$AddressText[^\n]+-Append\s+\$false/);
-  assert.match(windows, /Start-Job[^\n]+-ScriptBlock\s+\$RunnerAddressRefresherScript/);
-  assert.match(windows, /Start-Sleep\s+-Seconds\s+1/);
-  assert.match(windows, /Assert-RunnerAddressRefresherHealthy/);
-  assert.match(windows, /Get-DnsClientCache[^\n]+-Type\s+A,AAAA,CNAME[^\n]+-Status\s+Success/);
-  assert.match(windows, /RunnerProcessIdList/);
-  assert.doesNotMatch(windows, /Keyword\.Addresses\s+-cne/);
-  assert.doesNotMatch(windows, /Get-MpComputerStatus|Set-MpPreference|-AutoResolve\s+\$true/);
-  assert.doesNotMatch(windows, /['"]\*\.actions\.githubusercontent\.com['"]|['"]\*\.blob\.core\.windows\.net['"]/);
-  assert.match(windows, /New-NetFirewallRule[^\n]+-RemoteDynamicKeywordAddresses\s+\$RunnerKeywordIds/);
-  assert.doesNotMatch(windows, /New-NetFirewallRule[^\n]+-Program\s+\$Program[^\n]+-RemoteAddress\s+Any/);
+  assert.match(windows, /Get-NetFirewallApplicationFilter/);
+  assert.match(windows, /Get-NetFirewallAddressFilter/);
+  assert.match(windows, /Get-NetFirewallPortFilter/);
+  assert.match(windows, /RemoteAddress[^\n]+-cne\s+['"]Any['"]/);
+  assert.match(windows, /RemotePort[^\n]+-cne\s+['"]443['"]/);
+  assert.match(windows, /@\(['"]TCP['"],\s*['"]6['"]\)\s+-notcontains\s+\[string\]\$Port\.Protocol/);
+  assert.doesNotMatch(windows, /New-NetFirewallDynamicKeywordAddress|Update-NetFirewallDynamicKeywordAddress/);
+  assert.doesNotMatch(windows, /Start-Job|RunnerAddressRefresher|Get-NetTCPConnection/);
   assert.match(windows, /Get-DnsClientServerAddress/);
   assert.match(
     windows,
@@ -451,132 +399,12 @@ test('Windows offline build pins bounded runner-config and observed control-plan
   );
   assert.doesNotMatch(windows, /WriteAll(?:Text|Lines|Bytes)\([^\n]*(?:Uri|Url|Diag|Log)/i);
 
-  assert.doesNotMatch(windows, /HostsOverlay|HostsSnapshot|RunnerHostPins/);
-  const keywordAt = windows.indexOf('New-NetFirewallDynamicKeywordAddress');
-  const blockAt = windows.search(/Set-NetFirewallProfile[^\n]+-DefaultOutboundAction\s+Block/);
-  const resolutions = [...windows.matchAll(/\[Net\.Dns\]::GetHostAddresses\(\$Hostname\)/g)].map(({ index }) => index);
-  assert.match(
-    windows.slice(keywordAt, blockAt),
-    /Start-Job[\s\S]+Assert-RunnerAddressRefresherHealthy/,
-  );
-  assert.ok(resolutions.some((index) => index < blockAt), 'runner hosts must be resolved before outbound blocking');
-  assert.match(windows.slice(blockAt), /Assert-RunnerAddressRefresherHealthy[\s\S]+Build-Once[\s\S]+Assert-RunnerAddressRefresherHealthy/);
   assert.match(
     windows,
-    /finally\s*\{[\s\S]*Stop-Job[\s\S]*Remove-Job[\s\S]*Remove-NetFirewallRule[\s\S]*Remove-NetFirewallDynamicKeywordAddress/,
+    /finally\s*\{[\s\S]*Set-NetFirewallProfile[\s\S]*Enable-NetFirewallRule[\s\S]*Remove-NetFirewallRule/,
   );
 
   assert.doesNotMatch(windows, /New-NetFirewallRule[^\n]+-Service\s+Dnscache[^\n]+-RemoteAddress\s+Any/i);
-});
-
-test('Windows runner config supplies control-plane hosts when diagnostics contain no URLs', {
-  skip: process.platform !== 'win32',
-}, async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'context-relay-runner-config-'));
-  t.after(() => rm(root, { force: true, recursive: true }));
-  await mkdir(join(root, 'bin'));
-  await writeFile(join(root, '.runner'), `${JSON.stringify({
-    ServerUrl: 'https://fixture.actions.githubusercontent.com/job',
-    ServerUrlV2: 'https://broker-fixture.actions.githubusercontent.com/message',
-  })}\n`);
-
-  const harness = String.raw`
-$ErrorActionPreference = 'Stop'
-Set-StrictMode -Version Latest
-$tokens = $null
-$errors = $null
-$ast = [Management.Automation.Language.Parser]::ParseFile(
-  $env:CONTEXT_RELAY_TEST_WINDOWS_BUILDER,
-  [ref]$tokens,
-  [ref]$errors
-)
-if ($errors.Count -ne 0) { throw 'builder parse failed' }
-foreach ($name in @('Fail', 'Read-RunnerDiagnosticLog', 'Get-RunnerControlPlaneHosts')) {
-  $definition = $ast.Find({
-    param($node)
-    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
-  }, $true)
-  if ($null -eq $definition) { throw "missing function: $name" }
-  Invoke-Expression $definition.Extent.Text
-}
-function Get-DnsClientCache {
-  [CmdletBinding()]
-  param([object]$Type, [object]$Status)
-}
-$programs = @(
-  (Join-Path $env:CONTEXT_RELAY_TEST_RUNNER_ROOT 'bin\Runner.Worker.exe'),
-  (Join-Path $env:CONTEXT_RELAY_TEST_RUNNER_ROOT 'bin\Runner.Listener.exe')
-)
-@(Get-RunnerControlPlaneHosts $programs) | ConvertTo-Json -Compress
-`;
-  const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', harness], {
-    env: {
-      ...process.env,
-      CONTEXT_RELAY_TEST_RUNNER_ROOT: root,
-      CONTEXT_RELAY_TEST_WINDOWS_BUILDER: fileURLToPath(new URL(
-        '../third_party/sidecars/semgrep/build-public-source-windows.ps1',
-        import.meta.url,
-      )),
-      CONTEXT_RELAY_RUN_SERVICE_HOSTS: [
-        'run-actions.actions.githubusercontent.com',
-        'run-actions-1-azure-eastus.actions.githubusercontent.com',
-      ].join(','),
-    },
-    maxBuffer: 1024 * 1024,
-  });
-  assert.deepEqual(JSON.parse(stdout), [
-    'broker-fixture.actions.githubusercontent.com',
-    'fixture.actions.githubusercontent.com',
-    'results-receiver.actions.githubusercontent.com',
-    'run-actions-1-azure-eastus.actions.githubusercontent.com',
-    'run-actions.actions.githubusercontent.com',
-  ]);
-});
-
-test('Windows dynamic keyword comparison accepts only the exact normalized public address set', {
-  skip: process.platform !== 'win32',
-}, async () => {
-  const harness = String.raw`
-$ErrorActionPreference = 'Stop'
-$tokens = $null
-$errors = $null
-$ast = [Management.Automation.Language.Parser]::ParseFile(
-  $env:CONTEXT_RELAY_TEST_WINDOWS_BUILDER,
-  [ref]$tokens,
-  [ref]$errors
-)
-if ($errors.Count -ne 0) { throw 'builder parse failed' }
-foreach ($name in @('Test-RunnerControlPlaneAddress', 'Test-RunnerDynamicKeywordAddresses')) {
-  $definition = $ast.Find({
-    param($node)
-    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
-  }, $true)
-  if ($null -eq $definition) { throw "missing function: $name" }
-  Invoke-Expression $definition.Extent.Text
-}
-$expected = @('13.107.6.175', '2606:4700:4700::1111', '8.8.8.8')
-if (-not (Test-RunnerDynamicKeywordAddresses '8.8.8.8,13.107.6.175,2606:4700:4700::1111' $expected)) {
-  throw 'Windows-normalized order was rejected'
-}
-if (Test-RunnerDynamicKeywordAddresses '8.8.8.8,8.8.8.8' @('8.8.8.8', '13.107.6.175')) {
-  throw 'duplicate address set was accepted'
-}
-if (Test-RunnerDynamicKeywordAddresses '10.0.0.1' @('10.0.0.1')) {
-  throw 'private address set was accepted'
-}
-'ok'
-`;
-  const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', harness], {
-    env: {
-      ...process.env,
-      CONTEXT_RELAY_TEST_WINDOWS_BUILDER: fileURLToPath(new URL(
-        '../third_party/sidecars/semgrep/build-public-source-windows.ps1',
-        import.meta.url,
-      )),
-    },
-    maxBuffer: 1024 * 1024,
-  });
-  assert.equal(stdout.trim(), 'ok');
 });
 
 test('Windows runtime DLL closure never searches ambient PATH', async () => {

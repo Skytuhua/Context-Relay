@@ -199,7 +199,7 @@ async function addNativeEvidence(artifact, target, bootstrap, bundleEvidence) {
     await writeFile(
       join(artifact, `build-${slot}.offline-egress.v1.json`),
       target === 'windows-x86_64'
-        ? '{"mechanism":"windows-firewall-default-outbound-block-active-peer-dns-refreshed-runner-address-allow","probe":"hostile-outbound-tcp-denied","schemaVersion":1}\n'
+        ? '{"mechanism":"windows-firewall-default-outbound-block-hash-pinned-runner-tcp443-allow","probe":"hostile-outbound-tcp-denied","schemaVersion":1}\n'
         : '{"mechanism":"macos-sandbox-exec-network-deny","probe":"hostile-outbound-tcp-denied-with-eperm-or-eacces","schemaVersion":1}\n',
     );
   }
