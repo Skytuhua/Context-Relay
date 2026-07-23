@@ -199,6 +199,7 @@ fn enabled_semgrep_rejects_an_internally_incomplete_source_lock() {
         "--no-git-ignore",
         "--x-ignore-semgrepignore-files",
         "--time",
+        "--x-parmap",
         "--jobs=1",
         "--timeout=30",
         "--timeout-threshold=1",

@@ -263,7 +263,7 @@
         "revision": "bd614accba811b407ae5c9ec6f1eecd3bdc29911",
         "tree": "ad8e607874820dc7253d58997736463ed258ea34",
         "materialPath": "third_party/sidecars/semgrep/source-lock.v1.json",
-        "materialSha256": "d5c29931ef5e68a5f6840c9bb27557cbbc8b22ccbb9ae13592c97b928d65dd26"
+        "materialSha256": "564d65f05f8b81b7cbc83271a6f97a6882af7492efa56a29f33bfab73c4f481e"
       },
       "license": {
         "spdx": "LGPL-2.1-or-later",
@@ -288,12 +288,12 @@
         {
           "role": "macos-build",
           "path": "third_party/sidecars/semgrep/build-public-source-macos.sh",
-          "sha256": "5a16b8385c247c820904b814a43d8e7fdd70e1e06662031471e37aef15064a78"
+          "sha256": "00954cab36858cea0b1fca2f1e4356d12f3c250db437e9f50e540300c5f504fd"
         },
         {
           "role": "windows-build",
           "path": "third_party/sidecars/semgrep/build-public-source-windows.ps1",
-          "sha256": "9feef3967f376a520d8cb32034cb3bd2f1958c0e632850dabb35794f803b9dd0"
+          "sha256": "6d49076f2431d70d69090659d82150d48cfa709dc35379ff22b61adafaf097a2"
         },
         {
           "role": "windows-builder-evidence-schema",
@@ -308,7 +308,7 @@
         {
           "role": "native-ci-provenance",
           "path": "third_party/sidecars/semgrep/native-ci-provenance.v1.json",
-          "sha256": "52d166dcd02696865c44218499c28fba06bad30769faf048daaad55d82ec76f6"
+          "sha256": "7a6f7a326dee7053c61e8e6ab720f7873d4e83eae143beda75868a84627a925a"
         },
         {
           "role": "source-inventory-generator",
@@ -323,7 +323,7 @@
         {
           "role": "source-bundle-evidence",
           "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
-          "sha256": "7f12b5c33888b199ce4554bc725621717363b4fbe4afc4c86d4ebf68d2e7c1e2"
+          "sha256": "6b6142658f9d0709e917457a15c7c2c1cc84e3109ff02d5edee4731caee9bb58"
         },
         {
           "role": "manifest-rule",
@@ -352,6 +352,7 @@
           "--no-git-ignore",
           "--x-ignore-semgrepignore-files",
           "--time",
+          "--x-parmap",
           "--jobs=1",
           "--timeout=30",
           "--timeout-threshold=1",
@@ -360,7 +361,7 @@
           "<staged-rule>",
           "<staged-target>"
         ],
-        "sha256": "2ec1e7944e84d56222cf9717f82e429dfbceee6895041d898a08c7f20bfbd05d"
+        "sha256": "8c3cb0eaef65190c605fe0b1d388f22b068fb24e12ad41d087e95b6a0ffdbbe7"
       },
       "targets": [
         {

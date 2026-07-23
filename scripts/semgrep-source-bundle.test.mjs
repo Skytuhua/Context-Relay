@@ -509,6 +509,7 @@ test('native public-source builds smoke the literal closed scan template outside
     '--no-git-ignore',
     '--x-ignore-semgrepignore-files',
     '--time',
+    '--x-parmap',
     '--jobs=1',
     '--timeout=30',
     '--timeout-threshold=1',
