@@ -145,6 +145,21 @@ test('applies a declared Semgrep project patch without creating a worker-domain 
   assert.equal(await readFile(target, 'utf8'), patched);
 });
 
+test('the single-job Semgrep patch keeps Eio scheduling without a worker domain', async () => {
+  const inventory = JSON.parse(
+    await readFile(new URL('../third_party/sidecars/semgrep/patches.v1.json', import.meta.url)),
+  );
+  const patch = inventory.patches.find(({ id }) => id === 'semgrep-single-job-current-domain');
+  assert.ok(patch);
+  const replacement = patch.replacements[0].after;
+  const singleJobBranch = replacement.slice(
+    replacement.indexOf('if domain_count = 1 then'),
+    replacement.indexOf('\n  else\n'),
+  );
+  assert.match(singleJobBranch, /Eio\.Fiber\.List\.map ~max_fibers:1/);
+  assert.doesNotMatch(singleJobBranch, /Executor_pool|domain_mgr|Domain/);
+});
+
 test('both public-source builders apply the bundle-carried patch inventory', async () => {
   const [generator, macos, windows] = await Promise.all([
     readFile(new URL('./semgrep-source-bundle.mjs', import.meta.url), 'utf8'),
