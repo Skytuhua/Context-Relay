@@ -773,6 +773,7 @@ try {
     [pscustomobject]@{ Id = $KeywordId; Keyword = $_ }
   })
   $RunnerKeywordIds = [string[]]@($RunnerKeywordRecords | ForEach-Object Id)
+  Clear-DnsClientCache -ErrorAction Stop
   foreach ($Hostname in $RunnerHostnames) {
     $Addresses = @([Net.Dns]::GetHostAddresses($Hostname) | Where-Object { Test-RunnerControlPlaneAddress $_ })
     if ($Addresses.Count -eq 0 -or $Addresses.Count -gt 16) {

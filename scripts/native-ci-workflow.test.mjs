@@ -433,8 +433,13 @@ test('Windows offline build pins bounded runner-config and observed control-plan
   assert.doesNotMatch(windows, /WriteAll(?:Text|Lines|Bytes)\([^\n]*(?:Uri|Url|Diag|Log)/i);
 
   assert.doesNotMatch(windows, /HostsOverlay|HostsSnapshot|RunnerHostPins/);
+  const keywordAt = windows.indexOf('New-NetFirewallDynamicKeywordAddress');
   const blockAt = windows.search(/Set-NetFirewallProfile[^\n]+-DefaultOutboundAction\s+Block/);
   const resolutions = [...windows.matchAll(/\[Net\.Dns\]::GetHostAddresses\(\$Hostname\)/g)].map(({ index }) => index);
+  assert.match(
+    windows.slice(keywordAt, blockAt),
+    /Clear-DnsClientCache\s+-ErrorAction\s+Stop[\s\S]+\[Net\.Dns\]::GetHostAddresses\(\$Hostname\)/,
+  );
   assert.ok(resolutions.some((index) => index < blockAt), 'runner hosts must be resolved before outbound blocking');
   assert.ok(resolutions.some((index) => index > blockAt), 'dynamic runner hosts must resolve after outbound blocking');
   assert.match(windows.slice(blockAt), /Clear-DnsClientCache\s+-ErrorAction\s+Stop/);
