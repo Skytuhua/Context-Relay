@@ -416,9 +416,13 @@ test('Windows offline build pins bounded runner-config and observed control-plan
     /\[void\]\$Hosts\.Add\(['"]results-receiver\.actions\.githubusercontent\.com['"]\)/,
   );
   assert.match(windows, /New-NetFirewallDynamicKeywordAddress/);
+  assert.match(windows, /Get-MpComputerStatus/);
+  assert.match(windows, /AMProductVersion[\s\S]{0,500}4\.18\.2209\.7/);
+  assert.match(windows, /Set-MpPreference[^\n]+-EnableNetworkProtection\s+AuditMode/);
   assert.match(windows, /['"]\*\.actions\.githubusercontent\.com['"]/);
   assert.match(windows, /['"]\*\.blob\.core\.windows\.net['"]/);
   assert.match(windows, /-AutoResolve\s+\$true/);
+  assert.match(windows, /Get-NetFirewallDynamicKeywordAddress[^\n]+[\s\S]{0,500}\.Addresses/);
   assert.match(windows, /New-NetFirewallRule[^\n]+-RemoteDynamicKeywordAddresses\s+\$RunnerKeywordIds/);
   assert.doesNotMatch(windows, /New-NetFirewallRule[^\n]+-Program\s+\$Program[^\n]+-RemoteAddress\s+Any/);
   assert.match(windows, /Get-DnsClientServerAddress/);
@@ -437,7 +441,7 @@ test('Windows offline build pins bounded runner-config and observed control-plan
   assert.match(windows.slice(blockAt), /dynamic runner control-plane hostname resolution failed/);
   assert.match(
     windows,
-    /finally\s*\{[\s\S]*Remove-NetFirewallRule[\s\S]*Remove-NetFirewallDynamicKeywordAddress/,
+    /finally\s*\{[\s\S]*Remove-NetFirewallRule[\s\S]*Remove-NetFirewallDynamicKeywordAddress[\s\S]*Set-NetworkProtectionMode\s+\$OriginalNetworkProtection/,
   );
 
   assert.doesNotMatch(windows, /New-NetFirewallRule[^\n]+-Service\s+Dnscache[^\n]+-RemoteAddress\s+Any/i);

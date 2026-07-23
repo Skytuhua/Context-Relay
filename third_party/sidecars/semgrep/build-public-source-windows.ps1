@@ -424,6 +424,39 @@ function Test-RunnerControlPlaneAddress([Net.IPAddress]$Address) {
   return $true
 }
 
+function Wait-RunnerDynamicKeywordAddress([string]$Id, [string]$ExpectedKeyword) {
+  $Deadline = [DateTime]::UtcNow.AddSeconds(10)
+  do {
+    $Keyword = Get-NetFirewallDynamicKeywordAddress -Id $Id -ErrorAction Stop
+    $Addresses = @(([string]$Keyword.Addresses -split ',') |
+      ForEach-Object { $_.Trim() } |
+      Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($Addresses.Count -gt 0 -and $Addresses.Count -le 128) {
+      $AllPublic = $true
+      foreach ($Text in $Addresses) {
+        [Net.IPAddress]$Address = $null
+        if (-not [Net.IPAddress]::TryParse($Text, [ref]$Address) -or
+            -not (Test-RunnerControlPlaneAddress $Address)) {
+          $AllPublic = $false
+          break
+        }
+      }
+      if ($AllPublic) { return }
+    }
+    Start-Sleep -Milliseconds 200
+  } while ([DateTime]::UtcNow -lt $Deadline)
+  Fail "runner dynamic FQDN keyword has no bounded public address set: $ExpectedKeyword"
+}
+
+function Set-NetworkProtectionMode([int]$Mode) {
+  switch ($Mode) {
+    0 { Set-MpPreference -EnableNetworkProtection Disabled -ErrorAction Stop }
+    1 { Set-MpPreference -EnableNetworkProtection Enabled -ErrorAction Stop }
+    2 { Set-MpPreference -EnableNetworkProtection AuditMode -ErrorAction Stop }
+    default { Fail 'Microsoft Defender Network Protection mode is unsupported' }
+  }
+}
+
 function Test-DnsResolverAddress([Net.IPAddress]$Address) {
   if ($Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -and
       $Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetworkV6) { return $false }
@@ -685,6 +718,18 @@ $RunnerFqdns = [string[]]@(
 if ($RunnerFqdns.Count -gt 34 -or @($RunnerFqdns | Select-Object -Unique).Count -ne $RunnerFqdns.Count) {
   Fail 'runner FQDN allowlist is duplicated or unbounded'
 }
+$DefenderStatus = Get-MpComputerStatus -ErrorAction Stop
+[Version]$DefenderVersion = $null
+if (-not $DefenderStatus.AMServiceEnabled -or -not $DefenderStatus.AntivirusEnabled -or
+    -not [Version]::TryParse([string]$DefenderStatus.AMProductVersion, [ref]$DefenderVersion) -or
+    $DefenderVersion -lt [Version]'4.18.2209.7') {
+  Fail 'Microsoft Defender Antivirus does not meet the dynamic FQDN firewall requirement'
+}
+$OriginalNetworkProtection = [int](Get-MpPreference -ErrorAction Stop).EnableNetworkProtection
+if ($OriginalNetworkProtection -notin @(0, 1, 2)) {
+  Fail 'Microsoft Defender Network Protection has an unsupported initial mode'
+}
+$NetworkProtectionChanged = $OriginalNetworkProtection -eq 0
 $ResolverSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($Resolver in @(Get-DnsClientServerAddress -ErrorAction Stop | ForEach-Object ServerAddresses)) {
   [Net.IPAddress]$Address = $null
@@ -710,7 +755,14 @@ $DnsRuleNames = [Collections.Generic.List[string]]::new()
 $DynamicKeywordIds = [Collections.Generic.List[string]]::new()
 $DisabledOutboundRuleNames = [Collections.Generic.List[string]]::new()
 try {
-  $RunnerKeywordIds = [string[]]@($RunnerFqdns | ForEach-Object {
+  if ($NetworkProtectionChanged) {
+    Set-NetworkProtectionMode 2
+  }
+  $EffectiveNetworkProtection = [int](Get-MpPreference -ErrorAction Stop).EnableNetworkProtection
+  if ($EffectiveNetworkProtection -notin @(1, 2)) {
+    Fail 'Microsoft Defender Network Protection is not active for dynamic FQDN resolution'
+  }
+  $RunnerKeywordRecords = @($RunnerFqdns | ForEach-Object {
     $KeywordId = '{' + [Guid]::NewGuid().ToString() + '}'
     $DynamicKeywordIds.Add($KeywordId)
     New-NetFirewallDynamicKeywordAddress -Id $KeywordId -Keyword $_ -AutoResolve $true -ErrorAction Stop | Out-Null
@@ -718,13 +770,17 @@ try {
     if (-not $Keyword.AutoResolve -or [string]$Keyword.Keyword -cne $_) {
       Fail "runner dynamic FQDN keyword is not exact and active: $_"
     }
-    $KeywordId
+    [pscustomobject]@{ Id = $KeywordId; Keyword = $_ }
   })
+  $RunnerKeywordIds = [string[]]@($RunnerKeywordRecords | ForEach-Object Id)
   foreach ($Hostname in $RunnerHostnames) {
     $Addresses = @([Net.Dns]::GetHostAddresses($Hostname) | Where-Object { Test-RunnerControlPlaneAddress $_ })
     if ($Addresses.Count -eq 0 -or $Addresses.Count -gt 16) {
       Fail "runner control-plane hostname has no bounded public address set: $Hostname"
     }
+  }
+  foreach ($Record in @($RunnerKeywordRecords | Where-Object { $_.Keyword -match '(?:^|\.)actions\.githubusercontent\.com$' })) {
+    Wait-RunnerDynamicKeywordAddress $Record.Id $Record.Keyword
   }
   $RuleIndex = 0
   foreach ($Program in $RunnerPrograms) {
@@ -790,7 +846,7 @@ try {
   if (Test-OutboundTcp $ProbeAddress) { Fail 'offline firewall policy was removed during the native build' }
   [IO.File]::WriteAllText(
     (Join-Path $OutputRoot "$BuildLabel.offline-egress.v1.json"),
-    '{"mechanism":"windows-firewall-default-outbound-block-runner-fqdn-allow","probe":"hostile-outbound-tcp-denied","schemaVersion":1}' + "`n",
+    '{"mechanism":"windows-firewall-default-outbound-block-defender-fqdn-runner-allow","probe":"hostile-outbound-tcp-denied","schemaVersion":1}' + "`n",
     [Text.UTF8Encoding]::new($false)
   )
 } finally {
@@ -835,6 +891,17 @@ try {
       }
     } catch {
       $RestoreFailures.Add("dynamic keyword ${KeywordId}: $($_.Exception.Message)")
+    }
+  }
+  if ($NetworkProtectionChanged) {
+    try {
+      Set-NetworkProtectionMode $OriginalNetworkProtection
+      $RestoredNetworkProtection = [int](Get-MpPreference -ErrorAction Stop).EnableNetworkProtection
+      if ($RestoredNetworkProtection -ne $OriginalNetworkProtection) {
+        throw "restored value differs: $RestoredNetworkProtection"
+      }
+    } catch {
+      $RestoreFailures.Add("Microsoft Defender Network Protection: $($_.Exception.Message)")
     }
   }
   Clear-DnsClientCache -ErrorAction SilentlyContinue

@@ -1108,8 +1108,8 @@ test('Semgrep records the complete recursive source inventory but remains disabl
   );
   assert.equal('sourceAssetUrl' in lock, false);
   assert.equal('sourceBundleSha256' in lock, false);
-  assert.equal(bundleEvidence.bundle.sha256, '17f81c5e9523e8741de4d9ef63631b162d4fe2d3afebcf344d6d9f68c710d799');
-  assert.equal(bundleEvidence.bundle.size, 1149629440);
+  assert.equal(bundleEvidence.bundle.sha256, '8ebd3de097032af6d56bb213e080414dcb4344386b4bff226ffeff4b9a1705a6');
+  assert.equal(bundleEvidence.bundle.size, 1149632512);
   assert.equal(bundleEvidence.bundle.payloadEntries, 39540);
   assert.equal(bundleEvidence.bundle.recordedLinks, 222);
   assert.equal(bundleEvidence.sourceLockSha256, '2db57a4d26daa47612ec223f8941d4b95028153f49c0b45d51257a7fdedaffc9');

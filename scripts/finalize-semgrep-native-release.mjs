@@ -70,7 +70,7 @@ const TARGETS = new Map([
     smokeJob: 'native-isolation-windows-x64',
     sourceTarget: 'windows-x86_64',
     pendingReason: 'pending_two_matching_public_source_builds_and_no_python_smoke',
-    offline: '{"mechanism":"windows-firewall-default-outbound-block-runner-control-plane-allow","probe":"hostile-outbound-tcp-denied","schemaVersion":1}\n',
+    offline: '{"mechanism":"windows-firewall-default-outbound-block-defender-fqdn-runner-allow","probe":"hostile-outbound-tcp-denied","schemaVersion":1}\n',
   }],
   ['macos-aarch64', {
     executable: 'osemgrep',
