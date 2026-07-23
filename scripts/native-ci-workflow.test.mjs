@@ -416,6 +416,7 @@ test('Windows offline build pins bounded runner-config and observed control-plan
     /\[void\]\$Hosts\.Add\(['"]results-receiver\.actions\.githubusercontent\.com['"]\)/,
   );
   assert.match(windows, /New-NetFirewallDynamicKeywordAddress/);
+  assert.match(windows, /['"]\*\.actions\.githubusercontent\.com['"]/);
   assert.match(windows, /['"]\*\.blob\.core\.windows\.net['"]/);
   assert.match(windows, /-AutoResolve\s+\$true/);
   assert.match(windows, /New-NetFirewallRule[^\n]+-RemoteDynamicKeywordAddresses\s+\$RunnerKeywordIds/);

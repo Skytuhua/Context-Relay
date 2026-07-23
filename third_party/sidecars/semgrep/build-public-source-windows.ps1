@@ -677,8 +677,12 @@ foreach ($Program in $RunnerPrograms) {
   $RunnerProgramHashes[$Program] = (Get-FileHash -Algorithm SHA256 -LiteralPath $Program).Hash
 }
 $RunnerHostnames = @(Get-RunnerControlPlaneHosts $RunnerPrograms)
-$RunnerFqdns = [string[]]@($RunnerHostnames + '*.blob.core.windows.net')
-if ($RunnerFqdns.Count -gt 33 -or @($RunnerFqdns | Select-Object -Unique).Count -ne $RunnerFqdns.Count) {
+$RunnerFqdns = [string[]]@(
+  $RunnerHostnames +
+  '*.actions.githubusercontent.com' +
+  '*.blob.core.windows.net'
+)
+if ($RunnerFqdns.Count -gt 34 -or @($RunnerFqdns | Select-Object -Unique).Count -ne $RunnerFqdns.Count) {
   Fail 'runner FQDN allowlist is duplicated or unbounded'
 }
 $ResolverSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
