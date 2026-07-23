@@ -237,11 +237,11 @@ build_once() {
   mkdir -p "$CURRENT/bundle" "$CURRENT/home" "$CURRENT/tmp"
   tar -xf "$SOURCE_BUNDLE" -C "$CURRENT/bundle"
   "$NODE" "$WORKSPACE/scripts/semgrep-source-bundle.mjs" --materialize-links "$CURRENT/bundle" >/dev/null
-  cp -RL "$CURRENT/bundle/pins" "$CURRENT/pins"
-  test -z "$(find "$CURRENT/pins" -type l -print -quit)" || die "flattened pin sources retain symbolic links"
   "$NODE" "$CURRENT/bundle/support/scripts/apply-semgrep-source-patches.mjs" \
     "$CURRENT/bundle/support/third_party/sidecars/semgrep/patches.v1.json" \
-    "$CURRENT/pins" >/dev/null
+    "$CURRENT/bundle" >/dev/null
+  cp -RL "$CURRENT/bundle/pins" "$CURRENT/pins"
+  test -z "$(find "$CURRENT/pins" -type l -print -quit)" || die "flattened pin sources retain symbolic links"
   PROJECT="$CURRENT/bundle/sources/semgrep"
   test -f "$PROJECT/Makefile" || die "Semgrep source is missing"
   test "$SOURCE_REVISION" = bd614accba811b407ae5c9ec6f1eecd3bdc29911

@@ -11,11 +11,10 @@ use std::{
         unix::{
             ffi::OsStrExt,
             fs::{PermissionsExt, symlink},
-            process::CommandExt,
         },
     },
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -516,10 +515,7 @@ fn real_sidecar_semgrep_clean_and_finding_use_the_closed_policy() {
         ..
     } = clean_response
     else {
-        panic!(
-            "real Semgrep clean scan did not complete: {clean_response:?}; bounded direct diagnostic: {}",
-            fixture.diagnose_semgrep(b"osemgrep\n")
-        );
+        panic!("real Semgrep clean scan did not complete: {clean_response:?}");
     };
     assert_eq!(disposition, RunDisposition::Clean);
     assert_eq!(outputs.len(), 1);
@@ -540,10 +536,7 @@ fn real_sidecar_semgrep_clean_and_finding_use_the_closed_policy() {
         ..
     } = finding_response
     else {
-        panic!(
-            "real Semgrep finding scan did not complete: {finding_response:?}; bounded direct diagnostic: {}",
-            fixture.diagnose_semgrep(b"python.exe\n")
-        );
+        panic!("real Semgrep finding scan did not complete: {finding_response:?}");
     };
     assert_eq!(disposition, RunDisposition::Findings(1));
     assert_eq!(outputs.len(), 1);
@@ -645,81 +638,6 @@ impl RealFixture {
         launcher
             .run(&self.closure, request)
             .unwrap_or_else(|error| panic!("{error:?}; lifecycle={:?}", self.journal.events()))
-    }
-
-    fn diagnose_semgrep(&self, input: &[u8]) -> String {
-        assert_eq!(self.closure.sidecar(), SidecarId::Osemgrep);
-        let root = self.root.join("semgrep-bounded-direct-diagnostic");
-        let config = root.join("config/semgrep/package.yml");
-        let target = root.join("input/semgrep-target/runtime-inventory.txt");
-        fs::create_dir_all(config.parent().unwrap()).unwrap();
-        fs::create_dir_all(target.parent().unwrap()).unwrap();
-        fs::copy(
-            workspace_root().join("third_party/sidecars/policies/semgrep-package.yml"),
-            &config,
-        )
-        .unwrap();
-        fs::write(&target, input).unwrap();
-        for directory in ["home", "data", "cache", "temp", "runtime"] {
-            fs::create_dir_all(root.join(directory)).unwrap();
-        }
-        let executable = self
-            .closure
-            .root()
-            .join(self.closure.executable().path().as_str());
-        let argv = SidecarCommand::OsemgrepScanPackage.argv();
-        let mut command = Command::new(executable);
-        command
-            .args(argv.iter().skip(1))
-            .current_dir(&root)
-            .env_clear()
-            .env("HOME", root.join("home"))
-            .env("USERPROFILE", root.join("home"))
-            .env("APPDATA", root.join("data"))
-            .env("LOCALAPPDATA", root.join("data"))
-            .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("XDG_DATA_HOME", root.join("data"))
-            .env("XDG_CACHE_HOME", root.join("cache"))
-            .env("TMP", root.join("temp"))
-            .env("TEMP", root.join("temp"))
-            .env("TMPDIR", root.join("temp"))
-            .env("PATH", root.join("runtime"))
-            .env("LANG", "C.UTF-8")
-            .env("LC_ALL", "C.UTF-8")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        unsafe {
-            command.pre_exec(|| {
-                let no_children = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                if libc::setrlimit(libc::RLIMIT_NPROC, &no_children) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = command.spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let timed_out = loop {
-            if child.try_wait().unwrap().is_some() {
-                break false;
-            }
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                break true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let output = child.wait_with_output().unwrap();
-        format!(
-            "timed_out={timed_out}, status={:?}, stdout={}, stderr={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
     }
 
     fn assert_complete_lifecycles(&self, count: usize) {

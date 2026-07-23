@@ -278,7 +278,7 @@ function Build-Once([string]$Label) {
   Invoke-Checked {
     & $Node (Join-Path $Bundle 'support\scripts\apply-semgrep-source-patches.mjs') `
       (Join-Path $Bundle 'support\third_party\sidecars\semgrep\patches.v1.json') `
-      (Join-Path $Bundle 'pins') | Out-Null
+      $Bundle | Out-Null
   } 'source patch application'
   $Project = Join-Path $Bundle 'sources\semgrep'
   if (-not (Test-Path -LiteralPath (Join-Path $Project 'Makefile') -PathType Leaf)) { Fail 'Semgrep source is missing' }

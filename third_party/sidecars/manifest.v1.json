@@ -278,22 +278,22 @@
         {
           "role": "patch-inventory",
           "path": "third_party/sidecars/semgrep/patches.v1.json",
-          "sha256": "489c1c63776c82f14c62dc0735429660da66cca076dbe05c92df6e7143c80f38"
+          "sha256": "cca2af4444c17d96c8eb868df7c5501ec20f135ed43ccbe3215a6d404cf9fa07"
         },
         {
           "role": "source-patch-applicator",
           "path": "scripts/apply-semgrep-source-patches.mjs",
-          "sha256": "6212a1ccc417c502955e74715467f5c72b5e1ce874538e58a3cb288e6d3b13e4"
+          "sha256": "fd381cc85344e592fd15199d706cd19b0dcad1e706aae6e0df1a5a8efe5975ea"
         },
         {
           "role": "macos-build",
           "path": "third_party/sidecars/semgrep/build-public-source-macos.sh",
-          "sha256": "915c0ecab1d408398fb456fd8460ee644943422f52290ab76fd2613a5255ae10"
+          "sha256": "5a16b8385c247c820904b814a43d8e7fdd70e1e06662031471e37aef15064a78"
         },
         {
           "role": "windows-build",
           "path": "third_party/sidecars/semgrep/build-public-source-windows.ps1",
-          "sha256": "cacd830a2bb13f459a09d5db8b7f3938a9bcdcabaefe864f5814998f9f24b9ad"
+          "sha256": "79729aa3ffd24e63e144c6406f18c8e718195516a18ff59c026fa325f2d3f2b6"
         },
         {
           "role": "windows-builder-evidence-schema",
@@ -323,7 +323,7 @@
         {
           "role": "source-bundle-evidence",
           "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
-          "sha256": "bab98296abe5ba477750755d93c8c76825ec4ca1e85663d77e2e519584417920"
+          "sha256": "d4e3de2f6e82fd4adc2e190e322d070919cf92aaf160a6cfa99fa70e8b008387"
         },
         {
           "role": "manifest-rule",

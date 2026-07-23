@@ -70,12 +70,13 @@ function validateManifest(value) {
   return value.patches.map((patch, patchIndex) => {
     const label = `patch[${patchIndex}]`;
     exactKeys(patch, [
-      'id', 'package', 'revision', 'path', 'baseSha256', 'patchedSha256',
+      'id', 'package', 'revision', 'root', 'path', 'baseSha256', 'patchedSha256',
       'replacements', 'rationale',
     ], label);
     if (typeof patch.id !== 'string' || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(patch.id)
         || typeof patch.package !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._+-]*$/.test(patch.package)
         || typeof patch.revision !== 'string' || !/^[0-9a-f]{40}$/.test(patch.revision)
+        || !['pin', 'semgrep'].includes(patch.root)
         || typeof patch.baseSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(patch.baseSha256)
         || typeof patch.patchedSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(patch.patchedSha256)
         || patch.baseSha256 === patch.patchedSha256
@@ -101,11 +102,11 @@ function validateManifest(value) {
   });
 }
 
-export async function applySourcePatches({ manifestPath, pinsRoot }) {
-  if (typeof manifestPath !== 'string' || typeof pinsRoot !== 'string') fail('paths are required');
-  const root = resolve(pinsRoot);
-  const rootInfo = await lstat(root).catch(() => fail('pins root is missing'));
-  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) fail('pins root is invalid');
+export async function applySourcePatches({ bundleRoot, manifestPath }) {
+  if (typeof manifestPath !== 'string' || typeof bundleRoot !== 'string') fail('paths are required');
+  const root = resolve(bundleRoot);
+  const rootInfo = await lstat(root).catch(() => fail('bundle root is missing'));
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) fail('bundle root is invalid');
   const manifestBytes = await boundedRegularFile(resolve(manifestPath), MAX_MANIFEST_BYTES, 'manifest');
   let manifest;
   try {
@@ -116,10 +117,12 @@ export async function applySourcePatches({ manifestPath, pinsRoot }) {
   const patches = validateManifest(manifest);
   const results = [];
   for (const patch of patches) {
-    const target = resolve(join(root, patch.revision, ...patch.path.split('/')));
+    const target = patch.root === 'pin'
+      ? resolve(join(root, 'pins', patch.revision, ...patch.path.split('/')))
+      : resolve(join(root, 'sources', 'semgrep', ...patch.path.split('/')));
     const inside = relative(root, target);
     if (inside === '' || inside.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || isAbsolute(inside)) {
-      fail(`patch ${patch.id} target escapes the pins root`);
+      fail(`patch ${patch.id} target escapes the bundle root`);
     }
     const original = await boundedRegularFile(target, MAX_SOURCE_BYTES, `patch ${patch.id} source`);
     if (sha256(original) !== patch.baseSha256) fail(`patch ${patch.id} base sha256 mismatch`);
@@ -153,17 +156,23 @@ export async function applySourcePatches({ manifestPath, pinsRoot }) {
       await handle?.close().catch(() => {});
       await rm(temporary, { force: true }).catch(() => {});
     }
-    results.push({ id: patch.id, path: patch.path, revision: patch.revision, sha256: patch.patchedSha256 });
+    results.push({
+      id: patch.id,
+      path: patch.path,
+      revision: patch.revision,
+      root: patch.root,
+      sha256: patch.patchedSha256,
+    });
   }
   return results;
 }
 
 async function command() {
-  const [manifestPath, pinsRoot] = process.argv.slice(2);
-  if (!manifestPath || !pinsRoot || process.argv.length !== 4) {
-    fail('usage: apply-semgrep-source-patches.mjs PATCHES.v1.json PINS_ROOT');
+  const [manifestPath, bundleRoot] = process.argv.slice(2);
+  if (!manifestPath || !bundleRoot || process.argv.length !== 4) {
+    fail('usage: apply-semgrep-source-patches.mjs PATCHES.v1.json BUNDLE_ROOT');
   }
-  const result = await applySourcePatches({ manifestPath, pinsRoot });
+  const result = await applySourcePatches({ bundleRoot, manifestPath });
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 

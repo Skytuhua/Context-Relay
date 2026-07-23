@@ -6,6 +6,7 @@
       "id": "opentelemetry-client-cohttp-eio-lazy-authenticator",
       "package": "opentelemetry-client-cohttp-eio",
       "revision": "6cfa5f16d85ac65b602f732469b667bac4aca5ac",
+      "root": "pin",
       "path": "src/client-cohttp-eio/opentelemetry_client_cohttp_eio.ml",
       "baseSha256": "83829e6370fe445cad5f1a4ace923856e410a9b5fc4b526a8e325cf40ee590f5",
       "patchedSha256": "b3009e7230a0228782d0db8bfe47bfee83773039aa99e86fbe08d3df628db6c1",
@@ -20,6 +21,22 @@
         }
       ],
       "rationale": "Defer system CA discovery until an OpenTelemetry HTTP client is created."
+    },
+    {
+      "id": "semgrep-single-job-current-domain",
+      "package": "semgrep",
+      "revision": "bd614accba811b407ae5c9ec6f1eecd3bdc29911",
+      "root": "semgrep",
+      "path": "libs/parallelism/Concurrent.ml",
+      "baseSha256": "a1d4becebcbed4332124a95a7d1c1bee057181489daa76ad6d45f9f4e5710f37",
+      "patchedSha256": "b857098b40324b77cd3eaadeea70f720622a90620f4e85366f6f4838ad0b5524",
+      "replacements": [
+        {
+          "before": "let map ~(conf : Parallelism_config.eio_state) ~domain_count f l =\n  Eio.Switch.run @@ fun sw ->\n  let domain_mgr = Eio.Stdenv.domain_mgr conf.env in\n  let domain_count = max 1 (capped_length domain_count l) in\n  let pool = Executor_pool.create ~sw ~domain_count domain_mgr in\n\n  (* nosemgrep: no-logs-in-library *)\n  Logs.debug (fun m ->\n      m \"Mapping %d elements across %d domains\" (List.length l) domain_count);\n\n  Eio.Fiber.List.map ~max_fibers:domain_count\n    (fun elem ->\n      (* NOTE: [submit] blocks the fiber until the task returns a result.*)\n      (* Please see the comment block in [Hook.ml] concerning safe values of\n       * [weight], if you are intending on changing it! *)\n      match Executor_pool.submit pool ~weight:1.0 (fun () -> f elem) with\n      | Ok res -> Ok res\n      | Error err -> Error (elem, err))\n    l\n[@@tracing]\n",
+          "after": "let map ~(conf : Parallelism_config.eio_state) ~domain_count f l =\n  let domain_count = max 1 (capped_length domain_count l) in\n  if domain_count = 1 then\n    List.map\n      (fun elem ->\n        try Ok (f elem) with\n        | exn -> Error (elem, exn))\n      l\n  else\n    Eio.Switch.run @@ fun sw ->\n    let domain_mgr = Eio.Stdenv.domain_mgr conf.env in\n    let pool = Executor_pool.create ~sw ~domain_count domain_mgr in\n\n    (* nosemgrep: no-logs-in-library *)\n    Logs.debug (fun m ->\n        m \"Mapping %d elements across %d domains\" (List.length l) domain_count);\n\n    Eio.Fiber.List.map ~max_fibers:domain_count\n      (fun elem ->\n        (* NOTE: [submit] blocks the fiber until the task returns a result.*)\n        (* Please see the comment block in [Hook.ml] concerning safe values of\n         * [weight], if you are intending on changing it! *)\n        match Executor_pool.submit pool ~weight:1.0 (fun () -> f elem) with\n        | Ok res -> Ok res\n        | Error err -> Error (elem, err))\n      l\n[@@tracing]\n"
+        }
+      ],
+      "rationale": "Run explicitly single-job maps in the current domain so the closed runtime needs no worker domain."
     }
   ]
 }
