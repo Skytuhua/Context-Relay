@@ -52,7 +52,7 @@ fn semgrep_report(results: Vec<Value>, scanned: Vec<&str>) -> Value {
         "errors": [],
         "paths": { "scanned": scanned },
         "time": {
-            "rules": ["context-relay-no-python-runtime"],
+            "rules": ["config.semgrep.context-relay-no-python-runtime"],
             "rules_parse_time": 0.0,
             "profiling_times": {},
             "parsing_time": {
@@ -199,7 +199,7 @@ fn semgrep_requires_exact_schema_unique_paths_and_source_free_results() {
     );
 
     let result = json!({
-        "check_id": "context-relay-no-python-runtime",
+        "check_id": "config.semgrep.context-relay-no-python-runtime",
         "path": "input\\semgrep-target\\METADATA",
         "start": { "line": 1, "col": 1, "offset": 0 },
         "end": { "line": 1, "col": 7, "offset": 6 },
@@ -285,6 +285,7 @@ fn semgrep_timing_binds_the_exact_rule_paths_and_input_sizes() {
 
     for poisoned in [
         ("rules", json!([])),
+        ("rules", json!(["context-relay-no-python-runtime"])),
         ("profiling_times", json!([])),
         ("total_bytes", json!(10)),
         (

@@ -38,6 +38,7 @@ const SEMGREP_KEYS: [&str; 8] = [
     "profiling_results",
 ];
 const SEMGREP_WARNING: &str = "!!! You're using one or more options starting with '--x-'. These options are not part of the semgrep API. They will change or will be removed without notice !!! ";
+const SEMGREP_RULE_ID: &str = "config.semgrep.context-relay-no-python-runtime";
 
 pub fn validate_gitleaks_report(
     exit: i32,
@@ -480,7 +481,7 @@ fn validate_semgrep_result(
     identities: &mut BTreeSet<String>,
 ) -> Result<(), RunnerError> {
     if !exact_keys(result, &["check_id", "path", "start", "end", "extra"])
-        || result.get("check_id").and_then(Value::as_str) != Some("context-relay-no-python-runtime")
+        || result.get("check_id").and_then(Value::as_str) != Some(SEMGREP_RULE_ID)
     {
         return invalid();
     }
@@ -539,7 +540,7 @@ fn validate_semgrep_result(
     }
     let identity = format!(
         "{}:{path}:{}:{}:{}:{}:{}:{}",
-        "context-relay-no-python-runtime", start.0, start.1, start.2, end.0, end.1, end.2
+        SEMGREP_RULE_ID, start.0, start.1, start.2, end.0, end.1, end.2
     );
     identities
         .insert(identity)
@@ -583,9 +584,7 @@ fn validate_semgrep_time(
     ) || !time
         .get("rules")
         .and_then(Value::as_array)
-        .is_some_and(|rules| {
-            rules.len() == 1 && rules[0].as_str() == Some("context-relay-no-python-runtime")
-        })
+        .is_some_and(|rules| rules.len() == 1 && rules[0].as_str() == Some(SEMGREP_RULE_ID))
         || !empty_array(time.get("fixpoint_timeouts"))
         || !nonnegative_number(time.get("rules_parse_time"))
         || !time

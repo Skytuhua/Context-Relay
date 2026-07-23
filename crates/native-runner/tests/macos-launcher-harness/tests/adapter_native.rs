@@ -517,7 +517,7 @@ fn real_sidecar_semgrep_clean_and_finding_use_the_closed_policy() {
     else {
         panic!(
             "real Semgrep clean scan did not complete: {clean_response:?}; direct diagnostic: {}",
-            fixture.diagnose_semgrep_clean()
+            fixture.diagnose_semgrep(b"osemgrep\n")
         );
     };
     assert_eq!(disposition, RunDisposition::Clean);
@@ -539,7 +539,10 @@ fn real_sidecar_semgrep_clean_and_finding_use_the_closed_policy() {
         ..
     } = finding_response
     else {
-        panic!("real Semgrep finding scan did not complete: {finding_response:?}");
+        panic!(
+            "real Semgrep finding scan did not complete: {finding_response:?}; direct diagnostic: {}",
+            fixture.diagnose_semgrep(b"python.exe\n")
+        );
     };
     assert_eq!(disposition, RunDisposition::Findings(1));
     assert_eq!(outputs.len(), 1);
@@ -643,7 +646,7 @@ impl RealFixture {
             .unwrap_or_else(|error| panic!("{error:?}; lifecycle={:?}", self.journal.events()))
     }
 
-    fn diagnose_semgrep_clean(&self) -> String {
+    fn diagnose_semgrep(&self, input: &[u8]) -> String {
         assert_eq!(self.closure.sidecar(), SidecarId::Osemgrep);
         let root = self.root.join("semgrep-direct-diagnostic");
         let config = root.join("config/semgrep/package.yml");
@@ -655,7 +658,7 @@ impl RealFixture {
             &config,
         )
         .unwrap();
-        fs::write(&target, b"osemgrep\n").unwrap();
+        fs::write(&target, input).unwrap();
         let executable = self
             .closure
             .root()
