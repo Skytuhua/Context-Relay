@@ -415,34 +415,31 @@ test('Windows offline build pins bounded runner-config and observed control-plan
     windows,
     /\[void\]\$Hosts\.Add\(['"]results-receiver\.actions\.githubusercontent\.com['"]\)/,
   );
-  assert.match(windows, /\^\[a-z0-9\]\{3,24\}\\\.blob\\\.core\\\.windows\\\.net\$/);
+  assert.match(windows, /New-NetFirewallDynamicKeywordAddress/);
+  assert.match(windows, /['"]\*\.blob\.core\.windows\.net['"]/);
+  assert.match(windows, /-AutoResolve\s+\$true/);
+  assert.match(windows, /New-NetFirewallRule[^\n]+-RemoteDynamicKeywordAddresses\s+\$RunnerKeywordIds/);
+  assert.doesNotMatch(windows, /New-NetFirewallRule[^\n]+-Program\s+\$Program[^\n]+-RemoteAddress\s+Any/);
+  assert.match(windows, /Get-DnsClientServerAddress/);
   assert.match(
     windows,
-    /\$StorageHosts\.Count\s+-eq\s+0[\s\S]{0,300}runner diagnostics have no active Azure Blob results host/,
+    /New-NetFirewallRule[^\n]+-Service\s+Dnscache[^\n]+-RemoteAddress\s+\$ResolverAddresses[^\n]+-RemotePort\s+53/,
   );
-  assert.match(
-    windows,
-    /\$StorageHosts\.Count\s+-gt\s+8[\s\S]{0,300}Azure Blob results hosts are unbounded/,
-  );
-  assert.match(windows, /['"]\{0\}\s+\{1\}['"]\s+-f\s+\$Address,\s*\$Hostname/);
   assert.doesNotMatch(windows, /WriteAll(?:Text|Lines|Bytes)\([^\n]*(?:Uri|Url|Diag|Log)/i);
 
-  assert.match(windows, /\$HostsSnapshot\s*=\s*\[IO\.File\]::ReadAllBytes\(\$HostsPath\)/);
-  assert.match(windows, /\[IO\.File\]::WriteAllBytes\(\$HostsPath,\s*\$HostsOverlayBytes\)/);
+  assert.doesNotMatch(windows, /HostsOverlay|HostsSnapshot|RunnerHostPins/);
   const blockAt = windows.search(/Set-NetFirewallProfile[^\n]+-DefaultOutboundAction\s+Block/);
   const resolutions = [...windows.matchAll(/\[Net\.Dns\]::GetHostAddresses\(\$Hostname\)/g)].map(({ index }) => index);
   assert.ok(resolutions.some((index) => index < blockAt), 'runner hosts must be resolved before outbound blocking');
-  assert.ok(resolutions.some((index) => index > blockAt), 'pinned runner hosts must resolve after outbound blocking');
+  assert.ok(resolutions.some((index) => index > blockAt), 'dynamic runner hosts must resolve after outbound blocking');
   assert.match(windows.slice(blockAt), /Clear-DnsClientCache\s+-ErrorAction\s+Stop/);
-  assert.match(windows.slice(blockAt), /pinned runner control-plane hostname resolution mismatch/);
-  assert.match(windows.slice(blockAt), /@\(Compare-Object[\s\S]{0,300}\)\.Count\s+-ne\s+0/);
-  assert.match(windows.slice(blockAt), /ReadAllBytes\(\$HostsPath\)[\s\S]{0,500}SequenceEqual\([^,]+,\s*\$HostsOverlayBytes\)/);
+  assert.match(windows.slice(blockAt), /dynamic runner control-plane hostname resolution failed/);
   assert.match(
     windows,
-    /finally\s*\{[\s\S]*\[IO\.File\]::WriteAllBytes\(\$HostsPath,\s*\$HostsSnapshot\)/,
+    /finally\s*\{[\s\S]*Remove-NetFirewallRule[\s\S]*Remove-NetFirewallDynamicKeywordAddress/,
   );
 
-  assert.doesNotMatch(windows, /New-NetFirewallRule[^\n]*(?:svchost(?:\.exe)?|Dnscache)/i);
+  assert.doesNotMatch(windows, /New-NetFirewallRule[^\n]+-Service\s+Dnscache[^\n]+-RemoteAddress\s+Any/i);
 });
 
 test('Windows runner config supplies control-plane hosts when diagnostics contain no URLs', {
@@ -478,10 +475,6 @@ foreach ($name in @('Fail', 'Read-RunnerDiagnosticLog', 'Get-RunnerControlPlaneH
 function Get-DnsClientCache {
   [CmdletBinding()]
   param([object]$Type, [object]$Status)
-  [pscustomobject]@{
-    Entry = 'results-receiver.actions.githubusercontent.com'
-    Data = 'resultsstorefixture.blob.core.windows.net'
-  }
 }
 $programs = @(
   (Join-Path $env:CONTEXT_RELAY_TEST_RUNNER_ROOT 'bin\Runner.Worker.exe'),
@@ -508,7 +501,6 @@ $programs = @(
     'broker-fixture.actions.githubusercontent.com',
     'fixture.actions.githubusercontent.com',
     'results-receiver.actions.githubusercontent.com',
-    'resultsstorefixture.blob.core.windows.net',
     'run-actions-1-azure-eastus.actions.githubusercontent.com',
     'run-actions.actions.githubusercontent.com',
   ]);

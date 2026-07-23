@@ -335,7 +335,6 @@ function Get-RunnerControlPlaneHosts([string[]]$RunnerPrograms) {
   # it in .runner, so validate the early workflow snapshot before optionally
   # augmenting it with successful address records still present in the cache.
   $RunServiceHosts = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-  $StorageHosts = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
   $CapturedRunServiceHosts = [string]$env:CONTEXT_RELAY_RUN_SERVICE_HOSTS
   if ([string]::IsNullOrWhiteSpace($CapturedRunServiceHosts) -or
       $CapturedRunServiceHosts -ne $CapturedRunServiceHosts.Trim()) {
@@ -361,20 +360,10 @@ function Get-RunnerControlPlaneHosts([string[]]$RunnerPrograms) {
     if ($null -eq $EntryProperty -or [string]::IsNullOrWhiteSpace([string]$EntryProperty.Value)) {
       Fail 'DNS cache address record has no entry name'
     }
-    $HostCandidates = @([string]$EntryProperty.Value)
-    $DataProperty = $Record.PSObject.Properties['Data']
-    if ($null -ne $DataProperty -and -not [string]::IsNullOrWhiteSpace([string]$DataProperty.Value)) {
-      $HostCandidates += [string]$DataProperty.Value
-    }
-    foreach ($Candidate in $HostCandidates) {
-      $Hostname = $Candidate.TrimEnd('.').ToLowerInvariant()
-      if ($Hostname -match '^run-actions(?:-[a-z0-9-]+(?:\.[a-z0-9-]+)*)?\.actions\.githubusercontent\.com$') {
-        [void]$RunServiceHosts.Add($Hostname)
-        [void]$Hosts.Add($Hostname)
-      } elseif ($Hostname -match '^[a-z0-9]{3,24}\.blob\.core\.windows\.net$') {
-        [void]$StorageHosts.Add($Hostname)
-        [void]$Hosts.Add($Hostname)
-      }
+    $Hostname = ([string]$EntryProperty.Value).TrimEnd('.').ToLowerInvariant()
+    if ($Hostname -match '^run-actions(?:-[a-z0-9-]+(?:\.[a-z0-9-]+)*)?\.actions\.githubusercontent\.com$') {
+      [void]$RunServiceHosts.Add($Hostname)
+      [void]$Hosts.Add($Hostname)
     }
   }
   if ($RunServiceHosts.Count -eq 0) {
@@ -400,20 +389,11 @@ function Get-RunnerControlPlaneHosts([string[]]$RunnerPrograms) {
       [Uri]$Endpoint = $Match.Value
       $Hostname = $Endpoint.Host.TrimEnd('.').ToLowerInvariant()
       if ($Endpoint.Port -ne 443 -or
-          $Hostname -notmatch '^(?:github\.com|api\.github\.com|(?:[a-z0-9-]+\.)+actions\.githubusercontent\.com|[a-z0-9]{3,24}\.blob\.core\.windows\.net)$') {
+          $Hostname -notmatch '^(?:github\.com|api\.github\.com|(?:[a-z0-9-]+\.)+actions\.githubusercontent\.com)$') {
         continue
       }
       [void]$Hosts.Add($Hostname)
-      if ($Hostname -match '^[a-z0-9]{3,24}\.blob\.core\.windows\.net$') {
-        [void]$StorageHosts.Add($Hostname)
-      }
     }
-  }
-  if ($StorageHosts.Count -eq 0) {
-    Fail 'runner diagnostics have no active Azure Blob results host'
-  }
-  if ($StorageHosts.Count -gt 8) {
-    Fail 'observed Azure Blob results hosts are unbounded'
   }
   # GitHub documents this exact host for live logs and job results.
   # Unlike the listener endpoints persisted in .runner[_migrated], runner
@@ -442,6 +422,15 @@ function Test-RunnerControlPlaneAddress([Net.IPAddress]$Address) {
         ($Bytes[0] -eq 192 -and $Bytes[1] -eq 168) -or $Bytes[0] -ge 224) { return $false }
   }
   return $true
+}
+
+function Test-DnsResolverAddress([Net.IPAddress]$Address) {
+  if ($Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -and
+      $Address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetworkV6) { return $false }
+  return -not [Net.IPAddress]::IsLoopback($Address) -and
+    -not $Address.Equals([Net.IPAddress]::Any) -and
+    -not $Address.Equals([Net.IPAddress]::IPv6Any) -and
+    -not $Address.IsIPv6Multicast
 }
 
 function Test-TrustedDllPath([string]$Path, [string[]]$TrustedDllRoots) {
@@ -688,44 +677,22 @@ foreach ($Program in $RunnerPrograms) {
   $RunnerProgramHashes[$Program] = (Get-FileHash -Algorithm SHA256 -LiteralPath $Program).Hash
 }
 $RunnerHostnames = @(Get-RunnerControlPlaneHosts $RunnerPrograms)
-$RunnerHostPins = [Collections.Generic.List[object]]::new()
-foreach ($Hostname in $RunnerHostnames) {
-  $Addresses = @([Net.Dns]::GetHostAddresses($Hostname) |
-    Where-Object { Test-RunnerControlPlaneAddress $_ } |
-    Sort-Object { $_.ToString() } -Unique)
-  if ($Addresses.Count -eq 0 -or $Addresses.Count -gt 16) {
-    Fail "runner control-plane hostname has no bounded public address set: $Hostname"
-  }
-  foreach ($Address in $Addresses) {
-    $RunnerHostPins.Add([pscustomobject]@{ Hostname = $Hostname; Address = $Address.ToString() })
-  }
+$RunnerFqdns = [string[]]@($RunnerHostnames + '*.blob.core.windows.net')
+if ($RunnerFqdns.Count -gt 33 -or @($RunnerFqdns | Select-Object -Unique).Count -ne $RunnerFqdns.Count) {
+  Fail 'runner FQDN allowlist is duplicated or unbounded'
 }
-if ($RunnerHostPins.Count -gt 128) { Fail 'runner control-plane address set is unbounded' }
-$HostsPath = [IO.Path]::GetFullPath((Join-Path ([Environment]::SystemDirectory) 'drivers\etc\hosts'))
-$ExpectedHostsPath = [IO.Path]::GetFullPath("$env:SystemRoot\System32\drivers\etc\hosts")
-if (-not [string]::Equals($HostsPath, $ExpectedHostsPath, [StringComparison]::OrdinalIgnoreCase)) {
-  Fail 'Windows hosts path identity mismatch'
+$ResolverSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($Resolver in @(Get-DnsClientServerAddress -ErrorAction Stop | ForEach-Object ServerAddresses)) {
+  [Net.IPAddress]$Address = $null
+  if (-not [Net.IPAddress]::TryParse([string]$Resolver, [ref]$Address) -or
+      -not (Test-DnsResolverAddress $Address)) { continue }
+  [void]$ResolverSet.Add($Address.ToString())
 }
-$HostsItem = Get-Item -LiteralPath $HostsPath -Force -ErrorAction Stop
-if ($HostsItem.PSIsContainer -or (($HostsItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
-    $HostsItem.Length -gt 1048576) { Fail 'Windows hosts file is unsafe' }
-$HostsSnapshot = [IO.File]::ReadAllBytes($HostsPath)
-$HostsMarker = "ContextRelaySemgrepOffline-$PID-$([Guid]::NewGuid().ToString('N'))"
-$HostsSnapshotText = [Text.Encoding]::UTF8.GetString($HostsSnapshot)
-if ($HostsSnapshotText.IndexOf($HostsMarker, [StringComparison]::Ordinal) -ge 0 -or
-    $HostsSnapshotText.IndexOf([char]0) -ge 0) { Fail 'Windows hosts snapshot is unsafe' }
-$HostsOverlayLines = [Collections.Generic.List[string]]::new()
-$HostsOverlayLines.Add("# $HostsMarker begin")
-foreach ($Pin in $RunnerHostPins) {
-  $Address = [string]$Pin.Address
-  $Hostname = [string]$Pin.Hostname
-  $HostsOverlayLines.Add(("{0} {1}" -f $Address, $Hostname))
+$ResolverAddresses = [string[]]@($ResolverSet)
+[Array]::Sort($ResolverAddresses, [StringComparer]::Ordinal)
+if ($ResolverAddresses.Count -eq 0 -or $ResolverAddresses.Count -gt 16) {
+  Fail 'configured DNS resolver address set is missing or unbounded'
 }
-$HostsOverlayLines.Add("# $HostsMarker end")
-$HostsSuffix = [Text.Encoding]::ASCII.GetBytes("`r`n$($HostsOverlayLines -join "`r`n")`r`n")
-$HostsOverlayBytes = [byte[]]::new($HostsSnapshot.Length + $HostsSuffix.Length)
-[Array]::Copy($HostsSnapshot, 0, $HostsOverlayBytes, 0, $HostsSnapshot.Length)
-[Array]::Copy($HostsSuffix, 0, $HostsOverlayBytes, $HostsSnapshot.Length, $HostsSuffix.Length)
 $ProfileSnapshots = @(foreach ($ProfileName in @('Domain', 'Private', 'Public')) {
   $Profile = Get-NetFirewallProfile -Profile $ProfileName -ErrorAction Stop
   [pscustomobject]@{
@@ -735,21 +702,32 @@ $ProfileSnapshots = @(foreach ($ProfileName in @('Domain', 'Private', 'Public'))
 })
 $FirewallPrefix = "ContextRelaySemgrepOffline-$PID-$([Guid]::NewGuid().ToString('N'))"
 $RunnerRuleNames = [Collections.Generic.List[string]]::new()
+$DnsRuleNames = [Collections.Generic.List[string]]::new()
+$DynamicKeywordIds = [Collections.Generic.List[string]]::new()
 $DisabledOutboundRuleNames = [Collections.Generic.List[string]]::new()
-$HostsRestoreRequired = $false
 try {
-  $HostsRestoreRequired = $true
-  [IO.File]::WriteAllBytes($HostsPath, $HostsOverlayBytes)
-  $InstalledHostsBytes = [IO.File]::ReadAllBytes($HostsPath)
-  if (-not [Linq.Enumerable]::SequenceEqual($InstalledHostsBytes, $HostsOverlayBytes)) {
-    Fail 'runner control-plane hosts overlay write mismatch'
+  $RunnerKeywordIds = [string[]]@($RunnerFqdns | ForEach-Object {
+    $KeywordId = '{' + [Guid]::NewGuid().ToString() + '}'
+    $DynamicKeywordIds.Add($KeywordId)
+    New-NetFirewallDynamicKeywordAddress -Id $KeywordId -Keyword $_ -AutoResolve $true -ErrorAction Stop | Out-Null
+    $Keyword = Get-NetFirewallDynamicKeywordAddress -Id $KeywordId -ErrorAction Stop
+    if (-not $Keyword.AutoResolve -or [string]$Keyword.Keyword -cne $_) {
+      Fail "runner dynamic FQDN keyword is not exact and active: $_"
+    }
+    $KeywordId
+  })
+  foreach ($Hostname in $RunnerHostnames) {
+    $Addresses = @([Net.Dns]::GetHostAddresses($Hostname) | Where-Object { Test-RunnerControlPlaneAddress $_ })
+    if ($Addresses.Count -eq 0 -or $Addresses.Count -gt 16) {
+      Fail "runner control-plane hostname has no bounded public address set: $Hostname"
+    }
   }
   $RuleIndex = 0
   foreach ($Program in $RunnerPrograms) {
     $RuleIndex += 1
     $RuleName = "$FirewallPrefix-Runner-$RuleIndex"
     $RunnerRuleNames.Add($RuleName)
-    New-NetFirewallRule -Name $RuleName -DisplayName $RuleName -Direction Outbound -Program $Program -RemoteAddress Any -Protocol Any -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+    New-NetFirewallRule -Name $RuleName -DisplayName $RuleName -Direction Outbound -Program $Program -RemoteDynamicKeywordAddresses $RunnerKeywordIds -Protocol Any -Action Allow -Profile Any -ErrorAction Stop | Out-Null
     $Rule = Get-NetFirewallRule -Name $RuleName -PolicyStore ActiveStore -ErrorAction Stop
     $Application = $Rule | Get-NetFirewallApplicationFilter
     if ($Rule.Enabled -ne 'True' -or
@@ -760,8 +738,15 @@ try {
     }
   }
 
+  $DnsProgram = [IO.Path]::GetFullPath((Join-Path ([Environment]::SystemDirectory) 'svchost.exe'))
+  foreach ($Protocol in @('UDP', 'TCP')) {
+    $RuleName = "$FirewallPrefix-Dns-$Protocol"
+    $DnsRuleNames.Add($RuleName)
+    New-NetFirewallRule -Name $RuleName -DisplayName $RuleName -Direction Outbound -Program $DnsProgram -Service Dnscache -RemoteAddress $ResolverAddresses -RemotePort 53 -Protocol $Protocol -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+  }
+
   $ExistingOutboundAllows = @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow -Enabled True |
-    Where-Object { $RunnerRuleNames -notcontains $_.Name })
+    Where-Object { $RunnerRuleNames -notcontains $_.Name -and $DnsRuleNames -notcontains $_.Name })
   foreach ($ExistingRule in $ExistingOutboundAllows) {
     if ([string]$ExistingRule.PolicyStoreSourceType -ne 'Local' -or [string]::IsNullOrWhiteSpace($ExistingRule.Name)) {
       Fail "non-local outbound allow rule prevents fail-closed isolation: $($ExistingRule.DisplayName)"
@@ -770,7 +755,7 @@ try {
     Disable-NetFirewallRule -Name $ExistingRule.Name -ErrorAction Stop | Out-Null
   }
   $RemainingBroadAllows = @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow -Enabled True |
-    Where-Object { $RunnerRuleNames -notcontains $_.Name })
+    Where-Object { $RunnerRuleNames -notcontains $_.Name -and $DnsRuleNames -notcontains $_.Name })
   if ($RemainingBroadAllows.Count -ne 0) { Fail 'outbound allow rules remain outside the runner control-plane carveout' }
 
   foreach ($ProfileSnapshot in $ProfileSnapshots) {
@@ -782,22 +767,13 @@ try {
   }
   Clear-DnsClientCache -ErrorAction Stop
   foreach ($Hostname in $RunnerHostnames) {
-    $ActualAddresses = [string[]]@([Net.Dns]::GetHostAddresses($Hostname) | ForEach-Object { $_.ToString() } | Sort-Object -Unique)
-    $ExpectedAddresses = [string[]]@($RunnerHostPins |
-      Where-Object Hostname -eq $Hostname |
-      ForEach-Object Address |
-      Sort-Object -Unique)
-    if ($ActualAddresses.Count -ne $ExpectedAddresses.Count -or
-        @(Compare-Object -ReferenceObject $ExpectedAddresses -DifferenceObject $ActualAddresses).Count -ne 0) {
-      Fail "pinned runner control-plane hostname resolution mismatch: $Hostname"
+    $ActualAddresses = @([Net.Dns]::GetHostAddresses($Hostname) | Where-Object { Test-RunnerControlPlaneAddress $_ })
+    if ($ActualAddresses.Count -eq 0 -or $ActualAddresses.Count -gt 16) {
+      Fail "dynamic runner control-plane hostname resolution failed: $Hostname"
     }
   }
   if (Test-OutboundTcp $ProbeAddress) { Fail 'hostile outbound TCP probe bypassed the offline firewall policy' }
   Build-Once $BuildLabel
-  $CurrentHostsBytes = [IO.File]::ReadAllBytes($HostsPath)
-  if (-not [Linq.Enumerable]::SequenceEqual($CurrentHostsBytes, $HostsOverlayBytes)) {
-    Fail 'runner control-plane hosts overlay changed during the native build'
-  }
   foreach ($Program in $RunnerPrograms) {
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $Program).Hash -ne $RunnerProgramHashes[$Program]) {
       Fail "runner control-plane executable changed during the native build: $Program"
@@ -810,7 +786,7 @@ try {
   if (Test-OutboundTcp $ProbeAddress) { Fail 'offline firewall policy was removed during the native build' }
   [IO.File]::WriteAllText(
     (Join-Path $OutputRoot "$BuildLabel.offline-egress.v1.json"),
-    '{"mechanism":"windows-firewall-default-outbound-block-runner-control-plane-allow","probe":"hostile-outbound-tcp-denied","schemaVersion":1}' + "`n",
+    '{"mechanism":"windows-firewall-default-outbound-block-runner-fqdn-allow","probe":"hostile-outbound-tcp-denied","schemaVersion":1}' + "`n",
     [Text.UTF8Encoding]::new($false)
   )
 } finally {
@@ -835,32 +811,29 @@ try {
       $RestoreFailures.Add("outbound rule ${RuleName}: $($_.Exception.Message)")
     }
   }
-  foreach ($RuleName in $RunnerRuleNames) {
+  foreach ($RuleName in [string[]]@($RunnerRuleNames + $DnsRuleNames)) {
     try {
       if (Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) {
         Remove-NetFirewallRule -Name $RuleName -ErrorAction Stop
       }
       if (Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) { throw 'rule still exists' }
     } catch {
-      $RestoreFailures.Add("runner allow rule ${RuleName}: $($_.Exception.Message)")
+      $RestoreFailures.Add("isolation allow rule ${RuleName}: $($_.Exception.Message)")
     }
   }
-  if ($HostsRestoreRequired) {
+  foreach ($KeywordId in $DynamicKeywordIds) {
     try {
-      $CurrentHostsBytes = [IO.File]::ReadAllBytes($HostsPath)
-      if (-not [Linq.Enumerable]::SequenceEqual($CurrentHostsBytes, $HostsOverlayBytes)) {
-        $RestoreFailures.Add('runner control-plane hosts overlay changed before restoration')
+      if (Get-NetFirewallDynamicKeywordAddress -Id $KeywordId -ErrorAction SilentlyContinue) {
+        Remove-NetFirewallDynamicKeywordAddress -Id $KeywordId -ErrorAction Stop
       }
-      [IO.File]::WriteAllBytes($HostsPath, $HostsSnapshot)
-      $RestoredHostsBytes = [IO.File]::ReadAllBytes($HostsPath)
-      if (-not [Linq.Enumerable]::SequenceEqual($RestoredHostsBytes, $HostsSnapshot)) {
-        throw 'restored hosts bytes differ'
+      if (Get-NetFirewallDynamicKeywordAddress -Id $KeywordId -ErrorAction SilentlyContinue) {
+        throw 'dynamic keyword still exists'
       }
-      Clear-DnsClientCache -ErrorAction Stop
     } catch {
-      $RestoreFailures.Add("hosts file: $($_.Exception.Message)")
+      $RestoreFailures.Add("dynamic keyword ${KeywordId}: $($_.Exception.Message)")
     }
   }
+  Clear-DnsClientCache -ErrorAction SilentlyContinue
   if ($RestoreFailures.Count -ne 0) { Fail "firewall restoration failed: $($RestoreFailures -join '; ')" }
 }
 Write-Output "Windows Cygwin/MinGW public-source $BuildLabel completed with runner-safe firewall-enforced network denial."
