@@ -275,6 +275,11 @@ function Build-Once([string]$Label) {
   New-Item -ItemType Directory -Path $Bundle, (Join-Path $script:Current 'home'), (Join-Path $script:Current 'tmp') | Out-Null
   Invoke-Checked { & $Tar -xf $SourceBundle -C $Bundle } 'source bundle extraction'
   Invoke-Checked { & $Node (Join-Path $Workspace 'scripts\semgrep-source-bundle.mjs') --materialize-links $Bundle | Out-Null } 'source link materialization'
+  Invoke-Checked {
+    & $Node (Join-Path $Bundle 'support\scripts\apply-semgrep-source-patches.mjs') `
+      (Join-Path $Bundle 'support\third_party\sidecars\semgrep\patches.v1.json') `
+      (Join-Path $Bundle 'pins') | Out-Null
+  } 'source patch application'
   $Project = Join-Path $Bundle 'sources\semgrep'
   if (-not (Test-Path -LiteralPath (Join-Path $Project 'Makefile') -PathType Leaf)) { Fail 'Semgrep source is missing' }
 

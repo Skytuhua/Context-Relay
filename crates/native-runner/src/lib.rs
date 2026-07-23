@@ -67,9 +67,6 @@ pub enum RunnerError {
     InvalidEnvironment,
     #[error("the sidecar output is invalid")]
     InvalidToolOutput,
-    #[cfg(feature = "ci-candidate-sidecar-smoke")]
-    #[error("candidate Semgrep validation failed at stage {0}")]
-    CiSemgrepValidation(u8),
     #[error("the helper protocol frame is invalid")]
     InvalidFrame,
     #[error("the helper protocol frame exceeds its limit")]

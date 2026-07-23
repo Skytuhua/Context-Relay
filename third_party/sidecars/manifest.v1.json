@@ -263,7 +263,7 @@
         "revision": "bd614accba811b407ae5c9ec6f1eecd3bdc29911",
         "tree": "ad8e607874820dc7253d58997736463ed258ea34",
         "materialPath": "third_party/sidecars/semgrep/source-lock.v1.json",
-        "materialSha256": "5e8f14154862092d6bebb7b644e0cfe48599f848da7eaf2ad90af68944d6032c"
+        "materialSha256": "d8c0724ddd4503d3bd0b3c097bfd69c67b22ef0611e073cdcbcbe59635a5dba9"
       },
       "license": {
         "spdx": "LGPL-2.1-or-later",
@@ -278,17 +278,22 @@
         {
           "role": "patch-inventory",
           "path": "third_party/sidecars/semgrep/patches.v1.json",
-          "sha256": "0588726d0848cc67ddd23acf1dc3881415ac259154d75f862f6d0f9a2b4b9f25"
+          "sha256": "489c1c63776c82f14c62dc0735429660da66cca076dbe05c92df6e7143c80f38"
+        },
+        {
+          "role": "source-patch-applicator",
+          "path": "scripts/apply-semgrep-source-patches.mjs",
+          "sha256": "6212a1ccc417c502955e74715467f5c72b5e1ce874538e58a3cb288e6d3b13e4"
         },
         {
           "role": "macos-build",
           "path": "third_party/sidecars/semgrep/build-public-source-macos.sh",
-          "sha256": "afd400a6f842ce790f0571ceeb9db81eac734b49c7cc48f62a1df2969776b897"
+          "sha256": "915c0ecab1d408398fb456fd8460ee644943422f52290ab76fd2613a5255ae10"
         },
         {
           "role": "windows-build",
           "path": "third_party/sidecars/semgrep/build-public-source-windows.ps1",
-          "sha256": "4ec181cc2d7792b618aefd55b3c9f3e51dd47e91fb633e84a9950b890d6f488d"
+          "sha256": "cacd830a2bb13f459a09d5db8b7f3938a9bcdcabaefe864f5814998f9f24b9ad"
         },
         {
           "role": "windows-builder-evidence-schema",
@@ -303,7 +308,7 @@
         {
           "role": "native-ci-provenance",
           "path": "third_party/sidecars/semgrep/native-ci-provenance.v1.json",
-          "sha256": "5a9f7a11af3fa4d4c7882f6da914c7ffdc820fe4242ad2006147d7e9c3652326"
+          "sha256": "4935ac0502018e300fd04b5c90527ab15582594eccde3f347dc9244cb714eebc"
         },
         {
           "role": "source-inventory-generator",
@@ -313,12 +318,12 @@
         {
           "role": "source-bundle-generator",
           "path": "scripts/semgrep-source-bundle.mjs",
-          "sha256": "7ac41edd64e0f1ccadb125b6baf508d5416e3f6ce96b6be4cdef68ae5de86049"
+          "sha256": "3ee946303e33a152cb79d4a253fbdc19bfc80747af1ed42314a69e81887c6aaa"
         },
         {
           "role": "source-bundle-evidence",
           "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
-          "sha256": "c2e4673e58f3d5d91ad6c7d0125e314a8b48622e06e7faa29e8f19b1d678ce2e"
+          "sha256": "bab98296abe5ba477750755d93c8c76825ec4ca1e85663d77e2e519584417920"
         },
         {
           "role": "manifest-rule",

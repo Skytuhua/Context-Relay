@@ -175,13 +175,7 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
             .ok_or(RunnerError::LimitExceeded)
     })?;
     let stats = RunStats::new(scanned_files, scanned_bytes, duration_ms);
-    let exit = status.code().ok_or_else(|| {
-        #[cfg(feature = "ci-candidate-sidecar-smoke")]
-        if matches!(request.command(), SidecarCommand::OsemgrepScanPackage) {
-            return RunnerError::CiSemgrepValidation(1);
-        }
-        RunnerError::InvalidToolOutput
-    })?;
+    let exit = status.code().ok_or(RunnerError::InvalidToolOutput)?;
     match request.command() {
         SidecarCommand::RuleSyncGenerate { .. } => {
             let outputs = stage.read_outputs(limits)?;
@@ -1832,15 +1826,6 @@ fn kill_child_tree(child: &mut std::process::Child) {
 
 fn failure_code(error: RunnerError) -> FailureCode {
     match error {
-        #[cfg(feature = "ci-candidate-sidecar-smoke")]
-        RunnerError::CiSemgrepValidation(stage) => match stage {
-            0 => FailureCode::InvalidOutput,
-            1 => FailureCode::ToolFailed,
-            2 => FailureCode::TimedOut,
-            3 => FailureCode::LimitExceeded,
-            4 => FailureCode::ClosureMismatch,
-            _ => FailureCode::InvalidOutput,
-        },
         RunnerError::ClosureMismatch
         | RunnerError::MissingMaterial
         | RunnerError::SidecarUnavailable => FailureCode::ClosureMismatch,

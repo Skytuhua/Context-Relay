@@ -169,19 +169,12 @@ pub fn validate_semgrep_report(
     stderr: &[u8],
     inputs: &[ContentFrame],
 ) -> Result<(RunDisposition, Vec<u8>), RunnerError> {
-    if !matches!(exit, 0 | 1) {
-        let stage = match exit {
-            2 => 2,
-            3 => 3,
-            _ => 4,
-        };
-        return Err(semgrep_validation_error(stage));
+    if !matches!(exit, 0 | 1) || !valid_semgrep_warning(stderr) {
+        return invalid();
     }
-    validate_semgrep_warning(stderr).map_err(semgrep_validation_error)?;
-    let report: Value = serde_json::from_slice(stdout).map_err(|_| semgrep_validation_error(1))?;
-    let object = report
-        .as_object()
-        .ok_or_else(|| semgrep_validation_error(1))?;
+    let report: Value =
+        serde_json::from_slice(stdout).map_err(|_| RunnerError::InvalidToolOutput)?;
+    let object = report.as_object().ok_or(RunnerError::InvalidToolOutput)?;
     if !exact_keys(object, &SEMGREP_KEYS)
         || object.get("version").and_then(Value::as_str) != Some("1.170.0")
         || object.get("engine_requested").and_then(Value::as_str) != Some("OSS")
@@ -189,7 +182,7 @@ pub fn validate_semgrep_report(
         || !empty_array(object.get("skipped_rules"))
         || !empty_array(object.get("profiling_results"))
     {
-        return Err(semgrep_validation_error(1));
+        return invalid();
     }
     let expected = inputs
         .iter()
@@ -199,68 +192,51 @@ pub fn validate_semgrep_report(
         object
             .get("time")
             .and_then(Value::as_object)
-            .ok_or_else(|| semgrep_validation_error(2))?,
+            .ok_or(RunnerError::InvalidToolOutput)?,
         inputs,
-    )
-    .map_err(|_| semgrep_validation_error(2))?;
+    )?;
     let paths = object
         .get("paths")
         .and_then(Value::as_object)
-        .ok_or_else(|| semgrep_validation_error(3))?;
+        .ok_or(RunnerError::InvalidToolOutput)?;
     if !(exact_keys(paths, &["scanned"])
         || (exact_keys(paths, &["scanned", "skipped"]) && empty_array(paths.get("skipped"))))
     {
-        return Err(semgrep_validation_error(3));
+        return invalid();
     }
     let scanned_values = paths
         .get("scanned")
         .and_then(Value::as_array)
-        .ok_or_else(|| semgrep_validation_error(3))?;
+        .ok_or(RunnerError::InvalidToolOutput)?;
     let mut scanned = BTreeSet::new();
     for value in scanned_values {
-        let path = scanner_path(value.as_str().ok_or_else(|| semgrep_validation_error(3))?)
-            .map_err(|_| semgrep_validation_error(3))?;
+        let path = scanner_path(value.as_str().ok_or(RunnerError::InvalidToolOutput)?)?;
         if !scanned.insert(path) {
-            return Err(semgrep_validation_error(3));
+            return invalid();
         }
     }
     if scanned != expected || scanned_values.len() != expected.len() {
-        return Err(semgrep_validation_error(3));
+        return invalid();
     }
     let results = object
         .get("results")
         .and_then(Value::as_array)
-        .ok_or_else(|| semgrep_validation_error(4))?;
+        .ok_or(RunnerError::InvalidToolOutput)?;
     let mut identities = BTreeSet::new();
     for result in results {
         validate_semgrep_result(
-            result
-                .as_object()
-                .ok_or_else(|| semgrep_validation_error(4))?,
+            result.as_object().ok_or(RunnerError::InvalidToolOutput)?,
             &expected,
             &mut identities,
-        )
-        .map_err(|_| semgrep_validation_error(4))?;
+        )?;
     }
-    let count = u32::try_from(results.len()).map_err(|_| semgrep_validation_error(4))?;
+    let count = u32::try_from(results.len()).map_err(|_| RunnerError::LimitExceeded)?;
     let disposition = match (exit, count) {
         (0, 0) => RunDisposition::Clean,
         (1, count) if count > 0 => RunDisposition::Findings(count),
-        _ => return Err(semgrep_validation_error(4)),
+        _ => return invalid(),
     };
     Ok((disposition, stdout.to_vec()))
-}
-
-const fn semgrep_validation_error(stage: u8) -> RunnerError {
-    #[cfg(feature = "ci-candidate-sidecar-smoke")]
-    {
-        RunnerError::CiSemgrepValidation(stage)
-    }
-    #[cfg(not(feature = "ci-candidate-sidecar-smoke"))]
-    {
-        let _ = stage;
-        RunnerError::InvalidToolOutput
-    }
 }
 
 pub fn validate_rulesync_outputs(
@@ -476,36 +452,27 @@ fn valid_duration(value: &str) -> bool {
         && matches!(unit, "ns" | "us" | "µs" | "ms" | "s")
 }
 
-fn validate_semgrep_warning(stderr: &[u8]) -> Result<(), u8> {
-    if stderr.is_empty() {
-        return Err(1);
-    }
+fn valid_semgrep_warning(stderr: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(stderr) else {
-        return Err(2);
+        return false;
     };
     let Some(line) = text.strip_suffix('\n') else {
-        return Err(2);
+        return false;
     };
     if line.contains('\n') || line.contains('\r') {
-        return Err(2);
+        return false;
     }
     let Some(rest) = line.strip_prefix('[') else {
-        return Err(2);
+        return false;
     };
     let Some((timing, message)) = rest.split_once("][WARNING]: ") else {
-        return Err(2);
+        return false;
     };
-    if timing.matches('.').count() != 1
-        || !timing
+    timing.matches('.').count() == 1
+        && timing
             .bytes()
             .all(|byte| byte.is_ascii_digit() || byte == b'.')
-    {
-        return Err(3);
-    }
-    if message != SEMGREP_WARNING {
-        return Err(4);
-    }
-    Ok(())
+        && message == SEMGREP_WARNING
 }
 
 fn validate_semgrep_result(

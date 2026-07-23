@@ -7067,7 +7067,7 @@
   ],
   "patchInventory": {
     "path": "third_party/sidecars/semgrep/patches.v1.json",
-    "sourceModified": false
+    "sourceModified": true
   },
   "manifestRule": "third_party/sidecars/semgrep/MANIFEST.sha256.md",
   "targetStatus": [

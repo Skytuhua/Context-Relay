@@ -36,6 +36,7 @@ const LEGACY_HTTP_ARCHIVE = new Map([[
   '6a00db1b12b6f55e1b2419f206fdfbaa669e14b51c78f8ac3cffa0a58897be83',
 ]]);
 const DEFAULT_SUPPORT_PATHS = [
+  'scripts/apply-semgrep-source-patches.mjs',
   'scripts/semgrep-source-bundle.mjs',
   'scripts/semgrep-source-inventory.mjs',
   'third_party/sidecars/licenses/semgrep-LGPL-2.1-or-later.txt',

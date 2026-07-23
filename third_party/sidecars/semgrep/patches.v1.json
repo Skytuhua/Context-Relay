@@ -1,5 +1,25 @@
 {
   "schemaVersion": 1,
-  "sourceModified": false,
-  "patches": []
+  "sourceModified": true,
+  "patches": [
+    {
+      "id": "opentelemetry-client-cohttp-eio-lazy-authenticator",
+      "package": "opentelemetry-client-cohttp-eio",
+      "revision": "6cfa5f16d85ac65b602f732469b667bac4aca5ac",
+      "path": "src/client-cohttp-eio/opentelemetry_client_cohttp_eio.ml",
+      "baseSha256": "83829e6370fe445cad5f1a4ace923856e410a9b5fc4b526a8e325cf40ee590f5",
+      "patchedSha256": "b3009e7230a0228782d0db8bfe47bfee83773039aa99e86fbe08d3df628db6c1",
+      "replacements": [
+        {
+          "before": "  let authenticator =\n",
+          "after": "  let authenticator () =\n"
+        },
+        {
+          "before": "  let create net = Httpc.make ~https:(Some (https ~authenticator)) net\n",
+          "after": "  let create net =\n    Httpc.make ~https:(Some (https ~authenticator:(authenticator ()))) net\n"
+        }
+      ],
+      "rationale": "Defer system CA discovery until an OpenTelemetry HTTP client is created."
+    }
+  ]
 }
