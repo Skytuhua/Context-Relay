@@ -533,13 +533,13 @@ try {
     New-NetFirewallRule -Name $RuleName -DisplayName $RuleName -Direction Outbound -Program $Program -RemoteAddress Any -RemotePort 443 -Protocol TCP -Action Allow -Profile Any -ErrorAction Stop | Out-Null
     $Rule = Get-NetFirewallRule -Name $RuleName -PolicyStore ActiveStore -ErrorAction Stop
     $Application = $Rule | Get-NetFirewallApplicationFilter
-    $Address = $Rule | Get-NetFirewallAddressFilter
+    $AddressFilter = $Rule | Get-NetFirewallAddressFilter
     $Port = $Rule | Get-NetFirewallPortFilter
     if ($Rule.Enabled -ne 'True' -or
         $Rule.Direction -ne 'Outbound' -or
         $Rule.Action -ne 'Allow' -or
         [IO.Path]::GetFullPath($Application.Program) -ne [IO.Path]::GetFullPath($Program) -or
-        [string]$Address.RemoteAddress -cne 'Any' -or
+        [string]$AddressFilter.RemoteAddress -cne 'Any' -or
         [string]$Port.RemotePort -cne '443' -or
         @('TCP', '6') -notcontains [string]$Port.Protocol) {
       Fail 'runner control-plane firewall allow rule is not exact and active'

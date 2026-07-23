@@ -385,9 +385,10 @@ test('Windows offline build grants only the hash-pinned runner executables outbo
     /New-NetFirewallRule[^\n]+-Program\s+\$Program[^\n]+-RemoteAddress\s+Any[^\n]+-RemotePort\s+443[^\n]+-Protocol\s+TCP/,
   );
   assert.match(windows, /Get-NetFirewallApplicationFilter/);
-  assert.match(windows, /Get-NetFirewallAddressFilter/);
+  assert.match(windows, /\$AddressFilter\s*=\s*\$Rule\s*\|\s*Get-NetFirewallAddressFilter/);
   assert.match(windows, /Get-NetFirewallPortFilter/);
-  assert.match(windows, /RemoteAddress[^\n]+-cne\s+['"]Any['"]/);
+  assert.match(windows, /\$AddressFilter\.RemoteAddress[^\n]+-cne\s+['"]Any['"]/);
+  assert.doesNotMatch(windows, /\$Address\s*=\s*\$Rule\s*\|\s*Get-NetFirewallAddressFilter/);
   assert.match(windows, /RemotePort[^\n]+-cne\s+['"]443['"]/);
   assert.match(windows, /@\(['"]TCP['"],\s*['"]6['"]\)\s+-notcontains\s+\[string\]\$Port\.Protocol/);
   assert.doesNotMatch(windows, /New-NetFirewallDynamicKeywordAddress|Update-NetFirewallDynamicKeywordAddress/);
