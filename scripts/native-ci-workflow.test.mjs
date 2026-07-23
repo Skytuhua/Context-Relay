@@ -417,11 +417,13 @@ test('Windows offline build pins bounded runner-config and observed control-plan
   );
   assert.match(windows, /New-NetFirewallDynamicKeywordAddress/);
   assert.match(windows, /Resolve-RunnerControlPlaneAddresses/);
+  assert.match(windows, /Test-RunnerDynamicKeywordAddresses/);
   assert.match(windows, /New-NetFirewallDynamicKeywordAddress[^\n]+-Addresses\s+\$InitialRunnerAddressText[^\n]+-AutoResolve\s+\$false/);
   assert.match(windows, /Update-NetFirewallDynamicKeywordAddress[^\n]+-Addresses\s+\$AddressText[^\n]+-Append\s+\$false/);
   assert.match(windows, /Start-Job[^\n]+-ScriptBlock\s+\$RunnerAddressRefresherScript/);
   assert.match(windows, /Start-Sleep\s+-Seconds\s+5/);
   assert.match(windows, /Assert-RunnerAddressRefresherHealthy/);
+  assert.doesNotMatch(windows, /Keyword\.Addresses\s+-cne/);
   assert.doesNotMatch(windows, /Get-MpComputerStatus|Set-MpPreference|-AutoResolve\s+\$true/);
   assert.doesNotMatch(windows, /['"]\*\.actions\.githubusercontent\.com['"]|['"]\*\.blob\.core\.windows\.net['"]/);
   assert.match(windows, /New-NetFirewallRule[^\n]+-RemoteDynamicKeywordAddresses\s+\$RunnerKeywordIds/);
@@ -513,6 +515,52 @@ $programs = @(
     'run-actions-1-azure-eastus.actions.githubusercontent.com',
     'run-actions.actions.githubusercontent.com',
   ]);
+});
+
+test('Windows dynamic keyword comparison accepts only the exact normalized public address set', {
+  skip: process.platform !== 'win32',
+}, async () => {
+  const harness = String.raw`
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+  $env:CONTEXT_RELAY_TEST_WINDOWS_BUILDER,
+  [ref]$tokens,
+  [ref]$errors
+)
+if ($errors.Count -ne 0) { throw 'builder parse failed' }
+foreach ($name in @('Test-RunnerControlPlaneAddress', 'Test-RunnerDynamicKeywordAddresses')) {
+  $definition = $ast.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+  }, $true)
+  if ($null -eq $definition) { throw "missing function: $name" }
+  Invoke-Expression $definition.Extent.Text
+}
+$expected = @('13.107.6.175', '2606:4700:4700::1111', '8.8.8.8')
+if (-not (Test-RunnerDynamicKeywordAddresses '8.8.8.8,13.107.6.175,2606:4700:4700::1111' $expected)) {
+  throw 'Windows-normalized order was rejected'
+}
+if (Test-RunnerDynamicKeywordAddresses '8.8.8.8,8.8.8.8' @('8.8.8.8', '13.107.6.175')) {
+  throw 'duplicate address set was accepted'
+}
+if (Test-RunnerDynamicKeywordAddresses '10.0.0.1' @('10.0.0.1')) {
+  throw 'private address set was accepted'
+}
+'ok'
+`;
+  const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', harness], {
+    env: {
+      ...process.env,
+      CONTEXT_RELAY_TEST_WINDOWS_BUILDER: fileURLToPath(new URL(
+        '../third_party/sidecars/semgrep/build-public-source-windows.ps1',
+        import.meta.url,
+      )),
+    },
+    maxBuffer: 1024 * 1024,
+  });
+  assert.equal(stdout.trim(), 'ok');
 });
 
 test('Windows runtime DLL closure never searches ambient PATH', async () => {

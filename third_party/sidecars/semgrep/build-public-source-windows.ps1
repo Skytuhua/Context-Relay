@@ -447,6 +447,28 @@ function Resolve-RunnerControlPlaneAddresses([string[]]$Hostnames) {
   return $Sorted
 }
 
+function Test-RunnerDynamicKeywordAddresses([string]$Actual, [string[]]$Expected) {
+  $ActualTexts = @(($Actual -split ',') |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  if ($ActualTexts.Count -ne $Expected.Count -or $ActualTexts.Count -eq 0 -or $ActualTexts.Count -gt 128) {
+    return $false
+  }
+  $ActualSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+  foreach ($Text in $ActualTexts) {
+    [Net.IPAddress]$Address = $null
+    if (-not [Net.IPAddress]::TryParse($Text, [ref]$Address) -or
+        -not (Test-RunnerControlPlaneAddress $Address) -or
+        -not $ActualSet.Add($Address.ToString())) {
+      return $false
+    }
+  }
+  foreach ($Text in $Expected) {
+    if (-not $ActualSet.Contains($Text)) { return $false }
+  }
+  return $true
+}
+
 function Assert-RunnerAddressRefresherHealthy(
   [Management.Automation.Job]$Job,
   [string]$HeartbeatPath,
@@ -495,6 +517,28 @@ $RunnerAddressRefresherScript = {
     return $true
   }
 
+  function Test-RunnerDynamicKeywordAddresses([string]$Actual, [string[]]$Expected) {
+    $ActualTexts = @(($Actual -split ',') |
+      ForEach-Object { $_.Trim() } |
+      Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($ActualTexts.Count -ne $Expected.Count -or $ActualTexts.Count -eq 0 -or $ActualTexts.Count -gt 128) {
+      return $false
+    }
+    $ActualSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($Text in $ActualTexts) {
+      [Net.IPAddress]$Address = $null
+      if (-not [Net.IPAddress]::TryParse($Text, [ref]$Address) -or
+          -not (Test-PublicAddress $Address) -or
+          -not $ActualSet.Add($Address.ToString())) {
+        return $false
+      }
+    }
+    foreach ($Text in $Expected) {
+      if (-not $ActualSet.Contains($Text)) { return $false }
+    }
+    return $true
+  }
+
   $Hostnames = @($HostnameList -split ',')
   if ($Hostnames.Count -eq 0 -or $Hostnames.Count -gt 32 -or
       @($Hostnames | Select-Object -Unique).Count -ne $Hostnames.Count -or
@@ -521,7 +565,8 @@ $RunnerAddressRefresherScript = {
     $AddressText = $Addresses -join ','
     Update-NetFirewallDynamicKeywordAddress -Id $KeywordId -Addresses $AddressText -Append $false -ErrorAction Stop | Out-Null
     $Keyword = Get-NetFirewallDynamicKeywordAddress -Id $KeywordId -ErrorAction Stop
-    if ($Keyword.AutoResolve -or [string]$Keyword.Addresses -cne $AddressText) {
+    if ($Keyword.AutoResolve -or
+        -not (Test-RunnerDynamicKeywordAddresses ([string]$Keyword.Addresses) $Addresses)) {
       throw 'runner control-plane dynamic keyword update was not exact'
     }
     [IO.File]::WriteAllText($HeartbeatPath, [DateTime]::UtcNow.Ticks.ToString(), [Text.Encoding]::ASCII)
@@ -816,7 +861,7 @@ try {
   New-NetFirewallDynamicKeywordAddress -Id $RunnerKeywordId -Keyword 'ContextRelayRunnerControlPlane' -Addresses $InitialRunnerAddressText -AutoResolve $false -ErrorAction Stop | Out-Null
   $Keyword = Get-NetFirewallDynamicKeywordAddress -Id $RunnerKeywordId -ErrorAction Stop
   if ($Keyword.AutoResolve -or [string]$Keyword.Keyword -cne 'ContextRelayRunnerControlPlane' -or
-      [string]$Keyword.Addresses -cne $InitialRunnerAddressText) {
+      -not (Test-RunnerDynamicKeywordAddresses ([string]$Keyword.Addresses) $InitialRunnerAddresses)) {
     Fail 'runner control-plane dynamic keyword is not exact and active'
   }
   $RunnerKeywordIds = [string[]]@($RunnerKeywordId)
