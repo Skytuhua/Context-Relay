@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
@@ -183,16 +183,17 @@ pub fn validate_semgrep_report(
     {
         return invalid();
     }
+    let expected = inputs
+        .iter()
+        .map(|input| input.path().as_str().to_owned())
+        .collect::<BTreeSet<_>>();
     validate_semgrep_time(
         object
             .get("time")
             .and_then(Value::as_object)
             .ok_or(RunnerError::InvalidToolOutput)?,
+        inputs,
     )?;
-    let expected = inputs
-        .iter()
-        .map(|input| input.path().as_str().to_owned())
-        .collect::<BTreeSet<_>>();
     let paths = object
         .get("paths")
         .and_then(Value::as_object)
@@ -559,7 +560,10 @@ fn semgrep_position(position: &Map<String, Value>) -> Result<(u64, u64, u64), Ru
     Ok((line, column, offset))
 }
 
-fn validate_semgrep_time(time: &Map<String, Value>) -> Result<(), RunnerError> {
+fn validate_semgrep_time(
+    time: &Map<String, Value>,
+    inputs: &[ContentFrame],
+) -> Result<(), RunnerError> {
     if !exact_keys(
         time,
         &[
@@ -576,16 +580,23 @@ fn validate_semgrep_time(time: &Map<String, Value>) -> Result<(), RunnerError> {
             "total_bytes",
             "max_memory_bytes",
         ],
-    ) || !empty_array(time.get("rules"))
+    ) || !time
+        .get("rules")
+        .and_then(Value::as_array)
+        .is_some_and(|rules| {
+            rules.len() == 1 && rules[0].as_str() == Some("context-relay-no-python-runtime")
+        })
         || !empty_array(time.get("fixpoint_timeouts"))
-        || !empty_array(time.get("targets"))
         || !nonnegative_number(time.get("rules_parse_time"))
-        || !nonnegative_number(time.get("total_bytes"))
-        || !nonnegative_number(time.get("max_memory_bytes"))
+        || !time
+            .get("max_memory_bytes")
+            .and_then(Value::as_u64)
+            .is_some()
         || !number_object(time.get("profiling_times"))
     {
         return invalid();
     }
+    validate_semgrep_targets(time, inputs)?;
     validate_file_timing(time.get("parsing_time"), "per_file_time", "very_slow_files")?;
     validate_file_timing(
         time.get("scanning_time"),
@@ -623,6 +634,80 @@ fn validate_semgrep_time(time: &Map<String, Value>) -> Result<(), RunnerError> {
         return invalid();
     }
     Ok(())
+}
+
+fn validate_semgrep_targets(
+    time: &Map<String, Value>,
+    inputs: &[ContentFrame],
+) -> Result<(), RunnerError> {
+    let expected = inputs
+        .iter()
+        .map(|input| {
+            (
+                input.path().as_str().to_owned(),
+                u64::try_from(input.bytes().len()).map_err(|_| RunnerError::LimitExceeded),
+            )
+        })
+        .map(|(path, size)| size.map(|size| (path, size)))
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if expected.len() != inputs.len() {
+        return invalid();
+    }
+    let total_bytes = expected.values().try_fold(0_u64, |total, size| {
+        total.checked_add(*size).ok_or(RunnerError::LimitExceeded)
+    })?;
+    if time.get("total_bytes").and_then(Value::as_u64) != Some(total_bytes) {
+        return invalid();
+    }
+    let targets = time
+        .get("targets")
+        .and_then(Value::as_array)
+        .ok_or(RunnerError::InvalidToolOutput)?;
+    if targets.len() != expected.len() {
+        return invalid();
+    }
+    let mut seen = BTreeSet::new();
+    for target in targets {
+        let target = target.as_object().ok_or(RunnerError::InvalidToolOutput)?;
+        if !exact_keys(
+            target,
+            &[
+                "path",
+                "num_bytes",
+                "match_times",
+                "parse_times",
+                "run_time",
+            ],
+        ) || !nonnegative_number(target.get("run_time"))
+            || !one_nonnegative_number(target.get("match_times"))
+            || !one_nonnegative_number(target.get("parse_times"))
+        {
+            return invalid();
+        }
+        let path = scanner_path(
+            target
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or(RunnerError::InvalidToolOutput)?,
+        )?;
+        let Some(expected_size) = expected.get(&path) else {
+            return invalid();
+        };
+        if target.get("num_bytes").and_then(Value::as_u64) != Some(*expected_size)
+            || !seen.insert(path)
+        {
+            return invalid();
+        }
+    }
+    (seen.len() == expected.len())
+        .then_some(())
+        .ok_or(RunnerError::InvalidToolOutput)
+}
+
+fn one_nonnegative_number(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.len() == 1 && nonnegative_number(values.first()))
 }
 
 fn validate_file_timing(

@@ -33,13 +33,26 @@ fn gitleaks_finding() -> Value {
 }
 
 fn semgrep_report(results: Vec<Value>, scanned: Vec<&str>) -> Value {
+    let targets = scanned
+        .iter()
+        .map(|path| {
+            json!({
+                "path": path,
+                "num_bytes": 11,
+                "match_times": [0.0],
+                "parse_times": [0.0],
+                "run_time": 0.0
+            })
+        })
+        .collect::<Vec<_>>();
+    let total_bytes = scanned.len() * 11;
     json!({
         "version": "1.170.0",
         "results": results,
         "errors": [],
         "paths": { "scanned": scanned },
         "time": {
-            "rules": [],
+            "rules": ["context-relay-no-python-runtime"],
             "rules_parse_time": 0.0,
             "profiling_times": {},
             "parsing_time": {
@@ -74,8 +87,8 @@ fn semgrep_report(results: Vec<Value>, scanned: Vec<&str>) -> Value {
                 "rules_selected_ratio": 1.0,
                 "rules_matched_ratio": 0.0
             },
-            "targets": [],
-            "total_bytes": 11,
+            "targets": targets,
+            "total_bytes": total_bytes,
             "max_memory_bytes": 0,
             "fixpoint_timeouts": []
         },
@@ -254,6 +267,73 @@ fn semgrep_requires_exact_schema_unique_paths_and_source_free_results() {
     ))
     .unwrap();
     assert!(validate_semgrep_report(1, &source_bearing, semgrep_warning(), &inputs).is_err());
+}
+
+#[test]
+fn semgrep_timing_binds_the_exact_rule_paths_and_input_sizes() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
+    let valid = semgrep_report(vec![], vec!["input/semgrep-target/METADATA"]);
+    assert!(
+        validate_semgrep_report(
+            0,
+            &serde_json::to_vec(&valid).unwrap(),
+            semgrep_warning(),
+            &inputs,
+        )
+        .is_ok()
+    );
+
+    for poisoned in [
+        ("rules", json!([])),
+        ("total_bytes", json!(10)),
+        (
+            "targets",
+            json!([{
+                "path": "input/semgrep-target/METADATA",
+                "num_bytes": 10,
+                "match_times": [0.0],
+                "parse_times": [0.0],
+                "run_time": 0.0
+            }]),
+        ),
+        (
+            "targets",
+            json!([{
+                "path": "input/semgrep-target/OTHER",
+                "num_bytes": 11,
+                "match_times": [0.0],
+                "parse_times": [0.0],
+                "run_time": 0.0
+            }]),
+        ),
+        (
+            "targets",
+            json!([{
+                "path": "input/semgrep-target/METADATA",
+                "num_bytes": 11,
+                "match_times": [],
+                "parse_times": [0.0],
+                "run_time": 0.0
+            }]),
+        ),
+    ] {
+        let mut report = valid.clone();
+        report
+            .get_mut("time")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(poisoned.0.into(), poisoned.1);
+        assert!(
+            validate_semgrep_report(
+                0,
+                &serde_json::to_vec(&report).unwrap(),
+                semgrep_warning(),
+                &inputs,
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
