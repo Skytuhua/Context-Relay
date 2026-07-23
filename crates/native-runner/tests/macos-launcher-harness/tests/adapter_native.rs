@@ -11,6 +11,7 @@ use std::{
         unix::{
             ffi::OsStrExt,
             fs::{PermissionsExt, symlink},
+            process::CommandExt,
         },
     },
     path::{Path, PathBuf},
@@ -659,16 +660,45 @@ impl RealFixture {
         )
         .unwrap();
         fs::write(&target, input).unwrap();
+        for directory in ["home", "data", "cache", "temp", "runtime"] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
         let executable = self
             .closure
             .root()
             .join(self.closure.executable().path().as_str());
         let argv = SidecarCommand::OsemgrepScanPackage.argv();
-        let output = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .args(argv.iter().skip(1))
             .current_dir(&root)
-            .output()
-            .unwrap();
+            .env_clear()
+            .env("HOME", root.join("home"))
+            .env("USERPROFILE", root.join("home"))
+            .env("APPDATA", root.join("data"))
+            .env("LOCALAPPDATA", root.join("data"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("TMP", root.join("temp"))
+            .env("TEMP", root.join("temp"))
+            .env("TMPDIR", root.join("temp"))
+            .env("PATH", root.join("runtime"))
+            .env("LANG", "C.UTF-8")
+            .env("LC_ALL", "C.UTF-8");
+        unsafe {
+            command.pre_exec(|| {
+                let no_children = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::setrlimit(libc::RLIMIT_NPROC, &no_children) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
         format!(
             "status={:?}, stdout={}, stderr={}",
             output.status.code(),

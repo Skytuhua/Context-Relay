@@ -370,7 +370,9 @@ fn semgrep_candidate_diagnostics_classify_only_pre_json_rejections() {
     .unwrap();
 
     for (exit, stderr, stage) in [
-        (2, semgrep_warning(), 0),
+        (2, semgrep_warning(), 2),
+        (3, semgrep_warning(), 3),
+        (4, semgrep_warning(), 4),
         (0, b"".as_slice(), 1),
         (0, b"unexpected\n".as_slice(), 2),
         (0, b"[clock][WARNING]: warning\n".as_slice(), 3),

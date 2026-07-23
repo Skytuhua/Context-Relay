@@ -175,7 +175,13 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
             .ok_or(RunnerError::LimitExceeded)
     })?;
     let stats = RunStats::new(scanned_files, scanned_bytes, duration_ms);
-    let exit = status.code().ok_or(RunnerError::InvalidToolOutput)?;
+    let exit = status.code().ok_or_else(|| {
+        #[cfg(feature = "ci-candidate-sidecar-smoke")]
+        if matches!(request.command(), SidecarCommand::OsemgrepScanPackage) {
+            return RunnerError::CiSemgrepValidation(1);
+        }
+        RunnerError::InvalidToolOutput
+    })?;
     match request.command() {
         SidecarCommand::RuleSyncGenerate { .. } => {
             let outputs = stage.read_outputs(limits)?;

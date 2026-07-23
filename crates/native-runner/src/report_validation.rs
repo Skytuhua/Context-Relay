@@ -170,7 +170,12 @@ pub fn validate_semgrep_report(
     inputs: &[ContentFrame],
 ) -> Result<(RunDisposition, Vec<u8>), RunnerError> {
     if !matches!(exit, 0 | 1) {
-        return Err(semgrep_validation_error(0));
+        let stage = match exit {
+            2 => 2,
+            3 => 3,
+            _ => 4,
+        };
+        return Err(semgrep_validation_error(stage));
     }
     validate_semgrep_warning(stderr).map_err(semgrep_validation_error)?;
     let report: Value = serde_json::from_slice(stdout).map_err(|_| semgrep_validation_error(1))?;
