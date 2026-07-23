@@ -230,7 +230,6 @@ impl SidecarCommand {
                 "--no-git-ignore",
                 "--x-ignore-semgrepignore-files",
                 "--time",
-                "--x-parmap",
                 "--jobs=1",
                 "--timeout=30",
                 "--timeout-threshold=1",

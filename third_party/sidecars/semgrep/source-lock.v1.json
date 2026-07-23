@@ -7115,7 +7115,6 @@
       "--no-git-ignore",
       "--x-ignore-semgrepignore-files",
       "--time",
-      "--x-parmap",
       "--jobs=1",
       "--timeout=30",
       "--timeout-threshold=1",
@@ -7124,6 +7123,6 @@
       "<staged-rule>",
       "<staged-target>"
     ],
-    "sha256": "8c3cb0eaef65190c605fe0b1d388f22b068fb24e12ad41d087e95b6a0ffdbbe7"
+    "sha256": "2ec1e7944e84d56222cf9717f82e429dfbceee6895041d898a08c7f20bfbd05d"
   }
 }
