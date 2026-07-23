@@ -475,6 +475,7 @@ test('public-source build scripts consume the verified bundle through closed nat
     windows,
     /\$env:MAKEFLAGS = '-j1'[\s\S]+& \$Opam install --update-invariant 'ocaml-variants\.5\.3\.0'/,
   );
+  assert.doesNotMatch(windows, /ocaml-option-flambda/);
   assert.match(
     windows,
     /& \$Opam install --locked --update-invariant --deps-only '\.\\semgrep\.opam' \} 'dependency installation'/,

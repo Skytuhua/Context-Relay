@@ -469,7 +469,7 @@ function Build-Once([string]$Label) {
   if ($null -ne [Environment]::GetEnvironmentVariable('GIT_DIR', 'Process')) { Fail 'GIT_DIR must be unset before compiler installation' }
   $env:GIT_DIR = $CompilerGitDirForward
   try {
-    Invoke-Checked { & $Opam install --update-invariant 'ocaml-variants.5.3.0' 'ocaml-option-flambda' } 'compiler installation'
+    Invoke-Checked { & $Opam install --update-invariant 'ocaml-variants.5.3.0' } 'compiler installation'
   } finally {
     Remove-Item Env:GIT_DIR -ErrorAction SilentlyContinue
   }
