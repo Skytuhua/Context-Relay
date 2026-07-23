@@ -36,7 +36,9 @@ const CI_CANDIDATE_DOMAIN: &[u8] = b"context-relay/ci-candidate-sidecar-smoke/v1
 #[cfg(feature = "ci-candidate-sidecar-smoke")]
 const CI_CANDIDATE_PURPOSE: &str = "ci-native-sidecar-smoke-only";
 #[cfg(feature = "ci-candidate-sidecar-smoke")]
-const CI_CANDIDATE_PENDING_STATUS: &str = "source_bundle_reproducible_native_builds_pending";
+const CI_CANDIDATE_V1_STATUS: &str = "source_bundle_v1_native_builds_pending";
+#[cfg(feature = "ci-candidate-sidecar-smoke")]
+const CI_CANDIDATE_QUALIFIED_STATUS: &str = "source_bundle_reproducible_native_builds_pending";
 #[cfg(feature = "ci-candidate-sidecar-smoke")]
 const CI_CANDIDATE_MISSING_MATERIAL: [&str; 4] = [
     "two byte-identical executable and runtime-closure inventories per target",
@@ -882,7 +884,7 @@ pub fn verify_ci_candidate_closure(
         || candidate.version != tool.version
         || parse_hash(&candidate.production_manifest_sha256)? != manifest.sha256
         || candidate.source_lock_sha256 != tool.source.material_sha256
-        || candidate.bundle_evidence_status != CI_CANDIDATE_PENDING_STATUS
+        || ci_candidate_source_claim(&candidate.bundle_evidence_status).is_none()
         || production_target.enabled
         || production_target
             .disabled_reason
@@ -903,6 +905,7 @@ pub fn verify_ci_candidate_closure(
         target,
         &candidate.source_lock_sha256,
         &candidate.bundle_evidence_sha256,
+        &candidate.bundle_evidence_status,
     )?;
     validate_ci_candidate_runtime(&candidate)?;
     let materials = verify_candidate_hydrated_closure(hydrated_root, &candidate.closure)?;
@@ -1016,6 +1019,7 @@ fn verify_ci_candidate_workspace(
     target: RuntimeTarget,
     source_lock_sha256: &str,
     bundle_evidence_sha256: &str,
+    bundle_evidence_status: &str,
 ) -> Result<(), RunnerError> {
     let source_bytes = read_verified_file(
         root,
@@ -1083,7 +1087,12 @@ fn verify_ci_candidate_workspace(
     {
         return Err(RunnerError::InvalidManifest);
     }
-    verify_pending_semgrep_bundle_evidence(root, tool, bundle_evidence_sha256)
+    verify_pending_semgrep_bundle_evidence(
+        root,
+        tool,
+        bundle_evidence_sha256,
+        bundle_evidence_status,
+    )
 }
 
 #[cfg(feature = "ci-candidate-sidecar-smoke")]
@@ -1091,6 +1100,7 @@ fn verify_pending_semgrep_bundle_evidence(
     root: &Path,
     tool: &Tool,
     candidate_evidence_sha256: &str,
+    candidate_evidence_status: &str,
 ) -> Result<(), RunnerError> {
     let evidence = tool
         .materials
@@ -1117,13 +1127,15 @@ fn verify_pending_semgrep_bundle_evidence(
     let evidence: SemgrepBundleEvidence =
         serde_json::from_slice(&evidence_bytes).map_err(|_| RunnerError::InvalidManifest)?;
     let bundle_hash = parse_hash(&evidence.bundle.sha256)?;
+    let (independent_builds, byte_identical) =
+        ci_candidate_source_claim(candidate_evidence_status).ok_or(RunnerError::InvalidManifest)?;
     if evidence.schema_version != 1
         || evidence.format != "context-relay-semgrep-source-v1"
         || evidence.source_lock_sha256 != tool.source.material_sha256
         || evidence.bundle_generator_sha256 != generator[0].sha256
-        || evidence.independent_builds != 2
-        || !evidence.byte_identical
-        || evidence.status != CI_CANDIDATE_PENDING_STATUS
+        || evidence.independent_builds != independent_builds
+        || evidence.byte_identical != byte_identical
+        || evidence.status != candidate_evidence_status
         || evidence.source_asset_url != SEMGREP_SOURCE_ASSET_URL
         || bundle_hash == [0; 32]
         || evidence.bundle.size == 0
@@ -1135,6 +1147,15 @@ fn verify_pending_semgrep_bundle_evidence(
         return Err(RunnerError::InvalidManifest);
     }
     Ok(())
+}
+
+#[cfg(feature = "ci-candidate-sidecar-smoke")]
+fn ci_candidate_source_claim(status: &str) -> Option<(u8, bool)> {
+    match status {
+        CI_CANDIDATE_V1_STATUS => Some((1, false)),
+        CI_CANDIDATE_QUALIFIED_STATUS => Some((2, true)),
+        _ => None,
+    }
 }
 
 fn validate_manifest(manifest: &ManifestV1) -> Result<(), RunnerError> {

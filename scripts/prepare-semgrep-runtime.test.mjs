@@ -23,7 +23,7 @@ import {
 
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
-async function buildFixture({ includeRelease = true } = {}) {
+async function buildFixture({ builds = ['a', 'b'], includeRelease = true } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'context-relay-semgrep-runtime-'));
   const buildRoot = join(root, 'build');
   const runtime = new Map([
@@ -45,7 +45,10 @@ async function buildFixture({ includeRelease = true } = {}) {
     ['runtime-dependencies.txt', Buffer.from('kernel32.dll\nruntime.dll\n')],
     ['version.txt', Buffer.from('1.170.0\n')],
   ]);
-  const labels = includeRelease ? ['build-a', 'build-b', 'release'] : ['build-a', 'build-b'];
+  const labels = [
+    ...builds.map((build) => `build-${build}`),
+    ...(includeRelease ? ['release'] : []),
+  ];
   for (const label of labels) {
     const directory = join(buildRoot, label);
     await mkdir(directory, { recursive: true });
@@ -139,6 +142,26 @@ test('runtime artifact derives its canonical release from exact A/B builds witho
   assert.deepEqual(
     await readFile(join(runtime.artifactRoot, 'release-evidence', 'MANIFEST.sha256')),
     await readFile(join(fixture.buildRoot, 'build-a-evidence', 'MANIFEST.sha256')),
+  );
+});
+
+test('V1 runtime artifact honestly prepares one build without requiring build-b', async () => {
+  const fixture = await buildFixture({ builds: ['a'], includeRelease: false });
+  const runtime = await prepareRuntimeArtifact({
+    buildRoot: fixture.buildRoot,
+    outputRoot: join(fixture.root, 'candidate'),
+    releaseQualification: false,
+    targetName: 'windows-x86_64',
+    version: '1.170.0',
+  });
+
+  assert.deepEqual(
+    await readFile(join(runtime.artifactRoot, 'release', 'osemgrep.exe')),
+    await readFile(join(fixture.buildRoot, 'build-a', 'osemgrep.exe')),
+  );
+  await assert.rejects(
+    readFile(join(runtime.artifactRoot, 'build-b.MANIFEST.sha256')),
+    { code: 'ENOENT' },
   );
 });
 
@@ -258,9 +281,9 @@ test('candidate smoke document binds runtime while production manifest and sourc
   const bundleEvidence = {
     schemaVersion: 1,
     sourceLockSha256,
-    independentBuilds: 2,
-    byteIdentical: true,
-    status: 'source_bundle_reproducible_native_builds_pending',
+    independentBuilds: 1,
+    byteIdentical: false,
+    status: 'source_bundle_v1_native_builds_pending',
   };
   const result = createCandidateDocuments({
     bundleEvidence,

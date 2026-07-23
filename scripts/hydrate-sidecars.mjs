@@ -28,6 +28,10 @@ const ALLOWED_LICENSES = new Set(['MIT', 'LGPL-2.1-or-later']);
 const MAX_MANIFEST_BYTES = 1048576;
 const MAX_SOURCE_BUNDLE_BYTES = 2_147_483_648;
 const SEMGREP_SOURCE_ASSET_URL = 'https://github.com/Skytuhua/Context-Relay/releases/download/sidecars-semgrep-1.170.0-source.1/semgrep-1.170.0-corresponding-source.tar';
+const CI_CANDIDATE_SOURCE_CLAIMS = new Map([
+  ['source_bundle_v1_native_builds_pending', [1, false]],
+  ['source_bundle_reproducible_native_builds_pending', [2, true]],
+]);
 const SEMGREP_LICENSE_SOURCES = [
   'memtrace',
   'obackward',
@@ -1432,7 +1436,7 @@ function parseCiCandidateDocument(bytes) {
       || candidate.enabled !== false
       || candidate.sidecar !== 'semgrep'
       || !TARGETS.has(candidate.target)
-      || candidate.bundleEvidenceStatus !== 'source_bundle_reproducible_native_builds_pending') {
+      || !CI_CANDIDATE_SOURCE_CLAIMS.has(candidate.bundleEvidenceStatus)) {
     throw new Error('CI candidate document is not an explicitly pending smoke document');
   }
   text(candidate.version, 'CI candidate document.version');
@@ -1532,6 +1536,9 @@ function assertPendingCiCandidateMaterials(manifest, workspace, candidate) {
       throw new Error('CI candidate pending materials are not valid JSON');
     }
     const statuses = source.targetStatus?.filter(({ distributionTarget }) => distributionTarget === sourceTarget) ?? [];
+    const [independentBuilds, byteIdentical] = CI_CANDIDATE_SOURCE_CLAIMS.get(
+      candidate.bundleEvidenceStatus,
+    );
     if (source.completeCorrespondingSource !== false
         || source.recursiveInventoryComplete !== true
         || source.opam?.resolvedSourceArchivesComplete !== true
@@ -1540,8 +1547,8 @@ function assertPendingCiCandidateMaterials(manifest, workspace, candidate) {
         || statuses.length !== 1
         || statuses[0].enabled !== false
         || evidence.sourceLockSha256 !== candidate.sourceLockSha256
-        || evidence.independentBuilds !== 2
-        || evidence.byteIdentical !== true
+        || evidence.independentBuilds !== independentBuilds
+        || evidence.byteIdentical !== byteIdentical
         || evidence.status !== candidate.bundleEvidenceStatus) {
       throw new Error('CI candidate source or bundle evidence was prematurely completed');
     }

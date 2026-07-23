@@ -47,8 +47,9 @@ revision, tree, and gitlink. Verify the complete archive before extraction:
 node scripts/semgrep-source-bundle.mjs --verify SOURCE_LOCK OUTPUT.tar
 ```
 
-Generate two archives independently and require identical size and SHA-256.
+Task 9 V1 verifies the exact archive used by one native build per target and
+requires each resulting runtime closure to pass its platform sandbox smoke.
 The source inventory is complete enough to assemble this bundle, but
-`completeCorrespondingSource` and both distribution targets remain disabled
-until two native builds, runtime-closure inventories, and target sandbox smoke
-checks have been captured.
+`completeCorrespondingSource` and both distribution targets remain disabled.
+Two independent archives/builds, byte comparison, publication, and final
+evidence binding belong to Task 9R release qualification.

@@ -1,0 +1,13 @@
+name: Semgrep release qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    uses: ./.github/workflows/ci.yml
+    with:
+      semgrep_release_qualification: true

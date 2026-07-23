@@ -28,6 +28,7 @@ const MAX_BUNDLE_BYTES = 1280 * 1024 * 1024;
 const BUNDLE_METADATA = Buffer.from('{"format":"context-relay-semgrep-source-v1","schemaVersion":1}\n');
 const SOURCE_ASSET_URL = 'https://github.com/Skytuhua/Context-Relay/releases/download/sidecars-semgrep-1.170.0-source.1/semgrep-1.170.0-corresponding-source.tar';
 const BUNDLE_EVIDENCE_STATUSES = new Set([
+  'source_bundle_v1_native_builds_pending',
   'source_bundle_reproducible_native_builds_pending',
   'complete_corresponding_source',
 ]);
@@ -1162,8 +1163,8 @@ export async function verifyBundleEvidence({ bundlePath, evidencePath, sourceLoc
   }
   if (evidence.schemaVersion !== 1
       || evidence.format !== 'context-relay-semgrep-source-v1'
-      || evidence.independentBuilds !== 2
-      || evidence.byteIdentical !== true
+      || !Number.isSafeInteger(evidence.independentBuilds)
+      || typeof evidence.byteIdentical !== 'boolean'
       || !BUNDLE_EVIDENCE_STATUSES.has(evidence.status)
       || !sha256Pattern.test(evidence.sourceLockSha256)
       || !sha256Pattern.test(evidence.bundleGeneratorSha256)
@@ -1173,6 +1174,9 @@ export async function verifyBundleEvidence({ bundlePath, evidencePath, sourceLoc
       || !Number.isSafeInteger(evidence.bundle.recordedLinks) || evidence.bundle.recordedLinks < 0) {
     fail('bundle evidence is invalid');
   }
+  const v1 = evidence.status === 'source_bundle_v1_native_builds_pending';
+  if (evidence.independentBuilds !== (v1 ? 1 : 2)
+      || evidence.byteIdentical !== !v1) fail('bundle evidence qualification claim is invalid');
   if (evidence.sourceLockSha256 !== hash('sha256', sourceLockFile.bytes)) {
     fail('bundle evidence source lock hash mismatch');
   }

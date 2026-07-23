@@ -268,7 +268,13 @@ async function copyRuntimeFiles(source, destination, inventory) {
   }
 }
 
-export async function prepareRuntimeArtifact({ buildRoot, outputRoot, targetName, version }) {
+export async function prepareRuntimeArtifact({
+  buildRoot,
+  outputRoot,
+  releaseQualification = true,
+  targetName,
+  version,
+}) {
   targetPolicy(targetName);
   if (typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)) fail('version is invalid');
   buildRoot = resolve(buildRoot);
@@ -287,41 +293,51 @@ export async function prepareRuntimeArtifact({ buildRoot, outputRoot, targetName
     await mkdir(outputRoot);
     created = true;
     const aEvidence = await readEvidenceDirectory(join(buildRoot, 'build-a-evidence'), 'build-a evidence', version);
-    const bEvidence = await readEvidenceDirectory(join(buildRoot, 'build-b-evidence'), 'build-b evidence', version);
     const a = await readBuildDirectory(join(buildRoot, 'build-a'), aEvidence.root, targetName, 'build-a');
-    const b = await readBuildDirectory(join(buildRoot, 'build-b'), bEvidence.root, targetName, 'build-b');
-    if (!a.manifestBytes.equals(b.manifestBytes)) {
-      fail('twice-built MANIFEST.sha256 mismatch');
+    let b;
+    let bEvidence;
+    if (releaseQualification) {
+      bEvidence = await readEvidenceDirectory(join(buildRoot, 'build-b-evidence'), 'build-b evidence', version);
+      b = await readBuildDirectory(join(buildRoot, 'build-b'), bEvidence.root, targetName, 'build-b');
+      if (!a.manifestBytes.equals(b.manifestBytes)) {
+        fail('twice-built MANIFEST.sha256 mismatch');
+      }
+      assertExactRuntimeInventory(a.inventory, b.inventory);
+      assertExactRuntimeInventory(aEvidence.inventory, bEvidence.inventory);
     }
-    assertExactRuntimeInventory(a.inventory, b.inventory);
-    assertExactRuntimeInventory(aEvidence.inventory, bEvidence.inventory);
     const closure = a.inventory;
     const artifactRoot = join(outputRoot, 'artifact');
     await mkdir(artifactRoot);
     await copyRuntimeFiles(a.root, join(artifactRoot, 'release'), closure);
     await writeFile(join(artifactRoot, 'build-a.MANIFEST.sha256'), a.manifestBytes, { flag: 'wx' });
-    await writeFile(join(artifactRoot, 'build-b.MANIFEST.sha256'), b.manifestBytes, { flag: 'wx' });
     await writeFile(join(artifactRoot, 'build-a-evidence.MANIFEST.sha256'), inventoryManifest(aEvidence.inventory), { flag: 'wx' });
-    await writeFile(join(artifactRoot, 'build-b-evidence.MANIFEST.sha256'), inventoryManifest(bEvidence.inventory), { flag: 'wx' });
+    if (releaseQualification) {
+      await writeFile(join(artifactRoot, 'build-b.MANIFEST.sha256'), b.manifestBytes, { flag: 'wx' });
+      await writeFile(join(artifactRoot, 'build-b-evidence.MANIFEST.sha256'), inventoryManifest(bEvidence.inventory), { flag: 'wx' });
+    }
     await copyRuntimeFiles(aEvidence.root, join(artifactRoot, 'release-evidence'), aEvidence.inventory);
     const archiveName = `semgrep-${version}-${targetName}.tar.gz`;
     const archivePath = join(artifactRoot, archiveName);
-    const comparisonPath = join(outputRoot, 'runtime-build-b.tar.gz');
     const archiveA = await writeArchive(archivePath, a.root, a.inventory);
-    const archiveB = await writeArchive(comparisonPath, b.root, b.inventory);
-    if (archiveA.size !== archiveB.size || archiveA.sha256 !== archiveB.sha256) {
-      fail('twice-built runtime archives differ');
+    if (releaseQualification) {
+      const comparisonPath = join(outputRoot, 'runtime-build-b.tar.gz');
+      const archiveB = await writeArchive(comparisonPath, b.root, b.inventory);
+      if (archiveA.size !== archiveB.size || archiveA.sha256 !== archiveB.sha256) {
+        fail('twice-built runtime archives differ');
+      }
+      await rm(comparisonPath);
     }
-    await rm(comparisonPath);
     const evidenceArchiveName = `semgrep-${version}-${targetName}-release-evidence.tar.gz`;
     const evidenceArchivePath = join(artifactRoot, evidenceArchiveName);
-    const evidenceComparisonPath = join(outputRoot, 'evidence-build-b.tar.gz');
     const evidenceArchiveA = await writeArchive(evidenceArchivePath, aEvidence.root, aEvidence.inventory);
-    const evidenceArchiveB = await writeArchive(evidenceComparisonPath, bEvidence.root, bEvidence.inventory);
-    if (evidenceArchiveA.size !== evidenceArchiveB.size || evidenceArchiveA.sha256 !== evidenceArchiveB.sha256) {
-      fail('twice-built evidence archives differ');
+    if (releaseQualification) {
+      const evidenceComparisonPath = join(outputRoot, 'evidence-build-b.tar.gz');
+      const evidenceArchiveB = await writeArchive(evidenceComparisonPath, bEvidence.root, bEvidence.inventory);
+      if (evidenceArchiveA.size !== evidenceArchiveB.size || evidenceArchiveA.sha256 !== evidenceArchiveB.sha256) {
+        fail('twice-built evidence archives differ');
+      }
+      await rm(evidenceComparisonPath);
     }
-    await rm(evidenceComparisonPath);
     await writeFile(
       join(artifactRoot, `runtime-closure.${targetName}.v1.json`),
       jsonBytes({
@@ -398,12 +414,14 @@ export function createCandidateDocuments({
   if (statuses.length !== 1 || statuses[0].enabled !== false) {
     fail('candidate source target status is missing, ambiguous, or already enabled');
   }
+  const v1Source = bundleEvidence?.status === 'source_bundle_v1_native_builds_pending'
+    && bundleEvidence.independentBuilds === 1 && bundleEvidence.byteIdentical === false;
+  const qualifiedSource = bundleEvidence?.status === 'source_bundle_reproducible_native_builds_pending'
+    && bundleEvidence.independentBuilds === 2 && bundleEvidence.byteIdentical === true;
   if (!bundleEvidence || typeof bundleEvidence !== 'object' || Array.isArray(bundleEvidence)
       || bundleEvidence.sourceLockSha256 !== sourceLockSha256
-      || bundleEvidence.independentBuilds !== 2
-      || bundleEvidence.byteIdentical !== true
-      || bundleEvidence.status !== 'source_bundle_reproducible_native_builds_pending') {
-    fail('candidate bundle evidence is not honestly pending and reproducible');
+      || (!v1Source && !qualifiedSource)) {
+    fail('candidate bundle evidence is not an honest pending V1 or qualified source bundle');
   }
 
   const semgrep = manifest.tools?.find(({ id }) => id === 'semgrep');
@@ -533,6 +551,7 @@ export async function prepareAndHydrate({
   buildRoot,
   bundleEvidencePath,
   outputRoot,
+  releaseQualification = true,
   sourceBundlePath,
   targetName,
   workspace,
@@ -550,7 +569,13 @@ export async function prepareAndHydrate({
     evidencePath: committedEvidencePath,
     sourceLockPath,
   });
-  const runtime = await prepareRuntimeArtifact({ buildRoot, outputRoot, targetName, version: semgrep.version });
+  const runtime = await prepareRuntimeArtifact({
+    buildRoot,
+    outputRoot,
+    releaseQualification,
+    targetName,
+    version: semgrep.version,
+  });
   let hydrationWorkspace = workspace;
   let result;
   let mode;
@@ -735,7 +760,7 @@ export function createWindowsStableToolchainEvidence(bytes) {
 
 async function command() {
   const [mode, ...args] = process.argv.slice(2);
-  if (mode === '--prepare' && args.length === 12) {
+  if ((mode === '--prepare' || mode === '--prepare-v1') && args.length === 12) {
     const values = Object.fromEntries(Array.from({ length: 6 }, (_, index) => [args[index * 2], args[index * 2 + 1]]));
     if (JSON.stringify(Object.keys(values).sort()) !== JSON.stringify([
       '--build-root', '--bundle-evidence', '--output-root', '--source-bundle', '--target', '--workspace',
@@ -744,6 +769,7 @@ async function command() {
       buildRoot: values['--build-root'],
       bundleEvidencePath: values['--bundle-evidence'],
       outputRoot: values['--output-root'],
+      releaseQualification: mode === '--prepare',
       sourceBundlePath: values['--source-bundle'],
       targetName: values['--target'],
       workspace: values['--workspace'],
@@ -761,7 +787,7 @@ async function command() {
     await writeFile(args[1], createWindowsStableToolchainEvidence(await readFile(args[0])), { flag: 'wx' });
     return;
   }
-  fail('usage: --prepare --workspace ROOT --target TARGET --build-root ROOT --output-root ROOT --source-bundle TAR --bundle-evidence JSON | --windows-evidence FACTS.json CYGCHECK.txt OUTPUT.json | --windows-stable-toolchain BUILDER.json OUTPUT.json');
+  fail('usage: --prepare|--prepare-v1 --workspace ROOT --target TARGET --build-root ROOT --output-root ROOT --source-bundle TAR --bundle-evidence JSON | --windows-evidence FACTS.json CYGCHECK.txt OUTPUT.json | --windows-stable-toolchain BUILDER.json OUTPUT.json');
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

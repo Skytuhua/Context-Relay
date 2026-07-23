@@ -1082,7 +1082,7 @@ test('the committed manifest and all referenced material validate', async () => 
   await validateManifestMaterials(manifest, workspace);
 });
 
-test('Semgrep records the complete recursive source inventory but remains disabled until reproducible native proof', async () => {
+test('Semgrep records the V1 source bundle but remains disabled pending release qualification', async () => {
   const lockBytes = await readFile(new URL('../third_party/sidecars/semgrep/source-lock.v1.json', import.meta.url));
   const lock = JSON.parse(lockBytes);
   const bundleEvidence = JSON.parse(
@@ -1090,7 +1090,7 @@ test('Semgrep records the complete recursive source inventory but remains disabl
   );
   assert.equal(lock.completeCorrespondingSource, false);
   assert.equal(lock.recursiveInventoryComplete, true);
-  assert.equal(sha256(lockBytes), 'd8c0724ddd4503d3bd0b3c097bfd69c67b22ef0611e073cdcbcbe59635a5dba9');
+  assert.equal(sha256(lockBytes), 'd5c29931ef5e68a5f6840c9bb27557cbbc8b22ccbb9ae13592c97b928d65dd26');
   assert.equal(lock.licenseMaterials.length, 12);
   assert.equal(lock.rootGitlinks.length, 36);
   assert.equal(lock.opam.resolvedSourceArchivesComplete, true);
@@ -1100,23 +1100,24 @@ test('Semgrep records the complete recursive source inventory but remains disabl
   assert.equal(lock.opam.resolvedSourceArchives.reduce((count, entry) => count + entry.extraSources.length, 0), 10);
   assert.equal(lock.missingMaterial.includes('byte-identical complete corresponding-source bundle built twice'), false);
   assert.equal(lock.missingMaterial.some((entry) => /source-archive inventory|resolved opam source/i.test(entry)), false);
-  assert.equal(bundleEvidence.byteIdentical, true);
-  assert.equal(bundleEvidence.independentBuilds, 2);
+  assert.equal(bundleEvidence.byteIdentical, false);
+  assert.equal(bundleEvidence.independentBuilds, 1);
+  assert.equal(bundleEvidence.status, 'source_bundle_v1_native_builds_pending');
   assert.equal(
     bundleEvidence.sourceAssetUrl,
     'https://github.com/Skytuhua/Context-Relay/releases/download/sidecars-semgrep-1.170.0-source.1/semgrep-1.170.0-corresponding-source.tar',
   );
   assert.equal('sourceAssetUrl' in lock, false);
   assert.equal('sourceBundleSha256' in lock, false);
-  assert.equal(bundleEvidence.bundle.sha256, '6d750eeffac34c2079d46c99bce52442c955be9aaa2c7d60b6d350b3140a0a63');
-  assert.equal(bundleEvidence.bundle.size, 1149630464);
+  assert.equal(bundleEvidence.bundle.sha256, 'fd7a12196e7984d5af7d1239625e0315901f8be7b6ce24bfe9da00be887b48c2');
+  assert.equal(bundleEvidence.bundle.size, 1149630976);
   assert.equal(bundleEvidence.bundle.payloadEntries, 39541);
   assert.equal(bundleEvidence.bundle.recordedLinks, 222);
-  assert.equal(bundleEvidence.sourceLockSha256, 'd8c0724ddd4503d3bd0b3c097bfd69c67b22ef0611e073cdcbcbe59635a5dba9');
-  assert.equal(bundleEvidence.bundleGeneratorSha256, '3ee946303e33a152cb79d4a253fbdc19bfc80747af1ed42314a69e81887c6aaa');
+  assert.equal(bundleEvidence.sourceLockSha256, 'd5c29931ef5e68a5f6840c9bb27557cbbc8b22ccbb9ae13592c97b928d65dd26');
+  assert.equal(bundleEvidence.bundleGeneratorSha256, '63789074b65a4a065bf0e8c55adcf537f620fc190148faba59912e22ecd70db1');
   assert.equal(
     sha256(await readFile(new URL('./semgrep-source-bundle.mjs', import.meta.url))),
-    '3ee946303e33a152cb79d4a253fbdc19bfc80747af1ed42314a69e81887c6aaa',
+    '63789074b65a4a065bf0e8c55adcf537f620fc190148faba59912e22ecd70db1',
   );
   assert.equal(lock.researchEvidence.usableForHydration, false);
   assert.equal(lock.researchEvidence.usableForPackaging, false);

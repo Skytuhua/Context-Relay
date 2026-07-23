@@ -36,7 +36,7 @@ fn pending_semgrep_candidate_is_test_only_and_exactly_bound() {
         "productionManifestSha256": hex_hash(&manifest_bytes),
         "sourceLockSha256": hex_hash(&source_lock),
         "bundleEvidenceSha256": hex_hash(&bundle_evidence),
-        "bundleEvidenceStatus": "source_bundle_reproducible_native_builds_pending",
+        "bundleEvidenceStatus": "source_bundle_v1_native_builds_pending",
         "archive": {
             "format": "tar.gz",
             "size": 1234,

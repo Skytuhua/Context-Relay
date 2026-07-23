@@ -852,6 +852,20 @@ test('complete bundle includes recursive git, opam records, pins, archives, and 
     (await verifyBundleEvidence({ bundlePath: first, evidencePath, sourceLockPath })).sha256,
     verified.sha256,
   );
+  Object.assign(evidence, {
+    byteIdentical: false,
+    independentBuilds: 1,
+    status: 'source_bundle_v1_native_builds_pending',
+  });
+  await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
+  assert.equal(
+    (await verifyBundleEvidence({ bundlePath: first, evidencePath, sourceLockPath })).sha256,
+    verified.sha256,
+  );
+  Object.assign(evidence, {
+    byteIdentical: true,
+    independentBuilds: 2,
+  });
   evidence.status = 'complete_corresponding_source';
   await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
   assert.equal(

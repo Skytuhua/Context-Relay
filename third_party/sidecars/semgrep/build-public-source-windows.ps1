@@ -3,7 +3,8 @@ param(
   [Parameter(Mandatory = $true)][string]$SourceBundle,
   [Parameter(Mandatory = $true)][string]$WorkRoot,
   [Parameter(Mandatory = $true)][string]$OutputRoot,
-  [Parameter(Mandatory = $true)][ValidateSet('build-a', 'build-b')][string]$BuildLabel
+  [Parameter(Mandatory = $true)][ValidateSet('build-a', 'build-b')][string]$BuildLabel,
+  [switch]$OfflineBuild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -420,6 +421,21 @@ function Build-Once([string]$Label) {
   [IO.File]::WriteAllLines((Join-Path $SmokeFixtures 'invalid-rule.yml'), [string[]]@('rules: ['), $Utf8NoBom)
   [IO.File]::WriteAllLines((Join-Path $SmokeFixtures 'clean.txt'), [string[]]@('clean target'), $Utf8NoBom)
   [IO.File]::WriteAllLines((Join-Path $SmokeFixtures 'finding.txt'), [string[]]@('context-relay-finding'), $Utf8NoBom)
+  return [pscustomobject]@{
+    Destination = $Destination
+    Evidence = $Evidence
+    SmokeFixtures = $SmokeFixtures
+    SmokeHome = $SmokeHome
+    SmokeTmp = $SmokeTmp
+  }
+}
+
+function Invoke-RuntimeSmoke([pscustomobject]$Build) {
+  $Destination = $Build.Destination
+  $Evidence = $Build.Evidence
+  $SmokeFixtures = $Build.SmokeFixtures
+  $SmokeHome = $Build.SmokeHome
+  $SmokeTmp = $Build.SmokeTmp
   $SavedEnvironment = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
   foreach ($Entry in Get-ChildItem Env:) { $SavedEnvironment[$Entry.Name] = $Entry.Value }
   $EnvironmentNames = [string[]]@(Get-ChildItem Env: | ForEach-Object Name)
@@ -496,6 +512,7 @@ function Build-Once([string]$Label) {
   [IO.File]::WriteAllLines((Join-Path $Evidence 'MANIFEST.sha256'), $ManifestLines, [Text.Encoding]::ASCII)
 }
 
+$Build = if ($OfflineBuild) { $null } else { Build-Once $BuildLabel }
 $ProbeAddress = [Net.Dns]::GetHostAddresses('github.com') |
   Where-Object AddressFamily -eq ([Net.Sockets.AddressFamily]::InterNetwork) |
   Select-Object -First 1
@@ -580,20 +597,21 @@ try {
     if ([string]$Effective.DefaultOutboundAction -ne 'Block') { Fail "offline default outbound policy is not active: $($ProfileSnapshot.Name)" }
   }
   if (Test-OutboundTcp $ProbeAddress) { Fail 'hostile outbound TCP probe bypassed the offline firewall policy' }
-  Build-Once $BuildLabel
+  if ($OfflineBuild) { $Build = Build-Once $BuildLabel }
+  Invoke-RuntimeSmoke $Build
   foreach ($Program in $RunnerPrograms) {
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $Program).Hash -ne $RunnerProgramHashes[$Program]) {
-      Fail "runner control-plane executable changed during the native build: $Program"
+      Fail "runner control-plane executable changed during the runtime smoke: $Program"
     }
   }
   foreach ($ProfileSnapshot in $ProfileSnapshots) {
     $Effective = Get-NetFirewallProfile -Profile $ProfileSnapshot.Name -ErrorAction Stop
-    if ([string]$Effective.DefaultOutboundAction -ne 'Block') { Fail "offline firewall policy changed during the native build: $($ProfileSnapshot.Name)" }
+    if ([string]$Effective.DefaultOutboundAction -ne 'Block') { Fail "offline firewall policy changed during the runtime smoke: $($ProfileSnapshot.Name)" }
   }
-  if (Test-OutboundTcp $ProbeAddress) { Fail 'offline firewall policy was removed during the native build' }
+  if (Test-OutboundTcp $ProbeAddress) { Fail 'offline firewall policy was removed during the runtime smoke' }
   [IO.File]::WriteAllText(
     (Join-Path $OutputRoot "$BuildLabel.offline-egress.v1.json"),
-    '{"mechanism":"windows-firewall-default-outbound-block-hash-pinned-runner-tcp443-allow","probe":"hostile-outbound-tcp-denied","schemaVersion":1}' + "`n",
+    '{"mechanism":"' + $(if ($OfflineBuild) { 'windows-firewall-default-outbound-block-hash-pinned-runner-tcp443-allow' } else { 'windows-firewall-runtime-smoke-network-deny' }) + '","probe":"hostile-outbound-tcp-denied","schemaVersion":1}' + "`n",
     [Text.UTF8Encoding]::new($false)
   )
 } finally {
@@ -631,4 +649,8 @@ try {
   Clear-DnsClientCache -ErrorAction SilentlyContinue
   if ($RestoreFailures.Count -ne 0) { Fail "firewall restoration failed: $($RestoreFailures -join '; ')" }
 }
-Write-Output "Windows Cygwin/MinGW public-source $BuildLabel completed with runner-safe firewall-enforced network denial."
+if ($OfflineBuild) {
+  Write-Output "Windows Cygwin/MinGW public-source $BuildLabel build and runtime smoke completed with network denial."
+} else {
+  Write-Output "Windows Cygwin/MinGW public-source $BuildLabel runtime smoke completed with network denial."
+}
