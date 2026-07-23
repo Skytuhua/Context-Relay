@@ -109,6 +109,16 @@ test('macOS native CI mounts a debuggable case-sensitive APFS image', async () =
   assert.doesNotMatch(gates, /export TMPDIR="\$CONTEXT_RELAY_CASE_SENSITIVE_APFS_ROOT"/);
 });
 
+test('macOS generation bound contains the full Semgrep helper envelope', async () => {
+  const [launcher, native] = await Promise.all([
+    readFile(new URL('../crates/native-runner/src/launcher/macos/mod.rs', import.meta.url), 'utf8'),
+    readFile(new URL('../crates/native-runner/src/launcher/macos/native.rs', import.meta.url), 'utf8'),
+  ]);
+  assert.match(launcher, /checked_add\(HELPER_SHUTDOWN_GRACE\)/);
+  assert.match(launcher, /semgrep_helper_envelope_fits_the_native_generation_bound/);
+  assert.match(native, /pub\(super\) const MAX_RUNTIME:\s*Duration\s*=\s*Duration::from_secs\(95\)/);
+});
+
 test('the CI-only candidate verifier feature is scoped to the exact ignored Semgrep smokes', async () => {
   const source = await readFile(workflowUrl, 'utf8');
   const windows = job(source, 'native-isolation-windows-x64', 'native-semgrep-macos-arm64-builders');
@@ -417,12 +427,18 @@ test('Windows offline build pins bounded runner-config and observed control-plan
   );
   assert.match(windows, /New-NetFirewallDynamicKeywordAddress/);
   assert.match(windows, /Resolve-RunnerControlPlaneAddresses/);
+  assert.match(windows, /Get-RunnerControlPlaneProcessIds/);
+  assert.match(windows, /Get-RunnerControlPlanePeerAddresses/);
+  assert.match(windows, /Get-NetTCPConnection[^\n]+-State\s+Established/);
+  assert.match(windows, /RemotePort\s+-ne\s+443/);
   assert.match(windows, /Test-RunnerDynamicKeywordAddresses/);
   assert.match(windows, /New-NetFirewallDynamicKeywordAddress[^\n]+-Addresses\s+\$InitialRunnerAddressText[^\n]+-AutoResolve\s+\$false/);
   assert.match(windows, /Update-NetFirewallDynamicKeywordAddress[^\n]+-Addresses\s+\$AddressText[^\n]+-Append\s+\$false/);
   assert.match(windows, /Start-Job[^\n]+-ScriptBlock\s+\$RunnerAddressRefresherScript/);
-  assert.match(windows, /Start-Sleep\s+-Seconds\s+5/);
+  assert.match(windows, /Start-Sleep\s+-Seconds\s+1/);
   assert.match(windows, /Assert-RunnerAddressRefresherHealthy/);
+  assert.match(windows, /Get-DnsClientCache[^\n]+-Type\s+A,AAAA,CNAME[^\n]+-Status\s+Success/);
+  assert.match(windows, /RunnerProcessIdList/);
   assert.doesNotMatch(windows, /Keyword\.Addresses\s+-cne/);
   assert.doesNotMatch(windows, /Get-MpComputerStatus|Set-MpPreference|-AutoResolve\s+\$true/);
   assert.doesNotMatch(windows, /['"]\*\.actions\.githubusercontent\.com['"]|['"]\*\.blob\.core\.windows\.net['"]/);

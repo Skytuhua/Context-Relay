@@ -286,4 +286,14 @@ mod tests {
             ProcessOutcome::Abnormal(MacPolicyError::ProcessTimedOut)
         ));
     }
+
+    #[test]
+    fn semgrep_helper_envelope_fits_the_native_generation_bound() {
+        let limits = RunLimits::for_command(&SidecarCommand::OsemgrepScanPackage);
+        let helper_timeout = Duration::from_millis(u64::from(limits.timeout_ms()))
+            .checked_add(HELPER_SHUTDOWN_GRACE)
+            .unwrap();
+        assert_eq!(helper_timeout, Duration::from_secs(95));
+        assert!(helper_timeout <= native::MAX_RUNTIME);
+    }
 }
