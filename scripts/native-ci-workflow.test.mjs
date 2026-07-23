@@ -415,6 +415,15 @@ test('Windows offline build pins bounded runner-config and observed control-plan
     windows,
     /\[void\]\$Hosts\.Add\(['"]results-receiver\.actions\.githubusercontent\.com['"]\)/,
   );
+  assert.match(windows, /\^\[a-z0-9\]\{3,24\}\\\.blob\\\.core\\\.windows\\\.net\$/);
+  assert.match(
+    windows,
+    /\$StorageHosts\.Count\s+-eq\s+0[\s\S]{0,300}runner diagnostics have no active Azure Blob results host/,
+  );
+  assert.match(
+    windows,
+    /\$StorageHosts\.Count\s+-gt\s+8[\s\S]{0,300}Azure Blob results hosts are unbounded/,
+  );
   assert.match(windows, /['"]\{0\}\s+\{1\}['"]\s+-f\s+\$Address,\s*\$Hostname/);
   assert.doesNotMatch(windows, /WriteAll(?:Text|Lines|Bytes)\([^\n]*(?:Uri|Url|Diag|Log)/i);
 
@@ -469,6 +478,10 @@ foreach ($name in @('Fail', 'Read-RunnerDiagnosticLog', 'Get-RunnerControlPlaneH
 function Get-DnsClientCache {
   [CmdletBinding()]
   param([object]$Type, [object]$Status)
+  [pscustomobject]@{
+    Entry = 'results-receiver.actions.githubusercontent.com'
+    Data = 'resultsstorefixture.blob.core.windows.net'
+  }
 }
 $programs = @(
   (Join-Path $env:CONTEXT_RELAY_TEST_RUNNER_ROOT 'bin\Runner.Worker.exe'),
@@ -495,6 +508,7 @@ $programs = @(
     'broker-fixture.actions.githubusercontent.com',
     'fixture.actions.githubusercontent.com',
     'results-receiver.actions.githubusercontent.com',
+    'resultsstorefixture.blob.core.windows.net',
     'run-actions-1-azure-eastus.actions.githubusercontent.com',
     'run-actions.actions.githubusercontent.com',
   ]);

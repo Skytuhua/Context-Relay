@@ -31,23 +31,8 @@ use context_relay_native_runner::{
 };
 use sha2::{Digest, Sha256};
 
-#[cfg(feature = "helper-error-diagnostics")]
-use std::sync::{
-    Mutex, OnceLock,
-    atomic::{AtomicU8, Ordering},
-};
-
-#[cfg(all(target_os = "macos", feature = "helper-error-diagnostics"))]
-use std::{ffi::CString, os::unix::ffi::OsStrExt};
-
 #[cfg(windows)]
-use context_relay_native_runner::{StageLayout, validate_path_set};
-
-#[cfg(any(
-    windows,
-    all(target_os = "macos", feature = "helper-error-diagnostics")
-))]
-use context_relay_native_runner::StageDirectory;
+use context_relay_native_runner::{StageDirectory, StageLayout, validate_path_set};
 
 #[cfg(not(windows))]
 use context_relay_native_runner::{
@@ -84,40 +69,6 @@ const SEMGREP_POLICY: &[u8] =
     include_bytes!("../../../../third_party/sidecars/policies/semgrep-package.yml");
 const DRAIN_LIMIT: usize = 8 * 1024 * 1024;
 
-#[cfg(feature = "helper-error-diagnostics")]
-#[derive(Clone, Copy)]
-#[repr(u8)]
-enum DiagnosticStage {
-    VerifiedExecutable = 1,
-    PrepareStage,
-    InstallConfig,
-    WriteInputs,
-    ValidateRequest,
-    Environment,
-    Spawn,
-    Wait,
-    Drain,
-    VerifyExecutable,
-    VerifyInputs,
-    VerifyConfig,
-    ExitStatus,
-    ReadOutputs,
-    ValidateExit,
-    ValidateOutputs,
-}
-
-#[cfg(feature = "helper-error-diagnostics")]
-static DIAGNOSTIC_STAGE: AtomicU8 = AtomicU8::new(0);
-#[cfg(feature = "helper-error-diagnostics")]
-static DIAGNOSTIC_DETAIL: OnceLock<Mutex<String>> = OnceLock::new();
-
-macro_rules! diagnostic_stage {
-    ($stage:ident) => {
-        #[cfg(feature = "helper-error-diagnostics")]
-        DIAGNOSTIC_STAGE.store(DiagnosticStage::$stage as u8, Ordering::Release);
-    };
-}
-
 fn main() -> ExitCode {
     if std::env::args_os().len() != 1 {
         return ExitCode::from(2);
@@ -133,9 +84,6 @@ fn main() -> ExitCode {
     let request = helper_request.request();
     let response = match execute(&helper_request) {
         Ok(response) => response,
-        #[cfg(feature = "helper-error-diagnostics")]
-        Err(error) => diagnostic_response(request, error),
-        #[cfg(not(feature = "helper-error-diagnostics"))]
         Err(error) => RunResponse::failed(failure_code(error)),
     };
     if write_run_response_for(&mut std::io::stdout().lock(), request, &response).is_err() {
@@ -144,79 +92,15 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-#[cfg(feature = "helper-error-diagnostics")]
-fn diagnostic_response(request: &RunRequest, error: RunnerError) -> RunResponse {
-    if !matches!(request.command(), SidecarCommand::RuleSyncGenerate { .. }) {
-        return RunResponse::failed(failure_code(error));
-    }
-    let output = ContentFrame::new(
-        StagePath::try_from("output/.claude/rules/probe.md").expect("fixed diagnostic path"),
-        format!(
-            "HELPER_ERROR={error:?}\nHELPER_STAGE={}\nHELPER_DETAIL={}\n",
-            diagnostic_stage_name(DIAGNOSTIC_STAGE.load(Ordering::Acquire)),
-            DIAGNOSTIC_DETAIL
-                .get_or_init(|| Mutex::new(String::from("none")))
-                .lock()
-                .map(|detail| detail.clone())
-                .unwrap_or_else(|_| String::from("poisoned"))
-        )
-        .into_bytes(),
-    )
-    .expect("bounded diagnostic frame");
-    RunResponse::completed(
-        RunDisposition::Generated,
-        vec![output],
-        RunStats::new(0, 0, 0),
-        RunLimits::for_command(request.command()),
-    )
-    .expect("bounded diagnostic response")
-}
-
-#[cfg(feature = "helper-error-diagnostics")]
-const fn diagnostic_stage_name(stage: u8) -> &'static str {
-    match stage {
-        1 => "verified-executable",
-        2 => "prepare-stage",
-        3 => "install-config",
-        4 => "write-inputs",
-        5 => "validate-request",
-        6 => "environment",
-        7 => "spawn",
-        8 => "wait",
-        9 => "drain",
-        10 => "verify-executable",
-        11 => "verify-inputs",
-        12 => "verify-config",
-        13 => "exit-status",
-        14 => "read-outputs",
-        15 => "validate-exit",
-        16 => "validate-outputs",
-        _ => "unknown",
-    }
-}
-
 fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError> {
     let request = helper_request.request();
     let target = RuntimeTarget::current()?;
-    diagnostic_stage!(VerifiedExecutable);
     let executable = verified_executable(helper_request, target)?;
-    diagnostic_stage!(PrepareStage);
     let mut stage = prepare_stage(request.nonce(), target)?;
-    diagnostic_stage!(InstallConfig);
     let config_inventory = install_trusted_config(&mut stage, request.command(), target)?;
-    diagnostic_stage!(WriteInputs);
-    let input_inventory = match stage.write_and_seal_inputs(request.inputs()) {
-        Ok(inventory) => inventory,
-        Err(error) => {
-            #[cfg(all(target_os = "macos", feature = "helper-error-diagnostics"))]
-            record_input_tree_detail(&stage.layout().path(StageDirectory::Input));
-            return Err(error);
-        }
-    };
-    diagnostic_stage!(ValidateRequest);
+    let input_inventory = stage.write_and_seal_inputs(request.inputs())?;
     validate_pre_enumeration(request)?;
     let limits = RunLimits::for_command(request.command());
-    diagnostic_stage!(Environment);
     let environment = RestrictedEnvironment::for_stage(stage.layout(), target)?;
     let argv = request.command().argv();
     let started = Instant::now();
@@ -252,7 +136,6 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
             Ok(())
         });
     }
-    diagnostic_stage!(Spawn);
     let mut child = command
         .spawn()
         .map_err(|_| RunnerError::SidecarUnavailable)?;
@@ -260,7 +143,6 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
     let stderr = child.stderr.take().ok_or(RunnerError::Io)?;
     let stdout = thread::spawn(move || drain_bounded(stdout, DRAIN_LIMIT));
     let stderr = thread::spawn(move || drain_bounded(stderr, DRAIN_LIMIT));
-    diagnostic_stage!(Wait);
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|_| RunnerError::Io)? {
             break status;
@@ -274,17 +156,13 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
         }
         thread::sleep(Duration::from_millis(5));
     };
-    diagnostic_stage!(Drain);
     let stdout = stdout.join().map_err(|_| RunnerError::Io)??;
     let stderr = stderr.join().map_err(|_| RunnerError::Io)??;
-    diagnostic_stage!(VerifyExecutable);
     executable
         .verify_unchanged()
         .map_err(|_| RunnerError::ClosureMismatch)?;
-    diagnostic_stage!(VerifyInputs);
     input_inventory.verify_unchanged()?;
     if let Some(inventory) = config_inventory {
-        diagnostic_stage!(VerifyConfig);
         inventory.verify_unchanged()?;
     }
     let duration_ms =
@@ -297,20 +175,16 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
             .ok_or(RunnerError::LimitExceeded)
     })?;
     let stats = RunStats::new(scanned_files, scanned_bytes, duration_ms);
-    diagnostic_stage!(ExitStatus);
     let exit = status.code().ok_or(RunnerError::InvalidToolOutput)?;
     match request.command() {
         SidecarCommand::RuleSyncGenerate { .. } => {
-            diagnostic_stage!(ReadOutputs);
             let outputs = stage.read_outputs(limits)?;
-            diagnostic_stage!(ValidateExit);
             request.command().validate_rulesync_exit(
                 exit,
                 &stdout,
                 &stderr,
                 !outputs.is_empty(),
             )?;
-            diagnostic_stage!(ValidateOutputs);
             validate_rulesync_outputs(request.command(), request.inputs(), &outputs)?;
             RunResponse::completed(RunDisposition::Generated, outputs, stats, limits)
         }
@@ -341,95 +215,6 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
             )
         }
     }
-}
-
-#[cfg(all(target_os = "macos", feature = "helper-error-diagnostics"))]
-fn record_input_tree_detail(root: &Path) {
-    const MAX_NODES: usize = 32;
-    const MAX_DETAIL_BYTES: usize = 2_048;
-
-    fn visit(root: &Path, path: &Path, nodes: &mut usize, detail: &mut String) {
-        if *nodes >= MAX_NODES || detail.len() >= MAX_DETAIL_BYTES {
-            return;
-        }
-        *nodes += 1;
-        let relative = path.strip_prefix(root).unwrap_or(path);
-        let label = if relative.as_os_str().is_empty() {
-            "."
-        } else {
-            relative.to_str().unwrap_or("non-utf8")
-        };
-        let metadata = match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(_) => {
-                detail.push_str(&format!("{label}:metadata-error;"));
-                return;
-            }
-        };
-        let kind = if metadata.is_dir() {
-            "dir"
-        } else if metadata.is_file() {
-            "file"
-        } else {
-            "other"
-        };
-        let names = diagnostic_xattr_names(path).unwrap_or_else(|| String::from("xattr-error"));
-        detail.push_str(&format!("{label}:{kind}:{names};"));
-        if metadata.is_dir()
-            && let Ok(entries) = fs::read_dir(path)
-        {
-            let mut paths = entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .collect::<Vec<_>>();
-            paths.sort();
-            for child in paths {
-                visit(root, &child, nodes, detail);
-            }
-        }
-    }
-
-    let mut nodes = 0;
-    let mut detail = String::new();
-    visit(root, root, &mut nodes, &mut detail);
-    detail.truncate(detail.len().min(MAX_DETAIL_BYTES));
-    if detail.is_empty() {
-        detail.push_str("empty");
-    }
-    if let Ok(mut destination) = DIAGNOSTIC_DETAIL
-        .get_or_init(|| Mutex::new(String::from("none")))
-        .lock()
-    {
-        *destination = detail;
-    }
-}
-
-#[cfg(all(target_os = "macos", feature = "helper-error-diagnostics"))]
-fn diagnostic_xattr_names(path: &Path) -> Option<String> {
-    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let size = unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0, 0) };
-    if !(0..=2_048).contains(&size) {
-        return None;
-    }
-    let mut bytes = vec![0_u8; size as usize];
-    if size != 0 {
-        let read =
-            unsafe { libc::listxattr(path.as_ptr(), bytes.as_mut_ptr().cast(), bytes.len(), 0) };
-        if read != size {
-            return None;
-        }
-    }
-    let mut names = bytes
-        .split(|byte| *byte == 0)
-        .filter(|name| !name.is_empty())
-        .map(|name| std::str::from_utf8(name).unwrap_or("non-utf8"))
-        .collect::<Vec<_>>();
-    names.sort_unstable();
-    Some(if names.is_empty() {
-        String::from("no-xattrs")
-    } else {
-        names.join(",")
-    })
 }
 
 #[cfg(any(target_os = "macos", test))]

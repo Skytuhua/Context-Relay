@@ -335,6 +335,7 @@ function Get-RunnerControlPlaneHosts([string[]]$RunnerPrograms) {
   # it in .runner, so validate the early workflow snapshot before optionally
   # augmenting it with successful address records still present in the cache.
   $RunServiceHosts = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+  $StorageHosts = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
   $CapturedRunServiceHosts = [string]$env:CONTEXT_RELAY_RUN_SERVICE_HOSTS
   if ([string]::IsNullOrWhiteSpace($CapturedRunServiceHosts) -or
       $CapturedRunServiceHosts -ne $CapturedRunServiceHosts.Trim()) {
@@ -360,10 +361,20 @@ function Get-RunnerControlPlaneHosts([string[]]$RunnerPrograms) {
     if ($null -eq $EntryProperty -or [string]::IsNullOrWhiteSpace([string]$EntryProperty.Value)) {
       Fail 'DNS cache address record has no entry name'
     }
-    $Hostname = ([string]$EntryProperty.Value).TrimEnd('.').ToLowerInvariant()
-    if ($Hostname -match '^run-actions(?:-[a-z0-9-]+(?:\.[a-z0-9-]+)*)?\.actions\.githubusercontent\.com$') {
-      [void]$RunServiceHosts.Add($Hostname)
-      [void]$Hosts.Add($Hostname)
+    $HostCandidates = @([string]$EntryProperty.Value)
+    $DataProperty = $Record.PSObject.Properties['Data']
+    if ($null -ne $DataProperty -and -not [string]::IsNullOrWhiteSpace([string]$DataProperty.Value)) {
+      $HostCandidates += [string]$DataProperty.Value
+    }
+    foreach ($Candidate in $HostCandidates) {
+      $Hostname = $Candidate.TrimEnd('.').ToLowerInvariant()
+      if ($Hostname -match '^run-actions(?:-[a-z0-9-]+(?:\.[a-z0-9-]+)*)?\.actions\.githubusercontent\.com$') {
+        [void]$RunServiceHosts.Add($Hostname)
+        [void]$Hosts.Add($Hostname)
+      } elseif ($Hostname -match '^[a-z0-9]{3,24}\.blob\.core\.windows\.net$') {
+        [void]$StorageHosts.Add($Hostname)
+        [void]$Hosts.Add($Hostname)
+      }
     }
   }
   if ($RunServiceHosts.Count -eq 0) {
@@ -389,11 +400,20 @@ function Get-RunnerControlPlaneHosts([string[]]$RunnerPrograms) {
       [Uri]$Endpoint = $Match.Value
       $Hostname = $Endpoint.Host.TrimEnd('.').ToLowerInvariant()
       if ($Endpoint.Port -ne 443 -or
-          $Hostname -notmatch '^(?:github\.com|api\.github\.com|(?:[a-z0-9-]+\.)+actions\.githubusercontent\.com)$') {
+          $Hostname -notmatch '^(?:github\.com|api\.github\.com|(?:[a-z0-9-]+\.)+actions\.githubusercontent\.com|[a-z0-9]{3,24}\.blob\.core\.windows\.net)$') {
         continue
       }
       [void]$Hosts.Add($Hostname)
+      if ($Hostname -match '^[a-z0-9]{3,24}\.blob\.core\.windows\.net$') {
+        [void]$StorageHosts.Add($Hostname)
+      }
     }
+  }
+  if ($StorageHosts.Count -eq 0) {
+    Fail 'runner diagnostics have no active Azure Blob results host'
+  }
+  if ($StorageHosts.Count -gt 8) {
+    Fail 'observed Azure Blob results hosts are unbounded'
   }
   # GitHub documents this exact host for live logs and job results.
   # Unlike the listener endpoints persisted in .runner[_migrated], runner
