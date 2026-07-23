@@ -508,13 +508,14 @@ fn real_sidecar_semgrep_clean_and_finding_use_the_closed_policy() {
             b"osemgrep\n",
         )],
     );
+    let clean_response = fixture.run(&clean);
     let RunResponse::Completed {
         disposition,
         outputs,
         ..
-    } = fixture.run(&clean)
+    } = clean_response
     else {
-        panic!("real Semgrep clean scan did not complete");
+        panic!("real Semgrep clean scan did not complete: {clean_response:?}");
     };
     assert_eq!(disposition, RunDisposition::Clean);
     assert_eq!(outputs.len(), 1);
@@ -528,13 +529,14 @@ fn real_sidecar_semgrep_clean_and_finding_use_the_closed_policy() {
             b"python.exe\n",
         )],
     );
+    let finding_response = fixture.run(&finding);
     let RunResponse::Completed {
         disposition,
         outputs,
         ..
-    } = fixture.run(&finding)
+    } = finding_response
     else {
-        panic!("real Semgrep finding scan did not complete");
+        panic!("real Semgrep finding scan did not complete: {finding_response:?}");
     };
     assert_eq!(disposition, RunDisposition::Findings(1));
     assert_eq!(outputs.len(), 1);

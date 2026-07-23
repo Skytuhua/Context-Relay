@@ -18,7 +18,9 @@ const MAX_CONTENT_FRAMES: usize = 1_024;
 const MAX_CONTENT_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOTAL_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REPORT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_RUNTIME_MS: u32 = 30_000;
+const DEFAULT_RUNTIME_MS: u32 = 30_000;
+const SEMGREP_RUNTIME_MS: u32 = 90_000;
+const MAX_RUNTIME_MS: u32 = SEMGREP_RUNTIME_MS;
 const MAX_CLOSURE_MATERIALS: usize = 256;
 const MAX_CLOSURE_MATERIAL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CLOSURE_BYTES: u64 = 768 * 1024 * 1024;
@@ -67,13 +69,18 @@ pub struct RunLimits {
 }
 
 impl RunLimits {
-    pub const fn for_command(_command: &SidecarCommand) -> Self {
+    pub const fn for_command(command: &SidecarCommand) -> Self {
         Self {
             max_files: MAX_CONTENT_FRAMES,
             max_file_bytes: MAX_CONTENT_FRAME_BYTES,
             max_total_bytes: MAX_TOTAL_CONTENT_BYTES,
             max_report_bytes: MAX_REPORT_BYTES,
-            timeout_ms: MAX_RUNTIME_MS,
+            timeout_ms: match command {
+                SidecarCommand::OsemgrepScanPackage => SEMGREP_RUNTIME_MS,
+                SidecarCommand::RuleSyncGenerate { .. } | SidecarCommand::GitleaksScanPackage => {
+                    DEFAULT_RUNTIME_MS
+                }
+            },
         }
     }
 

@@ -36,6 +36,18 @@ fn encoded_request() -> Vec<u8> {
 }
 
 #[test]
+fn semgrep_has_a_bounded_startup_envelope_beyond_the_other_sidecars() {
+    assert_eq!(
+        RunLimits::for_command(&SidecarCommand::GitleaksScanPackage).timeout_ms(),
+        30_000
+    );
+    assert_eq!(
+        RunLimits::for_command(&SidecarCommand::OsemgrepScanPackage).timeout_ms(),
+        90_000
+    );
+}
+
+#[test]
 fn request_round_trip_handles_partial_reads_and_writes() {
     let expected = request();
     let encoded = encoded_request();
