@@ -515,7 +515,10 @@ fn real_sidecar_semgrep_clean_and_finding_use_the_closed_policy() {
         ..
     } = clean_response
     else {
-        panic!("real Semgrep clean scan did not complete: {clean_response:?}");
+        panic!(
+            "real Semgrep clean scan did not complete: {clean_response:?}; direct diagnostic: {}",
+            fixture.diagnose_semgrep_clean()
+        );
     };
     assert_eq!(disposition, RunDisposition::Clean);
     assert_eq!(outputs.len(), 1);
@@ -638,6 +641,37 @@ impl RealFixture {
         launcher
             .run(&self.closure, request)
             .unwrap_or_else(|error| panic!("{error:?}; lifecycle={:?}", self.journal.events()))
+    }
+
+    fn diagnose_semgrep_clean(&self) -> String {
+        assert_eq!(self.closure.sidecar(), SidecarId::Osemgrep);
+        let root = self.root.join("semgrep-direct-diagnostic");
+        let config = root.join("config/semgrep/package.yml");
+        let target = root.join("input/semgrep-target/runtime-inventory.txt");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(
+            workspace_root().join("third_party/sidecars/policies/semgrep-package.yml"),
+            &config,
+        )
+        .unwrap();
+        fs::write(&target, b"osemgrep\n").unwrap();
+        let executable = self
+            .closure
+            .root()
+            .join(self.closure.executable().path().as_str());
+        let argv = SidecarCommand::OsemgrepScanPackage.argv();
+        let output = Command::new(executable)
+            .args(argv.iter().skip(1))
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        format!(
+            "status={:?}, stdout={}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
     }
 
     fn assert_complete_lifecycles(&self, count: usize) {
