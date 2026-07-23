@@ -592,7 +592,7 @@ fn validate_semgrep_time(
             .get("max_memory_bytes")
             .and_then(Value::as_u64)
             .is_some()
-        || !number_object(time.get("profiling_times"))
+        || !empty_array(time.get("profiling_times"))
     {
         return invalid();
     }
@@ -766,12 +766,6 @@ fn exact_keys(object: &Map<String, Value>, keys: &[&str]) -> bool {
 
 fn empty_array(value: Option<&Value>) -> bool {
     value.and_then(Value::as_array).is_some_and(Vec::is_empty)
-}
-
-fn number_object(value: Option<&Value>) -> bool {
-    value
-        .and_then(Value::as_object)
-        .is_some_and(|object| object.values().all(|value| nonnegative_number(Some(value))))
 }
 
 fn nonnegative_number(value: Option<&Value>) -> bool {
