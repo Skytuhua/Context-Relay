@@ -382,6 +382,7 @@ function Build-Once([string]$Label) {
     $Destination,
     (Join-Path $Project '_build'),
     (Join-Path $Project '_build\install\default\bin'),
+    (Join-Path $Project 'libs\ocaml-tree-sitter-core\tree-sitter-0.22.6\lib'),
     (Join-Path $script:Current 'switch'),
     (Join-Path $script:Current 'switch\bin'),
     (Split-Path -Parent $Gcc),
