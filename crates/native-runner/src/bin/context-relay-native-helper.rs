@@ -1826,11 +1826,23 @@ fn kill_child_tree(child: &mut std::process::Child) {
 
 fn failure_code(error: RunnerError) -> FailureCode {
     match error {
-        RunnerError::ClosureMismatch
-        | RunnerError::MissingMaterial
-        | RunnerError::SidecarUnavailable => FailureCode::ClosureMismatch,
+        RunnerError::ClosureMismatch | RunnerError::MissingMaterial => FailureCode::ClosureMismatch,
+        RunnerError::SidecarUnavailable => FailureCode::ToolFailed,
         RunnerError::LimitExceeded | RunnerError::FrameTooLarge => FailureCode::LimitExceeded,
         _ => FailureCode::InvalidOutput,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_sidecar_is_not_a_closure_mismatch() {
+        assert_eq!(
+            failure_code(RunnerError::SidecarUnavailable),
+            FailureCode::ToolFailed
+        );
     }
 }
 
