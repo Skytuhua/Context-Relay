@@ -2,8 +2,8 @@
   "bundle": {
     "payloadEntries": 39542,
     "recordedLinks": 222,
-    "sha256": "ef75d1f6f9acdf64782496556f0442b459205dff107683a34797a1e3a79fb281",
-    "size": 1149639168
+    "sha256": "ecd4f087ff2be80c1265abb6ef76d62b804b845407589fee7ca4d1edd59d15c6",
+    "size": 1149640704
   },
   "bundleGeneratorSha256": "092fe2855df51267ca3c8525c0b404c3ca0587470cedfc63bf1818df60e72007",
   "byteIdentical": false,

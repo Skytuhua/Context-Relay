@@ -482,7 +482,8 @@ test('Windows stages exact OCaml compatibility sources and selects only AMD64 cu
   assert.match(windows, /patches\.windows\.v1\.json/);
   assert.match(windows, /ANSITerminal\.0\.8\.5/);
   assert.match(windows, /parmap\.1\.2\.5/);
-  assert.equal((windows.match(/pin add --no-action --kind=path/g) ?? []).length, 2);
+  assert.match(windows, /ocurl\.0\.9\.1/);
+  assert.equal((windows.match(/pin add --no-action --kind=path/g) ?? []).length, 3);
   assert.match(windows, /sources[\\/]opam/);
   assert.match(windows, /Get-FileHash[^\n]+SHA256/);
   assert.match(windows, /PKG_CONFIG_LIBDIR[^\n]+x86_64-w64-mingw32/);

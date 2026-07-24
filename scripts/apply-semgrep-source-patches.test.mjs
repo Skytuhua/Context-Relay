@@ -193,13 +193,14 @@ test('applies exact archive-identified Windows dependency patches', async (t) =>
   assert.equal(await readFile(target, 'utf8'), patched);
 });
 
-test('Windows dependency inventory binds the diagnosed upstream files and fixes only their C APIs', async () => {
+test('Windows dependency inventory binds diagnosed upstream files and the MinGW configure host', async () => {
   const inventory = JSON.parse(
     await readFile(new URL('../third_party/sidecars/semgrep/patches.windows.v1.json', import.meta.url)),
   );
-  assert.equal(inventory.patches.length, 2);
+  assert.equal(inventory.patches.length, 3);
   const ansi = inventory.patches.find(({ package: packageName }) => packageName === 'ANSITerminal');
   const parmap = inventory.patches.find(({ package: packageName }) => packageName === 'parmap');
+  const ocurl = inventory.patches.find(({ package: packageName }) => packageName === 'ocurl');
   assert.equal(ansi.baseSha256, '45c428bfb1f1a5ea17351b1aebe253e23b4065967680c7de992735874fca58e6');
   assert.equal(ansi.patchedSha256, '6367b47b7781587e27e7ed71111d4b5b137e01836d14ddaeca89035b71623887');
   assert.match(ansi.replacements[0].after, /caml\/fail\.h/);
@@ -209,6 +210,14 @@ test('Windows dependency inventory binds the diagnosed upstream files and fixes 
   assert.deepEqual(parmap.replacements, [{
     before: '  long len;\n',
     after: '  intnat len;\n',
+  }]);
+  assert.equal(ocurl.revision, 'c65f01913270b674a0ca0f278f91bc1e368d7110e8308084bc2280b43a0bc258');
+  assert.equal(ocurl.path, 'ocurl-0.9.1/opam');
+  assert.equal(ocurl.baseSha256, '17a98b1b80740fb18aed1354260991eb14acccc38afbf04d30b1630b6c9b185c');
+  assert.equal(ocurl.patchedSha256, 'd28b855937aa8b06860b30ae9010cb1cd0aae026f5c8fd6772742b3567c01dbe');
+  assert.deepEqual(ocurl.replacements, [{
+    before: '  ["./configure"]',
+    after: '  ["./configure" "--host=x86_64-w64-mingw32"]',
   }]);
 });
 

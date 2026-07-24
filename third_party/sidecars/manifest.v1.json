@@ -283,7 +283,7 @@
         {
           "role": "windows-patch-inventory",
           "path": "third_party/sidecars/semgrep/patches.windows.v1.json",
-          "sha256": "44ec61413d5b2c6715d47ab9f2dea541accca2070f042d3dda80c2077573f6ed"
+          "sha256": "0057edb48474b0e3e976626b070f92cb8f524805eb5da4c50a6d04f38e55074f"
         },
         {
           "role": "source-patch-applicator",
@@ -298,7 +298,7 @@
         {
           "role": "windows-build",
           "path": "third_party/sidecars/semgrep/build-public-source-windows.ps1",
-          "sha256": "e7bcb2195b927811bb16cfd79732d2facf2c39a4349ed079dd50b3efd433355f"
+          "sha256": "9afd9f3ef6fb2c853208bb954e8caaf59370d1082516e925e0cfc0d32ee1f233"
         },
         {
           "role": "windows-builder-evidence-schema",
@@ -328,7 +328,7 @@
         {
           "role": "source-bundle-evidence",
           "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
-          "sha256": "9ccaa73f3e0156dbeb8f1b362d264a7c2be03f1b8844a5debf222deb307a0fa5"
+          "sha256": "f8833c2e9863073bd66291ed499278297d18c6e18acc27b7409f8725a0ad36cd"
         },
         {
           "role": "manifest-rule",

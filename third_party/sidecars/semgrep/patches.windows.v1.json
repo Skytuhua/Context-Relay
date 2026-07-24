@@ -37,6 +37,22 @@
         }
       ],
       "rationale": "Match OCaml 5.3 intnat dimensions on Win64, where long remains 32-bit."
+    },
+    {
+      "id": "ocurl-windows-mingw-host",
+      "package": "ocurl",
+      "revision": "c65f01913270b674a0ca0f278f91bc1e368d7110e8308084bc2280b43a0bc258",
+      "root": "opam",
+      "path": "ocurl-0.9.1/opam",
+      "baseSha256": "17a98b1b80740fb18aed1354260991eb14acccc38afbf04d30b1630b6c9b185c",
+      "patchedSha256": "d28b855937aa8b06860b30ae9010cb1cd0aae026f5c8fd6772742b3567c01dbe",
+      "replacements": [
+        {
+          "before": "  [\"./configure\"]",
+          "after": "  [\"./configure\" \"--host=x86_64-w64-mingw32\"]"
+        }
+      ],
+      "rationale": "Declare the pinned Win64 MinGW host so Autoconf selects the prefixed compiler and does not execute cross-compiled probes."
     }
   ]
 }
