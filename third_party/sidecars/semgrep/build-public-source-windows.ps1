@@ -392,8 +392,7 @@ function Build-Once([string]$Label) {
     (Resolve-Path -LiteralPath $_).Path
   } | Select-Object -Unique
 
-  $SystemDlls = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-  foreach ($Name in @('advapi32.dll','bcrypt.dll','crypt32.dll','dbghelp.dll','dnsapi.dll','gdi32.dll','iphlpapi.dll','kernel32.dll','msvcrt.dll','ntdll.dll','ole32.dll','oleaut32.dll','secur32.dll','shell32.dll','user32.dll','userenv.dll','version.dll','winhttp.dll','winmm.dll','ws2_32.dll')) { [void]$SystemDlls.Add($Name) }
+  $SystemDllRoot = (Resolve-Path -LiteralPath ([Environment]::SystemDirectory)).Path
   $Queue = [Collections.Generic.Queue[string]]::new()
   $Queue.Enqueue((Join-Path $Destination 'osemgrep.exe'))
   $Seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -407,7 +406,14 @@ function Build-Once([string]$Label) {
       $Name = $Matches[1]
       [void]$Dependencies.Add($Name)
       if ($Name -match '(?i)python') { Fail 'Python runtime dependency detected' }
-      if ($SystemDlls.Contains($Name) -or $Name -match '^(?i)(api|ext)-ms-win-') { continue }
+      $SystemDllCandidate = Join-Path $SystemDllRoot $Name
+      if (Test-Path -LiteralPath $SystemDllCandidate -PathType Leaf) {
+        if ((Get-Item -LiteralPath $SystemDllCandidate).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+          Fail "untrusted system DLL path: $SystemDllCandidate"
+        }
+        continue
+      }
+      if ($Name -match '^(?i)(api|ext)-ms-win-') { continue }
       if (-not $Seen.Add($Name)) { continue }
       $Candidate = $null
       foreach ($Directory in $TrustedDllRoots) {
