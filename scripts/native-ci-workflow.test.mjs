@@ -509,6 +509,7 @@ test('Windows runtime DLL closure never searches ambient PATH', async () => {
   assert.doesNotMatch(windows, /\$env:PATH\.Split/);
   assert.match(windows, /TrustedDllRoots/);
   assert.match(windows, /x86_64-w64-mingw32-gcc/);
+  assert.match(windows, /'dbghelp\.dll'/);
   assert.match(windows, /untrusted runtime DLL path/);
 });
 

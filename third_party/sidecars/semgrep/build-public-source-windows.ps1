@@ -393,7 +393,7 @@ function Build-Once([string]$Label) {
   } | Select-Object -Unique
 
   $SystemDlls = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-  foreach ($Name in @('advapi32.dll','bcrypt.dll','crypt32.dll','dnsapi.dll','gdi32.dll','iphlpapi.dll','kernel32.dll','msvcrt.dll','ntdll.dll','ole32.dll','oleaut32.dll','secur32.dll','shell32.dll','user32.dll','userenv.dll','version.dll','winhttp.dll','winmm.dll','ws2_32.dll')) { [void]$SystemDlls.Add($Name) }
+  foreach ($Name in @('advapi32.dll','bcrypt.dll','crypt32.dll','dbghelp.dll','dnsapi.dll','gdi32.dll','iphlpapi.dll','kernel32.dll','msvcrt.dll','ntdll.dll','ole32.dll','oleaut32.dll','secur32.dll','shell32.dll','user32.dll','userenv.dll','version.dll','winhttp.dll','winmm.dll','ws2_32.dll')) { [void]$SystemDlls.Add($Name) }
   $Queue = [Collections.Generic.Queue[string]]::new()
   $Queue.Enqueue((Join-Path $Destination 'osemgrep.exe'))
   $Seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
