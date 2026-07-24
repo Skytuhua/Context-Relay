@@ -1109,15 +1109,15 @@ test('Semgrep records the V1 source bundle but remains disabled pending release 
   );
   assert.equal('sourceAssetUrl' in lock, false);
   assert.equal('sourceBundleSha256' in lock, false);
-  assert.equal(bundleEvidence.bundle.sha256, '192b7adf95be0343a526675a42373eec9a633a94ac954d9bb92a4c157944cb33');
-  assert.equal(bundleEvidence.bundle.size, 1149633024);
-  assert.equal(bundleEvidence.bundle.payloadEntries, 39541);
+  assert.equal(bundleEvidence.bundle.sha256, '8b2853f49b171a1dd49d5e37ddf02957f3aacf229bbfbd95f15df187e2c28c34');
+  assert.equal(bundleEvidence.bundle.size, 1149639168);
+  assert.equal(bundleEvidence.bundle.payloadEntries, 39542);
   assert.equal(bundleEvidence.bundle.recordedLinks, 222);
   assert.equal(bundleEvidence.sourceLockSha256, 'd5c29931ef5e68a5f6840c9bb27557cbbc8b22ccbb9ae13592c97b928d65dd26');
-  assert.equal(bundleEvidence.bundleGeneratorSha256, '63789074b65a4a065bf0e8c55adcf537f620fc190148faba59912e22ecd70db1');
+  assert.equal(bundleEvidence.bundleGeneratorSha256, '092fe2855df51267ca3c8525c0b404c3ca0587470cedfc63bf1818df60e72007');
   assert.equal(
     sha256(await readFile(new URL('./semgrep-source-bundle.mjs', import.meta.url))),
-    '63789074b65a4a065bf0e8c55adcf537f620fc190148faba59912e22ecd70db1',
+    '092fe2855df51267ca3c8525c0b404c3ca0587470cedfc63bf1818df60e72007',
   );
   assert.equal(lock.researchEvidence.usableForHydration, false);
   assert.equal(lock.researchEvidence.usableForPackaging, false);

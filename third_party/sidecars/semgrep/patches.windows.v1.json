@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "sourceModified": true,
+  "patches": [
+    {
+      "id": "ansiterminal-ocaml-53-windows-c-api",
+      "package": "ANSITerminal",
+      "revision": "ab73b218b6a30267d2bbc43312dcf313981b8b0bec555d92b06b87664b2dd30e",
+      "root": "opam",
+      "path": "ANSITerminal-0.8.5/src/ANSITerminal_win_stubs.c",
+      "baseSha256": "45c428bfb1f1a5ea17351b1aebe253e23b4065967680c7de992735874fca58e6",
+      "patchedSha256": "6367b47b7781587e27e7ed71111d4b5b137e01836d14ddaeca89035b71623887",
+      "replacements": [
+        {
+          "before": "#include <caml/callback.h>\n#include <windows.h>",
+          "after": "#include <caml/callback.h>\n#include <caml/fail.h>\n#include <windows.h>"
+        },
+        {
+          "before": "  int NumberOfCharsWritten;\n",
+          "after": "  DWORD NumberOfCharsWritten;\n"
+        }
+      ],
+      "rationale": "Use the OCaml 5.3 exception declaration and the exact Win64 console API output type."
+    },
+    {
+      "id": "parmap-ocaml-53-windows-intnat",
+      "package": "parmap",
+      "revision": "6709356e724436fba0b7a10f96f65a441c2b763832954707d5e30017e78fd285",
+      "root": "opam",
+      "path": "parmap-1.2.5/src/bytearray_stubs.c",
+      "baseSha256": "c6abd87cb802467948f63ecb2711088e5a576f49056e02151af6cbc67521a06b",
+      "patchedSha256": "88da5335c0966ca8962cb9d4e0cc1a4360f0346a659f752fe6525f6c4ec5c9b3",
+      "replacements": [
+        {
+          "before": "  long len;\n",
+          "after": "  intnat len;\n"
+        }
+      ],
+      "rationale": "Match OCaml 5.3 intnat dimensions on Win64, where long remains 32-bit."
+    }
+  ]
+}

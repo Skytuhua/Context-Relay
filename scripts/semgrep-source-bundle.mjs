@@ -48,6 +48,7 @@ const DEFAULT_SUPPORT_PATHS = [
   'third_party/sidecars/semgrep/build-public-source-macos.sh',
   'third_party/sidecars/semgrep/build-public-source-windows.ps1',
   'third_party/sidecars/semgrep/patches.v1.json',
+  'third_party/sidecars/semgrep/patches.windows.v1.json',
 ];
 
 function fail(message) {

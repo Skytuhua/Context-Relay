@@ -485,7 +485,7 @@ test('public-source build scripts consume the verified bundle through closed nat
     /'dependency installation'\r?\n\s+Assert-CompilerIdentity \$CompilerRevision/,
   );
   assert.match(windows, /\[Environment\]::SystemDirectory/);
-  assert.equal((windows.match(/& \$Tar /g) ?? []).length, 2);
+  assert.equal((windows.match(/& \$Tar /g) ?? []).length, 3);
   assert.doesNotMatch(windows, /& tar\.exe\b/i);
   assert.match(windows, /3\.6\.10/);
   assert.match(windows, /x86_64-w64-mingw32-(?:gcc|objdump)/);

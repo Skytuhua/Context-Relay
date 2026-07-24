@@ -23,6 +23,9 @@ $DownloadActionSha = '37930b1c2abaa49bbe596cd826c3c89aef350131'
 $SourceRevision = 'bd614accba811b407ae5c9ec6f1eecd3bdc29911'
 $CompilerRevision = '3499e5708b0637c12d24d973dd103406a32b8fe8'
 $TreeSitterSha = 'e2b687f74358ab6404730b7fb1a1ced7ddb3780202d37595ecd7b20a8f41861f'
+$AnsiTerminalArchiveSha256 = 'ab73b218b6a30267d2bbc43312dcf313981b8b0bec555d92b06b87664b2dd30e'
+$ParmapArchiveSha256 = '6709356e724436fba0b7a10f96f65a441c2b763832954707d5e30017e78fd285'
+$ParmapArchiveSha512 = '668e969a598cdb587597c7cabf7e299cfb4e3cc4cd229edf1888977f19bd5cdf169d39f5a6d923644bcd83f1ce1a3cfbd3a4e55ff59513736a9dc740a16b49d1'
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Workspace = [IO.Path]::GetFullPath((Join-Path $ScriptRoot '..\..\..'))
 $CiProvenance = Join-Path $ScriptRoot 'native-ci-provenance.v1.json'
@@ -276,12 +279,37 @@ function Build-Once([string]$Label) {
   New-Item -ItemType Directory -Path $Bundle, (Join-Path $script:Current 'home'), (Join-Path $script:Current 'tmp') | Out-Null
   Invoke-Checked { & $Tar -xf $SourceBundle -C $Bundle } 'source bundle extraction'
   Invoke-Checked { & $Node (Join-Path $Workspace 'scripts\semgrep-source-bundle.mjs') --materialize-links $Bundle | Out-Null } 'source link materialization'
+  $OpamSources = Join-Path $Bundle 'sources\opam'
+  $AnsiArchive = Join-Path $Bundle "opam-repository\cache\sha256\ab\$AnsiTerminalArchiveSha256"
+  $ParmapArchive = Join-Path $Bundle "opam-repository\cache\sha512\66\$($ParmapArchiveSha512.Substring(0, 64))\$($ParmapArchiveSha512.Substring(64))"
+  $AnsiStage = Join-Path $OpamSources $AnsiTerminalArchiveSha256
+  $ParmapStage = Join-Path $OpamSources $ParmapArchiveSha256
+  foreach ($Archive in @(
+    @{ Path = $AnsiArchive; Sha256 = $AnsiTerminalArchiveSha256; Stage = $AnsiStage; Root = 'ANSITerminal-0.8.5' },
+    @{ Path = $ParmapArchive; Sha256 = $ParmapArchiveSha256; Stage = $ParmapStage; Root = 'parmap-1.2.5' }
+  )) {
+    if ((Get-FileHash -Algorithm SHA256 -LiteralPath $Archive.Path).Hash.ToLowerInvariant() -ne $Archive.Sha256) {
+      Fail "opam compatibility source archive hash mismatch: $($Archive.Root)"
+    }
+    New-Item -ItemType Directory -Path $Archive.Stage | Out-Null
+    Invoke-Checked { & $Tar -xf $Archive.Path -C $Archive.Stage } "opam compatibility source extraction: $($Archive.Root)"
+    if (-not (Test-Path -LiteralPath (Join-Path $Archive.Stage $Archive.Root) -PathType Container)) {
+      Fail "opam compatibility source root mismatch: $($Archive.Root)"
+    }
+  }
   Invoke-Checked {
     & $Node (Join-Path $Bundle 'support\scripts\apply-semgrep-source-patches.mjs') `
       (Join-Path $Bundle 'support\third_party\sidecars\semgrep\patches.v1.json') `
       $Bundle | Out-Null
   } 'source patch application'
+  Invoke-Checked {
+    & $Node (Join-Path $Bundle 'support\scripts\apply-semgrep-source-patches.mjs') `
+      (Join-Path $Bundle 'support\third_party\sidecars\semgrep\patches.windows.v1.json') `
+      $Bundle | Out-Null
+  } 'Windows dependency patch application'
   $Project = Join-Path $Bundle 'sources\semgrep'
+  $AnsiSource = Join-Path $AnsiStage 'ANSITerminal-0.8.5'
+  $ParmapSource = Join-Path $ParmapStage 'parmap-1.2.5'
   if (-not (Test-Path -LiteralPath (Join-Path $Project 'Makefile') -PathType Leaf)) { Fail 'Semgrep source is missing' }
 
   $TreeSitterDownloads = Join-Path $Project 'libs\ocaml-tree-sitter-core\downloads'
@@ -314,6 +342,8 @@ function Build-Once([string]$Label) {
   } finally {
     Remove-Item Env:GIT_DIR -ErrorAction SilentlyContinue
   }
+  Invoke-Checked { & $Opam pin add --no-action --kind=path 'ANSITerminal.0.8.5' $AnsiSource } 'pin patched ANSITerminal'
+  Invoke-Checked { & $Opam pin add --no-action --kind=path 'parmap.1.2.5' $ParmapSource } 'pin patched parmap'
   Add-Pin 'pcre2.dev' '4e0a44486bb518b7a24ca11286c4b03a8d51e17e'
   Add-Pin 'tree-sitter.dev' 'c4baff8d83b2e1f83f247acb11d0c9dafa5e48f7'
   foreach ($Package in @('testo.dev', 'testo-util.dev', 'testo-diff.dev', 'testo-lwt.dev')) { Add-Pin $Package 'df18ea541c75c9acf75923218586c5ffe8915a04' }
@@ -328,6 +358,12 @@ function Build-Once([string]$Label) {
     Invoke-Checked { & $Bash './scripts/pick-lockfile.sh' '--strict' 'semgrep.opam' } 'lockfile selection'
     Invoke-Checked { & $Bash '-c' 'cd libs/ocaml-tree-sitter-core && patch -N -b -i patch/tree-sitter-0.22.6/0001-Makefile-backports.patch downloads/tree-sitter-0.22.6/Makefile' } 'tree-sitter source patch'
     Invoke-Checked { & $Bash '-c' 'cd libs/ocaml-tree-sitter-core && ./configure && ./scripts/install-tree-sitter-lib' } 'tree-sitter build'
+    $env:PKG_CONFIG_LIBDIR = '/usr/x86_64-w64-mingw32/sys-root/mingw/lib/pkgconfig'
+    $env:PKG_CONFIG_PATH = $env:PKG_CONFIG_LIBDIR
+    $CurlCflags = (& $Bash '-c' 'pkg-config --cflags libcurl').Trim()
+    if ($LASTEXITCODE -ne 0 -or $CurlCflags -notmatch '/usr/x86_64-w64-mingw32/' -or $CurlCflags -match '/usr/i686-w64-mingw32/') {
+      Fail 'AMD64 libcurl metadata selection failed'
+    }
     $env:OPAMIGNOREPINDEPENDS = 'true'
     Invoke-Checked { & $Opam install --locked --update-invariant --deps-only '.\semgrep.opam' } 'dependency installation'
     Assert-CompilerIdentity $CompilerRevision

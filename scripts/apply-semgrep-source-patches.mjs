@@ -75,8 +75,11 @@ function validateManifest(value) {
     ], label);
     if (typeof patch.id !== 'string' || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(patch.id)
         || typeof patch.package !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._+-]*$/.test(patch.package)
-        || typeof patch.revision !== 'string' || !/^[0-9a-f]{40}$/.test(patch.revision)
-        || !['pin', 'semgrep'].includes(patch.root)
+        || typeof patch.revision !== 'string'
+        || (patch.root === 'opam'
+          ? !/^[0-9a-f]{64}$/.test(patch.revision)
+          : !/^[0-9a-f]{40}$/.test(patch.revision))
+        || !['opam', 'pin', 'semgrep'].includes(patch.root)
         || typeof patch.baseSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(patch.baseSha256)
         || typeof patch.patchedSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(patch.patchedSha256)
         || patch.baseSha256 === patch.patchedSha256
@@ -119,7 +122,9 @@ export async function applySourcePatches({ bundleRoot, manifestPath }) {
   for (const patch of patches) {
     const target = patch.root === 'pin'
       ? resolve(join(root, 'pins', patch.revision, ...patch.path.split('/')))
-      : resolve(join(root, 'sources', 'semgrep', ...patch.path.split('/')));
+      : patch.root === 'opam'
+        ? resolve(join(root, 'sources', 'opam', patch.revision, ...patch.path.split('/')))
+        : resolve(join(root, 'sources', 'semgrep', ...patch.path.split('/')));
     const inside = relative(root, target);
     if (inside === '' || inside.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || isAbsolute(inside)) {
       fail(`patch ${patch.id} target escapes the bundle root`);

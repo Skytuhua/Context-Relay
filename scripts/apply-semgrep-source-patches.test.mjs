@@ -160,6 +160,58 @@ test('applies the exact pinned Semgrep empty-proxy patch and verifies its produc
   assert.equal(sha256(await readFile(target)), proxyPatch.patchedSha256);
 });
 
+test('applies exact archive-identified Windows dependency patches', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'context-relay-semgrep-windows-patches-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const original = 'long len;\n';
+  const patched = 'intnat len;\n';
+  const revision = 'a'.repeat(64);
+  const path = 'package-1.0/src/stubs.c';
+  const target = join(root, 'sources', 'opam', revision, ...path.split('/'));
+  await mkdir(join(target, '..'), { recursive: true });
+  await writeFile(target, original);
+  const inventory = {
+    schemaVersion: 1,
+    sourceModified: true,
+    patches: [{
+      id: 'package-intnat',
+      package: 'package',
+      revision,
+      root: 'opam',
+      path,
+      baseSha256: sha256(original),
+      patchedSha256: sha256(patched),
+      replacements: [{ before: original, after: patched }],
+      rationale: 'Match the pinned compiler C API.',
+    }],
+  };
+  const manifestPath = join(root, 'patches.windows.v1.json');
+  await writeFile(manifestPath, `${JSON.stringify(inventory, null, 2)}\n`);
+  const result = await applySourcePatches({ bundleRoot: root, manifestPath });
+  assert.equal(result.length, 1);
+  assert.equal(result[0].root, 'opam');
+  assert.equal(await readFile(target, 'utf8'), patched);
+});
+
+test('Windows dependency inventory binds the diagnosed upstream files and fixes only their C APIs', async () => {
+  const inventory = JSON.parse(
+    await readFile(new URL('../third_party/sidecars/semgrep/patches.windows.v1.json', import.meta.url)),
+  );
+  assert.equal(inventory.patches.length, 2);
+  const ansi = inventory.patches.find(({ package: packageName }) => packageName === 'ANSITerminal');
+  const parmap = inventory.patches.find(({ package: packageName }) => packageName === 'parmap');
+  assert.equal(ansi.baseSha256, '45c428bfb1f1a5ea17351b1aebe253e23b4065967680c7de992735874fca58e6');
+  assert.equal(ansi.patchedSha256, '6367b47b7781587e27e7ed71111d4b5b137e01836d14ddaeca89035b71623887');
+  assert.match(ansi.replacements[0].after, /caml\/fail\.h/);
+  assert.equal(ansi.replacements[1].after, '  DWORD NumberOfCharsWritten;\n');
+  assert.equal(parmap.baseSha256, 'c6abd87cb802467948f63ecb2711088e5a576f49056e02151af6cbc67521a06b');
+  assert.equal(parmap.patchedSha256, '88da5335c0966ca8962cb9d4e0cc1a4360f0346a659f752fe6525f6c4ec5c9b3');
+  assert.deepEqual(parmap.replacements, [{
+    before: '  long len;\n',
+    after: '  intnat len;\n',
+  }]);
+});
+
 test('the single-job Semgrep patch keeps Eio scheduling without a worker domain', async () => {
   const inventory = JSON.parse(
     await readFile(new URL('../third_party/sidecars/semgrep/patches.v1.json', import.meta.url)),
@@ -201,8 +253,10 @@ test('both public-source builders apply the bundle-carried patch inventory', asy
     readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
   ]);
   assert.match(generator, /scripts\/apply-semgrep-source-patches\.mjs/);
+  assert.match(generator, /third_party\/sidecars\/semgrep\/patches\.windows\.v1\.json/);
   for (const builder of [macos, windows]) {
     assert.match(builder, /support[\\/]scripts[\\/]apply-semgrep-source-patches\.mjs/);
     assert.match(builder, /support[\\/]third_party[\\/]sidecars[\\/]semgrep[\\/]patches\.v1\.json/);
   }
+  assert.match(windows, /support[\\/]third_party[\\/]sidecars[\\/]semgrep[\\/]patches\.windows\.v1\.json/);
 });

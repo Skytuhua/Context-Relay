@@ -474,6 +474,24 @@ test('Windows V1 compiles before the runtime-only firewall window', async () => 
   assert.doesNotMatch(windows, /native build completed with .*network denial/i);
 });
 
+test('Windows stages exact OCaml compatibility sources and selects only AMD64 curl metadata', async () => {
+  const windows = await readFile(
+    new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url),
+    'utf8',
+  );
+  assert.match(windows, /patches\.windows\.v1\.json/);
+  assert.match(windows, /ANSITerminal\.0\.8\.5/);
+  assert.match(windows, /parmap\.1\.2\.5/);
+  assert.equal((windows.match(/pin add --no-action --kind=path/g) ?? []).length, 2);
+  assert.match(windows, /sources[\\/]opam/);
+  assert.match(windows, /Get-FileHash[^\n]+SHA256/);
+  assert.match(windows, /PKG_CONFIG_LIBDIR[^\n]+x86_64-w64-mingw32/);
+  assert.doesNotMatch(windows, /PKG_CONFIG_LIBDIR[^\n]+i686-w64-mingw32/);
+  const patches = windows.indexOf('patches.windows.v1.json');
+  const install = windows.indexOf('$Opam install --locked');
+  assert.ok(patches >= 0 && install > patches, 'exact dependency patches must precede installation');
+});
+
 test('Windows runtime DLL closure never searches ambient PATH', async () => {
   const windows = await readFile(
     new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url),
