@@ -36,6 +36,8 @@ $Objdump = (Get-Command x86_64-w64-mingw32-objdump.exe -ErrorAction Stop).Source
 $Gcc = (Get-Command x86_64-w64-mingw32-gcc.exe -ErrorAction Stop).Source
 $Cygpath = (Get-Command cygpath.exe -ErrorAction Stop).Source
 $Tar = (Resolve-Path -LiteralPath (Join-Path ([Environment]::SystemDirectory) 'tar.exe') -ErrorAction Stop).Path
+$CygwinRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $Bash) '..'))
+$MingwRootForward = (Join-Path $CygwinRoot 'usr\x86_64-w64-mingw32\sys-root\mingw').Replace('\', '/')
 
 $ClosedScanArguments = @(
   'scan',
@@ -360,10 +362,15 @@ function Build-Once([string]$Label) {
     Invoke-Checked { & $Bash '-c' 'cd libs/ocaml-tree-sitter-core && ./configure && ./scripts/install-tree-sitter-lib' } 'tree-sitter build'
     $env:PKG_CONFIG_LIBDIR = '/usr/x86_64-w64-mingw32/sys-root/mingw/lib/pkgconfig'
     $env:PKG_CONFIG_PATH = $env:PKG_CONFIG_LIBDIR
+    $env:CPPFLAGS = "-I$MingwRootForward/include"
+    $env:LDFLAGS = "-L$MingwRootForward/lib"
     $CurlCflags = (& $Bash '-c' 'pkg-config --cflags libcurl').Trim()
     if ($LASTEXITCODE -ne 0 -or $CurlCflags -notmatch '/usr/x86_64-w64-mingw32/' -or $CurlCflags -match '/usr/i686-w64-mingw32/') {
       Fail 'AMD64 libcurl metadata selection failed'
     }
+    Invoke-Checked {
+      & $Bash '-c' 'printf "#include <curl/curl.h>\nint main(void) { return 0; }\n" | x86_64-w64-mingw32-gcc $CPPFLAGS -x c -c -o /dev/null -'
+    } 'AMD64 libcurl header preflight'
     $env:OPAMIGNOREPINDEPENDS = 'true'
     Invoke-Checked { & $Opam install --locked --update-invariant --deps-only '.\semgrep.opam' } 'dependency installation'
     Assert-CompilerIdentity $CompilerRevision
@@ -379,7 +386,6 @@ function Build-Once([string]$Label) {
   New-Item -ItemType Directory -Path $Destination, $Evidence | Out-Null
   Copy-Item -LiteralPath $Executable -Destination (Join-Path $Destination 'osemgrep.exe')
 
-  $CygwinRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $Bash) '..'))
   $TrustedDllRoots = [string[]]@(
     $Destination,
     (Join-Path $Project '_build'),

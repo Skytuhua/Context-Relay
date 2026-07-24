@@ -298,7 +298,7 @@
         {
           "role": "windows-build",
           "path": "third_party/sidecars/semgrep/build-public-source-windows.ps1",
-          "sha256": "c831f04cd9d77c168b3f809c9e665e46e56af52004f0438b75f15d194f66dee3"
+          "sha256": "e7bcb2195b927811bb16cfd79732d2facf2c39a4349ed079dd50b3efd433355f"
         },
         {
           "role": "windows-builder-evidence-schema",
@@ -328,7 +328,7 @@
         {
           "role": "source-bundle-evidence",
           "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
-          "sha256": "eac820cb3d78f690d7e6fb151ec372d604cd050826b279b6aaddfeb8d50efa01"
+          "sha256": "9ccaa73f3e0156dbeb8f1b362d264a7c2be03f1b8844a5debf222deb307a0fa5"
         },
         {
           "role": "manifest-rule",

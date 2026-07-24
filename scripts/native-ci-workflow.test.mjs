@@ -487,9 +487,15 @@ test('Windows stages exact OCaml compatibility sources and selects only AMD64 cu
   assert.match(windows, /Get-FileHash[^\n]+SHA256/);
   assert.match(windows, /PKG_CONFIG_LIBDIR[^\n]+x86_64-w64-mingw32/);
   assert.doesNotMatch(windows, /PKG_CONFIG_LIBDIR[^\n]+i686-w64-mingw32/);
+  assert.match(windows, /CPPFLAGS[^\n]+MingwRootForward[^\n]+include/);
+  assert.match(windows, /curl\/curl\.h[^\n]+x86_64-w64-mingw32-gcc \$CPPFLAGS/);
   const patches = windows.indexOf('patches.windows.v1.json');
+  const headerProbe = windows.indexOf('AMD64 libcurl header preflight');
   const install = windows.indexOf('$Opam install --locked');
-  assert.ok(patches >= 0 && install > patches, 'exact dependency patches must precede installation');
+  assert.ok(
+    patches >= 0 && headerProbe > patches && install > headerProbe,
+    'exact dependency patches and the header preflight must precede installation',
+  );
 });
 
 test('Windows runtime DLL closure never searches ambient PATH', async () => {
