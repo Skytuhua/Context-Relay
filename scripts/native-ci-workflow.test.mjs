@@ -508,9 +508,13 @@ test('Windows runtime DLL closure never searches ambient PATH', async () => {
   );
   assert.doesNotMatch(windows, /\$env:PATH\.Split/);
   assert.match(windows, /TrustedDllRoots/);
-  assert.match(
-    windows,
-    /libs\\ocaml-tree-sitter-core\\tree-sitter-0\.22\.6\\lib/,
+  assert.match(windows, /\$TreeSitterRuntime = Join-Path \$Project 'libs\\ocaml-tree-sitter-core\\tree-sitter-0\.22\.6\\bin\\libtree-sitter\.dll'/);
+  assert.match(windows, /\(Split-Path -Parent \$TreeSitterRuntime\)/);
+  const treeSitterPreflight = windows.indexOf('libtree-sitter.dll was not built');
+  assert.ok(
+    treeSitterPreflight > windows.indexOf("'tree-sitter build'")
+      && treeSitterPreflight < windows.indexOf('$Opam install --locked'),
+    'tree-sitter runtime closure must fail before the full Semgrep build',
   );
   assert.match(windows, /x86_64-w64-mingw32-gcc/);
   assert.match(windows, /\$SystemDllRoot = \(Resolve-Path -LiteralPath \(\[Environment\]::SystemDirectory\)\)\.Path/);

@@ -306,6 +306,7 @@ function Build-Once([string]$Label) {
       $Bundle | Out-Null
   } 'Windows dependency patch application'
   $Project = Join-Path $Bundle 'sources\semgrep'
+  $TreeSitterRuntime = Join-Path $Project 'libs\ocaml-tree-sitter-core\tree-sitter-0.22.6\bin\libtree-sitter.dll'
   $AnsiSource = Join-Path $AnsiStage 'ANSITerminal-0.8.5'
   $ParmapSource = Join-Path $ParmapStage 'parmap-1.2.5'
   $OcurlSource = Join-Path $OcurlStage 'ocurl-0.9.1'
@@ -352,6 +353,7 @@ function Build-Once([string]$Label) {
     Invoke-Checked { & $Bash './scripts/pick-lockfile.sh' '--strict' 'semgrep.opam' } 'lockfile selection'
     Invoke-Checked { & $Bash '-c' 'cd libs/ocaml-tree-sitter-core && patch -N -b -i patch/tree-sitter-0.22.6/0001-Makefile-backports.patch downloads/tree-sitter-0.22.6/Makefile' } 'tree-sitter source patch'
     Invoke-Checked { & $Bash '-c' 'cd libs/ocaml-tree-sitter-core && ./configure && ./scripts/install-tree-sitter-lib' } 'tree-sitter build'
+    if (-not (Test-Path -LiteralPath $TreeSitterRuntime -PathType Leaf)) { Fail 'libtree-sitter.dll was not built' }
     $env:PKG_CONFIG_LIBDIR = '/usr/x86_64-w64-mingw32/sys-root/mingw/lib/pkgconfig'
     $env:PKG_CONFIG_PATH = $env:PKG_CONFIG_LIBDIR
     $env:CPPFLAGS = "-I$MingwRootForward/include"
@@ -382,7 +384,7 @@ function Build-Once([string]$Label) {
     $Destination,
     (Join-Path $Project '_build'),
     (Join-Path $Project '_build\install\default\bin'),
-    (Join-Path $Project 'libs\ocaml-tree-sitter-core\tree-sitter-0.22.6\lib'),
+    (Split-Path -Parent $TreeSitterRuntime),
     (Join-Path $script:Current 'switch'),
     (Join-Path $script:Current 'switch\bin'),
     (Split-Path -Parent $Gcc),
