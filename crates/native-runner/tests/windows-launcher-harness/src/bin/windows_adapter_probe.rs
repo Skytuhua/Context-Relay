@@ -4,7 +4,7 @@ use std::{
     env, fs,
     io::Write,
     net::{SocketAddr, TcpStream},
-    process::{Command, ExitCode, Stdio},
+    process::ExitCode,
     time::Duration,
 };
 
@@ -28,14 +28,6 @@ fn main() -> ExitCode {
         std::thread::sleep(Duration::from_secs(60));
         return ExitCode::SUCCESS;
     }
-    let arguments = env::args().skip(1).collect::<Vec<_>>();
-    if arguments
-        .first()
-        .is_some_and(|value| value == "--sidecar-child")
-    {
-        return ExitCode::SUCCESS;
-    }
-
     if exact_environment().is_err() {
         return ExitCode::from(2);
     }
@@ -74,7 +66,7 @@ fn main() -> ExitCode {
     }
 
     let mut response = RunResponse::failed(FailureCode::InvalidOutput);
-    if mode == "NO_PROTOCOL_HANDLE_LEAK" {
+    if mode == "NONINHERITABLE_PROTOCOL_HANDLES" {
         let handles = unsafe {
             [
                 GetStdHandle(STD_INPUT_HANDLE),
@@ -90,21 +82,12 @@ fn main() -> ExitCode {
             })
         {
             response = RunResponse::failed(FailureCode::ClosureMismatch);
-        } else if !Command::new(env::current_exe().unwrap())
-            .arg("--sidecar-child")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-        {
-            response = RunResponse::failed(FailureCode::LimitExceeded);
         }
     }
 
     let mut stdout = std::io::stdout().lock();
     match mode {
-        "BOUND" | "NO_PROTOCOL_HANDLE_LEAK" => {
+        "BOUND" | "NONINHERITABLE_PROTOCOL_HANDLES" => {
             write_run_response_for(&mut stdout, request.request(), &response)
         }
         "BOUND_LARGE" => write_run_response_for(
