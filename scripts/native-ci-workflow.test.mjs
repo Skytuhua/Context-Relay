@@ -110,6 +110,21 @@ test('normal CI uses one native builder per platform and defers A/B qualificatio
   assert.match(qualification, /semgrep_release_qualification:\s*true/);
 });
 
+test('normal V1 retries reuse successful native artifacts across workflow attempts', async () => {
+  const source = await readFile(workflowUrl, 'utf8');
+  assert.equal(
+    (source.match(/inputs\.semgrep_release_qualification && format\('-\{0\}', github\.run_attempt\) \|\| ''/g) ?? []).length,
+    4,
+  );
+  assert.equal(
+    (source.match(/overwrite:\s*\$\{\{ !inputs\.semgrep_release_qualification \}\}/g) ?? []).length,
+    2,
+  );
+  assert.match(source, /\$artifactAttempt = if \(\$env:CONTEXT_RELAY_RELEASE_QUALIFICATION -eq 'true'\)/);
+  assert.match(source, /artifactName = "task9-semgrep-windows-build-[^"]+\$artifactAttempt"/);
+  assert.match(source, /const attempt=process\.env\.CONTEXT_RELAY_RELEASE_QUALIFICATION==="true"/);
+});
+
 test('normal CI skips native Semgrep for non-material evidence-only changes', async () => {
   const source = await readFile(workflowUrl, 'utf8');
   const changes = job(source, 'semgrep-materials', 'native-semgrep-windows-x64-builders');
