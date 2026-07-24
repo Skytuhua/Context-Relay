@@ -69,6 +69,54 @@
         }
       ],
       "rationale": "Embed the exact pinned Semgrep compiler revision deterministically because opam sanitizes ambient Git identity during the native Windows package build."
+    },
+    {
+      "id": "semgrep-windows-tree-sitter-no-rpath-cairo",
+      "package": "semgrep",
+      "revision": "bd614accba811b407ae5c9ec6f1eecd3bdc29911",
+      "root": "semgrep",
+      "path": "languages/cairo/tree-sitter/semgrep-cairo/lib/dune",
+      "baseSha256": "421953b7ec0fb31abe7cc4e9e6d9cc19daab8c227d5be31ad268f282ba36280c",
+      "patchedSha256": "e7e2afc55cc9c24978b29490a0fbe4eced330e5eb3ca5ffb0f5c8b0aa2299bcc",
+      "replacements": [
+        {
+          "before": "      -Wl,-rpath,%{env:TREESITTER_LIBDIR=/usr/local/lib}\n",
+          "after": "      ; Windows native build omits the Unix runtime search path.\n"
+        }
+      ],
+      "rationale": "Omit the Unix-only runtime search-path flag from the Cairo tree-sitter library when linking the exact pinned Semgrep source with MinGW."
+    },
+    {
+      "id": "semgrep-windows-tree-sitter-no-rpath-move-on-sui",
+      "package": "semgrep",
+      "revision": "bd614accba811b407ae5c9ec6f1eecd3bdc29911",
+      "root": "semgrep",
+      "path": "languages/move_on_sui/tree-sitter/semgrep-move-on-sui/lib/dune",
+      "baseSha256": "6de9cef5ea771d14dafcd1433a2e711860b5c96dd226ef91c3c57fbb16c08cb1",
+      "patchedSha256": "ef29d3e0cfcb2571cdfd91d5e92328e43d25ffb1f7005481c4cc9d91bd31972b",
+      "replacements": [
+        {
+          "before": "      -Wl,-rpath,%{env:TREESITTER_LIBDIR=/usr/local/lib}\n",
+          "after": "      ; Windows native build omits the Unix runtime search path.\n"
+        }
+      ],
+      "rationale": "Omit the Unix-only runtime search-path flag from the Move-on-Sui tree-sitter library when linking the exact pinned Semgrep source with MinGW."
+    },
+    {
+      "id": "semgrep-windows-tree-sitter-no-rpath-ql",
+      "package": "semgrep",
+      "revision": "bd614accba811b407ae5c9ec6f1eecd3bdc29911",
+      "root": "semgrep",
+      "path": "languages/ql/tree-sitter/semgrep-ql/lib/dune",
+      "baseSha256": "a5ff6a85eb795ca138b381d1da88ad665adc9a6575c54f0cf3d42852278da1ba",
+      "patchedSha256": "f3a0c05bbe91552dc95fa037bc4ccc2a8ca19472e4fb7894870ee226e3e37a68",
+      "replacements": [
+        {
+          "before": "      -Wl,-rpath,%{env:TREESITTER_LIBDIR=/usr/local/lib}\n",
+          "after": "      ; Windows native build omits the Unix runtime search path.\n"
+        }
+      ],
+      "rationale": "Omit the Unix-only runtime search-path flag from the QL tree-sitter library when linking the exact pinned Semgrep source with MinGW."
     }
   ]
 }

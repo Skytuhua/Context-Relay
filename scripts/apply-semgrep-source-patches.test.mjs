@@ -193,11 +193,11 @@ test('applies exact archive-identified Windows dependency patches', async (t) =>
   assert.equal(await readFile(target, 'utf8'), patched);
 });
 
-test('Windows dependency inventory binds diagnosed upstream files and deterministic compiler identity', async () => {
+test('Windows inventory binds diagnosed dependencies, compiler identity, and MinGW link inputs', async () => {
   const inventory = JSON.parse(
     await readFile(new URL('../third_party/sidecars/semgrep/patches.windows.v1.json', import.meta.url)),
   );
-  assert.equal(inventory.patches.length, 4);
+  assert.equal(inventory.patches.length, 7);
   const ansi = inventory.patches.find(({ package: packageName }) => packageName === 'ANSITerminal');
   const parmap = inventory.patches.find(({ package: packageName }) => packageName === 'parmap');
   const ocurl = inventory.patches.find(({ package: packageName }) => packageName === 'ocurl');
@@ -231,6 +231,38 @@ test('Windows dependency inventory binds diagnosed upstream files and determinis
     before: 'SHA=`git rev-parse HEAD 2>/dev/null || echo unknown`',
     after: "SHA='3499e5708b0637c12d24d973dd103406a32b8fe8'",
   }]);
+  const treeSitterRpath = inventory.patches
+    .filter(({ id }) => id.startsWith('semgrep-windows-tree-sitter-no-rpath-'))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  assert.deepEqual(treeSitterRpath.map(({ path }) => path), [
+    'languages/cairo/tree-sitter/semgrep-cairo/lib/dune',
+    'languages/move_on_sui/tree-sitter/semgrep-move-on-sui/lib/dune',
+    'languages/ql/tree-sitter/semgrep-ql/lib/dune',
+  ]);
+  assert.deepEqual(
+    treeSitterRpath.map(({ baseSha256, patchedSha256 }) => [baseSha256, patchedSha256]),
+    [
+      [
+        '421953b7ec0fb31abe7cc4e9e6d9cc19daab8c227d5be31ad268f282ba36280c',
+        'e7e2afc55cc9c24978b29490a0fbe4eced330e5eb3ca5ffb0f5c8b0aa2299bcc',
+      ],
+      [
+        '6de9cef5ea771d14dafcd1433a2e711860b5c96dd226ef91c3c57fbb16c08cb1',
+        'ef29d3e0cfcb2571cdfd91d5e92328e43d25ffb1f7005481c4cc9d91bd31972b',
+      ],
+      [
+        'a5ff6a85eb795ca138b381d1da88ad665adc9a6575c54f0cf3d42852278da1ba',
+        'f3a0c05bbe91552dc95fa037bc4ccc2a8ca19472e4fb7894870ee226e3e37a68',
+      ],
+    ],
+  );
+  for (const patch of treeSitterRpath) {
+    assert.equal(patch.root, 'semgrep');
+    assert.deepEqual(patch.replacements, [{
+      before: '      -Wl,-rpath,%{env:TREESITTER_LIBDIR=/usr/local/lib}\n',
+      after: '      ; Windows native build omits the Unix runtime search path.\n',
+    }]);
+  }
 });
 
 test('the single-job Semgrep patch keeps Eio scheduling without a worker domain', async () => {
