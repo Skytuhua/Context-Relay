@@ -27,7 +27,6 @@ $AnsiTerminalArchiveSha256 = 'ab73b218b6a30267d2bbc43312dcf313981b8b0bec555d92b0
 $ParmapArchiveSha256 = '6709356e724436fba0b7a10f96f65a441c2b763832954707d5e30017e78fd285'
 $ParmapArchiveSha512 = '668e969a598cdb587597c7cabf7e299cfb4e3cc4cd229edf1888977f19bd5cdf169d39f5a6d923644bcd83f1ce1a3cfbd3a4e55ff59513736a9dc740a16b49d1'
 $OcurlArchiveSha256 = 'c65f01913270b674a0ca0f278f91bc1e368d7110e8308084bc2280b43a0bc258'
-$OcurlArchiveSha512 = '1ec21065f67ac227efb071ad696648ab4ac488ce77db091b4f212821b863fdcb2b23b6b9d579e8878fe8f1a6b2f0ec81c2751a72a1df201ea47f016012107429'
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Workspace = [IO.Path]::GetFullPath((Join-Path $ScriptRoot '..\..\..'))
 $CiProvenance = Join-Path $ScriptRoot 'native-ci-provenance.v1.json'
@@ -286,7 +285,7 @@ function Build-Once([string]$Label) {
   $OpamSources = Join-Path $Bundle 'sources\opam'
   $AnsiArchive = Join-Path $Bundle "opam-repository\cache\sha256\ab\$AnsiTerminalArchiveSha256"
   $ParmapArchive = Join-Path $Bundle "opam-repository\cache\sha512\66\$($ParmapArchiveSha512.Substring(0, 64))\$($ParmapArchiveSha512.Substring(64))"
-  $OcurlArchive = Join-Path $Bundle "opam-repository\cache\sha512\1e\$($OcurlArchiveSha512.Substring(0, 64))\$($OcurlArchiveSha512.Substring(64))"
+  $OcurlArchive = Join-Path $Bundle "opam-repository\cache\sha256\c6\$OcurlArchiveSha256"
   $AnsiStage = Join-Path $OpamSources $AnsiTerminalArchiveSha256
   $ParmapStage = Join-Path $OpamSources $ParmapArchiveSha256
   $OcurlStage = Join-Path $OpamSources $OcurlArchiveSha256
