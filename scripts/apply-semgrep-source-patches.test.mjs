@@ -193,14 +193,17 @@ test('applies exact archive-identified Windows dependency patches', async (t) =>
   assert.equal(await readFile(target, 'utf8'), patched);
 });
 
-test('Windows dependency inventory binds diagnosed upstream files and the MinGW configure host', async () => {
+test('Windows dependency inventory binds diagnosed upstream files and deterministic compiler identity', async () => {
   const inventory = JSON.parse(
     await readFile(new URL('../third_party/sidecars/semgrep/patches.windows.v1.json', import.meta.url)),
   );
-  assert.equal(inventory.patches.length, 3);
+  assert.equal(inventory.patches.length, 4);
   const ansi = inventory.patches.find(({ package: packageName }) => packageName === 'ANSITerminal');
   const parmap = inventory.patches.find(({ package: packageName }) => packageName === 'parmap');
   const ocurl = inventory.patches.find(({ package: packageName }) => packageName === 'ocurl');
+  const compiler = inventory.patches.find(
+    ({ id }) => id === 'ocaml-variants-semgrep-fork-identity',
+  );
   assert.equal(ansi.baseSha256, '45c428bfb1f1a5ea17351b1aebe253e23b4065967680c7de992735874fca58e6');
   assert.equal(ansi.patchedSha256, '6367b47b7781587e27e7ed71111d4b5b137e01836d14ddaeca89035b71623887');
   assert.match(ansi.replacements[0].after, /caml\/fail\.h/);
@@ -218,6 +221,15 @@ test('Windows dependency inventory binds diagnosed upstream files and the MinGW 
   assert.deepEqual(ocurl.replacements, [{
     before: '  ["./configure"]',
     after: '  ["./configure" "--host=x86_64-w64-mingw32"]',
+  }]);
+  assert.equal(compiler.root, 'pin');
+  assert.equal(compiler.revision, '3499e5708b0637c12d24d973dd103406a32b8fe8');
+  assert.equal(compiler.path, 'configure');
+  assert.equal(compiler.baseSha256, '80d654acc82247b914d74510193307da183e354efb1b42372b887e2b20db7af6');
+  assert.equal(compiler.patchedSha256, '5db84af66f8c79cc4208bd66708949fb7a67027d5407ffb13e7b94f7eab10723');
+  assert.deepEqual(compiler.replacements, [{
+    before: 'SHA=`git rev-parse HEAD 2>/dev/null || echo unknown`',
+    after: "SHA='3499e5708b0637c12d24d973dd103406a32b8fe8'",
   }]);
 });
 

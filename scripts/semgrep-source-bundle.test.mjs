@@ -453,11 +453,7 @@ test('public-source build scripts consume the verified bundle through closed nat
   );
   assert.doesNotMatch(windows, /& \$Bash '-lc'/);
   assert.match(windows, /& \$RuntimeExecutable --experimental --version/);
-  assert.match(windows, /git init --bare "\$1"/);
-  assert.match(windows, /\$GitDirForward = \[IO\.Path\]::GetFullPath\(\$GitDir\)\.Replace\('\\', '\/'\)/);
-  assert.match(windows, /\$env:GIT_DIR = \$CompilerGitDirForward/);
-  assert.doesNotMatch(windows, /\$GitDirPosix = \(& \$Cygpath -u/);
-  assert.match(windows, /Remove-Item Env:GIT_DIR -ErrorAction SilentlyContinue/);
+  assert.doesNotMatch(windows, /Initialize-CompilerGitIdentity|GIT_DIR/);
   assert.match(windows, /StartsWith\('file:\/\/'/);
   assert.match(windows, /\$ExpectedPinUrl = "file:\/\/\$ExpectedPinPath"/);
   assert.match(
@@ -474,6 +470,10 @@ test('public-source build scripts consume the verified bundle through closed nat
   assert.match(
     windows,
     /\$env:MAKEFLAGS = '-j1'[\s\S]+& \$Opam install --update-invariant 'ocaml-variants\.5\.3\.0'/,
+  );
+  assert.match(
+    windows,
+    /'compiler installation'\r?\n\s+Assert-CompilerIdentity \$CompilerRevision/,
   );
   assert.doesNotMatch(windows, /ocaml-option-flambda/);
   assert.match(

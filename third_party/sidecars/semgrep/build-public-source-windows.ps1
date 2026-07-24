@@ -184,17 +184,6 @@ function Add-Pin([string]$Package, [string]$Revision) {
   Invoke-Checked { & $Opam pin add --no-action $Package (Join-Path $script:Current "bundle\pins\$Revision") } "pin $Package"
 }
 
-function Initialize-CompilerGitIdentity([string]$GitDir, [string]$Revision) {
-  $GitDirForward = [IO.Path]::GetFullPath($GitDir).Replace('\', '/')
-  if ($GitDirForward -notmatch '^[A-Za-z]:/') { Fail 'compiler Git directory is not an absolute Windows drive path' }
-  # The verified local rsync pin has no VCS metadata, but the fork's configure
-  # script embeds `git rev-parse HEAD` in the compiler version.
-  Invoke-Checked {
-    & $Bash -c 'set -eu; git init --bare "$1" >/dev/null; printf "%s\n" "$2" > "$1/HEAD"; test "$(git --git-dir="$1" rev-parse HEAD)" = "$2"' _ $GitDirForward $Revision
-  } 'compiler Git identity preparation'
-  return $GitDirForward
-}
-
 function Assert-CompilerIdentity([string]$Revision) {
   $ExpectedPinPath = [IO.Path]::GetFullPath((Join-Path $script:Current "bundle\pins\$Revision")).Replace('\', '/')
   if ($ExpectedPinPath -notmatch '^[A-Za-z]:/') { Fail 'compiler pin path is not an absolute Windows drive path' }
@@ -210,7 +199,10 @@ function Assert-CompilerIdentity([string]$Revision) {
       -not [string]::Equals($PinUrl, $ExpectedPinUrl, [StringComparison]::Ordinal)) { Fail 'compiler pin path mismatch' }
   $CompilerVersion = (& $Opam exec -- ocamlc -version).Trim()
   if ($LASTEXITCODE -ne 0) { Fail 'compiler embedded identity query failed' }
-  if ($CompilerVersion -ne "5.3.0+semgrep-fork@$Revision") { Fail 'compiler embedded identity mismatch' }
+  $ExpectedVersion = "5.3.0+semgrep-fork@$Revision"
+  if ($CompilerVersion -ne $ExpectedVersion) {
+    Fail "compiler embedded identity mismatch: expected '$ExpectedVersion', got '$CompilerVersion'"
+  }
 }
 
 function Test-OutboundTcp([Net.IPAddress]$Address) {
@@ -340,15 +332,9 @@ function Build-Once([string]$Label) {
   Invoke-Checked { & $Opam switch create $Switch --empty } 'empty switch creation'
   $env:OPAMSWITCH = $Switch
 
-  $CompilerGitDirForward = Initialize-CompilerGitIdentity (Join-Path $script:Current 'compiler-git') $CompilerRevision
   Add-Pin 'ocaml-variants.5.3.0' $CompilerRevision
-  if ($null -ne [Environment]::GetEnvironmentVariable('GIT_DIR', 'Process')) { Fail 'GIT_DIR must be unset before compiler installation' }
-  $env:GIT_DIR = $CompilerGitDirForward
-  try {
-    Invoke-Checked { & $Opam install --update-invariant 'ocaml-variants.5.3.0' } 'compiler installation'
-  } finally {
-    Remove-Item Env:GIT_DIR -ErrorAction SilentlyContinue
-  }
+  Invoke-Checked { & $Opam install --update-invariant 'ocaml-variants.5.3.0' } 'compiler installation'
+  Assert-CompilerIdentity $CompilerRevision
   Invoke-Checked { & $Opam pin add --no-action --kind=path 'ANSITerminal.0.8.5' $AnsiSource } 'pin patched ANSITerminal'
   Invoke-Checked { & $Opam pin add --no-action --kind=path 'parmap.1.2.5' $ParmapSource } 'pin patched parmap'
   Invoke-Checked { & $Opam pin add --no-action --kind=path 'ocurl.0.9.1' $OcurlSource } 'pin patched ocurl'

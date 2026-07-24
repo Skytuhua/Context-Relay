@@ -53,6 +53,22 @@
         }
       ],
       "rationale": "Declare the pinned Win64 MinGW host so Autoconf selects the prefixed compiler and does not execute cross-compiled probes."
+    },
+    {
+      "id": "ocaml-variants-semgrep-fork-identity",
+      "package": "ocaml-variants",
+      "revision": "3499e5708b0637c12d24d973dd103406a32b8fe8",
+      "root": "pin",
+      "path": "configure",
+      "baseSha256": "80d654acc82247b914d74510193307da183e354efb1b42372b887e2b20db7af6",
+      "patchedSha256": "5db84af66f8c79cc4208bd66708949fb7a67027d5407ffb13e7b94f7eab10723",
+      "replacements": [
+        {
+          "before": "SHA=`git rev-parse HEAD 2>/dev/null || echo unknown`",
+          "after": "SHA='3499e5708b0637c12d24d973dd103406a32b8fe8'"
+        }
+      ],
+      "rationale": "Embed the exact pinned Semgrep compiler revision deterministically because opam sanitizes ambient Git identity during the native Windows package build."
     }
   ]
 }
