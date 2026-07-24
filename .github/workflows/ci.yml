@@ -376,7 +376,7 @@ jobs:
           cargo test -p context-relay-native-runner
           cargo test -p context-relay-native-runner --test native_fs_windows_v1 -- --nocapture
           cargo test -p context-relay-native-runner --test windows_launcher_v1 -- --nocapture
-          cargo test --manifest-path crates/native-runner/tests/windows-launcher-harness/Cargo.toml -- --nocapture
+          cargo test --manifest-path crates/native-runner/tests/windows-launcher-harness/Cargo.toml -- --nocapture --test-threads=1
           $registered = cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 -- --list
           $tests = @('real_rulesync_generates_only_the_validated_output_inside_appcontainer','real_rulesync_rejects_malformed_frontmatter_and_cleans_up','real_gitleaks_distinguishes_clean_and_findings_and_ignores_attacker_ignore_file','real_semgrep_clean_and_finding_use_the_closed_policy')
           foreach ($name in $tests) {
