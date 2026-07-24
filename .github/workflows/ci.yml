@@ -149,7 +149,7 @@ jobs:
           path: task9-opam-repository
           fetch-depth: 1
           persist-credentials: false
-      - uses: semgrep/setup-ocaml@3e4c6ff8c9a04c9ec8f6f87701cd4b661b0f1f18
+      - uses: semgrep/setup-ocaml@926350de15633adaddead51ba8297f4a9a8e96e4
         with:
           cache-prefix: context-relay-task9-windows-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build }}
           ocaml-compiler: 5.3.0
@@ -435,7 +435,7 @@ jobs:
           path: task9-opam-repository
           fetch-depth: 1
           persist-credentials: false
-      - uses: semgrep/setup-ocaml@a739c5405d73c42ef15a9dc995efc0f87396cc36
+      - uses: semgrep/setup-ocaml@926350de15633adaddead51ba8297f4a9a8e96e4
         with:
           cache-prefix: context-relay-task9-macos-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.build }}
           ocaml-compiler: ocaml-variants.5.3.0+options,ocaml-option-flambda
