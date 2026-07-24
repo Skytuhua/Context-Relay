@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 function Fail([string]$Message) { throw $Message }
 function Invoke-Checked([scriptblock]$Command, [string]$Label) {
-  & $Command
+  & $Command | Out-Host
   if ($LASTEXITCODE -ne 0) { Fail "$Label failed with exit code $LASTEXITCODE" }
 }
 

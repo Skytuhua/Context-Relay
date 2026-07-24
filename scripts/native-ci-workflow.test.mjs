@@ -474,6 +474,17 @@ test('Windows V1 compiles before the runtime-only firewall window', async () => 
   assert.doesNotMatch(windows, /native build completed with .*network denial/i);
 });
 
+test('Windows checked commands cannot contaminate the typed build result', async () => {
+  const windows = await readFile(
+    new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    windows,
+    /function Invoke-Checked\(\[scriptblock\]\$Command, \[string\]\$Label\) \{\s*& \$Command \| Out-Host\s*if \(\$LASTEXITCODE -ne 0\)/,
+  );
+});
+
 test('Windows stages exact OCaml compatibility sources and selects only AMD64 curl metadata', async () => {
   const windows = await readFile(
     new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url),
