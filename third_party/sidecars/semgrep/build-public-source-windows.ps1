@@ -9,6 +9,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$PSNativeCommandUseErrorActionPreference = $false
 function Fail([string]$Message) { throw $Message }
 function Invoke-Checked([scriptblock]$Command, [string]$Label) {
   & $Command | Out-Host

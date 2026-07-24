@@ -485,6 +485,19 @@ test('Windows checked commands cannot contaminate the typed build result', async
   );
 });
 
+test('Windows closed scans validate native exit codes explicitly', async () => {
+  const windows = await readFile(
+    new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    windows,
+    /Set-StrictMode -Version Latest\s+\$PSNativeCommandUseErrorActionPreference = \$false/,
+  );
+  assert.match(windows, /\$FindingStatus -ne 1/);
+  assert.match(windows, /\$InvalidStatus -eq 0 -or \$InvalidStatus -eq 1/);
+});
+
 test('Windows stages exact OCaml compatibility sources and selects only AMD64 curl metadata', async () => {
   const windows = await readFile(
     new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url),
