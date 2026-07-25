@@ -103,6 +103,38 @@ fn semgrep_warning() -> &'static [u8] {
 }
 
 #[test]
+fn semgrep_accepts_windows_newlines_and_omitted_experimental_timing() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
+    let mut report = semgrep_report(vec![], vec!["input/semgrep-target/METADATA"]);
+    let time = report["time"].as_object_mut().unwrap();
+    for key in [
+        "parsing_time",
+        "scanning_time",
+        "matching_time",
+        "tainting_time",
+        "fixpoint_timeouts",
+        "prefiltering",
+        "max_memory_bytes",
+    ] {
+        time.remove(key);
+    }
+    let warning = semgrep_warning()
+        .strip_suffix(b"\n")
+        .unwrap()
+        .iter()
+        .copied()
+        .chain(b"\r\n".iter().copied())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        validate_semgrep_report(0, &serde_json::to_vec(&report).unwrap(), &warning, &inputs,)
+            .unwrap()
+            .0,
+        RunDisposition::Clean
+    );
+}
+
+#[test]
 fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_newlines() {
     let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
     let clean = serde_json::to_vec(&semgrep_report(
@@ -120,13 +152,13 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
 
     assert_eq!(
         classify_semgrep_invalid_output(0, &clean, &crlf_warning, &inputs),
-        Some("stderr-crlf")
+        None
     );
     let mut invalid_time: Value = serde_json::from_slice(&clean).unwrap();
     invalid_time["time"]
         .as_object_mut()
         .unwrap()
-        .remove("max_memory_bytes");
+        .remove("total_bytes");
     assert_eq!(
         classify_semgrep_invalid_output(
             0,
@@ -134,7 +166,7 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
             &crlf_warning,
             &inputs
         ),
-        Some("stderr-crlf-report-time")
+        Some("report")
     );
     assert_eq!(
         classify_semgrep_invalid_output(2, &clean, semgrep_warning(), &inputs),

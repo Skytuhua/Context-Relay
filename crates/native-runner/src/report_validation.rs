@@ -687,7 +687,10 @@ fn valid_semgrep_warning(stderr: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(stderr) else {
         return false;
     };
-    let Some(line) = text.strip_suffix('\n') else {
+    let Some(line) = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+    else {
         return false;
     };
     if line.contains('\n') || line.contains('\r') {
@@ -796,72 +799,84 @@ fn validate_semgrep_time(
     time: &Map<String, Value>,
     inputs: &[ContentFrame],
 ) -> Result<(), RunnerError> {
-    if !exact_keys(
-        time,
-        &[
+    const KEYS: [&str; 12] = [
+        "rules",
+        "rules_parse_time",
+        "profiling_times",
+        "parsing_time",
+        "scanning_time",
+        "matching_time",
+        "tainting_time",
+        "fixpoint_timeouts",
+        "prefiltering",
+        "targets",
+        "total_bytes",
+        "max_memory_bytes",
+    ];
+    if !time.keys().all(|key| KEYS.contains(&key.as_str()))
+        || ![
             "rules",
             "rules_parse_time",
             "profiling_times",
-            "parsing_time",
-            "scanning_time",
-            "matching_time",
-            "tainting_time",
-            "fixpoint_timeouts",
-            "prefiltering",
             "targets",
             "total_bytes",
-            "max_memory_bytes",
-        ],
-    ) || !time
-        .get("rules")
-        .and_then(Value::as_array)
-        .is_some_and(|rules| rules.len() == 1 && rules[0].as_str() == Some(SEMGREP_RULE_ID))
-        || !empty_array(time.get("fixpoint_timeouts"))
+        ]
+        .iter()
+        .all(|key| time.contains_key(*key))
+        || !time
+            .get("rules")
+            .and_then(Value::as_array)
+            .is_some_and(|rules| rules.len() == 1 && rules[0].as_str() == Some(SEMGREP_RULE_ID))
+        || !time
+            .get("fixpoint_timeouts")
+            .is_none_or(|value| empty_array(Some(value)))
         || !nonnegative_number(time.get("rules_parse_time"))
         || !time
             .get("max_memory_bytes")
-            .and_then(Value::as_u64)
-            .is_some()
+            .is_none_or(|value| value.as_u64().is_some())
         || !empty_object(time.get("profiling_times"))
     {
         return invalid();
     }
     validate_semgrep_targets(time, inputs)?;
-    validate_file_timing(time.get("parsing_time"), "per_file_time", "very_slow_files")?;
-    validate_file_timing(
-        time.get("scanning_time"),
-        "per_file_time",
-        "very_slow_files",
-    )?;
-    validate_file_timing(
-        time.get("matching_time"),
-        "per_file_and_rule_time",
-        "very_slow_rules_on_files",
-    )?;
-    validate_file_timing(
-        time.get("tainting_time"),
-        "per_def_and_rule_time",
-        "very_slow_rules_on_defs",
-    )?;
-    let prefiltering = time
-        .get("prefiltering")
-        .and_then(Value::as_object)
-        .ok_or(RunnerError::InvalidToolOutput)?;
-    if !exact_keys(
-        prefiltering,
-        &[
-            "project_level_time",
-            "file_level_time",
-            "rules_with_project_prefilters_ratio",
-            "rules_with_file_prefilters_ratio",
-            "rules_selected_ratio",
-            "rules_matched_ratio",
-        ],
-    ) || !prefiltering
-        .values()
-        .all(|value| nonnegative_number(Some(value)))
-    {
-        return invalid();
+    for (key, average_key, slow_key) in [
+        ("parsing_time", "per_file_time", "very_slow_files"),
+        ("scanning_time", "per_file_time", "very_slow_files"),
+        (
+            "matching_time",
+            "per_file_and_rule_time",
+            "very_slow_rules_on_files",
+        ),
+        (
+            "tainting_time",
+            "per_def_and_rule_time",
+            "very_slow_rules_on_defs",
+        ),
+    ] {
+        if let Some(value) = time.get(key) {
+            validate_file_timing(Some(value), average_key, slow_key)?;
+        }
+    }
+    if let Some(prefiltering) = time.get("prefiltering") {
+        let prefiltering = prefiltering
+            .as_object()
+            .ok_or(RunnerError::InvalidToolOutput)?;
+        if !exact_keys(
+            prefiltering,
+            &[
+                "project_level_time",
+                "file_level_time",
+                "rules_with_project_prefilters_ratio",
+                "rules_with_file_prefilters_ratio",
+                "rules_selected_ratio",
+                "rules_matched_ratio",
+            ],
+        ) || !prefiltering
+            .values()
+            .all(|value| nonnegative_number(Some(value)))
+        {
+            return invalid();
+        }
     }
     Ok(())
 }
