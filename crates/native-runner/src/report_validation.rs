@@ -380,6 +380,9 @@ pub fn classify_semgrep_invalid_output(
     if !matches!(exit, 0 | 1) {
         return Some("exit");
     }
+    if validate_semgrep_core_report(exit, stdout, inputs).is_ok() {
+        return Some("stderr-core-report");
+    }
 
     let canonical_warning = format!("[0.0][WARNING]: {SEMGREP_WARNING}\n");
     let report_is_valid =

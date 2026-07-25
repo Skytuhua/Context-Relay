@@ -175,6 +175,27 @@ fn semgrep_core_accepts_exit_zero_with_empty_stderr_and_strips_the_canary() {
 }
 
 #[test]
+fn semgrep_diagnostic_distinguishes_a_valid_core_report_with_stderr() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
+    let canary = semgrep_core_result(
+        "config.semgrep.context-relay-scan-canary",
+        "INFO",
+        "Context Relay scan coverage canary.",
+        1,
+    );
+
+    assert_eq!(
+        classify_semgrep_invalid_output(
+            0,
+            &serde_json::to_vec(&semgrep_core_report(vec![canary])).unwrap(),
+            b"untrusted stderr",
+            &inputs,
+        ),
+        Some("stderr-core-report")
+    );
+}
+
+#[test]
 fn semgrep_accepts_windows_newlines_and_omitted_experimental_timing() {
     let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
     let mut report = semgrep_report(vec![], vec!["input/semgrep-target/METADATA"]);

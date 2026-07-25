@@ -332,6 +332,7 @@ mod windows_adapter {
                     | "stderr-crlf-report-paths"
                     | "stderr-crlf-report-results"
                     | "stderr-crlf-report-disposition"
+                    | "stderr-core-report"
                     | "stderr"
                     | "stderr-and-report"
             ))
@@ -487,6 +488,12 @@ mod windows_adapter {
             assert_eq!(
                 validated_semgrep_diagnostic(b"context-relay-semgrep-invalid-output=stderr-crlf\n"),
                 Some("context-relay-semgrep-invalid-output=stderr-crlf")
+            );
+            assert_eq!(
+                validated_semgrep_diagnostic(
+                    b"context-relay-semgrep-invalid-output=stderr-core-report\n"
+                ),
+                Some("context-relay-semgrep-invalid-output=stderr-core-report")
             );
             assert_eq!(
                 validated_semgrep_diagnostic(
