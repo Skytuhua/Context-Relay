@@ -5,19 +5,11 @@ use std::{
     ffi::OsString,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
-    os::windows::ffi::{OsStrExt, OsStringExt},
-    path::{Path, PathBuf},
-    ptr::null_mut,
+    os::windows::ffi::OsStringExt,
+    path::PathBuf,
     time::Duration,
 };
-use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE},
-    Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
-        FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    },
-    System::SystemInformation::GetWindowsDirectoryW,
-};
+use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
 
 fn main() {
     assert_restricted_environment();
@@ -63,17 +55,6 @@ fn main() {
                 .is_err()
         );
         let executable = nested.join("pinned.exe");
-        std::fs::write(
-            PathBuf::from(env::var_os("XDG_DATA_HOME").unwrap()).join("runtime-access.txt"),
-            format!(
-                "context-relay-runtime-access=read:{} execute:{} combined:{} null:{}",
-                access_error(&executable, FILE_GENERIC_READ),
-                access_error(&executable, FILE_GENERIC_EXECUTE),
-                access_error(&executable, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE),
-                access_error(Path::new("NUL"), FILE_GENERIC_READ | FILE_GENERIC_WRITE)
-            ),
-        )
-        .unwrap();
         let mut child = std::process::Command::new(executable)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -101,27 +82,6 @@ fn main() {
 
     writeln!(stdout, "INPUT-OK").unwrap();
     writeln!(std::io::stderr().lock(), "PROBE-ERR").unwrap();
-}
-
-fn access_error(path: &Path, desired_access: u32) -> u32 {
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            desired_access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            null_mut(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        unsafe { GetLastError() }
-    } else {
-        unsafe { CloseHandle(handle) };
-        0
-    }
 }
 
 fn assert_restricted_environment() {

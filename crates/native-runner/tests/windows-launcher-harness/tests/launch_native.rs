@@ -103,7 +103,7 @@ fn native_launch_is_suspended_attested_pipe_only_and_bounded() {
 }
 
 #[test]
-fn closure_runtime_acl_denies_appcontainer_writes_and_allows_host_cleanup() {
+fn closure_runtime_acl_denies_writes_allows_execution_and_host_cleanup() {
     let mut profiles = Win32ProfileApi::new();
     let identity = profiles.derive_identity(&unique_moniker()).unwrap();
     assert_eq!(
@@ -125,7 +125,6 @@ fn closure_runtime_acl_denies_appcontainer_writes_and_allows_host_cleanup() {
     let pinned = nested.join("pinned.dll");
     fs::write(&pinned, b"pinned\n").unwrap();
     let executable = nested.join("pinned.exe");
-    let access_report = layout.root().join("stage/data/runtime-access.txt");
     fs::copy(
         env!("CARGO_BIN_EXE_windows_sandbox_probe"),
         &executable,
@@ -134,14 +133,6 @@ fn closure_runtime_acl_denies_appcontainer_writes_and_allows_host_cleanup() {
     let digest: [u8; 32] = Sha256::digest(fs::read(layout.helper_path()).unwrap()).into();
 
     let backend = Win32LaunchBackend::prepare(&identity, layout, digest).unwrap();
-    let acl = std::process::Command::new("icacls")
-        .arg(&executable)
-        .output()
-        .unwrap();
-    eprintln!(
-        "context-relay-runtime-executable-acl={}",
-        String::from_utf8_lossy(&acl.stdout).replace("\r\n", " | ")
-    );
     let inherited = nested.join("inherited.dll");
     fs::write(&inherited, b"inherited\n").unwrap();
     let mut running = LaunchSequence::for_identity(backend, &identity)
@@ -154,9 +145,6 @@ fn closure_runtime_acl_denies_appcontainer_writes_and_allows_host_cleanup() {
         .resume_once()
         .unwrap();
     let output = running.exchange(b"RUNTIME-SEAL\n").unwrap();
-    if let Ok(report) = fs::read_to_string(access_report) {
-        eprintln!("{report}");
-    }
 
     assert_eq!(
         output.exit_code(),
