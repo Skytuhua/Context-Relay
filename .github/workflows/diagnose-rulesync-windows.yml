@@ -1,0 +1,76 @@
+name: Diagnose RuleSync Windows launch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Reproduce the exact RuleSync AppContainer launch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = node scripts/hydrate-sidecars.mjs --target windows-x86_64
+          if ($LASTEXITCODE -ne 0) { throw 'sidecar hydration failed' }
+          $env:CONTEXT_RELAY_REAL_SIDECAR_ROOT = $root.Trim()
+          $rulesync = Join-Path $env:CONTEXT_RELAY_REAL_SIDECAR_ROOT 'rulesync\rulesync.exe'
+          Get-FileHash -Algorithm SHA256 $rulesync | Format-List
+          & $rulesync --version
+          if ($LASTEXITCODE -ne 0) { throw 'RuleSync failed outside AppContainer' }
+
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 real_rulesync_generates_only_the_validated_output_inside_appcontainer -- --ignored --exact --nocapture
+          $testExit = $LASTEXITCODE
+
+          'Application-control status:'
+          if (Get-Command Get-AppLockerPolicy -ErrorAction SilentlyContinue) {
+            (Get-AppLockerPolicy -Effective).RuleCollections |
+              Select-Object CollectionType, EnforcementMode, @{Name='RuleCount'; Expression={$_.Count}} |
+              Format-Table -AutoSize
+          }
+          Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard -ErrorAction SilentlyContinue |
+            Select-Object SecurityServicesConfigured, SecurityServicesRunning, CodeIntegrityPolicyEnforcementStatus, UsermodeCodeIntegrityPolicyEnforcementStatus |
+            Format-List
+          Get-MpComputerStatus -ErrorAction SilentlyContinue |
+            Select-Object AMServiceEnabled, AntivirusEnabled, BehaviorMonitorEnabled, RealTimeProtectionEnabled, IsTamperProtected |
+            Format-List
+
+          'Recent RuleSync-related policy events:'
+          $since = (Get-Date).AddMinutes(-15)
+          $logs = @(
+            'Microsoft-Windows-AppLocker/EXE and DLL',
+            'Microsoft-Windows-CodeIntegrity/Operational',
+            'Microsoft-Windows-Windows Defender/Operational',
+            'Microsoft-Windows-Security-Mitigations/KernelMode',
+            'Microsoft-Windows-Security-Mitigations/UserMode'
+          )
+          $events = foreach ($log in $logs) {
+            Get-WinEvent -FilterHashtable @{LogName=$log; StartTime=$since} -ErrorAction SilentlyContinue |
+              Where-Object Message -Match 'rulesync|context-relay|AppContainer'
+          }
+          if (-not $events) {
+            'No matching policy events.'
+          } else {
+            $events | Select-Object -First 30 | ForEach-Object {
+              $message = ($_.Message -replace '\s+', ' ').Trim()
+              if ($message.Length -gt 500) { $message = $message.Substring(0, 500) }
+              [pscustomobject]@{
+                Time = $_.TimeCreated
+                Provider = $_.ProviderName
+                Id = $_.Id
+                Level = $_.LevelDisplayName
+                Message = $message
+              }
+            } | Format-List
+          }
+
+          exit $testExit
