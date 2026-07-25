@@ -34,8 +34,7 @@ use windows_sys::Win32::{
         GetTokenInformation, InitializeAcl, IsValidSid, NO_INHERITANCE,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
         SECURITY_CAPABILITIES, SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_APPCONTAINER_INFORMATION,
-        TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid, TokenCapabilities, TokenIsAppContainer,
-        TokenUser,
+        TOKEN_QUERY, TokenAppContainerSid, TokenCapabilities, TokenIsAppContainer,
     },
     Storage::FileSystem::{
         CreateFileW, DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -366,7 +365,6 @@ impl Win32LaunchBackend {
 }
 
 fn seal_closure_runtime(layout: &Win32ProfileLayout, sid: &OwnedSid) -> Result<(), LaunchError> {
-    let (_user_sid_buffer, user_sid) = current_process_user_sid()?;
     let root = open_closure_root_for_seal(layout.closure_runtime())?;
     let retained = closure_node(layout.closure_runtime_lock()?)?;
     let opened = closure_node(&root)?;
@@ -374,40 +372,12 @@ fn seal_closure_runtime(layout: &Win32ProfileLayout, sid: &OwnedSid) -> Result<(
         return Err(LaunchError::InvalidSecurityPlan);
     }
     let mut entry_count = 0;
-    seal_closure_object(&root, sid, user_sid, 0, opened.volume, &mut entry_count)
-}
-
-fn current_process_user_sid() -> Result<(Vec<usize>, PSID), LaunchError> {
-    let mut token = null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(last_error());
-    }
-    let token = owned_handle(token)?;
-    let (buffer, bytes) = query_token_buffer(raw_handle(&token), TokenUser)
-        .map_err(|_| LaunchError::InvalidSecurityPlan)?;
-    if bytes < size_of::<TOKEN_USER>() {
-        return Err(LaunchError::InvalidSecurityPlan);
-    }
-    let sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
-    let start = buffer.as_ptr() as usize;
-    let end = start
-        .checked_add(bytes)
-        .ok_or(LaunchError::InvalidSecurityPlan)?;
-    let address = sid as usize;
-    if sid.is_null() || address < start || address >= end || unsafe { IsValidSid(sid) } == 0 {
-        return Err(LaunchError::InvalidSecurityPlan);
-    }
-    let length = unsafe { GetLengthSid(sid) } as usize;
-    if length == 0 || address.checked_add(length).is_none_or(|limit| limit > end) {
-        return Err(LaunchError::InvalidSecurityPlan);
-    }
-    Ok((buffer, sid))
+    seal_closure_object(&root, sid, 0, opened.volume, &mut entry_count)
 }
 
 fn seal_closure_object(
     object: &File,
     sid: &OwnedSid,
-    user_sid: PSID,
     depth: usize,
     volume: u64,
     entry_count: &mut usize,
@@ -419,7 +389,7 @@ fn seal_closure_object(
     if !safe_closure_node(&before, before.directory, volume) {
         return Err(LaunchError::InvalidSecurityPlan);
     }
-    seal_closure_acl(object, sid, user_sid, before.directory)?;
+    seal_closure_acl(object, sid, before.directory)?;
 
     if before.directory {
         let names = closure_directory_names(
@@ -436,7 +406,7 @@ fn seal_closure_object(
                 return Err(LaunchError::InvalidSecurityPlan);
             }
             let child = nt_open_closure_child(object, name)?;
-            seal_closure_object(&child, sid, user_sid, depth + 1, volume, entry_count)?;
+            seal_closure_object(&child, sid, depth + 1, volume, entry_count)?;
         }
         if closure_directory_names(object, names.len())? != names {
             return Err(LaunchError::InvalidSecurityPlan);
@@ -450,12 +420,7 @@ fn seal_closure_object(
     Ok(())
 }
 
-fn seal_closure_acl(
-    object: &File,
-    sid: &OwnedSid,
-    user_sid: PSID,
-    directory: bool,
-) -> Result<(), LaunchError> {
+fn seal_closure_acl(object: &File, sid: &OwnedSid, directory: bool) -> Result<(), LaunchError> {
     let mut old_acl: *mut ACL = null_mut();
     let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
     let result = unsafe {
@@ -484,25 +449,16 @@ fn seal_closure_acl(
     } else {
         NO_INHERITANCE
     };
-    let mut read_entries = [sid.as_ptr(), user_sid].map(|_| EXPLICIT_ACCESS_W {
+    let mut read_entry = EXPLICIT_ACCESS_W {
         grfAccessPermissions: CLOSURE_RUNTIME_ALLOWED_ACCESS,
         grfAccessMode: SET_ACCESS,
         grfInheritance: inheritance,
         ..EXPLICIT_ACCESS_W::default()
-    });
-    unsafe {
-        BuildTrusteeWithSidW(&mut read_entries[0].Trustee, sid.as_ptr());
-        BuildTrusteeWithSidW(&mut read_entries[1].Trustee, user_sid);
-    }
-    let mut restricted_acl: *mut ACL = null_mut();
-    let result = unsafe {
-        SetEntriesInAclW(
-            read_entries.len() as u32,
-            read_entries.as_ptr(),
-            filtered_acl.as_ptr(),
-            &mut restricted_acl,
-        )
     };
+    unsafe { BuildTrusteeWithSidW(&mut read_entry.Trustee, sid.as_ptr()) };
+    let mut restricted_acl: *mut ACL = null_mut();
+    let result =
+        unsafe { SetEntriesInAclW(1, &read_entry, filtered_acl.as_ptr(), &mut restricted_acl) };
     if result != ERROR_SUCCESS {
         return Err(LaunchError::Win32(result));
     }

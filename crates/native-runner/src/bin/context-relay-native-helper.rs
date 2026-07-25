@@ -110,7 +110,7 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
         .current_dir(stage.layout().root())
         .env_clear()
         .envs(environment.iter())
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(target_os = "macos")]
@@ -140,6 +140,8 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
         eprintln!("{}", spawn_failure_diagnostic(&error));
         RunnerError::SidecarUnavailable
     })?;
+    let stdin = child.stdin.take().ok_or(RunnerError::Io)?;
+    drop(stdin);
     let stdout = child.stdout.take().ok_or(RunnerError::Io)?;
     let stderr = child.stderr.take().ok_or(RunnerError::Io)?;
     let stdout = thread::spawn(move || drain_bounded(stdout, DRAIN_LIMIT));
