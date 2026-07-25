@@ -156,13 +156,14 @@ fn real_semgrep_clean_and_finding_use_the_closed_policy() {
             b"osemgrep\n".to_vec(),
         )],
     );
+    let clean_response = fixture.run(&clean).unwrap();
     let RunResponse::Completed {
         disposition,
         outputs,
         ..
-    } = fixture.run(&clean).unwrap()
+    } = clean_response
     else {
-        panic!("real Semgrep clean scan did not complete");
+        panic!("real Semgrep clean scan did not complete: {clean_response:?}");
     };
     assert_eq!(disposition, RunDisposition::Clean);
     assert_eq!(outputs.len(), 1);
