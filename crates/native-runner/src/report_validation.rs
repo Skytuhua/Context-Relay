@@ -239,6 +239,37 @@ pub fn validate_semgrep_report(
     Ok((disposition, stdout.to_vec()))
 }
 
+pub fn classify_semgrep_invalid_output(
+    exit: i32,
+    stdout: &[u8],
+    stderr: &[u8],
+    inputs: &[ContentFrame],
+) -> Option<&'static str> {
+    if validate_semgrep_report(exit, stdout, stderr, inputs).is_ok() {
+        return None;
+    }
+    if !matches!(exit, 0 | 1) {
+        return Some("exit");
+    }
+
+    let canonical_warning = format!("[0.0][WARNING]: {SEMGREP_WARNING}\n");
+    let report_is_valid =
+        validate_semgrep_report(exit, stdout, canonical_warning.as_bytes(), inputs).is_ok();
+    let crlf_warning = stderr
+        .strip_suffix(b"\r\n")
+        .map(|line| [line, b"\n"].concat())
+        .is_some_and(|warning| valid_semgrep_warning(&warning));
+
+    match (valid_semgrep_warning(stderr), crlf_warning, report_is_valid) {
+        (true, _, false) => Some("report"),
+        (false, true, true) => Some("stderr-crlf"),
+        (false, true, false) => Some("stderr-crlf-and-report"),
+        (false, false, true) => Some("stderr"),
+        (false, false, false) => Some("stderr-and-report"),
+        (true, _, true) => None,
+    }
+}
+
 pub fn validate_rulesync_outputs(
     command: &SidecarCommand,
     inputs: &[ContentFrame],

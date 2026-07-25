@@ -1,7 +1,7 @@
 use context_relay_native_runner::{
     ContentFrame, RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RunDisposition,
-    SidecarCommand, StagePath, validate_gitleaks_report, validate_rulesync_outputs,
-    validate_semgrep_report,
+    SidecarCommand, StagePath, classify_semgrep_invalid_output, validate_gitleaks_report,
+    validate_rulesync_outputs, validate_semgrep_report,
 };
 use serde_json::{Value, json};
 
@@ -100,6 +100,36 @@ fn semgrep_report(results: Vec<Value>, scanned: Vec<&str>) -> Value {
 
 fn semgrep_warning() -> &'static [u8] {
     b"[00.10][WARNING]: !!! You're using one or more options starting with '--x-'. These options are not part of the semgrep API. They will change or will be removed without notice !!! \n"
+}
+
+#[test]
+fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_newlines() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
+    let clean = serde_json::to_vec(&semgrep_report(
+        vec![],
+        vec!["input/semgrep-target/METADATA"],
+    ))
+    .unwrap();
+    let crlf_warning = semgrep_warning()
+        .strip_suffix(b"\n")
+        .unwrap()
+        .iter()
+        .copied()
+        .chain(b"\r\n".iter().copied())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        classify_semgrep_invalid_output(0, &clean, &crlf_warning, &inputs),
+        Some("stderr-crlf")
+    );
+    assert_eq!(
+        classify_semgrep_invalid_output(2, &clean, semgrep_warning(), &inputs),
+        Some("exit")
+    );
+    assert_eq!(
+        classify_semgrep_invalid_output(0, b"not-json", semgrep_warning(), &inputs),
+        Some("report")
+    );
 }
 
 #[test]

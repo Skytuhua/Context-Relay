@@ -173,7 +173,12 @@ mod windows_adapter {
         if let Some(diagnostic) = validated_spawn_diagnostic(output.stderr()) {
             eprintln!("{diagnostic}");
         }
-        if output.exit_code() != 0 || !output.stderr().is_empty() {
+        let semgrep_diagnostic = validated_semgrep_diagnostic(output.stderr());
+        if let Some(diagnostic) = semgrep_diagnostic {
+            eprintln!("{diagnostic}");
+        }
+        if output.exit_code() != 0 || (!output.stderr().is_empty() && semgrep_diagnostic.is_none())
+        {
             return Ok(RunResponse::failed(FailureCode::ToolFailed));
         }
         let mut cursor = Cursor::new(output.stdout());
@@ -189,6 +194,22 @@ mod windows_adapter {
         let diagnostic = diagnostic.strip_suffix('\r').unwrap_or(diagnostic);
         let code = diagnostic.strip_prefix("context-relay-sidecar-spawn-os-error=")?;
         (!code.is_empty() && code.bytes().all(|byte| byte.is_ascii_digit())).then_some(diagnostic)
+    }
+
+    fn validated_semgrep_diagnostic(stderr: &[u8]) -> Option<&str> {
+        let diagnostic = std::str::from_utf8(stderr).ok()?.strip_suffix('\n')?;
+        let diagnostic = diagnostic.strip_suffix('\r').unwrap_or(diagnostic);
+        let kind = diagnostic.strip_prefix("context-relay-semgrep-invalid-output=")?;
+        matches!(
+            kind,
+            "exit"
+                | "report"
+                | "stderr-crlf"
+                | "stderr-crlf-and-report"
+                | "stderr"
+                | "stderr-and-report"
+        )
+        .then_some(diagnostic)
     }
 
     fn stage_closure(
@@ -250,7 +271,7 @@ mod windows_adapter {
 
     #[cfg(test)]
     mod tests {
-        use super::validated_spawn_diagnostic;
+        use super::{validated_semgrep_diagnostic, validated_spawn_diagnostic};
 
         #[test]
         fn only_the_exact_numeric_spawn_diagnostic_is_forwarded() {
@@ -261,6 +282,20 @@ mod windows_adapter {
             assert_eq!(validated_spawn_diagnostic(b"PROBE-ERR\n"), None);
             assert_eq!(
                 validated_spawn_diagnostic(b"context-relay-sidecar-spawn-os-error=5 extra\n"),
+                None
+            );
+        }
+
+        #[test]
+        fn only_an_exact_static_semgrep_diagnostic_is_forwarded() {
+            assert_eq!(
+                validated_semgrep_diagnostic(b"context-relay-semgrep-invalid-output=stderr-crlf\n"),
+                Some("context-relay-semgrep-invalid-output=stderr-crlf")
+            );
+            assert_eq!(
+                validated_semgrep_diagnostic(
+                    b"context-relay-semgrep-invalid-output=stderr-crlf extra\n"
+                ),
                 None
             );
         }

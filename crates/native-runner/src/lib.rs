@@ -47,7 +47,8 @@ pub use native_fs::{
 };
 pub use path_policy::{StagePath, validate_path_set, windows_ordinal_ignore_case_eq};
 pub use report_validation::{
-    validate_gitleaks_report, validate_rulesync_outputs, validate_semgrep_report,
+    classify_semgrep_invalid_output, validate_gitleaks_report, validate_rulesync_outputs,
+    validate_semgrep_report,
 };
 pub use stage::{StageDirectory, StageLayout};
 
