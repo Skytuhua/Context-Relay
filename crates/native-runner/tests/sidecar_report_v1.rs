@@ -166,7 +166,7 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
             &crlf_warning,
             &inputs
         ),
-        Some("report")
+        Some("time-shape")
     );
     assert_eq!(
         classify_semgrep_invalid_output(2, &clean, semgrep_warning(), &inputs),
@@ -174,7 +174,7 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
     );
     assert_eq!(
         classify_semgrep_invalid_output(0, b"not-json", semgrep_warning(), &inputs),
-        Some("report")
+        Some("json")
     );
     assert_eq!(
         classify_semgrep_exit_details(

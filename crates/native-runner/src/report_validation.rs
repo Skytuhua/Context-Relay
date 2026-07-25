@@ -261,7 +261,7 @@ pub fn classify_semgrep_invalid_output(
         .is_some_and(|warning| valid_semgrep_warning(&warning));
 
     match (valid_semgrep_warning(stderr), crlf_warning, report_is_valid) {
-        (true, _, false) => Some("report"),
+        (true, _, false) => Some(semgrep_report_boundary(exit, stdout, inputs)),
         (false, true, true) => Some("stderr-crlf"),
         (false, true, false) => Some(match semgrep_report_boundary(exit, stdout, inputs) {
             "json" => "stderr-crlf-report-json",
@@ -294,12 +294,11 @@ fn semgrep_report_boundary(exit: i32, stdout: &[u8], inputs: &[ContentFrame]) ->
     {
         return "envelope";
     }
-    if object
-        .get("time")
-        .and_then(Value::as_object)
-        .is_none_or(|time| validate_semgrep_time(time, inputs).is_err())
-    {
-        return "time";
+    let Some(time) = object.get("time").and_then(Value::as_object) else {
+        return "time-shape";
+    };
+    if validate_semgrep_time(time, inputs).is_err() {
+        return semgrep_time_boundary(time, inputs);
     }
     let expected = inputs
         .iter()
@@ -343,6 +342,98 @@ fn semgrep_report_boundary(exit: i32, stdout: &[u8], inputs: &[ContentFrame]) ->
         (0, 0) | (1, 1..) => "valid",
         _ => "disposition",
     }
+}
+
+fn semgrep_time_boundary(time: &Map<String, Value>, inputs: &[ContentFrame]) -> &'static str {
+    const KEYS: [&str; 12] = [
+        "rules",
+        "rules_parse_time",
+        "profiling_times",
+        "parsing_time",
+        "scanning_time",
+        "matching_time",
+        "tainting_time",
+        "fixpoint_timeouts",
+        "prefiltering",
+        "targets",
+        "total_bytes",
+        "max_memory_bytes",
+    ];
+    if !time.keys().all(|key| KEYS.contains(&key.as_str()))
+        || ![
+            "rules",
+            "rules_parse_time",
+            "profiling_times",
+            "targets",
+            "total_bytes",
+        ]
+        .iter()
+        .all(|key| time.contains_key(*key))
+    {
+        return "time-shape";
+    }
+    if !time
+        .get("rules")
+        .and_then(Value::as_array)
+        .is_some_and(|rules| rules.len() == 1 && rules[0].as_str() == Some(SEMGREP_RULE_ID))
+    {
+        return "time-rules";
+    }
+    if !time
+        .get("fixpoint_timeouts")
+        .is_none_or(|value| empty_array(Some(value)))
+    {
+        return "time-fixpoints";
+    }
+    if !nonnegative_number(time.get("rules_parse_time")) {
+        return "time-rules-parse";
+    }
+    if !time
+        .get("max_memory_bytes")
+        .is_none_or(|value| value.as_u64().is_some())
+    {
+        return "time-max-memory";
+    }
+    if !empty_object(time.get("profiling_times")) {
+        return "time-profiling";
+    }
+    if validate_semgrep_targets(time, inputs).is_err() {
+        return "time-targets";
+    }
+    for (key, average_key, slow_key, label) in [
+        (
+            "parsing_time",
+            "per_file_time",
+            "very_slow_files",
+            "time-parsing",
+        ),
+        (
+            "scanning_time",
+            "per_file_time",
+            "very_slow_files",
+            "time-scanning",
+        ),
+        (
+            "matching_time",
+            "per_file_and_rule_time",
+            "very_slow_rules_on_files",
+            "time-matching",
+        ),
+        (
+            "tainting_time",
+            "per_def_and_rule_time",
+            "very_slow_rules_on_defs",
+            "time-tainting",
+        ),
+    ] {
+        if time
+            .get(key)
+            .is_some_and(|value| validate_file_timing(Some(value), average_key, slow_key).is_err())
+        {
+            return label;
+        }
+    }
+    "time-prefiltering"
 }
 
 pub fn classify_semgrep_exit_details(stdout: &[u8], stderr: &[u8]) -> (&'static str, String) {

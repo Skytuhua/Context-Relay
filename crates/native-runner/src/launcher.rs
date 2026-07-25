@@ -262,6 +262,18 @@ mod windows_adapter {
             || matches!(
                 kind,
                 "report"
+                    | "time-shape"
+                    | "time-rules"
+                    | "time-fixpoints"
+                    | "time-rules-parse"
+                    | "time-max-memory"
+                    | "time-profiling"
+                    | "time-targets"
+                    | "time-parsing"
+                    | "time-scanning"
+                    | "time-matching"
+                    | "time-tainting"
+                    | "time-prefiltering"
                     | "stderr-crlf"
                     | "stderr-crlf-and-report"
                     | "stderr-crlf-report-json"
@@ -361,6 +373,12 @@ mod windows_adapter {
                     b"context-relay-semgrep-invalid-output=stderr-crlf-report-time\n"
                 ),
                 Some("context-relay-semgrep-invalid-output=stderr-crlf-report-time")
+            );
+            assert_eq!(
+                validated_semgrep_diagnostic(
+                    b"context-relay-semgrep-invalid-output=time-targets\n"
+                ),
+                Some("context-relay-semgrep-invalid-output=time-targets")
             );
             assert_eq!(
                 validated_semgrep_diagnostic(
