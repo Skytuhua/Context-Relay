@@ -68,6 +68,7 @@ const GITLEAKS_EMPTY_IGNORE: &[u8] =
     include_bytes!("../../../../third_party/sidecars/policies/gitleaks.empty-ignore");
 const SEMGREP_POLICY: &[u8] =
     include_bytes!("../../../../third_party/sidecars/policies/semgrep-package.yml");
+const SEMGREP_CANARY_SUFFIX: &[u8] = b"\ncontext-relay-scan-canary";
 const DRAIN_LIMIT: usize = 8 * 1024 * 1024;
 
 fn main() -> ExitCode {
@@ -99,9 +100,10 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
     let executable = verified_executable(helper_request, target)?;
     let mut stage = prepare_stage(request.nonce(), target)?;
     let config_inventory = install_trusted_config(&mut stage, request.command(), target)?;
-    let input_inventory = stage.write_and_seal_inputs(request.inputs())?;
     validate_pre_enumeration(request)?;
     let limits = RunLimits::for_command(request.command());
+    let staged_inputs = staged_inputs(request.command(), request.inputs(), limits)?;
+    let input_inventory = stage.write_and_seal_inputs(&staged_inputs)?;
     let environment = RestrictedEnvironment::for_stage(stage.layout(), target)?;
     let argv = request.command().argv();
     let started = Instant::now();
@@ -206,10 +208,10 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
             )
         }
         SidecarCommand::OsemgrepScanPackage => {
-            let validated = validate_semgrep_report(exit, &stdout, &stderr, request.inputs());
+            let validated = validate_semgrep_report(exit, &stdout, &stderr, &staged_inputs);
             if validated.is_err()
                 && let Some(kind) =
-                    classify_semgrep_invalid_output(exit, &stdout, &stderr, request.inputs())
+                    classify_semgrep_invalid_output(exit, &stdout, &stderr, &staged_inputs)
             {
                 if kind == "exit" {
                     let (report_kind, stderr_kind) =
@@ -233,6 +235,34 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
             )
         }
     }
+}
+
+fn staged_inputs(
+    command: &SidecarCommand,
+    inputs: &[ContentFrame],
+    limits: RunLimits,
+) -> Result<Vec<ContentFrame>, RunnerError> {
+    if !matches!(command, SidecarCommand::OsemgrepScanPackage) {
+        return Ok(inputs.to_vec());
+    }
+    let staged = inputs
+        .iter()
+        .map(|input| {
+            let mut bytes = Vec::with_capacity(input.bytes().len() + SEMGREP_CANARY_SUFFIX.len());
+            bytes.extend_from_slice(input.bytes());
+            bytes.extend_from_slice(SEMGREP_CANARY_SUFFIX);
+            ContentFrame::new(input.path().clone(), bytes)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let total = staged.iter().try_fold(0_usize, |total, input| {
+        total
+            .checked_add(input.bytes().len())
+            .ok_or(RunnerError::LimitExceeded)
+    })?;
+    if total > limits.max_total_bytes() {
+        return Err(RunnerError::LimitExceeded);
+    }
+    Ok(staged)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1876,6 +1906,37 @@ mod tests {
         assert_eq!(
             spawn_failure_diagnostic(&error),
             "context-relay-sidecar-spawn-os-error=5"
+        );
+    }
+
+    #[test]
+    fn semgrep_stages_a_fixed_suffix_canary_without_changing_other_inputs() {
+        let input = ContentFrame::new(
+            StagePath::try_from("input/semgrep-target/runtime-inventory.txt").unwrap(),
+            b"osemgrep\n".to_vec(),
+        )
+        .unwrap();
+
+        let semgrep = staged_inputs(
+            &SidecarCommand::OsemgrepScanPackage,
+            std::slice::from_ref(&input),
+            RunLimits::for_command(&SidecarCommand::OsemgrepScanPackage),
+        )
+        .unwrap();
+        let gitleaks = staged_inputs(
+            &SidecarCommand::GitleaksScanPackage,
+            std::slice::from_ref(&input),
+            RunLimits::for_command(&SidecarCommand::GitleaksScanPackage),
+        )
+        .unwrap();
+
+        assert_eq!(input.bytes(), b"osemgrep\n");
+        assert_eq!(semgrep[0].bytes(), b"osemgrep\n\ncontext-relay-scan-canary");
+        assert_eq!(gitleaks, [input]);
+        assert!(
+            std::str::from_utf8(SEMGREP_POLICY)
+                .unwrap()
+                .contains("pattern-regex: \"(?s)\\\\A(?=.*\\\\ncontext-relay-scan-canary\\\\z).\"")
         );
     }
 }
