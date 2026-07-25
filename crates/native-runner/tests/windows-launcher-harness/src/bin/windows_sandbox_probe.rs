@@ -14,7 +14,7 @@ use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE},
     Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     },
     System::SystemInformation::GetWindowsDirectoryW,
 };
@@ -66,21 +66,22 @@ fn main() {
         std::fs::write(
             PathBuf::from(env::var_os("XDG_DATA_HOME").unwrap()).join("runtime-access.txt"),
             format!(
-                "context-relay-runtime-access=read:{} execute:{} combined:{}",
-            access_error(&executable, FILE_GENERIC_READ),
-            access_error(&executable, FILE_GENERIC_EXECUTE),
-            access_error(&executable, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)
+                "context-relay-runtime-access=read:{} execute:{} combined:{} null:{}",
+                access_error(&executable, FILE_GENERIC_READ),
+                access_error(&executable, FILE_GENERIC_EXECUTE),
+                access_error(&executable, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE),
+                access_error(Path::new("NUL"), FILE_GENERIC_READ | FILE_GENERIC_WRITE)
             ),
         )
         .unwrap();
-        assert!(
-            std::process::Command::new(executable)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok()
-        );
+        let mut child = std::process::Command::new(executable)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stdin.take());
+        child.wait().unwrap();
         writeln!(stdout, "RUNTIME-SEALED").unwrap();
         return;
     }
