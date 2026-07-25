@@ -213,6 +213,46 @@ fn semgrep_accepts_an_incomplete_target_profile_list() {
 }
 
 #[test]
+fn semgrep_uses_and_strips_a_fixed_coverage_canary() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
+    let canary = json!({
+        "check_id": "context-relay-scan-canary",
+        "path": "input/semgrep-target/METADATA",
+        "start": { "line": 1, "col": 1, "offset": 0 },
+        "end": { "line": 1, "col": 2, "offset": 1 },
+        "extra": {
+            "message": "Context Relay scan coverage canary.",
+            "metadata": {},
+            "severity": "INFO",
+            "fingerprint": "requires login",
+            "lines": "requires login",
+            "validation_state": "NO_VALIDATOR",
+            "engine_kind": "OSS"
+        }
+    });
+    let mut report = semgrep_report(vec![canary], vec!["input/semgrep-target/METADATA"]);
+    report["paths"]["scanned"] = json!([]);
+    report["time"]["rules"] = json!([]);
+    report["time"]["targets"] = json!([]);
+
+    let (disposition, normalized) = validate_semgrep_report(
+        1,
+        &serde_json::to_vec(&report).unwrap(),
+        semgrep_warning(),
+        &inputs,
+    )
+    .unwrap();
+
+    assert_eq!(disposition, RunDisposition::Clean);
+    assert!(
+        serde_json::from_slice::<Value>(&normalized).unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn semgrep_accepts_the_exact_declared_rule_id() {
     let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
     let mut report = semgrep_report(vec![], vec!["input/semgrep-target/METADATA"]);

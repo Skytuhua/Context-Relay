@@ -40,6 +40,8 @@ const SEMGREP_KEYS: [&str; 8] = [
 const SEMGREP_WARNING: &str = "!!! You're using one or more options starting with '--x-'. These options are not part of the semgrep API. They will change or will be removed without notice !!! ";
 const SEMGREP_RULE_ID: &str = "config.semgrep.context-relay-no-python-runtime";
 const SEMGREP_BARE_RULE_ID: &str = "context-relay-no-python-runtime";
+const SEMGREP_CANARY_RULE_ID: &str = "config.semgrep.context-relay-scan-canary";
+const SEMGREP_BARE_CANARY_RULE_ID: &str = "context-relay-scan-canary";
 
 pub fn validate_gitleaks_report(
     exit: i32,
@@ -173,7 +175,7 @@ pub fn validate_semgrep_report(
     if !matches!(exit, 0 | 1) || !valid_semgrep_warning(stderr) {
         return invalid();
     }
-    let report: Value =
+    let mut report: Value =
         serde_json::from_slice(stdout).map_err(|_| RunnerError::InvalidToolOutput)?;
     let object = report.as_object().ok_or(RunnerError::InvalidToolOutput)?;
     if !exact_keys(object, &SEMGREP_KEYS)
@@ -196,6 +198,27 @@ pub fn validate_semgrep_report(
             .ok_or(RunnerError::InvalidToolOutput)?,
         inputs,
     )?;
+    let results = object
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or(RunnerError::InvalidToolOutput)?;
+    let mut identities = BTreeSet::new();
+    let mut canaries = BTreeSet::new();
+    let mut findings = Vec::new();
+    for result in results {
+        let result_object = result.as_object().ok_or(RunnerError::InvalidToolOutput)?;
+        match validate_semgrep_result(result_object, &expected, &mut identities)? {
+            SemgrepResultKind::Canary(path) => {
+                if !canaries.insert(path) {
+                    return invalid();
+                }
+            }
+            SemgrepResultKind::Finding => findings.push(result.clone()),
+        }
+    }
+    if !canaries.is_empty() && canaries != expected {
+        return invalid();
+    }
     let paths = object
         .get("paths")
         .and_then(Value::as_object)
@@ -216,28 +239,24 @@ pub fn validate_semgrep_report(
             return invalid();
         }
     }
-    if scanned != expected || scanned_values.len() != expected.len() {
+    let exact_scanned = scanned == expected && scanned_values.len() == expected.len();
+    let canary_coverage = scanned.is_empty() && scanned_values.is_empty() && canaries == expected;
+    if !exact_scanned && !canary_coverage {
         return invalid();
     }
-    let results = object
-        .get("results")
-        .and_then(Value::as_array)
-        .ok_or(RunnerError::InvalidToolOutput)?;
-    let mut identities = BTreeSet::new();
-    for result in results {
-        validate_semgrep_result(
-            result.as_object().ok_or(RunnerError::InvalidToolOutput)?,
-            &expected,
-            &mut identities,
-        )?;
-    }
-    let count = u32::try_from(results.len()).map_err(|_| RunnerError::LimitExceeded)?;
-    let disposition = match (exit, count) {
-        (0, 0) => RunDisposition::Clean,
-        (1, count) if count > 0 => RunDisposition::Findings(count),
+    let count = u32::try_from(findings.len()).map_err(|_| RunnerError::LimitExceeded)?;
+    let disposition = match (exit, count, canaries.is_empty()) {
+        (0, 0, true) | (1, 0, false) => RunDisposition::Clean,
+        (1, count, _) if count > 0 => RunDisposition::Findings(count),
         _ => return invalid(),
     };
-    Ok((disposition, stdout.to_vec()))
+    if !canaries.is_empty() {
+        report["results"] = Value::Array(findings);
+    }
+    Ok((
+        disposition,
+        serde_json::to_vec(&report).map_err(|_| RunnerError::InvalidToolOutput)?,
+    ))
 }
 
 pub fn classify_semgrep_invalid_output(
@@ -901,16 +920,24 @@ fn valid_semgrep_warning(stderr: &[u8]) -> bool {
         && message == SEMGREP_WARNING
 }
 
+enum SemgrepResultKind {
+    Canary(String),
+    Finding,
+}
+
 fn validate_semgrep_result(
     result: &Map<String, Value>,
     expected_paths: &BTreeSet<String>,
     identities: &mut BTreeSet<String>,
-) -> Result<(), RunnerError> {
-    if !exact_keys(result, &["check_id", "path", "start", "end", "extra"])
-        || !valid_semgrep_rule_id(result.get("check_id").and_then(Value::as_str))
-    {
+) -> Result<SemgrepResultKind, RunnerError> {
+    if !exact_keys(result, &["check_id", "path", "start", "end", "extra"]) {
         return invalid();
     }
+    let rule_id = result
+        .get("check_id")
+        .and_then(Value::as_str)
+        .filter(|value| valid_semgrep_rule_id(Some(value)))
+        .ok_or(RunnerError::InvalidToolOutput)?;
     let path = scanner_path(
         result
             .get("path")
@@ -939,6 +966,10 @@ fn validate_semgrep_result(
         .get("extra")
         .and_then(Value::as_object)
         .ok_or(RunnerError::InvalidToolOutput)?;
+    let is_canary = matches!(
+        rule_id,
+        SEMGREP_CANARY_RULE_ID | SEMGREP_BARE_CANARY_RULE_ID
+    );
     if !exact_keys(
         extra,
         &[
@@ -951,12 +982,17 @@ fn validate_semgrep_result(
             "engine_kind",
         ],
     ) || extra.get("message").and_then(Value::as_str)
-        != Some("Native Semgrep packages must not contain Pysemgrep or a Python runtime.")
+        != Some(if is_canary {
+            "Context Relay scan coverage canary."
+        } else {
+            "Native Semgrep packages must not contain Pysemgrep or a Python runtime."
+        })
         || !extra
             .get("metadata")
             .and_then(Value::as_object)
             .is_some_and(Map::is_empty)
-        || extra.get("severity").and_then(Value::as_str) != Some("ERROR")
+        || extra.get("severity").and_then(Value::as_str)
+            != Some(if is_canary { "INFO" } else { "ERROR" })
         || extra.get("fingerprint").and_then(Value::as_str) != Some("requires login")
         || extra.get("lines").and_then(Value::as_str) != Some("requires login")
         || extra.get("validation_state").and_then(Value::as_str) != Some("NO_VALIDATOR")
@@ -964,13 +1000,18 @@ fn validate_semgrep_result(
     {
         return invalid();
     }
+    if is_canary {
+        return (start == (1, 1, 0) && end > start)
+            .then_some(SemgrepResultKind::Canary(path))
+            .ok_or(RunnerError::InvalidToolOutput);
+    }
     let identity = format!(
         "{}:{path}:{}:{}:{}:{}:{}:{}",
         SEMGREP_RULE_ID, start.0, start.1, start.2, end.0, end.1, end.2
     );
     identities
         .insert(identity)
-        .then_some(())
+        .then_some(SemgrepResultKind::Finding)
         .ok_or(RunnerError::InvalidToolOutput)
 }
 
@@ -1019,10 +1060,16 @@ fn validate_semgrep_time(
             .get("rules")
             .and_then(Value::as_array)
             .is_some_and(|rules| {
-                rules.len() <= 1
+                rules.len() <= 2
                     && rules
-                        .first()
-                        .is_none_or(|rule| valid_semgrep_rule_id(rule.as_str()))
+                        .iter()
+                        .all(|rule| valid_semgrep_rule_id(rule.as_str()))
+                    && rules
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        == rules.len()
             })
         || !time
             .get("fixpoint_timeouts")
@@ -1192,7 +1239,15 @@ fn scanner_path(value: &str) -> Result<String, RunnerError> {
 }
 
 fn valid_semgrep_rule_id(value: Option<&str>) -> bool {
-    matches!(value, Some(SEMGREP_RULE_ID | SEMGREP_BARE_RULE_ID))
+    matches!(
+        value,
+        Some(
+            SEMGREP_RULE_ID
+                | SEMGREP_BARE_RULE_ID
+                | SEMGREP_CANARY_RULE_ID
+                | SEMGREP_BARE_CANARY_RULE_ID
+        )
+    )
 }
 
 fn has_nonempty_bash_permissions(bytes: &[u8]) -> Result<bool, RunnerError> {
