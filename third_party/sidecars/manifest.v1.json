@@ -338,7 +338,7 @@
         {
           "role": "package-policy",
           "path": "third_party/sidecars/policies/semgrep-package.yml",
-          "sha256": "91d06ae1f62981fe26f9b8e9360534ffef306c99b4715a9f70602e494f73f748"
+          "sha256": "f11b8cfb1143a66d1c21ebfd2d3ed4904da9f5026f355beabc9dcb286c4f5fec"
         }
       ],
       "commandTemplate": {

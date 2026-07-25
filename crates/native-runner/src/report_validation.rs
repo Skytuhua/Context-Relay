@@ -356,6 +356,19 @@ fn semgrep_paths_boundary(
     let Ok(scanned) = scanned else {
         return Some("paths-value");
     };
+    if scanned_values.is_empty() {
+        let target_count = report
+            .get("time")
+            .and_then(Value::as_object)
+            .and_then(|time| time.get("targets"))
+            .and_then(Value::as_array)
+            .map(Vec::len);
+        return Some(match target_count {
+            Some(0) => "paths-empty-time-empty",
+            Some(count) if count == expected.len() => "paths-empty-time-complete",
+            _ => "paths-empty-time-other",
+        });
+    }
     if scanned_values.len() != expected.len() {
         return Some("paths-count");
     }

@@ -278,6 +278,9 @@ mod windows_adapter {
                     | "paths-array"
                     | "paths-value"
                     | "paths-count"
+                    | "paths-empty-time-empty"
+                    | "paths-empty-time-complete"
+                    | "paths-empty-time-other"
                     | "paths-set"
                     | "results"
                     | "disposition"
@@ -424,6 +427,12 @@ mod windows_adapter {
             assert_eq!(
                 validated_semgrep_diagnostic(b"context-relay-semgrep-invalid-output=paths-set\n"),
                 Some("context-relay-semgrep-invalid-output=paths-set")
+            );
+            assert_eq!(
+                validated_semgrep_diagnostic(
+                    b"context-relay-semgrep-invalid-output=paths-empty-time-empty\n"
+                ),
+                Some("context-relay-semgrep-invalid-output=paths-empty-time-empty")
             );
             assert_eq!(
                 validated_semgrep_diagnostic(

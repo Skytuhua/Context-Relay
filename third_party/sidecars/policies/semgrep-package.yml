@@ -3,5 +3,11 @@ rules:
     message: Native Semgrep packages must not contain Pysemgrep or a Python runtime.
     severity: ERROR
     languages: [generic]
+    paths:
+      include:
+        - "**/METADATA"
+        - "**/RECORD"
+        - "**/*.pth"
+        - "**/runtime-inventory.txt"
     patterns:
       - pattern-regex: "(?i)(pysemgrep|site-packages|python(?:3(?:\\.\\d+)?)?(?:\\.exe)?)"
