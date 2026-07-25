@@ -214,6 +214,17 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
         ),
         Some("time-shape")
     );
+    let mut empty_rules: Value = serde_json::from_slice(&clean).unwrap();
+    empty_rules["time"]["rules"] = json!([]);
+    assert_eq!(
+        classify_semgrep_invalid_output(
+            0,
+            &serde_json::to_vec(&empty_rules).unwrap(),
+            &crlf_warning,
+            &inputs
+        ),
+        Some("time-rules-empty")
+    );
     assert_eq!(
         classify_semgrep_invalid_output(2, &clean, semgrep_warning(), &inputs),
         Some("exit")

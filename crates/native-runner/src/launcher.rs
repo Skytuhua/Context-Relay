@@ -263,7 +263,11 @@ mod windows_adapter {
                 kind,
                 "report"
                     | "time-shape"
-                    | "time-rules"
+                    | "time-rules-empty"
+                    | "time-rules-multiple"
+                    | "time-rules-non-string"
+                    | "time-rules-other-one"
+                    | "time-rules-non-array"
                     | "time-fixpoints"
                     | "time-rules-parse"
                     | "time-max-memory"

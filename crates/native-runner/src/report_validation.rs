@@ -372,12 +372,15 @@ fn semgrep_time_boundary(time: &Map<String, Value>, inputs: &[ContentFrame]) -> 
     {
         return "time-shape";
     }
-    if !time
-        .get("rules")
-        .and_then(Value::as_array)
-        .is_some_and(|rules| rules.len() == 1 && valid_semgrep_rule_id(rules[0].as_str()))
-    {
-        return "time-rules";
+    match time.get("rules").and_then(Value::as_array) {
+        Some(rules) if rules.is_empty() => return "time-rules-empty",
+        Some(rules) if rules.len() > 1 => return "time-rules-multiple",
+        Some(rules) if rules[0].as_str().is_none() => return "time-rules-non-string",
+        Some(rules) if !valid_semgrep_rule_id(rules[0].as_str()) => {
+            return "time-rules-other-one";
+        }
+        Some(_) => {}
+        None => return "time-rules-non-array",
     }
     if !time
         .get("fixpoint_timeouts")
