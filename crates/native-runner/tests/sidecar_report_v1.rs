@@ -156,6 +156,25 @@ fn semgrep_accepts_empty_serial_backend_rule_timings() {
 }
 
 #[test]
+fn semgrep_accepts_singleton_target_timings_without_profiled_rules() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
+    let mut report = semgrep_report(vec![], vec!["input/semgrep-target/METADATA"]);
+    report["time"]["rules"] = json!([]);
+
+    assert_eq!(
+        validate_semgrep_report(
+            0,
+            &serde_json::to_vec(&report).unwrap(),
+            semgrep_warning(),
+            &inputs,
+        )
+        .unwrap()
+        .0,
+        RunDisposition::Clean
+    );
+}
+
+#[test]
 fn semgrep_accepts_the_exact_declared_rule_id() {
     let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
     let mut report = semgrep_report(vec![], vec!["input/semgrep-target/METADATA"]);
@@ -257,7 +276,7 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
             semgrep_warning(),
             &inputs
         ),
-        Some("time-target-times-one")
+        None
     );
     assert_eq!(
         classify_semgrep_invalid_output(2, &clean, semgrep_warning(), &inputs),
@@ -506,7 +525,6 @@ fn semgrep_timing_binds_the_exact_rule_paths_and_input_sizes() {
     );
 
     for poisoned in [
-        ("rules", json!([])),
         ("rules", json!(["other.context-relay-no-python-runtime"])),
         ("profiling_times", json!([])),
         ("total_bytes", json!(10)),

@@ -1079,7 +1079,8 @@ fn validate_semgrep_targets(
 
 fn nonnegative_numbers(value: Option<&Value>, expected_len: usize) -> bool {
     value.and_then(Value::as_array).is_some_and(|values| {
-        values.len() == expected_len && values.iter().all(|value| nonnegative_number(Some(value)))
+        (values.len() == expected_len || (expected_len == 0 && values.len() == 1))
+            && values.iter().all(|value| nonnegative_number(Some(value)))
     })
 }
 
