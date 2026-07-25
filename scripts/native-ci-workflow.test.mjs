@@ -732,7 +732,7 @@ test('the focused Semgrep workflow runs only the exact AppContainer gate', async
   );
   assert.match(
     source,
-    /cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 real_semgrep_clean_and_finding_use_the_closed_policy -- --ignored --exact --nocapture/,
+    /cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 --features ci-candidate-sidecar-smoke real_semgrep_clean_and_finding_use_the_closed_policy -- --ignored --exact --nocapture/,
   );
   assert.doesNotMatch(source, /context-relay-semgrep-core-probe|New-Item -ItemType HardLink/);
 });
