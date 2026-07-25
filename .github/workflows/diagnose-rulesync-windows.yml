@@ -29,7 +29,9 @@ jobs:
 
           $PSNativeCommandUseErrorActionPreference = $false
           cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 real_rulesync_generates_only_the_validated_output_inside_appcontainer -- --ignored --exact --nocapture
-          $testExit = $LASTEXITCODE
+          $rulesyncExit = $LASTEXITCODE
+          cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 real_gitleaks_distinguishes_clean_and_findings_and_ignores_attacker_ignore_file -- --ignored --exact --nocapture
+          $gitleaksExit = $LASTEXITCODE
 
           'Application-control status:'
           if (Get-Command Get-AppLockerPolicy -ErrorAction SilentlyContinue) {
@@ -73,4 +75,5 @@ jobs:
             } | Format-List
           }
 
-          exit $testExit
+          if ($rulesyncExit -ne 0) { exit $rulesyncExit }
+          exit $gitleaksExit
