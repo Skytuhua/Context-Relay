@@ -325,7 +325,11 @@ fn validate_semgrep_core_report(
                     return invalid();
                 }
             }
-            SemgrepResultKind::Finding => findings.push(Value::Object(result.clone())),
+            SemgrepResultKind::Finding => {
+                let mut result = result.clone();
+                result["extra"]["metavars"] = Value::Object(Map::new());
+                findings.push(Value::Object(result));
+            }
         }
     }
     if canaries != expected {
@@ -597,7 +601,11 @@ fn classify_semgrep_core_result(
     {
         return Err("results-extra-keys");
     }
-    if !empty_object(extra.get("metavars")) {
+    let is_canary = matches!(
+        rule_id,
+        SEMGREP_CANARY_RULE_ID | SEMGREP_BARE_CANARY_RULE_ID
+    );
+    if !valid_semgrep_core_metavars(extra.get("metavars"), is_canary, start, end) {
         return Err("results-metavars");
     }
     if extra.get("is_ignored").and_then(Value::as_bool) != Some(false) {
@@ -606,10 +614,6 @@ fn classify_semgrep_core_result(
     if extra.get("validation_state").and_then(Value::as_str) != Some("NO_VALIDATOR") {
         return Err("results-state");
     }
-    let is_canary = matches!(
-        rule_id,
-        SEMGREP_CANARY_RULE_ID | SEMGREP_BARE_CANARY_RULE_ID
-    );
     if !extra
         .get("severity")
         .is_none_or(|severity| severity.as_str() == Some(if is_canary { "INFO" } else { "ERROR" }))
@@ -1298,7 +1302,7 @@ fn validate_semgrep_result(
             ]
             .iter()
             .all(|key| extra.contains_key(*key))
-            && empty_object(extra.get("metavars"))
+            && valid_semgrep_core_metavars(extra.get("metavars"), is_canary, start, end)
             && extra.get("is_ignored").and_then(Value::as_bool) == Some(false)
             && extra.get("validation_state").and_then(Value::as_str) == Some("NO_VALIDATOR")
             && extra.get("severity").is_none_or(|severity| {
@@ -1349,6 +1353,60 @@ fn validate_semgrep_result(
         .insert(identity)
         .then_some(SemgrepResultKind::Finding)
         .ok_or(RunnerError::InvalidToolOutput)
+}
+
+fn valid_semgrep_core_metavars(
+    value: Option<&Value>,
+    is_canary: bool,
+    start: (u64, u64, u64),
+    end: (u64, u64, u64),
+) -> bool {
+    let Some(metavars) = value.and_then(Value::as_object) else {
+        return false;
+    };
+    if metavars.is_empty() {
+        return true;
+    }
+    let Some(capture) = (!is_canary && metavars.len() == 1)
+        .then(|| metavars.get("$1"))
+        .flatten()
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    if !exact_keys(capture, &["start", "end", "abstract_content"]) {
+        return false;
+    }
+    let capture_start = capture
+        .get("start")
+        .and_then(Value::as_object)
+        .and_then(|position| semgrep_position(position).ok());
+    let capture_end = capture
+        .get("end")
+        .and_then(Value::as_object)
+        .and_then(|position| semgrep_position(position).ok());
+    capture_start == Some(start)
+        && capture_end == Some(end)
+        && capture
+            .get("abstract_content")
+            .and_then(Value::as_str)
+            .is_some_and(valid_semgrep_policy_capture)
+}
+
+fn valid_semgrep_policy_capture(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    if matches!(value.as_str(), "pysemgrep" | "site-packages") {
+        return true;
+    }
+    let Some(mut suffix) = value.strip_prefix("python") else {
+        return false;
+    };
+    suffix = suffix.strip_suffix(".exe").unwrap_or(suffix);
+    suffix.is_empty()
+        || suffix == "3"
+        || suffix.strip_prefix("3.").is_some_and(|minor| {
+            !minor.is_empty() && minor.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn semgrep_position(position: &Map<String, Value>) -> Result<(u64, u64, u64), RunnerError> {

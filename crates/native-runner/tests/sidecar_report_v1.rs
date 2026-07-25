@@ -199,6 +199,42 @@ fn semgrep_core_accepts_omitted_optional_rule_metadata() {
 }
 
 #[test]
+fn semgrep_core_accepts_and_strips_the_closed_regex_capture() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"python.exe\n")];
+    let canary = semgrep_core_result(
+        "config.semgrep.context-relay-scan-canary",
+        "INFO",
+        "Context Relay scan coverage canary.",
+        1,
+    );
+    let mut finding = semgrep_core_result(
+        "config.semgrep.context-relay-no-python-runtime",
+        "ERROR",
+        "Native Semgrep packages must not contain Pysemgrep or a Python runtime.",
+        10,
+    );
+    finding["extra"]["metavars"] = json!({
+        "$1": {
+            "start": { "line": 1, "col": 1, "offset": 0 },
+            "end": { "line": 1, "col": 11, "offset": 10 },
+            "abstract_content": "python.exe"
+        }
+    });
+
+    let (_, report) = validate_semgrep_report(
+        0,
+        &serde_json::to_vec(&semgrep_core_report(vec![canary, finding])).unwrap(),
+        b"",
+        &inputs,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&report).unwrap()["results"][0]["extra"]["metavars"],
+        json!({})
+    );
+}
+
+#[test]
 fn semgrep_diagnostic_distinguishes_a_valid_core_report_with_stderr() {
     let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
     let canary = semgrep_core_result(
