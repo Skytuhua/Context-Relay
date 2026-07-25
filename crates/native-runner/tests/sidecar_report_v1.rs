@@ -145,6 +145,13 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
         ("report-no-json", "stderr-unix-ebadf".to_owned())
     );
     assert_eq!(
+        classify_semgrep_exit_details(
+            b"",
+            b"Uncaught exception in worker during executor pool job: Unix_error: Bad file descriptor close attacker-controlled"
+        ),
+        ("report-no-json", "stderr-unix-ebadf".to_owned())
+    );
+    assert_eq!(
         classify_semgrep_exit_details(b"", b"Error: exception End_of_file"),
         ("report-no-json", "stderr-end-of-file".to_owned())
     );

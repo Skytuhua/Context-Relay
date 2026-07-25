@@ -338,23 +338,38 @@ pub fn classify_semgrep_exit_details(stdout: &[u8], stderr: &[u8]) -> (&'static 
         "stderr-out-of-memory"
     } else if stderr.contains("stack overflow") {
         "stderr-stack-overflow"
-    } else if stderr.contains("exception unix.unix_error(unix.ebadf") {
+    } else if stderr.contains("exception unix.unix_error(unix.ebadf")
+        || stderr.contains("unix_error: bad file descriptor")
+    {
         "stderr-unix-ebadf"
-    } else if stderr.contains("exception unix.unix_error(unix.epipe") {
+    } else if stderr.contains("exception unix.unix_error(unix.epipe")
+        || stderr.contains("unix_error: broken pipe")
+    {
         "stderr-unix-epipe"
-    } else if stderr.contains("exception unix.unix_error(unix.eio") {
+    } else if stderr.contains("exception unix.unix_error(unix.eio")
+        || stderr.contains("unix_error: input/output error")
+        || stderr.contains("unix_error: i/o error")
+    {
         "stderr-unix-eio"
-    } else if stderr.contains("exception unix.unix_error(unix.eintr") {
+    } else if stderr.contains("exception unix.unix_error(unix.eintr")
+        || stderr.contains("unix_error: interrupted system call")
+    {
         "stderr-unix-eintr"
     } else if stderr.contains("exception unix.unix_error(unix.eagain")
         || stderr.contains("exception unix.unix_error(unix.ewouldblock")
+        || stderr.contains("unix_error: resource temporarily unavailable")
+        || stderr.contains("unix_error: operation would block")
     {
         "stderr-unix-retry"
-    } else if stderr.contains("exception unix.unix_error(unix.enosys") {
+    } else if stderr.contains("exception unix.unix_error(unix.enosys")
+        || stderr.contains("unix_error: function not implemented")
+    {
         "stderr-unix-enosys"
-    } else if stderr.contains("exception unix.unix_error(unix.eunknownerr 5") {
+    } else if stderr.contains("exception unix.unix_error(unix.eunknownerr 5")
+        || stderr.contains("unix_error: unknown error 5")
+    {
         "stderr-unix-unknown-5"
-    } else if stderr.contains("exception unix.unix_error(") {
+    } else if stderr.contains("exception unix.unix_error(") || stderr.contains("unix_error:") {
         "stderr-unix-other"
     } else if stderr.contains("exception sys_error(") {
         "stderr-sys-error"
