@@ -1109,7 +1109,7 @@ test('Semgrep records the V1 source bundle but remains disabled pending release 
   );
   assert.equal('sourceAssetUrl' in lock, false);
   assert.equal('sourceBundleSha256' in lock, false);
-  assert.equal(bundleEvidence.bundle.sha256, 'e0cb84d738514ef0ebd0dea863f5647f3db6a32f16aa49ebcd3f7c282552cbb2');
+  assert.equal(bundleEvidence.bundle.sha256, '0142bd8aa73308e7a7350328e0c34537201e09a0b5554ba7a6307fa6d89f619e');
   assert.equal(bundleEvidence.bundle.size, 1149642752);
   assert.equal(bundleEvidence.bundle.payloadEntries, 39542);
   assert.equal(bundleEvidence.bundle.recordedLinks, 222);

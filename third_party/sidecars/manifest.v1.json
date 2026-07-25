@@ -328,7 +328,7 @@
         {
           "role": "source-bundle-evidence",
           "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
-          "sha256": "8c13eb764affe6415e1b217e2532f686daf289ee818444a48f7312b42fc5dc65"
+          "sha256": "0b5b54e2db72613111494839162080fcb7b6ca1c7d7835aea819077283451d97"
         },
         {
           "role": "manifest-rule",
