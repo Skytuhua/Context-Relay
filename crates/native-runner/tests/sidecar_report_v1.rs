@@ -135,18 +135,28 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
             br#"{"errors":[{"type":"Timeout","message":"attacker-controlled"}]}"#,
             b"Sys_error(\"NUL: Permission denied\")"
         ),
-        ("report-timeout", "stderr-permission-denied-nul")
+        ("report-timeout", "stderr-permission-denied-nul".to_owned())
     );
     assert_eq!(
         classify_semgrep_exit_details(
             b"",
             b"Error: exception Unix.Unix_error(Unix.EBADF, \"secret\", \"secret\")"
         ),
-        ("report-no-json", "stderr-unix-ebadf")
+        ("report-no-json", "stderr-unix-ebadf".to_owned())
     );
     assert_eq!(
         classify_semgrep_exit_details(b"", b"Error: exception End_of_file"),
-        ("report-no-json", "stderr-end-of-file")
+        ("report-no-json", "stderr-end-of-file".to_owned())
+    );
+    assert_eq!(
+        classify_semgrep_exit_details(
+            b"",
+            b"Error: exception Invalid_argument(\"attacker-controlled\")"
+        ),
+        (
+            "report-no-json",
+            "stderr-exception-invalid_argument".to_owned()
+        )
     );
 }
 

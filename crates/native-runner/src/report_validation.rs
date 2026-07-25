@@ -270,7 +270,7 @@ pub fn classify_semgrep_invalid_output(
     }
 }
 
-pub fn classify_semgrep_exit_details(stdout: &[u8], stderr: &[u8]) -> (&'static str, &'static str) {
+pub fn classify_semgrep_exit_details(stdout: &[u8], stderr: &[u8]) -> (&'static str, String) {
     let report_kind = serde_json::from_slice::<Value>(stdout)
         .ok()
         .and_then(|report| report.get("errors")?.as_array().cloned())
@@ -299,6 +299,20 @@ pub fn classify_semgrep_exit_details(stdout: &[u8], stderr: &[u8]) -> (&'static 
     let stderr = std::str::from_utf8(stderr)
         .unwrap_or("")
         .to_ascii_lowercase();
+    let exception_constructor = stderr
+        .split_once("error: exception ")
+        .and_then(|(_, tail)| {
+            let constructor = tail
+                .split(['(', ' ', '\r', '\n'])
+                .next()
+                .unwrap_or_default();
+            (!constructor.is_empty()
+                && constructor.len() <= 64
+                && constructor
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.')))
+            .then_some(constructor)
+        });
     let permission_denied = ["permission denied", "access is denied", "eacces"]
         .iter()
         .any(|needle| stderr.contains(needle));
@@ -352,6 +366,8 @@ pub fn classify_semgrep_exit_details(stdout: &[u8], stderr: &[u8]) -> (&'static 
         || stderr.contains("exception time_limit.timeout")
     {
         "stderr-timeout-exception"
+    } else if let Some(constructor) = exception_constructor {
+        return (report_kind, format!("stderr-exception-{constructor}"));
     } else if stderr.contains("exception") {
         "stderr-other-exception"
     } else if stderr.is_empty() {
@@ -359,7 +375,7 @@ pub fn classify_semgrep_exit_details(stdout: &[u8], stderr: &[u8]) -> (&'static 
     } else {
         "stderr-other"
     };
-    (report_kind, stderr_kind)
+    (report_kind, stderr_kind.to_owned())
 }
 
 pub fn validate_rulesync_outputs(

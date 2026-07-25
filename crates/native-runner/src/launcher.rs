@@ -204,6 +204,42 @@ mod windows_adapter {
             let mut parts = rest.split(':');
             let code = parts.next().unwrap_or("");
             let digits = code.strip_prefix('-').unwrap_or(code);
+            let valid_stderr_kind = |part: &str| {
+                matches!(
+                    part,
+                    "stderr-permission-denied-nul"
+                        | "stderr-permission-denied"
+                        | "stderr-not-found"
+                        | "stderr-invalid-argument"
+                        | "stderr-timeout"
+                        | "stderr-out-of-memory"
+                        | "stderr-stack-overflow"
+                        | "stderr-unix-ebadf"
+                        | "stderr-unix-epipe"
+                        | "stderr-unix-eio"
+                        | "stderr-unix-eintr"
+                        | "stderr-unix-retry"
+                        | "stderr-unix-enosys"
+                        | "stderr-unix-unknown-5"
+                        | "stderr-unix-other"
+                        | "stderr-sys-error"
+                        | "stderr-end-of-file"
+                        | "stderr-not-found-exception"
+                        | "stderr-cancelled"
+                        | "stderr-timeout-exception"
+                        | "stderr-other-exception"
+                        | "stderr-empty"
+                        | "stderr-other"
+                ) || part
+                    .strip_prefix("stderr-exception-")
+                    .is_some_and(|constructor| {
+                        !constructor.is_empty()
+                            && constructor.len() <= 64
+                            && constructor.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.')
+                            })
+                    })
+            };
             label == "exit"
                 && !digits.is_empty()
                 && digits.bytes().all(|byte| byte.is_ascii_digit())
@@ -219,34 +255,7 @@ mod windows_adapter {
                             | "report-no-json"
                     )
                 )
-                && matches!(
-                    parts.next(),
-                    Some(
-                        "stderr-permission-denied-nul"
-                            | "stderr-permission-denied"
-                            | "stderr-not-found"
-                            | "stderr-invalid-argument"
-                            | "stderr-timeout"
-                            | "stderr-out-of-memory"
-                            | "stderr-stack-overflow"
-                            | "stderr-unix-ebadf"
-                            | "stderr-unix-epipe"
-                            | "stderr-unix-eio"
-                            | "stderr-unix-eintr"
-                            | "stderr-unix-retry"
-                            | "stderr-unix-enosys"
-                            | "stderr-unix-unknown-5"
-                            | "stderr-unix-other"
-                            | "stderr-sys-error"
-                            | "stderr-end-of-file"
-                            | "stderr-not-found-exception"
-                            | "stderr-cancelled"
-                            | "stderr-timeout-exception"
-                            | "stderr-other-exception"
-                            | "stderr-empty"
-                            | "stderr-other"
-                    )
-                )
+                && parts.next().is_some_and(valid_stderr_kind)
                 && parts.next().is_none()
         });
         (valid_exit

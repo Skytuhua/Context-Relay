@@ -1,0 +1,44 @@
+name: Diagnose Semgrep Windows exception
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .node-version
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: task9-semgrep-windows-build-a-c3a9743012874bea2bb4e1daa4db81c4461852ff-30129619956
+          path: ${{ runner.temp }}/context-relay-semgrep-output-windows
+          run-id: 30129619956
+          github-token: ${{ github.token }}
+      - name: Prepare exact reused candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'context-relay-semgrep-output-windows'
+          $input = Join-Path $root 'source-a.tar'
+          $output = Join-Path $root 'source-a.resealed.tar'
+          node --input-type=module -e "import{readFile}from'node:fs/promises';import{resealSemgrepSourceBundle as r}from'./scripts/reseal-semgrep-source-bundle.mjs';const[i,o,l]=process.argv.slice(1);console.log(JSON.stringify(await r({additions:[],inputPath:i,outputPath:o,replacements:[{bytes:await readFile(l),executable:false,path:'metadata/source-lock.v1.json'}]})))" $input $output (Resolve-Path third_party/sidecars/semgrep/source-lock.v1.json).Path
+          Remove-Item -LiteralPath $input
+          Move-Item -LiteralPath $output -Destination $input
+          $candidate = Join-Path $env:RUNNER_TEMP 'context-relay-semgrep-candidate-windows'
+          $result = node scripts/prepare-semgrep-runtime.mjs --prepare-v1 --workspace $env:GITHUB_WORKSPACE --target windows-x86_64 --build-root $root --output-root $candidate --source-bundle $input --bundle-evidence (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path | ConvertFrom-Json
+          if ($result.mode -ne 'candidate' -or -not $result.candidateWorkspace -or -not $result.candidateDocumentPath) { throw 'candidate preparation failed' }
+          "CONTEXT_RELAY_REAL_SIDECAR_MANIFEST_ROOT=$($result.candidateWorkspace)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CONTEXT_RELAY_CI_CANDIDATE_DOCUMENT=$($result.candidateDocumentPath)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CONTEXT_RELAY_REAL_SIDECAR_ROOT=$($result.hydrationRoot)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Run only the exact failing gate
+        shell: pwsh
+        run: cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 --features ci-candidate-sidecar-smoke real_semgrep_clean_and_finding_use_the_closed_policy -- --ignored --exact --nocapture
