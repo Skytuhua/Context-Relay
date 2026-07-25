@@ -28,6 +28,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'RuleSync failed outside AppContainer' }
 
           $PSNativeCommandUseErrorActionPreference = $false
+          cargo test --manifest-path crates/native-runner/tests/windows-launcher-harness/Cargo.toml closure_runtime_acl_denies_appcontainer_writes_and_allows_host_cleanup -- --exact --nocapture --test-threads=1
+          $runtimeAclExit = $LASTEXITCODE
           cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 real_rulesync_generates_only_the_validated_output_inside_appcontainer -- --ignored --exact --nocapture
           $rulesyncExit = $LASTEXITCODE
           cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 real_gitleaks_distinguishes_clean_and_findings_and_ignores_attacker_ignore_file -- --ignored --exact --nocapture
@@ -75,5 +77,6 @@ jobs:
             } | Format-List
           }
 
+          if ($runtimeAclExit -ne 0) { exit $runtimeAclExit }
           if ($rulesyncExit -ne 0) { exit $rulesyncExit }
           exit $gitleaksExit

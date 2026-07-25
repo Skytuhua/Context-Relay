@@ -124,6 +124,12 @@ fn closure_runtime_acl_denies_appcontainer_writes_and_allows_host_cleanup() {
     fs::create_dir(&nested).unwrap();
     let pinned = nested.join("pinned.dll");
     fs::write(&pinned, b"pinned\n").unwrap();
+    let executable = nested.join("pinned.exe");
+    fs::copy(
+        env!("CARGO_BIN_EXE_windows_sandbox_probe"),
+        &executable,
+    )
+    .unwrap();
     let digest: [u8; 32] = Sha256::digest(fs::read(layout.helper_path()).unwrap()).into();
 
     let backend = Win32LaunchBackend::prepare(&identity, layout, digest).unwrap();
