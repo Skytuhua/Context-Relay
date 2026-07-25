@@ -237,7 +237,7 @@ impl SidecarCommand {
                 "--max-target-bytes=8388608",
                 "--config",
                 "config/semgrep/package.yml",
-                "input/semgrep-target",
+                "input/semgrep-target/runtime-inventory.txt",
             ]
             .map(str::to_owned)
             .into(),
@@ -288,11 +288,9 @@ impl SidecarCommand {
                 .filter(|relative| !relative.is_empty())
                 .map(|_| ())
                 .ok_or(RunnerError::InvalidCommand),
-            Self::OsemgrepScanPackage => path
-                .as_str()
-                .strip_prefix("input/semgrep-target/")
-                .filter(|relative| !relative.is_empty())
-                .map(|_| ())
+            Self::OsemgrepScanPackage => (path.as_str()
+                == "input/semgrep-target/runtime-inventory.txt")
+                .then_some(())
                 .ok_or(RunnerError::InvalidCommand),
         }
     }
@@ -314,6 +312,9 @@ impl SidecarCommand {
             {
                 return Err(RunnerError::InvalidCommand);
             }
+        }
+        if matches!(self, Self::OsemgrepScanPackage) && inputs.len() != 1 {
+            return Err(RunnerError::InvalidCommand);
         }
         Ok(())
     }

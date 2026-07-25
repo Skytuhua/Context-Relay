@@ -2,7 +2,7 @@ rules:
   - id: context-relay-scan-canary
     message: Context Relay scan coverage canary.
     severity: INFO
-    languages: [regex]
+    languages: [generic]
     patterns:
       - pattern-regex: "(?s)\\A(?=.*\\ncontext-relay-scan-canary\\z)."
   - id: context-relay-no-python-runtime
