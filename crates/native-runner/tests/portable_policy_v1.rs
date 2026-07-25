@@ -202,7 +202,7 @@ fn closed_commands_emit_only_the_frozen_argument_arrays() {
 }
 
 #[test]
-fn semgrep_canary_has_no_platform_sensitive_path_filter() {
+fn semgrep_canary_uses_the_regex_analyzer_without_a_path_filter() {
     let policy = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -217,6 +217,8 @@ fn semgrep_canary_has_no_platform_sensitive_path_filter() {
         .unwrap()
         .0;
 
+    assert!(canary.contains("\n    languages: [regex]"));
+    assert!(!canary.contains("\n    languages: [generic]"));
     assert!(!canary.contains("\n    paths:"));
 }
 
