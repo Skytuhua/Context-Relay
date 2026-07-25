@@ -250,6 +250,17 @@ fn semgrep_uses_and_strips_a_fixed_coverage_canary() {
             .unwrap()
             .is_empty()
     );
+
+    report["results"][0]["extra"]["severity"] = json!("WARNING");
+    assert_eq!(
+        classify_semgrep_invalid_output(
+            1,
+            &serde_json::to_vec(&report).unwrap(),
+            semgrep_warning(),
+            &inputs,
+        ),
+        Some("results")
+    );
 }
 
 #[test]

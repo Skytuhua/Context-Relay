@@ -2,7 +2,13 @@ rules:
   - id: context-relay-scan-canary
     message: Context Relay scan coverage canary.
     severity: INFO
-    languages: [regex]
+    languages: [generic]
+    paths:
+      include:
+        - "**/METADATA"
+        - "**/RECORD"
+        - "**/*.pth"
+        - "**/runtime-inventory.txt"
     patterns:
       - pattern-regex: "(?s)\\A."
   - id: context-relay-no-python-runtime

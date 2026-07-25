@@ -1,6 +1,6 @@
+use std::path::Path;
 #[cfg(windows)]
 use std::{ffi::OsString, os::windows::ffi::OsStringExt};
-use std::{fs, path::Path};
 
 use context_relay_native_runner::{
     RestrictedEnvironment, RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget,
@@ -199,27 +199,6 @@ fn closed_commands_emit_only_the_frozen_argument_arrays() {
     }
     assert!(RuleSyncFeatures::new(&[]).is_err());
     assert!(RuleSyncFeatures::new(&[RuleSyncFeature::Rules, RuleSyncFeature::Rules]).is_err());
-}
-
-#[test]
-fn semgrep_canary_uses_the_regex_analyzer_without_a_path_filter() {
-    let policy = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("third_party/sidecars/policies/semgrep-package.yml"),
-    )
-    .unwrap();
-    let canary = policy
-        .split_once("  - id: context-relay-scan-canary")
-        .unwrap()
-        .1
-        .split_once("  - id: context-relay-no-python-runtime")
-        .unwrap()
-        .0;
-
-    assert!(canary.contains("\n    languages: [regex]"));
-    assert!(!canary.contains("\n    languages: [generic]"));
-    assert!(!canary.contains("\n    paths:"));
 }
 
 #[test]

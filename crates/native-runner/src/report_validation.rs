@@ -324,22 +324,36 @@ fn semgrep_report_boundary(exit: i32, stdout: &[u8], inputs: &[ContentFrame]) ->
         .iter()
         .map(|input| input.path().as_str().to_owned())
         .collect::<BTreeSet<_>>();
-    if let Some(boundary) = semgrep_paths_boundary(object, &expected) {
-        return boundary;
-    }
     let Some(results) = object.get("results").and_then(Value::as_array) else {
         return "results";
     };
     let mut identities = BTreeSet::new();
-    if results.iter().any(|result| {
-        result.as_object().is_none_or(|result| {
-            validate_semgrep_result(result, &expected, &mut identities).is_err()
-        })
-    }) {
+    let mut canaries = BTreeSet::new();
+    let mut findings = 0;
+    for result in results {
+        let Some(result) = result.as_object() else {
+            return "results";
+        };
+        match validate_semgrep_result(result, &expected, &mut identities) {
+            Ok(SemgrepResultKind::Canary(path)) => {
+                if !canaries.insert(path) {
+                    return "results";
+                }
+            }
+            Ok(SemgrepResultKind::Finding) => findings += 1,
+            Err(_) => return "results",
+        }
+    }
+    if !canaries.is_empty() && canaries != expected {
         return "results";
     }
-    match (exit, results.len()) {
-        (0, 0) | (1, 1..) => "valid",
+    if let Some(boundary) = semgrep_paths_boundary(object, &expected)
+        && (boundary != "paths-empty-time-empty" || canaries != expected)
+    {
+        return boundary;
+    }
+    match (exit, findings, canaries.is_empty()) {
+        (0, 0, true) | (1, 0, false) | (1, 1.., _) => "valid",
         _ => "disposition",
     }
 }
