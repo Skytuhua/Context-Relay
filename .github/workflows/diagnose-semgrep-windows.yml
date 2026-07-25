@@ -107,6 +107,11 @@ jobs:
             if ($message -match '(?i)no such file') { return 'no-such-file' }
             'other'
           }
+          function Get-CoreArgumentLabel($Error) {
+            $message = if ($Error.message -is [string]) { $Error.message } else { '' }
+            if ($message -match '^Invalid_argument:\s*([A-Za-z0-9_.]{1,64})') { return $Matches[1] }
+            'none'
+          }
           function Invoke-CoreProbe([string] $Content) {
             Set-Content (Join-Path $probe 'input/semgrep-target/runtime-inventory.txt') -Value $Content -NoNewline
             $stdout = Join-Path $probe 'stdout.json'
@@ -134,6 +139,7 @@ jobs:
               errors = $errors.Count
               error = if ($errors.Count -eq 0) { 'none' } elseif ($errors.Count -gt 1) { 'multiple' } else { Get-CoreErrorLabel $error }
               exception = if ($null -eq $error) { 'none' } else { Get-CoreExceptionLabel $error }
+              argument = if ($null -eq $error) { 'none' } else { Get-CoreArgumentLabel $error }
               os = if ($null -eq $error) { 'none' } else { Get-CoreOsErrorLabel $error }
               located = if ($null -eq $error) { 'none' } elseif ($null -eq $error.location) { 'absent' } else { 'present' }
               ruled = if ($null -eq $error) { 'none' } elseif ($null -eq $error.rule_id) { 'absent' } else { 'present' }
