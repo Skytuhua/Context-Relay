@@ -7116,13 +7116,14 @@
       "--x-ignore-semgrepignore-files",
       "--time",
       "--jobs=1",
-      "--timeout=0",
+      "--x-parmap",
+      "--timeout=30",
       "--timeout-threshold=1",
       "--max-target-bytes=8388608",
       "--config",
       "<staged-rule>",
       "<staged-target>"
     ],
-    "sha256": "42ea5731bf9ac2e3886ef851919d8ff33db419c3fcc019431f444eeb547c2b3c"
+    "sha256": "c008682e8fa32fd0c1f929744084995b55f4b77fc8506cb3efa14cd16c70afde"
   }
 }
