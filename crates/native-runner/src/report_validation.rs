@@ -1182,7 +1182,6 @@ fn validate_semgrep_result(
                 "engine_kind",
                 "is_ignored",
                 "message",
-                "metadata",
                 "validation_state",
             ]
             .iter()
@@ -1220,8 +1219,7 @@ fn validate_semgrep_result(
             })
         || !extra
             .get("metadata")
-            .and_then(Value::as_object)
-            .is_some_and(Map::is_empty)
+            .is_none_or(|metadata| metadata.as_object().is_some_and(Map::is_empty))
         || extra.get("engine_kind").and_then(Value::as_str) != Some("OSS")
     {
         return invalid();
