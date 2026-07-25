@@ -205,7 +205,7 @@ fn enabled_semgrep_rejects_an_internally_incomplete_source_lock() {
         "--timeout-threshold=1",
         "--max-target-bytes=8388608",
         "--project-root",
-        ".",
+        "<staged-target>",
         "--config",
         "<staged-rule>",
         "<staged-target>",

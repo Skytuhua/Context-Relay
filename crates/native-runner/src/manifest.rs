@@ -148,7 +148,7 @@ const OSEMGREP_TEMPLATE: (&str, &[&str]) = (
         "--timeout-threshold=1",
         "--max-target-bytes=8388608",
         "--project-root",
-        ".",
+        "<staged-target>",
         "--config",
         "<staged-rule>",
         "<staged-target>",

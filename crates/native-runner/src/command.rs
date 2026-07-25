@@ -236,7 +236,7 @@ impl SidecarCommand {
                 "--timeout-threshold=1",
                 "--max-target-bytes=8388608",
                 "--project-root",
-                ".",
+                "input/semgrep-target",
                 "--config",
                 "config/semgrep/package.yml",
                 "input/semgrep-target",

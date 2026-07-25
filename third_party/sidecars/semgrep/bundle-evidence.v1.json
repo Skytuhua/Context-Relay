@@ -11,6 +11,6 @@
   "independentBuilds": 1,
   "schemaVersion": 1,
   "sourceAssetUrl": "https://github.com/Skytuhua/Context-Relay/releases/download/sidecars-semgrep-1.170.0-source.1/semgrep-1.170.0-corresponding-source.tar",
-  "sourceLockSha256": "98503f8b8b9cb6b7e272b5c192b00a85f6456f2a91bb69df53b064a4b6811ab9",
+  "sourceLockSha256": "2ba7f41e0b680f68164fed655fd7eb2df5f7a1642ff3ccdb2a7ea8a1f4c79633",
   "status": "source_bundle_v1_native_builds_pending"
 }
