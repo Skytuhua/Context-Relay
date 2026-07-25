@@ -52,7 +52,7 @@ fn semgrep_report(results: Vec<Value>, scanned: Vec<&str>) -> Value {
         "errors": [],
         "paths": { "scanned": scanned },
         "time": {
-            "rules": ["context-relay-no-python-runtime"],
+            "rules": ["config.semgrep.context-relay-no-python-runtime"],
             "rules_parse_time": 0.0,
             "profiling_times": {},
             "parsing_time": {
@@ -130,6 +130,27 @@ fn semgrep_accepts_windows_newlines_and_omitted_experimental_timing() {
         validate_semgrep_report(0, &serde_json::to_vec(&report).unwrap(), &warning, &inputs,)
             .unwrap()
             .0,
+        RunDisposition::Clean
+    );
+}
+
+#[test]
+fn semgrep_accepts_empty_serial_backend_rule_timings() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
+    let mut report = semgrep_report(vec![], vec!["input/semgrep-target/METADATA"]);
+    report["time"]["rules"] = json!([]);
+    report["time"]["targets"][0]["match_times"] = json!([]);
+    report["time"]["targets"][0]["parse_times"] = json!([]);
+
+    assert_eq!(
+        validate_semgrep_report(
+            0,
+            &serde_json::to_vec(&report).unwrap(),
+            semgrep_warning(),
+            &inputs,
+        )
+        .unwrap()
+        .0,
         RunDisposition::Clean
     );
 }
@@ -216,6 +237,8 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
     );
     let mut empty_rules: Value = serde_json::from_slice(&clean).unwrap();
     empty_rules["time"]["rules"] = json!([]);
+    empty_rules["time"]["targets"][0]["match_times"] = json!([]);
+    empty_rules["time"]["targets"][0]["parse_times"] = json!([]);
     assert_eq!(
         classify_semgrep_invalid_output(
             0,
@@ -223,7 +246,7 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
             &crlf_warning,
             &inputs
         ),
-        Some("time-rules-empty")
+        None
     );
     assert_eq!(
         classify_semgrep_invalid_output(2, &clean, semgrep_warning(), &inputs),

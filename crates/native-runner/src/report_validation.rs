@@ -38,7 +38,8 @@ const SEMGREP_KEYS: [&str; 8] = [
     "profiling_results",
 ];
 const SEMGREP_WARNING: &str = "!!! You're using one or more options starting with '--x-'. These options are not part of the semgrep API. They will change or will be removed without notice !!! ";
-const SEMGREP_RULE_ID: &str = "context-relay-no-python-runtime";
+const SEMGREP_RULE_ID: &str = "config.semgrep.context-relay-no-python-runtime";
+const SEMGREP_BARE_RULE_ID: &str = "context-relay-no-python-runtime";
 
 pub fn validate_gitleaks_report(
     exit: i32,
@@ -920,7 +921,12 @@ fn validate_semgrep_time(
         || !time
             .get("rules")
             .and_then(Value::as_array)
-            .is_some_and(|rules| rules.len() == 1 && valid_semgrep_rule_id(rules[0].as_str()))
+            .is_some_and(|rules| {
+                rules.len() <= 1
+                    && rules
+                        .first()
+                        .is_none_or(|rule| valid_semgrep_rule_id(rule.as_str()))
+            })
         || !time
             .get("fixpoint_timeouts")
             .is_none_or(|value| empty_array(Some(value)))
@@ -979,6 +985,11 @@ fn validate_semgrep_targets(
     time: &Map<String, Value>,
     inputs: &[ContentFrame],
 ) -> Result<(), RunnerError> {
+    let rule_count = time
+        .get("rules")
+        .and_then(Value::as_array)
+        .ok_or(RunnerError::InvalidToolOutput)?
+        .len();
     let expected = inputs
         .iter()
         .map(|input| {
@@ -1018,8 +1029,8 @@ fn validate_semgrep_targets(
                 "run_time",
             ],
         ) || !nonnegative_number(target.get("run_time"))
-            || !one_nonnegative_number(target.get("match_times"))
-            || !one_nonnegative_number(target.get("parse_times"))
+            || !nonnegative_numbers(target.get("match_times"), rule_count)
+            || !nonnegative_numbers(target.get("parse_times"), rule_count)
         {
             return invalid();
         }
@@ -1043,10 +1054,10 @@ fn validate_semgrep_targets(
         .ok_or(RunnerError::InvalidToolOutput)
 }
 
-fn one_nonnegative_number(value: Option<&Value>) -> bool {
-    value
-        .and_then(Value::as_array)
-        .is_some_and(|values| values.len() == 1 && nonnegative_number(values.first()))
+fn nonnegative_numbers(value: Option<&Value>, expected_len: usize) -> bool {
+    value.and_then(Value::as_array).is_some_and(|values| {
+        values.len() == expected_len && values.iter().all(|value| nonnegative_number(Some(value)))
+    })
 }
 
 fn validate_file_timing(
@@ -1091,7 +1102,7 @@ fn scanner_path(value: &str) -> Result<String, RunnerError> {
 }
 
 fn valid_semgrep_rule_id(value: Option<&str>) -> bool {
-    value == Some(SEMGREP_RULE_ID)
+    matches!(value, Some(SEMGREP_RULE_ID | SEMGREP_BARE_RULE_ID))
 }
 
 fn has_nonempty_bash_permissions(bytes: &[u8]) -> Result<bool, RunnerError> {
