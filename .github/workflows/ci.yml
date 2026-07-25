@@ -5,13 +5,29 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      semgrep_artifact_run_id:
+        description: Reuse normal-V1 native artifacts from this prior CI run
+        type: string
+        default: ''
+      semgrep_artifact_commit:
+        description: Commit that produced the reused normal-V1 native artifacts
+        type: string
+        default: ''
   workflow_call:
     inputs:
       semgrep_release_qualification:
         type: boolean
         default: false
+      semgrep_artifact_run_id:
+        type: string
+        default: ''
+      semgrep_artifact_commit:
+        type: string
+        default: ''
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -92,11 +108,20 @@ jobs:
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          FORCE: ${{ inputs.semgrep_release_qualification || github.event_name == 'workflow_dispatch' }}
+          FORCE: ${{ inputs.semgrep_release_qualification || (github.event_name == 'workflow_dispatch' && inputs.semgrep_artifact_run_id == '') }}
+          REUSE_COMMIT: ${{ inputs.semgrep_artifact_commit }}
+          REUSE_RUN_ID: ${{ inputs.semgrep_artifact_run_id }}
         run: |
           set -euo pipefail
           changed=false
-          if test "$FORCE" = true || test -z "$BASE_SHA" || test "$BASE_SHA" = 0000000000000000000000000000000000000000; then
+          if { test -n "$REUSE_RUN_ID" && test -z "$REUSE_COMMIT"; } || { test -z "$REUSE_RUN_ID" && test -n "$REUSE_COMMIT"; }; then
+            echo 'artifact run and commit must be supplied together' >&2
+            exit 1
+          elif test -n "$REUSE_RUN_ID"; then
+            [[ "$REUSE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+            [[ "$REUSE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+            test '${{ inputs.semgrep_release_qualification }}' != true
+          elif test "$FORCE" = true || test -z "$BASE_SHA" || test "$BASE_SHA" = 0000000000000000000000000000000000000000; then
             changed=true
           else
             while IFS= read -r path; do
@@ -289,7 +314,9 @@ jobs:
 
   native-isolation-windows-x64:
     needs:
+      - semgrep-materials
       - native-semgrep-windows-x64-builders
+    if: ${{ always() && !cancelled() && (needs.native-semgrep-windows-x64-builders.result == 'success' || inputs.semgrep_artifact_run_id != '') }}
     outputs:
       hydration_mode: ${{ steps.prepare.outputs.mode }}
     runs-on: windows-2022
@@ -302,14 +329,33 @@ jobs:
         with:
           node-version-file: .node-version
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        if: ${{ inputs.semgrep_artifact_run_id == '' }}
         with:
           name: task9-semgrep-windows-build-a-${{ github.sha }}-${{ github.run_id }}${{ inputs.semgrep_release_qualification && format('-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-windows
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        if: ${{ inputs.semgrep_artifact_run_id != '' }}
+        with:
+          name: task9-semgrep-windows-build-a-${{ inputs.semgrep_artifact_commit }}-${{ inputs.semgrep_artifact_run_id }}
+          path: ${{ runner.temp }}/context-relay-semgrep-output-windows
+          run-id: ${{ inputs.semgrep_artifact_run_id }}
+          github-token: ${{ github.token }}
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         if: ${{ inputs.semgrep_release_qualification }}
         with:
           name: task9-semgrep-windows-build-b-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-windows
+      - name: Reseal reused Windows V1 source evidence
+        if: ${{ inputs.semgrep_artifact_run_id != '' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'context-relay-semgrep-output-windows'
+          $input = Join-Path $root 'source-a.tar'
+          $output = Join-Path $root 'source-a.resealed.tar'
+          node --input-type=module -e "import{readFile}from'node:fs/promises';import{resealSemgrepSourceBundle as r}from'./scripts/reseal-semgrep-source-bundle.mjs';const[i,o,l]=process.argv.slice(1);console.log(JSON.stringify(await r({additions:[],inputPath:i,outputPath:o,replacements:[{bytes:await readFile(l),executable:false,path:'metadata/source-lock.v1.json'}]})))" $input $output (Resolve-Path third_party/sidecars/semgrep/source-lock.v1.json).Path
+          Remove-Item -LiteralPath $input
+          Move-Item -LiteralPath $output -Destination $input
       - name: Verify independent Windows build identities and source evidence
         if: ${{ inputs.semgrep_release_qualification }}
         shell: pwsh
@@ -504,7 +550,9 @@ jobs:
 
   native-isolation-macos-arm64:
     needs:
+      - semgrep-materials
       - native-semgrep-macos-arm64-builders
+    if: ${{ always() && !cancelled() && (needs.native-semgrep-macos-arm64-builders.result == 'success' || inputs.semgrep_artifact_run_id != '') }}
     outputs:
       hydration_mode: ${{ steps.prepare.outputs.mode }}
     runs-on: macos-15
@@ -517,14 +565,31 @@ jobs:
         with:
           node-version-file: .node-version
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        if: ${{ inputs.semgrep_artifact_run_id == '' }}
         with:
           name: task9-semgrep-macos-build-a-${{ github.sha }}-${{ github.run_id }}${{ inputs.semgrep_release_qualification && format('-{0}', github.run_attempt) || '' }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-macos
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        if: ${{ inputs.semgrep_artifact_run_id != '' }}
+        with:
+          name: task9-semgrep-macos-build-a-${{ inputs.semgrep_artifact_commit }}-${{ inputs.semgrep_artifact_run_id }}
+          path: ${{ runner.temp }}/context-relay-semgrep-output-macos
+          run-id: ${{ inputs.semgrep_artifact_run_id }}
+          github-token: ${{ github.token }}
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         if: ${{ inputs.semgrep_release_qualification }}
         with:
           name: task9-semgrep-macos-build-b-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/context-relay-semgrep-output-macos
+      - name: Reseal reused macOS V1 source evidence
+        if: ${{ inputs.semgrep_artifact_run_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/context-relay-semgrep-output-macos"
+          node --input-type=module -e "import{readFile}from'node:fs/promises';import{resealSemgrepSourceBundle as r}from'./scripts/reseal-semgrep-source-bundle.mjs';const[i,o,l]=process.argv.slice(1);console.log(JSON.stringify(await r({additions:[],inputPath:i,outputPath:o,replacements:[{bytes:await readFile(l),executable:false,path:'metadata/source-lock.v1.json'}]})))" "$root/source-a.tar" "$root/source-a.resealed.tar" "$GITHUB_WORKSPACE/third_party/sidecars/semgrep/source-lock.v1.json"
+          rm "$root/source-a.tar"
+          mv "$root/source-a.resealed.tar" "$root/source-a.tar"
       - name: Verify independent macOS build identities and source evidence
         if: ${{ inputs.semgrep_release_qualification }}
         shell: bash

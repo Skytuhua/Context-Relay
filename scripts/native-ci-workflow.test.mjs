@@ -129,6 +129,15 @@ test('normal V1 retries reuse successful native artifacts across workflow attemp
   assert.match(source, /const attempt=process\.env\.CONTEXT_RELAY_RELEASE_QUALIFICATION==="true"/);
 });
 
+test('normal V1 fixes can reuse a prior native build without repeating it', async () => {
+  const source = await readFile(workflowUrl, 'utf8');
+  assert.match(source, /semgrep_artifact_run_id:[\s\S]+type:\s*string/);
+  assert.match(source, /semgrep_artifact_commit:[\s\S]+type:\s*string/);
+  assert.equal((source.match(/run-id:\s*\$\{\{ inputs\.semgrep_artifact_run_id \}\}/g) ?? []).length, 2);
+  assert.equal((source.match(/github-token:\s*\$\{\{ github\.token \}\}/g) ?? []).length, 2);
+  assert.match(source, /workflow_dispatch' && inputs\.semgrep_artifact_run_id == ''/);
+});
+
 test('normal CI skips native Semgrep for non-material evidence-only changes', async () => {
   const source = await readFile(workflowUrl, 'utf8');
   const changes = job(source, 'semgrep-materials', 'native-semgrep-windows-x64-builders');

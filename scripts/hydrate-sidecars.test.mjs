@@ -1090,7 +1090,7 @@ test('Semgrep records the V1 source bundle but remains disabled pending release 
   );
   assert.equal(lock.completeCorrespondingSource, false);
   assert.equal(lock.recursiveInventoryComplete, true);
-  assert.equal(sha256(lockBytes), 'd256565f7d7b08648a5e609de05dea41a5ba0daa6db41ceec4bd6fae608c7a39');
+  assert.equal(sha256(lockBytes), '9559e4700fef3c97246b0b40c2ac158400c4e1d26be0eae68d864d02f5891bd8');
   assert.equal(lock.licenseMaterials.length, 12);
   assert.equal(lock.rootGitlinks.length, 36);
   assert.equal(lock.opam.resolvedSourceArchivesComplete, true);
@@ -1113,7 +1113,7 @@ test('Semgrep records the V1 source bundle but remains disabled pending release 
   assert.equal(bundleEvidence.bundle.size, 1149642752);
   assert.equal(bundleEvidence.bundle.payloadEntries, 39542);
   assert.equal(bundleEvidence.bundle.recordedLinks, 222);
-  assert.equal(bundleEvidence.sourceLockSha256, 'd256565f7d7b08648a5e609de05dea41a5ba0daa6db41ceec4bd6fae608c7a39');
+  assert.equal(bundleEvidence.sourceLockSha256, '9559e4700fef3c97246b0b40c2ac158400c4e1d26be0eae68d864d02f5891bd8');
   assert.equal(bundleEvidence.bundleGeneratorSha256, '092fe2855df51267ca3c8525c0b404c3ca0587470cedfc63bf1818df60e72007');
   assert.equal(
     sha256(await readFile(new URL('./semgrep-source-bundle.mjs', import.meta.url))),
