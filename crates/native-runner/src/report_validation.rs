@@ -458,9 +458,6 @@ fn semgrep_targets_boundary(time: &Map<String, Value>, inputs: &[ContentFrame]) 
     let Some(targets) = time.get("targets").and_then(Value::as_array) else {
         return "time-targets-array";
     };
-    if targets.len() != expected.len() {
-        return "time-targets-count";
-    }
     let rule_count = time
         .get("rules")
         .and_then(Value::as_array)
@@ -1080,9 +1077,6 @@ fn validate_semgrep_targets(
         .get("targets")
         .and_then(Value::as_array)
         .ok_or(RunnerError::InvalidToolOutput)?;
-    if targets.len() != expected.len() {
-        return invalid();
-    }
     let mut seen = BTreeSet::new();
     for target in targets {
         let target = target.as_object().ok_or(RunnerError::InvalidToolOutput)?;
@@ -1116,9 +1110,7 @@ fn validate_semgrep_targets(
             return invalid();
         }
     }
-    (seen.len() == expected.len())
-        .then_some(())
-        .ok_or(RunnerError::InvalidToolOutput)
+    Ok(())
 }
 
 fn nonnegative_numbers(value: Option<&Value>, expected_len: usize) -> bool {

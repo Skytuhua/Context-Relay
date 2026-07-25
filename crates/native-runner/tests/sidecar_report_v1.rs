@@ -194,6 +194,25 @@ fn semgrep_accepts_aggregate_bytes_from_incomplete_profiling() {
 }
 
 #[test]
+fn semgrep_accepts_an_incomplete_target_profile_list() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
+    let mut report = semgrep_report(vec![], vec!["input/semgrep-target/METADATA"]);
+    report["time"]["targets"] = json!([]);
+
+    assert_eq!(
+        validate_semgrep_report(
+            0,
+            &serde_json::to_vec(&report).unwrap(),
+            semgrep_warning(),
+            &inputs,
+        )
+        .unwrap()
+        .0,
+        RunDisposition::Clean
+    );
+}
+
+#[test]
 fn semgrep_accepts_the_exact_declared_rule_id() {
     let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
     let mut report = semgrep_report(vec![], vec!["input/semgrep-target/METADATA"]);
