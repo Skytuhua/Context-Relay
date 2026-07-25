@@ -264,6 +264,12 @@ mod windows_adapter {
                 "report"
                     | "stderr-crlf"
                     | "stderr-crlf-and-report"
+                    | "stderr-crlf-report-json"
+                    | "stderr-crlf-report-envelope"
+                    | "stderr-crlf-report-time"
+                    | "stderr-crlf-report-paths"
+                    | "stderr-crlf-report-results"
+                    | "stderr-crlf-report-disposition"
                     | "stderr"
                     | "stderr-and-report"
             ))
@@ -349,6 +355,12 @@ mod windows_adapter {
             assert_eq!(
                 validated_semgrep_diagnostic(b"context-relay-semgrep-invalid-output=stderr-crlf\n"),
                 Some("context-relay-semgrep-invalid-output=stderr-crlf")
+            );
+            assert_eq!(
+                validated_semgrep_diagnostic(
+                    b"context-relay-semgrep-invalid-output=stderr-crlf-report-time\n"
+                ),
+                Some("context-relay-semgrep-invalid-output=stderr-crlf-report-time")
             );
             assert_eq!(
                 validated_semgrep_diagnostic(

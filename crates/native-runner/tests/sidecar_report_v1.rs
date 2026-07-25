@@ -122,6 +122,20 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
         classify_semgrep_invalid_output(0, &clean, &crlf_warning, &inputs),
         Some("stderr-crlf")
     );
+    let mut invalid_time: Value = serde_json::from_slice(&clean).unwrap();
+    invalid_time["time"]
+        .as_object_mut()
+        .unwrap()
+        .remove("max_memory_bytes");
+    assert_eq!(
+        classify_semgrep_invalid_output(
+            0,
+            &serde_json::to_vec(&invalid_time).unwrap(),
+            &crlf_warning,
+            &inputs
+        ),
+        Some("stderr-crlf-report-time")
+    );
     assert_eq!(
         classify_semgrep_invalid_output(2, &clean, semgrep_warning(), &inputs),
         Some("exit")

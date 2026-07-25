@@ -263,10 +263,85 @@ pub fn classify_semgrep_invalid_output(
     match (valid_semgrep_warning(stderr), crlf_warning, report_is_valid) {
         (true, _, false) => Some("report"),
         (false, true, true) => Some("stderr-crlf"),
-        (false, true, false) => Some("stderr-crlf-and-report"),
+        (false, true, false) => Some(match semgrep_report_boundary(exit, stdout, inputs) {
+            "json" => "stderr-crlf-report-json",
+            "envelope" => "stderr-crlf-report-envelope",
+            "time" => "stderr-crlf-report-time",
+            "paths" => "stderr-crlf-report-paths",
+            "results" => "stderr-crlf-report-results",
+            "disposition" => "stderr-crlf-report-disposition",
+            _ => "stderr-crlf-and-report",
+        }),
         (false, false, true) => Some("stderr"),
         (false, false, false) => Some("stderr-and-report"),
         (true, _, true) => None,
+    }
+}
+
+fn semgrep_report_boundary(exit: i32, stdout: &[u8], inputs: &[ContentFrame]) -> &'static str {
+    let Ok(report) = serde_json::from_slice::<Value>(stdout) else {
+        return "json";
+    };
+    let Some(object) = report.as_object() else {
+        return "json";
+    };
+    if !exact_keys(object, &SEMGREP_KEYS)
+        || object.get("version").and_then(Value::as_str) != Some("1.170.0")
+        || object.get("engine_requested").and_then(Value::as_str) != Some("OSS")
+        || !empty_array(object.get("errors"))
+        || !empty_array(object.get("skipped_rules"))
+        || !empty_array(object.get("profiling_results"))
+    {
+        return "envelope";
+    }
+    if object
+        .get("time")
+        .and_then(Value::as_object)
+        .is_none_or(|time| validate_semgrep_time(time, inputs).is_err())
+    {
+        return "time";
+    }
+    let expected = inputs
+        .iter()
+        .map(|input| input.path().as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    let Some(paths) = object.get("paths").and_then(Value::as_object) else {
+        return "paths";
+    };
+    if !(exact_keys(paths, &["scanned"])
+        || (exact_keys(paths, &["scanned", "skipped"]) && empty_array(paths.get("skipped"))))
+    {
+        return "paths";
+    }
+    let Some(scanned_values) = paths.get("scanned").and_then(Value::as_array) else {
+        return "paths";
+    };
+    let scanned = scanned_values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or(())
+                .and_then(|path| scanner_path(path).map_err(|_| ()))
+        })
+        .collect::<Result<BTreeSet<_>, _>>();
+    if scanned.as_ref().ok() != Some(&expected) || scanned_values.len() != expected.len() {
+        return "paths";
+    }
+    let Some(results) = object.get("results").and_then(Value::as_array) else {
+        return "results";
+    };
+    let mut identities = BTreeSet::new();
+    if results.iter().any(|result| {
+        result.as_object().is_none_or(|result| {
+            validate_semgrep_result(result, &expected, &mut identities).is_err()
+        })
+    }) {
+        return "results";
+    }
+    match (exit, results.len()) {
+        (0, 0) | (1, 1..) => "valid",
+        _ => "disposition",
     }
 }
 
