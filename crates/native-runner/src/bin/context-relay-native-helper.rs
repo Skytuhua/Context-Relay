@@ -26,9 +26,8 @@ use std::{
 use context_relay_native_runner::{
     ClosureMaterial, ContentFrame, FailureCode, HelperRunRequest, RestrictedEnvironment,
     RunDisposition, RunLimits, RunRequest, RunResponse, RunStats, RunnerError, RuntimeTarget,
-    SidecarCommand, StagePath, classify_semgrep_exit_details, classify_semgrep_invalid_output,
-    read_helper_request, validate_gitleaks_report, validate_rulesync_outputs,
-    validate_semgrep_report, write_run_response_for,
+    SidecarCommand, StagePath, read_helper_request, validate_gitleaks_report,
+    validate_rulesync_outputs, validate_semgrep_report, write_run_response_for,
 };
 use sha2::{Digest, Sha256};
 
@@ -213,22 +212,8 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
             )
         }
         SidecarCommand::OsemgrepScanPackage => {
-            let validated = validate_semgrep_report(exit, &stdout, &stderr, &staged_inputs);
-            if validated.is_err()
-                && let Some(kind) =
-                    classify_semgrep_invalid_output(exit, &stdout, &stderr, &staged_inputs)
-            {
-                if kind == "exit" {
-                    let (report_kind, stderr_kind) =
-                        classify_semgrep_exit_details(&stdout, &stderr);
-                    eprintln!(
-                        "context-relay-semgrep-invalid-output=exit:{exit}:{report_kind}:{stderr_kind}"
-                    );
-                } else {
-                    eprintln!("context-relay-semgrep-invalid-output={kind}");
-                }
-            }
-            let (disposition, report) = validated?;
+            let (disposition, report) =
+                validate_semgrep_report(exit, &stdout, &stderr, &staged_inputs)?;
             RunResponse::completed(
                 disposition,
                 vec![ContentFrame::new(

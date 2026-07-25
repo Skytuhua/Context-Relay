@@ -176,184 +176,24 @@ mod windows_adapter {
                 return Ok(RunResponse::failed(FailureCode::LimitExceeded));
             }
             Err(LaunchError::PipeIo) => {
-                eprintln!("context-relay-helper-boundary=pipe-io");
                 return Ok(RunResponse::failed(FailureCode::ToolFailed));
             }
             Err(error) => return Err(map_launch_error(error)),
         };
-        if let Some(diagnostic) = validated_spawn_diagnostic(output.stderr()) {
-            eprintln!("{diagnostic}");
-        }
-        let semgrep_diagnostic = validated_semgrep_diagnostic(output.stderr());
-        if let Some(diagnostic) = semgrep_diagnostic {
-            eprintln!("{diagnostic}");
-        }
         if output.exit_code() != 0 {
-            eprintln!("context-relay-helper-boundary=exit");
             return Ok(RunResponse::failed(FailureCode::ToolFailed));
         }
-        if !output.stderr().is_empty() && semgrep_diagnostic.is_none() {
-            eprintln!("context-relay-helper-boundary=stderr");
+        if !output.stderr().is_empty() {
             return Ok(RunResponse::failed(FailureCode::ToolFailed));
         }
         let mut cursor = Cursor::new(output.stdout());
         let response = match read_run_response_for(&mut cursor, request) {
             Ok(response) if cursor.position() as usize == output.stdout().len() => response,
             _ => {
-                eprintln!("context-relay-helper-boundary=response");
                 return Ok(RunResponse::failed(FailureCode::ToolFailed));
             }
         };
         Ok(response)
-    }
-
-    fn validated_spawn_diagnostic(stderr: &[u8]) -> Option<&str> {
-        let diagnostic = std::str::from_utf8(stderr).ok()?.strip_suffix('\n')?;
-        let diagnostic = diagnostic.strip_suffix('\r').unwrap_or(diagnostic);
-        let code = diagnostic.strip_prefix("context-relay-sidecar-spawn-os-error=")?;
-        (!code.is_empty() && code.bytes().all(|byte| byte.is_ascii_digit())).then_some(diagnostic)
-    }
-
-    fn validated_semgrep_diagnostic(stderr: &[u8]) -> Option<&str> {
-        let diagnostic = std::str::from_utf8(stderr).ok()?.strip_suffix('\n')?;
-        let diagnostic = diagnostic.strip_suffix('\r').unwrap_or(diagnostic);
-        let kind = diagnostic.strip_prefix("context-relay-semgrep-invalid-output=")?;
-        let valid_exit = kind.split_once(':').is_some_and(|(label, rest)| {
-            let mut parts = rest.split(':');
-            let code = parts.next().unwrap_or("");
-            let digits = code.strip_prefix('-').unwrap_or(code);
-            let valid_stderr_kind = |part: &str| {
-                matches!(
-                    part,
-                    "stderr-permission-denied-nul"
-                        | "stderr-permission-denied"
-                        | "stderr-not-found"
-                        | "stderr-invalid-argument"
-                        | "stderr-timeout"
-                        | "stderr-out-of-memory"
-                        | "stderr-stack-overflow"
-                        | "stderr-unix-ebadf"
-                        | "stderr-unix-epipe"
-                        | "stderr-unix-eio"
-                        | "stderr-unix-eintr"
-                        | "stderr-unix-retry"
-                        | "stderr-unix-enosys"
-                        | "stderr-unix-unknown-5"
-                        | "stderr-unix-other"
-                        | "stderr-sys-error"
-                        | "stderr-end-of-file"
-                        | "stderr-not-found-exception"
-                        | "stderr-cancelled"
-                        | "stderr-timeout-exception"
-                        | "stderr-other-exception"
-                        | "stderr-empty"
-                        | "stderr-other"
-                ) || part
-                    .strip_prefix("stderr-exception-")
-                    .is_some_and(|constructor| {
-                        !constructor.is_empty()
-                            && constructor.len() <= 64
-                            && constructor.bytes().all(|byte| {
-                                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.')
-                            })
-                    })
-            };
-            label == "exit"
-                && !digits.is_empty()
-                && digits.bytes().all(|byte| byte.is_ascii_digit())
-                && matches!(
-                    parts.next(),
-                    Some(
-                        "report-timeout"
-                            | "report-out-of-memory"
-                            | "report-stack-overflow"
-                            | "report-fatal"
-                            | "report-no-errors"
-                            | "report-other-error"
-                            | "report-no-json"
-                    )
-                )
-                && parts.next().is_some_and(valid_stderr_kind)
-                && parts.next().is_none()
-        });
-        (valid_exit
-            || matches!(
-                kind,
-                "json"
-                    | "envelope"
-                    | "report"
-                    | "paths"
-                    | "paths-shape"
-                    | "paths-skipped"
-                    | "paths-array"
-                    | "paths-value"
-                    | "paths-count"
-                    | "paths-empty-time-empty"
-                    | "paths-empty-time-complete"
-                    | "paths-empty-time-other"
-                    | "paths-set"
-                    | "results"
-                    | "results-shape"
-                    | "results-rule"
-                    | "results-path"
-                    | "results-position"
-                    | "results-range"
-                    | "results-extra-shape"
-                    | "results-extra-keys"
-                    | "results-metavars"
-                    | "results-ignored"
-                    | "results-state"
-                    | "results-severity"
-                    | "results-message"
-                    | "results-metadata"
-                    | "results-engine"
-                    | "results-canary-range"
-                    | "results-duplicate"
-                    | "results-canary-set"
-                    | "disposition"
-                    | "valid"
-                    | "time-shape"
-                    | "time-rules-empty"
-                    | "time-rules-multiple"
-                    | "time-rules-non-string"
-                    | "time-rules-other-one"
-                    | "time-rules-non-array"
-                    | "time-fixpoints"
-                    | "time-rules-parse"
-                    | "time-max-memory"
-                    | "time-profiling"
-                    | "time-targets"
-                    | "time-targets-inputs"
-                    | "time-targets-total"
-                    | "time-targets-array"
-                    | "time-targets-count"
-                    | "time-targets-shape"
-                    | "time-targets-run"
-                    | "time-targets-timing"
-                    | "time-targets-path"
-                    | "time-targets-size"
-                    | "time-targets-duplicate"
-                    | "time-targets-other"
-                    | "time-target-times-one"
-                    | "time-target-times-other"
-                    | "time-parsing"
-                    | "time-scanning"
-                    | "time-matching"
-                    | "time-tainting"
-                    | "time-prefiltering"
-                    | "stderr-crlf"
-                    | "stderr-crlf-and-report"
-                    | "stderr-crlf-report-json"
-                    | "stderr-crlf-report-envelope"
-                    | "stderr-crlf-report-time"
-                    | "stderr-crlf-report-paths"
-                    | "stderr-crlf-report-results"
-                    | "stderr-crlf-report-disposition"
-                    | "stderr-core-report"
-                    | "stderr"
-                    | "stderr-and-report"
-            ))
-        .then_some(diagnostic)
     }
 
     fn stage_closure(
@@ -460,9 +300,7 @@ mod windows_adapter {
 
     #[cfg(test)]
     mod tests {
-        use super::{
-            staged_runtime_path, validated_semgrep_diagnostic, validated_spawn_diagnostic,
-        };
+        use super::staged_runtime_path;
         use crate::{SidecarCommand, StagePath};
 
         #[test]
@@ -484,79 +322,6 @@ mod windows_adapter {
                 staged_runtime_path(&SidecarCommand::GitleaksScanPackage, &executable, true)
                     .unwrap(),
                 executable
-            );
-        }
-
-        #[test]
-        fn only_the_exact_numeric_spawn_diagnostic_is_forwarded() {
-            assert_eq!(
-                validated_spawn_diagnostic(b"context-relay-sidecar-spawn-os-error=5\n"),
-                Some("context-relay-sidecar-spawn-os-error=5")
-            );
-            assert_eq!(validated_spawn_diagnostic(b"PROBE-ERR\n"), None);
-            assert_eq!(
-                validated_spawn_diagnostic(b"context-relay-sidecar-spawn-os-error=5 extra\n"),
-                None
-            );
-        }
-
-        #[test]
-        fn only_an_exact_static_semgrep_diagnostic_is_forwarded() {
-            assert_eq!(
-                validated_semgrep_diagnostic(b"context-relay-semgrep-invalid-output=stderr-crlf\n"),
-                Some("context-relay-semgrep-invalid-output=stderr-crlf")
-            );
-            assert_eq!(
-                validated_semgrep_diagnostic(
-                    b"context-relay-semgrep-invalid-output=stderr-core-report\n"
-                ),
-                Some("context-relay-semgrep-invalid-output=stderr-core-report")
-            );
-            assert_eq!(
-                validated_semgrep_diagnostic(
-                    b"context-relay-semgrep-invalid-output=stderr-crlf-report-time\n"
-                ),
-                Some("context-relay-semgrep-invalid-output=stderr-crlf-report-time")
-            );
-            assert_eq!(
-                validated_semgrep_diagnostic(
-                    b"context-relay-semgrep-invalid-output=time-targets-path\n"
-                ),
-                Some("context-relay-semgrep-invalid-output=time-targets-path")
-            );
-            assert_eq!(
-                validated_semgrep_diagnostic(
-                    b"context-relay-semgrep-invalid-output=results-metadata\n"
-                ),
-                Some("context-relay-semgrep-invalid-output=results-metadata")
-            );
-            assert_eq!(
-                validated_semgrep_diagnostic(b"context-relay-semgrep-invalid-output=valid\n"),
-                Some("context-relay-semgrep-invalid-output=valid")
-            );
-            assert_eq!(
-                validated_semgrep_diagnostic(b"context-relay-semgrep-invalid-output=paths-set\n"),
-                Some("context-relay-semgrep-invalid-output=paths-set")
-            );
-            assert_eq!(
-                validated_semgrep_diagnostic(
-                    b"context-relay-semgrep-invalid-output=paths-empty-time-empty\n"
-                ),
-                Some("context-relay-semgrep-invalid-output=paths-empty-time-empty")
-            );
-            assert_eq!(
-                validated_semgrep_diagnostic(
-                    b"context-relay-semgrep-invalid-output=exit:2:report-timeout:stderr-permission-denied-nul\n"
-                ),
-                Some(
-                    "context-relay-semgrep-invalid-output=exit:2:report-timeout:stderr-permission-denied-nul"
-                )
-            );
-            assert_eq!(
-                validated_semgrep_diagnostic(
-                    b"context-relay-semgrep-invalid-output=exit:2:report-timeout:stderr-secret\n"
-                ),
-                None
             );
         }
     }

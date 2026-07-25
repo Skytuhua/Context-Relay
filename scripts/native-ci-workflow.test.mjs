@@ -724,15 +724,3 @@ test('every workflow action remains pinned to a full commit SHA', async () => {
   }
   assert.doesNotMatch(source, /continue-on-error:\s*true/);
 });
-
-test('the focused Semgrep workflow runs only the exact AppContainer gate', async () => {
-  const source = await readFile(
-    new URL('../.github/workflows/diagnose-semgrep-windows.yml', import.meta.url),
-    'utf8',
-  );
-  assert.match(
-    source,
-    /cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 --features ci-candidate-sidecar-smoke real_semgrep_clean_and_finding_use_the_closed_policy -- --ignored --exact --nocapture/,
-  );
-  assert.doesNotMatch(source, /context-relay-semgrep-core-probe|New-Item -ItemType HardLink/);
-});
