@@ -293,6 +293,37 @@ fn helper_request_rejects_unbound_or_python_semgrep_closure_members() {
 }
 
 #[test]
+fn helper_request_accepts_only_the_staged_semgrep_core_executable_alias() {
+    let source = vec![
+        ClosureMaterial::new(path("bin/osemgrep.exe"), 3, [0x31; 32], true).unwrap(),
+        ClosureMaterial::new(path("bin/runtime.dll"), 5, [0x32; 32], false).unwrap(),
+    ];
+    let request = RunRequest::new(
+        [0x41; 16],
+        closure_material_digest(&source).unwrap(),
+        SidecarCommand::OsemgrepScanPackage,
+        vec![ContentFrame::new(path("input/semgrep-target/METADATA"), b"safe".to_vec()).unwrap()],
+    )
+    .unwrap();
+    let runtime = vec![
+        ClosureMaterial::new(path("bin/semgrep-core.exe"), 3, [0x31; 32], true).unwrap(),
+        ClosureMaterial::new(path("bin/runtime.dll"), 5, [0x32; 32], false).unwrap(),
+    ];
+
+    assert!(HelperRunRequest::for_resigned_runtime(request.clone(), runtime).is_ok());
+    assert!(
+        HelperRunRequest::for_resigned_runtime(
+            request,
+            vec![
+                ClosureMaterial::new(path("bin/osemgrep.exe"), 3, [0x31; 32], true).unwrap(),
+                ClosureMaterial::new(path("bin/semgrep-core.dll"), 5, [0x32; 32], false).unwrap(),
+            ],
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn response_rejects_reports_over_the_dedicated_eight_mibibyte_cap() {
     let reports = vec![
         ContentFrame::new(path("reports/a.json"), vec![0; 5 * 1024 * 1024]).unwrap(),

@@ -7102,30 +7102,22 @@
   "commandTemplate": {
     "format": "sha256-nul-argv-v1",
     "argv": [
-      "osemgrep",
-      "scan",
-      "--experimental",
-      "--oss-only",
-      "--metrics=off",
-      "--disable-version-check",
-      "--strict",
-      "--error",
-      "--json",
-      "--quiet",
-      "--no-git-ignore",
-      "--x-ignore-semgrepignore-files",
-      "--time",
-      "--jobs=1",
-      "--x-parmap",
-      "--timeout=0",
-      "--timeout-threshold=1",
-      "--max-target-bytes=8388608",
-      "--project-root",
-      "<staged-target>",
-      "--config",
+      "semgrep-core",
+      "-rules",
       "<staged-rule>",
-      "<staged-target>"
+      "-targets",
+      "<staged-target-list>",
+      "-json_time",
+      "-json_nodots",
+      "-strict",
+      "-j",
+      "1",
+      "-use_parmap",
+      "-timeout",
+      "0",
+      "-timeout_threshold",
+      "1"
     ],
-    "sha256": "2cbed5907c3aadf1eae9394631f83328d4f461ddf0fbebd267b3c67f4c9b7618"
+    "sha256": "f825a26726475e83cbdab1beab2feb6bde39fcc7493e6467c344e6d9ca8d2148"
   }
 }

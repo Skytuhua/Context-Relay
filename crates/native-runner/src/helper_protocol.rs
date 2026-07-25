@@ -464,10 +464,16 @@ fn normalize_closure_materials(materials: &mut [ClosureMaterial]) -> Result<(), 
 }
 
 fn expected_executable_name(command: &SidecarCommand, name: &str) -> bool {
+    if matches!(command, SidecarCommand::OsemgrepScanPackage) {
+        return matches!(
+            name,
+            "osemgrep" | "osemgrep.exe" | "semgrep-core" | "semgrep-core.exe"
+        );
+    }
     let stem = match command {
         SidecarCommand::RuleSyncGenerate { .. } => "rulesync",
         SidecarCommand::GitleaksScanPackage => "gitleaks",
-        SidecarCommand::OsemgrepScanPackage => "osemgrep",
+        SidecarCommand::OsemgrepScanPackage => unreachable!(),
     };
     name == stem || name == format!("{stem}.exe")
 }
@@ -478,16 +484,15 @@ fn forbidden_semgrep_material(material: &ClosureMaterial) -> bool {
             .nfkc()
             .flat_map(char::to_lowercase)
             .collect::<String>();
-        [
-            "python",
-            "pysemgrep",
-            "site-packages",
-            "wheelhouse",
-            "semgrep-core",
-        ]
-        .iter()
-        .any(|forbidden| normalized.contains(forbidden))
-    })
+        ["python", "pysemgrep", "site-packages", "wheelhouse"]
+            .iter()
+            .any(|forbidden| normalized.contains(forbidden))
+    }) || (!material.executable
+        && material
+            .path
+            .as_str()
+            .split('/')
+            .any(|component| component.to_ascii_lowercase().contains("semgrep-core")))
 }
 
 pub fn write_run_request<W: Write>(

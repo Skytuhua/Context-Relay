@@ -102,6 +102,78 @@ fn semgrep_warning() -> &'static [u8] {
     b"[00.10][WARNING]: !!! You're using one or more options starting with '--x-'. These options are not part of the semgrep API. They will change or will be removed without notice !!! \n"
 }
 
+fn semgrep_core_result(rule: &str, severity: &str, message: &str, end: u64) -> Value {
+    json!({
+        "check_id": rule,
+        "path": "input/semgrep-target/METADATA",
+        "start": { "line": 1, "col": 1, "offset": 0 },
+        "end": { "line": 1, "col": end + 1, "offset": end },
+        "extra": {
+            "metavars": {},
+            "engine_kind": "OSS",
+            "is_ignored": false,
+            "message": message,
+            "metadata": {},
+            "severity": severity,
+            "validation_state": "NO_VALIDATOR"
+        }
+    })
+}
+
+fn semgrep_core_report(results: Vec<Value>) -> Value {
+    let mut report = semgrep_report(results, vec!["input/semgrep-target/METADATA"]);
+    report["rules_by_engine"] = json!([
+        ["config.semgrep.context-relay-scan-canary", "OSS"],
+        ["config.semgrep.context-relay-no-python-runtime", "OSS"]
+    ]);
+    report["interfile_languages_used"] = json!([]);
+    report
+}
+
+#[test]
+fn semgrep_core_accepts_exit_zero_with_empty_stderr_and_strips_the_canary() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
+    let canary = semgrep_core_result(
+        "config.semgrep.context-relay-scan-canary",
+        "INFO",
+        "Context Relay scan coverage canary.",
+        1,
+    );
+    let finding = semgrep_core_result(
+        "config.semgrep.context-relay-no-python-runtime",
+        "ERROR",
+        "Native Semgrep packages must not contain Pysemgrep or a Python runtime.",
+        6,
+    );
+
+    let (clean, normalized) = validate_semgrep_report(
+        0,
+        &serde_json::to_vec(&semgrep_core_report(vec![canary.clone()])).unwrap(),
+        b"",
+        &inputs,
+    )
+    .unwrap();
+    assert_eq!(clean, RunDisposition::Clean);
+    assert!(
+        serde_json::from_slice::<Value>(&normalized).unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    assert_eq!(
+        validate_semgrep_report(
+            0,
+            &serde_json::to_vec(&semgrep_core_report(vec![canary, finding])).unwrap(),
+            b"",
+            &inputs,
+        )
+        .unwrap()
+        .0,
+        RunDisposition::Findings(1)
+    );
+}
+
 #[test]
 fn semgrep_accepts_windows_newlines_and_omitted_experimental_timing() {
     let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];

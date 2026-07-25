@@ -99,10 +99,11 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
     let target = RuntimeTarget::current()?;
     let executable = verified_executable(helper_request, target)?;
     let mut stage = prepare_stage(request.nonce(), target)?;
-    let config_inventory = install_trusted_config(&mut stage, request.command(), target)?;
     validate_pre_enumeration(request)?;
     let limits = RunLimits::for_command(request.command());
     let staged_inputs = staged_inputs(request.command(), request.inputs(), limits)?;
+    let config_inventory =
+        install_trusted_config(&mut stage, request.command(), &staged_inputs, target)?;
     let input_inventory = stage.write_and_seal_inputs(&staged_inputs)?;
     let environment = RestrictedEnvironment::for_stage(stage.layout(), target)?;
     let argv = request.command().argv();
@@ -116,6 +117,10 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(target_os = "macos")]
+    if matches!(request.command(), SidecarCommand::OsemgrepScanPackage) {
+        command.arg0(&argv[0]);
+    }
     #[cfg(target_os = "macos")]
     unsafe {
         command.pre_exec(|| {
@@ -1401,6 +1406,7 @@ impl LocalStage {
     fn install_trusted_config(
         &mut self,
         command: &SidecarCommand,
+        inputs: &[ContentFrame],
     ) -> Result<Option<LocalTreeInventory>, RunnerError> {
         match command {
             SidecarCommand::RuleSyncGenerate { .. } => {
@@ -1417,6 +1423,8 @@ impl LocalStage {
                 self.config.ensure_directory("semgrep")?;
                 self.config
                     .create_file("semgrep/package.yml", SEMGREP_POLICY)?;
+                self.config
+                    .create_file("semgrep/targets.json", &semgrep_targets_json(inputs)?)?;
                 self.seal_and_inventory_config().map(Some)
             }
         }
@@ -1786,12 +1794,13 @@ fn prepare_stage(_nonce: &[u8; 16], target: RuntimeTarget) -> Result<HelperStage
 fn install_trusted_config(
     stage: &mut HelperStage,
     command: &SidecarCommand,
+    inputs: &[ContentFrame],
     target: RuntimeTarget,
 ) -> Result<Option<HelperInventory>, RunnerError> {
     #[cfg(windows)]
     {
         let _ = target;
-        stage.install_trusted_config(command)
+        stage.install_trusted_config(command, inputs)
     }
     #[cfg(not(windows))]
     {
@@ -1811,10 +1820,36 @@ fn install_trusted_config(
                 let semgrep = config.join("semgrep");
                 fs::create_dir(&semgrep).map_err(|_| RunnerError::InvalidStage)?;
                 write_new(&semgrep.join("package.yml"), SEMGREP_POLICY)?;
+                write_new(
+                    &semgrep.join("targets.json"),
+                    &semgrep_targets_json(inputs)?,
+                )?;
                 inspect_helper_tree(&config, target).map(Some)
             }
         }
     }
+}
+
+fn semgrep_targets_json(inputs: &[ContentFrame]) -> Result<Vec<u8>, RunnerError> {
+    let targets = inputs
+        .iter()
+        .map(|input| {
+            let fpath = input.path().as_str();
+            serde_json::json!([
+                "CodeTarget",
+                {
+                    "path": {
+                        "fpath": fpath,
+                        "ppath": format!("/{fpath}")
+                    },
+                    "analyzer": "spacegrep",
+                    "products": ["sast"]
+                }
+            ])
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&serde_json::json!(["Targets", targets]))
+        .map_err(|_| RunnerError::InvalidStage)
 }
 
 #[cfg(not(windows))]
@@ -1938,6 +1973,54 @@ mod tests {
         assert!(
             policy
                 .contains("pattern-regex: \"(?s)\\\\A(?=.*\\\\ncontext-relay-scan-canary\\\\z).\"")
+        );
+    }
+
+    #[test]
+    fn semgrep_targets_bind_each_staged_input_with_a_slash_rooted_ppath() {
+        let inputs = [
+            ContentFrame::new(
+                StagePath::try_from("input/semgrep-target/a.txt").unwrap(),
+                b"a".to_vec(),
+            )
+            .unwrap(),
+            ContentFrame::new(
+                StagePath::try_from("input/semgrep-target/nested/b.txt").unwrap(),
+                b"b".to_vec(),
+            )
+            .unwrap(),
+        ];
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&semgrep_targets_json(&inputs).unwrap())
+                .unwrap(),
+            serde_json::json!([
+                "Targets",
+                [
+                    [
+                        "CodeTarget",
+                        {
+                            "path": {
+                                "fpath": "input/semgrep-target/a.txt",
+                                "ppath": "/input/semgrep-target/a.txt"
+                            },
+                            "analyzer": "spacegrep",
+                            "products": ["sast"]
+                        }
+                    ],
+                    [
+                        "CodeTarget",
+                        {
+                            "path": {
+                                "fpath": "input/semgrep-target/nested/b.txt",
+                                "ppath": "/input/semgrep-target/nested/b.txt"
+                            },
+                            "analyzer": "spacegrep",
+                            "products": ["sast"]
+                        }
+                    ]
+                ]
+            ])
         );
     }
 }

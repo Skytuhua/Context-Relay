@@ -30,8 +30,9 @@ mod windows_adapter {
         lock_directory,
     };
     use crate::{
-        FailureCode, HelperRunRequest, RunRequest, RunResponse, RunnerError, RuntimeTarget,
-        VerifiedClosure, read_run_response_for, write_helper_request,
+        ClosureMaterial, FailureCode, HelperRunRequest, RunRequest, RunResponse, RunnerError,
+        RuntimeTarget, SidecarCommand, StagePath, VerifiedClosure, read_run_response_for,
+        write_helper_request,
     };
 
     pub struct WindowsSandboxLauncher<J> {
@@ -105,7 +106,10 @@ mod windows_adapter {
                 .map_err(|_| RunnerError::SidecarUnavailable)?
                 .attest_created(lease.identity())
                 .map_err(map_launch_error)?;
-            let helper_request = HelperRunRequest::from_verified(request, closure)?;
+            let helper_request = HelperRunRequest::for_resigned_runtime(
+                request.clone(),
+                staged_runtime_materials(request.command(), closure)?,
+            )?;
             let mut protocol = Vec::new();
             write_helper_request(&mut protocol, &helper_request)?;
 
@@ -148,7 +152,13 @@ mod windows_adapter {
                 .map_err(map_launch_error)?,
         )
         .map_err(map_launch_error)?;
-        let _closure_locks = stage_closure(&layout, helper_template, helper_sha256, closure)?;
+        let _closure_locks = stage_closure(
+            &layout,
+            helper_template,
+            helper_sha256,
+            closure,
+            request.command(),
+        )?;
         let backend = Win32LaunchBackend::prepare(identity, layout, helper_sha256)
             .map_err(map_launch_error)?;
         let mut running = LaunchSequence::for_identity(backend, identity)
@@ -333,6 +343,7 @@ mod windows_adapter {
         helper_template: &Path,
         helper_sha256: [u8; 32],
         closure: &VerifiedClosure,
+        command: &SidecarCommand,
     ) -> Result<Vec<fs::File>, RunnerError> {
         let mut locks = vec![
             copy_locked_file(helper_template, &layout.helper_path(), None, helper_sha256)
@@ -341,6 +352,8 @@ mod windows_adapter {
         let runtime = layout.closure_runtime();
         let mut directories = BTreeSet::new();
         for material in closure.materials() {
+            let runtime_path =
+                staged_runtime_path(command, material.path(), material.executable())?;
             let source = material
                 .path()
                 .as_str()
@@ -348,15 +361,14 @@ mod windows_adapter {
                 .fold(closure.root().to_path_buf(), |path, component| {
                     path.join(component)
                 });
-            let destination = material
-                .path()
+            let destination = runtime_path
                 .as_str()
                 .split('/')
                 .fold(runtime.to_path_buf(), |path, component| {
                     path.join(component)
                 });
             let mut parent = PathBuf::new();
-            for component in Path::new(material.path().as_str())
+            for component in Path::new(runtime_path.as_str())
                 .parent()
                 .into_iter()
                 .flat_map(Path::components)
@@ -381,13 +393,77 @@ mod windows_adapter {
         Ok(locks)
     }
 
+    fn staged_runtime_materials(
+        command: &SidecarCommand,
+        closure: &VerifiedClosure,
+    ) -> Result<Vec<ClosureMaterial>, RunnerError> {
+        closure
+            .materials()
+            .iter()
+            .map(|material| {
+                ClosureMaterial::new(
+                    staged_runtime_path(command, material.path(), material.executable())?,
+                    material.size(),
+                    *material.sha256(),
+                    material.executable(),
+                )
+            })
+            .collect()
+    }
+
+    fn staged_runtime_path(
+        command: &SidecarCommand,
+        path: &StagePath,
+        executable: bool,
+    ) -> Result<StagePath, RunnerError> {
+        if !matches!(command, SidecarCommand::OsemgrepScanPackage) || !executable {
+            return Ok(path.clone());
+        }
+        let (parent, name) = path
+            .as_str()
+            .rsplit_once('/')
+            .ok_or(RunnerError::ClosureMismatch)?;
+        let core_name = match name {
+            "osemgrep.exe" => "semgrep-core.exe",
+            "osemgrep" => "semgrep-core",
+            _ => return Err(RunnerError::ClosureMismatch),
+        };
+        StagePath::try_from(format!("{parent}/{core_name}"))
+            .map_err(|_| RunnerError::ClosureMismatch)
+    }
+
     fn map_launch_error(_error: LaunchError) -> RunnerError {
         RunnerError::SidecarUnavailable
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{validated_semgrep_diagnostic, validated_spawn_diagnostic};
+        use super::{
+            staged_runtime_path, validated_semgrep_diagnostic, validated_spawn_diagnostic,
+        };
+        use crate::{SidecarCommand, StagePath};
+
+        #[test]
+        fn only_the_windows_semgrep_executable_is_staged_under_the_core_name() {
+            let executable = StagePath::try_from("bin/osemgrep.exe").unwrap();
+            let library = StagePath::try_from("bin/runtime.dll").unwrap();
+
+            assert_eq!(
+                staged_runtime_path(&SidecarCommand::OsemgrepScanPackage, &executable, true)
+                    .unwrap()
+                    .as_str(),
+                "bin/semgrep-core.exe"
+            );
+            assert_eq!(
+                staged_runtime_path(&SidecarCommand::OsemgrepScanPackage, &library, false).unwrap(),
+                library
+            );
+            assert_eq!(
+                staged_runtime_path(&SidecarCommand::GitleaksScanPackage, &executable, true)
+                    .unwrap(),
+                executable
+            );
+        }
 
         #[test]
         fn only_the_exact_numeric_spawn_diagnostic_is_forwarded() {

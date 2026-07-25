@@ -37,6 +37,18 @@ const SEMGREP_KEYS: [&str; 8] = [
     "skipped_rules",
     "profiling_results",
 ];
+const SEMGREP_CORE_KEYS: [&str; 10] = [
+    "version",
+    "results",
+    "errors",
+    "paths",
+    "time",
+    "rules_by_engine",
+    "engine_requested",
+    "interfile_languages_used",
+    "skipped_rules",
+    "profiling_results",
+];
 const SEMGREP_WARNING: &str = "!!! You're using one or more options starting with '--x-'. These options are not part of the semgrep API. They will change or will be removed without notice !!! ";
 const SEMGREP_RULE_ID: &str = "config.semgrep.context-relay-no-python-runtime";
 const SEMGREP_BARE_RULE_ID: &str = "context-relay-no-python-runtime";
@@ -172,6 +184,9 @@ pub fn validate_semgrep_report(
     stderr: &[u8],
     inputs: &[ContentFrame],
 ) -> Result<(RunDisposition, Vec<u8>), RunnerError> {
+    if stderr.is_empty() {
+        return validate_semgrep_core_report(exit, stdout, inputs);
+    }
     if !matches!(exit, 0 | 1) || !valid_semgrep_warning(stderr) {
         return invalid();
     }
@@ -207,7 +222,7 @@ pub fn validate_semgrep_report(
     let mut findings = Vec::new();
     for result in results {
         let result_object = result.as_object().ok_or(RunnerError::InvalidToolOutput)?;
-        match validate_semgrep_result(result_object, &expected, &mut identities)? {
+        match validate_semgrep_result(result_object, &expected, &mut identities, false)? {
             SemgrepResultKind::Canary(path) => {
                 if !canaries.insert(path) {
                     return invalid();
@@ -257,6 +272,100 @@ pub fn validate_semgrep_report(
         disposition,
         serde_json::to_vec(&report).map_err(|_| RunnerError::InvalidToolOutput)?,
     ))
+}
+
+fn validate_semgrep_core_report(
+    exit: i32,
+    stdout: &[u8],
+    inputs: &[ContentFrame],
+) -> Result<(RunDisposition, Vec<u8>), RunnerError> {
+    if exit != 0 {
+        return invalid();
+    }
+    let mut report: Value =
+        serde_json::from_slice(stdout).map_err(|_| RunnerError::InvalidToolOutput)?;
+    let object = report.as_object().ok_or(RunnerError::InvalidToolOutput)?;
+    if !exact_keys(object, &SEMGREP_CORE_KEYS)
+        || object.get("version").and_then(Value::as_str) != Some("1.170.0")
+        || object.get("engine_requested").and_then(Value::as_str) != Some("OSS")
+        || !empty_array(object.get("errors"))
+        || !empty_array(object.get("interfile_languages_used"))
+        || !empty_array(object.get("skipped_rules"))
+        || !empty_array(object.get("profiling_results"))
+        || !valid_semgrep_rules_by_engine(object.get("rules_by_engine"))
+    {
+        return invalid();
+    }
+    validate_semgrep_time(
+        object
+            .get("time")
+            .and_then(Value::as_object)
+            .ok_or(RunnerError::InvalidToolOutput)?,
+        inputs,
+    )?;
+    let expected = inputs
+        .iter()
+        .map(|input| input.path().as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    if semgrep_paths_boundary(object, &expected).is_some() {
+        return invalid();
+    }
+    let results = object
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or(RunnerError::InvalidToolOutput)?;
+    let mut identities = BTreeSet::new();
+    let mut canaries = BTreeSet::new();
+    let mut findings = Vec::new();
+    for result in results {
+        let result = result.as_object().ok_or(RunnerError::InvalidToolOutput)?;
+        match validate_semgrep_result(result, &expected, &mut identities, true)? {
+            SemgrepResultKind::Canary(path) => {
+                if !canaries.insert(path) {
+                    return invalid();
+                }
+            }
+            SemgrepResultKind::Finding => findings.push(Value::Object(result.clone())),
+        }
+    }
+    if canaries != expected {
+        return invalid();
+    }
+    let count = u32::try_from(findings.len()).map_err(|_| RunnerError::LimitExceeded)?;
+    report["results"] = Value::Array(findings);
+    Ok((
+        if count == 0 {
+            RunDisposition::Clean
+        } else {
+            RunDisposition::Findings(count)
+        },
+        serde_json::to_vec(&report).map_err(|_| RunnerError::InvalidToolOutput)?,
+    ))
+}
+
+fn valid_semgrep_rules_by_engine(value: Option<&Value>) -> bool {
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return false;
+    };
+    let rules = entries
+        .iter()
+        .map(|entry| {
+            let pair = entry.as_array().filter(|pair| pair.len() == 2)?;
+            (pair[1].as_str() == Some("OSS"))
+                .then(|| pair[0].as_str())
+                .flatten()
+        })
+        .collect::<Option<BTreeSet<_>>>();
+    rules.is_some_and(|rules| {
+        entries.len() == 2
+            && rules.len() == 2
+            && rules
+                .iter()
+                .any(|rule| matches!(*rule, SEMGREP_RULE_ID | SEMGREP_BARE_RULE_ID))
+            && rules
+                .iter()
+                .any(|rule| matches!(*rule, SEMGREP_CANARY_RULE_ID | SEMGREP_BARE_CANARY_RULE_ID))
+    })
 }
 
 pub fn classify_semgrep_invalid_output(
@@ -334,7 +443,7 @@ fn semgrep_report_boundary(exit: i32, stdout: &[u8], inputs: &[ContentFrame]) ->
         let Some(result) = result.as_object() else {
             return "results";
         };
-        match validate_semgrep_result(result, &expected, &mut identities) {
+        match validate_semgrep_result(result, &expected, &mut identities, false) {
             Ok(SemgrepResultKind::Canary(path)) => {
                 if !canaries.insert(path) {
                     return "results";
@@ -943,6 +1052,7 @@ fn validate_semgrep_result(
     result: &Map<String, Value>,
     expected_paths: &BTreeSet<String>,
     identities: &mut BTreeSet<String>,
+    core: bool,
 ) -> Result<SemgrepResultKind, RunnerError> {
     if !exact_keys(result, &["check_id", "path", "start", "end", "extra"]) {
         return invalid();
@@ -984,32 +1094,64 @@ fn validate_semgrep_result(
         rule_id,
         SEMGREP_CANARY_RULE_ID | SEMGREP_BARE_CANARY_RULE_ID
     );
-    if !exact_keys(
-        extra,
-        &[
+    let valid_extra = if core {
+        const CORE_EXTRA_KEYS: [&str; 7] = [
+            "metavars",
+            "engine_kind",
+            "is_ignored",
             "message",
             "metadata",
             "severity",
-            "fingerprint",
-            "lines",
             "validation_state",
-            "engine_kind",
-        ],
-    ) || extra.get("message").and_then(Value::as_str)
-        != Some(if is_canary {
-            "Context Relay scan coverage canary."
-        } else {
-            "Native Semgrep packages must not contain Pysemgrep or a Python runtime."
-        })
+        ];
+        extra
+            .keys()
+            .all(|key| CORE_EXTRA_KEYS.contains(&key.as_str()))
+            && [
+                "metavars",
+                "engine_kind",
+                "is_ignored",
+                "message",
+                "metadata",
+                "validation_state",
+            ]
+            .iter()
+            .all(|key| extra.contains_key(*key))
+            && empty_object(extra.get("metavars"))
+            && extra.get("is_ignored").and_then(Value::as_bool) == Some(false)
+            && extra.get("validation_state").and_then(Value::as_str) == Some("NO_VALIDATOR")
+            && extra.get("severity").is_none_or(|severity| {
+                severity.as_str() == Some(if is_canary { "INFO" } else { "ERROR" })
+            })
+    } else {
+        exact_keys(
+            extra,
+            &[
+                "message",
+                "metadata",
+                "severity",
+                "fingerprint",
+                "lines",
+                "validation_state",
+                "engine_kind",
+            ],
+        ) && extra.get("fingerprint").and_then(Value::as_str) == Some("requires login")
+            && extra.get("lines").and_then(Value::as_str) == Some("requires login")
+            && extra.get("validation_state").and_then(Value::as_str) == Some("NO_VALIDATOR")
+            && extra.get("severity").and_then(Value::as_str)
+                == Some(if is_canary { "INFO" } else { "ERROR" })
+    };
+    if !valid_extra
+        || extra.get("message").and_then(Value::as_str)
+            != Some(if is_canary {
+                "Context Relay scan coverage canary."
+            } else {
+                "Native Semgrep packages must not contain Pysemgrep or a Python runtime."
+            })
         || !extra
             .get("metadata")
             .and_then(Value::as_object)
             .is_some_and(Map::is_empty)
-        || extra.get("severity").and_then(Value::as_str)
-            != Some(if is_canary { "INFO" } else { "ERROR" })
-        || extra.get("fingerprint").and_then(Value::as_str) != Some("requires login")
-        || extra.get("lines").and_then(Value::as_str) != Some("requires login")
-        || extra.get("validation_state").and_then(Value::as_str) != Some("NO_VALIDATOR")
         || extra.get("engine_kind").and_then(Value::as_str) != Some("OSS")
     {
         return invalid();
