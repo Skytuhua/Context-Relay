@@ -120,6 +120,7 @@ jobs:
               '-rules', 'config/package.yml',
               '-targets', 'config/targets.json',
               '-json_time',
+              '-json_nodots',
               '-strict',
               '-j', '1',
               '-use_parmap',

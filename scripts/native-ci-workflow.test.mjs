@@ -731,4 +731,5 @@ test('the focused Semgrep core probe uses a slash-rooted project path', async ()
     'utf8',
   );
   assert.match(source, /"ppath":"\/input\/semgrep-target\/runtime-inventory\.txt"/);
+  assert.match(source, /'-json_time',[\s\S]+?'-json_nodots',/);
 });
