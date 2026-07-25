@@ -724,3 +724,11 @@ test('every workflow action remains pinned to a full commit SHA', async () => {
   }
   assert.doesNotMatch(source, /continue-on-error:\s*true/);
 });
+
+test('the focused Semgrep core probe uses a slash-rooted project path', async () => {
+  const source = await readFile(
+    new URL('../.github/workflows/diagnose-semgrep-windows.yml', import.meta.url),
+    'utf8',
+  );
+  assert.match(source, /"ppath":"\/input\/semgrep-target\/runtime-inventory\.txt"/);
+});

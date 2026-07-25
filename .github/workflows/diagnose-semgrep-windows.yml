@@ -53,7 +53,7 @@ jobs:
           New-Item -ItemType HardLink -Path $core -Target $osemgrep | Out-Null
           Copy-Item third_party/sidecars/policies/semgrep-package.yml (Join-Path $probe 'config/package.yml')
           @'
-          ["Targets",[["CodeTarget",{"path":{"fpath":"input/semgrep-target/runtime-inventory.txt","ppath":"input/semgrep-target/runtime-inventory.txt"},"analyzer":"spacegrep","products":["sast"]}]]]
+          ["Targets",[["CodeTarget",{"path":{"fpath":"input/semgrep-target/runtime-inventory.txt","ppath":"/input/semgrep-target/runtime-inventory.txt"},"analyzer":"spacegrep","products":["sast"]}]]]
           '@ | Set-Content (Join-Path $probe 'config/targets.json') -NoNewline
           function Get-CoreErrorLabel($Error) {
             $type = @($Error.error_type)[0]
