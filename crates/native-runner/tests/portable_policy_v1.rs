@@ -202,6 +202,17 @@ fn closed_commands_emit_only_the_frozen_argument_arrays() {
 }
 
 #[test]
+fn semgrep_policy_applies_to_every_closed_target() {
+    let policy = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../third_party/sidecars/policies/semgrep-package.yml"),
+    )
+    .unwrap();
+
+    assert!(!policy.lines().any(|line| line.trim() == "paths:"));
+}
+
+#[test]
 fn rulesync_accepts_only_canonical_config_and_enabled_curated_inputs() {
     let without_skills = SidecarCommand::RuleSyncGenerate {
         target: RuleSyncTarget::CodexCli,
