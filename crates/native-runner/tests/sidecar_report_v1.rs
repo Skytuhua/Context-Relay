@@ -135,6 +135,52 @@ fn semgrep_accepts_windows_newlines_and_omitted_experimental_timing() {
 }
 
 #[test]
+fn semgrep_accepts_the_exact_unprefixed_windows_rule_id() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
+    let mut report = semgrep_report(vec![], vec!["input/semgrep-target/METADATA"]);
+    report["time"]["rules"] = json!(["context-relay-no-python-runtime"]);
+
+    assert_eq!(
+        validate_semgrep_report(
+            0,
+            &serde_json::to_vec(&report).unwrap(),
+            semgrep_warning(),
+            &inputs,
+        )
+        .unwrap()
+        .0,
+        RunDisposition::Clean
+    );
+
+    report["results"] = json!([{
+        "check_id": "context-relay-no-python-runtime",
+        "path": "input/semgrep-target/METADATA",
+        "start": { "line": 1, "col": 1, "offset": 0 },
+        "end": { "line": 1, "col": 7, "offset": 6 },
+        "extra": {
+            "message": "Native Semgrep packages must not contain Pysemgrep or a Python runtime.",
+            "metadata": {},
+            "severity": "ERROR",
+            "fingerprint": "requires login",
+            "lines": "requires login",
+            "validation_state": "NO_VALIDATOR",
+            "engine_kind": "OSS"
+        }
+    }]);
+    assert_eq!(
+        validate_semgrep_report(
+            1,
+            &serde_json::to_vec(&report).unwrap(),
+            semgrep_warning(),
+            &inputs,
+        )
+        .unwrap()
+        .0,
+        RunDisposition::Findings(1)
+    );
+}
+
+#[test]
 fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_newlines() {
     let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
     let clean = serde_json::to_vec(&semgrep_report(
@@ -416,7 +462,7 @@ fn semgrep_timing_binds_the_exact_rule_paths_and_input_sizes() {
 
     for poisoned in [
         ("rules", json!([])),
-        ("rules", json!(["context-relay-no-python-runtime"])),
+        ("rules", json!(["other.context-relay-no-python-runtime"])),
         ("profiling_times", json!([])),
         ("total_bytes", json!(10)),
         (

@@ -39,6 +39,7 @@ const SEMGREP_KEYS: [&str; 8] = [
 ];
 const SEMGREP_WARNING: &str = "!!! You're using one or more options starting with '--x-'. These options are not part of the semgrep API. They will change or will be removed without notice !!! ";
 const SEMGREP_RULE_ID: &str = "config.semgrep.context-relay-no-python-runtime";
+const SEMGREP_BARE_RULE_ID: &str = "context-relay-no-python-runtime";
 
 pub fn validate_gitleaks_report(
     exit: i32,
@@ -375,7 +376,7 @@ fn semgrep_time_boundary(time: &Map<String, Value>, inputs: &[ContentFrame]) -> 
     if !time
         .get("rules")
         .and_then(Value::as_array)
-        .is_some_and(|rules| rules.len() == 1 && rules[0].as_str() == Some(SEMGREP_RULE_ID))
+        .is_some_and(|rules| rules.len() == 1 && valid_semgrep_rule_id(rules[0].as_str()))
     {
         return "time-rules";
     }
@@ -806,7 +807,7 @@ fn validate_semgrep_result(
     identities: &mut BTreeSet<String>,
 ) -> Result<(), RunnerError> {
     if !exact_keys(result, &["check_id", "path", "start", "end", "extra"])
-        || result.get("check_id").and_then(Value::as_str) != Some(SEMGREP_RULE_ID)
+        || !valid_semgrep_rule_id(result.get("check_id").and_then(Value::as_str))
     {
         return invalid();
     }
@@ -917,7 +918,7 @@ fn validate_semgrep_time(
         || !time
             .get("rules")
             .and_then(Value::as_array)
-            .is_some_and(|rules| rules.len() == 1 && rules[0].as_str() == Some(SEMGREP_RULE_ID))
+            .is_some_and(|rules| rules.len() == 1 && valid_semgrep_rule_id(rules[0].as_str()))
         || !time
             .get("fixpoint_timeouts")
             .is_none_or(|value| empty_array(Some(value)))
@@ -1085,6 +1086,10 @@ fn scanner_path(value: &str) -> Result<String, RunnerError> {
     StagePath::try_from(path)
         .map(|path| path.as_str().to_owned())
         .map_err(|_| RunnerError::InvalidToolOutput)
+}
+
+fn valid_semgrep_rule_id(value: Option<&str>) -> bool {
+    matches!(value, Some(SEMGREP_RULE_ID | SEMGREP_BARE_RULE_ID))
 }
 
 fn has_nonempty_bash_permissions(bytes: &[u8]) -> Result<bool, RunnerError> {
