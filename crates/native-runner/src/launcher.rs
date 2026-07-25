@@ -170,6 +170,9 @@ mod windows_adapter {
             }
             Err(error) => return Err(map_launch_error(error)),
         };
+        if let Some(diagnostic) = validated_spawn_diagnostic(output.stderr()) {
+            eprintln!("{diagnostic}");
+        }
         if output.exit_code() != 0 || !output.stderr().is_empty() {
             return Ok(RunResponse::failed(FailureCode::ToolFailed));
         }
@@ -179,6 +182,13 @@ mod windows_adapter {
             _ => return Ok(RunResponse::failed(FailureCode::ToolFailed)),
         };
         Ok(response)
+    }
+
+    fn validated_spawn_diagnostic(stderr: &[u8]) -> Option<&str> {
+        let diagnostic = std::str::from_utf8(stderr).ok()?.strip_suffix('\n')?;
+        let diagnostic = diagnostic.strip_suffix('\r').unwrap_or(diagnostic);
+        let code = diagnostic.strip_prefix("context-relay-sidecar-spawn-os-error=")?;
+        (!code.is_empty() && code.bytes().all(|byte| byte.is_ascii_digit())).then_some(diagnostic)
     }
 
     fn stage_closure(
@@ -236,6 +246,24 @@ mod windows_adapter {
 
     fn map_launch_error(_error: LaunchError) -> RunnerError {
         RunnerError::SidecarUnavailable
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::validated_spawn_diagnostic;
+
+        #[test]
+        fn only_the_exact_numeric_spawn_diagnostic_is_forwarded() {
+            assert_eq!(
+                validated_spawn_diagnostic(b"context-relay-sidecar-spawn-os-error=5\n"),
+                Some("context-relay-sidecar-spawn-os-error=5")
+            );
+            assert_eq!(validated_spawn_diagnostic(b"PROBE-ERR\n"), None);
+            assert_eq!(
+                validated_spawn_diagnostic(b"context-relay-sidecar-spawn-os-error=5 extra\n"),
+                None
+            );
+        }
     }
 }
 

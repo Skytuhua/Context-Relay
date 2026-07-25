@@ -136,9 +136,10 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
             Ok(())
         });
     }
-    let mut child = command
-        .spawn()
-        .map_err(|_| RunnerError::SidecarUnavailable)?;
+    let mut child = command.spawn().map_err(|error| {
+        eprintln!("{}", spawn_failure_diagnostic(&error));
+        RunnerError::SidecarUnavailable
+    })?;
     let stdout = child.stdout.take().ok_or(RunnerError::Io)?;
     let stderr = child.stderr.take().ok_or(RunnerError::Io)?;
     let stdout = thread::spawn(move || drain_bounded(stdout, DRAIN_LIMIT));
@@ -1833,6 +1834,13 @@ fn failure_code(error: RunnerError) -> FailureCode {
     }
 }
 
+fn spawn_failure_diagnostic(error: &std::io::Error) -> String {
+    format!(
+        "context-relay-sidecar-spawn-os-error={}",
+        error.raw_os_error().unwrap_or(0)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1842,6 +1850,15 @@ mod tests {
         assert_eq!(
             failure_code(RunnerError::SidecarUnavailable),
             FailureCode::ToolFailed
+        );
+    }
+
+    #[test]
+    fn spawn_failure_diagnostic_keeps_only_the_numeric_os_code() {
+        let error = std::io::Error::from_raw_os_error(5);
+        assert_eq!(
+            spawn_failure_diagnostic(&error),
+            "context-relay-sidecar-spawn-os-error=5"
         );
     }
 }
