@@ -49,7 +49,7 @@ jobs:
           New-Item -ItemType Directory -Path (Join-Path $probe 'config') | Out-Null
           New-Item -ItemType Directory -Path (Join-Path $probe 'input/semgrep-target') | Out-Null
           $osemgrep = Join-Path $env:CONTEXT_RELAY_REAL_SIDECAR_ROOT 'semgrep/osemgrep.exe'
-          $core = Join-Path $probe 'semgrep-core.exe'
+          $core = Join-Path (Split-Path $osemgrep) 'semgrep-core.exe'
           New-Item -ItemType HardLink -Path $core -Target $osemgrep | Out-Null
           Copy-Item third_party/sidecars/policies/semgrep-package.yml (Join-Path $probe 'config/package.yml')
           @'
@@ -72,9 +72,10 @@ jobs:
             $report = Get-Content $stdout -Raw | ConvertFrom-Json
             $knownKeys = @('engine_requested','errors','interfile_languages_used','paths','profiling_results','results','rules_by_engine','skipped_rules','time','version')
             $keys = @($report.PSObject.Properties.Name | Sort-Object)
-            $results = @($report.results)
+            $results = if ($report.results -is [array]) { @($report.results) } else { @() }
             [ordered]@{
               exit = $process.ExitCode
+              json = $null -ne $report
               envelope = (Compare-Object $knownKeys $keys).Count -eq 0
               results = $results.Count
               canary = @($results | Where-Object { $_.check_id -in @('config.semgrep.context-relay-scan-canary','context-relay-scan-canary') }).Count
@@ -87,3 +88,4 @@ jobs:
           $clean = Invoke-CoreProbe "osemgrep`ncontext-relay-scan-canary"
           $finding = Invoke-CoreProbe "python.exe`ncontext-relay-scan-canary"
           Write-Host "context-relay-semgrep-core-probe=$([ordered]@{ clean = $clean; finding = $finding } | ConvertTo-Json -Compress -Depth 4)"
+          Remove-Item -LiteralPath $core
