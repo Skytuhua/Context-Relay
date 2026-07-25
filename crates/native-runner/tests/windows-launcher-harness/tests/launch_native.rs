@@ -133,6 +133,14 @@ fn closure_runtime_acl_denies_appcontainer_writes_and_allows_host_cleanup() {
     let digest: [u8; 32] = Sha256::digest(fs::read(layout.helper_path()).unwrap()).into();
 
     let backend = Win32LaunchBackend::prepare(&identity, layout, digest).unwrap();
+    let acl = std::process::Command::new("icacls")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    eprintln!(
+        "context-relay-runtime-executable-acl={}",
+        String::from_utf8_lossy(&acl.stdout).replace("\r\n", " | ")
+    );
     let inherited = nested.join("inherited.dll");
     fs::write(&inherited, b"inherited\n").unwrap();
     let mut running = LaunchSequence::for_identity(backend, &identity)
