@@ -518,23 +518,135 @@ fn semgrep_core_report_boundary(
     let mut canaries = BTreeSet::new();
     for result in results {
         let Some(result) = result.as_object() else {
-            return Some("results");
+            return Some("results-shape");
         };
-        match validate_semgrep_result(result, &expected, &mut identities, true) {
+        match classify_semgrep_core_result(result, &expected, &mut identities) {
             Ok(SemgrepResultKind::Canary(path)) => {
                 if !canaries.insert(path) {
-                    return Some("results");
+                    return Some("results-duplicate");
                 }
             }
             Ok(SemgrepResultKind::Finding) => {}
-            _ => return Some("results"),
+            Err(boundary) => return Some(boundary),
         }
     }
     Some(if canaries == expected {
         "valid"
     } else {
-        "results"
+        "results-canary-set"
     })
+}
+
+fn classify_semgrep_core_result(
+    result: &Map<String, Value>,
+    expected_paths: &BTreeSet<String>,
+    identities: &mut BTreeSet<String>,
+) -> Result<SemgrepResultKind, &'static str> {
+    if !exact_keys(result, &["check_id", "path", "start", "end", "extra"]) {
+        return Err("results-shape");
+    }
+    let rule_id = result
+        .get("check_id")
+        .and_then(Value::as_str)
+        .filter(|value| valid_semgrep_rule_id(Some(value)))
+        .ok_or("results-rule")?;
+    let path = result
+        .get("path")
+        .and_then(Value::as_str)
+        .and_then(|path| scanner_path(path).ok())
+        .filter(|path| expected_paths.contains(path))
+        .ok_or("results-path")?;
+    let start = result
+        .get("start")
+        .and_then(Value::as_object)
+        .and_then(|position| semgrep_position(position).ok())
+        .ok_or("results-position")?;
+    let end = result
+        .get("end")
+        .and_then(Value::as_object)
+        .and_then(|position| semgrep_position(position).ok())
+        .ok_or("results-position")?;
+    if end < start {
+        return Err("results-range");
+    }
+    let extra = result
+        .get("extra")
+        .and_then(Value::as_object)
+        .ok_or("results-extra-shape")?;
+    const CORE_EXTRA_KEYS: [&str; 7] = [
+        "metavars",
+        "engine_kind",
+        "is_ignored",
+        "message",
+        "metadata",
+        "severity",
+        "validation_state",
+    ];
+    if !extra
+        .keys()
+        .all(|key| CORE_EXTRA_KEYS.contains(&key.as_str()))
+        || ![
+            "metavars",
+            "engine_kind",
+            "is_ignored",
+            "message",
+            "validation_state",
+        ]
+        .iter()
+        .all(|key| extra.contains_key(*key))
+    {
+        return Err("results-extra-keys");
+    }
+    if !empty_object(extra.get("metavars")) {
+        return Err("results-metavars");
+    }
+    if extra.get("is_ignored").and_then(Value::as_bool) != Some(false) {
+        return Err("results-ignored");
+    }
+    if extra.get("validation_state").and_then(Value::as_str) != Some("NO_VALIDATOR") {
+        return Err("results-state");
+    }
+    let is_canary = matches!(
+        rule_id,
+        SEMGREP_CANARY_RULE_ID | SEMGREP_BARE_CANARY_RULE_ID
+    );
+    if !extra
+        .get("severity")
+        .is_none_or(|severity| severity.as_str() == Some(if is_canary { "INFO" } else { "ERROR" }))
+    {
+        return Err("results-severity");
+    }
+    if extra.get("message").and_then(Value::as_str)
+        != Some(if is_canary {
+            "Context Relay scan coverage canary."
+        } else {
+            "Native Semgrep packages must not contain Pysemgrep or a Python runtime."
+        })
+    {
+        return Err("results-message");
+    }
+    if !extra
+        .get("metadata")
+        .is_none_or(|metadata| metadata.as_object().is_some_and(Map::is_empty))
+    {
+        return Err("results-metadata");
+    }
+    if extra.get("engine_kind").and_then(Value::as_str) != Some("OSS") {
+        return Err("results-engine");
+    }
+    if is_canary {
+        return (start == (1, 1, 0) && end > start)
+            .then_some(SemgrepResultKind::Canary(path))
+            .ok_or("results-canary-range");
+    }
+    let identity = format!(
+        "{}:{path}:{}:{}:{}:{}:{}:{}",
+        SEMGREP_RULE_ID, start.0, start.1, start.2, end.0, end.1, end.2
+    );
+    identities
+        .insert(identity)
+        .then_some(SemgrepResultKind::Finding)
+        .ok_or("results-duplicate")
 }
 
 fn semgrep_paths_boundary(

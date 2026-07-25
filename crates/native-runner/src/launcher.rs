@@ -293,6 +293,23 @@ mod windows_adapter {
                     | "paths-empty-time-other"
                     | "paths-set"
                     | "results"
+                    | "results-shape"
+                    | "results-rule"
+                    | "results-path"
+                    | "results-position"
+                    | "results-range"
+                    | "results-extra-shape"
+                    | "results-extra-keys"
+                    | "results-metavars"
+                    | "results-ignored"
+                    | "results-state"
+                    | "results-severity"
+                    | "results-message"
+                    | "results-metadata"
+                    | "results-engine"
+                    | "results-canary-range"
+                    | "results-duplicate"
+                    | "results-canary-set"
                     | "disposition"
                     | "valid"
                     | "time-shape"
@@ -506,6 +523,12 @@ mod windows_adapter {
                     b"context-relay-semgrep-invalid-output=time-targets-path\n"
                 ),
                 Some("context-relay-semgrep-invalid-output=time-targets-path")
+            );
+            assert_eq!(
+                validated_semgrep_diagnostic(
+                    b"context-relay-semgrep-invalid-output=results-metadata\n"
+                ),
+                Some("context-relay-semgrep-invalid-output=results-metadata")
             );
             assert_eq!(
                 validated_semgrep_diagnostic(b"context-relay-semgrep-invalid-output=valid\n"),

@@ -229,6 +229,23 @@ fn semgrep_diagnostic_distinguishes_a_valid_core_report_with_stderr() {
         ),
         Some("paths-set")
     );
+
+    let mut invalid_metadata = semgrep_core_result(
+        "config.semgrep.context-relay-scan-canary",
+        "INFO",
+        "Context Relay scan coverage canary.",
+        1,
+    );
+    invalid_metadata["extra"]["metadata"] = json!({"untrusted": true});
+    assert_eq!(
+        classify_semgrep_invalid_output(
+            0,
+            &serde_json::to_vec(&semgrep_core_report(vec![invalid_metadata])).unwrap(),
+            b"untrusted stderr",
+            &inputs,
+        ),
+        Some("results-metadata")
+    );
 }
 
 #[test]
