@@ -1933,9 +1933,10 @@ mod tests {
         assert_eq!(input.bytes(), b"osemgrep\n");
         assert_eq!(semgrep[0].bytes(), b"osemgrep\n\ncontext-relay-scan-canary");
         assert_eq!(gitleaks, [input]);
+        let policy = std::str::from_utf8(SEMGREP_POLICY).unwrap();
+        assert!(policy.contains("languages: [regex]"));
         assert!(
-            std::str::from_utf8(SEMGREP_POLICY)
-                .unwrap()
+            policy
                 .contains("pattern-regex: \"(?s)\\\\A(?=.*\\\\ncontext-relay-scan-canary\\\\z).\"")
         );
     }
