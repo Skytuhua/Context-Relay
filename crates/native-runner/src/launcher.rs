@@ -269,7 +269,13 @@ mod windows_adapter {
         (valid_exit
             || matches!(
                 kind,
-                "report"
+                "json"
+                    | "envelope"
+                    | "report"
+                    | "paths"
+                    | "results"
+                    | "disposition"
+                    | "valid"
                     | "time-shape"
                     | "time-rules-empty"
                     | "time-rules-multiple"
@@ -404,6 +410,10 @@ mod windows_adapter {
                     b"context-relay-semgrep-invalid-output=time-targets-path\n"
                 ),
                 Some("context-relay-semgrep-invalid-output=time-targets-path")
+            );
+            assert_eq!(
+                validated_semgrep_diagnostic(b"context-relay-semgrep-invalid-output=valid\n"),
+                Some("context-relay-semgrep-invalid-output=valid")
             );
             assert_eq!(
                 validated_semgrep_diagnostic(
