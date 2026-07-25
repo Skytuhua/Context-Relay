@@ -158,6 +158,16 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
             "stderr-exception-invalid_argument".to_owned()
         )
     );
+    assert_eq!(
+        classify_semgrep_exit_details(
+            b"",
+            b"exception during worker:\nexception: Invalid_argument(\"attacker-controlled\")"
+        ),
+        (
+            "report-no-json",
+            "stderr-exception-invalid_argument".to_owned()
+        )
+    );
 }
 
 #[test]

@@ -299,9 +299,10 @@ pub fn classify_semgrep_exit_details(stdout: &[u8], stderr: &[u8]) -> (&'static 
     let stderr = std::str::from_utf8(stderr)
         .unwrap_or("")
         .to_ascii_lowercase();
-    let exception_constructor = stderr
-        .split_once("error: exception ")
-        .and_then(|(_, tail)| {
+    let exception_constructor = ["error: exception ", "exception: "]
+        .iter()
+        .find_map(|marker| {
+            let (_, tail) = stderr.split_once(marker)?;
             let constructor = tail
                 .split(['(', ' ', '\r', '\n'])
                 .next()
