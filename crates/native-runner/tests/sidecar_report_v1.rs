@@ -248,6 +248,17 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
         ),
         None
     );
+    let mut empty_rules_with_times: Value = serde_json::from_slice(&clean).unwrap();
+    empty_rules_with_times["time"]["rules"] = json!([]);
+    assert_eq!(
+        classify_semgrep_invalid_output(
+            0,
+            &serde_json::to_vec(&empty_rules_with_times).unwrap(),
+            semgrep_warning(),
+            &inputs
+        ),
+        Some("time-target-times-one")
+    );
     assert_eq!(
         classify_semgrep_invalid_output(2, &clean, semgrep_warning(), &inputs),
         Some("exit")

@@ -273,6 +273,9 @@ mod windows_adapter {
                     | "time-max-memory"
                     | "time-profiling"
                     | "time-targets"
+                    | "time-targets-other"
+                    | "time-target-times-one"
+                    | "time-target-times-other"
                     | "time-parsing"
                     | "time-scanning"
                     | "time-matching"
@@ -380,9 +383,9 @@ mod windows_adapter {
             );
             assert_eq!(
                 validated_semgrep_diagnostic(
-                    b"context-relay-semgrep-invalid-output=time-targets\n"
+                    b"context-relay-semgrep-invalid-output=time-target-times-one\n"
                 ),
-                Some("context-relay-semgrep-invalid-output=time-targets")
+                Some("context-relay-semgrep-invalid-output=time-target-times-one")
             );
             assert_eq!(
                 validated_semgrep_diagnostic(

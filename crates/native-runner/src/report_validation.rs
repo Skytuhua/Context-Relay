@@ -374,8 +374,8 @@ fn semgrep_time_boundary(time: &Map<String, Value>, inputs: &[ContentFrame]) -> 
         return "time-shape";
     }
     match time.get("rules").and_then(Value::as_array) {
-        Some(rules) if rules.is_empty() => return "time-rules-empty",
         Some(rules) if rules.len() > 1 => return "time-rules-multiple",
+        Some(rules) if rules.is_empty() => {}
         Some(rules) if rules[0].as_str().is_none() => return "time-rules-non-string",
         Some(rules) if !valid_semgrep_rule_id(rules[0].as_str()) => {
             return "time-rules-other-one";
@@ -402,7 +402,7 @@ fn semgrep_time_boundary(time: &Map<String, Value>, inputs: &[ContentFrame]) -> 
         return "time-profiling";
     }
     if validate_semgrep_targets(time, inputs).is_err() {
-        return "time-targets";
+        return semgrep_target_timing_boundary(time);
     }
     for (key, average_key, slow_key, label) in [
         (
@@ -438,6 +438,29 @@ fn semgrep_time_boundary(time: &Map<String, Value>, inputs: &[ContentFrame]) -> 
         }
     }
     "time-prefiltering"
+}
+
+fn semgrep_target_timing_boundary(time: &Map<String, Value>) -> &'static str {
+    let Some(targets) = time.get("targets").and_then(Value::as_array) else {
+        return "time-targets-other";
+    };
+    let timings = targets
+        .iter()
+        .filter_map(Value::as_object)
+        .flat_map(|target| [target.get("match_times"), target.get("parse_times")])
+        .flatten()
+        .filter_map(Value::as_array)
+        .collect::<Vec<_>>();
+    if timings.len() != targets.len() * 2 {
+        return "time-targets-other";
+    }
+    if timings.iter().all(|values| {
+        values.len() == 1 && values.iter().all(|value| nonnegative_number(Some(value)))
+    }) {
+        "time-target-times-one"
+    } else {
+        "time-target-times-other"
+    }
 }
 
 pub fn classify_semgrep_exit_details(stdout: &[u8], stderr: &[u8]) -> (&'static str, String) {
