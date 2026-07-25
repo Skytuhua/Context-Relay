@@ -273,6 +273,12 @@ mod windows_adapter {
                     | "envelope"
                     | "report"
                     | "paths"
+                    | "paths-shape"
+                    | "paths-skipped"
+                    | "paths-array"
+                    | "paths-value"
+                    | "paths-count"
+                    | "paths-set"
                     | "results"
                     | "disposition"
                     | "valid"
@@ -414,6 +420,10 @@ mod windows_adapter {
             assert_eq!(
                 validated_semgrep_diagnostic(b"context-relay-semgrep-invalid-output=valid\n"),
                 Some("context-relay-semgrep-invalid-output=valid")
+            );
+            assert_eq!(
+                validated_semgrep_diagnostic(b"context-relay-semgrep-invalid-output=paths-set\n"),
+                Some("context-relay-semgrep-invalid-output=paths-set")
             );
             assert_eq!(
                 validated_semgrep_diagnostic(

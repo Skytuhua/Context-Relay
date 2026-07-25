@@ -305,28 +305,8 @@ fn semgrep_report_boundary(exit: i32, stdout: &[u8], inputs: &[ContentFrame]) ->
         .iter()
         .map(|input| input.path().as_str().to_owned())
         .collect::<BTreeSet<_>>();
-    let Some(paths) = object.get("paths").and_then(Value::as_object) else {
-        return "paths";
-    };
-    if !(exact_keys(paths, &["scanned"])
-        || (exact_keys(paths, &["scanned", "skipped"]) && empty_array(paths.get("skipped"))))
-    {
-        return "paths";
-    }
-    let Some(scanned_values) = paths.get("scanned").and_then(Value::as_array) else {
-        return "paths";
-    };
-    let scanned = scanned_values
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .ok_or(())
-                .and_then(|path| scanner_path(path).map_err(|_| ()))
-        })
-        .collect::<Result<BTreeSet<_>, _>>();
-    if scanned.as_ref().ok() != Some(&expected) || scanned_values.len() != expected.len() {
-        return "paths";
+    if let Some(boundary) = semgrep_paths_boundary(object, &expected) {
+        return boundary;
     }
     let Some(results) = object.get("results").and_then(Value::as_array) else {
         return "results";
@@ -343,6 +323,43 @@ fn semgrep_report_boundary(exit: i32, stdout: &[u8], inputs: &[ContentFrame]) ->
         (0, 0) | (1, 1..) => "valid",
         _ => "disposition",
     }
+}
+
+fn semgrep_paths_boundary(
+    report: &Map<String, Value>,
+    expected: &BTreeSet<String>,
+) -> Option<&'static str> {
+    let Some(paths) = report.get("paths").and_then(Value::as_object) else {
+        return Some("paths-shape");
+    };
+    if !(exact_keys(paths, &["scanned"])
+        || (exact_keys(paths, &["scanned", "skipped"]) && empty_array(paths.get("skipped"))))
+    {
+        return Some(if paths.contains_key("skipped") {
+            "paths-skipped"
+        } else {
+            "paths-shape"
+        });
+    }
+    let Some(scanned_values) = paths.get("scanned").and_then(Value::as_array) else {
+        return Some("paths-array");
+    };
+    let scanned = scanned_values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or(())
+                .and_then(|path| scanner_path(path).map_err(|_| ()))
+        })
+        .collect::<Result<BTreeSet<_>, _>>();
+    let Ok(scanned) = scanned else {
+        return Some("paths-value");
+    };
+    if scanned_values.len() != expected.len() {
+        return Some("paths-count");
+    }
+    (scanned != *expected).then_some("paths-set")
 }
 
 fn semgrep_time_boundary(time: &Map<String, Value>, inputs: &[ContentFrame]) -> &'static str {

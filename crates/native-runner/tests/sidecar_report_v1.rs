@@ -326,6 +326,17 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
         ),
         Some("time-targets-path")
     );
+    let mut invalid_paths: Value = serde_json::from_slice(&clean).unwrap();
+    invalid_paths["paths"]["scanned"] = json!(["input/semgrep-target/OTHER"]);
+    assert_eq!(
+        classify_semgrep_invalid_output(
+            0,
+            &serde_json::to_vec(&invalid_paths).unwrap(),
+            semgrep_warning(),
+            &inputs
+        ),
+        Some("paths-set")
+    );
     assert_eq!(
         classify_semgrep_invalid_output(2, &clean, semgrep_warning(), &inputs),
         Some("exit")
