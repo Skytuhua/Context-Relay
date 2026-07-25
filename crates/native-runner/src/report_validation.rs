@@ -299,7 +299,7 @@ pub fn classify_semgrep_exit_details(stdout: &[u8], stderr: &[u8]) -> (&'static 
     let stderr = std::str::from_utf8(stderr)
         .unwrap_or("")
         .to_ascii_lowercase();
-    let exception_constructor = ["error: exception ", "exception: "]
+    let exception_constructor = ["error: exception ", "exception: ", "executor pool job: "]
         .iter()
         .find_map(|marker| {
             let (_, tail) = stderr.split_once(marker)?;

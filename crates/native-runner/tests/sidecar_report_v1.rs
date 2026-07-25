@@ -168,6 +168,16 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
             "stderr-exception-invalid_argument".to_owned()
         )
     );
+    assert_eq!(
+        classify_semgrep_exit_details(
+            b"",
+            b"Uncaught exception in worker during executor pool job: Sys_error(\"attacker-controlled\")"
+        ),
+        (
+            "report-no-json",
+            "stderr-exception-sys_error".to_owned()
+        )
+    );
 }
 
 #[test]
