@@ -38,8 +38,7 @@ const SEMGREP_KEYS: [&str; 8] = [
     "profiling_results",
 ];
 const SEMGREP_WARNING: &str = "!!! You're using one or more options starting with '--x-'. These options are not part of the semgrep API. They will change or will be removed without notice !!! ";
-const SEMGREP_RULE_ID: &str = "config.semgrep.context-relay-no-python-runtime";
-const SEMGREP_BARE_RULE_ID: &str = "context-relay-no-python-runtime";
+const SEMGREP_RULE_ID: &str = "context-relay-no-python-runtime";
 
 pub fn validate_gitleaks_report(
     exit: i32,
@@ -1089,7 +1088,7 @@ fn scanner_path(value: &str) -> Result<String, RunnerError> {
 }
 
 fn valid_semgrep_rule_id(value: Option<&str>) -> bool {
-    matches!(value, Some(SEMGREP_RULE_ID | SEMGREP_BARE_RULE_ID))
+    value == Some(SEMGREP_RULE_ID)
 }
 
 fn has_nonempty_bash_permissions(bytes: &[u8]) -> Result<bool, RunnerError> {

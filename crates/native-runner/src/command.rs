@@ -229,6 +229,7 @@ impl SidecarCommand {
                 "--quiet",
                 "--no-git-ignore",
                 "--x-ignore-semgrepignore-files",
+                "--no-rewrite-rule-ids",
                 "--time",
                 "--jobs=1",
                 "--x-parmap",

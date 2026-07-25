@@ -7112,9 +7112,10 @@
       "--error",
       "--json",
       "--quiet",
-      "--no-git-ignore",
-      "--x-ignore-semgrepignore-files",
-      "--time",
+        "--no-git-ignore",
+        "--x-ignore-semgrepignore-files",
+        "--no-rewrite-rule-ids",
+        "--time",
       "--jobs=1",
       "--x-parmap",
       "--timeout=0",
@@ -7124,6 +7125,6 @@
       "<staged-rule>",
       "<staged-target>"
     ],
-    "sha256": "302a2d6fe029e35327e273887ee8e5d6199e5d8d18885bd951423d16abe78341"
+      "sha256": "4347fae53f02f45428615aa7f8f814f918a36f0d950822f3b73802a97216599b"
   }
 }
