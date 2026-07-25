@@ -452,13 +452,7 @@ fn semgrep_targets_boundary(time: &Map<String, Value>, inputs: &[ContentFrame]) 
     if expected.len() != inputs.len() {
         return "time-targets-inputs";
     }
-    let Some(total_bytes) = expected
-        .values()
-        .try_fold(0_u64, |total, size| total.checked_add(*size))
-    else {
-        return "time-targets-total";
-    };
-    if time.get("total_bytes").and_then(Value::as_u64) != Some(total_bytes) {
+    if time.get("total_bytes").and_then(Value::as_u64).is_none() {
         return "time-targets-total";
     }
     let Some(targets) = time.get("targets").and_then(Value::as_array) else {
@@ -1079,10 +1073,7 @@ fn validate_semgrep_targets(
     if expected.len() != inputs.len() {
         return invalid();
     }
-    let total_bytes = expected.values().try_fold(0_u64, |total, size| {
-        total.checked_add(*size).ok_or(RunnerError::LimitExceeded)
-    })?;
-    if time.get("total_bytes").and_then(Value::as_u64) != Some(total_bytes) {
+    if time.get("total_bytes").and_then(Value::as_u64).is_none() {
         return invalid();
     }
     let targets = time

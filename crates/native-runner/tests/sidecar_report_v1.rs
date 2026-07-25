@@ -175,6 +175,25 @@ fn semgrep_accepts_singleton_target_timings_without_profiled_rules() {
 }
 
 #[test]
+fn semgrep_accepts_aggregate_bytes_from_incomplete_profiling() {
+    let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
+    let mut report = semgrep_report(vec![], vec!["input/semgrep-target/METADATA"]);
+    report["time"]["total_bytes"] = json!(0);
+
+    assert_eq!(
+        validate_semgrep_report(
+            0,
+            &serde_json::to_vec(&report).unwrap(),
+            semgrep_warning(),
+            &inputs,
+        )
+        .unwrap()
+        .0,
+        RunDisposition::Clean
+    );
+}
+
+#[test]
 fn semgrep_accepts_the_exact_declared_rule_id() {
     let inputs = vec![frame("input/semgrep-target/METADATA", b"hello world")];
     let mut report = semgrep_report(vec![], vec!["input/semgrep-target/METADATA"]);
@@ -537,7 +556,6 @@ fn semgrep_timing_binds_the_exact_rule_paths_and_input_sizes() {
     for poisoned in [
         ("rules", json!(["other.context-relay-no-python-runtime"])),
         ("profiling_times", json!([])),
-        ("total_bytes", json!(10)),
         (
             "targets",
             json!([{
