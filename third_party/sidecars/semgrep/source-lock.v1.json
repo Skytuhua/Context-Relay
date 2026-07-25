@@ -7120,10 +7120,12 @@
       "--timeout=0",
       "--timeout-threshold=1",
       "--max-target-bytes=8388608",
+      "--project-root",
+      ".",
       "--config",
       "<staged-rule>",
       "<staged-target>"
     ],
-    "sha256": "302a2d6fe029e35327e273887ee8e5d6199e5d8d18885bd951423d16abe78341"
+    "sha256": "cb2aabd89fa3c56d376bae835334bbab533c637f1e95e55a17c7fed6a74c2886"
   }
 }

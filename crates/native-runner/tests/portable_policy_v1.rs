@@ -175,6 +175,8 @@ fn closed_commands_emit_only_the_frozen_argument_arrays() {
             "--timeout=0",
             "--timeout-threshold=1",
             "--max-target-bytes=8388608",
+            "--project-root",
+            ".",
             "--config",
             "config/semgrep/package.yml",
             "input/semgrep-target",
