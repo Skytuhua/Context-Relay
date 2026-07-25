@@ -200,15 +200,19 @@ mod windows_adapter {
         let diagnostic = std::str::from_utf8(stderr).ok()?.strip_suffix('\n')?;
         let diagnostic = diagnostic.strip_suffix('\r').unwrap_or(diagnostic);
         let kind = diagnostic.strip_prefix("context-relay-semgrep-invalid-output=")?;
-        matches!(
-            kind,
-            "exit"
-                | "report"
-                | "stderr-crlf"
-                | "stderr-crlf-and-report"
-                | "stderr"
-                | "stderr-and-report"
-        )
+        let valid_exit = kind.strip_prefix("exit:").is_some_and(|code| {
+            let digits = code.strip_prefix('-').unwrap_or(code);
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        });
+        (valid_exit
+            || matches!(
+                kind,
+                "report"
+                    | "stderr-crlf"
+                    | "stderr-crlf-and-report"
+                    | "stderr"
+                    | "stderr-and-report"
+            ))
         .then_some(diagnostic)
     }
 
@@ -293,8 +297,12 @@ mod windows_adapter {
                 Some("context-relay-semgrep-invalid-output=stderr-crlf")
             );
             assert_eq!(
+                validated_semgrep_diagnostic(b"context-relay-semgrep-invalid-output=exit:2\n"),
+                Some("context-relay-semgrep-invalid-output=exit:2")
+            );
+            assert_eq!(
                 validated_semgrep_diagnostic(
-                    b"context-relay-semgrep-invalid-output=stderr-crlf extra\n"
+                    b"context-relay-semgrep-invalid-output=exit:2 extra\n"
                 ),
                 None
             );

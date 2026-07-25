@@ -211,7 +211,11 @@ fn execute(helper_request: &HelperRunRequest) -> Result<RunResponse, RunnerError
                 && let Some(kind) =
                     classify_semgrep_invalid_output(exit, &stdout, &stderr, request.inputs())
             {
-                eprintln!("context-relay-semgrep-invalid-output={kind}");
+                if kind == "exit" {
+                    eprintln!("context-relay-semgrep-invalid-output=exit:{exit}");
+                } else {
+                    eprintln!("context-relay-semgrep-invalid-output={kind}");
+                }
             }
             let (disposition, report) = validated?;
             RunResponse::completed(
