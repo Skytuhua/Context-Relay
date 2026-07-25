@@ -303,10 +303,11 @@ pub fn classify_semgrep_exit_details(stdout: &[u8], stderr: &[u8]) -> (&'static 
         .iter()
         .find_map(|marker| {
             let (_, tail) = stderr.split_once(marker)?;
-            let constructor = tail
-                .split(['(', ' ', '\r', '\n'])
-                .next()
-                .unwrap_or_default();
+            let constructor = &tail[..tail
+                .find(|character: char| {
+                    !character.is_ascii_alphanumeric() && !matches!(character, '_' | '.')
+                })
+                .unwrap_or(tail.len())];
             (!constructor.is_empty()
                 && constructor.len() <= 64
                 && constructor

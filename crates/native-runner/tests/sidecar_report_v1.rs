@@ -171,11 +171,11 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
     assert_eq!(
         classify_semgrep_exit_details(
             b"",
-            b"Uncaught exception in worker during executor pool job: Sys_error(\"attacker-controlled\")"
+            b"Uncaught exception in worker during executor pool job: Eio.Exn.Multiple[\"attacker-controlled\"]"
         ),
         (
             "report-no-json",
-            "stderr-exception-sys_error".to_owned()
+            "stderr-exception-eio.exn.multiple".to_owned()
         )
     );
 }
