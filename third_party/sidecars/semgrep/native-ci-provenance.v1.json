@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "sourceLock": {
     "path": "third_party/sidecars/semgrep/source-lock.v1.json",
-    "sha256": "4d4b3a6b8af6b6c0e3686c096ad9313d9359346eb8d4945fff57f6ddcc883bab",
+    "sha256": "a86f0e2e4b32cccfca8abb490ee24b848c02b5fee924eb127cbb7b8dba614bba",
     "embeddedActionToolchainStatus": "sealed-historical-metadata-non-authoritative-for-native-ci"
   },
   "actions": [

@@ -200,7 +200,7 @@ fn enabled_semgrep_rejects_an_internally_incomplete_source_lock() {
         "--x-ignore-semgrepignore-files",
         "--time",
         "--jobs=1",
-        "--timeout=30",
+        "--timeout=0",
         "--timeout-threshold=1",
         "--max-target-bytes=8388608",
         "--config",
