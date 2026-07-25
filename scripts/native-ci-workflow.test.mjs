@@ -79,6 +79,7 @@ test('native CI prepares, candidate-smokes, then uploads exact target artifacts'
     windows,
     /windows-launcher-harness\/Cargo\.toml -- --nocapture --test-threads=1/,
   );
+  assert.match(windows, /runs-on: windows-2025\n/);
 
   assert.match(macosBuilder, /runs-on: macos-15\n/);
   assert.match(macos, /runs-on: macos-15\n/);

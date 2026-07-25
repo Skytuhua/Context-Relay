@@ -319,7 +319,7 @@ jobs:
     if: ${{ always() && !cancelled() && (needs.native-semgrep-windows-x64-builders.result == 'success' || inputs.semgrep_artifact_run_id != '') }}
     outputs:
       hydration_mode: ${{ steps.prepare.outputs.mode }}
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
