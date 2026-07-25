@@ -380,8 +380,12 @@ pub fn classify_semgrep_invalid_output(
     if !matches!(exit, 0 | 1) {
         return Some("exit");
     }
-    if validate_semgrep_core_report(exit, stdout, inputs).is_ok() {
-        return Some("stderr-core-report");
+    if let Some(boundary) = semgrep_core_report_boundary(exit, stdout, inputs) {
+        return Some(if boundary == "valid" {
+            "stderr-core-report"
+        } else {
+            boundary
+        });
     }
 
     let canonical_warning = format!("[0.0][WARNING]: {SEMGREP_WARNING}\n");
@@ -468,6 +472,69 @@ fn semgrep_report_boundary(exit: i32, stdout: &[u8], inputs: &[ContentFrame]) ->
         (0, 0, true) | (1, 0, false) | (1, 1.., _) => "valid",
         _ => "disposition",
     }
+}
+
+fn semgrep_core_report_boundary(
+    exit: i32,
+    stdout: &[u8],
+    inputs: &[ContentFrame],
+) -> Option<&'static str> {
+    let report = serde_json::from_slice::<Value>(stdout).ok()?;
+    let object = report.as_object()?;
+    if !object.contains_key("rules_by_engine") && !object.contains_key("interfile_languages_used") {
+        return None;
+    }
+    if exit != 0 {
+        return Some("disposition");
+    }
+    if !exact_keys(object, &SEMGREP_CORE_KEYS)
+        || object.get("version").and_then(Value::as_str) != Some("1.170.0")
+        || object.get("engine_requested").and_then(Value::as_str) != Some("OSS")
+        || !empty_array(object.get("errors"))
+        || !empty_array(object.get("interfile_languages_used"))
+        || !empty_array(object.get("skipped_rules"))
+        || !empty_array(object.get("profiling_results"))
+        || !valid_semgrep_rules_by_engine(object.get("rules_by_engine"))
+    {
+        return Some("envelope");
+    }
+    let Some(time) = object.get("time").and_then(Value::as_object) else {
+        return Some("time-shape");
+    };
+    if validate_semgrep_time(time, inputs).is_err() {
+        return Some(semgrep_time_boundary(time, inputs));
+    }
+    let expected = inputs
+        .iter()
+        .map(|input| input.path().as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    if let Some(boundary) = semgrep_paths_boundary(object, &expected) {
+        return Some(boundary);
+    }
+    let Some(results) = object.get("results").and_then(Value::as_array) else {
+        return Some("results");
+    };
+    let mut identities = BTreeSet::new();
+    let mut canaries = BTreeSet::new();
+    for result in results {
+        let Some(result) = result.as_object() else {
+            return Some("results");
+        };
+        match validate_semgrep_result(result, &expected, &mut identities, true) {
+            Ok(SemgrepResultKind::Canary(path)) => {
+                if !canaries.insert(path) {
+                    return Some("results");
+                }
+            }
+            Ok(SemgrepResultKind::Finding) => {}
+            _ => return Some("results"),
+        }
+    }
+    Some(if canaries == expected {
+        "valid"
+    } else {
+        "results"
+    })
 }
 
 fn semgrep_paths_boundary(

@@ -193,6 +193,18 @@ fn semgrep_diagnostic_distinguishes_a_valid_core_report_with_stderr() {
         ),
         Some("stderr-core-report")
     );
+
+    let mut invalid_paths = semgrep_core_report(vec![]);
+    invalid_paths["paths"]["scanned"] = json!(["input/semgrep-target/OTHER"]);
+    assert_eq!(
+        classify_semgrep_invalid_output(
+            0,
+            &serde_json::to_vec(&invalid_paths).unwrap(),
+            b"untrusted stderr",
+            &inputs,
+        ),
+        Some("paths-set")
+    );
 }
 
 #[test]
