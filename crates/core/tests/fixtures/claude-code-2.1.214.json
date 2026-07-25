@@ -1,0 +1,40 @@
+{
+  "version": "2.1.214",
+  "config": {
+    "CLAUDE.md": "# Global instructions\nKeep changes small.\n",
+    "settings.json": "{\"theme\":\"dark\",\"oauthAccount\":\"untouched\",\"permissions\":{\"allow\":[\"Read\"]},\"hooks\":{\"PostToolUse\":[]},\"enabledPlugins\":{\"formatter@team\":true}}\n",
+    "rules/global.md": "# Global rule\nRun tests.\n",
+    "skills/review/SKILL.md": "---\ndescription: Review changes\n---\nReview the diff.\n"
+  },
+  "project": {
+    "CLAUDE.md": "# Project instructions\nUse Rust 2024.\n",
+    ".claude/CLAUDE.md": "# Nested project instructions\nPreserve public APIs.\n",
+    ".claude/settings.json": "{\"unmanaged\":{\"keep\":true},\"permissions\":{\"deny\":[\"Read(.env)\"]},\"hooks\":{\"PreToolUse\":[]},\"enabledPlugins\":{\"lint@team\":true}}\n",
+    ".claude/rules/project.md": "# Project rule\nNo shell strings.\n",
+    ".claude/skills/release/SKILL.md": "---\ndescription: Prepare a release\n---\nVerify artifacts.\n",
+    ".mcp.json": "{\"mcpServers\":{\"docs\":{\"type\":\"http\",\"url\":\"https://example.com/mcp\",\"headers\":{\"Authorization\":\"secret\"}}}}\n"
+  },
+  "state": {
+    "oauthAccount": "must-survive",
+    "history": ["must-survive"],
+    "projects": {
+      "$PROJECT": {
+        "hasTrustDialogAccepted": true,
+        "mcpServers": {
+          "local-only": {
+            "type": "stdio",
+            "command": "local-server",
+            "env": {
+              "TOKEN": "secret"
+            }
+          }
+        }
+      }
+    }
+  },
+  "managedSettings": {
+    "permissions": {
+      "deny": ["Bash(curl *)"]
+    }
+  }
+}
