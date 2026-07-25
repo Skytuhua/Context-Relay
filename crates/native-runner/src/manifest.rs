@@ -144,7 +144,7 @@ const OSEMGREP_TEMPLATE: (&str, &[&str]) = (
         "--time",
         "--jobs=1",
         "--x-parmap",
-        "--timeout=30",
+        "--timeout=0",
         "--timeout-threshold=1",
         "--max-target-bytes=8388608",
         "--config",

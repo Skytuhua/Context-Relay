@@ -7117,13 +7117,13 @@
       "--time",
       "--jobs=1",
       "--x-parmap",
-      "--timeout=30",
+      "--timeout=0",
       "--timeout-threshold=1",
       "--max-target-bytes=8388608",
       "--config",
       "<staged-rule>",
       "<staged-target>"
     ],
-    "sha256": "c008682e8fa32fd0c1f929744084995b55f4b77fc8506cb3efa14cd16c70afde"
+    "sha256": "302a2d6fe029e35327e273887ee8e5d6199e5d8d18885bd951423d16abe78341"
   }
 }
