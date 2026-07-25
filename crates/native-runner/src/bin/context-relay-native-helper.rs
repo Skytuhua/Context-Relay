@@ -1935,10 +1935,7 @@ mod tests {
         assert_eq!(gitleaks, [input]);
         let policy = std::str::from_utf8(SEMGREP_POLICY).unwrap();
         assert!(policy.contains("languages: [generic]"));
-        assert!(
-            policy
-                .contains("pattern-regex: \"(?s)\\\\A(?=.*\\\\ncontext-relay-scan-canary\\\\z).\"")
-        );
+        assert!(policy.contains("pattern-regex: \"(?s)\\\\A.\""));
     }
 }
 

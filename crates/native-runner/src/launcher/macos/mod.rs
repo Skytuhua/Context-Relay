@@ -248,7 +248,7 @@ mod tests {
             SidecarCommand::OsemgrepScanPackage,
             vec![
                 ContentFrame::new(
-                    StagePath::try_from("input/semgrep-target/runtime-inventory.txt").unwrap(),
+                    StagePath::try_from("input/semgrep-target/main.rs").unwrap(),
                     b"fn main() {}".to_vec(),
                 )
                 .unwrap(),

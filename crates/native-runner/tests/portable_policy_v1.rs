@@ -177,7 +177,7 @@ fn closed_commands_emit_only_the_frozen_argument_arrays() {
             "--max-target-bytes=8388608",
             "--config",
             "config/semgrep/package.yml",
-            "input/semgrep-target/runtime-inventory.txt",
+            "input/semgrep-target",
         ]
     );
     assert_eq!(

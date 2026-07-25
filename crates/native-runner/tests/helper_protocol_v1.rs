@@ -20,7 +20,7 @@ fn request() -> RunRequest {
         SidecarCommand::OsemgrepScanPackage,
         vec![
             ContentFrame::new(
-                path("input/semgrep-target/runtime-inventory.txt"),
+                path("input/semgrep-target/main.rs"),
                 b"fn main() {}".to_vec(),
             )
             .unwrap(),
@@ -100,20 +100,20 @@ fn protocol_rejects_noncanonical_keys_and_content_digest_changes() {
 
 #[test]
 fn requests_canonicalize_paths_and_reject_duplicates() {
-    let command = SidecarCommand::GitleaksScanPackage;
+    let command = SidecarCommand::OsemgrepScanPackage;
     let request = RunRequest::new(
         [1; 16],
         [2; 32],
         command.clone(),
         vec![
-            ContentFrame::new(path("input/gitleaks-scan/payload/z"), vec![]).unwrap(),
-            ContentFrame::new(path("input/gitleaks-scan/payload/a"), vec![]).unwrap(),
+            ContentFrame::new(path("input/semgrep-target/z"), vec![]).unwrap(),
+            ContentFrame::new(path("input/semgrep-target/a"), vec![]).unwrap(),
         ],
     )
     .unwrap();
     assert_eq!(
         request.inputs()[0].path().as_str(),
-        "input/gitleaks-scan/payload/a"
+        "input/semgrep-target/a"
     );
 
     assert!(
@@ -122,8 +122,8 @@ fn requests_canonicalize_paths_and_reject_duplicates() {
             [2; 32],
             command,
             vec![
-                ContentFrame::new(path("input/gitleaks-scan/payload/a"), vec![]).unwrap(),
-                ContentFrame::new(path("input/gitleaks-scan/payload/a"), vec![]).unwrap(),
+                ContentFrame::new(path("input/semgrep-target/a"), vec![]).unwrap(),
+                ContentFrame::new(path("input/semgrep-target/a"), vec![]).unwrap(),
             ],
         )
         .is_err()
@@ -217,13 +217,7 @@ fn helper_request_binds_a_bounded_multifile_runtime_closure() {
         [0x41; 16],
         closure_material_digest(&materials).unwrap(),
         SidecarCommand::OsemgrepScanPackage,
-        vec![
-            ContentFrame::new(
-                path("input/semgrep-target/runtime-inventory.txt"),
-                b"safe".to_vec(),
-            )
-            .unwrap(),
-        ],
+        vec![ContentFrame::new(path("input/semgrep-target/METADATA"), b"safe".to_vec()).unwrap()],
     )
     .unwrap();
     let expected = HelperRunRequest::new(request, materials).unwrap();
@@ -279,13 +273,7 @@ fn helper_request_rejects_unbound_or_python_semgrep_closure_members() {
         [0x41; 16],
         closure_material_digest(std::slice::from_ref(&native)).unwrap(),
         SidecarCommand::OsemgrepScanPackage,
-        vec![
-            ContentFrame::new(
-                path("input/semgrep-target/runtime-inventory.txt"),
-                b"safe".to_vec(),
-            )
-            .unwrap(),
-        ],
+        vec![ContentFrame::new(path("input/semgrep-target/METADATA"), b"safe".to_vec()).unwrap()],
     )
     .unwrap();
     assert!(HelperRunRequest::new(request.clone(), vec![native.clone(), python]).is_err());

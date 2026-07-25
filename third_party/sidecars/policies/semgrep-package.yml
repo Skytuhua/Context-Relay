@@ -4,7 +4,7 @@ rules:
     severity: INFO
     languages: [generic]
     patterns:
-      - pattern-regex: "(?s)\\A(?=.*\\ncontext-relay-scan-canary\\z)."
+      - pattern-regex: "(?s)\\A."
   - id: context-relay-no-python-runtime
     message: Native Semgrep packages must not contain Pysemgrep or a Python runtime.
     severity: ERROR
