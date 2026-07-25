@@ -200,9 +200,41 @@ mod windows_adapter {
         let diagnostic = std::str::from_utf8(stderr).ok()?.strip_suffix('\n')?;
         let diagnostic = diagnostic.strip_suffix('\r').unwrap_or(diagnostic);
         let kind = diagnostic.strip_prefix("context-relay-semgrep-invalid-output=")?;
-        let valid_exit = kind.strip_prefix("exit:").is_some_and(|code| {
+        let valid_exit = kind.split_once(':').is_some_and(|(label, rest)| {
+            let mut parts = rest.split(':');
+            let code = parts.next().unwrap_or("");
             let digits = code.strip_prefix('-').unwrap_or(code);
-            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            label == "exit"
+                && !digits.is_empty()
+                && digits.bytes().all(|byte| byte.is_ascii_digit())
+                && matches!(
+                    parts.next(),
+                    Some(
+                        "report-timeout"
+                            | "report-out-of-memory"
+                            | "report-stack-overflow"
+                            | "report-fatal"
+                            | "report-no-errors"
+                            | "report-other-error"
+                            | "report-no-json"
+                    )
+                )
+                && matches!(
+                    parts.next(),
+                    Some(
+                        "stderr-permission-denied-nul"
+                            | "stderr-permission-denied"
+                            | "stderr-not-found"
+                            | "stderr-invalid-argument"
+                            | "stderr-timeout"
+                            | "stderr-out-of-memory"
+                            | "stderr-stack-overflow"
+                            | "stderr-exception"
+                            | "stderr-empty"
+                            | "stderr-other"
+                    )
+                )
+                && parts.next().is_none()
         });
         (valid_exit
             || matches!(
@@ -297,12 +329,16 @@ mod windows_adapter {
                 Some("context-relay-semgrep-invalid-output=stderr-crlf")
             );
             assert_eq!(
-                validated_semgrep_diagnostic(b"context-relay-semgrep-invalid-output=exit:2\n"),
-                Some("context-relay-semgrep-invalid-output=exit:2")
+                validated_semgrep_diagnostic(
+                    b"context-relay-semgrep-invalid-output=exit:2:report-timeout:stderr-permission-denied-nul\n"
+                ),
+                Some(
+                    "context-relay-semgrep-invalid-output=exit:2:report-timeout:stderr-permission-denied-nul"
+                )
             );
             assert_eq!(
                 validated_semgrep_diagnostic(
-                    b"context-relay-semgrep-invalid-output=exit:2 extra\n"
+                    b"context-relay-semgrep-invalid-output=exit:2:report-timeout:stderr-secret\n"
                 ),
                 None
             );

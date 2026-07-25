@@ -1,7 +1,7 @@
 use context_relay_native_runner::{
     ContentFrame, RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RunDisposition,
-    SidecarCommand, StagePath, classify_semgrep_invalid_output, validate_gitleaks_report,
-    validate_rulesync_outputs, validate_semgrep_report,
+    SidecarCommand, StagePath, classify_semgrep_exit_details, classify_semgrep_invalid_output,
+    validate_gitleaks_report, validate_rulesync_outputs, validate_semgrep_report,
 };
 use serde_json::{Value, json};
 
@@ -129,6 +129,13 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
     assert_eq!(
         classify_semgrep_invalid_output(0, b"not-json", semgrep_warning(), &inputs),
         Some("report")
+    );
+    assert_eq!(
+        classify_semgrep_exit_details(
+            br#"{"errors":[{"type":"Timeout","message":"attacker-controlled"}]}"#,
+            b"Sys_error(\"NUL: Permission denied\")"
+        ),
+        ("report-timeout", "stderr-permission-denied-nul")
     );
 }
 

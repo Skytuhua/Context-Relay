@@ -270,6 +270,68 @@ pub fn classify_semgrep_invalid_output(
     }
 }
 
+pub fn classify_semgrep_exit_details(stdout: &[u8], stderr: &[u8]) -> (&'static str, &'static str) {
+    let report_kind = serde_json::from_slice::<Value>(stdout)
+        .ok()
+        .and_then(|report| report.get("errors")?.as_array().cloned())
+        .map(|errors| {
+            let has = |expected| {
+                errors
+                    .iter()
+                    .any(|error| error.get("type").and_then(Value::as_str) == Some(expected))
+            };
+            if has("Timeout") || has("Timeout during interfile analysis") {
+                "report-timeout"
+            } else if has("Out of memory") || has("OOM during interfile analysis") {
+                "report-out-of-memory"
+            } else if has("Stack overflow") {
+                "report-stack-overflow"
+            } else if has("Fatal error") {
+                "report-fatal"
+            } else if errors.is_empty() {
+                "report-no-errors"
+            } else {
+                "report-other-error"
+            }
+        })
+        .unwrap_or("report-no-json");
+
+    let stderr = std::str::from_utf8(stderr)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let permission_denied = ["permission denied", "access is denied", "eacces"]
+        .iter()
+        .any(|needle| stderr.contains(needle));
+    let stderr_kind = if permission_denied && stderr.contains("nul") {
+        "stderr-permission-denied-nul"
+    } else if permission_denied {
+        "stderr-permission-denied"
+    } else if ["no such file", "not found", "enoent"]
+        .iter()
+        .any(|needle| stderr.contains(needle))
+    {
+        "stderr-not-found"
+    } else if ["invalid argument", "einval"]
+        .iter()
+        .any(|needle| stderr.contains(needle))
+    {
+        "stderr-invalid-argument"
+    } else if stderr.contains("timeout") {
+        "stderr-timeout"
+    } else if stderr.contains("out of memory") {
+        "stderr-out-of-memory"
+    } else if stderr.contains("stack overflow") {
+        "stderr-stack-overflow"
+    } else if stderr.contains("exception") {
+        "stderr-exception"
+    } else if stderr.is_empty() {
+        "stderr-empty"
+    } else {
+        "stderr-other"
+    };
+    (report_kind, stderr_kind)
+}
+
 pub fn validate_rulesync_outputs(
     command: &SidecarCommand,
     inputs: &[ContentFrame],
