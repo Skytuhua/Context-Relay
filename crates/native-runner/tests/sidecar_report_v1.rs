@@ -278,6 +278,16 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
         ),
         None
     );
+    empty_rules_with_times["time"]["targets"][0]["path"] = json!("input/semgrep-target/OTHER");
+    assert_eq!(
+        classify_semgrep_invalid_output(
+            0,
+            &serde_json::to_vec(&empty_rules_with_times).unwrap(),
+            semgrep_warning(),
+            &inputs
+        ),
+        Some("time-targets-path")
+    );
     assert_eq!(
         classify_semgrep_invalid_output(2, &clean, semgrep_warning(), &inputs),
         Some("exit")

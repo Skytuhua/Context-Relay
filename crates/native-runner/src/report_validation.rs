@@ -402,7 +402,7 @@ fn semgrep_time_boundary(time: &Map<String, Value>, inputs: &[ContentFrame]) -> 
         return "time-profiling";
     }
     if validate_semgrep_targets(time, inputs).is_err() {
-        return semgrep_target_timing_boundary(time);
+        return semgrep_targets_boundary(time, inputs);
     }
     for (key, average_key, slow_key, label) in [
         (
@@ -440,27 +440,80 @@ fn semgrep_time_boundary(time: &Map<String, Value>, inputs: &[ContentFrame]) -> 
     "time-prefiltering"
 }
 
-fn semgrep_target_timing_boundary(time: &Map<String, Value>) -> &'static str {
-    let Some(targets) = time.get("targets").and_then(Value::as_array) else {
-        return "time-targets-other";
-    };
-    let timings = targets
+fn semgrep_targets_boundary(time: &Map<String, Value>, inputs: &[ContentFrame]) -> &'static str {
+    let expected = inputs
         .iter()
-        .filter_map(Value::as_object)
-        .flat_map(|target| [target.get("match_times"), target.get("parse_times")])
-        .flatten()
-        .filter_map(Value::as_array)
-        .collect::<Vec<_>>();
-    if timings.len() != targets.len() * 2 {
-        return "time-targets-other";
+        .filter_map(|input| {
+            u64::try_from(input.bytes().len())
+                .ok()
+                .map(|size| (input.path().as_str().to_owned(), size))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if expected.len() != inputs.len() {
+        return "time-targets-inputs";
     }
-    if timings.iter().all(|values| {
-        values.len() == 1 && values.iter().all(|value| nonnegative_number(Some(value)))
-    }) {
-        "time-target-times-one"
-    } else {
-        "time-target-times-other"
+    let Some(total_bytes) = expected
+        .values()
+        .try_fold(0_u64, |total, size| total.checked_add(*size))
+    else {
+        return "time-targets-total";
+    };
+    if time.get("total_bytes").and_then(Value::as_u64) != Some(total_bytes) {
+        return "time-targets-total";
     }
+    let Some(targets) = time.get("targets").and_then(Value::as_array) else {
+        return "time-targets-array";
+    };
+    if targets.len() != expected.len() {
+        return "time-targets-count";
+    }
+    let rule_count = time
+        .get("rules")
+        .and_then(Value::as_array)
+        .map_or(usize::MAX, Vec::len);
+    let mut seen = BTreeSet::new();
+    for target in targets {
+        let Some(target) = target.as_object() else {
+            return "time-targets-shape";
+        };
+        if !exact_keys(
+            target,
+            &[
+                "path",
+                "num_bytes",
+                "match_times",
+                "parse_times",
+                "run_time",
+            ],
+        ) {
+            return "time-targets-shape";
+        }
+        if !nonnegative_number(target.get("run_time")) {
+            return "time-targets-run";
+        }
+        if !nonnegative_numbers(target.get("match_times"), rule_count)
+            || !nonnegative_numbers(target.get("parse_times"), rule_count)
+        {
+            return "time-targets-timing";
+        }
+        let Some(path) = target
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| scanner_path(path).ok())
+        else {
+            return "time-targets-path";
+        };
+        let Some(expected_size) = expected.get(&path) else {
+            return "time-targets-path";
+        };
+        if target.get("num_bytes").and_then(Value::as_u64) != Some(*expected_size) {
+            return "time-targets-size";
+        }
+        if !seen.insert(path) {
+            return "time-targets-duplicate";
+        }
+    }
+    "time-targets-other"
 }
 
 pub fn classify_semgrep_exit_details(stdout: &[u8], stderr: &[u8]) -> (&'static str, String) {

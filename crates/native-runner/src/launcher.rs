@@ -273,6 +273,16 @@ mod windows_adapter {
                     | "time-max-memory"
                     | "time-profiling"
                     | "time-targets"
+                    | "time-targets-inputs"
+                    | "time-targets-total"
+                    | "time-targets-array"
+                    | "time-targets-count"
+                    | "time-targets-shape"
+                    | "time-targets-run"
+                    | "time-targets-timing"
+                    | "time-targets-path"
+                    | "time-targets-size"
+                    | "time-targets-duplicate"
                     | "time-targets-other"
                     | "time-target-times-one"
                     | "time-target-times-other"
@@ -383,9 +393,9 @@ mod windows_adapter {
             );
             assert_eq!(
                 validated_semgrep_diagnostic(
-                    b"context-relay-semgrep-invalid-output=time-target-times-one\n"
+                    b"context-relay-semgrep-invalid-output=time-targets-path\n"
                 ),
-                Some("context-relay-semgrep-invalid-output=time-target-times-one")
+                Some("context-relay-semgrep-invalid-output=time-targets-path")
             );
             assert_eq!(
                 validated_semgrep_diagnostic(
