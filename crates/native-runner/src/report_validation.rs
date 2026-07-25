@@ -322,8 +322,38 @@ pub fn classify_semgrep_exit_details(stdout: &[u8], stderr: &[u8]) -> (&'static 
         "stderr-out-of-memory"
     } else if stderr.contains("stack overflow") {
         "stderr-stack-overflow"
+    } else if stderr.contains("exception unix.unix_error(unix.ebadf") {
+        "stderr-unix-ebadf"
+    } else if stderr.contains("exception unix.unix_error(unix.epipe") {
+        "stderr-unix-epipe"
+    } else if stderr.contains("exception unix.unix_error(unix.eio") {
+        "stderr-unix-eio"
+    } else if stderr.contains("exception unix.unix_error(unix.eintr") {
+        "stderr-unix-eintr"
+    } else if stderr.contains("exception unix.unix_error(unix.eagain")
+        || stderr.contains("exception unix.unix_error(unix.ewouldblock")
+    {
+        "stderr-unix-retry"
+    } else if stderr.contains("exception unix.unix_error(unix.enosys") {
+        "stderr-unix-enosys"
+    } else if stderr.contains("exception unix.unix_error(unix.eunknownerr 5") {
+        "stderr-unix-unknown-5"
+    } else if stderr.contains("exception unix.unix_error(") {
+        "stderr-unix-other"
+    } else if stderr.contains("exception sys_error(") {
+        "stderr-sys-error"
+    } else if stderr.contains("exception end_of_file") {
+        "stderr-end-of-file"
+    } else if stderr.contains("exception not_found") {
+        "stderr-not-found-exception"
+    } else if stderr.contains("exception eio.cancel.cancelled") {
+        "stderr-cancelled"
+    } else if stderr.contains("exception exception.timeout")
+        || stderr.contains("exception time_limit.timeout")
+    {
+        "stderr-timeout-exception"
     } else if stderr.contains("exception") {
-        "stderr-exception"
+        "stderr-other-exception"
     } else if stderr.is_empty() {
         "stderr-empty"
     } else {

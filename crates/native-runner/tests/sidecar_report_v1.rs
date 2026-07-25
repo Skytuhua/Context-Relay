@@ -137,6 +137,17 @@ fn semgrep_invalid_output_classification_is_bounded_and_distinguishes_windows_ne
         ),
         ("report-timeout", "stderr-permission-denied-nul")
     );
+    assert_eq!(
+        classify_semgrep_exit_details(
+            b"",
+            b"Error: exception Unix.Unix_error(Unix.EBADF, \"secret\", \"secret\")"
+        ),
+        ("report-no-json", "stderr-unix-ebadf")
+    );
+    assert_eq!(
+        classify_semgrep_exit_details(b"", b"Error: exception End_of_file"),
+        ("report-no-json", "stderr-end-of-file")
+    );
 }
 
 #[test]
