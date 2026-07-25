@@ -43,4 +43,47 @@ jobs:
           "CONTEXT_RELAY_REAL_SIDECAR_ROOT=$($result.hydrationRoot)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Run only the exact failing gate
         shell: pwsh
-        run: cargo test -p context-relay-native-runner --test real_sidecars_windows_v1 --features ci-candidate-sidecar-smoke real_semgrep_clean_and_finding_use_the_closed_policy -- --ignored --exact --nocapture
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $probe = Join-Path $env:RUNNER_TEMP 'context-relay-semgrep-core-probe'
+          New-Item -ItemType Directory -Path (Join-Path $probe 'config') | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $probe 'input/semgrep-target') | Out-Null
+          $osemgrep = Join-Path $env:CONTEXT_RELAY_REAL_SIDECAR_ROOT 'semgrep/osemgrep.exe'
+          $core = Join-Path $probe 'semgrep-core.exe'
+          New-Item -ItemType HardLink -Path $core -Target $osemgrep | Out-Null
+          Copy-Item third_party/sidecars/policies/semgrep-package.yml (Join-Path $probe 'config/package.yml')
+          @'
+          ["Targets",[["CodeTarget",{"path":{"fpath":"input/semgrep-target/runtime-inventory.txt","ppath":"input/semgrep-target/runtime-inventory.txt"},"analyzer":"spacegrep","products":["sast"]}]]]
+          '@ | Set-Content (Join-Path $probe 'config/targets.json') -NoNewline
+          function Invoke-CoreProbe([string] $Content) {
+            Set-Content (Join-Path $probe 'input/semgrep-target/runtime-inventory.txt') -Value $Content -NoNewline
+            $stdout = Join-Path $probe 'stdout.json'
+            $stderr = Join-Path $probe 'stderr.txt'
+            $process = Start-Process -FilePath $core -ArgumentList @(
+              '-rules', 'config/package.yml',
+              '-targets', 'config/targets.json',
+              '-json_time',
+              '-strict',
+              '-j', '1',
+              '-use_parmap',
+              '-timeout', '0',
+              '-timeout_threshold', '1'
+            ) -WorkingDirectory $probe -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru -WindowStyle Hidden
+            $report = Get-Content $stdout -Raw | ConvertFrom-Json
+            $knownKeys = @('engine_requested','errors','interfile_languages_used','paths','profiling_results','results','rules_by_engine','skipped_rules','time','version')
+            $keys = @($report.PSObject.Properties.Name | Sort-Object)
+            $results = @($report.results)
+            [ordered]@{
+              exit = $process.ExitCode
+              envelope = (Compare-Object $knownKeys $keys).Count -eq 0
+              results = $results.Count
+              canary = @($results | Where-Object { $_.check_id -in @('config.semgrep.context-relay-scan-canary','context-relay-scan-canary') }).Count
+              policy = @($results | Where-Object { $_.check_id -in @('config.semgrep.context-relay-no-python-runtime','context-relay-no-python-runtime') }).Count
+              scanned = @($report.paths.scanned).Count
+              timed = @($report.time.targets).Count
+              stderr = if ((Get-Item $stderr).Length -eq 0) { 'empty' } else { 'present' }
+            }
+          }
+          $clean = Invoke-CoreProbe "osemgrep`ncontext-relay-scan-canary"
+          $finding = Invoke-CoreProbe "python.exe`ncontext-relay-scan-canary"
+          Write-Host "context-relay-semgrep-core-probe=$([ordered]@{ clean = $clean; finding = $finding } | ConvertTo-Json -Compress -Depth 4)"
