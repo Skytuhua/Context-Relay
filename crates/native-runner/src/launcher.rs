@@ -422,14 +422,18 @@ mod windows_adapter {
         let (parent, name) = path
             .as_str()
             .rsplit_once('/')
-            .ok_or(RunnerError::ClosureMismatch)?;
+            .unwrap_or(("", path.as_str()));
         let core_name = match name {
             "osemgrep.exe" => "semgrep-core.exe",
             "osemgrep" => "semgrep-core",
             _ => return Err(RunnerError::ClosureMismatch),
         };
-        StagePath::try_from(format!("{parent}/{core_name}"))
-            .map_err(|_| RunnerError::ClosureMismatch)
+        StagePath::try_from(if parent.is_empty() {
+            core_name.to_owned()
+        } else {
+            format!("{parent}/{core_name}")
+        })
+        .map_err(|_| RunnerError::ClosureMismatch)
     }
 
     fn map_launch_error(_error: LaunchError) -> RunnerError {
@@ -445,14 +449,14 @@ mod windows_adapter {
 
         #[test]
         fn only_the_windows_semgrep_executable_is_staged_under_the_core_name() {
-            let executable = StagePath::try_from("bin/osemgrep.exe").unwrap();
+            let executable = StagePath::try_from("osemgrep.exe").unwrap();
             let library = StagePath::try_from("bin/runtime.dll").unwrap();
 
             assert_eq!(
                 staged_runtime_path(&SidecarCommand::OsemgrepScanPackage, &executable, true)
                     .unwrap()
                     .as_str(),
-                "bin/semgrep-core.exe"
+                "semgrep-core.exe"
             );
             assert_eq!(
                 staged_runtime_path(&SidecarCommand::OsemgrepScanPackage, &library, false).unwrap(),
