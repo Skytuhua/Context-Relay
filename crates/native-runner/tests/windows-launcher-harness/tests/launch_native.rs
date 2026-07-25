@@ -125,6 +125,7 @@ fn closure_runtime_acl_denies_appcontainer_writes_and_allows_host_cleanup() {
     let pinned = nested.join("pinned.dll");
     fs::write(&pinned, b"pinned\n").unwrap();
     let executable = nested.join("pinned.exe");
+    let access_report = layout.root().join("stage/data/runtime-access.txt");
     fs::copy(
         env!("CARGO_BIN_EXE_windows_sandbox_probe"),
         &executable,
@@ -153,6 +154,9 @@ fn closure_runtime_acl_denies_appcontainer_writes_and_allows_host_cleanup() {
         .resume_once()
         .unwrap();
     let output = running.exchange(b"RUNTIME-SEAL\n").unwrap();
+    if let Ok(report) = fs::read_to_string(access_report) {
+        eprintln!("{report}");
+    }
 
     assert_eq!(
         output.exit_code(),
