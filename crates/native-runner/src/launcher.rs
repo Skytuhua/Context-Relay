@@ -166,6 +166,7 @@ mod windows_adapter {
                 return Ok(RunResponse::failed(FailureCode::LimitExceeded));
             }
             Err(LaunchError::PipeIo) => {
+                eprintln!("context-relay-helper-boundary=pipe-io");
                 return Ok(RunResponse::failed(FailureCode::ToolFailed));
             }
             Err(error) => return Err(map_launch_error(error)),
@@ -177,14 +178,21 @@ mod windows_adapter {
         if let Some(diagnostic) = semgrep_diagnostic {
             eprintln!("{diagnostic}");
         }
-        if output.exit_code() != 0 || (!output.stderr().is_empty() && semgrep_diagnostic.is_none())
-        {
+        if output.exit_code() != 0 {
+            eprintln!("context-relay-helper-boundary=exit");
+            return Ok(RunResponse::failed(FailureCode::ToolFailed));
+        }
+        if !output.stderr().is_empty() && semgrep_diagnostic.is_none() {
+            eprintln!("context-relay-helper-boundary=stderr");
             return Ok(RunResponse::failed(FailureCode::ToolFailed));
         }
         let mut cursor = Cursor::new(output.stdout());
         let response = match read_run_response_for(&mut cursor, request) {
             Ok(response) if cursor.position() as usize == output.stdout().len() => response,
-            _ => return Ok(RunResponse::failed(FailureCode::ToolFailed)),
+            _ => {
+                eprintln!("context-relay-helper-boundary=response");
+                return Ok(RunResponse::failed(FailureCode::ToolFailed));
+            }
         };
         Ok(response)
     }
