@@ -1,0 +1,6 @@
+7e5089dd4e433ddd552e91a9abb184225618079d:crates/native-runner/tests/real_sidecars_windows_v1.rs:aws-access-token:123
+7e5089dd4e433ddd552e91a9abb184225618079d:crates/native-runner/tests/macos-launcher-harness/tests/adapter_native.rs:aws-access-token:452
+d7855f58669beb6f6814d6450253761448edd5b5:apps/desktop/src/schema-parity.test.ts:private-key:77
+d7855f58669beb6f6814d6450253761448edd5b5:apps/desktop/src/schema-parity.test.ts:private-key:79
+d7855f58669beb6f6814d6450253761448edd5b5:crates/protocol/tests/packages_v1.rs:private-key:85
+d7855f58669beb6f6814d6450253761448edd5b5:crates/protocol/tests/packages_v1.rs:private-key:87
