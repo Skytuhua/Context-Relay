@@ -134,6 +134,53 @@ Markdown and JSON content that preceded apply.
 Golden fixtures cover Claude Code 2.1.213 and 2.1.214. Unknown versions remain
 import-only.
 
+## Task 9 Superseding V1 Rules
+
+The user-provided revised Task 9 rules supersede every earlier conflicting
+completion, reproducibility, publication, and evidence-binding requirement.
+Existing useful implementation and security tests remain in place; Task 9 is
+not restarted.
+
+Task 9 V1 is complete when normal JavaScript, Rust, schema,
+manifest-material, formatting, and Clippy checks pass and the following native
+evidence exists for the current Task 9 source revision:
+
+- the patch inventory accepts exact base hashes and verifies exact patched
+  hashes;
+- one macOS arm64 native build succeeds;
+- one Windows x64 native build succeeds;
+- each resulting runtime passes version/startup, clean-scan, one-finding,
+  invalid-rule/config, strict-report, no-Python, runtime-closure, and manifest
+  gates;
+- runtime execution is network-denied inside the existing macOS or Windows
+  isolation boundary;
+- runtime execution retains `--jobs=1`, the frozen command template, private
+  temporary/configuration roots, and bounded output;
+- source revision, source archive, patch inventory, build scripts, runtime
+  files, and policy files remain hash-pinned; and
+- `main` and `codex/bootstrap-v1` point to the same completion commit.
+
+Normal pushes and pull requests run no more than one Semgrep native builder per
+platform. Evidence-only changes do not trigger Semgrep compilation. Source
+acquisition and compilation may use normal GitHub-hosted-runner networking;
+network denial applies to the completed runtime smoke, and any temporary
+firewall change is restored even when smoke fails. The V1 evidence must not
+claim that compilation was offline.
+
+Independent A/B builds, byte-identical executables, same-attempt comparison,
+publication approval, releases and release assets, final published-evidence
+binding, repository-dispatch publication, and release-grade supply-chain
+attestation belong exclusively to **Task 9R — Semgrep release qualification**.
+Task 9R remains separate, disabled by default, and must not run unless the user
+explicitly requests it. This completion effort does not manually publish a
+release.
+
+Task 9 security boundaries remain unchanged: no distributed Python runtime,
+ambient executable or DLL lookup, unverified build/runtime material, runtime
+network access, unbounded child-process surface, relaxed report/schema
+validation, weakened hash verification, non-private runtime roots, or silent
+malformed-output acceptance.
+
 ## Data Flow
 
 Desktop actions use generated protocol bindings to call authenticated local
@@ -164,6 +211,8 @@ Required evidence includes:
   workflow tests, bindings, schemas, and production builds;
 - hosted Windows and macOS native jobs;
 - Task 9 exact-artifact-reuse isolation jobs;
+- one successful native Semgrep build and isolated smoke on macOS arm64 and
+  Windows x64 for the Task 9 source revision, without any Task 9R claim;
 - `cargo deny`, license metadata, and `git diff --check`;
 - an exact Tasks 1 through 10 requirement ledger that points every requirement
   to current authoritative evidence.
