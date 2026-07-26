@@ -5,7 +5,7 @@ import test from 'node:test';
 const workflowUrl = new URL('../.github/workflows/secret-scan.yml', import.meta.url);
 const securityPolicyUrl = new URL('../SECURITY.md', import.meta.url);
 const ignoreUrl = new URL(
-  '../third_party/sidecars/policies/repository.gitleaksignore',
+  '../.github/repository.gitleaksignore',
   import.meta.url,
 );
 
@@ -32,7 +32,8 @@ test('repository secret scan verifies pinned Gitleaks and scans every Git ref', 
   assert.match(source, /gitleaks_8\.30\.1_windows_x64\.zip/);
   assert.match(source, /d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e/);
   assert.match(source, /17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c/);
-  assert.match(source, /repository\.gitleaksignore/);
+  assert.match(source, /\.github\/repository\.gitleaksignore/);
+  assert.doesNotMatch(source, /third_party\/sidecars\/policies\/repository\.gitleaksignore/);
   assert.match(source, /d5d44a8d107c0e407ba99ce0e7400b66e6b538de6e3b0c9b4ddbb9f6ab9bccd8/);
   assert.match(source, /--gitleaks-ignore-path/);
   assert.match(source, /--ignore-gitleaks-allow/);
