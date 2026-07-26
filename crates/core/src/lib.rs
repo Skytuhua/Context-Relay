@@ -2,6 +2,7 @@ pub mod claude_code;
 pub mod crypto;
 pub mod native_transaction;
 pub mod search;
+pub mod service;
 pub mod vault;
 
 use context_relay_protocol::{PROTOCOL_VERSION, ProtocolVersion};
