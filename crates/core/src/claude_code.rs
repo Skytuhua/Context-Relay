@@ -3,8 +3,10 @@ use std::{
     env, fs,
     io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     str::FromStr,
+    thread,
+    time::{Duration, Instant},
 };
 
 use context_relay_native_runner::{NativeState, OsNativeFileSystem};
@@ -26,6 +28,9 @@ use crate::native_transaction::{
 
 const SUPPORTED_VERSIONS: [&str; 2] = ["2.1.214", "2.1.213"];
 const CLI_TIMEOUT_MS: u32 = 30_000;
+const CLI_OUTPUT_LIMIT: u64 = 64 * 1024;
+const MANAGED_START: &str = "<!-- context-relay:start -->";
+const MANAGED_END: &str = "<!-- context-relay:end -->";
 
 #[derive(Clone, Debug)]
 pub struct ClaudeCodeLayout {
@@ -47,6 +52,27 @@ pub struct ClaudeCodeAdapter {
     executable_hash: Sha256Digest,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ClaudeCommand {
+    Doctor,
+    PluginList,
+    McpList,
+    McpGet(String),
+}
+
+impl ClaudeCommand {
+    fn argv(&self) -> Vec<String> {
+        match self {
+            Self::Doctor => vec!["doctor".to_owned()],
+            Self::PluginList => {
+                vec!["plugin".to_owned(), "list".to_owned(), "--json".to_owned()]
+            }
+            Self::McpList => vec!["mcp".to_owned(), "list".to_owned()],
+            Self::McpGet(name) => vec!["mcp".to_owned(), "get".to_owned(), name.clone()],
+        }
+    }
+}
+
 impl ClaudeCodeAdapter {
     pub fn discover(
         project_root: impl Into<PathBuf>,
@@ -62,30 +88,21 @@ impl ClaudeCodeAdapter {
                 false,
             )
         })?;
-        let output = Command::new(&executable)
-            .arg("--version")
-            .output()
-            .map_err(|_| {
+        let executable_hash = digest_file(&executable)?;
+        let output = run_bounded_command(&executable, &["--version"], executable_hash)?;
+        let version =
+            parse_version(std::str::from_utf8(&output).unwrap_or_default()).ok_or_else(|| {
                 client_error(
                     ErrorCode::HarnessUnsupported,
-                    "Claude Code probe failed",
-                    true,
+                    "Claude Code returned an invalid version",
+                    false,
                 )
             })?;
-        if !output.status.success() {
-            return Err(client_error(
-                ErrorCode::HarnessUnsupported,
-                "Claude Code probe failed",
-                true,
-            ));
-        }
-        let version = parse_version(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
-            client_error(
-                ErrorCode::HarnessUnsupported,
-                "Claude Code returned an invalid version",
-                false,
-            )
-        })?;
+        parse_doctor_output(&run_bounded_command(
+            &executable,
+            &["doctor"],
+            executable_hash,
+        )?)?;
         let home = home_dir().ok_or_else(|| {
             client_error(
                 ErrorCode::NotFound,
@@ -187,6 +204,44 @@ impl ClaudeCodeAdapter {
         })
     }
 
+    pub fn plan_native_file(
+        &self,
+        component: &ComponentRecord,
+    ) -> Result<ApprovedMutation, ClientError> {
+        self.require_apply_supported()?;
+        component
+            .validate()
+            .map_err(|_| invalid_request("Claude Code file component is invalid"))?;
+        if !matches!(
+            component.kind,
+            ComponentKind::Instruction | ComponentKind::Rule | ComponentKind::Skill
+        ) {
+            return Err(invalid_request("Claude Code file component is invalid"));
+        }
+        let path = component_path(self, component)?;
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid_request("Claude Code Markdown cannot be safely inspected"))?;
+        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
+            return Err(invalid_request(
+                "Claude Code Markdown must already exist before it is managed",
+            ));
+        };
+        let intended = NativeState::regular_file(
+            render_managed_markdown(bytes, &component.body_markdown, component.archived)?,
+            metadata.clone(),
+        );
+        Ok(ApprovedMutation {
+            target: wire_path(&path),
+            kind: MutationKind::Payload,
+            content: intended
+                .encode_v1()
+                .map_err(|_| invalid_request("Claude Code Markdown is not representable"))?,
+            expected: RestorableStateFingerprint(Sha256Digest(*snapshot.fingerprint())),
+            intended: RestorableStateFingerprint(Sha256Digest(intended.fingerprint())),
+        })
+    }
+
     fn capability(&self) -> CapabilityLevel {
         if SUPPORTED_VERSIONS.contains(&self.layout.version.as_str()) {
             CapabilityLevel::Full
@@ -220,7 +275,41 @@ impl ClaudeCodeAdapter {
         if !project_is_approved(&self.layout.state_path, &self.layout.project_root) {
             conflicts.push("project_unapproved".to_owned());
         }
+        match project_mcp_approval_status(&self.layout.state_path, &self.layout.project_root) {
+            Ok((true, false)) => conflicts.push("project_mcp_approvals_configured".to_owned()),
+            Ok((true, true)) => {
+                conflicts.push("project_mcp_approvals_configured".to_owned());
+                conflicts.push("project_mcp_approval_conflict".to_owned());
+            }
+            Ok((false, _)) => {}
+            Err(()) => conflicts.push("project_mcp_approvals_invalid".to_owned()),
+        }
         conflicts
+    }
+
+    fn validation_commands(&self) -> Result<Vec<ClaudeCommand>, ClientError> {
+        let path = self.layout.project_root.join(".mcp.json");
+        let names = match read_optional_file(&path)? {
+            Some(bytes) => {
+                let value = parse_object(&bytes, "Claude Code MCP configuration is invalid")?;
+                let mut names = match value.get("mcpServers") {
+                    Some(servers) => servers
+                        .as_object()
+                        .ok_or_else(|| invalid_request("Claude Code MCP configuration is invalid"))?
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    None => Vec::new(),
+                };
+                for name in &names {
+                    safe_name(name)?;
+                }
+                names.sort();
+                names
+            }
+            None => Vec::new(),
+        };
+        Ok(validation_commands(names))
     }
 
     fn import_scope(
@@ -806,6 +895,29 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         receipt
             .validate()
             .map_err(|_| invalid_request("Claude Code receipt is invalid"))?;
+        self.require_apply_supported()?;
+        let commands = self.validation_commands()?;
+        let mut listed_mcp = BTreeSet::new();
+        for command in commands {
+            let argv = command.argv();
+            let arguments = argv.iter().map(String::as_str).collect::<Vec<_>>();
+            let output =
+                run_bounded_command(&self.layout.executable, &arguments, self.executable_hash)?;
+            match command {
+                ClaudeCommand::Doctor => parse_doctor_output(&output)?,
+                ClaudeCommand::PluginList => parse_plugin_list_output(&output)?,
+                ClaudeCommand::McpList => listed_mcp = parse_mcp_list_output(&output)?,
+                ClaudeCommand::McpGet(name) => {
+                    if !listed_mcp.contains(&name) {
+                        return Ok(ValidationReport {
+                            valid: false,
+                            findings: vec!["configured_mcp_server_missing".to_owned()],
+                        });
+                    }
+                    parse_mcp_get_output(&output, &name)?;
+                }
+            }
+        }
         Ok(ValidationReport {
             valid: true,
             findings: vec![],
@@ -937,6 +1049,270 @@ fn settings_path(adapter: &ClaudeCodeAdapter, scope: &ScopeRef) -> Result<PathBu
     }
 }
 
+fn validation_commands(mcp_names: Vec<String>) -> Vec<ClaudeCommand> {
+    let mut commands = vec![
+        ClaudeCommand::Doctor,
+        ClaudeCommand::PluginList,
+        ClaudeCommand::McpList,
+    ];
+    commands.extend(mcp_names.into_iter().map(ClaudeCommand::McpGet));
+    commands
+}
+
+fn run_bounded_command(
+    executable: &Path,
+    arguments: &[&str],
+    expected_hash: Sha256Digest,
+) -> Result<Vec<u8>, ClientError> {
+    if digest_file(executable)? != expected_hash {
+        return Err(client_error(
+            ErrorCode::Conflict,
+            "Claude Code executable changed",
+            false,
+        ));
+    }
+    let mut child = Command::new(executable)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| {
+            client_error(
+                ErrorCode::HarnessUnsupported,
+                "Claude Code command failed",
+                true,
+            )
+        })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| invalid_request("Claude Code command output is unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| invalid_request("Claude Code command output is unavailable"))?;
+    let stdout_thread = thread::spawn(move || read_capped(stdout));
+    let stderr_thread = thread::spawn(move || read_capped(stderr));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|_| {
+            client_error(
+                ErrorCode::HarnessUnsupported,
+                "Claude Code command failed",
+                true,
+            )
+        })? {
+            break status;
+        }
+        if started.elapsed() >= Duration::from_millis(u64::from(CLI_TIMEOUT_MS)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(client_error(
+                ErrorCode::Timeout,
+                "Claude Code command timed out",
+                true,
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| invalid_request("Claude Code command output is invalid"))?
+        .map_err(|_| invalid_request("Claude Code command output is invalid"))?;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| invalid_request("Claude Code command output is invalid"))?
+        .map_err(|_| invalid_request("Claude Code command output is invalid"))?;
+    if !status.success() || !stderr.is_empty() {
+        return Err(client_error(
+            ErrorCode::HarnessUnsupported,
+            "Claude Code command failed",
+            false,
+        ));
+    }
+    Ok(stdout)
+}
+
+fn read_capped(reader: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(CLI_OUTPUT_LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
+        return Err(std::io::Error::other("output limit exceeded"));
+    }
+    Ok(bytes)
+}
+
+fn bounded_utf8(bytes: &[u8]) -> Result<&str, ClientError> {
+    if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
+        return Err(invalid_request("Claude Code command output is too large"));
+    }
+    std::str::from_utf8(bytes)
+        .map_err(|_| invalid_request("Claude Code command output is not UTF-8"))
+}
+
+fn parse_doctor_output(bytes: &[u8]) -> Result<(), ClientError> {
+    (bounded_utf8(bytes)?.trim() == "Claude Code diagnostics: OK")
+        .then_some(())
+        .ok_or_else(|| invalid_request("Claude Code doctor output is invalid"))
+}
+
+fn parse_plugin_list_output(bytes: &[u8]) -> Result<(), ClientError> {
+    bounded_utf8(bytes)?;
+    let plugins = serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .filter(|plugins| plugins.len() <= 256)
+        .ok_or_else(|| invalid_request("Claude Code plugin output is invalid"))?;
+    for plugin in plugins {
+        let plugin = plugin
+            .as_object()
+            .ok_or_else(|| invalid_request("Claude Code plugin output is invalid"))?;
+        let allowed = ["id", "version", "enabled", "errors"];
+        if plugin.keys().any(|key| !allowed.contains(&key.as_str()))
+            || plugin.len() != allowed.len()
+        {
+            return Err(invalid_request("Claude Code plugin output is invalid"));
+        }
+        safe_name(
+            plugin
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_request("Claude Code plugin output is invalid"))?,
+        )?;
+        let version = plugin
+            .get("version")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_request("Claude Code plugin output is invalid"))?;
+        if version.is_empty()
+            || version.len() > 128
+            || !version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"+._-".contains(&byte))
+            || plugin.get("enabled").and_then(Value::as_bool).is_none()
+            || plugin
+                .get("errors")
+                .and_then(Value::as_array)
+                .is_none_or(|errors| !errors.is_empty())
+        {
+            return Err(invalid_request("Claude Code plugin output is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_mcp_list_output(bytes: &[u8]) -> Result<BTreeSet<String>, ClientError> {
+    let output = bounded_utf8(bytes)?;
+    let mut names = BTreeSet::new();
+    for line in output.lines() {
+        let (name, detail) = line
+            .split_once(": ")
+            .ok_or_else(|| invalid_request("Claude Code MCP list output is invalid"))?;
+        safe_name(name)?;
+        let (endpoint, kind) = detail
+            .rsplit_once(" (")
+            .filter(|(_, kind)| kind.ends_with(')'))
+            .ok_or_else(|| invalid_request("Claude Code MCP list output is invalid"))?;
+        if endpoint.is_empty()
+            || endpoint.len() > 2_048
+            || endpoint.chars().any(char::is_control)
+            || kind.len() < 2
+            || kind.len() > 33
+            || !kind[..kind.len() - 1]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || !names.insert(name.to_owned())
+        {
+            return Err(invalid_request("Claude Code MCP list output is invalid"));
+        }
+    }
+    Ok(names)
+}
+
+fn parse_mcp_get_output(bytes: &[u8], expected_name: &str) -> Result<(), ClientError> {
+    bounded_utf8(bytes)?;
+    let server = serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .ok_or_else(|| invalid_request("Claude Code MCP get output is invalid"))?;
+    if server
+        .keys()
+        .any(|key| !["name", "type", "url"].contains(&key.as_str()))
+        || server.len() != 3
+        || server.get("name").and_then(Value::as_str) != Some(expected_name)
+    {
+        return Err(invalid_request("Claude Code MCP get output is invalid"));
+    }
+    safe_name(expected_name)?;
+    for key in ["type", "url"] {
+        let value = server
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_request("Claude Code MCP get output is invalid"))?;
+        if value.is_empty() || value.len() > 2_048 || value.chars().any(char::is_control) {
+            return Err(invalid_request("Claude Code MCP get output is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn render_managed_markdown(
+    existing: &[u8],
+    body: &str,
+    archived: bool,
+) -> Result<Vec<u8>, ClientError> {
+    let existing = std::str::from_utf8(existing)
+        .map_err(|_| invalid_request("Claude Code Markdown is not UTF-8"))?;
+    if body.contains(MANAGED_START) || body.contains(MANAGED_END) {
+        return Err(invalid_request(
+            "Claude Code managed Markdown contains reserved markers",
+        ));
+    }
+    let starts = existing.match_indices(MANAGED_START).collect::<Vec<_>>();
+    let ends = existing.match_indices(MANAGED_END).collect::<Vec<_>>();
+    let rendered = match (starts.as_slice(), ends.as_slice()) {
+        ([], []) if !archived => {
+            let mut rendered = existing.to_owned();
+            if !rendered.is_empty() && !rendered.ends_with('\n') {
+                rendered.push('\n');
+            }
+            rendered.push_str(MANAGED_START);
+            rendered.push('\n');
+            rendered.push_str(body);
+            if !body.ends_with('\n') {
+                rendered.push('\n');
+            }
+            rendered.push_str(MANAGED_END);
+            rendered.push('\n');
+            rendered
+        }
+        ([(start, _)], [(end, _)]) if start < end => {
+            let suffix = end + MANAGED_END.len();
+            if archived {
+                format!("{}{}", &existing[..*start], &existing[suffix..])
+            } else {
+                let mut rendered = existing[..start + MANAGED_START.len()].to_owned();
+                rendered.push('\n');
+                rendered.push_str(body);
+                if !body.ends_with('\n') {
+                    rendered.push('\n');
+                }
+                rendered.push_str(&existing[*end..]);
+                rendered
+            }
+        }
+        _ => {
+            return Err(invalid_request(
+                "Claude Code managed Markdown markers are malformed",
+            ));
+        }
+    };
+    if rendered.len() > 1024 * 1024 {
+        return Err(invalid_request("Claude Code managed Markdown is too large"));
+    }
+    Ok(rendered.into_bytes())
+}
+
 fn reviewed_markdown_files(root: &Path, kind: ComponentKind) -> Result<Vec<PathBuf>, ClientError> {
     if !root.exists() {
         return Ok(Vec::new());
@@ -1066,6 +1442,59 @@ fn project_is_approved(state_path: &Path, project_root: &Path) -> bool {
                 .as_bool()
         })
         == Some(true)
+}
+
+fn project_mcp_approval_status(state_path: &Path, project_root: &Path) -> Result<(bool, bool), ()> {
+    let Some(bytes) = read_optional_file(state_path).map_err(|_| ())? else {
+        return Ok((false, false));
+    };
+    let state = serde_json::from_slice::<Value>(&bytes).map_err(|_| ())?;
+    let Some(project) = state
+        .get("projects")
+        .and_then(Value::as_object)
+        .and_then(|projects| projects.get(project_root.to_string_lossy().as_ref()))
+        .and_then(Value::as_object)
+    else {
+        return Ok((false, false));
+    };
+    let configured = [
+        "enableAllProjectMcpServers",
+        "enabledMcpjsonServers",
+        "disabledMcpjsonServers",
+    ]
+    .iter()
+    .any(|key| project.contains_key(*key));
+    if !configured {
+        return Ok((false, false));
+    }
+    if project
+        .get("enableAllProjectMcpServers")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(());
+    }
+    let enabled = approval_names(project.get("enabledMcpjsonServers"))?;
+    let disabled = approval_names(project.get("disabledMcpjsonServers"))?;
+    Ok((true, !enabled.is_disjoint(&disabled)))
+}
+
+fn approval_names(value: Option<&Value>) -> Result<BTreeSet<String>, ()> {
+    let Some(value) = value else {
+        return Ok(BTreeSet::new());
+    };
+    let values = value
+        .as_array()
+        .filter(|values| values.len() <= 256)
+        .ok_or(())?;
+    let mut names = BTreeSet::new();
+    for value in values {
+        let name = value.as_str().ok_or(())?;
+        safe_name(name).map_err(|_| ())?;
+        if !names.insert(name.to_owned()) {
+            return Err(());
+        }
+    }
+    Ok(names)
 }
 
 fn stable_record_id(key: &str) -> Result<RecordId, ClientError> {
@@ -1326,7 +1755,11 @@ fn client_error(code: ErrorCode, message: &'static str, retryable: bool) -> Clie
 
 #[cfg(test)]
 mod tests {
-    use super::digest_file;
+    use super::{
+        digest_file, parse_doctor_output, parse_mcp_get_output, parse_mcp_list_output,
+        parse_plugin_list_output, validation_commands,
+    };
+    use serde_json::Value;
     use std::fs;
 
     #[test]
@@ -1339,5 +1772,54 @@ mod tests {
         let result = digest_file(&path);
         let _ = fs::remove_file(path);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validation_uses_only_reviewed_read_only_commands_and_bounded_outputs() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/claude-code-2.1.214.json"))
+                .unwrap();
+        let commands = validation_commands(vec!["docs".to_owned()]);
+        assert_eq!(
+            commands
+                .into_iter()
+                .map(|command| command.argv())
+                .collect::<Vec<_>>(),
+            vec![
+                vec!["doctor".to_owned()],
+                vec!["plugin".to_owned(), "list".to_owned(), "--json".to_owned()],
+                vec!["mcp".to_owned(), "list".to_owned()],
+                vec!["mcp".to_owned(), "get".to_owned(), "docs".to_owned()],
+            ]
+        );
+        parse_doctor_output(fixture["doctorOutput"].as_str().unwrap().as_bytes()).unwrap();
+        parse_plugin_list_output(
+            serde_json::to_vec(&fixture["pluginListJson"])
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        parse_mcp_list_output(fixture["mcpListOutput"].as_str().unwrap().as_bytes()).unwrap();
+        parse_mcp_get_output(
+            serde_json::to_vec(&fixture["mcpGetOutput"])
+                .unwrap()
+                .as_slice(),
+            "docs",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_unbounded_malformed_or_secret_output() {
+        assert!(parse_doctor_output(&vec![b'x'; 65 * 1024]).is_err());
+        assert!(parse_plugin_list_output(br#"[{"id":"ok","token":"secret"}]"#).is_err());
+        assert!(parse_mcp_list_output(b"not a reviewed line").is_err());
+        assert!(
+            parse_mcp_get_output(
+                br#"{"name":"docs","type":"http","url":"https://example.com","headers":{"Authorization":"secret"}}"#,
+                "docs",
+            )
+            .is_err()
+        );
     }
 }

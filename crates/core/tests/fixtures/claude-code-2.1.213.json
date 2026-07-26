@@ -1,5 +1,25 @@
 {
   "version": "2.1.213",
+  "doctorOutput": "Claude Code diagnostics: OK\n",
+  "pluginListJson": [
+    {
+      "id": "formatter@team",
+      "version": "1.2.3",
+      "enabled": true,
+      "errors": []
+    }
+  ],
+  "mcpListOutput": "docs: https://example.com/mcp (HTTP)\n",
+  "mcpGetOutput": {
+    "name": "docs",
+    "type": "http",
+    "url": "https://example.com/mcp"
+  },
+  "projectMcpApprovals": {
+    "enableAllProjectMcpServers": false,
+    "enabledMcpjsonServers": ["docs"],
+    "disabledMcpjsonServers": ["blocked"]
+  },
   "config": {
     "CLAUDE.md": "# Global instructions\nKeep changes small.\n",
     "settings.json": "{\"theme\":\"dark\",\"oauthAccount\":\"untouched\",\"permissions\":{\"allow\":[\"Read\"]},\"hooks\":{\"PostToolUse\":[]},\"enabledPlugins\":{\"formatter@team\":true}}\n",

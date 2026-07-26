@@ -53,6 +53,13 @@ fn fixture(source: &str) -> Fixture {
         .unwrap()
         .remove("$PROJECT")
         .unwrap();
+    let mut project = project;
+    for (key, value) in fixture["projectMcpApprovals"].as_object().unwrap() {
+        project
+            .as_object_mut()
+            .unwrap()
+            .insert(key.clone(), value.clone());
+    }
     state["projects"]
         .as_object_mut()
         .unwrap()
@@ -138,7 +145,10 @@ fn supported_release_fixtures_import_the_reviewed_surfaces_without_secrets() {
         assert_eq!(report.capability, CapabilityLevel::Full);
         assert_eq!(
             report.policy_conflicts,
-            vec!["managed_settings_active".to_owned()]
+            vec![
+                "managed_settings_active".to_owned(),
+                "project_mcp_approvals_configured".to_owned(),
+            ]
         );
 
         let imported = import_everything(&fixture);
@@ -275,6 +285,114 @@ fn concurrent_native_edit_invalidates_the_planned_settings_mutation() {
     .unwrap();
     assert!(
         OsNativeTransactionFileSystem::new([8; 16])
+            .create_before_images(&[mutation])
+            .is_err()
+    );
+}
+
+#[test]
+fn managed_markdown_blocks_preserve_unmanaged_bytes_and_rollback() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let components = [
+        component(
+            fixture.project_id,
+            ComponentKind::Instruction,
+            "CLAUDE.md",
+            "Managed project instructions.",
+        ),
+        component(
+            fixture.project_id,
+            ComponentKind::Rule,
+            "project.md",
+            "Managed project rule.",
+        ),
+        component(
+            fixture.project_id,
+            ComponentKind::Skill,
+            "release",
+            "Managed release skill.",
+        ),
+    ];
+    let paths = [
+        fixture.root.join("project with spaces").join("CLAUDE.md"),
+        fixture
+            .root
+            .join("project with spaces/.claude/rules/project.md"),
+        fixture
+            .root
+            .join("project with spaces/.claude/skills/release/SKILL.md"),
+    ];
+    fs::write(
+        &paths[0],
+        "# User preface\n\n<!-- context-relay:start -->\nold managed text\n<!-- context-relay:end -->\n\nUser footer\n",
+    )
+    .unwrap();
+    let before = paths
+        .iter()
+        .map(fs::read)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mutations = components
+        .iter()
+        .map(|component| fixture.adapter.plan_native_file(component).unwrap())
+        .collect::<Vec<_>>();
+
+    let nonce = [9; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native.create_before_images(&mutations).unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native.compare_and_swap_targets(&mutations).unwrap();
+    for mutation in &mutations {
+        native.apply_mutation(&nonce, mutation).unwrap();
+    }
+    for (index, ((path, original), component)) in
+        paths.iter().zip(&before).zip(&components).enumerate()
+    {
+        let applied = fs::read(path).unwrap();
+        if index == 0 {
+            let applied_text = String::from_utf8(applied.clone()).unwrap();
+            assert!(applied_text.starts_with("# User preface\n"));
+            assert!(applied_text.ends_with("\nUser footer\n"));
+            assert!(!applied_text.contains("old managed text"));
+        } else {
+            assert!(applied.starts_with(original));
+        }
+        let applied = String::from_utf8(applied).unwrap();
+        assert!(applied.contains("<!-- context-relay:start -->"));
+        assert!(applied.contains(&component.body_markdown));
+        assert!(applied.contains("<!-- context-relay:end -->"));
+    }
+
+    native.restore_matching_applied_targets(&nonce).unwrap();
+    for (path, original) in paths.iter().zip(before) {
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+}
+
+#[test]
+fn managed_markdown_plan_rejects_malformed_markers_and_concurrent_edits() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let path = fixture.root.join("project with spaces").join("CLAUDE.md");
+    let managed = component(
+        fixture.project_id,
+        ComponentKind::Instruction,
+        "CLAUDE.md",
+        "Managed instructions.",
+    );
+    for malformed in [
+        "<!-- context-relay:start -->\nmissing end\n",
+        "<!-- context-relay:end -->\n<!-- context-relay:start -->\n",
+        "<!-- context-relay:start -->\na\n<!-- context-relay:end -->\n<!-- context-relay:start -->\nb\n<!-- context-relay:end -->\n",
+    ] {
+        fs::write(&path, malformed).unwrap();
+        assert!(fixture.adapter.plan_native_file(&managed).is_err());
+    }
+
+    fs::write(&path, "# User preface\n").unwrap();
+    let mutation = fixture.adapter.plan_native_file(&managed).unwrap();
+    fs::write(&path, "# Concurrent edit\n").unwrap();
+    assert!(
+        OsNativeTransactionFileSystem::new([10; 16])
             .create_before_images(&[mutation])
             .is_err()
     );
