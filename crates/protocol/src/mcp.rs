@@ -152,6 +152,7 @@ pub enum VaultState {
 pub enum SyncState {
     Idle,
     Syncing,
+    Offline,
     Error,
 }
 
@@ -383,7 +384,7 @@ pub fn mcp_schema(name: &str) -> Option<McpToolSchema> {
             vec![],
             json!({}),
             vec!["protocol", "vault", "resolvedProject", "sync", "access"],
-            json!({"protocol":protocol_range(),"vault":{"enum":["locked","unlocked"]},"resolvedProject":{"oneOf":[{"type":"null"},uuid()]},"sync":{"enum":["idle","syncing","error"]},"access":access_policy()}),
+            json!({"protocol":protocol_range(),"vault":{"enum":["locked","unlocked"]},"resolvedProject":{"oneOf":[{"type":"null"},uuid()]},"sync":{"enum":["idle","syncing","offline","error"]},"access":access_policy()}),
         ),
         _ => return None,
     };

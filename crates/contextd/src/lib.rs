@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread::JoinHandle,
@@ -13,6 +14,7 @@ use context_relay_core::{
             recover_native_transactions,
         },
     },
+    service::OfflineWorkspace,
     vault::{DatabaseKeyStore, PlatformKeyStore, Vault, VaultError},
 };
 use context_relay_local_ipc::{
@@ -23,9 +25,13 @@ use context_relay_local_ipc::{
     load_installation_token,
 };
 use context_relay_protocol::{
-    ClientError, ClientRole, DaemonInstanceNonce, ErrorCode, LocalRequest, LocalResult,
-    MemoryParams, PROTOCOL_VERSION, ProjectPathParams,
+    AccountDeletionState, BoundedBytes, ClientError, ClientRole, DaemonInstanceNonce, DeviceId,
+    DeviceState, DeviceSummary, ErrorCode, ExportId, ExportPayload, HandoffPayload, HarnessId,
+    LocalRequest, LocalResult, MAX_ARBITRARY_BYTES, MemoryKind, MemoryParams, NativePlatform,
+    PROTOCOL_VERSION, ProjectPathParams, ProtocolVersionRange, ScopeRef, Sha256Digest, SyncState,
+    VaultState,
 };
+use sha2::{Digest, Sha256};
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
@@ -125,6 +131,7 @@ struct VaultConfig {
     path: PathBuf,
     credential_id: String,
     key_store: Arc<dyn DatabaseKeyStore>,
+    device_id: DeviceId,
     worker_hook: Option<Arc<dyn WorkerHook>>,
     #[cfg(test)]
     startup_recovery: Option<StartupRecovery>,
@@ -140,10 +147,16 @@ impl VaultConfig {
             path,
             credential_id: credential_id.into(),
             key_store,
+            device_id: stable_device_id(b"context-relay-test-device"),
             worker_hook: None,
             #[cfg(test)]
             startup_recovery: None,
         }
+    }
+
+    fn with_device_id(mut self, device_id: DeviceId) -> Self {
+        self.device_id = device_id;
+        self
     }
 
     #[cfg(test)]
@@ -332,7 +345,12 @@ impl Daemon {
         let mut instance = InstanceGuard::acquire(&config.runtime).map_err(map_guard_error)?;
         let token = Arc::new(config.token_provider.load_or_create()?);
         let instance_nonce = generate_instance_nonce().map_err(|_| DaemonError::Startup)?;
-        let worker = VaultWorker::spawn(config.vault).await?;
+        let worker = VaultWorker::spawn(
+            config
+                .vault
+                .with_device_id(stable_device_id(token.as_bytes())),
+        )
+        .await?;
         let listener =
             Listener::bind(&config.runtime, &mut instance).map_err(map_transport_error)?;
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
@@ -560,6 +578,7 @@ enum RoutedRequest {
 enum VaultCommand {
     ProjectPathSet(ProjectPathParams),
     MemoryGet(MemoryParams),
+    Workspace(LocalRequest),
     #[cfg(test)]
     TestBlock {
         entered: std::sync::mpsc::SyncSender<()>,
@@ -567,69 +586,62 @@ enum VaultCommand {
     },
 }
 
-fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
+fn route_request(_role: ClientRole, request: LocalRequest) -> RoutedRequest {
     match request {
         LocalRequest::Hello(_) => RoutedRequest::Immediate(Err(invalid_request_error())),
         LocalRequest::Cancel(_) => RoutedRequest::Immediate(Err(invalid_request_error())),
         LocalRequest::Shutdown(_) => RoutedRequest::Shutdown,
         LocalRequest::Health(_) => RoutedRequest::Health,
-        LocalRequest::Unlock(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::ProjectsList(_) => RoutedRequest::Immediate(Err(unavailable_error())),
+        LocalRequest::Unlock(_) => RoutedRequest::Immediate(Ok(LocalResult::Empty)),
         LocalRequest::ProjectPathSet(params) => {
-            if role == ClientRole::Desktop {
-                RoutedRequest::Work(VaultCommand::ProjectPathSet(params))
-            } else {
-                RoutedRequest::Immediate(Err(unavailable_error()))
-            }
+            RoutedRequest::Work(VaultCommand::ProjectPathSet(params))
         }
-        LocalRequest::MemoryGet(params) => {
-            if role == ClientRole::Desktop {
-                RoutedRequest::Work(VaultCommand::MemoryGet(params))
-            } else {
-                RoutedRequest::Immediate(Err(unavailable_error()))
-            }
+        LocalRequest::MemoryGet(params) => RoutedRequest::Work(VaultCommand::MemoryGet(params)),
+        request @ (LocalRequest::ProjectsList(_)
+        | LocalRequest::ProjectUpsert(_)
+        | LocalRequest::MemorySearch(_)
+        | LocalRequest::MemoryCreate(_)
+        | LocalRequest::MemoryUpdate(_)
+        | LocalRequest::MemoryArchive(_)
+        | LocalRequest::CandidatesList(_)
+        | LocalRequest::CandidateReview(_)
+        | LocalRequest::TasksList(_)
+        | LocalRequest::TaskUpsert(_)
+        | LocalRequest::TaskComplete(_)
+        | LocalRequest::TaskTransition(_)
+        | LocalRequest::HandoffCreate(_)
+        | LocalRequest::AccessGet(_)
+        | LocalRequest::AccessSet(_)
+        | LocalRequest::SyncStatus(_)
+        | LocalRequest::DevicesList(_)
+        | LocalRequest::ExportRecords(_)
+        | LocalRequest::ExportChunk(_)
+        | LocalRequest::AccountDeletionBegin(_)
+        | LocalRequest::AccountDeletionStatus(_)
+        | LocalRequest::AccountDeletionCancel(_)) => {
+            RoutedRequest::Work(VaultCommand::Workspace(request))
         }
-        LocalRequest::MemorySearch(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::MemoryCreate(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::MemoryUpdate(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::MemoryArchive(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::CandidatesList(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::CandidateReview(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::TasksList(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::TaskUpsert(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::TaskComplete(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::TaskTransition(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::HandoffCreate(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::AccessGet(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::AccessSet(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::HarnessProbe(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::HarnessPreview(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::HarnessApply(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::HarnessRepair(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::HarnessRollback(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::PackageImport(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::PackageExport(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::SyncStatus(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::SyncRetry(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::DevicesList(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::DeviceRename(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::DeviceRevoke(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::PairingCreate(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::PairingJoin(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::PairingStatus(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::PairingDecision(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::PairingCancel(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::RecoveryBegin(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::RecoveryComplete(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::ExportRecords(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::ExportChunk(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::AccountDeletionBegin(_) => RoutedRequest::Immediate(Err(unavailable_error())),
-        LocalRequest::AccountDeletionStatus(_) => {
-            RoutedRequest::Immediate(Err(unavailable_error()))
-        }
-        LocalRequest::AccountDeletionCancel(_) => {
-            RoutedRequest::Immediate(Err(unavailable_error()))
-        }
+        LocalRequest::HarnessProbe(_)
+        | LocalRequest::HarnessPreview(_)
+        | LocalRequest::HarnessApply(_)
+        | LocalRequest::HarnessRepair(_)
+        | LocalRequest::HarnessRollback(_)
+        | LocalRequest::PackageImport(_)
+        | LocalRequest::PackageExport(_) => RoutedRequest::Immediate(Err(unsupported_error(
+            "The requested local adapter operation is not supported",
+        ))),
+        LocalRequest::SyncRetry(_)
+        | LocalRequest::DeviceRename(_)
+        | LocalRequest::DeviceRevoke(_)
+        | LocalRequest::PairingCreate(_)
+        | LocalRequest::PairingJoin(_)
+        | LocalRequest::PairingStatus(_)
+        | LocalRequest::PairingDecision(_)
+        | LocalRequest::PairingCancel(_)
+        | LocalRequest::RecoveryBegin(_)
+        | LocalRequest::RecoveryComplete(_) => RoutedRequest::Immediate(Err(unsupported_error(
+            "Hosted workspace configuration is not available",
+        ))),
     }
 }
 
@@ -642,10 +654,20 @@ fn invalid_request_error() -> ClientError {
     }
 }
 
+#[cfg(test)]
 fn unavailable_error() -> ClientError {
     ClientError {
         code: ErrorCode::Internal,
         message: "This service is not available in this build".into(),
+        field_path: None,
+        retryable: false,
+    }
+}
+
+fn unsupported_error(message: &str) -> ClientError {
+    ClientError {
+        code: ErrorCode::HarnessUnsupported,
+        message: message.into(),
         field_path: None,
         retryable: false,
     }
@@ -761,6 +783,20 @@ struct VaultWorker {
     worker_hook: Option<Arc<dyn WorkerHook>>,
 }
 
+struct StoredExport {
+    chunks: Vec<Vec<u8>>,
+    total_bytes: u64,
+    record_count: u32,
+}
+
+struct WorkspaceState {
+    vault: Vault,
+    vault_path: PathBuf,
+    device_id: DeviceId,
+    exports: BTreeMap<ExportId, StoredExport>,
+    deletion: AccountDeletionState,
+}
+
 impl VaultWorker {
     async fn spawn(config: VaultConfig) -> Result<Self, DaemonError> {
         let (sender, mut receiver) = mpsc::channel::<WorkItem>(REQUEST_QUEUE_CAPACITY);
@@ -800,7 +836,17 @@ impl VaultWorker {
                         if ready_sender.send(Ok(())).is_err() {
                             return;
                         }
-                        run_vault_worker(vault, &mut receiver, config.worker_hook.as_deref());
+                        run_vault_worker(
+                            WorkspaceState {
+                                vault,
+                                vault_path: config.path,
+                                device_id: config.device_id,
+                                exports: BTreeMap::new(),
+                                deletion: AccountDeletionState::Active,
+                            },
+                            &mut receiver,
+                            config.worker_hook.as_deref(),
+                        );
                     }
                     Err(error) => {
                         let _ = ready_sender.send(Err(error));
@@ -871,7 +917,7 @@ impl VaultWorker {
 }
 
 fn run_vault_worker(
-    mut vault: Vault,
+    mut state: WorkspaceState,
     receiver: &mut mpsc::Receiver<WorkItem>,
     worker_hook: Option<&dyn WorkerHook>,
 ) {
@@ -885,7 +931,7 @@ fn run_vault_worker(
             if let Some(worker_hook) = worker_hook {
                 worker_hook.before_execute();
             }
-            execute_vault_command(&mut vault, command)
+            execute_vault_command(&mut state, command)
         } else {
             Err(canceled_error())
         };
@@ -895,24 +941,375 @@ fn run_vault_worker(
 }
 
 fn execute_vault_command(
-    vault: &mut Vault,
+    state: &mut WorkspaceState,
     command: VaultCommand,
 ) -> Result<LocalResult, ClientError> {
     match command {
-        VaultCommand::ProjectPathSet(params) => vault
+        VaultCommand::ProjectPathSet(params) => state
+            .vault
             .put_path(&params.project_id.to_string(), &params.path)
             .map(|()| LocalResult::Empty)
             .map_err(client_error_from_vault),
-        VaultCommand::MemoryGet(params) => vault
+        VaultCommand::MemoryGet(params) => state
+            .vault
             .memory(&params.memory_id)
             .map(|memory| LocalResult::Memory { memory })
             .map_err(client_error_from_vault),
+        VaultCommand::Workspace(request) => execute_workspace_request(state, request),
         #[cfg(test)]
         VaultCommand::TestBlock { entered, release } => {
             entered.send(()).map_err(|_| service_internal_error())?;
             release.recv().map_err(|_| service_internal_error())?;
             Ok(LocalResult::Empty)
         }
+    }
+}
+
+fn execute_workspace_request(
+    state: &mut WorkspaceState,
+    request: LocalRequest,
+) -> Result<LocalResult, ClientError> {
+    match request {
+        LocalRequest::ProjectsList(_) => OfflineWorkspace::new(&mut state.vault, state.device_id)
+            .projects()
+            .map(|projects| LocalResult::Projects { projects }),
+        LocalRequest::ProjectUpsert(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .upsert_project(params.project)
+                .map(|()| LocalResult::Empty)
+        }
+        LocalRequest::MemorySearch(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .search_memories(params)
+                .map(|memories| LocalResult::Memories { memories })
+        }
+        LocalRequest::MemoryCreate(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .create_memory(params)
+                .map(|memory| LocalResult::Memory {
+                    memory: Some(memory),
+                })
+        }
+        LocalRequest::MemoryUpdate(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .update_memory(params)
+                .map(|memory| LocalResult::Memory {
+                    memory: Some(memory),
+                })
+        }
+        LocalRequest::MemoryArchive(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .archive_memory(params)
+                .map(|memory| LocalResult::Memory {
+                    memory: Some(memory),
+                })
+        }
+        LocalRequest::CandidatesList(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .candidates(params.project_id)
+                .map(|candidates| LocalResult::Candidates { candidates })
+        }
+        LocalRequest::CandidateReview(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .review_candidate(params)
+                .map(|candidate| LocalResult::Candidates {
+                    candidates: vec![candidate],
+                })
+        }
+        LocalRequest::TasksList(params) => OfflineWorkspace::new(&mut state.vault, state.device_id)
+            .tasks(params.project_id)
+            .map(|tasks| LocalResult::Tasks { tasks }),
+        LocalRequest::TaskUpsert(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .upsert_task(params)
+                .map(|task| LocalResult::Tasks { tasks: vec![task] })
+        }
+        LocalRequest::TaskComplete(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .complete_task(params)
+                .map(|task| LocalResult::Tasks { tasks: vec![task] })
+        }
+        LocalRequest::TaskTransition(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .transition_task(params)
+                .map(|task| LocalResult::Tasks { tasks: vec![task] })
+        }
+        LocalRequest::HandoffCreate(params) => create_handoff(state, params),
+        LocalRequest::AccessGet(params) => OfflineWorkspace::new(&mut state.vault, state.device_id)
+            .access_policy(params.harness)
+            .map(|policy| LocalResult::Access { policy }),
+        LocalRequest::AccessSet(params) => OfflineWorkspace::new(&mut state.vault, state.device_id)
+            .set_access_policy(params.harness, &params.policy)
+            .map(|()| LocalResult::Access {
+                policy: params.policy,
+            }),
+        LocalRequest::SyncStatus(_) => state
+            .vault
+            .access_policy(HarnessId::Codex)
+            .map_err(client_error_from_vault)
+            .map(|access| LocalResult::Status {
+                status: context_relay_protocol::StatusOutput {
+                    protocol: ProtocolVersionRange {
+                        min: PROTOCOL_VERSION,
+                        max: PROTOCOL_VERSION,
+                    },
+                    vault: VaultState::Unlocked,
+                    resolved_project: None,
+                    sync: SyncState::Offline,
+                    access,
+                },
+            }),
+        LocalRequest::DevicesList(_) => Ok(LocalResult::Devices {
+            devices: vec![DeviceSummary {
+                device_id: state.device_id,
+                name: "This device".into(),
+                platform: native_platform(),
+                state: DeviceState::Active,
+                is_current: true,
+            }],
+        }),
+        LocalRequest::ExportRecords(params) => create_encrypted_export(state, params),
+        LocalRequest::ExportChunk(params) => {
+            export_chunk(state, params.export_id, params.chunk_index)
+        }
+        LocalRequest::AccountDeletionBegin(params) => {
+            if !params.confirmation.eq_ignore_ascii_case("delete") {
+                return Err(invalid_request_error());
+            }
+            state.deletion = AccountDeletionState::PendingDelete;
+            Ok(account_deletion_result(state.deletion))
+        }
+        LocalRequest::AccountDeletionStatus(_) => Ok(account_deletion_result(state.deletion)),
+        LocalRequest::AccountDeletionCancel(_) => {
+            state.deletion = AccountDeletionState::Active;
+            Ok(account_deletion_result(state.deletion))
+        }
+        _ => Err(invalid_request_error()),
+    }
+}
+
+fn create_handoff(
+    state: &mut WorkspaceState,
+    params: context_relay_protocol::HandoffParams,
+) -> Result<LocalResult, ClientError> {
+    let memories = params
+        .memory_ids
+        .iter()
+        .map(|id| {
+            state
+                .vault
+                .memory(id)
+                .map_err(client_error_from_vault)?
+                .ok_or_else(record_not_found_error)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let decisions = params
+        .decision_ids
+        .iter()
+        .map(|id| {
+            let memory = state
+                .vault
+                .memory(id)
+                .map_err(client_error_from_vault)?
+                .ok_or_else(record_not_found_error)?;
+            (memory.kind == MemoryKind::Decision)
+                .then_some(memory)
+                .ok_or_else(invalid_request_error)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let tasks = params
+        .task_ids
+        .iter()
+        .map(|id| {
+            state
+                .vault
+                .task(id)
+                .map_err(client_error_from_vault)?
+                .ok_or_else(record_not_found_error)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let project_id = tasks.first().map(|task| task.project_id).or_else(|| {
+        memories
+            .iter()
+            .chain(&decisions)
+            .find_map(|memory| match memory.scope {
+                ScopeRef::Project { project_id } => Some(project_id),
+                ScopeRef::Global => None,
+            })
+    });
+    let project = project_id
+        .map(|id| {
+            state
+                .vault
+                .projects()
+                .map_err(client_error_from_vault)?
+                .into_iter()
+                .find(|project| project.project_id == id)
+                .ok_or_else(record_not_found_error)
+        })
+        .transpose()?;
+    let payload = HandoffPayload {
+        project,
+        markdown: format!("# Handoff\n\n{}", params.summary),
+        memories,
+        decisions,
+        tasks,
+        instruction_refs: Vec::new(),
+    };
+    payload.validate().map_err(|_| invalid_request_error())?;
+    Ok(LocalResult::Handoff {
+        handoff_id: params.operation_id,
+        payload,
+    })
+}
+
+fn create_encrypted_export(
+    state: &mut WorkspaceState,
+    params: context_relay_protocol::ExportParams,
+) -> Result<LocalResult, ClientError> {
+    if params.project_id.is_some() || !params.include_archived {
+        return Err(unsupported_error(
+            "Only a complete encrypted vault export is supported",
+        ));
+    }
+    state
+        .vault
+        .checkpoint_wal()
+        .map_err(client_error_from_vault)?;
+    let bytes = std::fs::read(&state.vault_path).map_err(|_| service_internal_error())?;
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    let export_id = export_id_from_digest(digest);
+    let record_count = export_record_count(&state.vault)?;
+    let chunks = bytes
+        .chunks(MAX_ARBITRARY_BYTES)
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    let export = StoredExport {
+        total_bytes: u64::try_from(bytes.len()).map_err(|_| service_internal_error())?,
+        record_count,
+        chunks,
+    };
+    let payload = export_payload(export_id, &export, 0)?;
+    state.exports.clear();
+    state.exports.insert(export_id, export);
+    Ok(LocalResult::Export { payload })
+}
+
+fn export_chunk(
+    state: &WorkspaceState,
+    export_id: ExportId,
+    chunk_index: u32,
+) -> Result<LocalResult, ClientError> {
+    let export = state
+        .exports
+        .get(&export_id)
+        .ok_or_else(record_not_found_error)?;
+    export_payload(export_id, export, chunk_index).map(|payload| LocalResult::Export { payload })
+}
+
+fn export_payload(
+    export_id: ExportId,
+    export: &StoredExport,
+    chunk_index: u32,
+) -> Result<ExportPayload, ClientError> {
+    let index = usize::try_from(chunk_index).map_err(|_| invalid_request_error())?;
+    let bytes = export.chunks.get(index).ok_or_else(invalid_request_error)?;
+    Ok(ExportPayload {
+        export_id,
+        chunk_index,
+        chunk_count: u32::try_from(export.chunks.len()).map_err(|_| service_internal_error())?,
+        chunk: BoundedBytes::new(bytes.clone()).map_err(|_| service_internal_error())?,
+        chunk_digest: Sha256Digest(Sha256::digest(bytes).into()),
+        total_bytes: export.total_bytes,
+        record_count: export.record_count,
+    })
+}
+
+fn export_record_count(vault: &Vault) -> Result<u32, ClientError> {
+    let projects = vault.projects().map_err(client_error_from_vault)?;
+    let mut count = projects.len()
+        + vault
+            .memories(None, true)
+            .map_err(client_error_from_vault)?
+            .len()
+        + vault
+            .candidates(None)
+            .map_err(client_error_from_vault)?
+            .len();
+    for project in projects {
+        count += vault
+            .memories(Some(project.project_id), true)
+            .map_err(client_error_from_vault)?
+            .len();
+        count += vault
+            .candidates(Some(project.project_id))
+            .map_err(client_error_from_vault)?
+            .len();
+        count += vault
+            .tasks(project.project_id)
+            .map_err(client_error_from_vault)?
+            .len();
+    }
+    u32::try_from(count).map_err(|_| service_internal_error())
+}
+
+fn account_deletion_result(state: AccountDeletionState) -> LocalResult {
+    LocalResult::AccountDeletion {
+        state,
+        purge_deadline: None,
+        export_available: state == AccountDeletionState::PendingDelete,
+    }
+}
+
+fn stable_device_id(seed: &[u8]) -> DeviceId {
+    let digest: [u8; 32] = Sha256::digest(seed).into();
+    uuid_v7_text(digest).parse().expect("stable UUIDv7")
+}
+
+fn export_id_from_digest(digest: [u8; 32]) -> ExportId {
+    uuid_v7_text(digest).parse().expect("stable UUIDv7")
+}
+
+fn uuid_v7_text(mut bytes: [u8; 32]) -> String {
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+
+#[cfg(windows)]
+const fn native_platform() -> NativePlatform {
+    NativePlatform::Windows
+}
+
+#[cfg(not(windows))]
+const fn native_platform() -> NativePlatform {
+    NativePlatform::Macos
+}
+
+fn record_not_found_error() -> ClientError {
+    ClientError {
+        code: ErrorCode::NotFound,
+        message: "The requested record was not found".into(),
+        field_path: None,
+        retryable: false,
     }
 }
 
@@ -1241,9 +1638,9 @@ mod tests {
     }
 
     #[test]
-    fn routing_covers_all_45_requests_without_falling_through() {
+    fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 45);
+        assert_eq!(fixtures.len(), 46);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -1251,30 +1648,12 @@ mod tests {
                 "Hello" | "Cancel" => assert_exact_error(routed, invalid_request_error()),
                 "Shutdown" => assert!(matches!(routed, RoutedRequest::Shutdown)),
                 "Health" => assert!(matches!(routed, RoutedRequest::Health)),
-                "ProjectPathSet" => {
-                    assert!(matches!(
-                        routed,
-                        RoutedRequest::Work(VaultCommand::ProjectPathSet(_))
-                    ))
-                }
-                "MemoryGet" => {
-                    assert!(matches!(
-                        routed,
-                        RoutedRequest::Work(VaultCommand::MemoryGet(_))
-                    ))
-                }
-                _ => assert_exact_error(routed, unavailable_error()),
+                _ => assert!(!matches!(
+                    routed,
+                    RoutedRequest::Immediate(Err(error)) if error == unavailable_error()
+                )),
             }
         }
-
-        let memory_get = request_fixture(
-            "memory_get",
-            serde_json::json!({"memoryId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f"}),
-        );
-        assert_exact_error(
-            route_request(ClientRole::McpBridge, memory_get),
-            unavailable_error(),
-        );
     }
 
     #[tokio::test]
@@ -1343,6 +1722,86 @@ mod tests {
         let reopened = Vault::open(&path, "worker-commands", keys.as_ref()).unwrap();
         assert_eq!(reopened.path(project_id).unwrap(), Some(expected_path));
         assert_eq!(reopened.path(&canceled_project).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn vault_worker_runs_the_offline_workspace_and_encrypted_export() {
+        let path = unique_temp_path("worker-offline-workspace").join("vault.db");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut worker =
+            VaultWorker::spawn(VaultConfig::new(path, "worker-offline-workspace", keys))
+                .await
+                .unwrap();
+        let client = worker.client();
+        let project_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073980";
+        let memory_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073981";
+
+        for request in [
+            request_fixture(
+                "project_upsert",
+                serde_json::json!({"project": {"projectId": project_id, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}}),
+            ),
+            request_fixture(
+                "memory_create",
+                serde_json::json!({"operationId": memory_id, "scope": {"scope": "project", "projectId": project_id}, "kind": "note", "title": "encrypted-canary-title", "bodyMarkdown": "body", "tags": []}),
+            ),
+            request_fixture(
+                "task_upsert",
+                serde_json::json!({"operationId": "018f22e2-79b0-7cc8-98c4-dc0c0c073982", "taskId": null, "projectId": project_id, "title": "task", "bodyMarkdown": "body", "status": "open", "expectedRevision": null}),
+            ),
+        ] {
+            client
+                .try_submit(VaultCommand::Workspace(request), TestAdmission(true))
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        let status = client
+            .try_submit(
+                VaultCommand::Workspace(request_fixture("sync_status", serde_json::json!({}))),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            status,
+            LocalResult::Status {
+                status: context_relay_protocol::StatusOutput {
+                    sync: SyncState::Offline,
+                    ..
+                }
+            }
+        ));
+
+        let export = client
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "export_records",
+                    serde_json::json!({"projectId": null, "includeArchived": true}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let LocalResult::Export { payload } = export else {
+            panic!("expected encrypted export")
+        };
+        assert_eq!(payload.record_count, 3);
+        assert!(
+            !payload
+                .chunk
+                .as_slice()
+                .windows("encrypted-canary-title".len())
+                .any(|window| window == b"encrypted-canary-title")
+        );
+
+        worker.shutdown_and_join();
     }
 
     #[tokio::test]
@@ -1485,8 +1944,8 @@ mod tests {
             desktop
                 .call(LocalRequest::Unlock(EmptyParams {}))
                 .await
-                .unwrap_err(),
-            unavailable_error()
+                .unwrap(),
+            LocalResult::Empty
         );
         let LocalRequest::ProjectPathSet(path_set) = request_fixture(
             "project_path_set",
@@ -1509,8 +1968,8 @@ mod tests {
             serde_json::json!({"memoryId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f"}),
         );
         assert_eq!(
-            idle_mcp.call(mcp_memory).await.unwrap_err(),
-            unavailable_error()
+            idle_mcp.call(mcp_memory).await.unwrap(),
+            LocalResult::Memory { memory: None }
         );
 
         assert_eq!(
@@ -1933,6 +2392,13 @@ mod tests {
             ("Health", request_fixture("health", empty())),
             ("Unlock", request_fixture("unlock", empty())),
             ("ProjectsList", request_fixture("projects_list", empty())),
+            (
+                "ProjectUpsert",
+                request_fixture(
+                    "project_upsert",
+                    serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}}),
+                ),
+            ),
             (
                 "ProjectPathSet",
                 request_fixture(

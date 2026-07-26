@@ -14,6 +14,7 @@ context-relay-native-runner = { version = "0.1.0", path = "../native-runner" }
 context-relay-protocol = { version = "0.1.0", path = "../protocol" }
 dirs.workspace = true
 keyring.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 

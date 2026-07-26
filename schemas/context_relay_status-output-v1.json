@@ -156,6 +156,7 @@
       "enum": [
         "idle",
         "syncing",
+        "offline",
         "error"
       ]
     },

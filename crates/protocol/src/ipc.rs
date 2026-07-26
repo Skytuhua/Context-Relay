@@ -59,6 +59,9 @@ params!(EmptyParams {});
 params!(ProjectParams {
     project_id: ProjectId
 });
+params!(ProjectUpsertParams {
+    project: ProjectIdentity
+});
 params!(ProjectPathParams {
     project_id: ProjectId,
     path: WireNativeValue
@@ -331,6 +334,7 @@ pub enum LocalRequest {
     Health(EmptyParams),
     Unlock(EmptyParams),
     ProjectsList(EmptyParams),
+    ProjectUpsert(ProjectUpsertParams),
     ProjectPathSet(ProjectPathParams),
     MemoryGet(MemoryParams),
     MemorySearch(SearchParams),
@@ -391,6 +395,7 @@ fn validate_tags(tags: &[String]) -> Result<(), ValidationError> {
 impl LocalRequest {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::ProjectUpsert(p) => p.project.validate(),
             Self::ProjectPathSet(p) => p.path.validate(),
             Self::MemorySearch(p) => required_text(&p.query, "query", MAX_MARKDOWN_BYTES),
             Self::MemoryCreate(p) => {

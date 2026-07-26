@@ -168,6 +168,12 @@ impl CachedScope {
 }
 
 impl Vault {
+    pub fn checkpoint_wal(&self) -> Result<(), VaultError> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(FULL)")?;
+        Ok(())
+    }
+
     pub fn open(
         path: &Path,
         credential_id: &str,

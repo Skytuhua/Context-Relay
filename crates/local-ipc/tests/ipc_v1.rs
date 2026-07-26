@@ -691,6 +691,13 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         ("Unlock", request_fixture("unlock", empty())),
         ("ProjectsList", request_fixture("projects_list", empty())),
         (
+            "ProjectUpsert",
+            request_fixture(
+                "project_upsert",
+                serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}}),
+            ),
+        ),
+        (
             "ProjectPathSet",
             request_fixture(
                 "project_path_set",
@@ -953,9 +960,9 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
 }
 
 #[test]
-fn role_allowlist_covers_all_45_requests() {
+fn role_allowlist_covers_all_46_requests() {
     let fixtures = all_request_fixtures();
-    assert_eq!(fixtures.len(), 45);
+    assert_eq!(fixtures.len(), 46);
 
     for (name, request) in &fixtures {
         let common = matches!(*name, "Cancel" | "Health");
@@ -1007,7 +1014,7 @@ fn role_allowlist_covers_all_45_requests() {
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::Desktop, request))
             .count(),
-        44
+        45
     );
     assert_eq!(
         fixtures
