@@ -1,10 +1,10 @@
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use context_relay_protocol::{
-    ApplyReceipt, CandidateId, CandidateState, CheckpointV1, InstructionRecord, MemoryCandidate,
-    MemoryId, MemoryRecord, MutationKind, PlanId, ProjectId, Provenance, RecordId, RecordKind,
-    ScopeRef, Sha256Digest, SyncOperationV1, TaskId, TaskRecord, TaskStatus, WireNativeValue,
-    encode_sync_operation_v1,
+    ApplyReceipt, CandidateId, CandidateState, CheckpointV1, HarnessAccessPolicy, HarnessId,
+    InstructionRecord, MemoryCandidate, MemoryId, MemoryRecord, MutationKind, PlanId, ProjectId,
+    ProjectIdentity, Provenance, RecordId, RecordKind, ScopeRef, Sha256Digest, SyncOperationV1,
+    TaskId, TaskRecord, TaskStatus, WireNativeValue, encode_sync_operation_v1,
 };
 use keyring::Entry;
 use rand_core::{OsRng, RngCore};
@@ -19,7 +19,7 @@ use crate::search::{
 mod native_transactions;
 pub use native_transactions::*;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 3;
+pub const LATEST_SCHEMA_VERSION: u32 = 4;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
 const DEFAULT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
@@ -355,6 +355,53 @@ impl Vault {
         )
     }
 
+    pub fn put_local_memory(
+        &mut self,
+        memory: &MemoryRecord,
+        embedding: &Embedding384,
+    ) -> Result<(), VaultError> {
+        memory
+            .validate()
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        let transaction = self.connection.transaction()?;
+        upsert_searchable_record(
+            &transaction,
+            &memory.id.to_string(),
+            "memory",
+            &memory.scope,
+            memory.archived,
+            &memory.title,
+            &memory.body_markdown,
+            &to_json(memory)?,
+            &memory.provenance,
+            embedding,
+        )?;
+        transaction.commit()?;
+        self.embedding_cache.insert(
+            memory.id.to_string(),
+            cached_embedding(&memory.scope, memory.archived, embedding),
+        );
+        Ok(())
+    }
+
+    pub fn memories(
+        &self,
+        project_id: Option<ProjectId>,
+        include_archived: bool,
+    ) -> Result<Vec<MemoryRecord>, VaultError> {
+        let (scope_kind, project_id) = project_id
+            .map(|project_id| ("project", Some(project_id.to_string())))
+            .unwrap_or(("global", None));
+        load_json_list(
+            &self.connection,
+            "SELECT payload_json FROM records
+             WHERE kind = 'memory' AND scope_kind = ?1
+               AND project_id IS ?2 AND (?3 = 1 OR archived = 0)
+             ORDER BY id",
+            params![scope_kind, project_id, i64::from(include_archived)],
+        )
+    }
+
     pub fn put_instruction(
         &mut self,
         instruction: &InstructionRecord,
@@ -433,6 +480,89 @@ impl Vault {
         )
     }
 
+    pub fn candidates(
+        &self,
+        project_id: Option<ProjectId>,
+    ) -> Result<Vec<MemoryCandidate>, VaultError> {
+        let mut candidates: Vec<MemoryCandidate> = load_json_list(
+            &self.connection,
+            "SELECT payload_json FROM candidates ORDER BY id",
+            [],
+        )?;
+        candidates.retain(
+            |candidate| match (&candidate.proposed_memory.scope, project_id) {
+                (ScopeRef::Global, None) => true,
+                (ScopeRef::Project { project_id: actual }, Some(expected)) => actual == &expected,
+                _ => false,
+            },
+        );
+        Ok(candidates)
+    }
+
+    pub fn review_candidate(
+        &mut self,
+        id: CandidateId,
+        state: CandidateState,
+        memory: Option<&MemoryRecord>,
+        embedding: Option<&Embedding384>,
+    ) -> Result<(), VaultError> {
+        if state == CandidateState::Pending {
+            return Err(VaultError::Validation(
+                "candidate review must accept or reject".to_owned(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        let payload = transaction
+            .query_row(
+                "SELECT payload_json FROM candidates WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| VaultError::Validation("candidate does not exist".to_owned()))?;
+        let mut candidate: MemoryCandidate = from_json(&payload)?;
+        match (state, memory, embedding) {
+            (CandidateState::Accepted, Some(memory), Some(embedding))
+                if memory == &candidate.proposed_memory =>
+            {
+                memory
+                    .validate()
+                    .map_err(|error| VaultError::Validation(error.to_string()))?;
+                upsert_searchable_record(
+                    &transaction,
+                    &memory.id.to_string(),
+                    "memory",
+                    &memory.scope,
+                    memory.archived,
+                    &memory.title,
+                    &memory.body_markdown,
+                    &to_json(memory)?,
+                    &memory.provenance,
+                    embedding,
+                )?;
+            }
+            (CandidateState::Rejected, None, None) => {}
+            _ => {
+                return Err(VaultError::Validation(
+                    "candidate review payload does not match its decision".to_owned(),
+                ));
+            }
+        }
+        candidate.state = state;
+        transaction.execute(
+            "UPDATE candidates SET state = ?2, payload_json = ?3 WHERE id = ?1",
+            params![id.to_string(), candidate_state(state), to_json(&candidate)?],
+        )?;
+        transaction.commit()?;
+        if let (Some(memory), Some(embedding)) = (memory, embedding) {
+            self.embedding_cache.insert(
+                memory.id.to_string(),
+                cached_embedding(&memory.scope, memory.archived, embedding),
+            );
+        }
+        Ok(())
+    }
+
     pub fn put_task(&mut self, task: &TaskRecord) -> Result<(), VaultError> {
         task.validate()
             .map_err(|error| VaultError::Validation(error.to_string()))?;
@@ -463,6 +593,62 @@ impl Vault {
             "SELECT payload_json FROM tasks WHERE id = ?1",
             &id.to_string(),
         )
+    }
+
+    pub fn tasks(&self, project_id: ProjectId) -> Result<Vec<TaskRecord>, VaultError> {
+        load_json_list(
+            &self.connection,
+            "SELECT payload_json FROM tasks WHERE project_id = ?1 ORDER BY id",
+            [project_id.to_string()],
+        )
+    }
+
+    pub fn put_project(&mut self, project: &ProjectIdentity) -> Result<(), VaultError> {
+        project
+            .validate()
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        self.connection.execute(
+            "INSERT INTO projects(id, payload_json) VALUES (?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET payload_json = excluded.payload_json",
+            params![project.project_id.to_string(), to_json(project)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn projects(&self) -> Result<Vec<ProjectIdentity>, VaultError> {
+        let mut projects: Vec<ProjectIdentity> = load_json_list(
+            &self.connection,
+            "SELECT payload_json FROM projects ORDER BY id",
+            [],
+        )?;
+        projects.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.project_id.cmp(&right.project_id))
+        });
+        Ok(projects)
+    }
+
+    pub fn set_access_policy(
+        &mut self,
+        harness: HarnessId,
+        policy: &HarnessAccessPolicy,
+    ) -> Result<(), VaultError> {
+        self.connection.execute(
+            "INSERT INTO harness_access(harness, payload_json) VALUES (?1, ?2)
+             ON CONFLICT(harness) DO UPDATE SET payload_json = excluded.payload_json",
+            params![harness_name(harness), to_json(policy)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn access_policy(&self, harness: HarnessId) -> Result<HarnessAccessPolicy, VaultError> {
+        Ok(load_json(
+            &self.connection,
+            "SELECT payload_json FROM harness_access WHERE harness = ?1",
+            harness_name(harness),
+        )?
+        .unwrap_or(HarnessAccessPolicy::Default))
     }
 
     pub fn put_checkpoint(&mut self, checkpoint: &CheckpointV1) -> Result<(), VaultError> {
@@ -898,6 +1084,16 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }
+    if found < 4 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0004_offline_workspace.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 4))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
     Ok(())
 }
 
@@ -972,6 +1168,54 @@ fn put_searchable_record(
         ));
     }
 
+    upsert_searchable_record(
+        transaction,
+        id,
+        kind,
+        scope,
+        archived,
+        title,
+        body,
+        payload,
+        provenance,
+        embedding,
+    )?;
+    transaction.execute(
+        "INSERT INTO operations(id, record_id, payload_json) VALUES (?1, ?2, ?3)",
+        params![&operation_id, id, &operation_payload],
+    )?;
+    transaction.execute(
+        "INSERT INTO outbox(operation_id) VALUES (?1)",
+        [operation_id],
+    )?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_searchable_record(
+    transaction: &Transaction<'_>,
+    id: &str,
+    kind: &str,
+    scope: &ScopeRef,
+    archived: bool,
+    title: &str,
+    body: &str,
+    payload: &[u8],
+    provenance: &Provenance,
+    embedding: &Embedding384,
+) -> Result<(), VaultError> {
+    let existing_kind = transaction
+        .query_row("SELECT kind FROM records WHERE id = ?1", [id], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?;
+    if let Some(existing_kind) = existing_kind
+        && existing_kind != kind
+    {
+        return Err(VaultError::Validation(
+            "record kind cannot change".to_owned(),
+        ));
+    }
     let (scope_kind, project_id) = scope_columns(scope);
     transaction.execute(
         "INSERT INTO records(id, kind, scope_kind, project_id, archived, payload_json)
@@ -992,14 +1236,6 @@ fn put_searchable_record(
         "INSERT INTO provenance(record_id, payload_json) VALUES (?1, ?2)
          ON CONFLICT(record_id) DO UPDATE SET payload_json = excluded.payload_json",
         params![id, to_json(provenance)?],
-    )?;
-    transaction.execute(
-        "INSERT INTO operations(id, record_id, payload_json) VALUES (?1, ?2, ?3)",
-        params![&operation_id, id, &operation_payload],
-    )?;
-    transaction.execute(
-        "INSERT INTO outbox(operation_id) VALUES (?1)",
-        [operation_id],
     )?;
     transaction.execute(
         "INSERT INTO search_documents(
@@ -1029,7 +1265,7 @@ fn put_searchable_record(
         "INSERT INTO search_fts(record_id, title, body) VALUES (?1, ?2, ?3)",
         params![id, title, body],
     )?;
-    Ok(true)
+    Ok(())
 }
 
 fn validate_operation_for(
@@ -1077,6 +1313,34 @@ fn load_json<T: DeserializeOwned>(
         .query_row(sql, [id], |row| row.get::<_, Vec<u8>>(0))
         .optional()?;
     payload.map(|bytes| from_json(&bytes)).transpose()
+}
+
+fn load_json_list<T: DeserializeOwned, P: rusqlite::Params>(
+    connection: &Connection,
+    sql: &str,
+    params: P,
+) -> Result<Vec<T>, VaultError> {
+    let mut statement = connection.prepare(sql)?;
+    statement
+        .query_map(params, |row| row.get::<_, Vec<u8>>(0))?
+        .map(|payload| from_json(&payload?))
+        .collect()
+}
+
+const fn candidate_state(state: CandidateState) -> &'static str {
+    match state {
+        CandidateState::Pending => "pending",
+        CandidateState::Accepted => "accepted",
+        CandidateState::Rejected => "rejected",
+    }
+}
+
+const fn harness_name(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::ClaudeCode => "claude_code",
+        HarnessId::Codex => "codex",
+        HarnessId::Hermes => "hermes",
+    }
 }
 
 fn pragma_bool(connection: &Connection, name: &str) -> Result<bool, VaultError> {

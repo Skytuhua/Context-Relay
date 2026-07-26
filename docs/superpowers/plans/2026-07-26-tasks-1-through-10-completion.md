@@ -42,7 +42,7 @@ Actions and repository rulesets.
 
 **Files:**
 
-- Create: `crates/core/migrations/0002_offline_workspace.sql`
+- Create: `crates/core/migrations/0004_offline_workspace.sql`
 - Modify: `crates/core/src/vault.rs`
 - Test: `crates/core/tests/offline_workspace_v1.rs`
 
@@ -136,7 +136,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit the Vault slice**
 
 ```powershell
-git add -- crates/core/migrations/0002_offline_workspace.sql crates/core/src/vault.rs crates/core/tests/offline_workspace_v1.rs
+git add -- crates/core/migrations/0004_offline_workspace.sql crates/core/src/vault.rs crates/core/tests/offline_workspace_v1.rs
 git commit -m "feat: add offline workspace storage"
 ```
 
