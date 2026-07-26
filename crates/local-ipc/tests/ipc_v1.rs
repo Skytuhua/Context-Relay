@@ -712,6 +712,13 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
             request_fixture("memory_get", serde_json::json!({"memoryId": ID})),
         ),
         (
+            "MemoryList",
+            request_fixture(
+                "memory_list",
+                serde_json::json!({"projectId": null, "includeArchived": false}),
+            ),
+        ),
+        (
             "MemorySearch",
             request_fixture(
                 "memory_search",
@@ -960,9 +967,9 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
 }
 
 #[test]
-fn role_allowlist_covers_all_46_requests() {
+fn role_allowlist_covers_all_47_requests() {
     let fixtures = all_request_fixtures();
-    assert_eq!(fixtures.len(), 46);
+    assert_eq!(fixtures.len(), 47);
 
     for (name, request) in &fixtures {
         let common = matches!(*name, "Cancel" | "Health");
@@ -1014,7 +1021,7 @@ fn role_allowlist_covers_all_46_requests() {
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::Desktop, request))
             .count(),
-        45
+        46
     );
     assert_eq!(
         fixtures

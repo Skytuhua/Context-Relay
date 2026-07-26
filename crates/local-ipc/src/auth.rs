@@ -197,6 +197,7 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::ProjectUpsert(_) => matches!(role, Desktop),
         LocalRequest::ProjectPathSet(_) => matches!(role, Desktop),
         LocalRequest::MemoryGet(_) => matches!(role, Desktop | McpBridge),
+        LocalRequest::MemoryList(_) => matches!(role, Desktop),
         LocalRequest::MemorySearch(_) => matches!(role, Desktop | McpBridge),
         LocalRequest::MemoryCreate(_) => matches!(role, Desktop | McpBridge),
         LocalRequest::MemoryUpdate(_) => matches!(role, Desktop | McpBridge),

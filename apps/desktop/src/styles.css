@@ -37,6 +37,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -201,6 +202,72 @@ dialog > :last-child {
   display: grid;
   max-width: 40rem;
   gap: 1.25rem;
+}
+
+.inline-form {
+  display: flex;
+  align-items: end;
+  gap: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+
+.inline-form label {
+  font-weight: 700;
+}
+
+.inline-form input {
+  min-height: 40px;
+  border: 1px solid var(--color-muted);
+  border-radius: 8px;
+  padding: 0.5rem 0.75rem;
+}
+
+.edit-form,
+.records {
+  margin-top: 1.5rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--color-surface-strong);
+}
+
+.record-list {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.record-card {
+  display: grid;
+  gap: 0.625rem;
+  border: 1px solid var(--color-surface-strong);
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+.record-card h3,
+.record-card p {
+  margin: 0;
+}
+
+.record-card button,
+.record-button {
+  width: fit-content;
+}
+
+.state-label,
+.context-label {
+  color: var(--color-muted);
+  font-weight: 700;
+  text-transform: capitalize;
+}
+
+.notice {
+  border: 1px solid var(--color-primary);
+  border-radius: 8px;
+  padding: 0.75rem;
+  color: var(--color-primary-strong);
+  font-weight: 700;
 }
 
 .capture-form h2,

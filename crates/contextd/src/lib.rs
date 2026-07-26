@@ -599,6 +599,7 @@ fn route_request(_role: ClientRole, request: LocalRequest) -> RoutedRequest {
         LocalRequest::MemoryGet(params) => RoutedRequest::Work(VaultCommand::MemoryGet(params)),
         request @ (LocalRequest::ProjectsList(_)
         | LocalRequest::ProjectUpsert(_)
+        | LocalRequest::MemoryList(_)
         | LocalRequest::MemorySearch(_)
         | LocalRequest::MemoryCreate(_)
         | LocalRequest::MemoryUpdate(_)
@@ -983,6 +984,11 @@ fn execute_workspace_request(
                 .search_memories(params)
                 .map(|memories| LocalResult::Memories { memories })
         }
+        LocalRequest::MemoryList(params) => state
+            .vault
+            .memories(params.project_id, params.include_archived)
+            .map_err(client_error_from_vault)
+            .map(|memories| LocalResult::Memories { memories }),
         LocalRequest::MemoryCreate(params) => {
             OfflineWorkspace::new(&mut state.vault, state.device_id)
                 .create_memory(params)
@@ -1640,7 +1646,7 @@ mod tests {
     #[test]
     fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 46);
+        assert_eq!(fixtures.len(), 47);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -2409,6 +2415,13 @@ mod tests {
             (
                 "MemoryGet",
                 request_fixture("memory_get", serde_json::json!({"memoryId": ID})),
+            ),
+            (
+                "MemoryList",
+                request_fixture(
+                    "memory_list",
+                    serde_json::json!({"projectId": null, "includeArchived": false}),
+                ),
             ),
             (
                 "MemorySearch",

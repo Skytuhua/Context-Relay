@@ -69,6 +69,11 @@ params!(ProjectPathParams {
 params!(MemoryParams {
     memory_id: MemoryId
 });
+params!(MemoryListParams {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    project_id: Option<ProjectId>,
+    include_archived: bool
+});
 params!(MemoryCreateParams { operation_id:OperationId,scope:ScopeRef,kind:MemoryKind,title:String,body_markdown:String,tags:Vec<String> });
 params!(MemoryUpdateParams {
     operation_id: OperationId,
@@ -337,6 +342,7 @@ pub enum LocalRequest {
     ProjectUpsert(ProjectUpsertParams),
     ProjectPathSet(ProjectPathParams),
     MemoryGet(MemoryParams),
+    MemoryList(MemoryListParams),
     MemorySearch(SearchParams),
     MemoryCreate(MemoryCreateParams),
     MemoryUpdate(MemoryUpdateParams),
