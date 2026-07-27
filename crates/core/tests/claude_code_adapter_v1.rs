@@ -36,11 +36,13 @@ impl Drop for Fixture {
 
 fn fixture(source: &str) -> Fixture {
     let fixture: Value = serde_json::from_str(source).unwrap();
-    let root = std::env::temp_dir().join(format!(
-        "context-relay-claude-code-{}-{}",
-        std::process::id(),
-        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
+    let root = fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "context-relay-claude-code-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
     let config_dir = root.join("custom claude config");
     let project_root = root.join("project with spaces");
     materialize(&config_dir, fixture["config"].as_object().unwrap());

@@ -1,0 +1,1965 @@
+//! The deliberately small Codex 0.144.x integration surface.
+//!
+//! This module only reads configuration which is useful to relay.  In
+//! particular it deliberately never walks `$CODEX_HOME`: auth, sessions,
+//! history, sqlite state, logs, and approval records are not adapter input.
+
+use std::{
+    collections::{BTreeSet, HashSet},
+    env, fs,
+    io::Read,
+    path::{Component, Path, PathBuf},
+    process::{Command, Stdio},
+    str::FromStr,
+    thread,
+    time::{Duration, Instant},
+};
+
+use context_relay_native_runner::{NativeState, OsNativeFileSystem};
+use context_relay_protocol::{
+    ApplyReceipt, CapabilityLevel, ChangeClass, ClassifiedChanges, CliOperation, CliOperations,
+    ClientError, ComponentKind, ComponentRecord, DesiredState, DeviceId, DiscoveredScopes,
+    ErrorCode, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest, ImportedState,
+    InstallationMethod, NativePlatform, NativeScope, ProbeContext, ProbeReport, ProjectId,
+    Provenance, RecordId, RenderedFile, RenderedState, ScopeRef, SemanticDiff, Sha256Digest,
+    ValidationReport, WireNativeValue,
+};
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+use toml_edit::{DocumentMut, Item, Value as TomlValue};
+
+use crate::native_transaction::{
+    engine::{BoundaryError, FrozenOutput, NativeAdapter, RestrictedRun},
+    model::{ApprovedMutation, MutationKind, NativeTransactionPlan, RestorableStateFingerprint},
+};
+
+const SUPPORTED_VERSIONS: [&str; 2] = ["0.144.1", "0.144.0"];
+const CLI_TIMEOUT_MS: u32 = 30_000;
+const CLI_OUTPUT_LIMIT: u64 = 64 * 1024;
+const MANAGED_START: &str = "<!-- context-relay:start -->";
+const MANAGED_END: &str = "<!-- context-relay:end -->";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexExecutableKind {
+    Native,
+    Wrapper,
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+pub struct CodexLayout {
+    pub executable: PathBuf,
+    pub executable_kind: CodexExecutableKind,
+    pub version: String,
+    pub installation_method: InstallationMethod,
+    pub codex_home: PathBuf,
+    pub user_skills_dir: PathBuf,
+    pub project_root: PathBuf,
+    pub working_directory: PathBuf,
+    pub requirements_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CodexAdapter {
+    layout: CodexLayout,
+    project_id: ProjectId,
+    origin_device: DeviceId,
+    observed_hlc: HybridLogicalClock,
+    executable_hash: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CodexCommand {
+    PluginList,
+    McpList,
+    McpGet(String),
+}
+
+impl CodexCommand {
+    fn argv(&self) -> Vec<String> {
+        match self {
+            Self::PluginList => vec!["plugin".into(), "list".into(), "--json".into()],
+            Self::McpList => vec!["mcp".into(), "list".into(), "--json".into()],
+            Self::McpGet(name) => vec!["mcp".into(), "get".into(), name.clone(), "--json".into()],
+        }
+    }
+}
+
+impl CodexAdapter {
+    pub fn discover(
+        project_root: impl Into<PathBuf>,
+        working_directory: impl Into<PathBuf>,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+    ) -> Result<Self, ClientError> {
+        let project_root = project_root.into();
+        let working_directory = working_directory.into();
+        let home = home_dir().ok_or_else(|| not_found("Codex home was not found"))?;
+        let codex_home = match env::var_os("CODEX_HOME") {
+            Some(value) => {
+                let value = PathBuf::from(value);
+                if !value.is_dir() {
+                    return Err(not_found("CODEX_HOME does not exist"));
+                }
+                value
+            }
+            None => home.join(".codex"),
+        };
+        let executable =
+            find_executable(&home).ok_or_else(|| not_found("Codex executable was not found"))?;
+        let executable_kind = classify_executable(&executable);
+        let executable_hash = digest_file(&executable)?;
+        let output = run_bounded_command(
+            &executable,
+            &["--version"],
+            executable_hash,
+            &working_directory,
+        )?;
+        let version = parse_version(std::str::from_utf8(&output).unwrap_or_default())
+            .ok_or_else(|| unsupported("Codex returned an invalid version"))?;
+        Self::from_layout(
+            CodexLayout {
+                installation_method: installation_method(&executable),
+                executable,
+                executable_kind,
+                version,
+                codex_home,
+                user_skills_dir: home.join(".agents/skills"),
+                project_root,
+                working_directory,
+                requirements_paths: requirements_paths(),
+            },
+            project_id,
+            origin_device,
+            observed_hlc,
+        )
+    }
+
+    pub fn from_layout(
+        layout: CodexLayout,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+    ) -> Result<Self, ClientError> {
+        if !valid_version(&layout.version) {
+            return Err(invalid("Codex version is invalid"));
+        }
+        for path in [
+            &layout.executable,
+            &layout.codex_home,
+            &layout.project_root,
+            &layout.working_directory,
+        ] {
+            wire_path(path)
+                .validate()
+                .map_err(|_| invalid("Codex path is not representable"))?;
+        }
+        if !layout.executable.is_file()
+            || !layout.codex_home.is_dir()
+            || !layout.project_root.is_dir()
+            || !layout.working_directory.is_dir()
+        {
+            return Err(not_found("Codex installation or project is missing"));
+        }
+        if !layout.working_directory.starts_with(&layout.project_root) {
+            return Err(invalid(
+                "Codex working directory is outside the project root",
+            ));
+        }
+        let executable_hash = digest_file(&layout.executable)?;
+        Ok(Self {
+            layout,
+            project_id,
+            origin_device,
+            observed_hlc,
+            executable_hash,
+        })
+    }
+
+    pub fn project_root_wire(&self) -> WireNativeValue {
+        wire_path(&self.layout.project_root)
+    }
+    pub fn project_config_path(&self) -> PathBuf {
+        self.layout.project_root.join(".codex/config.toml")
+    }
+
+    pub fn plan_native_config(
+        &self,
+        desired: &DesiredState,
+        scope: ScopeRef,
+    ) -> Result<ApprovedMutation, ClientError> {
+        self.require_apply_supported()?;
+        desired
+            .validate()
+            .map_err(|_| invalid("Desired Codex state is invalid"))?;
+        if matches!(scope, ScopeRef::Project { .. }) && !self.project_is_trusted()? {
+            return Err(unsupported(
+                "Untrusted project configuration is import-only",
+            ));
+        }
+        let path = self.config_path(&scope)?;
+        let existing = read_required_regular(&path, "Codex config must already exist")?;
+        let rendered = self.render_config(&existing, desired, &scope)?;
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid("Codex config cannot be safely inspected"))?;
+        let NativeState::RegularFile { metadata, .. } = snapshot.state() else {
+            return Err(invalid("Codex config must be a regular file"));
+        };
+        self.approved_file(
+            &path,
+            snapshot.fingerprint(),
+            NativeState::regular_file(rendered, metadata.clone()),
+        )
+    }
+
+    pub fn plan_native_markdown(
+        &self,
+        component: &ComponentRecord,
+    ) -> Result<ApprovedMutation, ClientError> {
+        self.require_apply_supported()?;
+        if !matches!(
+            component.kind,
+            ComponentKind::Instruction | ComponentKind::Rule | ComponentKind::Skill
+        ) {
+            return Err(invalid("Codex Markdown component is invalid"));
+        }
+        let path = self.markdown_path(component)?;
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid("Codex Markdown cannot be safely inspected"))?;
+        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
+            return Err(invalid("Codex Markdown must already exist"));
+        };
+        self.approved_file(
+            &path,
+            snapshot.fingerprint(),
+            NativeState::regular_file(
+                render_managed_markdown(bytes, &component.body_markdown, component.archived)?,
+                metadata.clone(),
+            ),
+        )
+    }
+
+    pub fn plan_native_hooks_json(
+        &self,
+        component: &ComponentRecord,
+    ) -> Result<ApprovedMutation, ClientError> {
+        self.require_apply_supported()?;
+        if component.kind != ComponentKind::Hook {
+            return Err(invalid("Codex hooks component is invalid"));
+        }
+        let path = self.hooks_path(&component.scope)?;
+        let existing = read_required_regular(&path, "Codex hooks must already exist")?;
+        let mut object = parse_object(&existing, "Codex hooks are invalid")?;
+        if component.archived {
+            object.remove("hooks");
+        } else {
+            object.insert(
+                "hooks".into(),
+                serde_json::from_str(&component.body_markdown)
+                    .map_err(|_| invalid("Codex hooks component is invalid"))?,
+            );
+        }
+        let bytes = serde_json::to_vec(&Value::Object(object))
+            .map_err(|_| invalid("Codex hooks cannot be rendered"))?;
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid("Codex hooks cannot be safely inspected"))?;
+        let NativeState::RegularFile { metadata, .. } = snapshot.state() else {
+            return Err(invalid("Codex hooks must be a regular file"));
+        };
+        self.approved_file(
+            &path,
+            snapshot.fingerprint(),
+            NativeState::regular_file(bytes, metadata.clone()),
+        )
+    }
+
+    fn approved_file(
+        &self,
+        path: &Path,
+        expected: &[u8; 32],
+        intended: NativeState,
+    ) -> Result<ApprovedMutation, ClientError> {
+        Ok(ApprovedMutation {
+            target: wire_path(path),
+            kind: MutationKind::Payload,
+            content: intended
+                .encode_v1()
+                .map_err(|_| invalid("Codex native state is not representable"))?,
+            expected: RestorableStateFingerprint(Sha256Digest(*expected)),
+            intended: RestorableStateFingerprint(Sha256Digest(intended.fingerprint())),
+        })
+    }
+
+    fn capability(&self) -> CapabilityLevel {
+        if SUPPORTED_VERSIONS.contains(&self.layout.version.as_str())
+            && self.layout.executable_kind == CodexExecutableKind::Native
+        {
+            CapabilityLevel::Full
+        } else {
+            CapabilityLevel::ImportOnly
+        }
+    }
+
+    fn require_apply_supported(&self) -> Result<(), ClientError> {
+        (self.capability() == CapabilityLevel::Full)
+            .then_some(())
+            .ok_or_else(|| unsupported("This Codex installation is import-only"))
+    }
+
+    fn policy_conflicts(&self) -> Result<Vec<String>, ClientError> {
+        let mut conflicts = Vec::new();
+        if nonempty_file(&self.layout.codex_home.join("AGENTS.override.md"))?
+            && nonempty_file(&self.layout.codex_home.join("AGENTS.md"))?
+        {
+            conflicts.push("global_instructions_shadowed".into());
+        }
+        if self
+            .layout
+            .requirements_paths
+            .iter()
+            .any(|path| path.is_file())
+        {
+            conflicts.push("managed_requirements_active".into());
+        }
+        if self.project_instruction_shadowed()? {
+            conflicts.push("project_instructions_shadowed".into());
+        }
+        if !self.project_is_trusted()? {
+            conflicts.push("project_untrusted".into());
+        }
+        conflicts.sort();
+        conflicts.dedup();
+        Ok(conflicts)
+    }
+
+    fn project_instruction_shadowed(&self) -> Result<bool, ClientError> {
+        for directory in self.project_layers()? {
+            if nonempty_file(&directory.join("AGENTS.override.md"))?
+                && nonempty_file(&directory.join("AGENTS.md"))?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn project_is_trusted(&self) -> Result<bool, ClientError> {
+        let Some(bytes) = read_optional_file(&self.layout.codex_home.join("config.toml"))? else {
+            return Ok(false);
+        };
+        let document = bytes_to_document(&bytes)?;
+        let root = self.layout.project_root.to_string_lossy();
+        Ok(document
+            .get("projects")
+            .and_then(Item::as_table)
+            .and_then(|projects| projects.get(root.as_ref()))
+            .and_then(Item::as_table)
+            .and_then(|project| project.get("trust_level"))
+            .and_then(Item::as_str)
+            == Some("trusted"))
+    }
+
+    fn config_path(&self, scope: &ScopeRef) -> Result<PathBuf, ClientError> {
+        match scope {
+            ScopeRef::Global => Ok(self.layout.codex_home.join("config.toml")),
+            ScopeRef::Project { project_id } if *project_id == self.project_id => {
+                Ok(self.project_config_path())
+            }
+            _ => Err(invalid("Codex scope is not configured")),
+        }
+    }
+    fn hooks_path(&self, scope: &ScopeRef) -> Result<PathBuf, ClientError> {
+        match scope {
+            ScopeRef::Global => Ok(self.layout.codex_home.join("hooks.json")),
+            ScopeRef::Project { project_id } if *project_id == self.project_id => {
+                Ok(self.layout.project_root.join(".codex/hooks.json"))
+            }
+            _ => Err(invalid("Codex scope is not configured")),
+        }
+    }
+
+    fn markdown_path(&self, component: &ComponentRecord) -> Result<PathBuf, ClientError> {
+        let root = match component.scope {
+            ScopeRef::Global => self.layout.codex_home.clone(),
+            ScopeRef::Project { project_id } if project_id == self.project_id => {
+                self.layout.project_root.clone()
+            }
+            _ => return Err(invalid("Codex scope is not configured")),
+        };
+        match component.kind {
+            ComponentKind::Instruction => {
+                safe_file_name(&component.name)?;
+                Ok(root.join(&component.name))
+            }
+            ComponentKind::Rule => {
+                safe_relative(&component.name, ".rules")?;
+                Ok(root.join(".codex/rules").join(&component.name))
+            }
+            ComponentKind::Skill => {
+                safe_name(&component.name)?;
+                Ok(root
+                    .join(".agents/skills")
+                    .join(&component.name)
+                    .join("SKILL.md"))
+            }
+            _ => Err(invalid("Codex Markdown component is invalid")),
+        }
+    }
+
+    fn render_config(
+        &self,
+        existing: &[u8],
+        desired: &DesiredState,
+        scope: &ScopeRef,
+    ) -> Result<Vec<u8>, ClientError> {
+        let mut document = bytes_to_document(existing)?;
+        for component in desired
+            .components
+            .iter()
+            .filter(|component| &component.scope == scope)
+        {
+            let key = match component.kind {
+                ComponentKind::PermissionDeclaration => "approval_policy",
+                ComponentKind::Hook => "hooks",
+                _ => continue,
+            };
+            if component.archived {
+                document.remove(key);
+                continue;
+            }
+            let value = component
+                .body_markdown
+                .parse::<TomlValue>()
+                .map_err(|_| invalid("Codex config component is invalid"))?;
+            document[key] = Item::Value(value);
+        }
+        Ok(document.to_string().into_bytes())
+    }
+
+    fn import_scope(
+        &self,
+        scope: ScopeRef,
+        include_disabled: bool,
+        components: &mut Vec<ComponentRecord>,
+        digests: &mut BTreeSet<Sha256Digest>,
+    ) -> Result<(), ClientError> {
+        match scope {
+            ScopeRef::Global => {
+                self.import_instruction(
+                    &self.layout.codex_home,
+                    ScopeRef::Global,
+                    0,
+                    "",
+                    components,
+                    digests,
+                )?;
+                self.import_config(
+                    &self.layout.codex_home.join("config.toml"),
+                    ScopeRef::Global,
+                    include_disabled,
+                    components,
+                    digests,
+                )?;
+                self.import_hooks(
+                    &self.layout.codex_home.join("hooks.json"),
+                    ScopeRef::Global,
+                    components,
+                    digests,
+                )?;
+                self.import_rules(
+                    &self.layout.codex_home.join("rules"),
+                    ScopeRef::Global,
+                    "rules",
+                    components,
+                    digests,
+                )?;
+                self.import_skills(
+                    &self.layout.user_skills_dir,
+                    ScopeRef::Global,
+                    "user skills",
+                    components,
+                    digests,
+                )?;
+            }
+            ScopeRef::Project { project_id } => {
+                for (index, directory) in self.project_layers()?.into_iter().enumerate() {
+                    self.import_instruction(
+                        &directory,
+                        ScopeRef::Project { project_id },
+                        index + 1,
+                        &display_project_location(&self.layout.project_root, &directory)?,
+                        components,
+                        digests,
+                    )?;
+                    self.import_skills(
+                        &directory.join(".agents/skills"),
+                        ScopeRef::Project { project_id },
+                        &format!(
+                            "{}/.agents/skills",
+                            display_project_location(&self.layout.project_root, &directory)?
+                        ),
+                        components,
+                        digests,
+                    )?;
+                    if self.project_is_trusted()? {
+                        self.import_config(
+                            &directory.join(".codex/config.toml"),
+                            ScopeRef::Project { project_id },
+                            include_disabled,
+                            components,
+                            digests,
+                        )?;
+                        self.import_hooks(
+                            &directory.join(".codex/hooks.json"),
+                            ScopeRef::Project { project_id },
+                            components,
+                            digests,
+                        )?;
+                        self.import_rules(
+                            &directory.join(".codex/rules"),
+                            ScopeRef::Project { project_id },
+                            &format!(
+                                "{}/.codex/rules",
+                                display_project_location(&self.layout.project_root, &directory)?
+                            ),
+                            components,
+                            digests,
+                        )?;
+                    }
+                }
+            }
+        };
+        Ok(())
+    }
+
+    fn import_instruction(
+        &self,
+        root: &Path,
+        scope: ScopeRef,
+        precedence: usize,
+        location_prefix: &str,
+        components: &mut Vec<ComponentRecord>,
+        digests: &mut BTreeSet<Sha256Digest>,
+    ) -> Result<(), ClientError> {
+        let override_path = root.join("AGENTS.override.md");
+        let standard_path = root.join("AGENTS.md");
+        let selected = if nonempty_file(&override_path)? {
+            Some((override_path, "AGENTS.override.md"))
+        } else if nonempty_file(&standard_path)? {
+            Some((standard_path, "AGENTS.md"))
+        } else {
+            None
+        };
+        if let Some((path, name)) = selected {
+            let location = if location_prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{location_prefix}/{name}")
+            };
+            self.import_markdown(
+                &path,
+                scope,
+                ComponentKind::Instruction,
+                name,
+                &location,
+                Some(precedence),
+                components,
+                digests,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn import_rules(
+        &self,
+        root: &Path,
+        scope: ScopeRef,
+        location: &str,
+        components: &mut Vec<ComponentRecord>,
+        digests: &mut BTreeSet<Sha256Digest>,
+    ) -> Result<(), ClientError> {
+        for path in reviewed_files(root, |path| {
+            path.extension()
+                .is_some_and(|extension| extension == "rules")
+        })? {
+            let name = display_relative(
+                path.strip_prefix(root)
+                    .map_err(|_| invalid("Codex rule escaped its root"))?,
+            )?;
+            self.import_markdown(
+                &path,
+                scope.clone(),
+                ComponentKind::Rule,
+                &name,
+                &format!("{location}/{name}"),
+                None,
+                components,
+                digests,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn import_skills(
+        &self,
+        root: &Path,
+        scope: ScopeRef,
+        location: &str,
+        components: &mut Vec<ComponentRecord>,
+        digests: &mut BTreeSet<Sha256Digest>,
+    ) -> Result<(), ClientError> {
+        for path in reviewed_files(root, |path| {
+            path.file_name().is_some_and(|name| name == "SKILL.md")
+        })? {
+            let name = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| invalid("Codex skill name is invalid"))?;
+            safe_name(name)?;
+            self.import_markdown(
+                &path,
+                scope.clone(),
+                ComponentKind::Skill,
+                name,
+                &format!("{location}/{name}/SKILL.md"),
+                None,
+                components,
+                digests,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn import_markdown(
+        &self,
+        path: &Path,
+        scope: ScopeRef,
+        kind: ComponentKind,
+        name: &str,
+        location: &str,
+        precedence: Option<usize>,
+        components: &mut Vec<ComponentRecord>,
+        digests: &mut BTreeSet<Sha256Digest>,
+    ) -> Result<(), ClientError> {
+        let Some(bytes) = read_optional_file(path)? else {
+            return Ok(());
+        };
+        let body =
+            String::from_utf8(bytes.clone()).map_err(|_| invalid("Codex Markdown is not UTF-8"))?;
+        digests.insert(digest(&bytes));
+        let mut component = self.component(scope, kind, name, body, location)?;
+        if let Some(precedence) = precedence {
+            component
+                .metadata
+                .push(("precedenceIndex".into(), precedence.to_string()));
+        }
+        components.push(component);
+        Ok(())
+    }
+
+    fn import_config(
+        &self,
+        path: &Path,
+        scope: ScopeRef,
+        include_disabled: bool,
+        components: &mut Vec<ComponentRecord>,
+        digests: &mut BTreeSet<Sha256Digest>,
+    ) -> Result<(), ClientError> {
+        let Some(bytes) = read_optional_file(path)? else {
+            return Ok(());
+        };
+        let document = bytes_to_document(&bytes)?;
+        digests.insert(digest(&bytes));
+        let location = format!(
+            "{}#",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("config.toml")
+        );
+        for key in [
+            "approval_policy",
+            "approvals_reviewer",
+            "sandbox_mode",
+            "default_permissions",
+            "permissions",
+        ] {
+            if let Some(item) = document.get(key) {
+                components.push(self.component(
+                    scope.clone(),
+                    ComponentKind::PermissionDeclaration,
+                    key,
+                    item.to_string(),
+                    &format!("{location}{key}"),
+                )?);
+            }
+        }
+        if let Some(hooks) = document.get("hooks") {
+            components.push(self.component(
+                scope.clone(),
+                ComponentKind::Hook,
+                "hooks",
+                toml_item_text(hooks),
+                &format!("{location}hooks"),
+            )?);
+        }
+        if let Some(plugins) = document.get("plugins").and_then(Item::as_table) {
+            for (name, table) in plugins {
+                safe_name(name)?;
+                let enabled = table
+                    .as_table()
+                    .and_then(|table| table.get("enabled"))
+                    .and_then(Item::as_bool)
+                    .unwrap_or(true);
+                if enabled || include_disabled {
+                    let mut component = self.component(
+                        scope.clone(),
+                        ComponentKind::Plugin,
+                        name,
+                        table.to_string(),
+                        &format!("{location}plugins/{name}"),
+                    )?;
+                    component.archived = !enabled;
+                    components.push(component);
+                }
+            }
+        }
+        if let Some(servers) = document.get("mcp_servers").and_then(Item::as_table) {
+            for (name, table) in servers {
+                safe_name(name)?;
+                let value = toml_item_json(table);
+                let redacted = redact_sensitive(value);
+                let mut component = self.component(
+                    scope.clone(),
+                    ComponentKind::McpServer,
+                    name,
+                    canonical_json(&redacted)?,
+                    &format!("{location}mcp_servers/{name}"),
+                )?;
+                if contains_redaction(&redacted) {
+                    component.archived = false;
+                }
+                components.push(component);
+            }
+        }
+        Ok(())
+    }
+
+    fn import_hooks(
+        &self,
+        path: &Path,
+        scope: ScopeRef,
+        components: &mut Vec<ComponentRecord>,
+        digests: &mut BTreeSet<Sha256Digest>,
+    ) -> Result<(), ClientError> {
+        let Some(bytes) = read_optional_file(path)? else {
+            return Ok(());
+        };
+        let object = parse_object(&bytes, "Codex hooks are invalid")?;
+        digests.insert(digest(&bytes));
+        if let Some(hooks) = object.get("hooks") {
+            components.push(self.component(
+                scope,
+                ComponentKind::Hook,
+                "hooks.json",
+                canonical_json(hooks)?,
+                "hooks.json#hooks",
+            )?);
+        }
+        Ok(())
+    }
+
+    fn component(
+        &self,
+        scope: ScopeRef,
+        kind: ComponentKind,
+        name: &str,
+        body_markdown: String,
+        location: &str,
+    ) -> Result<ComponentRecord, ClientError> {
+        let scope_key = match scope {
+            ScopeRef::Global => "global".to_owned(),
+            ScopeRef::Project { project_id } => format!("project:{project_id}"),
+        };
+        let component = ComponentRecord {
+            id: stable_record_id(&format!("{scope_key}|{kind:?}|{location}|{name}"))?,
+            scope,
+            kind,
+            name: name.to_owned(),
+            body_markdown,
+            metadata: vec![("structuralLocation".into(), location.to_owned())],
+            provenance: Provenance {
+                origin_device: self.origin_device,
+                harness: Some(HarnessId::Codex),
+                source: None,
+                created_hlc: self.observed_hlc,
+            },
+            archived: false,
+        };
+        component
+            .validate()
+            .map_err(|_| invalid("Codex component exceeds protocol limits"))?;
+        Ok(component)
+    }
+
+    fn project_layers(&self) -> Result<Vec<PathBuf>, ClientError> {
+        let relative = self
+            .layout
+            .working_directory
+            .strip_prefix(&self.layout.project_root)
+            .map_err(|_| invalid("Codex working directory is outside the project root"))?;
+        let mut layers = vec![self.layout.project_root.clone()];
+        let mut current = self.layout.project_root.clone();
+        for component in relative.components() {
+            if let Component::Normal(name) = component {
+                current.push(name);
+                layers.push(current.clone());
+            } else {
+                return Err(invalid("Codex working directory is unsafe"));
+            }
+        }
+        Ok(layers)
+    }
+}
+
+impl HarnessAdapter for CodexAdapter {
+    fn probe(&self, context: &ProbeContext) -> Result<ProbeReport, ClientError> {
+        context
+            .validate()
+            .map_err(|_| invalid("Codex probe context is invalid"))?;
+        if context.harness != HarnessId::Codex {
+            return Err(invalid("Codex adapter received another harness"));
+        }
+        Ok(ProbeReport {
+            executable: Some(wire_path(&self.layout.executable)),
+            executable_sha256: Some(self.executable_hash),
+            harness_version: Some(self.layout.version.clone()),
+            installation_method: self.layout.installation_method,
+            config_roots: vec![
+                wire_path(&self.layout.codex_home),
+                wire_path(&self.layout.user_skills_dir),
+                wire_path(&self.layout.project_root),
+            ],
+            active_profile: context.requested_profile.clone(),
+            policy_conflicts: self.policy_conflicts()?,
+            capability: self.capability(),
+        })
+    }
+
+    fn discover_scopes(&self, report: &ProbeReport) -> Result<DiscoveredScopes, ClientError> {
+        report
+            .validate()
+            .map_err(|_| invalid("Codex probe report is invalid"))?;
+        Ok(DiscoveredScopes(vec![
+            NativeScope::Global,
+            NativeScope::Project {
+                project_id: self.project_id,
+                root: self.project_root_wire(),
+            },
+        ]))
+    }
+
+    fn import(&self, request: &ImportRequest) -> Result<ImportedState, ClientError> {
+        request
+            .validate()
+            .map_err(|_| invalid("Codex import request is invalid"))?;
+        let mut components = Vec::new();
+        let mut digests = BTreeSet::new();
+        let mut seen = HashSet::new();
+        for native_scope in &request.scopes {
+            let scope = match native_scope {
+                NativeScope::Global => ScopeRef::Global,
+                NativeScope::Project { project_id, root }
+                    if *project_id == self.project_id && *root == self.project_root_wire() =>
+                {
+                    ScopeRef::Project {
+                        project_id: *project_id,
+                    }
+                }
+                _ => return Err(invalid("Codex import requested an unconfigured project")),
+            };
+            let key = match &scope {
+                ScopeRef::Global => "global".to_owned(),
+                ScopeRef::Project { project_id } => format!("project:{project_id}"),
+            };
+            if !seen.insert(key) {
+                return Err(invalid("Codex import repeated a scope"));
+            }
+            self.import_scope(
+                scope,
+                request.include_disabled,
+                &mut components,
+                &mut digests,
+            )?;
+        }
+        components.sort_by_key(|component| component.id);
+        Ok(ImportedState {
+            components,
+            source_digests: digests.into_iter().collect(),
+        })
+    }
+
+    fn render(&self, desired: &DesiredState) -> Result<RenderedState, ClientError> {
+        self.require_apply_supported()?;
+        desired
+            .validate()
+            .map_err(|_| invalid("Desired Codex state is invalid"))?;
+        let mut files = Vec::new();
+        let mut cli_operations = Vec::new();
+        let mut config_scopes = Vec::new();
+        let mut hook_components = Vec::new();
+        for component in &desired.components {
+            match component.kind {
+                ComponentKind::PermissionDeclaration => {
+                    if !config_scopes.contains(&component.scope) {
+                        config_scopes.push(component.scope.clone());
+                    }
+                }
+                ComponentKind::Hook => hook_components.push(component),
+                ComponentKind::Instruction | ComponentKind::Rule | ComponentKind::Skill => {
+                    let path = self.markdown_path(component)?;
+                    let existing =
+                        read_required_regular(&path, "Codex Markdown must already exist")?;
+                    let bytes = render_managed_markdown(
+                        &existing,
+                        &component.body_markdown,
+                        component.archived,
+                    )?;
+                    files.push(rendered_file(path, &bytes));
+                }
+                ComponentKind::Plugin | ComponentKind::McpServer => {
+                    if let Some(operation) = self.render_cli_operation(component)? {
+                        cli_operations.push(operation);
+                    }
+                }
+            }
+        }
+        for scope in config_scopes {
+            let path = self.config_path(&scope)?;
+            let existing = read_required_regular(&path, "Codex config must already exist")?;
+            files.push(rendered_file(
+                path,
+                &self.render_config(&existing, desired, &scope)?,
+            ));
+        }
+        for component in hook_components {
+            let path = self.hooks_path(&component.scope)?;
+            let existing = read_required_regular(&path, "Codex hooks must already exist")?;
+            let mut object = parse_object(&existing, "Codex hooks are invalid")?;
+            if component.archived {
+                object.remove("hooks");
+            } else {
+                object.insert(
+                    "hooks".into(),
+                    serde_json::from_str(&component.body_markdown)
+                        .map_err(|_| invalid("Codex hooks component is invalid"))?,
+                );
+            }
+            let bytes = serde_json::to_vec(&Value::Object(object))
+                .map_err(|_| invalid("Codex hooks cannot be rendered"))?;
+            files.push(rendered_file(path, &bytes));
+        }
+        files.sort_by(|left, right| left.path.bytes.cmp(&right.path.bytes));
+        Ok(RenderedState {
+            files,
+            cli_operations,
+        })
+    }
+
+    fn classify(&self, diff: &SemanticDiff) -> Result<ClassifiedChanges, ClientError> {
+        diff.validate()
+            .map_err(|_| invalid("Codex semantic diff is invalid"))?;
+        if !diff.conflicts.is_empty() {
+            return Err(client_error(
+                ErrorCode::Conflict,
+                "Codex semantic diff has conflicts",
+                false,
+            ));
+        }
+        Ok(ClassifiedChanges(diff.changes.clone()))
+    }
+
+    fn plan_cli_ops(&self, changes: &ClassifiedChanges) -> Result<CliOperations, ClientError> {
+        self.require_apply_supported()?;
+        changes
+            .validate()
+            .map_err(|_| invalid("Codex changes are invalid"))?;
+        let mut operations = Vec::new();
+        for change in &changes.0 {
+            let (kind, scope, name) = parse_change_target(&change.target)?;
+            let component = ComponentRecord {
+                id: stable_record_id(&change.target)?,
+                scope,
+                kind,
+                name,
+                body_markdown: change.summary.clone(),
+                metadata: vec![],
+                provenance: Provenance {
+                    origin_device: self.origin_device,
+                    harness: Some(HarnessId::Codex),
+                    source: None,
+                    created_hlc: self.observed_hlc,
+                },
+                archived: matches!(change.class, ChangeClass::Remove | ChangeClass::Disable),
+            };
+            if let Some(operation) = self.render_cli_operation(&component)? {
+                operations.push(operation);
+            }
+        }
+        Ok(CliOperations(operations))
+    }
+
+    fn validate_effective(&self, receipt: &ApplyReceipt) -> Result<ValidationReport, ClientError> {
+        receipt
+            .validate()
+            .map_err(|_| invalid("Codex receipt is invalid"))?;
+        self.require_apply_supported()?;
+        let commands = [CodexCommand::PluginList, CodexCommand::McpList];
+        let mut configured = BTreeSet::new();
+        for command in commands {
+            let argv = command.argv();
+            let args = argv.iter().map(String::as_str).collect::<Vec<_>>();
+            let output = run_bounded_command(
+                &self.layout.executable,
+                &args,
+                self.executable_hash,
+                &self.layout.working_directory,
+            )?;
+            match command {
+                CodexCommand::PluginList => parse_plugin_list_json(&output)?,
+                CodexCommand::McpList => configured = parse_mcp_list_json(&output)?,
+                CodexCommand::McpGet(_) => unreachable!(),
+            };
+        }
+        for name in self.imported_mcp_names()? {
+            if !configured.contains(&name) {
+                return Ok(ValidationReport {
+                    valid: false,
+                    findings: vec!["configured_mcp_server_missing".into()],
+                });
+            }
+            let command = CodexCommand::McpGet(name.clone());
+            let argv = command.argv();
+            let output = run_bounded_command(
+                &self.layout.executable,
+                &argv.iter().map(String::as_str).collect::<Vec<_>>(),
+                self.executable_hash,
+                &self.layout.working_directory,
+            )?;
+            parse_mcp_get_json(&output, &name)?;
+        }
+        Ok(ValidationReport {
+            valid: true,
+            findings: vec![],
+        })
+    }
+}
+
+impl CodexAdapter {
+    fn render_cli_operation(
+        &self,
+        component: &ComponentRecord,
+    ) -> Result<Option<CliOperation>, ClientError> {
+        if !matches!(component.scope, ScopeRef::Global) {
+            return Err(unsupported("Project Codex CLI changes are import-only"));
+        }
+        let arguments = match component.kind {
+            ComponentKind::Plugin => {
+                safe_name(&component.name)?;
+                if component.archived {
+                    vec![
+                        "plugin".into(),
+                        "remove".into(),
+                        component.name.clone(),
+                        "--json".into(),
+                    ]
+                } else {
+                    vec![
+                        "plugin".into(),
+                        "add".into(),
+                        component.name.clone(),
+                        "--json".into(),
+                    ]
+                }
+            }
+            ComponentKind::McpServer => {
+                safe_name(&component.name)?;
+                if component.archived {
+                    vec!["mcp".into(), "remove".into(), component.name.clone()]
+                } else {
+                    let value: Value = serde_json::from_str(&component.body_markdown)
+                        .map_err(|_| invalid("Codex MCP component is invalid"))?;
+                    if contains_redaction(&value) {
+                        return Err(invalid(
+                            "Redacted Codex MCP configuration cannot be applied",
+                        ));
+                    }
+                    render_mcp_add(&component.name, &value)?
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(CliOperation {
+            executable: wire_path(&self.layout.executable),
+            arguments: arguments
+                .into_iter()
+                .map(|argument| wire_text(&argument))
+                .collect(),
+            timeout_ms: CLI_TIMEOUT_MS,
+        }))
+    }
+
+    fn imported_mcp_names(&self) -> Result<Vec<String>, ClientError> {
+        let mut names = BTreeSet::new();
+        for path in [
+            self.layout.codex_home.join("config.toml"),
+            self.project_config_path(),
+        ] {
+            let Some(bytes) = read_optional_file(&path)? else {
+                continue;
+            };
+            let document = bytes_to_document(&bytes)?;
+            if let Some(servers) = document.get("mcp_servers").and_then(Item::as_table) {
+                for (name, _) in servers {
+                    safe_name(name)?;
+                    names.insert(name.to_owned());
+                }
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+}
+
+impl NativeAdapter for CodexAdapter {
+    fn reprobe_live_state(&mut self, plan: &NativeTransactionPlan) -> Result<(), BoundaryError> {
+        if self.capability() != CapabilityLevel::Full
+            || plan.setup.harness != HarnessId::Codex
+            || plan.setup.harness_version != self.layout.version
+            || plan.setup.executable_path != wire_path(&self.layout.executable)
+            || digest_file_boundary(&self.layout.executable)? != plan.setup.executable_hash
+        {
+            return Err(BoundaryError::new("Codex installation changed"));
+        }
+        Ok(())
+    }
+    fn compare_approved_digests(
+        &mut self,
+        plan: &NativeTransactionPlan,
+    ) -> Result<(), BoundaryError> {
+        for expected in &plan.setup.expected_native_digests {
+            let path = decode_wire_path(&expected.target)?;
+            let actual = if path.is_file() {
+                Some(digest_file_boundary(&path)?)
+            } else {
+                None
+            };
+            if actual != expected.expected_digest {
+                return Err(BoundaryError::new("Codex native state changed"));
+            }
+        }
+        Ok(())
+    }
+    fn validate_staged_output(
+        &mut self,
+        plan: &NativeTransactionPlan,
+        run: &RestrictedRun,
+    ) -> Result<FrozenOutput, BoundaryError> {
+        if run.staged_output_hash != plan.expected_semantic_output_hash
+            || run.scanner_result_hash != plan.scanner_result_hash
+        {
+            return Err(BoundaryError::new("Codex staged output changed"));
+        }
+        Ok(FrozenOutput {
+            staged_output_hash: run.staged_output_hash,
+            scanner_result_hash: run.scanner_result_hash,
+        })
+    }
+    fn validate_effective(
+        &mut self,
+        plan: &NativeTransactionPlan,
+        receipt: &ApplyReceipt,
+    ) -> Result<(), BoundaryError> {
+        let intended = plan
+            .mutations
+            .iter()
+            .map(|mutation| mutation.intended.0)
+            .collect::<Vec<_>>();
+        if receipt.plan_id != plan.setup.plan_id || receipt.resulting_digests != intended {
+            return Err(BoundaryError::new(
+                "Codex effective state differs from the plan",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn rendered_file(path: PathBuf, bytes: &[u8]) -> RenderedFile {
+    RenderedFile {
+        path: wire_path(&path),
+        bytes_sha256: digest(bytes),
+        byte_length: bytes.len() as u64,
+    }
+}
+
+fn render_mcp_add(name: &str, value: &Value) -> Result<Vec<String>, ClientError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("Codex MCP component is invalid"))?;
+    if let (Some(url), Some(token)) = (
+        object.get("url").and_then(Value::as_str),
+        object.get("bearer_token_env_var").and_then(Value::as_str),
+    ) {
+        return Ok(vec![
+            "mcp".into(),
+            "add".into(),
+            name.into(),
+            "--url".into(),
+            url.into(),
+            "--bearer-token-env-var".into(),
+            token.into(),
+        ]);
+    }
+    let command = object
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|command| !command.is_empty())
+        .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?;
+    let mut rendered = vec!["mcp".into(), "add".into(), name.into()];
+    let environment = object
+        .get("env")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?;
+    let mut environment = environment.iter().collect::<Vec<_>>();
+    environment.sort_by_key(|(key, _)| *key);
+    for (key, value) in environment {
+        let value = value
+            .as_str()
+            .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?;
+        if value == "<redacted>" {
+            return Err(invalid(
+                "Redacted Codex MCP configuration cannot be applied",
+            ));
+        }
+        rendered.push("--env".into());
+        rendered.push(format!("{key}={value}"));
+    }
+    rendered.push("--".into());
+    rendered.push(command.into());
+    if let Some(arguments) = object.get("args").and_then(Value::as_array) {
+        for argument in arguments {
+            rendered.push(
+                argument
+                    .as_str()
+                    .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?
+                    .into(),
+            );
+        }
+    }
+    Ok(rendered)
+}
+
+fn parse_plugin_list_json(bytes: &[u8]) -> Result<(), ClientError> {
+    let object = serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
+    if object.len() != 2 || !object.contains_key("installed") || !object.contains_key("available") {
+        return Err(invalid("Codex plugin output is invalid"));
+    }
+    let plugins = object
+        .get("installed")
+        .and_then(Value::as_array)
+        .filter(|plugins| plugins.len() <= 256)
+        .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
+    let mut ids = BTreeSet::new();
+    for plugin in plugins {
+        let plugin = plugin
+            .as_object()
+            .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
+        let allowed = [
+            "pluginId",
+            "name",
+            "marketplaceName",
+            "version",
+            "installed",
+            "enabled",
+            "source",
+            "installPolicy",
+            "authPolicy",
+        ];
+        if plugin.len() != allowed.len()
+            || plugin.keys().any(|key| !allowed.contains(&key.as_str()))
+        {
+            return Err(invalid("Codex plugin output is invalid"));
+        }
+        let id = plugin
+            .get("pluginId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
+        safe_name(id)?;
+        if !ids.insert(id)
+            || plugin.get("installed").and_then(Value::as_bool).is_none()
+            || plugin.get("enabled").and_then(Value::as_bool).is_none()
+        {
+            return Err(invalid("Codex plugin output is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_mcp_list_json(bytes: &[u8]) -> Result<BTreeSet<String>, ClientError> {
+    let servers = serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .filter(|servers| servers.len() <= 256)
+        .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+    let mut names = BTreeSet::new();
+    for server in &servers {
+        let name = parse_mcp_server(server)?;
+        if !names.insert(name) {
+            return Err(invalid("Codex MCP output is invalid"));
+        }
+    }
+    Ok(names)
+}
+
+fn parse_mcp_get_json(bytes: &[u8], expected_name: &str) -> Result<(), ClientError> {
+    if parse_mcp_server(
+        &serde_json::from_slice::<Value>(bytes)
+            .map_err(|_| invalid("Codex MCP output is invalid"))?,
+    )? != expected_name
+    {
+        return Err(invalid("Codex MCP output is invalid"));
+    }
+    Ok(())
+}
+
+fn parse_mcp_server(value: &Value) -> Result<String, ClientError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+    safe_name(name)?;
+    let transport = object
+        .get("transport")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+    let kind = transport
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+    if !["streamable_http", "stdio"].contains(&kind) || transport.values().any(contains_control) {
+        return Err(invalid("Codex MCP output is invalid"));
+    }
+    Ok(name.to_owned())
+}
+
+fn contains_control(value: &Value) -> bool {
+    match value {
+        Value::String(value) => value.chars().any(char::is_control),
+        Value::Array(values) => values.iter().any(contains_control),
+        Value::Object(values) => values.values().any(contains_control),
+        _ => false,
+    }
+}
+
+fn render_managed_markdown(
+    existing: &[u8],
+    body: &str,
+    archived: bool,
+) -> Result<Vec<u8>, ClientError> {
+    let existing =
+        std::str::from_utf8(existing).map_err(|_| invalid("Codex Markdown is not UTF-8"))?;
+    if body.contains(MANAGED_START) || body.contains(MANAGED_END) {
+        return Err(invalid("Codex managed Markdown contains reserved markers"));
+    }
+    let starts = existing.match_indices(MANAGED_START).collect::<Vec<_>>();
+    let ends = existing.match_indices(MANAGED_END).collect::<Vec<_>>();
+    let rendered = match (starts.as_slice(), ends.as_slice()) {
+        ([], []) if !archived => {
+            let mut output = existing.to_owned();
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(MANAGED_START);
+            output.push('\n');
+            output.push_str(body);
+            if !body.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(MANAGED_END);
+            output.push('\n');
+            output
+        }
+        ([(start, _)], [(end, _)]) if start < end => {
+            let suffix = end + MANAGED_END.len();
+            if archived {
+                format!("{}{}", &existing[..*start], &existing[suffix..])
+            } else {
+                let mut output = existing[..start + MANAGED_START.len()].to_owned();
+                output.push('\n');
+                output.push_str(body);
+                if !body.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str(&existing[*end..]);
+                output
+            }
+        }
+        _ => return Err(invalid("Codex managed Markdown markers are malformed")),
+    };
+    (rendered.len() <= 1024 * 1024)
+        .then_some(rendered.into_bytes())
+        .ok_or_else(|| invalid("Codex managed Markdown is too large"))
+}
+
+fn reviewed_files(
+    root: &Path,
+    predicate: impl Fn(&Path) -> bool,
+) -> Result<Vec<PathBuf>, ClientError> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|_| invalid("Codex configuration cannot be inspected"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(invalid("Codex configuration has unsafe topology"));
+    }
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)
+            .map_err(|_| invalid("Codex configuration cannot be inspected"))?
+        {
+            let entry = entry.map_err(|_| invalid("Codex configuration cannot be inspected"))?;
+            let kind = entry
+                .file_type()
+                .map_err(|_| invalid("Codex configuration cannot be inspected"))?;
+            if kind.is_symlink() {
+                return Err(invalid("Codex configuration has unsafe topology"));
+            }
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() && predicate(&entry.path()) {
+                files.push(entry.path());
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| invalid("Codex configuration cannot be inspected"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
+        return Err(invalid("Codex configuration has unsafe topology or size"));
+    }
+    fs::read(path)
+        .map(Some)
+        .map_err(|_| invalid("Codex configuration cannot be read"))
+}
+fn read_required_regular(path: &Path, message: &'static str) -> Result<Vec<u8>, ClientError> {
+    read_optional_file(path)?.ok_or_else(|| invalid(message))
+}
+fn nonempty_file(path: &Path) -> Result<bool, ClientError> {
+    Ok(read_optional_file(path)?.is_some_and(|bytes| !bytes.is_empty()))
+}
+fn bytes_to_document(bytes: &[u8]) -> Result<DocumentMut, ClientError> {
+    std::str::from_utf8(bytes)
+        .map_err(|_| invalid("Codex TOML is not UTF-8"))?
+        .parse::<DocumentMut>()
+        .map_err(|_| invalid("Codex TOML is invalid"))
+}
+fn parse_object(bytes: &[u8], message: &'static str) -> Result<Map<String, Value>, ClientError> {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .ok_or_else(|| invalid(message))
+}
+fn canonical_json(value: &Value) -> Result<String, ClientError> {
+    serde_json::to_string(value).map_err(|_| invalid("Codex configuration cannot be serialized"))
+}
+fn toml_item_json(item: &Item) -> Value {
+    Value::String(item.to_string())
+}
+fn toml_item_text(item: &Item) -> String {
+    let text = item.to_string();
+    if text.trim().is_empty() {
+        "# managed table".into()
+    } else {
+        text
+    }
+}
+fn redact_sensitive(value: Value) -> Value {
+    match value {
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| {
+                    let lower = key.to_ascii_lowercase();
+                    let sensitive = [
+                        "token",
+                        "secret",
+                        "password",
+                        "authorization",
+                        "cookie",
+                        "credential",
+                    ]
+                    .iter()
+                    .any(|needle| lower.contains(needle));
+                    (
+                        key,
+                        if sensitive {
+                            Value::String("<redacted>".into())
+                        } else {
+                            redact_sensitive(value)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.into_iter().map(redact_sensitive).collect()),
+        value => value,
+    }
+}
+fn contains_redaction(value: &Value) -> bool {
+    match value {
+        Value::String(value) => value == "<redacted>",
+        Value::Array(values) => values.iter().any(contains_redaction),
+        Value::Object(values) => values.values().any(contains_redaction),
+        _ => false,
+    }
+}
+fn display_project_location(root: &Path, directory: &Path) -> Result<String, ClientError> {
+    let relative = directory
+        .strip_prefix(root)
+        .map_err(|_| invalid("Codex project path escaped its root"))?;
+    if relative.as_os_str().is_empty() {
+        Ok("project".into())
+    } else {
+        display_relative(relative)
+    }
+}
+fn display_relative(path: &Path) -> Result<String, ClientError> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| invalid("Codex relative path is not Unicode"))?
+        .replace('\\', "/");
+    if value.chars().any(char::is_control) {
+        return Err(invalid("Codex relative path is unsafe"));
+    }
+    Ok(value)
+}
+
+fn parse_change_target(target: &str) -> Result<(ComponentKind, ScopeRef, String), ClientError> {
+    let mut parts = target.splitn(3, '|');
+    let kind = match parts.next() {
+        Some("codex-plugin") => ComponentKind::Plugin,
+        Some("codex-mcp") => ComponentKind::McpServer,
+        _ => return Err(invalid("Codex CLI change target is invalid")),
+    };
+    let scope = match parts.next() {
+        Some("global") => ScopeRef::Global,
+        _ => return Err(unsupported("Project Codex CLI changes are import-only")),
+    };
+    let name = parts
+        .next()
+        .ok_or_else(|| invalid("Codex CLI component name is missing"))?
+        .to_owned();
+    safe_name(&name)?;
+    Ok((kind, scope, name))
+}
+fn safe_name(name: &str) -> Result<(), ClientError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.len() > 255
+        || name.chars().any(char::is_control)
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"@._-".contains(&byte))
+    {
+        return Err(invalid("Codex component name is unsafe"));
+    }
+    Ok(())
+}
+fn safe_file_name(name: &str) -> Result<(), ClientError> {
+    safe_name(name)?;
+    if !name.ends_with(".md") {
+        return Err(invalid("Codex instruction name is unsafe"));
+    }
+    Ok(())
+}
+fn safe_relative(name: &str, extension: &str) -> Result<(), ClientError> {
+    if name.is_empty()
+        || Path::new(name).is_absolute()
+        || !name.ends_with(extension)
+        || Path::new(name)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(invalid("Codex relative path is unsafe"));
+    }
+    Ok(())
+}
+fn stable_record_id(key: &str) -> Result<RecordId, ClientError> {
+    let mut bytes: [u8; 32] = Sha256::digest(key.as_bytes()).into();
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    RecordId::from_str(&format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15])).map_err(|_| invalid("Codex component identifier cannot be derived"))
+}
+fn digest(bytes: &[u8]) -> Sha256Digest {
+    Sha256Digest(Sha256::digest(bytes).into())
+}
+fn digest_file(path: &Path) -> Result<Sha256Digest, ClientError> {
+    hash_file(path).map_err(|_| not_found("Codex executable is missing"))
+}
+fn digest_file_boundary(path: &Path) -> Result<Sha256Digest, BoundaryError> {
+    hash_file(path).map_err(|_| BoundaryError::new("Codex file cannot be read"))
+}
+fn hash_file(path: &Path) -> std::io::Result<Sha256Digest> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(Sha256Digest(hasher.finalize().into()));
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
+fn run_bounded_command(
+    executable: &Path,
+    arguments: &[&str],
+    expected_hash: Sha256Digest,
+    working_directory: &Path,
+) -> Result<Vec<u8>, ClientError> {
+    if digest_file(executable)? != expected_hash {
+        return Err(client_error(
+            ErrorCode::Conflict,
+            "Codex executable changed",
+            false,
+        ));
+    }
+    let mut child = Command::new(executable)
+        .args(arguments)
+        .current_dir(working_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| unsupported("Codex command failed"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| invalid("Codex command output is unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| invalid("Codex command output is unavailable"))?;
+    let stdout_thread = thread::spawn(move || read_capped(stdout));
+    let stderr_thread = thread::spawn(move || read_capped(stderr));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|_| unsupported("Codex command failed"))?
+        {
+            break status;
+        }
+        if started.elapsed() >= Duration::from_millis(u64::from(CLI_TIMEOUT_MS)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(client_error(
+                ErrorCode::Timeout,
+                "Codex command timed out",
+                true,
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| invalid("Codex command output is invalid"))?
+        .map_err(|_| invalid("Codex command output is invalid"))?;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| invalid("Codex command output is invalid"))?
+        .map_err(|_| invalid("Codex command output is invalid"))?;
+    if !status.success() || !stderr.is_empty() {
+        return Err(unsupported("Codex command failed"));
+    }
+    Ok(stdout)
+}
+fn read_capped(reader: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(CLI_OUTPUT_LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
+        return Err(std::io::Error::other("output limit exceeded"));
+    }
+    Ok(bytes)
+}
+fn valid_version(version: &str) -> bool {
+    let mut parts = version.split('.');
+    (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) && parts.next().is_none()
+}
+fn parse_version(output: &str) -> Option<String> {
+    let mut parts = output.split_whitespace();
+    let prefix = parts.next()?;
+    let version = parts.next()?;
+    if !["codex", "codex-cli"].contains(&prefix)
+        || parts.next().is_some()
+        || !valid_version(version)
+    {
+        return None;
+    }
+    Some(version.to_owned())
+}
+fn classify_executable(path: &Path) -> CodexExecutableKind {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if ["cmd", "bat", "ps1"].contains(&extension.as_str()) {
+        return CodexExecutableKind::Wrapper;
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return CodexExecutableKind::Unknown;
+    };
+    classify_executable_magic(&bytes)
+}
+fn classify_executable_magic(bytes: &[u8]) -> CodexExecutableKind {
+    if bytes.starts_with(b"#!") {
+        CodexExecutableKind::Wrapper
+    } else if bytes.starts_with(b"\x7fELF")
+        || bytes.starts_with(b"MZ")
+        || bytes.starts_with(&[0xfe, 0xed, 0xfa, 0xce])
+        || bytes.starts_with(&[0xfe, 0xed, 0xfa, 0xcf])
+        || bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
+        || bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe])
+    {
+        CodexExecutableKind::Native
+    } else {
+        CodexExecutableKind::Unknown
+    }
+}
+fn find_executable(home: &Path) -> Option<PathBuf> {
+    let mut candidates = env::var_os("PATH")
+        .map(|path| {
+            env::split_paths(&path)
+                .map(|directory| directory.join(if cfg!(windows) { "codex.exe" } else { "codex" }))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    candidates.extend(platform_candidates(
+        home,
+        env::var_os("LOCALAPPDATA").as_deref().map(Path::new),
+    ));
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+fn platform_candidates(home: &Path, local_app_data: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
+        home.join("Applications/ChatGPT.app/Contents/Resources/codex"),
+        home.join(".local/bin/codex"),
+    ];
+    if let Some(local_app_data) = local_app_data {
+        candidates.push(local_app_data.join("Programs/OpenAI/Codex/bin/codex.exe"));
+        candidates.push(local_app_data.join("Programs/ChatGPT/resources/codex.exe"));
+    }
+    candidates
+}
+fn installation_method(path: &Path) -> InstallationMethod {
+    let value = path.to_string_lossy().to_ascii_lowercase();
+    if value.contains("node_modules")
+        || value.contains("npm")
+        || value.contains("homebrew")
+        || value.contains("winget")
+    {
+        InstallationMethod::PackageManager
+    } else {
+        InstallationMethod::Manual
+    }
+}
+fn home_dir() -> Option<PathBuf> {
+    env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
+}
+fn requirements_paths() -> Vec<PathBuf> {
+    if cfg!(windows) {
+        env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .into_iter()
+            .map(|root| root.join("OpenAI/Codex/requirements.toml"))
+            .collect()
+    } else {
+        vec![PathBuf::from("/etc/codex/requirements.toml")]
+    }
+}
+
+fn wire_text(value: &str) -> WireNativeValue {
+    let mut wire = wire_path(Path::new(value));
+    wire.display = Some(value.to_owned());
+    wire
+}
+#[cfg(windows)]
+fn wire_path(path: &Path) -> WireNativeValue {
+    use std::os::windows::ffi::OsStrExt as _;
+    WireNativeValue {
+        platform: NativePlatform::Windows,
+        bytes: path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect(),
+        display: path.to_str().map(str::to_owned),
+    }
+}
+#[cfg(not(windows))]
+fn wire_path(path: &Path) -> WireNativeValue {
+    use std::os::unix::ffi::OsStrExt as _;
+    WireNativeValue {
+        platform: NativePlatform::Macos,
+        bytes: path.as_os_str().as_bytes().to_vec(),
+        display: path.to_str().map(str::to_owned),
+    }
+}
+#[cfg(windows)]
+fn decode_wire_path(value: &WireNativeValue) -> Result<PathBuf, BoundaryError> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
+    if value.platform != NativePlatform::Windows || !value.bytes.len().is_multiple_of(2) {
+        return Err(BoundaryError::new("Codex native path is invalid"));
+    }
+    Ok(PathBuf::from(OsString::from_wide(
+        &value
+            .bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>(),
+    )))
+}
+#[cfg(not(windows))]
+fn decode_wire_path(value: &WireNativeValue) -> Result<PathBuf, BoundaryError> {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+    if value.platform != NativePlatform::Macos || value.bytes.contains(&0) {
+        return Err(BoundaryError::new("Codex native path is invalid"));
+    }
+    Ok(PathBuf::from(OsString::from_vec(value.bytes.clone())))
+}
+fn invalid(message: &'static str) -> ClientError {
+    client_error(ErrorCode::InvalidRequest, message, false)
+}
+fn not_found(message: &'static str) -> ClientError {
+    client_error(ErrorCode::NotFound, message, false)
+}
+fn unsupported(message: &'static str) -> ClientError {
+    client_error(ErrorCode::HarnessUnsupported, message, false)
+}
+fn client_error(code: ErrorCode, message: &'static str, retryable: bool) -> ClientError {
+    ClientError {
+        code,
+        message: message.into(),
+        field_path: None,
+        retryable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn validation_commands_never_start_mcp_servers() {
+        assert_eq!(
+            [
+                CodexCommand::PluginList,
+                CodexCommand::McpList,
+                CodexCommand::McpGet("docs".into())
+            ]
+            .into_iter()
+            .map(|command| command.argv())
+            .collect::<Vec<_>>(),
+            vec![
+                vec!["plugin", "list", "--json"],
+                vec!["mcp", "list", "--json"],
+                vec!["mcp", "get", "docs", "--json"]
+            ]
+        );
+    }
+    #[test]
+    fn native_executable_magic_is_classified_without_executing_wrappers() {
+        assert_eq!(
+            classify_executable_magic(b"\x7fELF"),
+            CodexExecutableKind::Native
+        );
+        assert_eq!(
+            classify_executable_magic(b"#!/bin/sh"),
+            CodexExecutableKind::Wrapper
+        );
+        assert_eq!(
+            classify_executable_magic(b"text"),
+            CodexExecutableKind::Unknown
+        );
+    }
+    #[test]
+    fn frozen_release_outputs_match_reviewed_json_contracts() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/codex-0.144.1.json")).unwrap();
+        parse_plugin_list_json(&serde_json::to_vec(&fixture["pluginListJson"]).unwrap()).unwrap();
+        assert!(
+            parse_mcp_list_json(&serde_json::to_vec(&fixture["mcpListJson"]).unwrap())
+                .unwrap()
+                .contains("docs")
+        );
+        parse_mcp_get_json(&serde_json::to_vec(&fixture["mcpGetJson"]).unwrap(), "docs").unwrap();
+    }
+    #[test]
+    fn unreviewed_plugin_and_mcp_json_is_rejected() {
+        assert!(
+            parse_plugin_list_json(
+                br#"{"installed":[{"pluginId":"one","extra":true}],"available":[]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_mcp_list_json(br#"[{"name":"bad\nname","transport":{"type":"unknown"}}]"#)
+                .is_err()
+        );
+        let oversized = Value::Array((0..257).map(|index| serde_json::json!({"name":format!("m{index}"),"transport":{"type":"stdio"}})).collect());
+        assert!(parse_mcp_list_json(&serde_json::to_vec(&oversized).unwrap()).is_err());
+    }
+    #[test]
+    fn platform_candidates_include_native_macos_and_windows_locations() {
+        let candidates = platform_candidates(
+            Path::new("/Users/test"),
+            Some(Path::new("C:/Users/test/AppData/Local")),
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
+                PathBuf::from("/Users/test/Applications/ChatGPT.app/Contents/Resources/codex"),
+                PathBuf::from("/Users/test/.local/bin/codex"),
+                PathBuf::from("C:/Users/test/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe"),
+                PathBuf::from("C:/Users/test/AppData/Local/Programs/ChatGPT/resources/codex.exe")
+            ]
+        );
+    }
+}
