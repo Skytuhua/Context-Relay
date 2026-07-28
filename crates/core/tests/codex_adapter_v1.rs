@@ -153,6 +153,13 @@ fn import_project(
     })
 }
 
+fn assert_excludes_sensitive_values(serialized: &str, sensitive_values: &[&str]) {
+    let leaked = sensitive_values
+        .iter()
+        .any(|value| serialized.contains(value));
+    assert!(!leaked, "Codex import contained a sensitive value");
+}
+
 fn test_wire_path(path: &Path) -> WireNativeValue {
     #[cfg(windows)]
     let bytes = {
@@ -324,12 +331,62 @@ fn supported_release_fixtures_import_reviewed_surfaces_without_secrets() {
 fn toml_mcp_secrets_are_recursively_redacted_before_import() {
     let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
     let config = fixture.codex_home.join("config.toml");
-    fs::write(&config, format!("{}\n[mcp_servers.secret]\nurl = \"https://example.com\"\napi_token = \"literal-token\"\nauthorization = \"Bearer literal-auth\"\n[mcp_servers.secret.env]\nSECRET_VALUE = \"literal-env\"\n", fs::read_to_string(&config).unwrap())).unwrap();
+    fs::write(
+        &config,
+        format!(
+            "{}\n[mcp_servers.secret]\nurl = \"https://safe.example/mcp\"\napi_token = \"sensitive-mcp-token\"\nauthorization = \"Bearer sensitive-auth\"\nbearer = \"sensitive-bearer\"\ncookie = \"sensitive-cookie\"\ncredential = \"sensitive-credential\"\n[mcp_servers.secret.env]\nOPENAI_API_KEY = \"sensitive-openai\"\nAWS_ACCESS_KEY_ID = \"sensitive-aws-id\"\nAWS_SECRET_ACCESS_KEY = \"sensitive-aws-secret\"\nPRIVATE_KEY = \"sensitive-private-key\"\nPUBLIC_SETTING = \"sensitive-env-fallback\"\n[mcp_servers.secret.http_headers]\nX_CUSTOM_HEADER = \"sensitive-custom-header\"\nACCEPT = \"sensitive-standard-header\"\n",
+            fs::read_to_string(&config).unwrap()
+        ),
+    )
+    .unwrap();
     let serialized = serde_json::to_string(&import_everything(&fixture)).unwrap();
-    for secret in ["literal-token", "literal-auth", "literal-env"] {
-        assert!(!serialized.contains(secret));
-    }
+    assert_excludes_sensitive_values(
+        &serialized,
+        &[
+            "sensitive-mcp-token",
+            "sensitive-auth",
+            "sensitive-bearer",
+            "sensitive-cookie",
+            "sensitive-credential",
+            "sensitive-openai",
+            "sensitive-aws-id",
+            "sensitive-aws-secret",
+            "sensitive-private-key",
+            "sensitive-env-fallback",
+            "sensitive-custom-header",
+            "sensitive-standard-header",
+        ],
+    );
     assert!(serialized.contains("<redacted>"));
+    assert!(serialized.contains("https://safe.example/mcp"));
+}
+
+#[test]
+fn toml_plugin_secrets_are_recursively_redacted_before_import() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let config = fixture.codex_home.join("config.toml");
+    let existing = fs::read_to_string(&config).unwrap();
+    let configured = existing.replace(
+        "[plugins.\"formatter@team\"]\nenabled = true",
+        "[plugins]\n\"formatter@team\" = { enabled = true }\n\"secret-plugin\" = { enabled = true, description = \"safe plugin description\", settings = { apiKey = \"sensitive-plugin-api-key\", token = \"sensitive-plugin-token\", passphrase = \"sensitive-plugin-passphrase\", pwd = \"sensitive-plugin-pwd\", auth = \"sensitive-plugin-auth\", endpoint = \"https://safe.example/plugin\" } }",
+    );
+    assert_ne!(configured, existing);
+    fs::write(&config, configured).unwrap();
+
+    let serialized = serde_json::to_string(&import_everything(&fixture)).unwrap();
+    assert_excludes_sensitive_values(
+        &serialized,
+        &[
+            "sensitive-plugin-api-key",
+            "sensitive-plugin-token",
+            "sensitive-plugin-passphrase",
+            "sensitive-plugin-pwd",
+            "sensitive-plugin-auth",
+        ],
+    );
+    assert!(serialized.contains("<redacted>"));
+    assert!(serialized.contains("safe plugin description"));
+    assert!(serialized.contains("https://safe.example/plugin"));
 }
 
 #[test]
@@ -348,7 +405,7 @@ fn discovery_never_executes_wrapper_candidates() {
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(home.join(".codex")).unwrap();
     fs::create_dir_all(&project).unwrap();
-    let wrapper = bin.join("codex");
+    let wrapper = bin.join(if cfg!(windows) { "codex.exe" } else { "codex" });
     fs::write(
         &wrapper,
         format!(
@@ -1498,6 +1555,87 @@ fn fallback_instruction_topology_errors_are_propagated() {
     let target = fixture.root.join("fallback-target.md");
     fs::write(&target, "# unsafe fallback\n").unwrap();
     symlink(&target, fixture.layout.project_root.join("FALLBACK.md")).unwrap();
+    assert!(import_project(&fixture).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn physical_working_directory_must_remain_inside_the_project() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let outside = fixture.root.join("outside-working-directory");
+    fs::create_dir_all(outside.join(".codex")).unwrap();
+    fs::create_dir_all(outside.join(".agents/skills/outside")).unwrap();
+    fs::write(outside.join("AGENTS.md"), "# outside instruction\n").unwrap();
+    fs::write(
+        outside.join(".codex/config.toml"),
+        "approval_policy = \"never\"\n",
+    )
+    .unwrap();
+    fs::write(
+        outside.join(".agents/skills/outside/SKILL.md"),
+        "# outside skill\n",
+    )
+    .unwrap();
+    fs::remove_dir_all(&fixture.layout.working_directory).unwrap();
+    symlink(&outside, &fixture.layout.working_directory).unwrap();
+
+    let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
+    assert!(
+        CodexAdapter::from_layout(
+            fixture.layout.clone(),
+            fixture.project_id,
+            device_id,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+        )
+        .is_err()
+    );
+    assert!(import_project(&fixture).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn project_codex_root_symlink_cannot_import_outside_configuration() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let project_codex = fixture.layout.project_root.join(".codex");
+    let outside = fixture.root.join("outside-codex");
+    fs::create_dir_all(outside.join("rules")).unwrap();
+    fs::write(outside.join("config.toml"), "approval_policy = \"never\"\n").unwrap();
+    fs::write(outside.join("rules/outside.rules"), "outside-rule\n").unwrap();
+    fs::remove_dir_all(&project_codex).unwrap();
+    symlink(&outside, &project_codex).unwrap();
+
+    assert!(import_project(&fixture).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn untrusted_project_agents_root_symlink_cannot_import_outside_skills() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let config = fixture.codex_home.join("config.toml");
+    fs::write(
+        &config,
+        fs::read_to_string(&config)
+            .unwrap()
+            .replace("trust_level = \"trusted\"", "trust_level = \"untrusted\""),
+    )
+    .unwrap();
+    let project_agents = fixture.layout.project_root.join(".agents");
+    let outside = fixture.root.join("outside-agents");
+    fs::create_dir_all(outside.join("skills/outside")).unwrap();
+    fs::write(
+        outside.join("skills/outside/SKILL.md"),
+        "# outside untrusted skill\n",
+    )
+    .unwrap();
+    fs::remove_dir_all(&project_agents).unwrap();
+    symlink(&outside, &project_agents).unwrap();
+
     assert!(import_project(&fixture).is_err());
 }
 

@@ -121,14 +121,14 @@ impl CodexAdapter {
         };
         let executable =
             find_executable(&home).ok_or_else(|| not_found("Codex executable was not found"))?;
-        let (executable_kind, version) =
+        let (executable_snapshot, version) =
             discover_executable_version(&executable, &working_directory)?;
-        Self::from_layout(
+        Self::from_discovered_layout_after_version(
             CodexLayout {
                 installation_method: installation_method(&executable),
                 executable,
-                executable_kind,
-                version,
+                executable_kind: CodexExecutableKind::Unknown,
+                version: String::new(),
                 codex_home,
                 user_skills_dir: home.join(".agents/skills"),
                 project_root,
@@ -138,14 +138,56 @@ impl CodexAdapter {
             project_id,
             origin_device,
             observed_hlc,
+            executable_snapshot,
+            version,
+            || {},
         )
     }
 
     pub fn from_layout(
+        layout: CodexLayout,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+    ) -> Result<Self, ClientError> {
+        let executable_snapshot = snapshot_executable(&layout.executable)?;
+        Self::from_attested_layout(
+            layout,
+            project_id,
+            origin_device,
+            observed_hlc,
+            executable_snapshot,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_discovered_layout_after_version(
         mut layout: CodexLayout,
         project_id: ProjectId,
         origin_device: DeviceId,
         observed_hlc: HybridLogicalClock,
+        executable_snapshot: CodexExecutableSnapshot,
+        version: String,
+        after_version: impl FnOnce(),
+    ) -> Result<Self, ClientError> {
+        layout.executable_kind = executable_snapshot.kind;
+        layout.version = version;
+        after_version();
+        Self::from_attested_layout(
+            layout,
+            project_id,
+            origin_device,
+            observed_hlc,
+            executable_snapshot,
+        )
+    }
+
+    fn from_attested_layout(
+        mut layout: CodexLayout,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        executable_snapshot: CodexExecutableSnapshot,
     ) -> Result<Self, ClientError> {
         if !valid_version(&layout.version) {
             return Err(invalid("Codex version is invalid"));
@@ -167,12 +209,22 @@ impl CodexAdapter {
         {
             return Err(not_found("Codex installation or project is missing"));
         }
+        layout.project_root = fs::canonicalize(&layout.project_root)
+            .map_err(|_| invalid("Codex project root cannot be safely resolved"))?;
+        layout.working_directory = fs::canonicalize(&layout.working_directory)
+            .map_err(|_| invalid("Codex working directory cannot be safely resolved"))?;
         if !layout.working_directory.starts_with(&layout.project_root) {
             return Err(invalid(
                 "Codex working directory is outside the project root",
             ));
         }
-        let executable_snapshot = snapshot_executable(&layout.executable)?;
+        if snapshot_executable(&layout.executable)? != executable_snapshot {
+            return Err(client_error(
+                ErrorCode::Conflict,
+                "Codex executable changed",
+                false,
+            ));
+        }
         layout.executable_kind = executable_snapshot.kind;
         let executable_hash = executable_snapshot.digest;
         Ok(Self {
@@ -229,6 +281,9 @@ impl CodexAdapter {
                 "Untrusted project configuration is import-only",
             ));
         }
+        if matches!(scope, ScopeRef::Project { .. }) {
+            self.validate_project_path(&path)?;
+        }
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid("Codex config cannot be safely inspected"))?;
@@ -261,6 +316,9 @@ impl CodexAdapter {
             return Err(unsupported("Untrusted project rules are import-only"));
         }
         let path = self.markdown_path(component)?;
+        if matches!(component.scope, ScopeRef::Project { .. }) {
+            self.validate_project_path(&path)?;
+        }
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid("Codex Markdown cannot be safely inspected"))?;
@@ -289,6 +347,9 @@ impl CodexAdapter {
             return Err(unsupported("Untrusted project hooks are import-only"));
         }
         let path = self.hooks_json_path(component)?;
+        if matches!(component.scope, ScopeRef::Project { .. }) {
+            self.validate_project_path(&path)?;
+        }
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid("Codex hooks cannot be safely inspected"))?;
@@ -828,6 +889,9 @@ impl CodexAdapter {
         components: &mut Vec<ComponentRecord>,
         digests: &mut BTreeSet<Sha256Digest>,
     ) -> Result<(), ClientError> {
+        if matches!(&scope, ScopeRef::Project { .. }) {
+            self.validate_project_path(root)?;
+        }
         let override_path = root.join("AGENTS.override.md");
         let standard_path = root.join("AGENTS.md");
         let selected = if nonempty_file(&override_path)? {
@@ -903,6 +967,9 @@ impl CodexAdapter {
         components: &mut Vec<ComponentRecord>,
         digests: &mut BTreeSet<Sha256Digest>,
     ) -> Result<(), ClientError> {
+        if matches!(&scope, ScopeRef::Project { .. }) {
+            self.validate_project_path(root)?;
+        }
         for path in reviewed_files(root, |path| {
             path.extension()
                 .is_some_and(|extension| extension == "rules")
@@ -933,6 +1000,9 @@ impl CodexAdapter {
         components: &mut Vec<ComponentRecord>,
         digests: &mut BTreeSet<Sha256Digest>,
     ) -> Result<(), ClientError> {
+        if matches!(&scope, ScopeRef::Project { .. }) {
+            self.validate_project_path(root)?;
+        }
         for path in reviewed_skill_files(root)? {
             let name = path
                 .parent()
@@ -966,6 +1036,9 @@ impl CodexAdapter {
         components: &mut Vec<ComponentRecord>,
         digests: &mut BTreeSet<Sha256Digest>,
     ) -> Result<(), ClientError> {
+        if matches!(&scope, ScopeRef::Project { .. }) {
+            self.validate_project_path(path)?;
+        }
         let Some(bytes) = read_optional_file(path)? else {
             return Ok(());
         };
@@ -990,6 +1063,9 @@ impl CodexAdapter {
         components: &mut Vec<ComponentRecord>,
         digests: &mut BTreeSet<Sha256Digest>,
     ) -> Result<(), ClientError> {
+        if matches!(&scope, ScopeRef::Project { .. }) {
+            self.validate_project_path(path)?;
+        }
         let Some(bytes) = read_optional_file(path)? else {
             return Ok(());
         };
@@ -1033,11 +1109,12 @@ impl CodexAdapter {
                     .and_then(Item::as_bool)
                     .unwrap_or(true);
                 if enabled || include_disabled {
+                    let redacted = redact_plugin_sensitive(toml_item_json(table));
                     let mut component = self.component(
                         scope.clone(),
                         ComponentKind::Plugin,
                         name,
-                        table.to_string(),
+                        canonical_json(&redacted)?,
                         &format!("{location}plugins/{name}"),
                     )?;
                     component.archived = !enabled;
@@ -1073,6 +1150,9 @@ impl CodexAdapter {
         components: &mut Vec<ComponentRecord>,
         digests: &mut BTreeSet<Sha256Digest>,
     ) -> Result<(), ClientError> {
+        if matches!(&scope, ScopeRef::Project { .. }) {
+            self.validate_project_path(path)?;
+        }
         let Some(bytes) = read_optional_file(path)? else {
             return Ok(());
         };
@@ -1132,15 +1212,50 @@ impl CodexAdapter {
             .map_err(|_| invalid("Codex working directory is outside the project root"))?;
         let mut layers = vec![self.layout.project_root.clone()];
         let mut current = self.layout.project_root.clone();
+        self.validate_project_path(&current)?;
         for component in relative.components() {
             if let Component::Normal(name) = component {
                 current.push(name);
+                self.validate_project_path(&current)?;
                 layers.push(current.clone());
             } else {
                 return Err(invalid("Codex working directory is unsafe"));
             }
         }
         Ok(layers)
+    }
+
+    fn validate_project_path(&self, path: &Path) -> Result<(), ClientError> {
+        let relative = path
+            .strip_prefix(&self.layout.project_root)
+            .map_err(|_| invalid("Codex project path escaped its root"))?;
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(invalid("Codex project path is unsafe"));
+        }
+        let mut current = self.layout.project_root.clone();
+        let root_metadata = fs::symlink_metadata(&current)
+            .map_err(|_| invalid("Codex project path cannot be inspected"))?;
+        if !root_metadata.is_dir() || project_metadata_is_link(&root_metadata) {
+            return Err(invalid("Codex project path has unsafe topology"));
+        }
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(invalid("Codex project path is unsafe"));
+            };
+            current.push(name);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if project_metadata_is_link(&metadata) => {
+                    return Err(invalid("Codex project path has unsafe topology"));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => break,
+                Err(_) => return Err(invalid("Codex project path cannot be inspected")),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1246,16 +1361,25 @@ impl HarnessAdapter for CodexAdapter {
             }
             match component.kind {
                 ComponentKind::PermissionDeclaration => {
-                    config_paths.insert(
-                        self.config_component_path(component)?
-                            .ok_or_else(|| invalid("Codex permission target is invalid"))?,
-                    );
+                    let path = self
+                        .config_component_path(component)?
+                        .ok_or_else(|| invalid("Codex permission target is invalid"))?;
+                    if matches!(component.scope, ScopeRef::Project { .. }) {
+                        self.validate_project_path(&path)?;
+                    }
+                    config_paths.insert(path);
                 }
                 ComponentKind::Hook => {
                     if let Some(path) = self.config_component_path(component)? {
+                        if matches!(component.scope, ScopeRef::Project { .. }) {
+                            self.validate_project_path(&path)?;
+                        }
                         config_paths.insert(path);
                     } else {
                         let path = self.hooks_json_path(component)?;
+                        if matches!(component.scope, ScopeRef::Project { .. }) {
+                            self.validate_project_path(&path)?;
+                        }
                         if hook_components.insert(path, component).is_some() {
                             return Err(invalid("Codex hooks target is repeated"));
                         }
@@ -1263,6 +1387,9 @@ impl HarnessAdapter for CodexAdapter {
                 }
                 ComponentKind::Instruction | ComponentKind::Rule | ComponentKind::Skill => {
                     let path = self.markdown_path(component)?;
+                    if matches!(component.scope, ScopeRef::Project { .. }) {
+                        self.validate_project_path(&path)?;
+                    }
                     let existing =
                         read_required_regular(&path, "Codex Markdown must already exist")?;
                     let bytes = render_managed_markdown(
@@ -1459,15 +1586,18 @@ impl CodexAdapter {
 
     fn imported_mcp_names(&self) -> Result<Vec<String>, ClientError> {
         let mut names = BTreeSet::new();
-        let mut paths = vec![self.layout.codex_home.join("config.toml")];
+        let mut paths = vec![(self.layout.codex_home.join("config.toml"), false)];
         if self.project_is_trusted()? {
             paths.extend(
                 self.project_layers()?
                     .into_iter()
-                    .map(|layer| layer.join(".codex/config.toml")),
+                    .map(|layer| (layer.join(".codex/config.toml"), true)),
             );
         }
-        for path in paths {
+        for (path, is_project) in paths {
+            if is_project {
+                self.validate_project_path(&path)?;
+            }
             let Some(bytes) = read_optional_file(&path)? else {
                 continue;
             };
@@ -2156,7 +2286,7 @@ fn reviewed_files(
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(_) => return Err(invalid("Codex configuration cannot be inspected")),
     };
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.is_dir() || project_metadata_is_link(&metadata) {
         return Err(invalid("Codex configuration has unsafe topology"));
     }
     let mut pending = vec![root.to_path_buf()];
@@ -2166,15 +2296,14 @@ fn reviewed_files(
             .map_err(|_| invalid("Codex configuration cannot be inspected"))?
         {
             let entry = entry.map_err(|_| invalid("Codex configuration cannot be inspected"))?;
-            let kind = entry
-                .file_type()
+            let metadata = fs::symlink_metadata(entry.path())
                 .map_err(|_| invalid("Codex configuration cannot be inspected"))?;
-            if kind.is_symlink() {
+            if project_metadata_is_link(&metadata) {
                 return Err(invalid("Codex configuration has unsafe topology"));
             }
-            if kind.is_dir() {
+            if metadata.is_dir() {
                 pending.push(entry.path());
-            } else if kind.is_file() && predicate(&entry.path()) {
+            } else if metadata.is_file() && predicate(&entry.path()) {
                 files.push(entry.path());
             }
         }
@@ -2183,30 +2312,46 @@ fn reviewed_files(
     Ok(files)
 }
 
+fn project_metadata_is_link(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn reviewed_skill_files(root: &Path) -> Result<Vec<PathBuf>, ClientError> {
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(_) => return Err(invalid("Codex skills cannot be inspected")),
     };
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.is_dir() || project_metadata_is_link(&metadata) {
         return Err(invalid("Codex skills have unsafe topology"));
     }
     let mut files = Vec::new();
     for entry in fs::read_dir(root).map_err(|_| invalid("Codex skills cannot be inspected"))? {
         let entry = entry.map_err(|_| invalid("Codex skills cannot be inspected"))?;
-        let kind = entry
-            .file_type()
+        let metadata = fs::symlink_metadata(entry.path())
             .map_err(|_| invalid("Codex skills cannot be inspected"))?;
-        if kind.is_symlink() {
+        if project_metadata_is_link(&metadata) {
             return Err(invalid("Codex skills have unsafe topology"));
         }
-        if !kind.is_dir() {
+        if !metadata.is_dir() {
             continue;
         }
         let skill = entry.path().join("SKILL.md");
         match fs::symlink_metadata(&skill) {
-            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            Ok(metadata) if metadata.is_file() && !project_metadata_is_link(&metadata) => {
                 files.push(skill);
             }
             Ok(_) => return Err(invalid("Codex skills have unsafe topology")),
@@ -2224,7 +2369,7 @@ fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(invalid("Codex configuration cannot be inspected")),
     };
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
+    if !metadata.is_file() || project_metadata_is_link(&metadata) || metadata.len() > 1024 * 1024 {
         return Err(invalid("Codex configuration has unsafe topology or size"));
     }
     fs::read(path)
@@ -2371,20 +2516,11 @@ fn redact_sensitive(value: Value) -> Value {
             values
                 .into_iter()
                 .map(|(key, value)| {
-                    let lower = key.to_ascii_lowercase();
-                    let sensitive = [
-                        "token",
-                        "secret",
-                        "password",
-                        "authorization",
-                        "cookie",
-                        "credential",
-                    ]
-                    .iter()
-                    .any(|needle| lower.contains(needle));
                     (
-                        key,
-                        if sensitive {
+                        key.clone(),
+                        if sensitive_map(&key) {
+                            redact_all_values(value)
+                        } else if sensitive_key(&key) {
                             Value::String("<redacted>".into())
                         } else {
                             redact_sensitive(value)
@@ -2395,6 +2531,115 @@ fn redact_sensitive(value: Value) -> Value {
         ),
         Value::Array(values) => Value::Array(values.into_iter().map(redact_sensitive).collect()),
         value => value,
+    }
+}
+fn redact_plugin_sensitive(value: Value) -> Value {
+    match value {
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| {
+                    let redacted = if sensitive_map(&key) {
+                        redact_all_values(value)
+                    } else if sensitive_key(&key) {
+                        Value::String("<redacted>".into())
+                    } else if plugin_public_key(&key) {
+                        redact_sensitive(value)
+                    } else {
+                        match value {
+                            Value::Object(_) | Value::Array(_) => redact_plugin_sensitive(value),
+                            Value::Null => Value::Null,
+                            _ => Value::String("<redacted>".into()),
+                        }
+                    };
+                    (key, redacted)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(redact_plugin_sensitive).collect())
+        }
+        Value::Null => Value::Null,
+        _ => Value::String("<redacted>".into()),
+    }
+}
+fn plugin_public_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "description"
+            | "enabled"
+            | "endpoint"
+            | "name"
+            | "path"
+            | "pluginid"
+            | "ref"
+            | "source"
+            | "type"
+            | "url"
+            | "version"
+    )
+}
+fn sensitive_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    [
+        "apikey",
+        "accesskey",
+        "privatekey",
+        "token",
+        "secret",
+        "auth",
+        "password",
+        "passphrase",
+        "pwd",
+        "authorization",
+        "bearer",
+        "cookie",
+        "credential",
+        "header",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+        || normalized == "key"
+        || matches!(
+            normalized.as_str(),
+            "clientkey"
+                | "encryptionkey"
+                | "hmackey"
+                | "serviceaccountkey"
+                | "signingkey"
+                | "sshkey"
+        )
+}
+fn sensitive_map(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(normalized.as_str(), "env" | "environment")
+        || normalized.ends_with("headers")
+        || normalized.ends_with("headermap")
+}
+fn redact_all_values(value: Value) -> Value {
+    match value {
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, redact_all_values(value)))
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.into_iter().map(redact_all_values).collect()),
+        Value::Null => Value::Null,
+        _ => Value::String("<redacted>".into()),
     }
 }
 fn contains_redaction(value: &Value) -> bool {
@@ -2518,7 +2763,7 @@ fn hash_file(path: &Path) -> std::io::Result<Sha256Digest> {
 fn discover_executable_version(
     executable: &Path,
     working_directory: &Path,
-) -> Result<(CodexExecutableKind, String), ClientError> {
+) -> Result<(CodexExecutableSnapshot, String), ClientError> {
     discover_executable_version_after_snapshot(executable, working_directory, || {})
 }
 
@@ -2526,7 +2771,7 @@ fn discover_executable_version_after_snapshot(
     executable: &Path,
     working_directory: &Path,
     after_snapshot: impl FnOnce(),
-) -> Result<(CodexExecutableKind, String), ClientError> {
+) -> Result<(CodexExecutableSnapshot, String), ClientError> {
     let snapshot = snapshot_executable(executable)?;
     let version = if snapshot.kind == CodexExecutableKind::Native {
         after_snapshot();
@@ -2543,7 +2788,14 @@ fn discover_executable_version_after_snapshot(
         // unclassified candidate merely to obtain its version.
         "0.0.0".to_owned()
     };
-    Ok((snapshot.kind, version))
+    if snapshot_executable(executable)? != snapshot {
+        return Err(client_error(
+            ErrorCode::Conflict,
+            "Codex executable changed",
+            false,
+        ));
+    }
+    Ok((snapshot, version))
 }
 
 fn run_bounded_command(
@@ -2674,20 +2926,26 @@ fn find_executable(home: &Path) -> Option<PathBuf> {
     candidates.extend(platform_candidates(
         home,
         env::var_os("LOCALAPPDATA").as_deref().map(Path::new),
+        cfg!(windows),
     ));
     candidates.into_iter().find(|candidate| candidate.is_file())
 }
-fn platform_candidates(home: &Path, local_app_data: Option<&Path>) -> Vec<PathBuf> {
-    let mut candidates = vec![
-        PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
-        home.join("Applications/ChatGPT.app/Contents/Resources/codex"),
-        home.join(".local/bin/codex"),
-    ];
-    if let Some(local_app_data) = local_app_data {
-        candidates.push(local_app_data.join("Programs/OpenAI/Codex/bin/codex.exe"));
-        candidates.push(local_app_data.join("Programs/ChatGPT/resources/codex.exe"));
+fn platform_candidates(home: &Path, local_app_data: Option<&Path>, windows: bool) -> Vec<PathBuf> {
+    if windows {
+        let Some(local_app_data) = local_app_data else {
+            return Vec::new();
+        };
+        vec![
+            local_app_data.join("Programs/OpenAI/Codex/bin/codex.exe"),
+            local_app_data.join("Programs/ChatGPT/resources/codex.exe"),
+        ]
+    } else {
+        vec![
+            PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
+            home.join("Applications/ChatGPT.app/Contents/Resources/codex"),
+            home.join(".local/bin/codex"),
+        ]
     }
-    candidates
 }
 fn installation_method(path: &Path) -> InstallationMethod {
     let value = path.to_string_lossy().to_ascii_lowercase();
@@ -3154,6 +3412,70 @@ mod tests {
         ));
         assert!(!sentinel_exists);
     }
+    #[cfg(unix)]
+    #[test]
+    fn native_discovery_rejects_replacement_after_version_before_construction() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-codex-discovery-post-version-race-{}-{}",
+            std::process::id(),
+            NEXT_EFFECTIVE_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let codex_home = root.join("codex-home");
+        let user_skills_dir = root.join("user-skills");
+        let project_root = root.join("project");
+        for directory in [&codex_home, &user_skills_dir, &project_root] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let executable = root.join("codex");
+        fs::copy("/usr/bin/true", &executable).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let attested = snapshot_executable(&executable).unwrap();
+        assert_eq!(attested.kind, CodexExecutableKind::Native);
+        let replacement = fs::read("/usr/bin/touch").unwrap();
+        assert_eq!(
+            classify_executable_bytes(&executable, &replacement),
+            CodexExecutableKind::Native
+        );
+        let sentinel = project_root.join("plugin");
+        let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
+        let result = CodexAdapter::from_discovered_layout_after_version(
+            CodexLayout {
+                executable: executable.clone(),
+                executable_kind: CodexExecutableKind::Unknown,
+                version: String::new(),
+                installation_method: InstallationMethod::Manual,
+                codex_home,
+                user_skills_dir,
+                project_root: project_root.clone(),
+                working_directory: project_root,
+                requirements_paths: vec![],
+            },
+            ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073981").unwrap(),
+            device_id,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+            attested,
+            "0.144.1".into(),
+            || {
+                fs::write(&executable, replacement).unwrap();
+                fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            },
+        );
+        if let Ok(adapter) = &result {
+            let _ = adapter.validate_effective(&effective_validation_receipt());
+        }
+        let sentinel_exists = sentinel.exists();
+        let _ = fs::remove_dir_all(root);
+        assert!(matches!(
+            result,
+            Err(ClientError {
+                code: ErrorCode::Conflict,
+                ..
+            })
+        ));
+        assert!(!sentinel_exists);
+    }
     #[test]
     fn frozen_release_outputs_match_reviewed_json_contracts() {
         for source in [
@@ -3402,17 +3724,28 @@ mod tests {
         assert!(parse_mcp_list_json(&server_bytes).is_err());
     }
     #[test]
-    fn platform_candidates_include_native_macos_and_windows_locations() {
-        let candidates = platform_candidates(
+    fn platform_candidates_are_isolated_by_native_platform() {
+        let macos = platform_candidates(
             Path::new("/Users/test"),
             Some(Path::new("C:/Users/test/AppData/Local")),
+            false,
         );
         assert_eq!(
-            candidates,
+            macos,
             vec![
                 PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
                 PathBuf::from("/Users/test/Applications/ChatGPT.app/Contents/Resources/codex"),
                 PathBuf::from("/Users/test/.local/bin/codex"),
+            ]
+        );
+        let windows = platform_candidates(
+            Path::new("/Users/test"),
+            Some(Path::new("C:/Users/test/AppData/Local")),
+            true,
+        );
+        assert_eq!(
+            windows,
+            vec![
                 PathBuf::from("C:/Users/test/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe"),
                 PathBuf::from("C:/Users/test/AppData/Local/Programs/ChatGPT/resources/codex.exe")
             ]
