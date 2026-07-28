@@ -1490,6 +1490,8 @@ impl CodexAdapter {
                     };
                     if enabled {
                         names.insert(name.to_owned());
+                    } else {
+                        names.remove(name);
                     }
                 }
             }

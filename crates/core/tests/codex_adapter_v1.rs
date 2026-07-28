@@ -796,6 +796,93 @@ esac
     assert!(fixture.adapter.validate_effective(&receipt).is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn effective_validation_honors_same_name_mcp_shadowing_across_layers() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let global_config = fixture.codex_home.join("config.toml");
+    fs::write(
+        &global_config,
+        format!(
+            "{}\n[mcp_servers.shadowed]\ncommand = \"global-shadowed\"\n\n[mcp_servers.reenabled]\nenabled = false\ncommand = \"global-disabled\"\n",
+            fs::read_to_string(&global_config).unwrap()
+        ),
+    )
+    .unwrap();
+    let root_config = fixture.layout.project_root.join(".codex/config.toml");
+    fs::write(
+        &root_config,
+        format!(
+            "{}\n[mcp_servers.shadowed]\nenabled = true\ncommand = \"root-shadowed\"\n",
+            fs::read_to_string(&root_config).unwrap()
+        ),
+    )
+    .unwrap();
+    let nested_config = fixture
+        .layout
+        .project_root
+        .join("service/.codex/config.toml");
+    fs::write(
+        &nested_config,
+        format!(
+            "{}\n[mcp_servers.shadowed]\nenabled = false\ncommand = \"nested-disabled\"\n\n[mcp_servers.reenabled]\nenabled = true\ncommand = \"nested-reenabled\"\n",
+            fs::read_to_string(&nested_config).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let script = r#"#!/bin/sh
+printf '%s\n' "$*" >> ../../codex-argv.log
+case "$1 $2" in
+  "plugin list")
+    printf '%s' '{"installed":[],"available":[]}'
+    ;;
+  "mcp list")
+    printf '%s' '[{"name":"docs","enabled":true,"disabled_reason":null,"transport":{"type":"stdio","command":"never-run","args":[],"env":{},"env_vars":[],"cwd":null},"startup_timeout_sec":null,"tool_timeout_sec":null,"auth_status":"unsupported"},{"name":"reenabled","enabled":true,"disabled_reason":null,"transport":{"type":"stdio","command":"never-run","args":[],"env":{},"env_vars":[],"cwd":null},"startup_timeout_sec":null,"tool_timeout_sec":null,"auth_status":"unsupported"}]'
+    ;;
+  "mcp get")
+    [ "$3" != "shadowed" ] || exit 8
+    printf '{"name":"%s","enabled":true,"disabled_reason":null,"transport":{"type":"stdio","command":"never-run","args":[],"env":{},"env_vars":[],"cwd":null},"enabled_tools":null,"disabled_tools":null,"startup_timeout_sec":null,"tool_timeout_sec":null}' "$3"
+    ;;
+  *)
+    exit 9
+    ;;
+esac
+"#;
+    fs::write(&fixture.layout.executable, script).unwrap();
+    let mut permissions = fs::metadata(&fixture.layout.executable)
+        .unwrap()
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&fixture.layout.executable, permissions).unwrap();
+    fixture.adapter = CodexAdapter::from_layout(
+        fixture.layout.clone(),
+        fixture.project_id,
+        DeviceId::from_str(DEVICE_ID).unwrap(),
+        HybridLogicalClock::new(1_900_000_000_000, 0, DeviceId::from_str(DEVICE_ID).unwrap()),
+    )
+    .unwrap();
+
+    let receipt = ApplyReceipt {
+        plan_id: PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073984").unwrap(),
+        applied_hlc: HybridLogicalClock::new(
+            1_900_000_000_001,
+            0,
+            DeviceId::from_str(DEVICE_ID).unwrap(),
+        ),
+        resulting_digests: vec![],
+    };
+    let report = fixture.adapter.validate_effective(&receipt).unwrap();
+
+    assert!(report.valid);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("codex-argv.log")).unwrap(),
+        "plugin list --json\nmcp list --json\nmcp get docs --json\nmcp get reenabled --json\n"
+    );
+}
+
 #[test]
 fn managed_markdown_preserves_unmanaged_bytes_and_rejects_malformed_markers() {
     let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
