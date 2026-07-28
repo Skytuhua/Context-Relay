@@ -11,9 +11,9 @@ use context_relay_core::{
 };
 use context_relay_native_runner::NativeState;
 use context_relay_protocol::{
-    CapabilityLevel, ComponentKind, ComponentRecord, DesiredState, DeviceId, HarnessAdapter,
-    HarnessId, HybridLogicalClock, ImportRequest, InstallationMethod, NativeScope, ProbeContext,
-    ProjectId, Provenance, ScopeRef,
+    ApplyReceipt, CapabilityLevel, ComponentKind, ComponentRecord, DesiredState, DeviceId,
+    HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest, InstallationMethod, NativeScope,
+    PlanId, ProbeContext, ProjectId, Provenance, ScopeRef,
 };
 use serde_json::{Map, Value, json};
 
@@ -522,6 +522,22 @@ fn mixed_toml_preserves_comments_unknown_fields_trust_and_rolls_back() {
 #[test]
 fn plugin_and_global_mcp_changes_use_only_official_cli_argv() {
     let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let mut removed_plugin = component(
+        fixture.project_id,
+        ScopeRef::Global,
+        ComponentKind::Plugin,
+        "old@team",
+        "true",
+    );
+    removed_plugin.archived = true;
+    let mut removed_mcp = component(
+        fixture.project_id,
+        ScopeRef::Global,
+        ComponentKind::McpServer,
+        "old-tools",
+        "{}",
+    );
+    removed_mcp.archived = true;
     let rendered = fixture
         .adapter
         .render(&DesiredState {
@@ -539,6 +555,22 @@ fn plugin_and_global_mcp_changes_use_only_official_cli_argv() {
                     ComponentKind::McpServer,
                     "docs",
                     r#"{"url":"https://example.com/mcp","bearer_token_env_var":"DOCS_TOKEN"}"#,
+                ),
+                removed_plugin,
+                removed_mcp,
+                component(
+                    fixture.project_id,
+                    ScopeRef::Global,
+                    ComponentKind::McpServer,
+                    "public-docs",
+                    r#"{"url":"https://example.com/public"}"#,
+                ),
+                component(
+                    fixture.project_id,
+                    ScopeRef::Global,
+                    ComponentKind::McpServer,
+                    "local-tools",
+                    r#"{"type":"stdio","command":"local-server","args":["--safe"],"env":{"ZETA":"last","ALPHA":"first"}}"#,
                 ),
             ],
             scopes: vec![NativeScope::Global],
@@ -567,9 +599,201 @@ fn plugin_and_global_mcp_changes_use_only_official_cli_argv() {
                 "https://example.com/mcp",
                 "--bearer-token-env-var",
                 "DOCS_TOKEN"
-            ]
+            ],
+            vec!["plugin", "remove", "old@team", "--json"],
+            vec!["mcp", "remove", "old-tools"],
+            vec![
+                "mcp",
+                "add",
+                "public-docs",
+                "--url",
+                "https://example.com/public"
+            ],
+            vec![
+                "mcp",
+                "add",
+                "local-tools",
+                "--env",
+                "ALPHA=first",
+                "--env",
+                "ZETA=last",
+                "--",
+                "local-server",
+                "--safe"
+            ],
         ]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn effective_validation_uses_enabled_global_and_trusted_layered_mcp_servers_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let sentinel = fixture.root.join("configured-server-ran");
+    let root_config = fixture.layout.project_root.join(".codex/config.toml");
+    fs::write(
+        &root_config,
+        format!(
+            "{}\n[mcp_servers.root]\ncommand = \"/usr/bin/touch\"\nargs = [\"{}\"]\n\n[mcp_servers.root_disabled]\nenabled = false\ncommand = \"/usr/bin/touch\"\nargs = [\"{}\"]\n",
+            fs::read_to_string(&root_config).unwrap(),
+            sentinel.display(),
+            sentinel.display()
+        ),
+    )
+    .unwrap();
+    let nested_config = fixture
+        .layout
+        .project_root
+        .join("service/.codex/config.toml");
+    fs::write(
+        &nested_config,
+        format!(
+            "{}\n[mcp_servers.nested]\ncommand = \"/usr/bin/touch\"\nargs = [\"{}\"]\n\n[mcp_servers.nested_disabled]\nenabled = false\ncommand = \"/usr/bin/touch\"\nargs = [\"{}\"]\n",
+            fs::read_to_string(&nested_config).unwrap(),
+            sentinel.display(),
+            sentinel.display()
+        ),
+    )
+    .unwrap();
+    let global_config = fixture.codex_home.join("config.toml");
+    fs::write(
+        &global_config,
+        format!(
+            "{}\n[mcp_servers.global_disabled]\nenabled = false\ncommand = \"/usr/bin/touch\"\nargs = [\"{}\"]\n",
+            fs::read_to_string(&global_config).unwrap(),
+            sentinel.display()
+        ),
+    )
+    .unwrap();
+
+    let script = r#"#!/bin/sh
+printf '%s\n' "$*" >> ../../codex-argv.log
+case "$1 $2" in
+  "plugin list")
+    printf '%s' '{"installed":[],"available":[]}'
+    ;;
+  "mcp list")
+    cat ../../mcp-list.json
+    ;;
+  "mcp get")
+    printf '{"name":"%s","enabled":true,"disabled_reason":null,"transport":{"type":"stdio","command":"never-run","args":[],"env":{},"env_vars":[],"cwd":null},"enabled_tools":null,"disabled_tools":null,"startup_timeout_sec":null,"tool_timeout_sec":null}' "$3"
+    ;;
+  *)
+    exit 9
+    ;;
+esac
+"#;
+    fs::write(&fixture.layout.executable, script).unwrap();
+    let mut permissions = fs::metadata(&fixture.layout.executable)
+        .unwrap()
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&fixture.layout.executable, permissions).unwrap();
+    fixture.adapter = CodexAdapter::from_layout(
+        fixture.layout.clone(),
+        fixture.project_id,
+        DeviceId::from_str(DEVICE_ID).unwrap(),
+        HybridLogicalClock::new(1_900_000_000_000, 0, DeviceId::from_str(DEVICE_ID).unwrap()),
+    )
+    .unwrap();
+    let list_path = fixture.root.join("mcp-list.json");
+    let write_list = |enabled: &[&str]| {
+        let mut servers = enabled
+            .iter()
+            .map(|name| {
+                json!({
+                    "name": name,
+                    "enabled": true,
+                    "disabled_reason": null,
+                    "transport": {
+                        "type": "stdio",
+                        "command": "never-run",
+                        "args": [],
+                        "env": {},
+                        "env_vars": [],
+                        "cwd": null
+                    },
+                    "startup_timeout_sec": null,
+                    "tool_timeout_sec": null,
+                    "auth_status": "unsupported"
+                })
+            })
+            .collect::<Vec<_>>();
+        servers.push(json!({
+            "name": "listed-disabled",
+            "enabled": false,
+            "disabled_reason": "disabled by config",
+            "transport": {
+                "type": "stdio",
+                "command": "never-run",
+                "args": [],
+                "env": {},
+                "env_vars": [],
+                "cwd": null
+            },
+            "startup_timeout_sec": null,
+            "tool_timeout_sec": null,
+            "auth_status": "unsupported"
+        }));
+        fs::write(&list_path, serde_json::to_vec(&servers).unwrap()).unwrap();
+    };
+    let receipt = ApplyReceipt {
+        plan_id: PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073984").unwrap(),
+        applied_hlc: HybridLogicalClock::new(
+            1_900_000_000_001,
+            0,
+            DeviceId::from_str(DEVICE_ID).unwrap(),
+        ),
+        resulting_digests: vec![],
+    };
+
+    write_list(&["docs", "nested", "root"]);
+    let trusted = fixture.adapter.validate_effective(&receipt).unwrap();
+    assert!(trusted.valid);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("codex-argv.log")).unwrap(),
+        "plugin list --json\nmcp list --json\nmcp get docs --json\nmcp get nested --json\nmcp get root --json\n"
+    );
+
+    fs::remove_file(fixture.root.join("codex-argv.log")).unwrap();
+    fs::write(
+        &global_config,
+        fs::read_to_string(&global_config)
+            .unwrap()
+            .replace("trust_level = \"trusted\"", "trust_level = \"untrusted\""),
+    )
+    .unwrap();
+    let untrusted = fixture.adapter.validate_effective(&receipt).unwrap();
+    assert!(untrusted.valid);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("codex-argv.log")).unwrap(),
+        "plugin list --json\nmcp list --json\nmcp get docs --json\n"
+    );
+
+    fs::write(
+        &global_config,
+        fs::read_to_string(&global_config)
+            .unwrap()
+            .replace("trust_level = \"untrusted\"", "trust_level = \"trusted\""),
+    )
+    .unwrap();
+    write_list(&["docs", "root"]);
+    let missing = fixture.adapter.validate_effective(&receipt).unwrap();
+    assert!(!missing.valid);
+    assert_eq!(missing.findings, vec!["configured_mcp_server_missing"]);
+    assert!(!sentinel.exists());
+
+    fs::write(
+        &global_config,
+        format!(
+            "mcp_servers = \"not-a-table\"\n\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            fixture.layout.project_root.display()
+        ),
+    )
+    .unwrap();
+    assert!(fixture.adapter.validate_effective(&receipt).is_err());
 }
 
 #[test]
@@ -682,6 +906,22 @@ fn project_mcp_changes_are_import_only_and_redacted_mcp_cannot_be_applied() {
             .adapter
             .render(&DesiredState {
                 components: vec![redacted],
+                scopes: vec![]
+            })
+            .is_err()
+    );
+    let unsupported_headers = component(
+        fixture.project_id,
+        ScopeRef::Global,
+        ComponentKind::McpServer,
+        "docs",
+        r#"{"url":"https://example.com/mcp","http_headers":{"X-Test":"value"}}"#,
+    );
+    assert!(
+        fixture
+            .adapter
+            .render(&DesiredState {
+                components: vec![unsupported_headers],
                 scopes: vec![]
             })
             .is_err()

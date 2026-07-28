@@ -1473,10 +1473,24 @@ impl CodexAdapter {
                 continue;
             };
             let document = bytes_to_document(&bytes)?;
-            if let Some(servers) = document.get("mcp_servers").and_then(Item::as_table) {
-                for (name, _) in servers {
+            if let Some(servers) = document.get("mcp_servers") {
+                let servers = servers
+                    .as_table()
+                    .ok_or_else(|| invalid("Codex MCP configuration is invalid"))?;
+                for (name, item) in servers {
                     safe_name(name)?;
-                    names.insert(name.to_owned());
+                    let table = item
+                        .as_table()
+                        .ok_or_else(|| invalid("Codex MCP configuration is invalid"))?;
+                    let enabled = match table.get("enabled") {
+                        Some(enabled) => enabled
+                            .as_bool()
+                            .ok_or_else(|| invalid("Codex MCP configuration is invalid"))?,
+                        None => true,
+                    };
+                    if enabled {
+                        names.insert(name.to_owned());
+                    }
                 }
             }
         }
@@ -1559,27 +1573,36 @@ fn render_mcp_add(name: &str, value: &Value) -> Result<Vec<String>, ClientError>
     let object = value
         .as_object()
         .ok_or_else(|| invalid("Codex MCP component is invalid"))?;
-    if let (Some(url), Some(token)) = (
-        object.get("url").and_then(Value::as_str),
-        object.get("bearer_token_env_var").and_then(Value::as_str),
-    ) {
-        if object.len() != 2
-            || url.is_empty()
-            || token.is_empty()
+    if object.contains_key("url") {
+        if object
+            .keys()
+            .any(|key| !["url", "bearer_token_env_var"].contains(&key.as_str()))
             || contains_control(value)
             || contains_redaction(value)
         {
             return Err(invalid("Codex MCP transport is unsupported"));
         }
-        return Ok(vec![
+        let url = object
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?;
+        let mut rendered = vec![
             "mcp".into(),
             "add".into(),
             name.into(),
             "--url".into(),
             url.into(),
-            "--bearer-token-env-var".into(),
-            token.into(),
-        ]);
+        ];
+        if let Some(token) = object.get("bearer_token_env_var") {
+            let token = token
+                .as_str()
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?;
+            rendered.push("--bearer-token-env-var".into());
+            rendered.push(token.into());
+        }
+        return Ok(rendered);
     }
     if object
         .keys()
@@ -1589,16 +1612,25 @@ fn render_mcp_add(name: &str, value: &Value) -> Result<Vec<String>, ClientError>
     {
         return Err(invalid("Codex MCP transport is unsupported"));
     }
+    if object
+        .get("type")
+        .is_some_and(|kind| kind.as_str() != Some("stdio"))
+    {
+        return Err(invalid("Codex MCP transport is unsupported"));
+    }
     let command = object
         .get("command")
         .and_then(Value::as_str)
         .filter(|command| !command.is_empty())
         .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?;
     let mut rendered = vec!["mcp".into(), "add".into(), name.into()];
-    let environment = object
-        .get("env")
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?;
+    let empty_environment = Map::new();
+    let environment = match object.get("env") {
+        Some(environment) => environment
+            .as_object()
+            .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?,
+        None => &empty_environment,
+    };
     let mut environment = environment.iter().collect::<Vec<_>>();
     environment.sort_by_key(|(key, _)| *key);
     for (key, value) in environment {
@@ -1607,7 +1639,7 @@ fn render_mcp_add(name: &str, value: &Value) -> Result<Vec<String>, ClientError>
             .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?;
         if key.is_empty()
             || key.chars().any(char::is_control)
-            || value.is_empty()
+            || key.contains('=')
             || value == "<redacted>"
         {
             return Err(invalid(
@@ -1619,16 +1651,16 @@ fn render_mcp_add(name: &str, value: &Value) -> Result<Vec<String>, ClientError>
     }
     rendered.push("--".into());
     rendered.push(command.into());
-    if let Some(arguments) = object.get("args").and_then(Value::as_array) {
+    if let Some(arguments) = object.get("args") {
+        let arguments = arguments
+            .as_array()
+            .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?;
         for argument in arguments {
             let argument = argument
                 .as_str()
-                .filter(|argument| !argument.is_empty())
                 .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?;
             rendered.push(argument.into());
         }
-    } else {
-        return Err(invalid("Codex MCP transport is unsupported"));
     }
     Ok(rendered)
 }
@@ -1656,7 +1688,11 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<(), ClientError> {
         return Err(invalid("Codex plugin output is invalid"));
     }
     let mut ids = BTreeSet::new();
-    for plugin in installed.iter().chain(available) {
+    for (plugin, expected_installed) in installed
+        .iter()
+        .map(|plugin| (plugin, true))
+        .chain(available.iter().map(|plugin| (plugin, false)))
+    {
         let plugin = plugin
             .as_object()
             .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
@@ -1681,12 +1717,31 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<(), ClientError> {
             .and_then(Value::as_str)
             .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
         safe_name(id)?;
+        let string_field = |name| {
+            plugin
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+                .ok_or_else(|| invalid("Codex plugin output is invalid"))
+        };
+        safe_name(string_field("name")?)?;
+        safe_name(string_field("marketplaceName")?)?;
+        string_field("version")?;
+        let install_policy = string_field("installPolicy")?;
+        let auth_policy = string_field("authPolicy")?;
         if !ids.insert(id)
-            || plugin.get("installed").and_then(Value::as_bool).is_none()
+            || plugin.get("installed").and_then(Value::as_bool) != Some(expected_installed)
             || plugin.get("enabled").and_then(Value::as_bool).is_none()
+            || install_policy != "AVAILABLE"
+            || !["ON_USE", "ON_INSTALL"].contains(&auth_policy)
         {
             return Err(invalid("Codex plugin output is invalid"));
         }
+        parse_plugin_source(
+            plugin
+                .get("source")
+                .ok_or_else(|| invalid("Codex plugin output is invalid"))?,
+        )?;
     }
     Ok(())
 }
@@ -1701,50 +1756,335 @@ fn parse_mcp_list_json(bytes: &[u8]) -> Result<BTreeSet<String>, ClientError> {
         .filter(|servers| servers.len() <= 256)
         .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
     let mut names = BTreeSet::new();
+    let mut enabled_names = BTreeSet::new();
     for server in &servers {
-        let name = parse_mcp_server(server)?;
-        if !names.insert(name) {
+        let server = parse_mcp_server(server, McpOutputKind::List)?;
+        if !names.insert(server.name.clone()) {
             return Err(invalid("Codex MCP output is invalid"));
         }
+        if server.enabled {
+            enabled_names.insert(server.name);
+        }
     }
-    Ok(names)
+    Ok(enabled_names)
 }
 
 fn parse_mcp_get_json(bytes: &[u8], expected_name: &str) -> Result<(), ClientError> {
     if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
         return Err(invalid("Codex MCP output is invalid"));
     }
-    if parse_mcp_server(
+    let parsed = parse_mcp_server(
         &serde_json::from_slice::<Value>(bytes)
             .map_err(|_| invalid("Codex MCP output is invalid"))?,
-    )? != expected_name
-    {
+        McpOutputKind::Get,
+    )?;
+    if parsed.name != expected_name || !parsed.enabled {
         return Err(invalid("Codex MCP output is invalid"));
     }
     Ok(())
 }
 
-fn parse_mcp_server(value: &Value) -> Result<String, ClientError> {
+#[derive(Clone, Copy)]
+enum McpOutputKind {
+    List,
+    Get,
+}
+
+struct ParsedMcpServer {
+    name: String,
+    enabled: bool,
+}
+
+fn parse_mcp_server(
+    value: &Value,
+    output_kind: McpOutputKind,
+) -> Result<ParsedMcpServer, ClientError> {
     let object = value
         .as_object()
         .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+    let expected = match output_kind {
+        McpOutputKind::List => [
+            "name",
+            "enabled",
+            "disabled_reason",
+            "transport",
+            "startup_timeout_sec",
+            "tool_timeout_sec",
+            "auth_status",
+        ]
+        .as_slice(),
+        McpOutputKind::Get => [
+            "name",
+            "enabled",
+            "disabled_reason",
+            "transport",
+            "enabled_tools",
+            "disabled_tools",
+            "startup_timeout_sec",
+            "tool_timeout_sec",
+        ]
+        .as_slice(),
+    };
+    if object.len() != expected.len() || object.keys().any(|key| !expected.contains(&key.as_str()))
+    {
+        return Err(invalid("Codex MCP output is invalid"));
+    }
     let name = object
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
     safe_name(name)?;
+    let enabled = object
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+    parse_nullable_string(
+        object
+            .get("disabled_reason")
+            .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+        false,
+    )?;
     let transport = object
         .get("transport")
         .and_then(Value::as_object)
         .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+    parse_mcp_transport(transport)?;
+    parse_timeout(
+        object
+            .get("startup_timeout_sec")
+            .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+    )?;
+    parse_timeout(
+        object
+            .get("tool_timeout_sec")
+            .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+    )?;
+    match output_kind {
+        McpOutputKind::List => {
+            parse_required_string(
+                object
+                    .get("auth_status")
+                    .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+            )?;
+        }
+        McpOutputKind::Get => {
+            parse_nullable_string_array(
+                object
+                    .get("enabled_tools")
+                    .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+            )?;
+            parse_nullable_string_array(
+                object
+                    .get("disabled_tools")
+                    .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+            )?;
+        }
+    }
+    Ok(ParsedMcpServer {
+        name: name.to_owned(),
+        enabled,
+    })
+}
+
+fn parse_plugin_source(value: &Value) -> Result<(), ClientError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
+    let source = object
+        .get("source")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
+    let expected = match source {
+        "git" => ["source", "url", "ref"].as_slice(),
+        "local" => ["source", "path"].as_slice(),
+        _ => return Err(invalid("Codex plugin output is invalid")),
+    };
+    if object.len() != expected.len() || object.keys().any(|key| !expected.contains(&key.as_str()))
+    {
+        return Err(invalid("Codex plugin output is invalid"));
+    }
+    for key in expected.iter().filter(|key| **key != "source") {
+        let value = object
+            .get(*key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+            .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
+        if value == "<redacted>" {
+            return Err(invalid("Codex plugin output is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_mcp_transport(transport: &Map<String, Value>) -> Result<(), ClientError> {
     let kind = transport
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
-    if !["streamable_http", "stdio"].contains(&kind) || transport.values().any(contains_control) {
+    let expected = match kind {
+        "streamable_http" => [
+            "type",
+            "url",
+            "bearer_token_env_var",
+            "http_headers",
+            "env_http_headers",
+        ]
+        .as_slice(),
+        "stdio" => ["type", "command", "args", "env", "env_vars", "cwd"].as_slice(),
+        _ => return Err(invalid("Codex MCP output is invalid")),
+    };
+    if transport.len() != expected.len()
+        || transport
+            .keys()
+            .any(|key| !expected.contains(&key.as_str()))
+    {
         return Err(invalid("Codex MCP output is invalid"));
     }
-    Ok(name.to_owned())
+    match kind {
+        "streamable_http" => {
+            parse_required_string(
+                transport
+                    .get("url")
+                    .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+            )?;
+            parse_nullable_string(
+                transport
+                    .get("bearer_token_env_var")
+                    .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+                true,
+            )?;
+            parse_nullable_headers(
+                transport
+                    .get("http_headers")
+                    .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+            )?;
+            parse_nullable_headers(
+                transport
+                    .get("env_http_headers")
+                    .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+            )?;
+        }
+        "stdio" => {
+            parse_required_string(
+                transport
+                    .get("command")
+                    .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+            )?;
+            parse_string_array(
+                transport
+                    .get("args")
+                    .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+                false,
+            )?;
+            parse_string_map(
+                transport
+                    .get("env")
+                    .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+            )?;
+            parse_string_array(
+                transport
+                    .get("env_vars")
+                    .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+                true,
+            )?;
+            parse_nullable_string(
+                transport
+                    .get("cwd")
+                    .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
+                true,
+            )?;
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+fn parse_required_string(value: &Value) -> Result<&str, ClientError> {
+    value
+        .as_str()
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+        .ok_or_else(|| invalid("Codex MCP output is invalid"))
+}
+
+fn parse_nullable_string(value: &Value, nonempty: bool) -> Result<(), ClientError> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let value = value
+        .as_str()
+        .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+    if value.chars().any(char::is_control) || (nonempty && value.is_empty()) {
+        return Err(invalid("Codex MCP output is invalid"));
+    }
+    Ok(())
+}
+
+fn parse_string_array(value: &Value, nonempty: bool) -> Result<(), ClientError> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+    for value in values {
+        let value = value
+            .as_str()
+            .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+        if value.chars().any(char::is_control) || (nonempty && value.is_empty()) {
+            return Err(invalid("Codex MCP output is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_nullable_string_array(value: &Value) -> Result<(), ClientError> {
+    if value.is_null() {
+        Ok(())
+    } else {
+        parse_string_array(value, false)
+    }
+}
+
+fn parse_string_map(value: &Value) -> Result<(), ClientError> {
+    let values = value
+        .as_object()
+        .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+    for (key, value) in values {
+        if key.is_empty() || key.chars().any(char::is_control) {
+            return Err(invalid("Codex MCP output is invalid"));
+        }
+        let value = value
+            .as_str()
+            .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+        if value.chars().any(char::is_control) {
+            return Err(invalid("Codex MCP output is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_nullable_headers(value: &Value) -> Result<(), ClientError> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let headers = value
+        .as_object()
+        .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+    for (key, value) in headers {
+        if key.is_empty() || key.chars().any(char::is_control) {
+            return Err(invalid("Codex MCP output is invalid"));
+        }
+        parse_nullable_string(value, false)?;
+    }
+    Ok(())
+}
+
+fn parse_timeout(value: &Value) -> Result<(), ClientError> {
+    if value.is_null() {
+        return Ok(());
+    }
+    value
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+    Ok(())
 }
 
 fn contains_control(value: &Value) -> bool {
@@ -2445,30 +2785,250 @@ mod tests {
     }
     #[test]
     fn frozen_release_outputs_match_reviewed_json_contracts() {
-        let fixture: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/codex-0.144.1.json")).unwrap();
-        parse_plugin_list_json(&serde_json::to_vec(&fixture["pluginListJson"]).unwrap()).unwrap();
-        assert!(
-            parse_mcp_list_json(&serde_json::to_vec(&fixture["mcpListJson"]).unwrap())
-                .unwrap()
-                .contains("docs")
-        );
-        parse_mcp_get_json(&serde_json::to_vec(&fixture["mcpGetJson"]).unwrap(), "docs").unwrap();
+        for source in [
+            include_str!("../tests/fixtures/codex-0.144.0.json"),
+            include_str!("../tests/fixtures/codex-0.144.1.json"),
+        ] {
+            let fixture: Value = serde_json::from_str(source).unwrap();
+            parse_plugin_list_json(&serde_json::to_vec(&fixture["pluginListJson"]).unwrap())
+                .unwrap();
+            assert_eq!(
+                parse_mcp_list_json(&serde_json::to_vec(&fixture["mcpListJson"]).unwrap()).unwrap(),
+                BTreeSet::from(["docs".to_owned()])
+            );
+            parse_mcp_get_json(&serde_json::to_vec(&fixture["mcpGetJson"]).unwrap(), "docs")
+                .unwrap();
+        }
     }
     #[test]
-    fn unreviewed_plugin_and_mcp_json_is_rejected() {
-        assert!(
-            parse_plugin_list_json(
-                br#"{"installed":[{"pluginId":"one","extra":true}],"available":[]}"#
+    fn plugin_json_schema_rejects_wrong_types_membership_sources_and_unknown_fields() {
+        let plugin = serde_json::json!({
+            "pluginId": "formatter@team",
+            "name": "formatter",
+            "marketplaceName": "team",
+            "version": "1.2.3",
+            "installed": true,
+            "enabled": true,
+            "source": {
+                "source": "git",
+                "url": "https://example.com/team/plugins.git",
+                "ref": "v1.2.3"
+            },
+            "installPolicy": "AVAILABLE",
+            "authPolicy": "ON_USE"
+        });
+        let valid = |installed: Vec<Value>, available: Vec<Value>| {
+            serde_json::to_vec(&serde_json::json!({
+                "installed": installed,
+                "available": available
+            }))
+            .unwrap()
+        };
+        let local = serde_json::json!({
+            "pluginId": "local@team",
+            "name": "local",
+            "marketplaceName": "team",
+            "version": "1.0.0",
+            "installed": false,
+            "enabled": false,
+            "source": {"source": "local", "path": "/safe/plugin"},
+            "installPolicy": "AVAILABLE",
+            "authPolicy": "ON_INSTALL"
+        });
+        parse_plugin_list_json(&valid(vec![plugin.clone()], vec![local])).unwrap();
+
+        let mut cases = Vec::new();
+        let mut unknown = plugin.clone();
+        unknown["control"] = Value::Bool(true);
+        cases.push(valid(vec![unknown], vec![]));
+        let mut wrong_name = plugin.clone();
+        wrong_name["name"] = Value::Bool(true);
+        cases.push(valid(vec![wrong_name], vec![]));
+        let mut wrong_membership = plugin.clone();
+        wrong_membership["installed"] = Value::Bool(false);
+        cases.push(valid(vec![wrong_membership], vec![]));
+        let mut wrong_source = plugin.clone();
+        wrong_source["source"]["path"] = Value::String("/extra".into());
+        cases.push(valid(vec![wrong_source], vec![]));
+        cases.push(valid(vec![plugin.clone()], vec![plugin]));
+        cases.push(br#"{"installed":[],"available":[],"unexpected":[]}"#.to_vec());
+        for case in cases {
+            assert!(parse_plugin_list_json(&case).is_err());
+        }
+    }
+    #[test]
+    fn mcp_list_and_get_schemas_reject_wrong_types_unknown_fields_and_disabled_entries() {
+        let stdio_transport = serde_json::json!({
+            "type": "stdio",
+            "command": "local-server",
+            "args": ["--safe"],
+            "env": {"ALPHA": "first", "ZETA": "last"},
+            "env_vars": ["INHERITED"],
+            "cwd": null
+        });
+        let list_entry = serde_json::json!({
+            "name": "local-tools",
+            "enabled": true,
+            "disabled_reason": null,
+            "transport": stdio_transport,
+            "startup_timeout_sec": 5.5,
+            "tool_timeout_sec": 10,
+            "auth_status": "unsupported"
+        });
+        let mut disabled = list_entry.clone();
+        disabled["name"] = Value::String("disabled".into());
+        disabled["enabled"] = Value::Bool(false);
+        disabled["disabled_reason"] = Value::String("disabled by config".into());
+        assert_eq!(
+            parse_mcp_list_json(
+                &serde_json::to_vec(&Value::Array(vec![list_entry.clone(), disabled.clone()]))
+                    .unwrap()
             )
-            .is_err()
+            .unwrap(),
+            BTreeSet::from(["local-tools".to_owned()])
         );
+
+        let mut get_entry = list_entry.clone();
+        let object = get_entry.as_object_mut().unwrap();
+        object.remove("auth_status");
+        object.insert(
+            "enabled_tools".into(),
+            serde_json::json!(["read", "search"]),
+        );
+        object.insert("disabled_tools".into(), Value::Null);
+        parse_mcp_get_json(&serde_json::to_vec(&get_entry).unwrap(), "local-tools").unwrap();
+
+        let mut cases = Vec::new();
+        let mut wrong_enabled = list_entry.clone();
+        wrong_enabled["enabled"] = Value::String("true".into());
+        cases.push(Value::Array(vec![wrong_enabled]));
+        let mut unknown_server = list_entry.clone();
+        unknown_server["unknown"] = Value::Bool(true);
+        cases.push(Value::Array(vec![unknown_server]));
+        let mut unknown_transport = list_entry.clone();
+        unknown_transport["transport"]["unknown"] = Value::Bool(true);
+        cases.push(Value::Array(vec![unknown_transport]));
+        let mut wrong_env = list_entry.clone();
+        wrong_env["transport"]["env"]["ALPHA"] = Value::Null;
+        cases.push(Value::Array(vec![wrong_env]));
+        let mut negative_timeout = list_entry.clone();
+        negative_timeout["tool_timeout_sec"] = serde_json::json!(-1);
+        cases.push(Value::Array(vec![negative_timeout]));
+        cases.push(Value::Array(vec![list_entry.clone(), list_entry]));
+        for case in cases {
+            assert!(parse_mcp_list_json(&serde_json::to_vec(&case).unwrap()).is_err());
+        }
+
+        let mut wrong_get = get_entry.clone();
+        wrong_get["enabled_tools"] = Value::String("read".into());
         assert!(
-            parse_mcp_list_json(br#"[{"name":"bad\nname","transport":{"type":"unknown"}}]"#)
-                .is_err()
+            parse_mcp_get_json(&serde_json::to_vec(&wrong_get).unwrap(), "local-tools").is_err()
         );
-        let oversized = Value::Array((0..257).map(|index| serde_json::json!({"name":format!("m{index}"),"transport":{"type":"stdio"}})).collect());
-        assert!(parse_mcp_list_json(&serde_json::to_vec(&oversized).unwrap()).is_err());
+        let mut unknown_get = get_entry;
+        unknown_get["auth_status"] = Value::String("unsupported".into());
+        assert!(
+            parse_mcp_get_json(&serde_json::to_vec(&unknown_get).unwrap(), "local-tools").is_err()
+        );
+
+        let http_list = serde_json::json!([{
+            "name": "docs",
+            "enabled": true,
+            "disabled_reason": null,
+            "transport": {
+                "type": "streamable_http",
+                "url": "https://example.com/mcp",
+                "bearer_token_env_var": null,
+                "http_headers": {"X-Literal": "value", "X-None": null},
+                "env_http_headers": {"Authorization": "DOCS_TOKEN"}
+            },
+            "startup_timeout_sec": null,
+            "tool_timeout_sec": 1,
+            "auth_status": "bearer_token"
+        }]);
+        assert_eq!(
+            parse_mcp_list_json(&serde_json::to_vec(&http_list).unwrap()).unwrap(),
+            BTreeSet::from(["docs".to_owned()])
+        );
+        let mut wrong_http_header = http_list.clone();
+        wrong_http_header[0]["transport"]["http_headers"]["X-Literal"] = serde_json::json!(true);
+        assert!(parse_mcp_list_json(&serde_json::to_vec(&wrong_http_header).unwrap()).is_err());
+        let mut unknown_http = http_list;
+        unknown_http[0]["transport"]["cwd"] = Value::Null;
+        assert!(parse_mcp_list_json(&serde_json::to_vec(&unknown_http).unwrap()).is_err());
+
+        let mut http_get = serde_json::json!({
+            "name": "docs",
+            "enabled": true,
+            "disabled_reason": null,
+            "transport": {
+                "type": "streamable_http",
+                "url": "https://example.com/mcp",
+                "bearer_token_env_var": "DOCS_TOKEN",
+                "http_headers": null,
+                "env_http_headers": null
+            },
+            "enabled_tools": null,
+            "disabled_tools": ["write"],
+            "startup_timeout_sec": null,
+            "tool_timeout_sec": null
+        });
+        parse_mcp_get_json(&serde_json::to_vec(&http_get).unwrap(), "docs").unwrap();
+        http_get["transport"]["bearer_token_env_var"] = serde_json::json!(false);
+        assert!(parse_mcp_get_json(&serde_json::to_vec(&http_get).unwrap(), "docs").is_err());
+    }
+    #[test]
+    fn cli_json_parsers_reject_outputs_over_the_size_and_entry_limits() {
+        let oversized = vec![b' '; (CLI_OUTPUT_LIMIT + 1) as usize];
+        assert!(parse_plugin_list_json(&oversized).is_err());
+        assert!(parse_mcp_list_json(&oversized).is_err());
+        assert!(parse_mcp_get_json(&oversized, "docs").is_err());
+
+        let plugins: Vec<Value> = (0..257)
+            .map(|index| {
+                serde_json::json!({
+                    "pluginId": format!("p{index}"),
+                    "name": format!("p{index}"),
+                    "marketplaceName": "team",
+                    "version": "1",
+                    "installed": true,
+                    "enabled": true,
+                    "source": {"source": "local", "path": "/safe/plugin"},
+                    "installPolicy": "AVAILABLE",
+                    "authPolicy": "ON_USE"
+                })
+            })
+            .collect();
+        let plugin_bytes = serde_json::to_vec(&serde_json::json!({
+            "installed": plugins,
+            "available": []
+        }))
+        .unwrap();
+        assert!(plugin_bytes.len() as u64 <= CLI_OUTPUT_LIMIT);
+        assert!(parse_plugin_list_json(&plugin_bytes).is_err());
+
+        let servers: Vec<Value> = (0..257)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("m{index}"),
+                    "enabled": true,
+                    "disabled_reason": null,
+                    "transport": {
+                        "type": "stdio",
+                        "command": "server",
+                        "args": [],
+                        "env": {},
+                        "env_vars": [],
+                        "cwd": null
+                    },
+                    "startup_timeout_sec": null,
+                    "tool_timeout_sec": null,
+                    "auth_status": "unsupported"
+                })
+            })
+            .collect();
+        let server_bytes = serde_json::to_vec(&Value::Array(servers)).unwrap();
+        assert!(server_bytes.len() as u64 <= CLI_OUTPUT_LIMIT);
+        assert!(parse_mcp_list_json(&server_bytes).is_err());
     }
     #[test]
     fn platform_candidates_include_native_macos_and_windows_locations() {
