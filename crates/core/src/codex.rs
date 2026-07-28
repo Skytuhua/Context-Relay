@@ -5,9 +5,9 @@
 //! history, sqlite state, logs, and approval records are not adapter input.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     env, fs,
-    io::Read,
+    io::{ErrorKind, Read},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     str::FromStr,
@@ -38,6 +38,13 @@ const CLI_TIMEOUT_MS: u32 = 30_000;
 const CLI_OUTPUT_LIMIT: u64 = 64 * 1024;
 const MANAGED_START: &str = "<!-- context-relay:start -->";
 const MANAGED_END: &str = "<!-- context-relay:end -->";
+const MANAGED_PERMISSION_KEYS: [&str; 5] = [
+    "approval_policy",
+    "approvals_reviewer",
+    "sandbox_mode",
+    "default_permissions",
+    "permissions",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodexExecutableKind {
@@ -195,6 +202,30 @@ impl CodexAdapter {
         desired: &DesiredState,
         scope: ScopeRef,
     ) -> Result<ApprovedMutation, ClientError> {
+        let path = self.config_path(&scope)?;
+        self.plan_native_config_path(desired, scope, path)
+    }
+
+    pub fn plan_native_config_at(
+        &self,
+        desired: &DesiredState,
+        scope: ScopeRef,
+        structural_location: &str,
+    ) -> Result<ApprovedMutation, ClientError> {
+        let (_, fragment) = split_structural_location(structural_location)?;
+        if !MANAGED_PERMISSION_KEYS.contains(&fragment) && fragment != "hooks" {
+            return Err(invalid("Codex config structural location is invalid"));
+        }
+        let path = self.config_path_from_location(&scope, structural_location, fragment)?;
+        self.plan_native_config_path(desired, scope, path)
+    }
+
+    fn plan_native_config_path(
+        &self,
+        desired: &DesiredState,
+        scope: ScopeRef,
+        path: PathBuf,
+    ) -> Result<ApprovedMutation, ClientError> {
         self.require_apply_supported()?;
         desired
             .validate()
@@ -204,14 +235,13 @@ impl CodexAdapter {
                 "Untrusted project configuration is import-only",
             ));
         }
-        let path = self.config_path(&scope)?;
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid("Codex config cannot be safely inspected"))?;
         let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
             return Err(invalid("Codex config must be a regular file"));
         };
-        let rendered = self.render_config(bytes, desired, &scope)?;
+        let rendered = self.render_config(bytes, desired, &path)?;
         self.approved_file(
             &path,
             snapshot.fingerprint(),
@@ -264,7 +294,7 @@ impl CodexAdapter {
         if matches!(component.scope, ScopeRef::Project { .. }) && !self.project_is_trusted()? {
             return Err(unsupported("Untrusted project hooks are import-only"));
         }
-        let path = self.hooks_path(&component.scope)?;
+        let path = self.hooks_json_path(component)?;
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid("Codex hooks cannot be safely inspected"))?;
@@ -389,6 +419,97 @@ impl CodexAdapter {
             _ => Err(invalid("Codex scope is not configured")),
         }
     }
+
+    fn config_path_from_location(
+        &self,
+        scope: &ScopeRef,
+        location: &str,
+        expected_fragment: &str,
+    ) -> Result<PathBuf, ClientError> {
+        let (path, fragment) = split_structural_location(location)?;
+        if fragment != expected_fragment {
+            return Err(invalid("Codex config structural location is invalid"));
+        }
+        match scope {
+            ScopeRef::Global if path == "config.toml" => {
+                Ok(self.layout.codex_home.join("config.toml"))
+            }
+            ScopeRef::Project { project_id } if *project_id == self.project_id => {
+                for layer in self.project_layers()? {
+                    let expected = format!(
+                        "{}/.codex/config.toml",
+                        display_project_location(&self.layout.project_root, &layer)?
+                    );
+                    if path == expected {
+                        return Ok(layer.join(".codex/config.toml"));
+                    }
+                }
+                Err(invalid("Codex project config location is inactive"))
+            }
+            _ => Err(invalid("Codex config structural location is invalid")),
+        }
+    }
+
+    fn config_location_for_path(
+        &self,
+        path: &Path,
+        scope: &ScopeRef,
+    ) -> Result<String, ClientError> {
+        match scope {
+            ScopeRef::Global if path == self.layout.codex_home.join("config.toml") => {
+                Ok("config.toml".into())
+            }
+            ScopeRef::Project { project_id } if *project_id == self.project_id => {
+                for layer in self.project_layers()? {
+                    if path == layer.join(".codex/config.toml") {
+                        return Ok(format!(
+                            "{}/.codex/config.toml",
+                            display_project_location(&self.layout.project_root, &layer)?
+                        ));
+                    }
+                }
+                Err(invalid("Codex project config location is inactive"))
+            }
+            _ => Err(invalid("Codex config path is not configured")),
+        }
+    }
+
+    fn config_component_path(
+        &self,
+        component: &ComponentRecord,
+    ) -> Result<Option<PathBuf>, ClientError> {
+        match component.kind {
+            ComponentKind::PermissionDeclaration => {
+                if !MANAGED_PERMISSION_KEYS.contains(&component.name.as_str()) {
+                    return Err(invalid("Codex permission component is invalid"));
+                }
+                match structural_location(component)? {
+                    Some(location) => self
+                        .config_path_from_location(
+                            &component.scope,
+                            location,
+                            component.name.as_str(),
+                        )
+                        .map(Some),
+                    None => self.config_path(&component.scope).map(Some),
+                }
+            }
+            ComponentKind::Hook => {
+                let Some(location) = structural_location(component)? else {
+                    return Ok(None);
+                };
+                let (path, fragment) = split_structural_location(location)?;
+                if fragment == "hooks" && path.ends_with("config.toml") {
+                    return self
+                        .config_path_from_location(&component.scope, location, "hooks")
+                        .map(Some);
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn hooks_path(&self, scope: &ScopeRef) -> Result<PathBuf, ClientError> {
         match scope {
             ScopeRef::Global => Ok(self.layout.codex_home.join("hooks.json")),
@@ -399,97 +520,194 @@ impl CodexAdapter {
         }
     }
 
+    fn hooks_json_path(&self, component: &ComponentRecord) -> Result<PathBuf, ClientError> {
+        let Some(location) = structural_location(component)? else {
+            return self.hooks_path(&component.scope);
+        };
+        let (path, fragment) = split_structural_location(location)?;
+        if fragment != "hooks" {
+            return Err(invalid("Codex hooks structural location is invalid"));
+        }
+        match component.scope {
+            ScopeRef::Global if path == "hooks.json" => {
+                Ok(self.layout.codex_home.join("hooks.json"))
+            }
+            ScopeRef::Project { project_id } if project_id == self.project_id => {
+                for layer in self.project_layers()? {
+                    let expected = format!(
+                        "{}/.codex/hooks.json",
+                        display_project_location(&self.layout.project_root, &layer)?
+                    );
+                    if path == expected {
+                        return Ok(layer.join(".codex/hooks.json"));
+                    }
+                }
+                Err(invalid("Codex project hooks location is inactive"))
+            }
+            _ => Err(invalid("Codex hooks structural location is invalid")),
+        }
+    }
+
+    fn hooks_location_for_path(
+        &self,
+        path: &Path,
+        scope: &ScopeRef,
+    ) -> Result<String, ClientError> {
+        match scope {
+            ScopeRef::Global if path == self.layout.codex_home.join("hooks.json") => {
+                Ok("hooks.json".into())
+            }
+            ScopeRef::Project { project_id } if *project_id == self.project_id => {
+                for layer in self.project_layers()? {
+                    if path == layer.join(".codex/hooks.json") {
+                        return Ok(format!(
+                            "{}/.codex/hooks.json",
+                            display_project_location(&self.layout.project_root, &layer)?
+                        ));
+                    }
+                }
+                Err(invalid("Codex project hooks location is inactive"))
+            }
+            _ => Err(invalid("Codex hooks path is not configured")),
+        }
+    }
+
     fn markdown_path(&self, component: &ComponentRecord) -> Result<PathBuf, ClientError> {
-        let location = component
-            .metadata
-            .iter()
-            .find_map(|(key, value)| (key == "structuralLocation").then_some(value.as_str()))
-            .unwrap_or(component.name.as_str());
-        let expected_root = match (component.scope.clone(), component.kind) {
-            (ScopeRef::Global, ComponentKind::Instruction) => self.layout.codex_home.clone(),
-            (ScopeRef::Global, ComponentKind::Rule) => self.layout.codex_home.join("rules"),
-            (ScopeRef::Global, ComponentKind::Skill) => self.layout.user_skills_dir.clone(),
-            (ScopeRef::Project { project_id }, ComponentKind::Instruction)
-                if project_id == self.project_id =>
+        let location = structural_location(component)?;
+        match (&component.scope, component.kind, location) {
+            (ScopeRef::Global, ComponentKind::Instruction, None) => {
+                safe_file_name(&component.name)?;
+                Ok(self.layout.codex_home.join(&component.name))
+            }
+            (ScopeRef::Global, ComponentKind::Rule, None) => Ok(self
+                .layout
+                .codex_home
+                .join("rules")
+                .join(safe_rule_relative(&component.name)?)),
+            (ScopeRef::Global, ComponentKind::Skill, None) => {
+                safe_name(&component.name)?;
+                Ok(self
+                    .layout
+                    .user_skills_dir
+                    .join(&component.name)
+                    .join("SKILL.md"))
+            }
+            (ScopeRef::Project { project_id }, ComponentKind::Instruction, None)
+                if *project_id == self.project_id =>
             {
-                self.layout.project_root.clone()
+                safe_file_name(&component.name)?;
+                Ok(self.layout.project_root.join(&component.name))
             }
-            (ScopeRef::Project { project_id }, ComponentKind::Rule)
-                if project_id == self.project_id =>
+            (ScopeRef::Project { project_id }, ComponentKind::Rule, None)
+                if *project_id == self.project_id =>
             {
-                self.layout.project_root.clone()
+                Ok(self
+                    .layout
+                    .project_root
+                    .join(".codex/rules")
+                    .join(safe_rule_relative(&component.name)?))
             }
-            (ScopeRef::Project { project_id }, ComponentKind::Skill)
-                if project_id == self.project_id =>
+            (ScopeRef::Project { project_id }, ComponentKind::Skill, None)
+                if *project_id == self.project_id =>
             {
-                self.layout.project_root.clone()
+                safe_name(&component.name)?;
+                Ok(self
+                    .layout
+                    .project_root
+                    .join(".agents/skills")
+                    .join(&component.name)
+                    .join("SKILL.md"))
             }
-            _ => return Err(invalid("Codex scope is not configured")),
-        };
-        let relative = match component.scope {
-            ScopeRef::Global if component.kind == ComponentKind::Instruction => {
-                PathBuf::from(location)
+            (ScopeRef::Global, ComponentKind::Instruction, Some(location)) => {
+                safe_file_name(location)?;
+                if location != component.name {
+                    return Err(invalid("Codex instruction location is inconsistent"));
+                }
+                Ok(self.layout.codex_home.join(location))
             }
-            ScopeRef::Global if component.kind == ComponentKind::Rule => PathBuf::from(
-                location
+            (ScopeRef::Global, ComponentKind::Rule, Some(location)) => {
+                let relative = location
                     .strip_prefix("rules/")
-                    .ok_or_else(|| invalid("Codex rule location is unsafe"))?,
-            ),
-            ScopeRef::Global if component.kind == ComponentKind::Skill => PathBuf::from(
-                location
-                    .strip_prefix("user skills/")
-                    .ok_or_else(|| invalid("Codex skill location is unsafe"))?,
-            ),
-            ScopeRef::Project { .. } => {
-                PathBuf::from(location.strip_prefix("project/").unwrap_or(location))
+                    .ok_or_else(|| invalid("Codex rule location is unsafe"))?;
+                if relative != component.name {
+                    return Err(invalid("Codex rule location is inconsistent"));
+                }
+                Ok(self
+                    .layout
+                    .codex_home
+                    .join("rules")
+                    .join(safe_rule_relative(relative)?))
             }
-            _ => return Err(invalid("Codex Markdown location is unsafe")),
-        };
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|part| !matches!(part, Component::Normal(_)))
-        {
-            return Err(invalid("Codex Markdown location is unsafe"));
+            (ScopeRef::Global, ComponentKind::Skill, Some(location)) => {
+                safe_name(&component.name)?;
+                if location != format!("user skills/{}/SKILL.md", component.name) {
+                    return Err(invalid("Codex skill location is unsafe"));
+                }
+                Ok(self
+                    .layout
+                    .user_skills_dir
+                    .join(&component.name)
+                    .join("SKILL.md"))
+            }
+            (ScopeRef::Project { project_id }, kind, Some(location))
+                if *project_id == self.project_id =>
+            {
+                for layer in self.project_layers()? {
+                    let prefix = display_project_location(&self.layout.project_root, &layer)?;
+                    match kind {
+                        ComponentKind::Instruction => {
+                            safe_file_name(&component.name)?;
+                            if location == format!("{prefix}/{}", component.name) {
+                                return Ok(layer.join(&component.name));
+                            }
+                        }
+                        ComponentKind::Rule => {
+                            let rule_prefix = format!("{prefix}/.codex/rules/");
+                            if let Some(relative) = location.strip_prefix(&rule_prefix)
+                                && relative == component.name
+                            {
+                                return Ok(layer
+                                    .join(".codex/rules")
+                                    .join(safe_rule_relative(relative)?));
+                            }
+                        }
+                        ComponentKind::Skill => {
+                            safe_name(&component.name)?;
+                            if location
+                                == format!("{prefix}/.agents/skills/{}/SKILL.md", component.name)
+                            {
+                                return Ok(layer
+                                    .join(".agents/skills")
+                                    .join(&component.name)
+                                    .join("SKILL.md"));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Err(invalid("Codex project Markdown location is inactive"))
+            }
+            _ => Err(invalid("Codex Markdown location is unsafe")),
         }
-        let path = expected_root.join(relative);
-        if component.kind == ComponentKind::Rule
-            && matches!(component.scope, ScopeRef::Project { .. })
-            && !path.components().any(|part| part.as_os_str() == ".codex")
-        {
-            return Err(invalid("Codex rule location is unsafe"));
-        }
-        if component.kind == ComponentKind::Skill
-            && matches!(component.scope, ScopeRef::Project { .. })
-            && !path.components().any(|part| part.as_os_str() == ".agents")
-        {
-            return Err(invalid("Codex skill location is unsafe"));
-        }
-        Ok(path)
     }
 
     fn render_config(
         &self,
         existing: &[u8],
         desired: &DesiredState,
-        scope: &ScopeRef,
+        target: &Path,
     ) -> Result<Vec<u8>, ClientError> {
         let mut document = bytes_to_document(existing)?;
-        for component in desired
-            .components
-            .iter()
-            .filter(|component| &component.scope == scope)
-        {
+        for component in &desired.components {
+            let Some(component_path) = self.config_component_path(component)? else {
+                continue;
+            };
+            if component_path != target {
+                continue;
+            }
             let key = match component.kind {
                 ComponentKind::PermissionDeclaration
-                    if [
-                        "approval_policy",
-                        "approvals_reviewer",
-                        "sandbox_mode",
-                        "default_permissions",
-                        "permissions",
-                    ]
-                    .contains(&component.name.as_str()) =>
+                    if MANAGED_PERMISSION_KEYS.contains(&component.name.as_str()) =>
                 {
                     component.name.as_str()
                 }
@@ -506,11 +724,7 @@ impl CodexAdapter {
                 document.remove(key);
                 continue;
             }
-            let value = component
-                .body_markdown
-                .parse::<TomlValue>()
-                .map_err(|_| invalid("Codex config component is invalid"))?;
-            document[key] = Item::Value(value);
+            document[key] = managed_toml_item(component, key)?;
         }
         Ok(document.to_string().into_bytes())
     }
@@ -627,15 +841,15 @@ impl CodexAdapter {
         } else if nonempty_file(&standard_path)? {
             Some((standard_path, "AGENTS.md".to_owned()))
         } else {
-            self.project_doc_fallback_filenames()?
-                .into_iter()
-                .find_map(|name| {
-                    let path = root.join(&name);
-                    nonempty_file(&path)
-                        .ok()
-                        .filter(|present| *present)
-                        .map(|_| (path, name))
-                })
+            let mut selected = None;
+            for name in self.project_doc_fallback_filenames()? {
+                let path = root.join(&name);
+                if nonempty_file(&path)? {
+                    selected = Some((path, name));
+                    break;
+                }
+            }
+            selected
         };
         if let Some((path, name)) = selected {
             let location = if location_prefix.is_empty() {
@@ -662,12 +876,12 @@ impl CodexAdapter {
             return Ok(Vec::new());
         };
         let document = bytes_to_document(&bytes)?;
-        let Some(values) = document
-            .get("project_doc_fallback_filenames")
-            .and_then(Item::as_array)
-        else {
+        let Some(item) = document.get("project_doc_fallback_filenames") else {
             return Ok(Vec::new());
         };
+        let values = item
+            .as_array()
+            .ok_or_else(|| invalid("Codex fallback instruction names are invalid"))?;
         values
             .iter()
             .map(|value| {
@@ -723,9 +937,7 @@ impl CodexAdapter {
         components: &mut Vec<ComponentRecord>,
         digests: &mut BTreeSet<Sha256Digest>,
     ) -> Result<(), ClientError> {
-        for path in reviewed_files(root, |path| {
-            path.file_name().is_some_and(|name| name == "SKILL.md")
-        })? {
+        for path in reviewed_skill_files(root)? {
             let name = path
                 .parent()
                 .and_then(Path::file_name)
@@ -787,37 +999,34 @@ impl CodexAdapter {
         };
         let document = bytes_to_document(&bytes)?;
         digests.insert(digest(&bytes));
-        let location = format!(
-            "{}#",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("config.toml")
-        );
-        for key in [
-            "approval_policy",
-            "approvals_reviewer",
-            "sandbox_mode",
-            "default_permissions",
-            "permissions",
-        ] {
+        let location = format!("{}#", self.config_location_for_path(path, &scope)?);
+        for key in MANAGED_PERMISSION_KEYS {
             if let Some(item) = document.get(key) {
-                components.push(self.component(
+                let mut component = self.component(
                     scope.clone(),
                     ComponentKind::PermissionDeclaration,
                     key,
-                    item.to_string(),
+                    synthetic_toml_item(key, item)?,
                     &format!("{location}{key}"),
-                )?);
+                )?;
+                component
+                    .metadata
+                    .push(("tomlItemKind".into(), toml_item_kind(item)?.into()));
+                components.push(component);
             }
         }
         if let Some(hooks) = document.get("hooks") {
-            components.push(self.component(
+            let mut component = self.component(
                 scope.clone(),
                 ComponentKind::Hook,
                 "hooks",
-                toml_item_text(hooks),
+                synthetic_toml_item("hooks", hooks)?,
                 &format!("{location}hooks"),
-            )?);
+            )?;
+            component
+                .metadata
+                .push(("tomlItemKind".into(), toml_item_kind(hooks)?.into()));
+            components.push(component);
         }
         if let Some(plugins) = document.get("plugins").and_then(Item::as_table) {
             for (name, table) in plugins {
@@ -874,12 +1083,13 @@ impl CodexAdapter {
         let object = parse_object(&bytes, "Codex hooks are invalid")?;
         digests.insert(digest(&bytes));
         if let Some(hooks) = object.get("hooks") {
+            let location = format!("{}#hooks", self.hooks_location_for_path(path, &scope)?);
             components.push(self.component(
                 scope,
                 ComponentKind::Hook,
                 "hooks.json",
                 canonical_json(hooks)?,
-                "hooks.json#hooks",
+                &location,
             )?);
         }
         Ok(())
@@ -1022,8 +1232,8 @@ impl HarnessAdapter for CodexAdapter {
             .map_err(|_| invalid("Desired Codex state is invalid"))?;
         let mut files = Vec::new();
         let mut cli_operations = Vec::new();
-        let mut config_scopes = Vec::new();
-        let mut hook_components = Vec::new();
+        let mut config_paths = BTreeSet::new();
+        let mut hook_components = BTreeMap::new();
         for component in &desired.components {
             if matches!(component.scope, ScopeRef::Project { .. })
                 && matches!(
@@ -1040,20 +1250,21 @@ impl HarnessAdapter for CodexAdapter {
             }
             match component.kind {
                 ComponentKind::PermissionDeclaration => {
-                    if !config_scopes.contains(&component.scope) {
-                        config_scopes.push(component.scope.clone());
+                    config_paths.insert(
+                        self.config_component_path(component)?
+                            .ok_or_else(|| invalid("Codex permission target is invalid"))?,
+                    );
+                }
+                ComponentKind::Hook => {
+                    if let Some(path) = self.config_component_path(component)? {
+                        config_paths.insert(path);
+                    } else {
+                        let path = self.hooks_json_path(component)?;
+                        if hook_components.insert(path, component).is_some() {
+                            return Err(invalid("Codex hooks target is repeated"));
+                        }
                     }
                 }
-                ComponentKind::Hook
-                    if component.metadata.iter().any(|(key, value)| {
-                        key == "structuralLocation" && value.contains("config.toml#hooks")
-                    }) =>
-                {
-                    if !config_scopes.contains(&component.scope) {
-                        config_scopes.push(component.scope.clone());
-                    }
-                }
-                ComponentKind::Hook => hook_components.push(component),
                 ComponentKind::Instruction | ComponentKind::Rule | ComponentKind::Skill => {
                     let path = self.markdown_path(component)?;
                     let existing =
@@ -1072,16 +1283,14 @@ impl HarnessAdapter for CodexAdapter {
                 }
             }
         }
-        for scope in config_scopes {
-            let path = self.config_path(&scope)?;
+        for path in config_paths {
             let existing = read_required_regular(&path, "Codex config must already exist")?;
             files.push(rendered_file(
-                path,
-                &self.render_config(&existing, desired, &scope)?,
+                path.clone(),
+                &self.render_config(&existing, desired, &path)?,
             ));
         }
-        for component in hook_components {
-            let path = self.hooks_path(&component.scope)?;
+        for (path, component) in hook_components {
             let existing = read_required_regular(&path, "Codex hooks must already exist")?;
             let mut object = parse_object(&existing, "Codex hooks are invalid")?;
             if component.archived {
@@ -1599,11 +1808,11 @@ fn reviewed_files(
     root: &Path,
     predicate: impl Fn(&Path) -> bool,
 ) -> Result<Vec<PathBuf>, ClientError> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let metadata = fs::symlink_metadata(root)
-        .map_err(|_| invalid("Codex configuration cannot be inspected"))?;
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(invalid("Codex configuration cannot be inspected")),
+    };
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(invalid("Codex configuration has unsafe topology"));
     }
@@ -1631,12 +1840,47 @@ fn reviewed_files(
     Ok(files)
 }
 
-fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
-    if !path.exists() {
-        return Ok(None);
+fn reviewed_skill_files(root: &Path) -> Result<Vec<PathBuf>, ClientError> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(invalid("Codex skills cannot be inspected")),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(invalid("Codex skills have unsafe topology"));
     }
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|_| invalid("Codex configuration cannot be inspected"))?;
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root).map_err(|_| invalid("Codex skills cannot be inspected"))? {
+        let entry = entry.map_err(|_| invalid("Codex skills cannot be inspected"))?;
+        let kind = entry
+            .file_type()
+            .map_err(|_| invalid("Codex skills cannot be inspected"))?;
+        if kind.is_symlink() {
+            return Err(invalid("Codex skills have unsafe topology"));
+        }
+        if !kind.is_dir() {
+            continue;
+        }
+        let skill = entry.path().join("SKILL.md");
+        match fs::symlink_metadata(&skill) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                files.push(skill);
+            }
+            Ok(_) => return Err(invalid("Codex skills have unsafe topology")),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Err(invalid("Codex skills cannot be inspected")),
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(invalid("Codex configuration cannot be inspected")),
+    };
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
         return Err(invalid("Codex configuration has unsafe topology or size"));
     }
@@ -1655,6 +1899,75 @@ fn bytes_to_document(bytes: &[u8]) -> Result<DocumentMut, ClientError> {
         .map_err(|_| invalid("Codex TOML is not UTF-8"))?
         .parse::<DocumentMut>()
         .map_err(|_| invalid("Codex TOML is invalid"))
+}
+fn synthetic_toml_item(key: &str, item: &Item) -> Result<String, ClientError> {
+    let mut document = DocumentMut::new();
+    document[key] = item.clone();
+    let rendered = document.to_string();
+    (!rendered.is_empty())
+        .then_some(rendered)
+        .ok_or_else(|| invalid("Codex managed TOML item is invalid"))
+}
+fn toml_item_kind(item: &Item) -> Result<&'static str, ClientError> {
+    match item {
+        Item::Value(_) => Ok("value"),
+        Item::Table(_) => Ok("table"),
+        Item::ArrayOfTables(_) => Ok("array-of-tables"),
+        Item::None => Err(invalid("Codex managed TOML item is invalid")),
+    }
+}
+fn managed_toml_item(component: &ComponentRecord, key: &str) -> Result<Item, ClientError> {
+    let Some(expected_kind) = metadata_value(component, "tomlItemKind")? else {
+        let value = component
+            .body_markdown
+            .parse::<TomlValue>()
+            .map_err(|_| invalid("Codex config component is invalid"))?;
+        return Ok(Item::Value(value));
+    };
+    let document = component
+        .body_markdown
+        .parse::<DocumentMut>()
+        .map_err(|_| invalid("Codex config component is invalid"))?;
+    if document.iter().count() != 1 {
+        return Err(invalid("Codex config component is invalid"));
+    }
+    let item = document
+        .get(key)
+        .cloned()
+        .ok_or_else(|| invalid("Codex config component is invalid"))?;
+    if toml_item_kind(&item)? != expected_kind {
+        return Err(invalid("Codex config component kind changed"));
+    }
+    Ok(item)
+}
+fn metadata_value<'a>(
+    component: &'a ComponentRecord,
+    key: &str,
+) -> Result<Option<&'a str>, ClientError> {
+    let mut values = component
+        .metadata
+        .iter()
+        .filter_map(|(candidate, value)| (candidate == key).then_some(value.as_str()));
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(invalid("Codex component metadata is ambiguous"));
+    }
+    Ok(first)
+}
+fn structural_location(component: &ComponentRecord) -> Result<Option<&str>, ClientError> {
+    metadata_value(component, "structuralLocation")
+}
+fn split_structural_location(location: &str) -> Result<(&str, &str), ClientError> {
+    if location.chars().any(char::is_control) {
+        return Err(invalid("Codex structural location is unsafe"));
+    }
+    let (path, fragment) = location
+        .split_once('#')
+        .ok_or_else(|| invalid("Codex structural location is invalid"))?;
+    if path.is_empty() || fragment.is_empty() || fragment.contains('#') {
+        return Err(invalid("Codex structural location is invalid"));
+    }
+    Ok((path, fragment))
 }
 fn parse_object(bytes: &[u8], message: &'static str) -> Result<Map<String, Value>, ClientError> {
     serde_json::from_slice::<Value>(bytes)
@@ -1709,14 +2022,6 @@ fn toml_value_json(value: &TomlValue) -> Value {
         ),
     }
 }
-fn toml_item_text(item: &Item) -> String {
-    let text = item.to_string();
-    if text.trim().is_empty() {
-        "# managed table".into()
-    } else {
-        text
-    }
-}
 fn redact_sensitive(value: Value) -> Value {
     match value {
         Value::Object(values) => Value::Object(
@@ -1764,7 +2069,7 @@ fn display_project_location(root: &Path, directory: &Path) -> Result<String, Cli
     if relative.as_os_str().is_empty() {
         Ok("project".into())
     } else {
-        display_relative(relative)
+        Ok(format!("project/{}", display_relative(relative)?))
     }
 }
 fn display_relative(path: &Path) -> Result<String, ClientError> {
@@ -1816,6 +2121,21 @@ fn safe_file_name(name: &str) -> Result<(), ClientError> {
         return Err(invalid("Codex instruction name is unsafe"));
     }
     Ok(())
+}
+fn safe_rule_relative(relative: &str) -> Result<PathBuf, ClientError> {
+    let path = PathBuf::from(relative);
+    if relative.is_empty()
+        || relative.contains('\\')
+        || relative.chars().any(char::is_control)
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || path.extension().and_then(|extension| extension.to_str()) != Some("rules")
+    {
+        return Err(invalid("Codex rule location is unsafe"));
+    }
+    Ok(path)
 }
 fn stable_record_id(key: &str) -> Result<RecordId, ClientError> {
     let mut bytes: [u8; 32] = Sha256::digest(key.as_bytes()).into();

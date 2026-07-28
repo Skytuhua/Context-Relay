@@ -131,6 +131,18 @@ fn import_everything(fixture: &Fixture) -> context_relay_protocol::ImportedState
         .unwrap()
 }
 
+fn import_project(
+    fixture: &Fixture,
+) -> Result<context_relay_protocol::ImportedState, context_relay_protocol::ClientError> {
+    fixture.adapter.import(&ImportRequest {
+        scopes: vec![NativeScope::Project {
+            project_id: fixture.project_id,
+            root: fixture.adapter.project_root_wire(),
+        }],
+        include_disabled: true,
+    })
+}
+
 #[test]
 fn supported_release_fixtures_import_reviewed_surfaces_without_secrets() {
     for source in [
@@ -703,6 +715,520 @@ fn concurrent_native_edit_invalidates_the_planned_config_mutation() {
             .create_before_images(&[mutation])
             .is_err()
     );
+}
+
+#[test]
+fn table_valued_permissions_and_inline_hooks_round_trip_as_toml_items() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let path = fixture.codex_home.join("config.toml");
+    let existing = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        format!(
+            "{existing}\n[permissions]\n# permissions comment\nmode = \"strict\"\n\n[permissions.nested]\nkeep = true\n"
+        ),
+    )
+    .unwrap();
+
+    let imported = import_everything(&fixture);
+    let permission = imported
+        .components
+        .iter()
+        .find(|component| {
+            component.scope == ScopeRef::Global
+                && component.kind == ComponentKind::PermissionDeclaration
+                && component.name == "permissions"
+        })
+        .unwrap()
+        .clone();
+    let inline_hooks = imported
+        .components
+        .iter()
+        .find(|component| {
+            component.scope == ScopeRef::Global
+                && component.kind == ComponentKind::Hook
+                && metadata(component, "structuralLocation") == Some("config.toml#hooks")
+        })
+        .unwrap()
+        .clone();
+    assert_eq!(metadata(&permission, "tomlItemKind"), Some("table"));
+    assert_eq!(metadata(&inline_hooks, "tomlItemKind"), Some("table"));
+
+    let desired = DesiredState {
+        components: vec![permission, inline_hooks],
+        scopes: vec![NativeScope::Global],
+    };
+    let rendered = fixture.adapter.render(&desired).unwrap();
+    assert_eq!(rendered.files.len(), 1);
+    assert_eq!(rendered.files[0].path.display.as_deref(), path.to_str());
+    let mutation = fixture
+        .adapter
+        .plan_native_config(&desired, ScopeRef::Global)
+        .unwrap();
+    let NativeState::RegularFile { bytes, .. } = NativeState::decode_v1(&mutation.content).unwrap()
+    else {
+        panic!("regular file")
+    };
+    let rendered = String::from_utf8(bytes).unwrap();
+    for expected in [
+        "# user heading",
+        "unknown_user_key",
+        "[projects",
+        "[plugins",
+        "[mcp_servers.docs]",
+        "[permissions]",
+        "# permissions comment",
+        "[permissions.nested]",
+        "keep = true",
+        "[hooks]",
+        "# inline hook comment",
+        "[[hooks.PostToolUse]]",
+        "[[hooks.PostToolUse.hooks]]",
+        "command = \"check-write\"",
+    ] {
+        assert!(rendered.contains(expected), "missing {expected}");
+    }
+}
+
+#[test]
+fn array_of_tables_managed_items_round_trip_without_scalar_coercion() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let path = fixture.codex_home.join("config.toml");
+    let existing = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        format!(
+            "{existing}\n[[permissions]]\nname = \"first\"\n\n[[permissions]]\nname = \"second\"\n"
+        ),
+    )
+    .unwrap();
+    let permission = import_everything(&fixture)
+        .components
+        .into_iter()
+        .find(|component| {
+            component.scope == ScopeRef::Global
+                && component.kind == ComponentKind::PermissionDeclaration
+                && component.name == "permissions"
+        })
+        .unwrap();
+    assert_eq!(
+        metadata(&permission, "tomlItemKind"),
+        Some("array-of-tables")
+    );
+    let desired = DesiredState {
+        components: vec![permission],
+        scopes: vec![NativeScope::Global],
+    };
+    let mutation = fixture
+        .adapter
+        .plan_native_config(&desired, ScopeRef::Global)
+        .unwrap();
+    let NativeState::RegularFile { bytes, .. } = NativeState::decode_v1(&mutation.content).unwrap()
+    else {
+        panic!("regular file")
+    };
+    let rendered = String::from_utf8(bytes).unwrap();
+    assert_eq!(rendered.matches("[[permissions]]").count(), 2);
+    assert!(rendered.contains("name = \"first\""));
+    assert!(rendered.contains("name = \"second\""));
+}
+
+#[test]
+fn nested_project_configs_keep_layer_identity_and_exact_mutation_targets() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let nested_path = fixture
+        .layout
+        .project_root
+        .join("service/.codex/config.toml");
+    let nested = fs::read_to_string(&nested_path).unwrap();
+    fs::write(
+        &nested_path,
+        format!("approval_policy = \"on-request\"\n{nested}"),
+    )
+    .unwrap();
+
+    let imported = import_everything(&fixture);
+    let root = imported
+        .components
+        .iter()
+        .find(|component| {
+            component.kind == ComponentKind::PermissionDeclaration
+                && component.name == "approval_policy"
+                && metadata(component, "structuralLocation")
+                    == Some("project/.codex/config.toml#approval_policy")
+        })
+        .unwrap()
+        .clone();
+    let nested = imported
+        .components
+        .iter()
+        .find(|component| {
+            component.kind == ComponentKind::PermissionDeclaration
+                && component.name == "approval_policy"
+                && metadata(component, "structuralLocation")
+                    == Some("project/service/.codex/config.toml#approval_policy")
+        })
+        .unwrap()
+        .clone();
+    assert_ne!(root.id, nested.id);
+
+    let scope = ScopeRef::Project {
+        project_id: fixture.project_id,
+    };
+    let desired = DesiredState {
+        components: vec![root, nested.clone()],
+        scopes: vec![NativeScope::Project {
+            project_id: fixture.project_id,
+            root: fixture.adapter.project_root_wire(),
+        }],
+    };
+    let mut targets = fixture
+        .adapter
+        .render(&desired)
+        .unwrap()
+        .files
+        .into_iter()
+        .map(|file| file.path.display.unwrap())
+        .collect::<Vec<_>>();
+    targets.sort();
+    let mut expected = vec![
+        fixture
+            .layout
+            .project_root
+            .join(".codex/config.toml")
+            .to_string_lossy()
+            .into_owned(),
+        nested_path.to_string_lossy().into_owned(),
+    ];
+    expected.sort();
+    assert_eq!(targets, expected);
+
+    let mutation = fixture
+        .adapter
+        .plan_native_config_at(
+            &desired,
+            scope.clone(),
+            "project/service/.codex/config.toml#approval_policy",
+        )
+        .unwrap();
+    assert_eq!(mutation.target.display.as_deref(), nested_path.to_str());
+
+    let mut escaped = nested;
+    set_metadata(
+        &mut escaped,
+        "structuralLocation",
+        "project/../escape/.codex/config.toml#approval_policy",
+    );
+    let escaped = DesiredState {
+        components: vec![escaped],
+        scopes: vec![],
+    };
+    assert!(fixture.adapter.render(&escaped).is_err());
+    assert!(
+        fixture
+            .adapter
+            .plan_native_config_at(
+                &escaped,
+                scope,
+                "project/../escape/.codex/config.toml#approval_policy",
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn fallback_instructions_select_the_first_nonempty_name_only_when_standard_files_are_absent() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let config = fixture.codex_home.join("config.toml");
+    let existing = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        format!("project_doc_fallback_filenames = [\"FIRST.md\", \"SECOND.md\"]\n{existing}"),
+    )
+    .unwrap();
+    fs::write(fixture.layout.project_root.join("FIRST.md"), "").unwrap();
+    fs::write(
+        fixture.layout.project_root.join("SECOND.md"),
+        "# Selected fallback\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.layout.working_directory.join("SECOND.md"),
+        "# Shadowed fallback\n",
+    )
+    .unwrap();
+    fs::remove_file(fixture.layout.project_root.join("AGENTS.md")).unwrap();
+
+    let instructions = import_project(&fixture)
+        .unwrap()
+        .components
+        .into_iter()
+        .filter(|component| component.kind == ComponentKind::Instruction)
+        .collect::<Vec<_>>();
+    assert!(instructions.iter().any(|component| {
+        component.body_markdown.contains("Selected fallback")
+            && metadata(component, "structuralLocation") == Some("project/SECOND.md")
+    }));
+    assert!(
+        !instructions
+            .iter()
+            .any(|component| { component.body_markdown.contains("Shadowed fallback") })
+    );
+    assert!(
+        instructions
+            .iter()
+            .any(|component| { component.body_markdown.contains("Service override") })
+    );
+}
+
+#[test]
+fn malformed_fallback_names_are_rejected() {
+    for setting in [
+        r#"project_doc_fallback_filenames = ["bad/name.md"]"#,
+        r#"project_doc_fallback_filenames = ["bad\\name.md"]"#,
+        r#"project_doc_fallback_filenames = ["."]"#,
+        r#"project_doc_fallback_filenames = [".."]"#,
+        r#"project_doc_fallback_filenames = ["bad\u0007.md"]"#,
+        r#"project_doc_fallback_filenames = [42]"#,
+        r#"project_doc_fallback_filenames = "FALLBACK.md""#,
+    ] {
+        let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+        let config = fixture.codex_home.join("config.toml");
+        let existing = fs::read_to_string(&config).unwrap();
+        fs::write(&config, format!("{setting}\n{existing}")).unwrap();
+        fs::remove_file(fixture.layout.project_root.join("AGENTS.md")).unwrap();
+        assert!(
+            import_project(&fixture).is_err(),
+            "accepted malformed setting {setting}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fallback_instruction_topology_errors_are_propagated() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let config = fixture.codex_home.join("config.toml");
+    let existing = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        format!("project_doc_fallback_filenames = [\"FALLBACK.md\"]\n{existing}"),
+    )
+    .unwrap();
+    fs::remove_file(fixture.layout.project_root.join("AGENTS.md")).unwrap();
+    let target = fixture.root.join("fallback-target.md");
+    fs::write(&target, "# unsafe fallback\n").unwrap();
+    symlink(&target, fixture.layout.project_root.join("FALLBACK.md")).unwrap();
+    assert!(import_project(&fixture).is_err());
+}
+
+#[test]
+fn skill_discovery_stops_after_one_directory_level() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let nested_user = fixture
+        .layout
+        .user_skills_dir
+        .join("review/descendant/hidden/SKILL.md");
+    let nested_project = fixture
+        .layout
+        .project_root
+        .join(".agents/skills/release/descendant/hidden/SKILL.md");
+    fs::create_dir_all(nested_user.parent().unwrap()).unwrap();
+    fs::create_dir_all(nested_project.parent().unwrap()).unwrap();
+    fs::write(&nested_user, "# hidden user skill\n").unwrap();
+    fs::write(&nested_project, "# hidden project skill\n").unwrap();
+
+    let imported = import_everything(&fixture);
+    assert!(
+        imported.components.iter().any(|component| {
+            component.kind == ComponentKind::Skill && component.name == "review"
+        })
+    );
+    assert!(imported.components.iter().any(|component| {
+        component.kind == ComponentKind::Skill && component.name == "release"
+    }));
+    assert!(!imported.components.iter().any(|component| {
+        component.kind == ComponentKind::Skill
+            && (component.name == "hidden" || component.body_markdown.contains("hidden"))
+    }));
+}
+
+#[test]
+fn markdown_components_round_trip_to_exact_global_and_nested_paths() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let nested_rule_path = fixture
+        .layout
+        .working_directory
+        .join(".codex/rules/nested.rules");
+    fs::create_dir_all(nested_rule_path.parent().unwrap()).unwrap();
+    fs::write(&nested_rule_path, "prefix_rule(pattern=[\"cargo\"])\n").unwrap();
+
+    let imported = import_everything(&fixture);
+    let cases = [
+        (
+            ComponentKind::Rule,
+            "rules/default.rules",
+            fixture.codex_home.join("rules/default.rules"),
+        ),
+        (
+            ComponentKind::Skill,
+            "user skills/review/SKILL.md",
+            fixture.layout.user_skills_dir.join("review/SKILL.md"),
+        ),
+        (
+            ComponentKind::Instruction,
+            "project/service/AGENTS.override.md",
+            fixture.layout.working_directory.join("AGENTS.override.md"),
+        ),
+        (
+            ComponentKind::Rule,
+            "project/service/.codex/rules/nested.rules",
+            nested_rule_path,
+        ),
+        (
+            ComponentKind::Skill,
+            "project/service/.agents/skills/audit/SKILL.md",
+            fixture
+                .layout
+                .working_directory
+                .join(".agents/skills/audit/SKILL.md"),
+        ),
+    ];
+    let mut selected = Vec::new();
+    for (kind, location, expected) in cases {
+        let component = imported
+            .components
+            .iter()
+            .find(|component| {
+                component.kind == kind
+                    && metadata(component, "structuralLocation") == Some(location)
+            })
+            .unwrap()
+            .clone();
+        let mutation = fixture.adapter.plan_native_markdown(&component).unwrap();
+        assert_eq!(mutation.target.display.as_deref(), expected.to_str());
+        selected.push(component);
+    }
+
+    let global_rule_path = fixture.codex_home.join("rules/constructed.rules");
+    fs::write(&global_rule_path, "# constructed rule\n").unwrap();
+    let global_skill_path = fixture.layout.user_skills_dir.join("constructed/SKILL.md");
+    fs::create_dir_all(global_skill_path.parent().unwrap()).unwrap();
+    fs::write(&global_skill_path, "# constructed skill\n").unwrap();
+    for (component, expected) in [
+        (
+            component(
+                fixture.project_id,
+                ScopeRef::Global,
+                ComponentKind::Rule,
+                "constructed.rules",
+                "managed",
+            ),
+            global_rule_path,
+        ),
+        (
+            component(
+                fixture.project_id,
+                ScopeRef::Global,
+                ComponentKind::Skill,
+                "constructed",
+                "managed",
+            ),
+            global_skill_path,
+        ),
+    ] {
+        let mutation = fixture.adapter.plan_native_markdown(&component).unwrap();
+        assert_eq!(mutation.target.display.as_deref(), expected.to_str());
+    }
+
+    let config = fixture.codex_home.join("config.toml");
+    let untrusted = fs::read_to_string(&config)
+        .unwrap()
+        .replace("trust_level = \"trusted\"", "trust_level = \"untrusted\"");
+    fs::write(config, untrusted).unwrap();
+    let project_instruction = selected
+        .iter()
+        .find(|component| component.kind == ComponentKind::Instruction)
+        .unwrap();
+    let project_rule = selected
+        .iter()
+        .find(|component| {
+            component.kind == ComponentKind::Rule
+                && metadata(component, "structuralLocation")
+                    == Some("project/service/.codex/rules/nested.rules")
+        })
+        .unwrap();
+    let project_skill = selected
+        .iter()
+        .find(|component| {
+            component.kind == ComponentKind::Skill
+                && matches!(component.scope, ScopeRef::Project { .. })
+        })
+        .unwrap();
+    assert!(
+        fixture
+            .adapter
+            .plan_native_markdown(project_instruction)
+            .is_ok()
+    );
+    assert!(fixture.adapter.plan_native_markdown(project_skill).is_ok());
+    assert!(fixture.adapter.plan_native_markdown(project_rule).is_err());
+}
+
+#[test]
+fn unsafe_markdown_structural_locations_are_rejected() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    for (kind, scope, name, location) in [
+        (
+            ComponentKind::Rule,
+            ScopeRef::Global,
+            "default.rules",
+            "rules/../escape.rules",
+        ),
+        (
+            ComponentKind::Skill,
+            ScopeRef::Global,
+            "review",
+            "user skills/review/nested/SKILL.md",
+        ),
+        (
+            ComponentKind::Instruction,
+            ScopeRef::Project {
+                project_id: fixture.project_id,
+            },
+            "AGENTS.md",
+            "project/other/AGENTS.md",
+        ),
+        (
+            ComponentKind::Skill,
+            ScopeRef::Project {
+                project_id: fixture.project_id,
+            },
+            "audit",
+            "project/service/.agents/skills/audit/../escape/SKILL.md",
+        ),
+    ] {
+        let mut component = component(fixture.project_id, scope, kind, name, "managed");
+        set_metadata(&mut component, "structuralLocation", location);
+        assert!(
+            fixture.adapter.plan_native_markdown(&component).is_err(),
+            "accepted unsafe location {location}"
+        );
+    }
+}
+
+fn metadata<'a>(component: &'a ComponentRecord, key: &str) -> Option<&'a str> {
+    component
+        .metadata
+        .iter()
+        .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
+}
+
+fn set_metadata(component: &mut ComponentRecord, key: &str, value: &str) {
+    component.metadata.retain(|(candidate, _)| candidate != key);
+    component.metadata.push((key.to_owned(), value.to_owned()));
 }
 
 fn component(
