@@ -109,15 +109,21 @@ impl CodexAdapter {
         let executable =
             find_executable(&home).ok_or_else(|| not_found("Codex executable was not found"))?;
         let executable_kind = classify_executable(&executable);
-        let executable_hash = digest_file(&executable)?;
-        let output = run_bounded_command(
-            &executable,
-            &["--version"],
-            executable_hash,
-            &working_directory,
-        )?;
-        let version = parse_version(std::str::from_utf8(&output).unwrap_or_default())
-            .ok_or_else(|| unsupported("Codex returned an invalid version"))?;
+        let version = if executable_kind == CodexExecutableKind::Native {
+            let executable_hash = digest_file(&executable)?;
+            let output = run_bounded_command(
+                &executable,
+                &["--version"],
+                executable_hash,
+                &working_directory,
+            )?;
+            parse_version(std::str::from_utf8(&output).unwrap_or_default())
+                .ok_or_else(|| unsupported("Codex returned an invalid version"))?
+        } else {
+            // Wrapper and unknown files remain import-only.  Never execute an
+            // unclassified candidate merely to obtain its version.
+            "0.0.0".to_owned()
+        };
         Self::from_layout(
             CodexLayout {
                 installation_method: installation_method(&executable),
@@ -199,14 +205,13 @@ impl CodexAdapter {
             ));
         }
         let path = self.config_path(&scope)?;
-        let existing = read_required_regular(&path, "Codex config must already exist")?;
-        let rendered = self.render_config(&existing, desired, &scope)?;
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid("Codex config cannot be safely inspected"))?;
-        let NativeState::RegularFile { metadata, .. } = snapshot.state() else {
+        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
             return Err(invalid("Codex config must be a regular file"));
         };
+        let rendered = self.render_config(bytes, desired, &scope)?;
         self.approved_file(
             &path,
             snapshot.fingerprint(),
@@ -224,6 +229,12 @@ impl CodexAdapter {
             ComponentKind::Instruction | ComponentKind::Rule | ComponentKind::Skill
         ) {
             return Err(invalid("Codex Markdown component is invalid"));
+        }
+        if component.kind == ComponentKind::Rule
+            && matches!(component.scope, ScopeRef::Project { .. })
+            && !self.project_is_trusted()?
+        {
+            return Err(unsupported("Untrusted project rules are import-only"));
         }
         let path = self.markdown_path(component)?;
         let snapshot = OsNativeFileSystem::new()
@@ -250,9 +261,21 @@ impl CodexAdapter {
         if component.kind != ComponentKind::Hook {
             return Err(invalid("Codex hooks component is invalid"));
         }
+        if matches!(component.scope, ScopeRef::Project { .. }) && !self.project_is_trusted()? {
+            return Err(unsupported("Untrusted project hooks are import-only"));
+        }
         let path = self.hooks_path(&component.scope)?;
-        let existing = read_required_regular(&path, "Codex hooks must already exist")?;
-        let mut object = parse_object(&existing, "Codex hooks are invalid")?;
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid("Codex hooks cannot be safely inspected"))?;
+        let NativeState::RegularFile {
+            bytes: existing,
+            metadata,
+        } = snapshot.state()
+        else {
+            return Err(invalid("Codex hooks must be a regular file"));
+        };
+        let mut object = parse_object(existing, "Codex hooks are invalid")?;
         if component.archived {
             object.remove("hooks");
         } else {
@@ -264,12 +287,6 @@ impl CodexAdapter {
         }
         let bytes = serde_json::to_vec(&Value::Object(object))
             .map_err(|_| invalid("Codex hooks cannot be rendered"))?;
-        let snapshot = OsNativeFileSystem::new()
-            .snapshot(&path)
-            .map_err(|_| invalid("Codex hooks cannot be safely inspected"))?;
-        let NativeState::RegularFile { metadata, .. } = snapshot.state() else {
-            return Err(invalid("Codex hooks must be a regular file"));
-        };
         self.approved_file(
             &path,
             snapshot.fingerprint(),
@@ -383,31 +400,72 @@ impl CodexAdapter {
     }
 
     fn markdown_path(&self, component: &ComponentRecord) -> Result<PathBuf, ClientError> {
-        let root = match component.scope {
-            ScopeRef::Global => self.layout.codex_home.clone(),
-            ScopeRef::Project { project_id } if project_id == self.project_id => {
+        let location = component
+            .metadata
+            .iter()
+            .find_map(|(key, value)| (key == "structuralLocation").then_some(value.as_str()))
+            .unwrap_or(component.name.as_str());
+        let expected_root = match (component.scope.clone(), component.kind) {
+            (ScopeRef::Global, ComponentKind::Instruction) => self.layout.codex_home.clone(),
+            (ScopeRef::Global, ComponentKind::Rule) => self.layout.codex_home.join("rules"),
+            (ScopeRef::Global, ComponentKind::Skill) => self.layout.user_skills_dir.clone(),
+            (ScopeRef::Project { project_id }, ComponentKind::Instruction)
+                if project_id == self.project_id =>
+            {
+                self.layout.project_root.clone()
+            }
+            (ScopeRef::Project { project_id }, ComponentKind::Rule)
+                if project_id == self.project_id =>
+            {
+                self.layout.project_root.clone()
+            }
+            (ScopeRef::Project { project_id }, ComponentKind::Skill)
+                if project_id == self.project_id =>
+            {
                 self.layout.project_root.clone()
             }
             _ => return Err(invalid("Codex scope is not configured")),
         };
-        match component.kind {
-            ComponentKind::Instruction => {
-                safe_file_name(&component.name)?;
-                Ok(root.join(&component.name))
+        let relative = match component.scope {
+            ScopeRef::Global if component.kind == ComponentKind::Instruction => {
+                PathBuf::from(location)
             }
-            ComponentKind::Rule => {
-                safe_relative(&component.name, ".rules")?;
-                Ok(root.join(".codex/rules").join(&component.name))
+            ScopeRef::Global if component.kind == ComponentKind::Rule => PathBuf::from(
+                location
+                    .strip_prefix("rules/")
+                    .ok_or_else(|| invalid("Codex rule location is unsafe"))?,
+            ),
+            ScopeRef::Global if component.kind == ComponentKind::Skill => PathBuf::from(
+                location
+                    .strip_prefix("user skills/")
+                    .ok_or_else(|| invalid("Codex skill location is unsafe"))?,
+            ),
+            ScopeRef::Project { .. } => {
+                PathBuf::from(location.strip_prefix("project/").unwrap_or(location))
             }
-            ComponentKind::Skill => {
-                safe_name(&component.name)?;
-                Ok(root
-                    .join(".agents/skills")
-                    .join(&component.name)
-                    .join("SKILL.md"))
-            }
-            _ => Err(invalid("Codex Markdown component is invalid")),
+            _ => return Err(invalid("Codex Markdown location is unsafe")),
+        };
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(invalid("Codex Markdown location is unsafe"));
         }
+        let path = expected_root.join(relative);
+        if component.kind == ComponentKind::Rule
+            && matches!(component.scope, ScopeRef::Project { .. })
+            && !path.components().any(|part| part.as_os_str() == ".codex")
+        {
+            return Err(invalid("Codex rule location is unsafe"));
+        }
+        if component.kind == ComponentKind::Skill
+            && matches!(component.scope, ScopeRef::Project { .. })
+            && !path.components().any(|part| part.as_os_str() == ".agents")
+        {
+            return Err(invalid("Codex skill location is unsafe"));
+        }
+        Ok(path)
     }
 
     fn render_config(
@@ -423,8 +481,25 @@ impl CodexAdapter {
             .filter(|component| &component.scope == scope)
         {
             let key = match component.kind {
-                ComponentKind::PermissionDeclaration => "approval_policy",
-                ComponentKind::Hook => "hooks",
+                ComponentKind::PermissionDeclaration
+                    if [
+                        "approval_policy",
+                        "approvals_reviewer",
+                        "sandbox_mode",
+                        "default_permissions",
+                        "permissions",
+                    ]
+                    .contains(&component.name.as_str()) =>
+                {
+                    component.name.as_str()
+                }
+                ComponentKind::PermissionDeclaration => {
+                    return Err(invalid("Codex permission component is invalid"));
+                }
+                ComponentKind::Hook if component.name == "hooks" => "hooks",
+                ComponentKind::Hook => {
+                    return Err(invalid("Codex inline hooks component is invalid"));
+                }
                 _ => continue,
             };
             if component.archived {
@@ -548,11 +623,19 @@ impl CodexAdapter {
         let override_path = root.join("AGENTS.override.md");
         let standard_path = root.join("AGENTS.md");
         let selected = if nonempty_file(&override_path)? {
-            Some((override_path, "AGENTS.override.md"))
+            Some((override_path, "AGENTS.override.md".to_owned()))
         } else if nonempty_file(&standard_path)? {
-            Some((standard_path, "AGENTS.md"))
+            Some((standard_path, "AGENTS.md".to_owned()))
         } else {
-            None
+            self.project_doc_fallback_filenames()?
+                .into_iter()
+                .find_map(|name| {
+                    let path = root.join(&name);
+                    nonempty_file(&path)
+                        .ok()
+                        .filter(|present| *present)
+                        .map(|_| (path, name))
+                })
         };
         if let Some((path, name)) = selected {
             let location = if location_prefix.is_empty() {
@@ -564,7 +647,7 @@ impl CodexAdapter {
                 &path,
                 scope,
                 ComponentKind::Instruction,
-                name,
+                &name,
                 &location,
                 Some(precedence),
                 components,
@@ -572,6 +655,34 @@ impl CodexAdapter {
             )?;
         }
         Ok(())
+    }
+
+    fn project_doc_fallback_filenames(&self) -> Result<Vec<String>, ClientError> {
+        let Some(bytes) = read_optional_file(&self.layout.codex_home.join("config.toml"))? else {
+            return Ok(Vec::new());
+        };
+        let document = bytes_to_document(&bytes)?;
+        let Some(values) = document
+            .get("project_doc_fallback_filenames")
+            .and_then(Item::as_array)
+        else {
+            return Ok(Vec::new());
+        };
+        values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid("Codex fallback instruction name is invalid"))
+            })
+            .map(|result| {
+                result.and_then(|name| {
+                    safe_file_name(&name)?;
+                    Ok(name)
+                })
+            })
+            .collect()
     }
 
     fn import_rules(
@@ -914,8 +1025,30 @@ impl HarnessAdapter for CodexAdapter {
         let mut config_scopes = Vec::new();
         let mut hook_components = Vec::new();
         for component in &desired.components {
+            if matches!(component.scope, ScopeRef::Project { .. })
+                && matches!(
+                    component.kind,
+                    ComponentKind::PermissionDeclaration
+                        | ComponentKind::Hook
+                        | ComponentKind::Rule
+                )
+                && !self.project_is_trusted()?
+            {
+                return Err(unsupported(
+                    "Untrusted project Codex configuration is import-only",
+                ));
+            }
             match component.kind {
                 ComponentKind::PermissionDeclaration => {
+                    if !config_scopes.contains(&component.scope) {
+                        config_scopes.push(component.scope.clone());
+                    }
+                }
+                ComponentKind::Hook
+                    if component.metadata.iter().any(|(key, value)| {
+                        key == "structuralLocation" && value.contains("config.toml#hooks")
+                    }) =>
+                {
                     if !config_scopes.contains(&component.scope) {
                         config_scopes.push(component.scope.clone());
                     }
@@ -1116,10 +1249,15 @@ impl CodexAdapter {
 
     fn imported_mcp_names(&self) -> Result<Vec<String>, ClientError> {
         let mut names = BTreeSet::new();
-        for path in [
-            self.layout.codex_home.join("config.toml"),
-            self.project_config_path(),
-        ] {
+        let mut paths = vec![self.layout.codex_home.join("config.toml")];
+        if self.project_is_trusted()? {
+            paths.extend(
+                self.project_layers()?
+                    .into_iter()
+                    .map(|layer| layer.join(".codex/config.toml")),
+            );
+        }
+        for path in paths {
             let Some(bytes) = read_optional_file(&path)? else {
                 continue;
             };
@@ -1214,6 +1352,14 @@ fn render_mcp_add(name: &str, value: &Value) -> Result<Vec<String>, ClientError>
         object.get("url").and_then(Value::as_str),
         object.get("bearer_token_env_var").and_then(Value::as_str),
     ) {
+        if object.len() != 2
+            || url.is_empty()
+            || token.is_empty()
+            || contains_control(value)
+            || contains_redaction(value)
+        {
+            return Err(invalid("Codex MCP transport is unsupported"));
+        }
         return Ok(vec![
             "mcp".into(),
             "add".into(),
@@ -1223,6 +1369,14 @@ fn render_mcp_add(name: &str, value: &Value) -> Result<Vec<String>, ClientError>
             "--bearer-token-env-var".into(),
             token.into(),
         ]);
+    }
+    if object
+        .keys()
+        .any(|key| !["type", "command", "args", "env"].contains(&key.as_str()))
+        || contains_control(value)
+        || contains_redaction(value)
+    {
+        return Err(invalid("Codex MCP transport is unsupported"));
     }
     let command = object
         .get("command")
@@ -1240,7 +1394,11 @@ fn render_mcp_add(name: &str, value: &Value) -> Result<Vec<String>, ClientError>
         let value = value
             .as_str()
             .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?;
-        if value == "<redacted>" {
+        if key.is_empty()
+            || key.chars().any(char::is_control)
+            || value.is_empty()
+            || value == "<redacted>"
+        {
             return Err(invalid(
                 "Redacted Codex MCP configuration cannot be applied",
             ));
@@ -1252,18 +1410,22 @@ fn render_mcp_add(name: &str, value: &Value) -> Result<Vec<String>, ClientError>
     rendered.push(command.into());
     if let Some(arguments) = object.get("args").and_then(Value::as_array) {
         for argument in arguments {
-            rendered.push(
-                argument
-                    .as_str()
-                    .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?
-                    .into(),
-            );
+            let argument = argument
+                .as_str()
+                .filter(|argument| !argument.is_empty())
+                .ok_or_else(|| invalid("Codex MCP transport is unsupported"))?;
+            rendered.push(argument.into());
         }
+    } else {
+        return Err(invalid("Codex MCP transport is unsupported"));
     }
     Ok(rendered)
 }
 
 fn parse_plugin_list_json(bytes: &[u8]) -> Result<(), ClientError> {
+    if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
+        return Err(invalid("Codex plugin output is invalid"));
+    }
     let object = serde_json::from_slice::<Value>(bytes)
         .ok()
         .and_then(|value| value.as_object().cloned())
@@ -1271,13 +1433,19 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<(), ClientError> {
     if object.len() != 2 || !object.contains_key("installed") || !object.contains_key("available") {
         return Err(invalid("Codex plugin output is invalid"));
     }
-    let plugins = object
+    let installed = object
         .get("installed")
         .and_then(Value::as_array)
-        .filter(|plugins| plugins.len() <= 256)
         .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
+    let available = object
+        .get("available")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
+    if installed.len() + available.len() > 256 {
+        return Err(invalid("Codex plugin output is invalid"));
+    }
     let mut ids = BTreeSet::new();
-    for plugin in plugins {
+    for plugin in installed.iter().chain(available) {
         let plugin = plugin
             .as_object()
             .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
@@ -1313,6 +1481,9 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<(), ClientError> {
 }
 
 fn parse_mcp_list_json(bytes: &[u8]) -> Result<BTreeSet<String>, ClientError> {
+    if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
+        return Err(invalid("Codex MCP output is invalid"));
+    }
     let servers = serde_json::from_slice::<Value>(bytes)
         .ok()
         .and_then(|value| value.as_array().cloned())
@@ -1329,6 +1500,9 @@ fn parse_mcp_list_json(bytes: &[u8]) -> Result<BTreeSet<String>, ClientError> {
 }
 
 fn parse_mcp_get_json(bytes: &[u8], expected_name: &str) -> Result<(), ClientError> {
+    if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
+        return Err(invalid("Codex MCP output is invalid"));
+    }
     if parse_mcp_server(
         &serde_json::from_slice::<Value>(bytes)
             .map_err(|_| invalid("Codex MCP output is invalid"))?,
@@ -1492,7 +1666,48 @@ fn canonical_json(value: &Value) -> Result<String, ClientError> {
     serde_json::to_string(value).map_err(|_| invalid("Codex configuration cannot be serialized"))
 }
 fn toml_item_json(item: &Item) -> Value {
-    Value::String(item.to_string())
+    match item {
+        Item::None => Value::Null,
+        Item::Value(value) => toml_value_json(value),
+        Item::Table(table) => Value::Object(
+            table
+                .iter()
+                .map(|(key, value)| (key.to_owned(), toml_item_json(value)))
+                .collect(),
+        ),
+        Item::ArrayOfTables(tables) => Value::Array(
+            tables
+                .iter()
+                .map(|table| {
+                    Value::Object(
+                        table
+                            .iter()
+                            .map(|(key, value)| (key.to_owned(), toml_item_json(value)))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn toml_value_json(value: &TomlValue) -> Value {
+    match value {
+        TomlValue::String(value) => Value::String(value.value().to_owned()),
+        TomlValue::Integer(value) => Value::Number((*value.value()).into()),
+        TomlValue::Float(value) => serde_json::Number::from_f64(*value.value())
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        TomlValue::Boolean(value) => Value::Bool(*value.value()),
+        TomlValue::Datetime(value) => Value::String(value.value().to_string()),
+        TomlValue::Array(values) => Value::Array(values.iter().map(toml_value_json).collect()),
+        TomlValue::InlineTable(table) => Value::Object(
+            table
+                .iter()
+                .map(|(key, value)| (key.to_owned(), toml_value_json(value)))
+                .collect(),
+        ),
+    }
 }
 fn toml_item_text(item: &Item) -> String {
     let text = item.to_string();
@@ -1599,18 +1814,6 @@ fn safe_file_name(name: &str) -> Result<(), ClientError> {
     safe_name(name)?;
     if !name.ends_with(".md") {
         return Err(invalid("Codex instruction name is unsafe"));
-    }
-    Ok(())
-}
-fn safe_relative(name: &str, extension: &str) -> Result<(), ClientError> {
-    if name.is_empty()
-        || Path::new(name).is_absolute()
-        || !name.ends_with(extension)
-        || Path::new(name)
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(invalid("Codex relative path is unsafe"));
     }
     Ok(())
 }

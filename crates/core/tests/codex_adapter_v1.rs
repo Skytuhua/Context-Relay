@@ -20,6 +20,7 @@ use serde_json::{Map, Value, json};
 const PROJECT_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073981";
 const DEVICE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073982";
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Fixture {
     root: PathBuf,
@@ -191,6 +192,93 @@ fn supported_release_fixtures_import_reviewed_surfaces_without_secrets() {
             assert!(!serialized.contains(forbidden));
         }
     }
+}
+
+#[test]
+fn toml_mcp_secrets_are_recursively_redacted_before_import() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let config = fixture.codex_home.join("config.toml");
+    fs::write(&config, format!("{}\n[mcp_servers.secret]\nurl = \"https://example.com\"\napi_token = \"literal-token\"\nauthorization = \"Bearer literal-auth\"\n[mcp_servers.secret.env]\nSECRET_VALUE = \"literal-env\"\n", fs::read_to_string(&config).unwrap())).unwrap();
+    let serialized = serde_json::to_string(&import_everything(&fixture)).unwrap();
+    for secret in ["literal-token", "literal-auth", "literal-env"] {
+        assert!(!serialized.contains(secret));
+    }
+    assert!(serialized.contains("<redacted>"));
+}
+
+#[test]
+fn discovery_never_executes_wrapper_candidates() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let root = fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "context-relay-codex-discover-{}",
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+    let bin = root.join("bin");
+    let home = root.join("home");
+    let project = root.join("project");
+    let marker = root.join("executed");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    let wrapper = bin.join("codex");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\necho executed > {}\necho 'codex 0.144.1'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let old_path = std::env::var_os("PATH");
+    let old_home = std::env::var_os("HOME");
+    let old_codex_home = std::env::var_os("CODEX_HOME");
+    unsafe {
+        std::env::set_var("PATH", &bin);
+        std::env::set_var("HOME", &home);
+        std::env::set_var("CODEX_HOME", home.join(".codex"));
+    }
+    let device = DeviceId::from_str(DEVICE_ID).unwrap();
+    let result = CodexAdapter::discover(
+        &project,
+        &project,
+        ProjectId::from_str(PROJECT_ID).unwrap(),
+        device,
+        HybridLogicalClock::new(1, 0, device),
+    );
+    unsafe {
+        match old_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        };
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        };
+        match old_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        };
+    }
+    let adapter = result.unwrap();
+    assert_eq!(
+        adapter
+            .probe(&ProbeContext {
+                harness: HarnessId::Codex,
+                requested_profile: None
+            })
+            .unwrap()
+            .capability,
+        CapabilityLevel::ImportOnly
+    );
+    assert!(!marker.exists());
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
