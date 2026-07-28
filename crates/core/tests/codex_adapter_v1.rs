@@ -537,7 +537,7 @@ fn untrusted_projects_skip_project_config_hooks_and_rules() {
 }
 
 #[test]
-fn unknown_versions_and_wrapper_executables_are_import_only() {
+fn unknown_versions_are_import_only() {
     let mut source: Value =
         serde_json::from_str(include_str!("fixtures/codex-0.144.1.json")).unwrap();
     source["version"] = json!("9.9.9");
@@ -563,9 +563,34 @@ fn unknown_versions_and_wrapper_executables_are_import_only() {
             })
             .is_err()
     );
-    let wrapped = CodexAdapter::from_layout(
+}
+
+#[test]
+fn forged_native_classification_cannot_execute_a_wrapper() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let sentinel = fixture.root.join("forged-wrapper-ran");
+    fs::write(
+        &fixture.layout.executable,
+        format!(
+            "#!/bin/sh\n/usr/bin/touch '{}'\nexit 9\n",
+            sentinel.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut permissions = fs::metadata(&fixture.layout.executable)
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&fixture.layout.executable, permissions).unwrap();
+    }
+
+    let forged = CodexAdapter::from_layout(
         CodexLayout {
-            executable_kind: CodexExecutableKind::Wrapper,
+            executable_kind: CodexExecutableKind::Native,
             ..fixture.layout.clone()
         },
         fixture.project_id,
@@ -573,18 +598,33 @@ fn unknown_versions_and_wrapper_executables_are_import_only() {
         HybridLogicalClock::new(1_900_000_000_000, 0, DeviceId::from_str(DEVICE_ID).unwrap()),
     )
     .unwrap();
+    let receipt = ApplyReceipt {
+        plan_id: PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073984").unwrap(),
+        applied_hlc: HybridLogicalClock::new(
+            1_900_000_000_001,
+            0,
+            DeviceId::from_str(DEVICE_ID).unwrap(),
+        ),
+        resulting_digests: vec![],
+    };
+
+    assert!(forged.validate_effective(&receipt).is_err());
+    assert!(
+        !sentinel.exists(),
+        "forged native classification executed a wrapper"
+    );
     assert_eq!(
-        wrapped
+        forged
             .probe(&ProbeContext {
                 harness: HarnessId::Codex,
-                requested_profile: None
+                requested_profile: None,
             })
             .unwrap()
             .capability,
         CapabilityLevel::ImportOnly
     );
     assert!(
-        wrapped
+        forged
             .render(&DesiredState {
                 components: vec![],
                 scopes: vec![],
@@ -592,7 +632,7 @@ fn unknown_versions_and_wrapper_executables_are_import_only() {
             .is_err()
     );
     assert!(
-        wrapped
+        forged
             .plan_native_markdown(&component(
                 fixture.project_id,
                 ScopeRef::Global,
@@ -602,6 +642,30 @@ fn unknown_versions_and_wrapper_executables_are_import_only() {
             ))
             .is_err()
     );
+
+    fs::write(&fixture.layout.executable, b"unknown executable format").unwrap();
+    let unknown = CodexAdapter::from_layout(
+        CodexLayout {
+            executable_kind: CodexExecutableKind::Native,
+            ..fixture.layout.clone()
+        },
+        fixture.project_id,
+        DeviceId::from_str(DEVICE_ID).unwrap(),
+        HybridLogicalClock::new(1_900_000_000_000, 0, DeviceId::from_str(DEVICE_ID).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(
+        unknown
+            .probe(&ProbeContext {
+                harness: HarnessId::Codex,
+                requested_profile: None,
+            })
+            .unwrap()
+            .capability,
+        CapabilityLevel::ImportOnly
+    );
+    assert!(unknown.validate_effective(&receipt).is_err());
+    assert!(!sentinel.exists());
 }
 
 #[test]
@@ -645,9 +709,10 @@ fn native_reprobe_rejects_changed_codex_installation_identity() {
         );
     }
 
+    fs::write(&fixture.layout.executable, b"#!/bin/sh\nexit 9\n").unwrap();
     let mut import_only = CodexAdapter::from_layout(
         CodexLayout {
-            executable_kind: CodexExecutableKind::Wrapper,
+            executable_kind: CodexExecutableKind::Native,
             ..fixture.layout.clone()
         },
         fixture.project_id,
@@ -923,264 +988,6 @@ fn plugin_and_global_mcp_changes_use_only_official_cli_argv() {
                 "--safe"
             ],
         ]
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn effective_validation_uses_enabled_global_and_trusted_layered_mcp_servers_only() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
-    let sentinel = fixture.root.join("configured-server-ran");
-    let root_config = fixture.layout.project_root.join(".codex/config.toml");
-    fs::write(
-        &root_config,
-        format!(
-            "{}\n[mcp_servers.root]\ncommand = \"/usr/bin/touch\"\nargs = [\"{}\"]\n\n[mcp_servers.root_disabled]\nenabled = false\ncommand = \"/usr/bin/touch\"\nargs = [\"{}\"]\n",
-            fs::read_to_string(&root_config).unwrap(),
-            sentinel.display(),
-            sentinel.display()
-        ),
-    )
-    .unwrap();
-    let nested_config = fixture
-        .layout
-        .project_root
-        .join("service/.codex/config.toml");
-    fs::write(
-        &nested_config,
-        format!(
-            "{}\n[mcp_servers.nested]\ncommand = \"/usr/bin/touch\"\nargs = [\"{}\"]\n\n[mcp_servers.nested_disabled]\nenabled = false\ncommand = \"/usr/bin/touch\"\nargs = [\"{}\"]\n",
-            fs::read_to_string(&nested_config).unwrap(),
-            sentinel.display(),
-            sentinel.display()
-        ),
-    )
-    .unwrap();
-    let global_config = fixture.codex_home.join("config.toml");
-    fs::write(
-        &global_config,
-        format!(
-            "{}\n[mcp_servers.global_disabled]\nenabled = false\ncommand = \"/usr/bin/touch\"\nargs = [\"{}\"]\n",
-            fs::read_to_string(&global_config).unwrap(),
-            sentinel.display()
-        ),
-    )
-    .unwrap();
-
-    let script = r#"#!/bin/sh
-printf '%s\n' "$*" >> ../../codex-argv.log
-case "$1 $2" in
-  "plugin list")
-    printf '%s' '{"installed":[],"available":[]}'
-    ;;
-  "mcp list")
-    cat ../../mcp-list.json
-    ;;
-  "mcp get")
-    printf '{"name":"%s","enabled":true,"disabled_reason":null,"transport":{"type":"stdio","command":"never-run","args":[],"env":{},"env_vars":[],"cwd":null},"enabled_tools":null,"disabled_tools":null,"startup_timeout_sec":null,"tool_timeout_sec":null}' "$3"
-    ;;
-  *)
-    exit 9
-    ;;
-esac
-"#;
-    fs::write(&fixture.layout.executable, script).unwrap();
-    let mut permissions = fs::metadata(&fixture.layout.executable)
-        .unwrap()
-        .permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&fixture.layout.executable, permissions).unwrap();
-    fixture.adapter = CodexAdapter::from_layout(
-        fixture.layout.clone(),
-        fixture.project_id,
-        DeviceId::from_str(DEVICE_ID).unwrap(),
-        HybridLogicalClock::new(1_900_000_000_000, 0, DeviceId::from_str(DEVICE_ID).unwrap()),
-    )
-    .unwrap();
-    let list_path = fixture.root.join("mcp-list.json");
-    let write_list = |enabled: &[&str]| {
-        let mut servers = enabled
-            .iter()
-            .map(|name| {
-                json!({
-                    "name": name,
-                    "enabled": true,
-                    "disabled_reason": null,
-                    "transport": {
-                        "type": "stdio",
-                        "command": "never-run",
-                        "args": [],
-                        "env": {},
-                        "env_vars": [],
-                        "cwd": null
-                    },
-                    "startup_timeout_sec": null,
-                    "tool_timeout_sec": null,
-                    "auth_status": "unsupported"
-                })
-            })
-            .collect::<Vec<_>>();
-        servers.push(json!({
-            "name": "listed-disabled",
-            "enabled": false,
-            "disabled_reason": "disabled by config",
-            "transport": {
-                "type": "stdio",
-                "command": "never-run",
-                "args": [],
-                "env": {},
-                "env_vars": [],
-                "cwd": null
-            },
-            "startup_timeout_sec": null,
-            "tool_timeout_sec": null,
-            "auth_status": "unsupported"
-        }));
-        fs::write(&list_path, serde_json::to_vec(&servers).unwrap()).unwrap();
-    };
-    let receipt = ApplyReceipt {
-        plan_id: PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073984").unwrap(),
-        applied_hlc: HybridLogicalClock::new(
-            1_900_000_000_001,
-            0,
-            DeviceId::from_str(DEVICE_ID).unwrap(),
-        ),
-        resulting_digests: vec![],
-    };
-
-    write_list(&["docs", "nested", "root"]);
-    let trusted = fixture.adapter.validate_effective(&receipt).unwrap();
-    assert!(trusted.valid);
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("codex-argv.log")).unwrap(),
-        "plugin list --json\nmcp list --json\nmcp get docs --json\nmcp get nested --json\nmcp get root --json\n"
-    );
-
-    fs::remove_file(fixture.root.join("codex-argv.log")).unwrap();
-    fs::write(
-        &global_config,
-        fs::read_to_string(&global_config)
-            .unwrap()
-            .replace("trust_level = \"trusted\"", "trust_level = \"untrusted\""),
-    )
-    .unwrap();
-    let untrusted = fixture.adapter.validate_effective(&receipt).unwrap();
-    assert!(untrusted.valid);
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("codex-argv.log")).unwrap(),
-        "plugin list --json\nmcp list --json\nmcp get docs --json\n"
-    );
-
-    fs::write(
-        &global_config,
-        fs::read_to_string(&global_config)
-            .unwrap()
-            .replace("trust_level = \"untrusted\"", "trust_level = \"trusted\""),
-    )
-    .unwrap();
-    write_list(&["docs", "root"]);
-    let missing = fixture.adapter.validate_effective(&receipt).unwrap();
-    assert!(!missing.valid);
-    assert_eq!(missing.findings, vec!["configured_mcp_server_missing"]);
-    assert!(!sentinel.exists());
-
-    fs::write(
-        &global_config,
-        format!(
-            "mcp_servers = \"not-a-table\"\n\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
-            fixture.layout.project_root.display()
-        ),
-    )
-    .unwrap();
-    assert!(fixture.adapter.validate_effective(&receipt).is_err());
-}
-
-#[cfg(unix)]
-#[test]
-fn effective_validation_honors_same_name_mcp_shadowing_across_layers() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
-    let global_config = fixture.codex_home.join("config.toml");
-    fs::write(
-        &global_config,
-        format!(
-            "{}\n[mcp_servers.shadowed]\ncommand = \"global-shadowed\"\n\n[mcp_servers.reenabled]\nenabled = false\ncommand = \"global-disabled\"\n",
-            fs::read_to_string(&global_config).unwrap()
-        ),
-    )
-    .unwrap();
-    let root_config = fixture.layout.project_root.join(".codex/config.toml");
-    fs::write(
-        &root_config,
-        format!(
-            "{}\n[mcp_servers.shadowed]\nenabled = true\ncommand = \"root-shadowed\"\n",
-            fs::read_to_string(&root_config).unwrap()
-        ),
-    )
-    .unwrap();
-    let nested_config = fixture
-        .layout
-        .project_root
-        .join("service/.codex/config.toml");
-    fs::write(
-        &nested_config,
-        format!(
-            "{}\n[mcp_servers.shadowed]\nenabled = false\ncommand = \"nested-disabled\"\n\n[mcp_servers.reenabled]\nenabled = true\ncommand = \"nested-reenabled\"\n",
-            fs::read_to_string(&nested_config).unwrap()
-        ),
-    )
-    .unwrap();
-
-    let script = r#"#!/bin/sh
-printf '%s\n' "$*" >> ../../codex-argv.log
-case "$1 $2" in
-  "plugin list")
-    printf '%s' '{"installed":[],"available":[]}'
-    ;;
-  "mcp list")
-    printf '%s' '[{"name":"docs","enabled":true,"disabled_reason":null,"transport":{"type":"stdio","command":"never-run","args":[],"env":{},"env_vars":[],"cwd":null},"startup_timeout_sec":null,"tool_timeout_sec":null,"auth_status":"unsupported"},{"name":"reenabled","enabled":true,"disabled_reason":null,"transport":{"type":"stdio","command":"never-run","args":[],"env":{},"env_vars":[],"cwd":null},"startup_timeout_sec":null,"tool_timeout_sec":null,"auth_status":"unsupported"}]'
-    ;;
-  "mcp get")
-    [ "$3" != "shadowed" ] || exit 8
-    printf '{"name":"%s","enabled":true,"disabled_reason":null,"transport":{"type":"stdio","command":"never-run","args":[],"env":{},"env_vars":[],"cwd":null},"enabled_tools":null,"disabled_tools":null,"startup_timeout_sec":null,"tool_timeout_sec":null}' "$3"
-    ;;
-  *)
-    exit 9
-    ;;
-esac
-"#;
-    fs::write(&fixture.layout.executable, script).unwrap();
-    let mut permissions = fs::metadata(&fixture.layout.executable)
-        .unwrap()
-        .permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&fixture.layout.executable, permissions).unwrap();
-    fixture.adapter = CodexAdapter::from_layout(
-        fixture.layout.clone(),
-        fixture.project_id,
-        DeviceId::from_str(DEVICE_ID).unwrap(),
-        HybridLogicalClock::new(1_900_000_000_000, 0, DeviceId::from_str(DEVICE_ID).unwrap()),
-    )
-    .unwrap();
-
-    let receipt = ApplyReceipt {
-        plan_id: PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073984").unwrap(),
-        applied_hlc: HybridLogicalClock::new(
-            1_900_000_000_001,
-            0,
-            DeviceId::from_str(DEVICE_ID).unwrap(),
-        ),
-        resulting_digests: vec![],
-    };
-    let report = fixture.adapter.validate_effective(&receipt).unwrap();
-
-    assert!(report.valid);
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("codex-argv.log")).unwrap(),
-        "plugin list --json\nmcp list --json\nmcp get docs --json\nmcp get reenabled --json\n"
     );
 }
 

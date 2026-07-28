@@ -150,7 +150,7 @@ impl CodexAdapter {
     }
 
     pub fn from_layout(
-        layout: CodexLayout,
+        mut layout: CodexLayout,
         project_id: ProjectId,
         origin_device: DeviceId,
         observed_hlc: HybridLogicalClock,
@@ -180,7 +180,10 @@ impl CodexAdapter {
                 "Codex working directory is outside the project root",
             ));
         }
-        let executable_hash = digest_file(&layout.executable)?;
+        let executable_bytes =
+            fs::read(&layout.executable).map_err(|_| not_found("Codex executable is missing"))?;
+        layout.executable_kind = classify_executable_bytes(&layout.executable, &executable_bytes);
+        let executable_hash = digest(&executable_bytes);
         Ok(Self {
             layout,
             project_id,
@@ -1359,6 +1362,24 @@ impl HarnessAdapter for CodexAdapter {
     }
 
     fn validate_effective(&self, receipt: &ApplyReceipt) -> Result<ValidationReport, ClientError> {
+        self.validate_effective_with(receipt, |command| {
+            let argv = command.argv();
+            run_bounded_command(
+                &self.layout.executable,
+                &argv.iter().map(String::as_str).collect::<Vec<_>>(),
+                self.executable_hash,
+                &self.layout.working_directory,
+            )
+        })
+    }
+}
+
+impl CodexAdapter {
+    fn validate_effective_with(
+        &self,
+        receipt: &ApplyReceipt,
+        mut execute: impl FnMut(&CodexCommand) -> Result<Vec<u8>, ClientError>,
+    ) -> Result<ValidationReport, ClientError> {
         receipt
             .validate()
             .map_err(|_| invalid("Codex receipt is invalid"))?;
@@ -1366,14 +1387,7 @@ impl HarnessAdapter for CodexAdapter {
         let commands = [CodexCommand::PluginList, CodexCommand::McpList];
         let mut configured = BTreeSet::new();
         for command in commands {
-            let argv = command.argv();
-            let args = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = run_bounded_command(
-                &self.layout.executable,
-                &args,
-                self.executable_hash,
-                &self.layout.working_directory,
-            )?;
+            let output = execute(&command)?;
             match command {
                 CodexCommand::PluginList => parse_plugin_list_json(&output)?,
                 CodexCommand::McpList => configured = parse_mcp_list_json(&output)?,
@@ -1388,13 +1402,7 @@ impl HarnessAdapter for CodexAdapter {
                 });
             }
             let command = CodexCommand::McpGet(name.clone());
-            let argv = command.argv();
-            let output = run_bounded_command(
-                &self.layout.executable,
-                &argv.iter().map(String::as_str).collect::<Vec<_>>(),
-                self.executable_hash,
-                &self.layout.working_directory,
-            )?;
+            let output = execute(&command)?;
             parse_mcp_get_json(&output, &name)?;
         }
         Ok(ValidationReport {
@@ -2601,6 +2609,12 @@ fn parse_version(output: &str) -> Option<String> {
     Some(version.to_owned())
 }
 fn classify_executable(path: &Path) -> CodexExecutableKind {
+    let Ok(bytes) = fs::read(path) else {
+        return CodexExecutableKind::Unknown;
+    };
+    classify_executable_bytes(path, &bytes)
+}
+fn classify_executable_bytes(path: &Path, bytes: &[u8]) -> CodexExecutableKind {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -2609,10 +2623,7 @@ fn classify_executable(path: &Path) -> CodexExecutableKind {
     if ["cmd", "bat", "ps1"].contains(&extension.as_str()) {
         return CodexExecutableKind::Wrapper;
     }
-    let Ok(bytes) = fs::read(path) else {
-        return CodexExecutableKind::Unknown;
-    };
-    classify_executable_magic(&bytes)
+    classify_executable_magic(bytes)
 }
 fn classify_executable_magic(bytes: &[u8]) -> CodexExecutableKind {
     if bytes.starts_with(b"#!") {
@@ -2752,6 +2763,304 @@ fn client_error(code: ErrorCode, message: &'static str, retryable: bool) -> Clie
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static NEXT_EFFECTIVE_FIXTURE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    struct EffectiveValidationFixture {
+        root: PathBuf,
+        adapter: CodexAdapter,
+        global_config: PathBuf,
+        root_config: PathBuf,
+        nested_config: PathBuf,
+        sentinel: PathBuf,
+    }
+
+    impl Drop for EffectiveValidationFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn effective_validation_fixture() -> EffectiveValidationFixture {
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-codex-effective-{}-{}",
+            std::process::id(),
+            NEXT_EFFECTIVE_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let codex_home = root.join("codex home");
+        let user_skills_dir = root.join("home/.agents/skills");
+        let project_root = root.join("project with spaces");
+        let working_directory = project_root.join("service");
+        for directory in [
+            &codex_home,
+            &user_skills_dir,
+            &project_root,
+            &working_directory,
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let executable = root.join("codex");
+        fs::write(&executable, b"\x7fELFtest executable").unwrap();
+        let sentinel = root.join("configured-stdio-ran");
+        let quoted_project = serde_json::to_string(&project_root.to_string_lossy()).unwrap();
+        let quoted_sentinel = serde_json::to_string(&sentinel.to_string_lossy()).unwrap();
+        let global_config = codex_home.join("config.toml");
+        fs::write(
+            &global_config,
+            format!(
+                "[mcp_servers.docs]\ncommand = \"/usr/bin/touch\"\nargs = [{quoted_sentinel}]\n\n[mcp_servers.global_disabled]\nenabled = false\ncommand = \"/usr/bin/touch\"\nargs = [{quoted_sentinel}]\n\n[projects.{quoted_project}]\ntrust_level = \"trusted\"\n"
+            ),
+        )
+        .unwrap();
+        let root_config = project_root.join(".codex/config.toml");
+        fs::create_dir_all(root_config.parent().unwrap()).unwrap();
+        fs::write(
+            &root_config,
+            format!(
+                "[mcp_servers.root]\ncommand = \"/usr/bin/touch\"\nargs = [{quoted_sentinel}]\n\n[mcp_servers.root_disabled]\nenabled = false\ncommand = \"/usr/bin/touch\"\nargs = [{quoted_sentinel}]\n"
+            ),
+        )
+        .unwrap();
+        let nested_config = working_directory.join(".codex/config.toml");
+        fs::create_dir_all(nested_config.parent().unwrap()).unwrap();
+        fs::write(
+            &nested_config,
+            format!(
+                "[mcp_servers.nested]\ncommand = \"/usr/bin/touch\"\nargs = [{quoted_sentinel}]\n\n[mcp_servers.nested_disabled]\nenabled = false\ncommand = \"/usr/bin/touch\"\nargs = [{quoted_sentinel}]\n"
+            ),
+        )
+        .unwrap();
+        let project_id = ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073981").unwrap();
+        let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
+        let adapter = CodexAdapter::from_layout(
+            CodexLayout {
+                executable,
+                executable_kind: CodexExecutableKind::Unknown,
+                version: "0.144.1".into(),
+                installation_method: InstallationMethod::Manual,
+                codex_home,
+                user_skills_dir,
+                project_root,
+                working_directory,
+                requirements_paths: vec![],
+            },
+            project_id,
+            device_id,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+        )
+        .unwrap();
+        EffectiveValidationFixture {
+            root,
+            adapter,
+            global_config,
+            root_config,
+            nested_config,
+            sentinel,
+        }
+    }
+
+    fn effective_validation_receipt() -> ApplyReceipt {
+        ApplyReceipt {
+            plan_id: context_relay_protocol::PlanId::from_str(
+                "018f22e2-79b0-7cc8-98c4-dc0c0c073984",
+            )
+            .unwrap(),
+            applied_hlc: HybridLogicalClock::new(
+                1_900_000_000_001,
+                0,
+                DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap(),
+            ),
+            resulting_digests: vec![],
+        }
+    }
+
+    fn effective_validation_output(command: &CodexCommand, enabled_names: &[&str]) -> Vec<u8> {
+        match command {
+            CodexCommand::PluginList => br#"{"installed":[],"available":[]}"#.to_vec(),
+            CodexCommand::McpList => serde_json::to_vec(
+                &enabled_names
+                    .iter()
+                    .map(|name| {
+                        serde_json::json!({
+                            "name": name,
+                            "enabled": true,
+                            "disabled_reason": null,
+                            "transport": {
+                                "type": "stdio",
+                                "command": "never-run",
+                                "args": [],
+                                "env": {},
+                                "env_vars": [],
+                                "cwd": null
+                            },
+                            "startup_timeout_sec": null,
+                            "tool_timeout_sec": null,
+                            "auth_status": "unsupported"
+                        })
+                    })
+                    .chain(std::iter::once(serde_json::json!({
+                        "name": "listed-disabled",
+                        "enabled": false,
+                        "disabled_reason": "disabled by config",
+                        "transport": {
+                            "type": "stdio",
+                            "command": "never-run",
+                            "args": [],
+                            "env": {},
+                            "env_vars": [],
+                            "cwd": null
+                        },
+                        "startup_timeout_sec": null,
+                        "tool_timeout_sec": null,
+                        "auth_status": "unsupported"
+                    })))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            CodexCommand::McpGet(name) => serde_json::to_vec(&serde_json::json!({
+                "name": name,
+                "enabled": true,
+                "disabled_reason": null,
+                "transport": {
+                    "type": "stdio",
+                    "command": "never-run",
+                    "args": [],
+                    "env": {},
+                    "env_vars": [],
+                    "cwd": null
+                },
+                "enabled_tools": null,
+                "disabled_tools": null,
+                "startup_timeout_sec": null,
+                "tool_timeout_sec": null
+            }))
+            .unwrap(),
+        }
+    }
+
+    fn validate_with_frozen_outputs(
+        fixture: &EffectiveValidationFixture,
+        enabled_names: &[&str],
+    ) -> (Result<ValidationReport, ClientError>, Vec<Vec<String>>) {
+        let mut commands = Vec::new();
+        let result =
+            fixture
+                .adapter
+                .validate_effective_with(&effective_validation_receipt(), |command| {
+                    commands.push(command.argv());
+                    Ok(effective_validation_output(command, enabled_names))
+                });
+        (result, commands)
+    }
+
+    #[test]
+    fn effective_validation_selects_trusted_layers_in_exact_cli_order_without_starting_stdio() {
+        let fixture = effective_validation_fixture();
+        let (trusted, commands) =
+            validate_with_frozen_outputs(&fixture, &["docs", "nested", "root"]);
+        assert!(trusted.unwrap().valid);
+        assert_eq!(
+            commands,
+            vec![
+                vec!["plugin", "list", "--json"],
+                vec!["mcp", "list", "--json"],
+                vec!["mcp", "get", "docs", "--json"],
+                vec!["mcp", "get", "nested", "--json"],
+                vec!["mcp", "get", "root", "--json"],
+            ]
+        );
+        assert!(!fixture.sentinel.exists());
+
+        let trusted_config = fs::read_to_string(&fixture.global_config).unwrap();
+        fs::write(
+            &fixture.global_config,
+            trusted_config.replace("trust_level = \"trusted\"", "trust_level = \"untrusted\""),
+        )
+        .unwrap();
+        let (untrusted, commands) = validate_with_frozen_outputs(&fixture, &["docs"]);
+        assert!(untrusted.unwrap().valid);
+        assert_eq!(
+            commands,
+            vec![
+                vec!["plugin", "list", "--json"],
+                vec!["mcp", "list", "--json"],
+                vec!["mcp", "get", "docs", "--json"],
+            ]
+        );
+
+        fs::write(&fixture.global_config, trusted_config).unwrap();
+        let (missing, commands) = validate_with_frozen_outputs(&fixture, &["docs", "root"]);
+        let missing = missing.unwrap();
+        assert!(!missing.valid);
+        assert_eq!(missing.findings, vec!["configured_mcp_server_missing"]);
+        assert_eq!(
+            commands,
+            vec![
+                vec!["plugin", "list", "--json"],
+                vec!["mcp", "list", "--json"],
+                vec!["mcp", "get", "docs", "--json"],
+            ]
+        );
+        assert!(!fixture.sentinel.exists());
+
+        let quoted_project =
+            serde_json::to_string(&fixture.adapter.layout.project_root.to_string_lossy()).unwrap();
+        fs::write(
+            &fixture.global_config,
+            format!(
+                "mcp_servers = \"not-a-table\"\n\n[projects.{quoted_project}]\ntrust_level = \"trusted\"\n"
+            ),
+        )
+        .unwrap();
+        assert!(validate_with_frozen_outputs(&fixture, &[]).0.is_err());
+    }
+
+    #[test]
+    fn effective_validation_honors_same_name_shadowing_across_trusted_layers() {
+        let fixture = effective_validation_fixture();
+        fs::write(
+            &fixture.global_config,
+            format!(
+                "{}\n[mcp_servers.shadowed]\ncommand = \"global-shadowed\"\n\n[mcp_servers.reenabled]\nenabled = false\ncommand = \"global-disabled\"\n",
+                fs::read_to_string(&fixture.global_config).unwrap()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &fixture.root_config,
+            format!(
+                "{}\n[mcp_servers.shadowed]\nenabled = true\ncommand = \"root-shadowed\"\n",
+                fs::read_to_string(&fixture.root_config).unwrap()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &fixture.nested_config,
+            format!(
+                "{}\n[mcp_servers.shadowed]\nenabled = false\ncommand = \"nested-disabled\"\n\n[mcp_servers.reenabled]\nenabled = true\ncommand = \"nested-reenabled\"\n",
+                fs::read_to_string(&fixture.nested_config).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let (report, commands) =
+            validate_with_frozen_outputs(&fixture, &["docs", "nested", "reenabled", "root"]);
+        assert!(report.unwrap().valid);
+        assert_eq!(
+            commands,
+            vec![
+                vec!["plugin", "list", "--json"],
+                vec!["mcp", "list", "--json"],
+                vec!["mcp", "get", "docs", "--json"],
+                vec!["mcp", "get", "nested", "--json"],
+                vec!["mcp", "get", "reenabled", "--json"],
+                vec!["mcp", "get", "root", "--json"],
+            ]
+        );
+        assert!(!fixture.sentinel.exists());
+    }
+
     #[test]
     fn validation_commands_never_start_mcp_servers() {
         assert_eq!(
