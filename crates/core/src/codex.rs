@@ -82,6 +82,12 @@ enum CodexCommand {
     McpGet(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CodexExecutableSnapshot {
+    kind: CodexExecutableKind,
+    digest: Sha256Digest,
+}
+
 impl CodexCommand {
     fn argv(&self) -> Vec<String> {
         match self {
@@ -115,22 +121,8 @@ impl CodexAdapter {
         };
         let executable =
             find_executable(&home).ok_or_else(|| not_found("Codex executable was not found"))?;
-        let executable_kind = classify_executable(&executable);
-        let version = if executable_kind == CodexExecutableKind::Native {
-            let executable_hash = digest_file(&executable)?;
-            let output = run_bounded_command(
-                &executable,
-                &["--version"],
-                executable_hash,
-                &working_directory,
-            )?;
-            parse_version(std::str::from_utf8(&output).unwrap_or_default())
-                .ok_or_else(|| unsupported("Codex returned an invalid version"))?
-        } else {
-            // Wrapper and unknown files remain import-only.  Never execute an
-            // unclassified candidate merely to obtain its version.
-            "0.0.0".to_owned()
-        };
+        let (executable_kind, version) =
+            discover_executable_version(&executable, &working_directory)?;
         Self::from_layout(
             CodexLayout {
                 installation_method: installation_method(&executable),
@@ -180,10 +172,9 @@ impl CodexAdapter {
                 "Codex working directory is outside the project root",
             ));
         }
-        let executable_bytes =
-            fs::read(&layout.executable).map_err(|_| not_found("Codex executable is missing"))?;
-        layout.executable_kind = classify_executable_bytes(&layout.executable, &executable_bytes);
-        let executable_hash = digest(&executable_bytes);
+        let executable_snapshot = snapshot_executable(&layout.executable)?;
+        layout.executable_kind = executable_snapshot.kind;
+        let executable_hash = executable_snapshot.digest;
         Ok(Self {
             layout,
             project_id,
@@ -2498,6 +2489,13 @@ fn stable_record_id(key: &str) -> Result<RecordId, ClientError> {
 fn digest(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest(Sha256::digest(bytes).into())
 }
+fn snapshot_executable(path: &Path) -> Result<CodexExecutableSnapshot, ClientError> {
+    let bytes = fs::read(path).map_err(|_| not_found("Codex executable is missing"))?;
+    Ok(CodexExecutableSnapshot {
+        kind: classify_executable_bytes(path, &bytes),
+        digest: digest(&bytes),
+    })
+}
 fn digest_file(path: &Path) -> Result<Sha256Digest, ClientError> {
     hash_file(path).map_err(|_| not_found("Codex executable is missing"))
 }
@@ -2515,6 +2513,37 @@ fn hash_file(path: &Path) -> std::io::Result<Sha256Digest> {
         }
         hasher.update(&buffer[..read]);
     }
+}
+
+fn discover_executable_version(
+    executable: &Path,
+    working_directory: &Path,
+) -> Result<(CodexExecutableKind, String), ClientError> {
+    discover_executable_version_after_snapshot(executable, working_directory, || {})
+}
+
+fn discover_executable_version_after_snapshot(
+    executable: &Path,
+    working_directory: &Path,
+    after_snapshot: impl FnOnce(),
+) -> Result<(CodexExecutableKind, String), ClientError> {
+    let snapshot = snapshot_executable(executable)?;
+    let version = if snapshot.kind == CodexExecutableKind::Native {
+        after_snapshot();
+        let output = run_bounded_command(
+            executable,
+            &["--version"],
+            snapshot.digest,
+            working_directory,
+        )?;
+        parse_version(std::str::from_utf8(&output).unwrap_or_default())
+            .ok_or_else(|| unsupported("Codex returned an invalid version"))?
+    } else {
+        // Wrapper and unknown files remain import-only. Never execute an
+        // unclassified candidate merely to obtain its version.
+        "0.0.0".to_owned()
+    };
+    Ok((snapshot.kind, version))
 }
 
 fn run_bounded_command(
@@ -2607,12 +2636,6 @@ fn parse_version(output: &str) -> Option<String> {
         return None;
     }
     Some(version.to_owned())
-}
-fn classify_executable(path: &Path) -> CodexExecutableKind {
-    let Ok(bytes) = fs::read(path) else {
-        return CodexExecutableKind::Unknown;
-    };
-    classify_executable_bytes(path, &bytes)
 }
 fn classify_executable_bytes(path: &Path, bytes: &[u8]) -> CodexExecutableKind {
     let extension = path
@@ -3093,6 +3116,43 @@ mod tests {
             classify_executable_magic(b"text"),
             CodexExecutableKind::Unknown
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn native_discovery_rejects_replacement_before_version_without_execution() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-codex-discovery-race-{}-{}",
+            std::process::id(),
+            NEXT_EFFECTIVE_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("codex");
+        let sentinel = root.join("wrapper-ran");
+        fs::write(&executable, b"\x7fELFnative executable").unwrap();
+
+        let result = discover_executable_version_after_snapshot(&executable, &root, || {
+            fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\n/usr/bin/touch '{}'\nprintf 'codex 0.144.1\\n'\n",
+                    sentinel.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        });
+        let sentinel_exists = sentinel.exists();
+        let _ = fs::remove_dir_all(root);
+        assert!(matches!(
+            result,
+            Err(ClientError {
+                code: ErrorCode::Conflict,
+                ..
+            })
+        ));
+        assert!(!sentinel_exists);
     }
     #[test]
     fn frozen_release_outputs_match_reviewed_json_contracts() {
