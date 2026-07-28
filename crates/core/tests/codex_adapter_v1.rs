@@ -7,15 +7,25 @@ use std::{
 
 use context_relay_core::{
     codex::{CodexAdapter, CodexExecutableKind, CodexLayout},
-    native_transaction::{engine::NativeFileSystem, filesystem::OsNativeTransactionFileSystem},
+    native_transaction::{
+        approval_hash_v1,
+        engine::{NativeAdapter, NativeFileSystem, RestrictedRun},
+        filesystem::OsNativeTransactionFileSystem,
+        model::{NativeTransactionPlan, SidecarBinding},
+    },
 };
-use context_relay_native_runner::NativeState;
+use context_relay_native_runner::{
+    NativeState, RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand,
+    SidecarId,
+};
 use context_relay_protocol::{
-    ApplyReceipt, CapabilityLevel, ComponentKind, ComponentRecord, DesiredState, DeviceId,
-    HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest, InstallationMethod, NativeScope,
-    PlanId, ProbeContext, ProjectId, Provenance, ScopeRef,
+    ApplyReceipt, ApprovalClass, CapabilityLevel, ComponentKind, ComponentRecord, DesiredState,
+    DeviceId, ExpectedNativeDigest, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest,
+    InstallationMethod, NativePlatform, NativeScope, NetworkDelta, PermissionDelta, PlanId,
+    ProbeContext, ProjectId, Provenance, ScopeRef, SetupPlan, Sha256Digest, WireNativeValue,
 };
 use serde_json::{Map, Value, json};
+use sha2::{Digest as _, Sha256};
 
 const PROJECT_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073981";
 const DEVICE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073982";
@@ -141,6 +151,110 @@ fn import_project(
         }],
         include_disabled: true,
     })
+}
+
+fn test_wire_path(path: &Path) -> WireNativeValue {
+    #[cfg(windows)]
+    let bytes = {
+        use std::os::windows::ffi::OsStrExt as _;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    #[cfg(not(windows))]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt as _;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    WireNativeValue {
+        platform: if cfg!(windows) {
+            NativePlatform::Windows
+        } else {
+            NativePlatform::Macos
+        },
+        bytes,
+        display: path.to_str().map(str::to_owned),
+    }
+}
+
+fn test_digest(bytes: &[u8]) -> Sha256Digest {
+    Sha256Digest(Sha256::digest(bytes).into())
+}
+
+fn test_file_digest(path: &Path) -> Sha256Digest {
+    test_digest(&fs::read(path).unwrap())
+}
+
+fn codex_native_plan(
+    fixture: &Fixture,
+    expected_native_digests: Vec<ExpectedNativeDigest>,
+) -> NativeTransactionPlan {
+    let mutation = fixture
+        .adapter
+        .plan_native_markdown(&component(
+            fixture.project_id,
+            ScopeRef::Global,
+            ComponentKind::Instruction,
+            "AGENTS.override.md",
+            "approved global instructions",
+        ))
+        .unwrap();
+    let setup = SetupPlan {
+        plan_id: PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073984").unwrap(),
+        harness: HarnessId::Codex,
+        adapter_version: 1,
+        executable_path: test_wire_path(&fixture.layout.executable),
+        executable_hash: test_file_digest(&fixture.layout.executable),
+        harness_version: fixture.layout.version.clone(),
+        target_scopes: vec![NativeScope::Global],
+        expected_native_digests,
+        semantic_changes: vec![],
+        cli_operations: vec![],
+        package_artifacts: vec![],
+        permission_delta: PermissionDelta {
+            added: vec![],
+            removed: vec![],
+        },
+        network_delta: NetworkDelta {
+            added: vec![],
+            removed: vec![],
+        },
+        scanner_report_hash: Sha256Digest([21; 32]),
+        rulesync_version: "0.2.0".to_owned(),
+        rulesync_hash: Sha256Digest([22; 32]),
+        approval_class: ApprovalClass::Passive,
+        expires_at: 2_000_000_000_000,
+        batch_hash: Sha256Digest([0; 32]),
+    };
+    let mut plan = NativeTransactionPlan {
+        setup,
+        helper_policy_version: 1,
+        manifest_schema_version: 1,
+        manifest_digest: Sha256Digest([23; 32]),
+        helper_hash: Sha256Digest([24; 32]),
+        sidecars: vec![SidecarBinding {
+            id: SidecarId::RuleSync,
+            target: RuntimeTarget::MacosArm64,
+            version: "0.2.0".to_owned(),
+            closure_hash: Sha256Digest([25; 32]),
+            source_bundle_hash: Sha256Digest([26; 32]),
+            build_toolchain_hash: Sha256Digest([27; 32]),
+            command_template_digest: Sha256Digest([28; 32]),
+            command: SidecarCommand::RuleSyncGenerate {
+                target: RuleSyncTarget::CodexCli,
+                features: RuleSyncFeatures::new(&[RuleSyncFeature::Rules]).unwrap(),
+            },
+        }],
+        structural_allowlist_hash: Sha256Digest([29; 32]),
+        staged_inputs: vec![],
+        expected_semantic_output_hash: Sha256Digest([30; 32]),
+        scanner_result_hash: Sha256Digest([31; 32]),
+        mutations: vec![mutation],
+        ownership_changes: vec![],
+    };
+    plan.setup.batch_hash = approval_hash_v1(&plan).unwrap();
+    plan
 }
 
 #[test]
@@ -468,6 +582,193 @@ fn unknown_versions_and_wrapper_executables_are_import_only() {
             .unwrap()
             .capability,
         CapabilityLevel::ImportOnly
+    );
+    assert!(
+        wrapped
+            .render(&DesiredState {
+                components: vec![],
+                scopes: vec![],
+            })
+            .is_err()
+    );
+    assert!(
+        wrapped
+            .plan_native_markdown(&component(
+                fixture.project_id,
+                ScopeRef::Global,
+                ComponentKind::Instruction,
+                "AGENTS.override.md",
+                "managed",
+            ))
+            .is_err()
+    );
+}
+
+#[test]
+fn native_reprobe_rejects_changed_codex_installation_identity() {
+    let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let plan = codex_native_plan(&fixture, vec![]);
+    NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).unwrap();
+
+    let original_executable = fs::read(&fixture.layout.executable).unwrap();
+    fs::write(&fixture.layout.executable, b"concurrently replaced").unwrap();
+    assert_eq!(
+        NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan)
+            .unwrap_err()
+            .to_string(),
+        "Codex installation changed"
+    );
+    fs::write(&fixture.layout.executable, original_executable).unwrap();
+
+    for changed in [
+        {
+            let mut changed = plan.clone();
+            changed.setup.harness = HarnessId::ClaudeCode;
+            changed
+        },
+        {
+            let mut changed = plan.clone();
+            changed.setup.harness_version = "0.143.0".to_owned();
+            changed
+        },
+        {
+            let mut changed = plan.clone();
+            changed.setup.executable_path = test_wire_path(&fixture.root.join("other-codex"));
+            changed
+        },
+    ] {
+        assert_eq!(
+            NativeAdapter::reprobe_live_state(&mut fixture.adapter, &changed)
+                .unwrap_err()
+                .to_string(),
+            "Codex installation changed"
+        );
+    }
+
+    let mut import_only = CodexAdapter::from_layout(
+        CodexLayout {
+            executable_kind: CodexExecutableKind::Wrapper,
+            ..fixture.layout.clone()
+        },
+        fixture.project_id,
+        DeviceId::from_str(DEVICE_ID).unwrap(),
+        HybridLogicalClock::new(1_900_000_000_000, 0, DeviceId::from_str(DEVICE_ID).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(
+        NativeAdapter::reprobe_live_state(&mut import_only, &plan)
+            .unwrap_err()
+            .to_string(),
+        "Codex installation changed"
+    );
+}
+
+#[test]
+fn native_digest_comparison_rejects_concurrent_mutation_and_absence() {
+    let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let target = fixture.root.join("approved-native-target");
+    let approved_bytes = b"approved native bytes";
+    fs::write(&target, approved_bytes).unwrap();
+    let plan = codex_native_plan(
+        &fixture,
+        vec![ExpectedNativeDigest {
+            target: test_wire_path(&target),
+            expected_digest: Some(test_digest(approved_bytes)),
+        }],
+    );
+    NativeAdapter::compare_approved_digests(&mut fixture.adapter, &plan).unwrap();
+
+    fs::write(&target, b"concurrent mutation").unwrap();
+    assert_eq!(
+        NativeAdapter::compare_approved_digests(&mut fixture.adapter, &plan)
+            .unwrap_err()
+            .to_string(),
+        "Codex native state changed"
+    );
+
+    fs::remove_file(&target).unwrap();
+    assert_eq!(
+        NativeAdapter::compare_approved_digests(&mut fixture.adapter, &plan)
+            .unwrap_err()
+            .to_string(),
+        "Codex native state changed"
+    );
+}
+
+#[test]
+fn native_staged_output_validation_rejects_either_changed_hash() {
+    let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let plan = codex_native_plan(&fixture, vec![]);
+    let approved = RestrictedRun {
+        staged_output_hash: plan.expected_semantic_output_hash,
+        scanner_result_hash: plan.scanner_result_hash,
+    };
+    let frozen =
+        NativeAdapter::validate_staged_output(&mut fixture.adapter, &plan, &approved).unwrap();
+    assert_eq!(
+        frozen.staged_output_hash,
+        plan.expected_semantic_output_hash
+    );
+    assert_eq!(frozen.scanner_result_hash, plan.scanner_result_hash);
+
+    for changed in [
+        RestrictedRun {
+            staged_output_hash: Sha256Digest([41; 32]),
+            ..approved.clone()
+        },
+        RestrictedRun {
+            scanner_result_hash: Sha256Digest([42; 32]),
+            ..approved
+        },
+    ] {
+        assert_eq!(
+            NativeAdapter::validate_staged_output(&mut fixture.adapter, &plan, &changed)
+                .unwrap_err()
+                .to_string(),
+            "Codex staged output changed"
+        );
+    }
+}
+
+#[test]
+fn native_effective_validation_rejects_receipts_outside_the_plan() {
+    let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let plan = codex_native_plan(&fixture, vec![]);
+    let receipt = ApplyReceipt {
+        plan_id: plan.setup.plan_id,
+        applied_hlc: HybridLogicalClock::new(
+            1_900_000_000_001,
+            0,
+            DeviceId::from_str(DEVICE_ID).unwrap(),
+        ),
+        resulting_digests: plan
+            .mutations
+            .iter()
+            .map(|mutation| mutation.intended.0)
+            .collect(),
+    };
+    NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &receipt).unwrap();
+
+    let wrong_plan = ApplyReceipt {
+        plan_id: PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073985").unwrap(),
+        ..receipt.clone()
+    };
+    assert_eq!(
+        NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &wrong_plan)
+            .unwrap_err()
+            .to_string(),
+        "Codex effective state differs from the plan"
+    );
+
+    let wrong_digests = ApplyReceipt {
+        resulting_digests: vec![Sha256Digest([43; 32])],
+        ..receipt
+    };
+    assert_eq!(
+        NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &wrong_digests)
+            .unwrap_err()
+            .to_string(),
+        "Codex effective state differs from the plan"
     );
 }
 
