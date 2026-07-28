@@ -1532,7 +1532,7 @@ mod tests {
             .endpoint_name()
             .unwrap();
 
-        assert!(endpoint.as_bytes().len() <= 103);
+        assert!(endpoint.len() <= 103);
     }
 
     #[cfg(target_os = "macos")]
