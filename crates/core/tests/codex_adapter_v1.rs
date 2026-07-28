@@ -982,6 +982,48 @@ fn fallback_instructions_select_the_first_nonempty_name_only_when_standard_files
 }
 
 #[test]
+fn fallback_instruction_names_apply_to_project_layers_but_not_codex_home() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let config = fixture.codex_home.join("config.toml");
+    let existing = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        format!("project_doc_fallback_filenames = [\"README.md\"]\n{existing}"),
+    )
+    .unwrap();
+    fs::remove_file(fixture.codex_home.join("AGENTS.override.md")).unwrap();
+    fs::remove_file(fixture.codex_home.join("AGENTS.md")).unwrap();
+    fs::write(
+        fixture.codex_home.join("README.md"),
+        "# Must not become global instructions\n",
+    )
+    .unwrap();
+    fs::remove_file(fixture.layout.project_root.join("AGENTS.md")).unwrap();
+    fs::write(
+        fixture.layout.project_root.join("README.md"),
+        "# Repository fallback instructions\n",
+    )
+    .unwrap();
+
+    let instructions = import_everything(&fixture)
+        .components
+        .into_iter()
+        .filter(|component| component.kind == ComponentKind::Instruction)
+        .collect::<Vec<_>>();
+    assert!(instructions.iter().any(|component| {
+        component
+            .body_markdown
+            .contains("Repository fallback instructions")
+            && metadata(component, "structuralLocation") == Some("project/README.md")
+    }));
+    assert!(
+        !instructions
+            .iter()
+            .any(|component| component.body_markdown.contains("Must not become global"))
+    );
+}
+
+#[test]
 fn malformed_fallback_names_are_rejected() {
     for setting in [
         r#"project_doc_fallback_filenames = ["bad/name.md"]"#,

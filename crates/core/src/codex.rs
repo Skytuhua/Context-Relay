@@ -840,7 +840,7 @@ impl CodexAdapter {
             Some((override_path, "AGENTS.override.md".to_owned()))
         } else if nonempty_file(&standard_path)? {
             Some((standard_path, "AGENTS.md".to_owned()))
-        } else {
+        } else if matches!(&scope, ScopeRef::Project { .. }) {
             let mut selected = None;
             for name in self.project_doc_fallback_filenames()? {
                 let path = root.join(&name);
@@ -850,6 +850,8 @@ impl CodexAdapter {
                 }
             }
             selected
+        } else {
+            None
         };
         if let Some((path, name)) = selected {
             let location = if location_prefix.is_empty() {
