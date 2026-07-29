@@ -380,7 +380,7 @@ impl HermesAdapter {
         if !yaml::topology_supported(&parsed) {
             return Err(invalid("Hermes config topology is unsupported"));
         }
-        import::reviewed_config_projection(&parsed, &self.layout.profile.name)
+        import::validation_config_projection(&parsed, &self.layout.profile.name)
     }
 }
 
@@ -1380,11 +1380,18 @@ mod tests {
             "  docs:\n",
             "    url: https://example.com/mcp\n",
             "    command: safe-command\n",
+            "    args:\n",
+            "      - --serve\n",
+            "      - \"${MCP_TOKEN}\"\n",
             "    headers:\n",
             "      Authorization: must-not-stage-header\n",
             "hooks:\n",
             "  shell:\n",
             "    enabled: true\n",
+            "    command: configured-hook-command\n",
+            "    args:\n",
+            "      - --audit\n",
+            "    extension_scalar: arbitrary-extension-value\n",
             "provider:\n",
             "  api_key: must-not-stage-provider\n",
         );
@@ -1502,6 +1509,53 @@ mod tests {
     #[test]
     fn effective_validation_uses_only_isolated_nonsecret_home() {
         let fixture = validation_fixture("0.18.2");
+        let imported = fixture
+            .adapter
+            .import(&ImportRequest {
+                scopes: vec![
+                    NativeScope::Global,
+                    NativeScope::Project {
+                        project_id: fixture.project_id,
+                        root: fixture.adapter.project_root_wire(),
+                    },
+                ],
+                include_disabled: true,
+            })
+            .unwrap();
+        let imported_mcp = imported
+            .components
+            .iter()
+            .find(|component| component.kind == ComponentKind::McpServer)
+            .unwrap();
+        assert!(imported_mcp.body_markdown.contains("safe-command"));
+        assert!(imported_mcp.body_markdown.contains("--serve"));
+        assert!(imported_mcp.body_markdown.contains("${MCP_TOKEN}"));
+        assert!(
+            imported_mcp
+                .body_markdown
+                .contains("https://example.com/mcp")
+        );
+        let imported_hook = imported
+            .components
+            .iter()
+            .find(|component| {
+                component.kind == ComponentKind::Hook
+                    && component.metadata.iter().any(|(key, value)| {
+                        key == "structuralLocation" && value == "config:hooks.shell"
+                    })
+            })
+            .unwrap();
+        assert!(
+            imported_hook
+                .body_markdown
+                .contains("arbitrary-extension-value")
+        );
+        assert!(
+            imported_hook
+                .body_markdown
+                .contains("configured-hook-command")
+        );
+        assert!(imported_hook.body_markdown.contains("--audit"));
         let stages = RefCell::new(Vec::new());
         for _ in 0..2 {
             let report = fixture
@@ -1539,15 +1593,10 @@ mod tests {
                     stages.borrow_mut().push(request.staged_hermes_home.clone());
                     let staged =
                         fs::read_to_string(request.staged_hermes_home.join("config.yaml")).unwrap();
-                    for reviewed in [
-                        "approvals:",
-                        "command_allowlist:",
-                        "plugins:",
-                        "mcp_servers:",
-                        "hooks:",
-                    ] {
-                        assert!(staged.contains(reviewed), "missing {reviewed}");
-                    }
+                    let parsed = yaml::parse_config(staged.as_bytes()).unwrap();
+                    let expected: serde_yaml_ng::Value =
+                        serde_yaml_ng::from_str("approvals:\n  mode: smart\n").unwrap();
+                    assert_eq!(parsed.value, expected);
                     for excluded in [
                         "must-not-stage",
                         "provider:",
@@ -1555,6 +1604,18 @@ mod tests {
                         "authorization",
                         "headers:",
                         "env:",
+                        "command_allowlist:",
+                        "cargo test",
+                        "plugins:",
+                        "mcp_servers:",
+                        "hooks:",
+                        "safe-command",
+                        "--serve",
+                        "https://example.com/mcp",
+                        "${mcp_token}",
+                        "configured-hook-command",
+                        "--audit",
+                        "arbitrary-extension-value",
                     ] {
                         assert!(!staged.to_ascii_lowercase().contains(excluded));
                     }

@@ -8,12 +8,23 @@ use std::{
 use context_relay_core::{
     hermes::{HermesAdapter, HermesExecutableKind, HermesLayout, HermesMemoryKind, HermesProfile},
     native_transaction::{
-        engine::{NativeAdapter, NativeFileSystem, RestrictedRun},
+        approval_hash_v1,
+        engine::{
+            BeforeImage, BoundaryError, FaultHook, MutationOutcome, NativeAdapter,
+            NativeFileSystem, NativeJournal, NativeTransactionEngine, RestrictedExecutor,
+            RestrictedRun,
+        },
         filesystem::OsNativeTransactionFileSystem,
-        model::{NativeTransactionPlan, SidecarBinding},
+        model::{
+            ApprovedInput, ApprovedMutation, NativeApplyReceipt, NativeObjectToken,
+            NativeTransactionPlan, SidecarBinding, TransactionStep,
+        },
     },
 };
-use context_relay_native_runner::{NativeState, OsNativeFileSystem};
+use context_relay_native_runner::{
+    NativeState, OsNativeFileSystem, RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget,
+    RuntimeTarget, SidecarCommand, SidecarId,
+};
 use context_relay_protocol::{
     ApplyReceipt, ApprovalClass, CapabilityLevel, ChangeClass, ClassifiedChange, ComponentKind,
     ComponentRecord, DesiredState, DeviceId, ErrorCode, ExpectedNativeDigest, HarnessAdapter,
@@ -358,6 +369,175 @@ fn hermes_native_plan(
         scanner_result_hash: Sha256Digest([28; 32]),
         mutations: vec![mutation],
         ownership_changes: vec![],
+    }
+}
+
+struct RollbackExecutor {
+    run: RestrictedRun,
+}
+
+impl RestrictedExecutor for RollbackExecutor {
+    fn copy_allowlisted_inputs(&mut self, _inputs: &[ApprovedInput]) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn create_fake_roots(&mut self) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn build_restricted_environment(&mut self) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn run_restricted_tools(
+        &mut self,
+        _sidecars: &[SidecarBinding],
+    ) -> Result<RestrictedRun, BoundaryError> {
+        Ok(self.run.clone())
+    }
+
+    fn reject_unsafe_topology(&mut self) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RollbackJournal {
+    compensated: bool,
+    restored_candidates: usize,
+}
+
+impl NativeJournal for RollbackJournal {
+    fn acquire_lock_and_begin(
+        &mut self,
+        _plan: &NativeTransactionPlan,
+    ) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn enter_step(&mut self, _step: TransactionStep) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn complete_step(&mut self, _step: TransactionStep) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn put_before_images(&mut self, _images: &[BeforeImage]) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn prepare_mutation(
+        &mut self,
+        _index: usize,
+        _mutation: &ApprovedMutation,
+    ) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn mark_mutation_applied(
+        &mut self,
+        _index: usize,
+        _mutation: &ApprovedMutation,
+        _outcome: &MutationOutcome,
+        _applied_token: Option<&NativeObjectToken>,
+    ) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn record_mutation_candidate(
+        &mut self,
+        _index: usize,
+        _mutation: &ApprovedMutation,
+        _candidate_token: &NativeObjectToken,
+    ) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn mark_mutation_conflict(
+        &mut self,
+        _index: usize,
+        _applied_token: &NativeObjectToken,
+    ) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn mark_mutation_applied_for_recovery(
+        &mut self,
+        _index: usize,
+        _mutation: &ApprovedMutation,
+        _applied_token: &NativeObjectToken,
+    ) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn record_mutation_restored_candidate(
+        &mut self,
+        _index: usize,
+        _candidate_token: &NativeObjectToken,
+    ) -> Result<(), BoundaryError> {
+        self.restored_candidates += 1;
+        Ok(())
+    }
+
+    fn checkpoint_mutation_applied_absence(
+        &mut self,
+        _index: usize,
+        _later_index: usize,
+        _expected_old_token: &NativeObjectToken,
+        _new_token: &NativeObjectToken,
+    ) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn rebind_mutation_applied_absence(
+        &mut self,
+        _index: usize,
+        _later_index: usize,
+        _expected_old_token: &NativeObjectToken,
+        _new_token: &NativeObjectToken,
+    ) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn prepare_compensation(&mut self) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn commit_native_transaction(
+        &mut self,
+        _plan: &NativeTransactionPlan,
+        _receipt: &NativeApplyReceipt,
+    ) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn finish_committed(&mut self) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn finish_compensated(
+        &mut self,
+        _conflict_target_sequences: &[u32],
+    ) -> Result<(), BoundaryError> {
+        self.compensated = true;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct FailAfterPayloadWrites {
+    injected: bool,
+}
+
+impl FaultHook for FailAfterPayloadWrites {
+    fn after_step(&mut self, step: TransactionStep) -> Result<(), BoundaryError> {
+        if step == TransactionStep::WritePayloads {
+            self.injected = true;
+            Err(BoundaryError::new("injected after Hermes payload writes"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -2266,21 +2446,45 @@ fn rollback_restores_all_hermes_targets_and_metadata() {
             )
         })
         .collect::<Vec<_>>();
-    let nonce = [44; 16];
+    let mut plan = hermes_native_plan(&fixture, ApprovalClass::Passive, vec![]);
+    plan.mutations = mutations;
+    plan.sidecars = vec![SidecarBinding {
+        id: SidecarId::RuleSync,
+        target: RuntimeTarget::MacosArm64,
+        version: plan.setup.rulesync_version.clone(),
+        closure_hash: Sha256Digest([45; 32]),
+        source_bundle_hash: Sha256Digest([46; 32]),
+        build_toolchain_hash: Sha256Digest([47; 32]),
+        command_template_digest: Sha256Digest([48; 32]),
+        command: SidecarCommand::RuleSyncGenerate {
+            target: RuleSyncTarget::CodexCli,
+            features: RuleSyncFeatures::new(&[RuleSyncFeature::Rules]).unwrap(),
+        },
+    }];
+    plan.setup.batch_hash = approval_hash_v1(&plan).unwrap();
+    let nonce = *plan.setup.plan_id.as_bytes();
+    let mut adapter = fixture.adapter.clone();
+    let mut executor = RollbackExecutor {
+        run: RestrictedRun {
+            staged_output_hash: plan.expected_semantic_output_hash,
+            scanner_result_hash: plan.scanner_result_hash,
+        },
+    };
     let mut native = OsNativeTransactionFileSystem::new(nonce);
-    let images = native.create_before_images(&mutations).unwrap();
-    native.record_native_metadata(&images).unwrap();
-    native.compare_and_swap_targets(&mutations).unwrap();
-    for mutation in &mutations {
-        native.apply_mutation(&nonce, mutation).unwrap();
-    }
-    let injected_later_failure = Err::<(), _>(
-        context_relay_core::native_transaction::engine::BoundaryError::new(
-            "injected validation failure",
-        ),
-    );
-    assert!(injected_later_failure.is_err());
-    native.restore_matching_applied_targets(&nonce).unwrap();
+    let mut journal = RollbackJournal::default();
+    let mut fault = FailAfterPayloadWrites::default();
+    let result = NativeTransactionEngine::new(
+        &mut adapter,
+        &mut executor,
+        &mut native,
+        &mut journal,
+        &mut fault,
+    )
+    .apply(&plan, 1_900_000_000_000, validation_receipt().applied_hlc);
+    assert!(result.is_err());
+    assert!(fault.injected);
+    assert!(journal.compensated);
+    assert_eq!(journal.restored_candidates, plan.mutations.len());
 
     for (path, expected) in before {
         let restored = OsNativeFileSystem::new().snapshot(&path).unwrap();

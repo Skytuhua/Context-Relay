@@ -268,6 +268,22 @@ pub(super) fn reviewed_config_projection(
     serde_json::to_value(root).map_err(|_| invalid("Hermes reviewed config projection is invalid"))
 }
 
+pub(super) fn validation_config_projection(
+    parsed: &ParsedHermesYaml,
+    profile: &str,
+) -> Result<JsonValue, ClientError> {
+    let reviewed = reviewed_config_projection(parsed, profile)?;
+    let reviewed = reviewed
+        .as_object()
+        .ok_or_else(|| invalid("Hermes reviewed config projection is invalid"))?;
+    let mut root = BTreeMap::<String, JsonValue>::new();
+    if let Some(approvals) = reviewed.get("approvals") {
+        root.insert("approvals".into(), approvals.clone());
+    }
+    serde_json::to_value(root)
+        .map_err(|_| invalid("Hermes validation config projection is invalid"))
+}
+
 pub(super) fn permission_mapping(path: &str) -> Option<(&'static str, &'static str)> {
     match path {
         "approvals" => Some(("lossy", "confirmation_switch_not_portable")),
