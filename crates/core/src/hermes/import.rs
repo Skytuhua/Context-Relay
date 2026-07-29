@@ -645,6 +645,11 @@ fn sanitize_mcp(value: &YamlValue) -> Result<(JsonValue, bool, BTreeSet<String>)
                 if !matches!(tool_key, "include" | "exclude" | "prompts" | "resources") {
                     continue;
                 }
+                collect_redacted_placeholders(
+                    tool_value,
+                    &mut vec!["tools".into(), tool_key.into()],
+                    &mut placeholders,
+                );
                 let (reviewed, removed) =
                     sanitize_general(tool_value, &mut vec!["tools".into(), tool_key.into()]);
                 redacted |= removed;
@@ -657,6 +662,7 @@ fn sanitize_mcp(value: &YamlValue) -> Result<(JsonValue, bool, BTreeSet<String>)
                 JsonValue::Object(reviewed_tools.into_iter().collect()),
             );
         } else {
+            collect_redacted_placeholders(value, &mut vec![key.to_owned()], &mut placeholders);
             let (reviewed, removed) = sanitize_general(value, &mut vec![key.to_owned()]);
             redacted |= removed;
             if let Some(reviewed) = reviewed {
@@ -724,6 +730,40 @@ fn sanitize_general(value: &YamlValue, path: &mut Vec<String>) -> (Option<JsonVa
             )
         }
         YamlValue::Tagged(_) => (None, true),
+    }
+}
+
+fn collect_redacted_placeholders(
+    value: &YamlValue,
+    path: &mut Vec<String>,
+    names: &mut BTreeSet<String>,
+) {
+    match value {
+        YamlValue::Sequence(values) => {
+            for value in values {
+                collect_redacted_placeholders(value, path, names);
+            }
+        }
+        YamlValue::Mapping(values) => {
+            for (key, value) in values {
+                let Some(key) = key.as_str() else {
+                    continue;
+                };
+                path.push(key.to_owned());
+                if yaml::secret_key(key) || yaml::credential_container(path) {
+                    collect_placeholders(value, names);
+                } else {
+                    collect_redacted_placeholders(value, path, names);
+                }
+                path.pop();
+            }
+        }
+        YamlValue::String(value) if yaml::secret_scalar(value) => {
+            if let Some(name) = yaml::environment_placeholder(value) {
+                names.insert(name.to_owned());
+            }
+        }
+        _ => {}
     }
 }
 

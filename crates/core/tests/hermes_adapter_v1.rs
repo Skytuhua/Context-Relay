@@ -542,6 +542,97 @@ hooks:
 }
 
 #[test]
+fn nested_exact_mcp_placeholders_are_sorted_deduplicated_and_propagated() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    fs::write(
+        fixture.layout.profile.hermes_home.join("config.yaml"),
+        r#"mcp_servers:
+  nested_placeholders:
+    command:
+      oauth:
+        access_token: ${COMMAND_TOKEN}
+        duplicate: ${SHARED_TOKEN}
+        prefixed: prefix-${PREFIXED_TOKEN}
+    args:
+      credentials:
+        value: ${ARGS_TOKEN}
+        duplicate: ${SHARED_TOKEN}
+        lowercase: ${lowercase_token}
+    url:
+      auth:
+        value: ${URL_TOKEN}
+    timeout:
+      authorization_code:
+        value: ${TIMEOUT_TOKEN}
+    connect_timeout:
+      oauth2:
+        value: ${CONNECT_TIMEOUT_TOKEN}
+    idle_timeout_seconds:
+      authentication:
+        value: ${IDLE_TIMEOUT_TOKEN}
+    max_lifetime_seconds:
+      credential:
+        value: ${MAX_LIFETIME_TOKEN}
+    enabled:
+      authorization:
+        value: ${ENABLED_TOKEN}
+    supports_parallel_tool_calls:
+      credentials:
+        value: ${PARALLEL_TOKEN}
+    tools:
+      include:
+        oauth:
+          access_token: ${TOOLS_INCLUDE_TOKEN}
+      exclude:
+        auth:
+          value: ${TOOLS_EXCLUDE_TOKEN}
+      prompts:
+        authorization_code:
+          value: ${TOOLS_PROMPTS_TOKEN}
+      resources:
+        credentials:
+          value: ${TOOLS_RESOURCES_TOKEN}
+"#,
+    )
+    .unwrap();
+
+    let imported = import_everything(&fixture, true);
+    let component = imported
+        .components
+        .iter()
+        .find(|component| {
+            component.kind == ComponentKind::McpServer && component.name == "nested_placeholders"
+        })
+        .unwrap();
+
+    assert_eq!(metadata(component, "redacted"), Some("true"));
+    assert_eq!(
+        metadata(component, "secretReferenceNames"),
+        Some(
+            "ARGS_TOKEN,COMMAND_TOKEN,CONNECT_TIMEOUT_TOKEN,ENABLED_TOKEN,IDLE_TIMEOUT_TOKEN,\
+MAX_LIFETIME_TOKEN,PARALLEL_TOKEN,SHARED_TOKEN,TIMEOUT_TOKEN,TOOLS_EXCLUDE_TOKEN,\
+TOOLS_INCLUDE_TOKEN,TOOLS_PROMPTS_TOKEN,TOOLS_RESOURCES_TOKEN,URL_TOKEN"
+        )
+    );
+    assert!(
+        !component.body_markdown.contains("${")
+            && !component.body_markdown.contains("oauth")
+            && !component.body_markdown.contains("auth")
+            && !component.body_markdown.contains("credential")
+            && !component.body_markdown.contains("authorization")
+    );
+    assert!(
+        !metadata(component, "secretReferenceNames")
+            .unwrap()
+            .contains("PREFIXED_TOKEN")
+            && !metadata(component, "secretReferenceNames")
+                .unwrap()
+                .contains("lowercase_token"),
+        "non-exact placeholder forms entered MCP metadata"
+    );
+}
+
+#[test]
 fn soul_and_nearest_project_context_have_exact_precedence() {
     let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
     let imported = import_everything(&fixture, true);
