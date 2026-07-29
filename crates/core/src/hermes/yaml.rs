@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use context_relay_protocol::{ClientError, MAX_MARKDOWN_BYTES};
 use serde_yaml_ng::Value;
@@ -86,8 +86,42 @@ pub(super) fn topology_supported(parsed: &ParsedHermesYaml) -> bool {
                 return false;
             }
         }
+        if let (Some(enabled), Some(disabled)) = (
+            safe_plugin_names(plugins, "enabled"),
+            safe_plugin_names(plugins, "disabled"),
+        ) && !enabled.is_disjoint(&disabled)
+        {
+            return false;
+        }
     }
     true
+}
+
+fn safe_plugin_names<'a>(
+    plugins: &'a serde_yaml_ng::Mapping,
+    state: &str,
+) -> Option<BTreeSet<&'a str>> {
+    let Some(value) = plugins.get(Value::String(state.to_owned())) else {
+        return Some(BTreeSet::new());
+    };
+    let values = value.as_sequence()?;
+    if values.len() > MAX_COLLECTION_ENTRIES {
+        return None;
+    }
+    values
+        .iter()
+        .map(|value| value.as_str().filter(|name| safe_plugin_name(name)))
+        .collect()
+}
+
+fn safe_plugin_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        && !matches!(name, "." | "..")
 }
 
 pub(super) fn patch_owned_paths(
