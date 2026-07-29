@@ -89,7 +89,9 @@ pub(super) fn topology_supported(parsed: &ParsedHermesYaml) -> bool {
         if let (Some(enabled), Some(disabled)) = (
             safe_plugin_names(plugins, "enabled"),
             safe_plugin_names(plugins, "disabled"),
-        ) && !enabled.is_disjoint(&disabled)
+        ) && (enabled.duplicate
+            || disabled.duplicate
+            || !enabled.names.is_disjoint(&disabled.names))
         {
             return false;
         }
@@ -97,21 +99,32 @@ pub(super) fn topology_supported(parsed: &ParsedHermesYaml) -> bool {
     true
 }
 
+struct SafePluginNames<'a> {
+    names: BTreeSet<&'a str>,
+    duplicate: bool,
+}
+
 fn safe_plugin_names<'a>(
     plugins: &'a serde_yaml_ng::Mapping,
     state: &str,
-) -> Option<BTreeSet<&'a str>> {
+) -> Option<SafePluginNames<'a>> {
     let Some(value) = plugins.get(Value::String(state.to_owned())) else {
-        return Some(BTreeSet::new());
+        return Some(SafePluginNames {
+            names: BTreeSet::new(),
+            duplicate: false,
+        });
     };
     let values = value.as_sequence()?;
     if values.len() > MAX_COLLECTION_ENTRIES {
         return None;
     }
-    values
-        .iter()
-        .map(|value| value.as_str().filter(|name| safe_plugin_name(name)))
-        .collect()
+    let mut names = BTreeSet::new();
+    let mut duplicate = false;
+    for value in values {
+        let name = value.as_str().filter(|name| safe_plugin_name(name))?;
+        duplicate |= !names.insert(name);
+    }
+    Some(SafePluginNames { names, duplicate })
 }
 
 fn safe_plugin_name(name: &str) -> bool {

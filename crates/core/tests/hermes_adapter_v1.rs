@@ -699,6 +699,53 @@ fn conflicting_plugin_membership_is_importable_but_unpatchable() {
 }
 
 #[test]
+fn duplicate_enabled_plugin_membership_is_importable_but_unpatchable() {
+    assert_same_list_duplicate_is_unpatchable("enabled", false);
+}
+
+#[test]
+fn duplicate_disabled_plugin_membership_is_importable_but_unpatchable() {
+    assert_same_list_duplicate_is_unpatchable("disabled", true);
+}
+
+fn assert_same_list_duplicate_is_unpatchable(state: &str, archived: bool) {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let plugin_name = format!("{state}-duplicate");
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    fs::write(
+        config_path,
+        format!("plugins:\n  {state}:\n    - {plugin_name}\n    - {plugin_name}\n"),
+    )
+    .unwrap();
+
+    let imported = import_global(&fixture);
+    let location = format!("config:plugins.{state}.{plugin_name}");
+    let duplicates = imported
+        .components
+        .iter()
+        .filter(|component| {
+            component.kind == ComponentKind::Plugin
+                && component.name == plugin_name
+                && metadata(component, "structuralLocation") == Some(location.as_str())
+                && component.archived == archived
+        })
+        .count();
+    assert_eq!(duplicates, 2);
+
+    let desired = desired_global(&fixture, imported.components);
+    let report = probe(&fixture.adapter, Some("coder"));
+    let render_error = fixture.adapter.render(&desired).unwrap_err();
+    let plan_error = fixture.adapter.plan_native_config(&desired).unwrap_err();
+
+    assert_eq!(report.capability, CapabilityLevel::ImportOnly);
+    for error in [render_error, plan_error] {
+        assert_eq!(error.code, ErrorCode::HarnessUnsupported);
+        assert!(!format!("{error:?}").contains(&plugin_name));
+    }
+}
+
+#[test]
 fn plugin_toggle_preserves_retained_order_and_appends_deterministically() {
     let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
     clear_gateway_records(&fixture);
