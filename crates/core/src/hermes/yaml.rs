@@ -69,6 +69,13 @@ pub(super) fn topology_supported(parsed: &ParsedHermesYaml) -> bool {
         }
     }
     if let Some(Value::Mapping(plugins)) = root.get(Value::String("plugins".to_owned())) {
+        if !parsed
+            .patch_index
+            .paths
+            .contains_key(&vec!["plugins".to_owned()])
+        {
+            return false;
+        }
         for key in ["enabled", "disabled"] {
             if plugins.contains_key(Value::String(key.to_owned()))
                 && !parsed
@@ -595,6 +602,7 @@ fn parse_block_key(line: &str) -> Option<&str> {
 fn targeted_path(path: &[String]) -> bool {
     match path {
         [root, ..] if root == "approvals" || root == "command_allowlist" => true,
+        [root] if root == "plugins" => true,
         [root, state, ..]
             if root == "plugins" && matches!(state.as_str(), "enabled" | "disabled") =>
         {

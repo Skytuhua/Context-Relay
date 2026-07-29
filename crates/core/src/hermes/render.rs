@@ -167,17 +167,26 @@ impl HermesAdapter {
     ) -> Result<RenderedState, ClientError> {
         self.require_apply_supported()?;
         self.validate_desired(desired)?;
-        let active = desired.components.iter().any(is_active_component);
+        let config_path = self.layout.profile.hermes_home.join("config.yaml");
+        let config_existing = read_regular(&config_path, "Hermes config must be a regular file")?;
+        let parsed = super::yaml::parse_config(&config_existing)?;
+        let current_config = self.project_current_config(&parsed)?;
+        self.validate_config_authority(&current_config, desired)?;
+        let config_requested = desired.components.iter().any(|component| {
+            is_config_component(component)
+                || current_config
+                    .iter()
+                    .any(|current| current.id == component.id)
+        });
+        let active = config_requested || desired.components.iter().any(is_gateway_hook_component);
         if active {
             gateway::require_gateway_idle(&self.layout.profile)?;
         }
         let mut files = Vec::new();
-        if desired.components.iter().any(is_config_component) {
-            let path = self.layout.profile.hermes_home.join("config.yaml");
-            let existing = read_regular(&path, "Hermes config must be a regular file")?;
-            let rendered = self.render_config(&existing, desired)?;
-            if rendered != existing {
-                files.push(rendered_file(path, &rendered));
+        if config_requested {
+            let rendered = self.render_config(&config_existing, desired)?;
+            if rendered != config_existing {
+                files.push(rendered_file(config_path, &rendered));
             }
         }
         let mut gateway_hooks =
@@ -351,13 +360,112 @@ impl HermesAdapter {
         Ok(())
     }
 
+    fn validate_config_authority(
+        &self,
+        current: &[ComponentRecord],
+        desired: &DesiredState,
+    ) -> Result<(), ClientError> {
+        let current_by_location = current
+            .iter()
+            .filter_map(|component| {
+                metadata(component, "structuralLocation")
+                    .map(|location| (location.to_owned(), component))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for component in &desired.components {
+            let location = structural_location(component)?;
+            if let Some(native) = current.iter().find(|native| native.id == component.id) {
+                if metadata(native, "structuralLocation") != Some(location)
+                    || native.kind != component.kind
+                    || native.name != component.name
+                {
+                    return Err(invalid(
+                        "Hermes component identity does not match native state",
+                    ));
+                }
+                if metadata(native, "redacted") != metadata(component, "redacted")
+                    || metadata(native, "secretReferenceNames")
+                        != metadata(component, "secretReferenceNames")
+                {
+                    return Err(invalid(
+                        "Hermes component redaction metadata does not match native state",
+                    ));
+                }
+                if native.kind == ComponentKind::PermissionDeclaration
+                    && (metadata(native, "nativePermissionPath")
+                        != metadata(component, "nativePermissionPath")
+                        || metadata(native, "mappingFidelity")
+                            != metadata(component, "mappingFidelity")
+                        || metadata(native, "mappingReason")
+                            != metadata(component, "mappingReason"))
+                {
+                    return if metadata(native, "mappingFidelity") == Some("lossy") {
+                        Err(super::conflict(
+                            "Hermes permission mapping is unresolved and lossy",
+                        ))
+                    } else {
+                        Err(invalid(
+                            "Hermes permission metadata does not match native state",
+                        ))
+                    };
+                }
+                continue;
+            }
+            if !location.starts_with("config:") {
+                continue;
+            }
+            if current_by_location.contains_key(location) {
+                return Err(invalid(
+                    "Hermes component identity does not match native state",
+                ));
+            }
+            match component.kind {
+                ComponentKind::PermissionDeclaration => {
+                    let path = permission_path(component)?;
+                    let path = path.join(".");
+                    if location != format!("config:{path}") {
+                        return Err(invalid(
+                            "Hermes permission location does not match its native path",
+                        ));
+                    }
+                    let (fidelity, reason) = import::permission_mapping(&path)
+                        .ok_or_else(|| invalid("Hermes permission path is invalid"))?;
+                    if metadata(component, "mappingFidelity") != Some(fidelity)
+                        || metadata(component, "mappingReason") != Some(reason)
+                    {
+                        return Err(invalid(
+                            "Hermes permission metadata does not match its native path",
+                        ));
+                    }
+                    if fidelity == "lossy" {
+                        return Err(super::conflict(
+                            "Hermes permission mapping is unresolved and lossy",
+                        ));
+                    }
+                }
+                ComponentKind::Plugin | ComponentKind::McpServer | ComponentKind::Hook => {
+                    if metadata(component, "redacted").is_some()
+                        || metadata(component, "secretReferenceNames").is_some()
+                    {
+                        return Err(invalid(
+                            "Hermes new configuration cannot claim redaction metadata",
+                        ));
+                    }
+                }
+                _ => return Err(invalid("Hermes config component kind is invalid")),
+            }
+        }
+        Ok(())
+    }
+
     fn render_config(
         &self,
         existing: &[u8],
         desired: &DesiredState,
     ) -> Result<Vec<u8>, ClientError> {
         let parsed = super::yaml::parse_config(existing)?;
-        let current = import::project_reviewed_config(&parsed, &self.layout.profile.name)?;
+        let current = self.project_current_config(&parsed)?;
+        self.validate_config_authority(&current, desired)?;
         let current_by_location = current
             .iter()
             .filter_map(|component| {
@@ -366,20 +474,21 @@ impl HermesAdapter {
             })
             .collect::<BTreeMap<_, _>>();
         let mut replacements = BTreeMap::<Vec<String>, Option<YamlValue>>::new();
-        let mut enabled_plugins = yaml_string_set(
+        let mut enabled_plugins = yaml_string_list(
             resolve_yaml(&parsed.value, &["plugins", "enabled"]).and_then(YamlValue::as_sequence),
         )?;
-        let mut disabled_plugins = yaml_string_set(
+        let mut disabled_plugins = yaml_string_list(
             resolve_yaml(&parsed.value, &["plugins", "disabled"]).and_then(YamlValue::as_sequence),
         )?;
-        let mut plugin_changed = false;
+        let mut desired_plugin_states = BTreeMap::<String, bool>::new();
         for component in desired
             .components
             .iter()
             .filter(|component| is_config_component(component))
         {
             let location = structural_location(component)?;
-            if metadata(component, "redacted") == Some("true") {
+            let native = current_by_location.get(location).copied();
+            if native.and_then(|current| metadata(current, "redacted")) == Some("true") {
                 let unchanged = current_by_location.get(location).is_some_and(|current| {
                     current.body_markdown == component.body_markdown
                         && current.archived == component.archived
@@ -397,7 +506,14 @@ impl HermesAdapter {
                 ComponentKind::PermissionDeclaration => {
                     let path = permission_path(component)?;
                     let replacement = json_to_yaml(&component.body_markdown)?;
-                    if metadata(component, "mappingFidelity") == Some("lossy") {
+                    let native_path = path.join(".");
+                    let fidelity = native
+                        .and_then(|current| metadata(current, "mappingFidelity"))
+                        .or_else(|| {
+                            import::permission_mapping(&native_path).map(|(fidelity, _)| fidelity)
+                        })
+                        .ok_or_else(|| invalid("Hermes permission path is invalid"))?;
+                    if fidelity == "lossy" {
                         let unchanged = current_by_location.get(location).is_some_and(|current| {
                             current.body_markdown == component.body_markdown
                                 && current.archived == component.archived
@@ -413,14 +529,13 @@ impl HermesAdapter {
                 }
                 ComponentKind::Plugin => {
                     let name = plugin_name_from_location(location)?;
-                    enabled_plugins.remove(name);
-                    disabled_plugins.remove(name);
-                    if component.archived {
-                        disabled_plugins.insert(name.to_owned());
-                    } else {
-                        enabled_plugins.insert(name.to_owned());
+                    let enabled = !component.archived;
+                    if desired_plugin_states
+                        .insert(name.to_owned(), enabled)
+                        .is_some_and(|previous| previous != enabled)
+                    {
+                        return Err(invalid("Hermes plugin state is repeated"));
                     }
-                    plugin_changed = true;
                 }
                 ComponentKind::McpServer => {
                     let name = config_child_name(location, "config:mcp_servers.")?;
@@ -461,6 +576,34 @@ impl HermesAdapter {
                 _ => {}
             }
         }
+        let mut plugin_changed = false;
+        let mut append_enabled = Vec::new();
+        let mut append_disabled = Vec::new();
+        for (name, enabled) in desired_plugin_states {
+            let already_enabled = enabled_plugins
+                .iter()
+                .filter(|value| *value == &name)
+                .count();
+            let already_disabled = disabled_plugins
+                .iter()
+                .filter(|value| *value == &name)
+                .count();
+            if (enabled && already_enabled == 1 && already_disabled == 0)
+                || (!enabled && already_disabled == 1 && already_enabled == 0)
+            {
+                continue;
+            }
+            enabled_plugins.retain(|value| value != &name);
+            disabled_plugins.retain(|value| value != &name);
+            if enabled {
+                append_enabled.push(name);
+            } else {
+                append_disabled.push(name);
+            }
+            plugin_changed = true;
+        }
+        enabled_plugins.extend(append_enabled);
+        disabled_plugins.extend(append_disabled);
         if plugin_changed {
             let enabled = (!enabled_plugins.is_empty()).then(|| {
                 YamlValue::Sequence(enabled_plugins.into_iter().map(YamlValue::String).collect())
@@ -732,10 +875,6 @@ fn is_gateway_hook_component(component: &ComponentRecord) -> bool {
             .is_some_and(|location| location.starts_with("profile:hooks/"))
 }
 
-fn is_active_component(component: &ComponentRecord) -> bool {
-    is_config_component(component) || is_gateway_hook_component(component)
-}
-
 fn structural_location(component: &ComponentRecord) -> Result<&str, ClientError> {
     metadata(component, "structuralLocation")
         .ok_or_else(|| invalid("Hermes component structural location is missing"))
@@ -817,8 +956,8 @@ fn resolve_yaml<'a>(mut value: &'a YamlValue, path: &[&str]) -> Option<&'a YamlV
     Some(value)
 }
 
-fn yaml_string_set(values: Option<&Vec<YamlValue>>) -> Result<BTreeSet<String>, ClientError> {
-    values
+fn yaml_string_list(values: Option<&Vec<YamlValue>>) -> Result<Vec<String>, ClientError> {
+    let values = values
         .into_iter()
         .flatten()
         .map(|value| {
@@ -828,7 +967,12 @@ fn yaml_string_set(values: Option<&Vec<YamlValue>>) -> Result<BTreeSet<String>, 
                 .map(str::to_owned)
                 .ok_or_else(|| invalid("Hermes plugin state is invalid"))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut unique = BTreeSet::new();
+    if values.iter().any(|value| !unique.insert(value)) {
+        return Err(invalid("Hermes plugin state is repeated"));
+    }
+    Ok(values)
 }
 
 fn merge_reviewed_mapping(

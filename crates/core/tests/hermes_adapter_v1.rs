@@ -240,6 +240,14 @@ fn metadata<'a>(component: &'a ComponentRecord, key: &str) -> Option<&'a str> {
         .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
 }
 
+fn metadata_mut<'a>(component: &'a mut ComponentRecord, key: &str) -> &'a mut String {
+    component
+        .metadata
+        .iter_mut()
+        .find_map(|(candidate, value)| (candidate == key).then_some(value))
+        .unwrap()
+}
+
 #[test]
 fn yaml_patch_preserves_unowned_bytes_comments_order_and_scalar_style() {
     let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
@@ -513,6 +521,223 @@ fn unresolved_lossy_permission_change_cannot_render_or_plan() {
         fs::read(fixture.layout.profile.hermes_home.join("config.yaml")).unwrap(),
         before
     );
+}
+
+#[test]
+fn caller_cannot_downgrade_native_lossy_permission_metadata() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let imported = import_global(&fixture);
+    let mut permission = component_at(
+        &imported.components,
+        ComponentKind::PermissionDeclaration,
+        "config:approvals.mode",
+    );
+    permission.body_markdown = "\"manual\"".into();
+    *metadata_mut(&mut permission, "mappingFidelity") = "exact".into();
+    let desired = desired_global(&fixture, vec![permission]);
+
+    for error in [
+        fixture.adapter.render(&desired).unwrap_err(),
+        fixture.adapter.plan_native_config(&desired).unwrap_err(),
+    ] {
+        assert_eq!(error.code, ErrorCode::Conflict);
+        let diagnostic = format!("{error:?}");
+        assert!(!diagnostic.contains("smart"));
+        assert!(!diagnostic.contains("manual"));
+    }
+}
+
+#[test]
+fn caller_cannot_remove_native_redaction_metadata() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+        "    post_tool:\n      command: check-write\n",
+        "    token: must-not-import-hook-token\n    post_tool:\n      command: check-write\n",
+    );
+    fs::write(config_path, config).unwrap();
+    let imported = import_global(&fixture);
+
+    for (kind, location) in [
+        (ComponentKind::McpServer, "config:mcp_servers.docs"),
+        (ComponentKind::Hook, "config:hooks.shell"),
+    ] {
+        let mut component = component_at(&imported.components, kind, location);
+        assert_eq!(metadata(&component, "redacted"), Some("true"));
+        component
+            .metadata
+            .retain(|(key, _)| key.as_str() != "redacted");
+        let mut body: Value = serde_json::from_str(&component.body_markdown).unwrap();
+        body.as_object_mut()
+            .unwrap()
+            .insert("enabled".into(), Value::Bool(false));
+        component.body_markdown = serde_json::to_string(&body).unwrap();
+        let desired = desired_global(&fixture, vec![component]);
+
+        for error in [
+            fixture.adapter.render(&desired).unwrap_err(),
+            fixture.adapter.plan_native_config(&desired).unwrap_err(),
+        ] {
+            assert!(matches!(
+                error.code,
+                ErrorCode::InvalidRequest | ErrorCode::Conflict
+            ));
+            let diagnostic = format!("{error:?}");
+            assert!(!diagnostic.contains("must-not-import"));
+            assert!(!diagnostic.contains("must-not-render"));
+        }
+    }
+}
+
+#[test]
+fn caller_security_metadata_mismatches_fail_closed_without_native_values() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let imported = import_global(&fixture);
+    let template = component_at(
+        &imported.components,
+        ComponentKind::PermissionDeclaration,
+        "config:approvals.mode",
+    );
+
+    for (key, value) in [
+        ("mappingFidelity", "exact"),
+        ("mappingReason", "must-not-render-reason"),
+        ("nativePermissionPath", "approvals.deny"),
+        ("profile", "writer"),
+        ("structuralLocation", "config:approvals.deny"),
+    ] {
+        let mut permission = template.clone();
+        *metadata_mut(&mut permission, key) = value.into();
+        permission.body_markdown = "\"manual\"".into();
+        let desired = desired_global(&fixture, vec![permission]);
+
+        for error in [
+            fixture.adapter.render(&desired).unwrap_err(),
+            fixture.adapter.plan_native_config(&desired).unwrap_err(),
+        ] {
+            assert!(matches!(
+                error.code,
+                ErrorCode::InvalidRequest | ErrorCode::Conflict
+            ));
+            let diagnostic = format!("{error:?}");
+            assert!(!diagnostic.contains("smart"));
+            assert!(!diagnostic.contains("manual"));
+            assert!(!diagnostic.contains("must-not-render-reason"));
+        }
+    }
+}
+
+#[test]
+fn plugin_semantic_noop_preserves_native_sequence_order() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    let source = "plugins:\n  enabled:\n    - zeta\n    - alpha\n";
+    fs::write(&config_path, source).unwrap();
+    let imported = import_global(&fixture);
+    let plugins = imported
+        .components
+        .into_iter()
+        .filter(|component| component.kind == ComponentKind::Plugin)
+        .collect();
+    let desired = desired_global(&fixture, plugins);
+
+    assert!(fixture.adapter.render(&desired).unwrap().files.is_empty());
+    assert!(
+        fixture
+            .adapter
+            .plan_native_config(&desired)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fs::read_to_string(config_path).unwrap(), source);
+}
+
+#[test]
+fn plugin_toggle_preserves_retained_order_and_appends_deterministically() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    fs::write(
+        &config_path,
+        "plugins:\n  enabled:\n    - zeta\n    - alpha\n    - middle\n    - beta\n  disabled:\n    - omega\n    - old\n",
+    )
+    .unwrap();
+    let imported = import_global(&fixture);
+    let mut zeta = component_at(
+        &imported.components,
+        ComponentKind::Plugin,
+        "config:plugins.enabled.zeta",
+    );
+    zeta.archived = true;
+    let mut alpha = component_at(
+        &imported.components,
+        ComponentKind::Plugin,
+        "config:plugins.enabled.alpha",
+    );
+    alpha.archived = true;
+    let mut old = component_at(
+        &imported.components,
+        ComponentKind::Plugin,
+        "config:plugins.disabled.old",
+    );
+    old.archived = false;
+    let mutation = fixture
+        .adapter
+        .plan_native_config(&desired_global(&fixture, vec![zeta, old, alpha]))
+        .unwrap()
+        .unwrap();
+    let rendered = String::from_utf8(intended_bytes(&mutation)).unwrap();
+
+    assert!(rendered.contains("  enabled:\n    - middle\n    - beta\n    - old\n"));
+    assert!(rendered.contains("  disabled:\n    - omega\n    - alpha\n    - zeta\n"));
+}
+
+#[test]
+fn plugin_enabled_inserts_under_existing_parent_without_replacing_unknown_children() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    fs::write(
+        &config_path,
+        "plugins:\n  # keep this comment\n  unknown_child: preserve-me\n",
+    )
+    .unwrap();
+    let imported = import_global(&fixture);
+    let mut plugin = component_at(
+        &imported.components,
+        ComponentKind::Plugin,
+        "profile:plugins/reviewer/plugin.yaml",
+    );
+    plugin.metadata.retain(|(key, _)| {
+        !matches!(
+            key.as_str(),
+            "structuralLocation" | "nativeFormat" | "enabled"
+        )
+    });
+    plugin.metadata.extend([
+        (
+            "structuralLocation".into(),
+            "config:plugins.enabled.reviewer".into(),
+        ),
+        ("nativeFormat".into(), "json".into()),
+        ("enabled".into(), "true".into()),
+    ]);
+    plugin.metadata.sort();
+    plugin.archived = false;
+    let desired = desired_global(&fixture, vec![plugin]);
+    let mutation = fixture
+        .adapter
+        .plan_native_config(&desired)
+        .unwrap()
+        .unwrap();
+    let rendered = String::from_utf8(intended_bytes(&mutation)).unwrap();
+
+    assert!(rendered.contains("  # keep this comment\n  unknown_child: preserve-me\n"));
+    assert!(rendered.contains("  enabled:\n    - reviewer\n"));
 }
 
 #[test]

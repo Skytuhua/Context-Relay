@@ -55,17 +55,17 @@ pub(super) fn evaluate_gateway(observation: &GatewayObservation) -> GatewayStatu
             _ => GatewayStatus::Unverifiable,
         };
     }
-    match observation.process_exists {
-        Some(false) => GatewayStatus::Stale,
-        Some(true)
+    match (observation.process_exists, observation.lock_held) {
+        (Some(false), Some(false)) => GatewayStatus::Stale,
+        (Some(false), _) => GatewayStatus::Unverifiable,
+        (Some(true), _)
             if observation.start_time_matches == Some(true)
                 && observation.command_is_gateway == Some(true)
                 && observation.profile_matches == Some(true) =>
         {
             GatewayStatus::Live
         }
-        Some(true) => GatewayStatus::Unverifiable,
-        None => GatewayStatus::Unverifiable,
+        (Some(true), _) | (None, _) => GatewayStatus::Unverifiable,
     }
 }
 
@@ -537,6 +537,35 @@ mod tests {
             evaluate_gateway(&held_without_identity),
             GatewayStatus::Unverifiable
         );
+    }
+
+    #[test]
+    fn held_lock_dominates_stale_or_missing_process_identity() {
+        let mut dead_unlocked = observation();
+        dead_unlocked.process_exists = Some(false);
+        assert_eq!(evaluate_gateway(&dead_unlocked), GatewayStatus::Stale);
+
+        let mut dead_locked = dead_unlocked.clone();
+        dead_locked.lock_held = Some(true);
+        assert_eq!(evaluate_gateway(&dead_locked), GatewayStatus::Unverifiable);
+
+        for (record_present, record_valid) in [(false, true), (true, false)] {
+            let held_without_identity = GatewayObservation {
+                record_present,
+                record_valid,
+                lock_held: Some(true),
+                process_exists: None,
+                start_time_matches: None,
+                command_is_gateway: None,
+                profile_matches: None,
+            };
+            assert_eq!(
+                evaluate_gateway(&held_without_identity),
+                GatewayStatus::Unverifiable
+            );
+        }
+
+        assert_eq!(evaluate_gateway(&observation()), GatewayStatus::Live);
     }
 
     #[test]

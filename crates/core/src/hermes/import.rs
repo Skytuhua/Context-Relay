@@ -36,44 +36,42 @@ pub(super) fn project_reviewed_config(
                 let key = key
                     .as_str()
                     .ok_or_else(|| invalid("Hermes approval key is invalid"))?;
-                let (fidelity, reason) = match key {
-                    "mode" => ("lossy", "approval_mode_not_portable"),
-                    "deny" => ("lossy", "deny_pattern_not_portable"),
-                    "cron" => ("lossy", "cron_permission_not_portable"),
-                    "confirm" | "confirmation" | "require_confirmation" => {
-                        ("lossy", "confirmation_switch_not_portable")
-                    }
-                    _ => ("exact", "native_equivalent"),
-                };
+                let path = format!("approvals.{key}");
+                let (fidelity, reason) = permission_mapping(&path)
+                    .ok_or_else(|| invalid("Hermes permission path is invalid"))?;
                 push_permission_component(
                     &mut components,
                     profile,
-                    &format!("approvals.{key}"),
+                    &path,
                     value,
                     fidelity,
                     reason,
                 )?;
             }
         } else {
+            let (fidelity, reason) = permission_mapping("approvals")
+                .ok_or_else(|| invalid("Hermes permission path is invalid"))?;
             push_permission_component(
                 &mut components,
                 profile,
                 "approvals",
                 value,
-                "lossy",
-                "confirmation_switch_not_portable",
+                fidelity,
+                reason,
             )?;
         }
     }
 
     if let Some(value) = get(root, "command_allowlist") {
+        let (fidelity, reason) = permission_mapping("command_allowlist")
+            .ok_or_else(|| invalid("Hermes permission path is invalid"))?;
         push_permission_component(
             &mut components,
             profile,
             "command_allowlist",
             value,
-            "lossy",
-            "permanent_allowlist_not_portable",
+            fidelity,
+            reason,
         )?;
     }
 
@@ -172,6 +170,28 @@ pub(super) fn project_reviewed_config(
     Ok(components)
 }
 
+pub(super) fn permission_mapping(path: &str) -> Option<(&'static str, &'static str)> {
+    match path {
+        "approvals" => Some(("lossy", "confirmation_switch_not_portable")),
+        "command_allowlist" => Some(("lossy", "permanent_allowlist_not_portable")),
+        _ => {
+            let key = path.strip_prefix("approvals.")?;
+            if key.is_empty() || key.contains('.') {
+                return None;
+            }
+            Some(match key {
+                "mode" => ("lossy", "approval_mode_not_portable"),
+                "deny" => ("lossy", "deny_pattern_not_portable"),
+                "cron" => ("lossy", "cron_permission_not_portable"),
+                "confirm" | "confirmation" | "require_confirmation" => {
+                    ("lossy", "confirmation_switch_not_portable")
+                }
+                _ => ("exact", "native_equivalent"),
+            })
+        }
+    }
+}
+
 fn push_permission_component(
     components: &mut Vec<ComponentRecord>,
     profile: &str,
@@ -199,6 +219,17 @@ fn push_permission_component(
 }
 
 impl HermesAdapter {
+    pub(super) fn project_current_config(
+        &self,
+        parsed: &ParsedHermesYaml,
+    ) -> Result<Vec<ComponentRecord>, ClientError> {
+        let mut components = project_reviewed_config(parsed, &self.layout.profile.name)?;
+        for component in &mut components {
+            self.finish_component(component)?;
+        }
+        Ok(components)
+    }
+
     pub(super) fn import_policy_conflicts(&self) -> Vec<String> {
         let Ok(bytes) = fs::read(self.layout.profile.hermes_home.join("config.yaml")) else {
             return Vec::new();
