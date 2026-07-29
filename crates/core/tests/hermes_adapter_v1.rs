@@ -158,19 +158,26 @@ fn import_everything(
     fixture: &Fixture,
     include_disabled: bool,
 ) -> context_relay_protocol::ImportedState {
-    fixture
-        .adapter
-        .import(&ImportRequest {
-            scopes: vec![
-                NativeScope::Global,
-                NativeScope::Project {
-                    project_id: fixture.project_id,
-                    root: fixture.adapter.project_root_wire(),
-                },
-            ],
-            include_disabled,
-        })
-        .unwrap()
+    match fixture.adapter.import(&ImportRequest {
+        scopes: vec![
+            NativeScope::Global,
+            NativeScope::Project {
+                project_id: fixture.project_id,
+                root: fixture.adapter.project_root_wire(),
+            },
+        ],
+        include_disabled,
+    }) {
+        Ok(imported) => imported,
+        Err(error) => {
+            let diagnostic = format!("{error:?}");
+            assert!(
+                !diagnostic.contains("must-not-import"),
+                "Hermes import error exposed a secret canary"
+            );
+            panic!("Hermes import unexpectedly failed with {:?}", error.code);
+        }
+    }
 }
 
 fn metadata<'a>(component: &'a ComponentRecord, key: &str) -> Option<&'a str> {
@@ -380,6 +387,158 @@ fn secret_bearing_yaml_fields_are_removed_before_component_creation() {
     assert_eq!(metadata(local, "redacted"), Some("true"));
     assert_eq!(metadata(local, "secretReferenceNames"), Some("DOCS_TOKEN"));
     assert!(!local.body_markdown.contains("env"));
+}
+
+#[test]
+fn embedded_secret_text_is_removed_from_mcp_and_hook_components() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    fs::write(
+        fixture.layout.profile.hermes_home.join("config.yaml"),
+        r#"mcp_servers:
+  authorization:
+    command: "curl -H 'Authorization: Bearer must-not-import-mcp-authorization'"
+    enabled: true
+  basic:
+    args:
+      - "--header Basic must-not-import-mcp-basic"
+    enabled: true
+  private_key:
+    command: "loader --value prefix-----BEGIN PRIVATE KEY-----must-not-import-mcp-private"
+    enabled: true
+  token:
+    args:
+      - "--token=prefix:ghp_must-not-import-mcp-token"
+    enabled: true
+  credential_url:
+    url: "proxy=https://must-not-import-user:must-not-import-password@example.com/mcp"
+    enabled: true
+hooks:
+  scalar_guard:
+    enabled: true
+    preflight: "runner --header 'Authorization: Bearer must-not-import-hook-authorization'"
+    fallback: "runner --header Basic must-not-import-hook-basic"
+    loader: "loader prefix-----BEGIN OPENSSH PRIVATE KEY-----must-not-import-hook-private"
+    notifier: "runner --token=prefix:github_pat_must-not-import-hook-token"
+    callback: "proxy=https://must-not-import-hook-user:must-not-import-hook-password@example.com/callback"
+"#,
+    )
+    .unwrap();
+
+    let imported = import_everything(&fixture, true);
+    let serialized = serde_json::to_string(&imported).unwrap();
+    assert!(
+        !serialized.contains("must-not-import"),
+        "serialized Hermes import exposed an embedded scalar canary"
+    );
+
+    for name in [
+        "authorization",
+        "basic",
+        "private_key",
+        "token",
+        "credential_url",
+    ] {
+        let component = imported
+            .components
+            .iter()
+            .find(|component| component.kind == ComponentKind::McpServer && component.name == name)
+            .unwrap();
+        assert_eq!(metadata(component, "redacted"), Some("true"));
+        assert!(
+            !component.body_markdown.contains("Authorization")
+                && !component.body_markdown.contains("Bearer")
+                && !component.body_markdown.contains("Basic")
+                && !component.body_markdown.contains("PRIVATE KEY")
+                && !component.body_markdown.contains("ghp_")
+                && !component.body_markdown.contains('@'),
+            "MCP component retained secret-like scalar text"
+        );
+    }
+
+    let hook = imported
+        .components
+        .iter()
+        .find(|component| component.kind == ComponentKind::Hook && component.name == "scalar_guard")
+        .unwrap();
+    assert_eq!(metadata(hook, "redacted"), Some("true"));
+    assert_eq!(hook.body_markdown, r#"{"enabled":true}"#);
+}
+
+#[test]
+fn nested_auth_structures_are_removed_from_mcp_and_hook_components() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    fs::write(
+        fixture.layout.profile.hermes_home.join("config.yaml"),
+        r#"mcp_servers:
+  nested_auth:
+    command: safe-runner
+    tools:
+      prompts:
+        safe: safe-prompt
+        oauth:
+          access_token: must-not-import-mcp-access
+          refresh_token: must-not-import-mcp-refresh
+          client_secret: must-not-import-mcp-client
+        authorization_code:
+          code: must-not-import-mcp-code
+        credentials:
+          value: must-not-import-mcp-credential
+        access_token: must-not-import-mcp-leaf-access
+        refresh_token: must-not-import-mcp-leaf-refresh
+        client_secret: must-not-import-mcp-leaf-client
+    enabled: true
+hooks:
+  nested_auth:
+    enabled: true
+    settings:
+      mode: audited
+      oauth:
+        access_token: must-not-import-hook-access
+        refresh_token: must-not-import-hook-refresh
+        client_secret: must-not-import-hook-client
+      auth:
+        code: must-not-import-hook-auth
+      authorization_code:
+        code: must-not-import-hook-code
+      credentials:
+        value: must-not-import-hook-credential
+      access_token: must-not-import-hook-leaf-access
+      refresh_token: must-not-import-hook-leaf-refresh
+      client_secret: must-not-import-hook-leaf-client
+"#,
+    )
+    .unwrap();
+
+    let imported = import_everything(&fixture, true);
+    let serialized = serde_json::to_string(&imported).unwrap();
+    assert!(
+        !serialized.contains("must-not-import"),
+        "serialized Hermes import exposed a nested credential canary"
+    );
+
+    let mcp = imported
+        .components
+        .iter()
+        .find(|component| {
+            component.kind == ComponentKind::McpServer && component.name == "nested_auth"
+        })
+        .unwrap();
+    assert_eq!(metadata(mcp, "redacted"), Some("true"));
+    assert_eq!(
+        mcp.body_markdown,
+        r#"{"command":"safe-runner","enabled":true,"tools":{"prompts":{"safe":"safe-prompt"}}}"#
+    );
+
+    let hook = imported
+        .components
+        .iter()
+        .find(|component| component.kind == ComponentKind::Hook && component.name == "nested_auth")
+        .unwrap();
+    assert_eq!(metadata(hook, "redacted"), Some("true"));
+    assert_eq!(
+        hook.body_markdown,
+        r#"{"enabled":true,"settings":{"mode":"audited"}}"#
+    );
 }
 
 #[test]

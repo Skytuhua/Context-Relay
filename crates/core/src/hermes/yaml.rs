@@ -143,8 +143,9 @@ fn contains_structured_secret(text: &str) -> bool {
 }
 
 pub(super) fn secret_key(key: &str) -> bool {
+    let normalized = normalize_key(key);
     matches!(
-        normalize_key(key).as_str(),
+        normalized.as_str(),
         "apikey"
             | "token"
             | "password"
@@ -154,7 +155,9 @@ pub(super) fn secret_key(key: &str) -> bool {
             | "clientkey"
             | "clientkeypassphrase"
             | "credential"
-    )
+    ) || ["token", "secret", "password", "credential"]
+        .iter()
+        .any(|suffix| normalized.ends_with(suffix))
 }
 
 pub(super) fn credential_container(path: &[String]) -> bool {
@@ -169,15 +172,22 @@ pub(super) fn credential_container(path: &[String]) -> bool {
                 | "platforms"
                 | "gatewayauth"
                 | "pairing"
+                | "oauth"
+                | "oauth2"
+                | "auth"
+                | "authentication"
+                | "authorization"
+                | "authorizationcode"
+                | "credential"
         )
     })
 }
 
 pub(super) fn secret_scalar(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    lower.contains("-----begin private key-----")
-        || lower.starts_with("bearer ")
-        || lower.starts_with("basic ")
+    contains_private_key_header(&lower)
+        || contains_authorization_header(&lower)
+        || contains_authorization_scheme(&lower)
         || contains_supported_token_prefix(value)
         || contains_url_user_info(value)
 }
@@ -416,7 +426,7 @@ fn normalize_key(key: &str) -> String {
 fn contains_supported_token_prefix(value: &str) -> bool {
     value
         .split(|character: char| {
-            character.is_ascii_whitespace() || matches!(character, '"' | '\'' | '=' | ':')
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
         })
         .any(|token| {
             token.starts_with("sk-proj-")
@@ -433,6 +443,74 @@ fn contains_supported_token_prefix(value: &str) -> bool {
                 || ((token.starts_with("AKIA") || token.starts_with("ASIA")) && token.len() >= 16)
                 || token.starts_with("AIza")
         })
+}
+
+fn contains_private_key_header(value: &str) -> bool {
+    let mut remaining = value;
+    while let Some((_, after_begin)) = remaining.split_once("-----begin ") {
+        let Some((label, after_header)) = after_begin.split_once("-----") else {
+            return false;
+        };
+        let label = label.trim();
+        if label == "private key"
+            || label.ends_with(" private key")
+            || label == "pgp private key block"
+        {
+            return true;
+        }
+        remaining = after_header;
+    }
+    false
+}
+
+fn contains_authorization_header(value: &str) -> bool {
+    value.match_indices("authorization").any(|(start, _)| {
+        let bytes = value.as_bytes();
+        if !word_boundary(bytes, start, "authorization".len()) {
+            return false;
+        }
+        let mut cursor = start + "authorization".len();
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if !matches!(bytes.get(cursor), Some(b':' | b'=')) {
+            return false;
+        }
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        cursor < bytes.len()
+    })
+}
+
+fn contains_authorization_scheme(value: &str) -> bool {
+    ["bearer", "basic"].iter().any(|scheme| {
+        value.match_indices(scheme).any(|(start, _)| {
+            let bytes = value.as_bytes();
+            if !word_boundary(bytes, start, scheme.len()) {
+                return false;
+            }
+            let mut cursor = start + scheme.len();
+            if !bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                return false;
+            }
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            cursor < bytes.len()
+        })
+    })
+}
+
+fn word_boundary(bytes: &[u8], start: usize, length: usize) -> bool {
+    let identifier = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-');
+    start
+        .checked_sub(1)
+        .is_none_or(|index| !identifier(bytes[index]))
+        && bytes
+            .get(start + length)
+            .is_none_or(|byte| !identifier(*byte))
 }
 
 fn contains_url_user_info(value: &str) -> bool {
