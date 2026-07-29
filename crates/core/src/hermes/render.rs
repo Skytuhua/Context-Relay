@@ -827,6 +827,45 @@ pub(super) fn render_managed_markdown(
     Ok(rendered)
 }
 
+pub(super) fn validate_managed_markdown(existing: &[u8]) -> Result<(), ClientError> {
+    let text =
+        std::str::from_utf8(existing).map_err(|_| invalid("Hermes Markdown is not valid UTF-8"))?;
+    let _ = line_ending(text)?;
+    let starts = text.match_indices(MANAGED_START).collect::<Vec<_>>();
+    let ends = text.match_indices(MANAGED_END).collect::<Vec<_>>();
+    if starts.is_empty() && ends.is_empty() {
+        return Ok(());
+    }
+    if starts.len() != 1 || ends.len() != 1 || starts[0].0 >= ends[0].0 {
+        return Err(invalid("Hermes managed Markdown markers are malformed"));
+    }
+    let start = line_start(text, starts[0].0);
+    let start_marker_end = starts[0].0 + MANAGED_START.len();
+    let end_line_start = line_start(text, ends[0].0);
+    let end_marker_end = ends[0].0 + MANAGED_END.len();
+    let end = if text[end_marker_end..].starts_with("\r\n") {
+        end_marker_end + 2
+    } else if text[end_marker_end..].starts_with('\n') {
+        end_marker_end + 1
+    } else {
+        end_marker_end
+    };
+    let start_terminated =
+        text[start_marker_end..].starts_with("\r\n") || text[start_marker_end..].starts_with('\n');
+    let end_terminated = end_marker_end == text.len()
+        || text[end_marker_end..].starts_with("\r\n")
+        || text[end_marker_end..].starts_with('\n');
+    if !text[start..starts[0].0].trim().is_empty()
+        || !start_terminated
+        || !text[end_line_start..ends[0].0].trim().is_empty()
+        || !end_terminated
+        || !text[ends[0].0 + MANAGED_END.len()..end].trim().is_empty()
+    {
+        return Err(invalid("Hermes managed Markdown markers are malformed"));
+    }
+    Ok(())
+}
+
 fn managed_block(body: &str, newline: &str) -> String {
     let normalized = body.replace("\r\n", "\n");
     let normalized = normalized.trim_end_matches('\n').replace('\n', newline);

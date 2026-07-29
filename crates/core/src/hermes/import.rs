@@ -170,6 +170,104 @@ pub(super) fn project_reviewed_config(
     Ok(components)
 }
 
+pub(super) fn reviewed_config_projection(
+    parsed: &ParsedHermesYaml,
+    profile: &str,
+) -> Result<JsonValue, ClientError> {
+    let components = project_reviewed_config(parsed, profile)?;
+    let mut root = BTreeMap::<String, JsonValue>::new();
+    let mut approvals = BTreeMap::<String, JsonValue>::new();
+    let mut plugins_enabled = BTreeSet::new();
+    let mut plugins_disabled = BTreeSet::new();
+    let mut mcp_servers = BTreeMap::<String, JsonValue>::new();
+    let mut hooks = BTreeMap::<String, JsonValue>::new();
+
+    for component in components {
+        let location = component
+            .metadata
+            .iter()
+            .find_map(|(key, value)| (key == "structuralLocation").then_some(value.as_str()))
+            .ok_or_else(|| invalid("Hermes component location is missing"))?;
+        match component.kind {
+            ComponentKind::PermissionDeclaration => {
+                let value: JsonValue = serde_json::from_str(&component.body_markdown)
+                    .map_err(|_| invalid("Hermes reviewed permission is invalid"))?;
+                if location == "config:approvals" {
+                    root.insert("approvals".into(), value);
+                } else if let Some(key) = location.strip_prefix("config:approvals.") {
+                    safe_name(key)?;
+                    approvals.insert(key.to_owned(), value);
+                } else if location == "config:command_allowlist" {
+                    root.insert("command_allowlist".into(), value);
+                } else {
+                    return Err(invalid("Hermes reviewed permission path is invalid"));
+                }
+            }
+            ComponentKind::Plugin => {
+                if location.starts_with("config:plugins.enabled.") {
+                    plugins_enabled.insert(component.name);
+                } else if location.starts_with("config:plugins.disabled.") {
+                    plugins_disabled.insert(component.name);
+                } else {
+                    return Err(invalid("Hermes reviewed plugin path is invalid"));
+                }
+            }
+            ComponentKind::McpServer => {
+                mcp_servers.insert(
+                    component.name,
+                    serde_json::from_str(&component.body_markdown)
+                        .map_err(|_| invalid("Hermes reviewed MCP declaration is invalid"))?,
+                );
+            }
+            ComponentKind::Hook => {
+                hooks.insert(
+                    component.name,
+                    serde_json::from_str(&component.body_markdown)
+                        .map_err(|_| invalid("Hermes reviewed hook declaration is invalid"))?,
+                );
+            }
+            _ => return Err(invalid("Hermes reviewed config component is invalid")),
+        }
+    }
+
+    if !approvals.is_empty() {
+        root.insert(
+            "approvals".into(),
+            serde_json::to_value(approvals)
+                .map_err(|_| invalid("Hermes reviewed permission is invalid"))?,
+        );
+    }
+    if !plugins_enabled.is_empty() || !plugins_disabled.is_empty() {
+        let mut plugins = BTreeMap::<&str, Vec<String>>::new();
+        if !plugins_disabled.is_empty() {
+            plugins.insert("disabled", plugins_disabled.into_iter().collect::<Vec<_>>());
+        }
+        if !plugins_enabled.is_empty() {
+            plugins.insert("enabled", plugins_enabled.into_iter().collect::<Vec<_>>());
+        }
+        root.insert(
+            "plugins".into(),
+            serde_json::to_value(plugins)
+                .map_err(|_| invalid("Hermes reviewed plugin state is invalid"))?,
+        );
+    }
+    if !mcp_servers.is_empty() {
+        root.insert(
+            "mcp_servers".into(),
+            serde_json::to_value(mcp_servers)
+                .map_err(|_| invalid("Hermes reviewed MCP declaration is invalid"))?,
+        );
+    }
+    if !hooks.is_empty() {
+        root.insert(
+            "hooks".into(),
+            serde_json::to_value(hooks)
+                .map_err(|_| invalid("Hermes reviewed hook declaration is invalid"))?,
+        );
+    }
+    serde_json::to_value(root).map_err(|_| invalid("Hermes reviewed config projection is invalid"))
+}
+
 pub(super) fn permission_mapping(path: &str) -> Option<(&'static str, &'static str)> {
     match path {
         "approvals" => Some(("lossy", "confirmation_switch_not_portable")),

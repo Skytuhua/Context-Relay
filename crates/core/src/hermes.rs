@@ -21,15 +21,23 @@ use std::{
 };
 
 use context_relay_protocol::{
-    ApplyReceipt, CapabilityLevel, ClassifiedChanges, CliOperations, ClientError, DesiredState,
-    DeviceId, DiscoveredScopes, ErrorCode, HarnessAdapter, HarnessId, HybridLogicalClock,
-    ImportRequest, ImportedState, InstallationMethod, NativePlatform, NativeScope, ProbeContext,
-    ProbeReport, ProjectId, RenderedState, SemanticDiff, Sha256Digest, ValidationReport,
-    WireNativeValue,
+    ApplyReceipt, ApprovalClass, CapabilityLevel, ClassifiedChanges, CliOperations, ClientError,
+    ComponentKind, DesiredState, DeviceId, DiscoveredScopes, ErrorCode, HarnessAdapter, HarnessId,
+    HybridLogicalClock, ImportRequest, ImportedState, InstallationMethod, NativePlatform,
+    NativeScope, ProbeContext, ProbeReport, ProjectId, RenderedState, SemanticDiff, Sha256Digest,
+    ValidationReport, WireNativeValue,
 };
+use rand_core::{OsRng, RngCore as _};
+use serde_json::Value as JsonValue;
 use sha2::{Digest as _, Sha256};
 
+use crate::native_transaction::{
+    engine::{BoundaryError, FrozenOutput, NativeAdapter, RestrictedRun},
+    model::NativeTransactionPlan,
+};
+
 const SUPPORTED_VERSIONS: [&str; 2] = ["0.18.2", "0.18.1"];
+const HERMES_ADAPTER_VERSION: u32 = 1;
 const CLI_TIMEOUT_MS: u32 = 30_000;
 const CLI_OUTPUT_LIMIT: u64 = 64 * 1024;
 #[allow(dead_code)]
@@ -104,6 +112,41 @@ pub struct HermesAdapter {
     #[allow(dead_code)]
     observed_hlc: HybridLogicalClock,
     executable_hash: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HermesValidationRequest {
+    executable: PathBuf,
+    argv: Vec<String>,
+    working_directory: PathBuf,
+    staged_hermes_home: PathBuf,
+    executable_hash: Sha256Digest,
+}
+
+#[derive(Debug)]
+struct HermesValidationStage {
+    path: PathBuf,
+    temp_root: PathBuf,
+}
+
+impl Drop for HermesValidationStage {
+    fn drop(&mut self) {
+        let removable = self.path.parent() == Some(self.temp_root.as_path())
+            && self
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("context-relay-hermes-validation-")
+                        && name.len() == "context-relay-hermes-validation-".len() + 32
+                })
+            && fs::symlink_metadata(&self.path)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            && fs::canonicalize(&self.path).is_ok_and(|canonical| canonical == self.path);
+        if removable {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 impl HermesAdapter {
@@ -236,6 +279,34 @@ impl HermesAdapter {
         self.import_memory_documents()
     }
 
+    fn validate_effective_with(
+        &self,
+        receipt: &ApplyReceipt,
+        mut execute: impl FnMut(&HermesValidationRequest) -> Result<Vec<u8>, ClientError>,
+    ) -> Result<ValidationReport, ClientError> {
+        receipt
+            .validate()
+            .map_err(|_| invalid("Hermes receipt is invalid"))?;
+        self.require_apply_supported()?;
+        self.revalidate_bound_installation()?;
+        let projection = self.revalidate_effective_sources()?;
+        let staged_config = render_projection_yaml(&projection)?;
+        let parsed_staged = yaml::parse_config(&staged_config)?;
+        if !yaml::topology_supported(&parsed_staged) {
+            return Err(invalid("Hermes staged config topology is unsupported"));
+        }
+        let stage = create_validation_stage(&staged_config)?;
+        let request = HermesValidationRequest {
+            executable: self.layout.executable.clone(),
+            argv: vec!["config".into(), "check".into()],
+            working_directory: self.layout.working_directory.clone(),
+            staged_hermes_home: stage.path.clone(),
+            executable_hash: self.executable_hash,
+        };
+        let output = execute(&request)?;
+        parse_config_check_output(&output, &self.layout.version)
+    }
+
     fn capability(&self) -> CapabilityLevel {
         if SUPPORTED_VERSIONS.contains(&self.layout.version.as_str())
             && self.layout.executable_kind == HermesExecutableKind::Native
@@ -253,6 +324,150 @@ impl HermesAdapter {
             .ok()
             .and_then(|bytes| yaml::parse_config(&bytes).ok())
             .is_some_and(|parsed| yaml::topology_supported(&parsed))
+    }
+
+    fn revalidate_bound_installation(&self) -> Result<(), ClientError> {
+        profile::validate_profile_binding(&self.layout.default_hermes_home, &self.layout.profile)?;
+        let selected =
+            profile::select_profile(&self.layout.default_hermes_home, &self.layout.profile.name)?;
+        if selected != self.layout.profile {
+            return Err(conflict("Hermes profile binding changed"));
+        }
+        let executable = snapshot_executable(&self.layout.executable)?;
+        if executable.kind != HermesExecutableKind::Native
+            || executable.digest != self.executable_hash
+        {
+            return Err(conflict("Hermes executable changed"));
+        }
+        let project_root = fs::canonicalize(&self.layout.project_root)
+            .map_err(|_| conflict("Hermes project root changed"))?;
+        let working_directory = fs::canonicalize(&self.layout.working_directory)
+            .map_err(|_| conflict("Hermes working directory changed"))?;
+        if project_root != self.layout.project_root
+            || working_directory != self.layout.working_directory
+            || !working_directory.starts_with(&project_root)
+        {
+            return Err(conflict("Hermes project binding changed"));
+        }
+        Ok(())
+    }
+
+    fn revalidate_effective_sources(&self) -> Result<JsonValue, ClientError> {
+        let imported = self.import(&ImportRequest {
+            scopes: vec![
+                NativeScope::Global,
+                NativeScope::Project {
+                    project_id: self.project_id,
+                    root: self.project_root_wire(),
+                },
+            ],
+            include_disabled: true,
+        })?;
+        for component in &imported.components {
+            if matches!(
+                component.kind,
+                ComponentKind::Instruction | ComponentKind::Rule | ComponentKind::Skill
+            ) {
+                render::validate_managed_markdown(component.body_markdown.as_bytes())?;
+            }
+        }
+        for memory in self.import_memory_documents()? {
+            render::validate_managed_markdown(memory.body_markdown.as_bytes())?;
+        }
+        let config = fs::read(self.layout.profile.hermes_home.join("config.yaml"))
+            .map_err(|_| invalid("Hermes config cannot be read"))?;
+        let parsed = yaml::parse_config(&config)?;
+        if !yaml::topology_supported(&parsed) {
+            return Err(invalid("Hermes config topology is unsupported"));
+        }
+        import::reviewed_config_projection(&parsed, &self.layout.profile.name)
+    }
+}
+
+impl NativeAdapter for HermesAdapter {
+    fn reprobe_live_state(&mut self, plan: &NativeTransactionPlan) -> Result<(), BoundaryError> {
+        self.revalidate_bound_installation()
+            .map_err(|_| BoundaryError::new("Hermes installation changed"))?;
+        if self.capability() != CapabilityLevel::Full
+            || plan.setup.harness != HarnessId::Hermes
+            || plan.setup.adapter_version != HERMES_ADAPTER_VERSION
+            || plan.setup.harness_version != self.layout.version
+            || plan.setup.executable_path != wire_path(&self.layout.executable)
+            || plan.setup.executable_hash != self.executable_hash
+        {
+            return Err(BoundaryError::new("Hermes installation changed"));
+        }
+        if plan.setup.target_scopes.iter().any(|scope| match scope {
+            NativeScope::Global => false,
+            NativeScope::Project { project_id, root } => {
+                *project_id != self.project_id || *root != self.project_root_wire()
+            }
+        }) {
+            return Err(BoundaryError::new("Hermes project binding changed"));
+        }
+        if plan.setup.approval_class == ApprovalClass::Active {
+            gateway::require_gateway_idle(&self.layout.profile)
+                .map_err(|_| BoundaryError::new("Hermes gateway blocks active changes"))?;
+        }
+        Ok(())
+    }
+
+    fn compare_approved_digests(
+        &mut self,
+        plan: &NativeTransactionPlan,
+    ) -> Result<(), BoundaryError> {
+        for expected in &plan.setup.expected_native_digests {
+            let path = decode_wire_path(&expected.target)?;
+            let actual = match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    return Err(BoundaryError::new("Hermes native state changed"));
+                }
+                Ok(_) => Some(digest_file_boundary(&path)?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => return Err(BoundaryError::new("Hermes native state cannot be read")),
+            };
+            if actual != expected.expected_digest {
+                return Err(BoundaryError::new("Hermes native state changed"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_staged_output(
+        &mut self,
+        plan: &NativeTransactionPlan,
+        run: &RestrictedRun,
+    ) -> Result<FrozenOutput, BoundaryError> {
+        if run.staged_output_hash != plan.expected_semantic_output_hash
+            || run.scanner_result_hash != plan.scanner_result_hash
+        {
+            return Err(BoundaryError::new("Hermes staged output changed"));
+        }
+        Ok(FrozenOutput {
+            staged_output_hash: run.staged_output_hash,
+            scanner_result_hash: run.scanner_result_hash,
+        })
+    }
+
+    fn validate_effective(
+        &mut self,
+        plan: &NativeTransactionPlan,
+        receipt: &ApplyReceipt,
+    ) -> Result<(), BoundaryError> {
+        receipt
+            .validate()
+            .map_err(|_| BoundaryError::new("Hermes effective receipt is invalid"))?;
+        let intended = plan
+            .mutations
+            .iter()
+            .map(|mutation| mutation.intended.0)
+            .collect::<Vec<_>>();
+        if receipt.plan_id != plan.setup.plan_id || receipt.resulting_digests != intended {
+            return Err(BoundaryError::new(
+                "Hermes effective state differs from the plan",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -363,8 +578,402 @@ impl HarnessAdapter for HermesAdapter {
         Ok(CliOperations(vec![]))
     }
 
-    fn validate_effective(&self, _receipt: &ApplyReceipt) -> Result<ValidationReport, ClientError> {
-        Err(phase_unsupported())
+    fn validate_effective(&self, receipt: &ApplyReceipt) -> Result<ValidationReport, ClientError> {
+        self.validate_effective_with(receipt, run_validation)
+    }
+}
+
+fn create_validation_stage(config: &[u8]) -> Result<HermesValidationStage, ClientError> {
+    let temp_root = fs::canonicalize(env::temp_dir())
+        .map_err(|_| invalid("Hermes validation root is unavailable"))?;
+    for _ in 0..16 {
+        let mut random = [0u8; 16];
+        OsRng
+            .try_fill_bytes(&mut random)
+            .map_err(|_| invalid("Hermes validation randomness is unavailable"))?;
+        let name = format!(
+            "context-relay-hermes-validation-{}",
+            random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let candidate = temp_root.join(name);
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        match builder.create(&candidate) {
+            Ok(()) => {
+                let path = fs::canonicalize(&candidate)
+                    .map_err(|_| invalid("Hermes validation stage is unavailable"))?;
+                if path.parent() != Some(temp_root.as_path()) {
+                    let _ = fs::remove_dir_all(&candidate);
+                    return Err(invalid("Hermes validation stage escaped its root"));
+                }
+                let stage = HermesValidationStage { path, temp_root };
+                create_private_directory(&stage.path.join("memories"))?;
+                create_private_directory(&stage.path.join("home"))?;
+                write_private_file(&stage.path.join("config.yaml"), config)?;
+                return Ok(stage);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(invalid("Hermes validation stage cannot be created")),
+        }
+    }
+    Err(invalid("Hermes validation stage cannot be allocated"))
+}
+
+fn create_private_directory(path: &Path) -> Result<(), ClientError> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder
+        .create(path)
+        .map_err(|_| invalid("Hermes validation directory cannot be created"))
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ClientError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| invalid("Hermes validation config cannot be created"))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|_| invalid("Hermes validation config cannot be written"))
+}
+
+fn render_projection_yaml(value: &JsonValue) -> Result<Vec<u8>, ClientError> {
+    let mut rendered = String::new();
+    let JsonValue::Object(mapping) = value else {
+        return Err(invalid("Hermes reviewed config projection is invalid"));
+    };
+    write_yaml_mapping(mapping, 0, &mut rendered)?;
+    if rendered.is_empty() {
+        rendered.push_str("{}\n");
+    }
+    Ok(rendered.into_bytes())
+}
+
+fn write_yaml_mapping(
+    mapping: &serde_json::Map<String, JsonValue>,
+    indent: usize,
+    rendered: &mut String,
+) -> Result<(), ClientError> {
+    for (key, value) in mapping {
+        if !safe_yaml_key(key) {
+            return Err(invalid("Hermes reviewed config key is invalid"));
+        }
+        rendered.push_str(&" ".repeat(indent));
+        rendered.push_str(key);
+        match value {
+            JsonValue::Object(object) if object.is_empty() => rendered.push_str(": {}\n"),
+            JsonValue::Array(array) if array.is_empty() => rendered.push_str(": []\n"),
+            JsonValue::Object(object) => {
+                rendered.push_str(":\n");
+                write_yaml_mapping(object, indent + 2, rendered)?;
+            }
+            JsonValue::Array(array) => {
+                rendered.push_str(":\n");
+                write_yaml_sequence(array, indent + 2, rendered)?;
+            }
+            scalar => {
+                rendered.push_str(": ");
+                write_yaml_scalar(scalar, rendered)?;
+                rendered.push('\n');
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_yaml_sequence(
+    values: &[JsonValue],
+    indent: usize,
+    rendered: &mut String,
+) -> Result<(), ClientError> {
+    for value in values {
+        rendered.push_str(&" ".repeat(indent));
+        match value {
+            JsonValue::Object(object) if object.is_empty() => rendered.push_str("- {}\n"),
+            JsonValue::Array(array) if array.is_empty() => rendered.push_str("- []\n"),
+            JsonValue::Object(object) => {
+                rendered.push_str("-\n");
+                write_yaml_mapping(object, indent + 2, rendered)?;
+            }
+            JsonValue::Array(array) => {
+                rendered.push_str("-\n");
+                write_yaml_sequence(array, indent + 2, rendered)?;
+            }
+            scalar => {
+                rendered.push_str("- ");
+                write_yaml_scalar(scalar, rendered)?;
+                rendered.push('\n');
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_yaml_scalar(value: &JsonValue, rendered: &mut String) -> Result<(), ClientError> {
+    match value {
+        JsonValue::Null => rendered.push_str("null"),
+        JsonValue::Bool(value) => rendered.push_str(if *value { "true" } else { "false" }),
+        JsonValue::Number(value) => rendered.push_str(&value.to_string()),
+        JsonValue::String(value) => rendered.push_str(
+            &serde_json::to_string(value)
+                .map_err(|_| invalid("Hermes reviewed config scalar is invalid"))?,
+        ),
+        JsonValue::Array(_) | JsonValue::Object(_) => {
+            return Err(invalid("Hermes reviewed config scalar is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn safe_yaml_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn run_validation(request: &HermesValidationRequest) -> Result<Vec<u8>, ClientError> {
+    if request.argv != ["config", "check"] {
+        return Err(invalid("Hermes validation command is invalid"));
+    }
+    let path = minimal_system_path();
+    let mut child = Command::new(&request.executable);
+    child
+        .args(&request.argv)
+        .current_dir(&request.working_directory)
+        .env_clear()
+        .env("HERMES_HOME", &request.staged_hermes_home)
+        .env("HOME", request.staged_hermes_home.join("home"))
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if snapshot_executable(&request.executable)?.digest != request.executable_hash {
+        return Err(conflict("Hermes validation executable changed"));
+    }
+    let mut child = child
+        .spawn()
+        .map_err(|_| not_found("Hermes validation command could not be started"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| invalid("Hermes validation output is unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| invalid("Hermes validation output is unavailable"))?;
+    let stdout_thread = thread::spawn(move || read_capped(stdout));
+    let stderr_thread = thread::spawn(move || read_capped(stderr));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|_| invalid("Hermes validation command failed"))?
+        {
+            break status;
+        }
+        if started.elapsed() > Duration::from_millis(CLI_TIMEOUT_MS.into()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Err(ClientError {
+                code: ErrorCode::Timeout,
+                message: "Hermes validation timed out".into(),
+                field_path: None,
+                retryable: false,
+            });
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| invalid("Hermes validation output is invalid"))?
+        .map_err(|_| invalid("Hermes validation output is invalid"))?;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| invalid("Hermes validation output is invalid"))?
+        .map_err(|_| invalid("Hermes validation output is invalid"))?;
+    if !status.success() {
+        return Err(invalid("Hermes validation command failed"));
+    }
+    if !stderr.is_empty() {
+        return Err(invalid("Hermes validation wrote to stderr"));
+    }
+    Ok(stdout)
+}
+
+fn minimal_system_path() -> &'static str {
+    #[cfg(windows)]
+    {
+        r"C:\Windows\System32"
+    }
+    #[cfg(not(windows))]
+    {
+        "/usr/bin:/bin"
+    }
+}
+
+fn parse_config_check_output(bytes: &[u8], version: &str) -> Result<ValidationReport, ClientError> {
+    if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
+        return Err(invalid("Hermes validation output exceeds the limit"));
+    }
+    let output =
+        std::str::from_utf8(bytes).map_err(|_| invalid("Hermes validation output is invalid"))?;
+    let output = strip_ansi(output).replace("\r\n", "\n");
+    if output
+        .chars()
+        .any(|character| character.is_control() && character != '\n')
+    {
+        return Err(invalid("Hermes validation output is invalid"));
+    }
+    let lines = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    let mut state = 0u8;
+    let mut missing = false;
+    let mut notice = false;
+    for line in lines {
+        let trimmed = line.trim();
+        match state {
+            0 if matches!(trimmed, "Configuration Status" | "📋 Configuration Status") => {
+                state = 1
+            }
+            1 if valid_config_version_line(trimmed) => state = 2,
+            2 if trimmed == "Required:" => state = 3,
+            3 if trimmed == "Optional:" => state = 4,
+            3 | 4 if valid_credential_status_line(line) => {
+                missing |= trimmed.starts_with('✗') || trimmed.starts_with('○');
+            }
+            4 if valid_config_notice(trimmed, version) && !notice => {
+                notice = true;
+                state = 5;
+            }
+            5 if notice && trimmed == "Run 'hermes config migrate' to add them" => state = 6,
+            _ => return Err(invalid("Hermes validation output is unexpected")),
+        }
+    }
+    if state < 4 {
+        return Err(invalid("Hermes validation output is incomplete"));
+    }
+    Ok(ValidationReport {
+        valid: true,
+        findings: missing
+            .then(|| "isolated_credential_missing".to_owned())
+            .into_iter()
+            .collect(),
+    })
+}
+
+fn valid_config_version_line(line: &str) -> bool {
+    let Some(value) = line.strip_prefix("Config version: ") else {
+        return false;
+    };
+    let parts = value.split_whitespace().collect::<Vec<_>>();
+    matches!(
+        parts.as_slice(),
+        [current, "✓"] if current.bytes().all(|byte| byte.is_ascii_digit())
+    ) || matches!(
+        parts.as_slice(),
+        [current, "→", latest, "(update", "available)"]
+            if current.bytes().all(|byte| byte.is_ascii_digit())
+                && latest.bytes().all(|byte| byte.is_ascii_digit())
+    )
+}
+
+fn valid_credential_status_line(line: &str) -> bool {
+    let indentation = line.len() - line.trim_start_matches(' ').len();
+    if indentation < 4 {
+        return false;
+    }
+    let trimmed = line.trim();
+    let Some((status, rest)) = [("present", "✓ "), ("missing", "✗ "), ("optional", "○ ")]
+        .into_iter()
+        .find_map(|(status, prefix)| trimmed.strip_prefix(prefix).map(|rest| (status, rest)))
+    else {
+        return false;
+    };
+    let (name, suffix) = rest.split_once(' ').unwrap_or((rest, ""));
+    let valid_name = (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+    if !valid_name {
+        return false;
+    }
+    match status {
+        "present" => suffix.is_empty(),
+        "missing" => suffix == "(missing)",
+        "optional" if suffix.is_empty() => true,
+        "optional" => suffix.strip_prefix("→ ").is_some_and(|tools| {
+            !tools.is_empty()
+                && tools.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b',' | b' ')
+                })
+                && tools.split(", ").all(|tool| !tool.is_empty())
+        }),
+        _ => false,
+    }
+}
+
+fn valid_config_notice(line: &str, version: &str) -> bool {
+    if !SUPPORTED_VERSIONS.contains(&version) {
+        return false;
+    }
+    let Some((count, suffix)) = line.split_once(' ') else {
+        return false;
+    };
+    count.bytes().all(|byte| byte.is_ascii_digit()) && suffix == "new config option(s) available"
+}
+
+fn digest_file_boundary(path: &Path) -> Result<Sha256Digest, BoundaryError> {
+    fs::read(path)
+        .map(|bytes| Sha256Digest(Sha256::digest(bytes).into()))
+        .map_err(|_| BoundaryError::new("Hermes native state cannot be read"))
+}
+
+fn decode_wire_path(value: &WireNativeValue) -> Result<PathBuf, BoundaryError> {
+    #[cfg(windows)]
+    {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
+        if value.platform != NativePlatform::Windows || !value.bytes.len().is_multiple_of(2) {
+            return Err(BoundaryError::new("Hermes native target is invalid"));
+        }
+        let wide = value
+            .bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        Ok(PathBuf::from(OsString::from_wide(&wide)))
+    }
+    #[cfg(not(windows))]
+    {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+        if value.platform != NativePlatform::Macos {
+            return Err(BoundaryError::new("Hermes native target is invalid"));
+        }
+        Ok(PathBuf::from(OsString::from_vec(value.bytes.clone())))
     }
 }
 
@@ -725,21 +1334,421 @@ pub(super) fn conflict(message: &'static str) -> ClientError {
     }
 }
 
-fn phase_unsupported() -> ClientError {
-    ClientError {
-        code: ErrorCode::HarnessUnsupported,
-        message: "Hermes adapter phase is not available".into(),
-        field_path: None,
-        retryable: false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        cell::{Cell, RefCell},
+        str::FromStr,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    struct ValidationFixture {
+        root: PathBuf,
+        adapter: HermesAdapter,
+        layout: HermesLayout,
+        project_id: ProjectId,
+    }
+
+    impl Drop for ValidationFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn validation_fixture(version: &str) -> ValidationFixture {
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-hermes-validation-fixture-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let default_home = root.join("hermes home");
+        let profile_home = default_home.join("profiles/coder");
+        let project_root = root.join("project");
+        let working_directory = project_root.join("service");
+        let config = concat!(
+            "approvals:\n",
+            "  mode: smart\n",
+            "command_allowlist:\n",
+            "  - cargo test\n",
+            "plugins:\n",
+            "  enabled:\n",
+            "    - reviewer\n",
+            "mcp_servers:\n",
+            "  docs:\n",
+            "    url: https://example.com/mcp\n",
+            "    command: safe-command\n",
+            "    headers:\n",
+            "      Authorization: must-not-stage-header\n",
+            "hooks:\n",
+            "  shell:\n",
+            "    enabled: true\n",
+            "provider:\n",
+            "  api_key: must-not-stage-provider\n",
+        );
+        for home in [&default_home, &profile_home] {
+            fs::create_dir_all(home.join("memories")).unwrap();
+            fs::create_dir_all(home.join("plugins/reviewer")).unwrap();
+            fs::create_dir_all(home.join("hooks/audit")).unwrap();
+            fs::write(home.join("config.yaml"), config).unwrap();
+            fs::write(home.join("memories/MEMORY.md"), "safe memory\n").unwrap();
+            fs::write(
+                home.join("plugins/reviewer/plugin.yaml"),
+                "name: reviewer\nversion: 1\n",
+            )
+            .unwrap();
+            fs::write(
+                home.join("plugins/reviewer/plugin.py"),
+                "raise RuntimeError('must-not-execute-plugin')\n",
+            )
+            .unwrap();
+            fs::write(home.join("hooks/audit/HOOK.yaml"), "name: audit\n").unwrap();
+            fs::write(
+                home.join("hooks/audit/handler.py"),
+                "print('must-not-execute-hook')\n",
+            )
+            .unwrap();
+            fs::write(home.join(".env"), "TOKEN=must-not-stage-env\n").unwrap();
+            fs::write(
+                home.join("auth.json"),
+                "{\"token\":\"must-not-stage-auth\"}",
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(&working_directory).unwrap();
+        fs::write(project_root.join(".hermes.md"), "safe project context\n").unwrap();
+        let executable = root.join("hermes");
+        fs::write(&executable, b"\x7fELFfixture hermes executable").unwrap();
+        let project_id = ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073981").unwrap();
+        let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
+        let layout = HermesLayout {
+            executable,
+            executable_kind: HermesExecutableKind::Native,
+            version: version.to_owned(),
+            installation_method: InstallationMethod::PackageManager,
+            default_hermes_home: default_home,
+            profile: HermesProfile {
+                name: "coder".to_owned(),
+                hermes_home: profile_home,
+            },
+            project_root,
+            working_directory,
+        };
+        let adapter = HermesAdapter::from_layout(
+            layout.clone(),
+            project_id,
+            device_id,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+        )
+        .unwrap();
+        ValidationFixture {
+            root,
+            adapter,
+            layout,
+            project_id,
+        }
+    }
+
+    fn validation_receipt() -> ApplyReceipt {
+        let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
+        ApplyReceipt {
+            plan_id: context_relay_protocol::PlanId::from_str(
+                "018f22e2-79b0-7cc8-98c4-dc0c0c073984",
+            )
+            .unwrap(),
+            applied_hlc: HybridLogicalClock::new(1_900_000_000_001, 0, device_id),
+            resulting_digests: vec![],
+        }
+    }
+
+    fn config_check_output(version: &str) -> Vec<u8> {
+        match version {
+            "0.18.2" => concat!(
+                "\x1b[36;1m📋 Configuration Status\x1b[0m\n",
+                "\n",
+                "  Config version: 33 ✓\n",
+                "\n",
+                "\x1b[1m  Required:\x1b[0m\n",
+                "    \x1b[31m✗ MODEL_PROVIDER_KEY (missing)\x1b[0m\n",
+                "\n",
+                "\x1b[1m  Optional:\x1b[0m\n",
+                "    \x1b[2m○ OPENROUTER_API_KEY → vision_analyze, web_search\x1b[0m\n",
+                "    ✓ SAFE_OPTIONAL_KEY\n",
+                "\n",
+                "  2 new config option(s) available\n",
+                "    Run 'hermes config migrate' to add them\n",
+            )
+            .as_bytes()
+            .to_vec(),
+            "0.18.1" => concat!(
+                "📋 Configuration Status\r\n",
+                "\r\n",
+                "  Config version: 32 → 33 (update available)\r\n",
+                "\r\n",
+                "  Required:\r\n",
+                "    ✗ MODEL_PROVIDER_KEY (missing)\r\n",
+                "\r\n",
+                "  Optional:\r\n",
+                "    ○ OPENROUTER_API_KEY → vision_analyze\r\n",
+            )
+            .as_bytes()
+            .to_vec(),
+            _ => panic!("unsupported validation fixture version"),
+        }
+    }
+
+    #[test]
+    fn effective_validation_uses_only_isolated_nonsecret_home() {
+        let fixture = validation_fixture("0.18.2");
+        let stages = RefCell::new(Vec::new());
+        for _ in 0..2 {
+            let report = fixture
+                .adapter
+                .validate_effective_with(&validation_receipt(), |request| {
+                    assert_eq!(request.argv, ["config", "check"]);
+                    assert_eq!(request.executable, fixture.layout.executable);
+                    assert_eq!(request.working_directory, fixture.layout.working_directory);
+                    assert_eq!(
+                        request.executable_hash,
+                        snapshot_executable(&fixture.layout.executable)
+                            .unwrap()
+                            .digest
+                    );
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        assert_eq!(
+                            fs::metadata(&request.staged_hermes_home)
+                                .unwrap()
+                                .permissions()
+                                .mode()
+                                & 0o777,
+                            0o700
+                        );
+                        assert_eq!(
+                            fs::metadata(request.staged_hermes_home.join("config.yaml"))
+                                .unwrap()
+                                .permissions()
+                                .mode()
+                                & 0o777,
+                            0o600
+                        );
+                    }
+                    stages.borrow_mut().push(request.staged_hermes_home.clone());
+                    let staged =
+                        fs::read_to_string(request.staged_hermes_home.join("config.yaml")).unwrap();
+                    for reviewed in [
+                        "approvals:",
+                        "command_allowlist:",
+                        "plugins:",
+                        "mcp_servers:",
+                        "hooks:",
+                    ] {
+                        assert!(staged.contains(reviewed), "missing {reviewed}");
+                    }
+                    for excluded in [
+                        "must-not-stage",
+                        "provider:",
+                        "api_key",
+                        "authorization",
+                        "headers:",
+                        "env:",
+                    ] {
+                        assert!(!staged.to_ascii_lowercase().contains(excluded));
+                    }
+                    assert!(request.staged_hermes_home.join("memories").is_dir());
+                    for forbidden in [
+                        ".env",
+                        "auth.json",
+                        "SOUL.md",
+                        "skills",
+                        "plugins",
+                        "hooks",
+                        "mcp",
+                        "sessions",
+                        "channels",
+                        "gateway.pid",
+                        "gateway_state.json",
+                        "provider",
+                        "state.db",
+                        "logs",
+                        "canary",
+                    ] {
+                        assert!(!request.staged_hermes_home.join(forbidden).exists());
+                    }
+                    Ok(config_check_output("0.18.2"))
+                })
+                .unwrap();
+            assert!(report.valid);
+            assert_eq!(report.findings, ["isolated_credential_missing"]);
+        }
+        let stages = stages.into_inner();
+        assert_ne!(stages[0], stages[1]);
+        assert!(stages.iter().all(|stage| !stage.exists()));
+    }
+
+    #[test]
+    fn validation_never_starts_gateway_plugins_hooks_mcp_or_provider() {
+        let fixture = validation_fixture("0.18.2");
+        let sentinels = [
+            fixture.root.join("configured-command-ran"),
+            fixture.root.join("plugin-ran"),
+            fixture.root.join("hook-ran"),
+            fixture.root.join("provider-ran"),
+        ];
+        fixture
+            .adapter
+            .validate_effective_with(&validation_receipt(), |request| {
+                assert_eq!(request.argv, ["config", "check"]);
+                for forbidden in [
+                    "gateway",
+                    "doctor",
+                    "migrate",
+                    "setup",
+                    "plugin",
+                    "hook",
+                    "mcp",
+                    "chat",
+                    "provider",
+                    "safe-command",
+                    "https://example.com/mcp",
+                ] {
+                    assert!(
+                        request
+                            .argv
+                            .iter()
+                            .all(|argument| !argument.contains(forbidden))
+                    );
+                }
+                assert!(sentinels.iter().all(|sentinel| !sentinel.exists()));
+                Ok(config_check_output("0.18.2"))
+            })
+            .unwrap();
+        assert!(sentinels.iter().all(|sentinel| !sentinel.exists()));
+    }
+
+    #[test]
+    fn config_check_output_parser_accepts_both_frozen_release_contracts() {
+        for version in SUPPORTED_VERSIONS {
+            let fixture = validation_fixture(version);
+            let report = fixture
+                .adapter
+                .validate_effective_with(&validation_receipt(), |_| {
+                    Ok(config_check_output(version))
+                })
+                .unwrap();
+            assert!(report.valid);
+            assert_eq!(report.findings, ["isolated_credential_missing"]);
+        }
+    }
+
+    #[test]
+    fn unexpected_oversized_stderr_or_nonzero_validation_fails_closed() {
+        let fixture = validation_fixture("0.18.2");
+        let duplicate = [
+            config_check_output("0.18.2"),
+            b"\n  Required:\n    \xe2\x9c\x97 DUPLICATE_KEY (missing)\n".to_vec(),
+        ]
+        .concat();
+        let unknown = [
+            config_check_output("0.18.2"),
+            b"\n  Gateway: running\n".to_vec(),
+        ]
+        .concat();
+        let mut oversized = config_check_output("0.18.2");
+        oversized.resize(65_537, b' ');
+        for bytes in [duplicate, unknown, oversized, vec![0xff, 0xfe, 0xfd]] {
+            assert_eq!(
+                fixture
+                    .adapter
+                    .validate_effective_with(&validation_receipt(), |_| Ok(bytes.clone()))
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidRequest
+            );
+        }
+        for error in [
+            invalid("Hermes validation wrote to stderr"),
+            ClientError {
+                code: ErrorCode::Timeout,
+                message: "Hermes validation timed out".into(),
+                field_path: None,
+                retryable: false,
+            },
+            invalid("Hermes validation command failed"),
+        ] {
+            let actual = fixture
+                .adapter
+                .validate_effective_with(&validation_receipt(), |_| Err(error.clone()))
+                .unwrap_err();
+            assert_eq!(actual.code, error.code);
+        }
+    }
+
+    #[test]
+    fn unknown_version_or_wrapper_never_runs_validation_command() {
+        for (version, wrapper) in [("9.9.9", false), ("0.18.2", true)] {
+            let fixture = validation_fixture("0.18.2");
+            if wrapper {
+                fs::write(&fixture.layout.executable, b"#!/bin/sh\nexit 99\n").unwrap();
+            }
+            let mut layout = fixture.layout.clone();
+            layout.version = version.into();
+            layout.executable_kind = if wrapper {
+                HermesExecutableKind::Wrapper
+            } else {
+                HermesExecutableKind::Native
+            };
+            let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
+            let adapter = HermesAdapter::from_layout(
+                layout,
+                fixture.project_id,
+                device_id,
+                HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+            )
+            .unwrap();
+            let calls = Cell::new(0);
+            let error = adapter
+                .validate_effective_with(&validation_receipt(), |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(config_check_output("0.18.2"))
+                })
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::HarnessUnsupported);
+            assert_eq!(calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn validation_stage_is_removed_on_success_and_failure() {
+        let fixture = validation_fixture("0.18.2");
+        let success = RefCell::new(None);
+        fixture
+            .adapter
+            .validate_effective_with(&validation_receipt(), |request| {
+                success.replace(Some(request.staged_hermes_home.clone()));
+                Ok(config_check_output("0.18.2"))
+            })
+            .unwrap();
+        assert!(!success.into_inner().unwrap().exists());
+
+        let failure = RefCell::new(None);
+        fixture
+            .adapter
+            .validate_effective_with(&validation_receipt(), |request| {
+                failure.replace(Some(request.staged_hermes_home.clone()));
+                Err(ClientError {
+                    code: ErrorCode::Timeout,
+                    message: "Hermes validation timed out".into(),
+                    field_path: None,
+                    retryable: false,
+                })
+            })
+            .unwrap_err();
+        assert!(!failure.into_inner().unwrap().exists());
+    }
 
     #[test]
     fn parse_version_accepts_a_single_version_with_a_trailing_newline() {

@@ -5,19 +5,24 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use context_relay_core::hermes::{
-    HermesAdapter, HermesExecutableKind, HermesLayout, HermesMemoryKind, HermesProfile,
-};
-use context_relay_core::native_transaction::{
-    engine::NativeFileSystem, filesystem::OsNativeTransactionFileSystem,
+use context_relay_core::{
+    hermes::{HermesAdapter, HermesExecutableKind, HermesLayout, HermesMemoryKind, HermesProfile},
+    native_transaction::{
+        engine::{NativeAdapter, NativeFileSystem, RestrictedRun},
+        filesystem::OsNativeTransactionFileSystem,
+        model::{NativeTransactionPlan, SidecarBinding},
+    },
 };
 use context_relay_native_runner::{NativeState, OsNativeFileSystem};
 use context_relay_protocol::{
-    CapabilityLevel, ChangeClass, ClassifiedChange, ComponentKind, ComponentRecord, DesiredState,
-    DeviceId, ErrorCode, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest,
-    InstallationMethod, NativeScope, ProbeContext, ProjectId, SemanticDiff,
+    ApplyReceipt, ApprovalClass, CapabilityLevel, ChangeClass, ClassifiedChange, ComponentKind,
+    ComponentRecord, DesiredState, DeviceId, ErrorCode, ExpectedNativeDigest, HarnessAdapter,
+    HarnessId, HybridLogicalClock, ImportRequest, InstallationMethod, NativePlatform, NativeScope,
+    NetworkDelta, PermissionDelta, PlanId, ProbeContext, ProjectId, SemanticDiff, SetupPlan,
+    Sha256Digest, WireNativeValue,
 };
 use serde_json::{Map, Value};
+use sha2::{Digest as _, Sha256};
 
 const PROJECT_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073981";
 const DEVICE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073982";
@@ -246,6 +251,114 @@ fn metadata_mut<'a>(component: &'a mut ComponentRecord, key: &str) -> &'a mut St
         .iter_mut()
         .find_map(|(candidate, value)| (candidate == key).then_some(value))
         .unwrap()
+}
+
+fn test_digest(bytes: &[u8]) -> Sha256Digest {
+    Sha256Digest(Sha256::digest(bytes).into())
+}
+
+fn test_file_digest(path: &Path) -> Sha256Digest {
+    test_digest(&fs::read(path).unwrap())
+}
+
+fn test_wire_path(path: &Path) -> WireNativeValue {
+    #[cfg(windows)]
+    let bytes = {
+        use std::os::windows::ffi::OsStrExt as _;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    #[cfg(not(windows))]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt as _;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    WireNativeValue {
+        platform: if cfg!(windows) {
+            NativePlatform::Windows
+        } else {
+            NativePlatform::Macos
+        },
+        bytes,
+        display: path.to_str().map(str::to_owned),
+    }
+}
+
+fn validation_receipt() -> ApplyReceipt {
+    let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
+    ApplyReceipt {
+        plan_id: PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073984").unwrap(),
+        applied_hlc: HybridLogicalClock::new(1_900_000_000_001, 0, device_id),
+        resulting_digests: vec![],
+    }
+}
+
+fn hermes_native_plan(
+    fixture: &Fixture,
+    approval_class: ApprovalClass,
+    expected_native_digests: Vec<ExpectedNativeDigest>,
+) -> NativeTransactionPlan {
+    clear_gateway_records(fixture);
+    let imported = import_global(fixture);
+    let mut plugin = component_at(
+        &imported.components,
+        ComponentKind::Plugin,
+        "config:plugins.enabled.reviewer",
+    );
+    plugin.archived = true;
+    let mutation = fixture
+        .adapter
+        .plan_native_config(&desired_global(fixture, vec![plugin]))
+        .unwrap()
+        .unwrap();
+    NativeTransactionPlan {
+        setup: SetupPlan {
+            plan_id: validation_receipt().plan_id,
+            harness: HarnessId::Hermes,
+            adapter_version: 1,
+            executable_path: test_wire_path(&fixture.layout.executable),
+            executable_hash: test_file_digest(&fixture.layout.executable),
+            harness_version: fixture.layout.version.clone(),
+            target_scopes: vec![
+                NativeScope::Global,
+                NativeScope::Project {
+                    project_id: fixture.project_id,
+                    root: fixture.adapter.project_root_wire(),
+                },
+            ],
+            expected_native_digests,
+            semantic_changes: vec![],
+            cli_operations: vec![],
+            package_artifacts: vec![],
+            permission_delta: PermissionDelta {
+                added: vec![],
+                removed: vec![],
+            },
+            network_delta: NetworkDelta {
+                added: vec![],
+                removed: vec![],
+            },
+            scanner_report_hash: Sha256Digest([21; 32]),
+            rulesync_version: "0.2.0".to_owned(),
+            rulesync_hash: Sha256Digest([22; 32]),
+            approval_class,
+            expires_at: 2_000_000_000_000,
+            batch_hash: Sha256Digest([23; 32]),
+        },
+        helper_policy_version: 1,
+        manifest_schema_version: 1,
+        manifest_digest: Sha256Digest([24; 32]),
+        helper_hash: Sha256Digest([25; 32]),
+        sidecars: Vec::<SidecarBinding>::new(),
+        structural_allowlist_hash: Sha256Digest([26; 32]),
+        staged_inputs: vec![],
+        expected_semantic_output_hash: Sha256Digest([27; 32]),
+        scanner_result_hash: Sha256Digest([28; 32]),
+        mutations: vec![mutation],
+        ownership_changes: vec![],
+    }
 }
 
 #[test]
@@ -1996,6 +2109,216 @@ fn from_layout_reclassifies_wrapper_bytes_claimed_as_native() {
         probe(&adapter, Some("coder")).capability,
         CapabilityLevel::ImportOnly
     );
+}
+
+#[test]
+fn native_adapter_rechecks_gateway_profile_executable_and_digests() {
+    let digest_fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let config_path = digest_fixture
+        .layout
+        .profile
+        .hermes_home
+        .join("config.yaml");
+    let expected = ExpectedNativeDigest {
+        target: test_wire_path(&config_path),
+        expected_digest: Some(test_file_digest(&config_path)),
+    };
+    let mut plan = hermes_native_plan(&digest_fixture, ApprovalClass::Passive, vec![expected]);
+    let mut adapter = digest_fixture.adapter.clone();
+    assert!(adapter.reprobe_live_state(&plan).is_ok());
+    assert!(adapter.compare_approved_digests(&plan).is_ok());
+
+    fs::write(&config_path, b"changed native bytes").unwrap();
+    assert!(adapter.compare_approved_digests(&plan).is_err());
+
+    let live_fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    plan = hermes_native_plan(&live_fixture, ApprovalClass::Active, vec![]);
+    fs::write(
+        live_fixture
+            .layout
+            .profile
+            .hermes_home
+            .join("gateway.pid"),
+        format!(
+            r#"{{"pid":{},"kind":"gateway","argv":["hermes","gateway","run","--profile","coder"],"start_time":1}}"#,
+            std::process::id()
+        ),
+    )
+    .unwrap();
+    let mut adapter = live_fixture.adapter.clone();
+    assert!(adapter.reprobe_live_state(&plan).is_err());
+
+    for drift in ["version", "path", "hash"] {
+        let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+        let mut plan = hermes_native_plan(&fixture, ApprovalClass::Passive, vec![]);
+        match drift {
+            "version" => plan.setup.harness_version = "0.18.1".into(),
+            "path" => plan.setup.executable_path = test_wire_path(&fixture.root.join("other")),
+            "hash" => fs::write(&fixture.layout.executable, b"\x7fELFchanged executable").unwrap(),
+            _ => unreachable!(),
+        }
+        assert!(fixture.adapter.clone().reprobe_live_state(&plan).is_err());
+    }
+
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let plan = hermes_native_plan(&fixture, ApprovalClass::Passive, vec![]);
+    let original = fixture.layout.profile.hermes_home.clone();
+    let moved = fixture.root.join("moved profile");
+    fs::rename(&original, &moved).unwrap();
+    fs::create_dir_all(&original).unwrap();
+    assert!(fixture.adapter.clone().reprobe_live_state(&plan).is_err());
+}
+
+#[test]
+fn native_adapter_rejects_staged_hash_and_receipt_changes() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let plan = hermes_native_plan(&fixture, ApprovalClass::Passive, vec![]);
+    let mut adapter = fixture.adapter.clone();
+    let valid = RestrictedRun {
+        staged_output_hash: plan.expected_semantic_output_hash,
+        scanner_result_hash: plan.scanner_result_hash,
+    };
+    assert!(adapter.validate_staged_output(&plan, &valid).is_ok());
+    for invalid in [
+        RestrictedRun {
+            staged_output_hash: Sha256Digest([90; 32]),
+            ..valid.clone()
+        },
+        RestrictedRun {
+            scanner_result_hash: Sha256Digest([91; 32]),
+            ..valid.clone()
+        },
+    ] {
+        assert!(adapter.validate_staged_output(&plan, &invalid).is_err());
+    }
+
+    let intended = plan
+        .mutations
+        .iter()
+        .map(|mutation| mutation.intended.0)
+        .collect::<Vec<_>>();
+    let mut receipt = validation_receipt();
+    receipt.resulting_digests = intended;
+    assert!(NativeAdapter::validate_effective(&mut adapter, &plan, &receipt).is_ok());
+    receipt.plan_id = PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073985").unwrap();
+    assert!(NativeAdapter::validate_effective(&mut adapter, &plan, &receipt).is_err());
+    receipt.plan_id = plan.setup.plan_id;
+    receipt.resulting_digests = vec![Sha256Digest([92; 32])];
+    assert!(NativeAdapter::validate_effective(&mut adapter, &plan, &receipt).is_err());
+}
+
+#[test]
+fn rollback_restores_all_hermes_targets_and_metadata() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let imported = import_global(&fixture);
+    let mut plugin = component_at(
+        &imported.components,
+        ComponentKind::Plugin,
+        "config:plugins.enabled.reviewer",
+    );
+    plugin.archived = true;
+    let config = fixture
+        .adapter
+        .plan_native_config(&desired_global(&fixture, vec![plugin]))
+        .unwrap()
+        .unwrap();
+    let mut soul = component_at(&imported.components, ComponentKind::Rule, "profile:SOUL.md");
+    soul.body_markdown = "rollback changed soul".into();
+    let markdown = fixture
+        .adapter
+        .plan_native_markdown(&soul)
+        .unwrap()
+        .unwrap();
+    let memory = fixture
+        .adapter
+        .plan_native_memory(HermesMemoryKind::Agent, "rollback changed memory")
+        .unwrap()
+        .unwrap();
+    let mut manifest = component_at(
+        &imported.components,
+        ComponentKind::Hook,
+        "profile:hooks/audit/HOOK.yaml",
+    );
+    manifest.body_markdown = "name: audit\nevents: [post_tool, pre_tool]\n".into();
+    let mut handler = component_at(
+        &imported.components,
+        ComponentKind::Hook,
+        "profile:hooks/audit/handler.py",
+    );
+    handler.body_markdown = "print('changed safe handler')\n".into();
+    let hooks = fixture
+        .adapter
+        .plan_native_gateway_hook(&manifest, Some(&handler))
+        .unwrap();
+    let mutations = [vec![config, markdown, memory], hooks].concat();
+    let before = mutations
+        .iter()
+        .map(|mutation| {
+            let path = PathBuf::from(mutation.target.display.as_ref().unwrap());
+            (
+                path.clone(),
+                OsNativeFileSystem::new()
+                    .snapshot(&path)
+                    .unwrap()
+                    .state()
+                    .clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let nonce = [44; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native.create_before_images(&mutations).unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native.compare_and_swap_targets(&mutations).unwrap();
+    for mutation in &mutations {
+        native.apply_mutation(&nonce, mutation).unwrap();
+    }
+    let injected_later_failure = Err::<(), _>(
+        context_relay_core::native_transaction::engine::BoundaryError::new(
+            "injected validation failure",
+        ),
+    );
+    assert!(injected_later_failure.is_err());
+    native.restore_matching_applied_targets(&nonce).unwrap();
+
+    for (path, expected) in before {
+        let restored = OsNativeFileSystem::new().snapshot(&path).unwrap();
+        let (
+            NativeState::RegularFile {
+                bytes: expected_bytes,
+                metadata: expected_metadata,
+            },
+            NativeState::RegularFile {
+                bytes: restored_bytes,
+                metadata: restored_metadata,
+            },
+        ) = (&expected, restored.state())
+        else {
+            panic!("Hermes rollback target remained a regular file");
+        };
+        assert_eq!(restored_bytes, expected_bytes);
+        assert_eq!(
+            restored_metadata.file_attributes(),
+            expected_metadata.file_attributes()
+        );
+        assert_eq!(
+            restored_metadata.creation_time(),
+            expected_metadata.creation_time()
+        );
+        assert_eq!(
+            restored_metadata.last_write_time(),
+            expected_metadata.last_write_time()
+        );
+        assert_eq!(
+            restored_metadata.security_descriptor(),
+            expected_metadata.security_descriptor()
+        );
+        assert_eq!(
+            restored_metadata.alternate_streams(),
+            expected_metadata.alternate_streams()
+        );
+    }
 }
 
 #[cfg(windows)]
