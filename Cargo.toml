@@ -32,6 +32,7 @@ rand_core = { version = "0.6.4", features = ["getrandom"] }
 rusqlite = { version = "0.40.1", git = "https://github.com/rusqlite/rusqlite", rev = "62648175c23f84b45238f4a1fbb0133b75ce68f1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+serde_yaml_ng = "0.10.0"
 sha2 = "0.10.9"
 thiserror = "2.0.16"
 toml_edit = "0.25.13"

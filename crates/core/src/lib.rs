@@ -1,6 +1,7 @@
 pub mod claude_code;
 pub mod codex;
 pub mod crypto;
+pub mod hermes;
 pub mod native_transaction;
 pub mod search;
 pub mod service;

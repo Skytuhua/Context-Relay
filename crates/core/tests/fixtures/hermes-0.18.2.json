@@ -1,0 +1,31 @@
+{
+  "version": "0.18.2",
+  "profile": {
+    "name": "coder",
+    "configYaml": "# profile heading\nunknown_root: 'preserve-single-quotes'\napprovals:\n  mode: smart\n  deny:\n    - 'rm -rf *'\ncommand_allowlist:\n  - cargo test\nplugins:\n  unknown_child: preserve-me\n  enabled:\n    - reviewer\n  disabled:\n    - legacy\nmcp_servers:\n  docs:\n    url: https://example.com/mcp\n    enabled: true\n    tools:\n      include: [search]\n    headers:\n      Authorization: must-not-import-yaml-header\n  local:\n    command: node\n    args: [server.js]\n    env:\n      DOCS_TOKEN: must-not-import-yaml-env\nhooks:\n  shell:\n    post_tool:\n      command: check-write\nprovider:\n  api_key: must-not-import-provider-key\n",
+    "files": {
+      "SOUL.md": "# Soul\nPrefer small verified changes.\n",
+      "memories/MEMORY.md": "# Agent memory\nHermes-owned prefix.\n",
+      "memories/USER.md": "# User memory\nUser prefers concise output.\n",
+      "skills/review/SKILL.md": "---\nname: review\ndescription: Review a change.\n---\nReview the diff.\n",
+      "plugins/reviewer/plugin.yaml": "name: reviewer\nversion: 1.2.3\ndescription: Review changes.\nrequires_env:\n  - REVIEW_TOKEN\n",
+      "plugins/reviewer/plugin.py": "raise RuntimeError('must-not-execute-plugin')\n",
+      "hooks/audit/HOOK.yaml": "name: audit\nevents: [post_tool]\n",
+      "hooks/audit/handler.py": "print('safe handler body; must-not-execute-hook')\n",
+      ".env": "OPENROUTER_API_KEY=must-not-import-env\n",
+      "auth.json": "{\"token\":\"must-not-import-auth\"}\n",
+      "sessions/session.jsonl": "{\"token\":\"must-not-import-session\"}\n",
+      "state.db": "must-not-import-database",
+      "gateway.pid": "{\"pid\":999999,\"kind\":\"gateway\",\"argv\":[\"hermes\",\"gateway\",\"run\",\"--profile\",\"coder\"],\"start_time\":1}\n",
+      "gateway_state.json": "{\"channel_token\":\"must-not-import-gateway-token\"}\n",
+      "channels/telegram.json": "{\"bot_token\":\"must-not-import-channel\"}\n",
+      "logs/hermes.log": "must-not-import-log"
+    }
+  },
+  "project": {
+    "HERMES.md": "# Root fallback\nRoot context.\n",
+    ".hermes.md": "# Root preferred\nUse Rust 2024.\n",
+    "service/HERMES.md": "# Service fallback\nFallback context.\n",
+    "service/.hermes.md": "# Service preferred\nPreserve wire contracts.\n"
+  }
+}
