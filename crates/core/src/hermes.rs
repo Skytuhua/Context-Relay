@@ -1,11 +1,14 @@
 //! Hermes adapter identity and profile binding.
 //!
-//! This first adapter phase attests one explicit profile before it reads any
-//! Hermes configuration. Content import and native rendering remain closed.
+//! The adapter attests one explicit profile before importing only reviewed
+//! configuration and file surfaces. Native rendering remains closed.
 
+mod import;
 mod profile;
+mod yaml;
 
 use std::{
+    collections::BTreeSet,
     env, fs,
     fs::OpenOptions,
     io::{Read, Write},
@@ -63,6 +66,19 @@ struct StagedExecutable {
 pub struct HermesProfile {
     pub name: String,
     pub hermes_home: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HermesMemoryKind {
+    Agent,
+    User,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HermesMemoryDocument {
+    pub kind: HermesMemoryKind,
+    pub body_markdown: String,
+    pub source_digest: Sha256Digest,
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +230,10 @@ impl HermesAdapter {
         wire_path(&self.layout.project_root)
     }
 
+    pub fn import_native_memory(&self) -> Result<Vec<HermesMemoryDocument>, ClientError> {
+        self.import_memory_documents()
+    }
+
     fn capability(&self) -> CapabilityLevel {
         if SUPPORTED_VERSIONS.contains(&self.layout.version.as_str())
             && self.layout.executable_kind == HermesExecutableKind::Native
@@ -229,8 +249,8 @@ impl HermesAdapter {
         let path = self.layout.profile.hermes_home.join("config.yaml");
         fs::read(path)
             .ok()
-            .and_then(|bytes| serde_yaml_ng::from_slice::<serde_yaml_ng::Value>(&bytes).ok())
-            .is_some_and(|value| matches!(value, serde_yaml_ng::Value::Mapping(_)))
+            .and_then(|bytes| yaml::parse_config(&bytes).ok())
+            .is_some_and(|parsed| yaml::topology_supported(&parsed))
     }
 }
 
@@ -256,7 +276,7 @@ impl HarnessAdapter for HermesAdapter {
             installation_method: self.layout.installation_method,
             config_roots: vec![self.profile_home_wire(), self.project_root_wire()],
             active_profile: Some(self.layout.profile.name.clone()),
-            policy_conflicts: vec![],
+            policy_conflicts: self.import_policy_conflicts(),
             capability: self.capability(),
         })
     }
@@ -274,8 +294,40 @@ impl HarnessAdapter for HermesAdapter {
         ]))
     }
 
-    fn import(&self, _request: &ImportRequest) -> Result<ImportedState, ClientError> {
-        Err(phase_unsupported())
+    fn import(&self, request: &ImportRequest) -> Result<ImportedState, ClientError> {
+        request
+            .validate()
+            .map_err(|_| invalid("Hermes import request is invalid"))?;
+        let mut components = Vec::new();
+        let mut digests = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        for native_scope in &request.scopes {
+            let scope = import::validate_bound_scope(self, native_scope)?;
+            let key = match scope {
+                context_relay_protocol::ScopeRef::Global => "global".to_owned(),
+                context_relay_protocol::ScopeRef::Project { project_id } => {
+                    format!("project:{project_id}")
+                }
+            };
+            if !seen.insert(key) {
+                return Err(invalid("Hermes import repeated a scope"));
+            }
+            self.import_scope(
+                scope,
+                request.include_disabled,
+                &mut components,
+                &mut digests,
+            )?;
+        }
+        components.sort_by_key(|component| component.id);
+        let imported = ImportedState {
+            components,
+            source_digests: digests.into_iter().collect(),
+        };
+        imported
+            .validate()
+            .map_err(|_| invalid("Hermes imported state exceeds protocol limits"))?;
+        Ok(imported)
     }
 
     fn render(&self, _desired: &DesiredState) -> Result<RenderedState, ClientError> {

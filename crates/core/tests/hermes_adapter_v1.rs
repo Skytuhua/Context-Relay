@@ -6,11 +6,12 @@ use std::{
 };
 
 use context_relay_core::hermes::{
-    HermesAdapter, HermesExecutableKind, HermesLayout, HermesProfile,
+    HermesAdapter, HermesExecutableKind, HermesLayout, HermesMemoryKind, HermesProfile,
 };
 use context_relay_protocol::{
-    CapabilityLevel, DeviceId, ErrorCode, HarnessAdapter, HarnessId, HybridLogicalClock,
-    InstallationMethod, ProbeContext, ProjectId,
+    CapabilityLevel, ComponentKind, ComponentRecord, DeviceId, ErrorCode, HarnessAdapter,
+    HarnessId, HybridLogicalClock, ImportRequest, InstallationMethod, NativeScope, ProbeContext,
+    ProjectId,
 };
 use serde_json::{Map, Value};
 
@@ -55,7 +56,7 @@ fn fixture(source: &str) -> Fixture {
     materialize(&project_root, source["project"].as_object().unwrap());
     fs::create_dir_all(&working_directory).unwrap();
 
-    // Snapshot the operational canaries before removing them from this general fixture.
+    // Keep the operational canaries in place so import tests prove they are excluded.
     for profile_root in [
         &default_home,
         &profiles_root.join("coder"),
@@ -63,8 +64,6 @@ fn fixture(source: &str) -> Fixture {
     ] {
         assert!(profile_root.join("gateway.pid").is_file());
         assert!(profile_root.join("gateway_state.json").is_file());
-        fs::remove_file(profile_root.join("gateway.pid")).unwrap();
-        fs::remove_file(profile_root.join("gateway_state.json")).unwrap();
     }
 
     let executable = root.join("hermes");
@@ -155,6 +154,73 @@ fn probe(
         .unwrap()
 }
 
+fn import_everything(
+    fixture: &Fixture,
+    include_disabled: bool,
+) -> context_relay_protocol::ImportedState {
+    fixture
+        .adapter
+        .import(&ImportRequest {
+            scopes: vec![
+                NativeScope::Global,
+                NativeScope::Project {
+                    project_id: fixture.project_id,
+                    root: fixture.adapter.project_root_wire(),
+                },
+            ],
+            include_disabled,
+        })
+        .unwrap()
+}
+
+fn metadata<'a>(component: &'a ComponentRecord, key: &str) -> Option<&'a str> {
+    component
+        .metadata
+        .iter()
+        .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
+}
+
+fn global_import_error(fixture: &Fixture) -> context_relay_protocol::ClientError {
+    fixture
+        .adapter
+        .import(&ImportRequest {
+            scopes: vec![NativeScope::Global],
+            include_disabled: true,
+        })
+        .unwrap_err()
+}
+
+fn install_non_execution_sentinels(fixture: &Fixture) -> Vec<PathBuf> {
+    let profile = &fixture.layout.profile.hermes_home;
+    let mcp = fixture.root.join("mcp-ran");
+    let plugin = fixture.root.join("plugin-ran");
+    let hook = fixture.root.join("hook-ran");
+    let config = fs::read_to_string(profile.join("config.yaml"))
+        .unwrap()
+        .replace(
+            "command: node",
+            &format!("command: \"touch {}\"", mcp.display()),
+        );
+    fs::write(profile.join("config.yaml"), config).unwrap();
+    fs::write(
+        profile.join("plugins/reviewer/plugin.py"),
+        format!(
+            "from pathlib import Path\nPath({:?}).touch()\n",
+            plugin.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        profile.join("hooks/audit/handler.py"),
+        format!(
+            "from pathlib import Path\nPath({:?}).touch()\n",
+            hook.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    vec![mcp, plugin, hook]
+}
+
 #[test]
 fn supported_release_fixtures_bind_one_named_profile() {
     for source in [
@@ -166,11 +232,311 @@ fn supported_release_fixtures_bind_one_named_profile() {
         assert_eq!(report.capability, CapabilityLevel::Full);
         assert_eq!(report.active_profile.as_deref(), Some("coder"));
         assert_eq!(
+            report.policy_conflicts,
+            vec![
+                "approval_mode_not_portable".to_owned(),
+                "deny_pattern_not_portable".to_owned(),
+                "permanent_allowlist_not_portable".to_owned(),
+            ]
+        );
+        assert_eq!(
             report.config_roots,
             vec![
                 fixture.adapter.profile_home_wire(),
                 fixture.adapter.project_root_wire()
             ]
+        );
+    }
+}
+
+#[test]
+fn supported_releases_import_every_reviewed_component_kind() {
+    for source in [
+        include_str!("fixtures/hermes-0.18.2.json"),
+        include_str!("fixtures/hermes-0.18.1.json"),
+    ] {
+        let fixture = fixture(source);
+        let imported = import_everything(&fixture, true);
+        for kind in [
+            ComponentKind::Instruction,
+            ComponentKind::Rule,
+            ComponentKind::Skill,
+            ComponentKind::Plugin,
+            ComponentKind::McpServer,
+            ComponentKind::Hook,
+            ComponentKind::PermissionDeclaration,
+        ] {
+            assert!(
+                imported
+                    .components
+                    .iter()
+                    .any(|component| component.kind == kind),
+                "missing {kind:?}"
+            );
+        }
+        for name in ["reviewer", "legacy"] {
+            assert!(imported.components.iter().any(|component| {
+                component.kind == ComponentKind::Plugin && component.name == name
+            }));
+        }
+        for name in ["docs", "local"] {
+            assert!(imported.components.iter().any(|component| {
+                component.kind == ComponentKind::McpServer && component.name == name
+            }));
+        }
+        for (kind, name, location) in [
+            (ComponentKind::Hook, "shell", "config:hooks.shell"),
+            (
+                ComponentKind::Hook,
+                "audit",
+                "profile:hooks/audit/HOOK.yaml",
+            ),
+            (
+                ComponentKind::Hook,
+                "audit/handler.py",
+                "profile:hooks/audit/handler.py",
+            ),
+            (
+                ComponentKind::Skill,
+                "review",
+                "profile:skills/review/SKILL.md",
+            ),
+        ] {
+            assert!(imported.components.iter().any(|component| {
+                component.kind == kind
+                    && component.name == name
+                    && metadata(component, "structuralLocation") == Some(location)
+            }));
+        }
+        let permission_reasons = imported
+            .components
+            .iter()
+            .filter(|component| component.kind == ComponentKind::PermissionDeclaration)
+            .filter_map(|component| metadata(component, "mappingReason"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(permission_reasons.contains("approval_mode_not_portable"));
+        assert!(permission_reasons.contains("deny_pattern_not_portable"));
+        assert!(permission_reasons.contains("permanent_allowlist_not_portable"));
+        for component in &imported.components {
+            assert_eq!(metadata(component, "profile"), Some("coder"));
+            assert!(metadata(component, "structuralLocation").is_some());
+            assert!(metadata(component, "nativeFormat").is_some());
+        }
+    }
+}
+
+#[test]
+fn import_serialization_contains_no_secret_or_operational_canary() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let imported = import_everything(&fixture, true);
+    let memories = fixture.adapter.import_native_memory().unwrap();
+    let serialized =
+        format!("{}|{memories:?}", serde_json::to_string(&imported).unwrap()).to_ascii_lowercase();
+    for excluded in [
+        "must-not-import",
+        "openrouter_api_key",
+        "authorization",
+        ".env",
+        "auth.json",
+        "sessions",
+        "state.db",
+        "gateway.pid",
+        "gateway_state.json",
+        "channels",
+        "logs",
+    ] {
+        assert!(
+            !serialized.contains(excluded),
+            "serialized Hermes import exposed {excluded}"
+        );
+    }
+}
+
+#[test]
+fn secret_bearing_yaml_fields_are_removed_before_component_creation() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let imported = import_everything(&fixture, true);
+    let serialized = serde_json::to_string(&imported).unwrap();
+    for secret in [
+        "must-not-import-yaml-header",
+        "must-not-import-yaml-env",
+        "must-not-import-provider-key",
+    ] {
+        assert!(!serialized.contains(secret));
+    }
+    let docs = imported
+        .components
+        .iter()
+        .find(|component| component.kind == ComponentKind::McpServer && component.name == "docs")
+        .unwrap();
+    assert_eq!(metadata(docs, "redacted"), Some("true"));
+    assert_eq!(metadata(docs, "secretReferenceNames"), Some("HEADER_TOKEN"));
+    assert!(!docs.body_markdown.contains("headers"));
+    let local = imported
+        .components
+        .iter()
+        .find(|component| component.kind == ComponentKind::McpServer && component.name == "local")
+        .unwrap();
+    assert_eq!(metadata(local, "redacted"), Some("true"));
+    assert_eq!(metadata(local, "secretReferenceNames"), Some("DOCS_TOKEN"));
+    assert!(!local.body_markdown.contains("env"));
+}
+
+#[test]
+fn soul_and_nearest_project_context_have_exact_precedence() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let imported = import_everything(&fixture, true);
+    let soul = imported
+        .components
+        .iter()
+        .find(|component| metadata(component, "contextRole") == Some("soul"))
+        .unwrap();
+    assert_eq!(soul.name, "SOUL.md");
+    assert_eq!(metadata(soul, "precedenceIndex"), Some("0"));
+    assert_eq!(
+        metadata(soul, "structuralLocation"),
+        Some("profile:SOUL.md")
+    );
+    assert_eq!(metadata(soul, "profile"), Some("coder"));
+
+    let project = imported
+        .components
+        .iter()
+        .filter(|component| metadata(component, "contextRole") == Some("project"))
+        .collect::<Vec<_>>();
+    assert_eq!(project.len(), 1);
+    assert_eq!(project[0].name, ".hermes.md");
+    assert_eq!(metadata(project[0], "precedenceIndex"), Some("1"));
+    assert_eq!(
+        metadata(project[0], "structuralLocation"),
+        Some("project:service/.hermes.md")
+    );
+    assert_eq!(metadata(project[0], "profile"), Some("coder"));
+    assert!(
+        project[0]
+            .body_markdown
+            .contains("Preserve wire contracts.")
+    );
+    assert!(!project[0].body_markdown.contains("Fallback context."));
+    assert!(!project[0].body_markdown.contains("Root context."));
+}
+
+#[test]
+fn memory_documents_remain_typed_and_separate() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let memories = fixture.adapter.import_native_memory().unwrap();
+    assert_eq!(memories.len(), 2);
+    assert_eq!(memories[0].kind, HermesMemoryKind::Agent);
+    assert_eq!(memories[1].kind, HermesMemoryKind::User);
+    assert_ne!(memories[0].body_markdown, memories[1].body_markdown);
+    assert_ne!(memories[0].source_digest, memories[1].source_digest);
+    let imported = import_everything(&fixture, true);
+    assert!(imported.components.iter().all(|component| {
+        !component.body_markdown.contains("Hermes-owned prefix.")
+            && !component
+                .body_markdown
+                .contains("User prefers concise output.")
+    }));
+}
+
+#[test]
+fn skills_plugins_and_hooks_are_allowlist_walks() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let sentinels = install_non_execution_sentinels(&fixture);
+    let imported = import_everything(&fixture, true);
+    let serialized = serde_json::to_string(&imported).unwrap();
+    assert!(serialized.contains("Review the diff."));
+    assert!(serialized.contains("Nested review guidance."));
+    assert!(serialized.contains("Review changes."));
+    assert!(serialized.contains("profile:hooks/audit/handler.py"));
+    assert!(serialized.contains("Path("));
+    assert!(!serialized.contains("plugin.py"));
+    assert!(!serialized.contains("requirements.txt"));
+    assert!(!serialized.contains("ignored-hook.txt"));
+    for sentinel in sentinels {
+        assert!(!sentinel.exists(), "{} was executed", sentinel.display());
+    }
+}
+
+#[test]
+fn malformed_yaml_and_unsafe_topology_fail_closed_without_values() {
+    let cases = [
+        "approvals:\n  mode: smart\n  mode: must-not-import-duplicate\n",
+        "approvals: !must-not-import-tag\n  mode: smart\n",
+        "unknown: &outside\n  mode: must-not-import-alias\napprovals: *outside\n",
+        "approvals:\n  <<: {mode: must-not-import-merge}\n",
+        "approvals:\n  ? [not, string]\n  : must-not-import-key\n",
+        "approvals:\n  nested:\n    a:\n      b:\n        c:\n          d:\n            e:\n              f:\n                g:\n                  h:\n                    i:\n                      j:\n                        k:\n                          l:\n                            m:\n                              n:\n                                o:\n                                  p:\n                                    q:\n                                      r:\n                                        s:\n                                          t:\n                                            u:\n                                              v:\n                                                w:\n                                                  x:\n                                                    y:\n                                                      z:\n                                                        aa:\n                                                          bb:\n                                                            cc:\n                                                              dd:\n                                                                ee:\n                                                                  ff: must-not-import-depth\n",
+    ];
+    for yaml in cases {
+        let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+        fs::write(fixture.layout.profile.hermes_home.join("config.yaml"), yaml).unwrap();
+        let rendered = format!("{:?}", global_import_error(&fixture));
+        assert!(!rendered.contains("must-not-import"));
+    }
+
+    let collection_fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let collection = (0..257)
+        .map(|index| format!("  key{index}: value\n"))
+        .collect::<String>();
+    fs::write(
+        collection_fixture
+            .layout
+            .profile
+            .hermes_home
+            .join("config.yaml"),
+        format!("approvals:\n{collection}"),
+    )
+    .unwrap();
+    assert!(!format!("{:?}", global_import_error(&collection_fixture)).contains("value"));
+
+    let markdown_fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    fs::write(
+        markdown_fixture.layout.profile.hermes_home.join("SOUL.md"),
+        "-----BEGIN PRIVATE KEY-----\nmust-not-import-markdown\n",
+    )
+    .unwrap();
+    assert!(!format!("{:?}", global_import_error(&markdown_fixture)).contains("must-not-import"));
+
+    #[cfg(unix)]
+    {
+        let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+        let outside = fixture.root.join("outside-skill");
+        fs::write(&outside, "must-not-import-symlink").unwrap();
+        let target = fixture
+            .layout
+            .profile
+            .hermes_home
+            .join("skills/review/SKILL.md");
+        fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(outside, target).unwrap();
+        assert!(!format!("{:?}", global_import_error(&fixture)).contains("must-not-import"));
+    }
+}
+
+#[test]
+fn disabled_components_respect_include_disabled() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let enabled = import_everything(&fixture, false);
+    assert!(!enabled.components.iter().any(|component| {
+        (component.kind == ComponentKind::Plugin && component.name == "legacy")
+            || (component.kind == ComponentKind::McpServer && component.name == "old")
+            || (component.kind == ComponentKind::Hook && component.name == "disabled")
+    }));
+    let all = import_everything(&fixture, true);
+    for (kind, name) in [
+        (ComponentKind::Plugin, "legacy"),
+        (ComponentKind::McpServer, "old"),
+        (ComponentKind::Hook, "disabled"),
+    ] {
+        let component = all
+            .components
+            .iter()
+            .find(|component| component.kind == kind && component.name == name)
+            .unwrap();
+        assert!(
+            component.archived || metadata(component, "enabled") == Some("false"),
+            "{kind:?} {name} was not marked disabled"
         );
     }
 }
@@ -254,7 +620,7 @@ fn invalid_nested_symlinked_and_case_colliding_profiles_are_ignored() {
     fs::create_dir_all(fixture.profiles_root.join("Coder")).unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(
-        &fixture.profiles_root.join("writer"),
+        fixture.profiles_root.join("writer"),
         fixture.profiles_root.join("linked"),
     )
     .unwrap();
