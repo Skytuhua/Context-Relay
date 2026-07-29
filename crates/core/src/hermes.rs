@@ -3,8 +3,10 @@
 //! The adapter attests one explicit profile before importing only reviewed
 //! configuration and file surfaces. Native rendering remains closed.
 
+mod gateway;
 mod import;
 mod profile;
+mod render;
 mod yaml;
 
 use std::{
@@ -269,6 +271,21 @@ impl HarnessAdapter for HermesAdapter {
         if ascii_lowercase(requested) != self.layout.profile.name {
             return Err(invalid("Hermes probe profile does not match the adapter"));
         }
+        let mut policy_conflicts = self.import_policy_conflicts();
+        match gateway::inspect_gateway(&self.layout.profile)? {
+            gateway::GatewayStatus::Idle => {}
+            gateway::GatewayStatus::Stale => policy_conflicts.push("gateway_state_stale".into()),
+            gateway::GatewayStatus::Live => {
+                policy_conflicts.push("frozen_session_snapshot".into());
+                policy_conflicts.push("gateway_state_live".into());
+            }
+            gateway::GatewayStatus::Unverifiable => {
+                policy_conflicts.push("frozen_session_snapshot".into());
+                policy_conflicts.push("gateway_state_unverifiable".into());
+            }
+        }
+        policy_conflicts.sort();
+        policy_conflicts.dedup();
         Ok(ProbeReport {
             executable: Some(wire_path(&self.layout.executable)),
             executable_sha256: Some(self.executable_hash),
@@ -276,7 +293,7 @@ impl HarnessAdapter for HermesAdapter {
             installation_method: self.layout.installation_method,
             config_roots: vec![self.profile_home_wire(), self.project_root_wire()],
             active_profile: Some(self.layout.profile.name.clone()),
-            policy_conflicts: self.import_policy_conflicts(),
+            policy_conflicts,
             capability: self.capability(),
         })
     }
@@ -330,16 +347,20 @@ impl HarnessAdapter for HermesAdapter {
         Ok(imported)
     }
 
-    fn render(&self, _desired: &DesiredState) -> Result<RenderedState, ClientError> {
-        Err(phase_unsupported())
+    fn render(&self, desired: &DesiredState) -> Result<RenderedState, ClientError> {
+        self.render_desired(desired)
     }
 
-    fn classify(&self, _diff: &SemanticDiff) -> Result<ClassifiedChanges, ClientError> {
-        Err(phase_unsupported())
+    fn classify(&self, diff: &SemanticDiff) -> Result<ClassifiedChanges, ClientError> {
+        self.classify_changes(diff)
     }
 
-    fn plan_cli_ops(&self, _changes: &ClassifiedChanges) -> Result<CliOperations, ClientError> {
-        Err(phase_unsupported())
+    fn plan_cli_ops(&self, changes: &ClassifiedChanges) -> Result<CliOperations, ClientError> {
+        self.require_apply_supported()?;
+        changes
+            .validate()
+            .map_err(|_| invalid("Hermes changes are invalid"))?;
+        Ok(CliOperations(vec![]))
     }
 
     fn validate_effective(&self, _receipt: &ApplyReceipt) -> Result<ValidationReport, ClientError> {
@@ -695,7 +716,7 @@ pub(super) fn not_found(message: &'static str) -> ClientError {
     }
 }
 
-fn conflict(message: &'static str) -> ClientError {
+pub(super) fn conflict(message: &'static str) -> ClientError {
     ClientError {
         code: ErrorCode::Conflict,
         message: message.into(),

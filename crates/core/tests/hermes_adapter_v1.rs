@@ -8,10 +8,14 @@ use std::{
 use context_relay_core::hermes::{
     HermesAdapter, HermesExecutableKind, HermesLayout, HermesMemoryKind, HermesProfile,
 };
+use context_relay_core::native_transaction::{
+    engine::NativeFileSystem, filesystem::OsNativeTransactionFileSystem,
+};
+use context_relay_native_runner::{NativeState, OsNativeFileSystem};
 use context_relay_protocol::{
-    CapabilityLevel, ComponentKind, ComponentRecord, DeviceId, ErrorCode, HarnessAdapter,
-    HarnessId, HybridLogicalClock, ImportRequest, InstallationMethod, NativeScope, ProbeContext,
-    ProjectId,
+    CapabilityLevel, ChangeClass, ClassifiedChange, ComponentKind, ComponentRecord, DesiredState,
+    DeviceId, ErrorCode, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest,
+    InstallationMethod, NativeScope, ProbeContext, ProjectId, SemanticDiff,
 };
 use serde_json::{Map, Value};
 
@@ -180,11 +184,665 @@ fn import_everything(
     }
 }
 
+fn import_global(fixture: &Fixture) -> context_relay_protocol::ImportedState {
+    fixture
+        .adapter
+        .import(&ImportRequest {
+            scopes: vec![NativeScope::Global],
+            include_disabled: true,
+        })
+        .unwrap()
+}
+
+fn desired_global(_fixture: &Fixture, components: Vec<ComponentRecord>) -> DesiredState {
+    DesiredState {
+        components,
+        scopes: vec![NativeScope::Global],
+    }
+}
+
+fn clear_gateway_records(fixture: &Fixture) {
+    for name in ["gateway.pid", "gateway_state.json", "gateway.lock"] {
+        let path = fixture.layout.profile.hermes_home.join(name);
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+    }
+}
+
+fn intended_bytes(
+    mutation: &context_relay_core::native_transaction::model::ApprovedMutation,
+) -> Vec<u8> {
+    match NativeState::decode_v1(&mutation.content).unwrap() {
+        NativeState::RegularFile { bytes, .. } => bytes,
+        NativeState::Absent { .. } => panic!("Hermes planned an unexpected absence"),
+    }
+}
+
+fn component_at(
+    components: &[ComponentRecord],
+    kind: ComponentKind,
+    location: &str,
+) -> ComponentRecord {
+    components
+        .iter()
+        .find(|component| {
+            component.kind == kind && metadata(component, "structuralLocation") == Some(location)
+        })
+        .unwrap()
+        .clone()
+}
+
 fn metadata<'a>(component: &'a ComponentRecord, key: &str) -> Option<&'a str> {
     component
         .metadata
         .iter()
         .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
+}
+
+#[test]
+fn yaml_patch_preserves_unowned_bytes_comments_order_and_scalar_style() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let source = concat!(
+        "# root comment\r\n",
+        "unknown_root: 'preserve-single-quotes'\r\n",
+        "approvals:\r\n",
+        "  timeout: 1\r\n",
+        "plugins:\r\n",
+        "  unknown_child: preserve-me\r\n",
+        "  enabled:\r\n",
+        "    - reviewer\r\n",
+        "  disabled:\r\n",
+        "    - legacy\r\n",
+        "mcp_servers:\r\n",
+        "  docs:\r\n",
+        "    url: https://example.com/mcp\r\n",
+        "    sibling: 'keep-style'\r\n",
+        "hooks:\r\n",
+        "  shell:\r\n",
+        "    enabled: true\r\n",
+    );
+    fs::write(
+        fixture.layout.profile.hermes_home.join("config.yaml"),
+        source,
+    )
+    .unwrap();
+    let imported = import_global(&fixture);
+    let mut permission = component_at(
+        &imported.components,
+        ComponentKind::PermissionDeclaration,
+        "config:approvals.timeout",
+    );
+    permission.body_markdown = "2".into();
+    let mut plugin = component_at(
+        &imported.components,
+        ComponentKind::Plugin,
+        "config:plugins.enabled.reviewer",
+    );
+    plugin.archived = true;
+    let desired = desired_global(&fixture, vec![permission, plugin]);
+    let mutation = fixture
+        .adapter
+        .plan_native_config(&desired)
+        .unwrap()
+        .unwrap();
+    let rendered = String::from_utf8(intended_bytes(&mutation)).unwrap();
+
+    for unchanged in [
+        "# root comment\r\n",
+        "unknown_root: 'preserve-single-quotes'\r\n",
+        "  unknown_child: preserve-me\r\n",
+        "    url: https://example.com/mcp\r\n",
+        "    sibling: 'keep-style'\r\n",
+    ] {
+        assert!(
+            rendered.contains(unchanged),
+            "lost exact bytes: {unchanged:?}"
+        );
+    }
+    assert!(rendered.contains("  timeout: 2\r\n"));
+    assert!(!rendered.replace("\r\n", "").contains('\n'));
+    assert!(rendered.contains("  disabled:\r\n    - legacy\r\n    - reviewer\r\n"));
+}
+
+#[test]
+fn semantic_noop_produces_no_rendered_file_or_mutation() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let imported = import_global(&fixture);
+    let desired = desired_global(&fixture, imported.components.clone());
+    assert!(fixture.adapter.render(&desired).unwrap().files.is_empty());
+    assert!(
+        fixture
+            .adapter
+            .plan_native_config(&desired)
+            .unwrap()
+            .is_none()
+    );
+
+    let soul = component_at(&imported.components, ComponentKind::Rule, "profile:SOUL.md");
+    assert!(
+        fixture
+            .adapter
+            .plan_native_markdown(&soul)
+            .unwrap()
+            .is_none()
+    );
+    for memory in fixture.adapter.import_native_memory().unwrap() {
+        assert!(
+            fixture
+                .adapter
+                .plan_native_memory(memory.kind, &memory.body_markdown)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn managed_markdown_and_memory_preserve_unmanaged_bytes() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let imported = import_global(&fixture);
+    let mut soul = component_at(&imported.components, ComponentKind::Rule, "profile:SOUL.md");
+    let soul_path = fixture.layout.profile.hermes_home.join("SOUL.md");
+    fs::write(
+        &soul_path,
+        "user prefix\r\n<!-- context-relay:start -->\r\nold\r\n<!-- context-relay:end -->\r\nuser suffix\r\n",
+    )
+    .unwrap();
+    soul.body_markdown = "new managed".into();
+    let mutation = fixture
+        .adapter
+        .plan_native_markdown(&soul)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(intended_bytes(&mutation)).unwrap(),
+        "user prefix\r\n<!-- context-relay:start -->\r\nnew managed\r\n<!-- context-relay:end -->\r\nuser suffix\r\n"
+    );
+
+    soul.archived = true;
+    let mutation = fixture
+        .adapter
+        .plan_native_markdown(&soul)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(intended_bytes(&mutation)).unwrap(),
+        "user prefix\r\nuser suffix\r\n"
+    );
+
+    let memory_path = fixture
+        .layout
+        .profile
+        .hermes_home
+        .join("memories/MEMORY.md");
+    fs::write(
+        &memory_path,
+        "memory prefix\n<!-- context-relay:start -->\nold\n<!-- context-relay:end -->\nmemory suffix\n",
+    )
+    .unwrap();
+    let mutation = fixture
+        .adapter
+        .plan_native_memory(HermesMemoryKind::Agent, "new memory")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(intended_bytes(&mutation)).unwrap(),
+        "memory prefix\n<!-- context-relay:start -->\nnew memory\n<!-- context-relay:end -->\nmemory suffix\n"
+    );
+
+    for malformed in [
+        "<!-- context-relay:start -->\na\n<!-- context-relay:start -->\nb\n<!-- context-relay:end -->\n",
+        "<!-- context-relay:start -->\na\n<!-- context-relay:end -->\n<!-- context-relay:end -->\n",
+        "<!-- context-relay:start -->\na\n",
+        "a\n<!-- context-relay:end -->\n",
+        "<!-- context-relay:end -->\na\n<!-- context-relay:start -->\n",
+    ] {
+        fs::write(&soul_path, malformed).unwrap();
+        let error = fixture.adapter.plan_native_markdown(&soul).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+    }
+}
+
+#[test]
+fn redacted_or_secret_bearing_desired_state_cannot_render() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let imported = import_global(&fixture);
+    let template = component_at(
+        &imported.components,
+        ComponentKind::McpServer,
+        "config:mcp_servers.docs",
+    );
+    for rejected in [
+        "<redacted>",
+        "ghp_must-not-render-token",
+        "-----BEGIN PRIVATE KEY----- must-not-render-private",
+        "Authorization: Bearer must-not-render-authorization",
+        "https://user:must-not-render-password@example.com/mcp",
+    ] {
+        let mut component = template.clone();
+        component.body_markdown = serde_json::to_string(&serde_json::json!({
+            "command": rejected,
+            "enabled": true
+        }))
+        .unwrap();
+        let desired = desired_global(&fixture, vec![component]);
+        let error = fixture.adapter.render(&desired).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(!format!("{error:?}").contains(rejected));
+    }
+}
+
+#[test]
+fn unsupported_permission_mappings_are_visible_in_probe_and_preview() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let report = probe(&fixture.adapter, Some("coder"));
+    assert_eq!(
+        report.policy_conflicts,
+        vec![
+            "approval_mode_not_portable".to_owned(),
+            "deny_pattern_not_portable".to_owned(),
+            "frozen_session_snapshot".to_owned(),
+            "gateway_state_unverifiable".to_owned(),
+            "permanent_allowlist_not_portable".to_owned(),
+        ]
+    );
+    let classified = fixture
+        .adapter
+        .classify(&SemanticDiff {
+            changes: vec![
+                ClassifiedChange {
+                    class: ChangeClass::Update,
+                    target:
+                        "hermes-permission|coder|lossy|approvals.mode|approval_mode_not_portable"
+                            .into(),
+                    summary: "must-not-preview-native-value".into(),
+                },
+                ClassifiedChange {
+                    class: ChangeClass::Update,
+                    target: "hermes-permission|coder|exact|approvals.mode|-".into(),
+                    summary: "exact native change".into(),
+                },
+            ],
+            conflicts: vec![],
+        })
+        .unwrap();
+    assert_eq!(classified.0[0].class, ChangeClass::Conflict);
+    assert_eq!(
+        classified.0[0].summary,
+        "lossy Hermes permission mapping: approval_mode_not_portable"
+    );
+    assert!(
+        !classified.0[0]
+            .summary
+            .contains("must-not-preview-native-value")
+    );
+    assert_eq!(classified.0[1].class, ChangeClass::Update);
+}
+
+#[test]
+fn unresolved_lossy_permission_change_cannot_render_or_plan() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let before = fs::read(fixture.layout.profile.hermes_home.join("config.yaml")).unwrap();
+    let imported = import_global(&fixture);
+    let mut lossy = component_at(
+        &imported.components,
+        ComponentKind::PermissionDeclaration,
+        "config:approvals.mode",
+    );
+    lossy.body_markdown = "\"manual\"".into();
+    let desired = desired_global(&fixture, vec![lossy]);
+    assert_eq!(
+        fixture.adapter.render(&desired).unwrap_err().code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        fixture
+            .adapter
+            .plan_native_config(&desired)
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        fs::read(fixture.layout.profile.hermes_home.join("config.yaml")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn live_selected_profile_gateway_blocks_every_active_change() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let profile = &fixture.layout.profile.hermes_home;
+    fs::write(profile.join("gateway.pid"), b"{malformed").unwrap();
+    fs::remove_file(profile.join("gateway_state.json")).unwrap();
+    assert!(
+        probe(&fixture.adapter, Some("coder"))
+            .policy_conflicts
+            .contains(&"gateway_state_unverifiable".to_owned())
+    );
+    let imported = import_global(&fixture);
+    let config_components = imported
+        .components
+        .iter()
+        .filter(|component| {
+            metadata(component, "structuralLocation")
+                .is_some_and(|location| location.starts_with("config:"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let desired = desired_global(&fixture, config_components);
+    assert_eq!(
+        fixture.adapter.render(&desired).unwrap_err().code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        fixture
+            .adapter
+            .plan_native_config(&desired)
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+
+    let manifest = component_at(
+        &imported.components,
+        ComponentKind::Hook,
+        "profile:hooks/audit/HOOK.yaml",
+    );
+    let handler = component_at(
+        &imported.components,
+        ComponentKind::Hook,
+        "profile:hooks/audit/handler.py",
+    );
+    assert_eq!(
+        fixture
+            .adapter
+            .plan_native_gateway_hook(&manifest, Some(&handler))
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+
+    let mut soul = component_at(&imported.components, ComponentKind::Rule, "profile:SOUL.md");
+    soul.body_markdown.push_str("\nPassive update.");
+    assert!(
+        fixture
+            .adapter
+            .plan_native_markdown(&soul)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fixture
+            .adapter
+            .plan_native_memory(HermesMemoryKind::Agent, "Passive memory update.")
+            .unwrap()
+            .is_some()
+    );
+    let passive = fixture
+        .adapter
+        .classify(&SemanticDiff {
+            changes: vec![ClassifiedChange {
+                class: ChangeClass::Update,
+                target: "hermes-markdown|coder|profile:SOUL.md".into(),
+                summary: "passive Markdown update".into(),
+            }],
+            conflicts: vec![],
+        })
+        .unwrap();
+    assert_eq!(passive.0[0].class, ChangeClass::Update);
+    assert!(passive.0[0].summary.contains("frozen_session_snapshot"));
+    assert!(
+        probe(&fixture.adapter, Some("coder"))
+            .policy_conflicts
+            .contains(&"frozen_session_snapshot".to_owned())
+    );
+}
+
+#[test]
+fn other_profile_gateway_does_not_block_selected_profile() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    fs::write(
+        fixture.profiles_root.join("writer/gateway.pid"),
+        b"{malformed",
+    )
+    .unwrap();
+    let imported = import_global(&fixture);
+    let mut permission = component_at(
+        &imported.components,
+        ComponentKind::PermissionDeclaration,
+        "config:approvals.mode",
+    );
+    permission.body_markdown = permission.body_markdown.clone();
+    let desired = desired_global(&fixture, vec![permission]);
+    assert!(
+        fixture
+            .adapter
+            .plan_native_config(&desired)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn stale_dead_gateway_is_nonblocking_and_reported() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let profile = &fixture.layout.profile.hermes_home;
+    let stale = r#"{"pid":999999,"kind":"gateway","argv":["hermes","gateway","run","--profile","coder"],"start_time":1}"#;
+    fs::write(profile.join("gateway.pid"), stale).unwrap();
+    fs::write(profile.join("gateway_state.json"), stale).unwrap();
+    let imported = import_global(&fixture);
+    let mut exact = component_at(
+        &imported.components,
+        ComponentKind::PermissionDeclaration,
+        "config:approvals.deny",
+    );
+    exact.body_markdown = exact.body_markdown.clone();
+    let desired = desired_global(&fixture, vec![exact]);
+    assert!(
+        fixture
+            .adapter
+            .plan_native_config(&desired)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        probe(&fixture.adapter, Some("coder"))
+            .policy_conflicts
+            .contains(&"gateway_state_stale".to_owned())
+    );
+}
+
+#[test]
+fn malformed_recycled_or_foreign_gateway_state_blocks_active_apply() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let profile = &fixture.layout.profile.hermes_home;
+    let imported = import_global(&fixture);
+    let desired = desired_global(
+        &fixture,
+        vec![component_at(
+            &imported.components,
+            ComponentKind::PermissionDeclaration,
+            "config:approvals.mode",
+        )],
+    );
+    for record in [
+        "{malformed".to_owned(),
+        format!(
+            r#"{{"pid":{},"kind":"gateway","argv":["hermes","gateway","run","--profile","coder"],"start_time":1}}"#,
+            std::process::id()
+        ),
+        format!(
+            r#"{{"pid":{},"kind":"gateway","argv":["not-hermes","gateway","run","--profile","coder"],"start_time":1}}"#,
+            std::process::id()
+        ),
+        format!(
+            r#"{{"pid":{},"kind":"gateway","argv":["hermes","gateway","run","--profile","writer"],"start_time":1}}"#,
+            std::process::id()
+        ),
+    ] {
+        fs::write(profile.join("gateway.pid"), record).unwrap();
+        if profile.join("gateway_state.json").exists() {
+            fs::remove_file(profile.join("gateway_state.json")).unwrap();
+        }
+        assert_eq!(
+            fixture
+                .adapter
+                .plan_native_config(&desired)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+    }
+}
+
+#[test]
+fn concurrent_native_edit_invalidates_planned_config_and_memory() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let imported = import_global(&fixture);
+    let mut plugin = component_at(
+        &imported.components,
+        ComponentKind::Plugin,
+        "config:plugins.enabled.reviewer",
+    );
+    plugin.archived = true;
+    let config = fixture
+        .adapter
+        .plan_native_config(&desired_global(&fixture, vec![plugin]))
+        .unwrap()
+        .unwrap();
+    let memory = fixture
+        .adapter
+        .plan_native_memory(HermesMemoryKind::Agent, "changed memory")
+        .unwrap()
+        .unwrap();
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    let memory_path = fixture
+        .layout
+        .profile
+        .hermes_home
+        .join("memories/MEMORY.md");
+    let config_before = fs::read(&config_path).unwrap();
+    let memory_before = fs::read(&memory_path).unwrap();
+    fs::write(&config_path, b"concurrent config").unwrap();
+    fs::write(&memory_path, b"concurrent memory").unwrap();
+    let mut native = OsNativeTransactionFileSystem::new([13; 16]);
+    assert!(native.create_before_images(&[config]).is_err());
+    let mut native = OsNativeTransactionFileSystem::new([14; 16]);
+    assert!(native.create_before_images(&[memory]).is_err());
+    fs::write(&config_path, &config_before).unwrap();
+    fs::write(&memory_path, &memory_before).unwrap();
+    assert_eq!(fs::read(&config_path).unwrap(), config_before);
+    assert_eq!(fs::read(&memory_path).unwrap(), memory_before);
+
+    let before_snapshot = OsNativeFileSystem::new().snapshot(&memory_path).unwrap();
+    let rollback_mutation = fixture
+        .adapter
+        .plan_native_memory(HermesMemoryKind::Agent, "rollback verification memory")
+        .unwrap()
+        .unwrap();
+    let nonce = [16; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native
+        .create_before_images(std::slice::from_ref(&rollback_mutation))
+        .unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native
+        .compare_and_swap_targets(std::slice::from_ref(&rollback_mutation))
+        .unwrap();
+    native.apply_mutation(&nonce, &rollback_mutation).unwrap();
+    native.restore_matching_applied_targets(&nonce).unwrap();
+    let restored = OsNativeFileSystem::new().snapshot(&memory_path).unwrap();
+    let (
+        NativeState::RegularFile {
+            bytes: before_bytes,
+            metadata: before_metadata,
+        },
+        NativeState::RegularFile {
+            bytes: restored_bytes,
+            metadata: restored_metadata,
+        },
+    ) = (before_snapshot.state(), restored.state())
+    else {
+        panic!("Hermes memory remained a regular file");
+    };
+    assert_eq!(restored_bytes, before_bytes);
+    assert_eq!(
+        restored_metadata.file_attributes(),
+        before_metadata.file_attributes()
+    );
+    assert_eq!(
+        restored_metadata.creation_time(),
+        before_metadata.creation_time()
+    );
+    assert_eq!(
+        restored_metadata.last_write_time(),
+        before_metadata.last_write_time()
+    );
+    assert_eq!(
+        restored_metadata.security_descriptor(),
+        before_metadata.security_descriptor()
+    );
+    assert_eq!(
+        restored_metadata.alternate_streams(),
+        before_metadata.alternate_streams()
+    );
+}
+
+#[test]
+fn absent_gateway_hook_files_use_a_safe_template_and_reject_concurrent_creation() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let imported = import_global(&fixture);
+    let manifest = component_at(
+        &imported.components,
+        ComponentKind::Hook,
+        "profile:hooks/audit/HOOK.yaml",
+    );
+    let handler = component_at(
+        &imported.components,
+        ComponentKind::Hook,
+        "profile:hooks/audit/handler.py",
+    );
+    let manifest_path = fixture
+        .layout
+        .profile
+        .hermes_home
+        .join("hooks/audit/HOOK.yaml");
+    let handler_path = fixture
+        .layout
+        .profile
+        .hermes_home
+        .join("hooks/audit/handler.py");
+    fs::remove_file(&manifest_path).unwrap();
+    fs::remove_file(&handler_path).unwrap();
+    let mutations = fixture
+        .adapter
+        .plan_native_gateway_hook(&manifest, Some(&handler))
+        .unwrap();
+    assert_eq!(mutations.len(), 2);
+    assert!(mutations.iter().all(|mutation| matches!(
+        NativeState::decode_v1(&mutation.content).unwrap(),
+        NativeState::RegularFile { .. }
+    )));
+    fs::write(&manifest_path, "concurrent hook creation").unwrap();
+    let manifest_mutation = mutations
+        .into_iter()
+        .find(|mutation| mutation.target.display.as_deref() == manifest_path.to_str())
+        .unwrap();
+    assert!(
+        OsNativeTransactionFileSystem::new([15; 16])
+            .create_before_images(&[manifest_mutation])
+            .is_err()
+    );
 }
 
 fn global_import_error(fixture: &Fixture) -> context_relay_protocol::ClientError {
@@ -243,6 +901,8 @@ fn supported_release_fixtures_bind_one_named_profile() {
             vec![
                 "approval_mode_not_portable".to_owned(),
                 "deny_pattern_not_portable".to_owned(),
+                "frozen_session_snapshot".to_owned(),
+                "gateway_state_unverifiable".to_owned(),
                 "permanent_allowlist_not_portable".to_owned(),
             ]
         );

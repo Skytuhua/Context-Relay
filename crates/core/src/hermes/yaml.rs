@@ -83,6 +83,205 @@ pub(super) fn topology_supported(parsed: &ParsedHermesYaml) -> bool {
     true
 }
 
+pub(super) fn patch_owned_paths(
+    parsed: &ParsedHermesYaml,
+    replacements: &BTreeMap<Vec<String>, Option<Value>>,
+) -> Result<Vec<u8>, ClientError> {
+    if !topology_supported(parsed) {
+        return Err(invalid("Hermes reviewed config topology is unsupported"));
+    }
+    let line_ending = source_line_ending(&parsed.source)?;
+    let mut expected = parsed.value.clone();
+    let mut edits = Vec::<(usize, usize, Vec<u8>)>::new();
+    let mut insertions = BTreeMap::<usize, Vec<(Vec<String>, Vec<u8>)>>::new();
+
+    for (path, replacement) in replacements {
+        if !owned_replacement_path(path) {
+            return Err(invalid("Hermes config replacement path is not owned"));
+        }
+        if matches!(
+            path.as_slice(),
+            [root] if matches!(root.as_str(), "plugins" | "mcp_servers" | "hooks")
+        ) && resolve_path(&parsed.value, path).is_some()
+        {
+            return Err(invalid(
+                "Hermes config replacement would overwrite unowned children",
+            ));
+        }
+        set_semantic_path(&mut expected, path, replacement.clone())?;
+        if let Some(span) = parsed.patch_index.paths.get(path) {
+            let bytes = replacement
+                .as_ref()
+                .map(|value| {
+                    render_key_value(path.last().unwrap(), value, span.indent, line_ending)
+                })
+                .transpose()?
+                .unwrap_or_default();
+            edits.push((span.start, span.end, bytes));
+            continue;
+        }
+        let Some(value) = replacement.as_ref() else {
+            continue;
+        };
+        let parent = &path[..path.len() - 1];
+        let (offset, indent) = if parent.is_empty() {
+            (parsed.source.len(), 0)
+        } else {
+            let span = parsed
+                .patch_index
+                .paths
+                .get(parent)
+                .ok_or_else(|| invalid("Hermes config insertion parent is unavailable"))?;
+            let parent_value = resolve_path(&parsed.value, parent)
+                .ok_or_else(|| invalid("Hermes config insertion parent is unavailable"))?;
+            if !matches!(parent_value, Value::Mapping(_)) {
+                return Err(invalid("Hermes config insertion parent is not a mapping"));
+            }
+            (span.end, span.indent + 2)
+        };
+        let rendered = render_key_value(path.last().unwrap(), value, indent, line_ending)?;
+        insertions
+            .entry(offset)
+            .or_default()
+            .push((path.clone(), rendered));
+    }
+
+    for (offset, mut values) in insertions {
+        values.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut bytes = Vec::new();
+        if offset > 0 && !parsed.source[..offset].ends_with(line_ending.as_bytes()) {
+            bytes.extend_from_slice(line_ending.as_bytes());
+        }
+        for (_, value) in values {
+            bytes.extend_from_slice(&value);
+        }
+        edits.push((offset, offset, bytes));
+    }
+    edits.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    for window in edits.windows(2) {
+        let later = &window[0];
+        let earlier = &window[1];
+        if earlier.1 > later.0 {
+            return Err(invalid("Hermes config replacement spans overlap"));
+        }
+    }
+    let mut rendered = parsed.source.clone();
+    for (start, end, replacement) in edits {
+        if start > end || end > rendered.len() {
+            return Err(invalid("Hermes config replacement span is invalid"));
+        }
+        rendered.splice(start..end, replacement);
+    }
+    let reparsed = parse_config(&rendered)?;
+    if !topology_supported(&reparsed) {
+        return Err(invalid("Hermes rendered config topology is unsupported"));
+    }
+    if reparsed.value != expected {
+        return Err(invalid(
+            "Hermes rendered config changed an unowned semantic path",
+        ));
+    }
+    if reparsed.value == parsed.value {
+        Ok(parsed.source.clone())
+    } else {
+        Ok(rendered)
+    }
+}
+
+fn source_line_ending(source: &[u8]) -> Result<&'static str, ClientError> {
+    let mut saw_lf = false;
+    let mut saw_crlf = false;
+    for (index, byte) in source.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        if index > 0 && source[index - 1] == b'\r' {
+            saw_crlf = true;
+        } else {
+            saw_lf = true;
+        }
+    }
+    if saw_lf && saw_crlf {
+        return Err(invalid("Hermes config mixes line-ending conventions"));
+    }
+    Ok(if saw_crlf { "\r\n" } else { "\n" })
+}
+
+fn owned_replacement_path(path: &[String]) -> bool {
+    match path {
+        [root] => matches!(
+            root.as_str(),
+            "approvals" | "command_allowlist" | "plugins" | "mcp_servers" | "hooks"
+        ),
+        [root, _] if root == "approvals" || root == "mcp_servers" || root == "hooks" => true,
+        [root, state] if root == "plugins" && matches!(state.as_str(), "enabled" | "disabled") => {
+            true
+        }
+        _ => false,
+    }
+}
+
+fn set_semantic_path(
+    root: &mut Value,
+    path: &[String],
+    replacement: Option<Value>,
+) -> Result<(), ClientError> {
+    let (leaf, parent) = path
+        .split_last()
+        .ok_or_else(|| invalid("Hermes config replacement path is empty"))?;
+    let mut value = root;
+    for part in parent {
+        let Value::Mapping(mapping) = value else {
+            return Err(invalid("Hermes config replacement parent is not a mapping"));
+        };
+        value = mapping
+            .get_mut(Value::String(part.clone()))
+            .ok_or_else(|| invalid("Hermes config replacement parent is unavailable"))?;
+    }
+    let Value::Mapping(mapping) = value else {
+        return Err(invalid("Hermes config replacement parent is not a mapping"));
+    };
+    if let Some(replacement) = replacement {
+        mapping.insert(Value::String(leaf.clone()), replacement);
+    } else {
+        mapping.remove(Value::String(leaf.clone()));
+    }
+    Ok(())
+}
+
+fn render_key_value(
+    key: &str,
+    value: &Value,
+    indent: usize,
+    line_ending: &str,
+) -> Result<Vec<u8>, ClientError> {
+    let yaml = serde_yaml_ng::to_string(value)
+        .map_err(|_| invalid("Hermes reviewed value cannot be rendered"))?;
+    let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml);
+    let yaml = yaml.strip_suffix('\n').unwrap_or(yaml);
+    let prefix = " ".repeat(indent);
+    let mut output = String::new();
+    if !yaml.contains('\n') && !matches!(value, Value::Sequence(_) | Value::Mapping(_)) {
+        output.push_str(&prefix);
+        output.push_str(key);
+        output.push_str(": ");
+        output.push_str(yaml);
+        output.push_str(line_ending);
+    } else {
+        output.push_str(&prefix);
+        output.push_str(key);
+        output.push(':');
+        output.push_str(line_ending);
+        for line in yaml.split('\n') {
+            output.push_str(&prefix);
+            output.push_str("  ");
+            output.push_str(line);
+            output.push_str(line_ending);
+        }
+    }
+    Ok(output.into_bytes())
+}
+
 pub(super) fn scan_text_secret(bytes: &[u8], safe_location: &str) -> Result<(), ClientError> {
     if bytes.len() > MAX_MARKDOWN_BYTES {
         return Err(path_error(safe_location, "exceeds the size limit"));

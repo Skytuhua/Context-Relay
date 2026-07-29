@@ -1,0 +1,948 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Component, Path, PathBuf},
+};
+
+use context_relay_native_runner::{NativeState, OsNativeFileSystem};
+use context_relay_protocol::{
+    ChangeClass, ClassifiedChanges, ClientError, ComponentKind, ComponentRecord, DesiredState,
+    ErrorCode, HarnessId, MAX_MARKDOWN_BYTES, RenderedFile, RenderedState, ScopeRef, SemanticDiff,
+    Sha256Digest,
+};
+use serde_json::Value as JsonValue;
+use serde_yaml_ng::Value as YamlValue;
+use sha2::{Digest as _, Sha256};
+
+use crate::native_transaction::model::{
+    ApprovedMutation, MutationKind, RestorableStateFingerprint,
+};
+
+use super::{
+    HermesAdapter, HermesMemoryKind, MANAGED_END, MANAGED_START,
+    gateway::{self, GatewayStatus},
+    import, invalid, profile, wire_path,
+};
+
+const LOSSY_REASONS: [&str; 5] = [
+    "approval_mode_not_portable",
+    "deny_pattern_not_portable",
+    "permanent_allowlist_not_portable",
+    "cron_permission_not_portable",
+    "confirmation_switch_not_portable",
+];
+
+impl HermesAdapter {
+    pub fn plan_native_config(
+        &self,
+        desired: &DesiredState,
+    ) -> Result<Option<ApprovedMutation>, ClientError> {
+        self.require_apply_supported()?;
+        self.validate_desired(desired)?;
+        gateway::require_gateway_idle(&self.layout.profile)?;
+        let path = self.layout.profile.hermes_home.join("config.yaml");
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid("Hermes config cannot be safely inspected"))?;
+        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
+            return Err(invalid("Hermes config must be a regular file"));
+        };
+        let rendered = self.render_config(bytes, desired)?;
+        self.approved_regular_file(&path, &snapshot, rendered, metadata.clone())
+    }
+
+    pub fn plan_native_markdown(
+        &self,
+        component: &ComponentRecord,
+    ) -> Result<Option<ApprovedMutation>, ClientError> {
+        self.require_apply_supported()?;
+        self.validate_component(component)?;
+        if !matches!(
+            component.kind,
+            ComponentKind::Instruction | ComponentKind::Rule | ComponentKind::Skill
+        ) {
+            return Err(invalid("Hermes Markdown component is invalid"));
+        }
+        let path = self.markdown_path(component)?;
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid("Hermes Markdown cannot be safely inspected"))?;
+        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
+            return Err(invalid("Hermes Markdown must be a regular file"));
+        };
+        let rendered =
+            render_managed_markdown(bytes, &component.body_markdown, component.archived)?;
+        self.approved_regular_file(&path, &snapshot, rendered, metadata.clone())
+    }
+
+    pub fn plan_native_memory(
+        &self,
+        kind: HermesMemoryKind,
+        body_markdown: &str,
+    ) -> Result<Option<ApprovedMutation>, ClientError> {
+        self.require_apply_supported()?;
+        if body_markdown.chars().count() > MAX_MARKDOWN_BYTES {
+            return Err(invalid("Hermes memory exceeds the character limit"));
+        }
+        super::yaml::scan_text_secret(body_markdown.as_bytes(), "profile:memory")?;
+        let relative = match kind {
+            HermesMemoryKind::Agent => "memories/MEMORY.md",
+            HermesMemoryKind::User => "memories/USER.md",
+        };
+        let path = self.layout.profile.hermes_home.join(relative);
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid("Hermes memory cannot be safely inspected"))?;
+        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
+            return Err(invalid("Hermes memory must be a regular file"));
+        };
+        let rendered = render_managed_markdown(bytes, body_markdown, false)?;
+        self.approved_regular_file(&path, &snapshot, rendered, metadata.clone())
+    }
+
+    pub fn plan_native_gateway_hook(
+        &self,
+        manifest: &ComponentRecord,
+        handler: Option<&ComponentRecord>,
+    ) -> Result<Vec<ApprovedMutation>, ClientError> {
+        self.require_apply_supported()?;
+        self.validate_gateway_hook_pair(manifest, handler)?;
+        gateway::require_gateway_idle(&self.layout.profile)?;
+        let creation_metadata = std::iter::once(manifest)
+            .chain(handler)
+            .filter_map(|component| {
+                let path = self.gateway_hook_path(component).ok()?;
+                let snapshot = OsNativeFileSystem::new().snapshot(&path).ok()?;
+                match snapshot.state() {
+                    NativeState::RegularFile { metadata, .. } => Some(metadata.clone()),
+                    NativeState::Absent { .. } => None,
+                }
+            })
+            .next()
+            .or_else(|| {
+                let path = self.layout.profile.hermes_home.join("config.yaml");
+                let snapshot = OsNativeFileSystem::new().snapshot(&path).ok()?;
+                match snapshot.state() {
+                    NativeState::RegularFile { metadata, .. } => Some(metadata.clone()),
+                    NativeState::Absent { .. } => None,
+                }
+            });
+        let mut mutations = Vec::new();
+        for component in std::iter::once(manifest).chain(handler) {
+            let path = self.gateway_hook_path(component)?;
+            let snapshot = OsNativeFileSystem::new()
+                .snapshot(&path)
+                .map_err(|_| invalid("Hermes gateway hook cannot be safely inspected"))?;
+            let intended = if component.archived {
+                snapshot.absent_state()
+            } else {
+                super::yaml::scan_text_secret(
+                    component.body_markdown.as_bytes(),
+                    "profile:gateway-hook",
+                )?;
+                match snapshot.state() {
+                    NativeState::RegularFile { metadata, .. } => NativeState::regular_file(
+                        component.body_markdown.as_bytes().to_vec(),
+                        metadata.clone(),
+                    ),
+                    NativeState::Absent { .. } => NativeState::regular_file(
+                        component.body_markdown.as_bytes().to_vec(),
+                        creation_metadata.clone().ok_or_else(|| {
+                            invalid("Hermes new gateway hook needs an existing metadata template")
+                        })?,
+                    ),
+                }
+            };
+            if intended.fingerprint() == *snapshot.fingerprint() {
+                continue;
+            }
+            mutations.push(self.approved_state(&path, snapshot.fingerprint(), intended)?);
+        }
+        mutations.sort_by(|left, right| left.target.bytes.cmp(&right.target.bytes));
+        Ok(mutations)
+    }
+
+    pub(super) fn render_desired(
+        &self,
+        desired: &DesiredState,
+    ) -> Result<RenderedState, ClientError> {
+        self.require_apply_supported()?;
+        self.validate_desired(desired)?;
+        let active = desired.components.iter().any(is_active_component);
+        if active {
+            gateway::require_gateway_idle(&self.layout.profile)?;
+        }
+        let mut files = Vec::new();
+        if desired.components.iter().any(is_config_component) {
+            let path = self.layout.profile.hermes_home.join("config.yaml");
+            let existing = read_regular(&path, "Hermes config must be a regular file")?;
+            let rendered = self.render_config(&existing, desired)?;
+            if rendered != existing {
+                files.push(rendered_file(path, &rendered));
+            }
+        }
+        let mut gateway_hooks =
+            BTreeMap::<String, (Option<&ComponentRecord>, Option<&ComponentRecord>)>::new();
+        for component in &desired.components {
+            if is_config_component(component) {
+                continue;
+            }
+            if is_gateway_hook_component(component) {
+                let location = structural_location(component)?;
+                let directory = location
+                    .strip_prefix("profile:hooks/")
+                    .and_then(|rest| rest.rsplit_once('/').map(|(directory, _)| directory))
+                    .ok_or_else(|| invalid("Hermes gateway hook location is invalid"))?;
+                let entry = gateway_hooks.entry(directory.to_owned()).or_default();
+                if location.ends_with("/HOOK.yaml") {
+                    if entry.0.replace(component).is_some() {
+                        return Err(invalid("Hermes gateway hook manifest is repeated"));
+                    }
+                } else if location.ends_with("/handler.py") && entry.1.replace(component).is_some()
+                {
+                    return Err(invalid("Hermes gateway hook handler is repeated"));
+                }
+                continue;
+            }
+            if matches!(
+                component.kind,
+                ComponentKind::Instruction | ComponentKind::Rule | ComponentKind::Skill
+            ) {
+                let path = self.markdown_path(component)?;
+                let existing = read_regular(&path, "Hermes Markdown must be a regular file")?;
+                let rendered = render_managed_markdown(
+                    &existing,
+                    &component.body_markdown,
+                    component.archived,
+                )?;
+                if rendered != existing {
+                    files.push(rendered_file(path, &rendered));
+                }
+            }
+        }
+        for (_, (manifest, handler)) in gateway_hooks {
+            let manifest =
+                manifest.ok_or_else(|| invalid("Hermes gateway hook manifest is required"))?;
+            self.validate_gateway_hook_pair(manifest, handler)?;
+            for component in std::iter::once(manifest).chain(handler) {
+                let path = self.gateway_hook_path(component)?;
+                let existing = read_optional_regular(&path)?;
+                let rendered = if component.archived {
+                    Vec::new()
+                } else {
+                    component.body_markdown.as_bytes().to_vec()
+                };
+                if existing.as_deref() != Some(rendered.as_slice()) {
+                    files.push(rendered_file(path, &rendered));
+                }
+            }
+        }
+        files.sort_by(|left, right| left.path.bytes.cmp(&right.path.bytes));
+        Ok(RenderedState {
+            files,
+            cli_operations: vec![],
+        })
+    }
+
+    pub(super) fn classify_changes(
+        &self,
+        diff: &SemanticDiff,
+    ) -> Result<ClassifiedChanges, ClientError> {
+        diff.validate()
+            .map_err(|_| invalid("Hermes semantic diff is invalid"))?;
+        let permission_paths = self.reviewed_permission_paths()?;
+        let gateway_status = gateway::inspect_gateway(&self.layout.profile)?;
+        let mut changes = Vec::with_capacity(diff.changes.len());
+        for change in &diff.changes {
+            let mut classified = change.clone();
+            if change.target.starts_with("hermes-permission|") {
+                let parts = change.target.split('|').collect::<Vec<_>>();
+                if parts.len() != 5
+                    || parts[0] != "hermes-permission"
+                    || parts[1] != self.layout.profile.name
+                    || !permission_paths.contains(parts[3])
+                {
+                    return Err(invalid("Hermes permission change target is invalid"));
+                }
+                match (parts[2], parts[4]) {
+                    ("exact", "-") => {}
+                    ("lossy", reason) if LOSSY_REASONS.contains(&reason) => {
+                        classified.class = ChangeClass::Conflict;
+                        classified.summary = format!("lossy Hermes permission mapping: {reason}");
+                    }
+                    _ => return Err(invalid("Hermes permission change target is invalid")),
+                }
+            } else if !valid_nonpermission_target(&change.target, &self.layout.profile.name) {
+                return Err(invalid("Hermes change target is invalid"));
+            }
+            if is_passive_change_target(&change.target)
+                && matches!(
+                    gateway_status,
+                    GatewayStatus::Live | GatewayStatus::Unverifiable
+                )
+                && !classified.summary.contains("frozen_session_snapshot")
+            {
+                classified.summary.push_str(" [frozen_session_snapshot]");
+            }
+            changes.push(classified);
+        }
+        Ok(ClassifiedChanges(changes))
+    }
+
+    pub(super) fn require_apply_supported(&self) -> Result<(), ClientError> {
+        (self.capability() == context_relay_protocol::CapabilityLevel::Full)
+            .then_some(())
+            .ok_or_else(|| ClientError {
+                code: ErrorCode::HarnessUnsupported,
+                message: "This Hermes installation is import-only".into(),
+                field_path: None,
+                retryable: false,
+            })?;
+        profile::validate_profile_binding(&self.layout.default_hermes_home, &self.layout.profile)
+    }
+
+    fn validate_desired(&self, desired: &DesiredState) -> Result<(), ClientError> {
+        desired
+            .validate()
+            .map_err(|_| invalid("Desired Hermes state is invalid"))?;
+        let mut scopes = BTreeSet::new();
+        for scope in &desired.scopes {
+            let scope = import::validate_bound_scope(self, scope)?;
+            if !scopes.insert(scope_key(&scope)) {
+                return Err(invalid("Desired Hermes state repeated a scope"));
+            }
+        }
+        for component in &desired.components {
+            self.validate_component(component)?;
+            let expected_scope = match &component.scope {
+                ScopeRef::Global => "global".to_owned(),
+                ScopeRef::Project { project_id } => format!("project:{project_id}"),
+            };
+            if !scopes.contains(&expected_scope) {
+                return Err(invalid("Hermes component scope is not bound"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_component(&self, component: &ComponentRecord) -> Result<(), ClientError> {
+        component
+            .validate()
+            .map_err(|_| invalid("Hermes component is invalid"))?;
+        if component.provenance.harness != Some(HarnessId::Hermes) {
+            return Err(invalid("Hermes component provenance is invalid"));
+        }
+        if metadata(component, "profile") != Some(self.layout.profile.name.as_str()) {
+            return Err(invalid(
+                "Hermes component profile does not match the adapter",
+            ));
+        }
+        if component.body_markdown.contains(MANAGED_START)
+            || component.body_markdown.contains(MANAGED_END)
+            || component.body_markdown.contains("<redacted>")
+        {
+            return Err(invalid("Hermes desired body contains a forbidden sentinel"));
+        }
+        super::yaml::scan_text_secret(component.body_markdown.as_bytes(), "desired:component")?;
+        for (_, value) in &component.metadata {
+            if value == "<redacted>" || super::yaml::secret_scalar(value) {
+                return Err(invalid("Hermes desired metadata contains secret-like text"));
+            }
+        }
+        Ok(())
+    }
+
+    fn render_config(
+        &self,
+        existing: &[u8],
+        desired: &DesiredState,
+    ) -> Result<Vec<u8>, ClientError> {
+        let parsed = super::yaml::parse_config(existing)?;
+        let current = import::project_reviewed_config(&parsed, &self.layout.profile.name)?;
+        let current_by_location = current
+            .iter()
+            .filter_map(|component| {
+                metadata(component, "structuralLocation")
+                    .map(|location| (location.to_owned(), component))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut replacements = BTreeMap::<Vec<String>, Option<YamlValue>>::new();
+        let mut enabled_plugins = yaml_string_set(
+            resolve_yaml(&parsed.value, &["plugins", "enabled"]).and_then(YamlValue::as_sequence),
+        )?;
+        let mut disabled_plugins = yaml_string_set(
+            resolve_yaml(&parsed.value, &["plugins", "disabled"]).and_then(YamlValue::as_sequence),
+        )?;
+        let mut plugin_changed = false;
+        for component in desired
+            .components
+            .iter()
+            .filter(|component| is_config_component(component))
+        {
+            let location = structural_location(component)?;
+            if metadata(component, "redacted") == Some("true") {
+                let unchanged = current_by_location.get(location).is_some_and(|current| {
+                    current.body_markdown == component.body_markdown
+                        && current.archived == component.archived
+                });
+                if unchanged {
+                    continue;
+                }
+                return Err(invalid("Redacted Hermes configuration cannot be rendered"));
+            }
+            super::yaml::scan_text_secret(
+                component.body_markdown.as_bytes(),
+                "profile:config.yaml",
+            )?;
+            match component.kind {
+                ComponentKind::PermissionDeclaration => {
+                    let path = permission_path(component)?;
+                    let replacement = json_to_yaml(&component.body_markdown)?;
+                    if metadata(component, "mappingFidelity") == Some("lossy") {
+                        let unchanged = current_by_location.get(location).is_some_and(|current| {
+                            current.body_markdown == component.body_markdown
+                                && current.archived == component.archived
+                        });
+                        if !unchanged {
+                            return Err(super::conflict(
+                                "Hermes permission mapping is unresolved and lossy",
+                            ));
+                        }
+                        continue;
+                    }
+                    replacements.insert(path, (!component.archived).then_some(replacement));
+                }
+                ComponentKind::Plugin => {
+                    let name = plugin_name_from_location(location)?;
+                    enabled_plugins.remove(name);
+                    disabled_plugins.remove(name);
+                    if component.archived {
+                        disabled_plugins.insert(name.to_owned());
+                    } else {
+                        enabled_plugins.insert(name.to_owned());
+                    }
+                    plugin_changed = true;
+                }
+                ComponentKind::McpServer => {
+                    let name = config_child_name(location, "config:mcp_servers.")?;
+                    let desired_value = json_to_yaml(&component.body_markdown)?;
+                    let replacement = merge_reviewed_mapping(
+                        resolve_yaml(&parsed.value, &["mcp_servers", name]),
+                        &desired_value,
+                        &[
+                            "command",
+                            "args",
+                            "url",
+                            "timeout",
+                            "connect_timeout",
+                            "idle_timeout_seconds",
+                            "max_lifetime_seconds",
+                            "enabled",
+                            "supports_parallel_tool_calls",
+                            "tools",
+                        ],
+                        component.archived,
+                    )?;
+                    replacements.insert(vec!["mcp_servers".into(), name.into()], Some(replacement));
+                }
+                ComponentKind::Hook if location.starts_with("config:hooks.") => {
+                    let name = config_child_name(location, "config:hooks.")?;
+                    let desired_value = json_to_yaml(&component.body_markdown)?;
+                    let mut replacement = merge_reviewed_mapping(
+                        resolve_yaml(&parsed.value, &["hooks", name]),
+                        &desired_value,
+                        &[],
+                        component.archived,
+                    )?;
+                    if component.archived {
+                        set_mapping_bool(&mut replacement, "enabled", false)?;
+                    }
+                    replacements.insert(vec!["hooks".into(), name.into()], Some(replacement));
+                }
+                _ => {}
+            }
+        }
+        if plugin_changed {
+            let enabled = (!enabled_plugins.is_empty()).then(|| {
+                YamlValue::Sequence(enabled_plugins.into_iter().map(YamlValue::String).collect())
+            });
+            let disabled = (!disabled_plugins.is_empty()).then(|| {
+                YamlValue::Sequence(
+                    disabled_plugins
+                        .into_iter()
+                        .map(YamlValue::String)
+                        .collect(),
+                )
+            });
+            if resolve_yaml(&parsed.value, &["plugins"]).is_some() {
+                replacements.insert(vec!["plugins".into(), "enabled".into()], enabled);
+                replacements.insert(vec!["plugins".into(), "disabled".into()], disabled);
+            } else {
+                let mut plugins = serde_yaml_ng::Mapping::new();
+                if let Some(enabled) = enabled {
+                    plugins.insert(YamlValue::String("enabled".into()), enabled);
+                }
+                if let Some(disabled) = disabled {
+                    plugins.insert(YamlValue::String("disabled".into()), disabled);
+                }
+                replacements.insert(vec!["plugins".into()], Some(YamlValue::Mapping(plugins)));
+            }
+        }
+        normalize_missing_root_replacements(&parsed.value, &mut replacements, "mcp_servers");
+        normalize_missing_root_replacements(&parsed.value, &mut replacements, "hooks");
+        super::yaml::patch_owned_paths(&parsed, &replacements)
+    }
+
+    fn approved_regular_file(
+        &self,
+        path: &Path,
+        snapshot: &context_relay_native_runner::NativeSnapshot,
+        bytes: Vec<u8>,
+        metadata: context_relay_native_runner::NativeMetadata,
+    ) -> Result<Option<ApprovedMutation>, ClientError> {
+        if matches!(snapshot.state(), NativeState::RegularFile { bytes: current, .. } if current == &bytes)
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.approved_state(
+            path,
+            snapshot.fingerprint(),
+            NativeState::regular_file(bytes, metadata),
+        )?))
+    }
+
+    fn approved_state(
+        &self,
+        path: &Path,
+        expected: &[u8; 32],
+        intended: NativeState,
+    ) -> Result<ApprovedMutation, ClientError> {
+        Ok(ApprovedMutation {
+            target: wire_path(path),
+            kind: MutationKind::Payload,
+            content: intended
+                .encode_v1()
+                .map_err(|_| invalid("Hermes native state is not representable"))?,
+            expected: RestorableStateFingerprint(Sha256Digest(*expected)),
+            intended: RestorableStateFingerprint(Sha256Digest(intended.fingerprint())),
+        })
+    }
+
+    fn markdown_path(&self, component: &ComponentRecord) -> Result<PathBuf, ClientError> {
+        let location = structural_location(component)?;
+        let path = if location == "profile:SOUL.md"
+            && component.kind == ComponentKind::Rule
+            && matches!(component.scope, ScopeRef::Global)
+        {
+            self.layout.profile.hermes_home.join("SOUL.md")
+        } else if let Some(relative) = location.strip_prefix("profile:skills/") {
+            if component.kind != ComponentKind::Skill || !relative.ends_with("/SKILL.md") {
+                return Err(invalid("Hermes skill location is invalid"));
+            }
+            safe_relative(relative)?;
+            self.layout
+                .profile
+                .hermes_home
+                .join("skills")
+                .join(relative)
+        } else if let Some(relative) = location.strip_prefix("project:") {
+            if !matches!(
+                component.scope,
+                ScopeRef::Project {
+                    project_id
+                } if project_id == self.project_id
+            ) || !matches!(
+                component.kind,
+                ComponentKind::Instruction | ComponentKind::Rule
+            ) || !(relative.ends_with("/.hermes.md")
+                || relative.ends_with("/HERMES.md")
+                || matches!(relative, ".hermes.md" | "HERMES.md"))
+            {
+                return Err(invalid("Hermes project Markdown location is invalid"));
+            }
+            safe_relative(relative)?;
+            self.layout.project_root.join(relative)
+        } else {
+            return Err(invalid("Hermes Markdown location is invalid"));
+        };
+        Ok(path)
+    }
+
+    fn validate_gateway_hook_pair(
+        &self,
+        manifest: &ComponentRecord,
+        handler: Option<&ComponentRecord>,
+    ) -> Result<(), ClientError> {
+        self.validate_component(manifest)?;
+        if manifest.kind != ComponentKind::Hook
+            || !structural_location(manifest)?.ends_with("/HOOK.yaml")
+            || metadata(manifest, "gatewayHook") != Some("true")
+        {
+            return Err(invalid("Hermes gateway hook manifest is invalid"));
+        }
+        if let Some(handler) = handler {
+            self.validate_component(handler)?;
+            if handler.kind != ComponentKind::Hook
+                || metadata(handler, "gatewayHook") != Some("true")
+                || !structural_location(handler)?.ends_with("/handler.py")
+                || structural_location(handler)?.strip_suffix("/handler.py")
+                    != structural_location(manifest)?.strip_suffix("/HOOK.yaml")
+            {
+                return Err(invalid("Hermes gateway hook handler is invalid"));
+            }
+        }
+        Ok(())
+    }
+
+    fn gateway_hook_path(&self, component: &ComponentRecord) -> Result<PathBuf, ClientError> {
+        let relative = structural_location(component)?
+            .strip_prefix("profile:")
+            .ok_or_else(|| invalid("Hermes gateway hook location is invalid"))?;
+        safe_relative(relative)?;
+        if !relative.starts_with("hooks/")
+            || !(relative.ends_with("/HOOK.yaml") || relative.ends_with("/handler.py"))
+        {
+            return Err(invalid("Hermes gateway hook location is invalid"));
+        }
+        Ok(self.layout.profile.hermes_home.join(relative))
+    }
+
+    fn reviewed_permission_paths(&self) -> Result<BTreeSet<String>, ClientError> {
+        let bytes = read_regular(
+            &self.layout.profile.hermes_home.join("config.yaml"),
+            "Hermes config must be a regular file",
+        )?;
+        let parsed = super::yaml::parse_config(&bytes)?;
+        Ok(
+            import::project_reviewed_config(&parsed, &self.layout.profile.name)?
+                .into_iter()
+                .filter(|component| component.kind == ComponentKind::PermissionDeclaration)
+                .filter_map(|component| {
+                    metadata(&component, "nativePermissionPath").map(str::to_owned)
+                })
+                .collect(),
+        )
+    }
+}
+
+pub(super) fn render_managed_markdown(
+    existing: &[u8],
+    desired_body: &str,
+    archived: bool,
+) -> Result<Vec<u8>, ClientError> {
+    if desired_body.contains(MANAGED_START) || desired_body.contains(MANAGED_END) {
+        return Err(invalid("Hermes desired body contains a managed marker"));
+    }
+    super::yaml::scan_text_secret(desired_body.as_bytes(), "managed:markdown")?;
+    let text =
+        std::str::from_utf8(existing).map_err(|_| invalid("Hermes Markdown is not valid UTF-8"))?;
+    let newline = line_ending(text)?;
+    let starts = text.match_indices(MANAGED_START).collect::<Vec<_>>();
+    let ends = text.match_indices(MANAGED_END).collect::<Vec<_>>();
+    if starts.is_empty() && ends.is_empty() {
+        if archived || existing == desired_body.as_bytes() {
+            return Ok(existing.to_vec());
+        }
+        let mut rendered = existing.to_vec();
+        if !rendered.is_empty() && !rendered.ends_with(newline.as_bytes()) {
+            rendered.extend_from_slice(newline.as_bytes());
+        }
+        rendered.extend_from_slice(managed_block(desired_body, newline).as_bytes());
+        return Ok(rendered);
+    }
+    if starts.len() != 1 || ends.len() != 1 || starts[0].0 >= ends[0].0 {
+        return Err(invalid("Hermes managed Markdown markers are malformed"));
+    }
+    let start = line_start(text, starts[0].0);
+    let start_marker_end = starts[0].0 + MANAGED_START.len();
+    let end_line_start = line_start(text, ends[0].0);
+    let end_marker_end = ends[0].0 + MANAGED_END.len();
+    let end = if text[end_marker_end..].starts_with("\r\n") {
+        end_marker_end + 2
+    } else if text[end_marker_end..].starts_with('\n') {
+        end_marker_end + 1
+    } else {
+        end_marker_end
+    };
+    let start_terminated =
+        text[start_marker_end..].starts_with("\r\n") || text[start_marker_end..].starts_with('\n');
+    let end_terminated = end_marker_end == text.len()
+        || text[end_marker_end..].starts_with("\r\n")
+        || text[end_marker_end..].starts_with('\n');
+    if !text[start..starts[0].0].trim().is_empty()
+        || !start_terminated
+        || !text[end_line_start..ends[0].0].trim().is_empty()
+        || !end_terminated
+        || !text[ends[0].0 + MANAGED_END.len()..end].trim().is_empty()
+    {
+        return Err(invalid("Hermes managed Markdown markers are malformed"));
+    }
+    let mut rendered = existing[..start].to_vec();
+    if !archived {
+        rendered.extend_from_slice(managed_block(desired_body, newline).as_bytes());
+    }
+    rendered.extend_from_slice(&existing[end..]);
+    Ok(rendered)
+}
+
+fn managed_block(body: &str, newline: &str) -> String {
+    let normalized = body.replace("\r\n", "\n");
+    let normalized = normalized.trim_end_matches('\n').replace('\n', newline);
+    format!("{MANAGED_START}{newline}{normalized}{newline}{MANAGED_END}{newline}")
+}
+
+fn line_ending(text: &str) -> Result<&'static str, ClientError> {
+    let mut lf = false;
+    let mut crlf = false;
+    for (index, byte) in text.as_bytes().iter().enumerate() {
+        if *byte == b'\n' {
+            if index > 0 && text.as_bytes()[index - 1] == b'\r' {
+                crlf = true;
+            } else {
+                lf = true;
+            }
+        }
+    }
+    if lf && crlf {
+        return Err(invalid("Hermes Markdown mixes line-ending conventions"));
+    }
+    Ok(if crlf { "\r\n" } else { "\n" })
+}
+
+fn line_start(text: &str, offset: usize) -> usize {
+    text[..offset].rfind('\n').map_or(0, |index| index + 1)
+}
+
+fn is_config_component(component: &ComponentRecord) -> bool {
+    metadata(component, "structuralLocation").is_some_and(|location| {
+        location.starts_with("config:")
+            && matches!(
+                component.kind,
+                ComponentKind::PermissionDeclaration
+                    | ComponentKind::Plugin
+                    | ComponentKind::McpServer
+                    | ComponentKind::Hook
+            )
+    })
+}
+
+fn is_gateway_hook_component(component: &ComponentRecord) -> bool {
+    component.kind == ComponentKind::Hook
+        && metadata(component, "gatewayHook") == Some("true")
+        && metadata(component, "structuralLocation")
+            .is_some_and(|location| location.starts_with("profile:hooks/"))
+}
+
+fn is_active_component(component: &ComponentRecord) -> bool {
+    is_config_component(component) || is_gateway_hook_component(component)
+}
+
+fn structural_location(component: &ComponentRecord) -> Result<&str, ClientError> {
+    metadata(component, "structuralLocation")
+        .ok_or_else(|| invalid("Hermes component structural location is missing"))
+}
+
+fn metadata<'a>(component: &'a ComponentRecord, key: &str) -> Option<&'a str> {
+    component
+        .metadata
+        .iter()
+        .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
+}
+
+fn permission_path(component: &ComponentRecord) -> Result<Vec<String>, ClientError> {
+    let path = metadata(component, "nativePermissionPath")
+        .ok_or_else(|| invalid("Hermes permission path is missing"))?;
+    let parts = path.split('.').map(str::to_owned).collect::<Vec<_>>();
+    if !matches!(
+        parts.as_slice(),
+        [root] if root == "approvals" || root == "command_allowlist"
+    ) && !matches!(parts.as_slice(), [root, _] if root == "approvals")
+    {
+        return Err(invalid("Hermes permission path is invalid"));
+    }
+    Ok(parts)
+}
+
+fn plugin_name_from_location(location: &str) -> Result<&str, ClientError> {
+    location
+        .strip_prefix("config:plugins.enabled.")
+        .or_else(|| location.strip_prefix("config:plugins.disabled."))
+        .filter(|name| safe_name(name))
+        .ok_or_else(|| invalid("Hermes plugin state location is invalid"))
+}
+
+fn config_child_name<'a>(location: &'a str, prefix: &str) -> Result<&'a str, ClientError> {
+    location
+        .strip_prefix(prefix)
+        .filter(|name| safe_name(name))
+        .ok_or_else(|| invalid("Hermes config component location is invalid"))
+}
+
+fn safe_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        && !matches!(name, "." | "..")
+}
+
+fn safe_relative(relative: &str) -> Result<(), ClientError> {
+    let path = Path::new(relative);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            !matches!(component, Component::Normal(_))
+                || component.as_os_str().to_str().is_none_or(|part| {
+                    part.contains(['/', '\\']) || part.chars().any(char::is_control)
+                })
+        })
+    {
+        return Err(invalid("Hermes relative path is unsafe"));
+    }
+    Ok(())
+}
+
+fn json_to_yaml(body: &str) -> Result<YamlValue, ClientError> {
+    let json: JsonValue =
+        serde_json::from_str(body).map_err(|_| invalid("Hermes component body is invalid"))?;
+    serde_yaml_ng::to_value(json).map_err(|_| invalid("Hermes component body is invalid"))
+}
+
+fn resolve_yaml<'a>(mut value: &'a YamlValue, path: &[&str]) -> Option<&'a YamlValue> {
+    for part in path {
+        value = value
+            .as_mapping()?
+            .get(YamlValue::String((*part).to_owned()))?;
+    }
+    Some(value)
+}
+
+fn yaml_string_set(values: Option<&Vec<YamlValue>>) -> Result<BTreeSet<String>, ClientError> {
+    values
+        .into_iter()
+        .flatten()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|name| safe_name(name))
+                .map(str::to_owned)
+                .ok_or_else(|| invalid("Hermes plugin state is invalid"))
+        })
+        .collect()
+}
+
+fn merge_reviewed_mapping(
+    current: Option<&YamlValue>,
+    desired: &YamlValue,
+    reviewed_keys: &[&str],
+    archived: bool,
+) -> Result<YamlValue, ClientError> {
+    let desired = desired
+        .as_mapping()
+        .ok_or_else(|| invalid("Hermes component body must be an object"))?;
+    let mut merged = current
+        .and_then(YamlValue::as_mapping)
+        .cloned()
+        .unwrap_or_default();
+    let keys = if reviewed_keys.is_empty() {
+        desired
+            .keys()
+            .filter_map(YamlValue::as_str)
+            .collect::<Vec<_>>()
+    } else {
+        reviewed_keys.to_vec()
+    };
+    for key in keys {
+        let yaml_key = YamlValue::String(key.to_owned());
+        if let Some(value) = desired.get(&yaml_key) {
+            merged.insert(yaml_key, value.clone());
+        } else {
+            merged.remove(&yaml_key);
+        }
+    }
+    if archived {
+        merged.insert(YamlValue::String("enabled".into()), YamlValue::Bool(false));
+    }
+    Ok(YamlValue::Mapping(merged))
+}
+
+fn set_mapping_bool(value: &mut YamlValue, key: &str, enabled: bool) -> Result<(), ClientError> {
+    value
+        .as_mapping_mut()
+        .ok_or_else(|| invalid("Hermes component body must be an object"))?
+        .insert(YamlValue::String(key.into()), YamlValue::Bool(enabled));
+    Ok(())
+}
+
+fn normalize_missing_root_replacements(
+    current: &YamlValue,
+    replacements: &mut BTreeMap<Vec<String>, Option<YamlValue>>,
+    root: &str,
+) {
+    if resolve_yaml(current, &[root]).is_some() {
+        return;
+    }
+    let children = replacements
+        .keys()
+        .filter(|path| path.len() == 2 && path[0] == root)
+        .cloned()
+        .collect::<Vec<_>>();
+    if children.is_empty() {
+        return;
+    }
+    let mut mapping = serde_yaml_ng::Mapping::new();
+    for path in children {
+        if let Some(Some(value)) = replacements.remove(&path) {
+            mapping.insert(YamlValue::String(path[1].clone()), value);
+        }
+    }
+    replacements.insert(vec![root.into()], Some(YamlValue::Mapping(mapping)));
+}
+
+fn rendered_file(path: PathBuf, bytes: &[u8]) -> RenderedFile {
+    RenderedFile {
+        path: wire_path(&path),
+        bytes_sha256: Sha256Digest(Sha256::digest(bytes).into()),
+        byte_length: bytes.len() as u64,
+    }
+}
+
+fn read_regular(path: &Path, message: &'static str) -> Result<Vec<u8>, ClientError> {
+    read_optional_regular(path)?.ok_or_else(|| invalid(message))
+}
+
+fn read_optional_regular(path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(invalid("Hermes native file cannot be inspected")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(invalid("Hermes native target is not a regular file"));
+    }
+    std::fs::read(path)
+        .map(Some)
+        .map_err(|_| invalid("Hermes native file cannot be read"))
+}
+
+fn scope_key(scope: &ScopeRef) -> String {
+    match scope {
+        ScopeRef::Global => "global".into(),
+        ScopeRef::Project { project_id } => format!("project:{project_id}"),
+    }
+}
+
+fn valid_nonpermission_target(target: &str, profile: &str) -> bool {
+    let parts = target.split('|').collect::<Vec<_>>();
+    parts.len() >= 3
+        && matches!(
+            parts[0],
+            "hermes-config" | "hermes-markdown" | "hermes-memory" | "hermes-gateway-hook"
+        )
+        && parts[1] == profile
+        && !parts.iter().any(|part| part.is_empty())
+}
+
+fn is_passive_change_target(target: &str) -> bool {
+    target.starts_with("hermes-markdown|") || target.starts_with("hermes-memory|")
+}
