@@ -1371,6 +1371,14 @@ mod tests {
         let config = concat!(
             "approvals:\n",
             "  mode: smart\n",
+            "  extension:\n",
+            "    command: approval-command\n",
+            "    args:\n",
+            "      - --approval-arg\n",
+            "    url: https://example.com/approval\n",
+            "    placeholder: \"${APPROVAL_TOKEN}\"\n",
+            "    nested:\n",
+            "      arbitrary: approval-extension-value\n",
             "command_allowlist:\n",
             "  - cargo test\n",
             "plugins:\n",
@@ -1556,6 +1564,25 @@ mod tests {
                 .contains("configured-hook-command")
         );
         assert!(imported_hook.body_markdown.contains("--audit"));
+        let imported_approval = imported
+            .components
+            .iter()
+            .find(|component| {
+                component.kind == ComponentKind::PermissionDeclaration
+                    && component.metadata.iter().any(|(key, value)| {
+                        key == "structuralLocation" && value == "config:approvals.extension"
+                    })
+            })
+            .unwrap();
+        for preserved in [
+            "approval-command",
+            "--approval-arg",
+            "https://example.com/approval",
+            "${APPROVAL_TOKEN}",
+            "approval-extension-value",
+        ] {
+            assert!(imported_approval.body_markdown.contains(preserved));
+        }
         let stages = RefCell::new(Vec::new());
         for _ in 0..2 {
             let report = fixture
@@ -1593,9 +1620,9 @@ mod tests {
                     stages.borrow_mut().push(request.staged_hermes_home.clone());
                     let staged =
                         fs::read_to_string(request.staged_hermes_home.join("config.yaml")).unwrap();
+                    assert_eq!(staged, "{}\n");
                     let parsed = yaml::parse_config(staged.as_bytes()).unwrap();
-                    let expected: serde_yaml_ng::Value =
-                        serde_yaml_ng::from_str("approvals:\n  mode: smart\n").unwrap();
+                    let expected: serde_yaml_ng::Value = serde_yaml_ng::from_str("{}\n").unwrap();
                     assert_eq!(parsed.value, expected);
                     for excluded in [
                         "must-not-stage",
@@ -1616,6 +1643,13 @@ mod tests {
                         "configured-hook-command",
                         "--audit",
                         "arbitrary-extension-value",
+                        "smart",
+                        "extension:",
+                        "approval-command",
+                        "--approval-arg",
+                        "https://example.com/approval",
+                        "${approval_token}",
+                        "approval-extension-value",
                     ] {
                         assert!(!staged.to_ascii_lowercase().contains(excluded));
                     }

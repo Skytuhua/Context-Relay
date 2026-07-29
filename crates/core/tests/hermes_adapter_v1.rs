@@ -2511,8 +2511,17 @@ fn rollback_restores_all_hermes_targets_and_metadata() {
             expected_metadata.creation_time()
         );
         assert_eq!(
+            restored_metadata.last_access_time(),
+            expected_metadata.last_access_time()
+        );
+        assert_eq!(
             restored_metadata.last_write_time(),
             expected_metadata.last_write_time()
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            restored_metadata.change_time(),
+            expected_metadata.change_time()
         );
         assert_eq!(
             restored_metadata.security_descriptor(),
