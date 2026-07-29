@@ -21,7 +21,7 @@ pub(super) fn enumerate_profiles(default_root: &Path) -> Result<Vec<HermesProfil
     }
     let metadata = fs::symlink_metadata(&profiles_root)
         .map_err(|_| not_found("Hermes profiles root was not found"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
         return Ok(profiles);
     }
     let profiles_root = fs::canonicalize(&profiles_root)
@@ -39,10 +39,9 @@ pub(super) fn enumerate_profiles(default_root: &Path) -> Result<Vec<HermesProfil
         if !valid_profile_name(&normalized) {
             continue;
         }
-        let metadata = entry
-            .file_type()
+        let metadata = fs::symlink_metadata(entry.path())
             .map_err(|_| invalid("Hermes profile entry cannot be inspected"))?;
-        if metadata.is_symlink() || !metadata.is_dir() {
+        if is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
             continue;
         }
         let candidate = fs::canonicalize(entry.path())
@@ -108,12 +107,32 @@ pub(super) fn validate_profile_binding(
     Ok(())
 }
 
-fn canonical_real_directory(path: &Path, missing: &'static str) -> Result<PathBuf, ClientError> {
+pub(super) fn canonical_real_directory(
+    path: &Path,
+    missing: &'static str,
+) -> Result<PathBuf, ClientError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| not_found(missing))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
         return Err(not_found(missing));
     }
     fs::canonicalize(path).map_err(|_| invalid("Hermes profile root cannot be safely resolved"))
+}
+
+fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn ascii_lowercase(value: &str) -> String {

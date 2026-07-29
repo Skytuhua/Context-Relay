@@ -39,6 +39,12 @@ pub enum HermesExecutableKind {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecutableSnapshot {
+    kind: HermesExecutableKind,
+    digest: Sha256Digest,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HermesProfile {
     pub name: String,
@@ -81,18 +87,12 @@ impl HermesAdapter {
         let profile = profile::select_profile(&default_hermes_home, requested_profile)?;
         let executable =
             find_executable().ok_or_else(|| not_found("Hermes executable was not found"))?;
-        let executable_kind = classify_executable(&executable)?;
+        let (snapshot, version) = discover_executable_version(&executable)?;
         let installation_method = installation_method(&executable);
-        let version = if executable_kind == HermesExecutableKind::Native {
-            let output = run_version(&executable)?;
-            parse_version(&output).ok_or_else(|| invalid("Hermes returned an invalid version"))?
-        } else {
-            "unknown".to_owned()
-        };
         Self::from_layout(
             HermesLayout {
                 executable,
-                executable_kind,
+                executable_kind: snapshot.kind,
                 version,
                 installation_method,
                 default_hermes_home,
@@ -123,8 +123,10 @@ impl HermesAdapter {
         )?;
         layout.executable = fs::canonicalize(&layout.executable)
             .map_err(|_| invalid("Hermes executable cannot be safely resolved"))?;
-        layout.default_hermes_home = fs::canonicalize(&layout.default_hermes_home)
-            .map_err(|_| not_found("Hermes default profile was not found"))?;
+        layout.default_hermes_home = profile::canonical_real_directory(
+            &layout.default_hermes_home,
+            "Hermes default profile was not found",
+        )?;
         layout.project_root = fs::canonicalize(&layout.project_root)
             .map_err(|_| invalid("Hermes project root cannot be safely resolved"))?;
         layout.working_directory = fs::canonicalize(&layout.working_directory)
@@ -137,13 +139,14 @@ impl HermesAdapter {
         profile::validate_profile_binding(&layout.default_hermes_home, &layout.profile)?;
         layout.profile =
             profile::select_profile(&layout.default_hermes_home, &layout.profile.name)?;
-        let executable_hash = digest_file(&layout.executable)?;
+        let executable = snapshot_executable(&layout.executable)?;
+        layout.executable_kind = executable.kind;
         Ok(Self {
             layout,
             project_id,
             origin_device,
             observed_hlc,
-            executable_hash,
+            executable_hash: executable.digest,
         })
     }
 
@@ -278,28 +281,70 @@ fn find_executable() -> Option<PathBuf> {
         })
 }
 
-fn classify_executable(path: &Path) -> Result<HermesExecutableKind, ClientError> {
+fn snapshot_executable(path: &Path) -> Result<ExecutableSnapshot, ClientError> {
     let bytes = fs::read(path).map_err(|_| not_found("Hermes executable was not found"))?;
+    Ok(ExecutableSnapshot {
+        kind: classify_executable_bytes(path, &bytes),
+        digest: Sha256Digest(Sha256::digest(bytes).into()),
+    })
+}
+
+fn classify_executable_bytes(path: &Path, bytes: &[u8]) -> HermesExecutableKind {
     if bytes.starts_with(b"\x7fELF")
         || bytes.starts_with(b"MZ")
         || bytes.starts_with(&[0xfe, 0xed, 0xfa, 0xce])
         || bytes.starts_with(&[0xfe, 0xed, 0xfa, 0xcf])
         || bytes.starts_with(&[0xce, 0xfa, 0xed, 0xfe])
         || bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
+        || bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe])
+        || bytes.starts_with(&[0xbe, 0xba, 0xfe, 0xca])
+        || bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbf])
+        || bytes.starts_with(&[0xbf, 0xba, 0xfe, 0xca])
     {
-        return Ok(HermesExecutableKind::Native);
+        return HermesExecutableKind::Native;
     }
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .map(str::to_ascii_lowercase);
     if bytes.starts_with(b"#!") || matches!(extension.as_deref(), Some("cmd" | "bat" | "ps1")) {
-        return Ok(HermesExecutableKind::Wrapper);
+        return HermesExecutableKind::Wrapper;
     }
-    Ok(HermesExecutableKind::Unknown)
+    HermesExecutableKind::Unknown
 }
 
-fn run_version(executable: &Path) -> Result<Vec<u8>, ClientError> {
+fn discover_executable_version(
+    executable: &Path,
+) -> Result<(ExecutableSnapshot, String), ClientError> {
+    discover_executable_version_after_snapshot(executable, || {}, run_version)
+}
+
+fn discover_executable_version_after_snapshot(
+    executable: &Path,
+    after_snapshot: impl FnOnce(),
+    mut execute: impl FnMut(&Path, ExecutableSnapshot) -> Result<Vec<u8>, ClientError>,
+) -> Result<(ExecutableSnapshot, String), ClientError> {
+    let snapshot = snapshot_executable(executable)?;
+    let version = if snapshot.kind == HermesExecutableKind::Native {
+        after_snapshot();
+        let output = execute(executable, snapshot)?;
+        parse_version(&output).ok_or_else(|| invalid("Hermes returned an invalid version"))?
+    } else {
+        "unknown".to_owned()
+    };
+    if snapshot_executable(executable)? != snapshot {
+        return Err(conflict("Hermes executable changed"));
+    }
+    Ok((snapshot, version))
+}
+
+fn run_version(
+    executable: &Path,
+    expected_snapshot: ExecutableSnapshot,
+) -> Result<Vec<u8>, ClientError> {
+    if snapshot_executable(executable)? != expected_snapshot {
+        return Err(conflict("Hermes executable changed"));
+    }
     let mut child = Command::new(executable)
         .arg("--version")
         .stdin(Stdio::null())
@@ -362,17 +407,16 @@ fn read_capped(reader: impl Read) -> std::io::Result<Vec<u8>> {
 
 fn parse_version(bytes: &[u8]) -> Option<String> {
     let output = std::str::from_utf8(bytes).ok()?;
-    if output.chars().any(char::is_control)
-        && output
-            .chars()
-            .any(|character| character != '\n' && character != '\r' && character != '\t')
+    let output = strip_ansi(output).replace("\r\n", "\n");
+    if output
+        .chars()
+        .any(|character| character.is_control() && character != '\n')
     {
         return None;
     }
-    let output = strip_ansi(output);
     let versions = output
         .split(|character: char| !(character.is_ascii_alphanumeric() || character == '.'))
-        .filter(|token| valid_version(token))
+        .filter(|token| valid_version(token) && SUPPORTED_VERSIONS.contains(token))
         .collect::<Vec<_>>();
     (versions.len() == 1).then(|| versions[0].to_owned())
 }
@@ -422,12 +466,6 @@ fn require_directory(path: &Path, message: &'static str) -> Result<(), ClientErr
     path.is_dir()
         .then_some(())
         .ok_or_else(|| not_found(message))
-}
-
-fn digest_file(path: &Path) -> Result<Sha256Digest, ClientError> {
-    fs::read(path)
-        .map(|bytes| Sha256Digest(Sha256::digest(bytes).into()))
-        .map_err(|_| not_found("Hermes executable was not found"))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -484,11 +522,133 @@ pub(super) fn not_found(message: &'static str) -> ClientError {
     }
 }
 
+fn conflict(message: &'static str) -> ClientError {
+    ClientError {
+        code: ErrorCode::Conflict,
+        message: message.into(),
+        field_path: None,
+        retryable: false,
+    }
+}
+
 fn phase_unsupported() -> ClientError {
     ClientError {
         code: ErrorCode::HarnessUnsupported,
         message: "Hermes adapter phase is not available".into(),
         field_path: None,
         retryable: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn parse_version_accepts_a_single_version_with_a_trailing_newline() {
+        assert_eq!(parse_version(b"hermes 0.18.2\n"), Some("0.18.2".to_owned()));
+    }
+
+    #[test]
+    fn parse_version_accepts_a_single_ansi_decorated_version() {
+        assert_eq!(
+            parse_version(b"\x1b[32mhermes 0.18.2\x1b[0m\r\n"),
+            Some("0.18.2".to_owned())
+        );
+    }
+
+    #[test]
+    fn classify_executable_recognizes_universal_mach_o_headers() {
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-hermes-classifier-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("hermes");
+        for header in [
+            [0xca, 0xfe, 0xba, 0xbe],
+            [0xbe, 0xba, 0xfe, 0xca],
+            [0xca, 0xfe, 0xba, 0xbf],
+            [0xbf, 0xba, 0xfe, 0xca],
+        ] {
+            fs::write(&executable, header).unwrap();
+            assert_eq!(
+                snapshot_executable(&executable).unwrap().kind,
+                HermesExecutableKind::Native
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_discovery_rejects_replacement_after_snapshot_without_executing_wrapper() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-hermes-discovery-race-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("hermes");
+        let sentinel = root.join("wrapper-ran");
+        fs::write(&executable, b"\x7fELFnative executable").unwrap();
+
+        let result = discover_executable_version_after_snapshot(
+            &executable,
+            || {
+                fs::write(
+                    &executable,
+                    format!(
+                        "#!/bin/sh\n/usr/bin/touch '{}'\nprintf 'hermes 0.18.2\\n'\n",
+                        sentinel.display()
+                    ),
+                )
+                .unwrap();
+                fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            },
+            run_version,
+        );
+        let sentinel_exists = sentinel.exists();
+        let _ = fs::remove_dir_all(root);
+
+        assert!(matches!(
+            result,
+            Err(ClientError {
+                code: ErrorCode::Conflict,
+                ..
+            })
+        ));
+        assert!(!sentinel_exists);
+    }
+
+    #[test]
+    fn native_discovery_accepts_newline_and_ansi_version_output() {
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-hermes-version-output-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("hermes");
+        fs::write(&executable, b"\x7fELFnative executable").unwrap();
+        for output in [
+            b"hermes 0.18.2\n".as_slice(),
+            b"\x1b[32mhermes 0.18.2\x1b[0m\r\n",
+        ] {
+            let (_, version) = discover_executable_version_after_snapshot(
+                &executable,
+                || {},
+                |_, _| Ok(output.to_vec()),
+            )
+            .unwrap();
+            assert_eq!(version, "0.18.2");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

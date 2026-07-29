@@ -381,3 +381,82 @@ fn unknown_versions_and_wrappers_are_import_only() {
         );
     }
 }
+
+#[test]
+fn from_layout_reclassifies_wrapper_bytes_claimed_as_native() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let mut layout = profile_layout(
+        &fixture,
+        "coder",
+        &fixture.layout.version,
+        HermesExecutableKind::Native,
+    );
+    layout.executable = fixture.root.join("claimed-native-wrapper");
+    fs::write(&layout.executable, b"#!/bin/sh\necho 0.18.2\n").unwrap();
+
+    let adapter = HermesAdapter::from_layout(
+        layout,
+        fixture.project_id,
+        DeviceId::from_str(DEVICE_ID).unwrap(),
+        HybridLogicalClock::new(1_900_000_000_000, 0, DeviceId::from_str(DEVICE_ID).unwrap()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        probe(&adapter, Some("coder")).capability,
+        CapabilityLevel::ImportOnly
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_junction_profile_paths_are_rejected() {
+    fn junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(format!(
+                "mklink /J \"{}\" \"{}\"",
+                link.display(),
+                target.display()
+            ))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let default_junction = fixture.root.join("default-junction");
+    junction(&default_junction, &fixture.default_home);
+    assert_eq!(
+        HermesAdapter::discover_profiles(&default_junction)
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound
+    );
+    fs::remove_dir(&default_junction).unwrap();
+
+    let profiles_target = fixture.root.join("profiles-target");
+    fs::rename(&fixture.profiles_root, &profiles_target).unwrap();
+    junction(&fixture.profiles_root, &profiles_target);
+    assert_eq!(
+        HermesAdapter::discover_profiles(&fixture.default_home)
+            .unwrap()
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["default"]
+    );
+    fs::remove_dir(&fixture.profiles_root).unwrap();
+    fs::rename(&profiles_target, &fixture.profiles_root).unwrap();
+
+    let candidate_junction = fixture.profiles_root.join("fake");
+    junction(&candidate_junction, &fixture.profiles_root.join("writer"));
+    assert_eq!(
+        HermesAdapter::discover_profiles(&fixture.default_home)
+            .unwrap()
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["default", "coder", "writer"]
+    );
+}
