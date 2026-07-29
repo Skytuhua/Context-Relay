@@ -23,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 toml_edit.workspace = true
 unicode-normalization.workspace = true

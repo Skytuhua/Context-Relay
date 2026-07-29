@@ -7,7 +7,8 @@ mod profile;
 
 use std::{
     env, fs,
-    io::Read,
+    fs::OpenOptions,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -43,6 +44,19 @@ pub enum HermesExecutableKind {
 struct ExecutableSnapshot {
     kind: HermesExecutableKind,
     digest: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AttestedExecutable {
+    snapshot: ExecutableSnapshot,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct StagedExecutable {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+    snapshot: ExecutableSnapshot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,7 +103,7 @@ impl HermesAdapter {
             find_executable().ok_or_else(|| not_found("Hermes executable was not found"))?;
         let (snapshot, version) = discover_executable_version(&executable)?;
         let installation_method = installation_method(&executable);
-        Self::from_layout(
+        Self::from_attested_layout(
             HermesLayout {
                 executable,
                 executable_kind: snapshot.kind,
@@ -103,26 +117,63 @@ impl HermesAdapter {
             project_id,
             origin_device,
             observed_hlc,
+            snapshot,
         )
     }
 
     pub fn from_layout(
+        layout: HermesLayout,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+    ) -> Result<Self, ClientError> {
+        Self::from_layout_with_expected_snapshot(
+            layout,
+            project_id,
+            origin_device,
+            observed_hlc,
+            None,
+        )
+    }
+
+    fn from_attested_layout(
+        layout: HermesLayout,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        expected_snapshot: ExecutableSnapshot,
+    ) -> Result<Self, ClientError> {
+        Self::from_layout_with_expected_snapshot(
+            layout,
+            project_id,
+            origin_device,
+            observed_hlc,
+            Some(expected_snapshot),
+        )
+    }
+
+    fn from_layout_with_expected_snapshot(
         mut layout: HermesLayout,
         project_id: ProjectId,
         origin_device: DeviceId,
         observed_hlc: HybridLogicalClock,
+        expected_snapshot: Option<ExecutableSnapshot>,
     ) -> Result<Self, ClientError> {
         if !valid_version(&layout.version) && layout.version != "unknown" {
             return Err(invalid("Hermes version is invalid"));
         }
         require_file(&layout.executable, "Hermes executable was not found")?;
+        layout.executable = fs::canonicalize(&layout.executable)
+            .map_err(|_| invalid("Hermes executable cannot be safely resolved"))?;
+        let executable = snapshot_executable(&layout.executable)?;
+        if expected_snapshot.is_some_and(|expected| executable != expected) {
+            return Err(conflict("Hermes executable changed"));
+        }
         require_directory(&layout.project_root, "Hermes project root was not found")?;
         require_directory(
             &layout.working_directory,
             "Hermes working directory was not found",
         )?;
-        layout.executable = fs::canonicalize(&layout.executable)
-            .map_err(|_| invalid("Hermes executable cannot be safely resolved"))?;
         layout.default_hermes_home = profile::canonical_real_directory(
             &layout.default_hermes_home,
             "Hermes default profile was not found",
@@ -139,7 +190,6 @@ impl HermesAdapter {
         profile::validate_profile_binding(&layout.default_hermes_home, &layout.profile)?;
         layout.profile =
             profile::select_profile(&layout.default_hermes_home, &layout.profile.name)?;
-        let executable = snapshot_executable(&layout.executable)?;
         layout.executable_kind = executable.kind;
         Ok(Self {
             layout,
@@ -282,14 +332,75 @@ fn find_executable() -> Option<PathBuf> {
 }
 
 fn snapshot_executable(path: &Path) -> Result<ExecutableSnapshot, ClientError> {
+    Ok(attest_executable(path)?.snapshot)
+}
+
+fn attest_executable(path: &Path) -> Result<AttestedExecutable, ClientError> {
     let bytes = fs::read(path).map_err(|_| not_found("Hermes executable was not found"))?;
-    Ok(ExecutableSnapshot {
-        kind: classify_executable_bytes(path, &bytes),
-        digest: Sha256Digest(Sha256::digest(bytes).into()),
+    Ok(AttestedExecutable {
+        snapshot: ExecutableSnapshot {
+            kind: classify_executable_bytes(path, &bytes),
+            digest: Sha256Digest(Sha256::digest(&bytes).into()),
+        },
+        bytes,
+    })
+}
+
+fn stage_executable(attested: &AttestedExecutable) -> Result<StagedExecutable, ClientError> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("context-relay-hermes-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    let directory = builder
+        .tempdir()
+        .map_err(|_| invalid("Hermes executable could not be staged"))?;
+    let path = directory.path().join(if cfg!(windows) {
+        "hermes.exe"
+    } else {
+        "hermes"
+    });
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o700);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|_| invalid("Hermes executable could not be staged"))?;
+    file.write_all(&attested.bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|_| invalid("Hermes executable could not be staged"))?;
+    drop(file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .map_err(|_| invalid("Hermes executable could not be staged"))?;
+    }
+    let staged_snapshot = snapshot_executable(&path)?;
+    if staged_snapshot != attested.snapshot {
+        return Err(conflict("Hermes staged executable changed"));
+    }
+    Ok(StagedExecutable {
+        _directory: directory,
+        path,
+        snapshot: staged_snapshot,
     })
 }
 
 fn classify_executable_bytes(path: &Path, bytes: &[u8]) -> HermesExecutableKind {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    if matches!(extension.as_deref(), Some("cmd" | "bat" | "ps1")) {
+        return HermesExecutableKind::Wrapper;
+    }
     if bytes.starts_with(b"\x7fELF")
         || bytes.starts_with(b"MZ")
         || bytes.starts_with(&[0xfe, 0xed, 0xfa, 0xce])
@@ -303,11 +414,7 @@ fn classify_executable_bytes(path: &Path, bytes: &[u8]) -> HermesExecutableKind 
     {
         return HermesExecutableKind::Native;
     }
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(str::to_ascii_lowercase);
-    if bytes.starts_with(b"#!") || matches!(extension.as_deref(), Some("cmd" | "bat" | "ps1")) {
+    if bytes.starts_with(b"#!") {
         return HermesExecutableKind::Wrapper;
     }
     HermesExecutableKind::Unknown
@@ -322,20 +429,34 @@ fn discover_executable_version(
 fn discover_executable_version_after_snapshot(
     executable: &Path,
     after_snapshot: impl FnOnce(),
+    execute: impl FnMut(&Path, ExecutableSnapshot) -> Result<Vec<u8>, ClientError>,
+) -> Result<(ExecutableSnapshot, String), ClientError> {
+    discover_executable_version_with_boundaries(executable, after_snapshot, |_, _| {}, execute)
+}
+
+fn discover_executable_version_with_boundaries(
+    executable: &Path,
+    after_snapshot: impl FnOnce(),
+    after_staging: impl FnOnce(&Path, &Path),
     mut execute: impl FnMut(&Path, ExecutableSnapshot) -> Result<Vec<u8>, ClientError>,
 ) -> Result<(ExecutableSnapshot, String), ClientError> {
-    let snapshot = snapshot_executable(executable)?;
-    let version = if snapshot.kind == HermesExecutableKind::Native {
+    let attested = attest_executable(executable)?;
+    let version = if attested.snapshot.kind == HermesExecutableKind::Native {
         after_snapshot();
-        let output = execute(executable, snapshot)?;
+        if snapshot_executable(executable)? != attested.snapshot {
+            return Err(conflict("Hermes executable changed"));
+        }
+        let staged = stage_executable(&attested)?;
+        after_staging(executable, &staged.path);
+        let output = execute(&staged.path, staged.snapshot)?;
+        if snapshot_executable(&staged.path)? != staged.snapshot {
+            return Err(conflict("Hermes staged executable changed"));
+        }
         parse_version(&output).ok_or_else(|| invalid("Hermes returned an invalid version"))?
     } else {
         "unknown".to_owned()
     };
-    if snapshot_executable(executable)? != snapshot {
-        return Err(conflict("Hermes executable changed"));
-    }
-    Ok((snapshot, version))
+    Ok((attested.snapshot, version))
 }
 
 fn run_version(
@@ -416,7 +537,7 @@ fn parse_version(bytes: &[u8]) -> Option<String> {
     }
     let versions = output
         .split(|character: char| !(character.is_ascii_alphanumeric() || character == '.'))
-        .filter(|token| valid_version(token) && SUPPORTED_VERSIONS.contains(token))
+        .filter(|token| valid_version(token))
         .collect::<Vec<_>>();
     (versions.len() == 1).then(|| versions[0].to_owned())
 }
@@ -561,6 +682,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_version_rejects_malformed_or_multiple_versions() {
+        assert_eq!(parse_version(b"hermes 9.9\n"), None);
+        assert_eq!(parse_version(b"hermes 9.9.9.9\n"), None);
+        assert_eq!(parse_version(b"hermes 9.9.9 runtime 0.18.2\n"), None);
+    }
+
+    #[test]
     fn classify_executable_recognizes_universal_mach_o_headers() {
         let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
             "context-relay-hermes-classifier-{}-{}",
@@ -581,6 +709,24 @@ mod tests {
                 HermesExecutableKind::Native
             );
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wrapper_extension_overrides_native_magic() {
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-hermes-wrapper-precedence-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("hermes.cmd");
+        fs::write(&executable, b"MZnative-looking wrapper").unwrap();
+
+        assert_eq!(
+            snapshot_executable(&executable).unwrap().kind,
+            HermesExecutableKind::Wrapper
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -627,6 +773,127 @@ mod tests {
         assert!(!sentinel_exists);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn native_discovery_executes_staged_attested_bytes_when_source_changes_after_staging() {
+        use std::{cell::RefCell, os::unix::fs::PermissionsExt as _};
+
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-hermes-staged-race-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("hermes");
+        let sentinel = root.join("wrapper-ran");
+        fs::write(&executable, b"\x7fELFattested native executable").unwrap();
+        let executed_path = RefCell::new(None);
+
+        let (snapshot, version) = discover_executable_version_with_boundaries(
+            &executable,
+            || {},
+            |source, staged| {
+                assert_ne!(staged, source);
+                fs::write(
+                    source,
+                    format!(
+                        "#!/bin/sh\n/usr/bin/touch '{}'\nprintf 'hermes 0.18.2\\n'\n",
+                        sentinel.display()
+                    ),
+                )
+                .unwrap();
+                fs::set_permissions(source, fs::Permissions::from_mode(0o700)).unwrap();
+            },
+            |staged, expected_snapshot| {
+                assert_eq!(snapshot_executable(staged).unwrap(), expected_snapshot);
+                assert_eq!(
+                    fs::metadata(staged).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+                assert_eq!(
+                    fs::metadata(staged.parent().unwrap())
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
+                );
+                executed_path.replace(Some(staged.to_owned()));
+                Ok(b"hermes 0.18.2\n".to_vec())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.kind, HermesExecutableKind::Native);
+        assert_eq!(version, "0.18.2");
+        assert_ne!(
+            executed_path.borrow().as_deref(),
+            Some(executable.as_path())
+        );
+        assert!(!executed_path.borrow().as_ref().unwrap().exists());
+        assert!(!sentinel.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attested_constructor_rejects_different_native_binary_replaced_after_version_probe() {
+        use std::str::FromStr as _;
+
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-hermes-constructor-race-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let default_home = root.join("home");
+        let profile_home = default_home.join("profiles/coder");
+        let project_root = root.join("project");
+        let working_directory = project_root.join("service");
+        fs::create_dir_all(&profile_home).unwrap();
+        fs::create_dir_all(&working_directory).unwrap();
+        fs::write(profile_home.join("config.yaml"), "approvals: {}\n").unwrap();
+        let executable = root.join("hermes");
+        fs::write(&executable, b"\x7fELForiginal native executable").unwrap();
+
+        let (snapshot, version) = discover_executable_version_after_snapshot(
+            &executable,
+            || {},
+            |_, _| Ok(b"hermes 0.18.2\n".to_vec()),
+        )
+        .unwrap();
+        fs::write(&executable, b"\x7fELFdifferent native executable").unwrap();
+
+        let project_id = ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073981").unwrap();
+        let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
+        let result = HermesAdapter::from_attested_layout(
+            HermesLayout {
+                executable,
+                executable_kind: snapshot.kind,
+                version,
+                installation_method: InstallationMethod::PackageManager,
+                default_hermes_home: default_home,
+                profile: HermesProfile {
+                    name: "coder".to_owned(),
+                    hermes_home: profile_home,
+                },
+                project_root,
+                working_directory,
+            },
+            project_id,
+            device_id,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+            snapshot,
+        );
+
+        assert!(matches!(
+            result,
+            Err(ClientError {
+                code: ErrorCode::Conflict,
+                ..
+            })
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn native_discovery_accepts_newline_and_ansi_version_output() {
         let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
@@ -649,6 +916,69 @@ mod tests {
             .unwrap();
             assert_eq!(version, "0.18.2");
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_discovery_accepts_one_unknown_semantic_version() {
+        use std::str::FromStr as _;
+
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-hermes-unknown-version-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let default_home = root.join("home");
+        let profile_home = default_home.join("profiles/coder");
+        let project_root = root.join("project");
+        let working_directory = project_root.join("service");
+        fs::create_dir_all(&profile_home).unwrap();
+        fs::create_dir_all(&working_directory).unwrap();
+        fs::write(profile_home.join("config.yaml"), "approvals: {}\n").unwrap();
+        let executable = root.join("hermes");
+        fs::write(&executable, b"\x7fELFnative executable").unwrap();
+
+        let (snapshot, version) = discover_executable_version_after_snapshot(
+            &executable,
+            || {},
+            |_, _| Ok(b"hermes 9.9.9\n".to_vec()),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.kind, HermesExecutableKind::Native);
+        assert_eq!(version, "9.9.9");
+        let project_id = ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073981").unwrap();
+        let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
+        let adapter = HermesAdapter::from_attested_layout(
+            HermesLayout {
+                executable,
+                executable_kind: snapshot.kind,
+                version,
+                installation_method: InstallationMethod::PackageManager,
+                default_hermes_home: default_home,
+                profile: HermesProfile {
+                    name: "coder".to_owned(),
+                    hermes_home: profile_home,
+                },
+                project_root,
+                working_directory,
+            },
+            project_id,
+            device_id,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+            snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            adapter
+                .probe(&ProbeContext {
+                    harness: HarnessId::Hermes,
+                    requested_profile: Some("coder".to_owned()),
+                })
+                .unwrap()
+                .capability,
+            CapabilityLevel::ImportOnly
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
