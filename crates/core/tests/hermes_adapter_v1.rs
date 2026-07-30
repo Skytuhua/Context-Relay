@@ -1973,6 +1973,69 @@ fn hook_context_redaction_preserves_embedded_placeholder_names_without_command()
 }
 
 #[test]
+fn ignored_nested_mcp_command_cannot_influence_placeholder_metadata() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    fs::write(
+        fixture.layout.profile.hermes_home.join("config.yaml"),
+        r#"mcp_servers:
+  guarded:
+    command: "helper --token ${SUPPORTED_KEY}"
+    enabled: true
+    experimental:
+      command: "ignored --api-key=${IGNORED_KEY}"
+"#,
+    )
+    .unwrap();
+
+    let imported = import_everything(&fixture, true);
+    let component = imported
+        .components
+        .iter()
+        .find(|component| component.kind == ComponentKind::McpServer && component.name == "guarded")
+        .unwrap();
+    assert_eq!(metadata(component, "redacted"), Some("true"));
+    assert_eq!(
+        metadata(component, "secretReferenceNames"),
+        Some("SUPPORTED_KEY")
+    );
+    assert_eq!(component.body_markdown, r#"{"enabled":true}"#);
+    assert!(
+        !serde_json::to_string(&imported)
+            .unwrap()
+            .contains("IGNORED_KEY")
+    );
+}
+
+#[test]
+fn ignored_nested_mcp_args_over_context_limit_do_not_fail_import() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let ignored_arguments = (0..129)
+        .map(|index| format!("        - ignored-{index}\n"))
+        .collect::<String>();
+    let config = format!(
+        "mcp_servers:\n  guarded:\n    command: safe-runner\n    enabled: true\n    experimental:\n      args:\n{ignored_arguments}"
+    );
+    fs::write(
+        fixture.layout.profile.hermes_home.join("config.yaml"),
+        config,
+    )
+    .unwrap();
+
+    let imported = import_everything(&fixture, true);
+    let component = imported
+        .components
+        .iter()
+        .find(|component| component.kind == ComponentKind::McpServer && component.name == "guarded")
+        .unwrap();
+    assert_eq!(metadata(component, "redacted"), None);
+    assert_eq!(metadata(component, "secretReferenceNames"), None);
+    assert_eq!(
+        component.body_markdown,
+        r#"{"command":"safe-runner","enabled":true}"#
+    );
+}
+
+#[test]
 fn nested_auth_structures_are_removed_from_mcp_and_hook_components() {
     let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
     fs::write(

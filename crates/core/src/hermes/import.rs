@@ -757,7 +757,6 @@ fn sanitize_mcp(value: &YamlValue) -> Result<(JsonValue, bool, BTreeSet<String>)
     let mut object = BTreeMap::new();
     let mut redacted = false;
     let mut placeholders = BTreeSet::new();
-    collect_contextual_placeholders(value, &mut placeholders)?;
     for (key, value) in mapping {
         let key = key
             .as_str()
@@ -784,6 +783,7 @@ fn sanitize_mcp(value: &YamlValue) -> Result<(JsonValue, bool, BTreeSet<String>)
         }
         if credential_context_field(key, value) {
             redacted = true;
+            collect_context_field_placeholders(key, value, &mut placeholders)?;
             continue;
         }
         if key == "tools" {
