@@ -19,7 +19,6 @@ use super::{HermesProfile, conflict};
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
 #[cfg(all(unix, not(target_os = "linux")))]
 const PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(unix)]
 const PROCESS_OUTPUT_LIMIT: u64 = 16 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -499,6 +498,41 @@ struct ProcessObservation {
     profile_matches: Option<bool>,
 }
 
+#[cfg(any(windows, test))]
+enum LiveCommandLine {
+    Readable(Vec<String>),
+    Unreadable,
+    Ambiguous,
+}
+
+#[cfg(any(windows, test))]
+fn inspect_live_process_identity(
+    record: &GatewayIdentityRecord,
+    profile: &HermesProfile,
+    actual_start: Option<u64>,
+    live_command_line: LiveCommandLine,
+) -> ProcessObservation {
+    let (command_is_gateway, profile_matches) = match live_command_line {
+        LiveCommandLine::Readable(argv) if valid_argv(&argv) => (
+            Some(command_is_gateway(&argv)),
+            Some(argv_matches_profile(&argv, profile)),
+        ),
+        LiveCommandLine::Unreadable if valid_argv(&record.argv) => (
+            Some(command_is_gateway(&record.argv)),
+            Some(argv_matches_profile(&record.argv, profile)),
+        ),
+        LiveCommandLine::Readable(_) | LiveCommandLine::Unreadable | LiveCommandLine::Ambiguous => {
+            (None, None)
+        }
+    };
+    ProcessObservation {
+        exists: Some(true),
+        start_time_matches: start_time_matches(record.start_time, actual_start),
+        command_is_gateway,
+        profile_matches,
+    }
+}
+
 #[cfg(unix)]
 fn inspect_process(record: &GatewayIdentityRecord, profile: &HermesProfile) -> ProcessObservation {
     let exists = process_exists_unix(record.pid);
@@ -691,9 +725,9 @@ fn inspect_process(record: &GatewayIdentityRecord, profile: &HermesProfile) -> P
     use std::mem::MaybeUninit;
     use windows_sys::Win32::{
         Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, GetLastError, STILL_ACTIVE},
+        Storage::FileSystem::SYNCHRONIZE,
         System::Threading::{
             GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-            SYNCHRONIZE,
         },
     };
 
@@ -723,7 +757,7 @@ fn inspect_process(record: &GatewayIdentityRecord, profile: &HermesProfile) -> P
     let mut kernel = MaybeUninit::<FILETIME>::uninit();
     let mut user = MaybeUninit::<FILETIME>::uninit();
     let exit_ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
-    let live = exit_ok && exit_code == STILL_ACTIVE;
+    let live = exit_ok && exit_code == STILL_ACTIVE as u32;
     let times_ok = unsafe {
         GetProcessTimes(
             handle,
@@ -733,6 +767,7 @@ fn inspect_process(record: &GatewayIdentityRecord, profile: &HermesProfile) -> P
             user.as_mut_ptr(),
         )
     } != 0;
+    let live_command_line = live.then(|| windows_process_command_line(handle));
     unsafe { CloseHandle(handle) };
     if !exit_ok {
         return ProcessObservation {
@@ -754,12 +789,197 @@ fn inspect_process(record: &GatewayIdentityRecord, profile: &HermesProfile) -> P
     let creation_ticks =
         creation.map(|time| ((time.dwHighDateTime as u64) << 32) | time.dwLowDateTime as u64);
     let creation_centiseconds = creation_ticks.and_then(windows_filetime_centiseconds);
-    ProcessObservation {
-        exists: Some(true),
-        start_time_matches: start_time_matches(record.start_time, creation_centiseconds),
-        command_is_gateway: Some(command_is_gateway(&record.argv)),
-        profile_matches: Some(argv_matches_profile(&record.argv, profile)),
+    inspect_live_process_identity(
+        record,
+        profile,
+        creation_centiseconds,
+        live_command_line.unwrap_or(LiveCommandLine::Ambiguous),
+    )
+}
+
+#[cfg(windows)]
+const WINDOWS_PROCESS_COMMAND_LINE_INFORMATION: i32 = 60;
+#[cfg(windows)]
+const WINDOWS_COMMAND_LINE_BYTES_LIMIT: usize = PROCESS_OUTPUT_LIMIT as usize;
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsUnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *const u16,
+}
+
+#[cfg(windows)]
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    #[link_name = "NtQueryInformationProcess"]
+    fn nt_query_information_process(
+        process_handle: *mut std::ffi::c_void,
+        process_information_class: i32,
+        process_information: *mut std::ffi::c_void,
+        process_information_length: u32,
+        return_length: *mut u32,
+    ) -> windows_sys::Win32::Foundation::NTSTATUS;
+}
+
+#[cfg(windows)]
+#[link(name = "shell32")]
+unsafe extern "system" {
+    #[link_name = "CommandLineToArgvW"]
+    fn command_line_to_argv_w(command_line: *const u16, argument_count: *mut i32) -> *mut *mut u16;
+}
+
+#[cfg(windows)]
+fn windows_process_command_line(handle: windows_sys::Win32::Foundation::HANDLE) -> LiveCommandLine {
+    use windows_sys::Win32::Foundation::{STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH};
+
+    let mut required = 0u32;
+    let status = unsafe {
+        nt_query_information_process(
+            handle,
+            WINDOWS_PROCESS_COMMAND_LINE_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut required,
+        )
+    };
+    if windows_command_line_unreadable(status) {
+        return LiveCommandLine::Unreadable;
     }
+    if !matches!(
+        status,
+        STATUS_INFO_LENGTH_MISMATCH | STATUS_BUFFER_TOO_SMALL
+    ) {
+        return LiveCommandLine::Ambiguous;
+    }
+    let header_size = std::mem::size_of::<WindowsUnicodeString>();
+    let required = required as usize;
+    if required < header_size
+        || required > header_size.saturating_add(WINDOWS_COMMAND_LINE_BYTES_LIMIT)
+    {
+        return LiveCommandLine::Ambiguous;
+    }
+
+    let mut information = vec![0u8; required];
+    let mut returned = 0u32;
+    let status = unsafe {
+        nt_query_information_process(
+            handle,
+            WINDOWS_PROCESS_COMMAND_LINE_INFORMATION,
+            information.as_mut_ptr().cast(),
+            information.len() as u32,
+            &mut returned,
+        )
+    };
+    if windows_command_line_unreadable(status) {
+        return LiveCommandLine::Unreadable;
+    }
+    if status != 0 {
+        return LiveCommandLine::Ambiguous;
+    }
+    let returned = returned as usize;
+    let written = if returned == 0 {
+        information.len()
+    } else if (header_size..=information.len()).contains(&returned) {
+        returned
+    } else {
+        return LiveCommandLine::Ambiguous;
+    };
+    windows_command_line_from_information(&information[..written])
+        .map_or(LiveCommandLine::Ambiguous, LiveCommandLine::Readable)
+}
+
+#[cfg(windows)]
+fn windows_command_line_unreadable(status: windows_sys::Win32::Foundation::NTSTATUS) -> bool {
+    use windows_sys::Win32::Foundation::{
+        STATUS_ACCESS_DENIED, STATUS_INVALID_INFO_CLASS, STATUS_NOT_IMPLEMENTED,
+        STATUS_NOT_SUPPORTED,
+    };
+
+    matches!(
+        status,
+        STATUS_ACCESS_DENIED
+            | STATUS_INVALID_INFO_CLASS
+            | STATUS_NOT_IMPLEMENTED
+            | STATUS_NOT_SUPPORTED
+    )
+}
+
+#[cfg(windows)]
+fn windows_command_line_from_information(information: &[u8]) -> Option<Vec<String>> {
+    let header_size = std::mem::size_of::<WindowsUnicodeString>();
+    if information.len() < header_size {
+        return None;
+    }
+    let header =
+        unsafe { std::ptr::read_unaligned(information.as_ptr().cast::<WindowsUnicodeString>()) };
+    let length = usize::from(header.length);
+    if length == 0
+        || !length.is_multiple_of(2)
+        || length > WINDOWS_COMMAND_LINE_BYTES_LIMIT
+        || usize::from(header.maximum_length) < length
+        || header.buffer.is_null()
+    {
+        return None;
+    }
+    let information_start = information.as_ptr() as usize;
+    let information_end = information_start.checked_add(information.len())?;
+    let command_start = header.buffer as usize;
+    let command_end = command_start.checked_add(length)?;
+    if command_start < information_start
+        || command_end > information_end
+        || !command_start.is_multiple_of(std::mem::align_of::<u16>())
+    {
+        return None;
+    }
+    let command = unsafe { std::slice::from_raw_parts(header.buffer, length / 2) };
+    windows_command_line_to_argv(command)
+}
+
+#[cfg(windows)]
+fn windows_command_line_to_argv(command: &[u16]) -> Option<Vec<String>> {
+    use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
+
+    if command.is_empty() || command.len().saturating_mul(2) > WINDOWS_COMMAND_LINE_BYTES_LIMIT {
+        return None;
+    }
+    let mut terminated = command.to_vec();
+    terminated.push(0);
+    let mut argument_count = 0i32;
+    let raw_arguments = unsafe { command_line_to_argv_w(terminated.as_ptr(), &mut argument_count) };
+    if raw_arguments.is_null() || !(1..=64).contains(&argument_count) {
+        if !raw_arguments.is_null() {
+            unsafe {
+                LocalFree(raw_arguments.cast::<std::ffi::c_void>() as HLOCAL);
+            }
+        }
+        return None;
+    }
+    struct LocalArguments(HLOCAL);
+    impl Drop for LocalArguments {
+        fn drop(&mut self) {
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+    let _allocation = LocalArguments(raw_arguments.cast::<std::ffi::c_void>() as HLOCAL);
+    let argument_pointers =
+        unsafe { std::slice::from_raw_parts(raw_arguments, argument_count as usize) };
+    let mut argv = Vec::with_capacity(argument_pointers.len());
+    for &argument in argument_pointers {
+        if argument.is_null() {
+            return None;
+        }
+        let length = (0..=4096).find(|&index| unsafe { *argument.add(index) } == 0)?;
+        if length == 0 || length > 4096 {
+            return None;
+        }
+        let wide = unsafe { std::slice::from_raw_parts(argument, length) };
+        argv.push(String::from_utf16(wide).ok()?);
+    }
+    valid_argv(&argv).then_some(argv)
 }
 
 #[cfg(any(windows, test))]
@@ -1122,6 +1342,105 @@ mod tests {
         assert!(!command_text_matches_profile(
             "/opt/bin/hermes-gateway --profile writer",
             &default
+        ));
+    }
+
+    #[test]
+    fn readable_live_command_overrides_null_start_record_fallback() {
+        let profile = HermesProfile {
+            name: "coder".into(),
+            hermes_home: PathBuf::from("/tmp/hermes-coder"),
+        };
+        let record = GatewayIdentityRecord {
+            pid: 4242,
+            kind: "hermes-gateway".into(),
+            argv: vec!["hermes-gateway".into(), "-p".into(), "coder".into()],
+            start_time: None,
+        };
+        let status = |process: ProcessObservation| {
+            evaluate_gateway(&GatewayObservation {
+                record_present: true,
+                record_valid: true,
+                lock_held: Some(false),
+                process_exists: process.exists,
+                start_time_matches: process.start_time_matches,
+                command_is_gateway: process.command_is_gateway,
+                profile_matches: process.profile_matches,
+            })
+        };
+
+        let unrelated = inspect_live_process_identity(
+            &record,
+            &profile,
+            Some(123),
+            LiveCommandLine::Readable(vec![
+                "not-hermes.exe".into(),
+                "--profile".into(),
+                "coder".into(),
+            ]),
+        );
+        assert_eq!(unrelated.command_is_gateway, Some(false));
+        assert_eq!(status(unrelated), GatewayStatus::Unverifiable);
+
+        let wrong_profile = inspect_live_process_identity(
+            &record,
+            &profile,
+            Some(123),
+            LiveCommandLine::Readable(vec![
+                "hermes-gateway.exe".into(),
+                "--profile".into(),
+                "writer".into(),
+            ]),
+        );
+        assert_eq!(wrong_profile.command_is_gateway, Some(true));
+        assert_eq!(wrong_profile.profile_matches, Some(false));
+        assert_eq!(status(wrong_profile), GatewayStatus::Unverifiable);
+
+        let unreadable = inspect_live_process_identity(
+            &record,
+            &profile,
+            Some(123),
+            LiveCommandLine::Unreadable,
+        );
+        assert_eq!(status(unreadable), GatewayStatus::Live);
+
+        let ambiguous =
+            inspect_live_process_identity(&record, &profile, Some(123), LiveCommandLine::Ambiguous);
+        assert_eq!(ambiguous.command_is_gateway, None);
+        assert_eq!(status(ambiguous), GatewayStatus::Unverifiable);
+
+        let malformed = inspect_live_process_identity(
+            &record,
+            &profile,
+            Some(123),
+            LiveCommandLine::Readable(Vec::new()),
+        );
+        assert_eq!(malformed.command_is_gateway, None);
+        assert_eq!(status(malformed), GatewayStatus::Unverifiable);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_live_command_parser_preserves_quoted_executable_and_profile() {
+        let command = r#""C:\Program Files\Hermes\hermes-gateway.exe" --profile "coder""#
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let argv = windows_command_line_to_argv(&command).unwrap();
+        assert_eq!(
+            argv,
+            [
+                r"C:\Program Files\Hermes\hermes-gateway.exe",
+                "--profile",
+                "coder"
+            ]
+        );
+        assert!(command_is_gateway(&argv));
+        assert!(argv_matches_profile(
+            &argv,
+            &HermesProfile {
+                name: "coder".into(),
+                hermes_home: PathBuf::from(r"C:\Users\example\.hermes-coder"),
+            }
         ));
     }
 
