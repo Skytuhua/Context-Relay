@@ -1907,6 +1907,72 @@ fn hook_credential_option_command_is_omitted_and_marked_redacted() {
 }
 
 #[test]
+fn mcp_context_redaction_preserves_embedded_placeholder_names_without_command_or_args() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    fs::write(
+        fixture.layout.profile.hermes_home.join("config.yaml"),
+        r#"mcp_servers:
+  guarded:
+    command: "helper --token ${MCP_SHARED} --secret=${MCP_COMMAND_SECRET}"
+    args:
+      - "--api-key=${MCP_ARGS_KEY}"
+      - --client-key
+      - "prefix-${MCP_CLIENT_KEY}-suffix"
+      - --password
+      - "${MCP_SHARED}"
+    enabled: true
+    timeout: 30
+"#,
+    )
+    .unwrap();
+
+    let imported = import_everything(&fixture, true);
+    let component = imported
+        .components
+        .iter()
+        .find(|component| component.kind == ComponentKind::McpServer && component.name == "guarded")
+        .unwrap();
+    assert_eq!(metadata(component, "redacted"), Some("true"));
+    assert_eq!(
+        metadata(component, "secretReferenceNames"),
+        Some("MCP_ARGS_KEY,MCP_CLIENT_KEY,MCP_COMMAND_SECRET,MCP_SHARED")
+    );
+    assert_eq!(component.body_markdown, r#"{"enabled":true,"timeout":30}"#);
+    assert!(!component.body_markdown.contains("helper"));
+    assert!(!component.body_markdown.contains("--api-key"));
+}
+
+#[test]
+fn hook_context_redaction_preserves_embedded_placeholder_names_without_command() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    fs::write(
+        fixture.layout.profile.hermes_home.join("config.yaml"),
+        r#"hooks:
+  guarded:
+    command: "helper --token ${HOOK_TOKEN} --client-key=${HOOK_CLIENT_KEY} --secret prefix-${HOOK_SECRET}-suffix --password ${HOOK_TOKEN}"
+    enabled: false
+    timeout: 45
+"#,
+    )
+    .unwrap();
+
+    let imported = import_everything(&fixture, true);
+    let component = imported
+        .components
+        .iter()
+        .find(|component| component.kind == ComponentKind::Hook && component.name == "guarded")
+        .unwrap();
+    assert_eq!(metadata(component, "redacted"), Some("true"));
+    assert_eq!(
+        metadata(component, "secretReferenceNames"),
+        Some("HOOK_CLIENT_KEY,HOOK_SECRET,HOOK_TOKEN")
+    );
+    assert_eq!(component.body_markdown, r#"{"enabled":false,"timeout":45}"#);
+    assert!(!component.body_markdown.contains("helper"));
+    assert!(!component.body_markdown.contains("--token"));
+}
+
+#[test]
 fn nested_auth_structures_are_removed_from_mcp_and_hook_components() {
     let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
     fs::write(

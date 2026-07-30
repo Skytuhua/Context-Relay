@@ -141,6 +141,8 @@ pub(super) fn project_reviewed_config(
                 .as_str()
                 .ok_or_else(|| invalid("Hermes hook name is invalid"))?;
             safe_name(name)?;
+            let mut placeholders = BTreeSet::new();
+            collect_contextual_placeholders(hook, &mut placeholders)?;
             let (reviewed, redacted) = sanitize_general(hook, &mut vec!["hooks".to_owned()]);
             let reviewed =
                 reviewed.ok_or_else(|| invalid("Hermes hook contains no reviewed values"))?;
@@ -152,6 +154,12 @@ pub(super) fn project_reviewed_config(
             let mut extra = vec![("enabled".into(), enabled.to_string())];
             if redacted {
                 extra.push(("redacted".into(), "true".into()));
+                if !placeholders.is_empty() {
+                    extra.push((
+                        "secretReferenceNames".into(),
+                        placeholders.into_iter().collect::<Vec<_>>().join(","),
+                    ));
+                }
             }
             let mut component = draft_component(
                 profile,
@@ -749,6 +757,7 @@ fn sanitize_mcp(value: &YamlValue) -> Result<(JsonValue, bool, BTreeSet<String>)
     let mut object = BTreeMap::new();
     let mut redacted = false;
     let mut placeholders = BTreeSet::new();
+    collect_contextual_placeholders(value, &mut placeholders)?;
     for (key, value) in mapping {
         let key = key
             .as_str()
@@ -775,7 +784,6 @@ fn sanitize_mcp(value: &YamlValue) -> Result<(JsonValue, bool, BTreeSet<String>)
         }
         if credential_context_field(key, value) {
             redacted = true;
-            collect_placeholders(value, &mut placeholders);
             continue;
         }
         if key == "tools" {
@@ -903,14 +911,15 @@ fn credential_context_field(key: &str, value: &YamlValue) -> bool {
 }
 
 fn credential_option_tokens<'a>(tokens: impl IntoIterator<Item = &'a str>) -> bool {
-    const MAX_ARGUMENTS: usize = 128;
-    const MAX_ARGUMENT_BYTES: usize = 4096;
-
     let tokens = tokens
         .into_iter()
-        .take(MAX_ARGUMENTS + 1)
+        .take(MAX_CREDENTIAL_ARGUMENTS + 1)
         .collect::<Vec<_>>();
-    if tokens.len() > MAX_ARGUMENTS || tokens.iter().any(|token| token.len() > MAX_ARGUMENT_BYTES) {
+    if tokens.len() > MAX_CREDENTIAL_ARGUMENTS
+        || tokens
+            .iter()
+            .any(|token| token.len() > MAX_CREDENTIAL_ARGUMENT_BYTES)
+    {
         return true;
     }
     for (index, token) in tokens.iter().enumerate() {
@@ -950,6 +959,126 @@ fn credential_option_name(name: &str) -> bool {
             | b"authorization"
             | b"clientkey"
     )
+}
+
+const MAX_CREDENTIAL_ARGUMENTS: usize = 128;
+const MAX_CREDENTIAL_ARGUMENT_BYTES: usize = 4096;
+const MAX_CONTEXTUAL_PLACEHOLDERS: usize = 128;
+
+fn collect_contextual_placeholders(
+    value: &YamlValue,
+    names: &mut BTreeSet<String>,
+) -> Result<(), ClientError> {
+    match value {
+        YamlValue::Sequence(values) => {
+            for value in values {
+                collect_contextual_placeholders(value, names)?;
+            }
+        }
+        YamlValue::Mapping(values) => {
+            for (key, value) in values {
+                let Some(key) = key.as_str() else {
+                    continue;
+                };
+                if credential_context_field(key, value) {
+                    collect_context_field_placeholders(key, value, names)?;
+                } else {
+                    collect_contextual_placeholders(value, names)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collect_context_field_placeholders(
+    key: &str,
+    value: &YamlValue,
+    names: &mut BTreeSet<String>,
+) -> Result<(), ClientError> {
+    match (key, value) {
+        ("command", YamlValue::String(command)) => {
+            let tokens = command
+                .split_whitespace()
+                .take(MAX_CREDENTIAL_ARGUMENTS + 1)
+                .collect::<Vec<_>>();
+            if tokens.len() > MAX_CREDENTIAL_ARGUMENTS
+                || tokens
+                    .iter()
+                    .any(|token| token.len() > MAX_CREDENTIAL_ARGUMENT_BYTES)
+            {
+                return Err(invalid(
+                    "Hermes credential command exceeds the review limit",
+                ));
+            }
+            for token in tokens {
+                collect_embedded_placeholder_names(token, names)?;
+            }
+        }
+        ("args", YamlValue::Sequence(arguments)) => {
+            if arguments.len() > MAX_CREDENTIAL_ARGUMENTS {
+                return Err(invalid(
+                    "Hermes credential arguments exceed the review limit",
+                ));
+            }
+            for argument in arguments {
+                let argument = argument
+                    .as_str()
+                    .ok_or_else(|| invalid("Hermes credential argument is invalid"))?;
+                if argument.len() > MAX_CREDENTIAL_ARGUMENT_BYTES {
+                    return Err(invalid(
+                        "Hermes credential argument exceeds the review limit",
+                    ));
+                }
+                collect_embedded_placeholder_names(argument, names)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collect_embedded_placeholder_names(
+    value: &str,
+    names: &mut BTreeSet<String>,
+) -> Result<(), ClientError> {
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    while index + 3 < bytes.len() {
+        if bytes[index] != b'$' || bytes[index + 1] != b'{' {
+            index += 1;
+            continue;
+        }
+        let name_start = index + 2;
+        let search_end = bytes.len().min(name_start + 129);
+        let Some(relative_end) = bytes[name_start..search_end]
+            .iter()
+            .position(|byte| *byte == b'}')
+        else {
+            index += 2;
+            continue;
+        };
+        let name_end = name_start + relative_end;
+        let name = &bytes[name_start..name_end];
+        let valid = !name.is_empty()
+            && (name[0] == b'_' || name[0].is_ascii_uppercase())
+            && name[1..]
+                .iter()
+                .all(|byte| *byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit());
+        if valid {
+            let name = std::str::from_utf8(name)
+                .map_err(|_| invalid("Hermes placeholder name is invalid"))?;
+            if !names.contains(name) && names.len() >= MAX_CONTEXTUAL_PLACEHOLDERS {
+                return Err(invalid(
+                    "Hermes placeholder metadata exceeds the review limit",
+                ));
+            }
+            names.insert(name.to_owned());
+        }
+        index = name_end + 1;
+    }
+    Ok(())
 }
 
 fn collect_redacted_placeholders(
