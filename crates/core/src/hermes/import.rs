@@ -9,6 +9,7 @@ use context_relay_protocol::{
     ClientError, ComponentKind, ComponentRecord, DeviceId, ErrorCode, HarnessId,
     HybridLogicalClock, NativeScope, Provenance, RecordId, ScopeRef, Sha256Digest,
 };
+use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_yaml_ng::Value as YamlValue;
 use sha2::{Digest as _, Sha256};
@@ -396,10 +397,37 @@ impl HermesAdapter {
                 let parsed = yaml::parse_config(&bytes)?;
                 digests.insert(digest(&parsed.source));
                 let projected = project_reviewed_config(&parsed, &self.layout.profile.name)?;
+                let enabled_plugins = projected
+                    .iter()
+                    .filter(|component| {
+                        component.kind == ComponentKind::Plugin
+                            && !component.archived
+                            && component
+                                .metadata
+                                .iter()
+                                .find_map(|(key, value)| {
+                                    (key == "structuralLocation").then_some(value.as_str())
+                                })
+                                .is_some_and(|location| {
+                                    location.starts_with("config:plugins.enabled.")
+                                })
+                    })
+                    .map(|component| component.name.clone())
+                    .collect::<BTreeSet<_>>();
                 let disabled_plugins = projected
                     .iter()
                     .filter(|component| {
-                        component.kind == ComponentKind::Plugin && component.archived
+                        component.kind == ComponentKind::Plugin
+                            && component.archived
+                            && component
+                                .metadata
+                                .iter()
+                                .find_map(|(key, value)| {
+                                    (key == "structuralLocation").then_some(value.as_str())
+                                })
+                                .is_some_and(|location| {
+                                    location.starts_with("config:plugins.disabled.")
+                                })
                     })
                     .map(|component| component.name.clone())
                     .collect::<BTreeSet<_>>();
@@ -417,6 +445,7 @@ impl HermesAdapter {
                 }
                 self.import_profile_files(
                     include_disabled,
+                    &enabled_plugins,
                     &disabled_plugins,
                     &disabled_hooks,
                     components,
@@ -457,6 +486,7 @@ impl HermesAdapter {
     fn import_profile_files(
         &self,
         include_disabled: bool,
+        enabled_plugins: &BTreeSet<String>,
         disabled_plugins: &BTreeSet<String>,
         disabled_hooks: &BTreeSet<String>,
         components: &mut Vec<ComponentRecord>,
@@ -482,7 +512,13 @@ impl HermesAdapter {
             )?);
         }
         self.import_skills(components, digests)?;
-        self.import_plugins(include_disabled, disabled_plugins, components, digests)?;
+        self.import_plugins(
+            include_disabled,
+            enabled_plugins,
+            disabled_plugins,
+            components,
+            digests,
+        )?;
         self.import_hooks(include_disabled, disabled_hooks, components, digests)
     }
 
@@ -533,6 +569,7 @@ impl HermesAdapter {
     fn import_plugins(
         &self,
         include_disabled: bool,
+        enabled_plugins: &BTreeSet<String>,
         disabled_plugins: &BTreeSet<String>,
         components: &mut Vec<ComponentRecord>,
         digests: &mut BTreeSet<Sha256Digest>,
@@ -550,8 +587,17 @@ impl HermesAdapter {
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| invalid("Hermes plugin name is invalid"))?;
             safe_name(name)?;
-            let disabled = disabled_plugins.contains(name);
-            if disabled && !include_disabled {
+            let state = match (
+                enabled_plugins.contains(name),
+                disabled_plugins.contains(name),
+            ) {
+                (true, false) => "enabled",
+                (false, true) => "disabled",
+                (false, false) => "discovered",
+                (true, true) => "ambiguous",
+            };
+            let active = state == "enabled";
+            if !active && !include_disabled {
                 continue;
             }
             let location = format!("profile:plugins/{name}/plugin.yaml");
@@ -565,20 +611,21 @@ impl HermesAdapter {
             };
             yaml::scan_text_secret(&bytes, &location)?;
             digests.insert(digest(&bytes));
+            let body = reviewed_plugin_manifest(&bytes, name)?;
             let mut component = self.file_component(
                 ScopeRef::Global,
                 ComponentKind::Plugin,
                 name,
-                String::from_utf8(bytes)
-                    .map_err(|_| invalid("Hermes plugin manifest is not valid UTF-8"))?,
+                body,
                 &location,
                 "yaml",
                 vec![
                     ("manifest".into(), "true".into()),
-                    ("enabled".into(), (!disabled).to_string()),
+                    ("enabled".into(), active.to_string()),
+                    ("pluginState".into(), state.into()),
                 ],
             )?;
-            component.archived = disabled;
+            component.archived = !active;
             components.push(component);
         }
         Ok(())
@@ -663,7 +710,7 @@ impl HermesAdapter {
                     .ok_or_else(|| invalid("Hermes project context escaped its root"))?;
                 let relative_directory = display_relative(relative_directory)?;
                 let location = if relative_directory.is_empty() {
-                    format!("project:./{name}")
+                    format!("project:{name}")
                 } else {
                     format!("project:{relative_directory}/{name}")
                 };
@@ -889,6 +936,47 @@ fn sanitize_general(value: &YamlValue, path: &mut Vec<String>) -> (Option<JsonVa
         }
         YamlValue::Tagged(_) => (None, true),
     }
+}
+
+#[derive(Serialize)]
+struct ReviewedPluginManifest<'a> {
+    name: &'a str,
+    version: &'a YamlValue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+}
+
+fn reviewed_plugin_manifest(bytes: &[u8], expected_name: &str) -> Result<String, ClientError> {
+    let parsed = yaml::parse_config(bytes)?;
+    let root = parsed
+        .value
+        .as_mapping()
+        .ok_or_else(|| invalid("Hermes plugin manifest root is invalid"))?;
+    let name = get(root, "name")
+        .and_then(YamlValue::as_str)
+        .filter(|name| *name == expected_name)
+        .ok_or_else(|| invalid("Hermes plugin manifest name is invalid"))?;
+    let version = get(root, "version")
+        .filter(|version| match version {
+            YamlValue::String(value) => !value.is_empty() && value.len() <= 128,
+            YamlValue::Number(value) => value.to_string().len() <= 128,
+            _ => false,
+        })
+        .ok_or_else(|| invalid("Hermes plugin manifest version is invalid"))?;
+    let description = get(root, "description")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|description| description.len() <= 4096)
+                .ok_or_else(|| invalid("Hermes plugin manifest description is invalid"))
+        })
+        .transpose()?;
+    serde_yaml_ng::to_string(&ReviewedPluginManifest {
+        name,
+        version,
+        description,
+    })
+    .map_err(|_| invalid("Hermes plugin manifest projection is invalid"))
 }
 
 fn credential_context_field(key: &str, value: &YamlValue) -> bool {

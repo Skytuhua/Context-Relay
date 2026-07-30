@@ -848,8 +848,7 @@ fn unsupported_permission_mappings_are_visible_in_probe_and_preview() {
         vec![
             "approval_mode_not_portable".to_owned(),
             "deny_pattern_not_portable".to_owned(),
-            "frozen_session_snapshot".to_owned(),
-            "gateway_state_unverifiable".to_owned(),
+            "gateway_state_stale".to_owned(),
             "permanent_allowlist_not_portable".to_owned(),
         ]
     );
@@ -1224,6 +1223,65 @@ fn plugin_enabled_inserts_under_existing_parent_without_replacing_unknown_childr
 }
 
 #[test]
+fn plugin_manifests_preserve_enabled_disabled_and_discovered_states() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let plugins = fixture.layout.profile.hermes_home.join("plugins");
+    for (name, body) in [
+        (
+            "legacy",
+            "name: legacy\nversion: 0.9.0\ndescription: Disabled plugin.\n",
+        ),
+        (
+            "observer",
+            "name: observer\nversion: 1.0.0\ndescription: Discovered plugin.\n",
+        ),
+    ] {
+        fs::create_dir_all(plugins.join(name)).unwrap();
+        fs::write(plugins.join(name).join("plugin.yaml"), body).unwrap();
+    }
+
+    let imported = import_global(&fixture);
+    let manifest = |name: &str| {
+        imported
+            .components
+            .iter()
+            .find(|component| {
+                component.kind == ComponentKind::Plugin
+                    && component.name == name
+                    && metadata(component, "manifest") == Some("true")
+            })
+            .unwrap()
+    };
+    let enabled = manifest("reviewer");
+    let disabled = manifest("legacy");
+    let discovered = manifest("observer");
+
+    assert_eq!(metadata(enabled, "pluginState"), Some("enabled"));
+    assert_eq!(metadata(enabled, "enabled"), Some("true"));
+    assert!(!enabled.archived);
+    assert_eq!(metadata(disabled, "pluginState"), Some("disabled"));
+    assert_eq!(metadata(disabled, "enabled"), Some("false"));
+    assert!(disabled.archived);
+    assert_eq!(metadata(discovered, "pluginState"), Some("discovered"));
+    assert_eq!(metadata(discovered, "enabled"), Some("false"));
+    assert!(discovered.archived);
+    assert!(enabled.body_markdown.contains("name: reviewer"));
+    assert!(disabled.body_markdown.contains("name: legacy"));
+    assert!(discovered.body_markdown.contains("name: observer"));
+
+    let desired = desired_global(&fixture, vec![discovered.clone()]);
+    assert!(fixture.adapter.render(&desired).unwrap().files.is_empty());
+    assert!(
+        fixture
+            .adapter
+            .plan_native_config(&desired)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn live_selected_profile_gateway_blocks_every_active_change() {
     let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
     let profile = &fixture.layout.profile.hermes_home;
@@ -1343,9 +1401,10 @@ fn other_profile_gateway_does_not_block_selected_profile() {
 fn stale_dead_gateway_is_nonblocking_and_reported() {
     let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
     let profile = &fixture.layout.profile.hermes_home;
-    let stale = r#"{"pid":999999,"kind":"gateway","argv":["hermes","gateway","run","--profile","coder"],"start_time":1}"#;
+    let stale = r#"{"pid":999999,"kind":"hermes-gateway","argv":["hermes","gateway","run","--profile","coder"],"start_time":1}"#;
+    let stale_runtime = r#"{"pid":999999,"kind":"hermes-gateway","argv":["hermes","gateway","run","--profile","coder"],"start_time":1,"gateway_state":"running","exit_reason":null,"restart_requested":false,"active_agents":0,"platforms":{},"updated_at":"2026-07-07T12:00:00+00:00"}"#;
     fs::write(profile.join("gateway.pid"), stale).unwrap();
-    fs::write(profile.join("gateway_state.json"), stale).unwrap();
+    fs::write(profile.join("gateway_state.json"), stale_runtime).unwrap();
     let imported = import_global(&fixture);
     let mut exact = component_at(
         &imported.components,
@@ -1384,15 +1443,15 @@ fn malformed_recycled_or_foreign_gateway_state_blocks_active_apply() {
     for record in [
         "{malformed".to_owned(),
         format!(
-            r#"{{"pid":{},"kind":"gateway","argv":["hermes","gateway","run","--profile","coder"],"start_time":1}}"#,
+            r#"{{"pid":{},"kind":"hermes-gateway","argv":["hermes","gateway","run","--profile","coder"],"start_time":1}}"#,
             std::process::id()
         ),
         format!(
-            r#"{{"pid":{},"kind":"gateway","argv":["not-hermes","gateway","run","--profile","coder"],"start_time":1}}"#,
+            r#"{{"pid":{},"kind":"hermes-gateway","argv":["not-hermes","gateway","run","--profile","coder"],"start_time":1}}"#,
             std::process::id()
         ),
         format!(
-            r#"{{"pid":{},"kind":"gateway","argv":["hermes","gateway","run","--profile","writer"],"start_time":1}}"#,
+            r#"{{"pid":{},"kind":"hermes-gateway","argv":["hermes","gateway","run","--profile","writer"],"start_time":1}}"#,
             std::process::id()
         ),
     ] {
@@ -1609,8 +1668,7 @@ fn supported_release_fixtures_bind_one_named_profile() {
             vec![
                 "approval_mode_not_portable".to_owned(),
                 "deny_pattern_not_portable".to_owned(),
-                "frozen_session_snapshot".to_owned(),
-                "gateway_state_unverifiable".to_owned(),
+                "gateway_state_stale".to_owned(),
                 "permanent_allowlist_not_portable".to_owned(),
             ]
         );
@@ -2243,6 +2301,46 @@ fn soul_and_nearest_project_context_have_exact_precedence() {
 }
 
 #[test]
+fn root_project_context_round_trips_without_a_curdir_segment() {
+    for (remove_preferred, name) in [(false, ".hermes.md"), (true, "HERMES.md")] {
+        let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+        for service_name in [".hermes.md", "HERMES.md"] {
+            fs::remove_file(fixture.layout.working_directory.join(service_name)).unwrap();
+        }
+        if remove_preferred {
+            fs::remove_file(fixture.layout.project_root.join(".hermes.md")).unwrap();
+        }
+        let imported = import_everything(&fixture, true);
+        let context = imported
+            .components
+            .iter()
+            .find(|component| metadata(component, "contextRole") == Some("project"))
+            .unwrap();
+
+        assert_eq!(context.name, name);
+        assert_eq!(
+            metadata(context, "structuralLocation"),
+            Some(format!("project:{name}").as_str())
+        );
+        let desired = DesiredState {
+            components: vec![context.clone()],
+            scopes: vec![NativeScope::Project {
+                project_id: fixture.project_id,
+                root: fixture.adapter.project_root_wire(),
+            }],
+        };
+        assert!(fixture.adapter.render(&desired).unwrap().files.is_empty());
+        assert!(
+            fixture
+                .adapter
+                .plan_native_markdown(context)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn memory_documents_remain_typed_and_separate() {
     let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
     let memories = fixture.adapter.import_native_memory().unwrap();
@@ -2274,9 +2372,32 @@ fn skills_plugins_and_hooks_are_allowlist_walks() {
     assert!(!serialized.contains("plugin.py"));
     assert!(!serialized.contains("requirements.txt"));
     assert!(!serialized.contains("ignored-hook.txt"));
+    assert!(!serialized.contains("REVIEW_TOKEN"));
     for sentinel in sentinels {
         assert!(!sentinel.exists(), "{} was executed", sentinel.display());
     }
+}
+
+#[test]
+fn plugin_manifest_import_is_a_deterministic_reviewed_projection() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let imported = import_global(&fixture);
+    let manifest = imported
+        .components
+        .iter()
+        .find(|component| {
+            component.kind == ComponentKind::Plugin
+                && component.name == "reviewer"
+                && metadata(component, "manifest") == Some("true")
+        })
+        .unwrap();
+
+    assert_eq!(
+        manifest.body_markdown,
+        "name: reviewer\nversion: 1.2.3\ndescription: Review changes.\n"
+    );
+    assert!(!manifest.body_markdown.contains("requires_env"));
+    assert!(!manifest.body_markdown.contains("REVIEW_TOKEN"));
 }
 
 #[test]
@@ -2624,7 +2745,7 @@ fn native_adapter_rechecks_gateway_profile_executable_and_digests() {
             .hermes_home
             .join("gateway.pid"),
         format!(
-            r#"{{"pid":{},"kind":"gateway","argv":["hermes","gateway","run","--profile","coder"],"start_time":1}}"#,
+            r#"{{"pid":{},"kind":"hermes-gateway","argv":["hermes","gateway","run","--profile","coder"],"start_time":1}}"#,
             std::process::id()
         ),
     )

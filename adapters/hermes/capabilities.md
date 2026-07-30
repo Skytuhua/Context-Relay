@@ -21,7 +21,7 @@ Hermes `0.18.2` and `0.18.1` native executables are supported for import and app
 
 ## Effective validation
 
-Effective validation runs only the attested executable with the exact arguments `config check`. It uses a unique owner-only staged `HERMES_HOME` containing a deterministic, reviewed, non-secret `config.yaml` projection plus empty `memories/` and `home/` directories. It never copies the real profile's secrets, identity, extension code, sessions, channels, gateway state, provider state, databases, or logs.
+Internal validation performs the reviewed semantic and configuration checks. Effective child validation then runs only the attested executable with the exact arguments `config check`. It uses a unique owner-only staged `HERMES_HOME` containing a shape-only `{}` `config.yaml` plus empty safe `memories/` and `home/` scaffolding. It never copies the reviewed semantic projection or the real profile's secrets, identity, extension code, sessions, channels, gateway state, provider state, databases, or logs.
 
 The child environment is cleared and rebuilt with only `HERMES_HOME`, `HOME`, `NO_COLOR=1`, `TERM=dumb`, and the minimal platform system `PATH`. Standard input is null; stdout and stderr are separately bounded; timeout, non-zero exit, stderr, invalid UTF-8, oversized output, and output-contract drift fail closed. Missing credentials in the frozen `0.18.2` or `0.18.1` `Configuration Status` contract are reported as `isolated_credential_missing` findings and do not make the reviewed structural configuration invalid.
 

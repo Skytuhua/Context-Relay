@@ -19,8 +19,8 @@
       "auth.json": "{\"token\":\"must-not-import-auth\"}\n",
       "sessions/session.jsonl": "{\"token\":\"must-not-import-session\"}\n",
       "state.db": "must-not-import-database",
-      "gateway.pid": "{\"pid\":999999,\"kind\":\"gateway\",\"argv\":[\"hermes\",\"gateway\",\"run\",\"--profile\",\"coder\"],\"start_time\":1}\n",
-      "gateway_state.json": "{\"channel_token\":\"must-not-import-gateway-token\"}\n",
+      "gateway.pid": "{\"pid\":999999,\"kind\":\"hermes-gateway\",\"argv\":[\"hermes\",\"gateway\",\"run\",\"--profile\",\"coder\"],\"start_time\":1}\n",
+      "gateway_state.json": "{\"pid\":999999,\"kind\":\"hermes-gateway\",\"argv\":[\"hermes\",\"gateway\",\"run\",\"--profile\",\"coder\"],\"start_time\":1,\"gateway_state\":\"running\",\"exit_reason\":null,\"restart_requested\":false,\"active_agents\":0,\"platforms\":{\"telegram\":{\"state\":\"running\",\"error_code\":null,\"error_message\":null,\"updated_at\":\"2026-07-07T12:00:00+00:00\"}},\"updated_at\":\"2026-07-07T12:00:00+00:00\"}\n",
       "channels/telegram.json": "{\"bot_token\":\"must-not-import-channel\"}\n",
       "logs/hermes.log": "must-not-import-log"
     }

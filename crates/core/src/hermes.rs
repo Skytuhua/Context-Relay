@@ -1006,19 +1006,48 @@ fn decode_wire_path(value: &WireNativeValue) -> Result<PathBuf, BoundaryError> {
 }
 
 fn default_hermes_home() -> Result<PathBuf, ClientError> {
-    if let Some(home) = env::var_os("HERMES_HOME") {
-        return Ok(PathBuf::from(home));
-    }
-    let home = home_dir().ok_or_else(|| not_found("Hermes home directory was not found"))?;
+    default_hermes_home_from(
+        env::var_os("HERMES_HOME").map(PathBuf::from),
+        env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        platform_home_dir(),
+        cfg!(target_os = "windows"),
+    )
+    .ok_or_else(|| not_found("Hermes home directory was not found"))
+}
+
+fn default_hermes_home_from(
+    explicit: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    home: Option<PathBuf>,
+    windows: bool,
+) -> Option<PathBuf> {
+    explicit.or_else(|| {
+        if windows {
+            local_app_data
+                .map(|local| local.join("hermes"))
+                .or_else(|| home.map(|home| home.join("AppData/Local/hermes")))
+        } else {
+            home.map(|home| home.join(".hermes"))
+        }
+    })
+}
+
+fn platform_home_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        return Ok(env::var_os("LOCALAPPDATA")
+        env::var_os("USERPROFILE")
+            .or_else(|| env::var_os("HOME"))
             .map(PathBuf::from)
-            .map(|local| local.join("hermes"))
-            .unwrap_or_else(|| home.join(".hermes")));
+            .or_else(|| {
+                let drive = env::var_os("HOMEDRIVE")?;
+                let path = env::var_os("HOMEPATH")?;
+                Some(PathBuf::from(drive).join(path))
+            })
     }
     #[cfg(not(target_os = "windows"))]
-    Ok(home.join(".hermes"))
+    {
+        home_dir()
+    }
 }
 
 fn find_executable() -> Option<PathBuf> {
@@ -1411,6 +1440,35 @@ mod tests {
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn default_home_resolution_matches_windows_priority_and_fallback() {
+        let explicit = PathBuf::from("explicit");
+        let local = PathBuf::from("local");
+        let home = PathBuf::from("home");
+
+        assert_eq!(
+            default_hermes_home_from(
+                Some(explicit.clone()),
+                Some(local.clone()),
+                Some(home.clone()),
+                true,
+            ),
+            Some(explicit)
+        );
+        assert_eq!(
+            default_hermes_home_from(None, Some(local.clone()), None, true),
+            Some(local.join("hermes"))
+        );
+        assert_eq!(
+            default_hermes_home_from(None, None, Some(home.clone()), true),
+            Some(home.join("AppData/Local/hermes"))
+        );
+        assert_eq!(
+            default_hermes_home_from(None, Some(local), Some(home.clone()), false),
+            Some(home.join(".hermes"))
+        );
+    }
 
     struct ValidationFixture {
         root: PathBuf,
