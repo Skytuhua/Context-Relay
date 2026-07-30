@@ -88,6 +88,11 @@ fn fixture(source: &str) -> Fixture {
 
     let executable = root.join("hermes");
     fs::write(&executable, b"\x7fELFfixture hermes executable").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let project_id = ProjectId::from_str(PROJECT_ID).unwrap();
     let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
     let layout = HermesLayout {
@@ -538,6 +543,102 @@ impl FaultHook for FailAfterPayloadWrites {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(unix)]
+fn gateway_lock_available(path: &Path) -> bool {
+    use std::{fs::OpenOptions, os::fd::AsRawFd as _};
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .unwrap();
+    let acquired = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if acquired {
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) }, 0);
+    }
+    acquired
+}
+
+#[cfg(unix)]
+struct GatewayReservationHook {
+    lock_path: PathBuf,
+    fail_after: Option<TransactionStep>,
+    blocked_after_reprobe: bool,
+}
+
+#[cfg(unix)]
+impl FaultHook for GatewayReservationHook {
+    fn after_step(&mut self, step: TransactionStep) -> Result<(), BoundaryError> {
+        if step == TransactionStep::ReprobeLiveState {
+            self.blocked_after_reprobe = !gateway_lock_available(&self.lock_path);
+        }
+        if self.fail_after == Some(step) {
+            Err(BoundaryError::new("injected after gateway reservation"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn active_transaction_holds_gateway_lock_until_commit_or_compensation_finishes() {
+    for fail_after in [None, Some(TransactionStep::CompareApprovedDigests)] {
+        let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+        let mut plan = hermes_native_plan(&fixture, ApprovalClass::Active, vec![]);
+        plan.mutations.clear();
+        plan.sidecars = vec![SidecarBinding {
+            id: SidecarId::RuleSync,
+            target: RuntimeTarget::MacosArm64,
+            version: plan.setup.rulesync_version.clone(),
+            closure_hash: Sha256Digest([45; 32]),
+            source_bundle_hash: Sha256Digest([46; 32]),
+            build_toolchain_hash: Sha256Digest([47; 32]),
+            command_template_digest: Sha256Digest([48; 32]),
+            command: SidecarCommand::RuleSyncGenerate {
+                target: RuleSyncTarget::CodexCli,
+                features: RuleSyncFeatures::new(&[RuleSyncFeature::Rules]).unwrap(),
+            },
+        }];
+        plan.setup.batch_hash = approval_hash_v1(&plan).unwrap();
+        let nonce = *plan.setup.plan_id.as_bytes();
+        let lock_path = fixture.layout.profile.hermes_home.join("gateway.lock");
+        let mut adapter = fixture.adapter.clone();
+        let mut executor = RollbackExecutor {
+            run: RestrictedRun {
+                staged_output_hash: plan.expected_semantic_output_hash,
+                scanner_result_hash: plan.scanner_result_hash,
+            },
+        };
+        let mut native = OsNativeTransactionFileSystem::new(nonce);
+        let mut journal = RollbackJournal::default();
+        let mut hook = GatewayReservationHook {
+            lock_path: lock_path.clone(),
+            fail_after,
+            blocked_after_reprobe: false,
+        };
+
+        let result = NativeTransactionEngine::new(
+            &mut adapter,
+            &mut executor,
+            &mut native,
+            &mut journal,
+            &mut hook,
+        )
+        .apply(&plan, 1_900_000_000_000, validation_receipt().applied_hlc);
+
+        assert_eq!(
+            result.is_err(),
+            fail_after.is_some(),
+            "unexpected transaction result: {result:?}"
+        );
+        assert!(hook.blocked_after_reprobe);
+        assert!(gateway_lock_available(&lock_path));
     }
 }
 
@@ -1729,6 +1830,80 @@ hooks:
         .unwrap();
     assert_eq!(metadata(hook, "redacted"), Some("true"));
     assert_eq!(hook.body_markdown, r#"{"enabled":true}"#);
+}
+
+#[test]
+fn mcp_credential_option_args_are_omitted_and_marked_redacted() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    fs::write(
+        fixture.layout.profile.hermes_home.join("config.yaml"),
+        r#"mcp_servers:
+  guarded:
+    command: safe-runner
+    args:
+      - --api-key
+      - opaque-mcp-value
+      - --mode
+      - safe
+      - "${MCP_API_KEY}"
+    enabled: false
+    timeout: 30
+    tools:
+      include:
+        - safe-tool
+"#,
+    )
+    .unwrap();
+
+    let imported = import_everything(&fixture, true);
+    let serialized = serde_json::to_string(&imported).unwrap();
+    assert!(!serialized.contains("opaque-mcp-value"));
+    let component = imported
+        .components
+        .iter()
+        .find(|component| component.kind == ComponentKind::McpServer && component.name == "guarded")
+        .unwrap();
+    assert_eq!(metadata(component, "redacted"), Some("true"));
+    assert_eq!(
+        metadata(component, "secretReferenceNames"),
+        Some("MCP_API_KEY")
+    );
+    assert_eq!(metadata(component, "enabled"), Some("false"));
+    assert_eq!(
+        component.body_markdown,
+        r#"{"command":"safe-runner","enabled":false,"timeout":30,"tools":{"include":["safe-tool"]}}"#
+    );
+}
+
+#[test]
+fn hook_credential_option_command_is_omitted_and_marked_redacted() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    fs::write(
+        fixture.layout.profile.hermes_home.join("config.yaml"),
+        r#"hooks:
+  guarded:
+    command: "helper --token opaque-hook-value"
+    enabled: true
+    timeout: 45
+    tools:
+      - safe-tool
+"#,
+    )
+    .unwrap();
+
+    let imported = import_everything(&fixture, true);
+    let serialized = serde_json::to_string(&imported).unwrap();
+    assert!(!serialized.contains("opaque-hook-value"));
+    let component = imported
+        .components
+        .iter()
+        .find(|component| component.kind == ComponentKind::Hook && component.name == "guarded")
+        .unwrap();
+    assert_eq!(metadata(component, "redacted"), Some("true"));
+    assert_eq!(
+        component.body_markdown,
+        r#"{"enabled":true,"timeout":45,"tools":["safe-tool"]}"#
+    );
 }
 
 #[test]

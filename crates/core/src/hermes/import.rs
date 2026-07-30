@@ -773,6 +773,11 @@ fn sanitize_mcp(value: &YamlValue) -> Result<(JsonValue, bool, BTreeSet<String>)
         ) {
             continue;
         }
+        if credential_context_field(key, value) {
+            redacted = true;
+            collect_placeholders(value, &mut placeholders);
+            continue;
+        }
         if key == "tools" {
             let tools = value
                 .as_mapping()
@@ -857,6 +862,11 @@ fn sanitize_general(value: &YamlValue, path: &mut Vec<String>) -> (Option<JsonVa
                     path.pop();
                     continue;
                 }
+                if credential_context_field(key, value) {
+                    redacted = true;
+                    path.pop();
+                    continue;
+                }
                 let (reviewed, removed) = sanitize_general(value, path);
                 redacted |= removed;
                 if let Some(reviewed) = reviewed {
@@ -871,6 +881,75 @@ fn sanitize_general(value: &YamlValue, path: &mut Vec<String>) -> (Option<JsonVa
         }
         YamlValue::Tagged(_) => (None, true),
     }
+}
+
+fn credential_context_field(key: &str, value: &YamlValue) -> bool {
+    match (key, value) {
+        ("command", YamlValue::String(command)) => {
+            credential_option_tokens(command.split_whitespace())
+        }
+        ("args", YamlValue::Sequence(arguments)) => {
+            let Some(arguments) = arguments
+                .iter()
+                .map(YamlValue::as_str)
+                .collect::<Option<Vec<_>>>()
+            else {
+                return true;
+            };
+            credential_option_tokens(arguments)
+        }
+        _ => false,
+    }
+}
+
+fn credential_option_tokens<'a>(tokens: impl IntoIterator<Item = &'a str>) -> bool {
+    const MAX_ARGUMENTS: usize = 128;
+    const MAX_ARGUMENT_BYTES: usize = 4096;
+
+    let tokens = tokens
+        .into_iter()
+        .take(MAX_ARGUMENTS + 1)
+        .collect::<Vec<_>>();
+    if tokens.len() > MAX_ARGUMENTS || tokens.iter().any(|token| token.len() > MAX_ARGUMENT_BYTES) {
+        return true;
+    }
+    for (index, token) in tokens.iter().enumerate() {
+        let token = token.trim_matches(['\'', '"']);
+        let Some(option) = token
+            .strip_prefix("--")
+            .or_else(|| token.strip_prefix('-'))
+            .or_else(|| token.strip_prefix('/'))
+        else {
+            continue;
+        };
+        if let Some((name, value)) = option.split_once('=') {
+            if credential_option_name(name) && !value.is_empty() {
+                return true;
+            }
+        } else if credential_option_name(option) && tokens.get(index + 1).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+fn credential_option_name(name: &str) -> bool {
+    let normalized = name
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    matches!(
+        normalized.as_slice(),
+        b"apikey"
+            | b"token"
+            | b"password"
+            | b"secret"
+            | b"credential"
+            | b"cookie"
+            | b"authorization"
+            | b"clientkey"
+    )
 }
 
 fn collect_redacted_placeholders(

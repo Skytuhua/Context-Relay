@@ -103,7 +103,7 @@ pub struct HermesLayout {
     pub working_directory: PathBuf,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct HermesAdapter {
     layout: HermesLayout,
     project_id: ProjectId,
@@ -112,6 +112,20 @@ pub struct HermesAdapter {
     #[allow(dead_code)]
     observed_hlc: HybridLogicalClock,
     executable_hash: Sha256Digest,
+    gateway_lease: Option<gateway::GatewayLease>,
+}
+
+impl Clone for HermesAdapter {
+    fn clone(&self) -> Self {
+        Self {
+            layout: self.layout.clone(),
+            project_id: self.project_id,
+            origin_device: self.origin_device,
+            observed_hlc: self.observed_hlc,
+            executable_hash: self.executable_hash,
+            gateway_lease: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -258,6 +272,7 @@ impl HermesAdapter {
             origin_device,
             observed_hlc,
             executable_hash: executable.digest,
+            gateway_lease: None,
         })
     }
 
@@ -295,13 +310,20 @@ impl HermesAdapter {
         if !yaml::topology_supported(&parsed_staged) {
             return Err(invalid("Hermes staged config topology is unsupported"));
         }
+        let attested = attest_executable(&self.layout.executable)?;
+        if attested.snapshot.kind != HermesExecutableKind::Native
+            || attested.snapshot.digest != self.executable_hash
+        {
+            return Err(conflict("Hermes executable changed"));
+        }
+        let executable_stage = stage_executable(&attested)?;
         let stage = create_validation_stage(&staged_config)?;
         let request = HermesValidationRequest {
-            executable: self.layout.executable.clone(),
+            executable: executable_stage.path.clone(),
             argv: vec!["config".into(), "check".into()],
             working_directory: self.layout.working_directory.clone(),
             staged_hermes_home: stage.path.clone(),
-            executable_hash: self.executable_hash,
+            executable_hash: executable_stage.snapshot.digest,
         };
         let output = execute(&request)?;
         parse_config_check_output(&output, &self.layout.version)
@@ -406,8 +428,9 @@ impl NativeAdapter for HermesAdapter {
             return Err(BoundaryError::new("Hermes project binding changed"));
         }
         if plan.setup.approval_class == ApprovalClass::Active {
-            gateway::require_gateway_idle(&self.layout.profile)
+            let lease = gateway::acquire_gateway_idle(&self.layout.profile)
                 .map_err(|_| BoundaryError::new("Hermes gateway blocks active changes"))?;
+            self.gateway_lease = Some(lease);
         }
         Ok(())
     }
@@ -467,6 +490,11 @@ impl NativeAdapter for HermesAdapter {
                 "Hermes effective state differs from the plan",
             ));
         }
+        Ok(())
+    }
+
+    fn release_live_state_reservation(&mut self) -> Result<(), BoundaryError> {
+        self.gateway_lease.take();
         Ok(())
     }
 }
@@ -1018,10 +1046,36 @@ fn snapshot_executable(path: &Path) -> Result<ExecutableSnapshot, ClientError> {
 }
 
 fn attest_executable(path: &Path) -> Result<AttestedExecutable, ClientError> {
-    let bytes = fs::read(path).map_err(|_| not_found("Hermes executable was not found"))?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| not_found("Hermes executable was not found"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| invalid("Hermes executable cannot be inspected"))?;
+    if !metadata.is_file() {
+        return Err(invalid("Hermes executable cannot be inspected"));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|_| invalid("Hermes executable cannot be read"))?;
+    let mut kind = classify_executable_bytes(path, &bytes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if kind == HermesExecutableKind::Native && metadata.permissions().mode() & 0o111 == 0 {
+            kind = HermesExecutableKind::Unknown;
+        }
+    }
     Ok(AttestedExecutable {
         snapshot: ExecutableSnapshot {
-            kind: classify_executable_bytes(path, &bytes),
+            kind,
             digest: Sha256Digest(Sha256::digest(&bytes).into()),
         },
         bytes,
@@ -1148,11 +1202,23 @@ fn run_version(
     if snapshot_executable(executable)? != expected_snapshot {
         return Err(conflict("Hermes executable changed"));
     }
-    let mut child = Command::new(executable)
+    let stage_directory = executable
+        .parent()
+        .ok_or_else(|| invalid("Hermes executable stage is invalid"))?;
+    let mut child = Command::new(executable);
+    child
         .arg("--version")
+        .current_dir(stage_directory)
+        .env_clear()
+        .env("HOME", stage_directory)
+        .env("HERMES_HOME", stage_directory)
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .env("PATH", minimal_system_path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child
         .spawn()
         .map_err(|_| not_found("Hermes executable could not be started"))?;
     let stdout = child
@@ -1344,6 +1410,7 @@ mod tests {
     };
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct ValidationFixture {
         root: PathBuf,
@@ -1436,6 +1503,11 @@ mod tests {
         fs::write(project_root.join(".hermes.md"), "safe project context\n").unwrap();
         let executable = root.join("hermes");
         fs::write(&executable, b"\x7fELFfixture hermes executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let project_id = ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073981").unwrap();
         let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
         let layout = HermesLayout {
@@ -1589,13 +1661,15 @@ mod tests {
                 .adapter
                 .validate_effective_with(&validation_receipt(), |request| {
                     assert_eq!(request.argv, ["config", "check"]);
-                    assert_eq!(request.executable, fixture.layout.executable);
+                    assert_ne!(request.executable, fixture.layout.executable);
+                    assert_eq!(
+                        fs::read(&request.executable).unwrap(),
+                        fs::read(&fixture.layout.executable).unwrap()
+                    );
                     assert_eq!(request.working_directory, fixture.layout.working_directory);
                     assert_eq!(
                         request.executable_hash,
-                        snapshot_executable(&fixture.layout.executable)
-                            .unwrap()
-                            .digest
+                        snapshot_executable(&request.executable).unwrap().digest
                     );
                     #[cfg(unix)]
                     {
@@ -1682,6 +1756,33 @@ mod tests {
         let stages = stages.into_inner();
         assert_ne!(stages[0], stages[1]);
         assert!(stages.iter().all(|stage| !stage.exists()));
+    }
+
+    #[test]
+    fn effective_validation_executes_staged_attested_bytes_after_source_replacement() {
+        let fixture = validation_fixture("0.18.2");
+        let source = fixture.layout.executable.clone();
+        let attested_bytes = fs::read(&source).unwrap();
+        let expected_digest = Sha256Digest(Sha256::digest(&attested_bytes).into());
+        let executed = RefCell::new(None);
+
+        fixture
+            .adapter
+            .validate_effective_with(&validation_receipt(), |request| {
+                fs::write(&source, b"\x7fELFreplacement hermes executable").unwrap();
+                assert_ne!(request.executable, source);
+                assert_eq!(fs::read(&request.executable).unwrap(), attested_bytes);
+                assert_eq!(request.executable_hash, expected_digest);
+                assert_eq!(
+                    snapshot_executable(&request.executable).unwrap().digest,
+                    request.executable_hash
+                );
+                executed.replace(Some(request.executable.clone()));
+                Ok(config_check_output("0.18.2"))
+            })
+            .unwrap();
+
+        assert!(!executed.into_inner().unwrap().exists());
     }
 
     #[test]
@@ -1865,6 +1966,80 @@ mod tests {
         assert_eq!(parse_version(b"hermes 9.9.9 runtime 0.18.2\n"), None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_clears_caller_environment_and_uses_stage_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-hermes-version-process-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("hermes");
+        let canary = root.join("inherited-environment");
+        let observed_cwd = root.join("observed-cwd");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ -n \"$CONTEXT_RELAY_HERMES_VERSION_CANARY\" ]; then /usr/bin/touch '{}'; fi\n/bin/pwd > '{}'\nprintf 'hermes 0.18.2\\n'\n",
+                canary.display(),
+                observed_cwd.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: this test serializes its temporary process-environment mutation.
+        unsafe { env::set_var("CONTEXT_RELAY_HERMES_VERSION_CANARY", "must-not-inherit") };
+
+        let snapshot = snapshot_executable(&executable).unwrap();
+        let output = run_version(&executable, snapshot).unwrap();
+
+        // SAFETY: this test serializes its temporary process-environment mutation.
+        unsafe { env::remove_var("CONTEXT_RELAY_HERMES_VERSION_CANARY") };
+        assert_eq!(parse_version(&output).as_deref(), Some("0.18.2"));
+        assert!(!canary.exists());
+        assert_eq!(
+            fs::read_to_string(&observed_cwd).unwrap().trim(),
+            root.to_string_lossy()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonexecutable_native_source_is_not_staged_or_version_probed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-hermes-version-nonexec-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("hermes");
+        fs::write(&executable, b"\x7fELFnonexecutable native").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o600)).unwrap();
+        let calls = Cell::new(0);
+
+        let (snapshot, version) = discover_executable_version_after_snapshot(
+            &executable,
+            || {},
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(b"hermes 0.18.2\n".to_vec())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.kind, HermesExecutableKind::Unknown);
+        assert_eq!(version, "unknown");
+        assert_eq!(calls.get(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn classify_executable_recognizes_universal_mach_o_headers() {
         let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
@@ -1881,6 +2056,11 @@ mod tests {
             [0xbf, 0xba, 0xfe, 0xca],
         ] {
             fs::write(&executable, header).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            }
             assert_eq!(
                 snapshot_executable(&executable).unwrap().kind,
                 HermesExecutableKind::Native
@@ -1921,6 +2101,7 @@ mod tests {
         let executable = root.join("hermes");
         let sentinel = root.join("wrapper-ran");
         fs::write(&executable, b"\x7fELFnative executable").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
 
         let result = discover_executable_version_after_snapshot(
             &executable,
@@ -1964,6 +2145,7 @@ mod tests {
         let executable = root.join("hermes");
         let sentinel = root.join("wrapper-ran");
         fs::write(&executable, b"\x7fELFattested native executable").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let executed_path = RefCell::new(None);
 
         let (snapshot, version) = discover_executable_version_with_boundaries(
@@ -2030,6 +2212,11 @@ mod tests {
         fs::write(profile_home.join("config.yaml"), "approvals: {}\n").unwrap();
         let executable = root.join("hermes");
         fs::write(&executable, b"\x7fELForiginal native executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
 
         let (snapshot, version) = discover_executable_version_after_snapshot(
             &executable,
@@ -2081,6 +2268,11 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let executable = root.join("hermes");
         fs::write(&executable, b"\x7fELFnative executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         for output in [
             b"hermes 0.18.2\n".as_slice(),
             b"\x1b[32mhermes 0.18.2\x1b[0m\r\n",
@@ -2114,6 +2306,11 @@ mod tests {
         fs::write(profile_home.join("config.yaml"), "approvals: {}\n").unwrap();
         let executable = root.join("hermes");
         fs::write(&executable, b"\x7fELFnative executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
 
         let (snapshot, version) = discover_executable_version_after_snapshot(
             &executable,

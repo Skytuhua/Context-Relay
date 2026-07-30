@@ -109,6 +109,9 @@ pub trait NativeAdapter {
         plan: &NativeTransactionPlan,
         receipt: &ApplyReceipt,
     ) -> Result<(), BoundaryError>;
+    fn release_live_state_reservation(&mut self) -> Result<(), BoundaryError> {
+        Ok(())
+    }
 }
 
 pub trait RestrictedExecutor {
@@ -501,6 +504,7 @@ where
                                 .journal
                                 .mark_mutation_applied_for_recovery(index, mutation, &token)
                         {
+                            let _ = self.adapter.release_live_state_reservation();
                             return Err(TransactionError::Compensation {
                                 primary: Box::new(primary),
                                 compensation,
@@ -518,6 +522,7 @@ where
                     if let Some(token) = applied_token.as_ref()
                         && let Err(compensation) = self.journal.mark_mutation_conflict(index, token)
                     {
+                        let _ = self.adapter.release_live_state_reservation();
                         return Err(TransactionError::Compensation {
                             primary: Box::new(primary),
                             compensation,
@@ -604,6 +609,7 @@ where
                 .after_step(TransactionStep::RestoreMatchingAppliedTargets);
         }
 
+        self.adapter.release_live_state_reservation()?;
         Ok(receipt)
     }
 
@@ -614,7 +620,13 @@ where
         transaction_nonce: &[u8; 16],
     ) -> TransactionError {
         if !begun {
-            return primary;
+            return match self.adapter.release_live_state_reservation() {
+                Ok(()) => primary,
+                Err(compensation) => TransactionError::Compensation {
+                    primary: Box::new(primary),
+                    compensation,
+                },
+            };
         }
         let compensation = self
             .journal
@@ -656,12 +668,15 @@ where
         let _ = self
             .hook
             .after_step(TransactionStep::RestoreMatchingAppliedTargets);
-        match compensation {
-            Ok(()) => primary,
-            Err(compensation) => TransactionError::Compensation {
-                primary: Box::new(primary),
-                compensation,
-            },
+        let release = self.adapter.release_live_state_reservation();
+        match (compensation, release) {
+            (Ok(()), Ok(())) => primary,
+            (Err(compensation), _) | (Ok(()), Err(compensation)) => {
+                TransactionError::Compensation {
+                    primary: Box::new(primary),
+                    compensation,
+                }
+            }
         }
     }
 }

@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Read,
     path::Path,
     process::{Command, Stdio},
@@ -22,6 +22,11 @@ pub(super) enum GatewayStatus {
     Stale,
     Live,
     Unverifiable,
+}
+
+#[derive(Debug)]
+pub(super) struct GatewayLease {
+    _lock: File,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +75,13 @@ pub(super) fn evaluate_gateway(observation: &GatewayObservation) -> GatewayStatu
 }
 
 pub(super) fn inspect_gateway(profile: &HermesProfile) -> Result<GatewayStatus, ClientError> {
+    inspect_gateway_with_lock_state(profile, None)
+}
+
+fn inspect_gateway_with_lock_state(
+    profile: &HermesProfile,
+    known_lock_held: Option<bool>,
+) -> Result<GatewayStatus, ClientError> {
     let pid_record = read_record(&profile.hermes_home.join("gateway.pid"));
     let state_record = read_record(&profile.hermes_home.join("gateway_state.json"));
     let record_present = pid_record.is_some() || state_record.is_some();
@@ -88,7 +100,8 @@ pub(super) fn inspect_gateway(profile: &HermesProfile) -> Result<GatewayStatus, 
             Ok(_) | Err(()) => record_valid = false,
         }
     }
-    let lock_held = probe_lock(&profile.hermes_home.join("gateway.lock"));
+    let lock_held =
+        known_lock_held.or_else(|| probe_lock(&profile.hermes_home.join("gateway.lock")));
     let mut observation = GatewayObservation {
         record_present,
         record_valid,
@@ -120,6 +133,194 @@ pub(super) fn require_gateway_idle(profile: &HermesProfile) -> Result<(), Client
             "Hermes gateway state is unverifiable for the selected profile",
         )),
     }
+}
+
+pub(super) fn acquire_gateway_idle(profile: &HermesProfile) -> Result<GatewayLease, ClientError> {
+    let lease = acquire_gateway_lock(&profile.hermes_home.join("gateway.lock"))?;
+    match inspect_gateway_with_lock_state(profile, Some(false))? {
+        GatewayStatus::Idle | GatewayStatus::Stale => Ok(lease),
+        GatewayStatus::Live => Err(conflict("Hermes gateway is live for the selected profile")),
+        GatewayStatus::Unverifiable => Err(conflict(
+            "Hermes gateway state is unverifiable for the selected profile",
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn acquire_gateway_lock(path: &Path) -> Result<GatewayLease, ClientError> {
+    use std::os::{
+        fd::AsRawFd as _,
+        unix::fs::{MetadataExt as _, OpenOptionsExt as _},
+    };
+
+    if fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(conflict(
+            "Hermes gateway state is unverifiable for the selected profile",
+        ));
+    }
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| conflict("Hermes gateway state is unverifiable for the selected profile"))?;
+    let held = lock
+        .metadata()
+        .map_err(|_| conflict("Hermes gateway state is unverifiable for the selected profile"))?;
+    let named = fs::symlink_metadata(path)
+        .map_err(|_| conflict("Hermes gateway state is unverifiable for the selected profile"))?;
+    if !held.is_file()
+        || !named.is_file()
+        || named.file_type().is_symlink()
+        || held.uid() != unsafe { libc::geteuid() }
+        || held.nlink() != 1
+        || held.dev() != named.dev()
+        || held.ino() != named.ino()
+    {
+        return Err(conflict(
+            "Hermes gateway state is unverifiable for the selected profile",
+        ));
+    }
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(conflict("Hermes gateway is live for the selected profile"));
+    }
+    let named_after = fs::symlink_metadata(path)
+        .map_err(|_| conflict("Hermes gateway state is unverifiable for the selected profile"))?;
+    if named_after.file_type().is_symlink()
+        || !named_after.is_file()
+        || held.dev() != named_after.dev()
+        || held.ino() != named_after.ino()
+    {
+        return Err(conflict(
+            "Hermes gateway state is unverifiable for the selected profile",
+        ));
+    }
+    Ok(GatewayLease { _lock: lock })
+}
+
+#[cfg(windows)]
+fn acquire_gateway_lock(path: &Path) -> Result<GatewayLease, ClientError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::{
+        Foundation::{ERROR_LOCK_VIOLATION, GetLastError},
+        Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+            LockFileEx,
+        },
+        System::IO::OVERLAPPED,
+    };
+
+    if fs::symlink_metadata(path).is_ok_and(|metadata| {
+        use std::os::windows::fs::MetadataExt as _;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_file()
+    }) {
+        return Err(conflict(
+            "Hermes gateway state is unverifiable for the selected profile",
+        ));
+    }
+    let lock = open_windows_gateway_lock(path)?;
+    let metadata = lock
+        .metadata()
+        .map_err(|_| conflict("Hermes gateway state is unverifiable for the selected profile"))?;
+    let identity = windows_gateway_identity(&lock)?;
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if !metadata.is_file()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || identity.links != 1
+            || windows_gateway_identity(&open_windows_gateway_lock(path)?)? != identity
+        {
+            return Err(conflict(
+                "Hermes gateway state is unverifiable for the selected profile",
+            ));
+        }
+    }
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    if unsafe {
+        LockFileEx(
+            lock.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    } == 0
+    {
+        return if unsafe { GetLastError() } == ERROR_LOCK_VIOLATION {
+            Err(conflict("Hermes gateway is live for the selected profile"))
+        } else {
+            Err(conflict(
+                "Hermes gateway state is unverifiable for the selected profile",
+            ))
+        };
+    }
+    if windows_gateway_identity(&open_windows_gateway_lock(path)?)? != identity {
+        return Err(conflict(
+            "Hermes gateway state is unverifiable for the selected profile",
+        ));
+    }
+    Ok(GatewayLease { _lock: lock })
+}
+
+#[cfg(windows)]
+const WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const WINDOWS_FILE_SHARE_READ: u32 = 0x0000_0001;
+#[cfg(windows)]
+const WINDOWS_FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+#[cfg(windows)]
+fn open_windows_gateway_lock(path: &Path) -> Result<File, ClientError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE)
+        .custom_flags(WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| conflict("Hermes gateway state is unverifiable for the selected profile"))
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsGatewayIdentity {
+    volume: u32,
+    index: u64,
+    links: u32,
+}
+
+#[cfg(windows)]
+fn windows_gateway_identity(file: &File) -> Result<WindowsGatewayIdentity, ClientError> {
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle as _};
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    if unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr())
+    } == 0
+    {
+        return Err(conflict(
+            "Hermes gateway state is unverifiable for the selected profile",
+        ));
+    }
+    let information = unsafe { information.assume_init() };
+    Ok(WindowsGatewayIdentity {
+        volume: information.dwVolumeSerialNumber,
+        index: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        links: information.nNumberOfLinks,
+    })
 }
 
 fn read_record(path: &Path) -> Option<Result<GatewayRecord, ()>> {
