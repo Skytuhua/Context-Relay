@@ -46,3 +46,4 @@ Desktop.ini
 
 # Local development workflow state
 /.superpowers/
+/.worktrees/
