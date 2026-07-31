@@ -2,9 +2,10 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use context_relay_protocol::{
     ApplyReceipt, CandidateId, CandidateState, CheckpointV1, HarnessAccessPolicy, HarnessId,
-    InstructionRecord, MemoryCandidate, MemoryId, MemoryRecord, MutationKind, PlanId, ProjectId,
-    ProjectIdentity, Provenance, RecordId, RecordKind, ScopeRef, Sha256Digest, SyncOperationV1,
-    TaskId, TaskRecord, TaskStatus, WireNativeValue, encode_sync_operation_v1,
+    InstructionRecord, MAX_EVIDENCE_ITEMS, MemoryCandidate, MemoryId, MemoryRecord, MutationKind,
+    OperationId, PlanId, ProjectId, ProjectIdentity, Provenance, RecordId, RecordKind, ScopeRef,
+    Sha256Digest, SyncOperationV1, TaskId, TaskRecord, TaskStatus, WireNativeValue,
+    encode_sync_operation_v1,
 };
 use keyring::Entry;
 use rand_core::{OsRng, RngCore};
@@ -19,7 +20,7 @@ use crate::search::{
 mod native_transactions;
 pub use native_transactions::*;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 4;
+pub const LATEST_SCHEMA_VERSION: u32 = 9;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
 const DEFAULT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
@@ -44,10 +45,53 @@ pub enum VaultError {
     Security(String),
     #[error("invalid vault value: {0}")]
     Validation(String),
+    #[error("the operation ID is already bound to a different mutation")]
+    OperationConflict,
     #[error("vault serialization failed: {0}")]
     Serialization(String),
     #[error("vault database failure: {0}")]
     Database(#[from] rusqlite::Error),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalOperationKind {
+    Create,
+    Proposal,
+    Update,
+    Archive,
+    TaskUpsert,
+    TaskComplete,
+    TaskTransition,
+}
+
+impl LocalOperationKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "memory_create",
+            Self::Proposal => "memory_proposal",
+            Self::Update => "memory_update",
+            Self::Archive => "memory_archive",
+            Self::TaskUpsert => "task_upsert",
+            Self::TaskComplete => "task_complete",
+            Self::TaskTransition => "task_transition",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalOperationBinding {
+    pub operation_id: OperationId,
+    pub operation_kind: LocalOperationKind,
+    pub target_id: String,
+    pub expected_revision: Option<OperationId>,
+    pub canonical_payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LocalOperationReplay {
+    Fresh,
+    Snapshot(Vec<u8>),
+    Legacy,
 }
 
 pub trait DatabaseKeyStore: Send + Sync {
@@ -390,6 +434,47 @@ impl Vault {
         Ok(())
     }
 
+    pub(crate) fn local_operation_replay(
+        &self,
+        binding: &LocalOperationBinding,
+    ) -> Result<LocalOperationReplay, VaultError> {
+        check_local_operation_binding(&self.connection, binding)
+    }
+
+    pub(crate) fn put_local_memory_with_binding(
+        &mut self,
+        memory: &MemoryRecord,
+        embedding: &Embedding384,
+        binding: &LocalOperationBinding,
+    ) -> Result<(), VaultError> {
+        memory
+            .validate()
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        let canonical_response = to_json(memory)?;
+        let transaction = self.connection.transaction()?;
+        if !insert_local_operation_binding(&transaction, binding, &canonical_response)? {
+            return Err(VaultError::OperationConflict);
+        }
+        upsert_searchable_record(
+            &transaction,
+            &memory.id.to_string(),
+            "memory",
+            &memory.scope,
+            memory.archived,
+            &memory.title,
+            &memory.body_markdown,
+            &canonical_response,
+            &memory.provenance,
+            embedding,
+        )?;
+        transaction.commit()?;
+        self.embedding_cache.insert(
+            memory.id.to_string(),
+            cached_embedding(&memory.scope, memory.archived, embedding),
+        );
+        Ok(())
+    }
+
     pub fn memories(
         &self,
         project_id: Option<ProjectId>,
@@ -461,6 +546,77 @@ impl Vault {
         )
     }
 
+    pub fn instructions(
+        &self,
+        scope: &AllowedSearchScope,
+        limit: usize,
+    ) -> Result<Vec<InstructionRecord>, VaultError> {
+        if !(1..=100).contains(&limit) {
+            return Err(VaultError::Validation(
+                "instruction limit must be between 1 and 100".to_owned(),
+            ));
+        }
+        let limit_i64 = i64::try_from(limit)
+            .map_err(|_| VaultError::Validation("instruction limit exceeds i64".to_owned()))?;
+        load_json_list(
+            &self.connection,
+            "SELECT instructions.payload_json
+             FROM instructions
+             JOIN search_documents ON search_documents.record_id = instructions.id
+             WHERE search_documents.archived = 0
+               AND (
+                 (search_documents.scope_kind = 'global' AND ?1 = 1)
+                 OR (
+                   search_documents.scope_kind = 'project'
+                   AND search_documents.project_id = ?2
+                 )
+               )
+             ORDER BY instructions.id
+             LIMIT ?3",
+            params![
+                i64::from(scope.allows_global()),
+                scope.project_id().map(|id| id.to_string()),
+                limit_i64
+            ],
+        )
+    }
+
+    pub fn fold_instructions<State, Fold>(
+        &self,
+        scope: &AllowedSearchScope,
+        mut state: State,
+        mut fold: Fold,
+    ) -> Result<State, VaultError>
+    where
+        Fold: FnMut(&mut State, InstructionRecord) -> Result<(), VaultError>,
+    {
+        let mut statement = self.connection.prepare(
+            "SELECT instructions.payload_json
+             FROM instructions
+             JOIN search_documents ON search_documents.record_id = instructions.id
+             WHERE search_documents.archived = 0
+               AND (
+                 (search_documents.scope_kind = 'global' AND ?1 = 1)
+                 OR (
+                   search_documents.scope_kind = 'project'
+                   AND search_documents.project_id = ?2
+                 )
+               )
+             ORDER BY instructions.id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                i64::from(scope.allows_global()),
+                scope.project_id().map(|id| id.to_string())
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        for payload in rows {
+            fold(&mut state, from_json(&payload?)?)?;
+        }
+        Ok(state)
+    }
+
     pub fn put_candidate(&mut self, candidate: &MemoryCandidate) -> Result<(), VaultError> {
         candidate
             .validate()
@@ -475,6 +631,33 @@ impl Vault {
              ON CONFLICT(id) DO UPDATE SET state = excluded.state, payload_json = excluded.payload_json",
             params![candidate.id.to_string(), state, to_json(candidate)?],
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn put_candidate_with_binding(
+        &mut self,
+        candidate: &MemoryCandidate,
+        binding: &LocalOperationBinding,
+    ) -> Result<(), VaultError> {
+        candidate
+            .validate()
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        let state = match candidate.state {
+            CandidateState::Pending => "pending",
+            CandidateState::Accepted => "accepted",
+            CandidateState::Rejected => "rejected",
+        };
+        let canonical_response = to_json(candidate)?;
+        let transaction = self.connection.transaction()?;
+        if !insert_local_operation_binding(&transaction, binding, &canonical_response)? {
+            return Err(VaultError::OperationConflict);
+        }
+        transaction.execute(
+            "INSERT INTO candidates(id, state, payload_json) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET state = excluded.state, payload_json = excluded.payload_json",
+            params![candidate.id.to_string(), state, canonical_response],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -572,13 +755,6 @@ impl Vault {
     pub fn put_task(&mut self, task: &TaskRecord) -> Result<(), VaultError> {
         task.validate()
             .map_err(|error| VaultError::Validation(error.to_string()))?;
-        let status = match task.status {
-            TaskStatus::Open => "open",
-            TaskStatus::InProgress => "in_progress",
-            TaskStatus::Blocked => "blocked",
-            TaskStatus::Done => "done",
-            TaskStatus::Canceled => "canceled",
-        };
         self.connection.execute(
             "INSERT INTO tasks(id, project_id, status, payload_json) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET project_id = excluded.project_id,
@@ -586,10 +762,37 @@ impl Vault {
             params![
                 task.id.to_string(),
                 task.project_id.to_string(),
-                status,
+                task_status(task.status),
                 to_json(task)?
             ],
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn put_task_with_binding(
+        &mut self,
+        task: &TaskRecord,
+        binding: &LocalOperationBinding,
+    ) -> Result<(), VaultError> {
+        task.validate()
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        let canonical_response = to_json(task)?;
+        let transaction = self.connection.transaction()?;
+        if !insert_local_operation_binding(&transaction, binding, &canonical_response)? {
+            return Err(VaultError::OperationConflict);
+        }
+        transaction.execute(
+            "INSERT INTO tasks(id, project_id, status, payload_json) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET project_id = excluded.project_id,
+                status = excluded.status, payload_json = excluded.payload_json",
+            params![
+                task.id.to_string(),
+                task.project_id.to_string(),
+                task_status(task.status),
+                canonical_response
+            ],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -606,6 +809,48 @@ impl Vault {
             &self.connection,
             "SELECT payload_json FROM tasks WHERE project_id = ?1 ORDER BY id",
             [project_id.to_string()],
+        )
+    }
+
+    pub fn recent_project_decisions(
+        &self,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>, VaultError> {
+        let limit = handoff_limit(limit)?;
+        load_json_list(
+            &self.connection,
+            "SELECT payload_json
+             FROM records
+             WHERE kind = 'memory'
+               AND scope_kind = 'project'
+               AND project_id = ?1
+               AND archived = 0
+               AND memory_kind = 'decision'
+             ORDER BY updated_physical_sort DESC,
+                      updated_logical DESC,
+                      updated_node DESC,
+                      id ASC
+             LIMIT ?2",
+            params![project_id.to_string(), limit],
+        )
+    }
+
+    pub fn open_or_blocked_tasks(
+        &self,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> Result<Vec<TaskRecord>, VaultError> {
+        let limit = handoff_limit(limit)?;
+        load_json_list(
+            &self.connection,
+            "SELECT payload_json
+             FROM tasks
+             WHERE project_id = ?1
+               AND status IN ('open', 'blocked')
+             ORDER BY id
+             LIMIT ?2",
+            params![project_id.to_string(), limit],
         )
     }
 
@@ -1100,7 +1345,87 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }
+    if found < 5 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0005_local_operation_bindings.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 5))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 6 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0006_local_operation_results.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 6))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 7 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0007_task_operation_bindings.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 7))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 8 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0008_task_transitions_and_handoff_queries.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 8))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 9 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0009_setup_cli_transactions.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 9))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
     Ok(())
+}
+
+const fn task_status(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Open => "open",
+        TaskStatus::InProgress => "in_progress",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Done => "done",
+        TaskStatus::Canceled => "canceled",
+    }
+}
+
+fn handoff_limit(limit: usize) -> Result<i64, VaultError> {
+    if !(1..=MAX_EVIDENCE_ITEMS).contains(&limit) {
+        return Err(VaultError::Validation(
+            "handoff query limit must be between 1 and 64".to_owned(),
+        ));
+    }
+    i64::try_from(limit)
+        .map_err(|_| VaultError::Validation("handoff query limit exceeds i64".to_owned()))
 }
 
 fn put_memory_tx(
@@ -1152,6 +1477,17 @@ fn put_searchable_record(
     }
 
     let operation_id = operation.operation_id.to_string();
+    if transaction
+        .query_row(
+            "SELECT 1 FROM local_operation_bindings WHERE operation_id = ?1",
+            [&operation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some()
+    {
+        return Err(VaultError::OperationConflict);
+    }
     let operation_payload = to_json(operation)?;
     let operation_canonical = encode_sync_operation_v1(operation)
         .map_err(|error| VaultError::Validation(error.to_string()))?;
@@ -1197,6 +1533,100 @@ fn put_searchable_record(
     Ok(true)
 }
 
+fn check_local_operation_binding(
+    connection: &Connection,
+    binding: &LocalOperationBinding,
+) -> Result<LocalOperationReplay, VaultError> {
+    let operation_id = binding.operation_id.to_string();
+    let existing = connection
+        .query_row(
+            "SELECT binding.operation_kind,
+                    binding.target_id,
+                    binding.expected_revision,
+                    binding.canonical_payload,
+                    result.canonical_response
+             FROM local_operation_bindings AS binding
+             LEFT JOIN local_operation_results AS result
+               ON result.operation_id = binding.operation_id
+             WHERE binding.operation_id = ?1",
+            [&operation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((
+        operation_kind,
+        target_id,
+        expected_revision,
+        canonical_payload,
+        canonical_response,
+    )) = existing
+    {
+        if operation_kind == binding.operation_kind.as_str()
+            && target_id == binding.target_id
+            && expected_revision
+                == binding
+                    .expected_revision
+                    .map(|revision| revision.to_string())
+            && canonical_payload == binding.canonical_payload
+        {
+            return Ok(match canonical_response {
+                Some(response) => LocalOperationReplay::Snapshot(response),
+                None => LocalOperationReplay::Legacy,
+            });
+        }
+        return Err(VaultError::OperationConflict);
+    }
+    if connection
+        .query_row(
+            "SELECT 1 FROM operations WHERE id = ?1",
+            [&operation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some()
+    {
+        return Err(VaultError::OperationConflict);
+    }
+    Ok(LocalOperationReplay::Fresh)
+}
+
+fn insert_local_operation_binding(
+    transaction: &Transaction<'_>,
+    binding: &LocalOperationBinding,
+    canonical_response: &[u8],
+) -> Result<bool, VaultError> {
+    if check_local_operation_binding(transaction, binding)? != LocalOperationReplay::Fresh {
+        return Ok(false);
+    }
+    transaction.execute(
+        "INSERT INTO local_operation_bindings(
+             operation_id, operation_kind, target_id, expected_revision, canonical_payload
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            binding.operation_id.to_string(),
+            binding.operation_kind.as_str(),
+            &binding.target_id,
+            binding
+                .expected_revision
+                .map(|revision| revision.to_string()),
+            &binding.canonical_payload,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO local_operation_results(operation_id, canonical_response) VALUES (?1, ?2)",
+        params![binding.operation_id.to_string(), canonical_response],
+    )?;
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upsert_searchable_record(
     transaction: &Transaction<'_>,
@@ -1223,19 +1653,31 @@ fn upsert_searchable_record(
         ));
     }
     let (scope_kind, project_id) = scope_columns(scope);
+    let handoff_projection = handoff_projection(kind, payload)?;
     transaction.execute(
-        "INSERT INTO records(id, kind, scope_kind, project_id, archived, payload_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO records(
+             id, kind, scope_kind, project_id, archived, payload_json,
+             memory_kind, updated_physical_sort, updated_logical, updated_node
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET kind = excluded.kind,
             scope_kind = excluded.scope_kind, project_id = excluded.project_id,
-            archived = excluded.archived, payload_json = excluded.payload_json",
+            archived = excluded.archived, payload_json = excluded.payload_json,
+            memory_kind = excluded.memory_kind,
+            updated_physical_sort = excluded.updated_physical_sort,
+            updated_logical = excluded.updated_logical,
+            updated_node = excluded.updated_node",
         params![
             id,
             kind,
             scope_kind,
             project_id,
             i64::from(archived),
-            payload
+            payload,
+            handoff_projection.memory_kind,
+            handoff_projection.updated_physical_sort,
+            handoff_projection.updated_logical,
+            handoff_projection.updated_node
         ],
     )?;
     transaction.execute(
@@ -1272,6 +1714,42 @@ fn upsert_searchable_record(
         params![id, title, body],
     )?;
     Ok(())
+}
+
+struct HandoffProjection {
+    memory_kind: Option<&'static str>,
+    updated_physical_sort: Option<String>,
+    updated_logical: Option<i64>,
+    updated_node: Option<String>,
+}
+
+fn handoff_projection(record_kind: &str, payload: &[u8]) -> Result<HandoffProjection, VaultError> {
+    if record_kind != "memory" {
+        return Ok(HandoffProjection {
+            memory_kind: None,
+            updated_physical_sort: None,
+            updated_logical: None,
+            updated_node: None,
+        });
+    }
+    let memory: MemoryRecord = from_json(payload)?;
+    Ok(HandoffProjection {
+        memory_kind: Some(memory_kind(memory.kind)),
+        updated_physical_sort: Some(format!("{:020}", memory.updated_hlc.physical_ms)),
+        updated_logical: Some(i64::from(memory.updated_hlc.logical)),
+        updated_node: Some(memory.updated_hlc.node.to_string()),
+    })
+}
+
+const fn memory_kind(kind: context_relay_protocol::MemoryKind) -> &'static str {
+    match kind {
+        context_relay_protocol::MemoryKind::Fact => "fact",
+        context_relay_protocol::MemoryKind::Decision => "decision",
+        context_relay_protocol::MemoryKind::Preference => "preference",
+        context_relay_protocol::MemoryKind::Pattern => "pattern",
+        context_relay_protocol::MemoryKind::Procedure => "procedure",
+        context_relay_protocol::MemoryKind::Note => "note",
+    }
 }
 
 fn validate_operation_for(

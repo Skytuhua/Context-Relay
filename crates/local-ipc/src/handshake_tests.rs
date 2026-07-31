@@ -718,6 +718,113 @@ async fn cancel_on_a_second_connection_marks_a_shared_queued_request() {
 }
 
 #[tokio::test]
+async fn cancel_before_registration_marks_the_later_request_canceled() {
+    let registry = RequestRegistry::default();
+    let (mut original_client, mut original_server) =
+        authenticated_pair_with_registry(ClientRole::Desktop, registry.clone()).await;
+    let (mut cancel_client, mut cancel_server) =
+        authenticated_pair_with_registry(ClientRole::Desktop, registry).await;
+    let target = record_id("018f22e2-79b0-7cc8-98c4-dc0c0c0739a5");
+    let cancel_pump = tokio::spawn(async move { cancel_server.next_request().await });
+
+    assert!(matches!(
+        cancel_client
+            .call(
+                record_id("018f22e2-79b0-7cc8-98c4-dc0c0c0739a6"),
+                LocalRequest::Cancel(CancelParams { request_id: target }),
+            )
+            .await
+            .unwrap(),
+        LocalResult::Empty
+    ));
+
+    let original_call = tokio::spawn(async move {
+        original_client
+            .call(target, LocalRequest::Health(EmptyParams {}))
+            .await
+    });
+    let request = original_server.next_request().await.unwrap();
+    assert!(!request.registration.begin());
+    assert!(request.registration.is_canceled());
+    original_server
+        .respond(
+            request.id,
+            Err(ClientError {
+                code: ErrorCode::Canceled,
+                message: "The request was canceled".into(),
+                field_path: None,
+                retryable: false,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        original_call.await.unwrap().unwrap_err().code,
+        ErrorCode::Canceled
+    );
+    cancel_pump.abort();
+}
+
+#[tokio::test]
+async fn late_cancel_after_completion_does_not_cancel_sequential_reuse() {
+    let registry = RequestRegistry::default();
+    let (mut original_client, mut original_server) =
+        authenticated_pair_with_registry(ClientRole::Desktop, registry.clone()).await;
+    let (mut cancel_client, mut cancel_server) =
+        authenticated_pair_with_registry(ClientRole::Desktop, registry).await;
+    let target = record_id("018f22e2-79b0-7cc8-98c4-dc0c0c0739a7");
+
+    let first_server = tokio::spawn(async move {
+        let request = original_server.next_request().await.unwrap();
+        assert!(request.registration.begin());
+        original_server
+            .respond(request.id, Ok(LocalResult::Empty))
+            .await
+            .unwrap();
+        drop(request);
+        original_server
+    });
+    assert!(matches!(
+        original_client
+            .call(target, LocalRequest::Health(EmptyParams {}))
+            .await
+            .unwrap(),
+        LocalResult::Empty
+    ));
+    let mut original_server = first_server.await.unwrap();
+
+    let cancel_pump = tokio::spawn(async move { cancel_server.next_request().await });
+    assert!(matches!(
+        cancel_client
+            .call(
+                record_id("018f22e2-79b0-7cc8-98c4-dc0c0c0739a8"),
+                LocalRequest::Cancel(CancelParams { request_id: target }),
+            )
+            .await
+            .unwrap(),
+        LocalResult::Empty
+    ));
+
+    let reused_server = tokio::spawn(async move {
+        let request = original_server.next_request().await.unwrap();
+        assert!(request.registration.begin());
+        original_server
+            .respond(request.id, Ok(LocalResult::Empty))
+            .await
+            .unwrap();
+    });
+    assert!(matches!(
+        original_client
+            .call(target, LocalRequest::Health(EmptyParams {}))
+            .await
+            .unwrap(),
+        LocalResult::Empty
+    ));
+    reused_server.await.unwrap();
+    cancel_pump.abort();
+}
+
+#[tokio::test]
 async fn cancel_acknowledges_but_does_not_interrupt_an_active_request() {
     let registry = RequestRegistry::default();
     let (mut original_client, mut original_server) =

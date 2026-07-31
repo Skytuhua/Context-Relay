@@ -7,6 +7,7 @@ use std::{
 
 use context_relay_core::{
     hermes::{HermesAdapter, HermesExecutableKind, HermesLayout, HermesMemoryKind, HermesProfile},
+    mcp::install::bridge_component,
     native_transaction::{
         approval_hash_v1,
         engine::{
@@ -16,8 +17,8 @@ use context_relay_core::{
         },
         filesystem::OsNativeTransactionFileSystem,
         model::{
-            ApprovedInput, ApprovedMutation, NativeApplyReceipt, NativeObjectToken,
-            NativeTransactionPlan, SidecarBinding, TransactionStep,
+            ApprovedCliMutation, ApprovedInput, ApprovedMutation, NativeApplyReceipt,
+            NativeObjectToken, NativeTransactionPlan, SidecarBinding, TransactionStep,
         },
     },
 };
@@ -26,11 +27,11 @@ use context_relay_native_runner::{
     RuntimeTarget, SidecarCommand, SidecarId,
 };
 use context_relay_protocol::{
-    ApplyReceipt, ApprovalClass, CapabilityLevel, ChangeClass, ClassifiedChange, ComponentKind,
-    ComponentRecord, DesiredState, DeviceId, ErrorCode, ExpectedNativeDigest, HarnessAdapter,
-    HarnessId, HybridLogicalClock, ImportRequest, InstallationMethod, NativePlatform, NativeScope,
-    NetworkDelta, PermissionDelta, PlanId, ProbeContext, ProjectId, SemanticDiff, SetupPlan,
-    Sha256Digest, WireNativeValue,
+    ApplyReceipt, ApprovalClass, CapabilityLevel, ChangeClass, ClassifiedChange, CliOperation,
+    ComponentKind, ComponentRecord, DesiredState, DeviceId, ErrorCode, ExpectedNativeDigest,
+    HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest, InstallationMethod,
+    NativePlatform, NativeScope, NetworkDelta, PermissionDelta, PlanId, ProbeContext, ProjectId,
+    SemanticDiff, SetupPlan, Sha256Digest, WireNativeValue,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
@@ -231,6 +232,25 @@ fn clear_gateway_records(fixture: &Fixture) {
     }
 }
 
+fn managed_bridge_desired(fixture: &Fixture) -> (PathBuf, DesiredState) {
+    let executable = fixture.root.join("context-relay-context-mcp");
+    fs::write(&executable, b"attested Hermes bridge executable").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
+    let component = bridge_component(
+        HarnessId::Hermes,
+        &executable,
+        device_id,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+    )
+    .unwrap();
+    (executable, desired_global(fixture, vec![component]))
+}
+
 fn intended_bytes(
     mutation: &context_relay_core::native_transaction::model::ApprovedMutation,
 ) -> Vec<u8> {
@@ -363,6 +383,7 @@ fn hermes_native_plan(
             expires_at: 2_000_000_000_000,
             batch_hash: Sha256Digest([23; 32]),
         },
+        approval_version: 1,
         helper_policy_version: 1,
         manifest_schema_version: 1,
         manifest_digest: Sha256Digest([24; 32]),
@@ -373,6 +394,7 @@ fn hermes_native_plan(
         expected_semantic_output_hash: Sha256Digest([27; 32]),
         scanner_result_hash: Sha256Digest([28; 32]),
         mutations: vec![mutation],
+        cli_mutations: vec![],
         ownership_changes: vec![],
     }
 }
@@ -2736,6 +2758,18 @@ fn native_adapter_rechecks_gateway_profile_executable_and_digests() {
     fs::write(&config_path, b"changed native bytes").unwrap();
     assert!(adapter.compare_approved_digests(&plan).is_err());
 
+    let bridge_fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let (bridge, _) = managed_bridge_desired(&bridge_fixture);
+    let expected = ExpectedNativeDigest {
+        target: test_wire_path(&bridge),
+        expected_digest: Some(test_file_digest(&bridge)),
+    };
+    let bridge_plan = hermes_native_plan(&bridge_fixture, ApprovalClass::Passive, vec![expected]);
+    let mut adapter = bridge_fixture.adapter.clone();
+    assert!(adapter.compare_approved_digests(&bridge_plan).is_ok());
+    fs::write(&bridge, b"changed Hermes bridge executable").unwrap();
+    assert!(adapter.compare_approved_digests(&bridge_plan).is_err());
+
     let live_fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
     plan = hermes_native_plan(&live_fixture, ApprovalClass::Active, vec![]);
     fs::write(
@@ -2771,6 +2805,159 @@ fn native_adapter_rechecks_gateway_profile_executable_and_digests() {
     let moved = fixture.root.join("moved profile");
     fs::rename(&original, &moved).unwrap();
     fs::create_dir_all(&original).unwrap();
+    assert!(fixture.adapter.clone().reprobe_live_state(&plan).is_err());
+}
+
+#[test]
+fn managed_bridge_native_plan_binds_before_and_intended_fingerprints() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let (_, desired) = managed_bridge_desired(&fixture);
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    let before = OsNativeFileSystem::new().snapshot(&config_path).unwrap();
+    let before_bytes = fs::read(&config_path).unwrap();
+
+    let rendered = fixture.adapter.render(&desired).unwrap();
+    assert!(rendered.cli_operations.is_empty());
+    let mutation = fixture
+        .adapter
+        .plan_native_config(&desired)
+        .unwrap()
+        .unwrap();
+    assert_eq!(mutation.target, test_wire_path(&config_path));
+    assert_eq!(mutation.expected.0.0, *before.fingerprint());
+    let intended = NativeState::decode_v1(&mutation.content).unwrap();
+    assert_eq!(mutation.intended.0.0, intended.fingerprint());
+
+    let nonce = [29; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native
+        .create_before_images(std::slice::from_ref(&mutation))
+        .unwrap();
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].fingerprint, mutation.expected);
+    let NativeState::RegularFile {
+        bytes: captured_before,
+        ..
+    } = NativeState::decode_v1(&images[0].encrypted_state).unwrap()
+    else {
+        panic!("Hermes before-image did not capture config.yaml");
+    };
+    assert_eq!(captured_before, before_bytes);
+    native.record_native_metadata(&images).unwrap();
+    native
+        .compare_and_swap_targets(std::slice::from_ref(&mutation))
+        .unwrap();
+    native.apply_mutation(&nonce, &mutation).unwrap();
+    assert_eq!(
+        *OsNativeFileSystem::new()
+            .snapshot(&config_path)
+            .unwrap()
+            .fingerprint(),
+        intended.fingerprint()
+    );
+    let restored = native.restore_matching_applied_targets(&nonce).unwrap();
+    assert!(restored.conflict_target_sequences().is_empty());
+    assert_eq!(fs::read(&config_path).unwrap(), before_bytes);
+}
+
+#[test]
+fn managed_bridge_restore_preserves_divergent_live_yaml() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let (_, desired) = managed_bridge_desired(&fixture);
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    let mutation = fixture
+        .adapter
+        .plan_native_config(&desired)
+        .unwrap()
+        .unwrap();
+    let nonce = [30; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native
+        .create_before_images(std::slice::from_ref(&mutation))
+        .unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native
+        .compare_and_swap_targets(std::slice::from_ref(&mutation))
+        .unwrap();
+    native.apply_mutation(&nonce, &mutation).unwrap();
+
+    let divergent = b"mcp_servers:\n  context-relay:\n    command: external-change\n";
+    fs::write(&config_path, divergent).unwrap();
+    assert!(native.restore_matching_applied_targets(&nonce).is_err());
+    assert_eq!(fs::read(&config_path).unwrap(), divergent);
+}
+
+#[test]
+fn managed_bridge_authority_rejects_near_misses_and_unsafe_prior_state() {
+    let exact_fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&exact_fixture);
+    let (_, desired) = managed_bridge_desired(&exact_fixture);
+    assert!(exact_fixture.adapter.plan_native_config(&desired).is_ok());
+    let exact = desired.components[0].clone();
+
+    let mut near_misses = Vec::new();
+    let mut changed = exact.clone();
+    changed.body_markdown.push(' ');
+    near_misses.push(changed);
+    let mut changed = exact.clone();
+    changed
+        .metadata
+        .push(("profile".into(), exact_fixture.layout.profile.name.clone()));
+    near_misses.push(changed);
+    let mut changed = exact.clone();
+    changed.name = "context-relay-copy".into();
+    near_misses.push(changed);
+    let mut changed = exact;
+    changed.provenance.harness = Some(HarnessId::Hermes);
+    near_misses.push(changed);
+    for changed in near_misses {
+        assert!(
+            exact_fixture
+                .adapter
+                .plan_native_config(&desired_global(&exact_fixture, vec![changed]))
+                .is_err()
+        );
+    }
+
+    for prior in [
+        "mcp_servers:\n  context-relay: []\n",
+        "mcp_servers:\n  context-relay:\n    command: <redacted>\n",
+        "mcp_servers:\n  context-relay:\n    command: ghp_must-not-take-over\n",
+        "mcp_servers:\n  context-relay:\n    command: unmanaged-command\n    args: [--other]\n",
+    ] {
+        let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+        clear_gateway_records(&fixture);
+        let (_, desired) = managed_bridge_desired(&fixture);
+        let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+        fs::write(&config_path, prior).unwrap();
+        let error = fixture.adapter.plan_native_config(&desired).unwrap_err();
+        assert_eq!(fs::read_to_string(config_path).unwrap(), prior);
+        assert!(!format!("{error:?}").contains("ghp_must-not-take-over"));
+    }
+}
+
+#[test]
+fn native_adapter_rejects_every_cli_mutation_surface() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let mut plan = hermes_native_plan(&fixture, ApprovalClass::Passive, vec![]);
+    plan.cli_mutations.push(ApprovedCliMutation {
+        stable_id: "must-not-run-through-hermes-cli".into(),
+        expected: None,
+        intended: None,
+        forward: vec![],
+        rollback: vec![],
+    });
+
+    assert!(fixture.adapter.clone().reprobe_live_state(&plan).is_err());
+
+    plan.cli_mutations.clear();
+    plan.setup.cli_operations.push(CliOperation {
+        executable: plan.setup.executable_path.clone(),
+        arguments: vec![plan.setup.executable_path.clone()],
+        timeout_ms: 30_000,
+    });
     assert!(fixture.adapter.clone().reprobe_live_state(&plan).is_err());
 }
 

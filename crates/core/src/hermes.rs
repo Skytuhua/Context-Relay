@@ -408,6 +408,11 @@ impl HermesAdapter {
 
 impl NativeAdapter for HermesAdapter {
     fn reprobe_live_state(&mut self, plan: &NativeTransactionPlan) -> Result<(), BoundaryError> {
+        if !plan.cli_mutations.is_empty() || !plan.setup.cli_operations.is_empty() {
+            return Err(BoundaryError::new(
+                "Hermes native plans cannot contain CLI mutations",
+            ));
+        }
         self.revalidate_bound_installation()
             .map_err(|_| BoundaryError::new("Hermes installation changed"))?;
         if self.capability() != CapabilityLevel::Full

@@ -1,20 +1,28 @@
 use context_relay_protocol::{
-    CandidateReviewParams, CandidateState, ClientError, DeviceId, ErrorCode, HarnessAccessPolicy,
-    HarnessId, HybridLogicalClock, McpScopeSelector, MemoryArchiveParams, MemoryCreateParams,
-    MemoryId, MemoryOrigin, MemoryRecord, MemoryUpdateParams, OperationId, ProjectId,
-    ProjectIdentity, Provenance, SearchParams, TaskCompleteParams, TaskEvidence, TaskId,
+    CandidateId, CandidateReviewParams, CandidateState, ClientError, DeviceId, ErrorCode,
+    HarnessAccessPolicy, HarnessId, HybridLogicalClock, InstructionRecord, McpScopeSelector,
+    MemoryArchiveParams, MemoryCandidate, MemoryCreateParams, MemoryId, MemoryOrigin, MemoryRecord,
+    MemoryUpdateParams, OperationId, ProjectId, ProjectIdentity, ProposeMemoryInput, Provenance,
+    ReadableRecord, RecordId, ScopeRef, SearchParams, TaskCompleteParams, TaskEvidence, TaskId,
     TaskRecord, TaskStatus, TaskTransitionParams, TaskUpsertParams, WireNativeValue,
 };
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
     search::{AllowedSearchScope, EMBEDDING_DIMENSIONS, Embedding384},
-    vault::{Vault, VaultError},
+    vault::{LocalOperationBinding, LocalOperationKind, LocalOperationReplay, Vault, VaultError},
 };
 
 pub struct OfflineWorkspace<'a> {
     vault: &'a mut Vault,
     device_id: DeviceId,
+}
+
+struct PreparedLocalMutation<T> {
+    value: T,
+    binding: LocalOperationBinding,
+    should_write: bool,
 }
 
 impl<'a> OfflineWorkspace<'a> {
@@ -26,18 +34,70 @@ impl<'a> OfflineWorkspace<'a> {
         &mut self,
         params: MemoryCreateParams,
     ) -> Result<MemoryRecord, ClientError> {
+        let prepared = self.prepare_memory_create(&params)?;
+        if prepared.should_write {
+            vault(self.vault.put_local_memory_with_binding(
+                &prepared.value,
+                &memory_embedding(&prepared.value)?,
+                &prepared.binding,
+            ))?;
+        }
+        Ok(prepared.value)
+    }
+
+    pub(crate) fn preview_memory_create(
+        &self,
+        params: &MemoryCreateParams,
+    ) -> Result<MemoryRecord, ClientError> {
+        self.prepare_memory_create(params)
+            .map(|prepared| prepared.value)
+    }
+
+    fn prepare_memory_create(
+        &self,
+        params: &MemoryCreateParams,
+    ) -> Result<PreparedLocalMutation<MemoryRecord>, ClientError> {
         let id = MemoryId::new(params.operation_id.into_uuid()).map_err(|_| invalid_request())?;
-        if let Some(memory) = vault(self.vault.memory(&id))? {
-            return Ok(memory);
+        let binding = local_operation_binding(
+            params.operation_id,
+            LocalOperationKind::Create,
+            id.to_string(),
+            None,
+            params,
+        )?;
+        match vault(self.vault.local_operation_replay(&binding))? {
+            LocalOperationReplay::Snapshot(snapshot) => {
+                let memory = memory_snapshot(&snapshot, id, params.operation_id)?;
+                if memory.archived {
+                    return Err(internal());
+                }
+                return Ok(PreparedLocalMutation {
+                    value: memory,
+                    binding,
+                    should_write: false,
+                });
+            }
+            LocalOperationReplay::Legacy => {
+                let memory = vault(self.vault.memory(&id))?.ok_or_else(internal)?;
+                return Ok(PreparedLocalMutation {
+                    value: memory,
+                    binding,
+                    should_write: false,
+                });
+            }
+            LocalOperationReplay::Fresh => {}
+        }
+        if vault(self.vault.memory(&id))?.is_some() {
+            return Err(operation_conflict());
         }
         let clock = operation_clock(params.operation_id, self.device_id);
         let memory = MemoryRecord {
             id,
-            scope: params.scope,
+            scope: params.scope.clone(),
             kind: params.kind,
-            title: params.title,
-            body_markdown: params.body_markdown,
-            tags: params.tags,
+            title: params.title.clone(),
+            body_markdown: params.body_markdown.clone(),
+            tags: params.tags.clone(),
             origin: MemoryOrigin::Explicit,
             provenance: Provenance {
                 origin_device: self.device_id,
@@ -51,62 +111,267 @@ impl<'a> OfflineWorkspace<'a> {
             archived: false,
         };
         memory.validate().map_err(|_| invalid_request())?;
-        vault(
-            self.vault
-                .put_local_memory(&memory, &memory_embedding(&memory)?),
-        )?;
-        Ok(memory)
+        Ok(PreparedLocalMutation {
+            value: memory,
+            binding,
+            should_write: true,
+        })
     }
 
     pub fn memory(&self, id: MemoryId) -> Result<Option<MemoryRecord>, ClientError> {
         vault(self.vault.memory(&id))
     }
 
+    pub fn instruction(&self, id: RecordId) -> Result<Option<InstructionRecord>, ClientError> {
+        vault(self.vault.instruction(&id))
+    }
+
+    pub(crate) fn candidate(
+        &self,
+        id: CandidateId,
+    ) -> Result<Option<MemoryCandidate>, ClientError> {
+        vault(self.vault.candidate(&id))
+    }
+
+    pub fn propose_memory(
+        &mut self,
+        input: ProposeMemoryInput,
+        scope: ScopeRef,
+        harness: HarnessId,
+    ) -> Result<MemoryCandidate, ClientError> {
+        let prepared = self.prepare_memory_proposal(&input, &scope, harness)?;
+        if prepared.should_write {
+            vault(
+                self.vault
+                    .put_candidate_with_binding(&prepared.value, &prepared.binding),
+            )?;
+        }
+        Ok(prepared.value)
+    }
+
+    pub(crate) fn preview_memory_proposal(
+        &self,
+        input: &ProposeMemoryInput,
+        scope: &ScopeRef,
+        harness: HarnessId,
+    ) -> Result<MemoryCandidate, ClientError> {
+        self.prepare_memory_proposal(input, scope, harness)
+            .map(|prepared| prepared.value)
+    }
+
+    fn prepare_memory_proposal(
+        &self,
+        input: &ProposeMemoryInput,
+        scope: &ScopeRef,
+        harness: HarnessId,
+    ) -> Result<PreparedLocalMutation<MemoryCandidate>, ClientError> {
+        let id = CandidateId::new(input.operation_id.into_uuid()).map_err(|_| invalid_request())?;
+        let binding = local_operation_binding(
+            input.operation_id,
+            LocalOperationKind::Proposal,
+            id.to_string(),
+            None,
+            &(input, scope, harness),
+        )?;
+        match vault(self.vault.local_operation_replay(&binding))? {
+            LocalOperationReplay::Snapshot(snapshot) => {
+                let candidate = candidate_snapshot(&snapshot, id, input.operation_id)?;
+                return Ok(PreparedLocalMutation {
+                    value: candidate,
+                    binding,
+                    should_write: false,
+                });
+            }
+            LocalOperationReplay::Legacy => {
+                let candidate = vault(self.vault.candidate(&id))?.ok_or_else(internal)?;
+                return Ok(PreparedLocalMutation {
+                    value: candidate,
+                    binding,
+                    should_write: false,
+                });
+            }
+            LocalOperationReplay::Fresh => {}
+        }
+        if vault(self.vault.candidate(&id))?.is_some() {
+            return Err(operation_conflict());
+        }
+        let memory_id =
+            MemoryId::new(input.operation_id.into_uuid()).map_err(|_| invalid_request())?;
+        let clock = operation_clock(input.operation_id, self.device_id);
+        let proposed_memory = MemoryRecord {
+            id: memory_id,
+            scope: scope.clone(),
+            kind: input.kind,
+            title: input.title.clone(),
+            body_markdown: input.markdown.clone(),
+            tags: input.tags.clone(),
+            origin: MemoryOrigin::Inferred,
+            provenance: Provenance {
+                origin_device: self.device_id,
+                harness: Some(harness),
+                source: None,
+                created_hlc: clock,
+            },
+            revision: input.operation_id,
+            created_hlc: clock,
+            updated_hlc: clock,
+            archived: false,
+        };
+        let candidate = MemoryCandidate {
+            id,
+            proposed_memory,
+            evidence_summary: input.evidence_summary.clone(),
+            source_harness: harness,
+            state: CandidateState::Pending,
+        };
+        candidate.validate().map_err(|_| invalid_request())?;
+        Ok(PreparedLocalMutation {
+            value: candidate,
+            binding,
+            should_write: true,
+        })
+    }
+
     pub fn update_memory(
         &mut self,
         params: MemoryUpdateParams,
     ) -> Result<MemoryRecord, ClientError> {
+        let prepared = self.prepare_memory_update(&params)?;
+        if prepared.should_write {
+            vault(self.vault.put_local_memory_with_binding(
+                &prepared.value,
+                &memory_embedding(&prepared.value)?,
+                &prepared.binding,
+            ))?;
+        }
+        Ok(prepared.value)
+    }
+
+    pub(crate) fn preview_memory_update(
+        &self,
+        params: &MemoryUpdateParams,
+    ) -> Result<MemoryRecord, ClientError> {
+        self.prepare_memory_update(params)
+            .map(|prepared| prepared.value)
+    }
+
+    fn prepare_memory_update(
+        &self,
+        params: &MemoryUpdateParams,
+    ) -> Result<PreparedLocalMutation<MemoryRecord>, ClientError> {
+        let binding = local_operation_binding(
+            params.operation_id,
+            LocalOperationKind::Update,
+            params.memory_id.to_string(),
+            Some(params.expected_revision),
+            params,
+        )?;
+        match vault(self.vault.local_operation_replay(&binding))? {
+            LocalOperationReplay::Snapshot(snapshot) => {
+                let memory = memory_snapshot(&snapshot, params.memory_id, params.operation_id)?;
+                return Ok(PreparedLocalMutation {
+                    value: memory,
+                    binding,
+                    should_write: false,
+                });
+            }
+            LocalOperationReplay::Legacy => {
+                let memory = self.memory(params.memory_id)?.ok_or_else(internal)?;
+                return Ok(PreparedLocalMutation {
+                    value: memory,
+                    binding,
+                    should_write: false,
+                });
+            }
+            LocalOperationReplay::Fresh => {}
+        }
         let mut memory = self.memory(params.memory_id)?.ok_or_else(not_found)?;
-        if memory.revision == params.operation_id {
-            return Ok(memory);
-        }
         require_revision(memory.revision, params.expected_revision)?;
-        if let Some(title) = params.title {
-            memory.title = title;
+        if let Some(title) = &params.title {
+            memory.title.clone_from(title);
         }
-        if let Some(body) = params.body_markdown {
-            memory.body_markdown = body;
+        if let Some(body) = &params.body_markdown {
+            memory.body_markdown.clone_from(body);
         }
-        if let Some(tags) = params.tags {
-            memory.tags = tags;
+        if let Some(tags) = &params.tags {
+            memory.tags.clone_from(tags);
         }
         memory.revision = params.operation_id;
         memory.updated_hlc = operation_clock(params.operation_id, self.device_id);
         memory.validate().map_err(|_| invalid_request())?;
-        vault(
-            self.vault
-                .put_local_memory(&memory, &memory_embedding(&memory)?),
-        )?;
-        Ok(memory)
+        Ok(PreparedLocalMutation {
+            value: memory,
+            binding,
+            should_write: true,
+        })
     }
 
     pub fn archive_memory(
         &mut self,
         params: MemoryArchiveParams,
     ) -> Result<MemoryRecord, ClientError> {
-        let mut memory = self.memory(params.memory_id)?.ok_or_else(not_found)?;
-        if memory.revision == params.operation_id {
-            return Ok(memory);
+        let prepared = self.prepare_memory_archive(&params)?;
+        if prepared.should_write {
+            vault(self.vault.put_local_memory_with_binding(
+                &prepared.value,
+                &memory_embedding(&prepared.value)?,
+                &prepared.binding,
+            ))?;
         }
+        Ok(prepared.value)
+    }
+
+    pub(crate) fn preview_memory_archive(
+        &self,
+        params: &MemoryArchiveParams,
+    ) -> Result<MemoryRecord, ClientError> {
+        self.prepare_memory_archive(params)
+            .map(|prepared| prepared.value)
+    }
+
+    fn prepare_memory_archive(
+        &self,
+        params: &MemoryArchiveParams,
+    ) -> Result<PreparedLocalMutation<MemoryRecord>, ClientError> {
+        let binding = local_operation_binding(
+            params.operation_id,
+            LocalOperationKind::Archive,
+            params.memory_id.to_string(),
+            Some(params.expected_revision),
+            params,
+        )?;
+        match vault(self.vault.local_operation_replay(&binding))? {
+            LocalOperationReplay::Snapshot(snapshot) => {
+                let memory = memory_snapshot(&snapshot, params.memory_id, params.operation_id)?;
+                if !memory.archived {
+                    return Err(internal());
+                }
+                return Ok(PreparedLocalMutation {
+                    value: memory,
+                    binding,
+                    should_write: false,
+                });
+            }
+            LocalOperationReplay::Legacy => {
+                let memory = self.memory(params.memory_id)?.ok_or_else(internal)?;
+                return Ok(PreparedLocalMutation {
+                    value: memory,
+                    binding,
+                    should_write: false,
+                });
+            }
+            LocalOperationReplay::Fresh => {}
+        }
+        let mut memory = self.memory(params.memory_id)?.ok_or_else(not_found)?;
         require_revision(memory.revision, params.expected_revision)?;
         memory.archived = true;
         memory.revision = params.operation_id;
         memory.updated_hlc = operation_clock(params.operation_id, self.device_id);
-        vault(
-            self.vault
-                .put_local_memory(&memory, &memory_embedding(&memory)?),
-        )?;
-        Ok(memory)
+        Ok(PreparedLocalMutation {
+            value: memory,
+            binding,
+            should_write: true,
+        })
     }
 
     pub fn search_memories(&self, params: SearchParams) -> Result<Vec<MemoryRecord>, ClientError> {
@@ -142,6 +407,42 @@ impl<'a> OfflineWorkspace<'a> {
             }
         }
         Ok(memories)
+    }
+
+    pub fn search_records(
+        &self,
+        query: &str,
+        scope: &AllowedSearchScope,
+        limit: usize,
+    ) -> Result<Vec<ReadableRecord>, ClientError> {
+        if query.trim().is_empty() {
+            return Err(invalid_request());
+        }
+        let query_embedding = text_embedding(query)?;
+        let hits = vault(self.vault.search(query, scope, &query_embedding, limit))?;
+        let mut records = Vec::new();
+        for hit in hits {
+            let Ok(record_id) = hit.record_id().parse::<RecordId>() else {
+                continue;
+            };
+            let Ok(memory_id) = MemoryId::new(record_id.into_uuid()) else {
+                continue;
+            };
+            if let Some(memory) = vault(self.vault.memory(&memory_id))? {
+                records.push(ReadableRecord::Memory(memory));
+            } else if let Some(instruction) = vault(self.vault.instruction(&record_id))? {
+                records.push(ReadableRecord::Instruction(instruction));
+            }
+        }
+        Ok(records)
+    }
+
+    pub fn instructions(
+        &self,
+        scope: &AllowedSearchScope,
+        limit: usize,
+    ) -> Result<Vec<InstructionRecord>, ClientError> {
+        vault(self.vault.instructions(scope, limit))
     }
 
     pub fn review_candidate(
@@ -184,24 +485,75 @@ impl<'a> OfflineWorkspace<'a> {
     }
 
     pub fn upsert_task(&mut self, params: TaskUpsertParams) -> Result<TaskRecord, ClientError> {
+        let prepared = self.prepare_task_upsert(&params)?;
+        if prepared.should_write {
+            vault(
+                self.vault
+                    .put_task_with_binding(&prepared.value, &prepared.binding),
+            )?;
+        }
+        Ok(prepared.value)
+    }
+
+    pub(crate) fn preview_task_upsert(
+        &self,
+        params: &TaskUpsertParams,
+    ) -> Result<TaskRecord, ClientError> {
+        self.prepare_task_upsert(params)
+            .map(|prepared| prepared.value)
+    }
+
+    fn prepare_task_upsert(
+        &self,
+        params: &TaskUpsertParams,
+    ) -> Result<PreparedLocalMutation<TaskRecord>, ClientError> {
+        if params.task_id.is_some() != params.expected_revision.is_some() {
+            return Err(invalid_request());
+        }
         let id = match params.task_id {
             Some(id) => id,
             None => TaskId::new(params.operation_id.into_uuid()).map_err(|_| invalid_request())?,
         };
-        if let Some(mut task) = vault(self.vault.task(&id))? {
-            if task.revision == params.operation_id {
-                return Ok(task);
+        let binding = local_operation_binding(
+            params.operation_id,
+            LocalOperationKind::TaskUpsert,
+            id.to_string(),
+            params.expected_revision,
+            params,
+        )?;
+        match vault(self.vault.local_operation_replay(&binding))? {
+            LocalOperationReplay::Snapshot(snapshot) => {
+                let task = task_snapshot(&snapshot, id, params.operation_id)?;
+                return Ok(PreparedLocalMutation {
+                    value: task,
+                    binding,
+                    should_write: false,
+                });
             }
-            let expected = params.expected_revision.ok_or_else(invalid_request)?;
+            LocalOperationReplay::Legacy => {
+                let task = vault(self.vault.task(&id))?.ok_or_else(internal)?;
+                return Ok(PreparedLocalMutation {
+                    value: task,
+                    binding,
+                    should_write: false,
+                });
+            }
+            LocalOperationReplay::Fresh => {}
+        }
+        if let Some(mut task) = vault(self.vault.task(&id))? {
+            let expected = params.expected_revision.ok_or_else(operation_conflict)?;
             require_revision(task.revision, expected)?;
             task.project_id = params.project_id;
-            task.title = params.title;
-            task.body_markdown = params.body_markdown;
+            task.title.clone_from(&params.title);
+            task.body_markdown.clone_from(&params.body_markdown);
             task.status = params.status;
             task.revision = params.operation_id;
             task.validate().map_err(|_| invalid_request())?;
-            vault(self.vault.put_task(&task))?;
-            return Ok(task);
+            return Ok(PreparedLocalMutation {
+                value: task,
+                binding,
+                should_write: true,
+            });
         }
         if params.task_id.is_some() || params.expected_revision.is_some() {
             return Err(not_found());
@@ -209,58 +561,162 @@ impl<'a> OfflineWorkspace<'a> {
         let task = TaskRecord {
             id,
             project_id: params.project_id,
-            title: params.title,
-            body_markdown: params.body_markdown,
+            title: params.title.clone(),
+            body_markdown: params.body_markdown.clone(),
             status: params.status,
             evidence: Vec::new(),
             revision: params.operation_id,
         };
         task.validate().map_err(|_| invalid_request())?;
-        vault(self.vault.put_task(&task))?;
-        Ok(task)
+        Ok(PreparedLocalMutation {
+            value: task,
+            binding,
+            should_write: true,
+        })
     }
 
     pub fn transition_task(
         &mut self,
         params: TaskTransitionParams,
     ) -> Result<TaskRecord, ClientError> {
-        let mut task = vault(self.vault.task(&params.task_id))?.ok_or_else(not_found)?;
-        if task.revision == params.operation_id {
-            return Ok(task);
+        let prepared = self.prepare_task_transition(&params)?;
+        if prepared.should_write {
+            vault(
+                self.vault
+                    .put_task_with_binding(&prepared.value, &prepared.binding),
+            )?;
         }
-        require_revision(task.revision, params.expected_revision)?;
+        Ok(prepared.value)
+    }
+
+    fn prepare_task_transition(
+        &self,
+        params: &TaskTransitionParams,
+    ) -> Result<PreparedLocalMutation<TaskRecord>, ClientError> {
         if params.status == TaskStatus::Done {
             return Err(invalid_request());
         }
+        let binding = local_operation_binding(
+            params.operation_id,
+            LocalOperationKind::TaskTransition,
+            params.task_id.to_string(),
+            Some(params.expected_revision),
+            params,
+        )?;
+        match vault(self.vault.local_operation_replay(&binding))? {
+            LocalOperationReplay::Snapshot(snapshot) => {
+                let task = task_snapshot(&snapshot, params.task_id, params.operation_id)?;
+                if task.status != params.status {
+                    return Err(internal());
+                }
+                return Ok(PreparedLocalMutation {
+                    value: task,
+                    binding,
+                    should_write: false,
+                });
+            }
+            LocalOperationReplay::Legacy => {
+                let task = vault(self.vault.task(&params.task_id))?.ok_or_else(internal)?;
+                return Ok(PreparedLocalMutation {
+                    value: task,
+                    binding,
+                    should_write: false,
+                });
+            }
+            LocalOperationReplay::Fresh => {}
+        }
+        let mut task = vault(self.vault.task(&params.task_id))?.ok_or_else(not_found)?;
+        if task.revision == params.operation_id && task.status == params.status {
+            return Ok(PreparedLocalMutation {
+                value: task,
+                binding,
+                should_write: true,
+            });
+        }
+        require_revision(task.revision, params.expected_revision)?;
         task.status = params.status;
         task.revision = params.operation_id;
         task.validate().map_err(|_| invalid_request())?;
-        vault(self.vault.put_task(&task))?;
-        Ok(task)
+        Ok(PreparedLocalMutation {
+            value: task,
+            binding,
+            should_write: true,
+        })
     }
 
     pub fn complete_task(&mut self, params: TaskCompleteParams) -> Result<TaskRecord, ClientError> {
-        let mut task = vault(self.vault.task(&params.task_id))?.ok_or_else(not_found)?;
-        if task.revision == params.operation_id {
-            return Ok(task);
+        let prepared = self.prepare_task_completion(&params)?;
+        if prepared.should_write {
+            vault(
+                self.vault
+                    .put_task_with_binding(&prepared.value, &prepared.binding),
+            )?;
         }
+        Ok(prepared.value)
+    }
+
+    pub(crate) fn preview_task_completion(
+        &self,
+        params: &TaskCompleteParams,
+    ) -> Result<TaskRecord, ClientError> {
+        self.prepare_task_completion(params)
+            .map(|prepared| prepared.value)
+    }
+
+    fn prepare_task_completion(
+        &self,
+        params: &TaskCompleteParams,
+    ) -> Result<PreparedLocalMutation<TaskRecord>, ClientError> {
+        let binding = local_operation_binding(
+            params.operation_id,
+            LocalOperationKind::TaskComplete,
+            params.task_id.to_string(),
+            Some(params.expected_revision),
+            params,
+        )?;
+        match vault(self.vault.local_operation_replay(&binding))? {
+            LocalOperationReplay::Snapshot(snapshot) => {
+                let task = task_snapshot(&snapshot, params.task_id, params.operation_id)?;
+                if task.status != TaskStatus::Done {
+                    return Err(internal());
+                }
+                return Ok(PreparedLocalMutation {
+                    value: task,
+                    binding,
+                    should_write: false,
+                });
+            }
+            LocalOperationReplay::Legacy => {
+                let task = vault(self.vault.task(&params.task_id))?.ok_or_else(internal)?;
+                return Ok(PreparedLocalMutation {
+                    value: task,
+                    binding,
+                    should_write: false,
+                });
+            }
+            LocalOperationReplay::Fresh => {}
+        }
+        let mut task = vault(self.vault.task(&params.task_id))?.ok_or_else(not_found)?;
         require_revision(task.revision, params.expected_revision)?;
         let recorded_hlc = operation_clock(params.operation_id, self.device_id);
         task.status = TaskStatus::Done;
         task.revision = params.operation_id;
         task.evidence = params
             .evidence
-            .into_iter()
+            .iter()
             .map(|evidence| TaskEvidence {
-                summary: evidence.summary,
-                evidence_kind: evidence.kind,
-                reference: evidence.reference,
+                summary: evidence.summary.clone(),
+                evidence_kind: evidence.kind.clone(),
+                reference: evidence.reference.clone(),
                 recorded_hlc,
             })
             .collect();
         task.validate().map_err(|_| invalid_request())?;
-        vault(self.vault.put_task(&task))?;
-        Ok(task)
+        Ok(PreparedLocalMutation {
+            value: task,
+            binding,
+            should_write: true,
+        })
     }
 
     pub fn tasks(&self, project_id: ProjectId) -> Result<Vec<TaskRecord>, ClientError> {
@@ -311,6 +767,68 @@ fn operation_clock(operation_id: OperationId, device_id: DeviceId) -> HybridLogi
     HybridLogicalClock::new(physical_ms, 0, device_id)
 }
 
+fn local_operation_binding<T: Serialize>(
+    operation_id: OperationId,
+    operation_kind: LocalOperationKind,
+    target_id: String,
+    expected_revision: Option<OperationId>,
+    payload: &T,
+) -> Result<LocalOperationBinding, ClientError> {
+    let canonical_payload = serde_json::to_vec(payload).map_err(|_| internal())?;
+    Ok(LocalOperationBinding {
+        operation_id,
+        operation_kind,
+        target_id,
+        expected_revision,
+        canonical_payload,
+    })
+}
+
+fn memory_snapshot(
+    canonical_response: &[u8],
+    expected_id: MemoryId,
+    expected_revision: OperationId,
+) -> Result<MemoryRecord, ClientError> {
+    let memory: MemoryRecord =
+        serde_json::from_slice(canonical_response).map_err(|_| internal())?;
+    memory.validate().map_err(|_| internal())?;
+    if memory.id != expected_id || memory.revision != expected_revision {
+        return Err(internal());
+    }
+    Ok(memory)
+}
+
+fn candidate_snapshot(
+    canonical_response: &[u8],
+    expected_id: CandidateId,
+    expected_revision: OperationId,
+) -> Result<MemoryCandidate, ClientError> {
+    let candidate: MemoryCandidate =
+        serde_json::from_slice(canonical_response).map_err(|_| internal())?;
+    candidate.validate().map_err(|_| internal())?;
+    if candidate.id != expected_id
+        || candidate.proposed_memory.id.to_string() != expected_id.to_string()
+        || candidate.proposed_memory.revision != expected_revision
+        || candidate.state != CandidateState::Pending
+    {
+        return Err(internal());
+    }
+    Ok(candidate)
+}
+
+fn task_snapshot(
+    canonical_response: &[u8],
+    expected_id: TaskId,
+    expected_revision: OperationId,
+) -> Result<TaskRecord, ClientError> {
+    let task: TaskRecord = serde_json::from_slice(canonical_response).map_err(|_| internal())?;
+    task.validate().map_err(|_| internal())?;
+    if task.id != expected_id || task.revision != expected_revision {
+        return Err(internal());
+    }
+    Ok(task)
+}
+
 fn memory_embedding(memory: &MemoryRecord) -> Result<Embedding384, ClientError> {
     text_embedding(&format!(
         "{} {} {}",
@@ -350,7 +868,10 @@ fn require_revision(actual: OperationId, expected: OperationId) -> Result<(), Cl
 }
 
 fn vault<T>(result: Result<T, VaultError>) -> Result<T, ClientError> {
-    result.map_err(|_| internal())
+    result.map_err(|error| match error {
+        VaultError::OperationConflict => operation_conflict(),
+        _ => internal(),
+    })
 }
 
 fn invalid_request() -> ClientError {
@@ -378,6 +899,10 @@ fn scope_denied() -> ClientError {
         field_path: None,
         retryable: false,
     }
+}
+
+fn operation_conflict() -> ClientError {
+    conflict("The operation ID is already bound to a different mutation")
 }
 
 fn conflict(message: &str) -> ClientError {

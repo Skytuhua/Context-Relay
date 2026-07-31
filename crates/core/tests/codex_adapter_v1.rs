@@ -6,12 +6,16 @@ use std::{
 };
 
 use context_relay_core::{
-    codex::{CodexAdapter, CodexExecutableKind, CodexLayout},
+    codex::{
+        CodexAdapter, CodexCommandRunner, CodexExecutableKind, CodexLayout, VerifiedCodexCommand,
+    },
+    mcp::install::bridge_component,
     native_transaction::{
         approval_hash_v1,
+        cli::NativeCliExecutor,
         engine::{NativeAdapter, NativeFileSystem, RestrictedRun},
         filesystem::OsNativeTransactionFileSystem,
-        model::{NativeTransactionPlan, SidecarBinding},
+        model::{CanonicalCliDeclaration, NativeTransactionPlan, SidecarBinding},
     },
 };
 use context_relay_native_runner::{
@@ -193,6 +197,36 @@ fn test_file_digest(path: &Path) -> Sha256Digest {
     test_digest(&fs::read(path).unwrap())
 }
 
+fn executable_bridge(fixture: &Fixture, name: &str) -> ComponentRecord {
+    let path = fixture.root.join(name);
+    fs::write(&path, b"fixture bridge executable").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+    let device = DeviceId::from_str(DEVICE_ID).unwrap();
+    bridge_component(
+        HarnessId::Codex,
+        &path,
+        device,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device),
+    )
+    .unwrap()
+}
+
+fn declaration(body: &str) -> CanonicalCliDeclaration {
+    CanonicalCliDeclaration {
+        harness: HarnessId::Codex,
+        server_name: "context-relay".to_owned(),
+        canonical_body: body.to_owned(),
+        fingerprint: test_digest(body.as_bytes()),
+    }
+}
+
 fn codex_native_plan(
     fixture: &Fixture,
     expected_native_digests: Vec<ExpectedNativeDigest>,
@@ -236,6 +270,7 @@ fn codex_native_plan(
     };
     let mut plan = NativeTransactionPlan {
         setup,
+        approval_version: 1,
         helper_policy_version: 1,
         manifest_schema_version: 1,
         manifest_digest: Sha256Digest([23; 32]),
@@ -258,6 +293,7 @@ fn codex_native_plan(
         expected_semantic_output_hash: Sha256Digest([30; 32]),
         scanner_result_hash: Sha256Digest([31; 32]),
         mutations: vec![mutation],
+        cli_mutations: vec![],
         ownership_changes: vec![],
     };
     plan.setup.batch_hash = approval_hash_v1(&plan).unwrap();
@@ -785,10 +821,184 @@ fn native_reprobe_rejects_changed_codex_installation_identity() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn native_reprobe_rejects_a_symlinked_harness_even_with_identical_bytes() {
+    use std::os::unix::fs::symlink;
+
+    let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let plan = codex_native_plan(&fixture, vec![]);
+    let replacement = fixture.root.join("same-codex-bytes");
+    fs::write(&replacement, fs::read(&fixture.layout.executable).unwrap()).unwrap();
+    fs::remove_file(&fixture.layout.executable).unwrap();
+    symlink(&replacement, &fixture.layout.executable).unwrap();
+
+    assert_eq!(
+        NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan)
+            .unwrap_err()
+            .to_string(),
+        "Codex installation changed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verified_runner_rejects_path_substitution_before_execution() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    use context_relay_core::native_transaction::engine::BoundaryError;
+
+    struct SubstitutingRunner {
+        executable: PathBuf,
+        original: PathBuf,
+        replacement: PathBuf,
+        executions: Arc<AtomicU64>,
+    }
+
+    impl CodexCommandRunner for SubstitutingRunner {
+        fn before_launch(&mut self, _: &[String]) -> Result<(), BoundaryError> {
+            fs::rename(&self.executable, &self.original)
+                .map_err(|_| BoundaryError::new("fixture rename failed"))?;
+            fs::rename(&self.replacement, &self.executable)
+                .map_err(|_| BoundaryError::new("fixture substitution failed"))
+        }
+
+        fn run(&mut self, _: VerifiedCodexCommand<'_>) -> Result<Vec<u8>, BoundaryError> {
+            self.executions.fetch_add(1, Ordering::Relaxed);
+            Ok(br#"{"installed":[],"available":[]}"#.to_vec())
+        }
+    }
+
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let bridge = executable_bridge(&fixture, "bridge executable");
+    let replacement = fixture.root.join("replacement-codex");
+    fs::write(&replacement, fs::read(&fixture.layout.executable).unwrap()).unwrap();
+    let executions = Arc::new(AtomicU64::new(0));
+    let runner = SubstitutingRunner {
+        executable: fixture.layout.executable.clone(),
+        original: fixture.root.join("original-codex"),
+        replacement,
+        executions: Arc::clone(&executions),
+    };
+
+    assert!(
+        fixture
+            .adapter
+            .plan_bridge_cli_mutation_with_runner(&bridge, runner)
+            .is_err()
+    );
+    assert_eq!(
+        executions.load(Ordering::Relaxed),
+        0,
+        "substituted executable reached the runner launch boundary"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verified_runner_executes_prepared_identity_after_late_path_substitution() {
+    use std::{
+        os::unix::fs::PermissionsExt as _,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+
+    use context_relay_core::native_transaction::engine::BoundaryError;
+
+    struct LateSubstitutingRunner {
+        executable: PathBuf,
+        original: PathBuf,
+        replacement: PathBuf,
+        working_directory: PathBuf,
+        successful_launches: Arc<AtomicU64>,
+        substituted: bool,
+    }
+
+    impl CodexCommandRunner for LateSubstitutingRunner {
+        fn run(&mut self, command: VerifiedCodexCommand<'_>) -> Result<Vec<u8>, BoundaryError> {
+            let arguments = command.arguments().to_vec();
+            if !self.substituted {
+                fs::rename(&self.executable, &self.original)
+                    .map_err(|_| BoundaryError::new("fixture rename failed"))?;
+                fs::rename(&self.replacement, &self.executable)
+                    .map_err(|_| BoundaryError::new("fixture substitution failed"))?;
+                self.substituted = true;
+            }
+            command.execute(&self.working_directory)?;
+            self.successful_launches.fetch_add(1, Ordering::Relaxed);
+            Ok(match arguments.as_slice() {
+                [plugin, list, json]
+                    if (plugin.as_str(), list.as_str(), json.as_str())
+                        == ("plugin", "list", "--json") =>
+                {
+                    br#"{"installed":[],"available":[]}"#.to_vec()
+                }
+                _ => b"[]".to_vec(),
+            })
+        }
+    }
+
+    let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let true_source = ["/usr/bin/true", "/bin/true"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+        .unwrap();
+    let false_source = ["/usr/bin/false", "/bin/false"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+        .unwrap();
+    fs::copy(true_source, &fixture.layout.executable).unwrap();
+    fs::set_permissions(
+        &fixture.layout.executable,
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
+    fixture.adapter = CodexAdapter::from_layout(
+        fixture.layout.clone(),
+        fixture.project_id,
+        device_id,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+    )
+    .unwrap();
+    let replacement = fixture.root.join("replacement-codex");
+    fs::copy(false_source, &replacement).unwrap();
+    let successful_launches = Arc::new(AtomicU64::new(0));
+    let runner = LateSubstitutingRunner {
+        executable: fixture.layout.executable.clone(),
+        original: fixture.root.join("original-codex"),
+        replacement,
+        working_directory: fixture.layout.working_directory.clone(),
+        successful_launches: Arc::clone(&successful_launches),
+        substituted: false,
+    };
+    let bridge = executable_bridge(&fixture, "bridge executable");
+
+    assert!(
+        fixture
+            .adapter
+            .plan_bridge_cli_mutation_with_runner(&bridge, runner)
+            .is_err(),
+        "the next probe must reject the substituted executable"
+    );
+    assert_eq!(
+        successful_launches.load(Ordering::Relaxed),
+        1,
+        "the prepared verified identity did not execute successfully"
+    );
+}
+
 #[test]
 fn native_digest_comparison_rejects_concurrent_mutation_and_absence() {
     let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
-    let target = fixture.root.join("approved-native-target");
+    let target = fixture.root.join("approved-bridge-executable");
     let approved_bytes = b"approved native bytes";
     fs::write(&target, approved_bytes).unwrap();
     let plan = codex_native_plan(
@@ -1046,6 +1256,433 @@ fn plugin_and_global_mcp_changes_use_only_official_cli_argv() {
             ],
         ]
     );
+}
+
+fn codex_mcp_get(body: &str) -> Vec<u8> {
+    let body: Value = serde_json::from_str(body).unwrap();
+    serde_json::to_vec(&json!({
+        "name": "context-relay",
+        "enabled": true,
+        "disabled_reason": null,
+        "transport": {
+            "type": "stdio",
+            "command": body["command"],
+            "args": body["args"],
+            "env": {},
+            "env_vars": [],
+            "cwd": null
+        },
+        "enabled_tools": null,
+        "disabled_tools": null,
+        "startup_timeout_sec": null,
+        "tool_timeout_sec": null
+    }))
+    .unwrap()
+}
+
+fn codex_mcp_list(body: &str) -> Vec<u8> {
+    let body: Value = serde_json::from_str(body).unwrap();
+    serde_json::to_vec(&json!([{
+        "name": "context-relay",
+        "enabled": true,
+        "disabled_reason": null,
+        "transport": {
+            "type": "stdio",
+            "command": body["command"],
+            "args": body["args"],
+            "env": {},
+            "env_vars": [],
+            "cwd": null
+        },
+        "startup_timeout_sec": null,
+        "tool_timeout_sec": null,
+        "auth_status": "unsupported"
+    }]))
+    .unwrap()
+}
+
+#[test]
+fn bridge_cli_plan_binds_exact_declarations_and_preserves_argv_boundaries() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let bridge = executable_bridge(&fixture, "bridge executable with spaces");
+    let mut commands = Vec::new();
+    let mut validation = |argv: &[String]| {
+        commands.push(argv.to_vec());
+        Ok(match argv {
+            [plugin, list, json]
+                if (plugin.as_str(), list.as_str(), json.as_str())
+                    == ("plugin", "list", "--json") =>
+            {
+                br#"{"installed":[],"available":[]}"#.to_vec()
+            }
+            [mcp, list, json]
+                if (mcp.as_str(), list.as_str(), json.as_str()) == ("mcp", "list", "--json") =>
+            {
+                b"[]".to_vec()
+            }
+            _ => panic!("unexpected validation argv: {argv:?}"),
+        })
+    };
+
+    let mutation = fixture
+        .adapter
+        .plan_bridge_cli_mutation_with_runner(&bridge, &mut validation)
+        .unwrap();
+
+    assert_eq!(mutation.stable_id, bridge.id.to_string());
+    assert_eq!(mutation.expected, None);
+    assert_eq!(mutation.intended, Some(declaration(&bridge.body_markdown)));
+    assert_eq!(
+        mutation
+            .forward
+            .iter()
+            .map(|operation| {
+                operation
+                    .arguments
+                    .iter()
+                    .map(|argument| argument.display.clone().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+        vec![vec![
+            "mcp",
+            "add",
+            "context-relay",
+            "--",
+            bridge.body_markdown.parse::<Value>().unwrap()["command"]
+                .as_str()
+                .unwrap(),
+            "--harness",
+            "codex",
+        ]]
+    );
+    assert_eq!(
+        mutation.rollback[0]
+            .arguments
+            .iter()
+            .map(|argument| argument.display.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        ["mcp", "remove", "context-relay"]
+    );
+    assert_eq!(
+        commands,
+        vec![
+            vec!["plugin", "list", "--json"],
+            vec!["mcp", "list", "--json"],
+        ]
+    );
+}
+
+#[test]
+fn bridge_cli_plan_restores_the_exact_managed_prior_declaration() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let prior = executable_bridge(&fixture, "prior bridge executable");
+    let intended = executable_bridge(&fixture, "next bridge executable");
+    let prior_body = prior.body_markdown.clone();
+    let prior_list = codex_mcp_list(&prior_body);
+    let prior_get = codex_mcp_get(&prior_body);
+    let mut validation = move |argv: &[String]| {
+        Ok(match argv {
+            [plugin, list, json]
+                if (plugin.as_str(), list.as_str(), json.as_str())
+                    == ("plugin", "list", "--json") =>
+            {
+                br#"{"installed":[],"available":[]}"#.to_vec()
+            }
+            [mcp, list, json]
+                if (mcp.as_str(), list.as_str(), json.as_str()) == ("mcp", "list", "--json") =>
+            {
+                prior_list.clone()
+            }
+            [mcp, get, name, json]
+                if (mcp.as_str(), get.as_str(), name.as_str(), json.as_str())
+                    == ("mcp", "get", "context-relay", "--json") =>
+            {
+                prior_get.clone()
+            }
+            _ => panic!("unexpected validation argv: {argv:?}"),
+        })
+    };
+
+    let mutation = fixture
+        .adapter
+        .plan_bridge_cli_mutation_with_runner(&intended, &mut validation)
+        .unwrap();
+
+    assert_eq!(mutation.expected, Some(declaration(&prior.body_markdown)));
+    assert_eq!(
+        mutation.rollback[0]
+            .arguments
+            .iter()
+            .map(|argument| argument.display.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "mcp",
+            "add",
+            "context-relay",
+            "--",
+            serde_json::from_str::<Value>(&prior.body_markdown).unwrap()["command"]
+                .as_str()
+                .unwrap(),
+            "--harness",
+            "codex",
+        ]
+    );
+}
+
+#[test]
+fn bridge_cli_plan_rejects_malformed_redacted_secret_bearing_and_unmanaged_prior_state() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let intended = executable_bridge(&fixture, "intended bridge");
+    let malformed = b"not-json".to_vec();
+    let redacted =
+        codex_mcp_get(r#"{"args":["--harness","codex"],"command":"<redacted>","type":"stdio"}"#);
+    let secret_bearing = serde_json::to_vec(&json!({
+        "name": "context-relay",
+        "enabled": true,
+        "disabled_reason": null,
+        "transport": {
+            "type": "stdio",
+            "command": "/managed/bridge",
+            "args": ["--harness", "codex"],
+            "env": {"TOKEN": "secret"},
+            "env_vars": [],
+            "cwd": null
+        },
+        "enabled_tools": null,
+        "disabled_tools": null,
+        "startup_timeout_sec": null,
+        "tool_timeout_sec": null
+    }))
+    .unwrap();
+    let unmanaged = codex_mcp_get(
+        r#"{"args":["--harness","claude-code"],"command":"/managed/bridge","type":"stdio"}"#,
+    );
+
+    for rejected in [malformed, redacted, secret_bearing, unmanaged] {
+        let list = codex_mcp_list(&intended.body_markdown);
+        let mut validation = |argv: &[String]| {
+            Ok(match argv {
+                [plugin, list, json]
+                    if (plugin.as_str(), list.as_str(), json.as_str())
+                        == ("plugin", "list", "--json") =>
+                {
+                    br#"{"installed":[],"available":[]}"#.to_vec()
+                }
+                [mcp, list_command, json]
+                    if (mcp.as_str(), list_command.as_str(), json.as_str())
+                        == ("mcp", "list", "--json") =>
+                {
+                    list.clone()
+                }
+                [mcp, get, name, json]
+                    if (mcp.as_str(), get.as_str(), name.as_str(), json.as_str())
+                        == ("mcp", "get", "context-relay", "--json") =>
+                {
+                    rejected.clone()
+                }
+                _ => panic!("unexpected validation argv: {argv:?}"),
+            })
+        };
+        assert!(
+            fixture
+                .adapter
+                .plan_bridge_cli_mutation_with_runner(&intended, &mut validation)
+                .is_err()
+        );
+    }
+
+    let mut disabled_list: Value =
+        serde_json::from_slice(&codex_mcp_list(&intended.body_markdown)).unwrap();
+    disabled_list[0]["enabled"] = Value::Bool(false);
+    let disabled_list = serde_json::to_vec(&disabled_list).unwrap();
+    let mut validation = |argv: &[String]| {
+        Ok(match argv {
+            [plugin, list, json]
+                if (plugin.as_str(), list.as_str(), json.as_str())
+                    == ("plugin", "list", "--json") =>
+            {
+                br#"{"installed":[],"available":[]}"#.to_vec()
+            }
+            [mcp, list, json]
+                if (mcp.as_str(), list.as_str(), json.as_str()) == ("mcp", "list", "--json") =>
+            {
+                disabled_list.clone()
+            }
+            _ => panic!("disabled declaration must be rejected before mcp get"),
+        })
+    };
+    assert!(
+        fixture
+            .adapter
+            .plan_bridge_cli_mutation_with_runner(&intended, &mut validation)
+            .is_err()
+    );
+}
+
+#[test]
+fn cli_executor_reprobes_intended_state_without_starting_the_bridge() {
+    use std::sync::{Arc, Mutex};
+
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let bridge = executable_bridge(&fixture, "bridge executable");
+    let intended_body = bridge.body_markdown.clone();
+    let mutation = {
+        let mut validation = |argv: &[String]| {
+            Ok(match argv {
+                [plugin, list, json]
+                    if (plugin.as_str(), list.as_str(), json.as_str())
+                        == ("plugin", "list", "--json") =>
+                {
+                    br#"{"installed":[],"available":[]}"#.to_vec()
+                }
+                [mcp, list, json]
+                    if (mcp.as_str(), list.as_str(), json.as_str())
+                        == ("mcp", "list", "--json") =>
+                {
+                    b"[]".to_vec()
+                }
+                _ => panic!("unexpected validation argv: {argv:?}"),
+            })
+        };
+        fixture
+            .adapter
+            .plan_bridge_cli_mutation_with_runner(&bridge, &mut validation)
+            .unwrap()
+    };
+    let live = Arc::new(Mutex::new(None::<String>));
+    let operations = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let operation_live = Arc::clone(&live);
+    let operation_log = Arc::clone(&operations);
+    let operation = move |argv: &[String]| {
+        operation_log.lock().unwrap().push(argv.to_vec());
+        *operation_live.lock().unwrap() = Some(intended_body.clone());
+        Ok(Vec::new())
+    };
+    let validation_live = Arc::clone(&live);
+    let validation = move |argv: &[String]| {
+        let live = validation_live.lock().unwrap().clone();
+        Ok(match argv {
+            [plugin, list, json]
+                if (plugin.as_str(), list.as_str(), json.as_str())
+                    == ("plugin", "list", "--json") =>
+            {
+                br#"{"installed":[],"available":[]}"#.to_vec()
+            }
+            [mcp, list, json]
+                if (mcp.as_str(), list.as_str(), json.as_str()) == ("mcp", "list", "--json") =>
+            {
+                live.as_deref()
+                    .map(codex_mcp_list)
+                    .unwrap_or_else(|| b"[]".to_vec())
+            }
+            [mcp, get, name, json]
+                if (mcp.as_str(), get.as_str(), name.as_str(), json.as_str())
+                    == ("mcp", "get", "context-relay", "--json") =>
+            {
+                codex_mcp_get(live.as_deref().unwrap())
+            }
+            _ => panic!("unexpected validation argv: {argv:?}"),
+        })
+    };
+    let mut executor = fixture
+        .adapter
+        .cli_executor_with_runners(operation, validation);
+
+    executor
+        .compare_cli_targets(std::slice::from_ref(&mutation))
+        .unwrap();
+    assert!(operations.lock().unwrap().is_empty());
+    let outcome = executor.apply_cli_mutation(&mutation).unwrap();
+    assert_eq!(outcome.command_error, None);
+    assert_eq!(
+        outcome.resulting_fingerprint,
+        mutation
+            .intended
+            .as_ref()
+            .map(|declaration| declaration.fingerprint)
+    );
+    assert_eq!(operations.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn cli_executor_restores_only_while_live_declaration_equals_intended() {
+    use std::sync::{Arc, Mutex};
+
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let bridge = executable_bridge(&fixture, "bridge executable");
+    let mutation = {
+        let mut validation = |argv: &[String]| {
+            Ok(match argv {
+                [plugin, list, json]
+                    if (plugin.as_str(), list.as_str(), json.as_str())
+                        == ("plugin", "list", "--json") =>
+                {
+                    br#"{"installed":[],"available":[]}"#.to_vec()
+                }
+                [mcp, list, json]
+                    if (mcp.as_str(), list.as_str(), json.as_str())
+                        == ("mcp", "list", "--json") =>
+                {
+                    b"[]".to_vec()
+                }
+                _ => panic!("unexpected validation argv: {argv:?}"),
+            })
+        };
+        fixture
+            .adapter
+            .plan_bridge_cli_mutation_with_runner(&bridge, &mut validation)
+            .unwrap()
+    };
+    let divergent = executable_bridge(&fixture, "divergent bridge").body_markdown;
+    let live = Arc::new(Mutex::new(Some(divergent)));
+    let operations = Arc::new(Mutex::new(0_u64));
+    let operation_live = Arc::clone(&live);
+    let operation_count = Arc::clone(&operations);
+    let operation = move |_: &[String]| {
+        *operation_count.lock().unwrap() += 1;
+        *operation_live.lock().unwrap() = None;
+        Ok(Vec::new())
+    };
+    let validation_live = Arc::clone(&live);
+    let validation = move |argv: &[String]| {
+        let live = validation_live.lock().unwrap().clone();
+        Ok(match argv {
+            [plugin, list, json]
+                if (plugin.as_str(), list.as_str(), json.as_str())
+                    == ("plugin", "list", "--json") =>
+            {
+                br#"{"installed":[],"available":[]}"#.to_vec()
+            }
+            [mcp, list, json]
+                if (mcp.as_str(), list.as_str(), json.as_str()) == ("mcp", "list", "--json") =>
+            {
+                live.as_deref()
+                    .map(codex_mcp_list)
+                    .unwrap_or_else(|| b"[]".to_vec())
+            }
+            [mcp, get, name, json]
+                if (mcp.as_str(), get.as_str(), name.as_str(), json.as_str())
+                    == ("mcp", "get", "context-relay", "--json") =>
+            {
+                codex_mcp_get(live.as_deref().unwrap())
+            }
+            _ => panic!("unexpected validation argv: {argv:?}"),
+        })
+    };
+    let mut executor = fixture
+        .adapter
+        .cli_executor_with_runners(operation, validation);
+
+    let divergent = executor.restore_cli_mutation_if_matches(&mutation).unwrap();
+    assert!(!divergent.restored);
+    assert_eq!(*operations.lock().unwrap(), 0);
+
+    *live.lock().unwrap() = Some(bridge.body_markdown.clone());
+    let restored = executor.restore_cli_mutation_if_matches(&mutation).unwrap();
+    assert!(restored.restored);
+    assert_eq!(restored.resulting_fingerprint, None);
+    assert_eq!(*operations.lock().unwrap(), 1);
 }
 
 #[test]

@@ -123,6 +123,8 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         TaskUpsertParams,
         HandoffParams,
         HarnessParams,
+        McpBinding,
+        McpCallParams,
         PlanParams,
         PackageParams,
         RetryParams,

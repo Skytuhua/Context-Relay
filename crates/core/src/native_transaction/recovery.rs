@@ -8,9 +8,9 @@ use context_relay_protocol::{NativePlatform, Sha256Digest, WireNativeValue};
 use thiserror::Error;
 
 use crate::vault::{
-    MacGenerationState, MacGenerationSubstate, NativeSandboxCleanupState, NativeSandboxIdentity,
-    NativeTransactionStatus, NativeWalAbsenceRebind, NativeWalRecord, NativeWalState, Vault,
-    VaultError,
+    MacGenerationState, MacGenerationSubstate, NativeCliWalRecord, NativeCliWalState,
+    NativeSandboxCleanupState, NativeSandboxIdentity, NativeTransactionStatus,
+    NativeWalAbsenceRebind, NativeWalRecord, NativeWalState, Vault, VaultError,
 };
 
 use super::{
@@ -108,6 +108,12 @@ pub enum RecoveryProbe {
 pub enum RecoveryAction {
     PoisonGeneration,
     BeginRecovery,
+    ProbeCliMutation,
+    PrepareCliRestore,
+    RestoreCliMutation,
+    MarkCliRestored,
+    MarkCliConflict,
+    CleanupCommittedCliMutations,
     PrepareRestore,
     RestoreTarget,
     CheckpointAbsence,
@@ -153,6 +159,12 @@ impl RecoveryFaultPoint {
         let action = match fields.next()? {
             "poison_generation" => RecoveryAction::PoisonGeneration,
             "begin_recovery" => RecoveryAction::BeginRecovery,
+            "probe_cli_mutation" => RecoveryAction::ProbeCliMutation,
+            "prepare_cli_restore" => RecoveryAction::PrepareCliRestore,
+            "restore_cli_mutation" => RecoveryAction::RestoreCliMutation,
+            "mark_cli_restored" => RecoveryAction::MarkCliRestored,
+            "mark_cli_conflict" => RecoveryAction::MarkCliConflict,
+            "cleanup_committed_cli_mutations" => RecoveryAction::CleanupCommittedCliMutations,
             "prepare_restore" => RecoveryAction::PrepareRestore,
             "restore_target" => RecoveryAction::RestoreTarget,
             "checkpoint_absence" => RecoveryAction::CheckpointAbsence,
@@ -186,6 +198,12 @@ const fn action_name(action: RecoveryAction) -> &'static str {
     match action {
         RecoveryAction::PoisonGeneration => "poison_generation",
         RecoveryAction::BeginRecovery => "begin_recovery",
+        RecoveryAction::ProbeCliMutation => "probe_cli_mutation",
+        RecoveryAction::PrepareCliRestore => "prepare_cli_restore",
+        RecoveryAction::RestoreCliMutation => "restore_cli_mutation",
+        RecoveryAction::MarkCliRestored => "mark_cli_restored",
+        RecoveryAction::MarkCliConflict => "mark_cli_conflict",
+        RecoveryAction::CleanupCommittedCliMutations => "cleanup_committed_cli_mutations",
         RecoveryAction::PrepareRestore => "prepare_restore",
         RecoveryAction::RestoreTarget => "restore_target",
         RecoveryAction::CheckpointAbsence => "checkpoint_absence",
@@ -262,6 +280,70 @@ pub trait NativeRecoveryIo {
         expected_old_token: &NativeObjectToken,
         expected_applied: &RestorableStateFingerprint,
     ) -> Result<Option<NativeObjectToken>, BoundaryError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CliRecoveryRestore {
+    Restored,
+    Conflict,
+}
+
+/// Reconstructs adapter CLI recovery exclusively from durable, approval-bound
+/// inputs. Implementations must not accept command lines or declarations from
+/// the caller outside the sealed plan payload and its corresponding WAL row.
+pub trait NativeCliRecoveryIo {
+    fn probe_cli_declaration(
+        &mut self,
+        sealed_plan_payload: &[u8],
+        wal: &NativeCliWalRecord,
+    ) -> Result<Option<Sha256Digest>, BoundaryError>;
+
+    fn restore_cli_mutation_if_matches(
+        &mut self,
+        sealed_plan_payload: &[u8],
+        wal: &NativeCliWalRecord,
+    ) -> Result<CliRecoveryRestore, BoundaryError>;
+
+    fn finish_committed_cli_mutations(
+        &mut self,
+        sealed_plan_payload: &[u8],
+        wal: &[NativeCliWalRecord],
+    ) -> Result<(), BoundaryError>;
+}
+
+#[derive(Default)]
+pub struct NoNativeCliRecoveryIo;
+
+impl NoNativeCliRecoveryIo {
+    fn unavailable() -> BoundaryError {
+        BoundaryError::new("native CLI recovery I/O is unavailable for nonempty CLI WAL")
+    }
+}
+
+impl NativeCliRecoveryIo for NoNativeCliRecoveryIo {
+    fn probe_cli_declaration(
+        &mut self,
+        _sealed_plan_payload: &[u8],
+        _wal: &NativeCliWalRecord,
+    ) -> Result<Option<Sha256Digest>, BoundaryError> {
+        Err(Self::unavailable())
+    }
+
+    fn restore_cli_mutation_if_matches(
+        &mut self,
+        _sealed_plan_payload: &[u8],
+        _wal: &NativeCliWalRecord,
+    ) -> Result<CliRecoveryRestore, BoundaryError> {
+        Err(Self::unavailable())
+    }
+
+    fn finish_committed_cli_mutations(
+        &mut self,
+        _sealed_plan_payload: &[u8],
+        _wal: &[NativeCliWalRecord],
+    ) -> Result<(), BoundaryError> {
+        Err(Self::unavailable())
+    }
 }
 
 pub struct OsNativeRecoveryIo<C, R = ()> {
@@ -876,16 +958,197 @@ fn rebind_next_earlier_absence(
     Ok(false)
 }
 
+fn mark_cli_conflict(
+    vault: &mut Vault,
+    fault: &mut impl RecoveryFaultHook,
+    transaction_id: &str,
+    sequence: u32,
+) -> Result<(), NativeRecoveryError> {
+    hit(
+        fault,
+        RecoveryAction::MarkCliConflict,
+        RecoveryMoment::Before,
+        Some(sequence),
+    )?;
+    vault.transition_native_cli_wal(transaction_id, sequence, NativeCliWalState::Conflict)?;
+    hit(
+        fault,
+        RecoveryAction::MarkCliConflict,
+        RecoveryMoment::After,
+        Some(sequence),
+    )?;
+    Ok(())
+}
+
+fn mark_cli_restored(
+    vault: &mut Vault,
+    fault: &mut impl RecoveryFaultHook,
+    transaction_id: &str,
+    sequence: u32,
+) -> Result<(), NativeRecoveryError> {
+    hit(
+        fault,
+        RecoveryAction::MarkCliRestored,
+        RecoveryMoment::Before,
+        Some(sequence),
+    )?;
+    vault.transition_native_cli_wal(transaction_id, sequence, NativeCliWalState::Restored)?;
+    hit(
+        fault,
+        RecoveryAction::MarkCliRestored,
+        RecoveryMoment::After,
+        Some(sequence),
+    )?;
+    Ok(())
+}
+
+fn recover_cli_mutations(
+    vault: &mut Vault,
+    cli_io: &mut impl NativeCliRecoveryIo,
+    fault: &mut impl RecoveryFaultHook,
+    transaction_id: &str,
+    sealed_plan_payload: &[u8],
+    wal: &[NativeCliWalRecord],
+) -> Result<(bool, Vec<u32>), NativeRecoveryError> {
+    let mut conflict = false;
+    let mut prepared_no_write = Vec::new();
+    for durable in wal.iter().rev() {
+        let mut row = durable.clone();
+        match row.state {
+            NativeCliWalState::Conflict => {
+                conflict = true;
+                continue;
+            }
+            NativeCliWalState::Restored => continue,
+            NativeCliWalState::Prepared
+            | NativeCliWalState::Applied
+            | NativeCliWalState::RestorePrepared => {}
+        }
+
+        hit(
+            fault,
+            RecoveryAction::ProbeCliMutation,
+            RecoveryMoment::Before,
+            Some(row.sequence),
+        )?;
+        let live = cli_io.probe_cli_declaration(sealed_plan_payload, &row)?;
+        hit(
+            fault,
+            RecoveryAction::ProbeCliMutation,
+            RecoveryMoment::After,
+            Some(row.sequence),
+        )?;
+
+        if row.state == NativeCliWalState::Prepared && live == row.expected_fingerprint {
+            prepared_no_write.push(row.sequence);
+            continue;
+        }
+        if row.state == NativeCliWalState::RestorePrepared && live == row.expected_fingerprint {
+            mark_cli_restored(vault, fault, transaction_id, row.sequence)?;
+            continue;
+        }
+        if live != row.intended_fingerprint {
+            mark_cli_conflict(vault, fault, transaction_id, row.sequence)?;
+            conflict = true;
+            continue;
+        }
+
+        if row.state == NativeCliWalState::Prepared {
+            vault.transition_native_cli_wal(
+                transaction_id,
+                row.sequence,
+                NativeCliWalState::Applied,
+            )?;
+            row.state = NativeCliWalState::Applied;
+        }
+        if row.state == NativeCliWalState::Applied {
+            hit(
+                fault,
+                RecoveryAction::PrepareCliRestore,
+                RecoveryMoment::Before,
+                Some(row.sequence),
+            )?;
+            vault.transition_native_cli_wal(
+                transaction_id,
+                row.sequence,
+                NativeCliWalState::RestorePrepared,
+            )?;
+            row.state = NativeCliWalState::RestorePrepared;
+            hit(
+                fault,
+                RecoveryAction::PrepareCliRestore,
+                RecoveryMoment::After,
+                Some(row.sequence),
+            )?;
+        }
+
+        hit(
+            fault,
+            RecoveryAction::RestoreCliMutation,
+            RecoveryMoment::Before,
+            Some(row.sequence),
+        )?;
+        let restore = cli_io.restore_cli_mutation_if_matches(sealed_plan_payload, &row)?;
+        hit(
+            fault,
+            RecoveryAction::RestoreCliMutation,
+            RecoveryMoment::After,
+            Some(row.sequence),
+        )?;
+        match restore {
+            CliRecoveryRestore::Restored => {
+                mark_cli_restored(vault, fault, transaction_id, row.sequence)?;
+            }
+            CliRecoveryRestore::Conflict => {
+                mark_cli_conflict(vault, fault, transaction_id, row.sequence)?;
+                conflict = true;
+            }
+        }
+    }
+    Ok((conflict, prepared_no_write))
+}
+
+fn require_empty_cli_wal(vault: &Vault) -> Result<(), NativeRecoveryError> {
+    for transaction in vault.recoverable_native_transactions()? {
+        if !vault
+            .native_cli_wal(&transaction.transaction_id)?
+            .is_empty()
+        {
+            return Err(NoNativeCliRecoveryIo::unavailable().into());
+        }
+    }
+    Ok(())
+}
+
 pub fn recover_native_transactions(
     vault: &mut Vault,
     io: &mut impl NativeRecoveryIo,
 ) -> Result<RecoverySummary, NativeRecoveryError> {
-    recover_native_transactions_with_faults(vault, io, &mut NoRecoveryFault)
+    require_empty_cli_wal(vault)?;
+    recover_native_transactions_with_cli(vault, io, &mut NoNativeCliRecoveryIo)
 }
 
 pub fn recover_native_transactions_with_faults(
     vault: &mut Vault,
     io: &mut impl NativeRecoveryIo,
+    fault: &mut impl RecoveryFaultHook,
+) -> Result<RecoverySummary, NativeRecoveryError> {
+    require_empty_cli_wal(vault)?;
+    recover_native_transactions_with_cli_and_faults(vault, io, &mut NoNativeCliRecoveryIo, fault)
+}
+
+pub fn recover_native_transactions_with_cli(
+    vault: &mut Vault,
+    io: &mut impl NativeRecoveryIo,
+    cli_io: &mut impl NativeCliRecoveryIo,
+) -> Result<RecoverySummary, NativeRecoveryError> {
+    recover_native_transactions_with_cli_and_faults(vault, io, cli_io, &mut NoRecoveryFault)
+}
+
+pub fn recover_native_transactions_with_cli_and_faults(
+    vault: &mut Vault,
+    io: &mut impl NativeRecoveryIo,
+    cli_io: &mut impl NativeCliRecoveryIo,
     fault: &mut impl RecoveryFaultHook,
 ) -> Result<RecoverySummary, NativeRecoveryError> {
     let mut summary = RecoverySummary::default();
@@ -906,6 +1169,12 @@ pub fn recover_native_transactions_with_faults(
         transaction = vault
             .native_transaction(&transaction.transaction_id)?
             .ok_or_else(|| VaultError::Validation("native transaction disappeared".to_owned()))?;
+        let cli_wal = vault.native_cli_wal(&transaction.transaction_id)?;
+        let sealed_plan_payload = if cli_wal.is_empty() {
+            Vec::new()
+        } else {
+            vault.native_plan_payload_for_recovery(&transaction.transaction_id)?
+        };
 
         let cleanup_already_conflicted =
             transaction.sandbox_cleanup_state == NativeSandboxCleanupState::Conflict;
@@ -923,6 +1192,22 @@ pub fn recover_native_transactions_with_faults(
                 }
             }
         } else if transaction.status == NativeTransactionStatus::Committed {
+            if !cli_wal.is_empty() {
+                hit(
+                    fault,
+                    RecoveryAction::CleanupCommittedCliMutations,
+                    RecoveryMoment::Before,
+                    None,
+                )?;
+                cli_io.finish_committed_cli_mutations(&sealed_plan_payload, &cli_wal)?;
+                hit(
+                    fault,
+                    RecoveryAction::CleanupCommittedCliMutations,
+                    RecoveryMoment::After,
+                    None,
+                )?;
+                vault.finish_committed_native_cli_cleanup(&transaction.transaction_id)?;
+            }
             let mut cleaned_deletes = Vec::<NativeObjectToken>::new();
             for mutation in vault.native_wal(&transaction.transaction_id)? {
                 let is_delete = mutation
@@ -979,7 +1264,14 @@ pub fn recover_native_transactions_with_faults(
                 RecoveryMoment::After,
                 None,
             )?;
-            let mut conflict = false;
+            let (mut conflict, prepared_cli_no_write) = recover_cli_mutations(
+                vault,
+                cli_io,
+                fault,
+                &transaction.transaction_id,
+                &sealed_plan_payload,
+                &cli_wal,
+            )?;
             let mut wal = vault.native_wal(&transaction.transaction_id)?;
             for position in (0..wal.len()).rev() {
                 let mut mutation = wal[position].clone();
@@ -1297,7 +1589,11 @@ pub fn recover_native_transactions_with_faults(
                 RecoveryMoment::Before,
                 None,
             )?;
-            vault.finish_native_recovery(&transaction.transaction_id, conflict)?;
+            vault.finish_native_recovery_with_cli_no_write(
+                &transaction.transaction_id,
+                conflict,
+                &prepared_cli_no_write,
+            )?;
             hit(
                 fault,
                 RecoveryAction::FinishRecovery,

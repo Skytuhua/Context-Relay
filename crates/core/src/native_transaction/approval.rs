@@ -1,7 +1,10 @@
 use std::{cmp::Ordering, collections::BTreeSet};
 
 use context_relay_native_runner::NativeState;
-use context_relay_protocol::{NativePlatform, Sha256Digest, WireNativeValue};
+use context_relay_protocol::{
+    CliOperation, HarnessId, MAX_TITLE_BYTES, NativePlatform, Sha256Digest, WireNativeValue,
+    adapters::MAX_ADAPTER_TEXT_BYTES,
+};
 use minicbor::Encoder;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -9,9 +12,15 @@ use thiserror::Error;
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
-use super::model::{ApprovedInput, NativeTransactionPlan, OwnershipChange, SidecarBinding};
+use super::model::{
+    ApprovedCliMutation, ApprovedInput, CanonicalCliDeclaration, NativeTransactionPlan,
+    OwnershipChange, SidecarBinding,
+};
 
 pub const APPROVAL_DOMAIN_V1: &[u8] = b"context-relay/native-plan/v1\0";
+pub const APPROVAL_DOMAIN_V2: &[u8] = b"context-relay/native-plan/v2\0";
+const APPROVED_CLI_TIMEOUT_MS: u32 = 30_000;
+const MANAGED_SERVER_NAME: &str = "context-relay";
 
 #[derive(Debug, Error)]
 pub enum ApprovalError {
@@ -24,18 +33,38 @@ pub enum ApprovalError {
 }
 
 pub fn approval_hash_v1(plan: &NativeTransactionPlan) -> Result<Sha256Digest, ApprovalError> {
+    if !plan.cli_mutations.is_empty() {
+        return Err(ApprovalError::Invalid(
+            "approval v1 cannot bind cli mutations".into(),
+        ));
+    }
     plan.setup
         .validate()
         .map_err(|error| ApprovalError::Invalid(error.to_string()))?;
     validate(plan)?;
 
     let value = approval_value(plan)?;
+    hash_approval(APPROVAL_DOMAIN_V1, &value)
+}
+
+pub fn approval_hash_v2(plan: &NativeTransactionPlan) -> Result<Sha256Digest, ApprovalError> {
+    plan.setup
+        .validate()
+        .map_err(|error| ApprovalError::Invalid(error.to_string()))?;
+    validate(plan)?;
+    validate_cli_mutations(plan)?;
+
+    let value = json!([2, approval_value(plan)?, cli_approval_value(plan)?]);
+    hash_approval(APPROVAL_DOMAIN_V2, &value)
+}
+
+fn hash_approval(domain: &[u8], value: &Value) -> Result<Sha256Digest, ApprovalError> {
     let mut encoder = Encoder::new(Vec::new());
-    encode_value(&mut encoder, &value)?;
+    encode_value(&mut encoder, value)?;
     let encoded = encoder.into_writer();
 
     let mut hasher = Sha256::new();
-    hasher.update(APPROVAL_DOMAIN_V1);
+    hasher.update(domain);
     hasher.update(encoded);
     Ok(Sha256Digest(hasher.finalize().into()))
 }
@@ -129,6 +158,292 @@ fn unique(
         }
     }
     Ok(())
+}
+
+fn validate_cli_mutations(plan: &NativeTransactionPlan) -> Result<(), ApprovalError> {
+    if plan.setup.harness == HarnessId::Hermes && !plan.cli_mutations.is_empty() {
+        return Err(ApprovalError::Invalid(
+            "Hermes native plans cannot contain cli mutations".into(),
+        ));
+    }
+
+    unique(
+        plan.cli_mutations
+            .iter()
+            .map(|mutation| mutation.stable_id.clone()),
+        "cli stable id",
+    )?;
+
+    let mut targets = Vec::with_capacity(plan.cli_mutations.len());
+    for mutation in &plan.cli_mutations {
+        validate_stable_id(&mutation.stable_id)?;
+        let target = validate_cli_declarations(plan, mutation)?;
+        if targets.contains(&target) {
+            return Err(ApprovalError::Duplicate(format!(
+                "cli target: {}\0{}",
+                harness_name(target.0),
+                target.1
+            )));
+        }
+        targets.push(target);
+        if mutation.stable_id != managed_bridge_stable_id(target.0) {
+            return Err(ApprovalError::Invalid(
+                "cli mutation does not use the managed bridge stable id".into(),
+            ));
+        }
+
+        if mutation.forward.is_empty() || mutation.rollback.is_empty() {
+            return Err(ApprovalError::Invalid(
+                "cli forward and rollback operations cannot be empty".into(),
+            ));
+        }
+        for operation in mutation.forward.iter().chain(&mutation.rollback) {
+            validate_cli_operation(operation, &plan.setup.executable_path)?;
+        }
+    }
+
+    let flattened = plan
+        .cli_mutations
+        .iter()
+        .flat_map(|mutation| mutation.forward.iter());
+    if !flattened.eq(plan.setup.cli_operations.iter()) {
+        return Err(ApprovalError::Invalid(
+            "flattened cli forward operations do not match SetupPlan.cli_operations".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stable_id(stable_id: &str) -> Result<(), ApprovalError> {
+    if stable_id.trim().is_empty()
+        || stable_id.len() > MAX_TITLE_BYTES
+        || stable_id.chars().any(char::is_control)
+    {
+        return Err(ApprovalError::Invalid(
+            "cli stable id is not bounded canonical text".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cli_declarations<'a>(
+    plan: &NativeTransactionPlan,
+    mutation: &'a ApprovedCliMutation,
+) -> Result<(HarnessId, &'a str), ApprovalError> {
+    let declaration = mutation
+        .expected
+        .as_ref()
+        .or(mutation.intended.as_ref())
+        .ok_or_else(|| {
+            ApprovalError::Invalid(
+                "cli mutation must declare an expected or intended target".into(),
+            )
+        })?;
+    let target = (declaration.harness, declaration.server_name.as_str());
+
+    if target.0 != plan.setup.harness {
+        return Err(ApprovalError::Invalid(
+            "cli target does not match the plan harness".into(),
+        ));
+    }
+    if !matches!(target.0, HarnessId::ClaudeCode | HarnessId::Codex) {
+        return Err(ApprovalError::Invalid(
+            "cli mutations support only Claude Code and Codex".into(),
+        ));
+    }
+    if target.1 != MANAGED_SERVER_NAME {
+        return Err(ApprovalError::Invalid(
+            "cli target is not the managed context-relay server".into(),
+        ));
+    }
+
+    for declaration in [mutation.expected.as_ref(), mutation.intended.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if declaration.harness != target.0 || declaration.server_name != target.1 {
+            return Err(ApprovalError::Invalid(
+                "cli expected and intended declarations target different servers".into(),
+            ));
+        }
+        validate_cli_declaration(declaration)?;
+    }
+    Ok(target)
+}
+
+fn validate_cli_declaration(declaration: &CanonicalCliDeclaration) -> Result<(), ApprovalError> {
+    if declaration.canonical_body.is_empty()
+        || declaration.canonical_body.len() > MAX_ADAPTER_TEXT_BYTES
+    {
+        return Err(ApprovalError::Invalid(
+            "cli declaration body exceeds its bound".into(),
+        ));
+    }
+    let fingerprint = Sha256Digest(Sha256::digest(declaration.canonical_body.as_bytes()).into());
+    if declaration.fingerprint != fingerprint {
+        return Err(ApprovalError::Invalid(
+            "cli declaration fingerprint does not match its canonical body".into(),
+        ));
+    }
+
+    let value: Value = serde_json::from_str(&declaration.canonical_body).map_err(|_| {
+        ApprovalError::Invalid("cli declaration is not a canonical managed bridge".into())
+    })?;
+    if serde_json::to_string(&value).ok().as_deref() != Some(declaration.canonical_body.as_str())
+        || !is_managed_declaration_body(declaration.harness, &value)
+    {
+        return Err(ApprovalError::Invalid(
+            "cli declaration is not a canonical managed bridge".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_managed_declaration_body(harness: HarnessId, value: &Value) -> bool {
+    let (HarnessId::ClaudeCode | HarnessId::Codex) = harness else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.len() != 3
+        || object.get("type").and_then(Value::as_str) != Some("stdio")
+        || object
+            .get("args")
+            .and_then(Value::as_array)
+            .is_none_or(|args| {
+                args.len() != 2
+                    || args[0].as_str() != Some("--harness")
+                    || args[1].as_str() != Some(harness_name(harness))
+            })
+    {
+        return false;
+    }
+    object
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(is_canonical_absolute_command)
+}
+
+fn is_canonical_absolute_command(command: &str) -> bool {
+    if command.is_empty() || command.chars().any(char::is_control) {
+        return false;
+    }
+    if let Some(rest) = command.strip_prefix(r"\\?\UNC\") {
+        return is_canonical_windows_unc(rest);
+    }
+    if let Some(rest) = command.strip_prefix(r"\\?\") {
+        return is_canonical_windows_drive(rest);
+    }
+    if let Some(rest) = command.strip_prefix(r"\\") {
+        return is_canonical_windows_unc(rest);
+    }
+    if let Some(rest) = command.strip_prefix('/') {
+        return !rest.is_empty()
+            && rest
+                .split('/')
+                .all(|component| !component.is_empty() && component != "." && component != "..");
+    }
+    is_canonical_windows_drive(command)
+}
+
+fn is_canonical_windows_drive(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    bytes.len() >= 4
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+        && is_canonical_windows_components(&command[3..], 1)
+}
+
+fn is_canonical_windows_unc(command: &str) -> bool {
+    is_canonical_windows_components(command, 3)
+}
+
+fn is_canonical_windows_components(command: &str, minimum: usize) -> bool {
+    if command.contains('/') {
+        return false;
+    }
+    let components = command.split('\\').collect::<Vec<_>>();
+    components.len() >= minimum
+        && components.iter().all(|component| {
+            !component.is_empty()
+                && *component != "."
+                && *component != ".."
+                && !component.ends_with(['.', ' '])
+                && !reserved_windows_name(component)
+                && !component
+                    .chars()
+                    .any(|character| matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        })
+}
+
+fn validate_cli_operation(
+    operation: &CliOperation,
+    executable: &WireNativeValue,
+) -> Result<(), ApprovalError> {
+    operation
+        .validate()
+        .map_err(|error| ApprovalError::Invalid(error.to_string()))?;
+    if operation.executable.platform != executable.platform
+        || operation.executable.bytes != executable.bytes
+    {
+        return Err(ApprovalError::Invalid(
+            "cli operation does not use the attested harness executable".into(),
+        ));
+    }
+    if operation.timeout_ms != APPROVED_CLI_TIMEOUT_MS {
+        return Err(ApprovalError::Invalid(
+            "cli operation has an unsupported timeout".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn harness_name(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::ClaudeCode => "claude-code",
+        HarnessId::Codex => "codex",
+        HarnessId::Hermes => "hermes",
+    }
+}
+
+fn managed_bridge_stable_id(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::ClaudeCode => "f4a4f9a2-0e8d-720e-8df4-a5a68da3e9c7",
+        HarnessId::Codex => "b5be495e-d4ee-7a2e-a29e-b589ebc5d7fd",
+        HarnessId::Hermes => "92cb3173-a859-79e2-97e1-3ef3633fcb3a",
+    }
+}
+
+fn cli_approval_value(plan: &NativeTransactionPlan) -> Result<Value, ApprovalError> {
+    let mutations = plan
+        .cli_mutations
+        .iter()
+        .map(|mutation| {
+            Ok(json!({
+                "stableId": mutation.stable_id,
+                "expected": declaration_value(mutation.expected.as_ref()),
+                "intended": declaration_value(mutation.intended.as_ref()),
+                "forward": serde_json::to_value(&mutation.forward)
+                    .map_err(|error| ApprovalError::Serialization(error.to_string()))?,
+                "rollback": serde_json::to_value(&mutation.rollback)
+                    .map_err(|error| ApprovalError::Serialization(error.to_string()))?,
+            }))
+        })
+        .collect::<Result<Vec<_>, ApprovalError>>()?;
+    Ok(Value::Array(mutations))
+}
+
+fn declaration_value(declaration: Option<&CanonicalCliDeclaration>) -> Value {
+    declaration.map_or(Value::Null, |declaration| {
+        json!({
+            "harness": harness_name(declaration.harness),
+            "serverName": declaration.server_name,
+            "canonicalBody": declaration.canonical_body,
+            "fingerprint": digest(&declaration.fingerprint),
+        })
+    })
 }
 
 fn approval_value(plan: &NativeTransactionPlan) -> Result<Value, ApprovalError> {
@@ -458,7 +773,12 @@ fn internal_staging_name(name: &str) -> bool {
 }
 
 fn reserved_windows_name(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or_default().to_uppercase();
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches([' ', '.'])
+        .to_uppercase();
     if matches!(
         stem.as_str(),
         "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"

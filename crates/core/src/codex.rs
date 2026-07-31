@@ -7,7 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     env, fs,
-    io::{ErrorKind, Read},
+    io::{ErrorKind, Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     str::FromStr,
@@ -28,9 +28,16 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, Item, Value as TomlValue};
 
+use crate::mcp::install::{
+    BRIDGE_SERVER_NAME, is_canonical_bridge_body, is_managed_bridge_component,
+};
 use crate::native_transaction::{
+    cli::{CliMutationOutcome, CliRestoreOutcome, NativeCliExecutor},
     engine::{BoundaryError, FrozenOutput, NativeAdapter, RestrictedRun},
-    model::{ApprovedMutation, MutationKind, NativeTransactionPlan, RestorableStateFingerprint},
+    model::{
+        ApprovedCliMutation, ApprovedMutation, CanonicalCliDeclaration, MutationKind,
+        NativeTransactionPlan, RestorableStateFingerprint,
+    },
 };
 
 const SUPPORTED_VERSIONS: [&str; 2] = ["0.144.1", "0.144.0"];
@@ -73,6 +80,222 @@ pub struct CodexAdapter {
     origin_device: DeviceId,
     observed_hlc: HybridLogicalClock,
     executable_hash: Sha256Digest,
+}
+
+/// An opened, digest-bound Codex executable identity.
+#[derive(Debug)]
+struct VerifiedCodexExecutable {
+    path: PathBuf,
+    file: fs::File,
+    identity: CodexFileIdentity,
+    expected_hash: Sha256Digest,
+    #[cfg(windows)]
+    topology: Vec<CodexPathComponent>,
+}
+
+impl VerifiedCodexExecutable {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn prepare_launch(&self) -> Result<PreparedCodexLaunch, ClientError> {
+        use std::{
+            ffi::CString,
+            os::fd::{AsRawFd as _, FromRawFd as _},
+        };
+
+        let name = CString::new("context-relay-codex")
+            .map_err(|_| invalid("Codex executable staging failed"))?;
+        let descriptor = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING) };
+        if descriptor < 0 {
+            return Err(invalid("Codex executable staging failed"));
+        }
+        let mut staged = unsafe { fs::File::from_raw_fd(descriptor) };
+        if unsafe { libc::fchmod(descriptor, 0o700) } < 0 {
+            return Err(invalid("Codex executable staging failed"));
+        }
+        let mut input = self
+            .file
+            .try_clone()
+            .map_err(|_| invalid("Codex executable staging failed"))?;
+        input
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| invalid("Codex executable staging failed"))?;
+        std::io::copy(&mut input, &mut staged)
+            .map_err(|_| invalid("Codex executable staging failed"))?;
+        staged
+            .sync_all()
+            .map_err(|_| invalid("Codex executable staging failed"))?;
+        if hash_open_file(&staged).ok() != Some(self.expected_hash) {
+            return Err(invalid("Codex executable staging verification failed"));
+        }
+        let seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+        if unsafe { libc::fcntl(descriptor, libc::F_ADD_SEALS, seals) } < 0
+            || unsafe { libc::fcntl(descriptor, libc::F_GET_SEALS) } & seals != seals
+        {
+            return Err(invalid("Codex executable staging failed"));
+        }
+        let program = if Path::new("/proc/self/fd").is_dir() {
+            PathBuf::from(format!("/proc/self/fd/{descriptor}"))
+        } else {
+            PathBuf::from(format!("/dev/fd/{descriptor}"))
+        };
+        Ok(PreparedCodexLaunch {
+            program,
+            _descriptor: staged,
+        })
+    }
+
+    #[cfg(windows)]
+    fn prepare_launch(&self) -> Result<PreparedCodexLaunch, ClientError> {
+        Ok(PreparedCodexLaunch {
+            program: self.path.clone(),
+        })
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    fn prepare_launch(&self) -> Result<PreparedCodexLaunch, ClientError> {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let staging = tempfile::Builder::new()
+            .prefix("context-relay-codex-exec-")
+            .tempdir()
+            .map_err(|_| invalid("Codex executable staging failed"))?;
+        fs::set_permissions(staging.path(), fs::Permissions::from_mode(0o700))
+            .map_err(|_| invalid("Codex executable staging failed"))?;
+        let program = staging.path().join("codex");
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&program)
+            .map_err(|_| invalid("Codex executable staging failed"))?;
+        let mut input = self
+            .file
+            .try_clone()
+            .map_err(|_| invalid("Codex executable staging failed"))?;
+        input
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| invalid("Codex executable staging failed"))?;
+        std::io::copy(&mut input, &mut output)
+            .map_err(|_| invalid("Codex executable staging failed"))?;
+        output
+            .sync_all()
+            .map_err(|_| invalid("Codex executable staging failed"))?;
+        drop(output);
+        let metadata = fs::symlink_metadata(&program)
+            .map_err(|_| invalid("Codex executable staging failed"))?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.permissions().mode() & 0o777 != 0o700
+            || hash_file(&program).ok() != Some(self.expected_hash)
+        {
+            return Err(invalid("Codex executable staging verification failed"));
+        }
+        Ok(PreparedCodexLaunch {
+            program,
+            _staging: staging,
+        })
+    }
+
+    fn revalidate_before_launch(&self) -> Result<(), BoundaryError> {
+        #[cfg(windows)]
+        revalidate_codex_path_topology(&self.topology)?;
+        let held_identity = codex_file_identity(&self.file)
+            .map_err(|_| BoundaryError::new("Codex executable identity is unavailable"))?;
+        let held_hash = hash_open_file(&self.file)
+            .map_err(|_| BoundaryError::new("Codex executable cannot be read"))?;
+        let metadata = fs::symlink_metadata(&self.path)
+            .map_err(|_| BoundaryError::new("Codex executable is missing"))?;
+        if !metadata.is_file()
+            || is_link_or_reparse_point(&metadata)
+            || held_identity != self.identity
+            || held_hash != self.expected_hash
+        {
+            return Err(BoundaryError::new("Codex executable changed"));
+        }
+        let reopened = open_codex_executable(&self.path)
+            .map_err(|_| BoundaryError::new("Codex executable is unsafe"))?;
+        let reopened_identity = codex_file_identity(&reopened)
+            .map_err(|_| BoundaryError::new("Codex executable identity is unavailable"))?;
+        let reopened_hash = hash_open_file(&reopened)
+            .map_err(|_| BoundaryError::new("Codex executable cannot be read"))?;
+        if reopened_identity != self.identity || reopened_hash != self.expected_hash {
+            return Err(BoundaryError::new("Codex executable changed"));
+        }
+        Ok(())
+    }
+}
+
+struct PreparedCodexLaunch {
+    program: PathBuf,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    _descriptor: fs::File,
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    _staging: tempfile::TempDir,
+}
+
+/// A non-forgeable command capability bound to verified executable bytes.
+///
+/// Runners can inspect argument boundaries or execute this capability, but
+/// cannot recover the mutable pathname used during discovery.
+pub struct VerifiedCodexCommand<'a> {
+    executable: &'a VerifiedCodexExecutable,
+    launch: PreparedCodexLaunch,
+    arguments: &'a [String],
+}
+
+impl VerifiedCodexCommand<'_> {
+    pub fn arguments(&self) -> &[String] {
+        self.arguments
+    }
+
+    pub fn execute(self, working_directory: &Path) -> Result<Vec<u8>, BoundaryError> {
+        let arguments = self
+            .arguments
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        run_prepared_codex_command(
+            self.launch,
+            &self.executable.path,
+            &arguments,
+            working_directory,
+        )
+        .map_err(|_| BoundaryError::new("Codex command failed at the native transaction boundary"))
+    }
+}
+
+pub trait CodexCommandRunner {
+    fn before_launch(&mut self, _arguments: &[String]) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn run(&mut self, command: VerifiedCodexCommand<'_>) -> Result<Vec<u8>, BoundaryError>;
+}
+
+impl<F> CodexCommandRunner for F
+where
+    F: FnMut(&[String]) -> Result<Vec<u8>, BoundaryError>,
+{
+    fn run(&mut self, command: VerifiedCodexCommand<'_>) -> Result<Vec<u8>, BoundaryError> {
+        self(command.arguments())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CodexProcessRunner {
+    working_directory: PathBuf,
+}
+
+impl CodexCommandRunner for CodexProcessRunner {
+    fn run(&mut self, command: VerifiedCodexCommand<'_>) -> Result<Vec<u8>, BoundaryError> {
+        command.execute(&self.working_directory)
+    }
+}
+
+pub struct CodexCliExecutor<'a, O, V> {
+    adapter: &'a CodexAdapter,
+    operation_runner: O,
+    validation_runner: V,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -238,6 +461,146 @@ impl CodexAdapter {
 
     pub fn project_root_wire(&self) -> WireNativeValue {
         wire_path(&self.layout.project_root)
+    }
+
+    pub fn plan_bridge_cli_mutation(
+        &self,
+        intended: &ComponentRecord,
+    ) -> Result<ApprovedCliMutation, ClientError> {
+        self.plan_bridge_cli_mutation_with_runner(intended, self.process_runner())
+    }
+
+    pub fn plan_bridge_cli_mutation_with_runner(
+        &self,
+        intended: &ComponentRecord,
+        mut validation_runner: impl CodexCommandRunner,
+    ) -> Result<ApprovedCliMutation, ClientError> {
+        self.require_apply_supported()?;
+        if !is_managed_bridge_component(HarnessId::Codex, intended) {
+            return Err(invalid("Codex CLI mutation requires the managed bridge"));
+        }
+        self.recheck_executable_client()?;
+        let expected = self
+            .probe_managed_declaration(&mut validation_runner)
+            .map_err(|_| invalid("Codex managed bridge state cannot be safely inspected"))?;
+        let intended_declaration = canonical_cli_declaration(&intended.body_markdown)?;
+        Ok(ApprovedCliMutation {
+            stable_id: intended.id.to_string(),
+            forward: vec![self.declaration_operation(Some(&intended_declaration))?],
+            rollback: vec![self.declaration_operation(expected.as_ref())?],
+            expected,
+            intended: Some(intended_declaration),
+        })
+    }
+
+    pub fn cli_executor(&self) -> CodexCliExecutor<'_, CodexProcessRunner, CodexProcessRunner> {
+        self.cli_executor_with_runners(self.process_runner(), self.process_runner())
+    }
+
+    pub fn cli_executor_with_runners<O, V>(
+        &self,
+        operation_runner: O,
+        validation_runner: V,
+    ) -> CodexCliExecutor<'_, O, V>
+    where
+        O: CodexCommandRunner,
+        V: CodexCommandRunner,
+    {
+        CodexCliExecutor {
+            adapter: self,
+            operation_runner,
+            validation_runner,
+        }
+    }
+
+    fn process_runner(&self) -> CodexProcessRunner {
+        CodexProcessRunner {
+            working_directory: self.layout.working_directory.clone(),
+        }
+    }
+
+    fn recheck_executable_client(&self) -> Result<(), ClientError> {
+        open_verified_codex_executable(&self.layout.executable, self.executable_hash)
+            .map_err(|_| client_error(ErrorCode::Conflict, "Codex executable changed", false))?;
+        Ok(())
+    }
+
+    fn recheck_executable_boundary(&self) -> Result<(), BoundaryError> {
+        open_verified_codex_executable(&self.layout.executable, self.executable_hash)?;
+        Ok(())
+    }
+
+    fn run_verified(
+        &self,
+        runner: &mut impl CodexCommandRunner,
+        arguments: &[String],
+    ) -> Result<Vec<u8>, BoundaryError> {
+        let executable =
+            open_verified_codex_executable(&self.layout.executable, self.executable_hash)?;
+        runner.before_launch(arguments)?;
+        executable.revalidate_before_launch()?;
+        let launch = executable
+            .prepare_launch()
+            .map_err(|_| BoundaryError::new("Codex executable cannot be safely prepared"))?;
+        runner.run(VerifiedCodexCommand {
+            executable: &executable,
+            launch,
+            arguments,
+        })
+    }
+
+    fn declaration_operation(
+        &self,
+        declaration: Option<&CanonicalCliDeclaration>,
+    ) -> Result<CliOperation, ClientError> {
+        let arguments = match declaration {
+            Some(declaration) => {
+                let value: Value = serde_json::from_str(&declaration.canonical_body)
+                    .map_err(|_| invalid("Codex managed bridge declaration is invalid"))?;
+                render_mcp_add(BRIDGE_SERVER_NAME, &value)?
+            }
+            None => vec![
+                "mcp".to_owned(),
+                "remove".to_owned(),
+                BRIDGE_SERVER_NAME.to_owned(),
+            ],
+        };
+        Ok(CliOperation {
+            executable: wire_path(&self.layout.executable),
+            arguments: arguments
+                .into_iter()
+                .map(|argument| wire_text(&argument))
+                .collect(),
+            timeout_ms: CLI_TIMEOUT_MS,
+        })
+    }
+
+    fn probe_managed_declaration(
+        &self,
+        validation_runner: &mut impl CodexCommandRunner,
+    ) -> Result<Option<CanonicalCliDeclaration>, BoundaryError> {
+        let plugin_argv = CodexCommand::PluginList.argv();
+        let plugin_output = self.run_verified(validation_runner, &plugin_argv)?;
+        parse_plugin_list_json(&plugin_output)
+            .map_err(|_| BoundaryError::new("Codex plugin list output is invalid"))?;
+
+        let list_argv = CodexCommand::McpList.argv();
+        let listed = self.run_verified(validation_runner, &list_argv)?;
+        let states = parse_mcp_list_states(&listed)
+            .map_err(|_| BoundaryError::new("Codex MCP list output is invalid"))?;
+        match states.get(BRIDGE_SERVER_NAME) {
+            None => return Ok(None),
+            Some(false) => {
+                return Err(BoundaryError::new(
+                    "Codex prior MCP declaration is disabled or unmanaged",
+                ));
+            }
+            Some(true) => {}
+        }
+
+        let get_argv = CodexCommand::McpGet(BRIDGE_SERVER_NAME.to_owned()).argv();
+        let output = self.run_verified(validation_runner, &get_argv)?;
+        parse_managed_mcp_get_json(&output)
     }
     pub fn project_config_path(&self) -> PathBuf {
         self.layout.project_root.join(".codex/config.toml")
@@ -1631,11 +1994,14 @@ impl CodexAdapter {
 
 impl NativeAdapter for CodexAdapter {
     fn reprobe_live_state(&mut self, plan: &NativeTransactionPlan) -> Result<(), BoundaryError> {
+        let executable_matches =
+            open_verified_codex_executable(&self.layout.executable, plan.setup.executable_hash)
+                .is_ok();
         if self.capability() != CapabilityLevel::Full
             || plan.setup.harness != HarnessId::Codex
             || plan.setup.harness_version != self.layout.version
             || plan.setup.executable_path != wire_path(&self.layout.executable)
-            || digest_file_boundary(&self.layout.executable)? != plan.setup.executable_hash
+            || !executable_matches
         {
             return Err(BoundaryError::new("Codex installation changed"));
         }
@@ -1647,10 +2013,13 @@ impl NativeAdapter for CodexAdapter {
     ) -> Result<(), BoundaryError> {
         for expected in &plan.setup.expected_native_digests {
             let path = decode_wire_path(&expected.target)?;
-            let actual = if path.is_file() {
-                Some(digest_file_boundary(&path)?)
-            } else {
-                None
+            let actual = match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() && !is_link_or_reparse_point(&metadata) => {
+                    Some(digest_file_boundary(&path)?)
+                }
+                Ok(_) => None,
+                Err(error) if error.kind() == ErrorKind::NotFound => None,
+                Err(_) => return Err(BoundaryError::new("Codex native state cannot be inspected")),
             };
             if actual != expected.expected_digest {
                 return Err(BoundaryError::new("Codex native state changed"));
@@ -1687,6 +2056,176 @@ impl NativeAdapter for CodexAdapter {
             return Err(BoundaryError::new(
                 "Codex effective state differs from the plan",
             ));
+        }
+        Ok(())
+    }
+}
+
+impl<O, V> NativeCliExecutor for CodexCliExecutor<'_, O, V>
+where
+    O: CodexCommandRunner,
+    V: CodexCommandRunner,
+{
+    fn compare_cli_targets(
+        &mut self,
+        mutations: &[ApprovedCliMutation],
+    ) -> Result<(), BoundaryError> {
+        self.adapter.recheck_executable_boundary()?;
+        for mutation in mutations {
+            self.validate_mutation(mutation)?;
+            let live = self
+                .adapter
+                .probe_managed_declaration(&mut self.validation_runner)?;
+            if declaration_fingerprint(live.as_ref())
+                != declaration_fingerprint(mutation.expected.as_ref())
+            {
+                return Err(BoundaryError::new(
+                    "Codex managed bridge declaration changed",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_cli_mutation(
+        &mut self,
+        mutation: &ApprovedCliMutation,
+    ) -> Result<CliMutationOutcome, BoundaryError> {
+        self.adapter.recheck_executable_boundary()?;
+        self.validate_mutation(mutation)?;
+        let live = self
+            .adapter
+            .probe_managed_declaration(&mut self.validation_runner)?;
+        if declaration_fingerprint(live.as_ref())
+            != declaration_fingerprint(mutation.expected.as_ref())
+        {
+            return Ok(CliMutationOutcome {
+                resulting_fingerprint: declaration_fingerprint(live.as_ref()),
+                command_error: None,
+            });
+        }
+        let command_error = self.run_operations(&mutation.forward).err();
+        let resulting = self
+            .adapter
+            .probe_managed_declaration(&mut self.validation_runner)?;
+        Ok(CliMutationOutcome {
+            resulting_fingerprint: declaration_fingerprint(resulting.as_ref()),
+            command_error,
+        })
+    }
+
+    fn restore_cli_mutation_if_matches(
+        &mut self,
+        mutation: &ApprovedCliMutation,
+    ) -> Result<CliRestoreOutcome, BoundaryError> {
+        self.adapter.recheck_executable_boundary()?;
+        self.validate_mutation(mutation)?;
+        let live = self
+            .adapter
+            .probe_managed_declaration(&mut self.validation_runner)?;
+        if declaration_fingerprint(live.as_ref())
+            != declaration_fingerprint(mutation.intended.as_ref())
+        {
+            return Ok(CliRestoreOutcome {
+                restored: false,
+                resulting_fingerprint: declaration_fingerprint(live.as_ref()),
+            });
+        }
+        self.run_operations(&mutation.rollback)?;
+        let resulting = self
+            .adapter
+            .probe_managed_declaration(&mut self.validation_runner)?;
+        if declaration_fingerprint(resulting.as_ref())
+            != declaration_fingerprint(mutation.expected.as_ref())
+        {
+            return Err(BoundaryError::new(
+                "Codex managed bridge restore produced an unexpected declaration",
+            ));
+        }
+        Ok(CliRestoreOutcome {
+            restored: true,
+            resulting_fingerprint: declaration_fingerprint(resulting.as_ref()),
+        })
+    }
+
+    fn finish_committed_cli_mutations(
+        &mut self,
+        mutations: &[ApprovedCliMutation],
+    ) -> Result<(), BoundaryError> {
+        self.adapter.recheck_executable_boundary()?;
+        for mutation in mutations {
+            self.validate_mutation(mutation)?;
+            let live = self
+                .adapter
+                .probe_managed_declaration(&mut self.validation_runner)?;
+            if declaration_fingerprint(live.as_ref())
+                != declaration_fingerprint(mutation.intended.as_ref())
+            {
+                return Err(BoundaryError::new(
+                    "Codex committed bridge declaration changed",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<O, V> CodexCliExecutor<'_, O, V>
+where
+    O: CodexCommandRunner,
+    V: CodexCommandRunner,
+{
+    fn validate_mutation(&self, mutation: &ApprovedCliMutation) -> Result<(), BoundaryError> {
+        if mutation.stable_id.is_empty()
+            || (mutation.expected.is_none() && mutation.intended.is_none())
+        {
+            return Err(BoundaryError::new(
+                "Codex CLI mutation has no managed declaration",
+            ));
+        }
+        for declaration in [mutation.expected.as_ref(), mutation.intended.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            validate_cli_declaration(declaration)?;
+        }
+        let expected_forward = vec![
+            self.adapter
+                .declaration_operation(mutation.intended.as_ref())
+                .map_err(|_| BoundaryError::new("Codex intended declaration is invalid"))?,
+        ];
+        let expected_rollback = vec![
+            self.adapter
+                .declaration_operation(mutation.expected.as_ref())
+                .map_err(|_| BoundaryError::new("Codex expected declaration is invalid"))?,
+        ];
+        if mutation.forward != expected_forward || mutation.rollback != expected_rollback {
+            return Err(BoundaryError::new(
+                "Codex CLI operations differ from the approved declaration",
+            ));
+        }
+        Ok(())
+    }
+
+    fn run_operations(&mut self, operations: &[CliOperation]) -> Result<(), BoundaryError> {
+        for operation in operations {
+            if operation.executable != wire_path(&self.adapter.layout.executable)
+                || operation.timeout_ms != CLI_TIMEOUT_MS
+            {
+                return Err(BoundaryError::new("Codex CLI operation is not canonical"));
+            }
+            let arguments = operation
+                .arguments
+                .iter()
+                .map(|argument| {
+                    argument
+                        .display
+                        .clone()
+                        .ok_or_else(|| BoundaryError::new("Codex CLI argument is not text"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.adapter
+                .run_verified(&mut self.operation_runner, &arguments)?;
         }
         Ok(())
     }
@@ -1878,6 +2417,13 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<(), ClientError> {
 }
 
 fn parse_mcp_list_json(bytes: &[u8]) -> Result<BTreeSet<String>, ClientError> {
+    Ok(parse_mcp_list_states(bytes)?
+        .into_iter()
+        .filter_map(|(name, enabled)| enabled.then_some(name))
+        .collect())
+}
+
+fn parse_mcp_list_states(bytes: &[u8]) -> Result<BTreeMap<String, bool>, ClientError> {
     if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
         return Err(invalid("Codex MCP output is invalid"));
     }
@@ -1886,18 +2432,14 @@ fn parse_mcp_list_json(bytes: &[u8]) -> Result<BTreeSet<String>, ClientError> {
         .and_then(|value| value.as_array().cloned())
         .filter(|servers| servers.len() <= 256)
         .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
-    let mut names = BTreeSet::new();
-    let mut enabled_names = BTreeSet::new();
+    let mut states = BTreeMap::new();
     for server in &servers {
         let server = parse_mcp_server(server, McpOutputKind::List)?;
-        if !names.insert(server.name.clone()) {
+        if states.insert(server.name, server.enabled).is_some() {
             return Err(invalid("Codex MCP output is invalid"));
         }
-        if server.enabled {
-            enabled_names.insert(server.name);
-        }
     }
-    Ok(enabled_names)
+    Ok(states)
 }
 
 fn parse_mcp_get_json(bytes: &[u8], expected_name: &str) -> Result<(), ClientError> {
@@ -1913,6 +2455,68 @@ fn parse_mcp_get_json(bytes: &[u8], expected_name: &str) -> Result<(), ClientErr
         return Err(invalid("Codex MCP output is invalid"));
     }
     Ok(())
+}
+
+fn parse_managed_mcp_get_json(
+    bytes: &[u8],
+) -> Result<Option<CanonicalCliDeclaration>, BoundaryError> {
+    if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
+        return Err(BoundaryError::new("Codex MCP get output is invalid"));
+    }
+    let value = serde_json::from_slice::<Value>(bytes)
+        .map_err(|_| BoundaryError::new("Codex MCP get output is invalid"))?;
+    let parsed = parse_mcp_server(&value, McpOutputKind::Get)
+        .map_err(|_| BoundaryError::new("Codex MCP get output is invalid"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| BoundaryError::new("Codex MCP get output is invalid"))?;
+    if parsed.name != BRIDGE_SERVER_NAME
+        || !parsed.enabled
+        || !object.get("disabled_reason").is_some_and(Value::is_null)
+        || !object.get("enabled_tools").is_some_and(Value::is_null)
+        || !object.get("disabled_tools").is_some_and(Value::is_null)
+        || !object
+            .get("startup_timeout_sec")
+            .is_some_and(Value::is_null)
+        || !object.get("tool_timeout_sec").is_some_and(Value::is_null)
+    {
+        return Err(BoundaryError::new(
+            "Codex prior MCP declaration is unmanaged",
+        ));
+    }
+    let transport = object
+        .get("transport")
+        .and_then(Value::as_object)
+        .ok_or_else(|| BoundaryError::new("Codex MCP get output is invalid"))?;
+    if transport.get("type").and_then(Value::as_str) != Some("stdio")
+        || !transport
+            .get("env")
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty)
+        || !transport
+            .get("env_vars")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        || !transport.get("cwd").is_some_and(Value::is_null)
+    {
+        return Err(BoundaryError::new(
+            "Codex prior MCP declaration is secret-bearing or unmanaged",
+        ));
+    }
+    let body = serde_json::json!({
+        "args": transport
+            .get("args")
+            .ok_or_else(|| BoundaryError::new("Codex MCP get output is invalid"))?,
+        "command": transport
+            .get("command")
+            .ok_or_else(|| BoundaryError::new("Codex MCP get output is invalid"))?,
+        "type": "stdio",
+    });
+    let canonical_body = serde_json::to_string(&body)
+        .map_err(|_| BoundaryError::new("Codex MCP get output is invalid"))?;
+    canonical_cli_declaration(&canonical_body)
+        .map(Some)
+        .map_err(|_| BoundaryError::new("Codex prior MCP declaration is unmanaged"))
 }
 
 #[derive(Clone, Copy)]
@@ -2734,16 +3338,290 @@ fn stable_record_id(key: &str) -> Result<RecordId, ClientError> {
 fn digest(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest(Sha256::digest(bytes).into())
 }
-fn snapshot_executable(path: &Path) -> Result<CodexExecutableSnapshot, ClientError> {
-    let bytes = fs::read(path).map_err(|_| not_found("Codex executable is missing"))?;
-    Ok(CodexExecutableSnapshot {
-        kind: classify_executable_bytes(path, &bytes),
-        digest: digest(&bytes),
+
+fn canonical_cli_declaration(body: &str) -> Result<CanonicalCliDeclaration, ClientError> {
+    let value: Value = serde_json::from_str(body)
+        .map_err(|_| invalid("Codex managed bridge declaration is invalid"))?;
+    if serde_json::to_string(&value).ok().as_deref() != Some(body)
+        || !is_canonical_bridge_body(HarnessId::Codex, body, false)
+    {
+        return Err(invalid("Codex managed bridge declaration is invalid"));
+    }
+    Ok(CanonicalCliDeclaration {
+        harness: HarnessId::Codex,
+        server_name: BRIDGE_SERVER_NAME.to_owned(),
+        canonical_body: body.to_owned(),
+        fingerprint: digest(body.as_bytes()),
     })
 }
-fn digest_file(path: &Path) -> Result<Sha256Digest, ClientError> {
-    hash_file(path).map_err(|_| not_found("Codex executable is missing"))
+
+fn validate_cli_declaration(declaration: &CanonicalCliDeclaration) -> Result<(), BoundaryError> {
+    if declaration.harness != HarnessId::Codex
+        || declaration.server_name != BRIDGE_SERVER_NAME
+        || declaration.fingerprint != digest(declaration.canonical_body.as_bytes())
+        || canonical_cli_declaration(&declaration.canonical_body).is_err()
+    {
+        return Err(BoundaryError::new(
+            "Codex CLI declaration is not the managed bridge",
+        ));
+    }
+    Ok(())
 }
+
+fn declaration_fingerprint(declaration: Option<&CanonicalCliDeclaration>) -> Option<Sha256Digest> {
+    declaration.map(|declaration| declaration.fingerprint)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CodexFileIdentity {
+    device: u64,
+    inode: u64,
+    links: u64,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CodexFileIdentity {
+    volume: u32,
+    index: u64,
+    links: u32,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct CodexPathComponent {
+    path: PathBuf,
+    file: fs::File,
+    identity: CodexFileIdentity,
+}
+
+#[cfg(unix)]
+fn codex_file_identity(file: &fs::File) -> std::io::Result<CodexFileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    Ok(CodexFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        links: metadata.nlink(),
+    })
+}
+
+#[cfg(windows)]
+fn codex_file_identity(file: &fs::File) -> std::io::Result<CodexFileIdentity> {
+    let information = codex_file_information(file)?;
+    Ok(CodexFileIdentity {
+        volume: information.dwVolumeSerialNumber,
+        index: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        links: information.nNumberOfLinks,
+    })
+}
+
+#[cfg(windows)]
+fn codex_file_information(
+    file: &fs::File,
+) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle as _};
+
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    if unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr())
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { information.assume_init() })
+}
+
+#[cfg(windows)]
+fn open_codex_path_component(path: &Path) -> std::io::Result<CodexPathComponent> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        // Holding every directory handle without write/delete sharing prevents
+        // an already-open or new actor from retargeting an intermediate path
+        // component while CreateProcess resolves the executable pathname.
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let information = codex_file_information(&file)?;
+    if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(std::io::Error::other(
+            "Codex executable path component is unsafe",
+        ));
+    }
+    let identity = codex_file_identity(&file)?;
+    Ok(CodexPathComponent {
+        path: path.to_path_buf(),
+        file,
+        identity,
+    })
+}
+
+#[cfg(windows)]
+fn open_codex_path_topology(path: &Path) -> std::io::Result<Vec<CodexPathComponent>> {
+    let mut ancestors = path
+        .ancestors()
+        .skip(1)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .collect::<Vec<_>>();
+    ancestors.reverse();
+    ancestors
+        .into_iter()
+        .map(open_codex_path_component)
+        .collect()
+}
+
+#[cfg(windows)]
+fn revalidate_codex_path_topology(topology: &[CodexPathComponent]) -> Result<(), BoundaryError> {
+    for component in topology {
+        let held_identity = codex_file_identity(&component.file)
+            .map_err(|_| BoundaryError::new("Codex executable path topology is unavailable"))?;
+        let reopened = open_codex_path_component(&component.path)
+            .map_err(|_| BoundaryError::new("Codex executable path topology is unsafe"))?;
+        if held_identity != component.identity || reopened.identity != component.identity {
+            return Err(BoundaryError::new("Codex executable path topology changed"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_codex_executable(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_codex_executable(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ,
+    };
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        // CreateProcess may read the image, while write/delete/rename remain
+        // denied until the verified handle is dropped after process creation.
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let attributes = codex_file_information(&file)?.dwFileAttributes;
+    if attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return Err(std::io::Error::other("Codex executable is unsafe"));
+    }
+    Ok(file)
+}
+
+fn hash_open_file(file: &fs::File) -> std::io::Result<Sha256Digest> {
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(Sha256Digest(hasher.finalize().into()));
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
+fn read_open_file(file: &fs::File) -> std::io::Result<Vec<u8>> {
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn open_verified_codex_executable(
+    path: &Path,
+    expected_hash: Sha256Digest,
+) -> Result<VerifiedCodexExecutable, BoundaryError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| BoundaryError::new("Codex executable is missing"))?;
+    if !metadata.is_file() || is_link_or_reparse_point(&metadata) {
+        return Err(BoundaryError::new("Codex executable is unsafe"));
+    }
+    #[cfg(windows)]
+    let topology = open_codex_path_topology(path)
+        .map_err(|_| BoundaryError::new("Codex executable path topology is unsafe"))?;
+    let file = open_codex_executable(path)
+        .map_err(|_| BoundaryError::new("Codex executable cannot be safely opened"))?;
+    let identity = codex_file_identity(&file)
+        .map_err(|_| BoundaryError::new("Codex executable identity is unavailable"))?;
+    let hash =
+        hash_open_file(&file).map_err(|_| BoundaryError::new("Codex executable cannot be read"))?;
+    let executable = VerifiedCodexExecutable {
+        path: path.to_path_buf(),
+        file,
+        identity,
+        expected_hash,
+        #[cfg(windows)]
+        topology,
+    };
+    if hash != expected_hash {
+        return Err(BoundaryError::new("Codex executable changed"));
+    }
+    executable.revalidate_before_launch()?;
+    Ok(executable)
+}
+
+fn snapshot_executable(path: &Path) -> Result<CodexExecutableSnapshot, ClientError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| not_found("Codex executable is missing"))?;
+    if !metadata.is_file() || is_link_or_reparse_point(&metadata) {
+        return Err(invalid("Codex executable is unsafe"));
+    }
+    let file =
+        open_codex_executable(path).map_err(|_| invalid("Codex executable cannot be opened"))?;
+    let bytes = read_open_file(&file).map_err(|_| not_found("Codex executable is missing"))?;
+    let digest = digest(&bytes);
+    let verified = open_verified_codex_executable(path, digest)
+        .map_err(|_| invalid("Codex executable changed"))?;
+    drop(verified);
+    Ok(CodexExecutableSnapshot {
+        kind: classify_executable_bytes(path, &bytes),
+        digest,
+    })
+}
+
+fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn digest_file_boundary(path: &Path) -> Result<Sha256Digest, BoundaryError> {
     hash_file(path).map_err(|_| BoundaryError::new("Codex file cannot be read"))
 }
@@ -2804,19 +3682,65 @@ fn run_bounded_command(
     expected_hash: Sha256Digest,
     working_directory: &Path,
 ) -> Result<Vec<u8>, ClientError> {
-    if digest_file(executable)? != expected_hash {
-        return Err(client_error(
-            ErrorCode::Conflict,
-            "Codex executable changed",
-            false,
-        ));
-    }
-    let mut child = Command::new(executable)
+    let executable = open_verified_codex_executable(executable, expected_hash)
+        .map_err(|_| client_error(ErrorCode::Conflict, "Codex executable changed", false))?;
+    run_bounded_verified_command(&executable, arguments, working_directory)
+}
+
+fn run_bounded_verified_command(
+    executable: &VerifiedCodexExecutable,
+    arguments: &[&str],
+    working_directory: &Path,
+) -> Result<Vec<u8>, ClientError> {
+    run_bounded_verified_command_with_hook(executable, arguments, working_directory, || {})
+}
+
+fn run_bounded_verified_command_with_hook(
+    executable: &VerifiedCodexExecutable,
+    arguments: &[&str],
+    working_directory: &Path,
+    before_spawn: impl FnOnce(),
+) -> Result<Vec<u8>, ClientError> {
+    executable
+        .revalidate_before_launch()
+        .map_err(|_| client_error(ErrorCode::Conflict, "Codex executable changed", false))?;
+    before_spawn();
+    let launch = executable.prepare_launch()?;
+    run_prepared_codex_command(launch, &executable.path, arguments, working_directory)
+}
+
+fn run_prepared_codex_command(
+    launch: PreparedCodexLaunch,
+    original_path: &Path,
+    arguments: &[&str],
+    working_directory: &Path,
+) -> Result<Vec<u8>, ClientError> {
+    let mut command = Command::new(&launch.program);
+    command
         .args(arguments)
         .current_dir(working_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        command.arg0(original_path);
+        // SAFETY: the hook performs no work in the child. Its presence forces
+        // Rust's fork/exec path so the sealed, non-CLOEXEC memfd survives until
+        // execve resolves `/proc/self/fd/N`.
+        unsafe {
+            command.pre_exec(|| Ok(()));
+        }
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        command.arg0(original_path);
+    }
+    let mut child = command
         .spawn()
         .map_err(|_| unsupported("Codex command failed"))?;
     let stdout = child
@@ -3047,6 +3971,103 @@ mod tests {
 
     static NEXT_EFFECTIVE_FIXTURE: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_handle_execution_does_not_follow_a_late_path_replacement() {
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-codex-descriptor-{}-{}",
+            std::process::id(),
+            NEXT_EFFECTIVE_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let true_source = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .unwrap();
+        let false_source = ["/usr/bin/false", "/bin/false"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .unwrap();
+        let executable = root.join("codex");
+        let replacement = root.join("replacement");
+        let original = root.join("original");
+        fs::copy(true_source, &executable).unwrap();
+        fs::copy(false_source, &replacement).unwrap();
+        let expected_hash = hash_file(&executable).unwrap();
+        let verified = open_verified_codex_executable(&executable, expected_hash).unwrap();
+
+        let result = run_bounded_verified_command_with_hook(&verified, &[], &root, || {
+            fs::rename(&executable, &original).unwrap();
+            fs::rename(&replacement, &executable).unwrap();
+        });
+
+        let _ = fs::remove_dir_all(&root);
+        result.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_launch_rejects_in_place_mutation_after_final_check() {
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-codex-in-place-{}-{}",
+            std::process::id(),
+            NEXT_EFFECTIVE_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let true_source = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .unwrap();
+        let false_source = ["/usr/bin/false", "/bin/false"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .unwrap();
+        let executable = root.join("codex");
+        fs::copy(true_source, &executable).unwrap();
+        let expected_hash = hash_file(&executable).unwrap();
+        let verified = open_verified_codex_executable(&executable, expected_hash).unwrap();
+
+        let result = run_bounded_verified_command_with_hook(&verified, &[], &root, || {
+            fs::copy(false_source, &executable).unwrap();
+        });
+
+        let _ = fs::remove_dir_all(&root);
+        assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verified_executable_rejects_reparse_point_in_parent_topology() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = env::temp_dir().join(format!(
+            "context-relay-codex-reparse-{}-{}",
+            std::process::id(),
+            NEXT_EFFECTIVE_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let real_parent = root.join("real/bin");
+        fs::create_dir_all(&real_parent).unwrap();
+        let executable = real_parent.join("codex.exe");
+        fs::write(&executable, b"fixture executable").unwrap();
+        let linked_parent = root.join("linked");
+        if symlink_dir(root.join("real"), &linked_parent).is_err() {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let linked_executable = linked_parent.join("bin/codex.exe");
+        let expected_hash = hash_file(&executable).unwrap();
+
+        assert!(
+            open_verified_codex_executable(&linked_executable, expected_hash).is_err(),
+            "an intermediate reparse point reached the executable launch boundary"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 
     struct EffectiveValidationFixture {
         root: PathBuf,

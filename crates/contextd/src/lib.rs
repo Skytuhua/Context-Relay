@@ -7,6 +7,7 @@ use std::{
 };
 
 use context_relay_core::{
+    mcp::McpWorkspace,
     native_transaction::{
         engine::BoundaryError,
         recovery::{
@@ -159,7 +160,7 @@ impl VaultConfig {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn with_worker_hook(mut self, worker_hook: Arc<dyn WorkerHook>) -> Self {
         self.worker_hook = Some(worker_hook);
         self
@@ -597,7 +598,8 @@ fn route_request(_role: ClientRole, request: LocalRequest) -> RoutedRequest {
             RoutedRequest::Work(VaultCommand::ProjectPathSet(params))
         }
         LocalRequest::MemoryGet(params) => RoutedRequest::Work(VaultCommand::MemoryGet(params)),
-        request @ (LocalRequest::ProjectsList(_)
+        request @ (LocalRequest::McpCall(_)
+        | LocalRequest::ProjectsList(_)
         | LocalRequest::ProjectUpsert(_)
         | LocalRequest::MemoryList(_)
         | LocalRequest::MemorySearch(_)
@@ -971,6 +973,12 @@ fn execute_workspace_request(
     request: LocalRequest,
 ) -> Result<LocalResult, ClientError> {
     match request {
+        LocalRequest::McpCall(params) => {
+            let name = params.name.clone();
+            McpWorkspace::new(&mut state.vault, state.device_id)
+                .call(params)
+                .map(|output| LocalResult::McpOutput { name, output })
+        }
         LocalRequest::ProjectsList(_) => OfflineWorkspace::new(&mut state.vault, state.device_id)
             .projects()
             .map(|projects| LocalResult::Projects { projects }),
@@ -1351,6 +1359,12 @@ pub fn client_error_from_vault(error: VaultError) -> ClientError {
             field_path: None,
             retryable: false,
         },
+        VaultError::OperationConflict => ClientError {
+            code: ErrorCode::Conflict,
+            message: "The operation ID is already bound to a different mutation".into(),
+            field_path: None,
+            retryable: false,
+        },
         VaultError::FutureSchema { .. }
         | VaultError::Migration(_)
         | VaultError::Credential(_)
@@ -1362,6 +1376,190 @@ pub fn client_error_from_vault(error: VaultError) -> ClientError {
             field_path: None,
             retryable: false,
         },
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
+
+    use context_relay_core::vault::{DatabaseKeyStore, VaultError};
+    use context_relay_local_ipc::{InstallationToken, RuntimeConfig};
+    use tokio::sync::Notify;
+    use zeroize::Zeroizing;
+
+    use super::{
+        Daemon, DaemonConfig, DaemonError, InstallationTokenProvider, VaultConfig, WorkerHook,
+    };
+
+    #[derive(Clone)]
+    pub struct TestDaemonConfig {
+        runtime: RuntimeConfig,
+        vault_path: PathBuf,
+        token: [u8; 32],
+        keys: Arc<TestKeyStore>,
+        worker_gate: Option<Arc<TestWorkerGate>>,
+    }
+
+    impl TestDaemonConfig {
+        pub fn new(
+            runtime: RuntimeConfig,
+            vault_path: PathBuf,
+            installation_token: InstallationToken,
+        ) -> Self {
+            Self {
+                runtime,
+                vault_path,
+                token: *installation_token.as_bytes(),
+                keys: Arc::default(),
+                worker_gate: None,
+            }
+        }
+
+        pub fn runtime(&self) -> RuntimeConfig {
+            self.runtime.clone()
+        }
+
+        pub fn installation_token(&self) -> InstallationToken {
+            InstallationToken::from_bytes(self.token)
+        }
+
+        pub fn with_worker_gate(mut self, worker_gate: Arc<TestWorkerGate>) -> Self {
+            self.worker_gate = Some(worker_gate);
+            self
+        }
+
+        pub async fn start(&self) -> Result<Daemon, DaemonError> {
+            let mut vault = VaultConfig::new(
+                self.vault_path.clone(),
+                "context-relay-test-vault-key",
+                self.keys.clone(),
+            );
+            if let Some(worker_gate) = &self.worker_gate {
+                vault = vault.with_worker_hook(worker_gate.clone());
+            }
+            Daemon::start(DaemonConfig::new(
+                self.runtime.clone(),
+                vault,
+                Arc::new(TestTokenProvider { token: self.token }),
+            ))
+            .await
+        }
+    }
+
+    pub struct TestWorkerGate {
+        entered: AtomicBool,
+        entered_wake: Notify,
+        released: Mutex<bool>,
+        release_wake: Condvar,
+        enqueued: AtomicUsize,
+        enqueue_wake: Notify,
+    }
+
+    impl TestWorkerGate {
+        pub fn new() -> Self {
+            Self {
+                entered: AtomicBool::new(false),
+                entered_wake: Notify::new(),
+                released: Mutex::new(false),
+                release_wake: Condvar::new(),
+                enqueued: AtomicUsize::new(0),
+                enqueue_wake: Notify::new(),
+            }
+        }
+
+        pub async fn wait_until_entered(&self) {
+            loop {
+                let notified = self.entered_wake.notified();
+                if self.entered.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        pub async fn wait_until_enqueued(&self, target: usize) {
+            loop {
+                let notified = self.enqueue_wake.notified();
+                if self.enqueued() >= target {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        pub fn enqueued(&self) -> usize {
+            self.enqueued.load(Ordering::Acquire)
+        }
+
+        pub fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.release_wake.notify_all();
+        }
+    }
+
+    impl Default for TestWorkerGate {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl WorkerHook for TestWorkerGate {
+        fn before_execute(&self) {
+            self.entered.store(true, Ordering::Release);
+            self.entered_wake.notify_waiters();
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.release_wake.wait(released).unwrap();
+            }
+        }
+
+        fn after_enqueue(&self) {
+            self.enqueued.fetch_add(1, Ordering::Release);
+            self.enqueue_wake.notify_waiters();
+        }
+    }
+
+    struct TestTokenProvider {
+        token: [u8; 32],
+    }
+
+    impl InstallationTokenProvider for TestTokenProvider {
+        fn load_or_create(&self) -> Result<InstallationToken, DaemonError> {
+            Ok(InstallationToken::from_bytes(self.token))
+        }
+    }
+
+    #[derive(Default)]
+    struct TestKeyStore {
+        values: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl DatabaseKeyStore for TestKeyStore {
+        fn load_key(&self, credential_id: &str) -> Result<Option<Zeroizing<Vec<u8>>>, VaultError> {
+            Ok(self
+                .values
+                .lock()
+                .unwrap()
+                .get(credential_id)
+                .cloned()
+                .map(Zeroizing::new))
+        }
+
+        fn store_key(&self, credential_id: &str, key: &[u8]) -> Result<(), VaultError> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(credential_id.into(), key.to_vec());
+            Ok(())
+        }
     }
 }
 
@@ -1393,6 +1591,10 @@ mod tests {
         CancelParams, ClientRole, EmptyParams, HelloParams, JsonRpcErrorV1, JsonRpcRequestV1,
         JsonRpcSuccessV1, JsonRpcVersion, LocalRequest, PROTOCOL_VERSION, PlanId, RecordId,
         Sha256Digest,
+    };
+    #[cfg(any(windows, target_os = "macos"))]
+    use context_relay_protocol::{
+        HarnessAccessPolicy, McpBinding, McpCallParams, ProjectId, ProjectIdentity, WireNativeValue,
     };
     use zeroize::Zeroizing;
 
@@ -1646,7 +1848,7 @@ mod tests {
     #[test]
     fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 47);
+        assert_eq!(fixtures.len(), 48);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -1654,12 +1856,342 @@ mod tests {
                 "Hello" | "Cancel" => assert_exact_error(routed, invalid_request_error()),
                 "Shutdown" => assert!(matches!(routed, RoutedRequest::Shutdown)),
                 "Health" => assert!(matches!(routed, RoutedRequest::Health)),
+                "McpCall" => assert!(matches!(
+                    routed,
+                    RoutedRequest::Work(VaultCommand::Workspace(LocalRequest::McpCall(_)))
+                )),
                 _ => assert!(!matches!(
                     routed,
                     RoutedRequest::Immediate(Err(error)) if error == unavailable_error()
                 )),
             }
         }
+    }
+
+    #[test]
+    fn mcp_call_routes_through_the_ordered_vault_workspace() {
+        let request = request_fixture(
+            "mcp_call",
+            serde_json::json!({
+                "binding": {
+                    "harness": "codex",
+                    "workingDirectory": {
+                        "platform": "macos",
+                        "bytes": "L3dvcmtzcGFjZQ",
+                        "display": "/workspace",
+                    },
+                },
+                "name": "context_relay_status",
+                "arguments": {},
+            }),
+        );
+
+        let RoutedRequest::Work(VaultCommand::Workspace(LocalRequest::McpCall(params))) =
+            route_request(ClientRole::McpBridge, request)
+        else {
+            panic!("MCP call did not enter the ordered vault workspace")
+        };
+        assert_eq!(params.name, "context_relay_status");
+        assert_eq!(params.arguments, serde_json::json!({}));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn vault_worker_executes_scoped_mcp_status_for_the_canonical_project() {
+        let path = unique_temp_path("mcp-worker-status").join("vault.db");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let root = canonical_test_directory("mcp-worker-status-project");
+        let project_id = seed_mcp_project(
+            &path,
+            keys.as_ref(),
+            &root,
+            HarnessAccessPolicy::ActiveProjectOnly { read_only: true },
+        );
+        let mut worker = VaultWorker::spawn(VaultConfig::new(path, "test-vault-key", keys))
+            .await
+            .unwrap();
+        let response = worker
+            .client()
+            .try_submit(
+                routed_mcp_command(mcp_request(
+                    &root,
+                    "context_relay_status",
+                    serde_json::json!({}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+
+        let LocalResult::McpOutput { name, output } = response else {
+            panic!("expected scoped MCP output")
+        };
+        assert_eq!(name, "context_relay_status");
+        assert_eq!(output["resolvedProject"], project_id.to_string());
+        assert_eq!(
+            output["access"],
+            serde_json::json!({"mode": "active_project_only", "readOnly": true})
+        );
+        worker.shutdown_and_join();
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn authenticated_bridge_executes_only_scoped_mcp_calls() {
+        let runtime = test_runtime("daemon-mcp-auth");
+        let provider = Arc::new(FixedTokenProvider::default());
+        let keys = Arc::new(MemoryKeyStore::default());
+        let path = unique_temp_path("daemon-mcp-auth").join("vault.db");
+        let root = canonical_test_directory("daemon-mcp-auth-project");
+        let project_id =
+            seed_mcp_project(&path, keys.as_ref(), &root, HarnessAccessPolicy::Default);
+        assert!(matches!(
+            route_request(
+                ClientRole::McpBridge,
+                mcp_request(&root, "context_relay_status", serde_json::json!({}))
+            ),
+            RoutedRequest::Work(VaultCommand::Workspace(LocalRequest::McpCall(_)))
+        ));
+        let daemon = Daemon::start(test_config(runtime.clone(), path, keys, provider))
+            .await
+            .unwrap();
+        let handle = daemon.handle();
+        let owner = tokio::spawn(daemon.run());
+        let mut desktop = RawClient::connect(&runtime, ClientRole::Desktop).await;
+        let mut bridge = RawClient::connect(&runtime, ClientRole::McpBridge).await;
+
+        let LocalResult::McpOutput { name, output } = bridge
+            .call(mcp_request(
+                &root,
+                "context_relay_status",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap()
+        else {
+            panic!("expected scoped MCP output")
+        };
+        assert_eq!(name, "context_relay_status");
+        assert_eq!(output["resolvedProject"], project_id.to_string());
+
+        assert_eq!(
+            bridge
+                .call(request_fixture(
+                    "memory_search",
+                    serde_json::json!({"query": "other project", "projectId": project_id}),
+                ))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::ScopeDenied
+        );
+        assert_eq!(
+            bridge
+                .call(LocalRequest::SyncStatus(EmptyParams {}))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::ScopeDenied
+        );
+        assert!(matches!(
+            desktop
+                .call(LocalRequest::SyncStatus(EmptyParams {}))
+                .await
+                .unwrap(),
+            LocalResult::Status { .. }
+        ));
+
+        assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+        assert_eq!(owner.await.unwrap(), Ok(()));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn canceled_queued_mcp_write_does_not_mutate_the_vault() {
+        let runtime = test_runtime("daemon-mcp-cancel");
+        let provider = Arc::new(FixedTokenProvider::default());
+        let keys = Arc::new(MemoryKeyStore::default());
+        let path = unique_temp_path("daemon-mcp-cancel").join("vault.db");
+        let root = canonical_test_directory("daemon-mcp-cancel-project");
+        let project_id =
+            seed_mcp_project(&path, keys.as_ref(), &root, HarnessAccessPolicy::Default);
+        let remember_arguments = serde_json::json!({
+            "operationId": "018f22e2-79b0-7cc8-98c4-dc0c0c073990",
+            "kind": "note",
+            "title": "Canceled memory",
+            "markdown": "This write must never execute.",
+            "tags": [],
+            "scope": {"scope": "active_project"}
+        });
+        let _ = routed_mcp_command(mcp_request(
+            &root,
+            "context_relay_remember",
+            remember_arguments.clone(),
+        ));
+        let gate = Arc::new(BlockingWorkerHook::new());
+        let config = test_config(runtime.clone(), path.clone(), keys.clone(), provider)
+            .with_worker_hook(gate.clone());
+        let daemon = Daemon::start(config).await.unwrap();
+        let handle = daemon.handle();
+        let owner = tokio::spawn(daemon.run());
+        let mut active_client = RawClient::connect(&runtime, ClientRole::Desktop).await;
+        let mut bridge = RawClient::connect(&runtime, ClientRole::McpBridge).await;
+        let mut cancel_client = RawClient::connect(&runtime, ClientRole::Desktop).await;
+
+        let active = tokio::spawn(async move {
+            active_client
+                .call(LocalRequest::SyncStatus(EmptyParams {}))
+                .await
+        });
+        gate.wait_until_entered().await;
+        let request_id = next_record_id();
+        let queued_root = root.clone();
+        let queued = tokio::spawn(async move {
+            bridge
+                .call_with_id(
+                    request_id,
+                    mcp_request(&queued_root, "context_relay_remember", remember_arguments),
+                )
+                .await
+        });
+        gate.wait_until_enqueued(2).await;
+        assert_eq!(
+            cancel_client
+                .call(LocalRequest::Cancel(CancelParams { request_id }))
+                .await
+                .unwrap(),
+            LocalResult::Empty
+        );
+        gate.release();
+
+        assert!(matches!(
+            active.await.unwrap(),
+            Ok(LocalResult::Status { .. })
+        ));
+        assert_eq!(queued.await.unwrap(), Err(canceled_error()));
+        assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+        assert_eq!(owner.await.unwrap(), Ok(()));
+
+        let reopened = Vault::open(&path, "test-vault-key", keys.as_ref()).unwrap();
+        assert!(
+            reopened
+                .memories(Some(project_id), false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn queued_mcp_timeout_is_retryable() {
+        let runtime = test_runtime("daemon-mcp-timeout");
+        let provider = Arc::new(FixedTokenProvider::default());
+        let keys = Arc::new(MemoryKeyStore::default());
+        let path = unique_temp_path("daemon-mcp-timeout").join("vault.db");
+        let root = canonical_test_directory("daemon-mcp-timeout-project");
+        seed_mcp_project(&path, keys.as_ref(), &root, HarnessAccessPolicy::Default);
+        assert!(matches!(
+            route_request(
+                ClientRole::McpBridge,
+                mcp_request(&root, "context_relay_status", serde_json::json!({}))
+            ),
+            RoutedRequest::Work(VaultCommand::Workspace(LocalRequest::McpCall(_)))
+        ));
+        let gate = Arc::new(BlockingWorkerHook::new());
+        let config =
+            test_config(runtime.clone(), path, keys, provider).with_worker_hook(gate.clone());
+        let daemon = Daemon::start(config).await.unwrap();
+        let handle = daemon.handle();
+        let owner = tokio::spawn(daemon.run());
+        let mut bridge = RawClient::connect(&runtime, ClientRole::McpBridge).await;
+        tokio::time::pause();
+        let request = tokio::spawn(async move {
+            bridge
+                .call(mcp_request(
+                    &root,
+                    "context_relay_status",
+                    serde_json::json!({}),
+                ))
+                .await
+        });
+        gate.wait_until_entered().await;
+
+        tokio::time::advance(WORK_RESPONSE_TIMEOUT + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        let error = request.await.unwrap().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Timeout);
+        assert!(error.retryable);
+
+        gate.release();
+        tokio::time::resume();
+        assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+        assert_eq!(owner.await.unwrap(), Ok(()));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn bounded_worker_reports_busy_for_scoped_mcp_calls() {
+        let path = unique_temp_path("worker-mcp-busy").join("vault.db");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let root = canonical_test_directory("worker-mcp-busy-project");
+        seed_mcp_project(&path, keys.as_ref(), &root, HarnessAccessPolicy::Default);
+        let mut worker = VaultWorker::spawn(VaultConfig::new(path, "test-vault-key", keys))
+            .await
+            .unwrap();
+        let client = worker.client();
+        let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let blocked = client
+            .try_submit(
+                VaultCommand::TestBlock {
+                    entered: entered_sender,
+                    release: release_receiver,
+                },
+                TestAdmission(true),
+            )
+            .unwrap();
+        entered_receiver.recv().unwrap();
+
+        let mut queued = Vec::with_capacity(REQUEST_QUEUE_CAPACITY);
+        for _ in 0..REQUEST_QUEUE_CAPACITY {
+            queued.push(
+                client
+                    .try_submit(
+                        routed_mcp_command(mcp_request(
+                            &root,
+                            "context_relay_status",
+                            serde_json::json!({}),
+                        )),
+                        TestAdmission(true),
+                    )
+                    .unwrap(),
+            );
+        }
+        let overflow = client.try_submit(
+            routed_mcp_command(mcp_request(
+                &root,
+                "context_relay_status",
+                serde_json::json!({}),
+            )),
+            TestAdmission(true),
+        );
+        match overflow {
+            Err(error) => assert_eq!(error, busy_error()),
+            Ok(_) => panic!("queue overflow accepted an MCP call"),
+        }
+
+        release_sender.send(()).unwrap();
+        assert_eq!(blocked.await.unwrap(), Ok(LocalResult::Empty));
+        for response in queued {
+            assert!(matches!(
+                response.await.unwrap(),
+                Ok(LocalResult::McpOutput { ref name, .. })
+                    if name == "context_relay_status"
+            ));
+        }
+        worker.shutdown_and_join();
     }
 
     #[tokio::test]
@@ -1974,8 +2506,8 @@ mod tests {
             serde_json::json!({"memoryId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f"}),
         );
         assert_eq!(
-            idle_mcp.call(mcp_memory).await.unwrap(),
-            LocalResult::Memory { memory: None }
+            idle_mcp.call(mcp_memory).await.unwrap_err().code,
+            ErrorCode::ScopeDenied
         );
 
         assert_eq!(
@@ -2371,6 +2903,89 @@ mod tests {
         request
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
+    fn canonical_test_directory(label: &str) -> PathBuf {
+        let path = unique_temp_path(label);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::canonicalize(path).unwrap()
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn wire_native_path(path: &Path) -> WireNativeValue {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            WireNativeValue {
+                platform: NativePlatform::Macos,
+                bytes: path.as_os_str().as_bytes().to_vec(),
+                display: Some(path.display().to_string()),
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+
+            WireNativeValue {
+                platform: NativePlatform::Windows,
+                bytes: path
+                    .as_os_str()
+                    .encode_wide()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+                display: Some(path.display().to_string()),
+            }
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn mcp_request(path: &Path, name: &str, arguments: serde_json::Value) -> LocalRequest {
+        LocalRequest::McpCall(McpCallParams {
+            binding: McpBinding {
+                harness: HarnessId::Codex,
+                working_directory: wire_native_path(path),
+            },
+            name: name.to_owned(),
+            arguments,
+        })
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn routed_mcp_command(request: LocalRequest) -> VaultCommand {
+        match route_request(ClientRole::McpBridge, request) {
+            RoutedRequest::Work(command @ VaultCommand::Workspace(LocalRequest::McpCall(_))) => {
+                command
+            }
+            other => panic!("expected queued MCP workspace command, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn seed_mcp_project(
+        path: &Path,
+        keys: &dyn DatabaseKeyStore,
+        root: &Path,
+        policy: HarnessAccessPolicy,
+    ) -> ProjectId {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut vault = Vault::open(path, "test-vault-key", keys).unwrap();
+        let project_id = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f".parse().unwrap();
+        vault
+            .put_project(&ProjectIdentity {
+                project_id,
+                github_repository_id: None,
+                git_remote_fingerprint: None,
+                monorepo_subdirectory: None,
+                name: "Scoped MCP project".into(),
+            })
+            .unwrap();
+        vault
+            .put_path(&project_id.to_string(), &wire_native_path(root))
+            .unwrap();
+        vault.set_access_policy(HarnessId::Codex, &policy).unwrap();
+        project_id
+    }
+
     fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         const ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
         let bytes32 = serde_json::to_value(DaemonInstanceNonce::new([0x11; 32]))
@@ -2396,6 +3011,24 @@ mod tests {
             ),
             ("Shutdown", request_fixture("shutdown", empty())),
             ("Health", request_fixture("health", empty())),
+            (
+                "McpCall",
+                request_fixture(
+                    "mcp_call",
+                    serde_json::json!({
+                        "binding": {
+                            "harness": "codex",
+                            "workingDirectory": {
+                                "platform": "macos",
+                                "bytes": "L3dvcmtzcGFjZQ",
+                                "display": "/workspace",
+                            },
+                        },
+                        "name": "context_relay_status",
+                        "arguments": {},
+                    }),
+                ),
+            ),
             ("Unlock", request_fixture("unlock", empty())),
             ("ProjectsList", request_fixture("projects_list", empty())),
             (

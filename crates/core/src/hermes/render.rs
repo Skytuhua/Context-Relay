@@ -13,6 +13,9 @@ use serde_json::Value as JsonValue;
 use serde_yaml_ng::Value as YamlValue;
 use sha2::{Digest as _, Sha256};
 
+use crate::mcp::install::{
+    BRIDGE_SERVER_NAME, is_canonical_bridge_body, is_managed_bridge_component,
+};
 use crate::native_transaction::model::{
     ApprovedMutation, MutationKind, RestorableStateFingerprint,
 };
@@ -337,13 +340,15 @@ impl HermesAdapter {
         component
             .validate()
             .map_err(|_| invalid("Hermes component is invalid"))?;
-        if component.provenance.harness != Some(HarnessId::Hermes) {
-            return Err(invalid("Hermes component provenance is invalid"));
-        }
-        if metadata(component, "profile") != Some(self.layout.profile.name.as_str()) {
-            return Err(invalid(
-                "Hermes component profile does not match the adapter",
-            ));
+        if !is_managed_bridge_component(HarnessId::Hermes, component) {
+            if component.provenance.harness != Some(HarnessId::Hermes) {
+                return Err(invalid("Hermes component provenance is invalid"));
+            }
+            if metadata(component, "profile") != Some(self.layout.profile.name.as_str()) {
+                return Err(invalid(
+                    "Hermes component profile does not match the adapter",
+                ));
+            }
         }
         if component.body_markdown.contains(MANAGED_START)
             || component.body_markdown.contains(MANAGED_END)
@@ -374,6 +379,17 @@ impl HermesAdapter {
             .collect::<BTreeMap<_, _>>();
         for component in &desired.components {
             let location = structural_location(component)?;
+            if is_managed_bridge_component(HarnessId::Hermes, component) {
+                if current_by_location
+                    .get(location)
+                    .is_some_and(|native| !self.is_native_managed_bridge(native))
+                {
+                    return Err(invalid(
+                        "Hermes bridge location is occupied by unmanaged native state",
+                    ));
+                }
+                continue;
+            }
             if let Some(native) = current.iter().find(|native| native.id == component.id) {
                 if metadata(native, "structuralLocation") != Some(location)
                     || native.kind != component.kind
@@ -456,6 +472,22 @@ impl HermesAdapter {
             }
         }
         Ok(())
+    }
+
+    fn is_native_managed_bridge(&self, component: &ComponentRecord) -> bool {
+        component.scope == ScopeRef::Global
+            && component.kind == ComponentKind::McpServer
+            && component.name == BRIDGE_SERVER_NAME
+            && metadata(component, "profile") == Some(self.layout.profile.name.as_str())
+            && metadata(component, "structuralLocation") == Some("config:mcp_servers.context-relay")
+            && component.provenance.harness == Some(HarnessId::Hermes)
+            && component.provenance.source.is_none()
+            && component.archived
+                == serde_json::from_str::<JsonValue>(&component.body_markdown)
+                    .ok()
+                    .and_then(|body| body.get("enabled").and_then(JsonValue::as_bool))
+                    .is_some_and(|enabled| !enabled)
+            && is_canonical_bridge_body(HarnessId::Hermes, &component.body_markdown, true)
     }
 
     fn render_config(

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     fmt,
     future::Future,
     process::{Command, Stdio},
@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant as StdInstant},
 };
 
 use context_relay_protocol::{
@@ -58,10 +58,32 @@ const REQUEST_QUEUED: u8 = 0;
 const REQUEST_ACTIVE: u8 = 1;
 const REQUEST_CANCELED: u8 = 2;
 const REQUEST_COMPLETE: u8 = 3;
+// Twice the MCP dispatcher's 64-call ceiling, while bounding authenticated cancel floods.
+const EARLY_CANCEL_CAPACITY: usize = 128;
+// Covers the complete request deadline with a five-second registration margin.
+const EARLY_CANCEL_TTL: Duration = Duration::from_secs(35);
+const RECENT_COMPLETION_CAPACITY: usize = 128;
+const RECENT_COMPLETION_TTL: Duration = Duration::from_secs(35);
+const _: () = assert!(EARLY_CANCEL_CAPACITY >= 64);
+const _: () = assert!(EARLY_CANCEL_TTL.as_secs() >= REQUEST_TIMEOUT.as_secs());
+const _: () = assert!(RECENT_COMPLETION_CAPACITY >= 64);
+const _: () = assert!(RECENT_COMPLETION_TTL.as_secs() >= REQUEST_TIMEOUT.as_secs());
 
 #[derive(Clone, Default)]
 pub struct RequestRegistry {
-    inner: Arc<Mutex<HashMap<RecordId, Arc<RequestState>>>>,
+    inner: Arc<Mutex<RegistryState>>,
+}
+
+#[derive(Default)]
+struct RegistryState {
+    requests: HashMap<RecordId, Arc<RequestState>>,
+    early_cancels: VecDeque<ExpiringId>,
+    recent_completions: VecDeque<ExpiringId>,
+}
+
+struct ExpiringId {
+    id: RecordId,
+    expires_at: StdInstant,
 }
 
 struct RequestState {
@@ -76,14 +98,32 @@ pub struct RequestRegistration {
 
 impl RequestRegistry {
     fn register(&self, id: RecordId) -> Option<RequestRegistration> {
-        let mut requests = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        if requests.contains_key(&id) {
+        self.register_at(id, StdInstant::now())
+    }
+
+    fn register_at(&self, id: RecordId, now: StdInstant) -> Option<RequestRegistration> {
+        let mut registry = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        registry.remove_expired(now);
+        if registry.requests.contains_key(&id) {
             return None;
         }
+        // Reuse claims the ID for this registration. A later cancel targets this current
+        // request; production bridge calls avoid the ambiguity by using fresh UUIDv7 IDs.
+        registry.remove_recent_completion(id);
+        let canceled = registry
+            .early_cancels
+            .iter()
+            .position(|cancel| cancel.id == id)
+            .and_then(|index| registry.early_cancels.remove(index))
+            .is_some();
         let state = Arc::new(RequestState {
-            phase: AtomicU8::new(REQUEST_QUEUED),
+            phase: AtomicU8::new(if canceled {
+                REQUEST_CANCELED
+            } else {
+                REQUEST_QUEUED
+            }),
         });
-        requests.insert(id, state.clone());
+        registry.requests.insert(id, state.clone());
         Some(RequestRegistration {
             id,
             state,
@@ -92,12 +132,13 @@ impl RequestRegistry {
     }
 
     fn cancel(&self, id: RecordId) {
-        let state = self
-            .inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&id)
-            .cloned();
+        self.cancel_at(id, StdInstant::now());
+    }
+
+    fn cancel_at(&self, id: RecordId, now: StdInstant) {
+        let mut registry = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        registry.remove_expired(now);
+        let state = registry.requests.get(&id).cloned();
         if let Some(state) = state {
             let _ = state.phase.compare_exchange(
                 REQUEST_QUEUED,
@@ -105,7 +146,60 @@ impl RequestRegistry {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             );
+            return;
         }
+        if registry
+            .recent_completions
+            .iter()
+            .any(|completion| completion.id == id)
+        {
+            return;
+        }
+        if registry.early_cancels.iter().any(|cancel| cancel.id == id) {
+            return;
+        }
+        if registry.early_cancels.len() == EARLY_CANCEL_CAPACITY {
+            registry.early_cancels.pop_front();
+        }
+        registry.early_cancels.push_back(ExpiringId {
+            id,
+            expires_at: now + EARLY_CANCEL_TTL,
+        });
+    }
+}
+
+impl RegistryState {
+    fn remove_expired(&mut self, now: StdInstant) {
+        Self::remove_expired_from(&mut self.early_cancels, now);
+        Self::remove_expired_from(&mut self.recent_completions, now);
+    }
+
+    fn remove_expired_from(entries: &mut VecDeque<ExpiringId>, now: StdInstant) {
+        while entries.front().is_some_and(|entry| entry.expires_at <= now) {
+            entries.pop_front();
+        }
+    }
+
+    fn remove_recent_completion(&mut self, id: RecordId) {
+        if let Some(index) = self
+            .recent_completions
+            .iter()
+            .position(|completion| completion.id == id)
+        {
+            self.recent_completions.remove(index);
+        }
+    }
+
+    fn record_completion(&mut self, id: RecordId, now: StdInstant) {
+        self.remove_expired(now);
+        self.remove_recent_completion(id);
+        if self.recent_completions.len() == RECENT_COMPLETION_CAPACITY {
+            self.recent_completions.pop_front();
+        }
+        self.recent_completions.push_back(ExpiringId {
+            id,
+            expires_at: now + RECENT_COMPLETION_TTL,
+        });
     }
 }
 
@@ -140,16 +234,18 @@ impl fmt::Debug for RequestRegistration {
 impl Drop for RequestRegistration {
     fn drop(&mut self) {
         self.state.phase.store(REQUEST_COMPLETE, Ordering::Release);
-        let mut requests = self
+        let mut registry = self
             .registry
             .inner
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if requests
+        if registry
+            .requests
             .get(&self.id)
             .is_some_and(|state| Arc::ptr_eq(state, &self.state))
         {
-            requests.remove(&self.id);
+            registry.requests.remove(&self.id);
+            registry.record_completion(self.id, StdInstant::now());
         }
     }
 }
@@ -178,6 +274,21 @@ impl Client {
             .expect("UUID v7 constructor returns a valid RecordId");
         Ok(Self {
             inner: client_handshake(stream, role, &token, client_nonce, request_id).await?,
+        })
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn connect_for_test(
+        runtime: &RuntimeConfig,
+        role: ClientRole,
+        token: &InstallationToken,
+    ) -> Result<Self, IpcError> {
+        let stream = connect(runtime).await?;
+        let client_nonce = generate_instance_nonce()?;
+        let request_id = RecordId::new(uuid::Uuid::now_v7())
+            .expect("UUID v7 constructor returns a valid RecordId");
+        Ok(Self {
+            inner: client_handshake(stream, role, token, client_nonce, request_id).await?,
         })
     }
 
@@ -771,6 +882,118 @@ where
     })
     .await
     .map_err(|_| IpcError::HandshakeTimeout)?
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use std::time::{Duration, Instant};
+
+    use context_relay_protocol::RecordId;
+    use uuid::Uuid;
+
+    use super::{
+        EARLY_CANCEL_CAPACITY, EARLY_CANCEL_TTL, RECENT_COMPLETION_CAPACITY, RECENT_COMPLETION_TTL,
+        RequestRegistry,
+    };
+
+    fn id() -> RecordId {
+        RecordId::new(Uuid::now_v7()).unwrap()
+    }
+
+    fn complete(registry: &RequestRegistry, target: RecordId) {
+        let registration = registry.register(target).unwrap();
+        assert!(registration.begin());
+        drop(registration);
+    }
+
+    #[test]
+    fn early_cancel_tombstones_are_fifo_bounded() {
+        let registry = RequestRegistry::default();
+        let now = Instant::now();
+        let oldest = id();
+        registry.cancel_at(oldest, now);
+        let mut retained = Vec::new();
+        for _ in 0..EARLY_CANCEL_CAPACITY {
+            let target = id();
+            registry.cancel_at(target, now);
+            retained.push(target);
+        }
+
+        assert!(registry.register_at(oldest, now).unwrap().begin());
+        for target in retained {
+            assert!(!registry.register_at(target, now).unwrap().begin());
+        }
+    }
+
+    #[test]
+    fn early_cancel_tombstones_expire_after_covering_the_request_timeout() {
+        let registry = RequestRegistry::default();
+        let target = id();
+        let canceled_at = Instant::now();
+        registry.cancel_at(target, canceled_at);
+
+        let registration = registry
+            .register_at(
+                target,
+                canceled_at + EARLY_CANCEL_TTL + Duration::from_nanos(1),
+            )
+            .unwrap();
+
+        assert!(registration.begin());
+    }
+
+    #[test]
+    fn sequential_reuse_without_cancel_starts_queued() {
+        let registry = RequestRegistry::default();
+        let target = id();
+        complete(&registry, target);
+
+        assert!(registry.register(target).unwrap().begin());
+    }
+
+    #[test]
+    fn cancel_after_reuse_targets_the_current_registration() {
+        let registry = RequestRegistry::default();
+        let target = id();
+        complete(&registry, target);
+        let reused = registry.register(target).unwrap();
+
+        registry.cancel(target);
+
+        assert!(!reused.begin());
+    }
+
+    #[test]
+    fn recent_completion_markers_are_fifo_bounded() {
+        let registry = RequestRegistry::default();
+        let oldest = id();
+        complete(&registry, oldest);
+        let mut retained = Vec::new();
+        for _ in 0..RECENT_COMPLETION_CAPACITY {
+            let target = id();
+            complete(&registry, target);
+            retained.push(target);
+        }
+
+        registry.cancel(oldest);
+        assert!(!registry.register(oldest).unwrap().begin());
+
+        let newest = retained.pop().unwrap();
+        registry.cancel(newest);
+        assert!(registry.register(newest).unwrap().begin());
+    }
+
+    #[test]
+    fn expired_completion_marker_no_longer_swallows_a_cancel() {
+        let registry = RequestRegistry::default();
+        let target = id();
+        complete(&registry, target);
+        let after_expiry = Instant::now() + RECENT_COMPLETION_TTL + Duration::from_nanos(1);
+
+        registry.cancel_at(target, after_expiry);
+
+        assert!(!registry.register_at(target, after_expiry).unwrap().begin());
+    }
 }
 
 #[cfg(test)]

@@ -130,6 +130,16 @@ params!(HarnessParams {
     #[serde(deserialize_with = "crate::required_nullable")]
     project_id: Option<ProjectId>
 });
+params!(McpBinding {
+    harness: HarnessId,
+    working_directory: WireNativeValue
+});
+params!(McpCallParams {
+    binding: McpBinding,
+    name: String,
+    #[ts(type = "unknown")]
+    arguments: serde_json::Value
+});
 params!(PlanParams { plan_id: PlanId });
 params!(PackageParams {
     package_base64url: BoundedBytes,
@@ -337,6 +347,7 @@ pub enum LocalRequest {
     Cancel(CancelParams),
     Shutdown(EmptyParams),
     Health(EmptyParams),
+    McpCall(McpCallParams),
     Unlock(EmptyParams),
     ProjectsList(EmptyParams),
     ProjectUpsert(ProjectUpsertParams),
@@ -403,6 +414,10 @@ impl LocalRequest {
         match self {
             Self::ProjectUpsert(p) => p.project.validate(),
             Self::ProjectPathSet(p) => p.path.validate(),
+            Self::McpCall(p) => {
+                p.binding.working_directory.validate()?;
+                crate::validate_mcp_fixture(&p.name, true, &p.arguments)
+            }
             Self::MemorySearch(p) => required_text(&p.query, "query", MAX_MARKDOWN_BYTES),
             Self::MemoryCreate(p) => {
                 required_text(&p.title, "title", MAX_TITLE_BYTES)?;
@@ -564,6 +579,11 @@ pub enum LocalResult {
         protocol: ProtocolVersion,
         vault_locked: bool,
     },
+    McpOutput {
+        name: String,
+        #[ts(type = "unknown")]
+        output: serde_json::Value,
+    },
     Projects {
         projects: Vec<ProjectIdentity>,
     },
@@ -630,6 +650,10 @@ enum LocalResultSerde {
     Health {
         protocol: ProtocolVersion,
         vault_locked: bool,
+    },
+    McpOutput {
+        name: String,
+        output: serde_json::Value,
     },
     Projects {
         projects: Vec<ProjectIdentity>,
@@ -699,6 +723,7 @@ impl LocalResult {
                 }
                 Ok(())
             }
+            Self::McpOutput { name, output } => crate::validate_mcp_fixture(name, false, output),
             Self::Projects { projects } => {
                 for project in projects {
                     project.validate()?;

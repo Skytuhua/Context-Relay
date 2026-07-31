@@ -688,6 +688,24 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         ),
         ("Shutdown", request_fixture("shutdown", empty())),
         ("Health", request_fixture("health", empty())),
+        (
+            "McpCall",
+            request_fixture(
+                "mcp_call",
+                serde_json::json!({
+                    "binding": {
+                        "harness": "codex",
+                        "workingDirectory": {
+                            "platform": "macos",
+                            "bytes": "L3dvcmtzcGFjZQ",
+                            "display": "/workspace",
+                        },
+                    },
+                    "name": "context_relay_status",
+                    "arguments": {},
+                }),
+            ),
+        ),
         ("Unlock", request_fixture("unlock", empty())),
         ("ProjectsList", request_fixture("projects_list", empty())),
         (
@@ -967,25 +985,13 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
 }
 
 #[test]
-fn role_allowlist_covers_all_47_requests() {
+fn role_allowlist_covers_all_48_requests() {
     let fixtures = all_request_fixtures();
-    assert_eq!(fixtures.len(), 47);
+    assert_eq!(fixtures.len(), 48);
 
     for (name, request) in &fixtures {
         let common = matches!(*name, "Cancel" | "Health");
-        let mcp_domain = matches!(
-            *name,
-            "MemorySearch"
-                | "MemoryGet"
-                | "MemoryCreate"
-                | "MemoryUpdate"
-                | "MemoryArchive"
-                | "TasksList"
-                | "TaskUpsert"
-                | "TaskComplete"
-                | "HandoffCreate"
-                | "SyncStatus"
-        );
+        let mcp_domain = matches!(*name, "McpCall");
         let installer_setup = matches!(
             *name,
             "AccessGet"
@@ -1021,14 +1027,14 @@ fn role_allowlist_covers_all_47_requests() {
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::Desktop, request))
             .count(),
-        46
+        47
     );
     assert_eq!(
         fixtures
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::McpBridge, request))
             .count(),
-        12
+        3
     );
     assert_eq!(
         fixtures
