@@ -1,6 +1,6 @@
 mod support;
 
-use std::str::FromStr;
+use std::{panic::AssertUnwindSafe, str::FromStr};
 
 use context_relay_core::{
     native_transaction::{
@@ -8,7 +8,7 @@ use context_relay_core::{
         approval_hash_v2, seal_plan,
     },
     setup::{BridgeExecutionError, BridgeInstallService, BridgePlanExecutor},
-    vault::{SetupPlanAction, SetupPlanLifecycle, SetupPlanWrite, Vault},
+    vault::{NativeTransactionStatus, SetupPlanAction, SetupPlanLifecycle, SetupPlanWrite, Vault},
 };
 use context_relay_native_runner::{
     RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand, SidecarId,
@@ -19,7 +19,7 @@ use context_relay_protocol::{
 };
 use sha2::{Digest as _, Sha256};
 
-use support::{ID_1, MemoryKeyStore, TempVault};
+use support::{ID_1, MemoryKeyStore, TempVault, persist_native_terminal};
 
 const NOW_MS: u64 = 1_900_000_000_000;
 
@@ -47,6 +47,22 @@ impl BridgePlanExecutor for RecordingExecutor {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+}
+
+struct CrashAfterTerminal(NativeTransactionStatus);
+
+impl BridgePlanExecutor for CrashAfterTerminal {
+    fn execute(
+        &mut self,
+        vault: &mut Vault,
+        plan: &NativeTransactionPlan,
+        sealed_plan: &[u8],
+        created_ms: u64,
+        _now_ms: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        persist_native_terminal(vault, plan, sealed_plan, created_ms, NOW_MS + 1, self.0);
+        panic!("simulated process exit after durable native terminal state")
     }
 }
 
@@ -308,7 +324,7 @@ fn apply_records_restored_validation_failures_and_unknown_outcome_conflicts() {
 }
 
 #[test]
-fn apply_lifecycle_compare_and_swap_rejects_an_already_applying_plan() {
+fn apply_resumes_an_already_claimed_plan_when_the_native_transaction_is_missing() {
     let path = TempVault::new("bridge-setup-apply-cas");
     let keys = MemoryKeyStore::default();
     let mut vault = Vault::open(path.path(), "bridge-setup-apply-v1", &keys).unwrap();
@@ -318,18 +334,118 @@ fn apply_lifecycle_compare_and_swap_rejects_an_already_applying_plan() {
         .unwrap();
     let mut executor = RecordingExecutor::default();
 
-    assert!(
-        BridgeInstallService::persisted(&mut vault)
-            .apply(&candidate.setup.plan_id, NOW_MS + 2, &mut executor)
-            .is_err()
-    );
-    assert_eq!(executor.calls, 0);
+    BridgeInstallService::persisted(&mut vault)
+        .apply(&candidate.setup.plan_id, NOW_MS + 2, &mut executor)
+        .unwrap();
+    assert_eq!(executor.calls, 1);
     assert_eq!(
         vault
             .setup_plan(&candidate.setup.plan_id)
             .unwrap()
             .unwrap()
             .lifecycle,
-        SetupPlanLifecycle::Applying
+        SetupPlanLifecycle::Applied
     );
+}
+
+#[test]
+fn apply_reconciles_durable_native_terminal_states_without_reexecuting() {
+    let keys = MemoryKeyStore::default();
+    for (name, terminal, expected_lifecycle, succeeds) in [
+        (
+            "bridge-setup-apply-reconcile-committed",
+            NativeTransactionStatus::Committed,
+            SetupPlanLifecycle::Applied,
+            true,
+        ),
+        (
+            "bridge-setup-apply-reconcile-restored",
+            NativeTransactionStatus::Restored,
+            SetupPlanLifecycle::ApplyRestored,
+            false,
+        ),
+        (
+            "bridge-setup-apply-reconcile-conflict",
+            NativeTransactionStatus::Conflict,
+            SetupPlanLifecycle::Conflict,
+            false,
+        ),
+    ] {
+        let path = TempVault::new(name);
+        let mut vault = Vault::open(path.path(), "bridge-setup-apply-v1", &keys).unwrap();
+        let (candidate, _) = persist(&mut vault, plan());
+        let crashed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = BridgeInstallService::persisted(&mut vault).apply(
+                &candidate.setup.plan_id,
+                NOW_MS + 1,
+                &mut CrashAfterTerminal(terminal),
+            );
+        }));
+        assert!(crashed.is_err());
+        assert_eq!(
+            vault
+                .setup_plan(&candidate.setup.plan_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            SetupPlanLifecycle::Applying
+        );
+        let mut executor = RecordingExecutor::default();
+
+        let result = BridgeInstallService::persisted(&mut vault).apply(
+            &candidate.setup.plan_id,
+            NOW_MS + 2,
+            &mut executor,
+        );
+
+        assert_eq!(result.is_ok(), succeeds, "{name}");
+        assert_eq!(executor.calls, 0, "{name}: must not re-execute");
+        assert_eq!(
+            vault
+                .setup_plan(&candidate.setup.plan_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            expected_lifecycle,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn startup_reconciliation_leaves_pending_or_missing_native_outcomes_unexecuted() {
+    let keys = MemoryKeyStore::default();
+    for (name, native_status) in [
+        (
+            "bridge-setup-reconcile-pending",
+            Some(NativeTransactionStatus::Pending),
+        ),
+        ("bridge-setup-reconcile-missing", None),
+    ] {
+        let path = TempVault::new(name);
+        let mut vault = Vault::open(path.path(), "bridge-setup-apply-v1", &keys).unwrap();
+        let (candidate, sealed) = persist(&mut vault, plan());
+        vault
+            .claim_setup_plan(&candidate.setup.plan_id, SetupPlanAction::Apply, NOW_MS + 1)
+            .unwrap();
+        if let Some(status) = native_status {
+            persist_native_terminal(&mut vault, &candidate, &sealed, NOW_MS, NOW_MS + 1, status);
+        }
+
+        assert!(
+            BridgeInstallService::persisted(&mut vault)
+                .reconcile_after_native_recovery()
+                .is_err(),
+            "{name}"
+        );
+        assert_eq!(
+            vault
+                .setup_plan(&candidate.setup.plan_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            SetupPlanLifecycle::Applying,
+            "{name}"
+        );
+    }
 }

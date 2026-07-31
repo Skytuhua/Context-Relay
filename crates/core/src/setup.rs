@@ -150,7 +150,7 @@ where
         created_ms: u64,
         now_ms: u64,
     ) -> Result<(), BridgeExecutionError> {
-        let transaction_id = format!("bridge-setup-{}", plan.setup.plan_id);
+        let transaction_id = native_transaction_id(&plan.setup.plan_id);
         let result = {
             let mut journal = crate::native_transaction::journal::VaultNativeJournal::new(
                 vault,
@@ -376,6 +376,65 @@ impl<H, L> BridgeInstallService<'_, H, L> {
 }
 
 impl PersistedBridgeInstallService<'_> {
+    /// Reconciles setup lifecycles after native startup recovery has made each
+    /// begun transaction terminal. A missing native row is reported without
+    /// executing; a subsequent explicit apply/rollback may safely resume it.
+    pub fn reconcile_after_native_recovery(&mut self) -> Result<(), ClientError> {
+        let incomplete = self
+            .vault
+            .incomplete_setup_plans()
+            .map_err(|_| invalid("Incomplete bridge plans cannot be loaded"))?;
+        for candidate in incomplete {
+            let stored = self
+                .vault
+                .setup_plan(&candidate.plan_id)
+                .map_err(|_| invalid("Incomplete bridge plan cannot be reloaded"))?
+                .ok_or_else(|| invalid("Incomplete bridge plan disappeared"))?;
+            if !matches!(
+                stored.lifecycle,
+                SetupPlanLifecycle::Applying | SetupPlanLifecycle::RollingBack
+            ) {
+                continue;
+            }
+            let candidate_opened = open_plan(&stored.payload)
+                .map_err(|_| invalid("Incomplete bridge plan is malformed or unapproved"))?;
+            if let Some(original_id) = candidate_opened.rollback_of_plan_id {
+                let original = self
+                    .vault
+                    .setup_plan(&original_id)
+                    .map_err(|_| invalid("Rollback original plan cannot be loaded"))?
+                    .ok_or_else(|| invalid("Rollback original plan does not exist"))?;
+                if original.lifecycle != SetupPlanLifecycle::RollingBack {
+                    return Err(invalid("Rollback inverse has no active original"));
+                }
+                continue;
+            }
+            let opened = validated_original_plan(&stored, &stored.plan_id)?;
+            match stored.lifecycle {
+                SetupPlanLifecycle::Applying => {
+                    if self.reconcile_apply_terminal(&stored)?.is_none() {
+                        return Err(conflict(
+                            "Bridge apply has not begun its native transaction",
+                        ));
+                    }
+                }
+                SetupPlanLifecycle::RollingBack => {
+                    let (inverse, _) = self.validated_inverse_plan(&opened)?;
+                    if self
+                        .reconcile_rollback_terminal(&stored, &inverse)?
+                        .is_none()
+                    {
+                        return Err(conflict(
+                            "Bridge rollback has not begun its native transaction",
+                        ));
+                    }
+                }
+                _ => return Err(invalid("Incomplete bridge plan lifecycle is invalid")),
+            }
+        }
+        Ok(())
+    }
+
     pub fn apply<E: BridgePlanExecutor>(
         &mut self,
         plan_id: &PlanId,
@@ -387,18 +446,18 @@ impl PersistedBridgeInstallService<'_> {
             .setup_plan(plan_id)
             .map_err(|_| invalid("Persisted bridge plan cannot be loaded"))?
             .ok_or_else(|| invalid("Persisted bridge plan does not exist"))?;
-        let opened = open_plan(&stored.payload)
-            .map_err(|_| invalid("Persisted bridge plan is malformed or unapproved"))?;
-        let plan = opened.plan;
-        if stored.schema_version != opened.schema_version
-            || stored.approval_version != 2
-            || stored.approval_hash != plan.setup.batch_hash
-            || stored.plan_id != plan.setup.plan_id
-            || stored.expires_ms != plan.setup.expires_at
-            || &plan.setup.plan_id != plan_id
-            || opened.rollback_of_plan_id.is_some()
-        {
-            return Err(invalid("Persisted bridge plan binding is invalid"));
+        let opened = validated_original_plan(&stored, plan_id)?;
+        if stored.lifecycle == SetupPlanLifecycle::Applying {
+            if let Some(lifecycle) = self.reconcile_apply_terminal(&stored)? {
+                return apply_terminal_result(lifecycle);
+            }
+            return self.execute_claimed_apply(&stored, &opened.plan, now_ms, executor);
+        }
+        if matches!(
+            stored.lifecycle,
+            SetupPlanLifecycle::ApplyRestored | SetupPlanLifecycle::Conflict
+        ) {
+            return apply_terminal_result(stored.lifecycle);
         }
         match self
             .vault
@@ -408,16 +467,20 @@ impl PersistedBridgeInstallService<'_> {
             SetupPlanClaim::Replay => return Ok(()),
             SetupPlanClaim::Claimed => {}
         }
-        match executor.execute(
-            self.vault,
-            &plan,
-            &stored.payload,
-            stored.created_ms,
-            now_ms,
-        ) {
+        self.execute_claimed_apply(&stored, &opened.plan, now_ms, executor)
+    }
+
+    fn execute_claimed_apply<E: BridgePlanExecutor>(
+        &mut self,
+        stored: &crate::vault::SetupPlanRecord,
+        plan: &NativeTransactionPlan,
+        now_ms: u64,
+        executor: &mut E,
+    ) -> Result<(), ClientError> {
+        match executor.execute(self.vault, plan, &stored.payload, stored.created_ms, now_ms) {
             Ok(()) => self
                 .vault
-                .finish_setup_plan(plan_id, SetupPlanLifecycle::Applied)
+                .finish_setup_plan(&plan.setup.plan_id, SetupPlanLifecycle::Applied)
                 .map_err(|_| conflict("Persisted bridge apply cannot be finalized")),
             Err(error) => {
                 let lifecycle = match error {
@@ -425,7 +488,7 @@ impl PersistedBridgeInstallService<'_> {
                     BridgeExecutionError::Conflict(_) => SetupPlanLifecycle::Conflict,
                 };
                 self.vault
-                    .finish_setup_plan(plan_id, lifecycle)
+                    .finish_setup_plan(&plan.setup.plan_id, lifecycle)
                     .map_err(|_| conflict("Persisted bridge apply failure cannot be finalized"))?;
                 Err(conflict_owned(error.message()))
             }
@@ -443,21 +506,30 @@ impl PersistedBridgeInstallService<'_> {
             .setup_plan(original_plan_id)
             .map_err(|_| invalid("Persisted bridge plan cannot be loaded"))?
             .ok_or_else(|| invalid("Persisted bridge plan does not exist"))?;
-        let opened = open_plan(&stored.payload)
-            .map_err(|_| invalid("Persisted bridge plan is malformed or unapproved"))?;
-        if stored.schema_version != opened.schema_version
-            || stored.approval_version != 2
-            || stored.approval_hash != opened.plan.setup.batch_hash
-            || stored.plan_id != opened.plan.setup.plan_id
-            || stored.expires_ms != opened.plan.setup.expires_at
-            || &opened.plan.setup.plan_id != original_plan_id
-            || opened.rollback_of_plan_id.is_some()
-        {
-            return Err(invalid("Persisted bridge plan binding is invalid"));
-        }
+        let opened = validated_original_plan(&stored, original_plan_id)?;
         if stored.lifecycle == SetupPlanLifecycle::RolledBack {
             return Ok(());
         }
+        if stored.lifecycle == SetupPlanLifecycle::RollingBack {
+            let (inverse_record, inverse) = self.validated_inverse_plan(&opened)?;
+            if let Some(lifecycle) = self.reconcile_rollback_terminal(&stored, &inverse_record)? {
+                return rollback_terminal_result(lifecycle);
+            }
+            return self.execute_claimed_rollback(
+                &stored,
+                &inverse_record,
+                &inverse.plan,
+                now_ms,
+                executor,
+            );
+        }
+        if matches!(
+            stored.lifecycle,
+            SetupPlanLifecycle::RollbackRestored | SetupPlanLifecycle::Conflict
+        ) {
+            return rollback_terminal_result(stored.lifecycle);
+        }
+
         let (inverse, inverse_rollback_states) = inverse_plan(&opened, now_ms)?;
         let inverse_approval =
             approval_hash_v2(&inverse).map_err(|_| invalid("Rollback bridge plan is invalid"))?;
@@ -468,7 +540,6 @@ impl PersistedBridgeInstallService<'_> {
             Some(*original_plan_id),
         )
         .map_err(|_| invalid("Rollback bridge plan cannot be sealed"))?;
-
         match self
             .vault
             .claim_setup_plan_rollback(
@@ -489,22 +560,43 @@ impl PersistedBridgeInstallService<'_> {
             SetupPlanClaim::Replay => return Ok(()),
             SetupPlanClaim::Claimed => {}
         }
+        let inverse_record = self
+            .vault
+            .setup_plan(&inverse.setup.plan_id)
+            .map_err(|_| invalid("Rollback inverse plan cannot be reloaded"))?
+            .ok_or_else(|| invalid("Rollback inverse plan does not exist"))?;
+        self.execute_claimed_rollback(&stored, &inverse_record, &inverse, now_ms, executor)
+    }
 
-        match executor.execute(self.vault, &inverse, &inverse_sealed, now_ms, now_ms) {
+    fn execute_claimed_rollback<E: BridgePlanExecutor>(
+        &mut self,
+        original: &crate::vault::SetupPlanRecord,
+        inverse_record: &crate::vault::SetupPlanRecord,
+        inverse: &NativeTransactionPlan,
+        now_ms: u64,
+        executor: &mut E,
+    ) -> Result<(), ClientError> {
+        match executor.execute(
+            self.vault,
+            inverse,
+            &inverse_record.payload,
+            inverse_record.created_ms,
+            now_ms,
+        ) {
             Ok(()) => self
                 .vault
                 .finish_setup_plan_rollback(
-                    original_plan_id,
-                    &inverse.setup.plan_id,
+                    &original.plan_id,
+                    &inverse_record.plan_id,
                     SetupPlanLifecycle::RolledBack,
                     SetupPlanLifecycle::Applied,
                 )
                 .map_err(|_| conflict("Persisted bridge rollback cannot be finalized")),
             Err(error) => {
-                let (inverse_lifecycle, original_lifecycle) = match error {
+                let (original_lifecycle, inverse_lifecycle) = match error {
                     BridgeExecutionError::Restored(_) => (
-                        SetupPlanLifecycle::ApplyRestored,
                         SetupPlanLifecycle::RollbackRestored,
+                        SetupPlanLifecycle::ApplyRestored,
                     ),
                     BridgeExecutionError::Conflict(_) => {
                         (SetupPlanLifecycle::Conflict, SetupPlanLifecycle::Conflict)
@@ -512,8 +604,8 @@ impl PersistedBridgeInstallService<'_> {
                 };
                 self.vault
                     .finish_setup_plan_rollback(
-                        original_plan_id,
-                        &inverse.setup.plan_id,
+                        &original.plan_id,
+                        &inverse_record.plan_id,
                         original_lifecycle,
                         inverse_lifecycle,
                     )
@@ -523,6 +615,159 @@ impl PersistedBridgeInstallService<'_> {
                 Err(conflict_owned(error.message()))
             }
         }
+    }
+
+    fn reconcile_apply_terminal(
+        &mut self,
+        stored: &crate::vault::SetupPlanRecord,
+    ) -> Result<Option<SetupPlanLifecycle>, ClientError> {
+        let Some(status) = native_terminal_status(self.vault, &stored.plan_id)? else {
+            return Ok(None);
+        };
+        let lifecycle = match status {
+            NativeTransactionStatus::Committed => SetupPlanLifecycle::Applied,
+            NativeTransactionStatus::Restored => SetupPlanLifecycle::ApplyRestored,
+            NativeTransactionStatus::Conflict => SetupPlanLifecycle::Conflict,
+            NativeTransactionStatus::Pending | NativeTransactionStatus::Restoring => {
+                return Err(conflict(
+                    "Bridge apply native transaction recovery is incomplete",
+                ));
+            }
+        };
+        self.vault
+            .finish_setup_plan(&stored.plan_id, lifecycle)
+            .map_err(|_| conflict("Bridge apply lifecycle cannot be reconciled"))?;
+        Ok(Some(lifecycle))
+    }
+
+    fn reconcile_rollback_terminal(
+        &mut self,
+        original: &crate::vault::SetupPlanRecord,
+        inverse: &crate::vault::SetupPlanRecord,
+    ) -> Result<Option<SetupPlanLifecycle>, ClientError> {
+        let Some(status) = native_terminal_status(self.vault, &inverse.plan_id)? else {
+            return Ok(None);
+        };
+        let (original_next, inverse_next) = match status {
+            NativeTransactionStatus::Committed => {
+                (SetupPlanLifecycle::RolledBack, SetupPlanLifecycle::Applied)
+            }
+            NativeTransactionStatus::Restored => (
+                SetupPlanLifecycle::RollbackRestored,
+                SetupPlanLifecycle::ApplyRestored,
+            ),
+            NativeTransactionStatus::Conflict => {
+                (SetupPlanLifecycle::Conflict, SetupPlanLifecycle::Conflict)
+            }
+            NativeTransactionStatus::Pending | NativeTransactionStatus::Restoring => {
+                return Err(conflict(
+                    "Bridge rollback native transaction recovery is incomplete",
+                ));
+            }
+        };
+        self.vault
+            .finish_setup_plan_rollback(
+                &original.plan_id,
+                &inverse.plan_id,
+                original_next,
+                inverse_next,
+            )
+            .map_err(|_| conflict("Bridge rollback lifecycle cannot be reconciled"))?;
+        Ok(Some(original_next))
+    }
+
+    fn validated_inverse_plan(
+        &self,
+        original: &crate::native_transaction::OpenedPlan,
+    ) -> Result<
+        (
+            crate::vault::SetupPlanRecord,
+            crate::native_transaction::OpenedPlan,
+        ),
+        ClientError,
+    > {
+        let inverse_id = rollback_plan_id(&original.plan.setup.plan_id)?;
+        let stored = self
+            .vault
+            .setup_plan(&inverse_id)
+            .map_err(|_| invalid("Rollback inverse plan cannot be loaded"))?
+            .ok_or_else(|| invalid("Rollback inverse plan does not exist"))?;
+        let opened = open_plan(&stored.payload)
+            .map_err(|_| invalid("Rollback inverse plan is malformed or unapproved"))?;
+        let (expected, expected_rollback_states) = inverse_plan(original, stored.created_ms)?;
+        if stored.schema_version != REVERSIBLE_PLAN_SCHEMA_VERSION
+            || stored.schema_version != opened.schema_version
+            || stored.approval_version != 2
+            || stored.approval_hash != opened.plan.setup.batch_hash
+            || stored.plan_id != opened.plan.setup.plan_id
+            || stored.expires_ms != opened.plan.setup.expires_at
+            || stored.lifecycle != SetupPlanLifecycle::Applying
+            || opened.rollback_of_plan_id != Some(original.plan.setup.plan_id)
+            || opened.plan != expected
+            || opened.native_rollback_states != expected_rollback_states
+        {
+            return Err(invalid("Rollback inverse plan binding is invalid"));
+        }
+        Ok((stored, opened))
+    }
+}
+
+fn validated_original_plan(
+    stored: &crate::vault::SetupPlanRecord,
+    plan_id: &PlanId,
+) -> Result<crate::native_transaction::OpenedPlan, ClientError> {
+    let opened = open_plan(&stored.payload)
+        .map_err(|_| invalid("Persisted bridge plan is malformed or unapproved"))?;
+    if stored.schema_version != opened.schema_version
+        || stored.approval_version != 2
+        || stored.approval_hash != opened.plan.setup.batch_hash
+        || stored.plan_id != opened.plan.setup.plan_id
+        || stored.expires_ms != opened.plan.setup.expires_at
+        || &opened.plan.setup.plan_id != plan_id
+        || opened.rollback_of_plan_id.is_some()
+    {
+        return Err(invalid("Persisted bridge plan binding is invalid"));
+    }
+    Ok(opened)
+}
+
+fn native_terminal_status(
+    vault: &Vault,
+    plan_id: &PlanId,
+) -> Result<Option<NativeTransactionStatus>, ClientError> {
+    let snapshot = vault
+        .native_transaction(&native_transaction_id(plan_id))
+        .map_err(|_| invalid("Bridge native transaction cannot be loaded"))?;
+    match snapshot {
+        Some(snapshot) if snapshot.plan_id == *plan_id => Ok(Some(snapshot.status)),
+        Some(_) => Err(invalid("Bridge native transaction plan binding is invalid")),
+        None => Ok(None),
+    }
+}
+
+fn native_transaction_id(plan_id: &PlanId) -> String {
+    format!("bridge-setup-{plan_id}")
+}
+
+fn apply_terminal_result(lifecycle: SetupPlanLifecycle) -> Result<(), ClientError> {
+    match lifecycle {
+        SetupPlanLifecycle::Applied => Ok(()),
+        SetupPlanLifecycle::ApplyRestored => {
+            Err(conflict("Bridge apply failed and restored its prior state"))
+        }
+        SetupPlanLifecycle::Conflict => Err(conflict("Bridge apply ended in conflict")),
+        _ => Err(invalid("Bridge apply terminal lifecycle is invalid")),
+    }
+}
+
+fn rollback_terminal_result(lifecycle: SetupPlanLifecycle) -> Result<(), ClientError> {
+    match lifecycle {
+        SetupPlanLifecycle::RolledBack => Ok(()),
+        SetupPlanLifecycle::RollbackRestored => Err(conflict(
+            "Bridge rollback failed and restored the applied state",
+        )),
+        SetupPlanLifecycle::Conflict => Err(conflict("Bridge rollback ended in conflict")),
+        _ => Err(invalid("Bridge rollback terminal lifecycle is invalid")),
     }
 }
 

@@ -8,8 +8,16 @@ use std::{
 };
 
 use context_relay_core::{
+    native_transaction::{
+        MutationKind as NativeMutationKind, NativeApplyReceipt, NativeObjectToken,
+        NativeTransactionPlan, RestorableStateFingerprint, TransactionStep,
+    },
     search::Embedding384,
-    vault::{DatabaseKeyStore, VaultError},
+    vault::{
+        BeforeImagePolicy, BeforeImageWrite, DatabaseKeyStore, NativePlanWrite,
+        NativeSandboxIdentity, NativeTransactionStatus, NativeWalState, NativeWalWrite, Vault,
+        VaultError,
+    },
 };
 use context_relay_protocol::{
     AccountId, ApplyReceipt, BoundedCiphertext, CandidateId, CandidateState, CheckpointV1,
@@ -108,6 +116,113 @@ impl Drop for TempVault {
 
 pub fn clock(physical_ms: u64) -> HybridLogicalClock {
     HybridLogicalClock::new(physical_ms, 0, ID_9.parse::<DeviceId>().unwrap())
+}
+
+pub fn persist_native_terminal(
+    vault: &mut Vault,
+    plan: &NativeTransactionPlan,
+    sealed_plan: &[u8],
+    created_ms: u64,
+    applied_ms: u64,
+    status: NativeTransactionStatus,
+) {
+    let transaction_id = format!("bridge-setup-{}", plan.setup.plan_id);
+    vault
+        .begin_native_transaction(
+            &transaction_id,
+            NativePlanWrite {
+                plan_id: &plan.setup.plan_id,
+                approval_hash: &plan.setup.batch_hash,
+                payload: sealed_plan,
+                created_ms,
+                expires_ms: plan.setup.expires_at,
+            },
+            NativeSandboxIdentity::Windows {
+                moniker: "context-relay.native.0123456789abcdef0123456789abcdef".to_owned(),
+                sid: b"S-1-15-2-3872518810-2985098273-1912316193-2655983105-1250049442-371239648-1157085541".to_vec(),
+            },
+        )
+        .unwrap();
+    match status {
+        NativeTransactionStatus::Pending => return,
+        NativeTransactionStatus::Restored => {
+            vault.begin_native_recovery(&transaction_id).unwrap();
+            vault
+                .finish_native_recovery(&transaction_id, false)
+                .unwrap();
+        }
+        NativeTransactionStatus::Conflict => {
+            let before_id = format!("bridge-conflict-{}", plan.setup.plan_id);
+            vault
+                .put_before_images_batch(
+                    &[BeforeImageWrite {
+                        id: &before_id,
+                        plan_id: Some(&plan.setup.plan_id),
+                        payload: b"before",
+                        created_ms,
+                    }],
+                    BeforeImagePolicy::new(1024, 100),
+                )
+                .unwrap();
+            let target = WireNativeValue {
+                platform: NativePlatform::Macos,
+                bytes: b"/fixture/conflict".to_vec(),
+                display: None,
+            };
+            let token = NativeObjectToken {
+                volume: vec![1],
+                object: vec![2],
+                topology: vec![3],
+            };
+            let expected = RestorableStateFingerprint(Sha256Digest([1; 32]));
+            let applied = RestorableStateFingerprint(Sha256Digest([2; 32]));
+            vault
+                .prepare_native_wal(
+                    &transaction_id,
+                    &NativeWalWrite {
+                        target_sequence: 0,
+                        target: &target,
+                        object_token: &token,
+                        before_image_id: &before_id,
+                        operation_kind: NativeMutationKind::Payload,
+                        expected: &expected,
+                        intended_applied: &applied,
+                        intended_restored: &expected,
+                    },
+                )
+                .unwrap();
+            vault
+                .transition_native_wal(&transaction_id, 0, NativeWalState::Conflict)
+                .unwrap();
+            vault.begin_native_recovery(&transaction_id).unwrap();
+            vault.finish_native_recovery(&transaction_id, true).unwrap();
+        }
+        NativeTransactionStatus::Committed => {
+            for step in &TransactionStep::ORDER[..18] {
+                vault.enter_native_step(&transaction_id, *step).unwrap();
+                vault.complete_native_step(&transaction_id, *step).unwrap();
+            }
+            vault
+                .enter_native_step(&transaction_id, TransactionStep::CommitOwnershipAndReceipt)
+                .unwrap();
+            vault
+                .commit_native_success(
+                    &transaction_id,
+                    &NativeApplyReceipt {
+                        legacy: ApplyReceipt {
+                            plan_id: plan.setup.plan_id,
+                            applied_hlc: clock(applied_ms),
+                            resulting_digests: vec![],
+                        },
+                        targets: vec![],
+                    },
+                    &[],
+                )
+                .unwrap();
+        }
+        NativeTransactionStatus::Restoring => unreachable!(),
+    }
+    vault.finish_native_cleanup(&transaction_id).unwrap();
 }
 
 pub fn provenance() -> Provenance {

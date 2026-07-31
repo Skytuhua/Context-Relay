@@ -2709,6 +2709,32 @@ impl Vault {
         load_setup_plan(&self.connection, plan_id)
     }
 
+    pub fn incomplete_setup_plans(&self) -> Result<Vec<SetupPlanRecord>, VaultError> {
+        let plan_ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT plan_id FROM setup_plan_lifecycle
+                 WHERE state IN ('applying', 'rolling_back')
+                 ORDER BY updated_ms, plan_id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        plan_ids
+            .into_iter()
+            .map(|plan_id| {
+                let plan_id = plan_id.parse::<PlanId>().map_err(|_| {
+                    VaultError::Validation("setup plan identifier is invalid".to_owned())
+                })?;
+                load_setup_plan(&self.connection, &plan_id)?.ok_or_else(|| {
+                    VaultError::Validation(
+                        "incomplete setup plan disappeared during query".to_owned(),
+                    )
+                })
+            })
+            .collect()
+    }
+
     pub fn claim_setup_plan(
         &mut self,
         plan_id: &PlanId,

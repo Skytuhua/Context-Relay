@@ -1,6 +1,6 @@
 mod support;
 
-use std::str::FromStr;
+use std::{cell::RefCell, panic::AssertUnwindSafe, rc::Rc, str::FromStr};
 
 use context_relay_core::{
     native_transaction::{
@@ -9,7 +9,7 @@ use context_relay_core::{
         open_plan, seal_plan, seal_reversible_plan,
     },
     setup::{BridgeExecutionError, BridgeInstallService, BridgePlanExecutor},
-    vault::{SetupPlanLifecycle, SetupPlanWrite, Vault},
+    vault::{NativeTransactionStatus, SetupPlanLifecycle, SetupPlanWrite, Vault},
 };
 use context_relay_native_runner::{
     NativeState, RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand,
@@ -21,7 +21,7 @@ use context_relay_protocol::{
 };
 use sha2::{Digest as _, Sha256};
 
-use support::{ID_1, MemoryKeyStore, TempVault};
+use support::{ID_1, MemoryKeyStore, TempVault, persist_native_terminal};
 
 const NOW_MS: u64 = 1_900_000_000_000;
 
@@ -47,6 +47,28 @@ impl BridgePlanExecutor for RecordingExecutor {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+}
+
+struct CrashRollback {
+    status: Option<NativeTransactionStatus>,
+    inverse_id: Rc<RefCell<Option<PlanId>>>,
+}
+
+impl BridgePlanExecutor for CrashRollback {
+    fn execute(
+        &mut self,
+        vault: &mut Vault,
+        plan: &NativeTransactionPlan,
+        sealed_plan: &[u8],
+        created_ms: u64,
+        _now_ms: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        *self.inverse_id.borrow_mut() = Some(plan.setup.plan_id);
+        if let Some(status) = self.status {
+            persist_native_terminal(vault, plan, sealed_plan, created_ms, NOW_MS + 2, status);
+        }
+        panic!("simulated process exit after inverse native transaction")
     }
 }
 
@@ -418,5 +440,234 @@ fn rollback_rejects_the_wrong_lifecycle_before_persisting_or_executing_an_invers
             .unwrap()
             .lifecycle,
         SetupPlanLifecycle::Previewed
+    );
+}
+
+#[test]
+fn rollback_reconciles_the_inverse_native_terminal_without_reexecuting() {
+    let keys = MemoryKeyStore::default();
+    for (name, terminal, original_lifecycle, inverse_lifecycle, succeeds) in [
+        (
+            "bridge-setup-rollback-reconcile-committed",
+            NativeTransactionStatus::Committed,
+            SetupPlanLifecycle::RolledBack,
+            SetupPlanLifecycle::Applied,
+            true,
+        ),
+        (
+            "bridge-setup-rollback-reconcile-restored",
+            NativeTransactionStatus::Restored,
+            SetupPlanLifecycle::RollbackRestored,
+            SetupPlanLifecycle::ApplyRestored,
+            false,
+        ),
+        (
+            "bridge-setup-rollback-reconcile-conflict",
+            NativeTransactionStatus::Conflict,
+            SetupPlanLifecycle::Conflict,
+            SetupPlanLifecycle::Conflict,
+            false,
+        ),
+    ] {
+        let path = TempVault::new(name);
+        let mut vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
+        let original = persist(&mut vault, plan());
+        BridgeInstallService::persisted(&mut vault)
+            .apply(
+                &original.setup.plan_id,
+                NOW_MS + 1,
+                &mut RecordingExecutor::default(),
+            )
+            .unwrap();
+        let inverse_id = Rc::new(RefCell::new(None));
+        let crashed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = BridgeInstallService::persisted(&mut vault).rollback(
+                &original.setup.plan_id,
+                NOW_MS + 2,
+                &mut CrashRollback {
+                    status: Some(terminal),
+                    inverse_id: inverse_id.clone(),
+                },
+            );
+        }));
+        assert!(crashed.is_err());
+        let inverse_id = inverse_id.borrow().unwrap();
+        assert_eq!(
+            vault
+                .setup_plan(&original.setup.plan_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            SetupPlanLifecycle::RollingBack
+        );
+        assert_eq!(
+            vault.setup_plan(&inverse_id).unwrap().unwrap().lifecycle,
+            SetupPlanLifecycle::Applying
+        );
+        let mut executor = RecordingExecutor::default();
+
+        let result = BridgeInstallService::persisted(&mut vault).rollback(
+            &original.setup.plan_id,
+            NOW_MS + 3,
+            &mut executor,
+        );
+
+        assert_eq!(result.is_ok(), succeeds, "{name}");
+        assert!(executor.calls.is_empty(), "{name}: must not re-execute");
+        assert_eq!(
+            vault
+                .setup_plan(&original.setup.plan_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            original_lifecycle,
+            "{name}"
+        );
+        assert_eq!(
+            vault.setup_plan(&inverse_id).unwrap().unwrap().lifecycle,
+            inverse_lifecycle,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn rollback_does_not_reexecute_a_pending_inverse_native_outcome() {
+    let keys = MemoryKeyStore::default();
+    let path = TempVault::new("bridge-setup-rollback-pending-inverse");
+    let mut vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
+    let original = persist(&mut vault, plan());
+    BridgeInstallService::persisted(&mut vault)
+        .apply(
+            &original.setup.plan_id,
+            NOW_MS + 1,
+            &mut RecordingExecutor::default(),
+        )
+        .unwrap();
+    let inverse_id = Rc::new(RefCell::new(None));
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ = BridgeInstallService::persisted(&mut vault).rollback(
+            &original.setup.plan_id,
+            NOW_MS + 2,
+            &mut CrashRollback {
+                status: Some(NativeTransactionStatus::Pending),
+                inverse_id: inverse_id.clone(),
+            },
+        );
+    }));
+    let inverse_id = inverse_id.borrow().unwrap();
+    let mut executor = RecordingExecutor::default();
+
+    assert!(
+        BridgeInstallService::persisted(&mut vault)
+            .rollback(&original.setup.plan_id, NOW_MS + 3, &mut executor)
+            .is_err()
+    );
+    assert!(executor.calls.is_empty());
+    assert_eq!(
+        vault
+            .setup_plan(&original.setup.plan_id)
+            .unwrap()
+            .unwrap()
+            .lifecycle,
+        SetupPlanLifecycle::RollingBack
+    );
+    assert_eq!(
+        vault.setup_plan(&inverse_id).unwrap().unwrap().lifecycle,
+        SetupPlanLifecycle::Applying
+    );
+}
+
+#[test]
+fn rollback_resumes_a_claimed_inverse_when_its_native_transaction_is_missing() {
+    let keys = MemoryKeyStore::default();
+    let path = TempVault::new("bridge-setup-rollback-missing-inverse");
+    let mut vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
+    let original = persist(&mut vault, plan());
+    BridgeInstallService::persisted(&mut vault)
+        .apply(
+            &original.setup.plan_id,
+            NOW_MS + 1,
+            &mut RecordingExecutor::default(),
+        )
+        .unwrap();
+    let inverse_id = Rc::new(RefCell::new(None));
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ = BridgeInstallService::persisted(&mut vault).rollback(
+            &original.setup.plan_id,
+            NOW_MS + 2,
+            &mut CrashRollback {
+                status: None,
+                inverse_id: inverse_id.clone(),
+            },
+        );
+    }));
+    let inverse_id = inverse_id.borrow().unwrap();
+    let mut executor = RecordingExecutor::default();
+
+    BridgeInstallService::persisted(&mut vault)
+        .rollback(&original.setup.plan_id, NOW_MS + 3, &mut executor)
+        .unwrap();
+    assert_eq!(executor.calls.len(), 1);
+    assert_eq!(
+        vault
+            .setup_plan(&original.setup.plan_id)
+            .unwrap()
+            .unwrap()
+            .lifecycle,
+        SetupPlanLifecycle::RolledBack
+    );
+    assert_eq!(
+        vault.setup_plan(&inverse_id).unwrap().unwrap().lifecycle,
+        SetupPlanLifecycle::Applied
+    );
+}
+
+#[test]
+fn startup_reconciliation_finalizes_a_terminal_original_and_inverse_pair() {
+    let keys = MemoryKeyStore::default();
+    let path = TempVault::new("bridge-setup-rollback-startup-reconcile");
+    let mut vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
+    let original = persist(&mut vault, plan());
+    BridgeInstallService::persisted(&mut vault)
+        .apply(
+            &original.setup.plan_id,
+            NOW_MS + 1,
+            &mut RecordingExecutor::default(),
+        )
+        .unwrap();
+    let inverse_id = Rc::new(RefCell::new(None));
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ = BridgeInstallService::persisted(&mut vault).rollback(
+            &original.setup.plan_id,
+            NOW_MS + 2,
+            &mut CrashRollback {
+                status: Some(NativeTransactionStatus::Committed),
+                inverse_id: inverse_id.clone(),
+            },
+        );
+    }));
+    let inverse_id = inverse_id.borrow().unwrap();
+
+    BridgeInstallService::persisted(&mut vault)
+        .reconcile_after_native_recovery()
+        .unwrap();
+    let mut executor = RecordingExecutor::default();
+    BridgeInstallService::persisted(&mut vault)
+        .rollback(&original.setup.plan_id, NOW_MS + 3, &mut executor)
+        .unwrap();
+
+    assert!(executor.calls.is_empty());
+    assert_eq!(
+        vault
+            .setup_plan(&original.setup.plan_id)
+            .unwrap()
+            .unwrap()
+            .lifecycle,
+        SetupPlanLifecycle::RolledBack
+    );
+    assert_eq!(
+        vault.setup_plan(&inverse_id).unwrap().unwrap().lifecycle,
+        SetupPlanLifecycle::Applied
     );
 }
