@@ -1735,6 +1735,7 @@ impl VerifiedClaudeExecutable {
 
 struct PreparedClaudeLaunch {
     program: PathBuf,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     expected_hash: Sha256Digest,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     descriptor: fs::File,
@@ -1936,7 +1937,6 @@ fn prepare_staged_claude_launch(
     })?;
     Ok(PreparedClaudeLaunch {
         program: path,
-        expected_hash: executable.expected_hash,
         _directory: directory,
         executable: staged,
     })
