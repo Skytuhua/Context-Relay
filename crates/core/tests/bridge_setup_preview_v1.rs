@@ -309,6 +309,48 @@ fn preview_runs_the_adapter_path_derives_active_and_persists_the_sealed_v2_plan(
 }
 
 #[test]
+fn preview_rejects_a_forged_locator_digest_before_probing_or_persisting() {
+    let root = tempfile::tempdir().unwrap();
+    let bridge_path = root.path().join("context-relay-context-mcp");
+    bridge(&bridge_path);
+    let vault_path = TempVault::new("bridge-preview-forged-locator");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "bridge-preview-v1", &keys).unwrap();
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    let forged_locator = FixtureBridgeLocator {
+        bridge: BridgeExecutable {
+            path: bridge_path,
+            digest: Sha256Digest([0; 32]),
+        },
+        resolutions: Rc::new(Cell::new(0)),
+    };
+    let harness = Harness {
+        calls: calls.clone(),
+        executable: native_text("/fixture/codex"),
+        existing: None,
+    };
+
+    let error = service(&mut vault, harness, forged_locator)
+        .preview(None, NOW_MS)
+        .unwrap_err();
+
+    assert_eq!(error.code, context_relay_protocol::ErrorCode::Conflict);
+    let calls = calls.borrow();
+    assert_eq!(calls.probe, 0);
+    assert_eq!(calls.import, 0);
+    assert_eq!(calls.render, 0);
+    assert_eq!(calls.classify, 0);
+    assert_eq!(calls.cli, 0);
+    assert_eq!(calls.config_writes, 0);
+    assert!(
+        vault
+            .setup_plan(&PlanId::from_str(ID_1).unwrap())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn preview_rejects_a_conflicting_prior_declaration_without_persisting_or_writing() {
     let root = tempfile::tempdir().unwrap();
     let bridge_path = root.path().join("context-relay-context-mcp");

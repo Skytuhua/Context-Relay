@@ -18,8 +18,8 @@ use crate::{
     codex::CodexAdapter,
     hermes::HermesAdapter,
     mcp::install::{
-        BRIDGE_SERVER_NAME, bridge_component_for_attested, is_canonical_bridge_body,
-        is_managed_bridge_component,
+        BRIDGE_SERVER_NAME, attest_bridge_executable, bridge_component_for_attested,
+        is_canonical_bridge_body, is_managed_bridge_component,
     },
     native_transaction::{
         ApprovedCliMutation, ApprovedMutation, NativeTransactionPlan, SidecarBinding,
@@ -43,11 +43,11 @@ pub struct BridgeMutationPlan {
     pub native: Vec<ApprovedMutation>,
 }
 
-/// Resolves the bridge identity owned by the service composition layer.
+/// Locates the bridge executable selected by the service composition layer.
 ///
-/// Preview never accepts an executable path. Production composition supplies a
-/// locator for the installed bridge, while tests can inject a fixed attested
-/// identity through this boundary.
+/// Production composition supplies a locator for the installed bridge, while
+/// tests can inject a fixed identity through this boundary. Preview re-attests
+/// the returned path before using that identity.
 pub trait BridgeLocator {
     fn locate(&self) -> Result<crate::mcp::install::BridgeExecutable, ClientError>;
 }
@@ -167,7 +167,13 @@ where
         registered_project: Option<&RegisteredProject>,
         now_ms: u64,
     ) -> Result<SetupPlan, ClientError> {
-        let bridge = self.bridge_locator.locate()?;
+        let located_bridge = self.bridge_locator.locate()?;
+        let bridge = attest_bridge_executable(&located_bridge.path)?;
+        if bridge != located_bridge {
+            return Err(conflict(
+                "Bridge locator returned an unattested executable identity",
+            ));
+        }
         let harness = self.harness.bridge_harness();
         let report = self.harness.probe(&ProbeContext {
             harness,
