@@ -19,7 +19,7 @@ use crate::{
     hermes::HermesAdapter,
     mcp::install::{
         BRIDGE_SERVER_NAME, attest_bridge_executable, bridge_component_for_attested,
-        is_canonical_bridge_body, is_managed_bridge_component,
+        is_canonical_bridge_body,
     },
     native_transaction::{
         ApprovedCliMutation, ApprovedMutation, NativeTransactionPlan,
@@ -949,11 +949,26 @@ where
         })?;
         let intended =
             bridge_component_for_attested(harness, &bridge, self.origin_device, self.observed_hlc)?;
+        let desired = DesiredState {
+            components: vec![intended.clone()],
+            scopes: vec![NativeScope::Global],
+        };
+        // CLI harnesses capture their authoritative prior declaration here.
+        // Hermes instead classifies its imported native projection first.
+        let captured_mutations = match harness {
+            HarnessId::ClaudeCode | HarnessId::Codex => {
+                Some(self.harness.bridge_mutations(&desired, &intended)?)
+            }
+            HarnessId::Hermes => None,
+        };
         let change = bridge_change(
             harness,
             report.active_profile.as_deref(),
             &imported.components,
             &intended,
+            captured_mutations
+                .as_ref()
+                .and_then(|mutations| mutations.cli.as_ref()),
         )?;
         let semantic_diff = SemanticDiff {
             changes: change.into_iter().collect(),
@@ -962,10 +977,6 @@ where
 
         // These calls are intentionally kept in preview even though the exact
         // CLI mutation below is the authority for rollback argv.
-        let desired = DesiredState {
-            components: vec![intended.clone()],
-            scopes: vec![NativeScope::Global],
-        };
         let _rendered = self.harness.render(&desired)?;
         let classified = self.harness.classify(&semantic_diff)?;
         let adapter_operations = self.harness.plan_cli_ops(&classified)?.0;
@@ -975,7 +986,10 @@ where
                 native: vec![],
             }
         } else {
-            self.harness.bridge_mutations(&desired, &intended)?
+            match captured_mutations {
+                Some(mutations) => mutations,
+                None => self.harness.bridge_mutations(&desired, &intended)?,
+            }
         };
         let cli_mutation = mutations.cli;
         if adapter_operations
@@ -1108,37 +1122,63 @@ fn bridge_change(
     profile: Option<&str>,
     imported: &[ComponentRecord],
     intended: &ComponentRecord,
+    cli_mutation: Option<&ApprovedCliMutation>,
 ) -> Result<Option<ClassifiedChange>, ClientError> {
+    let class = match harness {
+        HarnessId::ClaudeCode | HarnessId::Codex => bridge_cli_change(cli_mutation, intended)?,
+        HarnessId::Hermes => bridge_hermes_change(profile, imported, intended)?,
+    };
+    let target = match harness {
+        HarnessId::ClaudeCode => format!("claude-mcp:global:{BRIDGE_SERVER_NAME}"),
+        HarnessId::Codex => format!("codex-mcp|global|{BRIDGE_SERVER_NAME}"),
+        HarnessId::Hermes => format!(
+            "hermes-config|{}|mcp_servers.{BRIDGE_SERVER_NAME}",
+            profile.ok_or_else(|| invalid("Hermes profile is unavailable"))?
+        ),
+    };
+    Ok(class.map(|class| ClassifiedChange {
+        class,
+        target,
+        summary: intended.body_markdown.clone(),
+    }))
+}
+
+fn bridge_cli_change(
+    cli_mutation: Option<&ApprovedCliMutation>,
+    intended: &ComponentRecord,
+) -> Result<Option<ChangeClass>, ClientError> {
+    let mutation = cli_mutation
+        .ok_or_else(|| invalid("CLI bridge preview is missing its authoritative declaration"))?;
+    Ok(match &mutation.expected {
+        None => Some(ChangeClass::Create),
+        Some(previous) if previous.canonical_body == intended.body_markdown => None,
+        Some(_) => Some(ChangeClass::Update),
+    })
+}
+
+fn bridge_hermes_change(
+    profile: Option<&str>,
+    imported: &[ComponentRecord],
+    intended: &ComponentRecord,
+) -> Result<Option<ChangeClass>, ClientError> {
     let same_name = imported.iter().find(|component| {
         component.kind == ComponentKind::McpServer
             && component.scope == ScopeRef::Global
             && component.name == BRIDGE_SERVER_NAME
     });
-    let class = match same_name {
-        None => ChangeClass::Create,
-        Some(component)
-            if !is_managed_bridge_component(harness, component)
-                && !is_imported_hermes_bridge(profile, component) =>
-        {
+    match same_name {
+        None => Ok(Some(ChangeClass::Create)),
+        Some(component) if !is_imported_hermes_bridge(profile, component) => {
             return Err(conflict(
                 "An unmanaged context-relay MCP declaration already exists",
             ));
         }
-        Some(component) if component.body_markdown == intended.body_markdown => return Ok(None),
-        Some(_) => ChangeClass::Update,
-    };
-    Ok(Some(ClassifiedChange {
-        class,
-        target: match harness {
-            HarnessId::ClaudeCode => format!("claude-mcp:global:{BRIDGE_SERVER_NAME}"),
-            HarnessId::Codex => format!("codex-mcp|global|{BRIDGE_SERVER_NAME}"),
-            HarnessId::Hermes => format!(
-                "hermes-config|{}|mcp_servers.{BRIDGE_SERVER_NAME}",
-                profile.ok_or_else(|| invalid("Hermes profile is unavailable"))?
-            ),
-        },
-        summary: intended.body_markdown.clone(),
-    }))
+        Some(component) if component.body_markdown == intended.body_markdown => Ok(None),
+        Some(component) if is_disabled_hermes_intended_bridge(component, intended) => {
+            Ok(Some(ChangeClass::Enable))
+        }
+        Some(_) => Ok(Some(ChangeClass::Update)),
+    }
 }
 
 fn is_imported_hermes_bridge(profile: Option<&str>, component: &ComponentRecord) -> bool {
@@ -1148,16 +1188,35 @@ fn is_imported_hermes_bridge(profile: Option<&str>, component: &ComponentRecord)
     component.scope == ScopeRef::Global
         && component.kind == ComponentKind::McpServer
         && component.name == BRIDGE_SERVER_NAME
-        && !component.archived
         && component.provenance.harness == Some(HarnessId::Hermes)
         && component.provenance.source.is_none()
         && component.metadata.len() == 4
-        && metadata_value(component, "enabled") == Some("true")
+        && metadata_value(component, "enabled")
+            == Some(if component.archived { "false" } else { "true" })
         && metadata_value(component, "nativeFormat") == Some("json")
         && metadata_value(component, "profile") == Some(profile)
         && metadata_value(component, "structuralLocation")
             == Some("config:mcp_servers.context-relay")
-        && is_canonical_bridge_body(HarnessId::Hermes, &component.body_markdown, false)
+        && is_canonical_bridge_body(HarnessId::Hermes, &component.body_markdown, true)
+}
+
+fn is_disabled_hermes_intended_bridge(
+    component: &ComponentRecord,
+    intended: &ComponentRecord,
+) -> bool {
+    if !component.archived {
+        return false;
+    }
+    let Ok(mut body) = serde_json::from_str::<serde_json::Value>(&component.body_markdown) else {
+        return false;
+    };
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    if object.remove("enabled") != Some(serde_json::Value::Bool(false)) {
+        return false;
+    }
+    serde_json::to_string(&body).is_ok_and(|body| body == intended.body_markdown)
 }
 
 fn metadata_value<'a>(component: &'a ComponentRecord, key: &str) -> Option<&'a str> {

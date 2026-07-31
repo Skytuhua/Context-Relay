@@ -44,6 +44,8 @@ struct Harness {
     calls: Rc<RefCell<Calls>>,
     executable: WireNativeValue,
     existing: Option<ComponentRecord>,
+    prior_declaration: Option<CanonicalCliDeclaration>,
+    reject_prior_declaration: bool,
 }
 
 #[derive(Clone)]
@@ -78,18 +80,42 @@ impl Harness {
         };
         ApprovedCliMutation {
             stable_id: intended.id.to_string(),
-            expected: None,
+            expected: self.prior_declaration.clone(),
             intended: Some(declaration),
             forward: vec![operation.clone()],
-            rollback: vec![CliOperation {
-                executable: self.executable.clone(),
-                arguments: ["mcp", "remove", BRIDGE_SERVER_NAME]
+            rollback: vec![match &self.prior_declaration {
+                Some(declaration) => CliOperation {
+                    executable: self.executable.clone(),
+                    arguments: [
+                        "mcp",
+                        "add",
+                        BRIDGE_SERVER_NAME,
+                        &declaration.canonical_body,
+                    ]
                     .into_iter()
                     .map(native_text)
                     .collect(),
-                timeout_ms: 30_000,
+                    timeout_ms: 30_000,
+                },
+                None => CliOperation {
+                    executable: self.executable.clone(),
+                    arguments: ["mcp", "remove", BRIDGE_SERVER_NAME]
+                        .into_iter()
+                        .map(native_text)
+                        .collect(),
+                    timeout_ms: 30_000,
+                },
             }],
         }
+    }
+}
+
+fn declaration(body: String) -> CanonicalCliDeclaration {
+    CanonicalCliDeclaration {
+        harness: HarnessId::Codex,
+        server_name: BRIDGE_SERVER_NAME.to_owned(),
+        fingerprint: Sha256Digest(Sha256::digest(body.as_bytes()).into()),
+        canonical_body: body,
     }
 }
 
@@ -134,23 +160,25 @@ impl HarnessAdapter for Harness {
 
     fn classify(&self, diff: &SemanticDiff) -> Result<ClassifiedChanges, ClientError> {
         assert_eq!(diff.conflicts, Vec::<String>::new());
-        assert_eq!(diff.changes.len(), 1);
-        assert_eq!(diff.changes[0].class, ChangeClass::Create);
-        assert_eq!(diff.changes[0].target, "codex-mcp|global|context-relay");
         self.calls.borrow_mut().classify += 1;
         Ok(ClassifiedChanges(diff.changes.clone()))
     }
 
-    fn plan_cli_ops(&self, _: &ClassifiedChanges) -> Result<CliOperations, ClientError> {
+    fn plan_cli_ops(&self, classified: &ClassifiedChanges) -> Result<CliOperations, ClientError> {
         self.calls.borrow_mut().cli += 1;
-        Ok(CliOperations(vec![CliOperation {
-            executable: self.executable.clone(),
-            arguments: ["mcp", "add", BRIDGE_SERVER_NAME]
+        Ok(CliOperations(
+            (!classified.0.is_empty())
+                .then(|| CliOperation {
+                    executable: self.executable.clone(),
+                    arguments: ["mcp", "add", BRIDGE_SERVER_NAME]
+                        .into_iter()
+                        .map(native_text)
+                        .collect(),
+                    timeout_ms: 30_000,
+                })
                 .into_iter()
-                .map(native_text)
                 .collect(),
-            timeout_ms: 30_000,
-        }]))
+        ))
     }
 
     fn validate_effective(
@@ -171,6 +199,14 @@ impl BridgePreviewHarness for Harness {
         _: &DesiredState,
         intended: &ComponentRecord,
     ) -> Result<BridgeMutationPlan, ClientError> {
+        if self.reject_prior_declaration {
+            return Err(ClientError {
+                code: context_relay_protocol::ErrorCode::Conflict,
+                message: "Codex prior MCP declaration is unmanaged".to_owned(),
+                field_path: None,
+                retryable: false,
+            });
+        }
         Ok(BridgeMutationPlan {
             cli: Some(self.bridge_mutation(intended)),
             native: vec![],
@@ -268,6 +304,8 @@ fn preview_runs_the_adapter_path_derives_active_and_persists_the_sealed_v2_plan(
         calls: calls.clone(),
         executable: native_text("/fixture/codex"),
         existing: None,
+        prior_declaration: None,
+        reject_prior_declaration: false,
     };
 
     let bridge_locator = locator(&bridge_path);
@@ -328,6 +366,8 @@ fn preview_rejects_a_forged_locator_digest_before_probing_or_persisting() {
         calls: calls.clone(),
         executable: native_text("/fixture/codex"),
         existing: None,
+        prior_declaration: None,
+        reject_prior_declaration: false,
     };
 
     let error = service(&mut vault, harness, forged_locator)
@@ -372,6 +412,8 @@ fn preview_rejects_a_conflicting_prior_declaration_without_persisting_or_writing
         calls: calls.clone(),
         executable: native_text("/fixture/codex"),
         existing: Some(conflicting),
+        prior_declaration: None,
+        reject_prior_declaration: true,
     };
 
     let error = service(&mut vault, harness, locator(&bridge_path))
@@ -385,6 +427,125 @@ fn preview_rejects_a_conflicting_prior_declaration_without_persisting_or_writing
             .setup_plan(&PlanId::from_str(ID_1).unwrap())
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn preview_uses_the_authoritative_cli_absence_over_an_imported_exact_bridge() {
+    let root = tempfile::tempdir().unwrap();
+    let bridge_path = root.path().join("context-relay-context-mcp");
+    bridge(&bridge_path);
+    let vault_path = TempVault::new("bridge-preview-authoritative-absence");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "bridge-preview-v1", &keys).unwrap();
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    let imported_exact = bridge_component(
+        HarnessId::Codex,
+        &bridge_path,
+        ID_1.parse().unwrap(),
+        clock(NOW_MS),
+    )
+    .unwrap();
+
+    let setup = service(
+        &mut vault,
+        Harness {
+            calls,
+            executable: native_text("/fixture/codex"),
+            existing: Some(imported_exact),
+            prior_declaration: None,
+            reject_prior_declaration: false,
+        },
+        locator(&bridge_path),
+    )
+    .preview(None, NOW_MS)
+    .unwrap();
+
+    assert_eq!(setup.approval_class, ApprovalClass::Active);
+    assert_eq!(setup.semantic_changes[0].class, ChangeClass::Create);
+}
+
+#[test]
+fn preview_keeps_an_authoritatively_exact_cli_bridge_passive_without_mutations() {
+    let root = tempfile::tempdir().unwrap();
+    let bridge_path = root.path().join("context-relay-context-mcp");
+    bridge(&bridge_path);
+    let vault_path = TempVault::new("bridge-preview-authoritative-exact");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "bridge-preview-v1", &keys).unwrap();
+    let exact = bridge_component(
+        HarnessId::Codex,
+        &bridge_path,
+        ID_1.parse().unwrap(),
+        clock(NOW_MS),
+    )
+    .unwrap();
+
+    let setup = service(
+        &mut vault,
+        Harness {
+            calls: Rc::new(RefCell::new(Calls::default())),
+            executable: native_text("/fixture/codex"),
+            existing: None,
+            prior_declaration: Some(declaration(exact.body_markdown)),
+            reject_prior_declaration: false,
+        },
+        locator(&bridge_path),
+    )
+    .preview(None, NOW_MS)
+    .unwrap();
+
+    assert_eq!(setup.approval_class, ApprovalClass::Passive);
+    assert!(setup.semantic_changes.is_empty());
+    assert!(setup.cli_operations.is_empty());
+    let stored = vault.setup_plan(&setup.plan_id).unwrap().unwrap();
+    let sealed: serde_json::Value = serde_json::from_slice(&stored.payload).unwrap();
+    assert_eq!(sealed["nativePlan"]["cliMutations"], serde_json::json!([]));
+}
+
+#[test]
+fn preview_binds_an_authoritatively_changed_cli_bridge_to_update_and_exact_rollback() {
+    let root = tempfile::tempdir().unwrap();
+    let bridge_path = root.path().join("context-relay-context-mcp");
+    let previous_bridge_path = root.path().join("previous-context-mcp");
+    bridge(&bridge_path);
+    bridge(&previous_bridge_path);
+    let vault_path = TempVault::new("bridge-preview-authoritative-update");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "bridge-preview-v1", &keys).unwrap();
+    let previous = bridge_component(
+        HarnessId::Codex,
+        &previous_bridge_path,
+        ID_1.parse().unwrap(),
+        clock(NOW_MS),
+    )
+    .unwrap();
+
+    let setup = service(
+        &mut vault,
+        Harness {
+            calls: Rc::new(RefCell::new(Calls::default())),
+            executable: native_text("/fixture/codex"),
+            existing: None,
+            prior_declaration: Some(declaration(previous.body_markdown.clone())),
+            reject_prior_declaration: false,
+        },
+        locator(&bridge_path),
+    )
+    .preview(None, NOW_MS)
+    .unwrap();
+
+    assert_eq!(setup.approval_class, ApprovalClass::Active);
+    assert_eq!(setup.semantic_changes[0].class, ChangeClass::Update);
+    let stored = vault.setup_plan(&setup.plan_id).unwrap().unwrap();
+    let sealed: serde_json::Value = serde_json::from_slice(&stored.payload).unwrap();
+    assert_eq!(
+        sealed["nativePlan"]["cliMutations"][0]["expected"]["canonicalBody"],
+        previous.body_markdown
+    );
+    assert_eq!(
+        sealed["nativePlan"]["cliMutations"][0]["rollback"][0]["arguments"][3]["display"],
+        previous.body_markdown
     );
 }
 
@@ -403,6 +564,8 @@ fn preview_replays_identical_sealed_bytes_and_the_persisted_plan_expires() {
             calls: Rc::new(RefCell::new(Calls::default())),
             executable: native_text("/fixture/codex"),
             existing: None,
+            prior_declaration: None,
+            reject_prior_declaration: false,
         },
         locator(&bridge_path),
     )
@@ -416,6 +579,8 @@ fn preview_replays_identical_sealed_bytes_and_the_persisted_plan_expires() {
             calls: Rc::new(RefCell::new(Calls::default())),
             executable: native_text("/fixture/codex"),
             existing: None,
+            prior_declaration: None,
+            reject_prior_declaration: false,
         },
         locator(&bridge_path),
     )
@@ -506,6 +671,84 @@ fn preview_accepts_an_existing_exact_hermes_bridge_projection() {
 
     assert_eq!(setup.harness, HarnessId::Hermes);
     assert_eq!(setup.approval_class, ApprovalClass::Passive);
+    assert!(setup.cli_operations.is_empty());
+    assert_eq!(fs::read(config_path).unwrap(), config.as_bytes());
+}
+
+#[test]
+fn preview_enables_an_existing_exact_disabled_hermes_bridge_projection() {
+    let root = tempfile::tempdir().unwrap();
+    let bridge_path = root.path().join("context-relay-context-mcp");
+    bridge(&bridge_path);
+    let bridge = bridge_component(
+        HarnessId::Hermes,
+        &bridge_path,
+        ID_1.parse().unwrap(),
+        clock(NOW_MS),
+    )
+    .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&bridge.body_markdown).unwrap();
+    let command = body["command"].as_str().unwrap();
+    let config = format!(
+        "mcp_servers:\n  context-relay:\n    args:\n      - --harness\n      - hermes\n    command: {command}\n    enabled: false\n"
+    );
+    let (adapter, config_path) = hermes_adapter(root.path(), config.as_bytes());
+    let vault_path = TempVault::new("bridge-preview-hermes-disabled");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "bridge-preview-v1", &keys).unwrap();
+
+    let setup = BridgeInstallService::new(
+        &mut vault,
+        adapter,
+        locator(&bridge_path),
+        ID_1.parse().unwrap(),
+        clock(NOW_MS),
+    )
+    .preview(None, NOW_MS)
+    .unwrap();
+
+    assert_eq!(setup.approval_class, ApprovalClass::Active);
+    assert_eq!(setup.semantic_changes[0].class, ChangeClass::Enable);
+    assert!(setup.cli_operations.is_empty());
+    assert_eq!(fs::read(config_path).unwrap(), config.as_bytes());
+}
+
+#[test]
+fn preview_updates_a_changed_managed_active_hermes_bridge_projection() {
+    let root = tempfile::tempdir().unwrap();
+    let bridge_path = root.path().join("context-relay-context-mcp");
+    let previous_bridge_path = root.path().join("previous-context-mcp");
+    bridge(&bridge_path);
+    bridge(&previous_bridge_path);
+    let bridge = bridge_component(
+        HarnessId::Hermes,
+        &previous_bridge_path,
+        ID_1.parse().unwrap(),
+        clock(NOW_MS),
+    )
+    .unwrap();
+    let body: serde_json::Value = serde_json::from_str(&bridge.body_markdown).unwrap();
+    let command = body["command"].as_str().unwrap();
+    let config = format!(
+        "mcp_servers:\n  context-relay:\n    args:\n      - --harness\n      - hermes\n    command: {command}\n"
+    );
+    let (adapter, config_path) = hermes_adapter(root.path(), config.as_bytes());
+    let vault_path = TempVault::new("bridge-preview-hermes-update");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "bridge-preview-v1", &keys).unwrap();
+
+    let setup = BridgeInstallService::new(
+        &mut vault,
+        adapter,
+        locator(&bridge_path),
+        ID_1.parse().unwrap(),
+        clock(NOW_MS),
+    )
+    .preview(None, NOW_MS)
+    .unwrap();
+
+    assert_eq!(setup.approval_class, ApprovalClass::Active);
+    assert_eq!(setup.semantic_changes[0].class, ChangeClass::Update);
     assert!(setup.cli_operations.is_empty());
     assert_eq!(fs::read(config_path).unwrap(), config.as_bytes());
 }
