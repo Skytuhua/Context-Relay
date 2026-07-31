@@ -54,6 +54,25 @@ const MANAGED_PERMISSION_KEYS: [&str; 5] = [
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BridgeDeclarationProbeError {
+    Conflict,
+    Inspection,
+}
+
+impl From<BridgeDeclarationProbeError> for BoundaryError {
+    fn from(error: BridgeDeclarationProbeError) -> Self {
+        BoundaryError::new(match error {
+            BridgeDeclarationProbeError::Conflict => {
+                "Codex prior MCP declaration is disabled or unmanaged"
+            }
+            BridgeDeclarationProbeError::Inspection => {
+                "Codex managed bridge state cannot be safely inspected"
+            }
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodexExecutableKind {
     Native,
     Wrapper,
@@ -482,12 +501,15 @@ impl CodexAdapter {
         self.recheck_executable_client()?;
         let expected = self
             .probe_managed_declaration(&mut validation_runner)
-            .map_err(|_| {
-                client_error(
+            .map_err(|error| match error {
+                BridgeDeclarationProbeError::Conflict => client_error(
                     ErrorCode::Conflict,
                     "Codex managed bridge state cannot be safely inspected",
                     false,
-                )
+                ),
+                BridgeDeclarationProbeError::Inspection => {
+                    invalid("Codex managed bridge state cannot be safely inspected")
+                }
             })?;
         let intended_declaration = canonical_cli_declaration(&intended.body_markdown)?;
         Ok(ApprovedCliMutation {
@@ -584,28 +606,32 @@ impl CodexAdapter {
     fn probe_managed_declaration(
         &self,
         validation_runner: &mut impl CodexCommandRunner,
-    ) -> Result<Option<CanonicalCliDeclaration>, BoundaryError> {
+    ) -> Result<Option<CanonicalCliDeclaration>, BridgeDeclarationProbeError> {
         let plugin_argv = CodexCommand::PluginList.argv();
-        let plugin_output = self.run_verified(validation_runner, &plugin_argv)?;
+        let plugin_output = self
+            .run_verified(validation_runner, &plugin_argv)
+            .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
         parse_plugin_list_json(&plugin_output)
-            .map_err(|_| BoundaryError::new("Codex plugin list output is invalid"))?;
+            .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
 
         let list_argv = CodexCommand::McpList.argv();
-        let listed = self.run_verified(validation_runner, &list_argv)?;
-        let states = parse_mcp_list_states(&listed)
-            .map_err(|_| BoundaryError::new("Codex MCP list output is invalid"))?;
+        let listed = self
+            .run_verified(validation_runner, &list_argv)
+            .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
+        let states =
+            parse_mcp_list_states(&listed).map_err(|_| BridgeDeclarationProbeError::Inspection)?;
         match states.get(BRIDGE_SERVER_NAME) {
             None => return Ok(None),
             Some(false) => {
-                return Err(BoundaryError::new(
-                    "Codex prior MCP declaration is disabled or unmanaged",
-                ));
+                return Err(BridgeDeclarationProbeError::Conflict);
             }
             Some(true) => {}
         }
 
         let get_argv = CodexCommand::McpGet(BRIDGE_SERVER_NAME.to_owned()).argv();
-        let output = self.run_verified(validation_runner, &get_argv)?;
+        let output = self
+            .run_verified(validation_runner, &get_argv)
+            .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
         parse_managed_mcp_get_json(&output)
     }
     pub fn project_config_path(&self) -> PathBuf {
@@ -2477,17 +2503,17 @@ fn parse_mcp_get_json(bytes: &[u8], expected_name: &str) -> Result<(), ClientErr
 
 fn parse_managed_mcp_get_json(
     bytes: &[u8],
-) -> Result<Option<CanonicalCliDeclaration>, BoundaryError> {
+) -> Result<Option<CanonicalCliDeclaration>, BridgeDeclarationProbeError> {
     if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
-        return Err(BoundaryError::new("Codex MCP get output is invalid"));
+        return Err(BridgeDeclarationProbeError::Inspection);
     }
     let value = serde_json::from_slice::<Value>(bytes)
-        .map_err(|_| BoundaryError::new("Codex MCP get output is invalid"))?;
+        .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
     let parsed = parse_mcp_server(&value, McpOutputKind::Get)
-        .map_err(|_| BoundaryError::new("Codex MCP get output is invalid"))?;
+        .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
     let object = value
         .as_object()
-        .ok_or_else(|| BoundaryError::new("Codex MCP get output is invalid"))?;
+        .ok_or(BridgeDeclarationProbeError::Inspection)?;
     if parsed.name != BRIDGE_SERVER_NAME
         || !parsed.enabled
         || !object.get("disabled_reason").is_some_and(Value::is_null)
@@ -2498,14 +2524,12 @@ fn parse_managed_mcp_get_json(
             .is_some_and(Value::is_null)
         || !object.get("tool_timeout_sec").is_some_and(Value::is_null)
     {
-        return Err(BoundaryError::new(
-            "Codex prior MCP declaration is unmanaged",
-        ));
+        return Err(BridgeDeclarationProbeError::Conflict);
     }
     let transport = object
         .get("transport")
         .and_then(Value::as_object)
-        .ok_or_else(|| BoundaryError::new("Codex MCP get output is invalid"))?;
+        .ok_or(BridgeDeclarationProbeError::Inspection)?;
     if transport.get("type").and_then(Value::as_str) != Some("stdio")
         || !transport
             .get("env")
@@ -2517,24 +2541,25 @@ fn parse_managed_mcp_get_json(
             .is_some_and(Vec::is_empty)
         || !transport.get("cwd").is_some_and(Value::is_null)
     {
-        return Err(BoundaryError::new(
-            "Codex prior MCP declaration is secret-bearing or unmanaged",
-        ));
+        return Err(BridgeDeclarationProbeError::Conflict);
+    }
+    if transport.get("command").and_then(Value::as_str) == Some("<redacted>") {
+        return Err(BridgeDeclarationProbeError::Inspection);
     }
     let body = serde_json::json!({
         "args": transport
             .get("args")
-            .ok_or_else(|| BoundaryError::new("Codex MCP get output is invalid"))?,
+            .ok_or(BridgeDeclarationProbeError::Inspection)?,
         "command": transport
             .get("command")
-            .ok_or_else(|| BoundaryError::new("Codex MCP get output is invalid"))?,
+            .ok_or(BridgeDeclarationProbeError::Inspection)?,
         "type": "stdio",
     });
-    let canonical_body = serde_json::to_string(&body)
-        .map_err(|_| BoundaryError::new("Codex MCP get output is invalid"))?;
+    let canonical_body =
+        serde_json::to_string(&body).map_err(|_| BridgeDeclarationProbeError::Inspection)?;
     canonical_cli_declaration(&canonical_body)
         .map(Some)
-        .map_err(|_| BoundaryError::new("Codex prior MCP declaration is unmanaged"))
+        .map_err(|_| BridgeDeclarationProbeError::Conflict)
 }
 
 #[derive(Clone, Copy)]

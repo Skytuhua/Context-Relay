@@ -729,35 +729,44 @@ fn bridge_cli_plan_rejects_malformed_redacted_secret_bearing_and_unmanaged_prior
     let bridge_path = executable_bridge(&fixture, "intended bridge", b"bridge");
     let intended = bridge(&fixture, &bridge_path);
     let invalid_get_outputs = [
-        b"not-json".to_vec(),
-        serde_json::to_vec(&json!({
-            "name": "context-relay",
-            "scope": "user",
-            "type": "stdio",
-            "command": "<redacted>",
-            "args": ["--harness", "claude-code"],
-        }))
-        .unwrap(),
-        serde_json::to_vec(&json!({
-            "name": "context-relay",
-            "scope": "user",
-            "type": "stdio",
-            "command": "/old/bridge",
-            "args": ["--harness", "claude-code"],
-            "env": {"TOKEN": "secret"},
-        }))
-        .unwrap(),
-        serde_json::to_vec(&json!({
-            "name": "context-relay",
-            "scope": "user",
-            "type": "http",
-            "command": "/old/bridge",
-            "args": ["--harness", "claude-code"],
-        }))
-        .unwrap(),
+        (b"not-json".to_vec(), ErrorCode::InvalidRequest),
+        (
+            serde_json::to_vec(&json!({
+                "name": "context-relay",
+                "scope": "user",
+                "type": "stdio",
+                "command": "<redacted>",
+                "args": ["--harness", "claude-code"],
+            }))
+            .unwrap(),
+            ErrorCode::InvalidRequest,
+        ),
+        (
+            serde_json::to_vec(&json!({
+                "name": "context-relay",
+                "scope": "user",
+                "type": "stdio",
+                "command": "/old/bridge",
+                "args": ["--harness", "claude-code"],
+                "env": {"TOKEN": "secret"},
+            }))
+            .unwrap(),
+            ErrorCode::Conflict,
+        ),
+        (
+            serde_json::to_vec(&json!({
+                "name": "context-relay",
+                "scope": "user",
+                "type": "http",
+                "command": "/old/bridge",
+                "args": ["--harness", "claude-code"],
+            }))
+            .unwrap(),
+            ErrorCode::Conflict,
+        ),
     ];
 
-    for get_output in invalid_get_outputs {
+    for (get_output, expected_code) in invalid_get_outputs {
         let mut calls = 0;
         let error = fixture
             .adapter
@@ -776,6 +785,7 @@ fn bridge_cli_plan_rejects_malformed_redacted_secret_bearing_and_unmanaged_prior
             .unwrap_err();
 
         assert_eq!(calls, 2);
+        assert_eq!(error.code, expected_code);
         assert!(!error.retryable);
     }
 }

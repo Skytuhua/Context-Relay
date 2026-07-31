@@ -1523,7 +1523,12 @@ fn bridge_cli_plan_rejects_malformed_redacted_secret_bearing_and_unmanaged_prior
         r#"{"args":["--harness","claude-code"],"command":"/managed/bridge","type":"stdio"}"#,
     );
 
-    for rejected in [malformed, redacted, secret_bearing, unmanaged] {
+    for (rejected, expected_code) in [
+        (malformed, ErrorCode::InvalidRequest),
+        (redacted, ErrorCode::InvalidRequest),
+        (secret_bearing, ErrorCode::Conflict),
+        (unmanaged, ErrorCode::Conflict),
+    ] {
         let list = codex_mcp_list(&intended.body_markdown);
         let mut validation = |argv: &[String]| {
             Ok(match argv {
@@ -1548,12 +1553,11 @@ fn bridge_cli_plan_rejects_malformed_redacted_secret_bearing_and_unmanaged_prior
                 _ => panic!("unexpected validation argv: {argv:?}"),
             })
         };
-        assert!(
-            fixture
-                .adapter
-                .plan_bridge_cli_mutation_with_runner(&intended, &mut validation)
-                .is_err()
-        );
+        let error = fixture
+            .adapter
+            .plan_bridge_cli_mutation_with_runner(&intended, &mut validation)
+            .unwrap_err();
+        assert_eq!(error.code, expected_code);
     }
 
     let mut disabled_list: Value =
@@ -1576,12 +1580,11 @@ fn bridge_cli_plan_rejects_malformed_redacted_secret_bearing_and_unmanaged_prior
             _ => panic!("disabled declaration must be rejected before mcp get"),
         })
     };
-    assert!(
-        fixture
-            .adapter
-            .plan_bridge_cli_mutation_with_runner(&intended, &mut validation)
-            .is_err()
-    );
+    let error = fixture
+        .adapter
+        .plan_bridge_cli_mutation_with_runner(&intended, &mut validation)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
 }
 
 #[test]

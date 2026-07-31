@@ -42,6 +42,25 @@ const MAX_MCP_VALIDATION_NAMES: usize = 64;
 const MANAGED_START: &str = "<!-- context-relay:start -->";
 const MANAGED_END: &str = "<!-- context-relay:end -->";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BridgeDeclarationProbeError {
+    Conflict,
+    Inspection,
+}
+
+impl From<BridgeDeclarationProbeError> for BoundaryError {
+    fn from(error: BridgeDeclarationProbeError) -> Self {
+        BoundaryError::new(match error {
+            BridgeDeclarationProbeError::Conflict => {
+                "Claude Code prior MCP declaration is disabled or unmanaged"
+            }
+            BridgeDeclarationProbeError::Inspection => {
+                "Claude Code managed bridge state cannot be safely inspected"
+            }
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ClaudeCodeLayout {
     pub executable: PathBuf,
@@ -305,12 +324,15 @@ impl ClaudeCodeAdapter {
         self.recheck_executable_client()?;
         let expected = self
             .probe_managed_declaration(&mut validation_runner)
-            .map_err(|_| {
-                client_error(
+            .map_err(|error| match error {
+                BridgeDeclarationProbeError::Conflict => client_error(
                     ErrorCode::Conflict,
                     "Claude Code managed bridge state cannot be safely inspected",
                     false,
-                )
+                ),
+                BridgeDeclarationProbeError::Inspection => {
+                    invalid_request("Claude Code managed bridge state cannot be safely inspected")
+                }
             })?;
         let intended_declaration = canonical_cli_declaration(&intended.body_markdown)?;
         Ok(ApprovedCliMutation {
@@ -412,11 +434,13 @@ impl ClaudeCodeAdapter {
     fn probe_managed_declaration(
         &self,
         validation_runner: &mut impl ClaudeCodeCommandRunner,
-    ) -> Result<Option<CanonicalCliDeclaration>, BoundaryError> {
+    ) -> Result<Option<CanonicalCliDeclaration>, BridgeDeclarationProbeError> {
         let list_argv = vec!["mcp".to_owned(), "list".to_owned()];
-        let listed = self.run_verified(validation_runner, &list_argv)?;
-        let names = parse_mcp_list_output(&listed)
-            .map_err(|_| BoundaryError::new("Claude Code MCP list output is invalid"))?;
+        let listed = self
+            .run_verified(validation_runner, &list_argv)
+            .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
+        let names =
+            parse_mcp_list_output(&listed).map_err(|_| BridgeDeclarationProbeError::Inspection)?;
         if !names.contains(BRIDGE_SERVER_NAME) {
             return Ok(None);
         }
@@ -425,7 +449,9 @@ impl ClaudeCodeAdapter {
             "get".to_owned(),
             BRIDGE_SERVER_NAME.to_owned(),
         ];
-        let output = self.run_verified(validation_runner, &get_argv)?;
+        let output = self
+            .run_verified(validation_runner, &get_argv)
+            .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
         parse_managed_mcp_get_output(&output)
     }
 
@@ -2118,33 +2144,45 @@ fn parse_mcp_get_output(bytes: &[u8], expected_name: &str) -> Result<(), ClientE
 
 fn parse_managed_mcp_get_output(
     bytes: &[u8],
-) -> Result<Option<CanonicalCliDeclaration>, BoundaryError> {
-    bounded_utf8(bytes).map_err(|_| BoundaryError::new("Claude Code MCP get output is invalid"))?;
+) -> Result<Option<CanonicalCliDeclaration>, BridgeDeclarationProbeError> {
+    bounded_utf8(bytes).map_err(|_| BridgeDeclarationProbeError::Inspection)?;
     let server = serde_json::from_slice::<Value>(bytes)
         .ok()
         .and_then(|value| value.as_object().cloned())
-        .ok_or_else(|| BoundaryError::new("Claude Code MCP get output is invalid"))?;
+        .ok_or(BridgeDeclarationProbeError::Inspection)?;
+    if server.get("enabled") == Some(&Value::Bool(false)) {
+        return Err(BridgeDeclarationProbeError::Conflict);
+    }
     if server.len() != 5
         || server
             .keys()
             .any(|key| !["name", "scope", "type", "command", "args"].contains(&key.as_str()))
-        || server.get("name").and_then(Value::as_str) != Some(BRIDGE_SERVER_NAME)
-        || server.get("scope").and_then(Value::as_str) != Some("user")
     {
-        return Err(BoundaryError::new(
-            "Claude Code MCP get output is not the managed user declaration",
-        ));
+        return Err(if server.contains_key("env") {
+            BridgeDeclarationProbeError::Conflict
+        } else {
+            BridgeDeclarationProbeError::Inspection
+        });
+    }
+    if server.get("name").and_then(Value::as_str) != Some(BRIDGE_SERVER_NAME) {
+        return Err(BridgeDeclarationProbeError::Inspection);
+    }
+    if server.get("scope").and_then(Value::as_str) != Some("user") {
+        return Err(BridgeDeclarationProbeError::Conflict);
+    }
+    if server.get("command").and_then(Value::as_str) == Some("<redacted>") {
+        return Err(BridgeDeclarationProbeError::Inspection);
     }
     let body = serde_json::json!({
         "args": server.get("args").cloned().unwrap_or(Value::Null),
         "command": server.get("command").cloned().unwrap_or(Value::Null),
         "type": server.get("type").cloned().unwrap_or(Value::Null),
     });
-    let canonical_body = canonical_json(&body)
-        .map_err(|_| BoundaryError::new("Claude Code MCP declaration is invalid"))?;
+    let canonical_body =
+        canonical_json(&body).map_err(|_| BridgeDeclarationProbeError::Inspection)?;
     canonical_cli_declaration(&canonical_body)
         .map(Some)
-        .map_err(|_| BoundaryError::new("Claude Code prior declaration is not managed"))
+        .map_err(|_| BridgeDeclarationProbeError::Conflict)
 }
 
 fn canonical_cli_declaration(body: &str) -> Result<CanonicalCliDeclaration, ClientError> {
