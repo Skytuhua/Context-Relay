@@ -1,6 +1,6 @@
 //! Mutation-free preview and persistence of managed bridge installation plans.
 
-use std::str::FromStr;
+use std::{path::PathBuf, str::FromStr};
 
 use context_relay_native_runner::{
     RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand, SidecarId,
@@ -22,10 +22,14 @@ use crate::{
         is_canonical_bridge_body, is_managed_bridge_component,
     },
     native_transaction::{
-        ApprovedCliMutation, ApprovedMutation, NativeTransactionPlan, SidecarBinding,
-        approval_hash_v2, seal_plan,
+        ApprovedCliMutation, ApprovedMutation, NativeTransactionPlan,
+        REVERSIBLE_PLAN_SCHEMA_VERSION, SidecarBinding, approval_hash_v2, open_plan, seal_plan,
+        seal_reversible_plan,
     },
-    vault::{SetupPlanWrite, Vault},
+    vault::{
+        BeforeImagePolicy, NativeSandboxIdentity, NativeTransactionStatus, SetupPlanAction,
+        SetupPlanClaim, SetupPlanLifecycle, SetupPlanWrite, Vault,
+    },
 };
 
 pub const PREVIEW_TTL_MS: u64 = 15 * 60 * 1_000;
@@ -50,6 +54,208 @@ pub struct BridgeMutationPlan {
 /// the returned path before using that identity.
 pub trait BridgeLocator {
     fn locate(&self) -> Result<crate::mcp::install::BridgeExecutable, ClientError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BridgeExecutionError {
+    Restored(String),
+    Conflict(String),
+}
+
+impl BridgeExecutionError {
+    pub fn restored(message: impl Into<String>) -> Self {
+        Self::Restored(message.into())
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict(message.into())
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::Restored(message) | Self::Conflict(message) => message,
+        }
+    }
+}
+
+/// Dependency-injection boundary for an already composed native transaction
+/// engine. The service supplies the opened persisted plan and its exact sealed
+/// bytes; callers cannot replace any approved field.
+pub trait BridgePlanExecutor {
+    fn execute(
+        &mut self,
+        vault: &mut Vault,
+        plan: &NativeTransactionPlan,
+        sealed_plan: &[u8],
+        created_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), BridgeExecutionError>;
+}
+
+/// Concrete production composition for the persisted-plan executor boundary.
+/// It constructs the existing native transaction engine with a journal bound
+/// to the exact sealed bytes supplied by the service.
+pub struct NativeEngineBridgePlanExecutor<'a, A, E, F, H, C> {
+    adapter: &'a mut A,
+    restricted_executor: &'a mut E,
+    filesystem: &'a mut F,
+    hook: &'a mut H,
+    cli_executor: &'a mut C,
+    lock_root: PathBuf,
+    identity: NativeSandboxIdentity,
+    before_image_policy: BeforeImagePolicy,
+    applied_hlc: HybridLogicalClock,
+}
+
+impl<'a, A, E, F, H, C> NativeEngineBridgePlanExecutor<'a, A, E, F, H, C> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        adapter: &'a mut A,
+        restricted_executor: &'a mut E,
+        filesystem: &'a mut F,
+        hook: &'a mut H,
+        cli_executor: &'a mut C,
+        lock_root: impl Into<PathBuf>,
+        identity: NativeSandboxIdentity,
+        before_image_policy: BeforeImagePolicy,
+        applied_hlc: HybridLogicalClock,
+    ) -> Self {
+        Self {
+            adapter,
+            restricted_executor,
+            filesystem,
+            hook,
+            cli_executor,
+            lock_root: lock_root.into(),
+            identity,
+            before_image_policy,
+            applied_hlc,
+        }
+    }
+}
+
+impl<A, E, F, H, C> BridgePlanExecutor for NativeEngineBridgePlanExecutor<'_, A, E, F, H, C>
+where
+    A: crate::native_transaction::engine::NativeAdapter,
+    E: crate::native_transaction::engine::RestrictedExecutor,
+    F: crate::native_transaction::engine::NativeFileSystem,
+    H: crate::native_transaction::engine::FaultHook,
+    C: crate::native_transaction::cli::NativeCliExecutor,
+{
+    fn execute(
+        &mut self,
+        vault: &mut Vault,
+        plan: &NativeTransactionPlan,
+        sealed_plan: &[u8],
+        created_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        let transaction_id = format!("bridge-setup-{}", plan.setup.plan_id);
+        let result = {
+            let mut journal = crate::native_transaction::journal::VaultNativeJournal::new(
+                vault,
+                &self.lock_root,
+                &transaction_id,
+                self.identity.clone(),
+                sealed_plan.to_vec(),
+                created_ms,
+                self.before_image_policy,
+            );
+            if plan.cli_mutations.is_empty() {
+                crate::native_transaction::engine::NativeTransactionEngine::new(
+                    self.adapter,
+                    self.restricted_executor,
+                    self.filesystem,
+                    &mut journal,
+                    self.hook,
+                )
+                .apply(plan, now_ms, self.applied_hlc)
+            } else {
+                crate::native_transaction::engine::NativeTransactionEngine::new_with_cli(
+                    self.adapter,
+                    self.restricted_executor,
+                    self.filesystem,
+                    &mut journal,
+                    self.hook,
+                    self.cli_executor,
+                )
+                .apply(plan, now_ms, self.applied_hlc)
+            }
+        };
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                match vault
+                    .native_transaction(&transaction_id)
+                    .ok()
+                    .flatten()
+                    .map(|snapshot| snapshot.status)
+                {
+                    Some(NativeTransactionStatus::Committed) => Ok(()),
+                    Some(NativeTransactionStatus::Restored) => {
+                        Err(BridgeExecutionError::Restored(message))
+                    }
+                    Some(NativeTransactionStatus::Conflict) => {
+                        Err(BridgeExecutionError::Conflict(message))
+                    }
+                    _ => Err(BridgeExecutionError::Conflict(message)),
+                }
+            }
+        }
+    }
+}
+
+/// CLI placeholder for a harness whose sealed plan has no CLI mutations.
+#[derive(Default)]
+pub struct NoBridgeCliExecutor;
+
+impl crate::native_transaction::cli::NativeCliExecutor for NoBridgeCliExecutor {
+    fn compare_cli_targets(
+        &mut self,
+        _: &[ApprovedCliMutation],
+    ) -> Result<(), crate::native_transaction::engine::BoundaryError> {
+        Err(crate::native_transaction::engine::BoundaryError::new(
+            "bridge plan unexpectedly contains CLI mutations",
+        ))
+    }
+
+    fn apply_cli_mutation(
+        &mut self,
+        _: &ApprovedCliMutation,
+    ) -> Result<
+        crate::native_transaction::cli::CliMutationOutcome,
+        crate::native_transaction::engine::BoundaryError,
+    > {
+        Err(crate::native_transaction::engine::BoundaryError::new(
+            "bridge plan unexpectedly contains CLI mutations",
+        ))
+    }
+
+    fn restore_cli_mutation_if_matches(
+        &mut self,
+        _: &ApprovedCliMutation,
+    ) -> Result<
+        crate::native_transaction::cli::CliRestoreOutcome,
+        crate::native_transaction::engine::BoundaryError,
+    > {
+        Err(crate::native_transaction::engine::BoundaryError::new(
+            "bridge plan unexpectedly contains CLI mutations",
+        ))
+    }
+
+    fn finish_committed_cli_mutations(
+        &mut self,
+        _: &[ApprovedCliMutation],
+    ) -> Result<(), crate::native_transaction::engine::BoundaryError> {
+        Err(crate::native_transaction::engine::BoundaryError::new(
+            "bridge plan unexpectedly contains CLI mutations",
+        ))
+    }
+}
+
+pub struct PersistedBridgeInstallService<'a> {
+    vault: &'a mut Vault,
 }
 
 /// The narrow capability preview needs in addition to the protocol adapter.
@@ -135,6 +341,264 @@ pub struct BridgeInstallService<'a, H, L> {
     bridge_locator: L,
     origin_device: DeviceId,
     observed_hlc: HybridLogicalClock,
+}
+
+impl<'a> BridgeInstallService<'a, (), ()> {
+    pub fn persisted(vault: &'a mut Vault) -> PersistedBridgeInstallService<'a> {
+        PersistedBridgeInstallService { vault }
+    }
+}
+
+impl<H, L> BridgeInstallService<'_, H, L> {
+    pub fn apply<E: BridgePlanExecutor>(
+        &mut self,
+        plan_id: &PlanId,
+        now_ms: u64,
+        executor: &mut E,
+    ) -> Result<(), ClientError> {
+        PersistedBridgeInstallService {
+            vault: &mut *self.vault,
+        }
+        .apply(plan_id, now_ms, executor)
+    }
+
+    pub fn rollback<E: BridgePlanExecutor>(
+        &mut self,
+        original_plan_id: &PlanId,
+        now_ms: u64,
+        executor: &mut E,
+    ) -> Result<(), ClientError> {
+        PersistedBridgeInstallService {
+            vault: &mut *self.vault,
+        }
+        .rollback(original_plan_id, now_ms, executor)
+    }
+}
+
+impl PersistedBridgeInstallService<'_> {
+    pub fn apply<E: BridgePlanExecutor>(
+        &mut self,
+        plan_id: &PlanId,
+        now_ms: u64,
+        executor: &mut E,
+    ) -> Result<(), ClientError> {
+        let stored = self
+            .vault
+            .setup_plan(plan_id)
+            .map_err(|_| invalid("Persisted bridge plan cannot be loaded"))?
+            .ok_or_else(|| invalid("Persisted bridge plan does not exist"))?;
+        let opened = open_plan(&stored.payload)
+            .map_err(|_| invalid("Persisted bridge plan is malformed or unapproved"))?;
+        let plan = opened.plan;
+        if stored.schema_version != opened.schema_version
+            || stored.approval_version != 2
+            || stored.approval_hash != plan.setup.batch_hash
+            || stored.plan_id != plan.setup.plan_id
+            || stored.expires_ms != plan.setup.expires_at
+            || &plan.setup.plan_id != plan_id
+            || opened.rollback_of_plan_id.is_some()
+        {
+            return Err(invalid("Persisted bridge plan binding is invalid"));
+        }
+        match self
+            .vault
+            .claim_setup_plan(plan_id, SetupPlanAction::Apply, now_ms)
+            .map_err(|_| conflict("Persisted bridge plan cannot be claimed for apply"))?
+        {
+            SetupPlanClaim::Replay => return Ok(()),
+            SetupPlanClaim::Claimed => {}
+        }
+        match executor.execute(
+            self.vault,
+            &plan,
+            &stored.payload,
+            stored.created_ms,
+            now_ms,
+        ) {
+            Ok(()) => self
+                .vault
+                .finish_setup_plan(plan_id, SetupPlanLifecycle::Applied)
+                .map_err(|_| conflict("Persisted bridge apply cannot be finalized")),
+            Err(error) => {
+                let lifecycle = match error {
+                    BridgeExecutionError::Restored(_) => SetupPlanLifecycle::ApplyRestored,
+                    BridgeExecutionError::Conflict(_) => SetupPlanLifecycle::Conflict,
+                };
+                self.vault
+                    .finish_setup_plan(plan_id, lifecycle)
+                    .map_err(|_| conflict("Persisted bridge apply failure cannot be finalized"))?;
+                Err(conflict_owned(error.message()))
+            }
+        }
+    }
+
+    pub fn rollback<E: BridgePlanExecutor>(
+        &mut self,
+        original_plan_id: &PlanId,
+        now_ms: u64,
+        executor: &mut E,
+    ) -> Result<(), ClientError> {
+        let stored = self
+            .vault
+            .setup_plan(original_plan_id)
+            .map_err(|_| invalid("Persisted bridge plan cannot be loaded"))?
+            .ok_or_else(|| invalid("Persisted bridge plan does not exist"))?;
+        let opened = open_plan(&stored.payload)
+            .map_err(|_| invalid("Persisted bridge plan is malformed or unapproved"))?;
+        if stored.schema_version != opened.schema_version
+            || stored.approval_version != 2
+            || stored.approval_hash != opened.plan.setup.batch_hash
+            || stored.plan_id != opened.plan.setup.plan_id
+            || stored.expires_ms != opened.plan.setup.expires_at
+            || &opened.plan.setup.plan_id != original_plan_id
+            || opened.rollback_of_plan_id.is_some()
+        {
+            return Err(invalid("Persisted bridge plan binding is invalid"));
+        }
+        if stored.lifecycle == SetupPlanLifecycle::RolledBack {
+            return Ok(());
+        }
+        let (inverse, inverse_rollback_states) = inverse_plan(&opened, now_ms)?;
+        let inverse_approval =
+            approval_hash_v2(&inverse).map_err(|_| invalid("Rollback bridge plan is invalid"))?;
+        let inverse_sealed = seal_reversible_plan(
+            &inverse,
+            inverse_approval,
+            &inverse_rollback_states,
+            Some(*original_plan_id),
+        )
+        .map_err(|_| invalid("Rollback bridge plan cannot be sealed"))?;
+
+        match self
+            .vault
+            .claim_setup_plan_rollback(
+                original_plan_id,
+                SetupPlanWrite {
+                    plan_id: &inverse.setup.plan_id,
+                    schema_version: REVERSIBLE_PLAN_SCHEMA_VERSION,
+                    approval_version: 2,
+                    approval_hash: &inverse_approval,
+                    payload: &inverse_sealed,
+                    created_ms: now_ms,
+                    expires_ms: inverse.setup.expires_at,
+                },
+                now_ms,
+            )
+            .map_err(|_| conflict("Rollback bridge plan cannot be persisted and claimed"))?
+        {
+            SetupPlanClaim::Replay => return Ok(()),
+            SetupPlanClaim::Claimed => {}
+        }
+
+        match executor.execute(self.vault, &inverse, &inverse_sealed, now_ms, now_ms) {
+            Ok(()) => self
+                .vault
+                .finish_setup_plan_rollback(
+                    original_plan_id,
+                    &inverse.setup.plan_id,
+                    SetupPlanLifecycle::RolledBack,
+                    SetupPlanLifecycle::Applied,
+                )
+                .map_err(|_| conflict("Persisted bridge rollback cannot be finalized")),
+            Err(error) => {
+                let (inverse_lifecycle, original_lifecycle) = match error {
+                    BridgeExecutionError::Restored(_) => (
+                        SetupPlanLifecycle::ApplyRestored,
+                        SetupPlanLifecycle::RollbackRestored,
+                    ),
+                    BridgeExecutionError::Conflict(_) => {
+                        (SetupPlanLifecycle::Conflict, SetupPlanLifecycle::Conflict)
+                    }
+                };
+                self.vault
+                    .finish_setup_plan_rollback(
+                        original_plan_id,
+                        &inverse.setup.plan_id,
+                        original_lifecycle,
+                        inverse_lifecycle,
+                    )
+                    .map_err(|_| {
+                        conflict("Persisted bridge rollback failure cannot be finalized")
+                    })?;
+                Err(conflict_owned(error.message()))
+            }
+        }
+    }
+}
+
+fn inverse_plan(
+    opened: &crate::native_transaction::OpenedPlan,
+    now_ms: u64,
+) -> Result<(NativeTransactionPlan, Vec<Vec<u8>>), ClientError> {
+    let original = &opened.plan;
+    if opened.native_rollback_states.len() != original.mutations.len() {
+        return Err(invalid("Persisted bridge plan lacks exact rollback state"));
+    }
+    let mut inverse = original.clone();
+    inverse.setup.plan_id = rollback_plan_id(&original.setup.plan_id)?;
+    inverse.setup.expires_at = now_ms
+        .checked_add(PREVIEW_TTL_MS)
+        .ok_or_else(|| invalid("Rollback expiry is outside the supported range"))?;
+    for change in &mut inverse.setup.semantic_changes {
+        change.class = match change.class {
+            ChangeClass::Create => ChangeClass::Remove,
+            ChangeClass::Remove => ChangeClass::Create,
+            ChangeClass::Enable => ChangeClass::Disable,
+            ChangeClass::Disable => ChangeClass::Enable,
+            ChangeClass::Update => ChangeClass::Update,
+            ChangeClass::Preserve => ChangeClass::Preserve,
+            ChangeClass::Conflict => {
+                return Err(invalid("Rollback bridge plan contains a conflict change"));
+            }
+        };
+    }
+    for mutation in &mut inverse.cli_mutations {
+        std::mem::swap(&mut mutation.expected, &mut mutation.intended);
+        std::mem::swap(&mut mutation.forward, &mut mutation.rollback);
+    }
+    inverse.setup.cli_operations = inverse
+        .cli_mutations
+        .iter()
+        .flat_map(|mutation| mutation.forward.clone())
+        .collect();
+    for ((inverse_mutation, original_mutation), rollback_state) in inverse
+        .mutations
+        .iter_mut()
+        .zip(&original.mutations)
+        .zip(&opened.native_rollback_states)
+    {
+        inverse_mutation.content.clone_from(rollback_state);
+        inverse_mutation.expected = original_mutation.intended.clone();
+        inverse_mutation.intended = original_mutation.expected.clone();
+    }
+    let inverse_rollback_states = original
+        .mutations
+        .iter()
+        .map(|mutation| mutation.content.clone())
+        .collect::<Vec<_>>();
+    inverse.setup.batch_hash = Sha256Digest([0; 32]);
+    inverse.setup.batch_hash = approval_hash_v2(&inverse)
+        .map_err(|_| invalid("Rollback bridge plan approval cannot be derived"))?;
+    Ok((inverse, inverse_rollback_states))
+}
+
+fn rollback_plan_id(original: &PlanId) -> Result<PlanId, ClientError> {
+    let mut bytes: [u8; 32] = Sha256::digest(
+        [
+            b"context-relay/bridge-rollback/v1\0".as_slice(),
+            original.as_bytes(),
+        ]
+        .concat(),
+    )
+    .into();
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    PlanId::from_str(&format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    ))
+    .map_err(|_| invalid("Rollback bridge plan identifier cannot be derived"))
 }
 
 impl<'a, H, L> BridgeInstallService<'a, H, L>
@@ -335,12 +799,25 @@ where
             approval_hash_v2(&plan).map_err(|_| invalid("Bridge preview plan is invalid"))?;
         setup.batch_hash = approval_hash;
         plan.setup = setup.clone();
-        let sealed = seal_plan(&plan, approval_hash)
-            .map_err(|_| invalid("Bridge preview plan cannot be sealed"))?;
+        let native_rollback_states =
+            crate::native_transaction::planner::capture_native_rollback_states(&plan.mutations)
+                .map_err(|_| invalid("Bridge preview rollback state cannot be sealed"))?;
+        let (schema_version, sealed) = if plan.mutations.is_empty() {
+            (
+                crate::native_transaction::SEALED_PLAN_SCHEMA_VERSION,
+                seal_plan(&plan, approval_hash),
+            )
+        } else {
+            (
+                REVERSIBLE_PLAN_SCHEMA_VERSION,
+                seal_reversible_plan(&plan, approval_hash, &native_rollback_states, None),
+            )
+        };
+        let sealed = sealed.map_err(|_| invalid("Bridge preview plan cannot be sealed"))?;
         self.vault
             .put_setup_plan(SetupPlanWrite {
                 plan_id: &setup.plan_id,
-                schema_version: crate::native_transaction::SEALED_PLAN_SCHEMA_VERSION,
+                schema_version,
                 approval_version: 2,
                 approval_hash: &approval_hash,
                 payload: &sealed,
@@ -488,6 +965,15 @@ fn invalid(message: &'static str) -> ClientError {
 }
 
 fn conflict(message: &'static str) -> ClientError {
+    ClientError {
+        code: ErrorCode::Conflict,
+        message: message.to_owned(),
+        field_path: None,
+        retryable: false,
+    }
+}
+
+fn conflict_owned(message: &str) -> ClientError {
     ClientError {
         code: ErrorCode::Conflict,
         message: message.to_owned(),

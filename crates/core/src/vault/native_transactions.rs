@@ -2843,6 +2843,182 @@ impl Vault {
         Ok(())
     }
 
+    /// Atomically persists a freshly sealed inverse plan, claims that inverse
+    /// for apply, and claims the original public plan for rollback.
+    pub fn claim_setup_plan_rollback(
+        &mut self,
+        original_plan_id: &PlanId,
+        inverse: SetupPlanWrite<'_>,
+        now_ms: u64,
+    ) -> Result<SetupPlanClaim, VaultError> {
+        validate_setup_plan_write(&inverse)?;
+        if original_plan_id == inverse.plan_id {
+            return Err(VaultError::Validation(
+                "rollback inverse plan id must differ from the original".to_owned(),
+            ));
+        }
+        let now_ms = to_i64(now_ms)?;
+        let inverse_created_ms = to_i64(inverse.created_ms)?;
+        let inverse_expires_ms = to_i64(inverse.expires_ms)?;
+        let original_id = original_plan_id.to_string();
+        let inverse_id = inverse.plan_id.to_string();
+        let transaction = self.connection.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT state FROM setup_plan_lifecycle WHERE plan_id = ?1",
+                [&original_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| VaultError::Validation("setup plan does not exist".to_owned()))
+            .and_then(|value| parse_setup_plan_lifecycle(&value))?;
+        if current == SetupPlanLifecycle::RolledBack {
+            transaction.commit()?;
+            return Ok(SetupPlanClaim::Replay);
+        }
+        if current != SetupPlanLifecycle::Applied {
+            return Err(VaultError::Validation(format!(
+                "setup plan cannot be claimed from {}",
+                setup_plan_lifecycle_name(current)
+            )));
+        }
+
+        transaction.execute(
+            "INSERT INTO native_plans(
+                 plan_id, approval_hash, payload, created_ms, expires_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(plan_id) DO NOTHING",
+            params![
+                inverse_id,
+                inverse.approval_hash.0.as_slice(),
+                inverse.payload,
+                inverse_created_ms,
+                inverse_expires_ms,
+            ],
+        )?;
+        let stored = transaction.query_row(
+            "SELECT approval_hash, payload, created_ms, expires_ms
+             FROM native_plans WHERE plan_id = ?1",
+            [&inverse_id],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )?;
+        if stored
+            != (
+                inverse.approval_hash.0.to_vec(),
+                inverse.payload.to_vec(),
+                inverse_created_ms,
+                inverse_expires_ms,
+            )
+        {
+            return Err(VaultError::Validation(
+                "rollback inverse plan id was reused with different canonical bytes".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO setup_plan_lifecycle(
+                 plan_id, schema_version, approval_version, state, updated_ms
+             ) VALUES (?1, ?2, ?3, 'applying', ?4)
+             ON CONFLICT(plan_id) DO NOTHING",
+            params![
+                inverse_id,
+                i64::from(inverse.schema_version),
+                i64::from(inverse.approval_version),
+                now_ms,
+            ],
+        )?;
+        let inverse_binding = transaction.query_row(
+            "SELECT schema_version, approval_version, state
+             FROM setup_plan_lifecycle WHERE plan_id = ?1",
+            [&inverse_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        if inverse_binding
+            != (
+                i64::from(inverse.schema_version),
+                i64::from(inverse.approval_version),
+                "applying".to_owned(),
+            )
+        {
+            return Err(VaultError::Validation(
+                "rollback inverse lifecycle binding differs".to_owned(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE setup_plan_lifecycle SET state = 'rolling_back', updated_ms = ?2
+             WHERE plan_id = ?1 AND state = 'applied'",
+            params![original_id, now_ms],
+        )?;
+        if changed != 1 {
+            return Err(VaultError::Validation(
+                "setup plan lifecycle changed concurrently".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(SetupPlanClaim::Claimed)
+    }
+
+    /// Atomically records the terminal outcome for an original rollback and
+    /// its internal inverse apply transaction.
+    pub fn finish_setup_plan_rollback(
+        &mut self,
+        original_plan_id: &PlanId,
+        inverse_plan_id: &PlanId,
+        original_next: SetupPlanLifecycle,
+        inverse_next: SetupPlanLifecycle,
+    ) -> Result<(), VaultError> {
+        let allowed = matches!(
+            (original_next, inverse_next),
+            (SetupPlanLifecycle::RolledBack, SetupPlanLifecycle::Applied)
+                | (
+                    SetupPlanLifecycle::RollbackRestored,
+                    SetupPlanLifecycle::ApplyRestored
+                )
+                | (SetupPlanLifecycle::Conflict, SetupPlanLifecycle::Conflict)
+        );
+        if !allowed || original_plan_id == inverse_plan_id {
+            return Err(VaultError::Validation(
+                "setup rollback terminal lifecycle pair is invalid".to_owned(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        let changed_inverse = transaction.execute(
+            "UPDATE setup_plan_lifecycle SET state = ?2
+             WHERE plan_id = ?1 AND state = 'applying'",
+            params![
+                inverse_plan_id.to_string(),
+                setup_plan_lifecycle_name(inverse_next),
+            ],
+        )?;
+        let changed_original = transaction.execute(
+            "UPDATE setup_plan_lifecycle SET state = ?2
+             WHERE plan_id = ?1 AND state = 'rolling_back'",
+            params![
+                original_plan_id.to_string(),
+                setup_plan_lifecycle_name(original_next),
+            ],
+        )?;
+        if changed_inverse != 1 || changed_original != 1 {
+            return Err(VaultError::Validation(
+                "setup rollback lifecycle changed concurrently".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn begin_native_transaction(
         &mut self,
         transaction_id: &str,
