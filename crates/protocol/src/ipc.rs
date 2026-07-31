@@ -140,6 +140,31 @@ params!(McpCallParams {
     #[ts(type = "unknown")]
     arguments: serde_json::Value
 });
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[ts(tag = "kind", rename_all = "snake_case")]
+pub enum NativeHookEvent {
+    SessionStart {
+        session_id: String,
+    },
+    SessionStop {
+        session_id: String,
+    },
+    TaskEvidence {
+        session_id: String,
+        task_id: TaskId,
+        evidence: Vec<CompletionEvidenceInput>,
+    },
+}
+
+params!(NativeHookEventParams {
+    binding: McpBinding,
+    event: NativeHookEvent,
+    #[serde(with = "decimal_u64")]
+    #[ts(type = "DecimalU64")]
+    occurred_at_ms: u64
+});
 params!(PlanParams { plan_id: PlanId });
 params!(PackageParams {
     package_base64url: BoundedBytes,
@@ -348,6 +373,7 @@ pub enum LocalRequest {
     Shutdown(EmptyParams),
     Health(EmptyParams),
     McpCall(McpCallParams),
+    NativeHookEvent(NativeHookEventParams),
     Unlock(EmptyParams),
     ProjectsList(EmptyParams),
     ProjectUpsert(ProjectUpsertParams),
@@ -418,6 +444,10 @@ impl LocalRequest {
                 p.binding.working_directory.validate()?;
                 crate::validate_mcp_fixture(&p.name, true, &p.arguments)
             }
+            Self::NativeHookEvent(p) => {
+                p.binding.working_directory.validate()?;
+                p.event.validate()
+            }
             Self::MemorySearch(p) => required_text(&p.query, "query", MAX_MARKDOWN_BYTES),
             Self::MemoryCreate(p) => {
                 required_text(&p.title, "title", MAX_TITLE_BYTES)?;
@@ -474,6 +504,50 @@ impl LocalRequest {
             }
             _ => Ok(()),
         }
+    }
+}
+
+impl NativeHookEvent {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let (session_id, evidence) = match self {
+            Self::SessionStart { session_id } | Self::SessionStop { session_id } => {
+                (session_id, None)
+            }
+            Self::TaskEvidence {
+                session_id,
+                evidence,
+                ..
+            } => (session_id, Some(evidence)),
+        };
+        required_text(session_id, "nativeHook.sessionId", MAX_TITLE_BYTES)?;
+
+        let Some(evidence) = evidence else {
+            return Ok(());
+        };
+        if evidence.is_empty() {
+            return Err(ValidationError::EmptyRequired("evidence"));
+        }
+        if evidence.len() > crate::MAX_EVIDENCE_ITEMS {
+            return Err(ValidationError::TooLarge {
+                field: "evidence",
+                limit: crate::MAX_EVIDENCE_ITEMS,
+            });
+        }
+        for item in evidence {
+            required_text(&item.summary, "evidence.summary", crate::MAX_EVIDENCE_BYTES)?;
+            required_text(&item.kind, "evidence.kind", 128)?;
+            if item
+                .reference
+                .as_ref()
+                .is_some_and(|value| value.len() > crate::MAX_EVIDENCE_BYTES)
+            {
+                return Err(ValidationError::TooLarge {
+                    field: "evidence.reference",
+                    limit: crate::MAX_EVIDENCE_BYTES,
+                });
+            }
+        }
+        Ok(())
     }
 }
 

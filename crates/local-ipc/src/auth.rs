@@ -193,6 +193,7 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::Shutdown(_) => matches!(role, Desktop),
         LocalRequest::Health(_) => true,
         LocalRequest::McpCall(_) => matches!(role, Desktop | McpBridge),
+        LocalRequest::NativeHookEvent(_) => matches!(role, Desktop | McpBridge),
         LocalRequest::Unlock(_) => matches!(role, Desktop),
         LocalRequest::ProjectsList(_) => matches!(role, Desktop),
         LocalRequest::ProjectUpsert(_) => matches!(role, Desktop),

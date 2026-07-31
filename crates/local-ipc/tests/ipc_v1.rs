@@ -706,6 +706,24 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
                 }),
             ),
         ),
+        (
+            "NativeHookEvent",
+            request_fixture(
+                "native_hook_event",
+                serde_json::json!({
+                    "binding": {
+                        "harness": "codex",
+                        "workingDirectory": {
+                            "platform": "macos",
+                            "bytes": "L3dvcmtzcGFjZQ",
+                            "display": "/workspace",
+                        },
+                    },
+                    "event": {"kind": "session_start", "session_id": "session-1"},
+                    "occurredAtMs": "1700000000123",
+                }),
+            ),
+        ),
         ("Unlock", request_fixture("unlock", empty())),
         ("ProjectsList", request_fixture("projects_list", empty())),
         (
@@ -985,13 +1003,13 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
 }
 
 #[test]
-fn role_allowlist_covers_all_48_requests() {
+fn role_allowlist_covers_all_49_requests() {
     let fixtures = all_request_fixtures();
-    assert_eq!(fixtures.len(), 48);
+    assert_eq!(fixtures.len(), 49);
 
     for (name, request) in &fixtures {
         let common = matches!(*name, "Cancel" | "Health");
-        let mcp_domain = matches!(*name, "McpCall");
+        let mcp_domain = matches!(*name, "McpCall" | "NativeHookEvent");
         let installer_setup = matches!(
             *name,
             "AccessGet"
@@ -1027,14 +1045,14 @@ fn role_allowlist_covers_all_48_requests() {
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::Desktop, request))
             .count(),
-        47
+        48
     );
     assert_eq!(
         fixtures
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::McpBridge, request))
             .count(),
-        3
+        4
     );
     assert_eq!(
         fixtures

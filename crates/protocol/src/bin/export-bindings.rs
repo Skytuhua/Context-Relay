@@ -125,6 +125,8 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         HarnessParams,
         McpBinding,
         McpCallParams,
+        NativeHookEvent,
+        NativeHookEventParams,
         PlanParams,
         PackageParams,
         RetryParams,
