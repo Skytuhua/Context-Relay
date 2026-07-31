@@ -773,6 +773,9 @@ fn route_request(_role: ClientRole, request: LocalRequest) -> RoutedRequest {
         LocalRequest::Cancel(_) => RoutedRequest::Immediate(Err(invalid_request_error())),
         LocalRequest::Shutdown(_) => RoutedRequest::Shutdown,
         LocalRequest::Health(_) => RoutedRequest::Health,
+        LocalRequest::NativeHookEvent(_) => RoutedRequest::Immediate(Err(unsupported_error(
+            "Native hook event handling is not available",
+        ))),
         LocalRequest::Unlock(_) => RoutedRequest::Immediate(Ok(LocalResult::Empty)),
         LocalRequest::ProjectPathSet(params) => {
             RoutedRequest::Work(VaultCommand::ProjectPathSet(params))
@@ -2442,7 +2445,7 @@ mod tests {
     #[test]
     fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 48);
+        assert_eq!(fixtures.len(), 49);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -2487,6 +2490,31 @@ mod tests {
         };
         assert_eq!(params.name, "context_relay_status");
         assert_eq!(params.arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn native_hook_event_is_explicitly_unsupported_until_workspace_route_exists() {
+        let request = request_fixture(
+            "native_hook_event",
+            serde_json::json!({
+                "binding": {
+                    "harness": "codex",
+                    "workingDirectory": {
+                        "platform": "macos",
+                        "bytes": "L3dvcmtzcGFjZQ",
+                        "display": "/workspace",
+                    },
+                },
+                "event": {"kind": "session_start", "session_id": "session-1"},
+                "occurredAtMs": "1700000000123",
+            }),
+        );
+
+        let RoutedRequest::Immediate(Err(error)) = route_request(ClientRole::McpBridge, request)
+        else {
+            panic!("native hook event must remain an explicit interim rejection")
+        };
+        assert_eq!(error.code, ErrorCode::HarnessUnsupported);
     }
 
     #[cfg(any(windows, target_os = "macos"))]
@@ -3620,6 +3648,24 @@ mod tests {
                         },
                         "name": "context_relay_status",
                         "arguments": {},
+                    }),
+                ),
+            ),
+            (
+                "NativeHookEvent",
+                request_fixture(
+                    "native_hook_event",
+                    serde_json::json!({
+                        "binding": {
+                            "harness": "codex",
+                            "workingDirectory": {
+                                "platform": "macos",
+                                "bytes": "L3dvcmtzcGFjZQ",
+                                "display": "/workspace",
+                            },
+                        },
+                        "event": {"kind": "session_start", "session_id": "session-1"},
+                        "occurredAtMs": "1700000000123",
                     }),
                 ),
             ),
