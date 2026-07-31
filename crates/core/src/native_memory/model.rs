@@ -1,0 +1,216 @@
+use context_relay_protocol::{
+    HarnessId, MAX_MARKDOWN_BYTES, MAX_TITLE_BYTES, NativePlatform, ScopeRef, Sha256Digest,
+    WireNativeValue,
+};
+use sha2::{Digest as _, Sha256};
+use std::{error::Error, fmt};
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NativeMemorySourceId(pub Sha256Digest);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeMemoryDocumentKind {
+    Agent,
+    UserProfile,
+    Summary,
+    Topic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeMemoryLimits {
+    pub max_bytes: usize,
+    pub max_characters: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeMemorySource {
+    pub id: NativeMemorySourceId,
+    pub harness: HarnessId,
+    pub adapter_version: String,
+    pub scope: ScopeRef,
+    pub document_kind: NativeMemoryDocumentKind,
+    pub path: WireNativeValue,
+    pub limits: NativeMemoryLimits,
+    pub managed_fence: bool,
+}
+
+impl NativeMemorySource {
+    pub fn new(
+        harness: HarnessId,
+        adapter_version: &str,
+        scope: ScopeRef,
+        document_kind: NativeMemoryDocumentKind,
+        path: WireNativeValue,
+        limits: NativeMemoryLimits,
+        managed_fence: bool,
+    ) -> Result<Self, NativeMemoryError> {
+        let id = derive_source_id(
+            harness,
+            adapter_version,
+            &scope,
+            document_kind,
+            &path,
+            limits,
+        )?;
+        Ok(Self {
+            id,
+            harness,
+            adapter_version: adapter_version.to_owned(),
+            scope,
+            document_kind,
+            path,
+            limits,
+            managed_fence,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), NativeMemoryError> {
+        let expected = derive_source_id(
+            self.harness,
+            &self.adapter_version,
+            &self.scope,
+            self.document_kind,
+            &self.path,
+            self.limits,
+        )?;
+        if expected != self.id {
+            return Err(NativeMemoryError::InvalidSource("id"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeMemorySnapshot {
+    Absent,
+    Regular(Vec<u8>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeMemoryLedger {
+    pub source_id: NativeMemorySourceId,
+    pub last_observed_digest: Option<Sha256Digest>,
+    pub last_unmanaged_digest: Option<Sha256Digest>,
+    pub last_imported_digest: Option<Sha256Digest>,
+    pub last_applied_digest: Option<Sha256Digest>,
+    pub initial_preview_complete: bool,
+}
+
+impl NativeMemoryLedger {
+    pub const fn new(source_id: NativeMemorySourceId) -> Self {
+        Self {
+            source_id,
+            last_observed_digest: None,
+            last_unmanaged_digest: None,
+            last_imported_digest: None,
+            last_applied_digest: None,
+            initial_preview_complete: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeMemoryError {
+    InvalidSource(&'static str),
+    InvalidUtf8,
+    TooLarge,
+    MalformedManagedFence,
+}
+
+impl fmt::Display for NativeMemoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSource(field) => {
+                write!(formatter, "invalid native memory source: {field}")
+            }
+            Self::InvalidUtf8 => formatter.write_str("native memory is not valid UTF-8"),
+            Self::TooLarge => formatter.write_str("native memory exceeds its declared limit"),
+            Self::MalformedManagedFence => {
+                formatter.write_str("native memory managed markers are malformed")
+            }
+        }
+    }
+}
+
+impl Error for NativeMemoryError {}
+
+fn derive_source_id(
+    harness: HarnessId,
+    adapter_version: &str,
+    scope: &ScopeRef,
+    document_kind: NativeMemoryDocumentKind,
+    path: &WireNativeValue,
+    limits: NativeMemoryLimits,
+) -> Result<NativeMemorySourceId, NativeMemoryError> {
+    if adapter_version.trim().is_empty()
+        || adapter_version.len() > MAX_TITLE_BYTES
+        || adapter_version.chars().any(char::is_control)
+    {
+        return Err(NativeMemoryError::InvalidSource("adapter_version"));
+    }
+    if path.validate().is_err() || path.bytes.is_empty() || path_contains_nul(path) {
+        return Err(NativeMemoryError::InvalidSource("path"));
+    }
+    if limits.max_bytes == 0
+        || limits.max_characters == 0
+        || limits.max_bytes > MAX_MARKDOWN_BYTES
+        || limits.max_characters > MAX_MARKDOWN_BYTES
+    {
+        return Err(NativeMemoryError::InvalidSource("limits"));
+    }
+
+    let mut hasher = Sha256::new();
+    add_field(&mut hasher, b"context-relay.native-memory-source.v1");
+    add_field(&mut hasher, harness_name(harness).as_bytes());
+    add_field(&mut hasher, adapter_version.as_bytes());
+    match scope {
+        ScopeRef::Global => {
+            add_field(&mut hasher, b"global");
+            add_field(&mut hasher, b"");
+        }
+        ScopeRef::Project { project_id } => {
+            add_field(&mut hasher, b"project");
+            add_field(&mut hasher, project_id.as_bytes());
+        }
+    }
+    add_field(&mut hasher, document_kind_name(document_kind).as_bytes());
+    add_field(&mut hasher, platform_name(path.platform).as_bytes());
+    add_field(&mut hasher, &path.bytes);
+    Ok(NativeMemorySourceId(Sha256Digest(hasher.finalize().into())))
+}
+
+fn add_field(hasher: &mut Sha256, field: &[u8]) {
+    hasher.update((field.len() as u64).to_be_bytes());
+    hasher.update(field);
+}
+
+fn path_contains_nul(path: &WireNativeValue) -> bool {
+    match path.platform {
+        NativePlatform::Macos => path.bytes.contains(&0),
+        NativePlatform::Windows => path.bytes.chunks_exact(2).any(|pair| pair == [0, 0]),
+    }
+}
+
+const fn harness_name(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::ClaudeCode => "claude_code",
+        HarnessId::Codex => "codex",
+        HarnessId::Hermes => "hermes",
+    }
+}
+
+const fn document_kind_name(kind: NativeMemoryDocumentKind) -> &'static str {
+    match kind {
+        NativeMemoryDocumentKind::Agent => "agent",
+        NativeMemoryDocumentKind::UserProfile => "user_profile",
+        NativeMemoryDocumentKind::Summary => "summary",
+        NativeMemoryDocumentKind::Topic => "topic",
+    }
+}
+
+const fn platform_name(platform: NativePlatform) -> &'static str {
+    match platform {
+        NativePlatform::Windows => "windows",
+        NativePlatform::Macos => "macos",
+    }
+}

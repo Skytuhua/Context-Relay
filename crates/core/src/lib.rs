@@ -3,6 +3,7 @@ pub mod codex;
 pub mod crypto;
 pub mod hermes;
 pub mod mcp;
+pub mod native_memory;
 pub mod native_transaction;
 pub mod search;
 pub mod service;
