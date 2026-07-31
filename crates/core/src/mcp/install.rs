@@ -1,4 +1,4 @@
-use std::{fs, path::Path, str::FromStr};
+use std::{fs, path::{Path, PathBuf}, str::FromStr};
 
 use context_relay_protocol::{
     ClientError, ComponentKind, ComponentRecord, DeviceId, ErrorCode, HarnessId,
@@ -9,6 +9,12 @@ use sha2::{Digest as _, Sha256};
 
 pub const BRIDGE_SERVER_NAME: &str = "context-relay";
 const HERMES_STRUCTURAL_LOCATION: &str = "config:mcp_servers.context-relay";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeExecutable {
+    pub path: PathBuf,
+    pub digest: context_relay_protocol::Sha256Digest,
+}
 
 pub const fn harness_cli_name(harness: HarnessId) -> &'static str {
     match harness {
@@ -24,13 +30,26 @@ pub fn bridge_component(
     origin_device: DeviceId,
     created_hlc: HybridLogicalClock,
 ) -> Result<ComponentRecord, ClientError> {
-    let command = absolute_non_link_executable(executable)?;
+    let executable = attest_bridge_executable(executable)?;
+    bridge_component_for_attested(harness, &executable, origin_device, created_hlc)
+}
+
+pub fn bridge_component_for_attested(
+    harness: HarnessId,
+    executable: &BridgeExecutable,
+    origin_device: DeviceId,
+    created_hlc: HybridLogicalClock,
+) -> Result<ComponentRecord, ClientError> {
+    let command = executable
+        .path
+        .to_str()
+        .ok_or_else(|| invalid("MCP bridge executable path is invalid"))?;
     let component = ComponentRecord {
         id: stable_bridge_record_id(harness)?,
         scope: ScopeRef::Global,
         kind: ComponentKind::McpServer,
         name: BRIDGE_SERVER_NAME.to_owned(),
-        body_markdown: canonical_bridge_body(harness, &command)?,
+        body_markdown: canonical_bridge_body(harness, command)?,
         metadata: bridge_metadata(harness),
         provenance: Provenance {
             origin_device,
@@ -44,6 +63,16 @@ pub fn bridge_component(
         .validate()
         .map_err(|_| invalid("MCP bridge component is invalid"))?;
     Ok(component)
+}
+
+pub fn attest_bridge_executable(path: &Path) -> Result<BridgeExecutable, ClientError> {
+    let command = absolute_non_link_executable(path)?;
+    let bytes = fs::read(&command)
+        .map_err(|_| invalid("MCP bridge executable cannot be safely read"))?;
+    Ok(BridgeExecutable {
+        path: PathBuf::from(command),
+        digest: context_relay_protocol::Sha256Digest(Sha256::digest(bytes).into()),
+    })
 }
 
 pub fn is_managed_bridge_component(harness: HarnessId, component: &ComponentRecord) -> bool {

@@ -6,6 +6,7 @@ pub mod mcp;
 pub mod native_transaction;
 pub mod search;
 pub mod service;
+pub mod setup;
 pub mod vault;
 
 use context_relay_protocol::{PROTOCOL_VERSION, ProtocolVersion};
