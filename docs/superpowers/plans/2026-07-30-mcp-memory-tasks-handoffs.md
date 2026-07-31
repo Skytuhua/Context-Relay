@@ -1258,7 +1258,7 @@ empty integration commit only when repository policy explicitly requires the
 roadmap's exact commit subject; otherwise retain the meaningful task commits
 and use the exact roadmap subject for the final substantive fix.
 
-- [ ] **Step 6: Push the branch and continue to Task 14**
+- [x] **Step 6: Push the branch and continue to Task 14**
 
 ```bash
 git push -u origin codex/mcp-memory-task-bridge
