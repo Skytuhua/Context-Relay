@@ -306,7 +306,11 @@ impl ClaudeCodeAdapter {
         let expected = self
             .probe_managed_declaration(&mut validation_runner)
             .map_err(|_| {
-                invalid_request("Claude Code managed bridge state cannot be safely inspected")
+                client_error(
+                    ErrorCode::Conflict,
+                    "Claude Code managed bridge state cannot be safely inspected",
+                    false,
+                )
             })?;
         let intended_declaration = canonical_cli_declaration(&intended.body_markdown)?;
         Ok(ApprovedCliMutation {

@@ -24,9 +24,10 @@ use context_relay_native_runner::{
 };
 use context_relay_protocol::{
     ApplyReceipt, ApprovalClass, CapabilityLevel, ComponentKind, ComponentRecord, DesiredState,
-    DeviceId, ExpectedNativeDigest, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest,
-    InstallationMethod, NativePlatform, NativeScope, NetworkDelta, PermissionDelta, PlanId,
-    ProbeContext, ProjectId, Provenance, ScopeRef, SetupPlan, Sha256Digest, WireNativeValue,
+    DeviceId, ErrorCode, ExpectedNativeDigest, HarnessAdapter, HarnessId, HybridLogicalClock,
+    ImportRequest, InstallationMethod, NativePlatform, NativeScope, NetworkDelta, PermissionDelta,
+    PlanId, ProbeContext, ProjectId, Provenance, ScopeRef, SetupPlan, Sha256Digest,
+    WireNativeValue,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
@@ -1428,6 +1429,69 @@ fn bridge_cli_plan_restores_the_exact_managed_prior_declaration() {
             "codex",
         ]
     );
+}
+
+#[test]
+fn bridge_cli_plan_reports_disabled_and_unmanaged_prior_declarations_as_conflicts() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let intended = executable_bridge(&fixture, "intended bridge executable");
+    let prior = executable_bridge(&fixture, "prior unmanaged bridge executable");
+    let mut unmanaged_body: Value = serde_json::from_str(&prior.body_markdown).unwrap();
+    unmanaged_body["args"][1] = Value::String("claude-code".to_owned());
+    let unmanaged = codex_mcp_get(&serde_json::to_string(&unmanaged_body).unwrap());
+    let listed = codex_mcp_list(&intended.body_markdown);
+    let mut unmanaged_validation = |argv: &[String]| {
+        Ok(match argv {
+            [plugin, list, json]
+                if (plugin.as_str(), list.as_str(), json.as_str())
+                    == ("plugin", "list", "--json") =>
+            {
+                br#"{"installed":[],"available":[]}"#.to_vec()
+            }
+            [mcp, list, json]
+                if (mcp.as_str(), list.as_str(), json.as_str()) == ("mcp", "list", "--json") =>
+            {
+                listed.clone()
+            }
+            [mcp, get, name, json]
+                if (mcp.as_str(), get.as_str(), name.as_str(), json.as_str())
+                    == ("mcp", "get", "context-relay", "--json") =>
+            {
+                unmanaged.clone()
+            }
+            _ => panic!("unexpected validation argv: {argv:?}"),
+        })
+    };
+    let unmanaged_error = fixture
+        .adapter
+        .plan_bridge_cli_mutation_with_runner(&intended, &mut unmanaged_validation)
+        .unwrap_err();
+    assert_eq!(unmanaged_error.code, ErrorCode::Conflict);
+
+    let mut disabled_list: Value = serde_json::from_slice(&listed).unwrap();
+    disabled_list[0]["enabled"] = Value::Bool(false);
+    let disabled_list = serde_json::to_vec(&disabled_list).unwrap();
+    let mut disabled_validation = |argv: &[String]| {
+        Ok(match argv {
+            [plugin, list, json]
+                if (plugin.as_str(), list.as_str(), json.as_str())
+                    == ("plugin", "list", "--json") =>
+            {
+                br#"{"installed":[],"available":[]}"#.to_vec()
+            }
+            [mcp, list, json]
+                if (mcp.as_str(), list.as_str(), json.as_str()) == ("mcp", "list", "--json") =>
+            {
+                disabled_list.clone()
+            }
+            _ => panic!("disabled declaration must be rejected before mcp get"),
+        })
+    };
+    let disabled_error = fixture
+        .adapter
+        .plan_bridge_cli_mutation_with_runner(&intended, &mut disabled_validation)
+        .unwrap_err();
+    assert_eq!(disabled_error.code, ErrorCode::Conflict);
 }
 
 #[test]

@@ -482,7 +482,13 @@ impl CodexAdapter {
         self.recheck_executable_client()?;
         let expected = self
             .probe_managed_declaration(&mut validation_runner)
-            .map_err(|_| invalid("Codex managed bridge state cannot be safely inspected"))?;
+            .map_err(|_| {
+                client_error(
+                    ErrorCode::Conflict,
+                    "Codex managed bridge state cannot be safely inspected",
+                    false,
+                )
+            })?;
         let intended_declaration = canonical_cli_declaration(&intended.body_markdown)?;
         Ok(ApprovedCliMutation {
             stable_id: intended.id.to_string(),

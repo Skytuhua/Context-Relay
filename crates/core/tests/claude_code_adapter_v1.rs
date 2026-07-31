@@ -22,7 +22,7 @@ use context_relay_core::{
 use context_relay_native_runner::NativeState;
 use context_relay_protocol::{
     ApprovalClass, CapabilityLevel, ComponentKind, ComponentRecord, DesiredState, DeviceId,
-    ExpectedNativeDigest, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest,
+    ErrorCode, ExpectedNativeDigest, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest,
     InstallationMethod, NativePlatform, NativeScope, NetworkDelta, PermissionDelta, PlanId,
     ProbeContext, ProjectId, Provenance, ScopeRef, SetupPlan, Sha256Digest, WireNativeValue,
 };
@@ -675,6 +675,52 @@ fn bridge_cli_plan_restores_the_exact_secret_free_managed_prior_declaration() {
             "user",
         ]
     );
+}
+
+#[test]
+fn bridge_cli_plan_reports_disabled_and_unmanaged_prior_declarations_as_conflicts() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let old_path = executable_bridge(&fixture, "old bridge", b"old bridge");
+    let intended_path = executable_bridge(&fixture, "intended bridge", b"intended bridge");
+    let old: Value = serde_json::from_str(&bridge(&fixture, &old_path).body_markdown).unwrap();
+    let intended = bridge(&fixture, &intended_path);
+    let rejected = [
+        json!({
+            "name": "context-relay",
+            "scope": "user",
+            "type": "stdio",
+            "command": old["command"],
+            "args": ["--harness", "codex"],
+        }),
+        json!({
+            "name": "context-relay",
+            "scope": "user",
+            "type": "stdio",
+            "command": old["command"],
+            "args": ["--harness", "claude-code"],
+            "enabled": false,
+        }),
+    ];
+
+    for prior in rejected {
+        let error = fixture
+            .adapter
+            .plan_bridge_cli_mutation_with_runner(&intended, |argv: &[String]| match argv {
+                [mcp, list] if (mcp.as_str(), list.as_str()) == ("mcp", "list") => {
+                    Ok(b"context-relay: local (stdio)\n".to_vec())
+                }
+                [mcp, get, name]
+                    if (mcp.as_str(), get.as_str(), name.as_str())
+                        == ("mcp", "get", "context-relay") =>
+                {
+                    Ok(serde_json::to_vec(&prior).unwrap())
+                }
+                _ => panic!("unexpected validation argv: {argv:?}"),
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Conflict);
+    }
 }
 
 #[test]
