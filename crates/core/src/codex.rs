@@ -2514,8 +2514,10 @@ fn parse_managed_mcp_get_json(
     let object = value
         .as_object()
         .ok_or(BridgeDeclarationProbeError::Inspection)?;
-    if parsed.name != BRIDGE_SERVER_NAME
-        || !parsed.enabled
+    if parsed.name != BRIDGE_SERVER_NAME {
+        return Err(BridgeDeclarationProbeError::Inspection);
+    }
+    if !parsed.enabled
         || !object.get("disabled_reason").is_some_and(Value::is_null)
         || !object.get("enabled_tools").is_some_and(Value::is_null)
         || !object.get("disabled_tools").is_some_and(Value::is_null)

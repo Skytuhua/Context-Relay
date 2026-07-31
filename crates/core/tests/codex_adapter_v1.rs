@@ -1432,6 +1432,46 @@ fn bridge_cli_plan_restores_the_exact_managed_prior_declaration() {
 }
 
 #[test]
+fn bridge_cli_plan_treats_a_mismatched_get_name_as_invalid_inspection_output() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let intended = executable_bridge(&fixture, "intended bridge executable");
+    let listed = codex_mcp_list(&intended.body_markdown);
+    let mut mismatched_get: Value =
+        serde_json::from_slice(&codex_mcp_get(&intended.body_markdown)).unwrap();
+    mismatched_get["name"] = Value::String("different-server".to_owned());
+    let mismatched_get = serde_json::to_vec(&mismatched_get).unwrap();
+    let mut validation = |argv: &[String]| {
+        Ok(match argv {
+            [plugin, list, json]
+                if (plugin.as_str(), list.as_str(), json.as_str())
+                    == ("plugin", "list", "--json") =>
+            {
+                br#"{"installed":[],"available":[]}"#.to_vec()
+            }
+            [mcp, list, json]
+                if (mcp.as_str(), list.as_str(), json.as_str()) == ("mcp", "list", "--json") =>
+            {
+                listed.clone()
+            }
+            [mcp, get, name, json]
+                if (mcp.as_str(), get.as_str(), name.as_str(), json.as_str())
+                    == ("mcp", "get", "context-relay", "--json") =>
+            {
+                mismatched_get.clone()
+            }
+            _ => panic!("unexpected validation argv: {argv:?}"),
+        })
+    };
+
+    let error = fixture
+        .adapter
+        .plan_bridge_cli_mutation_with_runner(&intended, &mut validation)
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::InvalidRequest);
+}
+
+#[test]
 fn bridge_cli_plan_reports_disabled_and_unmanaged_prior_declarations_as_conflicts() {
     let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
     let intended = executable_bridge(&fixture, "intended bridge executable");
