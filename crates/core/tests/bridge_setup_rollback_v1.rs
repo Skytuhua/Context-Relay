@@ -624,6 +624,54 @@ fn rollback_resumes_a_claimed_inverse_when_its_native_transaction_is_missing() {
 }
 
 #[test]
+fn rollback_expires_a_claimed_inverse_at_the_exact_expiry_boundary() {
+    let keys = MemoryKeyStore::default();
+    let path = TempVault::new("bridge-setup-rollback-resume-exact-expiry");
+    let mut vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
+    let original = persist(&mut vault, plan());
+    BridgeInstallService::persisted(&mut vault)
+        .apply(
+            &original.setup.plan_id,
+            NOW_MS + 1,
+            &mut RecordingExecutor::default(),
+        )
+        .unwrap();
+    let inverse_id = Rc::new(RefCell::new(None));
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ = BridgeInstallService::persisted(&mut vault).rollback(
+            &original.setup.plan_id,
+            NOW_MS + 2,
+            &mut CrashRollback {
+                status: None,
+                inverse_id: inverse_id.clone(),
+            },
+        );
+    }));
+    let inverse_id = inverse_id.borrow().unwrap();
+    let inverse_expiry = vault.setup_plan(&inverse_id).unwrap().unwrap().expires_ms;
+    let mut executor = RecordingExecutor::default();
+
+    assert!(
+        BridgeInstallService::persisted(&mut vault)
+            .rollback(&original.setup.plan_id, inverse_expiry, &mut executor)
+            .is_err()
+    );
+    assert!(executor.calls.is_empty());
+    assert_eq!(
+        vault
+            .setup_plan(&original.setup.plan_id)
+            .unwrap()
+            .unwrap()
+            .lifecycle,
+        SetupPlanLifecycle::RollbackRestored
+    );
+    assert_eq!(
+        vault.setup_plan(&inverse_id).unwrap().unwrap().lifecycle,
+        SetupPlanLifecycle::ApplyRestored
+    );
+}
+
+#[test]
 fn startup_reconciliation_finalizes_a_terminal_original_and_inverse_pair() {
     let keys = MemoryKeyStore::default();
     let path = TempVault::new("bridge-setup-rollback-startup-reconcile");

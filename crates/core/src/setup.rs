@@ -451,6 +451,12 @@ impl PersistedBridgeInstallService<'_> {
             if let Some(lifecycle) = self.reconcile_apply_terminal(&stored)? {
                 return apply_terminal_result(lifecycle);
             }
+            if now_ms >= stored.expires_ms {
+                self.vault
+                    .finish_setup_plan(plan_id, SetupPlanLifecycle::ApplyRestored)
+                    .map_err(|_| conflict("Expired bridge apply cannot be finalized"))?;
+                return Err(conflict("Persisted bridge apply plan has expired"));
+            }
             return self.execute_claimed_apply(&stored, &opened.plan, now_ms, executor);
         }
         if matches!(
@@ -514,6 +520,17 @@ impl PersistedBridgeInstallService<'_> {
             let (inverse_record, inverse) = self.validated_inverse_plan(&opened)?;
             if let Some(lifecycle) = self.reconcile_rollback_terminal(&stored, &inverse_record)? {
                 return rollback_terminal_result(lifecycle);
+            }
+            if now_ms >= inverse_record.expires_ms {
+                self.vault
+                    .finish_setup_plan_rollback(
+                        original_plan_id,
+                        &inverse_record.plan_id,
+                        SetupPlanLifecycle::RollbackRestored,
+                        SetupPlanLifecycle::ApplyRestored,
+                    )
+                    .map_err(|_| conflict("Expired bridge rollback cannot be finalized"))?;
+                return Err(conflict("Persisted bridge rollback plan has expired"));
             }
             return self.execute_claimed_rollback(
                 &stored,

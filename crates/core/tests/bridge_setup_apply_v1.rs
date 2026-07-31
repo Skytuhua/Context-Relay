@@ -349,6 +349,37 @@ fn apply_resumes_an_already_claimed_plan_when_the_native_transaction_is_missing(
 }
 
 #[test]
+fn apply_expires_an_already_claimed_plan_at_the_exact_expiry_boundary() {
+    let path = TempVault::new("bridge-setup-apply-resume-exact-expiry");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), "bridge-setup-apply-v1", &keys).unwrap();
+    let (candidate, _) = persist(&mut vault, plan());
+    vault
+        .claim_setup_plan(&candidate.setup.plan_id, SetupPlanAction::Apply, NOW_MS + 1)
+        .unwrap();
+    let mut executor = RecordingExecutor::default();
+
+    assert!(
+        BridgeInstallService::persisted(&mut vault)
+            .apply(
+                &candidate.setup.plan_id,
+                candidate.setup.expires_at,
+                &mut executor,
+            )
+            .is_err()
+    );
+    assert_eq!(executor.calls, 0);
+    assert_eq!(
+        vault
+            .setup_plan(&candidate.setup.plan_id)
+            .unwrap()
+            .unwrap()
+            .lifecycle,
+        SetupPlanLifecycle::ApplyRestored
+    );
+}
+
+#[test]
 fn apply_reconciles_durable_native_terminal_states_without_reexecuting() {
     let keys = MemoryKeyStore::default();
     for (name, terminal, expected_lifecycle, succeeds) in [
