@@ -1172,6 +1172,12 @@ git commit -m "feat: install the MCP bridge through adapters"
 
 ### Task 9: Complete MCP acceptance verification and publish Task 13
 
+> **Status (2026-08-01): Complete — Task 13 published.** The final
+> three-harness scenario, acceptance matrix, repository gates, and independent
+> review are complete. The only full-workspace exceptions were the macOS
+> native-filesystem tests affected by Codex-applied `com.apple.provenance`;
+> every Task 13 and adjacent suite passed independently.
+
 **Files:**
 - Modify: `crates/context-mcp/tests/end_to_end_v1.rs`
 - Modify: `docs/superpowers/plans/2026-07-30-mcp-memory-tasks-handoffs.md`
@@ -1180,7 +1186,7 @@ git commit -m "feat: install the MCP bridge through adapters"
 - Verifies every Task 13 acceptance criterion in a fresh context.
 - Produces final roadmap commit: `feat: add scoped MCP memory and task bridge`.
 
-- [ ] **Step 1: Add the final three-harness acceptance scenario**
+- [x] **Step 1: Add the final three-harness acceptance scenario**
 
 Exercise one registered project through bridge bindings for Claude Code,
 Codex, and Hermes:
@@ -1202,7 +1208,7 @@ async fn three_harnesses_share_one_scoped_project_without_native_approval() {
 Also assert another registered project is denied, a daemon restart reconnects,
 and replay after an unknown write result returns one record.
 
-- [ ] **Step 2: Run the Task 13 acceptance matrix**
+- [x] **Step 2: Run the Task 13 acceptance matrix**
 
 ```bash
 env CARGO_HOME=/private/tmp/context-relay-cargo RUSTUP_HOME=/private/tmp/context-relay-rustup /private/tmp/context-relay-cargo/bin/cargo test -p context-relay-protocol --test mcp_schema_parity_v1
@@ -1218,7 +1224,7 @@ backpressure, stdout purity, scope denial, replay, no-approval writes,
 locked/unavailable errors, complete handoffs, and all adapter registrations
 pass.
 
-- [ ] **Step 3: Run repository gates**
+- [x] **Step 3: Run repository gates**
 
 ```bash
 env CARGO_HOME=/private/tmp/context-relay-cargo RUSTUP_HOME=/private/tmp/context-relay-rustup /private/tmp/context-relay-cargo/bin/cargo fmt --all -- --check
@@ -1232,7 +1238,7 @@ Rust workspace suite as a final regression gate; if the same pre-existing nine
 `native_filesystem_macos_v1` `UnsafeTopology` failures remain, record them
 verbatim and prove every Task 13 and adjacent suite passed independently.
 
-- [ ] **Step 4: Request fresh code review and resolve every actionable finding**
+- [x] **Step 4: Request fresh code review and resolve every actionable finding**
 
 Review the complete branch diff from `e103ab49` through HEAD against the
 design, with special attention to project binding, output validation,
@@ -1240,7 +1246,7 @@ cancellation races, idempotency, stdout purity, and adapter activation.
 Implement findings with a new failing test before each fix, then rerun the
 focused and repository gates.
 
-- [ ] **Step 5: Create the roadmap feature commit if the task commits need a final integration commit**
+- [x] **Step 5: Create the roadmap feature commit if the task commits need a final integration commit**
 
 ```bash
 git add crates/context-mcp crates/contextd crates/core crates/local-ipc crates/protocol Cargo.lock docs/superpowers/specs/2026-07-30-mcp-memory-tasks-handoffs-design.md docs/superpowers/plans/2026-07-30-mcp-memory-tasks-handoffs.md

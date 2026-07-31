@@ -414,6 +414,11 @@ git commit -m "feat: route transactional harness setup through contextd"
 
 ### Task 9: Prove cross-adapter installation acceptance
 
+> **Status (2026-08-01): Complete.** The cross-adapter matrix, public contextd
+> routing, compensation/recovery, and independent review are complete. The
+> macOS native-filesystem regressions were also isolated to Codex-applied
+> `com.apple.provenance`; all Task 9 and adjacent suites passed independently.
+
 **Files:**
 
 - Create or extend: `crates/core/tests/mcp_bridge_install_v1.rs`
