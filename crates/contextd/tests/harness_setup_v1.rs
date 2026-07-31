@@ -203,6 +203,7 @@ async fn digest_change_rejects_apply_without_write_and_repair_stays_unsupported(
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Conflict);
     assert_eq!(fixture.engine.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.engine.bridge_launches.load(Ordering::SeqCst), 0);
 
     let error = client
         .call(LocalRequest::HarnessRepair(HarnessParams {

@@ -1605,15 +1605,19 @@ pub fn client_error_from_vault(error: VaultError) -> ClientError {
 pub mod test_support {
     use std::{
         collections::HashMap,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::{
             Arc, Condvar, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
 
-    use context_relay_core::vault::{DatabaseKeyStore, VaultError};
+    use context_relay_core::vault::{DatabaseKeyStore, Vault, VaultError};
     use context_relay_local_ipc::{InstallationToken, RuntimeConfig};
+    use context_relay_protocol::{
+        ClientError, DeviceId, ErrorCode, HarnessAccessPolicy, HarnessId, HarnessParams,
+        PlanParams, ProjectIdentity, SetupPlan, WireNativeValue,
+    };
     use tokio::sync::Notify;
     use zeroize::Zeroizing;
 
@@ -1667,6 +1671,31 @@ pub mod test_support {
         ) -> Self {
             self.bridge_install = Some(bridge_install);
             self
+        }
+
+        pub fn seed_mcp_project(
+            &self,
+            project: &ProjectIdentity,
+            root: &Path,
+            policies: &[(HarnessId, HarnessAccessPolicy)],
+        ) -> Result<(), VaultError> {
+            std::fs::create_dir_all(self.vault_path.parent().expect("test vault has a parent"))
+                .expect("create test vault directory");
+            let canonical_root = std::fs::canonicalize(root).expect("canonical test project root");
+            let mut vault = Vault::open(
+                &self.vault_path,
+                "context-relay-test-vault-key",
+                self.keys.as_ref(),
+            )?;
+            vault.put_project(project)?;
+            vault.put_path(
+                &project.project_id.to_string(),
+                &wire_native_path(&canonical_root),
+            )?;
+            for (harness, policy) in policies {
+                vault.set_access_policy(*harness, policy)?;
+            }
+            Ok(())
         }
 
         pub async fn start(&self) -> Result<Daemon, DaemonError> {
@@ -1747,6 +1776,78 @@ pub mod test_support {
         }
     }
 
+    #[derive(Default)]
+    pub struct TestRecordingBridgeInstallEngine {
+        reconciles: AtomicUsize,
+        previews: AtomicUsize,
+        applies: AtomicUsize,
+        rollbacks: AtomicUsize,
+        launches: AtomicUsize,
+    }
+
+    impl TestRecordingBridgeInstallEngine {
+        pub fn assert_no_setup_calls(&self) {
+            assert_eq!(self.previews.load(Ordering::SeqCst), 0);
+            assert_eq!(self.applies.load(Ordering::SeqCst), 0);
+            assert_eq!(self.rollbacks.load(Ordering::SeqCst), 0);
+            assert_eq!(self.launches.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    impl BridgeInstallEngine for TestRecordingBridgeInstallEngine {
+        fn reconcile_after_native_recovery(
+            &self,
+            _vault: &mut Vault,
+            _vault_path: &Path,
+            _device_id: DeviceId,
+        ) -> Result<(), ClientError> {
+            self.reconciles.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn preview(
+            &self,
+            _vault: &mut Vault,
+            _vault_path: &Path,
+            _device_id: DeviceId,
+            _params: HarnessParams,
+        ) -> Result<SetupPlan, ClientError> {
+            self.previews.fetch_add(1, Ordering::SeqCst);
+            Err(unexpected_setup_call())
+        }
+
+        fn apply(
+            &self,
+            _vault: &mut Vault,
+            _vault_path: &Path,
+            _device_id: DeviceId,
+            _params: PlanParams,
+        ) -> Result<(), ClientError> {
+            self.applies.fetch_add(1, Ordering::SeqCst);
+            Err(unexpected_setup_call())
+        }
+
+        fn rollback(
+            &self,
+            _vault: &mut Vault,
+            _vault_path: &Path,
+            _device_id: DeviceId,
+            _params: PlanParams,
+        ) -> Result<(), ClientError> {
+            self.rollbacks.fetch_add(1, Ordering::SeqCst);
+            Err(unexpected_setup_call())
+        }
+    }
+
+    fn unexpected_setup_call() -> ClientError {
+        ClientError {
+            code: ErrorCode::Internal,
+            message: "unexpected bridge setup call in daemon-backed test".into(),
+            field_path: None,
+            retryable: false,
+        }
+    }
+
     impl WorkerHook for TestWorkerGate {
         fn before_execute(&self) {
             self.entered.store(true, Ordering::Release);
@@ -1765,6 +1866,33 @@ pub mod test_support {
 
     struct TestTokenProvider {
         token: [u8; 32],
+    }
+
+    fn wire_native_path(path: &Path) -> WireNativeValue {
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+
+            WireNativeValue {
+                platform: context_relay_protocol::NativePlatform::Windows,
+                bytes: path
+                    .as_os_str()
+                    .encode_wide()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+                display: None,
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            WireNativeValue {
+                platform: context_relay_protocol::NativePlatform::Macos,
+                bytes: path.as_os_str().as_bytes().to_vec(),
+                display: None,
+            }
+        }
     }
 
     impl InstallationTokenProvider for TestTokenProvider {
