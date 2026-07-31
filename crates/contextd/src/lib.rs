@@ -1615,8 +1615,11 @@ pub mod test_support {
     use context_relay_core::vault::{DatabaseKeyStore, Vault, VaultError};
     use context_relay_local_ipc::{InstallationToken, RuntimeConfig};
     use context_relay_protocol::{
-        ClientError, DeviceId, ErrorCode, HarnessAccessPolicy, HarnessId, HarnessParams,
-        PlanParams, ProjectIdentity, SetupPlan, WireNativeValue,
+        ClientError, DeviceId, ErrorCode, HarnessParams, PlanParams, SetupPlan,
+    };
+    #[cfg(any(windows, target_os = "macos"))]
+    use context_relay_protocol::{
+        HarnessAccessPolicy, HarnessId, ProjectIdentity, WireNativeValue,
     };
     use tokio::sync::Notify;
     use zeroize::Zeroizing;
@@ -1673,6 +1676,7 @@ pub mod test_support {
             self
         }
 
+        #[cfg(any(windows, target_os = "macos"))]
         pub fn seed_mcp_project(
             &self,
             project: &ProjectIdentity,
@@ -1782,15 +1786,16 @@ pub mod test_support {
         previews: AtomicUsize,
         applies: AtomicUsize,
         rollbacks: AtomicUsize,
-        launches: AtomicUsize,
     }
 
     impl TestRecordingBridgeInstallEngine {
+        /// Bridge installation and native mutation are reachable only through
+        /// preview, apply, or rollback. Those methods record and fail on call,
+        /// so zero calls proves ordinary MCP work did not enter setup.
         pub fn assert_no_setup_calls(&self) {
             assert_eq!(self.previews.load(Ordering::SeqCst), 0);
             assert_eq!(self.applies.load(Ordering::SeqCst), 0);
             assert_eq!(self.rollbacks.load(Ordering::SeqCst), 0);
-            assert_eq!(self.launches.load(Ordering::SeqCst), 0);
         }
     }
 
@@ -1868,6 +1873,7 @@ pub mod test_support {
         token: [u8; 32],
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     fn wire_native_path(path: &Path) -> WireNativeValue {
         #[cfg(windows)]
         {
@@ -1883,7 +1889,7 @@ pub mod test_support {
                 display: None,
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         {
             use std::os::unix::ffi::OsStrExt;
 
