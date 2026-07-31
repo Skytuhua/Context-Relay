@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use context_relay_native_runner::{
     NativeObjectToken as RunnerObjectToken, NativeRecoveryDisposition, NativeState,
@@ -14,8 +14,10 @@ use crate::vault::{
 };
 
 use super::{
+    ApprovedCliMutation, NativeTransactionPlan,
     engine::BoundaryError,
     model::{MutationWalState, NativeObjectToken, RestorableStateFingerprint},
+    open_plan,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -309,6 +311,95 @@ pub trait NativeCliRecoveryIo {
         sealed_plan_payload: &[u8],
         wal: &[NativeCliWalRecord],
     ) -> Result<(), BoundaryError>;
+}
+
+/// Approval-bound CLI recovery inputs reconstructed from the sealed plan.
+///
+/// Callers receive no operation or declaration bytes sourced from the WAL;
+/// every returned mutation comes from the authenticated plan after the WAL is
+/// matched byte-for-byte to its sequence-indexed mutation.
+pub struct BoundCliRecoveryPlan {
+    pub plan: NativeTransactionPlan,
+    pub mutations: Vec<ApprovedCliMutation>,
+}
+
+pub fn bind_cli_recovery_plan(
+    sealed_plan_payload: &[u8],
+    wal: &[NativeCliWalRecord],
+) -> Result<BoundCliRecoveryPlan, BoundaryError> {
+    let opened = open_plan(sealed_plan_payload)
+        .map_err(|_| BoundaryError::new("native CLI recovery plan is invalid"))?;
+    // Bridge previews with CLI mutations are deliberately CLI-only. Enforcing
+    // that invariant here means adapter attestation cannot strand recovery in
+    // the middle of a partially applied native-file phase.
+    if opened.plan.approval_version != 2
+        || wal.is_empty()
+        || opened.plan.cli_mutations.is_empty()
+        || !opened.plan.mutations.is_empty()
+    {
+        return Err(BoundaryError::new(
+            "native CLI recovery plan is not approval-bound",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut mutations = Vec::with_capacity(wal.len());
+    for row in wal {
+        if !seen.insert(row.sequence) {
+            return Err(BoundaryError::new(
+                "native CLI recovery WAL repeats a sequence",
+            ));
+        }
+        let mutation = usize::try_from(row.sequence)
+            .ok()
+            .and_then(|sequence| opened.plan.cli_mutations.get(sequence))
+            .ok_or_else(|| {
+                BoundaryError::new("native CLI recovery WAL sequence is not in the sealed plan")
+            })?;
+        let target = mutation
+            .expected
+            .as_ref()
+            .or(mutation.intended.as_ref())
+            .ok_or_else(|| BoundaryError::new("native CLI recovery mutation has no target"))?;
+        let forward = serde_json::to_vec(&mutation.forward)
+            .map_err(|_| BoundaryError::new("native CLI recovery operations are invalid"))?;
+        let rollback = serde_json::to_vec(&mutation.rollback)
+            .map_err(|_| BoundaryError::new("native CLI recovery operations are invalid"))?;
+        let expected_declaration = mutation
+            .expected
+            .as_ref()
+            .map(|declaration| declaration.canonical_body.as_bytes());
+        let expected_fingerprint = mutation
+            .expected
+            .as_ref()
+            .map(|declaration| declaration.fingerprint);
+        let intended_declaration = mutation
+            .intended
+            .as_ref()
+            .map(|declaration| declaration.canonical_body.as_bytes());
+        let intended_fingerprint = mutation
+            .intended
+            .as_ref()
+            .map(|declaration| declaration.fingerprint);
+        if row.stable_id != mutation.stable_id
+            || row.harness != target.harness
+            || row.server_name != target.server_name
+            || row.expected_declaration.as_deref() != expected_declaration
+            || row.expected_fingerprint != expected_fingerprint
+            || row.intended_declaration.as_deref() != intended_declaration
+            || row.intended_fingerprint != intended_fingerprint
+            || row.forward_operations != forward
+            || row.rollback_operations != rollback
+        {
+            return Err(BoundaryError::new(
+                "native CLI recovery WAL does not match the sealed plan",
+            ));
+        }
+        mutations.push(mutation.clone());
+    }
+    Ok(BoundCliRecoveryPlan {
+        plan: opened.plan,
+        mutations,
+    })
 }
 
 #[derive(Default)]

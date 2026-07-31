@@ -1194,6 +1194,18 @@ where
     O: ClaudeCodeCommandRunner,
     V: ClaudeCodeCommandRunner,
 {
+    fn probe_cli_mutation(
+        &mut self,
+        mutation: &ApprovedCliMutation,
+    ) -> Result<Option<Sha256Digest>, BoundaryError> {
+        self.adapter.recheck_executable_boundary()?;
+        self.validate_mutation(mutation)?;
+        let live = self
+            .adapter
+            .probe_managed_declaration(&mut self.validation_runner)?;
+        Ok(declaration_fingerprint(live.as_ref()))
+    }
+
     fn compare_cli_targets(
         &mut self,
         mutations: &[ApprovedCliMutation],

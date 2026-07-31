@@ -28,6 +28,12 @@ pub struct CliRestoreOutcome {
 /// They are responsible for executing the mutation's sealed operations and
 /// reprobe declarations without launching the configured MCP bridge.
 pub trait NativeCliExecutor {
+    /// Reprobes one approval-bound declaration without executing a mutation.
+    fn probe_cli_mutation(
+        &mut self,
+        mutation: &ApprovedCliMutation,
+    ) -> Result<Option<Sha256Digest>, BoundaryError>;
+
     fn compare_cli_targets(
         &mut self,
         mutations: &[ApprovedCliMutation],

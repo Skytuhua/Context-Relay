@@ -211,6 +211,18 @@ where
 pub struct NoBridgeCliExecutor;
 
 impl crate::native_transaction::cli::NativeCliExecutor for NoBridgeCliExecutor {
+    fn probe_cli_mutation(
+        &mut self,
+        _: &ApprovedCliMutation,
+    ) -> Result<
+        Option<context_relay_protocol::Sha256Digest>,
+        crate::native_transaction::engine::BoundaryError,
+    > {
+        Err(crate::native_transaction::engine::BoundaryError::new(
+            "bridge plan unexpectedly contains CLI mutations",
+        ))
+    }
+
     fn compare_cli_targets(
         &mut self,
         _: &[ApprovedCliMutation],

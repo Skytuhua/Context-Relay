@@ -5,10 +5,13 @@ use std::{panic::AssertUnwindSafe, str::FromStr};
 use context_relay_core::{
     native_transaction::{
         ApprovedCliMutation, CanonicalCliDeclaration, NativeTransactionPlan, SidecarBinding,
-        approval_hash_v2, seal_plan,
+        approval_hash_v2, recovery::bind_cli_recovery_plan, seal_plan,
     },
     setup::{BridgeExecutionError, BridgeInstallService, BridgePlanExecutor},
-    vault::{NativeTransactionStatus, SetupPlanAction, SetupPlanLifecycle, SetupPlanWrite, Vault},
+    vault::{
+        NativeCliWalRecord, NativeCliWalState, NativeTransactionStatus, SetupPlanAction,
+        SetupPlanLifecycle, SetupPlanWrite, Vault,
+    },
 };
 use context_relay_native_runner::{
     RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand, SidecarId,
@@ -187,6 +190,90 @@ fn persist(vault: &mut Vault, mut plan: NativeTransactionPlan) -> (NativeTransac
         })
         .unwrap();
     (plan, sealed)
+}
+
+fn cli_wal(plan: &NativeTransactionPlan) -> NativeCliWalRecord {
+    let mutation = &plan.cli_mutations[0];
+    let target = mutation
+        .expected
+        .as_ref()
+        .or(mutation.intended.as_ref())
+        .unwrap();
+    NativeCliWalRecord {
+        sequence: 0,
+        stable_id: mutation.stable_id.clone(),
+        harness: target.harness,
+        server_name: target.server_name.clone(),
+        expected_declaration: mutation
+            .expected
+            .as_ref()
+            .map(|declaration| declaration.canonical_body.as_bytes().to_vec()),
+        expected_fingerprint: mutation
+            .expected
+            .as_ref()
+            .map(|declaration| declaration.fingerprint),
+        intended_declaration: mutation
+            .intended
+            .as_ref()
+            .map(|declaration| declaration.canonical_body.as_bytes().to_vec()),
+        intended_fingerprint: mutation
+            .intended
+            .as_ref()
+            .map(|declaration| declaration.fingerprint),
+        forward_operations: serde_json::to_vec(&mutation.forward).unwrap(),
+        rollback_operations: serde_json::to_vec(&mutation.rollback).unwrap(),
+        state: NativeCliWalState::Prepared,
+    }
+}
+
+#[test]
+fn cli_recovery_binding_accepts_only_exact_sealed_plan_wal_bytes() {
+    let path = TempVault::new("bridge-cli-recovery-binding");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), "bridge-setup-apply-v1", &keys).unwrap();
+    let (plan, sealed) = persist(&mut vault, plan());
+    let exact = cli_wal(&plan);
+
+    let bound = bind_cli_recovery_plan(&sealed, std::slice::from_ref(&exact)).unwrap();
+    assert_eq!(bound.plan, plan);
+    assert_eq!(bound.mutations, plan.cli_mutations);
+
+    let mut tampered = Vec::new();
+    let mut sequence = exact.clone();
+    sequence.sequence = 1;
+    tampered.push(sequence);
+    let mut stable_id = exact.clone();
+    stable_id.stable_id.push('x');
+    tampered.push(stable_id);
+    let mut harness = exact.clone();
+    harness.harness = HarnessId::ClaudeCode;
+    tampered.push(harness);
+    let mut server = exact.clone();
+    server.server_name.push('x');
+    tampered.push(server);
+    let mut declaration = exact.clone();
+    declaration
+        .intended_declaration
+        .as_mut()
+        .unwrap()
+        .push(b' ');
+    tampered.push(declaration);
+    let mut fingerprint = exact.clone();
+    fingerprint.intended_fingerprint = Some(Sha256Digest([99; 32]));
+    tampered.push(fingerprint);
+    let mut forward = exact.clone();
+    forward.forward_operations.push(b' ');
+    tampered.push(forward);
+    let mut rollback = exact.clone();
+    rollback.rollback_operations.push(b' ');
+    tampered.push(rollback);
+    for row in tampered {
+        assert!(bind_cli_recovery_plan(&sealed, &[row]).is_err());
+    }
+
+    let mut approval_mismatch = sealed.clone();
+    *approval_mismatch.last_mut().unwrap() ^= 1;
+    assert!(bind_cli_recovery_plan(&approval_mismatch, &[exact]).is_err());
 }
 
 #[test]

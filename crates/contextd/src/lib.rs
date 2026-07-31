@@ -6,17 +6,21 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(windows))]
+use context_relay_core::vault::{MacGenerationState, MacGenerationSubstate};
 use context_relay_core::{
     mcp::McpWorkspace,
     native_transaction::{
-        engine::BoundaryError,
+        cli::NativeCliExecutor,
+        engine::{BoundaryError, NativeAdapter},
         recovery::{
-            OsNativeRecoveryIo, RecoveryCleanup, RecoveryOutcome, RecoverySandboxIdentity,
-            recover_native_transactions,
+            BoundCliRecoveryPlan, CliRecoveryRestore, NativeCliRecoveryIo, OsNativeRecoveryIo,
+            RecoveryCleanup, RecoveryOutcome, RecoverySandboxIdentity, bind_cli_recovery_plan,
+            recover_native_transactions_with_cli,
         },
     },
     service::OfflineWorkspace,
-    vault::{DatabaseKeyStore, PlatformKeyStore, Vault, VaultError},
+    vault::{DatabaseKeyStore, NativeCliWalRecord, PlatformKeyStore, Vault, VaultError},
 };
 use context_relay_local_ipc::{
     AuthenticatedConnection, AuthenticatedRequest, CONNECTION_LIMIT, ConnectedStream,
@@ -28,9 +32,9 @@ use context_relay_local_ipc::{
 use context_relay_protocol::{
     AccountDeletionState, BoundedBytes, ClientError, ClientRole, DaemonInstanceNonce, DeviceId,
     DeviceState, DeviceSummary, ErrorCode, ExportId, ExportPayload, HandoffPayload, HarnessId,
-    LocalRequest, LocalResult, MAX_ARBITRARY_BYTES, MemoryKind, MemoryParams, NativePlatform,
-    PROTOCOL_VERSION, ProjectPathParams, ProtocolVersionRange, ScopeRef, Sha256Digest, SyncState,
-    VaultState,
+    HybridLogicalClock, LocalRequest, LocalResult, MAX_ARBITRARY_BYTES, MemoryKind, MemoryParams,
+    NativePlatform, PROTOCOL_VERSION, ProjectPathParams, ProtocolVersionRange, ScopeRef,
+    Sha256Digest, SyncState, VaultState,
 };
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -189,17 +193,127 @@ impl VaultConfig {
 fn recover_startup_native_transactions(
     vault: &mut Vault,
     vault_path: &Path,
+    device_id: DeviceId,
 ) -> Result<(), DaemonError> {
-    let private_root = vault_path
+    let root = vault_path
         .parent()
-        .ok_or(DaemonError::Startup)?
-        .join(NATIVE_SANDBOX_DIRECTORY);
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .ok_or(DaemonError::Startup)?;
+    let private_root = root.join(NATIVE_SANDBOX_DIRECTORY);
     let mut io = OsNativeRecoveryIo::new(|identity, outcome| {
         cleanup_recovered_sandbox(&private_root, &identity, outcome)
     });
-    recover_native_transactions(vault, &mut io)
+    let project_id = bridge_install::global_project_id().map_err(|_| DaemonError::Startup)?;
+    let observed_hlc = HybridLogicalClock::new(startup_now_ms()?, 0, device_id);
+    let mut cli = ProductionBridgeCliRecoveryIo {
+        root,
+        project_id,
+        device_id,
+        observed_hlc,
+    };
+    recover_native_transactions_with_cli(vault, &mut io, &mut cli)
         .map(|_| ())
         .map_err(|_| DaemonError::Startup)
+}
+
+struct ProductionBridgeCliRecoveryIo {
+    root: PathBuf,
+    project_id: context_relay_protocol::ProjectId,
+    device_id: DeviceId,
+    observed_hlc: HybridLogicalClock,
+}
+
+impl ProductionBridgeCliRecoveryIo {
+    fn with_executor<R>(
+        &self,
+        bound: &BoundCliRecoveryPlan,
+        operation: impl FnOnce(
+            &mut dyn NativeCliExecutor,
+            &[context_relay_core::native_transaction::ApprovedCliMutation],
+        ) -> Result<R, BoundaryError>,
+    ) -> Result<R, BoundaryError> {
+        match bound.plan.setup.harness {
+            HarnessId::ClaudeCode => {
+                let mut adapter = context_relay_core::claude_code::ClaudeCodeAdapter::discover(
+                    &self.root,
+                    self.project_id,
+                    self.device_id,
+                    self.observed_hlc,
+                )
+                .map_err(|error| BoundaryError::new(error.message))?;
+                adapter.reprobe_live_state(&bound.plan)?;
+                let mut executor = adapter.cli_executor();
+                operation(&mut executor, &bound.mutations)
+            }
+            HarnessId::Codex => {
+                let mut adapter = context_relay_core::codex::CodexAdapter::discover(
+                    &self.root,
+                    &self.root,
+                    self.project_id,
+                    self.device_id,
+                    self.observed_hlc,
+                )
+                .map_err(|error| BoundaryError::new(error.message))?;
+                adapter.reprobe_live_state(&bound.plan)?;
+                let mut executor = adapter.cli_executor();
+                operation(&mut executor, &bound.mutations)
+            }
+            HarnessId::Hermes => Err(BoundaryError::new(
+                "Hermes plans cannot contain native CLI recovery mutations",
+            )),
+        }
+    }
+}
+
+impl NativeCliRecoveryIo for ProductionBridgeCliRecoveryIo {
+    fn probe_cli_declaration(
+        &mut self,
+        sealed_plan_payload: &[u8],
+        wal: &NativeCliWalRecord,
+    ) -> Result<Option<Sha256Digest>, BoundaryError> {
+        let bound = bind_cli_recovery_plan(sealed_plan_payload, std::slice::from_ref(wal))?;
+        self.with_executor(&bound, |executor, mutations| {
+            executor.probe_cli_mutation(&mutations[0])
+        })
+    }
+
+    fn restore_cli_mutation_if_matches(
+        &mut self,
+        sealed_plan_payload: &[u8],
+        wal: &NativeCliWalRecord,
+    ) -> Result<CliRecoveryRestore, BoundaryError> {
+        let bound = bind_cli_recovery_plan(sealed_plan_payload, std::slice::from_ref(wal))?;
+        self.with_executor(&bound, |executor, mutations| {
+            executor
+                .restore_cli_mutation_if_matches(&mutations[0])
+                .map(|outcome| {
+                    if outcome.restored {
+                        CliRecoveryRestore::Restored
+                    } else {
+                        CliRecoveryRestore::Conflict
+                    }
+                })
+        })
+    }
+
+    fn finish_committed_cli_mutations(
+        &mut self,
+        sealed_plan_payload: &[u8],
+        wal: &[NativeCliWalRecord],
+    ) -> Result<(), BoundaryError> {
+        let bound = bind_cli_recovery_plan(sealed_plan_payload, wal)?;
+        self.with_executor(&bound, |executor, mutations| {
+            executor.finish_committed_cli_mutations(mutations)
+        })
+    }
+}
+
+fn startup_now_ms() -> Result<u64, DaemonError> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| DaemonError::Startup)?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| DaemonError::Startup)
 }
 
 #[cfg(windows)]
@@ -208,6 +322,9 @@ fn cleanup_recovered_sandbox(
     identity: &RecoverySandboxIdentity,
     _outcome: RecoveryOutcome,
 ) -> Result<RecoveryCleanup, BoundaryError> {
+    if is_nonlaunching_recovery_identity(identity) {
+        return Ok(RecoveryCleanup::Cleaned);
+    }
     let RecoverySandboxIdentity::Windows { moniker, sid } = identity else {
         return Err(BoundaryError::new(
             "sandbox identity does not match the current platform",
@@ -224,11 +341,14 @@ fn cleanup_recovered_sandbox(
     identity: &RecoverySandboxIdentity,
     outcome: RecoveryOutcome,
 ) -> Result<RecoveryCleanup, BoundaryError> {
-    use context_relay_core::vault::MacGenerationState;
     use context_relay_native_runner::macos::{
         GenerationState, MacRecoveryCleanup, MacRecoveryIdentity, MacRecoveryOutcome,
         MacRootIdentity, cleanup_recovered_generation,
     };
+
+    if is_nonlaunching_recovery_identity(identity) {
+        return Ok(RecoveryCleanup::Cleaned);
+    }
 
     let RecoverySandboxIdentity::Macos {
         generation_id,
@@ -287,12 +407,58 @@ fn cleanup_recovered_sandbox(
 #[cfg(not(any(windows, target_os = "macos")))]
 fn cleanup_recovered_sandbox(
     _private_root: &Path,
-    _identity: &RecoverySandboxIdentity,
+    identity: &RecoverySandboxIdentity,
     _outcome: RecoveryOutcome,
 ) -> Result<RecoveryCleanup, BoundaryError> {
+    if is_nonlaunching_recovery_identity(identity) {
+        return Ok(RecoveryCleanup::Cleaned);
+    }
     Err(BoundaryError::new(
         "native recovery is unavailable on this platform",
     ))
+}
+
+#[cfg(windows)]
+fn is_nonlaunching_recovery_identity(identity: &RecoverySandboxIdentity) -> bool {
+    matches!(
+        identity,
+        RecoverySandboxIdentity::Windows { moniker, sid }
+            if moniker == bridge_install::NON_LAUNCHING_WINDOWS_MONIKER
+                && sid == bridge_install::NON_LAUNCHING_WINDOWS_SID
+    )
+}
+
+#[cfg(not(windows))]
+fn is_nonlaunching_recovery_identity(identity: &RecoverySandboxIdentity) -> bool {
+    let RecoverySandboxIdentity::Macos {
+        generation_id,
+        bundle_id,
+        container,
+        guardian_pgid,
+        bundle_root,
+        signed_digest,
+        container_root,
+        substate,
+        state,
+    } = identity
+    else {
+        return false;
+    };
+    let expected_bundle = format!(
+        "com.contextrelay.native-runner.{}",
+        bridge_install::NON_LAUNCHING_GENERATION_ID
+    );
+    let mut expected_container = b"context-relay/macos-container/v1\0".to_vec();
+    expected_container.extend_from_slice(expected_bundle.as_bytes());
+    generation_id == bridge_install::NON_LAUNCHING_GENERATION_ID
+        && bundle_id == &expected_bundle
+        && container == &expected_container
+        && guardian_pgid.is_none()
+        && bundle_root.is_none()
+        && signed_digest.is_none()
+        && container_root.is_none()
+        && *substate == MacGenerationSubstate::Reserved
+        && *state == MacGenerationState::Poisoned
 }
 
 pub struct DaemonConfig {
@@ -847,10 +1013,18 @@ impl VaultWorker {
                     if let Some(recovery) = &config.startup_recovery {
                         recovery(&mut vault)?;
                     } else {
-                        recover_startup_native_transactions(&mut vault, &config.path)?;
+                        recover_startup_native_transactions(
+                            &mut vault,
+                            &config.path,
+                            config.device_id,
+                        )?;
                     }
                     #[cfg(not(test))]
-                    recover_startup_native_transactions(&mut vault, &config.path)?;
+                    recover_startup_native_transactions(
+                        &mut vault,
+                        &config.path,
+                        config.device_id,
+                    )?;
                     config
                         .bridge_install
                         .reconcile_after_native_recovery(&mut vault, &config.path, config.device_id)
@@ -1627,6 +1801,8 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use std::str::FromStr;
     use std::{
         collections::HashMap,
         sync::{
@@ -1636,12 +1812,15 @@ mod tests {
     };
 
     #[cfg(target_os = "macos")]
-    use context_relay_core::vault::{
-        MacGenerationState, NativeSandboxCleanupState, NativeTransactionStatus,
-    };
+    use context_relay_core::native_transaction::{NativeApplyReceipt, TransactionStep};
+    #[cfg(target_os = "macos")]
+    use context_relay_core::vault::NativeCliWalWrite;
     use context_relay_core::{
         native_transaction::recovery::{OsNativeRecoveryIo, recover_native_transactions},
-        vault::{NativePlanWrite, NativeSandboxIdentity},
+        vault::{
+            NativePlanWrite, NativeSandboxCleanupState, NativeSandboxIdentity,
+            NativeTransactionStatus, SetupPlanAction, SetupPlanLifecycle,
+        },
     };
     use context_relay_local_ipc::{
         AuthAcceptedV1, AuthTranscriptV1, ConnectedStream, InstallationToken, IpcError,
@@ -1649,6 +1828,8 @@ mod tests {
     };
     #[cfg(target_os = "macos")]
     use context_relay_native_runner::MacRootIdentity;
+    #[cfg(target_os = "macos")]
+    use context_relay_protocol::ApplyReceipt;
     use context_relay_protocol::{
         CancelParams, ClientRole, EmptyParams, HelloParams, JsonRpcErrorV1, JsonRpcRequestV1,
         JsonRpcSuccessV1, JsonRpcVersion, LocalRequest, PROTOCOL_VERSION, PlanId, RecordId,
@@ -1787,6 +1968,223 @@ mod tests {
         drop(daemon);
         let vault = Vault::open(&path, "test-vault-key", keys.as_ref()).unwrap();
         assert!(vault.recoverable_native_transactions().unwrap().is_empty());
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn interrupted_bridge_setup_recovers_nonlaunching_sandbox_before_listener_bind() {
+        let runtime = test_runtime("nonlaunching-setup-recovery");
+        let provider = Arc::new(FixedTokenProvider::default());
+        let keys = Arc::new(MemoryKeyStore::default());
+        let path = unique_temp_path("nonlaunching-setup-recovery").join("vault.db");
+        let (plan_id, transaction_id) =
+            seed_interrupted_nonlaunching_bridge_setup(&path, keys.as_ref());
+
+        let daemon = Daemon::start(test_config(
+            runtime.clone(),
+            path.clone(),
+            keys.clone(),
+            provider,
+        ))
+        .await
+        .expect("non-launching setup recovery must complete before listener bind");
+        drop(connect(&runtime).await.expect("listener must be published"));
+        drop(daemon);
+
+        let vault = Vault::open(&path, "test-vault-key", keys.as_ref()).unwrap();
+        assert_eq!(
+            vault.setup_plan(&plan_id).unwrap().unwrap().lifecycle,
+            SetupPlanLifecycle::ApplyRestored
+        );
+        let transaction = vault.native_transaction(&transaction_id).unwrap().unwrap();
+        assert_eq!(transaction.status, NativeTransactionStatus::Restored);
+        assert_eq!(
+            transaction.sandbox_cleanup_state,
+            NativeSandboxCleanupState::Cleaned
+        );
+        assert!(vault.recoverable_native_transactions().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn interrupted_bridge_cli_wal_recovers_before_listener_bind() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        static ENVIRONMENT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _environment = ENVIRONMENT_LOCK.lock().await;
+        for (label, initial, committed, lifecycle, status, final_state) in [
+            (
+                "cli-prepared-expected",
+                "absent",
+                false,
+                SetupPlanLifecycle::ApplyRestored,
+                NativeTransactionStatus::Restored,
+                "absent",
+            ),
+            (
+                "cli-prepared-intended",
+                "present",
+                false,
+                SetupPlanLifecycle::ApplyRestored,
+                NativeTransactionStatus::Restored,
+                "absent",
+            ),
+            (
+                "cli-committed-intended",
+                "present",
+                true,
+                SetupPlanLifecycle::Applied,
+                NativeTransactionStatus::Committed,
+                "present",
+            ),
+        ] {
+            let root = unique_temp_path(label);
+            let bin = root.join("bin");
+            let home = root.join("home");
+            let config_root = root.join("claude-config");
+            let state_path = root.join("live-state");
+            let get_path = root.join("mcp-get.json");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&config_root).unwrap();
+            std::fs::write(&state_path, initial).unwrap();
+            let executable = bin.join("claude");
+            std::fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\ncase \"$*\" in\n  --version) printf '2.1.214\\n' ;;\n  doctor) printf 'Claude Code diagnostics: OK\\n' ;;\n  'mcp list') if [ \"$(/bin/cat '{}')\" = present ]; then printf 'context-relay: local (stdio)\\n'; fi ;;\n  'mcp get context-relay') /bin/cat '{}' ;;\n  'mcp remove context-relay --scope user') printf absent > '{}' ;;\n  *) exit 9 ;;\nesac\n",
+                    state_path.display(),
+                    get_path.display(),
+                    state_path.display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let executable = std::fs::canonicalize(executable).unwrap();
+            let bin = executable.parent().unwrap();
+            let bridge_executable = bin.join("context-relay-context-mcp");
+            let bridge_canary = root.join("bridge-launched");
+            std::fs::write(
+                &bridge_executable,
+                format!(
+                    "#!/bin/sh\nprintf launched > '{}'\n",
+                    bridge_canary.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&bridge_executable, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let bridge_executable = std::fs::canonicalize(bridge_executable).unwrap();
+            std::fs::write(
+                &get_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "context-relay",
+                    "scope": "user",
+                    "type": "stdio",
+                    "command": bridge_executable.to_str().unwrap(),
+                    "args": ["--harness", "claude-code"],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let _path = EnvironmentOverride::set("PATH", bin.as_os_str());
+            let _home = EnvironmentOverride::set("HOME", home.as_os_str());
+            let _config = EnvironmentOverride::set("CLAUDE_CONFIG_DIR", config_root.as_os_str());
+
+            let runtime = test_runtime(label);
+            let provider = Arc::new(FixedTokenProvider::default());
+            let keys = Arc::new(MemoryKeyStore::default());
+            let path = root.join("vault.db");
+            let (plan_id, transaction_id) = seed_interrupted_bridge_cli_setup(
+                &path,
+                keys.as_ref(),
+                &executable,
+                &bridge_executable,
+                committed,
+            );
+
+            let daemon = Daemon::start(test_config(
+                runtime.clone(),
+                path.clone(),
+                keys.clone(),
+                provider,
+            ))
+            .await
+            .expect("approval-bound CLI WAL recovery must complete before listener bind");
+            drop(connect(&runtime).await.expect("listener must be published"));
+            drop(daemon);
+
+            let vault = Vault::open(&path, "test-vault-key", keys.as_ref()).unwrap();
+            assert_eq!(
+                vault.setup_plan(&plan_id).unwrap().unwrap().lifecycle,
+                lifecycle,
+                "{label}",
+            );
+            let transaction = vault.native_transaction(&transaction_id).unwrap().unwrap();
+            assert_eq!(transaction.status, status, "{label}");
+            assert_eq!(
+                transaction.sandbox_cleanup_state,
+                NativeSandboxCleanupState::Cleaned,
+                "{label}",
+            );
+            assert_eq!(
+                std::fs::read_to_string(&state_path).unwrap(),
+                final_state,
+                "{label}",
+            );
+            assert!(!bridge_canary.exists(), "{label}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nonlaunching_macos_cleanup_accepts_only_the_exact_reserved_identity() {
+        let exact = nonlaunching_macos_recovery_identity();
+        assert_eq!(
+            cleanup_recovered_sandbox(
+                Path::new("/definitely/missing/native-sandbox"),
+                &exact,
+                RecoveryOutcome::Restored,
+            )
+            .unwrap(),
+            RecoveryCleanup::Cleaned
+        );
+
+        let RecoverySandboxIdentity::Macos {
+            generation_id,
+            bundle_id,
+            mut container,
+            guardian_pgid,
+            bundle_root,
+            signed_digest,
+            container_root,
+            substate,
+            state,
+        } = exact
+        else {
+            unreachable!()
+        };
+        container.push(0);
+        let near_miss = RecoverySandboxIdentity::Macos {
+            generation_id,
+            bundle_id,
+            container,
+            guardian_pgid,
+            bundle_root,
+            signed_digest,
+            container_root,
+            substate,
+            state,
+        };
+        assert_eq!(
+            cleanup_recovered_sandbox(
+                Path::new("/definitely/missing/native-sandbox"),
+                &near_miss,
+                RecoveryOutcome::Restored,
+            )
+            .unwrap(),
+            RecoveryCleanup::Conflict
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -3379,6 +3777,178 @@ mod tests {
                     test_sandbox_identity(index as u8 + 1),
                 )
                 .unwrap();
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn seed_interrupted_nonlaunching_bridge_setup(
+        path: &Path,
+        keys: &dyn DatabaseKeyStore,
+    ) -> (PlanId, String) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut vault = Vault::open(path, "test-vault-key", keys).unwrap();
+        let plan = bridge_install::tests::persist_plan(&mut vault);
+        let plan_id = plan.setup.plan_id;
+        assert_eq!(
+            vault
+                .claim_setup_plan(&plan_id, SetupPlanAction::Apply, 2)
+                .unwrap(),
+            context_relay_core::vault::SetupPlanClaim::Claimed
+        );
+        let stored = vault.setup_plan(&plan_id).unwrap().unwrap();
+        let transaction_id = format!("bridge-setup-{plan_id}");
+        vault
+            .begin_native_transaction(
+                &transaction_id,
+                NativePlanWrite {
+                    plan_id: &plan_id,
+                    approval_hash: &stored.approval_hash,
+                    payload: &stored.payload,
+                    created_ms: stored.created_ms,
+                    expires_ms: stored.expires_ms,
+                },
+                bridge_install::nonlaunching_sandbox_identity(),
+            )
+            .unwrap();
+        (plan_id, transaction_id)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn seed_interrupted_bridge_cli_setup(
+        path: &Path,
+        keys: &dyn DatabaseKeyStore,
+        executable: &Path,
+        bridge_executable: &Path,
+        committed: bool,
+    ) -> (PlanId, String) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut vault = Vault::open(path, "test-vault-key", keys).unwrap();
+        let plan = bridge_install::tests::persist_claude_cli_plan(
+            &mut vault,
+            executable,
+            bridge_executable,
+        );
+        let plan_id = plan.setup.plan_id;
+        vault
+            .claim_setup_plan(&plan_id, SetupPlanAction::Apply, 2)
+            .unwrap();
+        let stored = vault.setup_plan(&plan_id).unwrap().unwrap();
+        let transaction_id = format!("bridge-setup-{plan_id}");
+        vault
+            .begin_native_transaction(
+                &transaction_id,
+                NativePlanWrite {
+                    plan_id: &plan_id,
+                    approval_hash: &stored.approval_hash,
+                    payload: &stored.payload,
+                    created_ms: stored.created_ms,
+                    expires_ms: stored.expires_ms,
+                },
+                bridge_install::nonlaunching_sandbox_identity(),
+            )
+            .unwrap();
+        let mutation = &plan.cli_mutations[0];
+        let target = mutation.intended.as_ref().unwrap();
+        let forward = serde_json::to_vec(&mutation.forward).unwrap();
+        let rollback = serde_json::to_vec(&mutation.rollback).unwrap();
+        vault
+            .prepare_native_cli_wal(
+                &transaction_id,
+                &NativeCliWalWrite {
+                    sequence: 0,
+                    stable_id: &mutation.stable_id,
+                    harness: target.harness,
+                    server_name: &target.server_name,
+                    expected_declaration: None,
+                    expected_fingerprint: None,
+                    intended_declaration: Some(target.canonical_body.as_bytes()),
+                    intended_fingerprint: Some(&target.fingerprint),
+                    forward_operations: &forward,
+                    rollback_operations: &rollback,
+                },
+            )
+            .unwrap();
+        if committed {
+            vault
+                .transition_native_cli_wal(
+                    &transaction_id,
+                    0,
+                    context_relay_core::vault::NativeCliWalState::Applied,
+                )
+                .unwrap();
+            for step in &TransactionStep::ORDER[..18] {
+                vault.enter_native_step(&transaction_id, *step).unwrap();
+                vault.complete_native_step(&transaction_id, *step).unwrap();
+            }
+            vault
+                .enter_native_step(&transaction_id, TransactionStep::CommitOwnershipAndReceipt)
+                .unwrap();
+            let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073990").unwrap();
+            vault
+                .commit_native_success(
+                    &transaction_id,
+                    &NativeApplyReceipt {
+                        legacy: ApplyReceipt {
+                            plan_id,
+                            applied_hlc: HybridLogicalClock::new(3, 0, device_id),
+                            resulting_digests: vec![],
+                        },
+                        targets: vec![],
+                    },
+                    &[],
+                )
+                .unwrap();
+        }
+        (plan_id, transaction_id)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn nonlaunching_macos_recovery_identity() -> RecoverySandboxIdentity {
+        let generation_id = bridge_install::NON_LAUNCHING_GENERATION_ID.to_owned();
+        let bundle_id = format!("com.contextrelay.native-runner.{generation_id}");
+        let mut container = b"context-relay/macos-container/v1\0".to_vec();
+        container.extend_from_slice(bundle_id.as_bytes());
+        RecoverySandboxIdentity::Macos {
+            generation_id,
+            bundle_id,
+            container,
+            guardian_pgid: None,
+            bundle_root: None,
+            signed_digest: None,
+            container_root: None,
+            substate: MacGenerationSubstate::Reserved,
+            state: MacGenerationState::Poisoned,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct EnvironmentOverride {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl EnvironmentOverride {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: this test holds `ENVIRONMENT_LOCK` for every temporary
+            // process-environment override it creates.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for EnvironmentOverride {
+        fn drop(&mut self) {
+            // SAFETY: the owning test still holds `ENVIRONMENT_LOCK` while
+            // restoring the exact prior process-environment value.
+            unsafe {
+                match &self.previous {
+                    Some(previous) => std::env::set_var(self.key, previous),
+                    None => std::env::remove_var(self.key),
+                }
+            }
         }
     }
 

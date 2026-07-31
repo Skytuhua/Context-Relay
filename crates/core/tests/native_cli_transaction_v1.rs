@@ -344,6 +344,13 @@ fn mutation_index(mutation: &ApprovedCliMutation) -> usize {
 }
 
 impl NativeCliExecutor for CliExecutor {
+    fn probe_cli_mutation(
+        &mut self,
+        mutation: &ApprovedCliMutation,
+    ) -> Result<Option<Sha256Digest>, BoundaryError> {
+        Ok(self.state.borrow().live[mutation_index(mutation)])
+    }
+
     fn compare_cli_targets(
         &mut self,
         mutations: &[ApprovedCliMutation],

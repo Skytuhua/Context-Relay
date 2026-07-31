@@ -750,7 +750,7 @@ fn cli_executor_runs_only_exact_approved_argv_and_read_only_validation() {
     let applied = Rc::new(Cell::new(false));
     let operation_applied = Rc::clone(&applied);
     let validation_applied = Rc::clone(&applied);
-    let outcome = {
+    let (probed, outcome) = {
         let mut executor = fixture.adapter.cli_executor_with_runners(
             |argv: &[String]| {
                 operation_argv.push(argv.to_vec());
@@ -762,9 +762,12 @@ fn cli_executor_runs_only_exact_approved_argv_and_read_only_validation() {
                 validation_output(argv, validation_applied.get().then_some(body.as_str()))
             },
         );
-        executor.apply_cli_mutation(&mutation).unwrap()
+        let probed = executor.probe_cli_mutation(&mutation).unwrap();
+        let outcome = executor.apply_cli_mutation(&mutation).unwrap();
+        (probed, outcome)
     };
 
+    assert_eq!(probed, None);
     assert_eq!(outcome.command_error, None);
     assert_eq!(
         outcome.resulting_fingerprint,

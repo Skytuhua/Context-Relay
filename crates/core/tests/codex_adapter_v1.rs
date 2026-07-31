@@ -1593,6 +1593,8 @@ fn cli_executor_reprobes_intended_state_without_starting_the_bridge() {
         .compare_cli_targets(std::slice::from_ref(&mutation))
         .unwrap();
     assert!(operations.lock().unwrap().is_empty());
+    assert_eq!(executor.probe_cli_mutation(&mutation).unwrap(), None);
+    assert!(operations.lock().unwrap().is_empty());
     let outcome = executor.apply_cli_mutation(&mutation).unwrap();
     assert_eq!(outcome.command_error, None);
     assert_eq!(
