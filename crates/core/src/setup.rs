@@ -1168,11 +1168,9 @@ fn bridge_hermes_change(
     });
     match same_name {
         None => Ok(Some(ChangeClass::Create)),
-        Some(component) if !is_imported_hermes_bridge(profile, component) => {
-            return Err(conflict(
-                "An unmanaged context-relay MCP declaration already exists",
-            ));
-        }
+        Some(component) if !is_imported_hermes_bridge(profile, component) => Err(conflict(
+            "An unmanaged context-relay MCP declaration already exists",
+        )),
         Some(component) if component.body_markdown == intended.body_markdown => Ok(None),
         Some(component) if is_disabled_hermes_intended_bridge(component, intended) => {
             Ok(Some(ChangeClass::Enable))
