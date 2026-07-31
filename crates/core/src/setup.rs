@@ -1,6 +1,6 @@
 //! Mutation-free preview and persistence of managed bridge installation plans.
 
-use std::{path::PathBuf, str::FromStr};
+use std::str::FromStr;
 
 use context_relay_native_runner::{
     RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand, SidecarId,
@@ -18,7 +18,7 @@ use crate::{
     codex::CodexAdapter,
     hermes::HermesAdapter,
     mcp::install::{
-        BRIDGE_SERVER_NAME, attest_bridge_executable, bridge_component_for_attested,
+        BRIDGE_SERVER_NAME, bridge_component_for_attested, is_canonical_bridge_body,
         is_managed_bridge_component,
     },
     native_transaction::{
@@ -41,6 +41,15 @@ pub struct RegisteredProject {
 pub struct BridgeMutationPlan {
     pub cli: Option<ApprovedCliMutation>,
     pub native: Vec<ApprovedMutation>,
+}
+
+/// Resolves the bridge identity owned by the service composition layer.
+///
+/// Preview never accepts an executable path. Production composition supplies a
+/// locator for the installed bridge, while tests can inject a fixed attested
+/// identity through this boundary.
+pub trait BridgeLocator {
+    fn locate(&self) -> Result<crate::mcp::install::BridgeExecutable, ClientError>;
 }
 
 /// The narrow capability preview needs in addition to the protocol adapter.
@@ -120,31 +129,32 @@ impl BridgePreviewHarness for HermesAdapter {
     }
 }
 
-pub struct BridgeInstallService<'a, H> {
+pub struct BridgeInstallService<'a, H, L> {
     vault: &'a mut Vault,
     harness: H,
-    bridge_path: PathBuf,
+    bridge_locator: L,
     origin_device: DeviceId,
     observed_hlc: HybridLogicalClock,
 }
 
-impl<'a, H> BridgeInstallService<'a, H>
+impl<'a, H, L> BridgeInstallService<'a, H, L>
 where
     H: BridgePreviewHarness,
+    L: BridgeLocator,
 {
     pub const PREVIEW_TTL_MS: u64 = PREVIEW_TTL_MS;
 
     pub fn new(
         vault: &'a mut Vault,
         harness: H,
-        bridge_path: PathBuf,
+        bridge_locator: L,
         origin_device: DeviceId,
         observed_hlc: HybridLogicalClock,
     ) -> Self {
         Self {
             vault,
             harness,
-            bridge_path,
+            bridge_locator,
             origin_device,
             observed_hlc,
         }
@@ -157,7 +167,7 @@ where
         registered_project: Option<&RegisteredProject>,
         now_ms: u64,
     ) -> Result<SetupPlan, ClientError> {
-        let bridge = attest_bridge_executable(&self.bridge_path)?;
+        let bridge = self.bridge_locator.locate()?;
         let harness = self.harness.bridge_harness();
         let report = self.harness.probe(&ProbeContext {
             harness,
@@ -349,7 +359,10 @@ fn bridge_change(
     });
     let class = match same_name {
         None => ChangeClass::Create,
-        Some(component) if !is_managed_bridge_component(harness, component) => {
+        Some(component)
+            if !is_managed_bridge_component(harness, component)
+                && !is_imported_hermes_bridge(profile, component) =>
+        {
             return Err(conflict(
                 "An unmanaged context-relay MCP declaration already exists",
             ));
@@ -369,6 +382,32 @@ fn bridge_change(
         },
         summary: intended.body_markdown.clone(),
     }))
+}
+
+fn is_imported_hermes_bridge(profile: Option<&str>, component: &ComponentRecord) -> bool {
+    let Some(profile) = profile else {
+        return false;
+    };
+    component.scope == ScopeRef::Global
+        && component.kind == ComponentKind::McpServer
+        && component.name == BRIDGE_SERVER_NAME
+        && !component.archived
+        && component.provenance.harness == Some(HarnessId::Hermes)
+        && component.provenance.source.is_none()
+        && component.metadata.len() == 4
+        && metadata_value(component, "enabled") == Some("true")
+        && metadata_value(component, "nativeFormat") == Some("json")
+        && metadata_value(component, "profile") == Some(profile)
+        && metadata_value(component, "structuralLocation")
+            == Some("config:mcp_servers.context-relay")
+        && is_canonical_bridge_body(HarnessId::Hermes, &component.body_markdown, false)
+}
+
+fn metadata_value<'a>(component: &'a ComponentRecord, key: &str) -> Option<&'a str> {
+    component
+        .metadata
+        .iter()
+        .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
 }
 
 fn approval_class(changes: &[ClassifiedChange]) -> ApprovalClass {
