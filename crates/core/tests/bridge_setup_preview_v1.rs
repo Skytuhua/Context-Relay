@@ -3,17 +3,18 @@ mod support;
 use std::{cell::RefCell, fs, path::Path, rc::Rc, str::FromStr};
 
 use context_relay_core::{
+    hermes::{HermesAdapter, HermesExecutableKind, HermesLayout, HermesProfile},
     mcp::install::{BRIDGE_SERVER_NAME, bridge_component},
     native_transaction::{ApprovedCliMutation, CanonicalCliDeclaration},
-    setup::{BridgeInstallService, BridgePreviewHarness},
+    setup::{BridgeInstallService, BridgeMutationPlan, BridgePreviewHarness},
     vault::{SetupPlanAction, SetupPlanLifecycle, Vault},
 };
 use context_relay_protocol::{
     ApprovalClass, CapabilityLevel, ChangeClass, ClassifiedChanges, CliOperation, CliOperations,
     ClientError, ComponentRecord, DesiredState, DeviceId, DiscoveredScopes, HarnessAdapter,
     HarnessId, ImportRequest, ImportedState, InstallationMethod, NativePlatform, NativeScope,
-    PlanId, ProbeContext, ProbeReport, RenderedState, SemanticDiff, Sha256Digest,
-    ValidationReport, WireNativeValue,
+    PlanId, ProbeContext, ProbeReport, RenderedState, SemanticDiff, Sha256Digest, ValidationReport,
+    WireNativeValue,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -50,7 +51,7 @@ impl Harness {
             executable: self.executable.clone(),
             arguments: ["mcp", "add", BRIDGE_SERVER_NAME]
                 .into_iter()
-                .map(|value| native_text(value))
+                .map(native_text)
                 .collect(),
             timeout_ms: 30_000,
         };
@@ -63,7 +64,7 @@ impl Harness {
                 executable: self.executable.clone(),
                 arguments: ["mcp", "remove", BRIDGE_SERVER_NAME]
                     .into_iter()
-                    .map(|value| native_text(value))
+                    .map(native_text)
                     .collect(),
                 timeout_ms: 30_000,
             }],
@@ -125,13 +126,16 @@ impl HarnessAdapter for Harness {
             executable: self.executable.clone(),
             arguments: ["mcp", "add", BRIDGE_SERVER_NAME]
                 .into_iter()
-                .map(|value| native_text(value))
+                .map(native_text)
                 .collect(),
             timeout_ms: 30_000,
         }]))
     }
 
-    fn validate_effective(&self, _: &context_relay_protocol::ApplyReceipt) -> Result<ValidationReport, ClientError> {
+    fn validate_effective(
+        &self,
+        _: &context_relay_protocol::ApplyReceipt,
+    ) -> Result<ValidationReport, ClientError> {
         unreachable!("preview never validates effective state")
     }
 }
@@ -141,11 +145,15 @@ impl BridgePreviewHarness for Harness {
         HarnessId::Codex
     }
 
-    fn bridge_cli_mutation(
+    fn bridge_mutations(
         &self,
+        _: &DesiredState,
         intended: &ComponentRecord,
-    ) -> Result<ApprovedCliMutation, ClientError> {
-        Ok(self.bridge_mutation(intended))
+    ) -> Result<BridgeMutationPlan, ClientError> {
+        Ok(BridgeMutationPlan {
+            cli: Some(self.bridge_mutation(intended)),
+            native: vec![],
+        })
     }
 }
 
@@ -166,7 +174,11 @@ fn bridge(path: &Path) {
     }
 }
 
-fn service<'a>(vault: &'a mut Vault, harness: Harness, path: &Path) -> BridgeInstallService<'a, Harness> {
+fn service<'a>(
+    vault: &'a mut Vault,
+    harness: Harness,
+    path: &Path,
+) -> BridgeInstallService<'a, Harness> {
     BridgeInstallService::new(
         vault,
         harness,
@@ -185,13 +197,22 @@ fn preview_runs_the_adapter_path_derives_active_and_persists_the_sealed_v2_plan(
     let keys = MemoryKeyStore::default();
     let mut vault = Vault::open(vault_path.path(), "bridge-preview-v1", &keys).unwrap();
     let calls = Rc::new(RefCell::new(Calls::default()));
-    let harness = Harness { calls: calls.clone(), executable: native_text("/fixture/codex"), existing: None };
+    let harness = Harness {
+        calls: calls.clone(),
+        executable: native_text("/fixture/codex"),
+        existing: None,
+    };
 
-    let setup = service(&mut vault, harness, &bridge_path).preview(None, NOW_MS).unwrap();
+    let setup = service(&mut vault, harness, &bridge_path)
+        .preview(None, NOW_MS)
+        .unwrap();
 
     assert_eq!(setup.harness, HarnessId::Codex);
     assert_eq!(setup.approval_class, ApprovalClass::Active);
-    assert_eq!(setup.expires_at, NOW_MS + BridgeInstallService::<Harness>::PREVIEW_TTL_MS);
+    assert_eq!(
+        setup.expires_at,
+        NOW_MS + BridgeInstallService::<Harness>::PREVIEW_TTL_MS
+    );
     assert_eq!(calls.borrow().probe, 1);
     assert_eq!(calls.borrow().import, 1);
     assert_eq!(calls.borrow().render, 1);
@@ -207,7 +228,10 @@ fn preview_runs_the_adapter_path_derives_active_and_persists_the_sealed_v2_plan(
     let sealed: serde_json::Value = serde_json::from_slice(&stored.payload).unwrap();
     assert_eq!(sealed["schemaVersion"], 1);
     assert_eq!(sealed["approvalVersion"], 2);
-    assert_eq!(sealed["nativePlan"]["setup"]["planId"], setup.plan_id.to_string());
+    assert_eq!(
+        sealed["nativePlan"]["setup"]["planId"],
+        setup.plan_id.to_string()
+    );
     assert_eq!(
         setup.expected_native_digests[0].expected_digest,
         Some(Sha256Digest(Sha256::digest(b"bridge-preview-v1").into()))
@@ -228,16 +252,28 @@ fn preview_rejects_a_conflicting_prior_declaration_without_persisting_or_writing
         &bridge_path,
         ID_2.parse().unwrap(),
         clock(NOW_MS),
-    ).unwrap();
+    )
+    .unwrap();
     let mut conflicting = conflicting;
     conflicting.body_markdown = "{\"command\":\"/unmanaged\"}".to_owned();
-    let harness = Harness { calls: calls.clone(), executable: native_text("/fixture/codex"), existing: Some(conflicting) };
+    let harness = Harness {
+        calls: calls.clone(),
+        executable: native_text("/fixture/codex"),
+        existing: Some(conflicting),
+    };
 
-    let error = service(&mut vault, harness, &bridge_path).preview(None, NOW_MS).unwrap_err();
+    let error = service(&mut vault, harness, &bridge_path)
+        .preview(None, NOW_MS)
+        .unwrap_err();
 
     assert_eq!(error.code, context_relay_protocol::ErrorCode::Conflict);
     assert_eq!(calls.borrow().config_writes, 0);
-    assert!(vault.setup_plan(&PlanId::from_str(ID_1).unwrap()).unwrap().is_none());
+    assert!(
+        vault
+            .setup_plan(&PlanId::from_str(ID_1).unwrap())
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -274,14 +310,84 @@ fn preview_replays_identical_sealed_bytes_and_the_persisted_plan_expires() {
     .preview(None, NOW_MS)
     .unwrap();
     assert_eq!(replay.plan_id, first.plan_id);
-    assert_eq!(vault.setup_plan(&replay.plan_id).unwrap().unwrap().payload, first_payload);
+    assert_eq!(
+        vault.setup_plan(&replay.plan_id).unwrap().unwrap().payload,
+        first_payload
+    );
 
-    assert!(matches!(
-        vault.claim_setup_plan(&first.plan_id, SetupPlanAction::Apply, first.expires_at),
-        Err(_)
-    ));
+    assert!(
+        vault
+            .claim_setup_plan(&first.plan_id, SetupPlanAction::Apply, first.expires_at)
+            .is_err()
+    );
     assert_eq!(
         vault.setup_plan(&first.plan_id).unwrap().unwrap().lifecycle,
         SetupPlanLifecycle::Expired
+    );
+}
+
+#[test]
+fn preview_uses_the_reviewed_hermes_native_path_without_cli_or_config_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let bridge_path = root.path().join("context-relay-context-mcp");
+    bridge(&bridge_path);
+    let project_root = root.path().join("project");
+    let working_directory = project_root.join("service");
+    fs::create_dir_all(&working_directory).unwrap();
+    let profile_home = root.path().join("hermes");
+    fs::create_dir_all(&profile_home).unwrap();
+    let config_path = profile_home.join("config.yaml");
+    let config_before = b"unknown_root: preserve-me\n";
+    fs::write(&config_path, config_before).unwrap();
+    let executable = root.path().join("hermes-bin");
+    fs::write(&executable, b"\x7fELFfixture hermes executable").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let adapter = HermesAdapter::from_layout(
+        HermesLayout {
+            executable,
+            executable_kind: HermesExecutableKind::Native,
+            version: "0.18.2".to_owned(),
+            installation_method: InstallationMethod::Manual,
+            default_hermes_home: profile_home.clone(),
+            profile: HermesProfile {
+                name: "default".to_owned(),
+                hermes_home: profile_home,
+            },
+            project_root,
+            working_directory,
+        },
+        ID_1.parse().unwrap(),
+        ID_2.parse().unwrap(),
+        clock(NOW_MS),
+    )
+    .unwrap();
+    let vault_path = TempVault::new("bridge-preview-hermes");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "bridge-preview-v1", &keys).unwrap();
+
+    let setup = BridgeInstallService::new(
+        &mut vault,
+        adapter,
+        bridge_path,
+        ID_1.parse().unwrap(),
+        clock(NOW_MS),
+    )
+    .preview(None, NOW_MS)
+    .unwrap();
+
+    assert_eq!(setup.harness, HarnessId::Hermes);
+    assert!(setup.cli_operations.is_empty());
+    assert_eq!(setup.approval_class, ApprovalClass::Active);
+    assert_eq!(fs::read(config_path).unwrap(), config_before);
+    let stored = vault.setup_plan(&setup.plan_id).unwrap().unwrap();
+    let sealed: serde_json::Value = serde_json::from_slice(&stored.payload).unwrap();
+    assert_eq!(sealed["nativePlan"]["cliMutations"], serde_json::json!([]));
+    assert_eq!(
+        sealed["nativePlan"]["mutations"].as_array().unwrap().len(),
+        1
     );
 }

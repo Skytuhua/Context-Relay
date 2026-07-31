@@ -1,4 +1,8 @@
-use std::{fs, path::{Path, PathBuf}, str::FromStr};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use context_relay_protocol::{
     ClientError, ComponentKind, ComponentRecord, DeviceId, ErrorCode, HarnessId,
@@ -67,8 +71,8 @@ pub fn bridge_component_for_attested(
 
 pub fn attest_bridge_executable(path: &Path) -> Result<BridgeExecutable, ClientError> {
     let command = absolute_non_link_executable(path)?;
-    let bytes = fs::read(&command)
-        .map_err(|_| invalid("MCP bridge executable cannot be safely read"))?;
+    let bytes =
+        fs::read(&command).map_err(|_| invalid("MCP bridge executable cannot be safely read"))?;
     Ok(BridgeExecutable {
         path: PathBuf::from(command),
         digest: context_relay_protocol::Sha256Digest(Sha256::digest(bytes).into()),

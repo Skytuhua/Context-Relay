@@ -91,9 +91,7 @@ pub fn seal_plan(
     .map_err(|error| PlanSealError::Serialization(error.to_string()))
 }
 
-fn cli_declaration(
-    declaration: &super::CanonicalCliDeclaration,
-) -> serde_json::Value {
+fn cli_declaration(declaration: &super::CanonicalCliDeclaration) -> serde_json::Value {
     json!({
         "harness": declaration.harness,
         "serverName": declaration.server_name,

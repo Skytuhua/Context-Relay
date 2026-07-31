@@ -9,19 +9,21 @@ use context_relay_protocol::{
     ApprovalClass, CapabilityLevel, ChangeClass, ClassifiedChange, ClientError, ComponentKind,
     ComponentRecord, DesiredState, DeviceId, ErrorCode, ExpectedNativeDigest, HarnessAdapter,
     HarnessId, HybridLogicalClock, ImportRequest, NativePlatform, NativeScope, PlanId,
-    ProbeContext, ScopeRef, SetupPlan, Sha256Digest, SemanticDiff, WireNativeValue,
+    ProbeContext, ScopeRef, SemanticDiff, SetupPlan, Sha256Digest, WireNativeValue,
 };
 use sha2::{Digest as _, Sha256};
 
 use crate::{
     claude_code::ClaudeCodeAdapter,
     codex::CodexAdapter,
+    hermes::HermesAdapter,
     mcp::install::{
         BRIDGE_SERVER_NAME, attest_bridge_executable, bridge_component_for_attested,
         is_managed_bridge_component,
     },
     native_transaction::{
-        ApprovedCliMutation, NativeTransactionPlan, SidecarBinding, approval_hash_v2, seal_plan,
+        ApprovedCliMutation, ApprovedMutation, NativeTransactionPlan, SidecarBinding,
+        approval_hash_v2, seal_plan,
     },
     vault::{SetupPlanWrite, Vault},
 };
@@ -36,6 +38,11 @@ pub struct RegisteredProject {
     pub root: WireNativeValue,
 }
 
+pub struct BridgeMutationPlan {
+    pub cli: Option<ApprovedCliMutation>,
+    pub native: Vec<ApprovedMutation>,
+}
+
 /// The narrow capability preview needs in addition to the protocol adapter.
 ///
 /// The specific adapter owns expected-state inspection and creation of both
@@ -43,10 +50,15 @@ pub struct RegisteredProject {
 pub trait BridgePreviewHarness: HarnessAdapter {
     fn bridge_harness(&self) -> HarnessId;
 
-    fn bridge_cli_mutation(
+    fn bridge_requested_profile(&self) -> Option<String> {
+        None
+    }
+
+    fn bridge_mutations(
         &self,
+        desired: &DesiredState,
         intended: &ComponentRecord,
-    ) -> Result<ApprovedCliMutation, ClientError>;
+    ) -> Result<BridgeMutationPlan, ClientError>;
 
     fn bridge_adapter_version(&self) -> u32 {
         1
@@ -58,11 +70,15 @@ impl BridgePreviewHarness for ClaudeCodeAdapter {
         HarnessId::ClaudeCode
     }
 
-    fn bridge_cli_mutation(
+    fn bridge_mutations(
         &self,
+        _: &DesiredState,
         intended: &ComponentRecord,
-    ) -> Result<ApprovedCliMutation, ClientError> {
-        self.plan_bridge_cli_mutation(intended)
+    ) -> Result<BridgeMutationPlan, ClientError> {
+        Ok(BridgeMutationPlan {
+            cli: Some(self.plan_bridge_cli_mutation(intended)?),
+            native: vec![],
+        })
     }
 }
 
@@ -71,11 +87,36 @@ impl BridgePreviewHarness for CodexAdapter {
         HarnessId::Codex
     }
 
-    fn bridge_cli_mutation(
+    fn bridge_mutations(
         &self,
+        _: &DesiredState,
         intended: &ComponentRecord,
-    ) -> Result<ApprovedCliMutation, ClientError> {
-        self.plan_bridge_cli_mutation(intended)
+    ) -> Result<BridgeMutationPlan, ClientError> {
+        Ok(BridgeMutationPlan {
+            cli: Some(self.plan_bridge_cli_mutation(intended)?),
+            native: vec![],
+        })
+    }
+}
+
+impl BridgePreviewHarness for HermesAdapter {
+    fn bridge_harness(&self) -> HarnessId {
+        HarnessId::Hermes
+    }
+
+    fn bridge_requested_profile(&self) -> Option<String> {
+        Some(self.profile_name().to_owned())
+    }
+
+    fn bridge_mutations(
+        &self,
+        desired: &DesiredState,
+        _: &ComponentRecord,
+    ) -> Result<BridgeMutationPlan, ClientError> {
+        Ok(BridgeMutationPlan {
+            cli: None,
+            native: self.plan_native_config(desired)?.into_iter().collect(),
+        })
     }
 }
 
@@ -120,7 +161,7 @@ where
         let harness = self.harness.bridge_harness();
         let report = self.harness.probe(&ProbeContext {
             harness,
-            requested_profile: None,
+            requested_profile: self.harness.bridge_requested_profile(),
         })?;
         if report.capability != CapabilityLevel::Full {
             return Err(unsupported("The selected harness is import-only"));
@@ -152,13 +193,14 @@ where
             scopes: import_scopes,
             include_disabled: true,
         })?;
-        let intended = bridge_component_for_attested(
+        let intended =
+            bridge_component_for_attested(harness, &bridge, self.origin_device, self.observed_hlc)?;
+        let change = bridge_change(
             harness,
-            &bridge,
-            self.origin_device,
-            self.observed_hlc,
+            report.active_profile.as_deref(),
+            &imported.components,
+            &intended,
         )?;
-        let change = bridge_change(harness, &imported.components, &intended)?;
         let semantic_diff = SemanticDiff {
             changes: change.into_iter().collect(),
             conflicts: vec![],
@@ -166,24 +208,41 @@ where
 
         // These calls are intentionally kept in preview even though the exact
         // CLI mutation below is the authority for rollback argv.
-        let _rendered = self.harness.render(&DesiredState {
+        let desired = DesiredState {
             components: vec![intended.clone()],
             scopes: vec![NativeScope::Global],
-        })?;
+        };
+        let _rendered = self.harness.render(&desired)?;
         let classified = self.harness.classify(&semantic_diff)?;
         let adapter_operations = self.harness.plan_cli_ops(&classified)?.0;
-        let cli_mutation = if classified.0.is_empty() {
-            None
+        let mutations = if classified.0.is_empty() {
+            BridgeMutationPlan {
+                cli: None,
+                native: vec![],
+            }
         } else {
-            Some(self.harness.bridge_cli_mutation(&intended)?)
+            self.harness.bridge_mutations(&desired, &intended)?
         };
+        let cli_mutation = mutations.cli;
         if adapter_operations
             != cli_mutation
                 .as_ref()
                 .map(|mutation| mutation.forward.clone())
                 .unwrap_or_default()
         {
-            return Err(conflict("Harness CLI preview differs from its approved bridge declaration"));
+            return Err(conflict(
+                "Harness CLI preview differs from its approved bridge declaration",
+            ));
+        }
+        if harness == HarnessId::Hermes && cli_mutation.is_some() {
+            return Err(conflict(
+                "Hermes bridge previews cannot contain CLI mutations",
+            ));
+        }
+        if harness != HarnessId::Hermes && !mutations.native.is_empty() {
+            return Err(conflict(
+                "CLI bridge previews cannot contain native mutations",
+            ));
         }
 
         let expires_at = now_ms
@@ -242,7 +301,7 @@ where
                     target: match harness {
                         HarnessId::ClaudeCode => RuleSyncTarget::ClaudeCode,
                         HarnessId::Codex => RuleSyncTarget::CodexCli,
-                        HarnessId::Hermes => return Err(unsupported("Hermes bridge preview is unavailable")),
+                        HarnessId::Hermes => RuleSyncTarget::ClaudeCode,
                     },
                     features: RuleSyncFeatures::new(&[RuleSyncFeature::Mcp])
                         .map_err(|_| invalid("Bridge preview sidecar is invalid"))?,
@@ -252,12 +311,12 @@ where
             staged_inputs: vec![],
             expected_semantic_output_hash: digest(b"bridge-preview-output-v1"),
             scanner_result_hash: digest(b"bridge-preview-scanner-v1"),
-            mutations: vec![],
+            mutations: mutations.native,
             cli_mutations: cli_mutation.into_iter().collect(),
             ownership_changes: vec![],
         };
-        let approval_hash = approval_hash_v2(&plan)
-            .map_err(|_| invalid("Bridge preview plan is invalid"))?;
+        let approval_hash =
+            approval_hash_v2(&plan).map_err(|_| invalid("Bridge preview plan is invalid"))?;
         setup.batch_hash = approval_hash;
         plan.setup = setup.clone();
         let sealed = seal_plan(&plan, approval_hash)
@@ -275,11 +334,11 @@ where
             .map_err(|_| invalid("Bridge preview plan cannot be persisted"))?;
         Ok(setup)
     }
-
 }
 
 fn bridge_change(
     harness: HarnessId,
+    profile: Option<&str>,
     imported: &[ComponentRecord],
     intended: &ComponentRecord,
 ) -> Result<Option<ClassifiedChange>, ClientError> {
@@ -291,7 +350,9 @@ fn bridge_change(
     let class = match same_name {
         None => ChangeClass::Create,
         Some(component) if !is_managed_bridge_component(harness, component) => {
-            return Err(conflict("An unmanaged context-relay MCP declaration already exists"));
+            return Err(conflict(
+                "An unmanaged context-relay MCP declaration already exists",
+            ));
         }
         Some(component) if component.body_markdown == intended.body_markdown => return Ok(None),
         Some(_) => ChangeClass::Update,
@@ -301,7 +362,10 @@ fn bridge_change(
         target: match harness {
             HarnessId::ClaudeCode => format!("claude-mcp:global:{BRIDGE_SERVER_NAME}"),
             HarnessId::Codex => format!("codex-mcp|global|{BRIDGE_SERVER_NAME}"),
-            HarnessId::Hermes => format!("hermes-mcp:{BRIDGE_SERVER_NAME}"),
+            HarnessId::Hermes => format!(
+                "hermes-config|{}|mcp_servers.{BRIDGE_SERVER_NAME}",
+                profile.ok_or_else(|| invalid("Hermes profile is unavailable"))?
+            ),
         },
         summary: intended.body_markdown.clone(),
     }))
@@ -330,7 +394,12 @@ fn preview_plan_id(
     now_ms: u64,
 ) -> Result<PlanId, ClientError> {
     let mut bytes: [u8; 32] = Sha256::digest(
-        [harness_cli_name(harness).as_bytes(), &bridge_digest.0, &now_ms.to_le_bytes()].concat(),
+        [
+            harness_cli_name(harness).as_bytes(),
+            &bridge_digest.0,
+            &now_ms.to_le_bytes(),
+        ]
+        .concat(),
     )
     .into();
     bytes[6] = (bytes[6] & 0x0f) | 0x70;

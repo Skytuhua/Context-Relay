@@ -286,6 +286,10 @@ impl HermesAdapter {
         wire_path(&self.layout.profile.hermes_home)
     }
 
+    pub fn profile_name(&self) -> &str {
+        &self.layout.profile.name
+    }
+
     pub fn project_root_wire(&self) -> WireNativeValue {
         wire_path(&self.layout.project_root)
     }
