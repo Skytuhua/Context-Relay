@@ -2,13 +2,16 @@ use context_relay_protocol::{
     HarnessId, MAX_MARKDOWN_BYTES, MAX_TITLE_BYTES, NativePlatform, ScopeRef, Sha256Digest,
     WireNativeValue,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::{error::Error, fmt};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct NativeMemorySourceId(pub Sha256Digest);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NativeMemoryDocumentKind {
     Agent,
     UserProfile,
@@ -16,13 +19,15 @@ pub enum NativeMemoryDocumentKind {
     Topic,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeMemoryLimits {
     pub max_bytes: usize,
     pub max_characters: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeMemorySource {
     pub id: NativeMemorySourceId,
     pub harness: HarnessId,
@@ -87,8 +92,17 @@ pub enum NativeMemorySnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadyNativeMemory {
+    pub source: NativeMemorySource,
+    pub snapshot: NativeMemorySnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeMemoryLedger {
     pub source_id: NativeMemorySourceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<NativeMemorySource>,
     pub last_observed_digest: Option<Sha256Digest>,
     pub last_unmanaged_digest: Option<Sha256Digest>,
     pub last_imported_digest: Option<Sha256Digest>,
@@ -100,12 +114,31 @@ impl NativeMemoryLedger {
     pub const fn new(source_id: NativeMemorySourceId) -> Self {
         Self {
             source_id,
+            source: None,
             last_observed_digest: None,
             last_unmanaged_digest: None,
             last_imported_digest: None,
             last_applied_digest: None,
             initial_preview_complete: false,
         }
+    }
+
+    pub fn for_source(source: NativeMemorySource) -> Self {
+        let mut ledger = Self::new(source.id);
+        ledger.source = Some(source);
+        ledger
+    }
+
+    pub(crate) fn validate_persisted(&self) -> Result<&NativeMemorySource, NativeMemoryError> {
+        let source = self
+            .source
+            .as_ref()
+            .ok_or(NativeMemoryError::InvalidSource("ledger.source"))?;
+        source.validate()?;
+        if source.id != self.source_id {
+            return Err(NativeMemoryError::InvalidSource("ledger.source_id"));
+        }
+        Ok(source)
     }
 }
 

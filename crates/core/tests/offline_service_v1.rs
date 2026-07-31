@@ -1,11 +1,18 @@
 mod support;
 
-use context_relay_core::{service::OfflineWorkspace, vault::Vault};
+use context_relay_core::{
+    native_memory::{
+        NativeMemoryDocumentKind, NativeMemoryLimits, NativeMemorySnapshot, NativeMemorySource,
+        ReadyNativeMemory,
+    },
+    service::OfflineWorkspace,
+    vault::Vault,
+};
 use context_relay_protocol::{
     CandidateReviewParams, CandidateState, CompletionEvidenceInput, ErrorCode, HarnessId,
     McpScopeSelector, MemoryArchiveParams, MemoryCreateParams, MemoryKind, MemoryUpdateParams,
-    ProjectIdentity, ProposeMemoryInput, ScopeRef, SearchParams, TaskCompleteParams, TaskStatus,
-    TaskTransitionParams, TaskUpsertParams,
+    NativePlatform, ProjectIdentity, ProposeMemoryInput, ScopeRef, SearchParams,
+    TaskCompleteParams, TaskStatus, TaskTransitionParams, TaskUpsertParams, WireNativeValue,
 };
 
 use support::{
@@ -332,6 +339,68 @@ fn candidate_review_and_task_completion_persist_real_state() {
         service.tasks(ID_7.parse().unwrap()).unwrap(),
         vec![completed]
     );
+}
+
+#[test]
+fn native_candidate_review_preserves_import_ledger_for_accept_and_reject() {
+    for accepted in [true, false] {
+        let fixture = Fixture::new(if accepted {
+            "native-review-accepted"
+        } else {
+            "native-review-rejected"
+        });
+        let mut vault = fixture.vault();
+        let source = NativeMemorySource::new(
+            HarnessId::Codex,
+            "test-1.0.0",
+            ScopeRef::Global,
+            NativeMemoryDocumentKind::Agent,
+            WireNativeValue {
+                platform: NativePlatform::Macos,
+                bytes: b"/tmp/context-relay/review.md".to_vec(),
+                display: Some("/tmp/context-relay/review.md".to_owned()),
+            },
+            NativeMemoryLimits {
+                max_bytes: 4_096,
+                max_characters: 4_096,
+            },
+            true,
+        )
+        .unwrap();
+        let pending = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
+            .reconcile_native_memory(ReadyNativeMemory {
+                source: source.clone(),
+                snapshot: NativeMemorySnapshot::Regular(b"review this native memory".to_vec()),
+            })
+            .unwrap()
+            .unwrap();
+        let ledger_before = vault.native_memory_ledger(&source.id).unwrap().unwrap();
+
+        let reviewed = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
+            .review_candidate(CandidateReviewParams {
+                candidate_id: pending.id,
+                accepted,
+                operation_id: ID_4.parse().unwrap(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            reviewed.state,
+            if accepted {
+                CandidateState::Accepted
+            } else {
+                CandidateState::Rejected
+            }
+        );
+        assert_eq!(
+            vault.memory(&pending.proposed_memory.id).unwrap().is_some(),
+            accepted
+        );
+        assert_eq!(
+            vault.native_memory_ledger(&source.id).unwrap(),
+            Some(ledger_before)
+        );
+    }
 }
 
 #[test]

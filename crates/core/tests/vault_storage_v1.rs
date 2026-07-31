@@ -627,7 +627,7 @@ fn v8_to_v9_preserves_operation_results_and_native_plan_rows() {
     drop(raw);
 
     let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
-    assert_eq!(vault.schema_version().unwrap(), 9);
+    assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     assert!(
         vault
             .table_names()
@@ -1180,6 +1180,7 @@ fn bundled_schema_contains_all_required_tables() {
         "before_images",
         "setup_plan_lifecycle",
         "native_cli_wal",
+        "native_memory_sources",
         "search_documents",
         "embeddings",
         "search_fts",

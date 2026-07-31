@@ -2,10 +2,10 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use context_relay_protocol::{
     ApplyReceipt, CandidateId, CandidateState, CheckpointV1, HarnessAccessPolicy, HarnessId,
-    InstructionRecord, MAX_EVIDENCE_ITEMS, MemoryCandidate, MemoryId, MemoryRecord, MutationKind,
-    OperationId, PlanId, ProjectId, ProjectIdentity, Provenance, RecordId, RecordKind, ScopeRef,
-    Sha256Digest, SyncOperationV1, TaskId, TaskRecord, TaskStatus, WireNativeValue,
-    encode_sync_operation_v1,
+    InstructionRecord, MAX_EVIDENCE_ITEMS, MemoryCandidate, MemoryId, MemoryKind, MemoryOrigin,
+    MemoryRecord, MutationKind, OperationId, PlanId, ProjectId, ProjectIdentity, Provenance,
+    RecordId, RecordKind, ScopeRef, Sha256Digest, SyncOperationV1, TaskId, TaskRecord, TaskStatus,
+    WireNativeValue, encode_sync_operation_v1,
 };
 use keyring::Entry;
 use rand_core::{OsRng, RngCore};
@@ -13,6 +13,11 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, config::Db
 use serde::{Serialize, de::DeserializeOwned};
 use zeroize::Zeroizing;
 
+use crate::native_memory::{
+    NativeMemoryChangeKind, NativeMemoryLedger, NativeMemorySource, NativeMemorySourceId,
+    extract_managed_markdown, native_memory_evidence, native_memory_identity, native_memory_tags,
+    native_memory_title,
+};
 use crate::search::{
     AllowedSearchScope, Embedding384, SearchHit, quote_fts_query, reciprocal_rank_fusion,
 };
@@ -20,7 +25,7 @@ use crate::search::{
 mod native_transactions;
 pub use native_transactions::*;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 9;
+pub const LATEST_SCHEMA_VERSION: u32 = 10;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
 const DEFAULT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
@@ -688,6 +693,144 @@ impl Vault {
         Ok(candidates)
     }
 
+    pub fn native_memory_ledger(
+        &self,
+        id: &NativeMemorySourceId,
+    ) -> Result<Option<NativeMemoryLedger>, VaultError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT harness, scope_kind, project_id, document_kind,
+                        last_observed_digest, last_unmanaged_digest,
+                        last_imported_digest, last_applied_digest,
+                        initial_preview_complete, payload_json
+                 FROM native_memory_sources WHERE source_id = ?1",
+                [sha256_key(&id.0)],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, Vec<u8>>(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            stored_harness,
+            stored_scope,
+            stored_project_id,
+            stored_document_kind,
+            stored_observed,
+            stored_unmanaged,
+            stored_imported,
+            stored_applied,
+            stored_initial_preview_complete,
+            payload,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let ledger: NativeMemoryLedger = from_json(&payload)?;
+        let source = ledger
+            .validate_persisted()
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        if ledger.source_id != *id
+            || harness_name(source.harness) != stored_harness
+            || scope_columns(&source.scope) != (stored_scope.as_str(), stored_project_id)
+            || native_memory_document_kind(source.document_kind) != stored_document_kind
+            || optional_sha256_key(ledger.last_observed_digest.as_ref()) != stored_observed
+            || optional_sha256_key(ledger.last_unmanaged_digest.as_ref()) != stored_unmanaged
+            || optional_sha256_key(ledger.last_imported_digest.as_ref()) != stored_imported
+            || optional_sha256_key(ledger.last_applied_digest.as_ref()) != stored_applied
+            || ledger.initial_preview_complete
+                != sqlite_bool(
+                    stored_initial_preview_complete,
+                    "native memory initial-preview flag",
+                )?
+        {
+            return Err(VaultError::Validation(
+                "native memory ledger metadata does not match its row".to_owned(),
+            ));
+        }
+        Ok(Some(ledger))
+    }
+
+    pub fn put_native_memory_candidate(
+        &mut self,
+        ledger: &NativeMemoryLedger,
+        candidate: Option<&MemoryCandidate>,
+    ) -> Result<(), VaultError> {
+        let source = ledger
+            .validate_persisted()
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        let (scope_kind, project_id) = scope_columns(&source.scope);
+        let transaction = self.connection.transaction()?;
+        if let Some(candidate) = candidate {
+            candidate
+                .validate()
+                .map_err(|error| VaultError::Validation(error.to_string()))?;
+            let existing = transaction
+                .query_row(
+                    "SELECT payload_json FROM candidates WHERE id = ?1",
+                    [candidate.id.to_string()],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing != to_json(candidate)? {
+                    return Err(VaultError::OperationConflict);
+                }
+                validate_native_memory_candidate(source, ledger, candidate)?;
+            } else {
+                validate_native_memory_candidate(source, ledger, candidate)?;
+                transaction.execute(
+                    "INSERT INTO candidates(id, state, payload_json) VALUES (?1, 'pending', ?2)",
+                    params![candidate.id.to_string(), to_json(candidate)?],
+                )?;
+            }
+        }
+        transaction.execute(
+            "INSERT INTO native_memory_sources(
+                 source_id, harness, scope_kind, project_id, document_kind,
+                 last_observed_digest, last_unmanaged_digest, last_imported_digest,
+                 last_applied_digest, initial_preview_complete, payload_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(source_id) DO UPDATE SET
+                 harness = excluded.harness,
+                 scope_kind = excluded.scope_kind,
+                 project_id = excluded.project_id,
+                 document_kind = excluded.document_kind,
+                 last_observed_digest = excluded.last_observed_digest,
+                 last_unmanaged_digest = excluded.last_unmanaged_digest,
+                 last_imported_digest = excluded.last_imported_digest,
+                 last_applied_digest = excluded.last_applied_digest,
+                 initial_preview_complete = excluded.initial_preview_complete,
+                 payload_json = excluded.payload_json",
+            params![
+                sha256_key(&ledger.source_id.0),
+                harness_name(source.harness),
+                scope_kind,
+                project_id,
+                native_memory_document_kind(source.document_kind),
+                optional_sha256_key(ledger.last_observed_digest.as_ref()),
+                optional_sha256_key(ledger.last_unmanaged_digest.as_ref()),
+                optional_sha256_key(ledger.last_imported_digest.as_ref()),
+                optional_sha256_key(ledger.last_applied_digest.as_ref()),
+                i64::from(ledger.initial_preview_complete),
+                to_json(ledger)?,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn review_candidate(
         &mut self,
         id: CandidateId,
@@ -1179,6 +1322,48 @@ fn cached_embedding(scope: &ScopeRef, archived: bool, embedding: &Embedding384) 
     }
 }
 
+fn validate_native_memory_candidate(
+    source: &NativeMemorySource,
+    ledger: &NativeMemoryLedger,
+    candidate: &MemoryCandidate,
+) -> Result<(), VaultError> {
+    let unmanaged_digest = ledger.last_imported_digest.ok_or_else(|| {
+        VaultError::Validation("native memory candidate requires an imported digest".to_owned())
+    })?;
+    let extracted = extract_managed_markdown(candidate.proposed_memory.body_markdown.as_bytes())
+        .map_err(|error| VaultError::Validation(error.to_string()))?;
+    let (expected_candidate_id, expected_memory_id, expected_operation_id) =
+        native_memory_identity(source.id, unmanaged_digest)
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+    let expected_evidence = [
+        native_memory_evidence(NativeMemoryChangeKind::InitialPreview),
+        native_memory_evidence(NativeMemoryChangeKind::LiveEdit),
+    ];
+    let memory = &candidate.proposed_memory;
+    if extracted.managed_body.is_some()
+        || extracted.unmanaged_digest != unmanaged_digest
+        || candidate.id != expected_candidate_id
+        || memory.id != expected_memory_id
+        || memory.revision != expected_operation_id
+        || candidate.state != CandidateState::Pending
+        || candidate.source_harness != source.harness
+        || memory.scope != source.scope
+        || memory.kind != MemoryKind::Note
+        || memory.origin != MemoryOrigin::NativeImport
+        || memory.title != native_memory_title(source)
+        || memory.tags != native_memory_tags(source.harness)
+        || memory.provenance.harness != Some(source.harness)
+        || memory.provenance.source.is_some()
+        || memory.archived
+        || !expected_evidence.contains(&candidate.evidence_summary.as_str())
+    {
+        return Err(VaultError::Validation(
+            "native memory candidate does not match its source ledger".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn load_embedding_cache(
     connection: &Connection,
 ) -> Result<BTreeMap<String, CachedEmbedding>, VaultError> {
@@ -1402,6 +1587,18 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
                 "../migrations/0009_setup_cli_transactions.sql"
             ))
             .and_then(|_| transaction.pragma_update(None, "user_version", 9))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 10 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0010_native_memory_reconciliation.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 10))
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }
@@ -1827,6 +2024,17 @@ const fn harness_name(harness: HarnessId) -> &'static str {
     }
 }
 
+const fn native_memory_document_kind(
+    kind: crate::native_memory::NativeMemoryDocumentKind,
+) -> &'static str {
+    match kind {
+        crate::native_memory::NativeMemoryDocumentKind::Agent => "agent",
+        crate::native_memory::NativeMemoryDocumentKind::UserProfile => "user_profile",
+        crate::native_memory::NativeMemoryDocumentKind::Summary => "summary",
+        crate::native_memory::NativeMemoryDocumentKind::Topic => "topic",
+    }
+}
+
 fn pragma_bool(connection: &Connection, name: &str) -> Result<bool, VaultError> {
     if !matches!(name, "trusted_schema" | "foreign_keys" | "secure_delete") {
         return Err(VaultError::Validation("unsupported pragma".to_owned()));
@@ -1872,4 +2080,8 @@ fn sha256_key(digest: &Sha256Digest) -> String {
         key.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     key
+}
+
+fn optional_sha256_key(digest: Option<&Sha256Digest>) -> Option<String> {
+    digest.map(sha256_key)
 }

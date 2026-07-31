@@ -10,6 +10,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
+    native_memory::{
+        NativeMemoryLedger, NativeMemorySnapshot, ReadyNativeMemory, ReconcileDecision,
+        build_native_memory_candidate, reconcile,
+    },
     search::{AllowedSearchScope, EMBEDDING_DIMENSIONS, Embedding384},
     vault::{LocalOperationBinding, LocalOperationKind, LocalOperationReplay, Vault, VaultError},
 };
@@ -28,6 +32,78 @@ struct PreparedLocalMutation<T> {
 impl<'a> OfflineWorkspace<'a> {
     pub const fn new(vault: &'a mut Vault, device_id: DeviceId) -> Self {
         Self { vault, device_id }
+    }
+
+    pub fn reconcile_native_memory(
+        &mut self,
+        ready: ReadyNativeMemory,
+    ) -> Result<Option<MemoryCandidate>, ClientError> {
+        ready.source.validate().map_err(|_| invalid_request())?;
+        let mut ledger = match vault(self.vault.native_memory_ledger(&ready.source.id))? {
+            Some(ledger) => {
+                if ledger.source.as_ref() != Some(&ready.source) {
+                    return Err(conflict("The native memory source metadata changed"));
+                }
+                ledger
+            }
+            None => NativeMemoryLedger::for_source(ready.source.clone()),
+        };
+
+        let candidate = match ready.snapshot {
+            NativeMemorySnapshot::Absent => {
+                ledger.last_observed_digest = None;
+                ledger.initial_preview_complete = true;
+                None
+            }
+            NativeMemorySnapshot::Regular(bytes) => {
+                match reconcile(&ready.source, &ledger, &bytes).map_err(|_| invalid_request())? {
+                    ReconcileDecision::Pending {
+                        full_digest,
+                        unmanaged_digest,
+                        candidate_markdown,
+                        change_kind,
+                        ..
+                    } => {
+                        let candidate = build_native_memory_candidate(
+                            &ready.source,
+                            unmanaged_digest,
+                            candidate_markdown,
+                            change_kind,
+                            self.device_id,
+                        )
+                        .map_err(|_| invalid_request())?;
+                        ledger.last_observed_digest = Some(full_digest);
+                        ledger.last_unmanaged_digest = Some(unmanaged_digest);
+                        ledger.last_imported_digest = Some(unmanaged_digest);
+                        ledger.initial_preview_complete = true;
+                        Some(candidate)
+                    }
+                    ReconcileDecision::NoContent {
+                        full_digest,
+                        unmanaged_digest,
+                    }
+                    | ReconcileDecision::AlreadyImported {
+                        full_digest,
+                        unmanaged_digest,
+                    } => {
+                        ledger.last_observed_digest = Some(full_digest);
+                        ledger.last_unmanaged_digest = Some(unmanaged_digest);
+                        ledger.initial_preview_complete = true;
+                        None
+                    }
+                    ReconcileDecision::SelfExport { full_digest } => {
+                        ledger.last_observed_digest = Some(full_digest);
+                        ledger.initial_preview_complete = true;
+                        None
+                    }
+                }
+            }
+        };
+        vault(
+            self.vault
+                .put_native_memory_candidate(&ledger, candidate.as_ref()),
+        )?;
+        Ok(candidate)
     }
 
     pub fn create_memory(

@@ -1,4 +1,9 @@
-use context_relay_protocol::Sha256Digest;
+use context_relay_protocol::{
+    CandidateId, CandidateState, DeviceId, HarnessId, HybridLogicalClock, MemoryCandidate,
+    MemoryId, MemoryKind, MemoryOrigin, MemoryRecord, OperationId, Provenance, Sha256Digest,
+};
+use sha2::{Digest as _, Sha256};
+use std::str::FromStr;
 
 use super::{
     NativeMemoryError, NativeMemoryLedger, NativeMemorySource, NativeMemorySourceId,
@@ -89,4 +94,131 @@ pub fn reconcile(
             NativeMemoryChangeKind::InitialPreview
         },
     })
+}
+
+pub(crate) fn build_native_memory_candidate(
+    source: &NativeMemorySource,
+    unmanaged_digest: Sha256Digest,
+    candidate_markdown: Vec<u8>,
+    change_kind: NativeMemoryChangeKind,
+    device_id: DeviceId,
+) -> Result<MemoryCandidate, NativeMemoryError> {
+    source.validate()?;
+    let body_markdown =
+        String::from_utf8(candidate_markdown).map_err(|_| NativeMemoryError::InvalidUtf8)?;
+    let (candidate_id, memory_id, operation_id) =
+        native_memory_identity(source.id, unmanaged_digest)?;
+    let clock = operation_clock(operation_id, device_id);
+    let candidate = MemoryCandidate {
+        id: candidate_id,
+        proposed_memory: MemoryRecord {
+            id: memory_id,
+            scope: source.scope.clone(),
+            kind: MemoryKind::Note,
+            title: native_memory_title(source),
+            body_markdown,
+            tags: native_memory_tags(source.harness),
+            origin: MemoryOrigin::NativeImport,
+            provenance: Provenance {
+                origin_device: device_id,
+                harness: Some(source.harness),
+                source: None,
+                created_hlc: clock,
+            },
+            revision: operation_id,
+            created_hlc: clock,
+            updated_hlc: clock,
+            archived: false,
+        },
+        evidence_summary: native_memory_evidence(change_kind).to_owned(),
+        source_harness: source.harness,
+        state: CandidateState::Pending,
+    };
+    candidate
+        .validate()
+        .map_err(|_| NativeMemoryError::InvalidSource("candidate"))?;
+    Ok(candidate)
+}
+
+pub(crate) fn native_memory_identity(
+    source_id: NativeMemorySourceId,
+    unmanaged_digest: Sha256Digest,
+) -> Result<(CandidateId, MemoryId, OperationId), NativeMemoryError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"context-relay.native-memory-candidate.v1");
+    hasher.update(source_id.0.0);
+    hasher.update(unmanaged_digest.0);
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let value = format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    );
+    Ok((
+        CandidateId::from_str(&value).map_err(|_| NativeMemoryError::InvalidSource("identity"))?,
+        MemoryId::from_str(&value).map_err(|_| NativeMemoryError::InvalidSource("identity"))?,
+        OperationId::from_str(&value).map_err(|_| NativeMemoryError::InvalidSource("identity"))?,
+    ))
+}
+
+pub(crate) fn native_memory_title(source: &NativeMemorySource) -> String {
+    format!(
+        "{} native {} memory",
+        match source.harness {
+            HarnessId::ClaudeCode => "Claude Code",
+            HarnessId::Codex => "Codex",
+            HarnessId::Hermes => "Hermes",
+        },
+        match source.document_kind {
+            super::NativeMemoryDocumentKind::Agent => "agent",
+            super::NativeMemoryDocumentKind::UserProfile => "user-profile",
+            super::NativeMemoryDocumentKind::Summary => "summary",
+            super::NativeMemoryDocumentKind::Topic => "topic",
+        }
+    )
+}
+
+pub(crate) fn native_memory_tags(harness: HarnessId) -> Vec<String> {
+    vec![
+        "native-import".to_owned(),
+        match harness {
+            HarnessId::ClaudeCode => "claude-code",
+            HarnessId::Codex => "codex",
+            HarnessId::Hermes => "hermes",
+        }
+        .to_owned(),
+    ]
+}
+
+pub(crate) const fn native_memory_evidence(change_kind: NativeMemoryChangeKind) -> &'static str {
+    match change_kind {
+        NativeMemoryChangeKind::InitialPreview => "initial native-memory preview",
+        NativeMemoryChangeKind::LiveEdit => "native-memory edit",
+    }
+}
+
+fn operation_clock(operation_id: OperationId, device_id: DeviceId) -> HybridLogicalClock {
+    let bytes = operation_id.as_bytes();
+    let physical_ms = u64::from_be_bytes([
+        0, 0, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+    ]);
+    HybridLogicalClock::new(physical_ms, 0, device_id)
 }
