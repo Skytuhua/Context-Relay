@@ -39,6 +39,10 @@ use tokio::{
     time::timeout,
 };
 
+pub mod bridge_install;
+
+use bridge_install::{BridgeInstallEngine, ProductionBridgeInstallEngine};
+
 pub const VAULT_CREDENTIAL_ID: &str = "vault-key-v1";
 const WORK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(29);
 const NATIVE_SANDBOX_DIRECTORY: &str = "native-sandboxes";
@@ -134,6 +138,7 @@ struct VaultConfig {
     key_store: Arc<dyn DatabaseKeyStore>,
     device_id: DeviceId,
     worker_hook: Option<Arc<dyn WorkerHook>>,
+    bridge_install: Arc<dyn BridgeInstallEngine>,
     #[cfg(test)]
     startup_recovery: Option<StartupRecovery>,
 }
@@ -150,6 +155,10 @@ impl VaultConfig {
             key_store,
             device_id: stable_device_id(b"context-relay-test-device"),
             worker_hook: None,
+            bridge_install: Arc::new(
+                ProductionBridgeInstallEngine::production()
+                    .expect("the running daemon has an executable location"),
+            ),
             #[cfg(test)]
             startup_recovery: None,
         }
@@ -160,7 +169,11 @@ impl VaultConfig {
         self
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    fn with_bridge_install(mut self, bridge_install: Arc<dyn BridgeInstallEngine>) -> Self {
+        self.bridge_install = bridge_install;
+        self
+    }
+
     fn with_worker_hook(mut self, worker_hook: Arc<dyn WorkerHook>) -> Self {
         self.worker_hook = Some(worker_hook);
         self
@@ -580,6 +593,7 @@ enum VaultCommand {
     ProjectPathSet(ProjectPathParams),
     MemoryGet(MemoryParams),
     Workspace(LocalRequest),
+    HarnessSetup(LocalRequest),
     #[cfg(test)]
     TestBlock {
         entered: std::sync::mpsc::SyncSender<()>,
@@ -624,11 +638,13 @@ fn route_request(_role: ClientRole, request: LocalRequest) -> RoutedRequest {
         | LocalRequest::AccountDeletionCancel(_)) => {
             RoutedRequest::Work(VaultCommand::Workspace(request))
         }
-        LocalRequest::HarnessProbe(_)
-        | LocalRequest::HarnessPreview(_)
+        request @ (LocalRequest::HarnessPreview(_)
         | LocalRequest::HarnessApply(_)
+        | LocalRequest::HarnessRollback(_)) => {
+            RoutedRequest::Work(VaultCommand::HarnessSetup(request))
+        }
+        LocalRequest::HarnessProbe(_)
         | LocalRequest::HarnessRepair(_)
-        | LocalRequest::HarnessRollback(_)
         | LocalRequest::PackageImport(_)
         | LocalRequest::PackageExport(_) => RoutedRequest::Immediate(Err(unsupported_error(
             "The requested local adapter operation is not supported",
@@ -798,6 +814,7 @@ struct WorkspaceState {
     device_id: DeviceId,
     exports: BTreeMap<ExportId, StoredExport>,
     deletion: AccountDeletionState,
+    bridge_install: Arc<dyn BridgeInstallEngine>,
 }
 
 impl VaultWorker {
@@ -829,9 +846,15 @@ impl VaultWorker {
                     #[cfg(test)]
                     if let Some(recovery) = &config.startup_recovery {
                         recovery(&mut vault)?;
-                        return Ok(vault);
+                    } else {
+                        recover_startup_native_transactions(&mut vault, &config.path)?;
                     }
+                    #[cfg(not(test))]
                     recover_startup_native_transactions(&mut vault, &config.path)?;
+                    config
+                        .bridge_install
+                        .reconcile_after_native_recovery(&mut vault, &config.path, config.device_id)
+                        .map_err(|_| DaemonError::Startup)?;
                     Ok(vault)
                 });
                 match opened {
@@ -846,6 +869,7 @@ impl VaultWorker {
                                 device_id: config.device_id,
                                 exports: BTreeMap::new(),
                                 deletion: AccountDeletionState::Active,
+                                bridge_install: config.bridge_install,
                             },
                             &mut receiver,
                             config.worker_hook.as_deref(),
@@ -959,12 +983,36 @@ fn execute_vault_command(
             .map(|memory| LocalResult::Memory { memory })
             .map_err(client_error_from_vault),
         VaultCommand::Workspace(request) => execute_workspace_request(state, request),
+        VaultCommand::HarnessSetup(request) => execute_harness_setup(state, request),
         #[cfg(test)]
         VaultCommand::TestBlock { entered, release } => {
             entered.send(()).map_err(|_| service_internal_error())?;
             release.recv().map_err(|_| service_internal_error())?;
             Ok(LocalResult::Empty)
         }
+    }
+}
+
+fn execute_harness_setup(
+    state: &mut WorkspaceState,
+    request: LocalRequest,
+) -> Result<LocalResult, ClientError> {
+    match request {
+        LocalRequest::HarnessPreview(params) => state
+            .bridge_install
+            .preview(&mut state.vault, &state.vault_path, state.device_id, params)
+            .map(|plan| LocalResult::Plan {
+                plan: Box::new(plan),
+            }),
+        LocalRequest::HarnessApply(params) => state
+            .bridge_install
+            .apply(&mut state.vault, &state.vault_path, state.device_id, params)
+            .map(|()| LocalResult::Empty),
+        LocalRequest::HarnessRollback(params) => state
+            .bridge_install
+            .rollback(&mut state.vault, &state.vault_path, state.device_id, params)
+            .map(|()| LocalResult::Empty),
+        _ => Err(invalid_request_error()),
     }
 }
 
@@ -1379,7 +1427,7 @@ pub fn client_error_from_vault(error: VaultError) -> ClientError {
     }
 }
 
-#[cfg(feature = "test-support")]
+#[doc(hidden)]
 pub mod test_support {
     use std::{
         collections::HashMap,
@@ -1396,7 +1444,8 @@ pub mod test_support {
     use zeroize::Zeroizing;
 
     use super::{
-        Daemon, DaemonConfig, DaemonError, InstallationTokenProvider, VaultConfig, WorkerHook,
+        BridgeInstallEngine, Daemon, DaemonConfig, DaemonError, InstallationTokenProvider,
+        VaultConfig, WorkerHook,
     };
 
     #[derive(Clone)]
@@ -1406,6 +1455,7 @@ pub mod test_support {
         token: [u8; 32],
         keys: Arc<TestKeyStore>,
         worker_gate: Option<Arc<TestWorkerGate>>,
+        bridge_install: Option<Arc<dyn BridgeInstallEngine>>,
     }
 
     impl TestDaemonConfig {
@@ -1420,6 +1470,7 @@ pub mod test_support {
                 token: *installation_token.as_bytes(),
                 keys: Arc::default(),
                 worker_gate: None,
+                bridge_install: None,
             }
         }
 
@@ -1436,6 +1487,14 @@ pub mod test_support {
             self
         }
 
+        pub fn with_bridge_install_engine(
+            mut self,
+            bridge_install: Arc<dyn BridgeInstallEngine>,
+        ) -> Self {
+            self.bridge_install = Some(bridge_install);
+            self
+        }
+
         pub async fn start(&self) -> Result<Daemon, DaemonError> {
             let mut vault = VaultConfig::new(
                 self.vault_path.clone(),
@@ -1444,6 +1503,9 @@ pub mod test_support {
             );
             if let Some(worker_gate) = &self.worker_gate {
                 vault = vault.with_worker_hook(worker_gate.clone());
+            }
+            if let Some(bridge_install) = &self.bridge_install {
+                vault = vault.with_bridge_install(bridge_install.clone());
             }
             Daemon::start(DaemonConfig::new(
                 self.runtime.clone(),
