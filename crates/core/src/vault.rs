@@ -809,18 +809,37 @@ impl Vault {
                 )
                 .optional()?;
             if let Some(existing) = existing {
-                if existing != canonical_candidate {
-                    return Err(VaultError::OperationConflict);
-                }
-                let replay_change_kind = if prior_ledger
-                    .as_ref()
-                    .is_some_and(|(_, payload)| payload == &canonical_ledger)
-                {
-                    native_memory_change_kind(candidate)?
+                if existing == canonical_candidate {
+                    let replay_change_kind = if prior_ledger
+                        .as_ref()
+                        .is_some_and(|(_, payload)| payload == &canonical_ledger)
+                    {
+                        native_memory_change_kind(candidate)?
+                    } else {
+                        expected_change_kind
+                    };
+                    validate_native_memory_candidate(
+                        source,
+                        ledger,
+                        candidate,
+                        replay_change_kind,
+                    )?;
                 } else {
-                    expected_change_kind
-                };
-                validate_native_memory_candidate(source, ledger, candidate, replay_change_kind)?;
+                    let existing_candidate: MemoryCandidate = from_json(&existing)?;
+                    existing_candidate
+                        .validate()
+                        .map_err(|error| VaultError::Validation(error.to_string()))?;
+                    native_memory_change_kind(&existing_candidate)?;
+                    if !same_native_candidate_identity(&existing_candidate, candidate) {
+                        return Err(VaultError::OperationConflict);
+                    }
+                    validate_native_memory_candidate(
+                        source,
+                        ledger,
+                        candidate,
+                        expected_change_kind,
+                    )?;
+                }
             } else {
                 validate_native_memory_candidate(source, ledger, candidate, expected_change_kind)?;
                 transaction.execute(
@@ -1408,6 +1427,15 @@ fn native_memory_change_kind(
             "native memory candidate has invalid reconciliation evidence".to_owned(),
         )),
     }
+}
+
+fn same_native_candidate_identity(existing: &MemoryCandidate, incoming: &MemoryCandidate) -> bool {
+    let mut normalized = existing.clone();
+    normalized
+        .evidence_summary
+        .clone_from(&incoming.evidence_summary);
+    normalized.state = incoming.state;
+    normalized == *incoming
 }
 
 fn load_embedding_cache(

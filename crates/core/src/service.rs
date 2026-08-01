@@ -99,11 +99,18 @@ impl<'a> OfflineWorkspace<'a> {
                 }
             }
         };
+        let candidate_is_new = candidate
+            .as_ref()
+            .map(|candidate| {
+                vault(self.vault.candidate(&candidate.id)).map(|stored| stored.is_none())
+            })
+            .transpose()?
+            .unwrap_or(false);
         vault(
             self.vault
                 .put_native_memory_candidate(&ledger, candidate.as_ref()),
         )?;
-        Ok(candidate)
+        Ok(candidate.filter(|_| candidate_is_new))
     }
 
     pub fn create_memory(

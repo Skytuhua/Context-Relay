@@ -9,8 +9,8 @@ use context_relay_core::{
     vault::{Vault, VaultError},
 };
 use context_relay_protocol::{
-    CandidateState, ErrorCode, HarnessId, MemoryOrigin, NativePlatform, ScopeRef, Sha256Digest,
-    WireNativeValue,
+    CandidateReviewParams, CandidateState, ErrorCode, HarnessId, MemoryOrigin, NativePlatform,
+    ScopeRef, Sha256Digest, WireNativeValue,
 };
 use rusqlite::{Connection, params};
 
@@ -385,6 +385,134 @@ fn direct_candidate_persistence_replay_is_idempotent() {
         target.native_memory_ledger(&source.id).unwrap(),
         Some(ledger)
     );
+}
+
+#[test]
+fn reverting_to_seen_content_advances_the_ledger_without_rewriting_the_candidate() {
+    for reviewed_state in [
+        CandidateState::Pending,
+        CandidateState::Accepted,
+        CandidateState::Rejected,
+    ] {
+        let suffix = match reviewed_state {
+            CandidateState::Pending => "pending",
+            CandidateState::Accepted => "accepted",
+            CandidateState::Rejected => "rejected",
+        };
+        let source = source(
+            ScopeRef::Global,
+            HarnessId::Codex,
+            &format!("revert-{suffix}"),
+        );
+        let path = TempVault::new(&format!("native-memory-revert-{suffix}"));
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+        let initial = OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
+            .reconcile_native_memory(ready(source.clone(), "content A"))
+            .unwrap()
+            .unwrap();
+        let preserved = if reviewed_state == CandidateState::Pending {
+            initial.clone()
+        } else {
+            OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
+                .review_candidate(CandidateReviewParams {
+                    candidate_id: initial.id,
+                    accepted: reviewed_state == CandidateState::Accepted,
+                    operation_id: ID_7.parse().unwrap(),
+                })
+                .unwrap()
+        };
+
+        let live = OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
+            .reconcile_native_memory(ready(source.clone(), "content B"))
+            .unwrap()
+            .unwrap();
+        assert_ne!(live.id, initial.id);
+
+        let reverted = OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
+            .reconcile_native_memory(ready(source.clone(), "content A"))
+            .unwrap();
+
+        assert_eq!(reverted, None);
+        assert_eq!(vault.candidate(&initial.id).unwrap(), Some(preserved));
+        assert_eq!(vault.candidates(None).unwrap().len(), 2);
+        let ledger = vault.native_memory_ledger(&source.id).unwrap().unwrap();
+        assert_eq!(
+            ledger.last_imported_digest,
+            Some(
+                extract_managed_markdown(b"content A")
+                    .unwrap()
+                    .unmanaged_digest
+            )
+        );
+        assert_eq!(
+            vault.memory(&initial.proposed_memory.id).unwrap().is_some(),
+            reviewed_state == CandidateState::Accepted
+        );
+    }
+}
+
+#[test]
+fn seen_candidate_dedup_rejects_every_immutable_field_mismatch() {
+    let source = source(ScopeRef::Global, HarnessId::Codex, "immutable-dedup");
+    let producer_path = TempVault::new("native-memory-immutable-producer");
+    let producer_keys = MemoryKeyStore::default();
+    let mut producer = Vault::open(producer_path.path(), CREDENTIAL, &producer_keys).unwrap();
+    let initial = OfflineWorkspace::new(&mut producer, ID_7.parse().unwrap())
+        .reconcile_native_memory(ready(source.clone(), "content A"))
+        .unwrap()
+        .unwrap();
+    let initial_ledger = producer.native_memory_ledger(&source.id).unwrap().unwrap();
+    OfflineWorkspace::new(&mut producer, ID_7.parse().unwrap())
+        .reconcile_native_memory(ready(source.clone(), "content B"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        OfflineWorkspace::new(&mut producer, ID_7.parse().unwrap())
+            .reconcile_native_memory(ready(source.clone(), "content A"))
+            .unwrap(),
+        None
+    );
+    let revert_ledger = producer.native_memory_ledger(&source.id).unwrap().unwrap();
+    let mut incoming = initial.clone();
+    incoming.evidence_summary = "native-memory edit".to_owned();
+
+    for field in [
+        "identity", "content", "scope", "harness", "title", "tags", "origin",
+    ] {
+        let path = TempVault::new(&format!("native-memory-immutable-{field}"));
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+        vault
+            .put_native_memory_candidate(&initial_ledger, Some(&initial))
+            .unwrap();
+        let mut corrupted = initial.clone();
+        match field {
+            "identity" => corrupted.proposed_memory.id = ID_7.parse().unwrap(),
+            "content" => corrupted.proposed_memory.body_markdown = "altered".to_owned(),
+            "scope" => {
+                corrupted.proposed_memory.scope = ScopeRef::Project {
+                    project_id: ID_7.parse().unwrap(),
+                };
+            }
+            "harness" => corrupted.source_harness = HarnessId::Hermes,
+            "title" => corrupted.proposed_memory.title = "Altered title".to_owned(),
+            "tags" => corrupted.proposed_memory.tags = vec!["altered".to_owned()],
+            "origin" => corrupted.proposed_memory.origin = MemoryOrigin::Explicit,
+            _ => unreachable!(),
+        }
+        vault.put_candidate(&corrupted).unwrap();
+
+        assert!(matches!(
+            vault.put_native_memory_candidate(&revert_ledger, Some(&incoming)),
+            Err(VaultError::OperationConflict)
+        ));
+        assert_eq!(
+            vault.native_memory_ledger(&source.id).unwrap(),
+            Some(initial_ledger.clone()),
+            "{field}"
+        );
+    }
 }
 
 #[test]
