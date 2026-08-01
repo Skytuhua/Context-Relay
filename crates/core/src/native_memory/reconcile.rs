@@ -6,8 +6,8 @@ use sha2::{Digest as _, Sha256};
 use std::str::FromStr;
 
 use super::{
-    NativeMemoryError, NativeMemoryLedger, NativeMemorySource, NativeMemorySourceId,
-    extract_managed_markdown,
+    NativeMemoryError, NativeMemoryLedger, NativeMemoryObservationKind, NativeMemorySource,
+    NativeMemorySourceId, extract_managed_markdown,
 };
 use crate::native_memory::markdown::{MANAGED_END, MANAGED_START, digest};
 
@@ -43,6 +43,24 @@ pub fn reconcile(
     source: &NativeMemorySource,
     ledger: &NativeMemoryLedger,
     bytes: &[u8],
+) -> Result<ReconcileDecision, NativeMemoryError> {
+    reconcile_classified(
+        source,
+        ledger,
+        bytes,
+        if ledger.initial_preview_complete {
+            NativeMemoryObservationKind::LiveEdit
+        } else {
+            NativeMemoryObservationKind::InitialPreview
+        },
+    )
+}
+
+pub fn reconcile_classified(
+    source: &NativeMemorySource,
+    ledger: &NativeMemoryLedger,
+    bytes: &[u8],
+    observation_kind: NativeMemoryObservationKind,
 ) -> Result<ReconcileDecision, NativeMemoryError> {
     source.validate()?;
     if source.id != ledger.source_id {
@@ -88,10 +106,9 @@ pub fn reconcile(
         full_digest,
         unmanaged_digest: extracted.unmanaged_digest,
         candidate_markdown: extracted.unmanaged_body,
-        change_kind: if ledger.initial_preview_complete {
-            NativeMemoryChangeKind::LiveEdit
-        } else {
-            NativeMemoryChangeKind::InitialPreview
+        change_kind: match observation_kind {
+            NativeMemoryObservationKind::InitialPreview => NativeMemoryChangeKind::InitialPreview,
+            NativeMemoryObservationKind::LiveEdit => NativeMemoryChangeKind::LiveEdit,
         },
     })
 }

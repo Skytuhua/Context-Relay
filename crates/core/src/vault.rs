@@ -774,6 +774,25 @@ impl Vault {
         Ok(Some(ledger))
     }
 
+    pub fn native_memory_ledgers(&self) -> Result<Vec<NativeMemoryLedger>, VaultError> {
+        let payloads: Vec<NativeMemoryLedger> = load_json_list(
+            &self.connection,
+            "SELECT payload_json FROM native_memory_sources ORDER BY source_id",
+            [],
+        )?;
+        payloads
+            .into_iter()
+            .map(|ledger| {
+                self.native_memory_ledger(&ledger.source_id)?
+                    .ok_or_else(|| {
+                        VaultError::Validation(
+                            "native memory ledger disappeared while loading".to_owned(),
+                        )
+                    })
+            })
+            .collect()
+    }
+
     pub fn put_native_memory_candidate(
         &mut self,
         ledger: &NativeMemoryLedger,
@@ -782,7 +801,6 @@ impl Vault {
         let source = ledger
             .validate_persisted()
             .map_err(|error| VaultError::Validation(error.to_string()))?;
-        let (scope_kind, project_id) = scope_columns(&source.scope);
         let canonical_ledger = to_json(ledger)?;
         let transaction = self.connection.transaction()?;
         if let Some(candidate) = candidate {
@@ -860,37 +878,7 @@ impl Vault {
                 )?;
             }
         }
-        transaction.execute(
-            "INSERT INTO native_memory_sources(
-                 source_id, harness, scope_kind, project_id, document_kind,
-                 last_observed_digest, last_unmanaged_digest, last_imported_digest,
-                 last_applied_digest, initial_preview_complete, payload_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(source_id) DO UPDATE SET
-                 harness = excluded.harness,
-                 scope_kind = excluded.scope_kind,
-                 project_id = excluded.project_id,
-                 document_kind = excluded.document_kind,
-                 last_observed_digest = excluded.last_observed_digest,
-                 last_unmanaged_digest = excluded.last_unmanaged_digest,
-                 last_imported_digest = excluded.last_imported_digest,
-                 last_applied_digest = excluded.last_applied_digest,
-                 initial_preview_complete = excluded.initial_preview_complete,
-                 payload_json = excluded.payload_json",
-            params![
-                sha256_key(&ledger.source_id.0),
-                harness_name(source.harness),
-                scope_kind,
-                project_id,
-                native_memory_document_kind(source.document_kind),
-                optional_sha256_key(ledger.last_observed_digest.as_ref()),
-                optional_sha256_key(ledger.last_unmanaged_digest.as_ref()),
-                optional_sha256_key(ledger.last_imported_digest.as_ref()),
-                optional_sha256_key(ledger.last_applied_digest.as_ref()),
-                i64::from(ledger.initial_preview_complete),
-                canonical_ledger,
-            ],
-        )?;
+        put_native_memory_ledger(&transaction, ledger, &canonical_ledger)?;
         transaction.commit()?;
         Ok(())
     }
@@ -2356,4 +2344,47 @@ fn sha256_key(digest: &Sha256Digest) -> String {
 
 fn optional_sha256_key(digest: Option<&Sha256Digest>) -> Option<String> {
     digest.map(sha256_key)
+}
+
+pub(super) fn put_native_memory_ledger(
+    transaction: &Transaction<'_>,
+    ledger: &NativeMemoryLedger,
+    canonical_ledger: &[u8],
+) -> Result<(), VaultError> {
+    let source = ledger
+        .validate_persisted()
+        .map_err(|error| VaultError::Validation(error.to_string()))?;
+    let (scope_kind, project_id) = scope_columns(&source.scope);
+    transaction.execute(
+        "INSERT INTO native_memory_sources(
+             source_id, harness, scope_kind, project_id, document_kind,
+             last_observed_digest, last_unmanaged_digest, last_imported_digest,
+             last_applied_digest, initial_preview_complete, payload_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(source_id) DO UPDATE SET
+             harness = excluded.harness,
+             scope_kind = excluded.scope_kind,
+             project_id = excluded.project_id,
+             document_kind = excluded.document_kind,
+             last_observed_digest = excluded.last_observed_digest,
+             last_unmanaged_digest = excluded.last_unmanaged_digest,
+             last_imported_digest = excluded.last_imported_digest,
+             last_applied_digest = excluded.last_applied_digest,
+             initial_preview_complete = excluded.initial_preview_complete,
+             payload_json = excluded.payload_json",
+        params![
+            sha256_key(&ledger.source_id.0),
+            harness_name(source.harness),
+            scope_kind,
+            project_id,
+            native_memory_document_kind(source.document_kind),
+            optional_sha256_key(ledger.last_observed_digest.as_ref()),
+            optional_sha256_key(ledger.last_unmanaged_digest.as_ref()),
+            optional_sha256_key(ledger.last_imported_digest.as_ref()),
+            optional_sha256_key(ledger.last_applied_digest.as_ref()),
+            i64::from(ledger.initial_preview_complete),
+            canonical_ledger,
+        ],
+    )?;
+    Ok(())
 }

@@ -2,19 +2,23 @@ mod support;
 
 use context_relay_core::{
     native_memory::{
-        NativeMemoryDocumentKind, NativeMemoryLedger, NativeMemoryLimits, NativeMemorySnapshot,
+        NativeMemoryDocumentKind, NativeMemoryLedger, NativeMemoryLimits,
+        NativeMemoryObservationKind, NativeMemoryRegistration, NativeMemorySnapshot,
         NativeMemorySource, NativeMemorySourceId, ReadyNativeMemory, extract_managed_markdown,
     },
     service::OfflineWorkspace,
-    vault::{LATEST_SCHEMA_VERSION, Vault, VaultError},
+    vault::{
+        LATEST_SCHEMA_VERSION, SetupPlanAction, SetupPlanLifecycle, SetupPlanWrite, Vault,
+        VaultError,
+    },
 };
 use context_relay_protocol::{
     CandidateReviewParams, CandidateState, ErrorCode, HarnessId, MemoryOrigin, NativePlatform,
-    ScopeRef, Sha256Digest, WireNativeValue,
+    PlanId, ScopeRef, Sha256Digest, WireNativeValue,
 };
 use rusqlite::{Connection, params};
 
-use support::{ID_7, MemoryKeyStore, TempVault};
+use support::{ID_1, ID_7, MemoryKeyStore, TempVault};
 
 const CREDENTIAL: &str = "native-memory-vault-tests";
 
@@ -232,7 +236,132 @@ fn ready(source: NativeMemorySource, body: &str) -> ReadyNativeMemory {
     ReadyNativeMemory {
         source,
         snapshot: NativeMemorySnapshot::Regular(body.as_bytes().to_vec()),
+        kind: NativeMemoryObservationKind::InitialPreview,
     }
+}
+
+fn ready_live(source: NativeMemorySource, body: &str) -> ReadyNativeMemory {
+    ReadyNativeMemory {
+        source,
+        snapshot: NativeMemorySnapshot::Regular(body.as_bytes().to_vec()),
+        kind: NativeMemoryObservationKind::LiveEdit,
+    }
+}
+
+#[test]
+fn successful_setup_apply_atomically_registers_descriptor_and_applied_digest() {
+    let path = TempVault::new("native-memory-applied-registration");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let plan_id = ID_1.parse::<PlanId>().unwrap();
+    let approval_hash = Sha256Digest([41; 32]);
+    vault
+        .put_setup_plan(SetupPlanWrite {
+            plan_id: &plan_id,
+            schema_version: 1,
+            approval_version: 2,
+            approval_hash: &approval_hash,
+            payload: b"sealed-native-memory-plan",
+            created_ms: 10,
+            expires_ms: 20,
+        })
+        .unwrap();
+    vault
+        .claim_setup_plan(&plan_id, SetupPlanAction::Apply, 11)
+        .unwrap();
+    let descriptor = source(ScopeRef::Global, HarnessId::Codex, "applied");
+    let applied = Sha256Digest([42; 32]);
+
+    vault
+        .finish_setup_plan_with_native_memory(
+            &plan_id,
+            SetupPlanLifecycle::Applied,
+            &[NativeMemoryRegistration {
+                source: descriptor.clone(),
+                last_applied_digest: Some(applied),
+            }],
+        )
+        .unwrap();
+    let stored = vault.native_memory_ledger(&descriptor.id).unwrap().unwrap();
+    assert_eq!(stored.source, Some(descriptor.clone()));
+    assert_eq!(stored.last_applied_digest, Some(applied));
+    assert_eq!(
+        vault.setup_plan(&plan_id).unwrap().unwrap().lifecycle,
+        SetupPlanLifecycle::Applied
+    );
+
+    vault
+        .finish_setup_plan_with_native_memory(
+            &plan_id,
+            SetupPlanLifecycle::Applied,
+            &[NativeMemoryRegistration {
+                source: descriptor.clone(),
+                last_applied_digest: Some(applied),
+            }],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        vault.finish_setup_plan_with_native_memory(
+            &plan_id,
+            SetupPlanLifecycle::Applied,
+            &[NativeMemoryRegistration {
+                source: descriptor.clone(),
+                last_applied_digest: Some(Sha256Digest([99; 32])),
+            }],
+        ),
+        Err(VaultError::Validation(_))
+    ));
+    assert_eq!(
+        vault
+            .native_memory_ledger(&descriptor.id)
+            .unwrap()
+            .unwrap()
+            .last_applied_digest,
+        Some(applied)
+    );
+}
+
+#[test]
+fn invalid_registration_cannot_publish_an_applied_lifecycle() {
+    let path = TempVault::new("native-memory-registration-rollback");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let plan_id = ID_1.parse::<PlanId>().unwrap();
+    let approval_hash = Sha256Digest([43; 32]);
+    vault
+        .put_setup_plan(SetupPlanWrite {
+            plan_id: &plan_id,
+            schema_version: 1,
+            approval_version: 2,
+            approval_hash: &approval_hash,
+            payload: b"sealed-invalid-registration-plan",
+            created_ms: 10,
+            expires_ms: 20,
+        })
+        .unwrap();
+    vault
+        .claim_setup_plan(&plan_id, SetupPlanAction::Apply, 11)
+        .unwrap();
+    let mut invalid = source(ScopeRef::Global, HarnessId::Codex, "invalid");
+    invalid.adapter_version = "changed-after-source-id".to_owned();
+
+    assert!(matches!(
+        vault.finish_setup_plan_with_native_memory(
+            &plan_id,
+            SetupPlanLifecycle::Applied,
+            &[NativeMemoryRegistration {
+                source: invalid,
+                last_applied_digest: Some(Sha256Digest([44; 32])),
+            }],
+        ),
+        Err(VaultError::Validation(_))
+    ));
+    assert_eq!(
+        vault.setup_plan(&plan_id).unwrap().unwrap().lifecycle,
+        SetupPlanLifecycle::Applying
+    );
+    assert!(vault.native_memory_ledgers().unwrap().is_empty());
 }
 
 #[test]
@@ -286,7 +415,7 @@ fn native_candidates_are_deterministic_bound_and_atomically_replayed() {
         let mut service = OfflineWorkspace::new(&mut vault_a, ID_7.parse().unwrap());
         assert_eq!(
             service
-                .reconcile_native_memory(ready(source.clone(), "Native fact\n"))
+                .reconcile_native_memory(ready_live(source.clone(), "Native fact\n"))
                 .unwrap(),
             None
         );
@@ -304,7 +433,7 @@ fn native_candidates_are_deterministic_bound_and_atomically_replayed() {
 
     let mut service = OfflineWorkspace::new(&mut vault_a, ID_7.parse().unwrap());
     let live = service
-        .reconcile_native_memory(ready(source.clone(), "Native fact changed\n"))
+        .reconcile_native_memory(ready_live(source.clone(), "Native fact changed\n"))
         .unwrap()
         .unwrap();
     assert_ne!(live.id, initial.id);
@@ -341,7 +470,7 @@ fn persistence_rejects_evidence_from_the_wrong_reconciliation_phase() {
         .put_native_memory_candidate(&ledger, Some(&initial_candidate))
         .unwrap();
     let mut live_candidate = OfflineWorkspace::new(&mut producer, ID_7.parse().unwrap())
-        .reconcile_native_memory(ready(source.clone(), "live candidate"))
+        .reconcile_native_memory(ready_live(source.clone(), "live candidate"))
         .unwrap()
         .unwrap();
     let live_ledger = producer.native_memory_ledger(&source.id).unwrap().unwrap();
@@ -424,13 +553,13 @@ fn reverting_to_seen_content_advances_the_ledger_without_rewriting_the_candidate
         };
 
         let live = OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
-            .reconcile_native_memory(ready(source.clone(), "content B"))
+            .reconcile_native_memory(ready_live(source.clone(), "content B"))
             .unwrap()
             .unwrap();
         assert_ne!(live.id, initial.id);
 
         let reverted = OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
-            .reconcile_native_memory(ready(source.clone(), "content A"))
+            .reconcile_native_memory(ready_live(source.clone(), "content A"))
             .unwrap();
 
         assert_eq!(reverted, None);
@@ -464,12 +593,12 @@ fn seen_candidate_dedup_rejects_every_immutable_field_mismatch() {
         .unwrap();
     let initial_ledger = producer.native_memory_ledger(&source.id).unwrap().unwrap();
     OfflineWorkspace::new(&mut producer, ID_7.parse().unwrap())
-        .reconcile_native_memory(ready(source.clone(), "content B"))
+        .reconcile_native_memory(ready_live(source.clone(), "content B"))
         .unwrap()
         .unwrap();
     assert_eq!(
         OfflineWorkspace::new(&mut producer, ID_7.parse().unwrap())
-            .reconcile_native_memory(ready(source.clone(), "content A"))
+            .reconcile_native_memory(ready_live(source.clone(), "content A"))
             .unwrap(),
         None
     );

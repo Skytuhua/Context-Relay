@@ -91,10 +91,23 @@ pub enum NativeMemorySnapshot {
     Regular(Vec<u8>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeMemoryObservationKind {
+    InitialPreview,
+    LiveEdit,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadyNativeMemory {
     pub source: NativeMemorySource,
     pub snapshot: NativeMemorySnapshot,
+    pub kind: NativeMemoryObservationKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeMemoryRegistration {
+    pub source: NativeMemorySource,
+    pub last_applied_digest: Option<Sha256Digest>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

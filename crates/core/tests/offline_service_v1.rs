@@ -988,6 +988,8 @@ fn native_candidate_review_preserves_import_ledger_for_accept_and_reject() {
             .reconcile_native_memory(ReadyNativeMemory {
                 source: source.clone(),
                 snapshot: NativeMemorySnapshot::Regular(b"review this native memory".to_vec()),
+                kind:
+                    context_relay_core::native_memory::NativeMemoryObservationKind::InitialPreview,
             })
             .unwrap()
             .unwrap();

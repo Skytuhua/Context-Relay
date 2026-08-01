@@ -21,6 +21,7 @@ use crate::{
         BRIDGE_SERVER_NAME, attest_bridge_executable, bridge_component_for_attested,
         is_canonical_bridge_body,
     },
+    native_memory::NativeMemoryRegistration,
     native_transaction::{
         ApprovedCliMutation, ApprovedMutation, NativeTransactionPlan,
         REVERSIBLE_PLAN_SCHEMA_VERSION, SidecarBinding, approval_hash_v2, open_plan, seal_plan,
@@ -388,6 +389,22 @@ impl<H, L> BridgeInstallService<'_, H, L> {
 }
 
 impl PersistedBridgeInstallService<'_> {
+    /// Transactional apply boundary used by Task 10 after it derives memory
+    /// registrations from the opened sealed setup plan.
+    pub fn finish_applied_with_native_memory(
+        &mut self,
+        plan_id: &PlanId,
+        registrations: &[NativeMemoryRegistration],
+    ) -> Result<(), ClientError> {
+        self.vault
+            .finish_setup_plan_with_native_memory(
+                plan_id,
+                SetupPlanLifecycle::Applied,
+                registrations,
+            )
+            .map_err(|_| conflict("Persisted bridge apply cannot be finalized"))
+    }
+
     /// Reconciles setup lifecycles after native startup recovery has made each
     /// begun transaction terminal. A missing native row is reported without
     /// executing; a subsequent explicit apply/rollback may safely resume it.
@@ -496,10 +513,7 @@ impl PersistedBridgeInstallService<'_> {
         executor: &mut E,
     ) -> Result<(), ClientError> {
         match executor.execute(self.vault, plan, &stored.payload, stored.created_ms, now_ms) {
-            Ok(()) => self
-                .vault
-                .finish_setup_plan(&plan.setup.plan_id, SetupPlanLifecycle::Applied)
-                .map_err(|_| conflict("Persisted bridge apply cannot be finalized")),
+            Ok(()) => self.finish_applied_with_native_memory(&plan.setup.plan_id, &[]),
             Err(error) => {
                 let lifecycle = match error {
                     BridgeExecutionError::Restored(_) => SetupPlanLifecycle::ApplyRestored,

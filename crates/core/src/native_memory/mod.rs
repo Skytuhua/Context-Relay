@@ -14,9 +14,10 @@ pub use instruction::{PRIMARY_MEMORY_INSTRUCTIONS, primary_memory_instruction_co
 pub use markdown::{ManagedMarkdown, extract_managed_markdown};
 pub use model::{
     NativeMemoryDocumentKind, NativeMemoryError, NativeMemoryLedger, NativeMemoryLimits,
-    NativeMemorySnapshot, NativeMemorySource, NativeMemorySourceId, ReadyNativeMemory,
+    NativeMemoryObservationKind, NativeMemoryRegistration, NativeMemorySnapshot,
+    NativeMemorySource, NativeMemorySourceId, ReadyNativeMemory,
 };
-pub use reconcile::{NativeMemoryChangeKind, ReconcileDecision, reconcile};
+pub use reconcile::{NativeMemoryChangeKind, ReconcileDecision, reconcile, reconcile_classified};
 pub(crate) use reconcile::{
     build_native_memory_candidate, native_memory_evidence, native_memory_identity,
     native_memory_tags, native_memory_title,

@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     native_memory::{
         NativeMemoryLedger, NativeMemorySnapshot, ReadyNativeMemory, ReconcileDecision,
-        build_native_memory_candidate, reconcile,
+        build_native_memory_candidate, reconcile_classified,
     },
     search::{AllowedSearchScope, EMBEDDING_DIMENSIONS, Embedding384},
     vault::{
@@ -143,7 +143,9 @@ impl<'a> OfflineWorkspace<'a> {
                 None
             }
             NativeMemorySnapshot::Regular(bytes) => {
-                match reconcile(&ready.source, &ledger, &bytes).map_err(|_| invalid_request())? {
+                match reconcile_classified(&ready.source, &ledger, &bytes, ready.kind)
+                    .map_err(|_| invalid_request())?
+                {
                     ReconcileDecision::Pending {
                         full_digest,
                         unmanaged_digest,

@@ -44,8 +44,10 @@ use tokio::{
 };
 
 pub mod bridge_install;
+mod native_memory;
 
 use bridge_install::{BridgeInstallEngine, ProductionBridgeInstallEngine};
+use native_memory::{NativeMemorySupervisor, NoopLifecycleProbe};
 
 pub const VAULT_CREDENTIAL_ID: &str = "vault-key-v1";
 const WORK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(29);
@@ -143,6 +145,9 @@ struct VaultConfig {
     device_id: DeviceId,
     worker_hook: Option<Arc<dyn WorkerHook>>,
     bridge_install: Arc<dyn BridgeInstallEngine>,
+    native_memory_probe: Arc<dyn native_memory::LifecycleProbe>,
+    native_memory_updates:
+        Option<mpsc::UnboundedSender<Vec<context_relay_core::native_memory::NativeMemoryLedger>>>,
     #[cfg(test)]
     startup_recovery: Option<StartupRecovery>,
 }
@@ -163,6 +168,8 @@ impl VaultConfig {
                 ProductionBridgeInstallEngine::production()
                     .expect("the running daemon has an executable location"),
             ),
+            native_memory_probe: Arc::new(NoopLifecycleProbe),
+            native_memory_updates: None,
             #[cfg(test)]
             startup_recovery: None,
         }
@@ -180,6 +187,19 @@ impl VaultConfig {
 
     fn with_worker_hook(mut self, worker_hook: Arc<dyn WorkerHook>) -> Self {
         self.worker_hook = Some(worker_hook);
+        self
+    }
+
+    fn with_native_memory_probe(mut self, probe: Arc<dyn native_memory::LifecycleProbe>) -> Self {
+        self.native_memory_probe = probe;
+        self
+    }
+
+    fn with_native_memory_updates(
+        mut self,
+        updates: mpsc::UnboundedSender<Vec<context_relay_core::native_memory::NativeMemoryLedger>>,
+    ) -> Self {
+        self.native_memory_updates = Some(updates);
         self
     }
 
@@ -512,6 +532,7 @@ pub struct Daemon {
     instance: Option<InstanceGuard>,
     listener: Option<Listener>,
     worker: VaultWorker,
+    native_memory: NativeMemorySupervisor,
     token: Arc<InstallationToken>,
     instance_nonce: DaemonInstanceNonce,
     shutdown_sender: watch::Sender<bool>,
@@ -525,20 +546,32 @@ impl Daemon {
         let mut instance = InstanceGuard::acquire(&config.runtime).map_err(map_guard_error)?;
         let token = Arc::new(config.token_provider.load_or_create()?);
         let instance_nonce = generate_instance_nonce().map_err(|_| DaemonError::Startup)?;
-        let worker = VaultWorker::spawn(
+        let native_memory_probe = config.vault.native_memory_probe.clone();
+        let (native_memory_updates, native_memory_update_receiver) = mpsc::unbounded_channel();
+        let mut worker = VaultWorker::spawn(
             config
                 .vault
+                .with_native_memory_updates(native_memory_updates)
                 .with_device_id(stable_device_id(token.as_bytes())),
         )
         .await?;
+        let native_memory_ledgers = worker.take_native_memory_ledgers();
         let listener =
             Listener::bind(&config.runtime, &mut instance).map_err(map_transport_error)?;
+        let native_memory = NativeMemorySupervisor::spawn(
+            worker.client(),
+            native_memory_ledgers,
+            native_memory_update_receiver,
+            native_memory_probe,
+        )
+        .map_err(|_| DaemonError::Startup)?;
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
         let (state_sender, state_receiver) = watch::channel(DaemonState::Running);
         Ok(Self {
             instance: Some(instance),
             listener: Some(listener),
             worker,
+            native_memory,
             token,
             instance_nonce,
             shutdown_sender,
@@ -604,6 +637,7 @@ impl Daemon {
         self.state_sender.send_replace(DaemonState::Draining);
         self.shutdown_sender.send_replace(true);
         while connections.join_next().await.is_some() {}
+        self.native_memory.shutdown_and_join_async().await;
         self.worker.shutdown_and_join_async().await;
         drop(listener);
         self.instance.take();
@@ -740,6 +774,7 @@ fn begin_immediate(registration: &RequestRegistration) -> Result<(), ClientError
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.listener.take();
+        self.native_memory.shutdown_and_join();
         self.worker.shutdown_and_join();
         self.instance.take();
         self.state_sender.send_replace(DaemonState::Stopped);
@@ -760,6 +795,7 @@ enum VaultCommand {
     MemoryGet(MemoryParams),
     Workspace(LocalRequest),
     HarnessSetup(LocalRequest),
+    NativeMemoryObservation(context_relay_core::native_memory::ReadyNativeMemory),
     #[cfg(test)]
     TestBlock {
         entered: std::sync::mpsc::SyncSender<()>,
@@ -967,6 +1003,7 @@ struct VaultWorker {
     exit: Option<oneshot::Receiver<()>>,
     admission: Arc<Mutex<bool>>,
     worker_hook: Option<Arc<dyn WorkerHook>>,
+    native_memory_ledgers: Option<Vec<context_relay_core::native_memory::NativeMemoryLedger>>,
 }
 
 struct StoredExport {
@@ -982,6 +1019,8 @@ struct WorkspaceState {
     exports: BTreeMap<ExportId, StoredExport>,
     deletion: AccountDeletionState,
     bridge_install: Arc<dyn BridgeInstallEngine>,
+    native_memory_updates:
+        Option<mpsc::UnboundedSender<Vec<context_relay_core::native_memory::NativeMemoryLedger>>>,
 }
 
 impl VaultWorker {
@@ -1030,11 +1069,14 @@ impl VaultWorker {
                         .bridge_install
                         .reconcile_after_native_recovery(&mut vault, &config.path, config.device_id)
                         .map_err(|_| DaemonError::Startup)?;
-                    Ok(vault)
+                    let ledgers = vault
+                        .native_memory_ledgers()
+                        .map_err(|_| DaemonError::Startup)?;
+                    Ok((vault, ledgers))
                 });
                 match opened {
-                    Ok(vault) => {
-                        if ready_sender.send(Ok(())).is_err() {
+                    Ok((vault, ledgers)) => {
+                        if ready_sender.send(Ok(ledgers)).is_err() {
                             return;
                         }
                         run_vault_worker(
@@ -1045,6 +1087,7 @@ impl VaultWorker {
                                 exports: BTreeMap::new(),
                                 deletion: AccountDeletionState::Active,
                                 bridge_install: config.bridge_install,
+                                native_memory_updates: config.native_memory_updates,
                             },
                             &mut receiver,
                             config.worker_hook.as_deref(),
@@ -1063,9 +1106,13 @@ impl VaultWorker {
             exit: Some(exit_receiver),
             admission,
             worker_hook,
+            native_memory_ledgers: None,
         };
         match ready_receiver.await {
-            Ok(Ok(())) => Ok(worker),
+            Ok(Ok(ledgers)) => {
+                worker.native_memory_ledgers = Some(ledgers);
+                Ok(worker)
+            }
             Ok(Err(error)) => {
                 worker.shutdown_and_join();
                 Err(error)
@@ -1087,6 +1134,12 @@ impl VaultWorker {
             admission: self.admission.clone(),
             worker_hook: self.worker_hook.clone(),
         }
+    }
+
+    fn take_native_memory_ledgers(
+        &mut self,
+    ) -> Vec<context_relay_core::native_memory::NativeMemoryLedger> {
+        self.native_memory_ledgers.take().unwrap_or_default()
     }
 
     fn close_admission(&self) {
@@ -1159,6 +1212,11 @@ fn execute_vault_command(
             .map_err(client_error_from_vault),
         VaultCommand::Workspace(request) => execute_workspace_request(state, request),
         VaultCommand::HarnessSetup(request) => execute_harness_setup(state, request),
+        VaultCommand::NativeMemoryObservation(ready) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .reconcile_native_memory(ready)
+                .map(|_| LocalResult::Empty)
+        }
         #[cfg(test)]
         VaultCommand::TestBlock { entered, release } => {
             entered.send(()).map_err(|_| service_internal_error())?;
@@ -1179,10 +1237,20 @@ fn execute_harness_setup(
             .map(|plan| LocalResult::Plan {
                 plan: Box::new(plan),
             }),
-        LocalRequest::HarnessApply(params) => state
-            .bridge_install
-            .apply(&mut state.vault, &state.vault_path, state.device_id, params)
-            .map(|()| LocalResult::Empty),
+        LocalRequest::HarnessApply(params) => {
+            state.bridge_install.apply(
+                &mut state.vault,
+                &state.vault_path,
+                state.device_id,
+                params,
+            )?;
+            if let Some(updates) = &state.native_memory_updates {
+                if let Ok(ledgers) = state.vault.native_memory_ledgers() {
+                    let _ = updates.send(ledgers);
+                }
+            }
+            Ok(LocalResult::Empty)
+        }
         LocalRequest::HarnessRollback(params) => state
             .bridge_install
             .rollback(&mut state.vault, &state.vault_path, state.device_id, params)
@@ -1630,10 +1698,14 @@ pub mod test_support {
         },
     };
 
-    use context_relay_core::vault::{DatabaseKeyStore, Vault, VaultError};
+    use context_relay_core::{
+        native_memory::{NativeMemoryLedger, NativeMemorySource, NativeMemorySourceId},
+        vault::{DatabaseKeyStore, Vault, VaultError},
+    };
     use context_relay_local_ipc::{InstallationToken, RuntimeConfig};
     use context_relay_protocol::{
-        ClientError, DeviceId, ErrorCode, HarnessParams, PlanParams, SetupPlan,
+        ClientError, DeviceId, ErrorCode, HarnessParams, MemoryCandidate, PlanParams, SetupPlan,
+        Sha256Digest,
     };
     #[cfg(any(windows, target_os = "macos"))]
     use context_relay_protocol::{
@@ -1655,6 +1727,7 @@ pub mod test_support {
         keys: Arc<TestKeyStore>,
         worker_gate: Option<Arc<TestWorkerGate>>,
         bridge_install: Option<Arc<dyn BridgeInstallEngine>>,
+        native_memory_probe: Option<Arc<TestNativeMemoryProbe>>,
     }
 
     impl TestDaemonConfig {
@@ -1670,6 +1743,7 @@ pub mod test_support {
                 keys: Arc::default(),
                 worker_gate: None,
                 bridge_install: None,
+                native_memory_probe: None,
             }
         }
 
@@ -1691,6 +1765,11 @@ pub mod test_support {
             bridge_install: Arc<dyn BridgeInstallEngine>,
         ) -> Self {
             self.bridge_install = Some(bridge_install);
+            self
+        }
+
+        pub fn with_native_memory_probe(mut self, probe: Arc<TestNativeMemoryProbe>) -> Self {
+            self.native_memory_probe = Some(probe);
             self
         }
 
@@ -1729,6 +1808,44 @@ pub mod test_support {
             vault.native_hook_session_count()
         }
 
+        pub fn seed_native_memory_source(
+            &self,
+            source: &NativeMemorySource,
+            last_applied_digest: Option<Sha256Digest>,
+        ) -> Result<(), VaultError> {
+            std::fs::create_dir_all(self.vault_path.parent().expect("test vault has a parent"))
+                .expect("create test vault directory");
+            let mut vault = Vault::open(
+                &self.vault_path,
+                "context-relay-test-vault-key",
+                self.keys.as_ref(),
+            )?;
+            let mut ledger = NativeMemoryLedger::for_source(source.clone());
+            ledger.last_applied_digest = last_applied_digest;
+            vault.put_native_memory_candidate(&ledger, None)
+        }
+
+        pub fn native_memory_ledger(
+            &self,
+            source_id: &NativeMemorySourceId,
+        ) -> Result<Option<NativeMemoryLedger>, VaultError> {
+            let vault = Vault::open(
+                &self.vault_path,
+                "context-relay-test-vault-key",
+                self.keys.as_ref(),
+            )?;
+            vault.native_memory_ledger(source_id)
+        }
+
+        pub fn native_memory_candidates(&self) -> Result<Vec<MemoryCandidate>, VaultError> {
+            let vault = Vault::open(
+                &self.vault_path,
+                "context-relay-test-vault-key",
+                self.keys.as_ref(),
+            )?;
+            vault.candidates(None)
+        }
+
         pub async fn start(&self) -> Result<Daemon, DaemonError> {
             let mut vault = VaultConfig::new(
                 self.vault_path.clone(),
@@ -1740,6 +1857,9 @@ pub mod test_support {
             }
             if let Some(bridge_install) = &self.bridge_install {
                 vault = vault.with_bridge_install(bridge_install.clone());
+            }
+            if let Some(probe) = &self.native_memory_probe {
+                vault = vault.with_native_memory_probe(probe.clone());
             }
             Daemon::start(DaemonConfig::new(
                 self.runtime.clone(),
@@ -1757,6 +1877,44 @@ pub mod test_support {
         release_wake: Condvar,
         enqueued: AtomicUsize,
         enqueue_wake: Notify,
+    }
+
+    #[derive(Default)]
+    pub struct TestNativeMemoryProbe {
+        starts: AtomicUsize,
+        stops: AtomicUsize,
+        started_wake: Notify,
+    }
+
+    impl TestNativeMemoryProbe {
+        pub fn starts(&self) -> usize {
+            self.starts.load(Ordering::Acquire)
+        }
+
+        pub fn stops(&self) -> usize {
+            self.stops.load(Ordering::Acquire)
+        }
+
+        pub async fn wait_until_started(&self) {
+            loop {
+                let notified = self.started_wake.notified();
+                if self.starts() != 0 {
+                    return;
+                }
+                notified.await;
+            }
+        }
+    }
+
+    impl super::native_memory::LifecycleProbe for TestNativeMemoryProbe {
+        fn started(&self) {
+            self.starts.fetch_add(1, Ordering::Release);
+            self.started_wake.notify_waiters();
+        }
+
+        fn stopped(&self) {
+            self.stops.fetch_add(1, Ordering::Release);
+        }
     }
 
     impl TestWorkerGate {

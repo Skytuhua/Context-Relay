@@ -6,12 +6,16 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::native_memory::{NativeMemoryLedger, NativeMemoryRegistration};
 use crate::native_transaction::{
     MutationKind, NativeApplyReceipt, NativeObjectToken, NativeReceiptEntry, OwnershipChange,
     RestorableStateFingerprint, TransactionStep,
 };
 
-use super::{BeforeImagePolicy, Vault, VaultError, from_json, sqlite_u64, to_i64, to_json};
+use super::{
+    BeforeImagePolicy, Vault, VaultError, from_json, put_native_memory_ledger, sha256_key,
+    sqlite_u64, to_i64, to_json,
+};
 
 pub use crate::native_transaction::MutationWalState as NativeWalState;
 
@@ -2818,6 +2822,36 @@ impl Vault {
         plan_id: &PlanId,
         next: SetupPlanLifecycle,
     ) -> Result<(), VaultError> {
+        self.finish_setup_plan_with_native_memory(plan_id, next, &[])
+    }
+
+    /// Finishes a successful setup apply and publishes the exact memory-source
+    /// descriptors and intended file digests in the same SQLite transaction.
+    /// Task-level composition derives these registrations only from the opened
+    /// sealed plan; the watcher cannot register paths by itself.
+    pub fn finish_setup_plan_with_native_memory(
+        &mut self,
+        plan_id: &PlanId,
+        next: SetupPlanLifecycle,
+        registrations: &[NativeMemoryRegistration],
+    ) -> Result<(), VaultError> {
+        if !registrations.is_empty() && next != SetupPlanLifecycle::Applied {
+            return Err(VaultError::Validation(
+                "native memory sources require a successful setup apply".to_owned(),
+            ));
+        }
+        let mut unique = BTreeSet::new();
+        for registration in registrations {
+            registration
+                .source
+                .validate()
+                .map_err(|error| VaultError::Validation(error.to_string()))?;
+            if !unique.insert(registration.source.id) {
+                return Err(VaultError::Validation(
+                    "native memory source is registered more than once".to_owned(),
+                ));
+            }
+        }
         let transaction = self.connection.transaction()?;
         let current = transaction
             .query_row(
@@ -2828,42 +2862,66 @@ impl Vault {
             .optional()?
             .ok_or_else(|| VaultError::Validation("setup plan does not exist".to_owned()))
             .and_then(|value| parse_setup_plan_lifecycle(&value))?;
-        if current == next {
-            transaction.commit()?;
-            return Ok(());
+        if current != next {
+            let allowed = matches!(
+                (current, next),
+                (
+                    SetupPlanLifecycle::Applying,
+                    SetupPlanLifecycle::Applied
+                        | SetupPlanLifecycle::ApplyRestored
+                        | SetupPlanLifecycle::Conflict
+                ) | (
+                    SetupPlanLifecycle::RollingBack,
+                    SetupPlanLifecycle::RolledBack
+                        | SetupPlanLifecycle::RollbackRestored
+                        | SetupPlanLifecycle::Conflict
+                )
+            );
+            if !allowed {
+                return Err(VaultError::Validation(
+                    "setup plan lifecycle finish is invalid".to_owned(),
+                ));
+            }
+            let changed = transaction.execute(
+                "UPDATE setup_plan_lifecycle SET state = ?2
+                 WHERE plan_id = ?1 AND state = ?3",
+                params![
+                    plan_id.to_string(),
+                    setup_plan_lifecycle_name(next),
+                    setup_plan_lifecycle_name(current),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(VaultError::Validation(
+                    "setup plan lifecycle changed concurrently".to_owned(),
+                ));
+            }
         }
-        let allowed = matches!(
-            (current, next),
-            (
-                SetupPlanLifecycle::Applying,
-                SetupPlanLifecycle::Applied
-                    | SetupPlanLifecycle::ApplyRestored
-                    | SetupPlanLifecycle::Conflict
-            ) | (
-                SetupPlanLifecycle::RollingBack,
-                SetupPlanLifecycle::RolledBack
-                    | SetupPlanLifecycle::RollbackRestored
-                    | SetupPlanLifecycle::Conflict
-            )
-        );
-        if !allowed {
-            return Err(VaultError::Validation(
-                "setup plan lifecycle finish is invalid".to_owned(),
-            ));
-        }
-        let changed = transaction.execute(
-            "UPDATE setup_plan_lifecycle SET state = ?2
-             WHERE plan_id = ?1 AND state = ?3",
-            params![
-                plan_id.to_string(),
-                setup_plan_lifecycle_name(next),
-                setup_plan_lifecycle_name(current),
-            ],
-        )?;
-        if changed != 1 {
-            return Err(VaultError::Validation(
-                "setup plan lifecycle changed concurrently".to_owned(),
-            ));
+        for registration in registrations {
+            let existing = transaction
+                .query_row(
+                    "SELECT payload_json FROM native_memory_sources WHERE source_id = ?1",
+                    [sha256_key(&registration.source.id.0)],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+                .map(|payload| from_json::<NativeMemoryLedger>(&payload))
+                .transpose()?;
+            let mut ledger = existing
+                .unwrap_or_else(|| NativeMemoryLedger::for_source(registration.source.clone()));
+            if ledger.source.as_ref() != Some(&registration.source) {
+                return Err(VaultError::Validation(
+                    "native memory source metadata changed after preview".to_owned(),
+                ));
+            }
+            if current == next && ledger.last_applied_digest != registration.last_applied_digest {
+                return Err(VaultError::Validation(
+                    "native memory applied digest changed during setup replay".to_owned(),
+                ));
+            }
+            ledger.last_applied_digest = registration.last_applied_digest;
+            let canonical = to_json(&ledger)?;
+            put_native_memory_ledger(&transaction, &ledger, &canonical)?;
         }
         transaction.commit()?;
         Ok(())

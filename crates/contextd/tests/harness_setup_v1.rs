@@ -10,9 +10,15 @@ use std::{
 
 use context_relay_contextd::{
     bridge_install::{AdjacentBridgeLocator, BridgeInstallEngine},
-    test_support::{TestDaemonConfig, TestWorkerGate},
+    test_support::{TestDaemonConfig, TestNativeMemoryProbe, TestWorkerGate},
 };
-use context_relay_core::{setup::BridgeLocator, vault::Vault};
+use context_relay_core::{
+    native_memory::{
+        NativeMemoryDocumentKind, NativeMemoryLedger, NativeMemoryLimits, NativeMemorySource,
+    },
+    setup::BridgeLocator,
+    vault::Vault,
+};
 use context_relay_local_ipc::{
     AuthAcceptedV1, AuthTranscriptV1, ConnectedStream, InstallationToken, RuntimeConfig,
     ServerHelloV1, connect, create_proof, read_json, write_json,
@@ -39,6 +45,53 @@ struct RecordingEngine {
     fail_digest: Mutex<bool>,
     fail_reconcile: bool,
     reconcile_gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+}
+
+struct RegisteringEngine {
+    source: NativeMemorySource,
+}
+
+impl BridgeInstallEngine for RegisteringEngine {
+    fn reconcile_after_native_recovery(
+        &self,
+        _vault: &mut Vault,
+        _vault_path: &Path,
+        _device_id: DeviceId,
+    ) -> Result<(), ClientError> {
+        Ok(())
+    }
+
+    fn preview(
+        &self,
+        _vault: &mut Vault,
+        _vault_path: &Path,
+        _device_id: DeviceId,
+        params: HarnessParams,
+    ) -> Result<SetupPlan, ClientError> {
+        Ok(plan(params.harness))
+    }
+
+    fn apply(
+        &self,
+        vault: &mut Vault,
+        _vault_path: &Path,
+        _device_id: DeviceId,
+        _params: PlanParams,
+    ) -> Result<(), ClientError> {
+        vault
+            .put_native_memory_candidate(&NativeMemoryLedger::for_source(self.source.clone()), None)
+            .map_err(|_| conflict("Native memory source could not be registered"))
+    }
+
+    fn rollback(
+        &self,
+        _vault: &mut Vault,
+        _vault_path: &Path,
+        _device_id: DeviceId,
+        _params: PlanParams,
+    ) -> Result<(), ClientError> {
+        Ok(())
+    }
 }
 
 impl RecordingEngine {
@@ -311,6 +364,39 @@ async fn setup_reconciliation_finishes_after_native_recovery_and_before_endpoint
 }
 
 #[tokio::test]
+async fn native_memory_supervisor_starts_after_reconciliation_and_joins_on_daemon_drop() {
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let engine = Arc::new(RecordingEngine::with_reconcile_gate(gate.clone()));
+    let probe = Arc::new(TestNativeMemoryProbe::default());
+    let root = unique_temp_path("native-memory-lifecycle");
+    let runtime =
+        RuntimeConfig::for_test(format!("hs-{}", unique_token()), Some(root.clone())).unwrap();
+    let config = TestDaemonConfig::new(
+        runtime,
+        root.join("vault.db"),
+        InstallationToken::from_bytes(TOKEN),
+    )
+    .with_bridge_install_engine(engine.clone())
+    .with_native_memory_probe(probe.clone());
+
+    let start = tokio::spawn(async move { config.start().await });
+    while engine.reconciles.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(probe.starts(), 0);
+
+    let (released, wake) = &*gate;
+    *released.lock().unwrap() = true;
+    wake.notify_all();
+    let daemon = start.await.unwrap().unwrap();
+    probe.wait_until_started().await;
+    assert_eq!(probe.starts(), 1);
+
+    drop(daemon);
+    assert_eq!(probe.stops(), 1);
+}
+
+#[tokio::test]
 async fn incomplete_setup_reconciliation_prevents_bind_and_never_executes_a_plan() {
     let engine = Arc::new(RecordingEngine::with_reconcile_failure());
     let root = unique_temp_path("reconcile-failure");
@@ -330,6 +416,98 @@ async fn incomplete_setup_reconciliation_prevents_bind_and_never_executes_a_plan
     assert!(connect(&runtime).await.is_err());
     assert_eq!(engine.reconciles.load(Ordering::SeqCst), 1);
     assert_eq!(engine.writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn failed_startup_never_launches_native_memory_supervision() {
+    let engine = Arc::new(RecordingEngine::with_reconcile_failure());
+    let probe = Arc::new(TestNativeMemoryProbe::default());
+    let root = unique_temp_path("native-memory-startup-failure");
+    let runtime =
+        RuntimeConfig::for_test(format!("hs-{}", unique_token()), Some(root.clone())).unwrap();
+    let config = TestDaemonConfig::new(
+        runtime,
+        root.join("vault.db"),
+        InstallationToken::from_bytes(TOKEN),
+    )
+    .with_bridge_install_engine(engine)
+    .with_native_memory_probe(probe.clone());
+
+    assert!(matches!(
+        config.start().await,
+        Err(context_relay_contextd::DaemonError::Startup)
+    ));
+    assert_eq!(probe.starts(), 0);
+    assert_eq!(probe.stops(), 0);
+}
+
+#[tokio::test]
+async fn successful_setup_apply_activates_a_new_descriptor_without_daemon_restart() {
+    let root = unique_temp_path("live-native-registration");
+    std::fs::create_dir_all(&root).unwrap();
+    let memory_path = root.join("memory.md");
+    std::fs::write(&memory_path, b"registered while daemon runs\n").unwrap();
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt as _;
+    let source = NativeMemorySource::new(
+        HarnessId::Codex,
+        "0.144.1",
+        context_relay_protocol::ScopeRef::Global,
+        NativeMemoryDocumentKind::Agent,
+        WireNativeValue {
+            platform: NativePlatform::Macos,
+            #[cfg(unix)]
+            bytes: memory_path.as_os_str().as_bytes().to_vec(),
+            #[cfg(windows)]
+            bytes: memory_path
+                .to_string_lossy()
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+            display: Some(memory_path.display().to_string()),
+        },
+        NativeMemoryLimits {
+            max_bytes: 4_096,
+            max_characters: 4_096,
+        },
+        true,
+    )
+    .unwrap();
+    let runtime =
+        RuntimeConfig::for_test(format!("hs-{}", unique_token()), Some(root.join("runtime")))
+            .unwrap();
+    let config = TestDaemonConfig::new(
+        runtime.clone(),
+        root.join("vault.db"),
+        InstallationToken::from_bytes(TOKEN),
+    )
+    .with_bridge_install_engine(Arc::new(RegisteringEngine { source }));
+    let daemon = config.start().await.unwrap();
+    let handle = daemon.handle();
+    let running = tokio::spawn(daemon.run());
+    let mut client = RawClient::connect(&runtime, ClientRole::Installer).await;
+
+    assert_eq!(
+        client
+            .call(LocalRequest::HarnessApply(PlanParams {
+                plan_id: PlanId::from_str(PLAN).unwrap(),
+            }))
+            .await
+            .unwrap(),
+        LocalResult::Empty
+    );
+    for _ in 0..80 {
+        if config.native_memory_candidates().unwrap().len() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(config.native_memory_candidates().unwrap().len(), 1);
+    assert_eq!(
+        handle.shutdown().await,
+        context_relay_contextd::DaemonState::Stopped
+    );
+    running.await.unwrap().unwrap();
 }
 
 #[test]
