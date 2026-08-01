@@ -10,6 +10,7 @@ use sha2::{Digest as _, Sha256};
 use crate::mcp::install::harness_cli_name;
 
 const DRAFT_DEVICE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073982";
+const MEMORY_HOOK_STATUS_MESSAGE: &str = "Context Relay memory lifecycle";
 const CLAUDE_EVENTS: [(&str, &str); 3] = [
     ("SessionStart", "session-start"),
     ("Stop", "session-stop"),
@@ -36,7 +37,11 @@ pub fn managed_memory_hooks(
         let command = format!("{executable} --hook-event {hook_event} --harness {harness_name}");
         hooks.insert(
             (*native_event).to_owned(),
-            json!([{"hooks": [{"command": command, "type": "command"}]}]),
+            json!([{"hooks": [{
+                "command": command,
+                "statusMessage": MEMORY_HOOK_STATUS_MESSAGE,
+                "type": "command"
+            }]}]),
         );
     }
     let (name, location) = match harness {
@@ -153,7 +158,7 @@ fn is_managed_hook_entry(harness: HarnessId, native_event: &str, entry: &Value) 
     let [hook] = hooks.as_slice() else {
         return false;
     };
-    let Some(hook) = hook.as_object().filter(|hook| hook.len() == 2) else {
+    let Some(hook) = hook.as_object().filter(|hook| hook.len() == 3) else {
         return false;
     };
     let Some(command) = hook.get("command").and_then(Value::as_str) else {
@@ -164,6 +169,7 @@ fn is_managed_hook_entry(harness: HarnessId, native_event: &str, entry: &Value) 
         harness_cli_name(harness)
     );
     hook.get("type").and_then(Value::as_str) == Some("command")
+        && hook.get("statusMessage").and_then(Value::as_str) == Some(MEMORY_HOOK_STATUS_MESSAGE)
         && !command.contains(['\n', '\r'])
         && command
             .strip_suffix(&suffix)

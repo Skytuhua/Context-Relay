@@ -407,6 +407,10 @@ fn memory_hooks_render_only_the_frozen_lifecycle_events_with_literal_arguments()
             assert!(command.contains(bridge.to_string_lossy().as_ref()));
             assert!(command.ends_with(&format!(" --hook-event {event} --harness codex")));
             assert_eq!(hooks[native_event][0]["hooks"][0]["type"], "command");
+            assert_eq!(
+                hooks[native_event][0]["hooks"][0]["statusMessage"],
+                "Context Relay memory lifecycle"
+            );
         }
         let serialized = serde_json::to_string(&hooks).unwrap();
         assert!(!serialized.contains("must-not-use-display"));
@@ -422,6 +426,45 @@ fn memory_hooks_render_only_the_frozen_lifecycle_events_with_literal_arguments()
             assert!(!serialized.contains(forbidden));
         }
     }
+}
+
+#[test]
+fn memory_hooks_install_preserves_exact_unmarked_and_differently_marked_user_commands() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let bridge = fixture.root.join("context-relay-context-mcp");
+    fs::write(&bridge, b"fixture bridge executable").unwrap();
+    let managed = managed_memory_hooks(HarnessId::Codex, &test_wire_path(&bridge))
+        .unwrap()
+        .remove(0);
+    let managed_hooks: Value = serde_json::from_str(&managed.body_markdown).unwrap();
+    let mut unmarked_user = managed_hooks["SessionStart"][0].clone();
+    unmarked_user["hooks"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("statusMessage");
+    let mut differently_marked_user = managed_hooks["SessionStart"][0].clone();
+    differently_marked_user["hooks"][0]["statusMessage"] =
+        Value::String("User lifecycle hook".into());
+    let path = fixture.codex_home.join("hooks.json");
+    let mut prior: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    prior["hooks"]["SessionStart"] =
+        Value::Array(vec![unmarked_user.clone(), differently_marked_user.clone()]);
+    fs::write(path, serde_json::to_vec(&prior).unwrap()).unwrap();
+
+    let mutation = fixture.adapter.plan_native_hooks_json(&managed).unwrap();
+    let NativeState::RegularFile { bytes, .. } = NativeState::decode_v1(&mutation.content).unwrap()
+    else {
+        panic!("Codex hooks remain a regular file")
+    };
+    let rendered: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        rendered["hooks"]["SessionStart"],
+        Value::Array(vec![
+            unmarked_user,
+            differently_marked_user,
+            managed_hooks["SessionStart"][0].clone(),
+        ])
+    );
 }
 
 #[test]
@@ -527,6 +570,30 @@ fn memory_hooks_reject_a_managed_identity_with_user_controlled_argv() {
         .plan_native_hooks_json(&managed)
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::InvalidRequest);
+
+    for marker in [None, Some("Not Context Relay")] {
+        let mut claimed = managed_memory_hooks(HarnessId::Codex, &test_wire_path(&bridge))
+            .unwrap()
+            .remove(0);
+        let mut body: Value = serde_json::from_str(&claimed.body_markdown).unwrap();
+        match marker {
+            Some(marker) => {
+                body["Stop"][0]["hooks"][0]["statusMessage"] = Value::String(marker.to_owned());
+            }
+            None => {
+                body["Stop"][0]["hooks"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("statusMessage");
+            }
+        }
+        claimed.body_markdown = serde_json::to_string(&body).unwrap();
+        let error = fixture
+            .adapter
+            .plan_native_hooks_json(&claimed)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+    }
 }
 
 #[test]
@@ -537,7 +604,7 @@ fn memory_hooks_archive_preserves_user_state_in_planning_render_and_rollback() {
     let mut managed = managed_memory_hooks(HarnessId::Codex, &test_wire_path(&bridge))
         .unwrap()
         .remove(0);
-    let managed_hooks: Value = serde_json::from_str(&managed.body_markdown).unwrap();
+    let mut managed_hooks: Value = serde_json::from_str(&managed.body_markdown).unwrap();
     let path = fixture.codex_home.join("hooks.json");
     let mut prior: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     prior["hooks"]["FutureEvent"] = serde_json::json!([{
@@ -545,9 +612,26 @@ fn memory_hooks_archive_preserves_user_state_in_planning_render_and_rollback() {
         "hooks": [],
         "unknown": {"keep": true}
     }]);
+    for entries in managed_hooks.as_object_mut().unwrap().values_mut() {
+        entries[0]["hooks"][0]["statusMessage"] =
+            Value::String("Context Relay memory lifecycle".into());
+    }
     for (event, entries) in managed_hooks.as_object().unwrap() {
         prior["hooks"][event] = entries.clone();
     }
+    let mut unmarked_user = managed_hooks["SessionStart"][0].clone();
+    unmarked_user["hooks"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("statusMessage");
+    let mut differently_marked_user = managed_hooks["SessionStart"][0].clone();
+    differently_marked_user["hooks"][0]["statusMessage"] =
+        Value::String("User lifecycle hook".into());
+    prior["hooks"]["SessionStart"] = Value::Array(vec![
+        unmarked_user.clone(),
+        differently_marked_user.clone(),
+        managed_hooks["SessionStart"][0].clone(),
+    ]);
     let user_stop = serde_json::json!({
         "matcher": "user-stop",
         "hooks": [{"type": "command", "command": "user-stop-command"}]
@@ -585,7 +669,10 @@ fn memory_hooks_archive_preserves_user_state_in_planning_render_and_rollback() {
         prior["hooks"]["FutureEvent"]
     );
     assert_eq!(rendered["hooks"]["Stop"], Value::Array(vec![user_stop]));
-    assert!(rendered["hooks"].get("SessionStart").is_none());
+    assert_eq!(
+        rendered["hooks"]["SessionStart"],
+        Value::Array(vec![unmarked_user, differently_marked_user])
+    );
     let preview = fixture.adapter.render(&desired).unwrap();
     assert_eq!(preview.files.len(), 1);
     assert_eq!(preview.files[0].bytes_sha256, test_digest(&bytes));
@@ -634,9 +721,21 @@ fn memory_hooks_rotate_executable_in_planning_and_render_without_removing_user_l
     let new = managed_memory_hooks(HarnessId::Codex, &test_wire_path(&new_bridge))
         .unwrap()
         .remove(0);
-    let old_hooks: Value = serde_json::from_str(&old.body_markdown).unwrap();
+    let mut old_hooks: Value = serde_json::from_str(&old.body_markdown).unwrap();
     let new_hooks: Value = serde_json::from_str(&new.body_markdown).unwrap();
+    for entries in old_hooks.as_object_mut().unwrap().values_mut() {
+        entries[0]["hooks"][0]["statusMessage"] =
+            Value::String("Context Relay memory lifecycle".into());
+    }
     let old_entry = old_hooks["SessionStart"][0].clone();
+    let mut unmarked_user = old_entry.clone();
+    unmarked_user["hooks"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("statusMessage");
+    let mut differently_marked_user = old_entry.clone();
+    differently_marked_user["hooks"][0]["statusMessage"] =
+        Value::String("User lifecycle hook".into());
     let mut schema_lookalike = old_entry.clone();
     schema_lookalike["matcher"] = Value::String("user-owned".into());
     let mut argv_lookalike = old_entry.clone();
@@ -649,6 +748,8 @@ fn memory_hooks_rotate_executable_in_planning_and_render_without_removing_user_l
     }
     prior["hooks"]["SessionStart"] = Value::Array(vec![
         old_entry.clone(),
+        unmarked_user.clone(),
+        differently_marked_user.clone(),
         schema_lookalike.clone(),
         old_entry,
         argv_lookalike.clone(),
@@ -665,6 +766,8 @@ fn memory_hooks_rotate_executable_in_planning_and_render_without_removing_user_l
     assert_eq!(
         rendered["hooks"]["SessionStart"],
         Value::Array(vec![
+            unmarked_user,
+            differently_marked_user,
             schema_lookalike,
             argv_lookalike,
             new_hooks["SessionStart"][0].clone(),
