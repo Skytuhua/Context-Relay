@@ -999,33 +999,44 @@ impl ClaudeCodeAdapter {
 impl NativeMemoryAdapter for ClaudeCodeAdapter {
     fn native_memory_capabilities(&self) -> Result<NativeMemoryCapabilities, ClientError> {
         let path = self.project_settings_path();
+        let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str());
         let snapshot = OsNativeFileSystem::new().snapshot(&path).map_err(|_| {
             invalid_request("Claude Code memory settings cannot be safely inspected")
         })?;
-        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
-            return Ok(NativeMemoryCapabilities {
-                disable: NativeMemoryDisable::Unavailable,
-                sources: vec![],
-            });
-        };
-        let mut settings = match parse_object(bytes, "Claude Code settings are invalid") {
-            Ok(settings) => settings,
-            Err(_) => {
-                return Ok(NativeMemoryCapabilities {
-                    disable: NativeMemoryDisable::Unavailable,
-                    sources: vec![],
-                });
+        let (project_settings, metadata) = match snapshot.state() {
+            NativeState::RegularFile { bytes, metadata } => {
+                let settings = match parse_object(bytes, "Claude Code settings are invalid") {
+                    Ok(settings) => settings,
+                    Err(_) => {
+                        return Ok(NativeMemoryCapabilities {
+                            disable: NativeMemoryDisable::Unavailable,
+                            sources: vec![],
+                        });
+                    }
+                };
+                (Some(settings), Some(metadata.clone()))
             }
+            NativeState::Absent { .. } => (None, None),
         };
-        let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str());
-        let Some(memory_root) = self.bound_native_memory_root(&settings, supported)? else {
+        let (effective_settings, managed) =
+            match self.effective_native_memory_settings(project_settings.as_ref()) {
+                Ok(effective) => effective,
+                Err(_) => {
+                    return Ok(NativeMemoryCapabilities {
+                        disable: NativeMemoryDisable::Unavailable,
+                        sources: vec![],
+                    });
+                }
+            };
+        let Some(memory_root) = self.bound_native_memory_root(&effective_settings, supported)?
+        else {
             return Ok(NativeMemoryCapabilities {
                 disable: NativeMemoryDisable::Unavailable,
                 sources: vec![],
             });
         };
         let sources = self.native_memory_sources(&memory_root)?;
-        if !supported || self.native_memory_setting_is_managed() {
+        if !supported || managed || project_settings.is_none() {
             let capabilities = NativeMemoryCapabilities {
                 disable: NativeMemoryDisable::WatchOnly,
                 sources,
@@ -1033,6 +1044,15 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
             capabilities.validate()?;
             return Ok(capabilities);
         }
+        let (mut settings, metadata) = match (project_settings, metadata) {
+            (Some(settings), Some(metadata)) => (settings, metadata),
+            _ => {
+                return Ok(NativeMemoryCapabilities {
+                    disable: NativeMemoryDisable::Unavailable,
+                    sources: vec![],
+                });
+            }
+        };
         let mutations = match settings.get("autoMemoryEnabled") {
             Some(Value::Bool(false)) => vec![],
             Some(Value::Bool(true)) | None => {
@@ -1040,7 +1060,7 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
                 let rendered = serde_json::to_vec(&Value::Object(settings)).map_err(|_| {
                     invalid_request("Claude Code memory settings cannot be rendered")
                 })?;
-                let intended = NativeState::regular_file(rendered, metadata.clone());
+                let intended = NativeState::regular_file(rendered, metadata);
                 vec![ApprovedMutation {
                     target: wire_path(&path),
                     kind: MutationKind::Payload,
@@ -1196,21 +1216,39 @@ impl ClaudeCodeAdapter {
         Ok(sources)
     }
 
-    fn native_memory_setting_is_managed(&self) -> bool {
-        self.layout.managed_settings_paths.iter().any(|path| {
+    fn effective_native_memory_settings(
+        &self,
+        project_settings: Option<&Map<String, Value>>,
+    ) -> Result<(Map<String, Value>, bool), ()> {
+        let mut effective = project_settings.cloned().unwrap_or_default();
+        let mut managed = false;
+        let mut managed_directory = None::<Value>;
+        for path in &self.layout.managed_settings_paths {
             if !path.is_file() {
-                return false;
+                continue;
             }
-            read_optional_file(path)
+            let settings = read_optional_file(path)
                 .ok()
                 .flatten()
                 .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                 .and_then(|value| value.as_object().cloned())
-                .is_none_or(|settings| {
-                    settings.contains_key("autoMemoryEnabled")
-                        || settings.contains_key("autoMemoryDirectory")
-                })
-        })
+                .ok_or(())?;
+            managed |= settings.contains_key("autoMemoryEnabled")
+                || settings.contains_key("autoMemoryDirectory");
+            if let Some(directory) = settings.get("autoMemoryDirectory") {
+                if managed_directory
+                    .as_ref()
+                    .is_some_and(|current| current != directory)
+                {
+                    return Err(());
+                }
+                managed_directory = Some(directory.clone());
+            }
+        }
+        if let Some(directory) = managed_directory {
+            effective.insert("autoMemoryDirectory".to_owned(), directory);
+        }
+        Ok((effective, managed))
     }
 }
 

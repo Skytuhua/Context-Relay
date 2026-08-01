@@ -1978,6 +1978,33 @@ fn native_memory_hermes_unsupported_setting_is_never_synthesized() {
 }
 
 #[test]
+fn native_memory_hermes_disable_preserves_inline_and_trailing_yaml_comments() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    let before = fs::read_to_string(&config_path).unwrap().replace(
+        "memory:\n  memory_enabled: true\n  user_profile_enabled: true\n",
+        "memory:\n  memory_enabled: true # keep agent rationale\n  user_profile_enabled: true # keep profile rationale\n# keep trailing memory comment\n",
+    );
+    fs::write(&config_path, &before).unwrap();
+
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+        panic!("supported Hermes memory booleans must remain writable");
+    };
+    let rendered = String::from_utf8(intended_bytes(&mutations[0])).unwrap();
+    assert_eq!(
+        rendered,
+        before
+            .replacen("memory_enabled: true", "memory_enabled: false", 1)
+            .replacen(
+                "user_profile_enabled: true",
+                "user_profile_enabled: false",
+                1,
+            )
+    );
+}
+
+#[test]
 fn supported_releases_import_every_reviewed_component_kind() {
     for source in [
         include_str!("fixtures/hermes-0.18.2.json"),

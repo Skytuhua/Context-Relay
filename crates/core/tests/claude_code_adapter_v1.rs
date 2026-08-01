@@ -712,6 +712,96 @@ fn native_memory_claude_accepts_an_exact_absolute_explicit_directory() {
 }
 
 #[test]
+fn native_memory_claude_absent_project_settings_watches_the_frozen_default_without_writing() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    fs::remove_file(fixture.adapter.project_settings_path()).unwrap();
+    let project_root = fixture.root.join("project with spaces");
+    let project_key = project_root
+        .to_string_lossy()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let memory_root = fixture
+        .root
+        .join("custom claude config/projects")
+        .join(project_key)
+        .join("memory");
+    fs::create_dir_all(&memory_root).unwrap();
+    fs::write(memory_root.join("topic.md"), "# Topic\n").unwrap();
+
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert!(matches!(
+        capabilities.disable,
+        NativeMemoryDisable::WatchOnly
+    ));
+    assert_eq!(
+        capabilities
+            .sources
+            .iter()
+            .map(|source| source.path.display.clone().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            memory_root.join("MEMORY.md").display().to_string(),
+            memory_root.join("topic.md").display().to_string(),
+        ]
+    );
+    assert!(!fixture.adapter.project_settings_path().exists());
+}
+
+#[test]
+fn native_memory_claude_managed_directory_is_the_only_effective_watch_binding() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let managed_root = fixture.root.join("managed memory directory");
+    fs::create_dir_all(&managed_root).unwrap();
+    fs::write(managed_root.join("MEMORY.md"), "# Managed memory\n").unwrap();
+    fs::write(
+        fixture.root.join("managed-settings.json"),
+        serde_json::to_vec(&json!({
+            "autoMemoryEnabled": true,
+            "autoMemoryDirectory": managed_root.to_string_lossy(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert!(matches!(
+        capabilities.disable,
+        NativeMemoryDisable::WatchOnly
+    ));
+    assert_eq!(
+        capabilities.sources[0].path.display.as_deref(),
+        Some(managed_root.join("MEMORY.md").to_string_lossy().as_ref())
+    );
+    assert!(capabilities.sources.iter().all(|source| {
+        !source
+            .path
+            .display
+            .as_deref()
+            .unwrap()
+            .contains(".claude/native-memory")
+    }));
+
+    fs::write(
+        fixture.root.join("managed-settings.json"),
+        br#"{"autoMemoryEnabled":true,"autoMemoryDirectory":"../sibling-project/memory"}"#,
+    )
+    .unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert!(matches!(
+        capabilities.disable,
+        NativeMemoryDisable::Unavailable
+    ));
+    assert!(capabilities.sources.is_empty());
+}
+
+#[test]
 fn primary_memory_claude_markdown_handles_crlf_replacement_archive_and_absence() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let device_id = DeviceId::from_str(DEVICE_ID).unwrap();

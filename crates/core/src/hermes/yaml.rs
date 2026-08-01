@@ -264,6 +264,87 @@ pub(super) fn patch_owned_paths(
     }
 }
 
+pub(super) fn patch_owned_boolean_scalars(
+    parsed: &ParsedHermesYaml,
+    replacements: &BTreeMap<Vec<String>, bool>,
+) -> Result<Vec<u8>, ClientError> {
+    if !topology_supported(parsed) {
+        return Err(invalid("Hermes reviewed config topology is unsupported"));
+    }
+    let mut expected = parsed.value.clone();
+    let mut edits = Vec::<(usize, usize, &'static [u8])>::new();
+    for (path, replacement) in replacements {
+        if !matches!(
+            path.as_slice(),
+            [root, key]
+                if root == "memory"
+                    && matches!(key.as_str(), "memory_enabled" | "user_profile_enabled")
+        ) {
+            return Err(invalid("Hermes boolean scalar path is not owned"));
+        }
+        let current = resolve_path(&parsed.value, path)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| invalid("Hermes owned boolean scalar is unavailable"))?;
+        set_semantic_path(&mut expected, path, Some(Value::Bool(*replacement)))?;
+        if current == *replacement {
+            continue;
+        }
+        let span = parsed
+            .patch_index
+            .paths
+            .get(path)
+            .ok_or_else(|| invalid("Hermes owned boolean scalar span is unavailable"))?;
+        let line_end = parsed.source[span.start..span.end]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(span.end, |offset| span.start + offset);
+        let line = &parsed.source[span.start..line_end];
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or_else(|| invalid("Hermes owned boolean scalar is malformed"))?;
+        let mut value_start = colon + 1;
+        while line
+            .get(value_start)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            value_start += 1;
+        }
+        let token = if line[value_start..].starts_with(b"true") {
+            b"true".as_slice()
+        } else if line[value_start..].starts_with(b"false") {
+            b"false".as_slice()
+        } else {
+            return Err(invalid("Hermes owned boolean scalar is malformed"));
+        };
+        let value_end = value_start + token.len();
+        if line
+            .get(value_end)
+            .is_some_and(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'#'))
+        {
+            return Err(invalid("Hermes owned boolean scalar is ambiguous"));
+        }
+        edits.push((
+            span.start + value_start,
+            span.start + value_end,
+            if *replacement { b"true" } else { b"false" },
+        ));
+    }
+
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.0));
+    let mut rendered = parsed.source.clone();
+    for (start, end, replacement) in edits {
+        rendered.splice(start..end, replacement.iter().copied());
+    }
+    let reparsed = parse_config(&rendered)?;
+    if reparsed.value != expected {
+        return Err(invalid(
+            "Hermes boolean scalar edit changed an unowned semantic path",
+        ));
+    }
+    Ok(rendered)
+}
+
 fn source_line_ending(source: &[u8]) -> Result<&'static str, ClientError> {
     let mut saw_lf = false;
     let mut saw_crlf = false;

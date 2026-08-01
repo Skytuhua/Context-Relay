@@ -956,7 +956,7 @@ impl NativeMemoryAdapter for HermesAdapter {
             vec![]
         } else {
             let mut replacements = BTreeMap::<Vec<String>, Option<YamlValue>>::new();
-            if memory.is_none() {
+            let rendered = if memory.is_none() {
                 let mut mapping = serde_yaml_ng::Mapping::new();
                 mapping.insert(
                     YamlValue::String("memory_enabled".to_owned()),
@@ -967,23 +967,56 @@ impl NativeMemoryAdapter for HermesAdapter {
                     YamlValue::Bool(false),
                 );
                 replacements.insert(vec!["memory".to_owned()], Some(YamlValue::Mapping(mapping)));
+                match super::yaml::patch_owned_paths(&parsed, &replacements) {
+                    Ok(rendered) => rendered,
+                    Err(_) => {
+                        return Ok(NativeMemoryCapabilities {
+                            disable: NativeMemoryDisable::WatchOnly,
+                            sources,
+                        });
+                    }
+                }
             } else {
-                replacements.insert(
-                    vec!["memory".to_owned(), "memory_enabled".to_owned()],
-                    Some(YamlValue::Bool(false)),
-                );
-                replacements.insert(
-                    vec!["memory".to_owned(), "user_profile_enabled".to_owned()],
-                    Some(YamlValue::Bool(false)),
-                );
-            }
-            let rendered = match super::yaml::patch_owned_paths(&parsed, &replacements) {
-                Ok(rendered) => rendered,
-                Err(_) => {
-                    return Ok(NativeMemoryCapabilities {
-                        disable: NativeMemoryDisable::WatchOnly,
-                        sources,
-                    });
+                let mut scalar_replacements = BTreeMap::new();
+                for key in ["memory_enabled", "user_profile_enabled"] {
+                    let key_path = vec!["memory".to_owned(), key.to_owned()];
+                    if resolve_yaml(&parsed.value, &["memory", key]).is_some() {
+                        scalar_replacements.insert(key_path, false);
+                    } else {
+                        replacements.insert(key_path, Some(YamlValue::Bool(false)));
+                    }
+                }
+                let scalar_rendered =
+                    match super::yaml::patch_owned_boolean_scalars(&parsed, &scalar_replacements) {
+                        Ok(rendered) => rendered,
+                        Err(_) => {
+                            return Ok(NativeMemoryCapabilities {
+                                disable: NativeMemoryDisable::WatchOnly,
+                                sources,
+                            });
+                        }
+                    };
+                if replacements.is_empty() {
+                    scalar_rendered
+                } else {
+                    let reparsed = match super::yaml::parse_config(&scalar_rendered) {
+                        Ok(reparsed) => reparsed,
+                        Err(_) => {
+                            return Ok(NativeMemoryCapabilities {
+                                disable: NativeMemoryDisable::WatchOnly,
+                                sources,
+                            });
+                        }
+                    };
+                    match super::yaml::patch_owned_paths(&reparsed, &replacements) {
+                        Ok(rendered) => rendered,
+                        Err(_) => {
+                            return Ok(NativeMemoryCapabilities {
+                                disable: NativeMemoryDisable::WatchOnly,
+                                sources,
+                            });
+                        }
+                    }
                 }
             };
             let intended = NativeState::regular_file(rendered, metadata.clone());
