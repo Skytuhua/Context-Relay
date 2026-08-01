@@ -147,6 +147,31 @@ struct PendingReady {
     stable: Option<StableObservation>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SupervisorSchedule {
+    Poll,
+    Updated,
+    UpdatesClosed,
+}
+
+async fn next_poll_or_update(
+    interval: &mut tokio::time::Interval,
+    updates: &mut watch::Receiver<Vec<NativeMemoryLedger>>,
+    updates_open: bool,
+) -> SupervisorSchedule {
+    tokio::select! {
+        biased;
+        _ = interval.tick() => SupervisorSchedule::Poll,
+        changed = updates.changed(), if updates_open => {
+            if changed.is_ok() {
+                SupervisorSchedule::Updated
+            } else {
+                SupervisorSchedule::UpdatesClosed
+            }
+        }
+    }
+}
+
 async fn run_supervisor(
     worker: WorkerClient,
     ledgers: Vec<NativeMemoryLedger>,
@@ -186,15 +211,6 @@ async fn run_supervisor(
                     break;
                 }
             }
-            changed = updates.changed(), if updates_open => {
-                match changed {
-                    Ok(()) => {
-                        let ledgers = updates.borrow_and_update().clone();
-                        merge_registered_sources(&mut sources, ledgers);
-                    }
-                    Err(_) => updates_open = false,
-                }
-            }
             completed = completions.join_next(), if !completions.is_empty() => {
                 if let Some(Ok((source_id, succeeded))) = completed {
                     in_flight.remove(&source_id);
@@ -209,10 +225,26 @@ async fn run_supervisor(
                     }
                 }
             }
-            _ = interval.tick() => {
-                let now_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                scan_sources(&mut sources, &mut debounce, &mut pending, &in_flight, now_ms);
-                submit_pending(&worker, &pending, &mut in_flight, &mut completions);
+            scheduled = next_poll_or_update(&mut interval, &mut updates, updates_open) => {
+                match scheduled {
+                    SupervisorSchedule::Poll => {
+                        let now_ms = u64::try_from(started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX);
+                        scan_sources(
+                            &mut sources,
+                            &mut debounce,
+                            &mut pending,
+                            &in_flight,
+                            now_ms,
+                        );
+                        submit_pending(&worker, &pending, &mut in_flight, &mut completions);
+                    }
+                    SupervisorSchedule::Updated => {
+                        let ledgers = updates.borrow_and_update().clone();
+                        merge_registered_sources(&mut sources, ledgers);
+                    }
+                    SupervisorSchedule::UpdatesClosed => updates_open = false,
+                }
             }
         }
     }
@@ -594,6 +626,41 @@ mod tests {
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].last_applied_digest, Some(Sha256Digest([64; 32])));
         assert!(!receiver.has_changed().unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_ready_refreshes_do_not_starve_scheduler_polls() {
+        let root = tempfile::tempdir().unwrap();
+        let descriptor = source(&root.path().join("memory.md"), 32);
+        let (updates, mut receiver) = native_memory_update_channel();
+        let mut interval = tokio::time::interval(Duration::from_millis(NATIVE_MEMORY_POLL_MS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        assert_eq!(
+            next_poll_or_update(&mut interval, &mut receiver, true).await,
+            SupervisorSchedule::Poll
+        );
+        for byte in 1..=16 {
+            let mut ledger = NativeMemoryLedger::for_source(descriptor.clone());
+            ledger.last_applied_digest = Some(Sha256Digest([byte; 32]));
+            updates.send_replace(vec![ledger]);
+            tokio::time::advance(Duration::from_millis(NATIVE_MEMORY_POLL_MS)).await;
+
+            assert_eq!(
+                next_poll_or_update(&mut interval, &mut receiver, true).await,
+                SupervisorSchedule::Poll,
+                "refresh {byte} suppressed a due poll"
+            );
+            assert_eq!(
+                next_poll_or_update(&mut interval, &mut receiver, true).await,
+                SupervisorSchedule::Updated,
+                "refresh {byte} was not activated after the poll"
+            );
+            assert_eq!(
+                receiver.borrow_and_update()[0].last_applied_digest,
+                Some(Sha256Digest([byte; 32]))
+            );
+        }
     }
 
     #[cfg(any(target_os = "macos", windows))]
