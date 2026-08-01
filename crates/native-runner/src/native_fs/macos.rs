@@ -1329,6 +1329,27 @@ fn validate_metadata(
     Ok(())
 }
 
+pub(super) fn metadata_for_absent_sibling_creation(
+    template: &NativeMetadata,
+) -> Result<NativeMetadata, RunnerError> {
+    let mut security = PosixSecurity::decode(&template.security_descriptor)?;
+    validate_metadata(template, &security)?;
+    security.parent_links = security
+        .parent_links
+        .checked_add(1)
+        .ok_or(RunnerError::LimitExceeded)?;
+    let mut metadata = template.clone();
+    (metadata.parent_attributes, metadata.parent_link_count) = parent_marker_fields(
+        security.parent_mode,
+        security.parent_flags,
+        security.parent_uid,
+        security.parent_gid,
+        security.parent_links,
+    );
+    metadata.security_descriptor = security.encode()?;
+    Ok(metadata)
+}
+
 fn verify_expected(
     parent: &OpenParent,
     expected: Option<&NativeObjectToken>,

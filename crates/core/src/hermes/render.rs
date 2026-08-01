@@ -66,39 +66,68 @@ impl HermesAdapter {
         ) {
             return Err(invalid("Hermes Markdown component is invalid"));
         }
+        if is_primary_memory_instruction_component(HarnessId::Hermes, component) {
+            let (path, expected, current, intended) =
+                self.primary_memory_instruction_projection(component)?;
+            if current.fingerprint() == intended.fingerprint() {
+                return Ok(None);
+            }
+            return Ok(Some(self.approved_state(&path, &expected, intended)?));
+        }
         let path = self.markdown_path(component)?;
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid("Hermes Markdown cannot be safely inspected"))?;
-        let (bytes, metadata) = match snapshot.state() {
-            NativeState::RegularFile { bytes, metadata } => (bytes.as_slice(), metadata.clone()),
-            NativeState::Absent { .. }
-                if is_primary_memory_instruction_component(HarnessId::Hermes, component) =>
-            {
-                if component.archived {
-                    return Ok(None);
-                }
-                let template_path = self.layout.profile.hermes_home.join("config.yaml");
+        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
+            return Err(invalid("Hermes Markdown must be a regular file"));
+        };
+        let rendered =
+            render_managed_markdown(bytes, &component.body_markdown, component.archived)?;
+        self.approved_regular_file(&path, &snapshot, rendered, metadata.clone())
+    }
+
+    fn primary_memory_instruction_projection(
+        &self,
+        component: &ComponentRecord,
+    ) -> Result<(PathBuf, [u8; 32], NativeState, NativeState), ClientError> {
+        let path = self.markdown_path(component)?;
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid("Hermes Markdown cannot be safely inspected"))?;
+        let current = snapshot.state().clone();
+        let intended = match snapshot.state() {
+            NativeState::RegularFile { bytes, metadata } => NativeState::regular_file(
+                render_managed_markdown(bytes, &component.body_markdown, component.archived)?,
+                metadata.clone(),
+            ),
+            NativeState::Absent { .. } if component.archived => current.clone(),
+            NativeState::Absent { .. } => {
+                let template_path = path.with_file_name("HERMES.md");
                 let template =
                     OsNativeFileSystem::new()
                         .snapshot(&template_path)
                         .map_err(|_| {
-                            invalid("Hermes primary instruction metadata template is unavailable")
+                            invalid("Hermes primary instruction metadata template is unsafe")
                         })?;
                 let NativeState::RegularFile { metadata, .. } = template.state() else {
                     return Err(invalid(
-                        "Hermes primary instruction needs an existing metadata template",
+                        "Hermes primary instruction needs an existing project-root metadata template",
                     ));
                 };
-                (&[][..], metadata.clone())
-            }
-            NativeState::Absent { .. } => {
-                return Err(invalid("Hermes Markdown must be a regular file"));
+                let metadata = metadata
+                    .for_absent_sibling_creation(&current)
+                    .map_err(|_| {
+                        invalid(
+                            "Hermes primary instruction metadata template is not bound to the target parent",
+                        )
+                    })?;
+                NativeState::regular_file(
+                    render_managed_markdown(&[], &component.body_markdown, false)?,
+                    metadata,
+                )
             }
         };
-        let rendered =
-            render_managed_markdown(bytes, &component.body_markdown, component.archived)?;
-        self.approved_regular_file(&path, &snapshot, rendered, metadata)
+        Ok((path, *snapshot.fingerprint(), current, intended))
     }
 
     pub fn plan_native_memory(
@@ -243,6 +272,16 @@ impl HermesAdapter {
                 component.kind,
                 ComponentKind::Instruction | ComponentKind::Rule | ComponentKind::Skill
             ) {
+                if is_primary_memory_instruction_component(HarnessId::Hermes, component) {
+                    let (path, _, current, intended) =
+                        self.primary_memory_instruction_projection(component)?;
+                    if current.fingerprint() != intended.fingerprint()
+                        && let NativeState::RegularFile { bytes, .. } = intended
+                    {
+                        files.push(rendered_file(path, &bytes));
+                    }
+                    continue;
+                }
                 let path = self.markdown_path(component)?;
                 let existing = read_regular(&path, "Hermes Markdown must be a regular file")?;
                 let rendered = render_managed_markdown(

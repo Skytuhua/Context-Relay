@@ -886,10 +886,74 @@ fn primary_memory_hermes_markdown_handles_crlf_replacement_archive_and_absence()
         .plan_native_markdown(&managed)
         .unwrap()
         .unwrap();
+    let created_bytes = intended_bytes(&created);
     assert!(
-        String::from_utf8(intended_bytes(&created))
+        String::from_utf8(created_bytes.clone())
             .unwrap()
             .contains(PRIMARY_MEMORY_INSTRUCTIONS)
+    );
+
+    let desired = DesiredState {
+        components: vec![managed.clone()],
+        scopes: vec![NativeScope::Project {
+            project_id: fixture.project_id,
+            root: fixture.adapter.project_root_wire(),
+        }],
+    };
+    let preview = fixture.adapter.render(&desired).unwrap();
+    assert_eq!(preview.files.len(), 1);
+    assert_eq!(preview.files[0].bytes_sha256, test_digest(&created_bytes));
+    assert_eq!(preview.files[0].byte_length, created_bytes.len() as u64);
+
+    let nonce = [43; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native
+        .create_before_images(std::slice::from_ref(&created))
+        .unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native
+        .compare_and_swap_targets(std::slice::from_ref(&created))
+        .unwrap();
+    native.apply_mutation(&nonce, &created).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), created_bytes);
+    assert!(fixture.adapter.render(&desired).unwrap().files.is_empty());
+
+    managed.archived = true;
+    let archived = fixture
+        .adapter
+        .plan_native_markdown(&managed)
+        .unwrap()
+        .unwrap();
+    let archived_bytes = intended_bytes(&archived);
+    let archived_preview = fixture
+        .adapter
+        .render(&DesiredState {
+            components: vec![managed.clone()],
+            scopes: desired.scopes.clone(),
+        })
+        .unwrap();
+    assert_eq!(archived_preview.files.len(), 1);
+    assert_eq!(
+        archived_preview.files[0].bytes_sha256,
+        test_digest(&archived_bytes)
+    );
+    assert_eq!(
+        archived_preview.files[0].byte_length,
+        archived_bytes.len() as u64
+    );
+
+    native.restore_matching_applied_targets(&nonce).unwrap();
+    assert!(!path.exists());
+    assert!(
+        fixture
+            .adapter
+            .render(&DesiredState {
+                components: vec![managed.clone()],
+                scopes: desired.scopes,
+            })
+            .unwrap()
+            .files
+            .is_empty()
     );
 
     fs::write(&path, "<!-- context-relay:start -->\nmissing end\n").unwrap();

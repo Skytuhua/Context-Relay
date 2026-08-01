@@ -501,19 +501,122 @@ fn primary_memory_claude_markdown_handles_crlf_replacement_archive_and_absence()
     fs::remove_file(&path).unwrap();
     managed.archived = false;
     let created = fixture.adapter.plan_native_file(&managed).unwrap();
-    let NativeState::RegularFile { bytes: created, .. } =
-        NativeState::decode_v1(&created.content).unwrap()
+    let NativeState::RegularFile {
+        bytes: created_bytes,
+        ..
+    } = NativeState::decode_v1(&created.content).unwrap()
     else {
         panic!("absent primary instruction is created from a metadata template")
     };
     assert!(
-        String::from_utf8(created)
+        String::from_utf8(created_bytes.clone())
             .unwrap()
             .contains(PRIMARY_MEMORY_INSTRUCTIONS)
     );
 
+    let desired = DesiredState {
+        components: vec![managed.clone()],
+        scopes: vec![NativeScope::Project {
+            project_id: fixture.project_id,
+            root: fixture.adapter.project_root_wire(),
+        }],
+    };
+    let preview = fixture.adapter.render(&desired).unwrap();
+    assert_eq!(preview.files.len(), 1);
+    assert_eq!(
+        preview.files[0].bytes_sha256,
+        Sha256Digest(Sha256::digest(&created_bytes).into())
+    );
+    assert_eq!(preview.files[0].byte_length, created_bytes.len() as u64);
+
+    let nonce = [41; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native
+        .create_before_images(std::slice::from_ref(&created))
+        .unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native
+        .compare_and_swap_targets(std::slice::from_ref(&created))
+        .unwrap();
+    native.apply_mutation(&nonce, &created).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), created_bytes);
+    assert!(fixture.adapter.render(&desired).unwrap().files.is_empty());
+
+    managed.archived = true;
+    let archived = fixture.adapter.plan_native_file(&managed).unwrap();
+    let NativeState::RegularFile {
+        bytes: archived_bytes,
+        ..
+    } = NativeState::decode_v1(&archived.content).unwrap()
+    else {
+        panic!("archived primary instructions preserve the unmanaged target")
+    };
+    let archived_preview = fixture
+        .adapter
+        .render(&DesiredState {
+            components: vec![managed.clone()],
+            scopes: desired.scopes.clone(),
+        })
+        .unwrap();
+    assert_eq!(archived_preview.files.len(), 1);
+    assert_eq!(
+        archived_preview.files[0].bytes_sha256,
+        Sha256Digest(Sha256::digest(&archived_bytes).into())
+    );
+    assert_eq!(
+        archived_preview.files[0].byte_length,
+        archived_bytes.len() as u64
+    );
+
+    native.restore_matching_applied_targets(&nonce).unwrap();
+    assert!(!path.exists());
+    assert!(
+        fixture
+            .adapter
+            .render(&DesiredState {
+                components: vec![managed.clone()],
+                scopes: desired.scopes,
+            })
+            .unwrap()
+            .files
+            .is_empty()
+    );
+
     fs::write(&path, "<!-- context-relay:start -->\nmissing end\n").unwrap();
     assert!(fixture.adapter.plan_native_file(&managed).is_err());
+}
+
+#[test]
+fn primary_memory_absent_creation_applies_and_restores_transactionally() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let path = fixture.root.join("project with spaces/CLAUDE.md");
+    fs::remove_file(&path).unwrap();
+    let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
+    let managed = primary_memory_instruction_component(
+        HarnessId::ClaudeCode,
+        fixture.project_id,
+        device_id,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+    )
+    .unwrap();
+    let mutation = fixture.adapter.plan_native_file(&managed).unwrap();
+    let nonce = [44; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native
+        .create_before_images(std::slice::from_ref(&mutation))
+        .unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native
+        .compare_and_swap_targets(std::slice::from_ref(&mutation))
+        .unwrap();
+    native.apply_mutation(&nonce, &mutation).unwrap();
+    assert!(
+        fs::read_to_string(&path)
+            .unwrap()
+            .contains(PRIMARY_MEMORY_INSTRUCTIONS)
+    );
+    native.restore_matching_applied_targets(&nonce).unwrap();
+    assert!(!path.exists());
 }
 
 #[test]

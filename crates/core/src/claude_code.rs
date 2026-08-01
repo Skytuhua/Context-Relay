@@ -280,45 +280,32 @@ impl ClaudeCodeAdapter {
         ) {
             return Err(invalid_request("Claude Code file component is invalid"));
         }
+        if is_primary_memory_instruction_component(HarnessId::ClaudeCode, component) {
+            let (path, expected, _, intended) =
+                self.primary_memory_instruction_projection(component)?;
+            return Ok(ApprovedMutation {
+                target: wire_path(&path),
+                kind: MutationKind::Payload,
+                content: intended
+                    .encode_v1()
+                    .map_err(|_| invalid_request("Claude Code Markdown is not representable"))?,
+                expected: RestorableStateFingerprint(Sha256Digest(expected)),
+                intended: RestorableStateFingerprint(Sha256Digest(intended.fingerprint())),
+            });
+        }
         let path = component_path(self, component)?;
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid_request("Claude Code Markdown cannot be safely inspected"))?;
-        let intended = match snapshot.state() {
-            NativeState::RegularFile { bytes, metadata } => NativeState::regular_file(
-                render_managed_markdown(bytes, &component.body_markdown, component.archived)?,
-                metadata.clone(),
-            ),
-            NativeState::Absent { .. }
-                if is_primary_memory_instruction_component(HarnessId::ClaudeCode, component) =>
-            {
-                if component.archived {
-                    snapshot.state().clone()
-                } else {
-                    let template = OsNativeFileSystem::new()
-                        .snapshot(&self.project_settings_path())
-                        .map_err(|_| {
-                            invalid_request(
-                                "Claude Code primary instruction metadata template is unavailable",
-                            )
-                        })?;
-                    let NativeState::RegularFile { metadata, .. } = template.state() else {
-                        return Err(invalid_request(
-                            "Claude Code primary instruction needs an existing metadata template",
-                        ));
-                    };
-                    NativeState::regular_file(
-                        render_managed_markdown(&[], &component.body_markdown, component.archived)?,
-                        metadata.clone(),
-                    )
-                }
-            }
-            NativeState::Absent { .. } => {
-                return Err(invalid_request(
-                    "Claude Code Markdown must already exist before it is managed",
-                ));
-            }
+        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
+            return Err(invalid_request(
+                "Claude Code Markdown must already exist before it is managed",
+            ));
         };
+        let intended = NativeState::regular_file(
+            render_managed_markdown(bytes, &component.body_markdown, component.archived)?,
+            metadata.clone(),
+        );
         Ok(ApprovedMutation {
             target: wire_path(&path),
             kind: MutationKind::Payload,
@@ -328,6 +315,52 @@ impl ClaudeCodeAdapter {
             expected: RestorableStateFingerprint(Sha256Digest(*snapshot.fingerprint())),
             intended: RestorableStateFingerprint(Sha256Digest(intended.fingerprint())),
         })
+    }
+
+    fn primary_memory_instruction_projection(
+        &self,
+        component: &ComponentRecord,
+    ) -> Result<(PathBuf, [u8; 32], NativeState, NativeState), ClientError> {
+        let path = component_path(self, component)?;
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid_request("Claude Code Markdown cannot be safely inspected"))?;
+        let current = snapshot.state().clone();
+        let intended = match snapshot.state() {
+            NativeState::RegularFile { bytes, metadata } => NativeState::regular_file(
+                render_managed_markdown(bytes, &component.body_markdown, component.archived)?,
+                metadata.clone(),
+            ),
+            NativeState::Absent { .. } if component.archived => current.clone(),
+            NativeState::Absent { .. } => {
+                let template_path = path.with_file_name(".mcp.json");
+                let template =
+                    OsNativeFileSystem::new()
+                        .snapshot(&template_path)
+                        .map_err(|_| {
+                            invalid_request(
+                                "Claude Code primary instruction metadata template is unavailable",
+                            )
+                        })?;
+                let NativeState::RegularFile { metadata, .. } = template.state() else {
+                    return Err(invalid_request(
+                        "Claude Code primary instruction needs an existing project-root metadata template",
+                    ));
+                };
+                let metadata = metadata
+                    .for_absent_sibling_creation(&current)
+                    .map_err(|_| {
+                        invalid_request(
+                            "Claude Code primary instruction metadata template is not bound to the target parent",
+                        )
+                    })?;
+                NativeState::regular_file(
+                    render_managed_markdown(&[], &component.body_markdown, false)?,
+                    metadata,
+                )
+            }
+        };
+        Ok((path, *snapshot.fingerprint(), current, intended))
     }
 
     pub fn plan_bridge_cli_mutation(
@@ -1063,6 +1096,20 @@ impl HarnessAdapter for ClaudeCodeAdapter {
                     }
                 }
                 ComponentKind::Instruction | ComponentKind::Rule | ComponentKind::Skill => {
+                    if is_primary_memory_instruction_component(HarnessId::ClaudeCode, component) {
+                        let (path, _, current, intended) =
+                            self.primary_memory_instruction_projection(component)?;
+                        if current.fingerprint() != intended.fingerprint()
+                            && let NativeState::RegularFile { bytes, .. } = intended
+                        {
+                            files.push(RenderedFile {
+                                path: wire_path(&path),
+                                bytes_sha256: digest(&bytes),
+                                byte_length: bytes.len() as u64,
+                            });
+                        }
+                        continue;
+                    }
                     if component.archived {
                         continue;
                     }

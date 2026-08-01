@@ -715,46 +715,83 @@ impl CodexAdapter {
         if matches!(component.scope, ScopeRef::Project { .. }) {
             self.validate_project_path(&path)?;
         }
+        if is_primary_memory_instruction_component(HarnessId::Codex, component) {
+            let (path, expected, _, intended) =
+                self.primary_memory_instruction_projection(component)?;
+            return self.approved_file(&path, &expected, intended);
+        }
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid("Codex Markdown cannot be safely inspected"))?;
+        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
+            return Err(invalid("Codex Markdown must already exist"));
+        };
+        let intended = NativeState::regular_file(
+            render_managed_markdown(bytes, &component.body_markdown, component.archived)?,
+            metadata.clone(),
+        );
+        self.approved_file(&path, snapshot.fingerprint(), intended)
+    }
+
+    fn primary_memory_instruction_projection(
+        &self,
+        component: &ComponentRecord,
+    ) -> Result<(PathBuf, [u8; 32], NativeState, NativeState), ClientError> {
+        let path = self.markdown_path(component)?;
+        self.validate_project_path(&path)?;
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid("Codex Markdown cannot be safely inspected"))?;
+        let current = snapshot.state().clone();
         let intended = match snapshot.state() {
             NativeState::RegularFile { bytes, metadata } => NativeState::regular_file(
                 render_managed_markdown(bytes, &component.body_markdown, component.archived)?,
                 metadata.clone(),
             ),
-            NativeState::Absent { .. }
-                if is_primary_memory_instruction_component(HarnessId::Codex, component) =>
-            {
-                if component.archived {
-                    snapshot.state().clone()
-                } else {
-                    let template_path = self.layout.project_root.join(".codex/config.toml");
+            NativeState::Absent { .. } if component.archived => current.clone(),
+            NativeState::Absent { .. } => {
+                let candidates = std::iter::once("AGENTS.override.md".to_owned())
+                    .chain(self.project_doc_fallback_filenames()?)
+                    .collect::<Vec<_>>();
+                let mut metadata = None;
+                for name in candidates {
+                    let template_path = path.with_file_name(name);
                     self.validate_project_path(&template_path)?;
                     let template =
                         OsNativeFileSystem::new()
                             .snapshot(&template_path)
                             .map_err(|_| {
-                                invalid(
-                                    "Codex primary instruction metadata template is unavailable",
-                                )
+                                invalid("Codex primary instruction metadata template is unsafe")
                             })?;
-                    let NativeState::RegularFile { metadata, .. } = template.state() else {
-                        return Err(invalid(
-                            "Codex primary instruction needs an existing metadata template",
-                        ));
-                    };
-                    NativeState::regular_file(
-                        render_managed_markdown(&[], &component.body_markdown, component.archived)?,
-                        metadata.clone(),
-                    )
+                    if let NativeState::RegularFile {
+                        metadata: candidate,
+                        ..
+                    } = template.state()
+                    {
+                        metadata = Some(
+                            candidate
+                                .for_absent_sibling_creation(&current)
+                                .map_err(|_| {
+                                    invalid(
+                                        "Codex primary instruction metadata template is not bound to the target parent",
+                                    )
+                                })?,
+                        );
+                        break;
+                    }
                 }
-            }
-            NativeState::Absent { .. } => {
-                return Err(invalid("Codex Markdown must already exist"));
+                let metadata = metadata.ok_or_else(|| {
+                    invalid(
+                        "Codex primary instruction needs an existing project-root metadata template",
+                    )
+                })?;
+                NativeState::regular_file(
+                    render_managed_markdown(&[], &component.body_markdown, false)?,
+                    metadata,
+                )
             }
         };
-        self.approved_file(&path, snapshot.fingerprint(), intended)
+        Ok((path, *snapshot.fingerprint(), current, intended))
     }
 
     pub fn plan_native_hooks_json(
@@ -1808,6 +1845,16 @@ impl HarnessAdapter for CodexAdapter {
                     }
                 }
                 ComponentKind::Instruction | ComponentKind::Rule | ComponentKind::Skill => {
+                    if is_primary_memory_instruction_component(HarnessId::Codex, component) {
+                        let (path, _, current, intended) =
+                            self.primary_memory_instruction_projection(component)?;
+                        if current.fingerprint() != intended.fingerprint()
+                            && let NativeState::RegularFile { bytes, .. } = intended
+                        {
+                            files.push(rendered_file(path, &bytes));
+                        }
+                        continue;
+                    }
                     let path = self.markdown_path(component)?;
                     if matches!(component.scope, ScopeRef::Project { .. }) {
                         self.validate_project_path(&path)?;

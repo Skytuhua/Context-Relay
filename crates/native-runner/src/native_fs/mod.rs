@@ -163,6 +163,35 @@ impl NativeMetadata {
     pub const fn link_count(&self) -> u64 {
         self.link_count
     }
+
+    /// Rebinds a same-directory template to the parent generation that will
+    /// exist after an absent sibling target is created.
+    pub fn for_absent_sibling_creation(&self, absent: &NativeState) -> Result<Self, RunnerError> {
+        let NativeState::Absent {
+            parent_attributes,
+            parent_link_count,
+        } = absent
+        else {
+            return Err(RunnerError::InvalidNativeState);
+        };
+        if (self.parent_attributes, self.parent_link_count)
+            != (*parent_attributes, *parent_link_count)
+        {
+            return Err(RunnerError::ConcurrentChange);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            macos::metadata_for_absent_sibling_creation(self)
+        }
+        #[cfg(windows)]
+        {
+            Ok(self.clone())
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            Err(RunnerError::UnsupportedTarget)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
