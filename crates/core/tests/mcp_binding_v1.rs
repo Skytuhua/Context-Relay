@@ -8,7 +8,7 @@ use std::{
 };
 
 use context_relay_core::{
-    mcp::binding::{ResolvedMcpBinding, resolve_binding},
+    mcp::binding::{ResolvedMcpBinding, resolve_binding, resolve_hook_binding},
     vault::Vault,
 };
 use context_relay_protocol::{
@@ -61,6 +61,16 @@ impl Fixture {
 
     fn resolve(&self, working_directory: &Path) -> Result<ResolvedMcpBinding, ClientError> {
         resolve_binding(
+            &self.vault,
+            &McpBinding {
+                harness: HarnessId::Codex,
+                working_directory: wire_path(working_directory),
+            },
+        )
+    }
+
+    fn resolve_hook(&self, working_directory: &Path) -> Result<ResolvedMcpBinding, ClientError> {
+        resolve_hook_binding(
             &self.vault,
             &McpBinding {
                 harness: HarnessId::Codex,
@@ -224,8 +234,10 @@ fn selected_project_must_be_the_canonical_active_project() {
     let mut fixture = Fixture::new("mcp-selected-project");
     let repo_a = fixture.root("alpha");
     let repo_b = fixture.root("beta");
+    let unmatched = fixture.root("unmatched");
     fs::create_dir_all(&repo_a).unwrap();
     fs::create_dir_all(&repo_b).unwrap();
+    fs::create_dir_all(&unmatched).unwrap();
     fixture.register(&project_a(), &repo_a);
     fixture.register(&project_b(), &repo_b);
     fixture.set_policy(HarnessAccessPolicy::SelectedProject {
@@ -234,6 +246,36 @@ fn selected_project_must_be_the_canonical_active_project() {
     });
 
     assert_denied(fixture.resolve(&repo_b).unwrap_err());
+    assert_denied(fixture.resolve(&unmatched).unwrap_err());
+}
+
+#[test]
+fn hook_binding_acknowledges_no_match_but_rejects_wrong_selected_or_ambiguous_projects() {
+    let mut fixture = Fixture::new("hook-selected-project");
+    let repo_a = fixture.root("alpha");
+    let repo_b = fixture.root("beta");
+    let unmatched = fixture.root("unmatched");
+    fs::create_dir_all(&repo_a).unwrap();
+    fs::create_dir_all(&repo_b).unwrap();
+    fs::create_dir_all(&unmatched).unwrap();
+    fixture.register(&project_a(), &repo_a);
+    fixture.register(&project_b(), &repo_b);
+    fixture.set_policy(HarnessAccessPolicy::SelectedProject {
+        project_id: project_a().project_id,
+        read_only: false,
+    });
+
+    assert_eq!(
+        fixture.resolve_hook(&unmatched).unwrap().active_project,
+        None
+    );
+    assert_denied(fixture.resolve_hook(&repo_b).unwrap_err());
+
+    fixture.register(
+        &project("018f22e2-79b0-7cc8-98c4-dc0c0c073986", "ambiguous alpha"),
+        &repo_a,
+    );
+    assert_denied(fixture.resolve_hook(&repo_a).unwrap_err());
 }
 
 #[test]

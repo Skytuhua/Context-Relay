@@ -56,6 +56,25 @@ impl<'a> OfflineWorkspace<'a> {
         }
         match &params.event {
             NativeHookEvent::SessionStart { .. } | NativeHookEvent::SessionStop { .. } => {
+                let session_id = match &params.event {
+                    NativeHookEvent::SessionStart { session_id }
+                    | NativeHookEvent::SessionStop { session_id } => session_id,
+                    NativeHookEvent::TaskEvidence { .. } => unreachable!(),
+                };
+                if let Some(current) = vault(
+                    self.vault
+                        .native_hook_session(params.binding.harness, session_id),
+                )? && current.project_id != project_id
+                {
+                    let latest = current.stopped_at_ms.unwrap_or(current.started_at_ms);
+                    let may_rebind = matches!(&params.event, NativeHookEvent::SessionStart { .. })
+                        && params.occurred_at_ms > latest;
+                    if !may_rebind {
+                        return Err(conflict(
+                            "The native hook session is bound to another project",
+                        ));
+                    }
+                }
                 vault(self.vault.put_native_hook_session(project_id, &params))
             }
             NativeHookEvent::TaskEvidence {
@@ -76,12 +95,15 @@ impl<'a> OfflineWorkspace<'a> {
                     }
                     return Err(conflict("The native hook task evidence is stale"));
                 }
-                self.complete_task(TaskCompleteParams {
-                    operation_id,
-                    task_id: *task_id,
-                    expected_revision: task.revision,
-                    evidence: evidence.clone(),
-                })
+                self.complete_task_with_recorded_hlc(
+                    TaskCompleteParams {
+                        operation_id,
+                        task_id: *task_id,
+                        expected_revision: task.revision,
+                        evidence: evidence.clone(),
+                    },
+                    HybridLogicalClock::new(params.occurred_at_ms, 0, self.device_id),
+                )
                 .map(|_| ())
             }
         }
@@ -793,7 +815,16 @@ impl<'a> OfflineWorkspace<'a> {
     }
 
     pub fn complete_task(&mut self, params: TaskCompleteParams) -> Result<TaskRecord, ClientError> {
-        let prepared = self.prepare_task_completion(&params)?;
+        let recorded_hlc = operation_clock(params.operation_id, self.device_id);
+        self.complete_task_with_recorded_hlc(params, recorded_hlc)
+    }
+
+    fn complete_task_with_recorded_hlc(
+        &mut self,
+        params: TaskCompleteParams,
+        recorded_hlc: HybridLogicalClock,
+    ) -> Result<TaskRecord, ClientError> {
+        let prepared = self.prepare_task_completion(&params, recorded_hlc)?;
         if prepared.should_write {
             vault(
                 self.vault
@@ -807,13 +838,14 @@ impl<'a> OfflineWorkspace<'a> {
         &self,
         params: &TaskCompleteParams,
     ) -> Result<TaskRecord, ClientError> {
-        self.prepare_task_completion(params)
+        self.prepare_task_completion(params, operation_clock(params.operation_id, self.device_id))
             .map(|prepared| prepared.value)
     }
 
     fn prepare_task_completion(
         &self,
         params: &TaskCompleteParams,
+        recorded_hlc: HybridLogicalClock,
     ) -> Result<PreparedLocalMutation<TaskRecord>, ClientError> {
         let binding = local_operation_binding(
             params.operation_id,
@@ -846,7 +878,6 @@ impl<'a> OfflineWorkspace<'a> {
         }
         let mut task = vault(self.vault.task(&params.task_id))?.ok_or_else(not_found)?;
         require_revision(task.revision, params.expected_revision)?;
-        let recorded_hlc = operation_clock(params.operation_id, self.device_id);
         task.status = TaskStatus::Done;
         task.revision = params.operation_id;
         task.evidence = params
@@ -919,11 +950,29 @@ fn native_hook_operation_id(
     project_id: ProjectId,
     params: &NativeHookEventParams,
 ) -> Result<OperationId, ClientError> {
-    let canonical = serde_json::to_vec(params).map_err(|_| internal())?;
+    let NativeHookEvent::TaskEvidence {
+        session_id,
+        task_id,
+        evidence,
+    } = &params.event
+    else {
+        return Err(invalid_request());
+    };
+    let canonical_evidence = serde_json::to_vec(evidence).map_err(|_| internal())?;
     let mut hasher = Sha256::new();
     hasher.update(b"context-relay.native-hook-task-evidence.v1");
     hasher.update(project_id.as_bytes());
-    hasher.update(canonical);
+    hash_identity_field(
+        &mut hasher,
+        match params.binding.harness {
+            HarnessId::ClaudeCode => b"claude_code",
+            HarnessId::Codex => b"codex",
+            HarnessId::Hermes => b"hermes",
+        },
+    );
+    hash_identity_field(&mut hasher, session_id.as_bytes());
+    hasher.update(task_id.as_bytes());
+    hash_identity_field(&mut hasher, &canonical_evidence);
     let digest: [u8; 32] = hasher.finalize().into();
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -949,6 +998,11 @@ fn native_hook_operation_id(
         bytes[15],
     ))
     .map_err(|_| internal())
+}
+
+fn hash_identity_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(value);
 }
 
 fn local_operation_binding<T: Serialize>(

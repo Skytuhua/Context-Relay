@@ -1203,13 +1203,20 @@ fn execute_workspace_request(
                 .map(|output| LocalResult::McpOutput { name, output })
         }
         LocalRequest::NativeHookEvent(params) => {
-            let resolved =
-                context_relay_core::mcp::binding::resolve_binding(&state.vault, &params.binding)?;
-            let Some(project) = resolved.active_project else {
+            let resolved = context_relay_core::mcp::binding::resolve_hook_binding(
+                &state.vault,
+                &params.binding,
+            )?;
+            let Some(_) = resolved.active_project else {
                 return Ok(LocalResult::Empty);
             };
+            let task_write = matches!(
+                params.event,
+                context_relay_protocol::NativeHookEvent::TaskEvidence { .. }
+            );
+            let project_id = resolved.access.require_tasks(task_write)?;
             OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .handle_native_hook_event(project.project_id, params)
+                .handle_native_hook_event(project_id, params)
                 .map(|()| LocalResult::Empty)
         }
         LocalRequest::ProjectsList(_) => OfflineWorkspace::new(&mut state.vault, state.device_id)
@@ -1711,6 +1718,15 @@ pub mod test_support {
                 vault.set_access_policy(*harness, policy)?;
             }
             Ok(())
+        }
+
+        pub fn native_hook_session_count(&self) -> Result<usize, VaultError> {
+            let vault = Vault::open(
+                &self.vault_path,
+                "context-relay-test-vault-key",
+                self.keys.as_ref(),
+            )?;
+            vault.native_hook_session_count()
         }
 
         pub async fn start(&self) -> Result<Daemon, DaemonError> {

@@ -113,6 +113,21 @@ pub fn resolve_binding(
     vault: &Vault,
     binding: &McpBinding,
 ) -> Result<ResolvedMcpBinding, ClientError> {
+    resolve_binding_with_selected_match(vault, binding, true)
+}
+
+pub fn resolve_hook_binding(
+    vault: &Vault,
+    binding: &McpBinding,
+) -> Result<ResolvedMcpBinding, ClientError> {
+    resolve_binding_with_selected_match(vault, binding, false)
+}
+
+fn resolve_binding_with_selected_match(
+    vault: &Vault,
+    binding: &McpBinding,
+    selected_requires_match: bool,
+) -> Result<ResolvedMcpBinding, ClientError> {
     let working_directory =
         canonical_directory(&binding.working_directory).map_err(|_| invalid_binding())?;
     let working_ancestors =
@@ -156,10 +171,12 @@ pub fn resolve_binding(
     let policy = vault
         .access_policy(binding.harness)
         .map_err(|_| vault_error())?;
-    if let HarnessAccessPolicy::SelectedProject { project_id, .. } = &policy
-        && active_project.as_ref().map(|project| project.project_id) != Some(*project_id)
-    {
-        return Err(scope_denied());
+    if let HarnessAccessPolicy::SelectedProject { project_id, .. } = &policy {
+        match active_project.as_ref().map(|project| project.project_id) {
+            Some(active) if active != *project_id => return Err(scope_denied()),
+            None if selected_requires_match => return Err(scope_denied()),
+            _ => {}
+        }
     }
     let access = McpAccess::resolve(
         &policy,

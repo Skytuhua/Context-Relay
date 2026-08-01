@@ -258,6 +258,251 @@ fn native_hook_lifecycle_replaces_one_bounded_sanitized_session_row() {
 }
 
 #[test]
+fn native_hook_lifecycle_ordering_is_monotonic_idempotent_and_project_bound() {
+    let fixture = Fixture::new("native-hook-ordering");
+    let project_id = ID_7.parse().unwrap();
+    let other_project_id = ID_6.parse().unwrap();
+    let mut vault = fixture.vault();
+    let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap());
+    for (id, name) in [(project_id, "Primary"), (other_project_id, "Other")] {
+        service
+            .upsert_project(ProjectIdentity {
+                project_id: id,
+                github_repository_id: None,
+                git_remote_fingerprint: None,
+                monorepo_subdirectory: None,
+                name: name.into(),
+            })
+            .unwrap();
+    }
+
+    let stop_first = hook_params(
+        HarnessId::Codex,
+        "ordered-stop-first",
+        |session_id| NativeHookEvent::SessionStop { session_id },
+        200,
+    );
+    service
+        .handle_native_hook_event(project_id, stop_first.clone())
+        .unwrap();
+    let terminal = service
+        .native_hook_session(HarnessId::Codex, "ordered-stop-first")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (terminal.started_at_ms, terminal.stopped_at_ms),
+        (200, Some(200))
+    );
+
+    for occurred_at_ms in [100, 200] {
+        service
+            .handle_native_hook_event(
+                project_id,
+                hook_params(
+                    HarnessId::Codex,
+                    "ordered-stop-first",
+                    |session_id| NativeHookEvent::SessionStart { session_id },
+                    occurred_at_ms,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            service
+                .native_hook_session(HarnessId::Codex, "ordered-stop-first")
+                .unwrap(),
+            Some(terminal.clone())
+        );
+    }
+    assert_eq!(
+        service
+            .handle_native_hook_event(
+                other_project_id,
+                hook_params(
+                    HarnessId::Codex,
+                    "ordered-stop-first",
+                    |session_id| NativeHookEvent::SessionStart { session_id },
+                    150,
+                ),
+            )
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        service
+            .native_hook_session(HarnessId::Codex, "ordered-stop-first")
+            .unwrap(),
+        Some(terminal)
+    );
+
+    let reopen = hook_params(
+        HarnessId::Codex,
+        "ordered-stop-first",
+        |session_id| NativeHookEvent::SessionStart { session_id },
+        201,
+    );
+    service
+        .handle_native_hook_event(project_id, reopen.clone())
+        .unwrap();
+    let reopened = service
+        .native_hook_session(HarnessId::Codex, "ordered-stop-first")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (reopened.started_at_ms, reopened.stopped_at_ms),
+        (201, None)
+    );
+    assert_eq!(reopened.payload, reopen);
+
+    let start_first = hook_params(
+        HarnessId::Codex,
+        "ordered-start-first",
+        |session_id| NativeHookEvent::SessionStart { session_id },
+        100,
+    );
+    service
+        .handle_native_hook_event(project_id, start_first.clone())
+        .unwrap();
+    service
+        .handle_native_hook_event(
+            project_id,
+            hook_params(
+                HarnessId::Codex,
+                "ordered-start-first",
+                |session_id| NativeHookEvent::SessionStop { session_id },
+                50,
+            ),
+        )
+        .unwrap();
+    let open = service
+        .native_hook_session(HarnessId::Codex, "ordered-start-first")
+        .unwrap()
+        .unwrap();
+    assert_eq!((open.started_at_ms, open.stopped_at_ms), (100, None));
+    assert_eq!(open.payload, start_first);
+
+    let stop_250 = hook_params(
+        HarnessId::Codex,
+        "ordered-start-first",
+        |session_id| NativeHookEvent::SessionStop { session_id },
+        250,
+    );
+    service
+        .handle_native_hook_event(project_id, stop_250.clone())
+        .unwrap();
+    let stopped_250 = service
+        .native_hook_session(HarnessId::Codex, "ordered-start-first")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped_250.stopped_at_ms, Some(250));
+    assert_eq!(stopped_250.payload, stop_250);
+
+    let mut conflicting_equal_stop = hook_params(
+        HarnessId::Codex,
+        "ordered-start-first",
+        |session_id| NativeHookEvent::SessionStop { session_id },
+        250,
+    );
+    conflicting_equal_stop.binding.working_directory.display = Some("equal-but-different".into());
+    for ignored in [
+        hook_params(
+            HarnessId::Codex,
+            "ordered-start-first",
+            |session_id| NativeHookEvent::SessionStop { session_id },
+            240,
+        ),
+        conflicting_equal_stop,
+    ] {
+        service
+            .handle_native_hook_event(project_id, ignored)
+            .unwrap();
+        assert_eq!(
+            service
+                .native_hook_session(HarnessId::Codex, "ordered-start-first")
+                .unwrap(),
+            Some(stopped_250.clone())
+        );
+    }
+
+    let stop_300 = hook_params(
+        HarnessId::Codex,
+        "ordered-start-first",
+        |session_id| NativeHookEvent::SessionStop { session_id },
+        300,
+    );
+    service
+        .handle_native_hook_event(project_id, stop_300.clone())
+        .unwrap();
+    let stopped_300 = service
+        .native_hook_session(HarnessId::Codex, "ordered-start-first")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped_300.stopped_at_ms, Some(300));
+    assert_eq!(stopped_300.payload, stop_300);
+
+    assert_eq!(
+        service
+            .handle_native_hook_event(
+                other_project_id,
+                hook_params(
+                    HarnessId::Codex,
+                    "ordered-start-first",
+                    |session_id| NativeHookEvent::SessionStop { session_id },
+                    350,
+                ),
+            )
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        service
+            .native_hook_session(HarnessId::Codex, "ordered-start-first")
+            .unwrap(),
+        Some(stopped_300.clone())
+    );
+
+    service
+        .handle_native_hook_event(
+            project_id,
+            hook_params(
+                HarnessId::Codex,
+                "ordered-start-first",
+                |session_id| NativeHookEvent::SessionStart { session_id },
+                300,
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        service
+            .native_hook_session(HarnessId::Codex, "ordered-start-first")
+            .unwrap(),
+        Some(stopped_300)
+    );
+    let start_301 = hook_params(
+        HarnessId::Codex,
+        "ordered-start-first",
+        |session_id| NativeHookEvent::SessionStart { session_id },
+        301,
+    );
+    service
+        .handle_native_hook_event(project_id, start_301.clone())
+        .unwrap();
+    service
+        .handle_native_hook_event(project_id, start_301.clone())
+        .unwrap();
+    let reopened = service
+        .native_hook_session(HarnessId::Codex, "ordered-start-first")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (reopened.started_at_ms, reopened.stopped_at_ms),
+        (301, None)
+    );
+    assert_eq!(reopened.payload, start_301);
+}
+
+#[test]
 fn native_hook_task_evidence_completes_only_the_explicit_current_project_task() {
     let fixture = Fixture::new("native-hook-task-evidence");
     let raw_session = fixture.path.path().with_extension("history.jsonl");
@@ -319,11 +564,20 @@ fn native_hook_task_evidence_completes_only_the_explicit_current_project_task() 
         assert_eq!(completed.status, TaskStatus::Done);
         assert_eq!(completed.evidence.len(), 1);
         assert_eq!(completed.evidence[0].summary, "Focused checks passed");
+        assert_eq!(completed.evidence[0].recorded_hlc.physical_ms, 404);
         assert_ne!(completed.revision, created.revision);
         assert_eq!(service.native_hook_session_count().unwrap(), 0);
 
+        let mut later_delivery = params.clone();
+        later_delivery.occurred_at_ms = 9_999;
+        later_delivery.binding.working_directory.bytes = r"C:\different\delivery\cwd"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        later_delivery.binding.working_directory.display =
+            Some(r"C:\different\delivery\cwd".into());
         service
-            .handle_native_hook_event(project_id, params.clone())
+            .handle_native_hook_event(project_id, later_delivery)
             .unwrap();
         assert_eq!(service.tasks(project_id).unwrap(), vec![completed]);
 

@@ -249,6 +249,273 @@ async fn task_evidence_is_completed_by_the_resolved_workspace_handler() {
     owner.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn hook_events_enforce_the_project_read_and_write_policy_matrix() {
+    struct Case {
+        label: &'static str,
+        policy: HarnessAccessPolicy,
+        lifecycle_read: bool,
+        task_write: bool,
+    }
+
+    let project_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073985".parse().unwrap();
+    let cases = [
+        Case {
+            label: "default",
+            policy: HarnessAccessPolicy::Default,
+            lifecycle_read: true,
+            task_write: true,
+        },
+        Case {
+            label: "read-only",
+            policy: HarnessAccessPolicy::ReadOnly,
+            lifecycle_read: true,
+            task_write: false,
+        },
+        Case {
+            label: "active-writable",
+            policy: HarnessAccessPolicy::ActiveProjectOnly { read_only: false },
+            lifecycle_read: true,
+            task_write: true,
+        },
+        Case {
+            label: "active-read-only",
+            policy: HarnessAccessPolicy::ActiveProjectOnly { read_only: true },
+            lifecycle_read: true,
+            task_write: false,
+        },
+        Case {
+            label: "selected-writable",
+            policy: HarnessAccessPolicy::SelectedProject {
+                project_id,
+                read_only: false,
+            },
+            lifecycle_read: true,
+            task_write: true,
+        },
+        Case {
+            label: "selected-read-only",
+            policy: HarnessAccessPolicy::SelectedProject {
+                project_id,
+                read_only: true,
+            },
+            lifecycle_read: true,
+            task_write: false,
+        },
+        Case {
+            label: "global-writable",
+            policy: HarnessAccessPolicy::GlobalOnly { read_only: false },
+            lifecycle_read: false,
+            task_write: false,
+        },
+        Case {
+            label: "global-read-only",
+            policy: HarnessAccessPolicy::GlobalOnly { read_only: true },
+            lifecycle_read: false,
+            task_write: false,
+        },
+        Case {
+            label: "disabled",
+            policy: HarnessAccessPolicy::Disabled,
+            lifecycle_read: false,
+            task_write: false,
+        },
+    ];
+
+    for case in cases {
+        let root = unique_temp_path(case.label);
+        let project_root = root.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let runtime = RuntimeConfig::for_test("native-hook", Some(short_runtime_root())).unwrap();
+        let config = TestDaemonConfig::new(
+            runtime.clone(),
+            root.join("vault.db"),
+            InstallationToken::from_bytes(TOKEN),
+        );
+        let project = ProjectIdentity {
+            project_id,
+            github_repository_id: None,
+            git_remote_fingerprint: None,
+            monorepo_subdirectory: None,
+            name: case.label.into(),
+        };
+        config
+            .seed_mcp_project(&project, &project_root, &[(HarnessId::Codex, case.policy)])
+            .unwrap();
+        let daemon = config.start().await.unwrap();
+        let handle = daemon.handle();
+        let owner = tokio::spawn(daemon.run());
+        let mut desktop = RawClient::connect(&runtime, ClientRole::Desktop).await;
+        let LocalResult::Tasks { tasks } = desktop
+            .call(LocalRequest::TaskUpsert(TaskUpsertParams {
+                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c073986".parse().unwrap(),
+                task_id: None,
+                project_id,
+                title: format!("{} task", case.label),
+                body_markdown: "Policy-gated native evidence".into(),
+                status: TaskStatus::InProgress,
+                expected_revision: None,
+            }))
+            .await
+            .unwrap()
+        else {
+            panic!("task upsert must return a task")
+        };
+        let task = tasks[0].clone();
+        let mut bridge = RawClient::connect(&runtime, ClientRole::McpBridge).await;
+
+        let lifecycle = bridge
+            .call(native_hook(
+                HarnessId::Codex,
+                &project_root,
+                NativeHookEvent::SessionStart {
+                    session_id: format!("{}-session", case.label),
+                },
+                1_700_000_000_100,
+            ))
+            .await;
+        if case.lifecycle_read {
+            assert_eq!(lifecycle.unwrap(), LocalResult::Empty, "{}", case.label);
+        } else {
+            assert_eq!(
+                lifecycle.unwrap_err().code,
+                ErrorCode::ScopeDenied,
+                "{}",
+                case.label
+            );
+        }
+
+        let evidence = bridge
+            .call(native_hook(
+                HarnessId::Codex,
+                &project_root,
+                NativeHookEvent::TaskEvidence {
+                    session_id: format!("{}-session", case.label),
+                    task_id: task.id,
+                    evidence: vec![CompletionEvidenceInput {
+                        summary: "Policy matrix evidence".into(),
+                        kind: "test".into(),
+                        reference: Some(case.label.into()),
+                    }],
+                },
+                1_700_000_000_101,
+            ))
+            .await;
+        if case.task_write {
+            assert_eq!(evidence.unwrap(), LocalResult::Empty, "{}", case.label);
+        } else {
+            assert_eq!(
+                evidence.unwrap_err().code,
+                ErrorCode::ScopeDenied,
+                "{}",
+                case.label
+            );
+        }
+
+        let LocalResult::Tasks { tasks } = desktop
+            .call(LocalRequest::TasksList(ProjectParams { project_id }))
+            .await
+            .unwrap()
+        else {
+            panic!("task list must return tasks")
+        };
+        assert_eq!(
+            tasks[0].status,
+            if case.task_write {
+                TaskStatus::Done
+            } else {
+                TaskStatus::InProgress
+            },
+            "{}",
+            case.label
+        );
+        assert_eq!(
+            handle.shutdown().await,
+            context_relay_contextd::DaemonState::Stopped
+        );
+        owner.await.unwrap().unwrap();
+        assert_eq!(
+            config.native_hook_session_count().unwrap(),
+            usize::from(case.lifecycle_read),
+            "{}",
+            case.label
+        );
+    }
+}
+
+#[tokio::test]
+async fn selected_project_unmatched_hook_is_no_op_but_wrong_matched_project_is_denied() {
+    let root = unique_temp_path("selected-unmatched");
+    let selected_root = root.join("selected");
+    let other_root = root.join("other");
+    let unmatched = root.join("unmatched");
+    for path in [&selected_root, &other_root, &unmatched] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let runtime = RuntimeConfig::for_test("native-hook", Some(short_runtime_root())).unwrap();
+    let config = TestDaemonConfig::new(
+        runtime.clone(),
+        root.join("vault.db"),
+        InstallationToken::from_bytes(TOKEN),
+    );
+    let selected = project("018f22e2-79b0-7cc8-98c4-dc0c0c073981", "selected");
+    let other = project("018f22e2-79b0-7cc8-98c4-dc0c0c073982", "other");
+    config
+        .seed_mcp_project(
+            &selected,
+            &selected_root,
+            &[(
+                HarnessId::Codex,
+                HarnessAccessPolicy::SelectedProject {
+                    project_id: selected.project_id,
+                    read_only: false,
+                },
+            )],
+        )
+        .unwrap();
+    config.seed_mcp_project(&other, &other_root, &[]).unwrap();
+    let daemon = config.start().await.unwrap();
+    let handle = daemon.handle();
+    let owner = tokio::spawn(daemon.run());
+    let mut bridge = RawClient::connect(&runtime, ClientRole::McpBridge).await;
+
+    assert_eq!(
+        bridge
+            .call(native_hook(
+                HarnessId::Codex,
+                &unmatched,
+                NativeHookEvent::SessionStart {
+                    session_id: "unmatched-selected".into(),
+                },
+                1_700_000_000_200,
+            ))
+            .await
+            .unwrap(),
+        LocalResult::Empty
+    );
+    assert_eq!(
+        bridge
+            .call(native_hook(
+                HarnessId::Codex,
+                &other_root,
+                NativeHookEvent::SessionStart {
+                    session_id: "wrong-selected".into(),
+                },
+                1_700_000_000_201,
+            ))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::ScopeDenied
+    );
+    assert_eq!(
+        handle.shutdown().await,
+        context_relay_contextd::DaemonState::Stopped
+    );
+    owner.await.unwrap().unwrap();
+    assert_eq!(config.native_hook_session_count().unwrap(), 0);
+}
+
 struct Fixture {
     root: PathBuf,
     runtime: RuntimeConfig,

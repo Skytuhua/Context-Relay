@@ -1043,9 +1043,14 @@ impl Vault {
                      harness, session_id, project_id, started_at_ms, stopped_at_ms, payload_json
                  ) VALUES (?1, ?2, ?3, ?4, ?4, ?5)
                  ON CONFLICT(harness, session_id) DO UPDATE SET
-                     project_id = excluded.project_id,
                      stopped_at_ms = excluded.stopped_at_ms,
-                     payload_json = excluded.payload_json",
+                     payload_json = excluded.payload_json
+                 WHERE native_hook_sessions.project_id = excluded.project_id
+                   AND excluded.stopped_at_ms >= native_hook_sessions.started_at_ms
+                   AND (
+                       native_hook_sessions.stopped_at_ms IS NULL
+                       OR excluded.stopped_at_ms > native_hook_sessions.stopped_at_ms
+                   )",
                 params![
                     harness,
                     session_id,
@@ -1063,7 +1068,11 @@ impl Vault {
                      project_id = excluded.project_id,
                      started_at_ms = excluded.started_at_ms,
                      stopped_at_ms = NULL,
-                     payload_json = excluded.payload_json",
+                     payload_json = excluded.payload_json
+                 WHERE excluded.started_at_ms > COALESCE(
+                     native_hook_sessions.stopped_at_ms,
+                     native_hook_sessions.started_at_ms
+                 )",
                 params![
                     harness,
                     session_id,
