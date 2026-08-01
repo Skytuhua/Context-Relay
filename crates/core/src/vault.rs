@@ -771,11 +771,36 @@ impl Vault {
             .validate_persisted()
             .map_err(|error| VaultError::Validation(error.to_string()))?;
         let (scope_kind, project_id) = scope_columns(&source.scope);
+        let canonical_ledger = to_json(ledger)?;
         let transaction = self.connection.transaction()?;
         if let Some(candidate) = candidate {
             candidate
                 .validate()
                 .map_err(|error| VaultError::Validation(error.to_string()))?;
+            let prior_ledger = transaction
+                .query_row(
+                    "SELECT initial_preview_complete, payload_json
+                     FROM native_memory_sources WHERE source_id = ?1",
+                    [sha256_key(&ledger.source_id.0)],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .optional()?;
+            let expected_change_kind = if prior_ledger
+                .as_ref()
+                .map(|(initial_preview_complete, _)| {
+                    sqlite_bool(
+                        *initial_preview_complete,
+                        "native memory initial-preview flag",
+                    )
+                })
+                .transpose()?
+                .unwrap_or(false)
+            {
+                NativeMemoryChangeKind::LiveEdit
+            } else {
+                NativeMemoryChangeKind::InitialPreview
+            };
+            let canonical_candidate = to_json(candidate)?;
             let existing = transaction
                 .query_row(
                     "SELECT payload_json FROM candidates WHERE id = ?1",
@@ -784,15 +809,23 @@ impl Vault {
                 )
                 .optional()?;
             if let Some(existing) = existing {
-                if existing != to_json(candidate)? {
+                if existing != canonical_candidate {
                     return Err(VaultError::OperationConflict);
                 }
-                validate_native_memory_candidate(source, ledger, candidate)?;
+                let replay_change_kind = if prior_ledger
+                    .as_ref()
+                    .is_some_and(|(_, payload)| payload == &canonical_ledger)
+                {
+                    native_memory_change_kind(candidate)?
+                } else {
+                    expected_change_kind
+                };
+                validate_native_memory_candidate(source, ledger, candidate, replay_change_kind)?;
             } else {
-                validate_native_memory_candidate(source, ledger, candidate)?;
+                validate_native_memory_candidate(source, ledger, candidate, expected_change_kind)?;
                 transaction.execute(
                     "INSERT INTO candidates(id, state, payload_json) VALUES (?1, 'pending', ?2)",
-                    params![candidate.id.to_string(), to_json(candidate)?],
+                    params![candidate.id.to_string(), canonical_candidate],
                 )?;
             }
         }
@@ -824,7 +857,7 @@ impl Vault {
                 optional_sha256_key(ledger.last_imported_digest.as_ref()),
                 optional_sha256_key(ledger.last_applied_digest.as_ref()),
                 i64::from(ledger.initial_preview_complete),
-                to_json(ledger)?,
+                canonical_ledger,
             ],
         )?;
         transaction.commit()?;
@@ -1326,6 +1359,7 @@ fn validate_native_memory_candidate(
     source: &NativeMemorySource,
     ledger: &NativeMemoryLedger,
     candidate: &MemoryCandidate,
+    expected_change_kind: NativeMemoryChangeKind,
 ) -> Result<(), VaultError> {
     let unmanaged_digest = ledger.last_imported_digest.ok_or_else(|| {
         VaultError::Validation("native memory candidate requires an imported digest".to_owned())
@@ -1335,10 +1369,6 @@ fn validate_native_memory_candidate(
     let (expected_candidate_id, expected_memory_id, expected_operation_id) =
         native_memory_identity(source.id, unmanaged_digest)
             .map_err(|error| VaultError::Validation(error.to_string()))?;
-    let expected_evidence = [
-        native_memory_evidence(NativeMemoryChangeKind::InitialPreview),
-        native_memory_evidence(NativeMemoryChangeKind::LiveEdit),
-    ];
     let memory = &candidate.proposed_memory;
     if extracted.managed_body.is_some()
         || extracted.unmanaged_digest != unmanaged_digest
@@ -1355,13 +1385,29 @@ fn validate_native_memory_candidate(
         || memory.provenance.harness != Some(source.harness)
         || memory.provenance.source.is_some()
         || memory.archived
-        || !expected_evidence.contains(&candidate.evidence_summary.as_str())
+        || candidate.evidence_summary != native_memory_evidence(expected_change_kind)
     {
         return Err(VaultError::Validation(
             "native memory candidate does not match its source ledger".to_owned(),
         ));
     }
     Ok(())
+}
+
+fn native_memory_change_kind(
+    candidate: &MemoryCandidate,
+) -> Result<NativeMemoryChangeKind, VaultError> {
+    match candidate.evidence_summary.as_str() {
+        evidence if evidence == native_memory_evidence(NativeMemoryChangeKind::InitialPreview) => {
+            Ok(NativeMemoryChangeKind::InitialPreview)
+        }
+        evidence if evidence == native_memory_evidence(NativeMemoryChangeKind::LiveEdit) => {
+            Ok(NativeMemoryChangeKind::LiveEdit)
+        }
+        _ => Err(VaultError::Validation(
+            "native memory candidate has invalid reconciliation evidence".to_owned(),
+        )),
+    }
 }
 
 fn load_embedding_cache(

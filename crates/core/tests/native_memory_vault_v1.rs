@@ -313,6 +313,81 @@ fn native_candidates_are_deterministic_bound_and_atomically_replayed() {
 }
 
 #[test]
+fn persistence_rejects_evidence_from_the_wrong_reconciliation_phase() {
+    let source = source(ScopeRef::Global, HarnessId::Codex, "phase-evidence");
+    let producer_path = TempVault::new("native-memory-phase-producer");
+    let producer_keys = MemoryKeyStore::default();
+    let mut producer = Vault::open(producer_path.path(), CREDENTIAL, &producer_keys).unwrap();
+    let initial_candidate = OfflineWorkspace::new(&mut producer, ID_7.parse().unwrap())
+        .reconcile_native_memory(ready(source.clone(), "initial candidate"))
+        .unwrap()
+        .unwrap();
+    let ledger = producer.native_memory_ledger(&source.id).unwrap().unwrap();
+    let mut candidate = initial_candidate.clone();
+    candidate.evidence_summary = "native-memory edit".to_owned();
+
+    let target_path = TempVault::new("native-memory-phase-target");
+    let target_keys = MemoryKeyStore::default();
+    let mut target = Vault::open(target_path.path(), CREDENTIAL, &target_keys).unwrap();
+
+    assert!(matches!(
+        target.put_native_memory_candidate(&ledger, Some(&candidate)),
+        Err(VaultError::Validation(_))
+    ));
+    assert_eq!(target.native_memory_ledger(&source.id).unwrap(), None);
+    assert!(target.candidates(None).unwrap().is_empty());
+
+    target
+        .put_native_memory_candidate(&ledger, Some(&initial_candidate))
+        .unwrap();
+    let mut live_candidate = OfflineWorkspace::new(&mut producer, ID_7.parse().unwrap())
+        .reconcile_native_memory(ready(source.clone(), "live candidate"))
+        .unwrap()
+        .unwrap();
+    let live_ledger = producer.native_memory_ledger(&source.id).unwrap().unwrap();
+    live_candidate.evidence_summary = "initial native-memory preview".to_owned();
+
+    assert!(matches!(
+        target.put_native_memory_candidate(&live_ledger, Some(&live_candidate)),
+        Err(VaultError::Validation(_))
+    ));
+    assert_eq!(
+        target.native_memory_ledger(&source.id).unwrap(),
+        Some(ledger)
+    );
+    assert_eq!(target.candidates(None).unwrap(), vec![initial_candidate]);
+}
+
+#[test]
+fn direct_candidate_persistence_replay_is_idempotent() {
+    let source = source(ScopeRef::Global, HarnessId::Hermes, "direct-replay");
+    let producer_path = TempVault::new("native-memory-replay-producer");
+    let producer_keys = MemoryKeyStore::default();
+    let mut producer = Vault::open(producer_path.path(), CREDENTIAL, &producer_keys).unwrap();
+    let candidate = OfflineWorkspace::new(&mut producer, ID_7.parse().unwrap())
+        .reconcile_native_memory(ready(source.clone(), "candidate replay"))
+        .unwrap()
+        .unwrap();
+    let ledger = producer.native_memory_ledger(&source.id).unwrap().unwrap();
+
+    let target_path = TempVault::new("native-memory-replay-target");
+    let target_keys = MemoryKeyStore::default();
+    let mut target = Vault::open(target_path.path(), CREDENTIAL, &target_keys).unwrap();
+    target
+        .put_native_memory_candidate(&ledger, Some(&candidate))
+        .unwrap();
+    target
+        .put_native_memory_candidate(&ledger, Some(&candidate))
+        .unwrap();
+
+    assert_eq!(target.candidates(None).unwrap(), vec![candidate]);
+    assert_eq!(
+        target.native_memory_ledger(&source.id).unwrap(),
+        Some(ledger)
+    );
+}
+
+#[test]
 fn candidate_conflict_rolls_back_the_ledger_advance() {
     let source = source(ScopeRef::Global, HarnessId::Codex, "rollback");
     let path = TempVault::new("native-memory-candidate-conflict");
