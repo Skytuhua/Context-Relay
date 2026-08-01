@@ -10,6 +10,7 @@ use context_relay_core::{
         CodexAdapter, CodexCommandRunner, CodexExecutableKind, CodexLayout, VerifiedCodexCommand,
     },
     mcp::install::bridge_component,
+    native_memory::{PRIMARY_MEMORY_INSTRUCTIONS, primary_memory_instruction_component},
     native_transaction::{
         approval_hash_v1,
         cli::NativeCliExecutor,
@@ -1835,6 +1836,73 @@ fn managed_markdown_preserves_unmanaged_bytes_and_rejects_malformed_markers() {
         fs::write(&path, malformed).unwrap();
         assert!(fixture.adapter.plan_native_markdown(&component).is_err());
     }
+}
+
+#[test]
+fn primary_memory_codex_markdown_handles_crlf_replacement_archive_and_absence() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
+    let mut managed = primary_memory_instruction_component(
+        HarnessId::Codex,
+        fixture.project_id,
+        device_id,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+    )
+    .unwrap();
+    let path = fixture.layout.project_root.join("AGENTS.md");
+    fs::write(
+        &path,
+        b"user prefix\r\n<!-- context-relay:start -->\r\nold\r\n<!-- context-relay:end -->\r\nuser suffix\r\n",
+    )
+    .unwrap();
+
+    let mutation = fixture.adapter.plan_native_markdown(&managed).unwrap();
+    let NativeState::RegularFile { bytes, .. } = NativeState::decode_v1(&mutation.content).unwrap()
+    else {
+        panic!("primary instructions remain a regular file")
+    };
+    let expected = format!(
+        "user prefix\r\n<!-- context-relay:start -->\r\n{}<!-- context-relay:end -->\r\nuser suffix\r\n",
+        PRIMARY_MEMORY_INSTRUCTIONS.replace('\n', "\r\n")
+    );
+    assert_eq!(bytes, expected.as_bytes());
+
+    fs::write(&path, &bytes).unwrap();
+    let reapplied = fixture.adapter.plan_native_markdown(&managed).unwrap();
+    let NativeState::RegularFile {
+        bytes: reapplied, ..
+    } = NativeState::decode_v1(&reapplied.content).unwrap()
+    else {
+        panic!("reapplied primary instructions remain a regular file")
+    };
+    assert_eq!(reapplied, bytes);
+
+    managed.archived = true;
+    let archived = fixture.adapter.plan_native_markdown(&managed).unwrap();
+    let NativeState::RegularFile {
+        bytes: archived, ..
+    } = NativeState::decode_v1(&archived.content).unwrap()
+    else {
+        panic!("archiving preserves the unmanaged file")
+    };
+    assert_eq!(archived, b"user prefix\r\nuser suffix\r\n");
+
+    fs::remove_file(&path).unwrap();
+    managed.archived = false;
+    let created = fixture.adapter.plan_native_markdown(&managed).unwrap();
+    let NativeState::RegularFile { bytes: created, .. } =
+        NativeState::decode_v1(&created.content).unwrap()
+    else {
+        panic!("absent primary instruction is created from a metadata template")
+    };
+    assert!(
+        String::from_utf8(created)
+            .unwrap()
+            .contains(PRIMARY_MEMORY_INSTRUCTIONS)
+    );
+
+    fs::write(&path, "<!-- context-relay:start -->\nmissing end\n").unwrap();
+    assert!(fixture.adapter.plan_native_markdown(&managed).is_err());
 }
 
 #[test]

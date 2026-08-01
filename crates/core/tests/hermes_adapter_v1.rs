@@ -8,6 +8,7 @@ use std::{
 use context_relay_core::{
     hermes::{HermesAdapter, HermesExecutableKind, HermesLayout, HermesMemoryKind, HermesProfile},
     mcp::install::bridge_component,
+    native_memory::{PRIMARY_MEMORY_INSTRUCTIONS, primary_memory_instruction_component},
     native_transaction::{
         approval_hash_v1,
         engine::{
@@ -829,6 +830,70 @@ fn managed_markdown_and_memory_preserve_unmanaged_bytes() {
         let error = fixture.adapter.plan_native_markdown(&soul).unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidRequest);
     }
+}
+
+#[test]
+fn primary_memory_hermes_markdown_handles_crlf_replacement_archive_and_absence() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
+    let mut managed = primary_memory_instruction_component(
+        HarnessId::Hermes,
+        fixture.project_id,
+        device_id,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+    )
+    .unwrap();
+    let path = fixture.layout.project_root.join(".hermes.md");
+    fs::write(
+        &path,
+        b"user prefix\r\n<!-- context-relay:start -->\r\nold\r\n<!-- context-relay:end -->\r\nuser suffix\r\n",
+    )
+    .unwrap();
+
+    let mutation = fixture
+        .adapter
+        .plan_native_markdown(&managed)
+        .unwrap()
+        .unwrap();
+    let expected = format!(
+        "user prefix\r\n<!-- context-relay:start -->\r\n{}<!-- context-relay:end -->\r\nuser suffix\r\n",
+        PRIMARY_MEMORY_INSTRUCTIONS.replace('\n', "\r\n")
+    );
+    assert_eq!(intended_bytes(&mutation), expected.as_bytes());
+
+    fs::write(&path, expected.as_bytes()).unwrap();
+    assert!(
+        fixture
+            .adapter
+            .plan_native_markdown(&managed)
+            .unwrap()
+            .is_none()
+    );
+
+    managed.archived = true;
+    let archived = fixture
+        .adapter
+        .plan_native_markdown(&managed)
+        .unwrap()
+        .unwrap();
+    assert_eq!(intended_bytes(&archived), b"user prefix\r\nuser suffix\r\n");
+
+    fs::remove_file(&path).unwrap();
+    managed.archived = false;
+    let created = fixture
+        .adapter
+        .plan_native_markdown(&managed)
+        .unwrap()
+        .unwrap();
+    assert!(
+        String::from_utf8(intended_bytes(&created))
+            .unwrap()
+            .contains(PRIMARY_MEMORY_INSTRUCTIONS)
+    );
+
+    fs::write(&path, "<!-- context-relay:start -->\nmissing end\n").unwrap();
+    assert!(fixture.adapter.plan_native_markdown(&managed).is_err());
 }
 
 #[test]

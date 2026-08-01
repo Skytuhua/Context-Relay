@@ -1,9 +1,12 @@
 mod debounce;
+mod instruction;
 mod markdown;
 mod model;
 mod reconcile;
 
 pub use debounce::{DebounceState, StableObservation, acknowledge, observe};
+pub(crate) use instruction::is_primary_memory_instruction_component;
+pub use instruction::{PRIMARY_MEMORY_INSTRUCTIONS, primary_memory_instruction_component};
 pub use markdown::{ManagedMarkdown, extract_managed_markdown};
 pub use model::{
     NativeMemoryDocumentKind, NativeMemoryError, NativeMemoryLedger, NativeMemoryLimits,

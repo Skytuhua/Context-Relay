@@ -31,6 +31,7 @@ use toml_edit::{DocumentMut, Item, Value as TomlValue};
 use crate::mcp::install::{
     BRIDGE_SERVER_NAME, is_canonical_bridge_body, is_managed_bridge_component,
 };
+use crate::native_memory::is_primary_memory_instruction_component;
 use crate::native_transaction::{
     cli::{CliMutationOutcome, CliRestoreOutcome, NativeCliExecutor},
     engine::{BoundaryError, FrozenOutput, NativeAdapter, RestrictedRun},
@@ -717,17 +718,43 @@ impl CodexAdapter {
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid("Codex Markdown cannot be safely inspected"))?;
-        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
-            return Err(invalid("Codex Markdown must already exist"));
-        };
-        self.approved_file(
-            &path,
-            snapshot.fingerprint(),
-            NativeState::regular_file(
+        let intended = match snapshot.state() {
+            NativeState::RegularFile { bytes, metadata } => NativeState::regular_file(
                 render_managed_markdown(bytes, &component.body_markdown, component.archived)?,
                 metadata.clone(),
             ),
-        )
+            NativeState::Absent { .. }
+                if is_primary_memory_instruction_component(HarnessId::Codex, component) =>
+            {
+                if component.archived {
+                    snapshot.state().clone()
+                } else {
+                    let template_path = self.layout.project_root.join(".codex/config.toml");
+                    self.validate_project_path(&template_path)?;
+                    let template =
+                        OsNativeFileSystem::new()
+                            .snapshot(&template_path)
+                            .map_err(|_| {
+                                invalid(
+                                    "Codex primary instruction metadata template is unavailable",
+                                )
+                            })?;
+                    let NativeState::RegularFile { metadata, .. } = template.state() else {
+                        return Err(invalid(
+                            "Codex primary instruction needs an existing metadata template",
+                        ));
+                    };
+                    NativeState::regular_file(
+                        render_managed_markdown(&[], &component.body_markdown, component.archived)?,
+                        metadata.clone(),
+                    )
+                }
+            }
+            NativeState::Absent { .. } => {
+                return Err(invalid("Codex Markdown must already exist"));
+            }
+        };
+        self.approved_file(&path, snapshot.fingerprint(), intended)
     }
 
     pub fn plan_native_hooks_json(
@@ -2888,33 +2915,45 @@ fn render_managed_markdown(
     }
     let starts = existing.match_indices(MANAGED_START).collect::<Vec<_>>();
     let ends = existing.match_indices(MANAGED_END).collect::<Vec<_>>();
+    let newline = if existing.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let normalized_body = body
+        .replace("\r\n", "\n")
+        .trim_end_matches('\n')
+        .replace('\n', newline);
     let rendered = match (starts.as_slice(), ends.as_slice()) {
         ([], []) if !archived => {
             let mut output = existing.to_owned();
-            if !output.is_empty() && !output.ends_with('\n') {
-                output.push('\n');
+            if !output.is_empty() && !output.ends_with(newline) {
+                output.push_str(newline);
             }
             output.push_str(MANAGED_START);
-            output.push('\n');
-            output.push_str(body);
-            if !body.ends_with('\n') {
-                output.push('\n');
-            }
+            output.push_str(newline);
+            output.push_str(&normalized_body);
+            output.push_str(newline);
             output.push_str(MANAGED_END);
-            output.push('\n');
+            output.push_str(newline);
             output
         }
         ([(start, _)], [(end, _)]) if start < end => {
-            let suffix = end + MANAGED_END.len();
+            let marker_end = end + MANAGED_END.len();
+            let suffix = if existing[marker_end..].starts_with("\r\n") {
+                marker_end + 2
+            } else if existing[marker_end..].starts_with('\n') {
+                marker_end + 1
+            } else {
+                marker_end
+            };
             if archived {
                 format!("{}{}", &existing[..*start], &existing[suffix..])
             } else {
                 let mut output = existing[..start + MANAGED_START.len()].to_owned();
-                output.push('\n');
-                output.push_str(body);
-                if !body.ends_with('\n') {
-                    output.push('\n');
-                }
+                output.push_str(newline);
+                output.push_str(&normalized_body);
+                output.push_str(newline);
                 output.push_str(&existing[*end..]);
                 output
             }

@@ -12,6 +12,7 @@ use context_relay_core::{
         ClaudeCodeAdapter, ClaudeCodeCommandRunner, ClaudeCodeLayout, VerifiedClaudeCommand,
     },
     mcp::install::bridge_component,
+    native_memory::{PRIMARY_MEMORY_INSTRUCTIONS, primary_memory_instruction_component},
     native_transaction::{
         NativeTransactionPlan,
         cli::NativeCliExecutor,
@@ -410,6 +411,109 @@ fn managed_markdown_plan_rejects_malformed_markers_and_concurrent_edits() {
             .create_before_images(&[mutation])
             .is_err()
     );
+}
+
+#[test]
+fn primary_memory_semantic_contract_is_shared_byte_for_byte() {
+    let project_id = ProjectId::from_str(PROJECT_ID).unwrap();
+    let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
+    let clock = HybridLogicalClock::new(1_900_000_000_000, 0, device_id);
+    let components = [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Hermes].map(|harness| {
+        primary_memory_instruction_component(harness, project_id, device_id, clock).unwrap()
+    });
+    let expected = "## Context Relay memory\n\n\
+- At the start of every session, query Context Relay with `context_relay_search` for the active project before relying on recalled context.\n\
+- Treat Context Relay results as the primary memory for decisions, project knowledge, and ongoing work. Native harness memory is only an import and recovery surface.\n\
+- Save explicit user or project decisions with `context_relay_remember`.\n\
+- Submit inferred knowledge with `context_relay_propose_memory` so it enters review instead of becoming authoritative immediately.\n\
+- Keep the shared task ledger current with `context_relay_list_tasks`, `context_relay_upsert_task`, and `context_relay_complete_task`.\n";
+
+    assert_eq!(PRIMARY_MEMORY_INSTRUCTIONS, expected);
+    assert!(components.iter().all(|component| {
+        component.kind == ComponentKind::Instruction
+            && component.scope == ScopeRef::Project { project_id }
+            && component.body_markdown.as_bytes() == expected.as_bytes()
+    }));
+    assert_eq!(components[0].name, "CLAUDE.md");
+    assert_eq!(components[1].name, "AGENTS.md");
+    assert_eq!(components[2].name, ".hermes.md");
+
+    let other_project = ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073999").unwrap();
+    let other = primary_memory_instruction_component(
+        HarnessId::ClaudeCode,
+        other_project,
+        device_id,
+        clock,
+    )
+    .unwrap();
+    assert_ne!(components[0].id, other.id);
+}
+
+#[test]
+fn primary_memory_claude_markdown_handles_crlf_replacement_archive_and_absence() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
+    let mut managed = primary_memory_instruction_component(
+        HarnessId::ClaudeCode,
+        fixture.project_id,
+        device_id,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+    )
+    .unwrap();
+    let path = fixture.root.join("project with spaces/CLAUDE.md");
+    fs::write(
+        &path,
+        b"user prefix\r\n<!-- context-relay:start -->\r\nold\r\n<!-- context-relay:end -->\r\nuser suffix\r\n",
+    )
+    .unwrap();
+
+    let mutation = fixture.adapter.plan_native_file(&managed).unwrap();
+    let NativeState::RegularFile { bytes, .. } = NativeState::decode_v1(&mutation.content).unwrap()
+    else {
+        panic!("primary instructions remain a regular file")
+    };
+    let expected = format!(
+        "user prefix\r\n<!-- context-relay:start -->\r\n{}<!-- context-relay:end -->\r\nuser suffix\r\n",
+        PRIMARY_MEMORY_INSTRUCTIONS.replace('\n', "\r\n")
+    );
+    assert_eq!(bytes, expected.as_bytes());
+
+    fs::write(&path, &bytes).unwrap();
+    let reapplied = fixture.adapter.plan_native_file(&managed).unwrap();
+    let NativeState::RegularFile {
+        bytes: reapplied, ..
+    } = NativeState::decode_v1(&reapplied.content).unwrap()
+    else {
+        panic!("reapplied primary instructions remain a regular file")
+    };
+    assert_eq!(reapplied, bytes);
+
+    managed.archived = true;
+    let archived = fixture.adapter.plan_native_file(&managed).unwrap();
+    let NativeState::RegularFile {
+        bytes: archived, ..
+    } = NativeState::decode_v1(&archived.content).unwrap()
+    else {
+        panic!("archiving preserves the unmanaged file")
+    };
+    assert_eq!(archived, b"user prefix\r\nuser suffix\r\n");
+
+    fs::remove_file(&path).unwrap();
+    managed.archived = false;
+    let created = fixture.adapter.plan_native_file(&managed).unwrap();
+    let NativeState::RegularFile { bytes: created, .. } =
+        NativeState::decode_v1(&created.content).unwrap()
+    else {
+        panic!("absent primary instruction is created from a metadata template")
+    };
+    assert!(
+        String::from_utf8(created)
+            .unwrap()
+            .contains(PRIMARY_MEMORY_INSTRUCTIONS)
+    );
+
+    fs::write(&path, "<!-- context-relay:start -->\nmissing end\n").unwrap();
+    assert!(fixture.adapter.plan_native_file(&managed).is_err());
 }
 
 #[test]

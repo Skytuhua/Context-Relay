@@ -16,6 +16,7 @@ use sha2::{Digest as _, Sha256};
 use crate::mcp::install::{
     BRIDGE_SERVER_NAME, is_canonical_bridge_body, is_managed_bridge_component,
 };
+use crate::native_memory::is_primary_memory_instruction_component;
 use crate::native_transaction::model::{
     ApprovedMutation, MutationKind, RestorableStateFingerprint,
 };
@@ -69,12 +70,35 @@ impl HermesAdapter {
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid("Hermes Markdown cannot be safely inspected"))?;
-        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
-            return Err(invalid("Hermes Markdown must be a regular file"));
+        let (bytes, metadata) = match snapshot.state() {
+            NativeState::RegularFile { bytes, metadata } => (bytes.as_slice(), metadata.clone()),
+            NativeState::Absent { .. }
+                if is_primary_memory_instruction_component(HarnessId::Hermes, component) =>
+            {
+                if component.archived {
+                    return Ok(None);
+                }
+                let template_path = self.layout.profile.hermes_home.join("config.yaml");
+                let template =
+                    OsNativeFileSystem::new()
+                        .snapshot(&template_path)
+                        .map_err(|_| {
+                            invalid("Hermes primary instruction metadata template is unavailable")
+                        })?;
+                let NativeState::RegularFile { metadata, .. } = template.state() else {
+                    return Err(invalid(
+                        "Hermes primary instruction needs an existing metadata template",
+                    ));
+                };
+                (&[][..], metadata.clone())
+            }
+            NativeState::Absent { .. } => {
+                return Err(invalid("Hermes Markdown must be a regular file"));
+            }
         };
         let rendered =
             render_managed_markdown(bytes, &component.body_markdown, component.archived)?;
-        self.approved_regular_file(&path, &snapshot, rendered, metadata.clone())
+        self.approved_regular_file(&path, &snapshot, rendered, metadata)
     }
 
     pub fn plan_native_memory(
@@ -340,7 +364,9 @@ impl HermesAdapter {
         component
             .validate()
             .map_err(|_| invalid("Hermes component is invalid"))?;
-        if !is_managed_bridge_component(HarnessId::Hermes, component) {
+        if !is_managed_bridge_component(HarnessId::Hermes, component)
+            && !is_primary_memory_instruction_component(HarnessId::Hermes, component)
+        {
             if component.provenance.harness != Some(HarnessId::Hermes) {
                 return Err(invalid("Hermes component provenance is invalid"));
             }
