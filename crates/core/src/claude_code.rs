@@ -1000,11 +1000,22 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
     fn native_memory_capabilities(&self) -> Result<NativeMemoryCapabilities, ClientError> {
         let path = self.project_settings_path();
         let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str());
-        let snapshot = OsNativeFileSystem::new().snapshot(&path).map_err(|_| {
-            invalid_request("Claude Code memory settings cannot be safely inspected")
-        })?;
-        let (project_settings, metadata) = match snapshot.state() {
-            NativeState::RegularFile { bytes, metadata } => {
+        let snapshot = match OsNativeFileSystem::new().snapshot(&path) {
+            Ok(snapshot) => Some(snapshot),
+            Err(context_relay_native_runner::RunnerError::Io)
+                if safely_missing_project_settings(&self.layout.project_root, &path) =>
+            {
+                None
+            }
+            Err(_) => {
+                return Err(invalid_request(
+                    "Claude Code memory settings cannot be safely inspected",
+                ));
+            }
+        };
+        let (project_settings, metadata) = match snapshot.as_ref().map(|snapshot| snapshot.state())
+        {
+            Some(NativeState::RegularFile { bytes, metadata }) => {
                 let settings = match parse_object(bytes, "Claude Code settings are invalid") {
                     Ok(settings) => settings,
                     Err(_) => {
@@ -1016,7 +1027,7 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
                 };
                 (Some(settings), Some(metadata.clone()))
             }
-            NativeState::Absent { .. } => (None, None),
+            Some(NativeState::Absent { .. }) | None => (None, None),
         };
         let (effective_settings, managed) =
             match self.effective_native_memory_settings(project_settings.as_ref()) {
@@ -1044,8 +1055,10 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
             capabilities.validate()?;
             return Ok(capabilities);
         }
-        let (mut settings, metadata) = match (project_settings, metadata) {
-            (Some(settings), Some(metadata)) => (settings, metadata),
+        let (mut settings, metadata, expected) = match (project_settings, metadata, snapshot) {
+            (Some(settings), Some(metadata), Some(snapshot)) => {
+                (settings, metadata, *snapshot.fingerprint())
+            }
             _ => {
                 return Ok(NativeMemoryCapabilities {
                     disable: NativeMemoryDisable::Unavailable,
@@ -1067,7 +1080,7 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
                     content: intended.encode_v1().map_err(|_| {
                         invalid_request("Claude Code memory settings are not representable")
                     })?,
-                    expected: RestorableStateFingerprint(Sha256Digest(*snapshot.fingerprint())),
+                    expected: RestorableStateFingerprint(Sha256Digest(expected)),
                     intended: RestorableStateFingerprint(Sha256Digest(intended.fingerprint())),
                 }]
             }
@@ -1249,6 +1262,41 @@ impl ClaudeCodeAdapter {
             effective.insert("autoMemoryDirectory".to_owned(), directory);
         }
         Ok((effective, managed))
+    }
+}
+
+fn safely_missing_project_settings(project_root: &Path, settings_path: &Path) -> bool {
+    let expected_parent = project_root.join(".claude");
+    if settings_path.parent() != Some(expected_parent.as_path())
+        || settings_path
+            .file_name()
+            .is_none_or(|name| name != "settings.json")
+    {
+        return false;
+    }
+    let Ok(project_metadata) = fs::symlink_metadata(project_root) else {
+        return false;
+    };
+    if project_metadata.file_type().is_symlink() || !project_metadata.is_dir() {
+        return false;
+    }
+    let Ok(canonical_project) = fs::canonicalize(project_root) else {
+        return false;
+    };
+    if canonical_project != project_root {
+        return false;
+    }
+    match fs::symlink_metadata(&expected_parent) {
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        Ok(parent_metadata)
+            if parent_metadata.is_dir() && !parent_metadata.file_type().is_symlink() =>
+        {
+            matches!(
+                fs::symlink_metadata(settings_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        }
+        Ok(_) => false,
     }
 }
 

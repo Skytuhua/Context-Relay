@@ -755,6 +755,52 @@ fn native_memory_claude_absent_project_settings_watches_the_frozen_default_witho
 }
 
 #[test]
+fn native_memory_claude_absent_project_settings_parent_watches_without_creating_it() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let settings_path = fixture.adapter.project_settings_path();
+    let settings_parent = settings_path.parent().unwrap();
+    fs::remove_dir_all(settings_parent).unwrap();
+    let project_root = fixture.root.join("project with spaces");
+    let project_key = project_root
+        .to_string_lossy()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let memory_root = fixture
+        .root
+        .join("custom claude config/projects")
+        .join(project_key)
+        .join("memory");
+    fs::create_dir_all(&memory_root).unwrap();
+    fs::write(memory_root.join("topic.md"), "# Topic\n").unwrap();
+
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert!(matches!(
+        capabilities.disable,
+        NativeMemoryDisable::WatchOnly
+    ));
+    assert_eq!(
+        capabilities
+            .sources
+            .iter()
+            .map(|source| source.path.display.clone().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            memory_root.join("MEMORY.md").display().to_string(),
+            memory_root.join("topic.md").display().to_string(),
+        ]
+    );
+    assert!(!settings_parent.exists());
+    assert!(!settings_path.exists());
+}
+
+#[test]
 fn native_memory_claude_managed_directory_is_the_only_effective_watch_binding() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let managed_root = fixture.root.join("managed memory directory");
