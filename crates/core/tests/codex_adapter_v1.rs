@@ -530,6 +530,161 @@ fn memory_hooks_reject_a_managed_identity_with_user_controlled_argv() {
 }
 
 #[test]
+fn memory_hooks_archive_preserves_user_state_in_planning_render_and_rollback() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let bridge = fixture.root.join("context-relay-context-mcp");
+    fs::write(&bridge, b"fixture bridge executable").unwrap();
+    let mut managed = managed_memory_hooks(HarnessId::Codex, &test_wire_path(&bridge))
+        .unwrap()
+        .remove(0);
+    let managed_hooks: Value = serde_json::from_str(&managed.body_markdown).unwrap();
+    let path = fixture.codex_home.join("hooks.json");
+    let mut prior: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    prior["hooks"]["FutureEvent"] = serde_json::json!([{
+        "matcher": "user",
+        "hooks": [],
+        "unknown": {"keep": true}
+    }]);
+    for (event, entries) in managed_hooks.as_object().unwrap() {
+        prior["hooks"][event] = entries.clone();
+    }
+    let user_stop = serde_json::json!({
+        "matcher": "user-stop",
+        "hooks": [{"type": "command", "command": "user-stop-command"}]
+    });
+    prior["hooks"]["Stop"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, user_stop.clone());
+    let mut before = serde_json::to_vec(&prior).unwrap();
+    before.push(b'\n');
+    fs::write(&path, &before).unwrap();
+
+    managed.archived = true;
+    let desired = DesiredState {
+        components: vec![managed],
+        scopes: vec![NativeScope::Global],
+    };
+    let mutation = fixture
+        .adapter
+        .plan_native_hooks_json(&desired.components[0])
+        .unwrap();
+    let NativeState::RegularFile { bytes, .. } = NativeState::decode_v1(&mutation.content).unwrap()
+    else {
+        panic!("Codex hooks remain a regular file")
+    };
+    let rendered: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(rendered["description"], prior["description"]);
+    assert_eq!(rendered["unknown"], prior["unknown"]);
+    assert_eq!(
+        rendered["hooks"]["PreToolUse"],
+        prior["hooks"]["PreToolUse"]
+    );
+    assert_eq!(
+        rendered["hooks"]["FutureEvent"],
+        prior["hooks"]["FutureEvent"]
+    );
+    assert_eq!(rendered["hooks"]["Stop"], Value::Array(vec![user_stop]));
+    assert!(rendered["hooks"].get("SessionStart").is_none());
+    let preview = fixture.adapter.render(&desired).unwrap();
+    assert_eq!(preview.files.len(), 1);
+    assert_eq!(preview.files[0].bytes_sha256, test_digest(&bytes));
+    assert_eq!(preview.files[0].byte_length, bytes.len() as u64);
+
+    let nonce = [44; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native
+        .create_before_images(std::slice::from_ref(&mutation))
+        .unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native
+        .compare_and_swap_targets(std::slice::from_ref(&mutation))
+        .unwrap();
+    native.apply_mutation(&nonce, &mutation).unwrap();
+    let reapplied = fixture
+        .adapter
+        .plan_native_hooks_json(&desired.components[0])
+        .unwrap();
+    let NativeState::RegularFile {
+        bytes: reapplied_bytes,
+        ..
+    } = NativeState::decode_v1(&reapplied.content).unwrap()
+    else {
+        panic!("Codex hooks remain a regular file")
+    };
+    assert_eq!(reapplied_bytes, bytes);
+    assert_eq!(
+        fixture.adapter.render(&desired).unwrap().files[0].bytes_sha256,
+        test_digest(&bytes)
+    );
+    native.restore_matching_applied_targets(&nonce).unwrap();
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn memory_hooks_rotate_executable_in_planning_and_render_without_removing_user_lookalikes() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let old_bridge = fixture.root.join("old bridge");
+    let new_bridge = fixture.root.join("new bridge");
+    fs::write(&old_bridge, b"old bridge executable").unwrap();
+    fs::write(&new_bridge, b"new bridge executable").unwrap();
+    let old = managed_memory_hooks(HarnessId::Codex, &test_wire_path(&old_bridge))
+        .unwrap()
+        .remove(0);
+    let new = managed_memory_hooks(HarnessId::Codex, &test_wire_path(&new_bridge))
+        .unwrap()
+        .remove(0);
+    let old_hooks: Value = serde_json::from_str(&old.body_markdown).unwrap();
+    let new_hooks: Value = serde_json::from_str(&new.body_markdown).unwrap();
+    let old_entry = old_hooks["SessionStart"][0].clone();
+    let mut schema_lookalike = old_entry.clone();
+    schema_lookalike["matcher"] = Value::String("user-owned".into());
+    let mut argv_lookalike = old_entry.clone();
+    let command = argv_lookalike["hooks"][0]["command"].as_str().unwrap();
+    argv_lookalike["hooks"][0]["command"] = Value::String(format!("{command} --user-owned"));
+    let path = fixture.codex_home.join("hooks.json");
+    let mut prior: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for (event, entries) in old_hooks.as_object().unwrap() {
+        prior["hooks"][event] = entries.clone();
+    }
+    prior["hooks"]["SessionStart"] = Value::Array(vec![
+        old_entry.clone(),
+        schema_lookalike.clone(),
+        old_entry,
+        argv_lookalike.clone(),
+    ]);
+    prior["hooks"]["FutureEvent"] = serde_json::json!([]);
+    fs::write(&path, serde_json::to_vec(&prior).unwrap()).unwrap();
+
+    let mutation = fixture.adapter.plan_native_hooks_json(&new).unwrap();
+    let NativeState::RegularFile { bytes, .. } = NativeState::decode_v1(&mutation.content).unwrap()
+    else {
+        panic!("Codex hooks remain a regular file")
+    };
+    let rendered: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        rendered["hooks"]["SessionStart"],
+        Value::Array(vec![
+            schema_lookalike,
+            argv_lookalike,
+            new_hooks["SessionStart"][0].clone(),
+        ])
+    );
+    assert_eq!(rendered["hooks"]["Stop"], new_hooks["Stop"]);
+    assert_eq!(rendered["hooks"]["FutureEvent"], serde_json::json!([]));
+    let preview = fixture
+        .adapter
+        .render(&DesiredState {
+            components: vec![new],
+            scopes: vec![NativeScope::Global],
+        })
+        .unwrap();
+    assert_eq!(preview.files.len(), 1);
+    assert_eq!(preview.files[0].bytes_sha256, test_digest(&bytes));
+    assert_eq!(preview.files[0].byte_length, bytes.len() as u64);
+}
+
+#[test]
 fn native_memory_capability_matrix_is_exact_for_frozen_codex_releases() {
     for source in [
         include_str!("fixtures/codex-0.144.1.json"),

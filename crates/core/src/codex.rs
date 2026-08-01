@@ -824,15 +824,17 @@ impl CodexAdapter {
             return Err(invalid("Codex hooks must be a regular file"));
         };
         let mut object = parse_object(existing, "Codex hooks are invalid")?;
-        if component.archived {
+        if has_managed_memory_hook_identity(HarnessId::Codex, component) {
+            if object.get("hooks").is_some() || !component.archived {
+                let hooks =
+                    merge_managed_memory_hooks(HarnessId::Codex, object.get("hooks"), component)?;
+                object.insert("hooks".into(), hooks);
+            }
+        } else if component.archived {
             object.remove("hooks");
         } else {
-            let hooks = if has_managed_memory_hook_identity(HarnessId::Codex, component) {
-                merge_managed_memory_hooks(HarnessId::Codex, object.get("hooks"), component)?
-            } else {
-                serde_json::from_str(&component.body_markdown)
-                    .map_err(|_| invalid("Codex hooks component is invalid"))?
-            };
+            let hooks = serde_json::from_str(&component.body_markdown)
+                .map_err(|_| invalid("Codex hooks component is invalid"))?;
             object.insert("hooks".into(), hooks);
         }
         let bytes = serde_json::to_vec(&Value::Object(object))
@@ -2018,15 +2020,20 @@ impl HarnessAdapter for CodexAdapter {
         for (path, component) in hook_components {
             let existing = read_required_regular(&path, "Codex hooks must already exist")?;
             let mut object = parse_object(&existing, "Codex hooks are invalid")?;
-            if component.archived {
+            if has_managed_memory_hook_identity(HarnessId::Codex, component) {
+                if object.get("hooks").is_some() || !component.archived {
+                    let hooks = merge_managed_memory_hooks(
+                        HarnessId::Codex,
+                        object.get("hooks"),
+                        component,
+                    )?;
+                    object.insert("hooks".into(), hooks);
+                }
+            } else if component.archived {
                 object.remove("hooks");
             } else {
-                let hooks = if has_managed_memory_hook_identity(HarnessId::Codex, component) {
-                    merge_managed_memory_hooks(HarnessId::Codex, object.get("hooks"), component)?
-                } else {
-                    serde_json::from_str(&component.body_markdown)
-                        .map_err(|_| invalid("Codex hooks component is invalid"))?
-                };
+                let hooks = serde_json::from_str(&component.body_markdown)
+                    .map_err(|_| invalid("Codex hooks component is invalid"))?;
                 object.insert("hooks".into(), hooks);
             }
             let bytes = serde_json::to_vec(&Value::Object(object))

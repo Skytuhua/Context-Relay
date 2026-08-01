@@ -29,11 +29,7 @@ pub fn managed_memory_hooks(
         return Ok(Vec::new());
     }
     let executable = literal_executable(bridge_executable)?;
-    let events = match harness {
-        HarnessId::ClaudeCode => CLAUDE_EVENTS.as_slice(),
-        HarnessId::Codex => CODEX_EVENTS.as_slice(),
-        HarnessId::Hermes => unreachable!("Hermes has no frozen lifecycle hooks"),
-    };
+    let events = managed_events(harness);
     let harness_name = harness_cli_name(harness);
     let mut hooks = serde_json::Map::new();
     for (native_event, hook_event) in events {
@@ -114,11 +110,10 @@ pub(crate) fn has_managed_memory_hook_identity(
 }
 
 fn valid_managed_hook_body(harness: HarnessId, body: &str) -> bool {
-    let events = match harness {
-        HarnessId::ClaudeCode => CLAUDE_EVENTS.as_slice(),
-        HarnessId::Codex => CODEX_EVENTS.as_slice(),
-        HarnessId::Hermes => return false,
-    };
+    if harness == HarnessId::Hermes {
+        return false;
+    }
+    let events = managed_events(harness);
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return false;
     };
@@ -131,38 +126,48 @@ fn valid_managed_hook_body(harness: HarnessId, body: &str) -> bool {
     else {
         return false;
     };
-    events.iter().all(|(native_event, hook_event)| {
+    events.iter().all(|(native_event, _)| {
         let Some(entries) = object.get(*native_event).and_then(Value::as_array) else {
             return false;
         };
         let [entry] = entries.as_slice() else {
             return false;
         };
-        let Some(entry) = entry.as_object().filter(|entry| entry.len() == 1) else {
-            return false;
-        };
-        let Some(hooks) = entry.get("hooks").and_then(Value::as_array) else {
-            return false;
-        };
-        let [hook] = hooks.as_slice() else {
-            return false;
-        };
-        let Some(hook) = hook.as_object().filter(|hook| hook.len() == 2) else {
-            return false;
-        };
-        let Some(command) = hook.get("command").and_then(Value::as_str) else {
-            return false;
-        };
-        let suffix = format!(
-            " --hook-event {hook_event} --harness {}",
-            harness_cli_name(harness)
-        );
-        hook.get("type").and_then(Value::as_str) == Some("command")
-            && !command.contains(['\n', '\r'])
-            && command
-                .strip_suffix(&suffix)
-                .is_some_and(canonical_literal_executable)
+        is_managed_hook_entry(harness, native_event, entry)
     })
+}
+
+fn is_managed_hook_entry(harness: HarnessId, native_event: &str, entry: &Value) -> bool {
+    let Some((_, hook_event)) = managed_events(harness)
+        .iter()
+        .find(|(candidate, _)| *candidate == native_event)
+    else {
+        return false;
+    };
+    let Some(entry) = entry.as_object().filter(|entry| entry.len() == 1) else {
+        return false;
+    };
+    let Some(hooks) = entry.get("hooks").and_then(Value::as_array) else {
+        return false;
+    };
+    let [hook] = hooks.as_slice() else {
+        return false;
+    };
+    let Some(hook) = hook.as_object().filter(|hook| hook.len() == 2) else {
+        return false;
+    };
+    let Some(command) = hook.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let suffix = format!(
+        " --hook-event {hook_event} --harness {}",
+        harness_cli_name(harness)
+    );
+    hook.get("type").and_then(Value::as_str) == Some("command")
+        && !command.contains(['\n', '\r'])
+        && command
+            .strip_suffix(&suffix)
+            .is_some_and(canonical_literal_executable)
 }
 
 #[cfg(not(windows))]
@@ -201,7 +206,7 @@ pub(crate) fn merge_managed_memory_hooks(
     current: Option<&Value>,
     component: &ComponentRecord,
 ) -> Result<Value, ClientError> {
-    if !is_managed_memory_hook_component(harness, component) || component.archived {
+    if !is_managed_memory_hook_component(harness, component) {
         return Err(invalid("Product memory hook component is invalid"));
     }
     let desired = serde_json::from_str::<Value>(&component.body_markdown)
@@ -214,21 +219,49 @@ pub(crate) fn merge_managed_memory_hooks(
         None => serde_json::Map::new(),
         Some(_) => return Err(invalid("Native product memory hooks are invalid")),
     };
+    let mut remove_empty_events = Vec::new();
     for (event, managed_entries) in desired {
         let managed_entries = managed_entries
             .as_array()
             .filter(|entries| entries.len() == 1)
             .ok_or_else(|| invalid("Product memory hook component is invalid"))?;
         let managed_entry = &managed_entries[0];
-        let entries = merged
-            .entry(event.clone())
-            .or_insert_with(|| Value::Array(Vec::new()))
-            .as_array_mut()
-            .ok_or_else(|| invalid("Native product memory hooks are invalid"))?;
-        entries.retain(|entry| entry != managed_entry);
-        entries.push(managed_entry.clone());
+        let entries = match merged.get_mut(event) {
+            Some(entries) => entries
+                .as_array_mut()
+                .ok_or_else(|| invalid("Native product memory hooks are invalid"))?,
+            None if component.archived => continue,
+            None => {
+                merged.insert(event.clone(), Value::Array(Vec::new()));
+                merged
+                    .get_mut(event)
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| invalid("Native product memory hooks are invalid"))?
+            }
+        };
+        let before = entries.len();
+        entries.retain(|entry| !is_managed_hook_entry(harness, event, entry));
+        let removed = entries.len() != before;
+        if component.archived {
+            if removed && entries.is_empty() {
+                remove_empty_events.push(event.clone());
+            }
+        } else {
+            entries.push(managed_entry.clone());
+        }
+    }
+    for event in remove_empty_events {
+        merged.remove(&event);
     }
     Ok(Value::Object(merged))
+}
+
+fn managed_events(harness: HarnessId) -> &'static [(&'static str, &'static str)] {
+    match harness {
+        HarnessId::ClaudeCode => CLAUDE_EVENTS.as_slice(),
+        HarnessId::Codex => CODEX_EVENTS.as_slice(),
+        HarnessId::Hermes => &[],
+    }
 }
 
 fn managed_hook_record_id(harness: HarnessId) -> Result<RecordId, ClientError> {

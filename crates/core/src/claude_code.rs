@@ -928,17 +928,23 @@ impl ClaudeCodeAdapter {
                 ComponentKind::Hook => "hooks",
                 _ => continue,
             };
-            if component.archived {
+            if component.kind == ComponentKind::Hook
+                && has_managed_memory_hook_identity(HarnessId::ClaudeCode, component)
+            {
+                if settings.get(key).is_none() && component.archived {
+                    continue;
+                }
+                let intended = merge_managed_memory_hooks(
+                    HarnessId::ClaudeCode,
+                    settings.get(key),
+                    component,
+                )?;
+                settings.insert(key.to_owned(), intended);
+            } else if component.archived {
                 settings.remove(key);
             } else {
-                let intended = if component.kind == ComponentKind::Hook
-                    && has_managed_memory_hook_identity(HarnessId::ClaudeCode, component)
-                {
-                    merge_managed_memory_hooks(HarnessId::ClaudeCode, settings.get(key), component)?
-                } else {
-                    serde_json::from_str(&component.body_markdown)
-                        .map_err(|_| invalid_request("Claude Code settings component is invalid"))?
-                };
+                let intended = serde_json::from_str(&component.body_markdown)
+                    .map_err(|_| invalid_request("Claude Code settings component is invalid"))?;
                 settings.insert(key.to_owned(), intended);
             }
         }
