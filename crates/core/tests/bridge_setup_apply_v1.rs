@@ -3,6 +3,9 @@ mod support;
 use std::{panic::AssertUnwindSafe, str::FromStr};
 
 use context_relay_core::{
+    native_memory::{
+        NativeMemoryDocumentKind, NativeMemoryLimits, NativeMemoryRegistration, NativeMemorySource,
+    },
     native_transaction::{
         ApprovedCliMutation, CanonicalCliDeclaration, NativeTransactionPlan, SidecarBinding,
         approval_hash_v2, recovery::bind_cli_recovery_plan, seal_plan,
@@ -18,7 +21,7 @@ use context_relay_native_runner::{
 };
 use context_relay_protocol::{
     ApprovalClass, CliOperation, HarnessId, NativePlatform, NativeScope, NetworkDelta,
-    PermissionDelta, PlanId, SetupPlan, Sha256Digest, WireNativeValue,
+    PermissionDelta, PlanId, ScopeRef, SetupPlan, Sha256Digest, WireNativeValue,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -75,6 +78,22 @@ fn native_text(value: &str) -> WireNativeValue {
         bytes: value.as_bytes().to_vec(),
         display: Some(value.to_owned()),
     }
+}
+
+fn native_memory_source() -> NativeMemorySource {
+    NativeMemorySource::new(
+        HarnessId::Codex,
+        "0.144.1",
+        ScopeRef::Global,
+        NativeMemoryDocumentKind::Agent,
+        native_text("/fixture/CODEX_MEMORY.md"),
+        NativeMemoryLimits {
+            max_bytes: 4_096,
+            max_characters: 4_096,
+        },
+        true,
+    )
+    .unwrap()
 }
 
 fn declaration(command: &str) -> CanonicalCliDeclaration {
@@ -528,6 +547,59 @@ fn apply_reconciles_durable_native_terminal_states_without_reexecuting() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn committed_apply_recovery_publishes_the_pre_execution_registration_binding() {
+    let path = TempVault::new("bridge-setup-apply-native-memory-binding-recovery");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), "bridge-setup-apply-v1", &keys).unwrap();
+    let (candidate, _) = persist(&mut vault, plan());
+    let descriptor = native_memory_source();
+    let intended_digest = Sha256Digest([77; 32]);
+    let registration = NativeMemoryRegistration {
+        source: descriptor.clone(),
+        last_applied_digest: Some(intended_digest),
+    };
+
+    let crashed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ = BridgeInstallService::persisted(&mut vault).apply_with_native_memory(
+            &candidate.setup.plan_id,
+            NOW_MS + 1,
+            std::slice::from_ref(&registration),
+            &mut CrashAfterTerminal(NativeTransactionStatus::Committed),
+        );
+    }));
+    assert!(crashed.is_err());
+    assert!(
+        vault
+            .native_memory_ledger(&descriptor.id)
+            .unwrap()
+            .is_none()
+    );
+    drop(vault);
+
+    let mut reopened = Vault::open(path.path(), "bridge-setup-apply-v1", &keys).unwrap();
+    BridgeInstallService::persisted(&mut reopened)
+        .reconcile_after_native_recovery()
+        .unwrap();
+
+    assert_eq!(
+        reopened
+            .native_memory_ledger(&descriptor.id)
+            .unwrap()
+            .unwrap()
+            .last_applied_digest,
+        Some(intended_digest)
+    );
+    assert_eq!(
+        reopened
+            .setup_plan(&candidate.setup.plan_id)
+            .unwrap()
+            .unwrap()
+            .lifecycle,
+        SetupPlanLifecycle::Applied
+    );
 }
 
 #[test]

@@ -61,7 +61,7 @@ fn open_keyed(path: &std::path::Path, key: &[u8; 32]) -> Connection {
 }
 
 #[test]
-fn migration_v10_to_v11_preserves_existing_workspace_rows() {
+fn migration_v10_through_latest_preserves_existing_workspace_rows() {
     let fixture = Fixture::new("native-hook-migration-v10");
     let project = ProjectIdentity {
         project_id: ID_7.parse().unwrap(),
@@ -88,14 +88,17 @@ fn migration_v10_to_v11_preserves_existing_workspace_rows() {
     };
 
     let raw = open_keyed(fixture.path.path(), &fixture.keys.key(CREDENTIAL));
-    raw.execute_batch("DROP TABLE IF EXISTS native_hook_sessions")
-        .unwrap();
+    raw.execute_batch(
+        "DROP TABLE IF EXISTS setup_native_memory_bindings;
+         DROP TABLE IF EXISTS native_hook_sessions;",
+    )
+    .unwrap();
     raw.pragma_update(None, "user_version", 10).unwrap();
     drop(raw);
 
     let vault = fixture.vault();
-    assert_eq!(LATEST_SCHEMA_VERSION, 11);
-    assert_eq!(vault.schema_version().unwrap(), 11);
+    assert_eq!(LATEST_SCHEMA_VERSION, 12);
+    assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     assert_eq!(vault.projects().unwrap(), vec![project]);
     assert_eq!(vault.task(&task.id).unwrap(), Some(task));
     assert!(
@@ -103,6 +106,12 @@ fn migration_v10_to_v11_preserves_existing_workspace_rows() {
             .table_names()
             .unwrap()
             .contains(&"native_hook_sessions".to_owned())
+    );
+    assert!(
+        vault
+            .table_names()
+            .unwrap()
+            .contains(&"setup_native_memory_bindings".to_owned())
     );
 }
 

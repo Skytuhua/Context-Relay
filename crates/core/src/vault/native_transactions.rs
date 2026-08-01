@@ -2356,6 +2356,51 @@ fn validate_setup_plan_write(plan: &SetupPlanWrite<'_>) -> Result<(), VaultError
     Ok(())
 }
 
+fn canonical_native_memory_registrations(
+    registrations: &[NativeMemoryRegistration],
+) -> Result<(Vec<NativeMemoryRegistration>, Vec<u8>), VaultError> {
+    let mut registrations = registrations.to_vec();
+    registrations.sort_by_key(|registration| registration.source.id);
+    let mut unique = BTreeSet::new();
+    for registration in &registrations {
+        registration
+            .source
+            .validate()
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        if !unique.insert(registration.source.id) {
+            return Err(VaultError::Validation(
+                "native memory source is registered more than once".to_owned(),
+            ));
+        }
+    }
+    let canonical = to_json(&registrations)?;
+    Ok((registrations, canonical))
+}
+
+fn load_setup_native_memory_binding(
+    connection: &Connection,
+    plan_id: &PlanId,
+) -> Result<Option<Vec<NativeMemoryRegistration>>, VaultError> {
+    let Some(payload) = connection
+        .query_row(
+            "SELECT payload_json FROM setup_native_memory_bindings WHERE plan_id = ?1",
+            [plan_id.to_string()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let decoded = from_json::<Vec<NativeMemoryRegistration>>(&payload)?;
+    let (registrations, canonical) = canonical_native_memory_registrations(&decoded)?;
+    if canonical != payload {
+        return Err(VaultError::Validation(
+            "native memory registration binding is not canonical".to_owned(),
+        ));
+    }
+    Ok(Some(registrations))
+}
+
 const fn setup_plan_lifecycle_name(state: SetupPlanLifecycle) -> &'static str {
     match state {
         SetupPlanLifecycle::Previewed => "previewed",
@@ -2822,7 +2867,79 @@ impl Vault {
         plan_id: &PlanId,
         next: SetupPlanLifecycle,
     ) -> Result<(), VaultError> {
-        self.finish_setup_plan_with_native_memory(plan_id, next, &[])
+        if next == SetupPlanLifecycle::Applied
+            && self
+                .setup_plan_native_memory_registrations(plan_id)?
+                .is_none()
+        {
+            self.bind_setup_plan_native_memory(plan_id, &[])?;
+        }
+        self.finish_setup_plan_from_native_memory_binding(plan_id, next)
+    }
+
+    /// Persists the exact native-memory descriptor and intended-digest set for
+    /// a claimed setup apply. Call this after deriving the registrations from
+    /// the opened sealed plan and before beginning native execution.
+    pub fn bind_setup_plan_native_memory(
+        &mut self,
+        plan_id: &PlanId,
+        registrations: &[NativeMemoryRegistration],
+    ) -> Result<(), VaultError> {
+        let (_, canonical) = canonical_native_memory_registrations(registrations)?;
+        let transaction = self.connection.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT state FROM setup_plan_lifecycle WHERE plan_id = ?1",
+                [plan_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| VaultError::Validation("setup plan does not exist".to_owned()))
+            .and_then(|value| parse_setup_plan_lifecycle(&value))?;
+        if !matches!(
+            current,
+            SetupPlanLifecycle::Applying | SetupPlanLifecycle::Applied
+        ) {
+            return Err(VaultError::Validation(
+                "native memory registrations require a claimed setup apply".to_owned(),
+            ));
+        }
+        let stored = transaction
+            .query_row(
+                "SELECT payload_json FROM setup_native_memory_bindings WHERE plan_id = ?1",
+                [plan_id.to_string()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        match stored {
+            Some(stored) if stored != canonical => {
+                return Err(VaultError::Validation(
+                    "native memory registration binding changed during setup replay".to_owned(),
+                ));
+            }
+            Some(_) => {}
+            None if current == SetupPlanLifecycle::Applying => {
+                transaction.execute(
+                    "INSERT INTO setup_native_memory_bindings(plan_id, payload_json)
+                     VALUES (?1, ?2)",
+                    params![plan_id.to_string(), canonical],
+                )?;
+            }
+            None => {
+                return Err(VaultError::Validation(
+                    "applied setup plan has no native memory registration binding".to_owned(),
+                ));
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn setup_plan_native_memory_registrations(
+        &self,
+        plan_id: &PlanId,
+    ) -> Result<Option<Vec<NativeMemoryRegistration>>, VaultError> {
+        load_setup_native_memory_binding(&self.connection, plan_id)
     }
 
     /// Finishes a successful setup apply and publishes the exact memory-source
@@ -2840,18 +2957,17 @@ impl Vault {
                 "native memory sources require a successful setup apply".to_owned(),
             ));
         }
-        let mut unique = BTreeSet::new();
-        for registration in registrations {
-            registration
-                .source
-                .validate()
-                .map_err(|error| VaultError::Validation(error.to_string()))?;
-            if !unique.insert(registration.source.id) {
-                return Err(VaultError::Validation(
-                    "native memory source is registered more than once".to_owned(),
-                ));
-            }
+        if next == SetupPlanLifecycle::Applied {
+            self.bind_setup_plan_native_memory(plan_id, registrations)?;
         }
+        self.finish_setup_plan_from_native_memory_binding(plan_id, next)
+    }
+
+    fn finish_setup_plan_from_native_memory_binding(
+        &mut self,
+        plan_id: &PlanId,
+        next: SetupPlanLifecycle,
+    ) -> Result<(), VaultError> {
         let transaction = self.connection.transaction()?;
         let current = transaction
             .query_row(
@@ -2862,6 +2978,15 @@ impl Vault {
             .optional()?
             .ok_or_else(|| VaultError::Validation("setup plan does not exist".to_owned()))
             .and_then(|value| parse_setup_plan_lifecycle(&value))?;
+        let registrations = if next == SetupPlanLifecycle::Applied {
+            load_setup_native_memory_binding(&transaction, plan_id)?.ok_or_else(|| {
+                VaultError::Validation(
+                    "setup apply has no native memory registration binding".to_owned(),
+                )
+            })?
+        } else {
+            Vec::new()
+        };
         if current != next {
             let allowed = matches!(
                 (current, next),
@@ -2897,7 +3022,7 @@ impl Vault {
                 ));
             }
         }
-        for registration in registrations {
+        for registration in &registrations {
             let existing = transaction
                 .query_row(
                     "SELECT payload_json FROM native_memory_sources WHERE source_id = ?1",

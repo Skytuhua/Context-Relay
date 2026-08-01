@@ -70,3 +70,7 @@ pub fn acknowledge(state: &mut DebounceState, observation: StableObservation) ->
     }
     matches
 }
+
+pub fn invalidate(state: &mut DebounceState, source_id: NativeMemorySourceId) -> bool {
+    state.pending.remove(&source_id).is_some()
+}

@@ -47,7 +47,10 @@ pub mod bridge_install;
 mod native_memory;
 
 use bridge_install::{BridgeInstallEngine, ProductionBridgeInstallEngine};
-use native_memory::{NativeMemorySupervisor, NoopLifecycleProbe};
+use native_memory::{
+    NativeMemorySupervisor, NativeMemoryUpdateSender, NoopLifecycleProbe,
+    native_memory_update_channel,
+};
 
 pub const VAULT_CREDENTIAL_ID: &str = "vault-key-v1";
 const WORK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(29);
@@ -146,8 +149,7 @@ struct VaultConfig {
     worker_hook: Option<Arc<dyn WorkerHook>>,
     bridge_install: Arc<dyn BridgeInstallEngine>,
     native_memory_probe: Arc<dyn native_memory::LifecycleProbe>,
-    native_memory_updates:
-        Option<mpsc::UnboundedSender<Vec<context_relay_core::native_memory::NativeMemoryLedger>>>,
+    native_memory_updates: Option<NativeMemoryUpdateSender>,
     #[cfg(test)]
     startup_recovery: Option<StartupRecovery>,
 }
@@ -195,10 +197,7 @@ impl VaultConfig {
         self
     }
 
-    fn with_native_memory_updates(
-        mut self,
-        updates: mpsc::UnboundedSender<Vec<context_relay_core::native_memory::NativeMemoryLedger>>,
-    ) -> Self {
+    fn with_native_memory_updates(mut self, updates: NativeMemoryUpdateSender) -> Self {
         self.native_memory_updates = Some(updates);
         self
     }
@@ -547,7 +546,7 @@ impl Daemon {
         let token = Arc::new(config.token_provider.load_or_create()?);
         let instance_nonce = generate_instance_nonce().map_err(|_| DaemonError::Startup)?;
         let native_memory_probe = config.vault.native_memory_probe.clone();
-        let (native_memory_updates, native_memory_update_receiver) = mpsc::unbounded_channel();
+        let (native_memory_updates, native_memory_update_receiver) = native_memory_update_channel();
         let mut worker = VaultWorker::spawn(
             config
                 .vault
@@ -1019,8 +1018,7 @@ struct WorkspaceState {
     exports: BTreeMap<ExportId, StoredExport>,
     deletion: AccountDeletionState,
     bridge_install: Arc<dyn BridgeInstallEngine>,
-    native_memory_updates:
-        Option<mpsc::UnboundedSender<Vec<context_relay_core::native_memory::NativeMemoryLedger>>>,
+    native_memory_updates: Option<NativeMemoryUpdateSender>,
 }
 
 impl VaultWorker {
@@ -1244,10 +1242,10 @@ fn execute_harness_setup(
                 state.device_id,
                 params,
             )?;
-            if let Some(updates) = &state.native_memory_updates {
-                if let Ok(ledgers) = state.vault.native_memory_ledgers() {
-                    let _ = updates.send(ledgers);
-                }
+            if let Some(updates) = &state.native_memory_updates
+                && let Ok(ledgers) = state.vault.native_memory_ledgers()
+            {
+                updates.send_replace(ledgers);
             }
             Ok(LocalResult::Empty)
         }

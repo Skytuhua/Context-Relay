@@ -119,11 +119,42 @@ fn migration_v9_through_latest_preserves_prior_rows_and_enforces_scope_shape() {
         params![ID_7, br#"{"preserved":true}"#.as_slice()],
     )
     .unwrap();
+    raw.execute(
+        "INSERT INTO native_plans(plan_id, approval_hash, payload, created_ms, expires_ms)
+         VALUES (?1, ?2, ?3, 10, 20)",
+        params![ID_1, [61_u8; 32].as_slice(), b"legacy-applied-plan"],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO setup_plan_lifecycle(
+             plan_id, schema_version, approval_version, state, updated_ms
+         ) VALUES (?1, 1, 2, 'applied', 11)",
+        [ID_1],
+    )
+    .unwrap();
     raw.pragma_update(None, "user_version", 9).unwrap();
     drop(raw);
 
-    let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
     assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+    let legacy_plan_id = ID_1.parse::<PlanId>().unwrap();
+    assert_eq!(
+        vault
+            .setup_plan_native_memory_registrations(&legacy_plan_id)
+            .unwrap(),
+        Some(Vec::new())
+    );
+    assert!(matches!(
+        vault.finish_setup_plan_with_native_memory(
+            &legacy_plan_id,
+            SetupPlanLifecycle::Applied,
+            &[NativeMemoryRegistration {
+                source: source(ScopeRef::Global, HarnessId::Codex, "legacy-replay"),
+                last_applied_digest: Some(Sha256Digest([62; 32])),
+            }],
+        ),
+        Err(VaultError::Validation(_))
+    ));
     drop(vault);
 
     let raw = open_keyed(path.path(), &key);
@@ -300,6 +331,30 @@ fn successful_setup_apply_atomically_registers_descriptor_and_applied_digest() {
             }],
         )
         .unwrap();
+
+    assert!(matches!(
+        vault.finish_setup_plan_with_native_memory(&plan_id, SetupPlanLifecycle::Applied, &[],),
+        Err(VaultError::Validation(_))
+    ));
+
+    let added = source(ScopeRef::Global, HarnessId::ClaudeCode, "added-on-replay");
+    assert!(matches!(
+        vault.finish_setup_plan_with_native_memory(
+            &plan_id,
+            SetupPlanLifecycle::Applied,
+            &[
+                NativeMemoryRegistration {
+                    source: descriptor.clone(),
+                    last_applied_digest: Some(applied),
+                },
+                NativeMemoryRegistration {
+                    source: added,
+                    last_applied_digest: None,
+                },
+            ],
+        ),
+        Err(VaultError::Validation(_))
+    ));
 
     assert!(matches!(
         vault.finish_setup_plan_with_native_memory(

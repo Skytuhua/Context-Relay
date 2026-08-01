@@ -104,7 +104,8 @@ pub struct ReadyNativeMemory {
     pub kind: NativeMemoryObservationKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeMemoryRegistration {
     pub source: NativeMemorySource,
     pub last_applied_digest: Option<Sha256Digest>,

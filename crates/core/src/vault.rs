@@ -26,7 +26,7 @@ use crate::search::{
 mod native_transactions;
 pub use native_transactions::*;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 11;
+pub const LATEST_SCHEMA_VERSION: u32 = 12;
 pub const MAX_NATIVE_HOOK_SESSIONS: usize = 256;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
@@ -1836,6 +1836,18 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
         transaction
             .execute_batch(include_str!("../migrations/0011_native_hook_sessions.sql"))
             .and_then(|_| transaction.pragma_update(None, "user_version", 11))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 12 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0012_setup_native_memory_bindings.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 12))
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }

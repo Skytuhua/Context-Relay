@@ -470,6 +470,19 @@ impl PersistedBridgeInstallService<'_> {
         now_ms: u64,
         executor: &mut E,
     ) -> Result<(), ClientError> {
+        self.apply_with_native_memory(plan_id, now_ms, &[], executor)
+    }
+
+    /// Applies a sealed setup plan with the exact native-memory registration
+    /// set derived by the Task 10 composition layer. The binding is durable
+    /// before the native executor starts, so startup recovery can finalize it.
+    pub fn apply_with_native_memory<E: BridgePlanExecutor>(
+        &mut self,
+        plan_id: &PlanId,
+        now_ms: u64,
+        registrations: &[NativeMemoryRegistration],
+        executor: &mut E,
+    ) -> Result<(), ClientError> {
         let stored = self
             .vault
             .setup_plan(plan_id)
@@ -477,6 +490,9 @@ impl PersistedBridgeInstallService<'_> {
             .ok_or_else(|| invalid("Persisted bridge plan does not exist"))?;
         let opened = validated_original_plan(&stored, plan_id)?;
         if stored.lifecycle == SetupPlanLifecycle::Applying {
+            self.vault
+                .bind_setup_plan_native_memory(plan_id, registrations)
+                .map_err(|_| conflict("Persisted bridge memory binding changed"))?;
             if let Some(lifecycle) = self.reconcile_apply_terminal(&stored)? {
                 return apply_terminal_result(lifecycle);
             }
@@ -486,7 +502,19 @@ impl PersistedBridgeInstallService<'_> {
                     .map_err(|_| conflict("Expired bridge apply cannot be finalized"))?;
                 return Err(conflict("Persisted bridge apply plan has expired"));
             }
-            return self.execute_claimed_apply(&stored, &opened.plan, now_ms, executor);
+            return self.execute_claimed_apply(
+                &stored,
+                &opened.plan,
+                registrations,
+                now_ms,
+                executor,
+            );
+        }
+        if stored.lifecycle == SetupPlanLifecycle::Applied {
+            self.vault
+                .bind_setup_plan_native_memory(plan_id, registrations)
+                .map_err(|_| conflict("Persisted bridge memory binding changed"))?;
+            return Ok(());
         }
         if matches!(
             stored.lifecycle,
@@ -502,18 +530,22 @@ impl PersistedBridgeInstallService<'_> {
             SetupPlanClaim::Replay => return Ok(()),
             SetupPlanClaim::Claimed => {}
         }
-        self.execute_claimed_apply(&stored, &opened.plan, now_ms, executor)
+        self.execute_claimed_apply(&stored, &opened.plan, registrations, now_ms, executor)
     }
 
     fn execute_claimed_apply<E: BridgePlanExecutor>(
         &mut self,
         stored: &crate::vault::SetupPlanRecord,
         plan: &NativeTransactionPlan,
+        registrations: &[NativeMemoryRegistration],
         now_ms: u64,
         executor: &mut E,
     ) -> Result<(), ClientError> {
+        self.vault
+            .bind_setup_plan_native_memory(&plan.setup.plan_id, registrations)
+            .map_err(|_| conflict("Persisted bridge memory binding cannot be recorded"))?;
         match executor.execute(self.vault, plan, &stored.payload, stored.created_ms, now_ms) {
-            Ok(()) => self.finish_applied_with_native_memory(&plan.setup.plan_id, &[]),
+            Ok(()) => self.finish_applied_with_native_memory(&plan.setup.plan_id, registrations),
             Err(error) => {
                 let lifecycle = match error {
                     BridgeExecutionError::Restored(_) => SetupPlanLifecycle::ApplyRestored,

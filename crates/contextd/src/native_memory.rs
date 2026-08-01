@@ -10,7 +10,7 @@ use std::{
 use context_relay_core::native_memory::{
     DebounceState, NATIVE_MEMORY_POLL_MS, NativeMemoryLedger, NativeMemoryObservationKind,
     NativeMemorySnapshot, NativeMemorySource, NativeMemorySourceId, ReadyNativeMemory,
-    StableObservation, acknowledge, observe,
+    StableObservation, acknowledge, invalidate, observe,
 };
 #[cfg(any(target_os = "macos", windows))]
 use context_relay_native_runner::OsNativeFileSystem;
@@ -35,11 +35,20 @@ pub(crate) struct NativeMemorySupervisor {
     thread: Option<JoinHandle<()>>,
 }
 
+pub(crate) type NativeMemoryUpdateSender = watch::Sender<Vec<NativeMemoryLedger>>;
+
+pub(crate) fn native_memory_update_channel() -> (
+    NativeMemoryUpdateSender,
+    watch::Receiver<Vec<NativeMemoryLedger>>,
+) {
+    watch::channel(Vec::new())
+}
+
 impl NativeMemorySupervisor {
     pub(crate) fn spawn(
         worker: WorkerClient,
         ledgers: Vec<NativeMemoryLedger>,
-        updates: tokio::sync::mpsc::UnboundedReceiver<Vec<NativeMemoryLedger>>,
+        updates: watch::Receiver<Vec<NativeMemoryLedger>>,
         probe: Arc<dyn LifecycleProbe>,
     ) -> io::Result<Self> {
         let (shutdown, shutdown_receiver) = watch::channel(false);
@@ -141,7 +150,7 @@ struct PendingReady {
 async fn run_supervisor(
     worker: WorkerClient,
     ledgers: Vec<NativeMemoryLedger>,
-    mut updates: tokio::sync::mpsc::UnboundedReceiver<Vec<NativeMemoryLedger>>,
+    mut updates: watch::Receiver<Vec<NativeMemoryLedger>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut sources = ledgers
@@ -177,10 +186,13 @@ async fn run_supervisor(
                     break;
                 }
             }
-            updated = updates.recv(), if updates_open => {
-                match updated {
-                    Some(ledgers) => merge_registered_sources(&mut sources, ledgers),
-                    None => updates_open = false,
+            changed = updates.changed(), if updates_open => {
+                match changed {
+                    Ok(()) => {
+                        let ledgers = updates.borrow_and_update().clone();
+                        merge_registered_sources(&mut sources, ledgers);
+                    }
+                    Err(_) => updates_open = false,
                 }
             }
             completed = completions.join_next(), if !completions.is_empty() => {
@@ -239,6 +251,9 @@ fn scan_sources(
             continue;
         }
         let Ok(observed) = safe_snapshot(&watched.source) else {
+            if !pending.contains_key(source_id) {
+                invalidate(debounce, *source_id);
+            }
             continue;
         };
         if pending
@@ -498,6 +513,87 @@ mod tests {
             true,
         )
         .unwrap()
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    fn watched_sources(
+        source: NativeMemorySource,
+    ) -> BTreeMap<NativeMemorySourceId, WatchedSource> {
+        BTreeMap::from([(
+            source.id,
+            WatchedSource {
+                source,
+                initial_preview_complete: true,
+                baseline: Some(None),
+            },
+        )])
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn unsafe_snapshot_restarts_an_unready_debounce_window() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let path = canonical_root.join("memory.md");
+        std::fs::write(&path, b"remember me").unwrap();
+        let descriptor = source(&path, 32);
+        let source_id = descriptor.id;
+        let mut sources = watched_sources(descriptor);
+        let mut debounce = DebounceState::default();
+        let mut pending = BTreeMap::new();
+        let in_flight = BTreeSet::new();
+
+        scan_sources(&mut sources, &mut debounce, &mut pending, &in_flight, 0);
+        std::fs::write(&path, vec![0_u8; 33]).unwrap();
+        scan_sources(&mut sources, &mut debounce, &mut pending, &in_flight, 1_000);
+        std::fs::write(&path, b"remember me").unwrap();
+        scan_sources(&mut sources, &mut debounce, &mut pending, &in_flight, 1_100);
+        assert!(!pending.contains_key(&source_id));
+        scan_sources(&mut sources, &mut debounce, &mut pending, &in_flight, 1_849);
+        assert!(!pending.contains_key(&source_id));
+        scan_sources(&mut sources, &mut debounce, &mut pending, &in_flight, 1_850);
+        assert!(pending.contains_key(&source_id));
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn unsafe_snapshot_preserves_an_already_ready_observation() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let path = canonical_root.join("memory.md");
+        std::fs::write(&path, b"remember me").unwrap();
+        let descriptor = source(&path, 32);
+        let source_id = descriptor.id;
+        let mut sources = watched_sources(descriptor);
+        let mut debounce = DebounceState::default();
+        let mut pending = BTreeMap::new();
+        let in_flight = BTreeSet::new();
+
+        scan_sources(&mut sources, &mut debounce, &mut pending, &in_flight, 0);
+        scan_sources(&mut sources, &mut debounce, &mut pending, &in_flight, 750);
+        assert!(pending.contains_key(&source_id));
+
+        std::fs::write(&path, vec![0_u8; 33]).unwrap();
+        scan_sources(&mut sources, &mut debounce, &mut pending, &in_flight, 1_500);
+        assert!(pending.contains_key(&source_id));
+    }
+
+    #[tokio::test]
+    async fn descriptor_refresh_burst_coalesces_to_the_latest_ledger_set() {
+        let root = tempfile::tempdir().unwrap();
+        let descriptor = source(&root.path().join("memory.md"), 32);
+        let (updates, mut receiver) = native_memory_update_channel();
+        for byte in 1..=64 {
+            let mut ledger = NativeMemoryLedger::for_source(descriptor.clone());
+            ledger.last_applied_digest = Some(Sha256Digest([byte; 32]));
+            updates.send_replace(vec![ledger]);
+        }
+
+        receiver.changed().await.unwrap();
+        let latest = receiver.borrow_and_update().clone();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].last_applied_digest, Some(Sha256Digest([64; 32])));
+        assert!(!receiver.has_changed().unwrap());
     }
 
     #[cfg(any(target_os = "macos", windows))]

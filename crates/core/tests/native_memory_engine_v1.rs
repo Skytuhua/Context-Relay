@@ -1,8 +1,8 @@
 use context_relay_core::native_memory::{
     DebounceState, NativeMemoryChangeKind, NativeMemoryDocumentKind, NativeMemoryError,
     NativeMemoryLedger, NativeMemoryLimits, NativeMemorySource, NativeMemorySourceId,
-    ReconcileDecision, StableObservation, acknowledge, extract_managed_markdown, observe,
-    reconcile,
+    ReconcileDecision, StableObservation, acknowledge, extract_managed_markdown, invalidate,
+    observe, reconcile,
 };
 use context_relay_protocol::{
     HarnessId, NativePlatform, ProjectId, ScopeRef, Sha256Digest, WireNativeValue,
@@ -109,6 +109,24 @@ fn debounce_retries_ready_observations_until_acknowledged_then_evicts_them() {
     assert!(!acknowledge(&mut state, ready));
     assert!(state.is_empty());
     assert_eq!(observe(&mut state, source(1), Some(digest(1)), 801), None);
+}
+
+#[test]
+fn debounce_invalid_observation_restarts_the_stability_window() {
+    let mut state = DebounceState::default();
+
+    assert_eq!(observe(&mut state, source(1), Some(digest(1)), 0), None);
+    assert!(invalidate(&mut state, source(1)));
+    assert_eq!(observe(&mut state, source(1), Some(digest(1)), 1_000), None);
+    assert_eq!(observe(&mut state, source(1), Some(digest(1)), 1_749), None);
+    assert_eq!(
+        observe(&mut state, source(1), Some(digest(1)), 1_750),
+        Some(StableObservation {
+            source_id: source(1),
+            digest: Some(digest(1)),
+            stable_since_ms: 1_000,
+        })
+    );
 }
 
 const START: &str = "<!-- context-relay:start -->";
