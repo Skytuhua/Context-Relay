@@ -1,5 +1,6 @@
 {
   "version": "0.18.2",
+  "lifecycleHookEvents": [],
   "nativeMemoryConfigYaml": "memory:\n  memory_enabled: true\n  user_profile_enabled: true\n",
   "profile": {
     "name": "coder",

@@ -1,5 +1,6 @@
 {
   "version": "0.144.0",
+  "lifecycleHookEvents": ["SessionStart", "Stop"],
   "nativeMemoryConfigToml": "\n[memories]\ngenerate_memories = true\nuse_memories = true\n",
   "nativeMemoryFiles": {"MEMORY.md":"# Agent memory\nCodex-owned prefix.\n","memory_summary.md":"# Memory summary\nReviewed facts.\n"},
   "executableKind": "native",

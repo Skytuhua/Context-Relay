@@ -33,7 +33,8 @@ use crate::mcp::install::{
 };
 use crate::native_memory::{
     NativeMemoryAdapter, NativeMemoryCapabilities, NativeMemoryDisable, NativeMemoryDocumentKind,
-    is_primary_memory_instruction_component, native_memory_source,
+    has_managed_memory_hook_identity, is_primary_memory_instruction_component,
+    merge_managed_memory_hooks, native_memory_source,
 };
 use crate::native_transaction::{
     cli::{CliMutationOutcome, CliRestoreOutcome, NativeCliExecutor},
@@ -826,11 +827,13 @@ impl CodexAdapter {
         if component.archived {
             object.remove("hooks");
         } else {
-            object.insert(
-                "hooks".into(),
+            let hooks = if has_managed_memory_hook_identity(HarnessId::Codex, component) {
+                merge_managed_memory_hooks(HarnessId::Codex, object.get("hooks"), component)?
+            } else {
                 serde_json::from_str(&component.body_markdown)
-                    .map_err(|_| invalid("Codex hooks component is invalid"))?,
-            );
+                    .map_err(|_| invalid("Codex hooks component is invalid"))?
+            };
+            object.insert("hooks".into(), hooks);
         }
         let bytes = serde_json::to_vec(&Value::Object(object))
             .map_err(|_| invalid("Codex hooks cannot be rendered"))?;
@@ -2018,11 +2021,13 @@ impl HarnessAdapter for CodexAdapter {
             if component.archived {
                 object.remove("hooks");
             } else {
-                object.insert(
-                    "hooks".into(),
+                let hooks = if has_managed_memory_hook_identity(HarnessId::Codex, component) {
+                    merge_managed_memory_hooks(HarnessId::Codex, object.get("hooks"), component)?
+                } else {
                     serde_json::from_str(&component.body_markdown)
-                        .map_err(|_| invalid("Codex hooks component is invalid"))?,
-                );
+                        .map_err(|_| invalid("Codex hooks component is invalid"))?
+                };
+                object.insert("hooks".into(), hooks);
             }
             let bytes = serde_json::to_vec(&Value::Object(object))
                 .map_err(|_| invalid("Codex hooks cannot be rendered"))?;

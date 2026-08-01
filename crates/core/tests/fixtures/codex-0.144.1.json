@@ -1,5 +1,6 @@
 {
   "version": "0.144.1",
+  "lifecycleHookEvents": ["SessionStart", "Stop"],
   "executableKind": "native",
   "pluginListJson": {"installed":[{"pluginId":"formatter@team","name":"formatter","marketplaceName":"team","version":"1.2.3","installed":true,"enabled":true,"source":{"source":"git","url":"https://example.com/team/plugins.git","ref":"v1.2.3"},"installPolicy":"AVAILABLE","authPolicy":"ON_USE"}],"available":[]},
   "mcpListJson": [{"name":"docs","enabled":true,"disabled_reason":null,"transport":{"type":"streamable_http","url":"https://example.com/mcp","bearer_token_env_var":"DOCS_TOKEN","http_headers":null,"env_http_headers":null},"startup_timeout_sec":null,"tool_timeout_sec":null,"auth_status":"bearer_token"}],

@@ -26,7 +26,8 @@ use crate::mcp::install::{
 };
 use crate::native_memory::{
     NativeMemoryAdapter, NativeMemoryCapabilities, NativeMemoryDisable, NativeMemoryDocumentKind,
-    is_primary_memory_instruction_component,
+    has_managed_memory_hook_identity, is_primary_memory_instruction_component,
+    merge_managed_memory_hooks,
 };
 use crate::native_transaction::{
     cli::{CliMutationOutcome, CliRestoreOutcome, NativeCliExecutor},
@@ -237,18 +238,32 @@ impl ClaudeCodeAdapter {
         &self,
         desired: &DesiredState,
     ) -> Result<ApprovedMutation, ClientError> {
-        self.require_apply_supported()?;
-        desired
-            .validate()
-            .map_err(|_| invalid_request("Desired Claude Code state is invalid"))?;
-        let path = self.project_settings_path();
-        let bytes = self.render_settings(
-            &path,
+        self.plan_native_settings_for_scope(
             desired,
             ScopeRef::Project {
                 project_id: self.project_id,
             },
-        )?;
+        )
+    }
+
+    pub fn plan_native_global_settings(
+        &self,
+        desired: &DesiredState,
+    ) -> Result<ApprovedMutation, ClientError> {
+        self.plan_native_settings_for_scope(desired, ScopeRef::Global)
+    }
+
+    fn plan_native_settings_for_scope(
+        &self,
+        desired: &DesiredState,
+        scope: ScopeRef,
+    ) -> Result<ApprovedMutation, ClientError> {
+        self.require_apply_supported()?;
+        desired
+            .validate()
+            .map_err(|_| invalid_request("Desired Claude Code state is invalid"))?;
+        let path = settings_path(self, &scope)?;
+        let bytes = self.render_settings(&path, desired, scope)?;
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid_request("Claude Code settings cannot be safely inspected"))?;
@@ -916,12 +931,15 @@ impl ClaudeCodeAdapter {
             if component.archived {
                 settings.remove(key);
             } else {
-                settings.insert(
-                    key.to_owned(),
-                    serde_json::from_str(&component.body_markdown).map_err(|_| {
-                        invalid_request("Claude Code settings component is invalid")
-                    })?,
-                );
+                let intended = if component.kind == ComponentKind::Hook
+                    && has_managed_memory_hook_identity(HarnessId::ClaudeCode, component)
+                {
+                    merge_managed_memory_hooks(HarnessId::ClaudeCode, settings.get(key), component)?
+                } else {
+                    serde_json::from_str(&component.body_markdown)
+                        .map_err(|_| invalid_request("Claude Code settings component is invalid"))?
+                };
+                settings.insert(key.to_owned(), intended);
             }
         }
         serde_json::to_vec(&Value::Object(settings))

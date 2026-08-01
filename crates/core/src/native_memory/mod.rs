@@ -1,11 +1,14 @@
 mod capability;
 mod debounce;
+mod hooks;
 mod instruction;
 mod markdown;
 mod model;
 mod reconcile;
 
 pub use debounce::{DebounceState, StableObservation, acknowledge, observe};
+pub use hooks::managed_memory_hooks;
+pub(crate) use hooks::{has_managed_memory_hook_identity, merge_managed_memory_hooks};
 pub(crate) use instruction::is_primary_memory_instruction_component;
 pub use instruction::{PRIMARY_MEMORY_INSTRUCTIONS, primary_memory_instruction_component};
 pub use markdown::{ManagedMarkdown, extract_managed_markdown};

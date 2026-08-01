@@ -12,7 +12,7 @@ use context_relay_core::{
     mcp::install::bridge_component,
     native_memory::{
         NativeMemoryAdapter, NativeMemoryDisable, NativeMemoryDocumentKind,
-        PRIMARY_MEMORY_INSTRUCTIONS, primary_memory_instruction_component,
+        PRIMARY_MEMORY_INSTRUCTIONS, managed_memory_hooks, primary_memory_instruction_component,
     },
     native_transaction::{
         approval_hash_v1,
@@ -375,6 +375,158 @@ fn supported_release_fixtures_import_reviewed_surfaces_without_secrets() {
             assert!(!serialized.contains(forbidden));
         }
     }
+}
+
+#[test]
+fn memory_hooks_render_only_the_frozen_lifecycle_events_with_literal_arguments() {
+    for source in [
+        include_str!("fixtures/codex-0.144.1.json"),
+        include_str!("fixtures/codex-0.144.0.json"),
+    ] {
+        let contract: Value = serde_json::from_str(source).unwrap();
+        let fixture = fixture(source);
+        let bridge = fixture.root.join("context-relay context-mcp");
+        fs::write(&bridge, b"fixture bridge executable").unwrap();
+        let mut bridge_wire = test_wire_path(&bridge);
+        bridge_wire.display = Some("/must-not-use-display".to_owned());
+        let components = managed_memory_hooks(HarnessId::Codex, &bridge_wire).unwrap();
+        assert_eq!(components.len(), 1);
+        let hooks: Value = serde_json::from_str(&components[0].body_markdown).unwrap();
+        let expected = contract["lifecycleHookEvents"].as_array().unwrap();
+        assert_eq!(hooks.as_object().unwrap().len(), expected.len());
+        for native_event in expected {
+            let native_event = native_event.as_str().unwrap();
+            let event = match native_event {
+                "SessionStart" => "session-start",
+                "Stop" => "session-stop",
+                _ => panic!("unsupported frozen Codex hook event"),
+            };
+            let command = hooks[native_event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap();
+            assert!(command.contains(bridge.to_string_lossy().as_ref()));
+            assert!(command.ends_with(&format!(" --hook-event {event} --harness codex")));
+            assert_eq!(hooks[native_event][0]["hooks"][0]["type"], "command");
+        }
+        let serialized = serde_json::to_string(&hooks).unwrap();
+        assert!(!serialized.contains("must-not-use-display"));
+        for forbidden in [
+            "TaskCompleted",
+            "task-evidence",
+            "transcript_path",
+            "prompt",
+            "response",
+            "last_assistant_message",
+            "${",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
+}
+
+#[test]
+fn memory_hooks_merge_deduplicate_reapply_and_rollback_exactly() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let bridge = fixture.root.join("context-relay context-mcp");
+    fs::write(&bridge, b"fixture bridge executable").unwrap();
+    let managed = managed_memory_hooks(HarnessId::Codex, &test_wire_path(&bridge))
+        .unwrap()
+        .remove(0);
+    let managed_hooks: Value = serde_json::from_str(&managed.body_markdown).unwrap();
+    let path = fixture.codex_home.join("hooks.json");
+    let mut prior: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for (event, entry) in managed_hooks.as_object().unwrap() {
+        let entry = entry.as_array().unwrap()[0].clone();
+        prior["hooks"][event] = Value::Array(vec![entry.clone(), entry]);
+    }
+    let mut before = serde_json::to_vec(&prior).unwrap();
+    before.push(b'\n');
+    fs::write(&path, &before).unwrap();
+
+    let mutation = fixture.adapter.plan_native_hooks_json(&managed).unwrap();
+    let NativeState::RegularFile { bytes, .. } = NativeState::decode_v1(&mutation.content).unwrap()
+    else {
+        panic!("Codex hooks remain a regular file")
+    };
+    let rendered: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(rendered["description"], "global hooks");
+    assert_eq!(rendered["unknown"]["keep"], true);
+    assert_eq!(rendered["hooks"]["PreToolUse"], serde_json::json!([]));
+    for event in ["SessionStart", "Stop"] {
+        assert_eq!(rendered["hooks"][event].as_array().unwrap().len(), 1);
+    }
+
+    let nonce = [42; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native
+        .create_before_images(std::slice::from_ref(&mutation))
+        .unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native
+        .compare_and_swap_targets(std::slice::from_ref(&mutation))
+        .unwrap();
+    native.apply_mutation(&nonce, &mutation).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+
+    let reapplied = fixture.adapter.plan_native_hooks_json(&managed).unwrap();
+    let NativeState::RegularFile {
+        bytes: reapplied_bytes,
+        ..
+    } = NativeState::decode_v1(&reapplied.content).unwrap()
+    else {
+        panic!("Codex hooks remain a regular file")
+    };
+    assert_eq!(reapplied_bytes, bytes);
+
+    native.restore_matching_applied_targets(&nonce).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn memory_hooks_retain_codex_project_trust_restrictions() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let bridge = fixture.root.join("context-relay-context-mcp");
+    fs::write(&bridge, b"fixture bridge executable").unwrap();
+    let mut managed = managed_memory_hooks(HarnessId::Codex, &test_wire_path(&bridge))
+        .unwrap()
+        .remove(0);
+    managed.scope = ScopeRef::Project {
+        project_id: fixture.project_id,
+    };
+    managed.metadata = vec![(
+        "structuralLocation".into(),
+        "project/.codex/hooks.json#hooks".into(),
+    )];
+    let config_path = fixture.codex_home.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("trust_level = \"trusted\"", "trust_level = \"untrusted\"");
+    fs::write(config_path, config).unwrap();
+    let error = fixture
+        .adapter
+        .plan_native_hooks_json(&managed)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::HarnessUnsupported);
+}
+
+#[test]
+fn memory_hooks_reject_a_managed_identity_with_user_controlled_argv() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let bridge = fixture.root.join("context-relay-context-mcp");
+    fs::write(&bridge, b"fixture bridge executable").unwrap();
+    let mut managed = managed_memory_hooks(HarnessId::Codex, &test_wire_path(&bridge))
+        .unwrap()
+        .remove(0);
+    let mut body: Value = serde_json::from_str(&managed.body_markdown).unwrap();
+    let command = body["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
+    body["Stop"][0]["hooks"][0]["command"] =
+        Value::String(format!("{command} --prompt must-not-enter-hook-argv"));
+    managed.body_markdown = serde_json::to_string(&body).unwrap();
+    let error = fixture
+        .adapter
+        .plan_native_hooks_json(&managed)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidRequest);
 }
 
 #[test]

@@ -10,7 +10,7 @@ use context_relay_core::{
     mcp::install::bridge_component,
     native_memory::{
         NativeMemoryAdapter, NativeMemoryDisable, NativeMemoryDocumentKind,
-        PRIMARY_MEMORY_INSTRUCTIONS, primary_memory_instruction_component,
+        PRIMARY_MEMORY_INSTRUCTIONS, managed_memory_hooks, primary_memory_instruction_component,
     },
     native_transaction::{
         approval_hash_v1,
@@ -224,6 +224,47 @@ fn import_everything(
             panic!("Hermes import unexpectedly failed with {:?}", error.code);
         }
     }
+}
+
+#[test]
+fn memory_hooks_do_not_invent_lifecycle_events_absent_from_the_frozen_contract() {
+    for source in [
+        include_str!("fixtures/hermes-0.18.2.json"),
+        include_str!("fixtures/hermes-0.18.1.json"),
+    ] {
+        let contract: Value = serde_json::from_str(source).unwrap();
+        assert_eq!(contract["lifecycleHookEvents"], serde_json::json!([]));
+        let fixture = fixture(source);
+        let bridge = fixture.root.join("context-relay context-mcp");
+        fs::write(&bridge, b"fixture bridge executable").unwrap();
+        assert!(
+            managed_memory_hooks(HarnessId::Hermes, &test_wire_path(&bridge))
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn memory_hooks_leave_existing_hermes_hook_config_byte_identical() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let path = fixture.layout.profile.hermes_home.join("config.yaml");
+    let before = fs::read(&path).unwrap();
+    let bridge = fixture.root.join("context-relay-context-mcp");
+    fs::write(&bridge, b"fixture bridge executable").unwrap();
+    let desired = desired_global(
+        &fixture,
+        managed_memory_hooks(HarnessId::Hermes, &test_wire_path(&bridge)).unwrap(),
+    );
+    assert!(
+        fixture
+            .adapter
+            .plan_native_config(&desired)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fs::read(path).unwrap(), before);
 }
 
 fn import_global(fixture: &Fixture) -> context_relay_protocol::ImportedState {

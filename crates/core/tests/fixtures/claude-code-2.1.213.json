@@ -1,5 +1,6 @@
 {
   "version": "2.1.213",
+  "lifecycleHookEvents": ["SessionStart", "Stop", "TaskCompleted"],
   "doctorOutput": "Claude Code diagnostics: OK\n",
   "pluginListJson": [
     {
