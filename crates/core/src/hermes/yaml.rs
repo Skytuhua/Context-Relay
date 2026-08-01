@@ -96,6 +96,28 @@ pub(super) fn topology_supported(parsed: &ParsedHermesYaml) -> bool {
             return false;
         }
     }
+    if let Some(memory) = root.get(Value::String("memory".to_owned())) {
+        let Some(memory) = memory.as_mapping() else {
+            return false;
+        };
+        if !parsed
+            .patch_index
+            .paths
+            .contains_key(&vec!["memory".to_owned()])
+        {
+            return false;
+        }
+        for key in ["memory_enabled", "user_profile_enabled"] {
+            if memory.contains_key(Value::String(key.to_owned()))
+                && !parsed
+                    .patch_index
+                    .paths
+                    .contains_key(&vec!["memory".to_owned(), key.to_owned()])
+            {
+                return false;
+            }
+        }
+    }
     true
 }
 
@@ -265,10 +287,16 @@ fn owned_replacement_path(path: &[String]) -> bool {
     match path {
         [root] => matches!(
             root.as_str(),
-            "approvals" | "command_allowlist" | "plugins" | "mcp_servers" | "hooks"
+            "approvals" | "command_allowlist" | "plugins" | "mcp_servers" | "hooks" | "memory"
         ),
         [root, _] if root == "approvals" || root == "mcp_servers" || root == "hooks" => true,
         [root, state] if root == "plugins" && matches!(state.as_str(), "enabled" | "disabled") => {
+            true
+        }
+        [root, key]
+            if root == "memory"
+                && matches!(key.as_str(), "memory_enabled" | "user_profile_enabled") =>
+        {
             true
         }
         _ => false,
@@ -649,6 +677,7 @@ fn parse_block_key(line: &str) -> Option<&str> {
 fn targeted_path(path: &[String]) -> bool {
     match path {
         [root, ..] if root == "approvals" || root == "command_allowlist" => true,
+        [root, ..] if root == "memory" => true,
         [root] if root == "plugins" => true,
         [root, state, ..]
             if root == "plugins" && matches!(state.as_str(), "enabled" | "disabled") =>

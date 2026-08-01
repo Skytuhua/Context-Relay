@@ -7,7 +7,9 @@
   "codexHome": {
     "AGENTS.md":"# Global instructions\nUse the stable toolchain.\n",
     "AGENTS.override.md":"# Global override\nPrefer the smallest safe change.\n",
-    "config.toml":"# user heading\nunknown_user_key = \"preserve-me\"\napproval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n\n[projects.\"$PROJECT\"]\ntrust_level = \"trusted\"\n\n[plugins.\"formatter@team\"]\nenabled = true\n\n[mcp_servers.docs]\nurl = \"https://example.com/mcp\"\nbearer_token_env_var = \"DOCS_TOKEN\"\n\n[hooks]\n# inline hook comment\n[[hooks.PostToolUse]]\nmatcher = \"^Write$\"\n\n[[hooks.PostToolUse.hooks]]\ntype = \"command\"\ncommand = \"check-write\"\n",
+    "config.toml":"# user heading\nunknown_user_key = \"preserve-me\"\napproval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n\n[memories]\ngenerate_memories = true\nuse_memories = true\n\n[projects.\"$PROJECT\"]\ntrust_level = \"trusted\"\n\n[plugins.\"formatter@team\"]\nenabled = true\n\n[mcp_servers.docs]\nurl = \"https://example.com/mcp\"\nbearer_token_env_var = \"DOCS_TOKEN\"\n\n[hooks]\n# inline hook comment\n[[hooks.PostToolUse]]\nmatcher = \"^Write$\"\n\n[[hooks.PostToolUse.hooks]]\ntype = \"command\"\ncommand = \"check-write\"\n",
+    "memories/MEMORY.md":"# Agent memory\nCodex-owned prefix.\n",
+    "memories/memory_summary.md":"# Memory summary\nReviewed facts.\n",
     "hooks.json":"{\"description\":\"global hooks\",\"unknown\":{\"keep\":true},\"hooks\":{\"PreToolUse\":[]}}\n",
     "rules/default.rules":"prefix_rule(pattern=[\"cargo\", \"test\"], decision=\"allow\")\n",
     "auth.json":"{\"OPENAI_API_KEY\":\"must-not-import\"}",

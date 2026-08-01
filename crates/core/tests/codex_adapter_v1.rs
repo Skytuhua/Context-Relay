@@ -10,7 +10,10 @@ use context_relay_core::{
         CodexAdapter, CodexCommandRunner, CodexExecutableKind, CodexLayout, VerifiedCodexCommand,
     },
     mcp::install::bridge_component,
-    native_memory::{PRIMARY_MEMORY_INSTRUCTIONS, primary_memory_instruction_component},
+    native_memory::{
+        NativeMemoryAdapter, NativeMemoryDisable, NativeMemoryDocumentKind,
+        PRIMARY_MEMORY_INSTRUCTIONS, primary_memory_instruction_component,
+    },
     native_transaction::{
         approval_hash_v1,
         cli::NativeCliExecutor,
@@ -70,6 +73,15 @@ fn fixture(source: &str) -> Fixture {
         fixture["codexHome"].as_object().unwrap(),
         &project_root,
     );
+    if let Some(extra) = fixture["nativeMemoryConfigToml"].as_str() {
+        let config_path = codex_home.join("config.toml");
+        let mut config = fs::read_to_string(&config_path).unwrap();
+        config.push_str(extra);
+        fs::write(config_path, config).unwrap();
+    }
+    if let Some(files) = fixture["nativeMemoryFiles"].as_object() {
+        materialize(&codex_home.join("memories"), files);
+    }
     materialize(
         &home.join(".agents/skills"),
         fixture["userSkills"].as_object().unwrap(),
@@ -363,6 +375,204 @@ fn supported_release_fixtures_import_reviewed_surfaces_without_secrets() {
             assert!(!serialized.contains(forbidden));
         }
     }
+}
+
+#[test]
+fn native_memory_capability_matrix_is_exact_for_frozen_codex_releases() {
+    for source in [
+        include_str!("fixtures/codex-0.144.1.json"),
+        include_str!("fixtures/codex-0.144.0.json"),
+    ] {
+        let fixture = fixture(source);
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+            panic!("frozen native Codex release must support native-memory disable");
+        };
+        assert_eq!(mutations.len(), 1);
+        let NativeState::RegularFile { bytes, .. } =
+            NativeState::decode_v1(&mutations[0].content).unwrap()
+        else {
+            panic!("Codex config remains a regular file");
+        };
+        let rendered = String::from_utf8(bytes).unwrap();
+        assert!(rendered.contains("[memories]\n"));
+        assert!(rendered.contains("generate_memories = false\n"));
+        assert!(rendered.contains("use_memories = false\n"));
+        assert!(rendered.contains("# user heading"));
+        assert!(rendered.contains("unknown_user_key = \"preserve-me\""));
+
+        assert_eq!(capabilities.sources.len(), 2);
+        assert_eq!(
+            capabilities.sources[0].document_kind,
+            NativeMemoryDocumentKind::Agent
+        );
+        assert_eq!(
+            capabilities.sources[1].document_kind,
+            NativeMemoryDocumentKind::Summary
+        );
+        assert_eq!(
+            capabilities
+                .sources
+                .iter()
+                .map(|source| source.path.display.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                fixture
+                    .codex_home
+                    .join("memories/MEMORY.md")
+                    .display()
+                    .to_string(),
+                fixture
+                    .codex_home
+                    .join("memories/memory_summary.md")
+                    .display()
+                    .to_string(),
+            ]
+        );
+        assert!(capabilities.sources.iter().all(|source| {
+            source.scope == ScopeRef::Global
+                && source.adapter_version == fixture.layout.version
+                && source.managed_fence
+        }));
+    }
+}
+
+#[test]
+fn unknown_and_wrapper_codex_installations_are_watch_only_without_guessed_settings() {
+    for (version, wrapper) in [("9.9.9", false), ("0.144.1", true)] {
+        let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+        let mut layout = fixture.layout.clone();
+        layout.version = version.to_owned();
+        if wrapper {
+            fs::write(&layout.executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        }
+        let device = DeviceId::from_str(DEVICE_ID).unwrap();
+        let adapter = CodexAdapter::from_layout(
+            layout,
+            fixture.project_id,
+            device,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device),
+        )
+        .unwrap();
+        let capabilities = adapter.native_memory_capabilities().unwrap();
+        assert!(matches!(
+            capabilities.disable,
+            NativeMemoryDisable::WatchOnly
+        ));
+        assert_eq!(capabilities.sources.len(), 2);
+    }
+}
+
+#[test]
+fn native_memory_disable_rolls_back_true_false_and_absent_codex_values_exactly() {
+    for (index, prior) in [Some(true), Some(false), None].into_iter().enumerate() {
+        let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+        let config_path = fixture.codex_home.join("config.toml");
+        let config = fs::read_to_string(&config_path).unwrap();
+        let memory_table = "[memories]\ngenerate_memories = true\nuse_memories = true\n\n";
+        let config = match prior {
+            Some(true) => config,
+            Some(false) => config.replace(
+                memory_table,
+                "[memories]\ngenerate_memories = false\nuse_memories = false\n\n",
+            ),
+            None => config.replace(memory_table, ""),
+        };
+        fs::write(&config_path, config).unwrap();
+        let before = fs::read(&config_path).unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+            panic!("supported Codex release must remain writable");
+        };
+        if prior == Some(false) {
+            assert!(mutations.is_empty());
+            assert_eq!(fs::read(&config_path).unwrap(), before);
+            continue;
+        }
+        let nonce = [50 + index as u8; 16];
+        let mut native = OsNativeTransactionFileSystem::new(nonce);
+        let images = native.create_before_images(&mutations).unwrap();
+        native.record_native_metadata(&images).unwrap();
+        native.compare_and_swap_targets(&mutations).unwrap();
+        for mutation in &mutations {
+            native.apply_mutation(&nonce, mutation).unwrap();
+        }
+        assert_eq!(
+            fixture
+                .adapter
+                .native_memory_capabilities()
+                .unwrap()
+                .sources,
+            capabilities.sources
+        );
+        native.restore_matching_applied_targets(&nonce).unwrap();
+        assert_eq!(fs::read(&config_path).unwrap(), before);
+    }
+}
+
+#[test]
+fn native_memory_codex_policy_conflicts_and_unsupported_values_never_write() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    fs::write(
+        &fixture.layout.requirements_paths[0],
+        "[memories]\ngenerate_memories = true\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        fixture
+            .adapter
+            .native_memory_capabilities()
+            .unwrap()
+            .disable,
+        NativeMemoryDisable::WatchOnly
+    ));
+
+    fs::write(
+        &fixture.layout.requirements_paths[0],
+        "allowed_approval_policies = [\"on-request\"]\n",
+    )
+    .unwrap();
+    let config_path = fixture.codex_home.join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+        "[memories]\ngenerate_memories = true\nuse_memories = true\n\n",
+        "memories = \"unsupported\"\n\n",
+    );
+    fs::write(&config_path, config).unwrap();
+    let before = fs::read(&config_path).unwrap();
+    assert!(matches!(
+        fixture
+            .adapter
+            .native_memory_capabilities()
+            .unwrap()
+            .disable,
+        NativeMemoryDisable::WatchOnly
+    ));
+    assert_eq!(fs::read(config_path).unwrap(), before);
+}
+
+#[test]
+fn native_memory_codex_disable_preserves_comments_on_owned_boolean_values() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let config_path = fixture.codex_home.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace(
+            "generate_memories = true\nuse_memories = true\n",
+            "generate_memories = true # keep generation rationale\n# keep usage rationale\nuse_memories = true # keep usage suffix\n",
+        );
+    fs::write(config_path, config).unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+        panic!("supported Codex memory booleans must remain writable");
+    };
+    let NativeState::RegularFile { bytes, .. } =
+        NativeState::decode_v1(&mutations[0].content).unwrap()
+    else {
+        panic!("Codex config remains a regular file");
+    };
+    let rendered = String::from_utf8(bytes).unwrap();
+    assert!(rendered.contains("generate_memories = false # keep generation rationale"));
+    assert!(rendered.contains("# keep usage rationale\nuse_memories = false # keep usage suffix"));
 }
 
 #[test]

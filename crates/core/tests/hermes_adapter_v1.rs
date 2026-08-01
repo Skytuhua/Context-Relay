@@ -8,7 +8,10 @@ use std::{
 use context_relay_core::{
     hermes::{HermesAdapter, HermesExecutableKind, HermesLayout, HermesMemoryKind, HermesProfile},
     mcp::install::bridge_component,
-    native_memory::{PRIMARY_MEMORY_INSTRUCTIONS, primary_memory_instruction_component},
+    native_memory::{
+        NativeMemoryAdapter, NativeMemoryDisable, NativeMemoryDocumentKind,
+        PRIMARY_MEMORY_INSTRUCTIONS, primary_memory_instruction_component,
+    },
     native_transaction::{
         approval_hash_v1,
         engine::{
@@ -72,9 +75,22 @@ fn fixture(source: &str) -> Fixture {
     let working_directory = project_root.join("service");
     let profile = source["profile"].as_object().unwrap();
     let files = profile["files"].as_object().unwrap();
-    materialize_profile(&default_home, profile, files);
-    materialize_profile(&profiles_root.join("coder"), profile, files);
-    materialize_profile(&profiles_root.join("writer"), profile, files);
+    let native_memory_config = source["nativeMemoryConfigYaml"]
+        .as_str()
+        .unwrap_or_default();
+    materialize_profile(&default_home, profile, files, native_memory_config);
+    materialize_profile(
+        &profiles_root.join("coder"),
+        profile,
+        files,
+        native_memory_config,
+    );
+    materialize_profile(
+        &profiles_root.join("writer"),
+        profile,
+        files,
+        native_memory_config,
+    );
     materialize(&project_root, source["project"].as_object().unwrap());
     fs::create_dir_all(&working_directory).unwrap();
 
@@ -127,13 +143,16 @@ fn fixture(source: &str) -> Fixture {
     }
 }
 
-fn materialize_profile(root: &Path, profile: &Map<String, Value>, files: &Map<String, Value>) {
+fn materialize_profile(
+    root: &Path,
+    profile: &Map<String, Value>,
+    files: &Map<String, Value>,
+    native_memory_config: &str,
+) {
     materialize(root, files);
-    fs::write(
-        root.join("config.yaml"),
-        profile["configYaml"].as_str().unwrap(),
-    )
-    .unwrap();
+    let mut config = profile["configYaml"].as_str().unwrap().to_owned();
+    config.push_str(native_memory_config);
+    fs::write(root.join("config.yaml"), config).unwrap();
 }
 
 fn materialize(root: &Path, files: &Map<String, Value>) {
@@ -1834,6 +1853,131 @@ fn supported_release_fixtures_bind_one_named_profile() {
 }
 
 #[test]
+fn native_memory_capability_matrix_is_exact_for_frozen_hermes_releases() {
+    for source in [
+        include_str!("fixtures/hermes-0.18.2.json"),
+        include_str!("fixtures/hermes-0.18.1.json"),
+    ] {
+        let fixture = fixture(source);
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+            panic!("frozen native Hermes release must support native-memory disable");
+        };
+        assert_eq!(mutations.len(), 1);
+        let rendered = String::from_utf8(intended_bytes(&mutations[0])).unwrap();
+        assert!(rendered.contains("memory:\n"));
+        assert!(rendered.contains("  memory_enabled: false\n"));
+        assert!(rendered.contains("  user_profile_enabled: false\n"));
+        assert!(rendered.contains("# profile heading"));
+        assert!(rendered.contains("unknown_root: 'preserve-single-quotes'"));
+
+        assert_eq!(capabilities.sources.len(), 2);
+        assert_eq!(
+            capabilities.sources[0].document_kind,
+            NativeMemoryDocumentKind::Agent
+        );
+        assert_eq!(
+            capabilities.sources[1].document_kind,
+            NativeMemoryDocumentKind::UserProfile
+        );
+        assert_eq!(
+            capabilities
+                .sources
+                .iter()
+                .map(|source| source.path.display.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                fixture
+                    .layout
+                    .profile
+                    .hermes_home
+                    .join("memories/MEMORY.md")
+                    .display()
+                    .to_string(),
+                fixture
+                    .layout
+                    .profile
+                    .hermes_home
+                    .join("memories/USER.md")
+                    .display()
+                    .to_string(),
+            ]
+        );
+        assert!(capabilities.sources.iter().all(|source| {
+            source.scope == context_relay_protocol::ScopeRef::Global
+                && source.adapter_version == fixture.layout.version
+                && source.managed_fence
+        }));
+    }
+}
+
+#[test]
+fn native_memory_disable_rolls_back_true_false_and_absent_hermes_values_exactly() {
+    for (index, prior) in [Some(true), Some(false), None].into_iter().enumerate() {
+        let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+        let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+        let config = fs::read_to_string(&config_path).unwrap();
+        let memory_block = "memory:\n  memory_enabled: true\n  user_profile_enabled: true\n";
+        let config = match prior {
+            Some(true) => config,
+            Some(false) => config.replace(
+                memory_block,
+                "memory:\n  memory_enabled: false\n  user_profile_enabled: false\n",
+            ),
+            None => config.replace(memory_block, ""),
+        };
+        fs::write(&config_path, config).unwrap();
+        let before = fs::read(&config_path).unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+            panic!("supported Hermes release must remain writable");
+        };
+        if prior == Some(false) {
+            assert!(mutations.is_empty());
+            assert_eq!(fs::read(&config_path).unwrap(), before);
+            continue;
+        }
+        let nonce = [60 + index as u8; 16];
+        let mut native = OsNativeTransactionFileSystem::new(nonce);
+        let images = native.create_before_images(&mutations).unwrap();
+        native.record_native_metadata(&images).unwrap();
+        native.compare_and_swap_targets(&mutations).unwrap();
+        for mutation in &mutations {
+            native.apply_mutation(&nonce, mutation).unwrap();
+        }
+        assert_eq!(
+            fixture
+                .adapter
+                .native_memory_capabilities()
+                .unwrap()
+                .sources,
+            capabilities.sources
+        );
+        native.restore_matching_applied_targets(&nonce).unwrap();
+        assert_eq!(fs::read(&config_path).unwrap(), before);
+    }
+}
+
+#[test]
+fn native_memory_hermes_unsupported_setting_is_never_synthesized() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+        "memory:\n  memory_enabled: true\n  user_profile_enabled: true\n",
+        "memory:\n  memory_enabled: unsupported\n  user_profile_enabled: true\n",
+    );
+    fs::write(&config_path, config).unwrap();
+    let before = fs::read(&config_path).unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert!(matches!(
+        capabilities.disable,
+        NativeMemoryDisable::WatchOnly
+    ));
+    assert_eq!(capabilities.sources.len(), 2);
+    assert_eq!(fs::read(config_path).unwrap(), before);
+}
+
+#[test]
 fn supported_releases_import_every_reviewed_component_kind() {
     for source in [
         include_str!("fixtures/hermes-0.18.2.json"),
@@ -2828,6 +2972,12 @@ fn unknown_versions_and_wrappers_are_import_only() {
             probe(&adapter, Some("coder")).capability,
             CapabilityLevel::ImportOnly
         );
+        let capabilities = adapter.native_memory_capabilities().unwrap();
+        assert!(matches!(
+            capabilities.disable,
+            NativeMemoryDisable::WatchOnly
+        ));
+        assert_eq!(capabilities.sources.len(), 2);
         assert_eq!(
             adapter
                 .render(&context_relay_protocol::DesiredState {

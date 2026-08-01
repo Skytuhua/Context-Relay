@@ -1,5 +1,6 @@
 {
   "version": "0.18.1",
+  "nativeMemoryConfigYaml": "memory:\n  memory_enabled: true\n  user_profile_enabled: true\n",
   "profile": {
     "name": "coder",
     "configYaml": "# profile heading\nunknown_root: 'preserve-single-quotes'\napprovals:\n  mode: smart\n  deny:\n    - 'rm -rf *'\ncommand_allowlist:\n  - cargo test\nplugins:\n  unknown_child: preserve-me\n  enabled:\n    - reviewer\n  disabled:\n    - legacy\nmcp_servers:\n  docs:\n    url: https://example.com/mcp\n    enabled: true\n    tools:\n      include:\n        - search\n    headers:\n      Authorization: must-not-import-yaml-header\n      X-Token: ${HEADER_TOKEN}\n  local:\n    command: node\n    args:\n      - server.js\n    env:\n      DOCS_TOKEN: ${DOCS_TOKEN}\n      LEAK: must-not-import-yaml-env\n  old:\n    command: old-server\n    enabled: false\nhooks:\n  shell:\n    enabled: true\n    post_tool:\n      command: check-write\n  disabled:\n    enabled: false\n    post_tool:\n      command: old-check\nprovider:\n  api_key: must-not-import-provider-key\n",

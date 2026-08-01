@@ -31,7 +31,10 @@ use toml_edit::{DocumentMut, Item, Value as TomlValue};
 use crate::mcp::install::{
     BRIDGE_SERVER_NAME, is_canonical_bridge_body, is_managed_bridge_component,
 };
-use crate::native_memory::is_primary_memory_instruction_component;
+use crate::native_memory::{
+    NativeMemoryAdapter, NativeMemoryCapabilities, NativeMemoryDisable, NativeMemoryDocumentKind,
+    is_primary_memory_instruction_component, native_memory_source,
+};
 use crate::native_transaction::{
     cli::{CliMutationOutcome, CliRestoreOutcome, NativeCliExecutor},
     engine::{BoundaryError, FrozenOutput, NativeAdapter, RestrictedRun},
@@ -1715,6 +1718,133 @@ impl CodexAdapter {
             }
         }
         Ok(())
+    }
+}
+
+impl NativeMemoryAdapter for CodexAdapter {
+    fn native_memory_capabilities(&self) -> Result<NativeMemoryCapabilities, ClientError> {
+        let memory_root = self.layout.codex_home.join("memories");
+        let sources = vec![
+            native_memory_source(
+                HarnessId::Codex,
+                &self.layout.version,
+                ScopeRef::Global,
+                NativeMemoryDocumentKind::Agent,
+                wire_path(&memory_root.join("MEMORY.md")),
+            )?,
+            native_memory_source(
+                HarnessId::Codex,
+                &self.layout.version,
+                ScopeRef::Global,
+                NativeMemoryDocumentKind::Summary,
+                wire_path(&memory_root.join("memory_summary.md")),
+            )?,
+        ];
+        if !SUPPORTED_VERSIONS.contains(&self.layout.version.as_str())
+            || self.layout.executable_kind != CodexExecutableKind::Native
+            || self.native_memory_setting_is_managed()
+        {
+            let capabilities = NativeMemoryCapabilities {
+                disable: NativeMemoryDisable::WatchOnly,
+                sources,
+            };
+            capabilities.validate()?;
+            return Ok(capabilities);
+        }
+
+        let path = self.layout.codex_home.join("config.toml");
+        let snapshot = match OsNativeFileSystem::new().snapshot(&path) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return Ok(NativeMemoryCapabilities {
+                    disable: NativeMemoryDisable::WatchOnly,
+                    sources,
+                });
+            }
+        };
+        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
+            return Ok(NativeMemoryCapabilities {
+                disable: NativeMemoryDisable::WatchOnly,
+                sources,
+            });
+        };
+        let mut document = match bytes_to_document(bytes) {
+            Ok(document) => document,
+            Err(_) => {
+                return Ok(NativeMemoryCapabilities {
+                    disable: NativeMemoryDisable::WatchOnly,
+                    sources,
+                });
+            }
+        };
+        let supported_shape = document.get("memories").is_none_or(|item| {
+            item.as_table_like().is_some_and(|table| {
+                ["generate_memories", "use_memories"].iter().all(|key| {
+                    table
+                        .get(key)
+                        .is_none_or(|value| value.as_value().and_then(TomlValue::as_bool).is_some())
+                })
+            })
+        });
+        if !supported_shape {
+            let capabilities = NativeMemoryCapabilities {
+                disable: NativeMemoryDisable::WatchOnly,
+                sources,
+            };
+            capabilities.validate()?;
+            return Ok(capabilities);
+        }
+        let already_disabled = document.get("memories").is_some_and(|item| {
+            item.as_table_like().is_some_and(|table| {
+                ["generate_memories", "use_memories"].iter().all(|key| {
+                    table
+                        .get(key)
+                        .and_then(Item::as_value)
+                        .and_then(TomlValue::as_bool)
+                        == Some(false)
+                })
+            })
+        });
+        let mutations = if already_disabled {
+            vec![]
+        } else {
+            for key in ["generate_memories", "use_memories"] {
+                let item = &mut document["memories"][key];
+                if let Some(TomlValue::Boolean(current)) = item.as_value_mut() {
+                    let decor = current.decor().clone();
+                    let mut intended = toml_edit::Formatted::new(false);
+                    *intended.decor_mut() = decor;
+                    *item = Item::Value(TomlValue::Boolean(intended));
+                } else {
+                    *item = toml_edit::value(false);
+                }
+            }
+            let intended =
+                NativeState::regular_file(document.to_string().into_bytes(), metadata.clone());
+            vec![self.approved_file(&path, snapshot.fingerprint(), intended)?]
+        };
+        let capabilities = NativeMemoryCapabilities {
+            disable: NativeMemoryDisable::Supported(mutations),
+            sources,
+        };
+        capabilities.validate()?;
+        Ok(capabilities)
+    }
+}
+
+impl CodexAdapter {
+    fn native_memory_setting_is_managed(&self) -> bool {
+        self.layout.requirements_paths.iter().any(|path| {
+            if !path.is_file() {
+                return false;
+            }
+            fs::read_to_string(path).map_or(true, |contents| {
+                let folded = contents.to_ascii_lowercase();
+                folded.contains("generate_memories")
+                    || folded.contains("use_memories")
+                    || folded.contains("[memories]")
+            })
+        })
     }
 }
 

@@ -16,7 +16,10 @@ use sha2::{Digest as _, Sha256};
 use crate::mcp::install::{
     BRIDGE_SERVER_NAME, is_canonical_bridge_body, is_managed_bridge_component,
 };
-use crate::native_memory::is_primary_memory_instruction_component;
+use crate::native_memory::{
+    NativeMemoryAdapter, NativeMemoryCapabilities, NativeMemoryDisable, NativeMemoryDocumentKind,
+    is_primary_memory_instruction_component, native_memory_source,
+};
 use crate::native_transaction::model::{
     ApprovedMutation, MutationKind, RestorableStateFingerprint,
 };
@@ -861,6 +864,137 @@ impl HermesAdapter {
                 })
                 .collect(),
         )
+    }
+}
+
+impl NativeMemoryAdapter for HermesAdapter {
+    fn native_memory_capabilities(&self) -> Result<NativeMemoryCapabilities, ClientError> {
+        let memory_root = self.layout.profile.hermes_home.join("memories");
+        let sources = vec![
+            native_memory_source(
+                HarnessId::Hermes,
+                &self.layout.version,
+                ScopeRef::Global,
+                NativeMemoryDocumentKind::Agent,
+                wire_path(&memory_root.join("MEMORY.md")),
+            )?,
+            native_memory_source(
+                HarnessId::Hermes,
+                &self.layout.version,
+                ScopeRef::Global,
+                NativeMemoryDocumentKind::UserProfile,
+                wire_path(&memory_root.join("USER.md")),
+            )?,
+        ];
+        if self.require_apply_supported().is_err() {
+            let capabilities = NativeMemoryCapabilities {
+                disable: NativeMemoryDisable::WatchOnly,
+                sources,
+            };
+            capabilities.validate()?;
+            return Ok(capabilities);
+        }
+
+        let path = self.layout.profile.hermes_home.join("config.yaml");
+        let snapshot = match OsNativeFileSystem::new().snapshot(&path) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return Ok(NativeMemoryCapabilities {
+                    disable: NativeMemoryDisable::WatchOnly,
+                    sources,
+                });
+            }
+        };
+        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
+            return Ok(NativeMemoryCapabilities {
+                disable: NativeMemoryDisable::WatchOnly,
+                sources,
+            });
+        };
+        let parsed = match super::yaml::parse_config(bytes) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                return Ok(NativeMemoryCapabilities {
+                    disable: NativeMemoryDisable::WatchOnly,
+                    sources,
+                });
+            }
+        };
+        let memory = resolve_yaml(&parsed.value, &["memory"]);
+        let supported_shape = memory.is_none_or(|value| {
+            value.as_mapping().is_some_and(|mapping| {
+                ["memory_enabled", "user_profile_enabled"]
+                    .iter()
+                    .all(|key| {
+                        mapping
+                            .get(YamlValue::String((*key).to_owned()))
+                            .is_none_or(|value| value.as_bool().is_some())
+                    })
+            })
+        });
+        if !supported_shape {
+            let capabilities = NativeMemoryCapabilities {
+                disable: NativeMemoryDisable::WatchOnly,
+                sources,
+            };
+            capabilities.validate()?;
+            return Ok(capabilities);
+        }
+        let already_disabled = memory.is_some_and(|value| {
+            value.as_mapping().is_some_and(|mapping| {
+                ["memory_enabled", "user_profile_enabled"]
+                    .iter()
+                    .all(|key| {
+                        mapping
+                            .get(YamlValue::String((*key).to_owned()))
+                            .and_then(YamlValue::as_bool)
+                            == Some(false)
+                    })
+            })
+        });
+        let mutations = if already_disabled {
+            vec![]
+        } else {
+            let mut replacements = BTreeMap::<Vec<String>, Option<YamlValue>>::new();
+            if memory.is_none() {
+                let mut mapping = serde_yaml_ng::Mapping::new();
+                mapping.insert(
+                    YamlValue::String("memory_enabled".to_owned()),
+                    YamlValue::Bool(false),
+                );
+                mapping.insert(
+                    YamlValue::String("user_profile_enabled".to_owned()),
+                    YamlValue::Bool(false),
+                );
+                replacements.insert(vec!["memory".to_owned()], Some(YamlValue::Mapping(mapping)));
+            } else {
+                replacements.insert(
+                    vec!["memory".to_owned(), "memory_enabled".to_owned()],
+                    Some(YamlValue::Bool(false)),
+                );
+                replacements.insert(
+                    vec!["memory".to_owned(), "user_profile_enabled".to_owned()],
+                    Some(YamlValue::Bool(false)),
+                );
+            }
+            let rendered = match super::yaml::patch_owned_paths(&parsed, &replacements) {
+                Ok(rendered) => rendered,
+                Err(_) => {
+                    return Ok(NativeMemoryCapabilities {
+                        disable: NativeMemoryDisable::WatchOnly,
+                        sources,
+                    });
+                }
+            };
+            let intended = NativeState::regular_file(rendered, metadata.clone());
+            vec![self.approved_state(&path, snapshot.fingerprint(), intended)?]
+        };
+        let capabilities = NativeMemoryCapabilities {
+            disable: NativeMemoryDisable::Supported(mutations),
+            sources,
+        };
+        capabilities.validate()?;
+        Ok(capabilities)
     }
 }
 

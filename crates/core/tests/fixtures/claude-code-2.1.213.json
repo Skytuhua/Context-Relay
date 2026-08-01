@@ -29,7 +29,9 @@
   "project": {
     "CLAUDE.md": "# Project instructions\nUse Rust 2024.\n",
     ".claude/CLAUDE.md": "# Nested project instructions\nPreserve public APIs.\n",
-    ".claude/settings.json": "{\"unmanaged\":{\"keep\":true},\"permissions\":{\"deny\":[\"Read(.env)\"]},\"hooks\":{\"PreToolUse\":[]},\"enabledPlugins\":{\"lint@team\":true}}\n",
+    ".claude/settings.json": "{\"unmanaged\":{\"keep\":true},\"autoMemoryEnabled\":true,\"autoMemoryDirectory\":\".claude/native-memory\",\"permissions\":{\"deny\":[\"Read(.env)\"]},\"hooks\":{\"PreToolUse\":[]},\"enabledPlugins\":{\"lint@team\":true}}\n",
+    ".claude/native-memory/MEMORY.md": "# Agent memory\nClaude-owned prefix.\n",
+    ".claude/native-memory/decisions.md": "# Decisions\nUse exact bindings.\n",
     ".claude/rules/project.md": "# Project rule\nNo shell strings.\n",
     ".claude/skills/release/SKILL.md": "---\ndescription: Prepare a release\n---\nVerify artifacts.\n",
     ".mcp.json": "{\"mcpServers\":{\"docs\":{\"type\":\"http\",\"url\":\"https://example.com/mcp\",\"headers\":{\"Authorization\":\"secret\"}}}}\n"

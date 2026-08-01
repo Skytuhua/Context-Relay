@@ -24,7 +24,10 @@ use sha2::{Digest, Sha256};
 use crate::mcp::install::{
     BRIDGE_SERVER_NAME, is_canonical_bridge_body, is_managed_bridge_component,
 };
-use crate::native_memory::is_primary_memory_instruction_component;
+use crate::native_memory::{
+    NativeMemoryAdapter, NativeMemoryCapabilities, NativeMemoryDisable, NativeMemoryDocumentKind,
+    is_primary_memory_instruction_component,
+};
 use crate::native_transaction::{
     cli::{CliMutationOutcome, CliRestoreOutcome, NativeCliExecutor},
     engine::{BoundaryError, FrozenOutput, NativeAdapter, RestrictedRun},
@@ -990,6 +993,235 @@ impl ClaudeCodeAdapter {
                 .collect(),
             timeout_ms: CLI_TIMEOUT_MS,
         }))
+    }
+}
+
+impl NativeMemoryAdapter for ClaudeCodeAdapter {
+    fn native_memory_capabilities(&self) -> Result<NativeMemoryCapabilities, ClientError> {
+        let path = self.project_settings_path();
+        let snapshot = OsNativeFileSystem::new().snapshot(&path).map_err(|_| {
+            invalid_request("Claude Code memory settings cannot be safely inspected")
+        })?;
+        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
+            return Ok(NativeMemoryCapabilities {
+                disable: NativeMemoryDisable::Unavailable,
+                sources: vec![],
+            });
+        };
+        let mut settings = match parse_object(bytes, "Claude Code settings are invalid") {
+            Ok(settings) => settings,
+            Err(_) => {
+                return Ok(NativeMemoryCapabilities {
+                    disable: NativeMemoryDisable::Unavailable,
+                    sources: vec![],
+                });
+            }
+        };
+        let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str());
+        let Some(memory_root) = self.bound_native_memory_root(&settings, supported)? else {
+            return Ok(NativeMemoryCapabilities {
+                disable: NativeMemoryDisable::Unavailable,
+                sources: vec![],
+            });
+        };
+        let sources = self.native_memory_sources(&memory_root)?;
+        if !supported || self.native_memory_setting_is_managed() {
+            let capabilities = NativeMemoryCapabilities {
+                disable: NativeMemoryDisable::WatchOnly,
+                sources,
+            };
+            capabilities.validate()?;
+            return Ok(capabilities);
+        }
+        let mutations = match settings.get("autoMemoryEnabled") {
+            Some(Value::Bool(false)) => vec![],
+            Some(Value::Bool(true)) | None => {
+                settings.insert("autoMemoryEnabled".to_owned(), Value::Bool(false));
+                let rendered = serde_json::to_vec(&Value::Object(settings)).map_err(|_| {
+                    invalid_request("Claude Code memory settings cannot be rendered")
+                })?;
+                let intended = NativeState::regular_file(rendered, metadata.clone());
+                vec![ApprovedMutation {
+                    target: wire_path(&path),
+                    kind: MutationKind::Payload,
+                    content: intended.encode_v1().map_err(|_| {
+                        invalid_request("Claude Code memory settings are not representable")
+                    })?,
+                    expected: RestorableStateFingerprint(Sha256Digest(*snapshot.fingerprint())),
+                    intended: RestorableStateFingerprint(Sha256Digest(intended.fingerprint())),
+                }]
+            }
+            Some(_) => {
+                let capabilities = NativeMemoryCapabilities {
+                    disable: NativeMemoryDisable::WatchOnly,
+                    sources,
+                };
+                capabilities.validate()?;
+                return Ok(capabilities);
+            }
+        };
+        let capabilities = NativeMemoryCapabilities {
+            disable: NativeMemoryDisable::Supported(mutations),
+            sources,
+        };
+        capabilities.validate()?;
+        Ok(capabilities)
+    }
+}
+
+impl ClaudeCodeAdapter {
+    fn bound_native_memory_root(
+        &self,
+        settings: &Map<String, Value>,
+        supported: bool,
+    ) -> Result<Option<PathBuf>, ClientError> {
+        if let Some(value) = settings.get("autoMemoryDirectory") {
+            let Some(value) = value.as_str() else {
+                return Ok(None);
+            };
+            let configured = Path::new(value);
+            if value.is_empty()
+                || value.len() > 4_096
+                || configured
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Ok(None);
+            }
+            let root = if configured.is_absolute() {
+                configured.to_path_buf()
+            } else {
+                if configured.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::RootDir | std::path::Component::Prefix(_)
+                    )
+                }) {
+                    return Ok(None);
+                }
+                self.layout.project_root.join(configured)
+            };
+            return safe_memory_directory_binding(&root);
+        }
+        if !supported {
+            return Ok(None);
+        }
+        let canonical_project = match fs::canonicalize(&self.layout.project_root) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let key = canonical_project
+            .to_string_lossy()
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        if key.is_empty() || key.len() > 4_096 {
+            return Ok(None);
+        }
+        safe_memory_directory_binding(
+            &self
+                .layout
+                .config_dir
+                .join("projects")
+                .join(key)
+                .join("memory"),
+        )
+    }
+
+    fn native_memory_sources(
+        &self,
+        root: &Path,
+    ) -> Result<Vec<crate::native_memory::NativeMemorySource>, ClientError> {
+        const MAX_TOPIC_FILES: usize = 32;
+
+        let mut sources = vec![crate::native_memory::native_memory_source(
+            HarnessId::ClaudeCode,
+            &self.layout.version,
+            ScopeRef::Project {
+                project_id: self.project_id,
+            },
+            NativeMemoryDocumentKind::Agent,
+            wire_path(&root.join("MEMORY.md")),
+        )?];
+        let mut topics = Vec::new();
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.take(MAX_TOPIC_FILES + 1) {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => continue,
+                };
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(_) => continue,
+                };
+                if !file_type.is_file() || file_type.is_symlink() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let folded = name.to_ascii_lowercase();
+                if name == "MEMORY.md"
+                    || !name.ends_with(".md")
+                    || name.len() > 128
+                    || folded.contains("session")
+                    || folded.contains("history")
+                    || folded.contains("rollout")
+                    || folded.contains("raw_memories")
+                {
+                    continue;
+                }
+                topics.push(entry.path());
+            }
+        }
+        topics.sort();
+        topics.truncate(MAX_TOPIC_FILES);
+        for path in topics {
+            sources.push(crate::native_memory::native_memory_source(
+                HarnessId::ClaudeCode,
+                &self.layout.version,
+                ScopeRef::Project {
+                    project_id: self.project_id,
+                },
+                NativeMemoryDocumentKind::Topic,
+                wire_path(&path),
+            )?);
+        }
+        Ok(sources)
+    }
+
+    fn native_memory_setting_is_managed(&self) -> bool {
+        self.layout.managed_settings_paths.iter().any(|path| {
+            if !path.is_file() {
+                return false;
+            }
+            read_optional_file(path)
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|value| value.as_object().cloned())
+                .is_none_or(|settings| {
+                    settings.contains_key("autoMemoryEnabled")
+                        || settings.contains_key("autoMemoryDirectory")
+                })
+        })
+    }
+}
+
+fn safe_memory_directory_binding(path: &Path) -> Result<Option<PathBuf>, ClientError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Ok(None),
+        Ok(_) => fs::canonicalize(path)
+            .map(Some)
+            .map_err(|_| invalid_request("Claude Code memory directory cannot be resolved")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(path.to_path_buf())),
+        Err(_) => Ok(None),
     }
 }
 
