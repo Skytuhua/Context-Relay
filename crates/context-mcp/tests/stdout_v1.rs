@@ -66,6 +66,39 @@ fn every_stdout_line_is_one_compact_json_rpc_object() {
     }
 }
 
+#[test]
+fn malformed_hook_input_uses_one_redacted_stderr_line_and_no_stdout() {
+    let sentinel = "HOOK_PRIVATE_INPUT_SENTINEL_234bb9";
+    let output = command_with_input(
+        &["--hook-event", "session-start", "--harness", "codex"],
+        format!(r#"{{"prompt":"{sentinel}"}}"#).as_bytes(),
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        output.stderr,
+        b"Context Relay hook stopped: A hook event was invalid\n"
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(sentinel));
+}
+
+#[test]
+fn oversized_hook_input_is_bounded_and_redacted_without_stdout() {
+    let input = vec![b'X'; context_relay_context_mcp::MAX_HOOK_INPUT_BYTES + 512];
+    let output = command_with_input(
+        &["--hook-event", "session-start", "--harness", "claude-code"],
+        &input,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        output.stderr,
+        b"Context Relay hook stopped: A hook event exceeded the size limit\n"
+    );
+}
+
 fn command(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_context-relay-context-mcp"))
         .args(arguments)
@@ -74,4 +107,16 @@ fn command(arguments: &[&str]) -> Output {
         .stderr(Stdio::piped())
         .output()
         .unwrap()
+}
+
+fn command_with_input(arguments: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_context-relay-context-mcp"))
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
 }

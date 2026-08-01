@@ -7,7 +7,7 @@ use context_relay_local_ipc::Client;
 use context_relay_local_ipc::{InstallationToken, RuntimeConfig};
 use context_relay_protocol::{
     CancelParams, ClientError, ClientRole, ErrorCode, LocalRequest, LocalResult, McpCallParams,
-    RecordId,
+    NativeHookEventParams, RecordId,
 };
 use serde_json::Value;
 #[cfg(feature = "test-support")]
@@ -24,10 +24,19 @@ pub trait Daemon: Clone + Send + Sync + 'static {
     fn cancel(&self, request_id: RecordId) -> impl Future<Output = Result<(), BridgeError>> + Send;
 }
 
+pub trait NativeHookDaemon: Clone + Send + Sync + 'static {
+    fn native_hook(
+        &self,
+        params: NativeHookEventParams,
+    ) -> impl Future<Output = Result<LocalResult, BridgeError>> + Send;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BridgeError {
     Client(ClientError),
     FrameTooLarge,
+    HookInputTooLarge,
+    InvalidHookInput,
     Io,
     Unavailable,
 }
@@ -46,6 +55,8 @@ impl BridgeError {
                 _ => "The local service could not complete the request",
             },
             Self::FrameTooLarge => "An MCP message exceeded the size limit",
+            Self::HookInputTooLarge => "A hook event exceeded the size limit",
+            Self::InvalidHookInput => "A hook event was invalid",
             Self::Io | Self::Unavailable => "The local service is unavailable",
         }
     }
@@ -55,6 +66,12 @@ impl BridgeError {
             Self::Client(error) => error.clone(),
             Self::FrameTooLarge => ClientError {
                 code: ErrorCode::FrameTooLarge,
+                message: self.redacted_message().into(),
+                field_path: None,
+                retryable: false,
+            },
+            Self::HookInputTooLarge | Self::InvalidHookInput => ClientError {
+                code: ErrorCode::InvalidRequest,
                 message: self.redacted_message().into(),
                 field_path: None,
                 retryable: false,
@@ -233,6 +250,24 @@ impl Daemon for LocalDaemon {
     }
 }
 
+impl NativeHookDaemon for LocalDaemon {
+    fn native_hook(
+        &self,
+        params: NativeHookEventParams,
+    ) -> impl Future<Output = Result<LocalResult, BridgeError>> + Send {
+        let daemon = self.clone();
+        async move {
+            let mut client = daemon.connect().await?;
+            let request_id =
+                RecordId::new(Uuid::now_v7()).expect("UUID v7 generator returns a valid RecordId");
+            client
+                .call(request_id, LocalRequest::NativeHookEvent(params))
+                .await
+                .map_err(BridgeError::from)
+        }
+    }
+}
+
 fn decode_mcp_result(expected_name: &str, result: LocalResult) -> Result<Value, BridgeError> {
     match result {
         LocalResult::McpOutput { name, output } if name == expected_name => Ok(output),
@@ -240,7 +275,7 @@ fn decode_mcp_result(expected_name: &str, result: LocalResult) -> Result<Value, 
     }
 }
 
-fn invalid_daemon_result() -> BridgeError {
+pub(crate) fn invalid_daemon_result() -> BridgeError {
     BridgeError::Client(ClientError {
         code: ErrorCode::Internal,
         message: "The local service returned an invalid response".into(),

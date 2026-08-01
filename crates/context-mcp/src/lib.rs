@@ -1,4 +1,5 @@
 mod daemon;
+mod hook;
 pub mod protocol;
 mod server;
 
@@ -7,23 +8,19 @@ use std::{ffi::OsString, path::Path};
 use context_relay_protocol::{HarnessId, McpBinding, NativePlatform, WireNativeValue};
 use tokio::io::BufReader;
 
-pub use daemon::{BridgeError, Daemon, LocalDaemon};
+pub use daemon::{BridgeError, Daemon, LocalDaemon, NativeHookDaemon};
+pub use hook::{
+    HookInvocationKind, Invocation, MAX_HOOK_INPUT_BYTES, SESSION_START_REMINDER, execute_hook,
+    parse_invocation, project_hook_input, read_hook_input, run_hook_stdio,
+};
 pub use protocol::{MCP_COMPAT_REVISION, MCP_REVISION, RpcId, encode_message};
 pub use server::{MAX_IN_FLIGHT_TOOL_CALLS, Server};
 
 pub fn parse_harness(arguments: impl IntoIterator<Item = OsString>) -> Option<HarnessId> {
-    let mut arguments = arguments.into_iter();
-    arguments.next()?;
-    if arguments.next()?.to_str()? != "--harness" {
-        return None;
+    match parse_invocation(arguments) {
+        Some(Invocation::Mcp { harness }) => Some(harness),
+        Some(Invocation::Hook { .. }) | None => None,
     }
-    let harness = match arguments.next()?.to_str()? {
-        "claude-code" => HarnessId::ClaudeCode,
-        "codex" => HarnessId::Codex,
-        "hermes" => HarnessId::Hermes,
-        _ => return None,
-    };
-    arguments.next().is_none().then_some(harness)
 }
 
 pub async fn run_stdio(harness: HarnessId) -> Result<(), BridgeError> {
