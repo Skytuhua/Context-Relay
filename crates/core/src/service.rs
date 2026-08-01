@@ -1,10 +1,13 @@
+use std::str::FromStr as _;
+
 use context_relay_protocol::{
     CandidateId, CandidateReviewParams, CandidateState, ClientError, DeviceId, ErrorCode,
-    HarnessAccessPolicy, HarnessId, HybridLogicalClock, InstructionRecord, McpScopeSelector,
-    MemoryArchiveParams, MemoryCandidate, MemoryCreateParams, MemoryId, MemoryOrigin, MemoryRecord,
-    MemoryUpdateParams, OperationId, ProjectId, ProjectIdentity, ProposeMemoryInput, Provenance,
-    ReadableRecord, RecordId, ScopeRef, SearchParams, TaskCompleteParams, TaskEvidence, TaskId,
-    TaskRecord, TaskStatus, TaskTransitionParams, TaskUpsertParams, WireNativeValue,
+    HarnessAccessPolicy, HarnessId, HybridLogicalClock, InstructionRecord, LocalRequest,
+    McpScopeSelector, MemoryArchiveParams, MemoryCandidate, MemoryCreateParams, MemoryId,
+    MemoryOrigin, MemoryRecord, MemoryUpdateParams, NativeHookEvent, NativeHookEventParams,
+    OperationId, ProjectId, ProjectIdentity, ProposeMemoryInput, Provenance, ReadableRecord,
+    RecordId, ScopeRef, SearchParams, TaskCompleteParams, TaskEvidence, TaskId, TaskRecord,
+    TaskStatus, TaskTransitionParams, TaskUpsertParams, WireNativeValue,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -15,7 +18,10 @@ use crate::{
         build_native_memory_candidate, reconcile,
     },
     search::{AllowedSearchScope, EMBEDDING_DIMENSIONS, Embedding384},
-    vault::{LocalOperationBinding, LocalOperationKind, LocalOperationReplay, Vault, VaultError},
+    vault::{
+        LocalOperationBinding, LocalOperationKind, LocalOperationReplay, NativeHookSession, Vault,
+        VaultError,
+    },
 };
 
 pub struct OfflineWorkspace<'a> {
@@ -32,6 +38,65 @@ struct PreparedLocalMutation<T> {
 impl<'a> OfflineWorkspace<'a> {
     pub const fn new(vault: &'a mut Vault, device_id: DeviceId) -> Self {
         Self { vault, device_id }
+    }
+
+    pub fn handle_native_hook_event(
+        &mut self,
+        project_id: ProjectId,
+        params: NativeHookEventParams,
+    ) -> Result<(), ClientError> {
+        LocalRequest::NativeHookEvent(params.clone())
+            .validate()
+            .map_err(|_| invalid_request())?;
+        if !vault(self.vault.projects())?
+            .into_iter()
+            .any(|project| project.project_id == project_id)
+        {
+            return Err(conflict("The native hook project is no longer registered"));
+        }
+        match &params.event {
+            NativeHookEvent::SessionStart { .. } | NativeHookEvent::SessionStop { .. } => {
+                vault(self.vault.put_native_hook_session(project_id, &params))
+            }
+            NativeHookEvent::TaskEvidence {
+                task_id, evidence, ..
+            } => {
+                let task = vault(self.vault.task(task_id))?.ok_or_else(|| {
+                    conflict("The native hook task evidence target does not exist")
+                })?;
+                if task.project_id != project_id {
+                    return Err(conflict(
+                        "The native hook task is outside the resolved project",
+                    ));
+                }
+                let operation_id = native_hook_operation_id(project_id, &params)?;
+                if task.status == TaskStatus::Done {
+                    if task.revision == operation_id {
+                        return Ok(());
+                    }
+                    return Err(conflict("The native hook task evidence is stale"));
+                }
+                self.complete_task(TaskCompleteParams {
+                    operation_id,
+                    task_id: *task_id,
+                    expected_revision: task.revision,
+                    evidence: evidence.clone(),
+                })
+                .map(|_| ())
+            }
+        }
+    }
+
+    pub fn native_hook_session(
+        &self,
+        harness: HarnessId,
+        session_id: &str,
+    ) -> Result<Option<NativeHookSession>, ClientError> {
+        vault(self.vault.native_hook_session(harness, session_id))
+    }
+
+    pub fn native_hook_session_count(&self) -> Result<usize, ClientError> {
+        vault(self.vault.native_hook_session_count())
     }
 
     pub fn reconcile_native_memory(
@@ -848,6 +913,42 @@ fn operation_clock(operation_id: OperationId, device_id: DeviceId) -> HybridLogi
         0, 0, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
     ]);
     HybridLogicalClock::new(physical_ms, 0, device_id)
+}
+
+fn native_hook_operation_id(
+    project_id: ProjectId,
+    params: &NativeHookEventParams,
+) -> Result<OperationId, ClientError> {
+    let canonical = serde_json::to_vec(params).map_err(|_| internal())?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"context-relay.native-hook-task-evidence.v1");
+    hasher.update(project_id.as_bytes());
+    hasher.update(canonical);
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    OperationId::from_str(&format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    ))
+    .map_err(|_| internal())
 }
 
 fn local_operation_binding<T: Serialize>(

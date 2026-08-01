@@ -773,15 +773,13 @@ fn route_request(_role: ClientRole, request: LocalRequest) -> RoutedRequest {
         LocalRequest::Cancel(_) => RoutedRequest::Immediate(Err(invalid_request_error())),
         LocalRequest::Shutdown(_) => RoutedRequest::Shutdown,
         LocalRequest::Health(_) => RoutedRequest::Health,
-        LocalRequest::NativeHookEvent(_) => RoutedRequest::Immediate(Err(unsupported_error(
-            "Native hook event handling is not available",
-        ))),
         LocalRequest::Unlock(_) => RoutedRequest::Immediate(Ok(LocalResult::Empty)),
         LocalRequest::ProjectPathSet(params) => {
             RoutedRequest::Work(VaultCommand::ProjectPathSet(params))
         }
         LocalRequest::MemoryGet(params) => RoutedRequest::Work(VaultCommand::MemoryGet(params)),
         request @ (LocalRequest::McpCall(_)
+        | LocalRequest::NativeHookEvent(_)
         | LocalRequest::ProjectsList(_)
         | LocalRequest::ProjectUpsert(_)
         | LocalRequest::MemoryList(_)
@@ -1203,6 +1201,16 @@ fn execute_workspace_request(
             McpWorkspace::new(&mut state.vault, state.device_id)
                 .call(params)
                 .map(|output| LocalResult::McpOutput { name, output })
+        }
+        LocalRequest::NativeHookEvent(params) => {
+            let resolved =
+                context_relay_core::mcp::binding::resolve_binding(&state.vault, &params.binding)?;
+            let Some(project) = resolved.active_project else {
+                return Ok(LocalResult::Empty);
+            };
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .handle_native_hook_event(project.project_id, params)
+                .map(|()| LocalResult::Empty)
         }
         LocalRequest::ProjectsList(_) => OfflineWorkspace::new(&mut state.vault, state.device_id)
             .projects()
@@ -2493,7 +2501,7 @@ mod tests {
     }
 
     #[test]
-    fn native_hook_event_is_explicitly_unsupported_until_workspace_route_exists() {
+    fn native_hook_event_routes_through_the_ordered_vault_workspace() {
         let request = request_fixture(
             "native_hook_event",
             serde_json::json!({
@@ -2510,11 +2518,13 @@ mod tests {
             }),
         );
 
-        let RoutedRequest::Immediate(Err(error)) = route_request(ClientRole::McpBridge, request)
+        let RoutedRequest::Work(VaultCommand::Workspace(LocalRequest::NativeHookEvent(params))) =
+            route_request(ClientRole::McpBridge, request)
         else {
-            panic!("native hook event must remain an explicit interim rejection")
+            panic!("native hook event did not enter the ordered vault workspace")
         };
-        assert_eq!(error.code, ErrorCode::HarnessUnsupported);
+        assert_eq!(params.binding.harness, HarnessId::Codex);
+        assert_eq!(params.occurred_at_ms, 1_700_000_000_123);
     }
 
     #[cfg(any(windows, target_os = "macos"))]

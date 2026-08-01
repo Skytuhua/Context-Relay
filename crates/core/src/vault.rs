@@ -2,9 +2,10 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use context_relay_protocol::{
     ApplyReceipt, CandidateId, CandidateState, CheckpointV1, HarnessAccessPolicy, HarnessId,
-    InstructionRecord, MAX_EVIDENCE_ITEMS, MemoryCandidate, MemoryId, MemoryKind, MemoryOrigin,
-    MemoryRecord, MutationKind, OperationId, PlanId, ProjectId, ProjectIdentity, Provenance,
-    RecordId, RecordKind, ScopeRef, Sha256Digest, SyncOperationV1, TaskId, TaskRecord, TaskStatus,
+    InstructionRecord, LocalRequest, MAX_ARBITRARY_BYTES, MAX_EVIDENCE_ITEMS, MemoryCandidate,
+    MemoryId, MemoryKind, MemoryOrigin, MemoryRecord, MutationKind, NativeHookEvent,
+    NativeHookEventParams, OperationId, PlanId, ProjectId, ProjectIdentity, Provenance, RecordId,
+    RecordKind, ScopeRef, Sha256Digest, SyncOperationV1, TaskId, TaskRecord, TaskStatus,
     WireNativeValue, encode_sync_operation_v1,
 };
 use keyring::Entry;
@@ -25,7 +26,8 @@ use crate::search::{
 mod native_transactions;
 pub use native_transactions::*;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 10;
+pub const LATEST_SCHEMA_VERSION: u32 = 11;
+pub const MAX_NATIVE_HOOK_SESSIONS: usize = 256;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
 const DEFAULT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
@@ -179,6 +181,16 @@ pub struct VaultRuntimeInfo {
     pub synchronous: i64,
     pub temp_store: i64,
     pub secure_delete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeHookSession {
+    pub harness: HarnessId,
+    pub session_id: String,
+    pub project_id: ProjectId,
+    pub started_at_ms: u64,
+    pub stopped_at_ms: Option<u64>,
+    pub payload: NativeHookEventParams,
 }
 
 pub struct Vault {
@@ -999,6 +1011,150 @@ impl Vault {
         )
     }
 
+    pub fn put_native_hook_session(
+        &mut self,
+        project_id: ProjectId,
+        payload: &NativeHookEventParams,
+    ) -> Result<(), VaultError> {
+        LocalRequest::NativeHookEvent(payload.clone())
+            .validate()
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        let (session_id, stopped) = match &payload.event {
+            NativeHookEvent::SessionStart { session_id } => (session_id, false),
+            NativeHookEvent::SessionStop { session_id } => (session_id, true),
+            NativeHookEvent::TaskEvidence { .. } => {
+                return Err(VaultError::Validation(
+                    "task evidence is not lifecycle session metadata".to_owned(),
+                ));
+            }
+        };
+        let canonical_payload = to_json(payload)?;
+        if canonical_payload.len() > MAX_ARBITRARY_BYTES {
+            return Err(VaultError::Validation(
+                "native hook payload exceeds the storage bound".to_owned(),
+            ));
+        }
+        let harness = harness_name(payload.binding.harness);
+        let occurred_at_ms = sortable_millis(payload.occurred_at_ms);
+        let transaction = self.connection.transaction()?;
+        if stopped {
+            transaction.execute(
+                "INSERT INTO native_hook_sessions(
+                     harness, session_id, project_id, started_at_ms, stopped_at_ms, payload_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?4, ?5)
+                 ON CONFLICT(harness, session_id) DO UPDATE SET
+                     project_id = excluded.project_id,
+                     stopped_at_ms = excluded.stopped_at_ms,
+                     payload_json = excluded.payload_json",
+                params![
+                    harness,
+                    session_id,
+                    project_id.to_string(),
+                    occurred_at_ms,
+                    canonical_payload,
+                ],
+            )?;
+        } else {
+            transaction.execute(
+                "INSERT INTO native_hook_sessions(
+                     harness, session_id, project_id, started_at_ms, stopped_at_ms, payload_json
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5)
+                 ON CONFLICT(harness, session_id) DO UPDATE SET
+                     project_id = excluded.project_id,
+                     started_at_ms = excluded.started_at_ms,
+                     stopped_at_ms = NULL,
+                     payload_json = excluded.payload_json",
+                params![
+                    harness,
+                    session_id,
+                    project_id.to_string(),
+                    occurred_at_ms,
+                    canonical_payload,
+                ],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM native_hook_sessions
+             WHERE rowid IN (
+                 SELECT rowid FROM native_hook_sessions
+                 ORDER BY started_at_ms DESC, harness ASC, session_id ASC
+                 LIMIT -1 OFFSET ?1
+             )",
+            [i64::try_from(MAX_NATIVE_HOOK_SESSIONS).map_err(|_| {
+                VaultError::Validation("native hook retention bound is invalid".to_owned())
+            })?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn native_hook_session(
+        &self,
+        harness: HarnessId,
+        session_id: &str,
+    ) -> Result<Option<NativeHookSession>, VaultError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT project_id, started_at_ms, stopped_at_ms, payload_json
+                 FROM native_hook_sessions
+                 WHERE harness = ?1 AND session_id = ?2",
+                params![harness_name(harness), session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(project_id, started_at_ms, stopped_at_ms, payload_json)| {
+            let project_id = project_id.parse().map_err(|_| {
+                VaultError::Validation("native hook project ID is invalid".to_owned())
+            })?;
+            let started_at_ms = parse_sortable_millis(&started_at_ms)?;
+            let stopped_at_ms = stopped_at_ms
+                .as_deref()
+                .map(parse_sortable_millis)
+                .transpose()?;
+            let payload: NativeHookEventParams = from_json(&payload_json)?;
+            LocalRequest::NativeHookEvent(payload.clone())
+                .validate()
+                .map_err(|error| VaultError::Validation(error.to_string()))?;
+            if payload.binding.harness != harness
+                || lifecycle_session_id(&payload.event) != Some(session_id)
+                || payload.occurred_at_ms != stopped_at_ms.unwrap_or(started_at_ms)
+                || matches!(payload.event, NativeHookEvent::SessionStop { .. })
+                    != stopped_at_ms.is_some()
+            {
+                return Err(VaultError::Validation(
+                    "native hook session metadata is inconsistent".to_owned(),
+                ));
+            }
+            Ok(NativeHookSession {
+                harness,
+                session_id: session_id.to_owned(),
+                project_id,
+                started_at_ms,
+                stopped_at_ms,
+                payload,
+            })
+        })
+        .transpose()
+    }
+
+    pub fn native_hook_session_count(&self) -> Result<usize, VaultError> {
+        let count: i64 =
+            self.connection
+                .query_row("SELECT count(*) FROM native_hook_sessions", [], |row| {
+                    row.get(0)
+                })?;
+        usize::try_from(count)
+            .map_err(|_| VaultError::Validation("native hook session count is invalid".to_owned()))
+    }
+
     pub fn tasks(&self, project_id: ProjectId) -> Result<Vec<TaskRecord>, VaultError> {
         load_json_list(
             &self.connection,
@@ -1676,6 +1832,16 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }
+    if found < 11 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0011_native_hook_sessions.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 11))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
     Ok(())
 }
 
@@ -2095,6 +2261,29 @@ const fn harness_name(harness: HarnessId) -> &'static str {
         HarnessId::ClaudeCode => "claude_code",
         HarnessId::Codex => "codex",
         HarnessId::Hermes => "hermes",
+    }
+}
+
+fn sortable_millis(value: u64) -> String {
+    format!("{value:020}")
+}
+
+fn parse_sortable_millis(value: &str) -> Result<u64, VaultError> {
+    if value.len() != 20 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(VaultError::Validation(
+            "native hook timestamp is invalid".to_owned(),
+        ));
+    }
+    value
+        .parse()
+        .map_err(|_| VaultError::Validation("native hook timestamp is invalid".to_owned()))
+}
+
+fn lifecycle_session_id(event: &NativeHookEvent) -> Option<&str> {
+    match event {
+        NativeHookEvent::SessionStart { session_id }
+        | NativeHookEvent::SessionStop { session_id } => Some(session_id),
+        NativeHookEvent::TaskEvidence { .. } => None,
     }
 }
 

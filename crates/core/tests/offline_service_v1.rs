@@ -6,14 +6,16 @@ use context_relay_core::{
         ReadyNativeMemory,
     },
     service::OfflineWorkspace,
-    vault::Vault,
+    vault::{LATEST_SCHEMA_VERSION, MAX_NATIVE_HOOK_SESSIONS, Vault},
 };
 use context_relay_protocol::{
     CandidateReviewParams, CandidateState, CompletionEvidenceInput, ErrorCode, HarnessId,
-    McpScopeSelector, MemoryArchiveParams, MemoryCreateParams, MemoryKind, MemoryUpdateParams,
-    NativePlatform, ProjectIdentity, ProposeMemoryInput, ScopeRef, SearchParams,
-    TaskCompleteParams, TaskStatus, TaskTransitionParams, TaskUpsertParams, WireNativeValue,
+    McpBinding, McpScopeSelector, MemoryArchiveParams, MemoryCreateParams, MemoryKind,
+    MemoryUpdateParams, NativeHookEvent, NativeHookEventParams, NativePlatform, ProjectIdentity,
+    ProposeMemoryInput, ScopeRef, SearchParams, TaskCompleteParams, TaskId, TaskStatus,
+    TaskTransitionParams, TaskUpsertParams, WireNativeValue,
 };
+use rusqlite::Connection;
 
 use support::{
     ID_1, ID_2, ID_3, ID_4, ID_5, ID_6, ID_7, ID_8, ID_9, MemoryKeyStore, TempVault, candidate,
@@ -38,6 +40,367 @@ impl Fixture {
     fn vault(&self) -> Vault {
         Vault::open(self.path.path(), CREDENTIAL, &self.keys).unwrap()
     }
+}
+
+fn open_keyed(path: &std::path::Path, key: &[u8; 32]) -> Connection {
+    let connection = Connection::open(path).unwrap();
+    // SAFETY: the connection owns the handle, the key remains valid for the call,
+    // and this is the first SQLite operation after open.
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_key(
+            connection.handle(),
+            key.as_ptr().cast(),
+            key.len().try_into().unwrap(),
+        )
+    };
+    assert_eq!(result, rusqlite::ffi::SQLITE_OK);
+    connection
+        .query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+        .unwrap();
+    connection
+}
+
+#[test]
+fn migration_v10_to_v11_preserves_existing_workspace_rows() {
+    let fixture = Fixture::new("native-hook-migration-v10");
+    let project = ProjectIdentity {
+        project_id: ID_7.parse().unwrap(),
+        github_repository_id: Some(41),
+        git_remote_fingerprint: None,
+        monorepo_subdirectory: None,
+        name: "Preserved project".into(),
+    };
+    let task = {
+        let mut vault = fixture.vault();
+        let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap());
+        service.upsert_project(project.clone()).unwrap();
+        service
+            .upsert_task(TaskUpsertParams {
+                operation_id: ID_1.parse().unwrap(),
+                task_id: None,
+                project_id: project.project_id,
+                title: "Preserved task".into(),
+                body_markdown: "Must survive the v11 migration".into(),
+                status: TaskStatus::Open,
+                expected_revision: None,
+            })
+            .unwrap()
+    };
+
+    let raw = open_keyed(fixture.path.path(), &fixture.keys.key(CREDENTIAL));
+    raw.execute_batch("DROP TABLE IF EXISTS native_hook_sessions")
+        .unwrap();
+    raw.pragma_update(None, "user_version", 10).unwrap();
+    drop(raw);
+
+    let vault = fixture.vault();
+    assert_eq!(LATEST_SCHEMA_VERSION, 11);
+    assert_eq!(vault.schema_version().unwrap(), 11);
+    assert_eq!(vault.projects().unwrap(), vec![project]);
+    assert_eq!(vault.task(&task.id).unwrap(), Some(task));
+    assert!(
+        vault
+            .table_names()
+            .unwrap()
+            .contains(&"native_hook_sessions".to_owned())
+    );
+}
+
+fn hook_params(
+    harness: HarnessId,
+    session_id: impl Into<String>,
+    event: impl FnOnce(String) -> NativeHookEvent,
+    occurred_at_ms: u64,
+) -> NativeHookEventParams {
+    let session_id = session_id.into();
+    NativeHookEventParams {
+        binding: McpBinding {
+            harness,
+            working_directory: native_path(),
+        },
+        event: event(session_id),
+        occurred_at_ms,
+    }
+}
+
+#[test]
+fn native_hook_lifecycle_replaces_one_bounded_sanitized_session_row() {
+    let fixture = Fixture::new("native-hook-lifecycle");
+    let raw_session = fixture.path.path().with_extension("raw-session.jsonl");
+    let raw_bytes = br#"{"prompt":"PROMPT_SENTINEL","response":"RESPONSE_SENTINEL","transcript_path":"TRANSCRIPT_SENTINEL","tool_output":"TOOL_SENTINEL"}"#;
+    std::fs::write(&raw_session, raw_bytes).unwrap();
+    let project = ProjectIdentity {
+        project_id: ID_7.parse().unwrap(),
+        github_repository_id: None,
+        git_remote_fingerprint: None,
+        monorepo_subdirectory: None,
+        name: "Hook project".into(),
+    };
+    {
+        let mut vault = fixture.vault();
+        let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap());
+        service.upsert_project(project.clone()).unwrap();
+
+        let start = hook_params(
+            HarnessId::Codex,
+            "session-replaced",
+            |session_id| NativeHookEvent::SessionStart { session_id },
+            101,
+        );
+        let serialized = serde_json::to_string(&start).unwrap();
+        for forbidden in [
+            "PROMPT_SENTINEL",
+            "RESPONSE_SENTINEL",
+            "TRANSCRIPT_SENTINEL",
+            "TOOL_SENTINEL",
+            "prompt",
+            "response",
+            "transcript_path",
+            "tool_output",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+        service
+            .handle_native_hook_event(project.project_id, start.clone())
+            .unwrap();
+        let stored = service
+            .native_hook_session(HarnessId::Codex, "session-replaced")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.project_id, project.project_id);
+        assert_eq!((stored.started_at_ms, stored.stopped_at_ms), (101, None));
+        assert_eq!(stored.payload, start);
+
+        let stop = hook_params(
+            HarnessId::Codex,
+            "session-replaced",
+            |session_id| NativeHookEvent::SessionStop { session_id },
+            202,
+        );
+        service
+            .handle_native_hook_event(project.project_id, stop.clone())
+            .unwrap();
+        let stored = service
+            .native_hook_session(HarnessId::Codex, "session-replaced")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (stored.started_at_ms, stored.stopped_at_ms),
+            (101, Some(202))
+        );
+        assert_eq!(stored.payload, stop);
+        assert_eq!(service.native_hook_session_count().unwrap(), 1);
+
+        let replacement = hook_params(
+            HarnessId::Codex,
+            "session-replaced",
+            |session_id| NativeHookEvent::SessionStart { session_id },
+            303,
+        );
+        service
+            .handle_native_hook_event(project.project_id, replacement.clone())
+            .unwrap();
+        let stored = service
+            .native_hook_session(HarnessId::Codex, "session-replaced")
+            .unwrap()
+            .unwrap();
+        assert_eq!((stored.started_at_ms, stored.stopped_at_ms), (303, None));
+        assert_eq!(stored.payload, replacement);
+
+        for index in 0..=MAX_NATIVE_HOOK_SESSIONS {
+            let session_id = format!("bounded-{index:04}");
+            service
+                .handle_native_hook_event(
+                    project.project_id,
+                    hook_params(
+                        HarnessId::ClaudeCode,
+                        session_id,
+                        |session_id| NativeHookEvent::SessionStart { session_id },
+                        1_000 + index as u64,
+                    ),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            service.native_hook_session_count().unwrap(),
+            MAX_NATIVE_HOOK_SESSIONS
+        );
+        assert!(
+            service
+                .native_hook_session(HarnessId::Codex, "session-replaced")
+                .unwrap()
+                .is_none(),
+            "the deterministic oldest row is evicted"
+        );
+    }
+
+    let raw = open_keyed(fixture.path.path(), &fixture.keys.key(CREDENTIAL));
+    let payloads: Vec<Vec<u8>> = raw
+        .prepare("SELECT payload_json FROM native_hook_sessions ORDER BY harness, session_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for payload in payloads {
+        let payload = String::from_utf8(payload).unwrap();
+        for forbidden in [
+            "prompt",
+            "response",
+            "transcript_path",
+            "tool_output",
+            "SENTINEL",
+        ] {
+            assert!(!payload.contains(forbidden));
+        }
+    }
+    assert_eq!(std::fs::read(&raw_session).unwrap(), raw_bytes);
+}
+
+#[test]
+fn native_hook_task_evidence_completes_only_the_explicit_current_project_task() {
+    let fixture = Fixture::new("native-hook-task-evidence");
+    let raw_session = fixture.path.path().with_extension("history.jsonl");
+    let raw_bytes = b"private prompt and response fixture";
+    std::fs::write(&raw_session, raw_bytes).unwrap();
+    let project_id = ID_7.parse().unwrap();
+    let other_project_id = ID_6.parse().unwrap();
+    let created = {
+        let mut vault = fixture.vault();
+        let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap());
+        for (id, name) in [
+            (project_id, "Hook project"),
+            (other_project_id, "Other project"),
+        ] {
+            service
+                .upsert_project(ProjectIdentity {
+                    project_id: id,
+                    github_repository_id: None,
+                    git_remote_fingerprint: None,
+                    monorepo_subdirectory: None,
+                    name: name.into(),
+                })
+                .unwrap();
+        }
+        let created = service
+            .upsert_task(TaskUpsertParams {
+                operation_id: ID_1.parse().unwrap(),
+                task_id: None,
+                project_id,
+                title: "Explicit task".into(),
+                body_markdown: "Complete only from explicit evidence".into(),
+                status: TaskStatus::InProgress,
+                expected_revision: None,
+            })
+            .unwrap();
+        let params = hook_params(
+            HarnessId::ClaudeCode,
+            "task-session",
+            |session_id| NativeHookEvent::TaskEvidence {
+                session_id,
+                task_id: created.id,
+                evidence: vec![CompletionEvidenceInput {
+                    summary: "Focused checks passed".into(),
+                    kind: "test".into(),
+                    reference: Some("offline_service_v1".into()),
+                }],
+            },
+            404,
+        );
+        service
+            .handle_native_hook_event(project_id, params.clone())
+            .unwrap();
+        let completed = service
+            .tasks(project_id)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == created.id)
+            .unwrap();
+        assert_eq!(completed.status, TaskStatus::Done);
+        assert_eq!(completed.evidence.len(), 1);
+        assert_eq!(completed.evidence[0].summary, "Focused checks passed");
+        assert_ne!(completed.revision, created.revision);
+        assert_eq!(service.native_hook_session_count().unwrap(), 0);
+
+        service
+            .handle_native_hook_event(project_id, params.clone())
+            .unwrap();
+        assert_eq!(service.tasks(project_id).unwrap(), vec![completed]);
+
+        let stale = hook_params(
+            HarnessId::ClaudeCode,
+            "task-session",
+            |session_id| NativeHookEvent::TaskEvidence {
+                session_id,
+                task_id: created.id,
+                evidence: vec![CompletionEvidenceInput {
+                    summary: "Different later evidence".into(),
+                    kind: "test".into(),
+                    reference: None,
+                }],
+            },
+            405,
+        );
+        assert_eq!(
+            service
+                .handle_native_hook_event(project_id, stale)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            service
+                .handle_native_hook_event(other_project_id, params.clone())
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        let missing = hook_params(
+            HarnessId::ClaudeCode,
+            "task-session",
+            |session_id| NativeHookEvent::TaskEvidence {
+                session_id,
+                task_id: ID_5.parse::<TaskId>().unwrap(),
+                evidence: vec![CompletionEvidenceInput {
+                    summary: "Must not infer a task".into(),
+                    kind: "test".into(),
+                    reference: None,
+                }],
+            },
+            406,
+        );
+        assert_eq!(
+            service
+                .handle_native_hook_event(project_id, missing)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        created
+    };
+
+    let raw = open_keyed(fixture.path.path(), &fixture.keys.key(CREDENTIAL));
+    let (kind, target_id, expected_revision): (String, String, Option<String>) = raw
+        .query_row(
+            "SELECT operation_kind, target_id, expected_revision
+             FROM local_operation_bindings
+             WHERE operation_kind = 'task_complete'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(kind, "task_complete");
+    assert_eq!(target_id, created.id.to_string());
+    assert_eq!(expected_revision, Some(created.revision.to_string()));
+    let binding_count: i64 = raw
+        .query_row(
+            "SELECT count(*) FROM local_operation_bindings WHERE operation_kind = 'task_complete'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(binding_count, 1, "replay must reuse the completion binding");
+    assert_eq!(std::fs::read(&raw_session).unwrap(), raw_bytes);
 }
 
 fn create(operation_id: &str, title: &str, body: &str) -> MemoryCreateParams {

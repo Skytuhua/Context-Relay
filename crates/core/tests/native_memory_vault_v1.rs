@@ -6,7 +6,7 @@ use context_relay_core::{
         NativeMemorySource, NativeMemorySourceId, ReadyNativeMemory, extract_managed_markdown,
     },
     service::OfflineWorkspace,
-    vault::{Vault, VaultError},
+    vault::{LATEST_SCHEMA_VERSION, Vault, VaultError},
 };
 use context_relay_protocol::{
     CandidateReviewParams, CandidateState, ErrorCode, HarnessId, MemoryOrigin, NativePlatform,
@@ -75,7 +75,7 @@ fn source_hex(id: NativeMemorySourceId) -> String {
 }
 
 #[test]
-fn migration_v9_to_v10_preserves_prior_rows_and_enforces_scope_shape() {
+fn migration_v9_through_latest_preserves_prior_rows_and_enforces_scope_shape() {
     let path = TempVault::new("native-memory-migration-v9");
     let keys = MemoryKeyStore::default();
     let key = [31; 32];
@@ -119,7 +119,7 @@ fn migration_v9_to_v10_preserves_prior_rows_and_enforces_scope_shape() {
     drop(raw);
 
     let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
-    assert_eq!(vault.schema_version().unwrap(), 10);
+    assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     drop(vault);
 
     let raw = open_keyed(path.path(), &key);
