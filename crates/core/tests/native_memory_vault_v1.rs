@@ -419,6 +419,168 @@ fn invalid_registration_cannot_publish_an_applied_lifecycle() {
     assert!(vault.native_memory_ledgers().unwrap().is_empty());
 }
 
+fn apply_registered_source(
+    vault: &mut Vault,
+    plan_id: &str,
+    registration: &NativeMemoryRegistration,
+    marker: u8,
+) {
+    let plan_id = plan_id.parse::<PlanId>().unwrap();
+    let approval_hash = Sha256Digest([marker; 32]);
+    let payload = vec![marker; 8];
+    vault
+        .put_setup_plan(SetupPlanWrite {
+            plan_id: &plan_id,
+            schema_version: 2,
+            approval_version: 2,
+            approval_hash: &approval_hash,
+            payload: &payload,
+            created_ms: 10,
+            expires_ms: 100,
+        })
+        .unwrap();
+    vault
+        .claim_setup_plan(&plan_id, SetupPlanAction::Apply, 11)
+        .unwrap();
+    vault
+        .finish_setup_plan_with_native_memory(
+            &plan_id,
+            SetupPlanLifecycle::Applied,
+            std::slice::from_ref(registration),
+        )
+        .unwrap();
+}
+
+fn rollback_registered_source(vault: &mut Vault, original_id: &str, inverse_id: &str, marker: u8) {
+    let original_id = original_id.parse::<PlanId>().unwrap();
+    let inverse_id = inverse_id.parse::<PlanId>().unwrap();
+    let approval_hash = Sha256Digest([marker; 32]);
+    let payload = vec![marker; 8];
+    vault
+        .claim_setup_plan_rollback(
+            &original_id,
+            SetupPlanWrite {
+                plan_id: &inverse_id,
+                schema_version: 2,
+                approval_version: 2,
+                approval_hash: &approval_hash,
+                payload: &payload,
+                created_ms: 20,
+                expires_ms: 100,
+            },
+            21,
+        )
+        .unwrap();
+    vault
+        .finish_setup_plan_rollback(
+            &original_id,
+            &inverse_id,
+            SetupPlanLifecycle::RolledBack,
+            SetupPlanLifecycle::Applied,
+        )
+        .unwrap();
+}
+
+#[test]
+fn rollback_unregisters_only_the_last_plan_owned_native_memory_source() {
+    const PLAN_A: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073983";
+    const PLAN_B: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073984";
+    const ROLLBACK_A: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073985";
+    const ROLLBACK_B: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073986";
+    let path = TempVault::new("native-memory-shared-setup-ownership");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let descriptor = source(ScopeRef::Global, HarnessId::Codex, "shared-owner");
+    let registration = NativeMemoryRegistration {
+        source: descriptor.clone(),
+        last_applied_digest: None,
+    };
+
+    apply_registered_source(&mut vault, PLAN_A, &registration, 51);
+    apply_registered_source(&mut vault, PLAN_B, &registration, 52);
+    rollback_registered_source(&mut vault, PLAN_A, ROLLBACK_A, 53);
+    assert!(
+        vault
+            .native_memory_ledger(&descriptor.id)
+            .unwrap()
+            .is_some()
+    );
+
+    rollback_registered_source(&mut vault, PLAN_B, ROLLBACK_B, 54);
+    assert!(
+        vault
+            .native_memory_ledger(&descriptor.id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn rollback_unregisters_a_setup_source_without_deleting_its_reviewed_candidate() {
+    const PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073991";
+    const ROLLBACK: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073992";
+    let path = TempVault::new("native-memory-setup-candidate-ownership");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let descriptor = source(ScopeRef::Global, HarnessId::Codex, "reviewed-setup-owner");
+    let registration = NativeMemoryRegistration {
+        source: descriptor.clone(),
+        last_applied_digest: None,
+    };
+    apply_registered_source(&mut vault, PLAN, &registration, 55);
+    let candidate = OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
+        .reconcile_native_memory(ready(descriptor.clone(), "reviewed native fact"))
+        .unwrap()
+        .unwrap();
+    let reviewed = OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
+        .review_candidate(CandidateReviewParams {
+            candidate_id: candidate.id,
+            accepted: false,
+            operation_id: ID_1.parse().unwrap(),
+        })
+        .unwrap();
+
+    rollback_registered_source(&mut vault, PLAN, ROLLBACK, 56);
+
+    assert!(
+        vault
+            .native_memory_ledger(&descriptor.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(vault.candidate(&candidate.id).unwrap(), Some(reviewed));
+}
+
+#[test]
+fn rollback_preserves_a_preexisting_native_memory_source_and_candidate_state() {
+    const PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073987";
+    const ROLLBACK: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073988";
+    let path = TempVault::new("native-memory-preexisting-setup-ownership");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let descriptor = source(ScopeRef::Global, HarnessId::Codex, "preexisting-owner");
+    let mut preexisting = NativeMemoryLedger::for_source(descriptor.clone());
+    preexisting.last_unmanaged_digest = Some(Sha256Digest([61; 32]));
+    preexisting.initial_preview_complete = true;
+    vault
+        .put_native_memory_candidate(&preexisting, None)
+        .unwrap();
+    let registration = NativeMemoryRegistration {
+        source: descriptor.clone(),
+        last_applied_digest: None,
+    };
+
+    apply_registered_source(&mut vault, PLAN, &registration, 62);
+    rollback_registered_source(&mut vault, PLAN, ROLLBACK, 63);
+
+    let preserved = vault.native_memory_ledger(&descriptor.id).unwrap().unwrap();
+    assert_eq!(
+        preserved.last_unmanaged_digest,
+        Some(Sha256Digest([61; 32]))
+    );
+    assert!(preserved.initial_preview_complete);
+}
+
 #[test]
 fn native_candidates_are_deterministic_bound_and_atomically_replayed() {
     let project_id = ID_7.parse().unwrap();

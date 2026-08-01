@@ -25,5 +25,5 @@ pub(crate) use reconcile::{
 
 pub const NATIVE_MEMORY_POLL_MS: u64 = 250;
 pub const NATIVE_MEMORY_DEBOUNCE_MS: u64 = 750;
-pub(crate) use capability::source as native_memory_source;
 pub use capability::{NativeMemoryAdapter, NativeMemoryCapabilities, NativeMemoryDisable};
+pub(crate) use capability::{source as native_memory_source, validate_source_descriptor};

@@ -140,6 +140,10 @@ impl ClaudeCommand {
 }
 
 impl ClaudeCodeAdapter {
+    pub fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+
     pub fn discover(
         project_root: impl Into<PathBuf>,
         project_id: ProjectId,

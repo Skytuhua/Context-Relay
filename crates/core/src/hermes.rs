@@ -164,6 +164,10 @@ impl Drop for HermesValidationStage {
 }
 
 impl HermesAdapter {
+    pub fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+
     pub fn discover(
         project_root: impl Into<PathBuf>,
         working_directory: impl Into<PathBuf>,

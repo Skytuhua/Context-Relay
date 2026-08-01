@@ -1,15 +1,20 @@
 use std::str::FromStr;
 
-use context_relay_core::native_transaction::{
-    APPROVAL_DOMAIN_V2, ApprovedCliMutation, CanonicalCliDeclaration, NativeTransactionPlan,
-    SidecarBinding, approval_hash_v2,
+use context_relay_core::{
+    native_memory::{
+        NativeMemoryDocumentKind, NativeMemoryLimits, NativeMemoryRegistration, NativeMemorySource,
+    },
+    native_transaction::{
+        APPROVAL_DOMAIN_V2, ApprovedCliMutation, CanonicalCliDeclaration, NativeTransactionPlan,
+        SidecarBinding, approval_hash_v2,
+    },
 };
 use context_relay_native_runner::{
     RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand, SidecarId,
 };
 use context_relay_protocol::{
     ApprovalClass, CliOperation, HarnessId, NativePlatform, NativeScope, NetworkDelta,
-    PermissionDelta, PlanId, SetupPlan, Sha256Digest, WireNativeValue,
+    PermissionDelta, PlanId, ProjectId, ScopeRef, SetupPlan, Sha256Digest, WireNativeValue,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -95,6 +100,42 @@ fn mutation() -> ApprovedCliMutation {
     }
 }
 
+fn memory_registration() -> NativeMemoryRegistration {
+    NativeMemoryRegistration {
+        source: NativeMemorySource::new(
+            HarnessId::Codex,
+            "0.144.1",
+            ScopeRef::Global,
+            NativeMemoryDocumentKind::Agent,
+            WireNativeValue {
+                platform: NativePlatform::Macos,
+                bytes: b"/fixture/codex/memories/MEMORY.md".to_vec(),
+                display: Some("Codex MEMORY.md".to_owned()),
+            },
+            NativeMemoryLimits {
+                max_bytes: 16 * 1024,
+                max_characters: 8 * 1024,
+            },
+            true,
+        )
+        .unwrap(),
+        last_applied_digest: None,
+    }
+}
+
+fn rebuild_source(source: &mut NativeMemorySource) {
+    *source = NativeMemorySource::new(
+        source.harness,
+        &source.adapter_version,
+        source.scope.clone(),
+        source.document_kind,
+        source.path.clone(),
+        source.limits,
+        source.managed_fence,
+    )
+    .unwrap();
+}
+
 fn plan() -> NativeTransactionPlan {
     let cli_mutation = mutation();
     NativeTransactionPlan {
@@ -149,6 +190,7 @@ fn plan() -> NativeTransactionPlan {
         scanner_result_hash: Sha256Digest([12; 32]),
         mutations: vec![],
         cli_mutations: vec![cli_mutation],
+        native_memory_registrations: vec![memory_registration()],
         ownership_changes: vec![],
     }
 }
@@ -185,6 +227,98 @@ fn expected_and_intended_declaration_bytes_affect_the_hash() {
         "/opt/context-relay-new",
     ));
     assert_ne!(approval_hash_v2(&changed_intended).unwrap(), baseline);
+}
+
+#[test]
+fn every_native_memory_descriptor_field_affects_the_v2_hash() {
+    let baseline = approval_hash_v2(&plan()).unwrap();
+
+    let mut changed_path = plan();
+    changed_path.native_memory_registrations[0]
+        .source
+        .path
+        .bytes
+        .extend_from_slice(b".other");
+    rebuild_source(&mut changed_path.native_memory_registrations[0].source);
+    assert_ne!(approval_hash_v2(&changed_path).unwrap(), baseline);
+
+    let mut changed_display = plan();
+    changed_display.native_memory_registrations[0]
+        .source
+        .path
+        .display = Some("Different display semantics".to_owned());
+    assert_ne!(approval_hash_v2(&changed_display).unwrap(), baseline);
+
+    for mutate in [
+        |source: &mut NativeMemorySource| source.limits.max_bytes -= 1,
+        |source: &mut NativeMemorySource| source.limits.max_characters -= 1,
+    ] {
+        let mut changed = plan();
+        mutate(&mut changed.native_memory_registrations[0].source);
+        rebuild_source(&mut changed.native_memory_registrations[0].source);
+        assert_ne!(approval_hash_v2(&changed).unwrap(), baseline);
+    }
+
+    let mut changed_scope = plan();
+    changed_scope.native_memory_registrations[0].source.scope = ScopeRef::Project {
+        project_id: ProjectId::from_str(PLAN_ID).unwrap(),
+    };
+    rebuild_source(&mut changed_scope.native_memory_registrations[0].source);
+    assert_ne!(approval_hash_v2(&changed_scope).unwrap(), baseline);
+
+    let mut changed_kind = plan();
+    changed_kind.native_memory_registrations[0]
+        .source
+        .document_kind = NativeMemoryDocumentKind::Summary;
+    rebuild_source(&mut changed_kind.native_memory_registrations[0].source);
+    assert_ne!(approval_hash_v2(&changed_kind).unwrap(), baseline);
+
+    let mut changed_version = plan();
+    changed_version.native_memory_registrations[0]
+        .source
+        .adapter_version = "0.144.0".to_owned();
+    rebuild_source(&mut changed_version.native_memory_registrations[0].source);
+    assert_ne!(approval_hash_v2(&changed_version).unwrap(), baseline);
+
+    let mut changed_fence = plan();
+    changed_fence.native_memory_registrations[0]
+        .source
+        .managed_fence = false;
+    assert_ne!(approval_hash_v2(&changed_fence).unwrap(), baseline);
+
+    let mut changed_digest = plan();
+    changed_digest.native_memory_registrations[0].last_applied_digest =
+        Some(Sha256Digest([0x44; 32]));
+    assert_ne!(approval_hash_v2(&changed_digest).unwrap(), baseline);
+}
+
+#[test]
+fn native_memory_descriptor_identity_and_metadata_must_validate_exactly() {
+    let mut changed_path_bytes = plan();
+    changed_path_bytes.native_memory_registrations[0]
+        .source
+        .path
+        .bytes
+        .push(b'x');
+    assert_rejects(&changed_path_bytes, "native memory source");
+
+    let mut changed_scope = plan();
+    changed_scope.native_memory_registrations[0].source.scope = ScopeRef::Project {
+        project_id: ProjectId::from_str(PLAN_ID).unwrap(),
+    };
+    assert_rejects(&changed_scope, "native memory source");
+
+    let mut changed_kind = plan();
+    changed_kind.native_memory_registrations[0]
+        .source
+        .document_kind = NativeMemoryDocumentKind::Summary;
+    assert_rejects(&changed_kind, "native memory source");
+
+    let mut changed_version = plan();
+    changed_version.native_memory_registrations[0]
+        .source
+        .adapter_version = "0.144.0".to_owned();
+    assert_rejects(&changed_version, "native memory source");
 }
 
 #[test]

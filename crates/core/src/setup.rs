@@ -1,6 +1,6 @@
 //! Mutation-free preview and persistence of managed bridge installation plans.
 
-use std::{path::PathBuf, str::FromStr};
+use std::{fmt::Write as _, path::PathBuf, str::FromStr};
 
 use context_relay_native_runner::{
     RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand, SidecarId,
@@ -9,7 +9,7 @@ use context_relay_protocol::{
     ApprovalClass, CapabilityLevel, ChangeClass, ClassifiedChange, ClientError, ComponentKind,
     ComponentRecord, DesiredState, DeviceId, ErrorCode, ExpectedNativeDigest, HarnessAdapter,
     HarnessId, HybridLogicalClock, ImportRequest, NativePlatform, NativeScope, PlanId,
-    ProbeContext, ScopeRef, SemanticDiff, SetupPlan, Sha256Digest, WireNativeValue,
+    ProbeContext, ProjectId, ScopeRef, SemanticDiff, SetupPlan, Sha256Digest, WireNativeValue,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -21,7 +21,10 @@ use crate::{
         BRIDGE_SERVER_NAME, attest_bridge_executable, bridge_component_for_attested,
         is_canonical_bridge_body,
     },
-    native_memory::NativeMemoryRegistration,
+    native_memory::{
+        NativeMemoryAdapter, NativeMemoryDisable, NativeMemoryRegistration, managed_memory_hooks,
+        primary_memory_instruction_component,
+    },
     native_transaction::{
         ApprovedCliMutation, ApprovedMutation, NativeTransactionPlan,
         REVERSIBLE_PLAN_SCHEMA_VERSION, SidecarBinding, approval_hash_v2, open_plan, seal_plan,
@@ -35,8 +38,8 @@ use crate::{
 
 pub const PREVIEW_TTL_MS: u64 = 15 * 60 * 1_000;
 
-/// A registered project is imported for conflict detection, but the managed
-/// bridge is always installed in global scope.
+/// A registered project is imported for conflict detection and binds the
+/// managed primary-memory instruction. The bridge itself remains global.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegisteredProject {
     pub project_id: context_relay_protocol::ProjectId,
@@ -46,6 +49,22 @@ pub struct RegisteredProject {
 pub struct BridgeMutationPlan {
     pub cli: Option<ApprovedCliMutation>,
     pub native: Vec<ApprovedMutation>,
+}
+
+pub struct PrimaryMemoryMutationPlan {
+    pub native: Vec<ApprovedMutation>,
+    pub registrations: Vec<NativeMemoryRegistration>,
+    pub semantic_changes: Vec<ClassifiedChange>,
+}
+
+impl PrimaryMemoryMutationPlan {
+    fn empty() -> Self {
+        Self {
+            native: vec![],
+            registrations: vec![],
+            semantic_changes: vec![],
+        }
+    }
 }
 
 /// Locates the bridge executable selected by the service composition layer.
@@ -278,6 +297,16 @@ pub struct PersistedBridgeInstallService<'a> {
 pub trait BridgePreviewHarness: HarnessAdapter {
     fn bridge_harness(&self) -> HarnessId;
 
+    /// The project receiving the managed primary-memory instruction. Legacy
+    /// bridge-only test harnesses opt out by retaining the default `None`.
+    fn bridge_project_id(&self) -> Option<ProjectId> {
+        None
+    }
+
+    fn bridge_project_root(&self) -> Option<WireNativeValue> {
+        None
+    }
+
     fn bridge_requested_profile(&self) -> Option<String> {
         None
     }
@@ -287,6 +316,13 @@ pub trait BridgePreviewHarness: HarnessAdapter {
         desired: &DesiredState,
         intended: &ComponentRecord,
     ) -> Result<BridgeMutationPlan, ClientError>;
+
+    fn primary_memory_mutations(
+        &self,
+        _desired: &DesiredState,
+    ) -> Result<PrimaryMemoryMutationPlan, ClientError> {
+        Ok(PrimaryMemoryMutationPlan::empty())
+    }
 
     fn bridge_adapter_version(&self) -> u32 {
         1
@@ -298,6 +334,14 @@ impl BridgePreviewHarness for ClaudeCodeAdapter {
         HarnessId::ClaudeCode
     }
 
+    fn bridge_project_id(&self) -> Option<ProjectId> {
+        Some(self.project_id())
+    }
+
+    fn bridge_project_root(&self) -> Option<WireNativeValue> {
+        Some(self.project_root_wire())
+    }
+
     fn bridge_mutations(
         &self,
         _: &DesiredState,
@@ -307,6 +351,42 @@ impl BridgePreviewHarness for ClaudeCodeAdapter {
             cli: Some(self.plan_bridge_cli_mutation(intended)?),
             native: vec![],
         })
+    }
+
+    fn primary_memory_mutations(
+        &self,
+        desired: &DesiredState,
+    ) -> Result<PrimaryMemoryMutationPlan, ClientError> {
+        let capabilities = self.native_memory_capabilities()?;
+        let mut plan = primary_memory_registration_plan(&capabilities.sources);
+        if let Some(instruction) = desired
+            .components
+            .iter()
+            .find(|component| component.kind == ComponentKind::Instruction)
+        {
+            push_memory_mutation(
+                &mut plan,
+                self.plan_native_file(instruction)?,
+                "primary-memory-instruction",
+            );
+        }
+        if desired
+            .components
+            .iter()
+            .any(|component| component.kind == ComponentKind::Hook)
+        {
+            push_memory_mutation(
+                &mut plan,
+                self.plan_native_global_settings(desired)?,
+                "primary-memory-hooks",
+            );
+        }
+        if let NativeMemoryDisable::Supported(mutations) = capabilities.disable {
+            for mutation in mutations {
+                push_memory_mutation(&mut plan, mutation, "native-memory-disable");
+            }
+        }
+        Ok(plan)
     }
 }
 
@@ -315,6 +395,14 @@ impl BridgePreviewHarness for CodexAdapter {
         HarnessId::Codex
     }
 
+    fn bridge_project_id(&self) -> Option<ProjectId> {
+        Some(self.project_id())
+    }
+
+    fn bridge_project_root(&self) -> Option<WireNativeValue> {
+        Some(self.project_root_wire())
+    }
+
     fn bridge_mutations(
         &self,
         _: &DesiredState,
@@ -325,11 +413,55 @@ impl BridgePreviewHarness for CodexAdapter {
             native: vec![],
         })
     }
+
+    fn primary_memory_mutations(
+        &self,
+        desired: &DesiredState,
+    ) -> Result<PrimaryMemoryMutationPlan, ClientError> {
+        let capabilities = self.native_memory_capabilities()?;
+        let mut plan = primary_memory_registration_plan(&capabilities.sources);
+        if let Some(instruction) = desired
+            .components
+            .iter()
+            .find(|component| component.kind == ComponentKind::Instruction)
+        {
+            push_memory_mutation(
+                &mut plan,
+                self.plan_native_markdown(instruction)?,
+                "primary-memory-instruction",
+            );
+        }
+        for hook in desired
+            .components
+            .iter()
+            .filter(|component| component.kind == ComponentKind::Hook)
+        {
+            push_memory_mutation(
+                &mut plan,
+                self.plan_native_hooks_json(hook)?,
+                "primary-memory-hooks",
+            );
+        }
+        if let NativeMemoryDisable::Supported(mutations) = capabilities.disable {
+            for mutation in mutations {
+                push_memory_mutation(&mut plan, mutation, "native-memory-disable");
+            }
+        }
+        Ok(plan)
+    }
 }
 
 impl BridgePreviewHarness for HermesAdapter {
     fn bridge_harness(&self) -> HarnessId {
         HarnessId::Hermes
+    }
+
+    fn bridge_project_id(&self) -> Option<ProjectId> {
+        Some(self.project_id())
+    }
+
+    fn bridge_project_root(&self) -> Option<WireNativeValue> {
+        Some(self.project_root_wire())
     }
 
     fn bridge_requested_profile(&self) -> Option<String> {
@@ -338,14 +470,80 @@ impl BridgePreviewHarness for HermesAdapter {
 
     fn bridge_mutations(
         &self,
-        desired: &DesiredState,
+        _: &DesiredState,
         _: &ComponentRecord,
     ) -> Result<BridgeMutationPlan, ClientError> {
         Ok(BridgeMutationPlan {
             cli: None,
-            native: self.plan_native_config(desired)?.into_iter().collect(),
+            native: vec![],
         })
     }
+
+    fn primary_memory_mutations(
+        &self,
+        desired: &DesiredState,
+    ) -> Result<PrimaryMemoryMutationPlan, ClientError> {
+        let capabilities = self.native_memory_capabilities()?;
+        let mut plan = primary_memory_registration_plan(&capabilities.sources);
+        if let Some(instruction) = desired
+            .components
+            .iter()
+            .find(|component| component.kind == ComponentKind::Instruction)
+            && let Some(mutation) = self.plan_native_markdown(instruction)?
+        {
+            push_memory_mutation(&mut plan, mutation, "primary-memory-instruction");
+        }
+        let disable = match capabilities.disable {
+            NativeMemoryDisable::Supported(mutations) => mutations,
+            NativeMemoryDisable::WatchOnly | NativeMemoryDisable::Unavailable => vec![],
+        };
+        if let Some(mutation) = self.plan_native_config_with_memory_disable(desired, &disable)? {
+            push_memory_mutation(
+                &mut plan,
+                mutation,
+                if disable.is_empty() {
+                    "primary-memory-bridge"
+                } else {
+                    "primary-memory-bridge-and-disable"
+                },
+            );
+        }
+        Ok(plan)
+    }
+}
+
+fn primary_memory_registration_plan(
+    sources: &[crate::native_memory::NativeMemorySource],
+) -> PrimaryMemoryMutationPlan {
+    let mut plan = PrimaryMemoryMutationPlan::empty();
+    for source in sources {
+        plan.registrations.push(NativeMemoryRegistration {
+            source: source.clone(),
+            last_applied_digest: None,
+        });
+        plan.semantic_changes.push(ClassifiedChange {
+            class: ChangeClass::Create,
+            target: format!("native-memory-source:{}", digest_text(source.id.0)),
+            summary: "Register a validated native memory fallback source".to_owned(),
+        });
+    }
+    plan
+}
+
+fn push_memory_mutation(
+    plan: &mut PrimaryMemoryMutationPlan,
+    mutation: ApprovedMutation,
+    target: &str,
+) {
+    if mutation.expected == mutation.intended {
+        return;
+    }
+    plan.native.push(mutation);
+    plan.semantic_changes.push(ClassifiedChange {
+        class: ChangeClass::Update,
+        target: target.to_owned(),
+        summary: target.to_owned(),
+    });
 }
 
 pub struct BridgeInstallService<'a, H, L> {
@@ -470,12 +668,12 @@ impl PersistedBridgeInstallService<'_> {
         now_ms: u64,
         executor: &mut E,
     ) -> Result<(), ClientError> {
-        self.apply_with_native_memory(plan_id, now_ms, &[], executor)
+        self.apply_sealed_native_memory(plan_id, now_ms, executor)
     }
 
-    /// Applies a sealed setup plan with the exact native-memory registration
-    /// set derived by the Task 10 composition layer. The binding is durable
-    /// before the native executor starts, so startup recovery can finalize it.
+    /// Compatibility entry point for callers that already hold the previewed
+    /// registrations. The opened sealed plan remains authoritative; a caller
+    /// cannot add, remove, or alter a descriptor through this argument.
     pub fn apply_with_native_memory<E: BridgePlanExecutor>(
         &mut self,
         plan_id: &PlanId,
@@ -489,6 +687,30 @@ impl PersistedBridgeInstallService<'_> {
             .map_err(|_| invalid("Persisted bridge plan cannot be loaded"))?
             .ok_or_else(|| invalid("Persisted bridge plan does not exist"))?;
         let opened = validated_original_plan(&stored, plan_id)?;
+        if opened.plan.native_memory_registrations != registrations {
+            return Err(conflict(
+                "Native memory registrations differ from the persisted bridge plan",
+            ));
+        }
+        self.apply_sealed_native_memory(plan_id, now_ms, executor)
+    }
+
+    /// Applies the exact native-memory registration set derived from the
+    /// opened sealed setup plan. The binding is durable before the native
+    /// executor starts, so startup recovery can finalize it.
+    fn apply_sealed_native_memory<E: BridgePlanExecutor>(
+        &mut self,
+        plan_id: &PlanId,
+        now_ms: u64,
+        executor: &mut E,
+    ) -> Result<(), ClientError> {
+        let stored = self
+            .vault
+            .setup_plan(plan_id)
+            .map_err(|_| invalid("Persisted bridge plan cannot be loaded"))?
+            .ok_or_else(|| invalid("Persisted bridge plan does not exist"))?;
+        let opened = validated_original_plan(&stored, plan_id)?;
+        let registrations = &opened.plan.native_memory_registrations;
         if stored.lifecycle == SetupPlanLifecycle::Applying {
             self.vault
                 .bind_setup_plan_native_memory(plan_id, registrations)
@@ -995,9 +1217,59 @@ where
         })?;
         let intended =
             bridge_component_for_attested(harness, &bridge, self.origin_device, self.observed_hlc)?;
+        let project_scope = match (
+            self.harness.bridge_project_id(),
+            self.harness.bridge_project_root(),
+        ) {
+            (Some(project_id), Some(root)) => {
+                root.validate()
+                    .map_err(|_| invalid("Harness project root is invalid"))?;
+                if let Some(registered) = registered_project
+                    && (registered.project_id != project_id
+                        || registered.root.platform != root.platform
+                        || registered.root.bytes != root.bytes)
+                {
+                    return Err(conflict(
+                        "Harness project binding differs from the registered project",
+                    ));
+                }
+                Some(NativeScope::Project { project_id, root })
+            }
+            (Some(project_id), None) => {
+                let registered = registered_project
+                    .ok_or_else(|| invalid("Harness project binding is incomplete"))?;
+                if registered.project_id != project_id {
+                    return Err(conflict(
+                        "Harness project binding differs from the registered project",
+                    ));
+                }
+                Some(NativeScope::Project {
+                    project_id,
+                    root: registered.root.clone(),
+                })
+            }
+            (None, None) => None,
+            _ => return Err(invalid("Harness project binding is incomplete")),
+        };
+        let mut desired_components = vec![intended.clone()];
+        let mut desired_scopes = vec![NativeScope::Global];
+        if let Some(NativeScope::Project { project_id, .. }) = &project_scope {
+            desired_components.push(primary_memory_instruction_component(
+                harness,
+                *project_id,
+                self.origin_device,
+                self.observed_hlc,
+            )?);
+            desired_components.extend(managed_memory_hooks(harness, &wire_path(&bridge.path))?);
+            desired_scopes.push(
+                project_scope
+                    .clone()
+                    .ok_or_else(|| invalid("Harness project binding disappeared"))?,
+            );
+        }
         let desired = DesiredState {
-            components: vec![intended.clone()],
-            scopes: vec![NativeScope::Global],
+            components: desired_components,
+            scopes: desired_scopes,
         };
         // CLI harnesses capture their authoritative prior declaration here.
         // Hermes instead classifies its imported native projection first.
@@ -1024,9 +1296,9 @@ where
         // These calls are intentionally kept in preview even though the exact
         // CLI mutation below is the authority for rollback argv.
         let _rendered = self.harness.render(&desired)?;
-        let classified = self.harness.classify(&semantic_diff)?;
+        let mut classified = self.harness.classify(&semantic_diff)?;
         let adapter_operations = self.harness.plan_cli_ops(&classified)?.0;
-        let mutations = if classified.0.is_empty() {
+        let mut mutations = if classified.0.is_empty() {
             BridgeMutationPlan {
                 cli: None,
                 native: vec![],
@@ -1053,11 +1325,9 @@ where
                 "Hermes bridge previews cannot contain CLI mutations",
             ));
         }
-        if harness != HarnessId::Hermes && !mutations.native.is_empty() {
-            return Err(conflict(
-                "CLI bridge previews cannot contain native mutations",
-            ));
-        }
+        let memory = self.harness.primary_memory_mutations(&desired)?;
+        mutations.native.extend(memory.native);
+        classified.0.extend(memory.semantic_changes);
 
         let expires_at = now_ms
             .checked_add(PREVIEW_TTL_MS)
@@ -1070,7 +1340,7 @@ where
             executable_path,
             executable_hash,
             harness_version,
-            target_scopes: vec![NativeScope::Global],
+            target_scopes: desired.scopes.clone(),
             expected_native_digests: vec![ExpectedNativeDigest {
                 target: wire_path(&bridge.path),
                 expected_digest: Some(bridge.digest),
@@ -1127,6 +1397,7 @@ where
             scanner_result_hash: digest(b"bridge-preview-scanner-v1"),
             mutations: mutations.native,
             cli_mutations: cli_mutation.into_iter().collect(),
+            native_memory_registrations: memory.registrations,
             ownership_changes: vec![],
         };
         let approval_hash =
@@ -1313,15 +1584,42 @@ fn preview_plan_id(
 
 fn wire_path(path: &std::path::Path) -> WireNativeValue {
     let display = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    let bytes = {
+        use std::os::windows::ffi::OsStrExt as _;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    #[cfg(not(windows))]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt as _;
+        path.as_os_str().as_bytes().to_vec()
+    };
     WireNativeValue {
-        platform: NativePlatform::Macos,
-        bytes: display.as_bytes().to_vec(),
+        platform: if cfg!(windows) {
+            NativePlatform::Windows
+        } else {
+            NativePlatform::Macos
+        },
+        bytes,
         display: Some(display),
     }
 }
 
 fn digest(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest(Sha256::digest(bytes).into())
+}
+
+fn digest_text(digest: Sha256Digest) -> String {
+    digest
+        .0
+        .iter()
+        .fold(String::with_capacity(64), |mut text, byte| {
+            write!(text, "{byte:02x}").expect("writing to a String cannot fail");
+            text
+        })
 }
 
 fn harness_cli_name(harness: HarnessId) -> &'static str {

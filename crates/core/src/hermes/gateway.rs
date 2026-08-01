@@ -236,9 +236,6 @@ fn acquire_gateway_lock(path: &Path) -> Result<GatewayLease, ClientError> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)
         .map_err(|_| conflict("Hermes gateway state is unverifiable for the selected profile"))?;
@@ -355,8 +352,6 @@ fn open_windows_gateway_lock(path: &Path) -> Result<File, ClientError> {
     OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
-        .truncate(false)
         .share_mode(WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE)
         .custom_flags(WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)

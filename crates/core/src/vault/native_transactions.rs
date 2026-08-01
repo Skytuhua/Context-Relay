@@ -3032,6 +3032,7 @@ impl Vault {
                 .optional()?
                 .map(|payload| from_json::<NativeMemoryLedger>(&payload))
                 .transpose()?;
+            let setup_created = existing.is_none();
             let mut ledger = existing
                 .unwrap_or_else(|| NativeMemoryLedger::for_source(registration.source.clone()));
             if ledger.source.as_ref() != Some(&registration.source) {
@@ -3047,6 +3048,19 @@ impl Vault {
             ledger.last_applied_digest = registration.last_applied_digest;
             let canonical = to_json(&ledger)?;
             put_native_memory_ledger(&transaction, &ledger, &canonical)?;
+            let source_id = sha256_key(&registration.source.id.0);
+            if setup_created {
+                transaction.execute(
+                    "INSERT INTO setup_native_memory_managed_sources(source_id)
+                     VALUES (?1) ON CONFLICT(source_id) DO NOTHING",
+                    [&source_id],
+                )?;
+            }
+            transaction.execute(
+                "INSERT INTO setup_native_memory_source_refs(plan_id, source_id)
+                 VALUES (?1, ?2) ON CONFLICT(plan_id, source_id) DO NOTHING",
+                params![plan_id.to_string(), source_id],
+            )?;
         }
         transaction.commit()?;
         Ok(())
@@ -3223,6 +3237,38 @@ impl Vault {
             return Err(VaultError::Validation(
                 "setup rollback lifecycle changed concurrently".to_owned(),
             ));
+        }
+        if original_next == SetupPlanLifecycle::RolledBack {
+            let source_ids = {
+                let mut statement = transaction.prepare(
+                    "SELECT source_id FROM setup_native_memory_source_refs
+                     WHERE plan_id = ?1 ORDER BY source_id",
+                )?;
+                statement
+                    .query_map([original_plan_id.to_string()], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            transaction.execute(
+                "DELETE FROM setup_native_memory_source_refs WHERE plan_id = ?1",
+                [original_plan_id.to_string()],
+            )?;
+            for source_id in source_ids {
+                transaction.execute(
+                    "DELETE FROM native_memory_sources
+                     WHERE source_id = ?1
+                       AND EXISTS (
+                           SELECT 1 FROM setup_native_memory_managed_sources managed
+                           WHERE managed.source_id = native_memory_sources.source_id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM setup_native_memory_source_refs refs
+                           WHERE refs.source_id = native_memory_sources.source_id
+                       )",
+                    [source_id],
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(())

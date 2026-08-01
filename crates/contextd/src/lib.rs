@@ -1211,6 +1211,15 @@ fn execute_vault_command(
         VaultCommand::Workspace(request) => execute_workspace_request(state, request),
         VaultCommand::HarnessSetup(request) => execute_harness_setup(state, request),
         VaultCommand::NativeMemoryObservation(ready) => {
+            let registered = state
+                .vault
+                .native_memory_ledger(&ready.source.id)
+                .map_err(client_error_from_vault)?
+                .and_then(|ledger| ledger.source)
+                .is_some_and(|source| source == ready.source);
+            if !registered {
+                return Ok(LocalResult::Empty);
+            }
             OfflineWorkspace::new(&mut state.vault, state.device_id)
                 .reconcile_native_memory(ready)
                 .map(|_| LocalResult::Empty)
@@ -1242,17 +1251,31 @@ fn execute_harness_setup(
                 state.device_id,
                 params,
             )?;
-            if let Some(updates) = &state.native_memory_updates
-                && let Ok(ledgers) = state.vault.native_memory_ledgers()
-            {
+            if let Some(updates) = &state.native_memory_updates {
+                let ledgers = state
+                    .vault
+                    .native_memory_ledgers()
+                    .map_err(client_error_from_vault)?;
                 updates.send_replace(ledgers);
             }
             Ok(LocalResult::Empty)
         }
-        LocalRequest::HarnessRollback(params) => state
-            .bridge_install
-            .rollback(&mut state.vault, &state.vault_path, state.device_id, params)
-            .map(|()| LocalResult::Empty),
+        LocalRequest::HarnessRollback(params) => {
+            state.bridge_install.rollback(
+                &mut state.vault,
+                &state.vault_path,
+                state.device_id,
+                params,
+            )?;
+            if let Some(updates) = &state.native_memory_updates {
+                let ledgers = state
+                    .vault
+                    .native_memory_ledgers()
+                    .map_err(client_error_from_vault)?;
+                updates.send_replace(ledgers);
+            }
+            Ok(LocalResult::Empty)
+        }
         _ => Err(invalid_request_error()),
     }
 }

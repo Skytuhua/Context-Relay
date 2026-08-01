@@ -241,7 +241,12 @@ async fn run_supervisor(
                     }
                     SupervisorSchedule::Updated => {
                         let ledgers = updates.borrow_and_update().clone();
-                        merge_registered_sources(&mut sources, ledgers);
+                        replace_registered_sources(
+                            &mut sources,
+                            &mut debounce,
+                            &mut pending,
+                            ledgers,
+                        );
                     }
                     SupervisorSchedule::UpdatesClosed => updates_open = false,
                 }
@@ -253,22 +258,38 @@ async fn run_supervisor(
     while completions.join_next().await.is_some() {}
 }
 
-fn merge_registered_sources(
+fn replace_registered_sources(
     sources: &mut BTreeMap<NativeMemorySourceId, WatchedSource>,
+    debounce: &mut DebounceState,
+    pending: &mut BTreeMap<NativeMemorySourceId, PendingReady>,
     ledgers: Vec<NativeMemoryLedger>,
 ) {
-    for ledger in ledgers {
-        let Some(source) = ledger.source else {
-            continue;
-        };
-        sources.entry(source.id).or_insert_with(|| WatchedSource {
-            source,
-            initial_preview_complete: ledger.initial_preview_complete,
-            baseline: ledger
-                .initial_preview_complete
-                .then_some(ledger.last_observed_digest),
-        });
+    let replacement = ledgers
+        .into_iter()
+        .filter_map(|ledger| {
+            let source = ledger.source?;
+            Some((
+                source.id,
+                WatchedSource {
+                    source,
+                    initial_preview_complete: ledger.initial_preview_complete,
+                    baseline: ledger
+                        .initial_preview_complete
+                        .then_some(ledger.last_observed_digest),
+                },
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for removed in sources
+        .keys()
+        .filter(|source_id| !replacement.contains_key(source_id))
+        .copied()
+        .collect::<Vec<_>>()
+    {
+        pending.remove(&removed);
+        invalidate(debounce, removed);
     }
+    *sources = replacement;
 }
 
 fn scan_sources(
@@ -626,6 +647,40 @@ mod tests {
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].last_applied_digest, Some(Sha256Digest([64; 32])));
         assert!(!receiver.has_changed().unwrap());
+    }
+
+    #[test]
+    fn descriptor_refresh_replaces_the_set_and_discards_removed_pending_work() {
+        let root = tempfile::tempdir().unwrap();
+        let removed = source(&root.path().join("removed.md"), 32);
+        let retained = source(&root.path().join("retained.md"), 32);
+        let removed_id = removed.id;
+        let retained_id = retained.id;
+        let mut sources = watched_sources(removed.clone());
+        let mut debounce = DebounceState::default();
+        let mut pending = BTreeMap::from([(
+            removed_id,
+            PendingReady {
+                ready: ReadyNativeMemory {
+                    source: removed,
+                    snapshot: NativeMemorySnapshot::Absent,
+                    kind: NativeMemoryObservationKind::LiveEdit,
+                },
+                digest: None,
+                stable: None,
+            },
+        )]);
+
+        replace_registered_sources(
+            &mut sources,
+            &mut debounce,
+            &mut pending,
+            vec![NativeMemoryLedger::for_source(retained)],
+        );
+
+        assert!(!sources.contains_key(&removed_id));
+        assert!(sources.contains_key(&retained_id));
+        assert!(!pending.contains_key(&removed_id));
     }
 
     #[tokio::test(start_paused = true)]

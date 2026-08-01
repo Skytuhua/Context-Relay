@@ -346,6 +346,10 @@ impl CodexCommand {
 }
 
 impl CodexAdapter {
+    pub fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+
     pub fn discover(
         project_root: impl Into<PathBuf>,
         working_directory: impl Into<PathBuf>,

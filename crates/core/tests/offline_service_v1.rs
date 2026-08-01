@@ -89,7 +89,9 @@ fn migration_v10_through_latest_preserves_existing_workspace_rows() {
 
     let raw = open_keyed(fixture.path.path(), &fixture.keys.key(CREDENTIAL));
     raw.execute_batch(
-        "DROP TABLE IF EXISTS setup_native_memory_bindings;
+        "DROP TABLE IF EXISTS setup_native_memory_source_refs;
+         DROP TABLE IF EXISTS setup_native_memory_managed_sources;
+         DROP TABLE IF EXISTS setup_native_memory_bindings;
          DROP TABLE IF EXISTS native_hook_sessions;",
     )
     .unwrap();
@@ -97,7 +99,7 @@ fn migration_v10_through_latest_preserves_existing_workspace_rows() {
     drop(raw);
 
     let vault = fixture.vault();
-    assert_eq!(LATEST_SCHEMA_VERSION, 12);
+    assert_eq!(LATEST_SCHEMA_VERSION, 13);
     assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     assert_eq!(vault.projects().unwrap(), vec![project]);
     assert_eq!(vault.task(&task.id).unwrap(), Some(task));
@@ -112,6 +114,18 @@ fn migration_v10_through_latest_preserves_existing_workspace_rows() {
             .table_names()
             .unwrap()
             .contains(&"setup_native_memory_bindings".to_owned())
+    );
+    assert!(
+        vault
+            .table_names()
+            .unwrap()
+            .contains(&"setup_native_memory_managed_sources".to_owned())
+    );
+    assert!(
+        vault
+            .table_names()
+            .unwrap()
+            .contains(&"setup_native_memory_source_refs".to_owned())
     );
 }
 

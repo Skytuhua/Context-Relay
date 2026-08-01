@@ -3,6 +3,9 @@ mod support;
 use std::{cell::RefCell, panic::AssertUnwindSafe, rc::Rc, str::FromStr};
 
 use context_relay_core::{
+    native_memory::{
+        NativeMemoryDocumentKind, NativeMemoryLimits, NativeMemoryRegistration, NativeMemorySource,
+    },
     native_transaction::{
         ApprovedCliMutation, ApprovedMutation, CanonicalCliDeclaration, MutationKind,
         NativeTransactionPlan, RestorableStateFingerprint, SidecarBinding, approval_hash_v2,
@@ -17,7 +20,7 @@ use context_relay_native_runner::{
 };
 use context_relay_protocol::{
     ApprovalClass, CliOperation, HarnessId, NativePlatform, NativeScope, NetworkDelta,
-    PermissionDelta, PlanId, SetupPlan, Sha256Digest, WireNativeValue,
+    PermissionDelta, PlanId, ScopeRef, SetupPlan, Sha256Digest, WireNativeValue,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -78,6 +81,22 @@ fn native_text(value: &str) -> WireNativeValue {
         bytes: value.as_bytes().to_vec(),
         display: Some(value.to_owned()),
     }
+}
+
+fn native_memory_source() -> NativeMemorySource {
+    NativeMemorySource::new(
+        HarnessId::Codex,
+        "0.144.1",
+        ScopeRef::Global,
+        NativeMemoryDocumentKind::Agent,
+        native_text("/fixture/CODEX_MEMORY.md"),
+        NativeMemoryLimits {
+            max_bytes: 4_096,
+            max_characters: 4_096,
+        },
+        true,
+    )
+    .unwrap()
 }
 
 fn declaration(command: &str) -> CanonicalCliDeclaration {
@@ -175,6 +194,7 @@ fn plan() -> NativeTransactionPlan {
         scanner_result_hash: Sha256Digest([12; 32]),
         mutations: vec![],
         cli_mutations: vec![cli],
+        native_memory_registrations: vec![],
         ownership_changes: vec![],
     }
 }
@@ -195,6 +215,48 @@ fn persist(vault: &mut Vault, mut plan: NativeTransactionPlan) -> NativeTransact
         })
         .unwrap();
     plan
+}
+
+#[test]
+fn successful_rollback_unregisters_the_source_owned_by_the_original_plan() {
+    let path = TempVault::new("bridge-setup-rollback-native-memory-source");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
+    let descriptor = native_memory_source();
+    let mut candidate = plan();
+    candidate.native_memory_registrations = vec![NativeMemoryRegistration {
+        source: descriptor.clone(),
+        last_applied_digest: Some(Sha256Digest([71; 32])),
+    }];
+    let original = persist(&mut vault, candidate);
+    BridgeInstallService::persisted(&mut vault)
+        .apply(
+            &original.setup.plan_id,
+            NOW_MS + 1,
+            &mut RecordingExecutor::default(),
+        )
+        .unwrap();
+    assert!(
+        vault
+            .native_memory_ledger(&descriptor.id)
+            .unwrap()
+            .is_some()
+    );
+
+    BridgeInstallService::persisted(&mut vault)
+        .rollback(
+            &original.setup.plan_id,
+            NOW_MS + 2,
+            &mut RecordingExecutor::default(),
+        )
+        .unwrap();
+
+    assert!(
+        vault
+            .native_memory_ledger(&descriptor.id)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -676,7 +738,13 @@ fn startup_reconciliation_finalizes_a_terminal_original_and_inverse_pair() {
     let keys = MemoryKeyStore::default();
     let path = TempVault::new("bridge-setup-rollback-startup-reconcile");
     let mut vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
-    let original = persist(&mut vault, plan());
+    let descriptor = native_memory_source();
+    let mut candidate = plan();
+    candidate.native_memory_registrations = vec![NativeMemoryRegistration {
+        source: descriptor.clone(),
+        last_applied_digest: Some(Sha256Digest([72; 32])),
+    }];
+    let original = persist(&mut vault, candidate);
     BridgeInstallService::persisted(&mut vault)
         .apply(
             &original.setup.plan_id,
@@ -684,6 +752,12 @@ fn startup_reconciliation_finalizes_a_terminal_original_and_inverse_pair() {
             &mut RecordingExecutor::default(),
         )
         .unwrap();
+    assert!(
+        vault
+            .native_memory_ledger(&descriptor.id)
+            .unwrap()
+            .is_some()
+    );
     let inverse_id = Rc::new(RefCell::new(None));
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let _ = BridgeInstallService::persisted(&mut vault).rollback(
@@ -717,5 +791,11 @@ fn startup_reconciliation_finalizes_a_terminal_original_and_inverse_pair() {
     assert_eq!(
         vault.setup_plan(&inverse_id).unwrap().unwrap().lifecycle,
         SetupPlanLifecycle::Applied
+    );
+    assert!(
+        vault
+            .native_memory_ledger(&descriptor.id)
+            .unwrap()
+            .is_none()
     );
 }

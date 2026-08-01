@@ -14,10 +14,10 @@ use context_relay_contextd::{
 };
 use context_relay_core::{
     native_memory::{
-        NativeMemoryDocumentKind, NativeMemoryLedger, NativeMemoryLimits, NativeMemorySource,
+        NativeMemoryDocumentKind, NativeMemoryLimits, NativeMemoryRegistration, NativeMemorySource,
     },
     setup::BridgeLocator,
-    vault::Vault,
+    vault::{SetupPlanAction, SetupPlanLifecycle, SetupPlanWrite, Vault},
 };
 use context_relay_local_ipc::{
     AuthAcceptedV1, AuthTranscriptV1, ConnectedStream, InstallationToken, RuntimeConfig,
@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 const TOKEN: [u8; 32] = [0x5a; 32];
 const PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
+const ROLLBACK_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073990";
 
 #[derive(Default)]
 struct RecordingEngine {
@@ -76,21 +77,71 @@ impl BridgeInstallEngine for RegisteringEngine {
         vault: &mut Vault,
         _vault_path: &Path,
         _device_id: DeviceId,
-        _params: PlanParams,
+        params: PlanParams,
     ) -> Result<(), ClientError> {
+        let approval_hash = Sha256Digest([0x31; 32]);
+        let payload = b"contextd native memory registration fixture";
         vault
-            .put_native_memory_candidate(&NativeMemoryLedger::for_source(self.source.clone()), None)
+            .put_setup_plan(SetupPlanWrite {
+                plan_id: &params.plan_id,
+                schema_version: 2,
+                approval_version: 2,
+                approval_hash: &approval_hash,
+                payload,
+                created_ms: 10,
+                expires_ms: 1_000_000,
+            })
+            .and_then(|()| {
+                vault
+                    .claim_setup_plan(&params.plan_id, SetupPlanAction::Apply, 11)
+                    .map(|_| ())
+            })
+            .and_then(|()| {
+                vault.finish_setup_plan_with_native_memory(
+                    &params.plan_id,
+                    SetupPlanLifecycle::Applied,
+                    &[NativeMemoryRegistration {
+                        source: self.source.clone(),
+                        last_applied_digest: None,
+                    }],
+                )
+            })
             .map_err(|_| conflict("Native memory source could not be registered"))
     }
 
     fn rollback(
         &self,
-        _vault: &mut Vault,
+        vault: &mut Vault,
         _vault_path: &Path,
         _device_id: DeviceId,
-        _params: PlanParams,
+        params: PlanParams,
     ) -> Result<(), ClientError> {
-        Ok(())
+        let inverse_id = PlanId::from_str(ROLLBACK_PLAN).unwrap();
+        let approval_hash = Sha256Digest([0x32; 32]);
+        let payload = b"contextd native memory rollback fixture";
+        vault
+            .claim_setup_plan_rollback(
+                &params.plan_id,
+                SetupPlanWrite {
+                    plan_id: &inverse_id,
+                    schema_version: 2,
+                    approval_version: 2,
+                    approval_hash: &approval_hash,
+                    payload,
+                    created_ms: 20,
+                    expires_ms: 1_000_000,
+                },
+                21,
+            )
+            .and_then(|_| {
+                vault.finish_setup_plan_rollback(
+                    &params.plan_id,
+                    &inverse_id,
+                    SetupPlanLifecycle::RolledBack,
+                    SetupPlanLifecycle::Applied,
+                )
+            })
+            .map_err(|_| conflict("Native memory source could not be unregistered"))
     }
 }
 
@@ -442,7 +493,7 @@ async fn failed_startup_never_launches_native_memory_supervision() {
 }
 
 #[tokio::test]
-async fn successful_setup_apply_activates_a_new_descriptor_without_daemon_restart() {
+async fn setup_apply_and_rollback_refresh_the_live_descriptor_set_without_watcher_leaks() {
     let root = unique_temp_path("live-native-registration");
     std::fs::create_dir_all(&root).unwrap();
     let memory_path = root.join("memory.md");
@@ -481,7 +532,11 @@ async fn successful_setup_apply_activates_a_new_descriptor_without_daemon_restar
         root.join("vault.db"),
         InstallationToken::from_bytes(TOKEN),
     )
-    .with_bridge_install_engine(Arc::new(RegisteringEngine { source }));
+    .with_bridge_install_engine(Arc::new(RegisteringEngine {
+        source: source.clone(),
+    }));
+    let probe = Arc::new(TestNativeMemoryProbe::default());
+    let config = config.with_native_memory_probe(probe.clone());
     let daemon = config.start().await.unwrap();
     let handle = daemon.handle();
     let running = tokio::spawn(daemon.run());
@@ -503,11 +558,29 @@ async fn successful_setup_apply_activates_a_new_descriptor_without_daemon_restar
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     assert_eq!(config.native_memory_candidates().unwrap().len(), 1);
+
+    assert_eq!(
+        client
+            .call(LocalRequest::HarnessRollback(PlanParams {
+                plan_id: PlanId::from_str(PLAN).unwrap(),
+            }))
+            .await
+            .unwrap(),
+        LocalResult::Empty
+    );
+    assert!(config.native_memory_ledger(&source.id).unwrap().is_none());
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    std::fs::write(&memory_path, b"must not be watched after rollback\n").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+    assert_eq!(config.native_memory_candidates().unwrap().len(), 1);
+    assert_eq!(probe.starts(), 1);
     assert_eq!(
         handle.shutdown().await,
         context_relay_contextd::DaemonState::Stopped
     );
     running.await.unwrap().unwrap();
+    assert_eq!(probe.stops(), 1);
 }
 
 #[test]

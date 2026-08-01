@@ -235,6 +235,11 @@ fn hermes_adapter(root: &Path, config: &[u8]) -> (HermesAdapter, std::path::Path
     let project_root = root.join("project");
     let working_directory = project_root.join("service");
     fs::create_dir_all(&working_directory).unwrap();
+    fs::write(
+        project_root.join("HERMES.md"),
+        b"user project instructions\n",
+    )
+    .unwrap();
     let profile_home = root.join("hermes");
     fs::create_dir_all(&profile_home).unwrap();
     let config_path = profile_home.join("config.yaml");
@@ -633,7 +638,7 @@ fn preview_uses_the_reviewed_hermes_native_path_without_cli_or_config_writes() {
     assert_eq!(sealed["nativePlan"]["cliMutations"], serde_json::json!([]));
     assert_eq!(
         sealed["nativePlan"]["mutations"].as_array().unwrap().len(),
-        1
+        2
     );
 }
 
@@ -670,7 +675,7 @@ fn preview_accepts_an_existing_exact_hermes_bridge_projection() {
     .unwrap();
 
     assert_eq!(setup.harness, HarnessId::Hermes);
-    assert_eq!(setup.approval_class, ApprovalClass::Passive);
+    assert_eq!(setup.approval_class, ApprovalClass::Active);
     assert!(setup.cli_operations.is_empty());
     assert_eq!(fs::read(config_path).unwrap(), config.as_bytes());
 }

@@ -398,6 +398,9 @@ fn hermes_native_plan(
     expected_native_digests: Vec<ExpectedNativeDigest>,
 ) -> NativeTransactionPlan {
     clear_gateway_records(fixture);
+    if approval_class == ApprovalClass::Active {
+        fs::write(fixture.layout.profile.hermes_home.join("gateway.lock"), b"").unwrap();
+    }
     let imported = import_global(fixture);
     let mut plugin = component_at(
         &imported.components,
@@ -456,6 +459,7 @@ fn hermes_native_plan(
         scanner_result_hash: Sha256Digest([28; 32]),
         mutations: vec![mutation],
         cli_mutations: vec![],
+        native_memory_registrations: vec![],
         ownership_changes: vec![],
     }
 }
@@ -723,6 +727,42 @@ fn active_transaction_holds_gateway_lock_until_commit_or_compensation_finishes()
         assert!(hook.blocked_after_reprobe);
         assert!(gateway_lock_available(&lock_path));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn active_reprobe_preserves_the_sealed_target_parent_boundary() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let plan = hermes_native_plan(&fixture, ApprovalClass::Active, vec![]);
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    let lock_path = fixture.layout.profile.hermes_home.join("gateway.lock");
+    let before = OsNativeFileSystem::new().snapshot(&config_path).unwrap();
+    let lock_before = fs::read(&lock_path).unwrap();
+
+    let mut adapter = fixture.adapter.clone();
+    adapter.reprobe_live_state(&plan).unwrap();
+
+    let after = OsNativeFileSystem::new().snapshot(&config_path).unwrap();
+    assert_eq!(before.fingerprint(), after.fingerprint());
+    assert_eq!(plan.mutations[0].expected.0.0, *after.fingerprint());
+    assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
+    assert!(!gateway_lock_available(&lock_path));
+    drop(adapter);
+    assert!(gateway_lock_available(&lock_path));
+}
+
+#[cfg(unix)]
+#[test]
+fn active_reprobe_never_creates_a_missing_gateway_lock() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let plan = hermes_native_plan(&fixture, ApprovalClass::Active, vec![]);
+    let lock_path = fixture.layout.profile.hermes_home.join("gateway.lock");
+    fs::remove_file(&lock_path).unwrap();
+
+    let result = fixture.adapter.clone().reprobe_live_state(&plan);
+
+    assert!(result.is_err());
+    assert!(!lock_path.exists());
 }
 
 #[test]

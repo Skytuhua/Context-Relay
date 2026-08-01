@@ -308,6 +308,7 @@ fn codex_native_plan(
         scanner_result_hash: Sha256Digest([31; 32]),
         mutations: vec![mutation],
         cli_mutations: vec![],
+        native_memory_registrations: vec![],
         ownership_changes: vec![],
     };
     plan.setup.batch_hash = approval_hash_v1(&plan).unwrap();

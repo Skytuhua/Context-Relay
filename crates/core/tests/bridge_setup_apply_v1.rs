@@ -20,7 +20,7 @@ use context_relay_native_runner::{
     RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand, SidecarId,
 };
 use context_relay_protocol::{
-    ApprovalClass, CliOperation, HarnessId, NativePlatform, NativeScope, NetworkDelta,
+    ApprovalClass, CliOperation, ErrorCode, HarnessId, NativePlatform, NativeScope, NetworkDelta,
     PermissionDelta, PlanId, ScopeRef, SetupPlan, Sha256Digest, WireNativeValue,
 };
 use sha2::{Digest as _, Sha256};
@@ -189,6 +189,7 @@ fn plan() -> NativeTransactionPlan {
         scanner_result_hash: Sha256Digest([12; 32]),
         mutations: vec![],
         cli_mutations: vec![cli],
+        native_memory_registrations: vec![],
         ownership_changes: vec![],
     }
 }
@@ -554,13 +555,22 @@ fn committed_apply_recovery_publishes_the_pre_execution_registration_binding() {
     let path = TempVault::new("bridge-setup-apply-native-memory-binding-recovery");
     let keys = MemoryKeyStore::default();
     let mut vault = Vault::open(path.path(), "bridge-setup-apply-v1", &keys).unwrap();
-    let (candidate, _) = persist(&mut vault, plan());
     let descriptor = native_memory_source();
     let intended_digest = Sha256Digest([77; 32]);
     let registration = NativeMemoryRegistration {
         source: descriptor.clone(),
         last_applied_digest: Some(intended_digest),
     };
+    let mut candidate = plan();
+    candidate.native_memory_registrations = vec![registration.clone()];
+    let (candidate, _) = persist(&mut vault, candidate);
+
+    let mut rejected = RecordingExecutor::default();
+    let error = BridgeInstallService::persisted(&mut vault)
+        .apply_with_native_memory(&candidate.setup.plan_id, NOW_MS + 1, &[], &mut rejected)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(rejected.calls, 0);
 
     let crashed = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let _ = BridgeInstallService::persisted(&mut vault).apply_with_native_memory(

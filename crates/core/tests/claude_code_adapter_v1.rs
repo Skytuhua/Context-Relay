@@ -1605,6 +1605,7 @@ fn native_digest_plan(target: &Path, digest: Sha256Digest) -> NativeTransactionP
         scanner_result_hash: Sha256Digest([8; 32]),
         mutations: vec![],
         cli_mutations: vec![],
+        native_memory_registrations: vec![],
         ownership_changes: vec![],
     }
 }

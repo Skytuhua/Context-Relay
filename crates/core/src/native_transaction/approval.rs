@@ -38,6 +38,11 @@ pub fn approval_hash_v1(plan: &NativeTransactionPlan) -> Result<Sha256Digest, Ap
             "approval v1 cannot bind cli mutations".into(),
         ));
     }
+    if !plan.native_memory_registrations.is_empty() {
+        return Err(ApprovalError::Invalid(
+            "approval v1 cannot bind native memory registrations".into(),
+        ));
+    }
     plan.setup
         .validate()
         .map_err(|error| ApprovalError::Invalid(error.to_string()))?;
@@ -53,9 +58,45 @@ pub fn approval_hash_v2(plan: &NativeTransactionPlan) -> Result<Sha256Digest, Ap
         .map_err(|error| ApprovalError::Invalid(error.to_string()))?;
     validate(plan)?;
     validate_cli_mutations(plan)?;
+    validate_native_memory_registrations(plan)?;
 
-    let value = json!([2, approval_value(plan)?, cli_approval_value(plan)?]);
-    hash_approval(APPROVAL_DOMAIN_V2, &value)
+    let mut value = vec![
+        Value::from(2),
+        approval_value(plan)?,
+        cli_approval_value(plan)?,
+    ];
+    // Preserve the already-shipped v2 preimage for legacy plans whose exact
+    // registration set was empty. Any Task 10 descriptor set adds this fully
+    // validated fourth member and is therefore approval-bound.
+    if !plan.native_memory_registrations.is_empty() {
+        value.push(native_memory_approval_value(plan)?);
+    }
+    hash_approval(APPROVAL_DOMAIN_V2, &Value::Array(value))
+}
+
+fn validate_native_memory_registrations(plan: &NativeTransactionPlan) -> Result<(), ApprovalError> {
+    let mut source_ids = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    for registration in &plan.native_memory_registrations {
+        crate::native_memory::validate_source_descriptor(&registration.source)
+            .map_err(|_| ApprovalError::Invalid("native memory source is invalid".into()))?;
+        if registration.source.harness != plan.setup.harness {
+            return Err(ApprovalError::Invalid(
+                "native memory source harness differs from setup plan".into(),
+            ));
+        }
+        if !source_ids.insert(registration.source.id) {
+            return Err(ApprovalError::Duplicate("native memory source id".into()));
+        }
+        let path = (
+            registration.source.path.platform as u8,
+            registration.source.path.bytes.clone(),
+        );
+        if !paths.insert(path) {
+            return Err(ApprovalError::Duplicate("native memory source path".into()));
+        }
+    }
+    Ok(())
 }
 
 fn hash_approval(domain: &[u8], value: &Value) -> Result<Sha256Digest, ApprovalError> {
@@ -433,6 +474,13 @@ fn cli_approval_value(plan: &NativeTransactionPlan) -> Result<Value, ApprovalErr
         })
         .collect::<Result<Vec<_>, ApprovalError>>()?;
     Ok(Value::Array(mutations))
+}
+
+fn native_memory_approval_value(plan: &NativeTransactionPlan) -> Result<Value, ApprovalError> {
+    let mut registrations = plan.native_memory_registrations.iter().collect::<Vec<_>>();
+    registrations.sort_by_key(|registration| registration.source.id);
+    serde_json::to_value(registrations)
+        .map_err(|error| ApprovalError::Serialization(error.to_string()))
 }
 
 fn declaration_value(declaration: Option<&CanonicalCliDeclaration>) -> Value {

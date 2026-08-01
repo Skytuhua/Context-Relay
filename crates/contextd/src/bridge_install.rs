@@ -28,7 +28,7 @@ use context_relay_native_runner::{
 };
 use context_relay_protocol::{
     ClientError, DeviceId, ErrorCode, HarnessId, HarnessParams, HybridLogicalClock, NativePlatform,
-    PlanId, PlanParams, ProjectId, SetupPlan, Sha256Digest, WireNativeValue,
+    NativeScope, PlanId, PlanParams, ProjectId, SetupPlan, Sha256Digest, WireNativeValue,
 };
 
 #[cfg(not(windows))]
@@ -280,8 +280,7 @@ impl ProductionBridgePlanExecutor<'_> {
         created_ms: u64,
         now_ms: u64,
     ) -> Result<(), ProductionExecutionError> {
-        let root = stable_process_root()?;
-        let project_id = global_project_id()?;
+        let (root, project_id) = sealed_project_binding(plan)?;
         let observed_hlc = HybridLogicalClock::new(now_ms, 0, self.device_id);
         let lock_root = canonical_lock_root(self.vault_path)?;
         let identity = nonlaunching_sandbox_identity();
@@ -358,6 +357,28 @@ impl ProductionBridgePlanExecutor<'_> {
         };
         result.map_err(ProductionExecutionError::Execute)
     }
+}
+
+fn sealed_project_binding(
+    plan: &context_relay_core::native_transaction::NativeTransactionPlan,
+) -> Result<(PathBuf, ProjectId), ClientError> {
+    let mut projects = plan.setup.target_scopes.iter().filter_map(|scope| {
+        if let NativeScope::Project { project_id, root } = scope {
+            Some((*project_id, root))
+        } else {
+            None
+        }
+    });
+    let Some((project_id, root)) = projects.next() else {
+        return Ok((stable_process_root()?, global_project_id()?));
+    };
+    if projects.next().is_some() {
+        return Err(invalid("Persisted bridge plan has ambiguous project roots"));
+    }
+    let decoded = decode_wire_path(root)?;
+    let canonical = fs::canonicalize(decoded)
+        .map_err(|_| invalid("Persisted bridge project root is unavailable"))?;
+    Ok((canonical, project_id))
 }
 
 fn execute_persisted(
@@ -804,6 +825,7 @@ pub(crate) mod tests {
             scanner_result_hash: Sha256Digest([8; 32]),
             mutations: vec![],
             cli_mutations: vec![],
+            native_memory_registrations: vec![],
             ownership_changes: vec![],
         }
     }

@@ -93,6 +93,7 @@ pub fn seal_plan(
             "forward": mutation.forward,
             "rollback": mutation.rollback,
         })).collect::<Vec<_>>(),
+        "nativeMemoryRegistrations": plan.native_memory_registrations,
         "ownershipChanges": plan.ownership_changes.iter().map(|change| json!({
             "stableId": change.stable_id,
             "structuralLocation": change.structural_location,
@@ -365,6 +366,8 @@ struct SealedNativePlan {
     scanner_result_hash: String,
     mutations: Vec<SealedMutation>,
     cli_mutations: Vec<SealedCliMutation>,
+    #[serde(default)]
+    native_memory_registrations: Vec<crate::native_memory::NativeMemoryRegistration>,
     ownership_changes: Vec<SealedOwnershipChange>,
 }
 
@@ -400,6 +403,7 @@ impl SealedNativePlan {
                 .into_iter()
                 .map(SealedCliMutation::open)
                 .collect::<Result<_, _>>()?,
+            native_memory_registrations: self.native_memory_registrations,
             ownership_changes: self
                 .ownership_changes
                 .into_iter()

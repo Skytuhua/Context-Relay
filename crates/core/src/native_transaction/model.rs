@@ -3,6 +3,8 @@ use context_relay_protocol::{
     ApplyReceipt, CliOperation, HarnessId, SetupPlan, Sha256Digest, WireNativeValue,
 };
 
+use crate::native_memory::NativeMemoryRegistration;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum TransactionStep {
@@ -176,6 +178,9 @@ pub struct NativeTransactionPlan {
     pub scanner_result_hash: Sha256Digest,
     pub mutations: Vec<ApprovedMutation>,
     pub cli_mutations: Vec<ApprovedCliMutation>,
+    /// Exact native fallback source descriptors activated only after this
+    /// sealed setup plan commits successfully.
+    pub native_memory_registrations: Vec<NativeMemoryRegistration>,
     pub ownership_changes: Vec<OwnershipChange>,
 }
 

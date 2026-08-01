@@ -192,6 +192,7 @@ fn plan_with_approval(
         scanner_result_hash: Sha256Digest([8; 32]),
         mutations: with_native.then(native_mutation).into_iter().collect(),
         cli_mutations,
+        native_memory_registrations: vec![],
         ownership_changes: vec![],
     };
     plan.setup.batch_hash = match approval_version {

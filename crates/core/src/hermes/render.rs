@@ -57,6 +57,47 @@ impl HermesAdapter {
         self.approved_regular_file(&path, &snapshot, rendered, metadata.clone())
     }
 
+    /// Coalesces the capability-derived native-memory disable projection with
+    /// the ordinary Hermes config projection. Both start from the same live
+    /// before-image, so applying them as separate mutations would create a
+    /// duplicate-target ambiguity and could lose one of the two changes.
+    pub fn plan_native_config_with_memory_disable(
+        &self,
+        desired: &DesiredState,
+        disable_mutations: &[ApprovedMutation],
+    ) -> Result<Option<ApprovedMutation>, ClientError> {
+        self.require_apply_supported()?;
+        self.validate_desired(desired)?;
+        gateway::require_gateway_idle(&self.layout.profile)?;
+        let path = self.layout.profile.hermes_home.join("config.yaml");
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid("Hermes config cannot be safely inspected"))?;
+        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
+            return Err(invalid("Hermes config must be a regular file"));
+        };
+        let (base_bytes, base_metadata) = match disable_mutations {
+            [] => (bytes.clone(), metadata.clone()),
+            [mutation]
+                if mutation.target == wire_path(&path)
+                    && mutation.expected.0.0 == *snapshot.fingerprint() =>
+            {
+                let state = NativeState::decode_v1(&mutation.content)
+                    .map_err(|_| invalid("Hermes memory disable state is invalid"))?;
+                if state.fingerprint() != mutation.intended.0.0 {
+                    return Err(invalid("Hermes memory disable state is invalid"));
+                }
+                let NativeState::RegularFile { bytes, metadata } = state else {
+                    return Err(invalid("Hermes memory disable state is invalid"));
+                };
+                (bytes, metadata)
+            }
+            _ => return Err(invalid("Hermes memory disable projection is ambiguous")),
+        };
+        let rendered = self.render_config(&base_bytes, desired)?;
+        self.approved_regular_file(&path, &snapshot, rendered, base_metadata)
+    }
+
     pub fn plan_native_markdown(
         &self,
         component: &ComponentRecord,

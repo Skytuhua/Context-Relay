@@ -36,9 +36,7 @@ impl NativeMemoryCapabilities {
         let mut ids = BTreeSet::<NativeMemorySourceId>::new();
         let mut paths = BTreeSet::<(u8, Vec<u8>)>::new();
         for source in &self.sources {
-            source
-                .validate()
-                .map_err(|_| invalid("Native memory source is invalid"))?;
+            validate_source_descriptor(source)?;
             if !ids.insert(source.id)
                 || !paths.insert((source.path.platform as u8, source.path.bytes.clone()))
             {
@@ -48,6 +46,13 @@ impl NativeMemoryCapabilities {
         }
         Ok(())
     }
+}
+
+pub(crate) fn validate_source_descriptor(source: &NativeMemorySource) -> Result<(), ClientError> {
+    source
+        .validate()
+        .map_err(|_| invalid("Native memory source is invalid"))?;
+    reject_forbidden_source_path(&source.path)
 }
 
 pub(crate) fn source(
