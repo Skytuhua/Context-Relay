@@ -1,6 +1,8 @@
 use std::{
+    cell::Cell,
     fs,
     path::{Path, PathBuf},
+    rc::Rc,
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -15,9 +17,9 @@ use context_relay_core::{
     native_transaction::{
         approval_hash_v1,
         engine::{
-            BeforeImage, BoundaryError, FaultHook, MutationOutcome, NativeAdapter,
-            NativeFileSystem, NativeJournal, NativeTransactionEngine, RestrictedExecutor,
-            RestrictedRun,
+            BeforeImage, BoundaryError, CompensationOutcome, FaultHook, MutationOutcome,
+            NativeAdapter, NativeFileSystem, NativeJournal, NativeTransactionEngine,
+            RestrictedExecutor, RestrictedRun,
         },
         filesystem::OsNativeTransactionFileSystem,
         model::{
@@ -670,6 +672,226 @@ impl FaultHook for GatewayReservationHook {
             Ok(())
         }
     }
+}
+
+#[cfg(unix)]
+struct ReplaceProfileHook {
+    after: TransactionStep,
+    profile: PathBuf,
+    parked: PathBuf,
+    replacement: PathBuf,
+    replaced: bool,
+}
+
+#[cfg(unix)]
+impl FaultHook for ReplaceProfileHook {
+    fn after_step(&mut self, step: TransactionStep) -> Result<(), BoundaryError> {
+        if step == self.after {
+            fs::rename(&self.profile, &self.parked)
+                .map_err(|_| BoundaryError::new("fixture profile rename failed"))?;
+            std::os::unix::fs::symlink(&self.replacement, &self.profile)
+                .map_err(|_| BoundaryError::new("fixture profile replacement failed"))?;
+            self.replaced = true;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct RejectingCompareFileSystem {
+    compare_called: Rc<Cell<bool>>,
+}
+
+#[cfg(unix)]
+impl NativeFileSystem for RejectingCompareFileSystem {
+    fn create_before_images(
+        &mut self,
+        mutations: &[ApprovedMutation],
+    ) -> Result<Vec<BeforeImage>, BoundaryError> {
+        Ok(mutations
+            .iter()
+            .enumerate()
+            .map(|(index, mutation)| BeforeImage {
+                id: format!("before-{index}"),
+                target: mutation.target.clone(),
+                object_token: NativeObjectToken {
+                    volume: vec![1],
+                    object: vec![index as u8],
+                    topology: vec![1],
+                },
+                fingerprint: mutation.expected.clone(),
+                encrypted_state: mutation.content.clone(),
+            })
+            .collect())
+    }
+
+    fn record_native_metadata(&mut self, _images: &[BeforeImage]) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn compare_and_swap_targets(
+        &mut self,
+        _mutations: &[ApprovedMutation],
+    ) -> Result<(), BoundaryError> {
+        self.compare_called.set(true);
+        Err(BoundaryError::new(
+            "fixture stops after reservation verification",
+        ))
+    }
+
+    fn apply_mutation(
+        &mut self,
+        _transaction_nonce: &[u8; 16],
+        _mutation: &ApprovedMutation,
+        _persist_candidate: &mut dyn FnMut(&NativeObjectToken) -> Result<(), BoundaryError>,
+    ) -> Result<MutationOutcome, BoundaryError> {
+        Err(BoundaryError::new("fixture mutation must not run"))
+    }
+
+    fn restore_matching_applied_targets(
+        &mut self,
+        _transaction_nonce: &[u8; 16],
+        _persist_restored_candidate: &mut dyn FnMut(
+            usize,
+            &NativeObjectToken,
+        ) -> Result<(), BoundaryError>,
+        _checkpoint_applied_absence: &mut context_relay_core::native_transaction::engine::CheckpointAppliedAbsence<'_>,
+        _rebind_applied_absence: &mut context_relay_core::native_transaction::engine::RebindAppliedAbsence<'_>,
+    ) -> Result<CompensationOutcome, BoundaryError> {
+        Ok(CompensationOutcome::new(vec![]))
+    }
+
+    fn finish_committed_targets(
+        &mut self,
+        _transaction_nonce: &[u8; 16],
+    ) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn replacement_profile(fixture: &Fixture, name: &str) -> (PathBuf, Vec<u8>) {
+    let replacement = fixture.root.join(name);
+    fs::create_dir(&replacement).unwrap();
+    let config = fs::read(fixture.layout.profile.hermes_home.join("config.yaml")).unwrap();
+    fs::write(replacement.join("config.yaml"), &config).unwrap();
+    (replacement, config)
+}
+
+#[cfg(unix)]
+fn hermes_test_sidecar(plan: &NativeTransactionPlan) -> SidecarBinding {
+    SidecarBinding {
+        id: SidecarId::RuleSync,
+        target: RuntimeTarget::MacosArm64,
+        version: plan.setup.rulesync_version.clone(),
+        closure_hash: Sha256Digest([45; 32]),
+        source_bundle_hash: Sha256Digest([46; 32]),
+        build_toolchain_hash: Sha256Digest([47; 32]),
+        command_template_digest: Sha256Digest([48; 32]),
+        command: SidecarCommand::RuleSyncGenerate {
+            target: RuleSyncTarget::ClaudeCode,
+            features: RuleSyncFeatures::new(&[RuleSyncFeature::Mcp]).unwrap(),
+        },
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_replacement_before_gateway_acquisition_never_creates_a_replacement_lease() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let mut plan = hermes_native_plan(&fixture, ApprovalClass::Active, vec![]);
+    plan.sidecars = vec![hermes_test_sidecar(&plan)];
+    plan.setup.batch_hash = approval_hash_v1(&plan).unwrap();
+    fs::remove_file(fixture.layout.profile.hermes_home.join("gateway.lock")).unwrap();
+    let (replacement, replacement_config) = replacement_profile(&fixture, "replacement-before");
+    let parked = fixture.root.join("parked-before");
+    let mut hook = ReplaceProfileHook {
+        after: TransactionStep::ReprobeLiveState,
+        profile: fixture.layout.profile.hermes_home.clone(),
+        parked,
+        replacement: replacement.clone(),
+        replaced: false,
+    };
+    let mut adapter = fixture.adapter.clone();
+    let mut executor = RollbackExecutor {
+        run: RestrictedRun {
+            staged_output_hash: plan.expected_semantic_output_hash,
+            scanner_result_hash: plan.scanner_result_hash,
+        },
+    };
+    let mut native = OsNativeTransactionFileSystem::new(*plan.setup.plan_id.as_bytes());
+    let mut journal = RollbackJournal::default();
+
+    let result = NativeTransactionEngine::new(
+        &mut adapter,
+        &mut executor,
+        &mut native,
+        &mut journal,
+        &mut hook,
+    )
+    .apply(&plan, 1_900_000_000_000, validation_receipt().applied_hlc);
+
+    assert!(result.is_err());
+    assert!(hook.replaced);
+    assert_eq!(
+        fs::read(replacement.join("config.yaml")).unwrap(),
+        replacement_config
+    );
+    assert!(
+        !replacement.join("gateway.lock").exists(),
+        "the replacement profile must never receive the gateway lease file"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_replacement_after_gateway_acquisition_is_rejected_before_mutation_preflight() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let mut plan = hermes_native_plan(&fixture, ApprovalClass::Active, vec![]);
+    plan.sidecars = vec![hermes_test_sidecar(&plan)];
+    plan.setup.batch_hash = approval_hash_v1(&plan).unwrap();
+    let (replacement, replacement_config) = replacement_profile(&fixture, "replacement-after");
+    let parked = fixture.root.join("parked-after");
+    let mut hook = ReplaceProfileHook {
+        after: TransactionStep::CompareApprovedDigests,
+        profile: fixture.layout.profile.hermes_home.clone(),
+        parked,
+        replacement: replacement.clone(),
+        replaced: false,
+    };
+    let mut adapter = fixture.adapter.clone();
+    let mut executor = RollbackExecutor {
+        run: RestrictedRun {
+            staged_output_hash: plan.expected_semantic_output_hash,
+            scanner_result_hash: plan.scanner_result_hash,
+        },
+    };
+    let compare_called = Rc::new(Cell::new(false));
+    let mut native = RejectingCompareFileSystem {
+        compare_called: Rc::clone(&compare_called),
+    };
+    let mut journal = RollbackJournal::default();
+
+    let result = NativeTransactionEngine::new(
+        &mut adapter,
+        &mut executor,
+        &mut native,
+        &mut journal,
+        &mut hook,
+    )
+    .apply(&plan, 1_900_000_000_000, validation_receipt().applied_hlc);
+
+    assert!(result.is_err());
+    assert!(hook.replaced);
+    assert!(
+        !compare_called.get(),
+        "the held profile parent must be revalidated before mutation preflight"
+    );
+    assert_eq!(
+        fs::read(replacement.join("config.yaml")).unwrap(),
+        replacement_config
+    );
+    assert!(!replacement.join("gateway.lock").exists());
 }
 
 #[cfg(unix)]

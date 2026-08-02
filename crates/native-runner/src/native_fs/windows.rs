@@ -50,6 +50,7 @@ const MAX_WIN32_PATH_UNITS: usize = 259;
 const STABLE_DIRECTORY_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 const FILE_OPEN: u32 = 1;
 const FILE_CREATE: u32 = 2;
+const FILE_OPEN_IF: u32 = 3;
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
@@ -997,6 +998,69 @@ fn validate_absent_state(
 pub(super) fn create_new_file(path: &Path) -> Result<File, RunnerError> {
     let held = HeldPath::new(path)?;
     held.create_named(&held.name, GENERIC_READ | GENERIC_WRITE | DELETE)
+}
+
+pub(super) fn open_pinned_directory(path: &Path) -> Result<File, RunnerError> {
+    let held = HeldPath::for_inspection(&path.join(".context-relay-directory-pin"))?;
+    let directory = held.parent()?.try_clone().map_err(|_| RunnerError::Io)?;
+    let node = raw_node(&directory)?;
+    if node.directory && node.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        Ok(directory)
+    } else {
+        Err(RunnerError::UnsafeTopology)
+    }
+}
+
+pub(super) fn verify_pinned_directory(directory: &File, path: &Path) -> Result<bool, RunnerError> {
+    let reopened = open_pinned_directory(path)?;
+    let held = raw_node(directory)?;
+    let named = raw_node(&reopened)?;
+    Ok(held.directory
+        && named.directory
+        && held.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        && named.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        && identity(directory)? == identity(&reopened)?)
+}
+
+pub(super) fn open_or_create_pinned_regular(
+    directory: &File,
+    name: &OsStr,
+) -> Result<File, RunnerError> {
+    validate_name(name, false)?;
+    nt_open_relative(
+        directory,
+        name,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_OPEN_IF,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+    )
+    .map_err(open_runner_error)
+}
+
+pub(super) fn verify_pinned_regular(
+    directory: &File,
+    name: &OsStr,
+    file: &File,
+) -> Result<bool, RunnerError> {
+    validate_name(name, false)?;
+    let reopened = nt_open_relative(
+        directory,
+        name,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+    )
+    .map_err(open_runner_error)?;
+    let held = raw_node(file)?;
+    let named = raw_node(&reopened)?;
+    Ok(!held.directory
+        && !named.directory
+        && held.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        && named.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        && held.links == 1
+        && identity(file)? == identity(&reopened)?)
 }
 
 pub(super) fn identity_matches_path(file: &File, path: &Path) -> Result<bool, RunnerError> {
@@ -3041,6 +3105,33 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn pinned_directory_opens_and_verifies_a_handle_relative_child() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "context-relay-pinned-directory-{}-{suffix}",
+            std::process::id()
+        ));
+        let profile = root.join("profile");
+        fs::create_dir_all(&profile).unwrap();
+
+        {
+            let directory = open_pinned_directory(&profile).unwrap();
+            let lock =
+                open_or_create_pinned_regular(&directory, OsStr::new("gateway.lock")).unwrap();
+            assert!(verify_pinned_directory(&directory, &profile).unwrap());
+            assert!(verify_pinned_regular(&directory, OsStr::new("gateway.lock"), &lock).unwrap());
+            assert!(fs::rename(&root, root.with_extension("attacker")).is_err());
+        }
+
+        let moved = root.with_extension("moved");
+        fs::rename(&root, &moved).unwrap();
+        fs::remove_dir_all(moved).unwrap();
+    }
 
     #[test]
     fn held_path_blocks_controlled_ancestor_rename_until_released() {

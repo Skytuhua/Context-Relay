@@ -113,6 +113,7 @@ pub struct HermesAdapter {
     #[allow(dead_code)]
     observed_hlc: HybridLogicalClock,
     executable_hash: Sha256Digest,
+    gateway_profile: Option<gateway::GatewayProfileReservation>,
     gateway_lease: Option<gateway::GatewayLease>,
 }
 
@@ -124,6 +125,7 @@ impl Clone for HermesAdapter {
             origin_device: self.origin_device,
             observed_hlc: self.observed_hlc,
             executable_hash: self.executable_hash,
+            gateway_profile: None,
             gateway_lease: None,
         }
     }
@@ -290,6 +292,7 @@ impl HermesAdapter {
             origin_device,
             observed_hlc,
             executable_hash: executable.digest,
+            gateway_profile: None,
             gateway_lease: None,
         })
     }
@@ -430,11 +433,17 @@ impl HermesAdapter {
 
 impl NativeAdapter for HermesAdapter {
     fn reprobe_live_state(&mut self, plan: &NativeTransactionPlan) -> Result<(), BoundaryError> {
+        self.gateway_profile.take();
+        self.gateway_lease.take();
         if !plan.cli_mutations.is_empty() || !plan.setup.cli_operations.is_empty() {
             return Err(BoundaryError::new(
                 "Hermes native plans cannot contain CLI mutations",
             ));
         }
+        let gateway_profile = (plan.setup.approval_class == ApprovalClass::Active)
+            .then(|| gateway::GatewayProfileReservation::observe(&self.layout.profile))
+            .transpose()
+            .map_err(|_| BoundaryError::new("Hermes profile binding changed"))?;
         self.revalidate_bound_installation()
             .map_err(|_| BoundaryError::new("Hermes installation changed"))?;
         if self.capability() != CapabilityLevel::Full
@@ -454,6 +463,12 @@ impl NativeAdapter for HermesAdapter {
         }) {
             return Err(BoundaryError::new("Hermes project binding changed"));
         }
+        if let Some(profile) = gateway_profile.as_ref() {
+            profile
+                .verify()
+                .map_err(|_| BoundaryError::new("Hermes profile binding changed"))?;
+        }
+        self.gateway_profile = gateway_profile;
         Ok(())
     }
 
@@ -461,6 +476,11 @@ impl NativeAdapter for HermesAdapter {
         &mut self,
         plan: &NativeTransactionPlan,
     ) -> Result<(), BoundaryError> {
+        if let Some(profile) = self.gateway_profile.as_ref() {
+            profile
+                .verify()
+                .map_err(|_| BoundaryError::new("Hermes profile binding changed"))?;
+        }
         for expected in &plan.setup.expected_native_digests {
             let path = decode_wire_path(&expected.target)?;
             let actual = match fs::symlink_metadata(&path) {
@@ -476,9 +496,27 @@ impl NativeAdapter for HermesAdapter {
             }
         }
         if plan.setup.approval_class == ApprovalClass::Active && self.gateway_lease.is_none() {
-            let lease = gateway::acquire_gateway_idle(&self.layout.profile)
+            let profile = self
+                .gateway_profile
+                .take()
+                .ok_or_else(|| BoundaryError::new("Hermes profile binding changed"))?;
+            let lease = gateway::acquire_gateway_idle(&self.layout.profile, profile)
                 .map_err(|_| BoundaryError::new("Hermes gateway blocks active changes"))?;
             self.gateway_lease = Some(lease);
+        }
+        Ok(())
+    }
+
+    fn verify_live_state_reservation(
+        &mut self,
+        plan: &NativeTransactionPlan,
+    ) -> Result<(), BoundaryError> {
+        if plan.setup.approval_class == ApprovalClass::Active {
+            self.gateway_lease
+                .as_ref()
+                .ok_or_else(|| BoundaryError::new("Hermes gateway reservation is missing"))?
+                .verify()
+                .map_err(|_| BoundaryError::new("Hermes profile binding changed"))?;
         }
         Ok(())
     }
@@ -522,6 +560,7 @@ impl NativeAdapter for HermesAdapter {
 
     fn release_live_state_reservation(&mut self) -> Result<(), BoundaryError> {
         self.gateway_lease.take();
+        self.gateway_profile.take();
         Ok(())
     }
 }

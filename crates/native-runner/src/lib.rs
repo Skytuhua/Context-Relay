@@ -43,7 +43,7 @@ pub use manifest::{
 pub use native_fs::{
     AlternateStream, NativeMetadata, NativeMutationFailure, NativeMutationOutcome,
     NativeObjectToken, NativeRecoveryDisposition, NativeSnapshot, NativeState, NativeTreeInventory,
-    OsNativeFileSystem, PrivateStage, inspect_native_tree,
+    OsNativeFileSystem, PinnedNativeDirectory, PrivateStage, inspect_native_tree,
 };
 pub use path_policy::{StagePath, validate_path_set, windows_ordinal_ignore_case_eq};
 pub use report_validation::{

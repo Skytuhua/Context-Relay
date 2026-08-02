@@ -1,5 +1,5 @@
 use std::{
-    ffi::{CStr, CString, c_void},
+    ffi::{CStr, CString, OsStr, c_void},
     fs::{self, File},
     io::Read,
     mem::{size_of, zeroed},
@@ -235,6 +235,46 @@ pub(super) fn create_new_file(path: &Path) -> Result<File, RunnerError> {
     )?;
     flush_directory(&parent.directory)?;
     Ok(file)
+}
+
+pub(super) fn open_pinned_directory(path: &Path) -> Result<File, RunnerError> {
+    let directory = open_path(path, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    if raw_node(&directory)?.directory() {
+        Ok(directory)
+    } else {
+        Err(RunnerError::UnsafeTopology)
+    }
+}
+
+pub(super) fn verify_pinned_directory(directory: &File, path: &Path) -> Result<bool, RunnerError> {
+    Ok(raw_node(directory)?.directory() && identity_matches_path(directory, path)?)
+}
+
+pub(super) fn open_or_create_pinned_regular(
+    directory: &File,
+    name: &OsStr,
+) -> Result<File, RunnerError> {
+    let name = CString::new(name.as_bytes()).map_err(|_| RunnerError::InvalidPath)?;
+    openat(
+        directory,
+        &name,
+        libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    )
+}
+
+pub(super) fn verify_pinned_regular(
+    directory: &File,
+    name: &OsStr,
+    file: &File,
+) -> Result<bool, RunnerError> {
+    let name = CString::new(name.as_bytes()).map_err(|_| RunnerError::InvalidPath)?;
+    let held = raw_node(file)?;
+    let named = raw_at(directory, &name)?;
+    Ok(held.regular()
+        && held.links == 1
+        && held.uid == unsafe { libc::geteuid() }
+        && held.same_identity(&named))
 }
 
 pub(super) fn identity_matches_path(file: &File, path: &Path) -> Result<bool, RunnerError> {
@@ -2362,6 +2402,30 @@ mod guarded_mutation_tests {
         ));
         fs::create_dir(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn pinned_directory_opens_children_relative_and_detects_path_replacement() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = test_root("pinned-directory");
+        let profile = root.join("profile");
+        let replacement = root.join("replacement");
+        let parked = root.join("parked");
+        fs::create_dir(&profile).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let directory = open_pinned_directory(&profile).unwrap();
+        let lock = open_or_create_pinned_regular(&directory, OsStr::new("gateway.lock")).unwrap();
+        assert!(verify_pinned_regular(&directory, OsStr::new("gateway.lock"), &lock).unwrap());
+
+        fs::rename(&profile, &parked).unwrap();
+        std::os::unix::fs::symlink(&replacement, &profile).unwrap();
+
+        assert!(verify_pinned_directory(&directory, &profile).is_err());
+        assert!(!replacement.join("gateway.lock").exists());
+        fs::remove_file(&profile).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

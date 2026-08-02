@@ -111,6 +111,12 @@ pub trait NativeAdapter {
         &mut self,
         plan: &NativeTransactionPlan,
     ) -> Result<(), BoundaryError>;
+    fn verify_live_state_reservation(
+        &mut self,
+        _plan: &NativeTransactionPlan,
+    ) -> Result<(), BoundaryError> {
+        Ok(())
+    }
     fn validate_staged_output(
         &mut self,
         plan: &NativeTransactionPlan,
@@ -570,6 +576,7 @@ where
             self.journal
                 .enter_step(TransactionStep::CompareAndSwapTargets)
         );
+        attempt!(self.adapter.verify_live_state_reservation(plan));
         attempt!(self.filesystem.compare_and_swap_targets(&plan.mutations));
         if !plan.cli_mutations.is_empty() {
             let cli_executor = match self.cli_executor.as_deref_mut() {
