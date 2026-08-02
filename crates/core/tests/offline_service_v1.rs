@@ -533,7 +533,7 @@ fn native_hook_task_evidence_completes_only_the_explicit_current_project_task() 
     std::fs::write(&raw_session, raw_bytes).unwrap();
     let project_id = ID_7.parse().unwrap();
     let other_project_id = ID_6.parse().unwrap();
-    let created = {
+    let (created, params) = {
         let mut vault = fixture.vault();
         let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap());
         for (id, name) in [
@@ -561,6 +561,28 @@ fn native_hook_task_evidence_completes_only_the_explicit_current_project_task() 
                 expected_revision: None,
             })
             .unwrap();
+        let other_task = service
+            .upsert_task(TaskUpsertParams {
+                operation_id: ID_2.parse().unwrap(),
+                task_id: None,
+                project_id: other_project_id,
+                title: "Other project task".into(),
+                body_markdown: "Must not use another project's session".into(),
+                status: TaskStatus::InProgress,
+                expected_revision: None,
+            })
+            .unwrap();
+        let stopped_task = service
+            .upsert_task(TaskUpsertParams {
+                operation_id: ID_3.parse().unwrap(),
+                task_id: None,
+                project_id,
+                title: "Stopped session task".into(),
+                body_markdown: "Must remain open after the session stops".into(),
+                status: TaskStatus::InProgress,
+                expected_revision: None,
+            })
+            .unwrap();
         let params = hook_params(
             HarnessId::ClaudeCode,
             "task-session",
@@ -574,6 +596,67 @@ fn native_hook_task_evidence_completes_only_the_explicit_current_project_task() 
                 }],
             },
             404,
+        );
+        assert_eq!(
+            service
+                .handle_native_hook_event(project_id, params.clone())
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict,
+            "task evidence must not create its own session binding"
+        );
+        assert_eq!(service.native_hook_session_count().unwrap(), 0);
+        assert_eq!(
+            service
+                .tasks(project_id)
+                .unwrap()
+                .into_iter()
+                .find(|task| task.id == created.id)
+                .unwrap()
+                .status,
+            TaskStatus::InProgress
+        );
+
+        service
+            .handle_native_hook_event(
+                project_id,
+                hook_params(
+                    HarnessId::ClaudeCode,
+                    "task-session",
+                    |session_id| NativeHookEvent::SessionStart { session_id },
+                    400,
+                ),
+            )
+            .unwrap();
+        let mut before_start = params.clone();
+        before_start.occurred_at_ms = 399;
+        assert_eq!(
+            service
+                .handle_native_hook_event(project_id, before_start)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        let wrong_project = hook_params(
+            HarnessId::ClaudeCode,
+            "task-session",
+            |session_id| NativeHookEvent::TaskEvidence {
+                session_id,
+                task_id: other_task.id,
+                evidence: vec![CompletionEvidenceInput {
+                    summary: "Wrong project evidence".into(),
+                    kind: "test".into(),
+                    reference: None,
+                }],
+            },
+            404,
+        );
+        assert_eq!(
+            service
+                .handle_native_hook_event(other_project_id, wrong_project)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
         );
         service
             .handle_native_hook_event(project_id, params.clone())
@@ -589,20 +672,57 @@ fn native_hook_task_evidence_completes_only_the_explicit_current_project_task() 
         assert_eq!(completed.evidence[0].summary, "Focused checks passed");
         assert_eq!(completed.evidence[0].recorded_hlc.physical_ms, 404);
         assert_ne!(completed.revision, created.revision);
-        assert_eq!(service.native_hook_session_count().unwrap(), 0);
+        assert_eq!(service.native_hook_session_count().unwrap(), 1);
 
-        let mut later_delivery = params.clone();
-        later_delivery.occurred_at_ms = 9_999;
-        later_delivery.binding.working_directory.bytes = r"C:\different\delivery\cwd"
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect();
-        later_delivery.binding.working_directory.display =
-            Some(r"C:\different\delivery\cwd".into());
         service
-            .handle_native_hook_event(project_id, later_delivery)
+            .handle_native_hook_event(
+                project_id,
+                hook_params(
+                    HarnessId::ClaudeCode,
+                    "task-session",
+                    |session_id| NativeHookEvent::SessionStop { session_id },
+                    500,
+                ),
+            )
             .unwrap();
-        assert_eq!(service.tasks(project_id).unwrap(), vec![completed]);
+        service
+            .handle_native_hook_event(project_id, params.clone())
+            .unwrap();
+        let tasks = service.tasks(project_id).unwrap();
+        assert_eq!(
+            tasks.iter().find(|task| task.id == created.id).unwrap(),
+            &completed
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .find(|task| task.id == stopped_task.id)
+                .unwrap()
+                .status,
+            TaskStatus::InProgress
+        );
+
+        let after_stop = hook_params(
+            HarnessId::ClaudeCode,
+            "task-session",
+            |session_id| NativeHookEvent::TaskEvidence {
+                session_id,
+                task_id: stopped_task.id,
+                evidence: vec![CompletionEvidenceInput {
+                    summary: "Arrived after the session stopped".into(),
+                    kind: "test".into(),
+                    reference: None,
+                }],
+            },
+            501,
+        );
+        assert_eq!(
+            service
+                .handle_native_hook_event(project_id, after_stop)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
 
         let stale = hook_params(
             HarnessId::ClaudeCode,
@@ -621,13 +741,6 @@ fn native_hook_task_evidence_completes_only_the_explicit_current_project_task() 
         assert_eq!(
             service
                 .handle_native_hook_event(project_id, stale)
-                .unwrap_err()
-                .code,
-            ErrorCode::Conflict
-        );
-        assert_eq!(
-            service
-                .handle_native_hook_event(other_project_id, params.clone())
                 .unwrap_err()
                 .code,
             ErrorCode::Conflict
@@ -653,7 +766,7 @@ fn native_hook_task_evidence_completes_only_the_explicit_current_project_task() 
                 .code,
             ErrorCode::Conflict
         );
-        created
+        (created, params)
     };
 
     let raw = open_keyed(fixture.path.path(), &fixture.keys.key(CREDENTIAL));
@@ -677,6 +790,20 @@ fn native_hook_task_evidence_completes_only_the_explicit_current_project_task() 
         )
         .unwrap();
     assert_eq!(binding_count, 1, "replay must reuse the completion binding");
+    raw.execute("DELETE FROM native_hook_sessions", []).unwrap();
+    drop(raw);
+    {
+        let mut vault = fixture.vault();
+        let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap());
+        assert_eq!(
+            service
+                .handle_native_hook_event(project_id, params)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict,
+            "a recorded task operation still requires its persisted session binding"
+        );
+    }
     assert_eq!(std::fs::read(&raw_session).unwrap(), raw_bytes);
 }
 

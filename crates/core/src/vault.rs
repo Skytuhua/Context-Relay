@@ -198,6 +198,15 @@ pub struct Vault {
     embedding_cache: BTreeMap<String, CachedEmbedding>,
 }
 
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct TestVaultCell {
+    pub table: String,
+    pub column: String,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Clone)]
 struct CachedEmbedding {
     approved: bool,
@@ -229,6 +238,56 @@ impl CachedScope {
 }
 
 impl Vault {
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_plaintext_cells(&self) -> Result<Vec<TestVaultCell>, VaultError> {
+        use rusqlite::types::ValueRef;
+
+        let tables = {
+            let mut statement = self.connection.prepare(
+                "SELECT name
+                 FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut cells = Vec::new();
+        for table in tables {
+            let quoted_table = format!("\"{}\"", table.replace('"', "\"\""));
+            let columns = {
+                let mut statement = self
+                    .connection
+                    .prepare(&format!("PRAGMA table_info({quoted_table})"))?;
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let mut statement = self
+                .connection
+                .prepare(&format!("SELECT * FROM {quoted_table}"))?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                for (index, column) in columns.iter().enumerate() {
+                    let bytes = match row.get_ref(index)? {
+                        ValueRef::Null => Vec::new(),
+                        ValueRef::Integer(value) => value.to_string().into_bytes(),
+                        ValueRef::Real(value) => value.to_string().into_bytes(),
+                        ValueRef::Text(value) | ValueRef::Blob(value) => value.to_vec(),
+                    };
+                    cells.push(TestVaultCell {
+                        table: table.clone(),
+                        column: column.clone(),
+                        bytes,
+                    });
+                }
+            }
+        }
+        Ok(cells)
+    }
+
     pub fn checkpoint_wal(&self) -> Result<(), VaultError> {
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(FULL)")?;

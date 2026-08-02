@@ -8,7 +8,8 @@ use context_relay_contextd::test_support::{
     TestDaemonConfig, TestRecordingBridgeInstallEngine, TestWorkerGate,
 };
 use context_relay_core::native_memory::{
-    NativeMemoryDocumentKind, NativeMemoryLimits, NativeMemorySource,
+    NativeMemoryDiagnosticClass, NativeMemoryDocumentKind, NativeMemoryLimits, NativeMemorySource,
+    NativeMemorySourceId,
 };
 use context_relay_local_ipc::{InstallationToken, RuntimeConfig};
 use context_relay_protocol::{HarnessId, NativePlatform, ScopeRef, WireNativeValue};
@@ -16,6 +17,51 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 const TOKEN: [u8; 32] = [0x71; 32];
+
+#[tokio::test]
+async fn persisted_v1_source_previews_and_observes_live_edits_after_upgrade_restart() {
+    let fixture = Fixture::new("legacy-v1-upgrade");
+    let path = fixture.root.join("memory.md");
+    std::fs::write(&path, b"legacy initial preview\n").unwrap();
+    let mut legacy = source(&path, 4_096);
+    legacy.id = legacy_source_id(&legacy);
+    assert!(legacy.validate().is_err());
+    fixture
+        .config
+        .seed_native_memory_source(&legacy, None)
+        .unwrap();
+
+    let daemon = fixture.config.start().await.unwrap();
+    wait_for_candidate_count(&fixture.config, 1).await;
+    drop(daemon);
+    let persisted = fixture
+        .config
+        .native_memory_ledger(&legacy.id)
+        .unwrap()
+        .unwrap();
+    assert!(persisted.initial_preview_complete);
+    assert_eq!(persisted.source, Some(legacy.clone()));
+    assert_eq!(
+        fixture.config.native_memory_candidates().unwrap()[0]
+            .proposed_memory
+            .body_markdown,
+        "legacy initial preview\n"
+    );
+
+    let daemon = fixture.config.start().await.unwrap();
+    std::fs::write(&path, b"legacy live edit after restart\n").unwrap();
+    wait_for_candidate_count(&fixture.config, 2).await;
+    drop(daemon);
+    assert!(
+        fixture
+            .config
+            .native_memory_candidates()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.proposed_memory.body_markdown
+                == "legacy live edit after restart\n")
+    );
+}
 
 #[tokio::test]
 async fn initial_preview_is_persisted_once_and_restart_does_not_duplicate_it() {
@@ -309,6 +355,99 @@ async fn applied_export_is_ignored_across_restart_then_only_unmanaged_bytes_are_
     assert_eq!(std::fs::read(&path).unwrap(), edited);
 }
 
+#[tokio::test]
+async fn rejected_text_records_only_redacted_digest_diagnostics_and_recovers_after_correction() {
+    let fixture = Fixture::new("redacted-diagnostics");
+    let invalid_path = fixture.root.join("invalid.md");
+    let invalid_bytes = b"invalid-utf8-\xff-private";
+    std::fs::write(&invalid_path, invalid_bytes).unwrap();
+    let invalid = source(&invalid_path, 4_096);
+    let sensitive_path = fixture.root.join("sensitive.md");
+    let sensitive_bytes = b"api_key = must-never-enter-the-vault\n";
+    std::fs::write(&sensitive_path, sensitive_bytes).unwrap();
+    let sensitive = source(&sensitive_path, 4_096);
+    for descriptor in [&invalid, &sensitive] {
+        fixture
+            .config
+            .seed_native_memory_source(descriptor, None)
+            .unwrap();
+    }
+
+    let daemon = fixture.config.start().await.unwrap();
+    wait_for_diagnostic(&fixture.config, &invalid).await;
+    wait_for_diagnostic(&fixture.config, &sensitive).await;
+    assert!(
+        fixture
+            .config
+            .native_memory_candidates()
+            .unwrap()
+            .is_empty()
+    );
+
+    let invalid_ledger = fixture
+        .config
+        .native_memory_ledger(&invalid.id)
+        .unwrap()
+        .unwrap();
+    let sensitive_ledger = fixture
+        .config
+        .native_memory_ledger(&sensitive.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        invalid_ledger.last_diagnostic.as_ref().unwrap().error_class,
+        NativeMemoryDiagnosticClass::InvalidUtf8
+    );
+    assert_eq!(
+        sensitive_ledger
+            .last_diagnostic
+            .as_ref()
+            .unwrap()
+            .error_class,
+        NativeMemoryDiagnosticClass::SensitiveText
+    );
+    assert_eq!(
+        invalid_ledger.last_diagnostic.as_ref().unwrap().digest,
+        context_relay_protocol::Sha256Digest(Sha256::digest(invalid_bytes).into())
+    );
+    assert_eq!(
+        sensitive_ledger.last_diagnostic.as_ref().unwrap().digest,
+        context_relay_protocol::Sha256Digest(Sha256::digest(sensitive_bytes).into())
+    );
+    for (ledger, forbidden) in [
+        (&invalid_ledger, "invalid-utf8"),
+        (&sensitive_ledger, "must-never-enter-the-vault"),
+    ] {
+        let diagnostic = serde_json::to_value(ledger.last_diagnostic.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            diagnostic
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["digest", "errorClass", "sourceId"]
+        );
+        assert!(!diagnostic.to_string().contains(forbidden));
+    }
+
+    std::fs::write(&invalid_path, b"corrected invalid source\n").unwrap();
+    std::fs::write(&sensitive_path, b"corrected sensitive source\n").unwrap();
+    wait_for_candidate_count(&fixture.config, 2).await;
+    drop(daemon);
+    for descriptor in [&invalid, &sensitive] {
+        assert!(
+            fixture
+                .config
+                .native_memory_ledger(&descriptor.id)
+                .unwrap()
+                .unwrap()
+                .last_diagnostic
+                .is_none()
+        );
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     config: TestDaemonConfig,
@@ -364,6 +503,20 @@ async fn wait_for_preview<const N: usize>(
     panic!("native memory previews did not complete");
 }
 
+async fn wait_for_diagnostic(config: &TestDaemonConfig, source: &NativeMemorySource) {
+    for _ in 0..80 {
+        if config
+            .native_memory_ledger(&source.id)
+            .unwrap()
+            .is_some_and(|ledger| ledger.last_diagnostic.is_some())
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("native memory diagnostic was not persisted");
+}
+
 fn source(path: &Path, max_bytes: usize) -> NativeMemorySource {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt as _;
@@ -391,4 +544,28 @@ fn source(path: &Path, max_bytes: usize) -> NativeMemorySource {
         true,
     )
     .unwrap()
+}
+
+fn legacy_source_id(source: &NativeMemorySource) -> NativeMemorySourceId {
+    let platform = match source.path.platform {
+        NativePlatform::Macos => b"macos".as_slice(),
+        NativePlatform::Windows => b"windows".as_slice(),
+    };
+    let mut hasher = Sha256::new();
+    for field in [
+        b"context-relay.native-memory-source.v1".as_slice(),
+        b"codex",
+        source.adapter_version.as_bytes(),
+        b"global",
+        b"",
+        b"agent",
+        platform,
+        source.path.bytes.as_slice(),
+    ] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    NativeMemorySourceId(context_relay_protocol::Sha256Digest(
+        hasher.finalize().into(),
+    ))
 }

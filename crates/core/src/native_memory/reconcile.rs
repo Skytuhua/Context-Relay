@@ -70,6 +70,9 @@ pub fn reconcile_classified(
         return Err(NativeMemoryError::TooLarge);
     }
     let text = std::str::from_utf8(bytes).map_err(|_| NativeMemoryError::InvalidUtf8)?;
+    if crate::mcp::contains_secret_like(text) {
+        return Err(NativeMemoryError::SensitiveText);
+    }
     if text.chars().count() > source.limits.max_characters {
         return Err(NativeMemoryError::TooLarge);
     }

@@ -25,13 +25,7 @@ const TOKEN_PREFIXES: [&str; 7] = [
 ];
 
 pub fn reject_secret_like(text: &str) -> Result<(), ClientError> {
-    let lower = text.to_ascii_lowercase();
-    if PRIVATE_KEY_MARKERS
-        .iter()
-        .any(|marker| lower.contains(marker))
-        || has_sensitive_assignment(&lower)
-        || has_bounded_token_shape(text)
-    {
+    if contains_secret_like(text) {
         return Err(ClientError {
             code: ErrorCode::InvalidRequest,
             message: "The handoff contains secret-like text".to_owned(),
@@ -42,27 +36,84 @@ pub fn reject_secret_like(text: &str) -> Result<(), ClientError> {
     Ok(())
 }
 
+pub(crate) fn contains_secret_like(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    PRIVATE_KEY_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+        || has_sensitive_assignment(&lower)
+        || has_bounded_token_shape(text)
+}
+
 fn has_sensitive_assignment(lower: &str) -> bool {
-    SENSITIVE_KEYS.iter().any(|key| {
-        lower.match_indices(key).any(|(start, _)| {
-            let before = lower[..start].chars().next_back();
-            if before.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
-            {
-                return false;
-            }
-            let mut suffix = lower[start + key.len()..].chars();
-            let after = suffix.next();
-            if after.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
-            {
-                return false;
-            }
-            let mut separator_text = lower[start + key.len()..].trim_start();
-            if let Some(stripped) = separator_text.strip_prefix(['"', '\'']) {
-                separator_text = stripped.trim_start();
-            }
-            separator_text.starts_with(':') || separator_text.starts_with('=')
+    lower.lines().any(|line| {
+        SENSITIVE_KEYS.iter().any(|key| {
+            line.match_indices(key).any(|(start, _)| {
+                let before = line[..start].chars().next_back();
+                if before
+                    .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+                {
+                    return false;
+                }
+                let suffix = &line[start + key.len()..];
+                let after = suffix.chars().next();
+                if after
+                    .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+                {
+                    return false;
+                }
+                let mut separator_text = suffix.trim_start();
+                if let Some(stripped) = separator_text.strip_prefix(['"', '\'']) {
+                    separator_text = stripped.trim_start();
+                }
+                let Some(rhs) = separator_text
+                    .strip_prefix(':')
+                    .or_else(|| separator_text.strip_prefix('='))
+                else {
+                    return false;
+                };
+                sensitive_rhs(rhs)
+            })
         })
     })
+}
+
+fn sensitive_rhs(rhs: &str) -> bool {
+    let mut value = rhs.trim();
+    if value.is_empty() || value.starts_with('#') {
+        return false;
+    }
+    value = value.trim_end_matches(',').trim_end();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if matches!(bytes[0], b'"' | b'\'') && bytes.last() == Some(&bytes[0]) {
+            value = value[1..value.len() - 1].trim();
+        }
+    }
+    if let Some((before_comment, _)) = value.split_once(" #") {
+        value = before_comment.trim_end();
+    }
+    if value.is_empty() || benign_sensitive_placeholder(value) {
+        return false;
+    }
+    true
+}
+
+fn benign_sensitive_placeholder(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if matches!(lower.as_str(), "<provided by environment>" | "[redacted]") {
+        return true;
+    }
+    let Some(environment) = value
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return false;
+    };
+    !environment.is_empty()
+        && environment.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
+        })
 }
 
 fn has_bounded_token_shape(text: &str) -> bool {
@@ -124,6 +175,43 @@ fn is_base64url(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_environment_and_redacted_sensitive_assignments_are_documentation() {
+        for separator in ['=', ':'] {
+            for rhs in [
+                "",
+                "# intentionally unset",
+                "<provided by environment>",
+                "${ENV_VAR}",
+                "[redacted]",
+            ] {
+                let text = format!("api_key {separator} {rhs}");
+                assert!(!contains_secret_like(&text), "{text}");
+            }
+        }
+
+        for text in [
+            "api_key = actual-secret-value",
+            "password: correct-horse-battery-staple",
+            "Authorization: Bearer must-not-echo",
+            "access_token = abc12345",
+        ] {
+            assert!(contains_secret_like(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn short_nonempty_sensitive_assignments_are_secret_like() {
+        for text in [
+            "password = abc123",
+            "api_key = abcdefg",
+            "password = \"abc123\"",
+            "api_key: 'abcdefg'",
+        ] {
+            assert!(contains_secret_like(text), "{text}");
+        }
+    }
 
     #[test]
     fn rendered_markdown_delimiters_do_not_hide_bounded_token_shapes() {

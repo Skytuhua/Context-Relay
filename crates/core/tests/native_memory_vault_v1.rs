@@ -566,6 +566,66 @@ fn rollback_unregisters_only_the_last_plan_owned_native_memory_source() {
 }
 
 #[test]
+fn setup_none_and_terminal_replays_preserve_the_newest_export_digest() {
+    const FIRST_EXPORT: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073993";
+    const ORDINARY_SETUP: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073994";
+    const NEWER_EXPORT: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073995";
+    let path = TempVault::new("native-memory-export-digest-preservation");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let descriptor = source(ScopeRef::Global, HarnessId::Hermes, "shared-export-source");
+    let first_digest = Sha256Digest([71; 32]);
+    let newer_digest = Sha256Digest([72; 32]);
+    let first_export = NativeMemoryRegistration {
+        source: descriptor.clone(),
+        last_applied_digest: Some(first_digest),
+    };
+    let ordinary_setup = NativeMemoryRegistration {
+        source: descriptor.clone(),
+        last_applied_digest: None,
+    };
+    let newer_export = NativeMemoryRegistration {
+        source: descriptor.clone(),
+        last_applied_digest: Some(newer_digest),
+    };
+
+    apply_registered_source(&mut vault, FIRST_EXPORT, &first_export, 71);
+    apply_registered_source(&mut vault, ORDINARY_SETUP, &ordinary_setup, 72);
+    assert_eq!(
+        vault
+            .native_memory_ledger(&descriptor.id)
+            .unwrap()
+            .unwrap()
+            .last_applied_digest,
+        Some(first_digest)
+    );
+
+    apply_registered_source(&mut vault, NEWER_EXPORT, &newer_export, 73);
+    vault
+        .finish_setup_plan_with_native_memory(
+            &ORDINARY_SETUP.parse().unwrap(),
+            SetupPlanLifecycle::Applied,
+            std::slice::from_ref(&ordinary_setup),
+        )
+        .unwrap();
+    vault
+        .finish_setup_plan_with_native_memory(
+            &FIRST_EXPORT.parse().unwrap(),
+            SetupPlanLifecycle::Applied,
+            std::slice::from_ref(&first_export),
+        )
+        .unwrap();
+    assert_eq!(
+        vault
+            .native_memory_ledger(&descriptor.id)
+            .unwrap()
+            .unwrap()
+            .last_applied_digest,
+        Some(newer_digest)
+    );
+}
+
+#[test]
 fn rollback_unregisters_a_setup_source_without_deleting_its_reviewed_candidate() {
     const PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073991";
     const ROLLBACK: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073992";

@@ -1,22 +1,45 @@
 #![cfg(all(feature = "test-support", any(windows, target_os = "macos")))]
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use context_relay_context_mcp::{
-    BridgeError, Daemon as _, LocalDaemon, MAX_IN_FLIGHT_TOOL_CALLS, MCP_REVISION, Server,
+    BridgeError, Daemon as _, HookInvocationKind, LocalDaemon, MAX_IN_FLIGHT_TOOL_CALLS,
+    MCP_REVISION, SESSION_START_REMINDER, Server, execute_hook, project_hook_input,
 };
 use context_relay_contextd::{
     DaemonHandle, DaemonState,
-    test_support::{TestDaemonConfig, TestRecordingBridgeInstallEngine, TestWorkerGate},
+    test_support::{
+        TestCodexBridgeInstallEngine, TestDaemonConfig, TestRecordingBridgeInstallEngine,
+        TestWorkerGate,
+    },
+};
+use context_relay_core::{
+    codex::{CodexAdapter, CodexExecutableKind, CodexLayout},
+    mcp::install::{BridgeExecutable, attest_bridge_executable},
+    native_memory::{
+        NativeMemoryAdapter, NativeMemorySource, primary_memory_instruction_component,
+    },
+    native_transaction::open_plan,
+    vault::{NativeTransactionStatus, SetupPlanLifecycle},
 };
 use context_relay_local_ipc::{
-    InstallationToken, REQUEST_TIMEOUT, RuntimeConfig, SHUTDOWN_TIMEOUT,
+    AuthAcceptedV1, AuthTranscriptV1, ConnectedStream, InstallationToken, REQUEST_TIMEOUT,
+    RuntimeConfig, SHUTDOWN_TIMEOUT, ServerHelloV1, connect, create_proof, read_json, write_json,
 };
 use context_relay_protocol::{
-    ClientError, ErrorCode, HarnessAccessPolicy, HarnessId, McpBinding, McpCallParams,
-    NativePlatform, ProjectIdentity, RecordId, WireNativeValue,
+    CandidateListParams, CandidateReviewParams, ClientError, ClientRole, DaemonInstanceNonce,
+    DeviceId, ErrorCode, HarnessAccessPolicy, HarnessId, HarnessParams, HelloParams,
+    HybridLogicalClock, InstallationMethod, JsonRpcErrorV1, JsonRpcRequestV1, JsonRpcSuccessV1,
+    JsonRpcVersion, ListTasksOutput, LocalRequest, LocalResult, McpBinding, McpCallParams,
+    MemoryCandidate, NativePlatform, OperationId, PlanParams, ProjectId, ProjectIdentity, RecordId,
+    SearchOutput, TaskStatus, UpsertTaskOutput, WireNativeValue,
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream},
@@ -93,8 +116,37 @@ async fn stop_daemon(
     assert_eq!(owner.await.unwrap(), Ok(()));
 }
 
+async fn wait_for_native_candidates(config: &TestDaemonConfig, count: usize) {
+    for _ in 0..120 {
+        if config.native_memory_candidates().unwrap().len() == count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("native memory candidate count did not reach {count}")
+}
+
+async fn wait_for_native_previews(config: &TestDaemonConfig, sources: &[NativeMemorySource]) {
+    for _ in 0..120 {
+        if sources.iter().all(|source| {
+            config
+                .native_memory_ledger(&source.id)
+                .unwrap()
+                .is_some_and(|ledger| ledger.initial_preview_complete)
+        }) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("native memory previews did not complete")
+}
+
 fn record_id() -> RecordId {
     RecordId::new(Uuid::now_v7()).unwrap()
+}
+
+fn operation_id() -> OperationId {
+    OperationId::new(Uuid::now_v7()).unwrap()
 }
 
 fn project_identity(name: &str) -> ProjectIdentity {
@@ -197,6 +249,97 @@ impl StartedServer {
     async fn close(mut self) {
         self.input.shutdown().await.unwrap();
         assert_eq!(self.task.await.unwrap(), Ok(()));
+    }
+}
+
+struct DesktopIpcClient {
+    stream: ConnectedStream,
+    protocol: context_relay_protocol::ProtocolVersion,
+    daemon_instance_nonce: DaemonInstanceNonce,
+}
+
+impl DesktopIpcClient {
+    async fn connect(config: &TestDaemonConfig) -> Self {
+        let mut stream = connect(&config.runtime()).await.unwrap();
+        let hello: ServerHelloV1 = read_json(&mut stream).await.unwrap();
+        let client_nonce = DaemonInstanceNonce::new([0x35; 32]);
+        let transcript = AuthTranscriptV1 {
+            role: ClientRole::Desktop,
+            client_nonce,
+            server_hello: hello,
+        };
+        write_json(
+            &mut stream,
+            &JsonRpcRequestV1 {
+                jsonrpc: JsonRpcVersion::V2,
+                id: record_id(),
+                protocol: hello.protocol,
+                daemon_instance_nonce: hello.daemon_instance_nonce,
+                request: LocalRequest::Hello(HelloParams {
+                    client_role: ClientRole::Desktop,
+                    client_nonce,
+                    session_proof: create_proof(&config.installation_token(), &transcript),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let _: AuthAcceptedV1 = read_json(&mut stream).await.unwrap();
+        Self {
+            stream,
+            protocol: hello.protocol,
+            daemon_instance_nonce: hello.daemon_instance_nonce,
+        }
+    }
+
+    async fn call(&mut self, request: LocalRequest) -> Result<LocalResult, ClientError> {
+        write_json(
+            &mut self.stream,
+            &JsonRpcRequestV1 {
+                jsonrpc: JsonRpcVersion::V2,
+                id: record_id(),
+                protocol: self.protocol,
+                daemon_instance_nonce: self.daemon_instance_nonce,
+                request,
+            },
+        )
+        .await
+        .unwrap();
+        let value: Value = read_json(&mut self.stream).await.unwrap();
+        if value.get("result").is_some() {
+            Ok(serde_json::from_value::<JsonRpcSuccessV1>(value)
+                .unwrap()
+                .result)
+        } else {
+            Err(serde_json::from_value::<JsonRpcErrorV1>(value)
+                .unwrap()
+                .error
+                .data)
+        }
+    }
+
+    async fn accept_only_candidate(&mut self) -> MemoryCandidate {
+        let LocalResult::Candidates { candidates } = self
+            .call(LocalRequest::CandidatesList(CandidateListParams {
+                project_id: None,
+            }))
+            .await
+            .unwrap()
+        else {
+            panic!("desktop candidate list returned the wrong result")
+        };
+        assert_eq!(candidates.len(), 1);
+        let candidate = candidates[0].clone();
+        let reviewed = self
+            .call(LocalRequest::CandidateReview(CandidateReviewParams {
+                candidate_id: candidate.id,
+                accepted: true,
+                operation_id: operation_id(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(reviewed, LocalResult::Candidates { .. }));
+        candidate
     }
 }
 
@@ -510,6 +653,499 @@ async fn three_harness_daemon_flow_is_scoped_idempotent_and_never_installs_a_bri
 }
 
 #[tokio::test]
+async fn production_setup_watcher_review_and_actual_mcp_form_one_chain() {
+    let fixture = Fixture::new();
+    let project = project_identity("authoritative native memory");
+    let materialized = MaterializedCodexE2e::new(&fixture, project.project_id);
+    let engine = Arc::new(TestCodexBridgeInstallEngine::new(
+        materialized.adapter.clone(),
+        materialized.bridge.clone(),
+        project.project_id,
+        fixture.project_root.clone(),
+        materialized.lock_root.clone(),
+    ));
+    let config = fixture.daemon.clone().with_bridge_install_engine(engine);
+    config
+        .seed_mcp_project(
+            &project,
+            &fixture.project_root,
+            &[(HarnessId::Codex, HarnessAccessPolicy::Default)],
+        )
+        .unwrap();
+
+    let (handle, owner) = start_daemon(&config).await;
+    let mut desktop = DesktopIpcClient::connect(&config).await;
+    let LocalResult::Plan { plan } = desktop
+        .call(LocalRequest::HarnessPreview(HarnessParams {
+            harness: HarnessId::Codex,
+            project_id: Some(project.project_id),
+        }))
+        .await
+        .unwrap()
+    else {
+        panic!("real Codex setup must return a plan")
+    };
+    config
+        .with_vault(|vault| {
+            let stored = vault.setup_plan(&plan.plan_id)?.unwrap();
+            assert_eq!(stored.lifecycle, SetupPlanLifecycle::Previewed);
+            let opened = open_plan(&stored.payload).unwrap();
+            assert_eq!(&opened.plan.setup, plan.as_ref());
+            assert_eq!(opened.plan.mutations.len(), 3);
+            assert_eq!(opened.plan.native_memory_registrations.len(), 2);
+            assert!(
+                opened
+                    .plan
+                    .native_memory_registrations
+                    .iter()
+                    .all(
+                        |registration| materialized.sources.contains(&registration.source)
+                            && registration.last_applied_digest.is_none()
+                    )
+            );
+            Ok(())
+        })
+        .unwrap();
+    desktop
+        .call(LocalRequest::HarnessApply(PlanParams {
+            plan_id: plan.plan_id,
+        }))
+        .await
+        .unwrap();
+    wait_for_native_previews(&config, &materialized.sources).await;
+    config
+        .with_vault(|vault| {
+            assert_eq!(
+                vault.setup_plan(&plan.plan_id)?.unwrap().lifecycle,
+                SetupPlanLifecycle::Applied
+            );
+            assert_eq!(
+                vault
+                    .native_transaction(&format!("bridge-setup-{}", plan.plan_id))?
+                    .unwrap()
+                    .status,
+                NativeTransactionStatus::Committed
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        std::fs::read_to_string(&materialized.config_path)
+            .unwrap()
+            .contains("generate_memories = false")
+    );
+    assert!(
+        std::fs::read_to_string(&materialized.instruction_path)
+            .unwrap()
+            .contains("context_relay_complete_task")
+    );
+    assert!(config.native_memory_candidates().unwrap().is_empty());
+    drop(desktop);
+
+    let native_edit = "The actual MCP bridge retrieves this reviewed setup-owned memory.\n";
+    std::fs::write(&materialized.memory_path, native_edit).unwrap();
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    wait_for_native_candidates(&config, 1).await;
+    let mut desktop = DesktopIpcClient::connect(&config).await;
+    let candidate = desktop.accept_only_candidate().await;
+    drop(desktop);
+
+    let mut bridge = StartedServer::start(fixture.local_daemon(), fixture.binding()).await;
+    bridge
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": "accepted-native-search",
+            "method": "tools/call",
+            "params": {
+                "name": "context_relay_search",
+                "arguments": {
+                    "query": "reviewed setup-owned memory",
+                    "scope": {"scope": "global"},
+                    "limit": 10
+                }
+            }
+        }))
+        .await;
+    let searched = bridge.receive().await;
+    assert_eq!(searched["id"], "accepted-native-search");
+    assert!(
+        searched["result"]["structuredContent"].is_object(),
+        "{searched}"
+    );
+    let output: SearchOutput =
+        serde_json::from_value(searched["result"]["structuredContent"].clone()).unwrap();
+    assert_eq!(output.memories.len(), 1, "{searched}");
+    assert_eq!(output.memories[0].id, candidate.proposed_memory.id);
+    assert_eq!(output.memories[0].body_markdown, native_edit);
+
+    bridge.close().await;
+    stop_daemon(handle, owner).await;
+}
+
+#[tokio::test]
+async fn claude_and_codex_primary_instructions_reach_same_session_task_evidence() {
+    let fixture = Fixture::new();
+    let project = project_identity("primary instruction task evidence");
+    fixture
+        .daemon
+        .seed_mcp_project(
+            &project,
+            &fixture.project_root,
+            &[
+                (HarnessId::ClaudeCode, HarnessAccessPolicy::Default),
+                (HarnessId::Codex, HarnessAccessPolicy::Default),
+            ],
+        )
+        .unwrap();
+    let config = fixture
+        .daemon
+        .clone()
+        .with_bridge_install_engine(Arc::new(TestRecordingBridgeInstallEngine::default()));
+    let (handle, owner) = start_daemon(&config).await;
+    let device_id: DeviceId = record_id().to_string().parse().unwrap();
+
+    for (harness, harness_name) in [
+        (HarnessId::ClaudeCode, "claude-code"),
+        (HarnessId::Codex, "codex"),
+    ] {
+        let instruction = primary_memory_instruction_component(
+            harness,
+            project.project_id,
+            device_id,
+            HybridLogicalClock::new(1_900_001_100_000, 0, device_id),
+        )
+        .unwrap();
+        assert!(instruction.body_markdown.contains(&format!(
+            "context-relay-context-mcp --hook-event task-evidence --harness {harness_name}"
+        )));
+        assert!(
+            instruction
+                .body_markdown
+                .contains("<current harness session ID>")
+        );
+        assert!(
+            instruction
+                .body_markdown
+                .contains("<current Context Relay task ID>")
+        );
+        assert!(
+            instruction
+                .body_markdown
+                .contains("never infer or substitute a vendor task identifier")
+        );
+
+        let binding = fixture.binding_for(harness, &fixture.project_root);
+        let mut bridge = StartedServer::start(fixture.local_daemon(), binding.clone()).await;
+        bridge
+            .send(json!({
+                "jsonrpc": "2.0",
+                "id": format!("create-{harness_name}-task"),
+                "method": "tools/call",
+                "params": {
+                    "name": "context_relay_upsert_task",
+                    "arguments": {
+                        "operationId": record_id(),
+                        "taskId": null,
+                        "title": format!("Reach {harness_name} task evidence"),
+                        "bodyMarkdown": "Complete through the installed primary-memory contract.",
+                        "status": "in_progress",
+                        "expectedRevision": null
+                    }
+                }
+            }))
+            .await;
+        let created_response = bridge.receive().await;
+        let created: UpsertTaskOutput =
+            serde_json::from_value(created_response["result"]["structuredContent"].clone())
+                .unwrap();
+        bridge.close().await;
+
+        let session_id = format!("same-lifecycle-session-{harness_name}");
+        let start = serde_json::to_vec(&json!({"session_id": session_id})).unwrap();
+        assert_eq!(
+            execute_hook(
+                fixture.local_daemon(),
+                harness,
+                HookInvocationKind::SessionStart,
+                &start,
+                &fixture.project_root,
+                1_900_001_100_100,
+            )
+            .await
+            .unwrap(),
+            SESSION_START_REMINDER
+        );
+        let evidence_summary = format!("Reached {harness_name} through the current session.");
+        let evidence = serde_json::to_vec(&json!({
+            "session_id": session_id,
+            "task_id": created.task.id,
+            "evidence": [{
+                "summary": evidence_summary,
+                "kind": "test",
+                "reference": null
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            execute_hook(
+                fixture.local_daemon(),
+                harness,
+                HookInvocationKind::TaskEvidence,
+                &evidence,
+                &fixture.project_root,
+                1_900_001_100_200,
+            )
+            .await
+            .unwrap(),
+            ""
+        );
+
+        let mut bridge = StartedServer::start(fixture.local_daemon(), binding).await;
+        bridge
+            .send(json!({
+                "jsonrpc": "2.0",
+                "id": format!("list-{harness_name}-task"),
+                "method": "tools/call",
+                "params": {
+                    "name": "context_relay_list_tasks",
+                    "arguments": {"status": "done"}
+                }
+            }))
+            .await;
+        let listed_response = bridge.receive().await;
+        let listed: ListTasksOutput =
+            serde_json::from_value(listed_response["result"]["structuredContent"].clone()).unwrap();
+        let completed = listed
+            .tasks
+            .iter()
+            .find(|task| task.id == created.task.id)
+            .expect("current Context Relay task must be reachable after task evidence");
+        assert_eq!(completed.status, TaskStatus::Done);
+        assert_eq!(completed.evidence.len(), 1);
+        assert_eq!(completed.evidence[0].summary, evidence_summary);
+        bridge.close().await;
+    }
+
+    assert_eq!(config.native_hook_session_count().unwrap(), 2);
+    stop_daemon(handle, owner).await;
+}
+
+#[tokio::test]
+async fn native_hooks_persist_only_allowlisted_fields_across_every_output_boundary() {
+    let fixture = Fixture::new();
+    let project = project_identity("native hook privacy");
+    fixture
+        .daemon
+        .seed_mcp_project(
+            &project,
+            &fixture.project_root,
+            &[(HarnessId::Codex, HarnessAccessPolicy::Default)],
+        )
+        .unwrap();
+    let config = fixture
+        .daemon
+        .clone()
+        .with_bridge_install_engine(Arc::new(TestRecordingBridgeInstallEngine::default()));
+    let (handle, owner) = start_daemon(&config).await;
+
+    let mut bridge = StartedServer::start(fixture.local_daemon(), fixture.binding()).await;
+    bridge
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": "create-hook-task",
+            "method": "tools/call",
+            "params": {
+                "name": "context_relay_upsert_task",
+                "arguments": {
+                    "operationId": record_id(),
+                    "taskId": null,
+                    "title": "Record allowlisted hook evidence",
+                    "bodyMarkdown": "Excluded native hook fields must never persist.",
+                    "status": "in_progress",
+                    "expectedRevision": null
+                }
+            }
+        }))
+        .await;
+    let created_response = bridge.receive().await;
+    let created: UpsertTaskOutput =
+        serde_json::from_value(created_response["result"]["structuredContent"].clone()).unwrap();
+    bridge.close().await;
+
+    let raw_session_bytes = b"raw native session content stays byte-for-byte unchanged\n";
+
+    let session_id = "allowlisted-session-0198";
+    let mut excluded_sentinels = Vec::new();
+    let mut raw_session_fixtures = Vec::new();
+    let events = [
+        (HookInvocationKind::SessionStart, "START", 1_900_001_000_000),
+        (
+            HookInvocationKind::TaskEvidence,
+            "EVIDENCE",
+            1_900_001_000_100,
+        ),
+        (HookInvocationKind::SessionStop, "STOP", 1_900_001_000_200),
+    ];
+    let mut captured_stdout = Vec::new();
+    let mut captured_stderr = Vec::new();
+    let mut ipc_fixtures = Vec::new();
+    for (event, label, now_ms) in events {
+        let prompt = format!("HOOK_PROMPT_EXCLUDED_{label}_6AC9");
+        let response = format!("HOOK_RESPONSE_EXCLUDED_{label}_A218");
+        let assistant = format!("HOOK_ASSISTANT_EXCLUDED_{label}_44DE");
+        let tool_input = format!("HOOK_TOOL_INPUT_EXCLUDED_{label}_E29B");
+        let tool_output = format!("HOOK_TOOL_OUTPUT_EXCLUDED_{label}_7B11");
+        let unknown = format!("HOOK_UNKNOWN_EXCLUDED_{label}_D087");
+        let transcript = format!("HOOK_TRANSCRIPT_PATH_EXCLUDED_{label}_8C84");
+        let raw_session_path = fixture
+            ._root
+            .path()
+            .join(format!("raw-session-{transcript}.jsonl"));
+        std::fs::write(&raw_session_path, raw_session_bytes).unwrap();
+        raw_session_fixtures.push((
+            raw_session_path.clone(),
+            <[u8; 32]>::from(Sha256::digest(raw_session_bytes)),
+        ));
+        excluded_sentinels.extend([
+            prompt.clone(),
+            response.clone(),
+            assistant.clone(),
+            transcript,
+            tool_input.clone(),
+            tool_output.clone(),
+            unknown.clone(),
+        ]);
+        let mut payload = json!({
+            "session_id": session_id,
+            "prompt": prompt,
+            "response": response,
+            "last_assistant_message": assistant,
+            "transcript_path": raw_session_path,
+            "tool_input": {"secret": tool_input},
+            "tool_output": [tool_output],
+            "future_unknown_field": {"nested": [unknown]}
+        });
+        if event == HookInvocationKind::TaskEvidence {
+            payload["task_id"] = json!(created.task.id);
+            payload["evidence"] = json!([{
+                "summary": "Verified through the real native hook path.",
+                "kind": "result",
+                "reference": "context-relay://hook/privacy-acceptance"
+            }]);
+        }
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        let projected = project_hook_input(
+            HarnessId::Codex,
+            event,
+            &payload_bytes,
+            &fixture.project_root,
+            now_ms,
+        )
+        .unwrap();
+        ipc_fixtures.push(serde_json::to_vec(&LocalRequest::NativeHookEvent(projected)).unwrap());
+        match execute_hook(
+            fixture.local_daemon(),
+            HarnessId::Codex,
+            event,
+            &payload_bytes,
+            &fixture.project_root,
+            now_ms,
+        )
+        .await
+        {
+            Ok(stdout) => captured_stdout.push(stdout.as_bytes().to_vec()),
+            Err(error) => captured_stderr.push(error.to_string().into_bytes()),
+        }
+    }
+    assert_eq!(captured_stdout[0], SESSION_START_REMINDER.as_bytes());
+    assert_eq!(captured_stdout[1], b"");
+    assert_eq!(captured_stdout[2], b"");
+    assert!(captured_stderr.is_empty());
+
+    let mut bridge = StartedServer::start(fixture.local_daemon(), fixture.binding()).await;
+    bridge
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": "list-hook-task",
+            "method": "tools/call",
+            "params": {
+                "name": "context_relay_list_tasks",
+                "arguments": {"status": "done"}
+            }
+        }))
+        .await;
+    let listed_response = bridge.receive().await;
+    let listed: ListTasksOutput =
+        serde_json::from_value(listed_response["result"]["structuredContent"].clone()).unwrap();
+    assert_eq!(listed.tasks.len(), 1);
+    assert_eq!(listed.tasks[0].id, created.task.id);
+    assert_eq!(listed.tasks[0].evidence.len(), 1);
+    assert_eq!(
+        listed.tasks[0].evidence[0].summary,
+        "Verified through the real native hook path."
+    );
+    let listed_fixture = serde_json::to_vec(&listed).unwrap();
+    bridge.close().await;
+    stop_daemon(handle, owner).await;
+
+    for (raw_session_path, raw_digest_before) in &raw_session_fixtures {
+        let raw_session_after = std::fs::read(raw_session_path).unwrap();
+        let raw_digest_after: [u8; 32] = Sha256::digest(&raw_session_after).into();
+        assert_eq!(&raw_digest_after, raw_digest_before);
+        assert_eq!(raw_session_after, raw_session_bytes);
+    }
+
+    let vault_cells = config.test_vault_plaintext_cells().unwrap();
+    assert!(!vault_cells.is_empty());
+    assert!(
+        vault_cells
+            .iter()
+            .any(|cell| cell.table == "native_hook_sessions")
+    );
+    assert!(vault_cells.iter().any(|cell| cell.table == "tasks"));
+    let native_outputs = regular_file_contents(fixture._root.path());
+    let mut boundaries: Vec<(&str, &[u8])> = Vec::new();
+    boundaries.extend(
+        vault_cells
+            .iter()
+            .map(|cell| (cell.column.as_str(), cell.bytes.as_slice())),
+    );
+    boundaries.extend(
+        native_outputs
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
+    );
+    boundaries.extend(
+        captured_stdout
+            .iter()
+            .map(|bytes| ("captured stdout", bytes.as_slice())),
+    );
+    boundaries.extend(
+        captured_stderr
+            .iter()
+            .map(|bytes| ("captured stderr", bytes.as_slice())),
+    );
+    boundaries.extend(
+        ipc_fixtures
+            .iter()
+            .map(|bytes| ("serialized IPC fixture", bytes.as_slice())),
+    );
+    boundaries.push(("typed MCP task output", &listed_fixture));
+
+    for sentinel in &excluded_sentinels {
+        for (boundary, bytes) in &boundaries {
+            assert_bytes_do_not_contain(bytes, sentinel, boundary);
+            if let Ok(decoded) = std::str::from_utf8(bytes) {
+                assert!(
+                    !decoded.contains(sentinel),
+                    "excluded sentinel {sentinel} leaked through decoded {boundary}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn sixty_four_real_calls_and_cancellations_fit_below_the_daemon_cap() {
     let fixture = Fixture::new();
     let gate = Arc::new(TestWorkerGate::new());
@@ -682,6 +1318,143 @@ async fn real_timeout_reports_unknown_outcome_without_retrying() {
     stop_daemon(handle, owner).await;
 }
 
+struct MaterializedCodexE2e {
+    adapter: CodexAdapter,
+    bridge: BridgeExecutable,
+    sources: Vec<NativeMemorySource>,
+    memory_path: PathBuf,
+    config_path: PathBuf,
+    instruction_path: PathBuf,
+    lock_root: PathBuf,
+}
+
+impl MaterializedCodexE2e {
+    fn new(fixture: &Fixture, project_id: ProjectId) -> Self {
+        let frozen: Value =
+            serde_json::from_str(include_str!("../../core/tests/fixtures/codex-0.144.1.json"))
+                .unwrap();
+        let root = std::fs::canonicalize(fixture._root.path()).unwrap();
+        let project_root = std::fs::canonicalize(&fixture.project_root).unwrap();
+        let codex_home = root.join("codex-home");
+        let home = root.join("home");
+        let working_directory = project_root.join("service");
+        materialize_json_substituting(
+            &codex_home,
+            frozen["codexHome"].as_object().unwrap(),
+            &project_root,
+        );
+        materialize_json(
+            &home.join(".agents/skills"),
+            frozen["userSkills"].as_object().unwrap(),
+        );
+        materialize_json(&project_root, frozen["project"].as_object().unwrap());
+        std::fs::create_dir_all(&working_directory).unwrap();
+        let requirements = root.join("requirements.toml");
+        std::fs::write(&requirements, frozen["requirements"].as_str().unwrap()).unwrap();
+        let executable = test_executable(root.join(if cfg!(windows) {
+            "codex-bin.exe"
+        } else {
+            "codex-bin"
+        }));
+        let bridge_path = test_executable(root.join(if cfg!(windows) {
+            "context-relay-context-mcp.exe"
+        } else {
+            "context-relay-context-mcp"
+        }));
+        let bridge = attest_bridge_executable(&bridge_path).unwrap();
+        let lock_root = root.join("native-locks");
+        std::fs::create_dir_all(&lock_root).unwrap();
+        let device_id: DeviceId = record_id().to_string().parse().unwrap();
+        let adapter = CodexAdapter::from_layout(
+            CodexLayout {
+                executable,
+                executable_kind: CodexExecutableKind::Native,
+                version: "0.144.1".into(),
+                installation_method: InstallationMethod::PackageManager,
+                codex_home: codex_home.clone(),
+                user_skills_dir: home.join(".agents/skills"),
+                project_root: project_root.clone(),
+                working_directory,
+                requirements_paths: vec![requirements],
+            },
+            project_id,
+            device_id,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+        )
+        .unwrap();
+        let capabilities = adapter.native_memory_capabilities().unwrap();
+        let sources = capabilities.sources;
+        for source in &sources {
+            std::fs::write(wire_path_to_path(&source.path), b"").unwrap();
+        }
+        Self {
+            adapter,
+            bridge,
+            sources,
+            memory_path: codex_home.join("memories/MEMORY.md"),
+            config_path: codex_home.join("config.toml"),
+            instruction_path: project_root.join("AGENTS.md"),
+            lock_root,
+        }
+    }
+}
+
+fn materialize_json(root: &Path, files: &Map<String, Value>) {
+    for (relative, contents) in files {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents.as_str().unwrap()).unwrap();
+    }
+}
+
+fn materialize_json_substituting(root: &Path, files: &Map<String, Value>, project: &Path) {
+    for (relative, contents) in files {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            contents
+                .as_str()
+                .unwrap()
+                .replace("$PROJECT", &project.to_string_lossy()),
+        )
+        .unwrap();
+    }
+}
+
+fn test_executable(path: PathBuf) -> PathBuf {
+    std::fs::write(&path, b"\x7fELFfixture executable").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    path
+}
+
+fn wire_path_to_path(path: &WireNativeValue) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let words = path
+            .bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        PathBuf::from(OsString::from_wide(&words))
+    }
+    #[cfg(not(windows))]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        PathBuf::from(OsString::from_vec(path.bytes.clone()))
+    }
+}
+
 fn wire_native_path(path: &std::path::Path) -> WireNativeValue {
     #[cfg(windows)]
     {
@@ -707,4 +1480,38 @@ fn wire_native_path(path: &std::path::Path) -> WireNativeValue {
             display: None,
         }
     }
+}
+
+fn regular_file_contents(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn collect(path: &Path, contents: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries = std::fs::read_dir(path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                collect(&entry.path(), contents);
+            } else if file_type.is_file() {
+                contents.push((
+                    entry.path().display().to_string(),
+                    std::fs::read(entry.path()).unwrap(),
+                ));
+            }
+        }
+    }
+
+    let mut contents = Vec::new();
+    collect(root, &mut contents);
+    contents
+}
+
+fn assert_bytes_do_not_contain(bytes: &[u8], sentinel: &str, boundary: &str) {
+    assert!(
+        !bytes
+            .windows(sentinel.len())
+            .any(|window| window == sentinel.as_bytes()),
+        "excluded sentinel {sentinel} leaked through {boundary}"
+    );
 }

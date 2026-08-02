@@ -15,6 +15,28 @@
 | Permissions | Exact native declaration | Exact Hermes mapping only | Block while live or unverifiable | Lossy mappings conflict |
 | `.env`, auth, providers, channels, sessions, databases, logs, gateway records | No | No | Read gateway records only for interlock | Always excluded |
 
+## Authoritative memory contract
+
+Hermes `0.18.1` and `0.18.2` receive the shared Context Relay memory and task
+ledger contract in the project-root `.hermes.md`. The reviewed setup writes
+only `memory.memory_enabled: false` and
+`memory.user_profile_enabled: false`. The daemon continues watching the exact
+bound profile files `memories/MEMORY.md` and `memories/USER.md`; an existing
+nonempty body is previewed once and later edits become eligible after the same
+digest is stable for 750 ms.
+
+Accepted records remain authoritative in the encrypted vault and are available
+through the local MCP bridge while the desktop is closed. Managed Hermes
+exports record their intended digest transactionally so they cannot re-import
+themselves. Unknown versions never receive guessed disable settings: an exact,
+safely bound source remains watch-only and any ambiguous source is unavailable.
+
+Hermes renders only lifecycle hooks present in its frozen fixture; it does not
+invent missing hook keys. Hook projection forwards session ID, project binding,
+locally generated event time, and explicit task evidence only. Prompts,
+responses, transcript paths, last assistant messages, tool input/output, and
+unknown fields are never forwarded or persisted.
+
 ## Supported installations and profile binding
 
 Hermes `0.18.2` and `0.18.1` native executables are supported for import and apply. The adapter binds one explicitly named profile to its canonical profile root; it never falls back to another profile or creates a missing profile. The executable wire path, native classification, SHA-256 digest, supported version, selected profile, canonical project root, and working directory are rechecked at the native transaction boundary.

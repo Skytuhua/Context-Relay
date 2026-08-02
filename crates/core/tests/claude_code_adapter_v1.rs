@@ -211,14 +211,21 @@ fn memory_hooks_render_only_the_frozen_lifecycle_events_with_literal_arguments()
         let components = managed_memory_hooks(HarnessId::ClaudeCode, &bridge_wire).unwrap();
         assert_eq!(components.len(), 1);
         let hooks: Value = serde_json::from_str(&components[0].body_markdown).unwrap();
-        let expected = contract["lifecycleHookEvents"].as_array().unwrap();
+        let expected = contract["lifecycleHookEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event.as_str().unwrap() {
+                "SessionStart" | "Stop" => event.as_str(),
+                "TaskCompleted" => None,
+                _ => panic!("unsupported frozen Claude hook event"),
+            })
+            .collect::<Vec<_>>();
         assert_eq!(hooks.as_object().unwrap().len(), expected.len());
         for native_event in expected {
-            let native_event = native_event.as_str().unwrap();
             let event = match native_event {
                 "SessionStart" => "session-start",
                 "Stop" => "session-stop",
-                "TaskCompleted" => "task-evidence",
                 _ => panic!("unsupported frozen Claude hook event"),
             };
             let command = hooks[native_event][0]["hooks"][0]["command"]
@@ -233,6 +240,8 @@ fn memory_hooks_render_only_the_frozen_lifecycle_events_with_literal_arguments()
             );
         }
         let serialized = serde_json::to_string(&hooks).unwrap();
+        assert!(!serialized.contains("TaskCompleted"));
+        assert!(!serialized.contains("task-evidence"));
         assert!(!serialized.contains("must-not-use-display"));
         for forbidden in [
             "transcript_path",
@@ -331,9 +340,10 @@ fn memory_hooks_merge_deduplicate_reapply_and_rollback_exactly() {
     let rendered: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(rendered["theme"], "dark");
     assert_eq!(rendered["hooks"]["PostToolUse"], serde_json::json!([]));
-    for event in ["SessionStart", "Stop", "TaskCompleted"] {
+    for event in ["SessionStart", "Stop"] {
         assert_eq!(rendered["hooks"][event].as_array().unwrap().len(), 1);
     }
+    assert!(rendered["hooks"].get("TaskCompleted").is_none());
 
     let nonce = [41; 16];
     let mut native = OsNativeTransactionFileSystem::new(nonce);
@@ -845,8 +855,32 @@ fn primary_memory_semantic_contract_is_shared_byte_for_byte() {
     assert!(components.iter().all(|component| {
         component.kind == ComponentKind::Instruction
             && component.scope == ScopeRef::Project { project_id }
-            && component.body_markdown.as_bytes() == expected.as_bytes()
+            && component.body_markdown.starts_with(expected)
     }));
+    for (component, harness) in components[..2].iter().zip(["claude-code", "codex"]) {
+        assert!(component.body_markdown.contains(&format!(
+            "context-relay-context-mcp --hook-event task-evidence --harness {harness}"
+        )));
+        assert!(component.body_markdown.contains("\"session_id\""));
+        assert!(component.body_markdown.contains("\"task_id\""));
+        assert!(component.body_markdown.contains("\"evidence\""));
+        assert!(
+            component
+                .body_markdown
+                .contains("current Context Relay task ID")
+        );
+    }
+    assert!(!components[2].body_markdown.contains("--hook-event"));
+    assert!(
+        components[2]
+            .body_markdown
+            .contains("typed `context_relay_complete_task` tool")
+    );
+    assert!(
+        components[2]
+            .body_markdown
+            .contains("current Context Relay task ID")
+    );
     assert_eq!(components[0].name, "CLAUDE.md");
     assert_eq!(components[1].name, "AGENTS.md");
     assert_eq!(components[2].name, ".hermes.md");
@@ -1122,7 +1156,7 @@ fn native_memory_claude_accepts_an_exact_absolute_explicit_directory() {
 }
 
 #[test]
-fn native_memory_claude_absent_project_settings_watches_the_frozen_default_without_writing() {
+fn native_memory_claude_supported_absent_project_settings_plans_exact_creation_and_rollback() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     fs::remove_file(fixture.adapter.project_settings_path()).unwrap();
     let project_root = fixture.root.join("project with spaces");
@@ -1146,10 +1180,23 @@ fn native_memory_claude_absent_project_settings_watches_the_frozen_default_witho
     fs::write(memory_root.join("topic.md"), "# Topic\n").unwrap();
 
     let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
-    assert!(matches!(
-        capabilities.disable,
-        NativeMemoryDisable::WatchOnly
-    ));
+    let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+        panic!("supported Claude must create its exact missing project settings file")
+    };
+    assert_eq!(mutations.len(), 1);
+    let mutation = &mutations[0];
+    assert_eq!(
+        mutation.target,
+        test_wire_path(&fixture.adapter.project_settings_path())
+    );
+    let intended = NativeState::decode_v1(&mutation.content).unwrap();
+    let NativeState::RegularFile { bytes, .. } = intended else {
+        panic!("missing project settings must become a regular file")
+    };
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        json!({"autoMemoryEnabled": false})
+    );
     assert_eq!(
         capabilities
             .sources
@@ -1161,6 +1208,26 @@ fn native_memory_claude_absent_project_settings_watches_the_frozen_default_witho
             memory_root.join("topic.md").display().to_string(),
         ]
     );
+    assert!(!fixture.adapter.project_settings_path().exists());
+
+    let nonce = [0x91; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native
+        .create_before_images(std::slice::from_ref(mutation))
+        .unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native
+        .compare_and_swap_targets(std::slice::from_ref(mutation))
+        .unwrap();
+    native.apply_mutation(&nonce, mutation).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(
+            &fs::read(fixture.adapter.project_settings_path()).unwrap()
+        )
+        .unwrap(),
+        json!({"autoMemoryEnabled": false})
+    );
+    native.restore_matching_applied_targets(&nonce).unwrap();
     assert!(!fixture.adapter.project_settings_path().exists());
 }
 
@@ -1282,7 +1349,7 @@ fn primary_memory_claude_markdown_handles_crlf_replacement_archive_and_absence()
     };
     let expected = format!(
         "user prefix\r\n<!-- context-relay:start -->\r\n{}<!-- context-relay:end -->\r\nuser suffix\r\n",
-        PRIMARY_MEMORY_INSTRUCTIONS.replace('\n', "\r\n")
+        managed.body_markdown.replace('\n', "\r\n")
     );
     assert_eq!(bytes, expected.as_bytes());
 

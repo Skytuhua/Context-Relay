@@ -2987,40 +2987,42 @@ impl Vault {
         } else {
             Vec::new()
         };
-        if current != next {
-            let allowed = matches!(
-                (current, next),
-                (
-                    SetupPlanLifecycle::Applying,
-                    SetupPlanLifecycle::Applied
-                        | SetupPlanLifecycle::ApplyRestored
-                        | SetupPlanLifecycle::Conflict
-                ) | (
-                    SetupPlanLifecycle::RollingBack,
-                    SetupPlanLifecycle::RolledBack
-                        | SetupPlanLifecycle::RollbackRestored
-                        | SetupPlanLifecycle::Conflict
-                )
-            );
-            if !allowed {
-                return Err(VaultError::Validation(
-                    "setup plan lifecycle finish is invalid".to_owned(),
-                ));
-            }
-            let changed = transaction.execute(
-                "UPDATE setup_plan_lifecycle SET state = ?2
-                 WHERE plan_id = ?1 AND state = ?3",
-                params![
-                    plan_id.to_string(),
-                    setup_plan_lifecycle_name(next),
-                    setup_plan_lifecycle_name(current),
-                ],
-            )?;
-            if changed != 1 {
-                return Err(VaultError::Validation(
-                    "setup plan lifecycle changed concurrently".to_owned(),
-                ));
-            }
+        if current == next {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let allowed = matches!(
+            (current, next),
+            (
+                SetupPlanLifecycle::Applying,
+                SetupPlanLifecycle::Applied
+                    | SetupPlanLifecycle::ApplyRestored
+                    | SetupPlanLifecycle::Conflict
+            ) | (
+                SetupPlanLifecycle::RollingBack,
+                SetupPlanLifecycle::RolledBack
+                    | SetupPlanLifecycle::RollbackRestored
+                    | SetupPlanLifecycle::Conflict
+            )
+        );
+        if !allowed {
+            return Err(VaultError::Validation(
+                "setup plan lifecycle finish is invalid".to_owned(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE setup_plan_lifecycle SET state = ?2
+             WHERE plan_id = ?1 AND state = ?3",
+            params![
+                plan_id.to_string(),
+                setup_plan_lifecycle_name(next),
+                setup_plan_lifecycle_name(current),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(VaultError::Validation(
+                "setup plan lifecycle changed concurrently".to_owned(),
+            ));
         }
         for registration in &registrations {
             let existing = transaction
@@ -3040,12 +3042,9 @@ impl Vault {
                     "native memory source metadata changed after preview".to_owned(),
                 ));
             }
-            if current == next && ledger.last_applied_digest != registration.last_applied_digest {
-                return Err(VaultError::Validation(
-                    "native memory applied digest changed during setup replay".to_owned(),
-                ));
+            if let Some(last_applied_digest) = registration.last_applied_digest {
+                ledger.last_applied_digest = Some(last_applied_digest);
             }
-            ledger.last_applied_digest = registration.last_applied_digest;
             let canonical = to_json(&ledger)?;
             put_native_memory_ledger(&transaction, &ledger, &canonical)?;
             let source_id = sha256_key(&registration.source.id.0);

@@ -537,7 +537,7 @@ impl ClaudeCodeAdapter {
         parse_managed_mcp_get_output(&output)
     }
 
-    fn capability(&self) -> CapabilityLevel {
+    pub(crate) fn capability(&self) -> CapabilityLevel {
         if SUPPORTED_VERSIONS.contains(&self.layout.version.as_str()) {
             CapabilityLevel::Full
         } else {
@@ -1075,7 +1075,7 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
             });
         };
         let sources = self.native_memory_sources(&memory_root)?;
-        if !supported || managed || project_settings.is_none() {
+        if !supported || managed {
             let capabilities = NativeMemoryCapabilities {
                 disable: NativeMemoryDisable::WatchOnly,
                 sources,
@@ -1087,10 +1087,16 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
             (Some(settings), Some(metadata), Some(snapshot)) => {
                 (settings, metadata, *snapshot.fingerprint())
             }
+            (None, None, Some(snapshot))
+                if matches!(snapshot.state(), NativeState::Absent { .. }) =>
+            {
+                let metadata = missing_project_settings_metadata(&path, snapshot.state())?;
+                (Map::new(), metadata, *snapshot.fingerprint())
+            }
             _ => {
                 return Ok(NativeMemoryCapabilities {
-                    disable: NativeMemoryDisable::Unavailable,
-                    sources: vec![],
+                    disable: NativeMemoryDisable::WatchOnly,
+                    sources,
                 });
             }
         };
@@ -1326,6 +1332,47 @@ fn safely_missing_project_settings(project_root: &Path, settings_path: &Path) ->
         }
         Ok(_) => false,
     }
+}
+
+fn missing_project_settings_metadata(
+    settings_path: &Path,
+    absent: &NativeState,
+) -> Result<context_relay_native_runner::NativeMetadata, ClientError> {
+    let parent = settings_path
+        .parent()
+        .ok_or_else(|| invalid_request("Claude Code memory settings parent is unavailable"))?;
+    let mut siblings = fs::read_dir(parent)
+        .map_err(|_| invalid_request("Claude Code memory settings parent cannot be inspected"))?
+        .map(|entry| {
+            entry.map(|entry| entry.path()).map_err(|_| {
+                invalid_request("Claude Code memory settings parent cannot be inspected")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    siblings.sort();
+    for sibling in siblings {
+        if sibling == settings_path {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&sibling).map_err(|_| {
+            invalid_request("Claude Code memory settings sibling cannot be inspected")
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        let snapshot = OsNativeFileSystem::new().snapshot(&sibling).map_err(|_| {
+            invalid_request("Claude Code memory settings sibling cannot be safely inspected")
+        })?;
+        let NativeState::RegularFile { metadata, .. } = snapshot.state() else {
+            continue;
+        };
+        return metadata.for_absent_sibling_creation(absent).map_err(|_| {
+            invalid_request("Claude Code memory settings sibling is not bound to the target parent")
+        });
+    }
+    Err(invalid_request(
+        "Claude Code memory settings need an existing same-directory metadata template",
+    ))
 }
 
 fn safe_memory_directory_binding(path: &Path) -> Result<Option<PathBuf>, ClientError> {

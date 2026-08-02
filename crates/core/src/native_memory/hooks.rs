@@ -11,11 +11,8 @@ use crate::mcp::install::harness_cli_name;
 
 const DRAFT_DEVICE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073982";
 const MEMORY_HOOK_STATUS_MESSAGE: &str = "Context Relay memory lifecycle";
-const CLAUDE_EVENTS: [(&str, &str); 3] = [
-    ("SessionStart", "session-start"),
-    ("Stop", "session-stop"),
-    ("TaskCompleted", "task-evidence"),
-];
+const CLAUDE_EVENTS: [(&str, &str); 2] =
+    [("SessionStart", "session-start"), ("Stop", "session-stop")];
 const CODEX_EVENTS: [(&str, &str); 2] =
     [("SessionStart", "session-start"), ("Stop", "session-stop")];
 

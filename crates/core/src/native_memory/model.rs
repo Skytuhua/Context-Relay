@@ -113,6 +113,23 @@ pub struct NativeMemoryRegistration {
     pub last_applied_digest: Option<Sha256Digest>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeMemoryDiagnosticClass {
+    InvalidUtf8,
+    SensitiveText,
+    TooLarge,
+    MalformedManagedFence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeMemoryDiagnostic {
+    pub source_id: NativeMemorySourceId,
+    pub error_class: NativeMemoryDiagnosticClass,
+    pub digest: Sha256Digest,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeMemoryLedger {
@@ -123,7 +140,19 @@ pub struct NativeMemoryLedger {
     pub last_unmanaged_digest: Option<Sha256Digest>,
     pub last_imported_digest: Option<Sha256Digest>,
     pub last_applied_digest: Option<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_diagnostic: Option<NativeMemoryDiagnostic>,
     pub initial_preview_complete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct ValidatedPersistedNativeMemorySource(NativeMemorySource);
+
+impl ValidatedPersistedNativeMemorySource {
+    pub fn as_source(&self) -> &NativeMemorySource {
+        &self.0
+    }
 }
 
 impl NativeMemoryLedger {
@@ -135,6 +164,7 @@ impl NativeMemoryLedger {
             last_unmanaged_digest: None,
             last_imported_digest: None,
             last_applied_digest: None,
+            last_diagnostic: None,
             initial_preview_complete: false,
         }
     }
@@ -143,6 +173,15 @@ impl NativeMemoryLedger {
         let mut ledger = Self::new(source.id);
         ledger.source = Some(source);
         ledger
+    }
+
+    #[doc(hidden)]
+    pub fn validated_persisted_source(
+        &self,
+    ) -> Result<ValidatedPersistedNativeMemorySource, NativeMemoryError> {
+        self.validate_persisted()
+            .cloned()
+            .map(ValidatedPersistedNativeMemorySource)
     }
 
     pub(crate) fn validate_persisted(&self) -> Result<&NativeMemorySource, NativeMemoryError> {
@@ -182,6 +221,7 @@ impl NativeMemorySource {
 pub enum NativeMemoryError {
     InvalidSource(&'static str),
     InvalidUtf8,
+    SensitiveText,
     TooLarge,
     MalformedManagedFence,
 }
@@ -193,6 +233,7 @@ impl fmt::Display for NativeMemoryError {
                 write!(formatter, "invalid native memory source: {field}")
             }
             Self::InvalidUtf8 => formatter.write_str("native memory is not valid UTF-8"),
+            Self::SensitiveText => formatter.write_str("native memory contains sensitive text"),
             Self::TooLarge => formatter.write_str("native memory exceeds its declared limit"),
             Self::MalformedManagedFence => {
                 formatter.write_str("native memory managed markers are malformed")

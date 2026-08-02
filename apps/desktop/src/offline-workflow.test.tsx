@@ -177,7 +177,7 @@ class FakeWorkspaceGateway implements WorkspaceGateway {
 
 afterEach(cleanup);
 
-it('completes project, memory, review, and task work with networking disabled', async () => {
+it('keeps daemon-owned project, review, and task state after the offline desktop closes', async () => {
   HTMLDialogElement.prototype.showModal = function showModal() {
     this.setAttribute('open', '');
   };
@@ -255,5 +255,14 @@ it('completes project, memory, review, and task work with networking disabled', 
   fireEvent.click(screen.getByRole('button', { name: 'Complete Verify offline workflow' }));
   expect(await screen.findByText('Done')).toBeVisible();
   expect(await screen.findByText('All checks passed')).toBeVisible();
+  expect(gateway.networkCalls).toBe(0);
+
+  cleanup();
+  expect((await gateway.projects()).map((project) => project.name)).toEqual(['Context Relay']);
+  expect(await gateway.candidates()).toEqual([]);
+  expect((await gateway.tasks())[0]).toMatchObject({
+    title: 'Verify offline workflow',
+    status: 'done',
+  });
   expect(gateway.networkCalls).toBe(0);
 });

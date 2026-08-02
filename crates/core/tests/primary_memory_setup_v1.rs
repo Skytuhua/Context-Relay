@@ -2,6 +2,7 @@ mod support;
 
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeMap,
     fs,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
@@ -12,7 +13,7 @@ use std::{
 use context_relay_core::{
     claude_code::{ClaudeCodeAdapter, ClaudeCodeLayout},
     codex::{CodexAdapter, CodexExecutableKind, CodexLayout},
-    hermes::{HermesAdapter, HermesExecutableKind, HermesLayout, HermesProfile},
+    hermes::{HermesAdapter, HermesExecutableKind, HermesLayout, HermesMemoryKind, HermesProfile},
     mcp::install::{BRIDGE_SERVER_NAME, BridgeExecutable, attest_bridge_executable},
     native_memory::{
         NativeMemoryDocumentKind, NativeMemoryLimits, NativeMemoryRegistration, NativeMemorySource,
@@ -30,10 +31,10 @@ use context_relay_core::{
     },
     setup::{
         BridgeExecutionError, BridgeInstallService, BridgeLocator, BridgeMutationPlan,
-        BridgePlanExecutor, BridgePreviewHarness, NativeEngineBridgePlanExecutor,
-        PrimaryMemoryMutationPlan, RegisteredProject,
+        BridgePlanExecutor, BridgePreviewHarness, HermesMemoryExportService,
+        NativeEngineBridgePlanExecutor, PrimaryMemoryMutationPlan, RegisteredProject,
     },
-    vault::{BeforeImagePolicy, NativeSandboxIdentity, SetupPlanLifecycle, Vault},
+    vault::{BeforeImagePolicy, NativeSandboxIdentity, SetupPlanAction, SetupPlanLifecycle, Vault},
 };
 use context_relay_native_runner::{NativeState, OsNativeFileSystem};
 use context_relay_protocol::{
@@ -138,7 +139,9 @@ impl HarnessAdapter for Harness {
         assert_eq!(desired.components[0].kind, ComponentKind::McpServer);
         assert!(desired.components.iter().any(|component| {
             component.kind == ComponentKind::Instruction
-                && component.body_markdown == PRIMARY_MEMORY_INSTRUCTIONS
+                && component
+                    .body_markdown
+                    .starts_with(PRIMARY_MEMORY_INSTRUCTIONS)
         }));
         assert!(
             desired
@@ -429,6 +432,14 @@ impl BridgePreviewHarness for FrozenHarness {
         self.id()
     }
 
+    fn bridge_setup_capability(&self) -> CapabilityLevel {
+        match self {
+            Self::Claude { adapter, .. } => BridgePreviewHarness::bridge_setup_capability(adapter),
+            Self::Codex { adapter, .. } => BridgePreviewHarness::bridge_setup_capability(adapter),
+            Self::Hermes(adapter) => BridgePreviewHarness::bridge_setup_capability(adapter),
+        }
+    }
+
     fn bridge_project_id(&self) -> Option<ProjectId> {
         Some(match self {
             Self::Claude { adapter, .. } => adapter.project_id(),
@@ -501,6 +512,20 @@ impl BridgePreviewHarness for FrozenHarness {
             Self::Hermes(adapter) => {
                 BridgePreviewHarness::primary_memory_mutations(adapter, desired)
             }
+        }
+    }
+
+    fn watch_only_memory_registrations(
+        &self,
+    ) -> Result<Option<Vec<NativeMemoryRegistration>>, ClientError> {
+        match self {
+            Self::Claude { adapter, .. } => {
+                BridgePreviewHarness::watch_only_memory_registrations(adapter)
+            }
+            Self::Codex { adapter, .. } => {
+                BridgePreviewHarness::watch_only_memory_registrations(adapter)
+            }
+            Self::Hermes(adapter) => BridgePreviewHarness::watch_only_memory_registrations(adapter),
         }
     }
 }
@@ -875,6 +900,10 @@ fn matrix_fixture(harness: HarnessId) -> MatrixFixture {
 }
 
 fn claude_matrix_fixture() -> MatrixFixture {
+    claude_matrix_fixture_with_version("2.1.214")
+}
+
+fn claude_matrix_fixture_with_version(version: &str) -> MatrixFixture {
     let source: Value =
         serde_json::from_str(include_str!("fixtures/claude-code-2.1.214.json")).unwrap();
     let temp = tempfile::tempdir().unwrap();
@@ -910,7 +939,7 @@ fn claude_matrix_fixture() -> MatrixFixture {
     let adapter = ClaudeCodeAdapter::from_layout(
         ClaudeCodeLayout {
             executable,
-            version: "2.1.214".to_owned(),
+            version: version.to_owned(),
             installation_method: InstallationMethod::PackageManager,
             config_dir,
             state_path,
@@ -937,6 +966,10 @@ fn claude_matrix_fixture() -> MatrixFixture {
 }
 
 fn codex_matrix_fixture() -> MatrixFixture {
+    codex_matrix_fixture_with_version("0.144.1")
+}
+
+fn codex_matrix_fixture_with_version(version: &str) -> MatrixFixture {
     let source: Value = serde_json::from_str(include_str!("fixtures/codex-0.144.1.json")).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
@@ -977,7 +1010,7 @@ fn codex_matrix_fixture() -> MatrixFixture {
         CodexLayout {
             executable,
             executable_kind: CodexExecutableKind::Native,
-            version: "0.144.1".to_owned(),
+            version: version.to_owned(),
             installation_method: InstallationMethod::PackageManager,
             codex_home,
             user_skills_dir: home.join(".agents/skills"),
@@ -1005,6 +1038,10 @@ fn codex_matrix_fixture() -> MatrixFixture {
 }
 
 fn hermes_matrix_fixture() -> MatrixFixture {
+    hermes_matrix_fixture_with_version("0.18.2")
+}
+
+fn hermes_matrix_fixture_with_version(version: &str) -> MatrixFixture {
     let source: Value = serde_json::from_str(include_str!("fixtures/hermes-0.18.2.json")).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
@@ -1045,7 +1082,7 @@ fn hermes_matrix_fixture() -> MatrixFixture {
         HermesLayout {
             executable,
             executable_kind: HermesExecutableKind::Native,
-            version: "0.18.2".to_owned(),
+            version: version.to_owned(),
             installation_method: InstallationMethod::PackageManager,
             default_hermes_home,
             profile: HermesProfile {
@@ -1130,6 +1167,31 @@ fn assert_raw_unchanged(fixture: &MatrixFixture) {
             path.display()
         );
     }
+}
+
+fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        let mut entries = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for entry in entries {
+            let metadata = fs::symlink_metadata(&entry).unwrap();
+            if metadata.is_dir() {
+                visit(root, &entry, files);
+            } else if metadata.is_file() {
+                files.insert(
+                    entry.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(entry).unwrap(),
+                );
+            }
+        }
+    }
+
+    let mut files = BTreeMap::new();
+    visit(root, root, &mut files);
+    files
 }
 
 fn mutation_path(value: &WireNativeValue) -> PathBuf {
@@ -1250,7 +1312,10 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
                     let text = String::from_utf8_lossy(bytes);
                     text.contains("--hook-event session-start --harness claude-code")
                         && text.contains("--hook-event session-stop --harness claude-code")
-                        && text.contains("--hook-event task-evidence --harness claude-code")
+                }));
+                assert!(intended.iter().any(|(_, bytes)| {
+                    String::from_utf8_lossy(bytes)
+                        .contains("--hook-event task-evidence --harness claude-code")
                 }));
             }
             HarnessId::Codex => {
@@ -1265,6 +1330,10 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
                     text.contains("--hook-event session-start --harness codex")
                         && text.contains("--hook-event session-stop --harness codex")
                         && !text.contains("task-evidence")
+                }));
+                assert!(intended.iter().any(|(_, bytes)| {
+                    String::from_utf8_lossy(bytes)
+                        .contains("--hook-event task-evidence --harness codex")
                 }));
             }
             HarnessId::Hermes => {
@@ -1365,6 +1434,421 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
         }
         BridgeInstallService::persisted(&mut vault)
             .rollback(&setup.plan_id, NOW_MS + 4, &mut MustNotExecute)
+            .unwrap();
+        assert_raw_unchanged(&fixture);
+    }
+}
+
+#[test]
+fn hermes_managed_export_seals_the_full_file_digest_and_recovers_before_activation() {
+    let mut fixture = hermes_matrix_fixture();
+    let FrozenHarness::Hermes(adapter) = fixture.harness.clone() else {
+        panic!("Hermes export fixture changed")
+    };
+    let vault_path = TempVault::new("primary-memory-hermes-export");
+    let keys = MemoryKeyStore::default();
+    let mut vault =
+        Vault::open(vault_path.path(), "primary-memory-hermes-export-v1", &keys).unwrap();
+
+    let setup = HermesMemoryExportService::new(&mut vault)
+        .preview(
+            &adapter,
+            HermesMemoryKind::Agent,
+            "Context Relay owns this exported Hermes memory.",
+            NOW_MS,
+        )
+        .unwrap();
+    let stored = vault.setup_plan(&setup.plan_id).unwrap().unwrap();
+    let opened = open_plan(&stored.payload).unwrap();
+    assert_eq!(opened.plan.mutations.len(), 1);
+    assert_eq!(opened.plan.native_memory_registrations.len(), 1);
+    let mutation = &opened.plan.mutations[0];
+    let intended = intended_bytes(mutation);
+    let registration = &opened.plan.native_memory_registrations[0];
+    assert_eq!(mutation.target, registration.source.path);
+    assert_eq!(
+        registration.last_applied_digest,
+        Some(Sha256Digest(Sha256::digest(&intended).into()))
+    );
+    assert!(
+        vault
+            .native_memory_ledger(&registration.source.id)
+            .unwrap()
+            .is_none()
+    );
+
+    let live = fixture.harness.cli_state();
+    let crashed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut executor = CrashAfterCommit(MatrixExecutor {
+            harness: &mut fixture.harness,
+            live,
+            lock_root: fixture.lock_root.clone(),
+        });
+        let _ = BridgeInstallService::persisted(&mut vault).apply(
+            &setup.plan_id,
+            NOW_MS + 1,
+            &mut executor,
+        );
+    }));
+    assert!(crashed.is_err());
+    assert_eq!(fs::read(mutation_path(&mutation.target)).unwrap(), intended);
+    assert_eq!(
+        vault.setup_plan(&setup.plan_id).unwrap().unwrap().lifecycle,
+        SetupPlanLifecycle::Applying
+    );
+    assert!(
+        vault
+            .native_memory_ledger(&registration.source.id)
+            .unwrap()
+            .is_none()
+    );
+
+    BridgeInstallService::persisted(&mut vault)
+        .reconcile_after_native_recovery()
+        .unwrap();
+    let ledger = vault
+        .native_memory_ledger(&registration.source.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.source, Some(registration.source.clone()));
+    assert_eq!(ledger.last_applied_digest, registration.last_applied_digest);
+    assert!(!ledger.initial_preview_complete);
+    assert_raw_unchanged(&fixture);
+}
+
+#[test]
+fn passive_hermes_export_rejects_concurrent_target_change_and_preserves_live_bytes() {
+    let mut fixture = hermes_matrix_fixture();
+    let FrozenHarness::Hermes(adapter) = fixture.harness.clone() else {
+        panic!("Hermes export fixture changed")
+    };
+    let vault_path = TempVault::new("primary-memory-hermes-export-concurrent-change");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(
+        vault_path.path(),
+        "primary-memory-hermes-export-concurrent-change-v1",
+        &keys,
+    )
+    .unwrap();
+
+    let setup = HermesMemoryExportService::new(&mut vault)
+        .preview(
+            &adapter,
+            HermesMemoryKind::Agent,
+            "Context Relay reviewed this export before a concurrent edit.",
+            NOW_MS,
+        )
+        .unwrap();
+    assert_eq!(
+        setup.approval_class,
+        context_relay_protocol::ApprovalClass::Passive
+    );
+    let opened = open_plan(&vault.setup_plan(&setup.plan_id).unwrap().unwrap().payload).unwrap();
+    let mutation = &opened.plan.mutations[0];
+    let target = mutation_path(&mutation.target);
+    let concurrent = b"Hermes changed this memory after preview.\n";
+    fs::write(&target, concurrent).unwrap();
+    let mut executor = MatrixExecutor {
+        live: fixture.harness.cli_state(),
+        harness: &mut fixture.harness,
+        lock_root: fixture.lock_root.clone(),
+    };
+
+    let error = HermesMemoryExportService::new(&mut vault)
+        .apply(&setup.plan_id, NOW_MS + 1, &mut executor)
+        .unwrap_err();
+
+    assert_eq!(error.code, context_relay_protocol::ErrorCode::Conflict);
+    assert_eq!(fs::read(&target).unwrap(), concurrent);
+    assert_eq!(
+        vault.setup_plan(&setup.plan_id).unwrap().unwrap().lifecycle,
+        SetupPlanLifecycle::ApplyRestored
+    );
+    for registration in &opened.plan.native_memory_registrations {
+        assert!(
+            vault
+                .native_memory_ledger(&registration.source.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_raw_unchanged(&fixture);
+}
+
+#[test]
+fn supported_claude_missing_project_settings_recovers_creation_and_rolls_back_to_absent() {
+    let mut fixture = claude_matrix_fixture();
+    let settings_path = fixture.project_root.join(".claude/settings.json");
+    fs::remove_file(&settings_path).unwrap();
+    assert!(!settings_path.exists());
+    let vault_path = TempVault::new("primary-memory-claude-missing-settings");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+    let setup = BridgeInstallService::new(
+        &mut vault,
+        fixture.harness.clone(),
+        Locator {
+            bridge: fixture.bridge.clone(),
+            calls: Rc::new(Cell::new(0)),
+        },
+        DeviceId::from_str(ID_1).unwrap(),
+        clock(NOW_MS),
+    )
+    .preview(
+        Some(&RegisteredProject {
+            project_id: fixture.project_id,
+            root: wire_path(&fixture.project_root),
+        }),
+        NOW_MS,
+    )
+    .unwrap();
+    let opened = open_plan(&vault.setup_plan(&setup.plan_id).unwrap().unwrap().payload).unwrap();
+    let settings = opened
+        .plan
+        .mutations
+        .iter()
+        .find(|mutation| mutation_path(&mutation.target) == settings_path)
+        .expect("missing supported settings must be sealed as an exact native mutation");
+    let NativeState::RegularFile { bytes, .. } = NativeState::decode_v1(&settings.content).unwrap()
+    else {
+        panic!("missing settings must be created as a regular file")
+    };
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["autoMemoryEnabled"],
+        false
+    );
+
+    let live = fixture.harness.cli_state();
+    let crashed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut executor = CrashAfterCommit(MatrixExecutor {
+            harness: &mut fixture.harness,
+            live: live.clone(),
+            lock_root: fixture.lock_root.clone(),
+        });
+        let _ = BridgeInstallService::persisted(&mut vault).apply(
+            &setup.plan_id,
+            NOW_MS + 1,
+            &mut executor,
+        );
+    }));
+    assert!(crashed.is_err());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&settings_path).unwrap()).unwrap()["autoMemoryEnabled"],
+        false
+    );
+    BridgeInstallService::persisted(&mut vault)
+        .reconcile_after_native_recovery()
+        .unwrap();
+
+    let mut executor = MatrixExecutor {
+        harness: &mut fixture.harness,
+        live,
+        lock_root: fixture.lock_root.clone(),
+    };
+    BridgeInstallService::persisted(&mut vault)
+        .rollback(&setup.plan_id, NOW_MS + 2, &mut executor)
+        .unwrap();
+    assert!(!settings_path.exists());
+}
+
+#[test]
+fn full_claude_setup_rejects_unavailable_native_memory_before_persisting_any_plan() {
+    for (case, settings, expected_code) in [
+        (
+            "malformed",
+            b"{malformed".as_slice(),
+            context_relay_protocol::ErrorCode::InvalidRequest,
+        ),
+        (
+            "unsafe-binding",
+            br#"{"autoMemoryDirectory":"../outside-project/memory"}"#.as_slice(),
+            context_relay_protocol::ErrorCode::HarnessUnsupported,
+        ),
+    ] {
+        let fixture = claude_matrix_fixture();
+        let settings_path = match &fixture.harness {
+            FrozenHarness::Claude { adapter, .. } => adapter.project_settings_path(),
+            _ => panic!("Claude fixture changed"),
+        };
+        fs::write(&settings_path, settings).unwrap();
+        let before_tree = snapshot_tree(fixture._temp.path());
+        let vault_path = TempVault::new(&format!("full-claude-unavailable-memory-{case}"));
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+        let before_vault = fs::read(vault_path.path()).unwrap();
+        let cli = fixture.harness.cli_state();
+
+        let error = BridgeInstallService::new(
+            &mut vault,
+            fixture.harness.clone(),
+            Locator {
+                bridge: fixture.bridge.clone(),
+                calls: Rc::new(Cell::new(0)),
+            },
+            DeviceId::from_str(ID_1).unwrap(),
+            clock(NOW_MS),
+        )
+        .preview(
+            Some(&RegisteredProject {
+                project_id: fixture.project_id,
+                root: wire_path(&fixture.project_root),
+            }),
+            NOW_MS,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, expected_code, "{case}");
+        assert_eq!(snapshot_tree(fixture._temp.path()), before_tree, "{case}");
+        assert_eq!(fs::read(vault_path.path()).unwrap(), before_vault, "{case}");
+        assert!(vault.native_memory_ledgers().unwrap().is_empty(), "{case}");
+        assert!(vault.incomplete_setup_plans().unwrap().is_empty(), "{case}");
+        assert!(cli.borrow().is_none(), "{case}");
+    }
+}
+
+#[test]
+fn import_only_exact_memory_bindings_apply_and_rollback_as_registration_only_plans() {
+    for (harness_id, fixture) in [
+        (
+            HarnessId::ClaudeCode,
+            claude_matrix_fixture_with_version("2.1.215"),
+        ),
+        (
+            HarnessId::Codex,
+            codex_matrix_fixture_with_version("0.145.0"),
+        ),
+        (
+            HarnessId::Hermes,
+            hermes_matrix_fixture_with_version("0.18.3"),
+        ),
+    ] {
+        let vault_path = TempVault::new(&format!("watch-only-registration-{harness_id:?}"));
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+        let setup = BridgeInstallService::new(
+            &mut vault,
+            fixture.harness.clone(),
+            Locator {
+                bridge: fixture.bridge.clone(),
+                calls: Rc::new(Cell::new(0)),
+            },
+            DeviceId::from_str(ID_1).unwrap(),
+            clock(NOW_MS),
+        )
+        .preview(
+            Some(&RegisteredProject {
+                project_id: fixture.project_id,
+                root: wire_path(&fixture.project_root),
+            }),
+            NOW_MS,
+        )
+        .unwrap();
+        assert_eq!(setup.rulesync_version, "native-memory-watch-only-v1");
+        assert!(setup.cli_operations.is_empty());
+        let opened =
+            open_plan(&vault.setup_plan(&setup.plan_id).unwrap().unwrap().payload).unwrap();
+        assert!(opened.plan.mutations.is_empty());
+        assert!(opened.plan.cli_mutations.is_empty());
+        assert_eq!(opened.plan.native_memory_registrations.len(), 2);
+        assert!(
+            opened
+                .plan
+                .native_memory_registrations
+                .iter()
+                .all(|registration| registration.source.harness == harness_id
+                    && registration.last_applied_digest.is_none())
+        );
+        assert_eq!(
+            opened.plan.setup.semantic_changes.len(),
+            opened.plan.native_memory_registrations.len()
+        );
+        for registration in &opened.plan.native_memory_registrations {
+            assert!(
+                vault
+                    .native_memory_ledger(&registration.source.id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        BridgeInstallService::persisted(&mut vault)
+            .apply(&setup.plan_id, NOW_MS + 1, &mut MustNotExecute)
+            .unwrap();
+        for registration in &opened.plan.native_memory_registrations {
+            assert_eq!(
+                vault
+                    .native_memory_ledger(&registration.source.id)
+                    .unwrap()
+                    .unwrap()
+                    .source,
+                Some(registration.source.clone())
+            );
+        }
+        BridgeInstallService::persisted(&mut vault)
+            .rollback(&setup.plan_id, NOW_MS + 2, &mut MustNotExecute)
+            .unwrap();
+        for registration in &opened.plan.native_memory_registrations {
+            assert!(
+                vault
+                    .native_memory_ledger(&registration.source.id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_raw_unchanged(&fixture);
+
+        let recovery_setup = BridgeInstallService::new(
+            &mut vault,
+            fixture.harness.clone(),
+            Locator {
+                bridge: fixture.bridge.clone(),
+                calls: Rc::new(Cell::new(0)),
+            },
+            DeviceId::from_str(ID_1).unwrap(),
+            clock(NOW_MS + 10),
+        )
+        .preview(
+            Some(&RegisteredProject {
+                project_id: fixture.project_id,
+                root: wire_path(&fixture.project_root),
+            }),
+            NOW_MS + 10,
+        )
+        .unwrap();
+        let recovery_opened = open_plan(
+            &vault
+                .setup_plan(&recovery_setup.plan_id)
+                .unwrap()
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        vault
+            .claim_setup_plan(&recovery_setup.plan_id, SetupPlanAction::Apply, NOW_MS + 11)
+            .unwrap();
+        BridgeInstallService::persisted(&mut vault)
+            .reconcile_after_native_recovery()
+            .unwrap();
+        assert_eq!(
+            vault
+                .setup_plan(&recovery_setup.plan_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            SetupPlanLifecycle::Applied
+        );
+        for registration in &recovery_opened.plan.native_memory_registrations {
+            assert_eq!(
+                vault
+                    .native_memory_ledger(&registration.source.id)
+                    .unwrap()
+                    .unwrap()
+                    .source,
+                Some(registration.source.clone())
+            );
+        }
+        BridgeInstallService::persisted(&mut vault)
+            .rollback(&recovery_setup.plan_id, NOW_MS + 12, &mut MustNotExecute)
             .unwrap();
         assert_raw_unchanged(&fixture);
     }

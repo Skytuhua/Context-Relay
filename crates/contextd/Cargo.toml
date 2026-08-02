@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-test-support = []
+test-support = ["context-relay-core/test-support"]
 
 [dependencies]
 context-relay-core = { version = "0.1.0", path = "../core" }

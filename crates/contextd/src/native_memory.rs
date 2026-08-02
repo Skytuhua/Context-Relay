@@ -10,7 +10,7 @@ use std::{
 use context_relay_core::native_memory::{
     DebounceState, NATIVE_MEMORY_POLL_MS, NativeMemoryLedger, NativeMemoryObservationKind,
     NativeMemorySnapshot, NativeMemorySource, NativeMemorySourceId, ReadyNativeMemory,
-    StableObservation, acknowledge, invalidate, observe,
+    StableObservation, ValidatedPersistedNativeMemorySource, acknowledge, invalidate, observe,
 };
 #[cfg(any(target_os = "macos", windows))]
 use context_relay_native_runner::OsNativeFileSystem;
@@ -136,7 +136,7 @@ impl WorkAdmission for SupervisorAdmission {
 }
 
 struct WatchedSource {
-    source: NativeMemorySource,
+    source: ValidatedPersistedNativeMemorySource,
     initial_preview_complete: bool,
     baseline: Option<Option<Sha256Digest>>,
 }
@@ -180,19 +180,7 @@ async fn run_supervisor(
 ) {
     let mut sources = ledgers
         .into_iter()
-        .filter_map(|ledger| {
-            let source = ledger.source?;
-            Some((
-                source.id,
-                WatchedSource {
-                    source,
-                    initial_preview_complete: ledger.initial_preview_complete,
-                    baseline: ledger
-                        .initial_preview_complete
-                        .then_some(ledger.last_observed_digest),
-                },
-            ))
-        })
+        .filter_map(watched_source_from_persisted_ledger)
         .collect::<BTreeMap<_, _>>();
     let mut debounce = DebounceState::default();
     let mut pending = BTreeMap::<NativeMemorySourceId, PendingReady>::new();
@@ -266,19 +254,7 @@ fn replace_registered_sources(
 ) {
     let replacement = ledgers
         .into_iter()
-        .filter_map(|ledger| {
-            let source = ledger.source?;
-            Some((
-                source.id,
-                WatchedSource {
-                    source,
-                    initial_preview_complete: ledger.initial_preview_complete,
-                    baseline: ledger
-                        .initial_preview_complete
-                        .then_some(ledger.last_observed_digest),
-                },
-            ))
-        })
+        .filter_map(watched_source_from_persisted_ledger)
         .collect::<BTreeMap<_, _>>();
     for removed in sources
         .keys()
@@ -303,7 +279,7 @@ fn scan_sources(
         if in_flight.contains(source_id) {
             continue;
         }
-        let Ok(observed) = safe_snapshot(&watched.source) else {
+        let Ok(observed) = safe_snapshot_persisted(&watched.source) else {
             if !pending.contains_key(source_id) {
                 invalidate(debounce, *source_id);
             }
@@ -320,7 +296,7 @@ fn scan_sources(
                 *source_id,
                 PendingReady {
                     ready: ReadyNativeMemory {
-                        source: watched.source.clone(),
+                        source: watched.source.as_source().clone(),
                         snapshot: observed.snapshot,
                         kind: NativeMemoryObservationKind::InitialPreview,
                     },
@@ -338,7 +314,7 @@ fn scan_sources(
                 *source_id,
                 PendingReady {
                     ready: ReadyNativeMemory {
-                        source: watched.source.clone(),
+                        source: watched.source.as_source().clone(),
                         snapshot: observed.snapshot,
                         kind: NativeMemoryObservationKind::LiveEdit,
                     },
@@ -386,12 +362,42 @@ enum SnapshotError {
     Io,
 }
 
+#[cfg(test)]
 fn safe_snapshot(source: &NativeMemorySource) -> Result<ObservedSnapshot, SnapshotError> {
     source
         .validate()
         .map_err(|_| SnapshotError::UnsupportedTopology)?;
+    snapshot_validated_source(source)
+}
+
+fn safe_snapshot_persisted(
+    source: &ValidatedPersistedNativeMemorySource,
+) -> Result<ObservedSnapshot, SnapshotError> {
+    snapshot_validated_source(source.as_source())
+}
+
+fn snapshot_validated_source(
+    source: &NativeMemorySource,
+) -> Result<ObservedSnapshot, SnapshotError> {
     let path = decode_path(source)?;
     safe_snapshot_path(&path, source.limits.max_bytes)
+}
+
+fn watched_source_from_persisted_ledger(
+    ledger: NativeMemoryLedger,
+) -> Option<(NativeMemorySourceId, WatchedSource)> {
+    let source = ledger.validated_persisted_source().ok()?;
+    let source_id = source.as_source().id;
+    Some((
+        source_id,
+        WatchedSource {
+            source,
+            initial_preview_complete: ledger.initial_preview_complete,
+            baseline: ledger
+                .initial_preview_complete
+                .then_some(ledger.last_observed_digest),
+        },
+    ))
 }
 
 #[cfg(unix)]
@@ -572,14 +578,9 @@ mod tests {
     fn watched_sources(
         source: NativeMemorySource,
     ) -> BTreeMap<NativeMemorySourceId, WatchedSource> {
-        BTreeMap::from([(
-            source.id,
-            WatchedSource {
-                source,
-                initial_preview_complete: true,
-                baseline: Some(None),
-            },
-        )])
+        let mut ledger = NativeMemoryLedger::for_source(source);
+        ledger.initial_preview_complete = true;
+        BTreeMap::from([watched_source_from_persisted_ledger(ledger).unwrap()])
     }
 
     #[cfg(any(target_os = "macos", windows))]

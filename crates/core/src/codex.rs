@@ -867,7 +867,7 @@ impl CodexAdapter {
         })
     }
 
-    fn capability(&self) -> CapabilityLevel {
+    pub(crate) fn capability(&self) -> CapabilityLevel {
         if SUPPORTED_VERSIONS.contains(&self.layout.version.as_str())
             && self.layout.executable_kind == CodexExecutableKind::Native
         {

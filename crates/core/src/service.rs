@@ -6,16 +6,17 @@ use context_relay_protocol::{
     McpScopeSelector, MemoryArchiveParams, MemoryCandidate, MemoryCreateParams, MemoryId,
     MemoryOrigin, MemoryRecord, MemoryUpdateParams, NativeHookEvent, NativeHookEventParams,
     OperationId, ProjectId, ProjectIdentity, ProposeMemoryInput, Provenance, ReadableRecord,
-    RecordId, ScopeRef, SearchParams, TaskCompleteParams, TaskEvidence, TaskId, TaskRecord,
-    TaskStatus, TaskTransitionParams, TaskUpsertParams, WireNativeValue,
+    RecordId, ScopeRef, SearchParams, Sha256Digest, TaskCompleteParams, TaskEvidence, TaskId,
+    TaskRecord, TaskStatus, TaskTransitionParams, TaskUpsertParams, WireNativeValue,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
     native_memory::{
-        NativeMemoryLedger, NativeMemorySnapshot, ReadyNativeMemory, ReconcileDecision,
-        build_native_memory_candidate, reconcile_classified,
+        NativeMemoryDiagnostic, NativeMemoryDiagnosticClass, NativeMemoryError, NativeMemoryLedger,
+        NativeMemorySnapshot, ReadyNativeMemory, ReconcileDecision, build_native_memory_candidate,
+        reconcile_classified,
     },
     search::{AllowedSearchScope, EMBEDDING_DIMENSIONS, Embedding384},
     vault::{
@@ -78,8 +79,29 @@ impl<'a> OfflineWorkspace<'a> {
                 vault(self.vault.put_native_hook_session(project_id, &params))
             }
             NativeHookEvent::TaskEvidence {
-                task_id, evidence, ..
+                session_id,
+                task_id,
+                evidence,
             } => {
+                let session = vault(
+                    self.vault
+                        .native_hook_session(params.binding.harness, session_id),
+                )?
+                .ok_or_else(|| conflict("The native hook task evidence session does not exist"))?;
+                if session.project_id != project_id {
+                    return Err(conflict(
+                        "The native hook task evidence session belongs to another project",
+                    ));
+                }
+                if params.occurred_at_ms < session.started_at_ms
+                    || session
+                        .stopped_at_ms
+                        .is_some_and(|stopped_at_ms| params.occurred_at_ms > stopped_at_ms)
+                {
+                    return Err(conflict(
+                        "The native hook task evidence is outside its session lifecycle",
+                    ));
+                }
                 let task = vault(self.vault.task(task_id))?.ok_or_else(|| {
                     conflict("The native hook task evidence target does not exist")
                 })?;
@@ -142,13 +164,47 @@ impl<'a> OfflineWorkspace<'a> {
         let candidate = match ready.snapshot {
             NativeMemorySnapshot::Absent => {
                 ledger.last_observed_digest = None;
+                ledger.last_diagnostic = None;
                 ledger.initial_preview_complete = true;
                 None
             }
             NativeMemorySnapshot::Regular(bytes) => {
-                match reconcile_classified(&ready.source, &ledger, &bytes, ready.kind)
-                    .map_err(|_| invalid_request())?
-                {
+                let decision =
+                    match reconcile_classified(&ready.source, &ledger, &bytes, ready.kind) {
+                        Ok(decision) => {
+                            ledger.last_diagnostic = None;
+                            decision
+                        }
+                        Err(NativeMemoryError::InvalidSource(_)) => return Err(invalid_request()),
+                        Err(error) => {
+                            let error_class = match error {
+                                NativeMemoryError::InvalidUtf8 => {
+                                    NativeMemoryDiagnosticClass::InvalidUtf8
+                                }
+                                NativeMemoryError::SensitiveText => {
+                                    NativeMemoryDiagnosticClass::SensitiveText
+                                }
+                                NativeMemoryError::TooLarge => {
+                                    NativeMemoryDiagnosticClass::TooLarge
+                                }
+                                NativeMemoryError::MalformedManagedFence => {
+                                    NativeMemoryDiagnosticClass::MalformedManagedFence
+                                }
+                                NativeMemoryError::InvalidSource(_) => unreachable!(),
+                            };
+                            let digest = Sha256Digest(Sha256::digest(&bytes).into());
+                            ledger.last_observed_digest = Some(digest);
+                            ledger.last_diagnostic = Some(NativeMemoryDiagnostic {
+                                source_id: ready.source.id,
+                                error_class,
+                                digest,
+                            });
+                            ledger.initial_preview_complete = true;
+                            vault(self.vault.put_native_memory_candidate(&ledger, None))?;
+                            return Ok(None);
+                        }
+                    };
+                match decision {
                     ReconcileDecision::Pending {
                         full_digest,
                         unmanaged_digest,

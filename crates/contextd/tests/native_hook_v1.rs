@@ -214,6 +214,20 @@ async fn task_evidence_is_completed_by_the_resolved_workspace_handler() {
             .call(native_hook(
                 HarnessId::ClaudeCode,
                 &project_root,
+                NativeHookEvent::SessionStart {
+                    session_id: "daemon-task-session".into(),
+                },
+                1_700_000_000_004,
+            ))
+            .await
+            .unwrap(),
+        LocalResult::Empty
+    );
+    assert_eq!(
+        bridge
+            .call(native_hook(
+                HarnessId::ClaudeCode,
+                &project_root,
                 NativeHookEvent::TaskEvidence {
                     session_id: "daemon-task-session".into(),
                     task_id: task.id,

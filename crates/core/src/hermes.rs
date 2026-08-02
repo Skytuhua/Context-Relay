@@ -354,7 +354,7 @@ impl HermesAdapter {
         parse_config_check_output(&output, &self.layout.version)
     }
 
-    fn capability(&self) -> CapabilityLevel {
+    pub(crate) fn capability(&self) -> CapabilityLevel {
         if SUPPORTED_VERSIONS.contains(&self.layout.version.as_str())
             && self.layout.executable_kind == HermesExecutableKind::Native
             && self.yaml_topology_supported()

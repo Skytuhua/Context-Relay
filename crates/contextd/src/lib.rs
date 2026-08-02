@@ -1719,19 +1719,39 @@ pub mod test_support {
         },
     };
 
+    #[cfg(feature = "test-support")]
+    use context_relay_core::vault::TestVaultCell;
     use context_relay_core::{
+        codex::CodexAdapter,
+        mcp::install::{BRIDGE_SERVER_NAME, BridgeExecutable},
         native_memory::{NativeMemoryLedger, NativeMemorySource, NativeMemorySourceId},
-        vault::{DatabaseKeyStore, Vault, VaultError},
+        native_transaction::{
+            ApprovedCliMutation, ApprovedInput, CanonicalCliDeclaration, NativeTransactionPlan,
+            SidecarBinding,
+            cli::{CliMutationOutcome, CliRestoreOutcome, NativeCliExecutor},
+            engine::{
+                BoundaryError, FrozenOutput, NativeAdapter, NoFault, RestrictedExecutor,
+                RestrictedRun,
+            },
+            filesystem::OsNativeTransactionFileSystem,
+            open_plan,
+        },
+        setup::{
+            BridgeInstallService, BridgeLocator, BridgeMutationPlan, BridgePreviewHarness,
+            NativeEngineBridgePlanExecutor, PrimaryMemoryMutationPlan, RegisteredProject,
+        },
+        vault::{BeforeImagePolicy, DatabaseKeyStore, NativeSandboxIdentity, Vault, VaultError},
     };
     use context_relay_local_ipc::{InstallationToken, RuntimeConfig};
     use context_relay_protocol::{
-        ClientError, DeviceId, ErrorCode, HarnessParams, MemoryCandidate, PlanParams, SetupPlan,
-        Sha256Digest,
+        ApplyReceipt, ClassifiedChanges, CliOperations, ClientError, ComponentRecord, DesiredState,
+        DeviceId, DiscoveredScopes, ErrorCode, HarnessAdapter, HarnessId, HarnessParams,
+        HybridLogicalClock, ImportRequest, ImportedState, MemoryCandidate, PlanId, PlanParams,
+        ProbeContext, ProbeReport, ProjectId, RenderedState, SemanticDiff, SetupPlan, Sha256Digest,
+        ValidationReport, WireNativeValue,
     };
     #[cfg(any(windows, target_os = "macos"))]
-    use context_relay_protocol::{
-        HarnessAccessPolicy, HarnessId, ProjectIdentity, WireNativeValue,
-    };
+    use context_relay_protocol::{HarnessAccessPolicy, ProjectIdentity};
     use tokio::sync::Notify;
     use zeroize::Zeroizing;
 
@@ -1829,6 +1849,16 @@ pub mod test_support {
             vault.native_hook_session_count()
         }
 
+        #[cfg(feature = "test-support")]
+        pub fn test_vault_plaintext_cells(&self) -> Result<Vec<TestVaultCell>, VaultError> {
+            let vault = Vault::open(
+                &self.vault_path,
+                "context-relay-test-vault-key",
+                self.keys.as_ref(),
+            )?;
+            vault.test_plaintext_cells()
+        }
+
         pub fn seed_native_memory_source(
             &self,
             source: &NativeMemorySource,
@@ -1844,6 +1874,23 @@ pub mod test_support {
             let mut ledger = NativeMemoryLedger::for_source(source.clone());
             ledger.last_applied_digest = last_applied_digest;
             vault.put_native_memory_candidate(&ledger, None)
+        }
+
+        /// Opens the daemon's encrypted test vault with its bound key store so
+        /// integration tests can exercise production core transactions before
+        /// the daemon process is started.
+        pub fn with_vault<T>(
+            &self,
+            operation: impl FnOnce(&mut Vault) -> Result<T, VaultError>,
+        ) -> Result<T, VaultError> {
+            std::fs::create_dir_all(self.vault_path.parent().expect("test vault has a parent"))
+                .expect("create test vault directory");
+            let mut vault = Vault::open(
+                &self.vault_path,
+                "context-relay-test-vault-key",
+                self.keys.as_ref(),
+            )?;
+            operation(&mut vault)
         }
 
         pub fn native_memory_ledger(
@@ -2059,6 +2106,503 @@ pub mod test_support {
         }
     }
 
+    /// Deterministic real Codex setup engine for cross-crate daemon/MCP
+    /// acceptance tests. Adapter planning and native transactions are
+    /// production code; only external CLI and restricted-run boundaries are
+    /// represented by in-memory test state.
+    pub struct TestCodexBridgeInstallEngine {
+        harness: Mutex<TestCodexHarness>,
+        bridge: BridgeExecutable,
+        project_id: ProjectId,
+        project_root: PathBuf,
+        lock_root: PathBuf,
+    }
+
+    impl TestCodexBridgeInstallEngine {
+        pub fn new(
+            adapter: CodexAdapter,
+            bridge: BridgeExecutable,
+            project_id: ProjectId,
+            project_root: PathBuf,
+            lock_root: PathBuf,
+        ) -> Self {
+            Self {
+                harness: Mutex::new(TestCodexHarness {
+                    adapter,
+                    live_cli: Arc::new(Mutex::new(None)),
+                }),
+                bridge,
+                project_id,
+                project_root: std::fs::canonicalize(project_root)
+                    .expect("test Codex project root is canonicalizable"),
+                lock_root,
+            }
+        }
+
+        fn execute(
+            &self,
+            vault: &mut Vault,
+            device_id: DeviceId,
+            plan_id: PlanId,
+            rollback: bool,
+        ) -> Result<(), ClientError> {
+            let mut harness = self.harness.lock().unwrap();
+            let stored = vault
+                .setup_plan(&plan_id)
+                .map_err(|_| test_conflict("Test Codex plan cannot be loaded"))?
+                .ok_or_else(|| test_conflict("Test Codex plan does not exist"))?;
+            let opened = open_plan(&stored.payload)
+                .map_err(|_| test_conflict("Test Codex plan cannot be opened"))?;
+            let mut restricted = TestCodexRestricted {
+                inputs: opened.plan.staged_inputs.clone(),
+                sidecars: opened.plan.sidecars.clone(),
+                run: RestrictedRun {
+                    staged_output_hash: opened.plan.expected_semantic_output_hash,
+                    scanner_result_hash: opened.plan.scanner_result_hash,
+                },
+            };
+            let mut filesystem = OsNativeTransactionFileSystem::new(*plan_id.as_bytes());
+            let mut hook = NoFault;
+            let mut cli = TestCodexCli {
+                live: harness.live_cli.clone(),
+            };
+            let mut executor = NativeEngineBridgePlanExecutor::new(
+                &mut *harness,
+                &mut restricted,
+                &mut filesystem,
+                &mut hook,
+                &mut cli,
+                &self.lock_root,
+                test_native_identity(),
+                BeforeImagePolicy::default(),
+                HybridLogicalClock::new(1_900_000_000_001, 0, device_id),
+            );
+            if rollback {
+                BridgeInstallService::persisted(vault).rollback(
+                    &plan_id,
+                    1_900_000_000_002,
+                    &mut executor,
+                )
+            } else {
+                BridgeInstallService::persisted(vault).apply(
+                    &plan_id,
+                    1_900_000_000_001,
+                    &mut executor,
+                )
+            }
+        }
+    }
+
+    impl BridgeInstallEngine for TestCodexBridgeInstallEngine {
+        fn reconcile_after_native_recovery(
+            &self,
+            vault: &mut Vault,
+            _vault_path: &Path,
+            _device_id: DeviceId,
+        ) -> Result<(), ClientError> {
+            BridgeInstallService::persisted(vault).reconcile_after_native_recovery()
+        }
+
+        fn preview(
+            &self,
+            vault: &mut Vault,
+            _vault_path: &Path,
+            device_id: DeviceId,
+            params: HarnessParams,
+        ) -> Result<SetupPlan, ClientError> {
+            if params.harness != HarnessId::Codex || params.project_id != Some(self.project_id) {
+                return Err(test_conflict("Test Codex setup binding changed"));
+            }
+            let observed_hlc = HybridLogicalClock::new(1_900_000_000_000, 0, device_id);
+            let harness = self.harness.lock().unwrap().clone();
+            let project_root = harness.adapter.project_root_wire();
+            assert_eq!(project_root, wire_native_path(&self.project_root));
+            BridgeInstallService::new(
+                vault,
+                harness,
+                TestFixedBridgeLocator(self.bridge.clone()),
+                device_id,
+                observed_hlc,
+            )
+            .preview(
+                Some(&RegisteredProject {
+                    project_id: self.project_id,
+                    root: project_root,
+                }),
+                1_900_000_000_000,
+            )
+        }
+
+        fn apply(
+            &self,
+            vault: &mut Vault,
+            _vault_path: &Path,
+            device_id: DeviceId,
+            params: PlanParams,
+        ) -> Result<(), ClientError> {
+            self.execute(vault, device_id, params.plan_id, false)
+        }
+
+        fn rollback(
+            &self,
+            vault: &mut Vault,
+            _vault_path: &Path,
+            device_id: DeviceId,
+            params: PlanParams,
+        ) -> Result<(), ClientError> {
+            self.execute(vault, device_id, params.plan_id, true)
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestCodexHarness {
+        adapter: CodexAdapter,
+        live_cli: Arc<Mutex<Option<CanonicalCliDeclaration>>>,
+    }
+
+    impl HarnessAdapter for TestCodexHarness {
+        fn probe(&self, context: &ProbeContext) -> Result<ProbeReport, ClientError> {
+            self.adapter.probe(context)
+        }
+
+        fn discover_scopes(&self, report: &ProbeReport) -> Result<DiscoveredScopes, ClientError> {
+            self.adapter.discover_scopes(report)
+        }
+
+        fn import(&self, request: &ImportRequest) -> Result<ImportedState, ClientError> {
+            self.adapter.import(request)
+        }
+
+        fn render(&self, desired: &DesiredState) -> Result<RenderedState, ClientError> {
+            self.adapter.render(desired)
+        }
+
+        fn classify(&self, diff: &SemanticDiff) -> Result<ClassifiedChanges, ClientError> {
+            self.adapter.classify(diff)
+        }
+
+        fn plan_cli_ops(&self, changes: &ClassifiedChanges) -> Result<CliOperations, ClientError> {
+            self.adapter.plan_cli_ops(changes)
+        }
+
+        fn validate_effective(
+            &self,
+            receipt: &ApplyReceipt,
+        ) -> Result<ValidationReport, ClientError> {
+            HarnessAdapter::validate_effective(&self.adapter, receipt)
+        }
+    }
+
+    impl BridgePreviewHarness for TestCodexHarness {
+        fn bridge_harness(&self) -> HarnessId {
+            HarnessId::Codex
+        }
+
+        fn bridge_project_id(&self) -> Option<ProjectId> {
+            Some(self.adapter.project_id())
+        }
+
+        fn bridge_project_root(&self) -> Option<WireNativeValue> {
+            Some(self.adapter.project_root_wire())
+        }
+
+        fn bridge_mutations(
+            &self,
+            _: &DesiredState,
+            intended: &ComponentRecord,
+        ) -> Result<BridgeMutationPlan, ClientError> {
+            let live = self.live_cli.clone();
+            Ok(BridgeMutationPlan {
+                cli: Some(self.adapter.plan_bridge_cli_mutation_with_runner(
+                    intended,
+                    move |arguments: &[String]| {
+                        test_codex_cli_output(arguments, live.lock().unwrap().as_ref())
+                    },
+                )?),
+                native: vec![],
+            })
+        }
+
+        fn primary_memory_mutations(
+            &self,
+            desired: &DesiredState,
+        ) -> Result<PrimaryMemoryMutationPlan, ClientError> {
+            BridgePreviewHarness::primary_memory_mutations(&self.adapter, desired)
+        }
+
+        fn watch_only_memory_registrations(
+            &self,
+        ) -> Result<
+            Option<Vec<context_relay_core::native_memory::NativeMemoryRegistration>>,
+            ClientError,
+        > {
+            BridgePreviewHarness::watch_only_memory_registrations(&self.adapter)
+        }
+    }
+
+    impl NativeAdapter for TestCodexHarness {
+        fn reprobe_live_state(
+            &mut self,
+            plan: &NativeTransactionPlan,
+        ) -> Result<(), BoundaryError> {
+            NativeAdapter::reprobe_live_state(&mut self.adapter, plan)
+        }
+
+        fn compare_approved_digests(
+            &mut self,
+            plan: &NativeTransactionPlan,
+        ) -> Result<(), BoundaryError> {
+            NativeAdapter::compare_approved_digests(&mut self.adapter, plan)
+        }
+
+        fn validate_staged_output(
+            &mut self,
+            plan: &NativeTransactionPlan,
+            run: &RestrictedRun,
+        ) -> Result<FrozenOutput, BoundaryError> {
+            NativeAdapter::validate_staged_output(&mut self.adapter, plan, run)
+        }
+
+        fn validate_effective(
+            &mut self,
+            plan: &NativeTransactionPlan,
+            receipt: &ApplyReceipt,
+        ) -> Result<(), BoundaryError> {
+            NativeAdapter::validate_effective(&mut self.adapter, plan, receipt)
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestFixedBridgeLocator(BridgeExecutable);
+
+    impl BridgeLocator for TestFixedBridgeLocator {
+        fn locate(&self) -> Result<BridgeExecutable, ClientError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct TestCodexRestricted {
+        inputs: Vec<ApprovedInput>,
+        sidecars: Vec<SidecarBinding>,
+        run: RestrictedRun,
+    }
+
+    impl RestrictedExecutor for TestCodexRestricted {
+        fn copy_allowlisted_inputs(
+            &mut self,
+            inputs: &[ApprovedInput],
+        ) -> Result<(), BoundaryError> {
+            (inputs == self.inputs)
+                .then_some(())
+                .ok_or_else(|| BoundaryError::new("Test Codex inputs changed"))
+        }
+
+        fn create_fake_roots(&mut self) -> Result<(), BoundaryError> {
+            Ok(())
+        }
+
+        fn build_restricted_environment(&mut self) -> Result<(), BoundaryError> {
+            Ok(())
+        }
+
+        fn run_restricted_tools(
+            &mut self,
+            sidecars: &[SidecarBinding],
+        ) -> Result<RestrictedRun, BoundaryError> {
+            (sidecars == self.sidecars)
+                .then(|| self.run.clone())
+                .ok_or_else(|| BoundaryError::new("Test Codex sidecars changed"))
+        }
+
+        fn reject_unsafe_topology(&mut self) -> Result<(), BoundaryError> {
+            Ok(())
+        }
+    }
+
+    struct TestCodexCli {
+        live: Arc<Mutex<Option<CanonicalCliDeclaration>>>,
+    }
+
+    impl NativeCliExecutor for TestCodexCli {
+        fn probe_cli_mutation(
+            &mut self,
+            _: &ApprovedCliMutation,
+        ) -> Result<Option<Sha256Digest>, BoundaryError> {
+            Ok(self
+                .live
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|value| value.fingerprint))
+        }
+
+        fn compare_cli_targets(
+            &mut self,
+            mutations: &[ApprovedCliMutation],
+        ) -> Result<(), BoundaryError> {
+            for mutation in mutations {
+                if self
+                    .live
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|value| value.fingerprint)
+                    != mutation.expected.as_ref().map(|value| value.fingerprint)
+                {
+                    return Err(BoundaryError::new("Test Codex CLI state changed"));
+                }
+            }
+            Ok(())
+        }
+
+        fn apply_cli_mutation(
+            &mut self,
+            mutation: &ApprovedCliMutation,
+        ) -> Result<CliMutationOutcome, BoundaryError> {
+            let current = self
+                .live
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|value| value.fingerprint);
+            if current == mutation.expected.as_ref().map(|value| value.fingerprint) {
+                self.live.lock().unwrap().clone_from(&mutation.intended);
+            }
+            Ok(CliMutationOutcome {
+                resulting_fingerprint: self
+                    .live
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|value| value.fingerprint),
+                command_error: None,
+            })
+        }
+
+        fn restore_cli_mutation_if_matches(
+            &mut self,
+            mutation: &ApprovedCliMutation,
+        ) -> Result<CliRestoreOutcome, BoundaryError> {
+            let intended = mutation.intended.as_ref().map(|value| value.fingerprint);
+            let mut live = self.live.lock().unwrap();
+            if live.as_ref().map(|value| value.fingerprint) != intended {
+                return Ok(CliRestoreOutcome {
+                    restored: false,
+                    resulting_fingerprint: live.as_ref().map(|value| value.fingerprint),
+                });
+            }
+            live.clone_from(&mutation.expected);
+            Ok(CliRestoreOutcome {
+                restored: true,
+                resulting_fingerprint: live.as_ref().map(|value| value.fingerprint),
+            })
+        }
+
+        fn finish_committed_cli_mutations(
+            &mut self,
+            mutations: &[ApprovedCliMutation],
+        ) -> Result<(), BoundaryError> {
+            for mutation in mutations {
+                if self
+                    .live
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|value| value.fingerprint)
+                    != mutation.intended.as_ref().map(|value| value.fingerprint)
+                {
+                    return Err(BoundaryError::new("Test Codex committed CLI state changed"));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn test_codex_cli_output(
+        arguments: &[String],
+        live: Option<&CanonicalCliDeclaration>,
+    ) -> Result<Vec<u8>, BoundaryError> {
+        match arguments {
+            [plugin, list, format]
+                if (plugin.as_str(), list.as_str(), format.as_str())
+                    == ("plugin", "list", "--json") =>
+            {
+                Ok(br#"{"installed":[],"available":[]}"#.to_vec())
+            }
+            [mcp, list, format]
+                if (mcp.as_str(), list.as_str(), format.as_str()) == ("mcp", "list", "--json") =>
+            {
+                Ok(match live {
+                    Some(declaration) => test_codex_mcp_list(&declaration.canonical_body)?,
+                    None => b"[]".to_vec(),
+                })
+            }
+            [mcp, get, name, format]
+                if (mcp.as_str(), get.as_str(), name.as_str(), format.as_str())
+                    == ("mcp", "get", BRIDGE_SERVER_NAME, "--json") =>
+            {
+                test_codex_mcp_get(
+                    &live
+                        .ok_or_else(|| BoundaryError::new("missing test Codex declaration"))?
+                        .canonical_body,
+                )
+            }
+            _ => Err(BoundaryError::new("unexpected test Codex CLI inspection")),
+        }
+    }
+
+    fn test_codex_transport(body: &str) -> Result<String, BoundaryError> {
+        let prefix = body
+            .strip_suffix('}')
+            .ok_or_else(|| BoundaryError::new("test Codex declaration is invalid"))?;
+        Ok(format!(
+            "{prefix},\"env\":{{}},\"env_vars\":[],\"cwd\":null}}"
+        ))
+    }
+
+    fn test_codex_mcp_list(body: &str) -> Result<Vec<u8>, BoundaryError> {
+        Ok(format!(
+            "[{{\"name\":\"{BRIDGE_SERVER_NAME}\",\"enabled\":true,\"disabled_reason\":null,\"transport\":{},\"startup_timeout_sec\":null,\"tool_timeout_sec\":null,\"auth_status\":\"unsupported\"}}]",
+            test_codex_transport(body)?
+        )
+        .into_bytes())
+    }
+
+    fn test_codex_mcp_get(body: &str) -> Result<Vec<u8>, BoundaryError> {
+        Ok(format!(
+            "{{\"name\":\"{BRIDGE_SERVER_NAME}\",\"enabled\":true,\"disabled_reason\":null,\"transport\":{},\"enabled_tools\":null,\"disabled_tools\":null,\"startup_timeout_sec\":null,\"tool_timeout_sec\":null}}",
+            test_codex_transport(body)?
+        )
+        .into_bytes())
+    }
+
+    fn test_native_identity() -> NativeSandboxIdentity {
+        #[cfg(windows)]
+        {
+            NativeSandboxIdentity::Windows {
+                moniker: "context-relay.native.0123456789abcdef0123456789abcdef".to_owned(),
+                sid: b"S-1-15-2-3872518810-2985098273-1912316193-2655983105-1250049442-371239648-1157085541".to_vec(),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let generation = "0123456789abcdef0123456789abcdef";
+            let bundle = format!("com.contextrelay.native-runner.{generation}");
+            let mut container = b"context-relay/macos-container/v1\0".to_vec();
+            container.extend_from_slice(bundle.as_bytes());
+            NativeSandboxIdentity::reserved_macos(generation.to_owned(), bundle, container)
+        }
+    }
+
+    fn test_conflict(message: &'static str) -> ClientError {
+        ClientError {
+            code: ErrorCode::Conflict,
+            message: message.to_owned(),
+            field_path: None,
+            retryable: false,
+        }
+    }
+
     impl WorkerHook for TestWorkerGate {
         fn before_execute(&self) {
             self.entered.store(true, Ordering::Release);
@@ -2079,7 +2623,6 @@ pub mod test_support {
         token: [u8; 32],
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
     fn wire_native_path(path: &Path) -> WireNativeValue {
         #[cfg(windows)]
         {
@@ -2092,17 +2635,17 @@ pub mod test_support {
                     .encode_wide()
                     .flat_map(u16::to_le_bytes)
                     .collect(),
-                display: None,
+                display: path.to_str().map(str::to_owned),
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(not(windows))]
         {
             use std::os::unix::ffi::OsStrExt;
 
             WireNativeValue {
                 platform: context_relay_protocol::NativePlatform::Macos,
                 bytes: path.as_os_str().as_bytes().to_vec(),
-                display: None,
+                display: path.to_str().map(str::to_owned),
             }
         }
     }

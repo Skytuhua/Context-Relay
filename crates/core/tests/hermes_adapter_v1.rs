@@ -1210,7 +1210,7 @@ fn primary_memory_hermes_markdown_handles_crlf_replacement_archive_and_absence()
         .unwrap();
     let expected = format!(
         "user prefix\r\n<!-- context-relay:start -->\r\n{}<!-- context-relay:end -->\r\nuser suffix\r\n",
-        PRIMARY_MEMORY_INSTRUCTIONS.replace('\n', "\r\n")
+        managed.body_markdown.replace('\n', "\r\n")
     );
     assert_eq!(intended_bytes(&mutation), expected.as_bytes());
 

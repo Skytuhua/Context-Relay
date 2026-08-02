@@ -3,7 +3,8 @@
 use std::{fmt::Write as _, path::PathBuf, str::FromStr};
 
 use context_relay_native_runner::{
-    RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand, SidecarId,
+    NativeState, RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand,
+    SidecarId,
 };
 use context_relay_protocol::{
     ApprovalClass, CapabilityLevel, ChangeClass, ClassifiedChange, ClientError, ComponentKind,
@@ -16,14 +17,14 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     claude_code::ClaudeCodeAdapter,
     codex::CodexAdapter,
-    hermes::HermesAdapter,
+    hermes::{HermesAdapter, HermesMemoryKind},
     mcp::install::{
         BRIDGE_SERVER_NAME, attest_bridge_executable, bridge_component_for_attested,
         is_canonical_bridge_body,
     },
     native_memory::{
-        NativeMemoryAdapter, NativeMemoryDisable, NativeMemoryRegistration, managed_memory_hooks,
-        primary_memory_instruction_component,
+        NativeMemoryAdapter, NativeMemoryCapabilities, NativeMemoryDisable,
+        NativeMemoryRegistration, managed_memory_hooks, primary_memory_instruction_component,
     },
     native_transaction::{
         ApprovedCliMutation, ApprovedMutation, NativeTransactionPlan,
@@ -297,6 +298,13 @@ pub struct PersistedBridgeInstallService<'a> {
 pub trait BridgePreviewHarness: HarnessAdapter {
     fn bridge_harness(&self) -> HarnessId;
 
+    /// Declares whether preview must attest the bridge before invoking any
+    /// adapter probe. Import-only adapters override this so registration-only
+    /// setup never resolves a bridge executable.
+    fn bridge_setup_capability(&self) -> CapabilityLevel {
+        CapabilityLevel::Full
+    }
+
     /// The project receiving the managed primary-memory instruction. Legacy
     /// bridge-only test harnesses opt out by retaining the default `None`.
     fn bridge_project_id(&self) -> Option<ProjectId> {
@@ -328,6 +336,14 @@ pub trait BridgePreviewHarness: HarnessAdapter {
         Ok(PrimaryMemoryMutationPlan::empty())
     }
 
+    /// Returns exact source registrations for an import-only harness that can
+    /// safely bind native fallback files but cannot mutate harness state.
+    fn watch_only_memory_registrations(
+        &self,
+    ) -> Result<Option<Vec<NativeMemoryRegistration>>, ClientError> {
+        Ok(None)
+    }
+
     fn bridge_adapter_version(&self) -> u32 {
         1
     }
@@ -336,6 +352,10 @@ pub trait BridgePreviewHarness: HarnessAdapter {
 impl BridgePreviewHarness for ClaudeCodeAdapter {
     fn bridge_harness(&self) -> HarnessId {
         HarnessId::ClaudeCode
+    }
+
+    fn bridge_setup_capability(&self) -> CapabilityLevel {
+        self.capability()
     }
 
     fn bridge_project_id(&self) -> Option<ProjectId> {
@@ -361,7 +381,7 @@ impl BridgePreviewHarness for ClaudeCodeAdapter {
         &self,
         desired: &DesiredState,
     ) -> Result<PrimaryMemoryMutationPlan, ClientError> {
-        let capabilities = self.native_memory_capabilities()?;
+        let capabilities = full_setup_memory_capabilities(self.native_memory_capabilities()?)?;
         let mut plan = primary_memory_registration_plan(&capabilities.sources);
         if let Some(instruction) = desired
             .components
@@ -392,11 +412,21 @@ impl BridgePreviewHarness for ClaudeCodeAdapter {
         }
         Ok(plan)
     }
+
+    fn watch_only_memory_registrations(
+        &self,
+    ) -> Result<Option<Vec<NativeMemoryRegistration>>, ClientError> {
+        watch_only_registrations(self.native_memory_capabilities()?)
+    }
 }
 
 impl BridgePreviewHarness for CodexAdapter {
     fn bridge_harness(&self) -> HarnessId {
         HarnessId::Codex
+    }
+
+    fn bridge_setup_capability(&self) -> CapabilityLevel {
+        self.capability()
     }
 
     fn bridge_project_id(&self) -> Option<ProjectId> {
@@ -422,7 +452,7 @@ impl BridgePreviewHarness for CodexAdapter {
         &self,
         desired: &DesiredState,
     ) -> Result<PrimaryMemoryMutationPlan, ClientError> {
-        let capabilities = self.native_memory_capabilities()?;
+        let capabilities = full_setup_memory_capabilities(self.native_memory_capabilities()?)?;
         let mut plan = primary_memory_registration_plan(&capabilities.sources);
         if let Some(instruction) = desired
             .components
@@ -453,11 +483,21 @@ impl BridgePreviewHarness for CodexAdapter {
         }
         Ok(plan)
     }
+
+    fn watch_only_memory_registrations(
+        &self,
+    ) -> Result<Option<Vec<NativeMemoryRegistration>>, ClientError> {
+        watch_only_registrations(self.native_memory_capabilities()?)
+    }
 }
 
 impl BridgePreviewHarness for HermesAdapter {
     fn bridge_harness(&self) -> HarnessId {
         HarnessId::Hermes
+    }
+
+    fn bridge_setup_capability(&self) -> CapabilityLevel {
+        self.capability()
     }
 
     fn bridge_project_id(&self) -> Option<ProjectId> {
@@ -491,7 +531,7 @@ impl BridgePreviewHarness for HermesAdapter {
         &self,
         desired: &DesiredState,
     ) -> Result<PrimaryMemoryMutationPlan, ClientError> {
-        let capabilities = self.native_memory_capabilities()?;
+        let capabilities = full_setup_memory_capabilities(self.native_memory_capabilities()?)?;
         let mut plan = primary_memory_registration_plan(&capabilities.sources);
         if let Some(instruction) = desired
             .components
@@ -518,6 +558,47 @@ impl BridgePreviewHarness for HermesAdapter {
         }
         Ok(plan)
     }
+
+    fn watch_only_memory_registrations(
+        &self,
+    ) -> Result<Option<Vec<NativeMemoryRegistration>>, ClientError> {
+        watch_only_registrations(self.native_memory_capabilities()?)
+    }
+}
+
+fn watch_only_registrations(
+    capabilities: NativeMemoryCapabilities,
+) -> Result<Option<Vec<NativeMemoryRegistration>>, ClientError> {
+    capabilities.validate()?;
+    Ok(match capabilities.disable {
+        NativeMemoryDisable::WatchOnly if !capabilities.sources.is_empty() => Some(
+            capabilities
+                .sources
+                .into_iter()
+                .map(|source| NativeMemoryRegistration {
+                    source,
+                    last_applied_digest: None,
+                })
+                .collect(),
+        ),
+        NativeMemoryDisable::WatchOnly
+        | NativeMemoryDisable::Unavailable
+        | NativeMemoryDisable::Supported(_) => None,
+    })
+}
+
+fn full_setup_memory_capabilities(
+    capabilities: NativeMemoryCapabilities,
+) -> Result<NativeMemoryCapabilities, ClientError> {
+    capabilities.validate()?;
+    if capabilities.sources.is_empty()
+        || matches!(&capabilities.disable, NativeMemoryDisable::Unavailable)
+    {
+        return Err(unsupported(
+            "Full setup needs an exact available native memory source",
+        ));
+    }
+    Ok(capabilities)
 }
 
 fn primary_memory_registration_plan(
@@ -560,6 +641,257 @@ pub struct BridgeInstallService<'a, H, L> {
     bridge_locator: L,
     origin_device: DeviceId,
     observed_hlc: HybridLogicalClock,
+}
+
+/// Plans a reviewed Context Relay export into Hermes's managed memory file.
+///
+/// The exact native mutation and the raw intended file digest are sealed in a
+/// single approval-v2 setup plan. Applying, recovering, or rolling back that
+/// plan uses the same persisted native transaction service as harness setup.
+pub struct HermesMemoryExportService<'a> {
+    vault: &'a mut Vault,
+}
+
+impl<'a> HermesMemoryExportService<'a> {
+    pub fn new(vault: &'a mut Vault) -> Self {
+        Self { vault }
+    }
+
+    pub fn preview(
+        &mut self,
+        adapter: &HermesAdapter,
+        kind: HermesMemoryKind,
+        body_markdown: &str,
+        now_ms: u64,
+    ) -> Result<SetupPlan, ClientError> {
+        let report = adapter.probe(&ProbeContext {
+            harness: HarnessId::Hermes,
+            requested_profile: Some(adapter.profile_name().to_owned()),
+        })?;
+        if report.capability != CapabilityLevel::Full {
+            return Err(unsupported(
+                "Hermes managed memory export needs a fully supported adapter",
+            ));
+        }
+        let executable_path = report
+            .executable
+            .ok_or_else(|| unsupported("The Hermes executable is unavailable"))?;
+        let executable_hash = report
+            .executable_sha256
+            .ok_or_else(|| unsupported("The Hermes executable cannot be attested"))?;
+        let harness_version = report
+            .harness_version
+            .ok_or_else(|| unsupported("The Hermes version is unavailable"))?;
+
+        let capabilities = adapter.native_memory_capabilities()?;
+        capabilities.validate()?;
+        let document_kind = match kind {
+            HermesMemoryKind::Agent => crate::native_memory::NativeMemoryDocumentKind::Agent,
+            HermesMemoryKind::User => crate::native_memory::NativeMemoryDocumentKind::UserProfile,
+        };
+        let source = capabilities
+            .sources
+            .into_iter()
+            .find(|source| source.document_kind == document_kind)
+            .ok_or_else(|| unsupported("Hermes has no exact managed memory export target"))?;
+        if source.harness != HarnessId::Hermes {
+            return Err(invalid("Hermes managed memory source is invalid"));
+        }
+        let target_scope = match source.scope {
+            ScopeRef::Global => NativeScope::Global,
+            ScopeRef::Project { project_id } if project_id == adapter.project_id() => {
+                NativeScope::Project {
+                    project_id,
+                    root: adapter.project_root_wire(),
+                }
+            }
+            ScopeRef::Project { .. } => {
+                return Err(conflict("Hermes managed memory project binding changed"));
+            }
+        };
+
+        let mutation = adapter.plan_native_memory(kind, body_markdown)?;
+        let intended_bytes = match mutation.as_ref() {
+            Some(mutation) => match NativeState::decode_v1(&mutation.content)
+                .map_err(|_| invalid("Hermes managed memory state is invalid"))?
+            {
+                NativeState::RegularFile { bytes, .. } => bytes,
+                NativeState::Absent { .. } => {
+                    return Err(invalid(
+                        "Hermes managed memory export cannot remove its target",
+                    ));
+                }
+            },
+            None => std::fs::read(native_path(&source.path)?)
+                .map_err(|_| conflict("Hermes managed memory changed during preview"))?,
+        };
+        let intended_digest = digest(&intended_bytes);
+        if mutation
+            .as_ref()
+            .is_some_and(|mutation| mutation.target != source.path)
+        {
+            return Err(invalid(
+                "Hermes managed memory target differs from its source",
+            ));
+        }
+
+        let expires_at = now_ms
+            .checked_add(PREVIEW_TTL_MS)
+            .ok_or_else(|| invalid("Hermes export expiry is outside the supported range"))?;
+        let export_identity = digest(
+            &[
+                b"context-relay/hermes-memory-export/v1\0".as_slice(),
+                &source.id.0.0,
+                &intended_digest.0,
+            ]
+            .concat(),
+        );
+        let plan_id = preview_plan_id(HarnessId::Hermes, &export_identity, now_ms)?;
+        let mut expected_native_digests = vec![ExpectedNativeDigest {
+            target: executable_path.clone(),
+            expected_digest: Some(executable_hash),
+        }];
+        if mutation.is_none() {
+            expected_native_digests.push(ExpectedNativeDigest {
+                target: source.path.clone(),
+                expected_digest: Some(intended_digest),
+            });
+        }
+        let mut setup = SetupPlan {
+            plan_id,
+            harness: HarnessId::Hermes,
+            adapter_version: BridgePreviewHarness::bridge_adapter_version(adapter),
+            executable_path,
+            executable_hash,
+            harness_version,
+            target_scopes: vec![target_scope],
+            expected_native_digests,
+            semantic_changes: vec![ClassifiedChange {
+                class: if mutation.is_some() {
+                    ChangeClass::Update
+                } else {
+                    ChangeClass::Preserve
+                },
+                target: format!("hermes-memory-export:{}", digest_text(source.id.0)),
+                summary: "Export reviewed Context Relay memory to Hermes".to_owned(),
+            }],
+            cli_operations: vec![],
+            package_artifacts: vec![],
+            permission_delta: context_relay_protocol::PermissionDelta {
+                added: vec![],
+                removed: vec![],
+            },
+            network_delta: context_relay_protocol::NetworkDelta {
+                added: vec![],
+                removed: vec![],
+            },
+            scanner_report_hash: digest(b"hermes-memory-export-scanner-v1"),
+            rulesync_version: "hermes-memory-export-v1".to_owned(),
+            rulesync_hash: digest(b"hermes-memory-export-rulesync-v1"),
+            approval_class: ApprovalClass::Passive,
+            expires_at,
+            batch_hash: Sha256Digest([0; 32]),
+        };
+        let mut plan = NativeTransactionPlan {
+            setup: setup.clone(),
+            approval_version: 2,
+            helper_policy_version: 1,
+            manifest_schema_version: 1,
+            manifest_digest: digest(b"hermes-memory-export-manifest-v1"),
+            helper_hash: digest(b"hermes-memory-export-helper-v1"),
+            sidecars: vec![SidecarBinding {
+                id: SidecarId::RuleSync,
+                target: if cfg!(windows) {
+                    RuntimeTarget::WindowsX86_64
+                } else {
+                    RuntimeTarget::MacosArm64
+                },
+                version: "hermes-memory-export-v1".to_owned(),
+                closure_hash: digest(b"hermes-memory-export-sidecar-closure-v1"),
+                source_bundle_hash: digest(b"hermes-memory-export-sidecar-source-v1"),
+                build_toolchain_hash: digest(b"hermes-memory-export-sidecar-toolchain-v1"),
+                command_template_digest: digest(b"hermes-memory-export-sidecar-command-v1"),
+                command: SidecarCommand::RuleSyncGenerate {
+                    target: RuleSyncTarget::ClaudeCode,
+                    features: RuleSyncFeatures::new(&[RuleSyncFeature::Rules])
+                        .map_err(|_| invalid("Hermes export sidecar is invalid"))?,
+                },
+            }],
+            structural_allowlist_hash: digest(b"hermes-memory-export-allowlist-v1"),
+            staged_inputs: vec![],
+            expected_semantic_output_hash: digest(b"hermes-memory-export-output-v1"),
+            scanner_result_hash: digest(b"hermes-memory-export-scanner-v1"),
+            mutations: mutation.into_iter().collect(),
+            cli_mutations: vec![],
+            native_memory_registrations: vec![NativeMemoryRegistration {
+                source,
+                last_applied_digest: Some(intended_digest),
+            }],
+            ownership_changes: vec![],
+        };
+        let approval_hash =
+            approval_hash_v2(&plan).map_err(|_| invalid("Hermes export plan is invalid"))?;
+        setup.batch_hash = approval_hash;
+        plan.setup = setup.clone();
+        let native_rollback_states =
+            crate::native_transaction::planner::capture_native_rollback_states(&plan)
+                .map_err(|_| invalid("Hermes export rollback state cannot be sealed"))?;
+        let (schema_version, sealed) = if plan.mutations.is_empty() {
+            (
+                crate::native_transaction::SEALED_PLAN_SCHEMA_VERSION,
+                seal_plan(&plan, approval_hash),
+            )
+        } else {
+            (
+                REVERSIBLE_PLAN_SCHEMA_VERSION,
+                seal_reversible_plan(&plan, approval_hash, &native_rollback_states, None),
+            )
+        };
+        let sealed = sealed.map_err(|_| invalid("Hermes export plan cannot be sealed"))?;
+        self.vault
+            .put_setup_plan(SetupPlanWrite {
+                plan_id: &setup.plan_id,
+                schema_version,
+                approval_version: 2,
+                approval_hash: &approval_hash,
+                payload: &sealed,
+                created_ms: now_ms,
+                expires_ms: expires_at,
+            })
+            .map_err(|_| invalid("Hermes export plan cannot be persisted"))?;
+        Ok(setup)
+    }
+
+    pub fn apply<E: BridgePlanExecutor>(
+        &mut self,
+        plan_id: &PlanId,
+        now_ms: u64,
+        executor: &mut E,
+    ) -> Result<(), ClientError> {
+        PersistedBridgeInstallService {
+            vault: &mut *self.vault,
+        }
+        .apply(plan_id, now_ms, executor)
+    }
+
+    pub fn rollback<E: BridgePlanExecutor>(
+        &mut self,
+        plan_id: &PlanId,
+        now_ms: u64,
+        executor: &mut E,
+    ) -> Result<(), ClientError> {
+        PersistedBridgeInstallService {
+            vault: &mut *self.vault,
+        }
+        .rollback(plan_id, now_ms, executor)
+    }
+
+    pub fn reconcile_after_native_recovery(&mut self) -> Result<(), ClientError> {
+        PersistedBridgeInstallService {
+            vault: &mut *self.vault,
+        }
+        .reconcile_after_native_recovery()
+    }
 }
 
 impl<'a> BridgeInstallService<'a, (), ()> {
@@ -647,6 +979,19 @@ impl PersistedBridgeInstallService<'_> {
             let opened = validated_original_plan(&stored, &stored.plan_id)?;
             match stored.lifecycle {
                 SetupPlanLifecycle::Applying => {
+                    if is_watch_only_registration_plan(&opened.plan) {
+                        self.vault
+                            .bind_setup_plan_native_memory(
+                                &stored.plan_id,
+                                &opened.plan.native_memory_registrations,
+                            )
+                            .map_err(|_| conflict("Persisted bridge memory binding changed"))?;
+                        self.finish_applied_with_native_memory(
+                            &stored.plan_id,
+                            &opened.plan.native_memory_registrations,
+                        )?;
+                        continue;
+                    }
                     if self.reconcile_apply_terminal(&stored)?.is_none() {
                         return Err(conflict(
                             "Bridge apply has not begun its native transaction",
@@ -654,7 +999,22 @@ impl PersistedBridgeInstallService<'_> {
                     }
                 }
                 SetupPlanLifecycle::RollingBack => {
-                    let (inverse, _) = self.validated_inverse_plan(&opened)?;
+                    let (inverse, inverse_opened) = self.validated_inverse_plan(&opened)?;
+                    if is_watch_only_registration_plan(&opened.plan)
+                        && is_watch_only_registration_plan(&inverse_opened.plan)
+                    {
+                        self.vault
+                            .finish_setup_plan_rollback(
+                                &stored.plan_id,
+                                &inverse.plan_id,
+                                SetupPlanLifecycle::RolledBack,
+                                SetupPlanLifecycle::Applied,
+                            )
+                            .map_err(|_| {
+                                conflict("Persisted bridge rollback cannot be finalized")
+                            })?;
+                        continue;
+                    }
                     if self
                         .reconcile_rollback_terminal(&stored, &inverse)?
                         .is_none()
@@ -723,6 +1083,9 @@ impl PersistedBridgeInstallService<'_> {
             self.vault
                 .bind_setup_plan_native_memory(plan_id, registrations)
                 .map_err(|_| conflict("Persisted bridge memory binding changed"))?;
+            if is_watch_only_registration_plan(&opened.plan) {
+                return self.finish_applied_with_native_memory(plan_id, registrations);
+            }
             if let Some(lifecycle) = self.reconcile_apply_terminal(&stored)? {
                 return apply_terminal_result(lifecycle);
             }
@@ -774,6 +1137,9 @@ impl PersistedBridgeInstallService<'_> {
         self.vault
             .bind_setup_plan_native_memory(&plan.setup.plan_id, registrations)
             .map_err(|_| conflict("Persisted bridge memory binding cannot be recorded"))?;
+        if is_watch_only_registration_plan(plan) {
+            return self.finish_applied_with_native_memory(&plan.setup.plan_id, registrations);
+        }
         match executor.execute(self.vault, plan, &stored.payload, stored.created_ms, now_ms) {
             Ok(()) => self.finish_applied_with_native_memory(&plan.setup.plan_id, registrations),
             Err(error) => {
@@ -806,6 +1172,19 @@ impl PersistedBridgeInstallService<'_> {
         }
         if stored.lifecycle == SetupPlanLifecycle::RollingBack {
             let (inverse_record, inverse) = self.validated_inverse_plan(&opened)?;
+            if is_watch_only_registration_plan(&opened.plan)
+                && is_watch_only_registration_plan(&inverse.plan)
+            {
+                self.vault
+                    .finish_setup_plan_rollback(
+                        original_plan_id,
+                        &inverse_record.plan_id,
+                        SetupPlanLifecycle::RolledBack,
+                        SetupPlanLifecycle::Applied,
+                    )
+                    .map_err(|_| conflict("Persisted bridge rollback cannot be finalized"))?;
+                return Ok(());
+            }
             if let Some(lifecycle) = self.reconcile_rollback_terminal(&stored, &inverse_record)? {
                 return rollback_terminal_result(lifecycle);
             }
@@ -881,6 +1260,17 @@ impl PersistedBridgeInstallService<'_> {
         now_ms: u64,
         executor: &mut E,
     ) -> Result<(), ClientError> {
+        if is_watch_only_registration_plan(inverse) {
+            return self
+                .vault
+                .finish_setup_plan_rollback(
+                    &original.plan_id,
+                    &inverse_record.plan_id,
+                    SetupPlanLifecycle::RolledBack,
+                    SetupPlanLifecycle::Applied,
+                )
+                .map_err(|_| conflict("Persisted bridge rollback cannot be finalized"));
+        }
         match executor.execute(
             self.vault,
             inverse,
@@ -1054,6 +1444,35 @@ fn native_transaction_id(plan_id: &PlanId) -> String {
     format!("bridge-setup-{plan_id}")
 }
 
+fn is_watch_only_registration_plan(plan: &NativeTransactionPlan) -> bool {
+    if plan.setup.rulesync_version != "native-memory-watch-only-v1"
+        || plan.native_memory_registrations.is_empty()
+        || !plan.mutations.is_empty()
+        || !plan.cli_mutations.is_empty()
+        || !plan.setup.cli_operations.is_empty()
+        || !plan.staged_inputs.is_empty()
+        || !plan.ownership_changes.is_empty()
+        || plan.setup.semantic_changes.len() != plan.native_memory_registrations.len()
+    {
+        return false;
+    }
+
+    plan.native_memory_registrations
+        .iter()
+        .zip(&plan.setup.semantic_changes)
+        .all(|(registration, change)| {
+            registration.source.harness == plan.setup.harness
+                && registration.last_applied_digest.is_none()
+                && matches!(change.class, ChangeClass::Create | ChangeClass::Remove)
+                && change.target
+                    == format!(
+                        "native-memory-watch:{}",
+                        digest_text(registration.source.id.0)
+                    )
+                && change.summary == "Register an exact watch-only native memory source"
+        })
+}
+
 fn apply_terminal_result(lifecycle: SetupPlanLifecycle) -> Result<(), ClientError> {
     match lifecycle {
         SetupPlanLifecycle::Applied => Ok(()),
@@ -1214,21 +1633,32 @@ where
         registered_project: Option<&RegisteredProject>,
         now_ms: u64,
     ) -> Result<SetupPlan, ClientError> {
-        let located_bridge = self.bridge_locator.locate()?;
-        let bridge = attest_bridge_executable(&located_bridge.path)?;
-        if bridge != located_bridge {
-            return Err(conflict(
-                "Bridge locator returned an unattested executable identity",
-            ));
-        }
         let harness = self.harness.bridge_harness();
+        let setup_capability = self.harness.bridge_setup_capability();
+        let located_bridge = if setup_capability == CapabilityLevel::Full {
+            let located = self.bridge_locator.locate()?;
+            let attested = attest_bridge_executable(&located.path)?;
+            if attested != located {
+                return Err(conflict(
+                    "Bridge locator returned an unattested executable identity",
+                ));
+            }
+            Some(attested)
+        } else {
+            None
+        };
         let report = self.harness.probe(&ProbeContext {
             harness,
             requested_profile: self.harness.bridge_requested_profile(),
         })?;
-        if report.capability != CapabilityLevel::Full {
-            return Err(unsupported("The selected harness is import-only"));
+        if report.capability != setup_capability {
+            return Err(conflict("Harness setup capability changed during preview"));
         }
+        if report.capability != CapabilityLevel::Full {
+            return self.preview_watch_only_registration(registered_project, report, now_ms);
+        }
+        let bridge = located_bridge
+            .ok_or_else(|| conflict("Full setup is missing its attested bridge executable"))?;
         let executable_path = report
             .executable
             .clone()
@@ -1475,6 +1905,158 @@ where
             .map_err(|_| invalid("Bridge preview plan cannot be persisted"))?;
         Ok(setup)
     }
+
+    fn preview_watch_only_registration(
+        &mut self,
+        registered_project: Option<&RegisteredProject>,
+        report: context_relay_protocol::ProbeReport,
+        now_ms: u64,
+    ) -> Result<SetupPlan, ClientError> {
+        let harness = self.harness.bridge_harness();
+        let registrations = self
+            .harness
+            .watch_only_memory_registrations()?
+            .ok_or_else(|| {
+                unsupported("The selected harness has no exact watch-only memory binding")
+            })?;
+        let executable_path = report
+            .executable
+            .ok_or_else(|| unsupported("The selected harness executable is unavailable"))?;
+        let executable_hash = report
+            .executable_sha256
+            .ok_or_else(|| unsupported("The selected harness cannot be attested"))?;
+        let harness_version = report
+            .harness_version
+            .ok_or_else(|| unsupported("The selected harness version is unavailable"))?;
+        let mut target_scopes = Vec::new();
+        for registration in &registrations {
+            if registration.source.harness != harness || registration.last_applied_digest.is_some()
+            {
+                return Err(invalid("Watch-only memory registration is invalid"));
+            }
+            let scope = match registration.source.scope {
+                ScopeRef::Global => NativeScope::Global,
+                ScopeRef::Project { project_id } => {
+                    let registered = registered_project.ok_or_else(|| {
+                        invalid("Watch-only project memory has no registered project binding")
+                    })?;
+                    if registered.project_id != project_id {
+                        return Err(conflict(
+                            "Watch-only memory differs from the registered project",
+                        ));
+                    }
+                    NativeScope::Project {
+                        project_id,
+                        root: registered.root.clone(),
+                    }
+                }
+            };
+            if !target_scopes.contains(&scope) {
+                target_scopes.push(scope);
+            }
+        }
+        let expires_at = now_ms
+            .checked_add(PREVIEW_TTL_MS)
+            .ok_or_else(|| invalid("Preview expiry is outside the supported range"))?;
+        let mut identity = Vec::with_capacity(registrations.len() * 32);
+        for registration in &registrations {
+            identity.extend_from_slice(&registration.source.id.0.0);
+        }
+        let plan_id = preview_plan_id(harness, &digest(&identity), now_ms)?;
+        let semantic_changes = registrations
+            .iter()
+            .map(|registration| ClassifiedChange {
+                class: ChangeClass::Create,
+                target: format!(
+                    "native-memory-watch:{}",
+                    digest_text(registration.source.id.0)
+                ),
+                summary: "Register an exact watch-only native memory source".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let sidecars = vec![SidecarBinding {
+            id: SidecarId::RuleSync,
+            target: RuntimeTarget::MacosArm64,
+            version: "bridge-preview-v1".to_owned(),
+            closure_hash: digest(b"bridge-preview-sidecar-closure-v1"),
+            source_bundle_hash: digest(b"bridge-preview-sidecar-source-v1"),
+            build_toolchain_hash: digest(b"bridge-preview-sidecar-toolchain-v1"),
+            command_template_digest: digest(b"bridge-preview-sidecar-command-v1"),
+            command: SidecarCommand::RuleSyncGenerate {
+                target: match harness {
+                    HarnessId::ClaudeCode | HarnessId::Hermes => RuleSyncTarget::ClaudeCode,
+                    HarnessId::Codex => RuleSyncTarget::CodexCli,
+                },
+                features: RuleSyncFeatures::new(&[RuleSyncFeature::Mcp])
+                    .map_err(|_| invalid("Watch-only setup sidecar is invalid"))?,
+            },
+        }];
+        let mut setup = SetupPlan {
+            plan_id,
+            harness,
+            adapter_version: self.harness.bridge_adapter_version(),
+            executable_path: executable_path.clone(),
+            executable_hash,
+            harness_version,
+            target_scopes,
+            expected_native_digests: vec![ExpectedNativeDigest {
+                target: executable_path,
+                expected_digest: Some(executable_hash),
+            }],
+            semantic_changes,
+            cli_operations: vec![],
+            package_artifacts: vec![],
+            permission_delta: context_relay_protocol::PermissionDelta {
+                added: vec![],
+                removed: vec![],
+            },
+            network_delta: context_relay_protocol::NetworkDelta {
+                added: vec![],
+                removed: vec![],
+            },
+            scanner_report_hash: digest(b"native-memory-watch-only-scanner-v1"),
+            rulesync_version: "native-memory-watch-only-v1".to_owned(),
+            rulesync_hash: digest(b"native-memory-watch-only-rulesync-v1"),
+            approval_class: ApprovalClass::Active,
+            expires_at,
+            batch_hash: Sha256Digest([0; 32]),
+        };
+        let mut plan = NativeTransactionPlan {
+            setup: setup.clone(),
+            approval_version: 2,
+            helper_policy_version: 1,
+            manifest_schema_version: 1,
+            manifest_digest: digest(b"native-memory-watch-only-manifest-v1"),
+            helper_hash: digest(b"native-memory-watch-only-helper-v1"),
+            sidecars,
+            structural_allowlist_hash: digest(b"native-memory-watch-only-allowlist-v1"),
+            staged_inputs: vec![],
+            expected_semantic_output_hash: digest(b"native-memory-watch-only-output-v1"),
+            scanner_result_hash: digest(b"native-memory-watch-only-scanner-v1"),
+            mutations: vec![],
+            cli_mutations: vec![],
+            native_memory_registrations: registrations,
+            ownership_changes: vec![],
+        };
+        let approval_hash =
+            approval_hash_v2(&plan).map_err(|_| invalid("Watch-only setup plan is invalid"))?;
+        setup.batch_hash = approval_hash;
+        plan.setup = setup.clone();
+        let sealed = seal_plan(&plan, approval_hash)
+            .map_err(|_| invalid("Watch-only setup plan cannot be sealed"))?;
+        self.vault
+            .put_setup_plan(SetupPlanWrite {
+                plan_id: &setup.plan_id,
+                schema_version: crate::native_transaction::SEALED_PLAN_SCHEMA_VERSION,
+                approval_version: 2,
+                approval_hash: &approval_hash,
+                payload: &sealed,
+                created_ms: now_ms,
+                expires_ms: expires_at,
+            })
+            .map_err(|_| invalid("Watch-only setup plan cannot be persisted"))?;
+        Ok(setup)
+    }
 }
 
 fn bridge_change(
@@ -1648,6 +2230,30 @@ fn wire_path(path: &std::path::Path) -> WireNativeValue {
         },
         bytes,
         display: Some(display),
+    }
+}
+
+fn native_path(value: &WireNativeValue) -> Result<PathBuf, ClientError> {
+    #[cfg(windows)]
+    {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
+        if value.platform != NativePlatform::Windows || !value.bytes.len().is_multiple_of(2) {
+            return Err(invalid("Native path is invalid"));
+        }
+        let wide = value
+            .bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        Ok(PathBuf::from(OsString::from_wide(&wide)))
+    }
+    #[cfg(not(windows))]
+    {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+        if value.platform != NativePlatform::Macos {
+            return Err(invalid("Native path is invalid"));
+        }
+        Ok(PathBuf::from(OsString::from_vec(value.bytes.clone())))
     }
 }
 
