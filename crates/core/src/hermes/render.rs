@@ -781,17 +781,63 @@ impl HermesAdapter {
         path: &Path,
         snapshot: &context_relay_native_runner::NativeSnapshot,
         bytes: Vec<u8>,
-        metadata: context_relay_native_runner::NativeMetadata,
+        mut metadata: context_relay_native_runner::NativeMetadata,
     ) -> Result<Option<ApprovedMutation>, ClientError> {
         if matches!(snapshot.state(), NativeState::RegularFile { bytes: current, .. } if current == &bytes)
         {
             return Ok(None);
         }
+        let expected = self.gateway_reserved_state(path, snapshot.state())?;
+        let (
+            NativeState::RegularFile {
+                metadata: current_metadata,
+                ..
+            },
+            NativeState::RegularFile {
+                metadata: reserved_metadata,
+                ..
+            },
+        ) = (snapshot.state(), &expected)
+        else {
+            return Err(invalid("Hermes native state is not a regular file"));
+        };
+        if metadata == *current_metadata {
+            metadata.clone_from(reserved_metadata);
+        } else if metadata != *reserved_metadata {
+            return Err(invalid(
+                "Hermes native metadata does not match the gateway reservation",
+            ));
+        }
         Ok(Some(self.approved_state(
             path,
-            snapshot.fingerprint(),
+            &expected.fingerprint(),
             NativeState::regular_file(bytes, metadata),
         )?))
+    }
+
+    fn gateway_reserved_state(
+        &self,
+        path: &Path,
+        state: &NativeState,
+    ) -> Result<NativeState, ClientError> {
+        if path.parent() != Some(self.layout.profile.hermes_home.as_path()) {
+            return Ok(state.clone());
+        }
+        let lock = OsNativeFileSystem::new()
+            .snapshot(&self.layout.profile.hermes_home.join("gateway.lock"))
+            .map_err(|_| invalid("Hermes gateway lock cannot be safely inspected"))?;
+        if matches!(lock.state(), NativeState::RegularFile { .. }) {
+            return Ok(state.clone());
+        }
+        let NativeState::RegularFile { bytes, metadata } = state else {
+            return Err(invalid(
+                "Hermes profile-root creation requires an existing gateway lock",
+            ));
+        };
+        let metadata = metadata
+            .for_absent_sibling_creation(lock.state())
+            .map_err(|_| invalid("Hermes gateway lock reservation changed"))?;
+        Ok(NativeState::regular_file(bytes.clone(), metadata))
     }
 
     fn approved_state(

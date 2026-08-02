@@ -655,14 +655,14 @@ fn gateway_lock_available(path: &Path) -> bool {
 struct GatewayReservationHook {
     lock_path: PathBuf,
     fail_after: Option<TransactionStep>,
-    blocked_after_reprobe: bool,
+    blocked_after_digest_preflight: bool,
 }
 
 #[cfg(unix)]
 impl FaultHook for GatewayReservationHook {
     fn after_step(&mut self, step: TransactionStep) -> Result<(), BoundaryError> {
-        if step == TransactionStep::ReprobeLiveState {
-            self.blocked_after_reprobe = !gateway_lock_available(&self.lock_path);
+        if step == TransactionStep::CompareApprovedDigests {
+            self.blocked_after_digest_preflight = !gateway_lock_available(&self.lock_path);
         }
         if self.fail_after == Some(step) {
             Err(BoundaryError::new("injected after gateway reservation"))
@@ -695,6 +695,7 @@ fn active_transaction_holds_gateway_lock_until_commit_or_compensation_finishes()
         plan.setup.batch_hash = approval_hash_v1(&plan).unwrap();
         let nonce = *plan.setup.plan_id.as_bytes();
         let lock_path = fixture.layout.profile.hermes_home.join("gateway.lock");
+        fs::remove_file(&lock_path).unwrap();
         let mut adapter = fixture.adapter.clone();
         let mut executor = RollbackExecutor {
             run: RestrictedRun {
@@ -707,7 +708,7 @@ fn active_transaction_holds_gateway_lock_until_commit_or_compensation_finishes()
         let mut hook = GatewayReservationHook {
             lock_path: lock_path.clone(),
             fail_after,
-            blocked_after_reprobe: false,
+            blocked_after_digest_preflight: false,
         };
 
         let result = NativeTransactionEngine::new(
@@ -724,7 +725,7 @@ fn active_transaction_holds_gateway_lock_until_commit_or_compensation_finishes()
             fail_after.is_some(),
             "unexpected transaction result: {result:?}"
         );
-        assert!(hook.blocked_after_reprobe);
+        assert!(hook.blocked_after_digest_preflight);
         assert!(gateway_lock_available(&lock_path));
     }
 }
@@ -746,6 +747,8 @@ fn active_reprobe_preserves_the_sealed_target_parent_boundary() {
     assert_eq!(before.fingerprint(), after.fingerprint());
     assert_eq!(plan.mutations[0].expected.0.0, *after.fingerprint());
     assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
+    assert!(gateway_lock_available(&lock_path));
+    adapter.compare_approved_digests(&plan).unwrap();
     assert!(!gateway_lock_available(&lock_path));
     drop(adapter);
     assert!(gateway_lock_available(&lock_path));
@@ -753,7 +756,7 @@ fn active_reprobe_preserves_the_sealed_target_parent_boundary() {
 
 #[cfg(unix)]
 #[test]
-fn active_reprobe_never_creates_a_missing_gateway_lock() {
+fn active_reprobe_is_read_only_when_the_gateway_lock_is_missing() {
     let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
     let plan = hermes_native_plan(&fixture, ApprovalClass::Active, vec![]);
     let lock_path = fixture.layout.profile.hermes_home.join("gateway.lock");
@@ -761,8 +764,35 @@ fn active_reprobe_never_creates_a_missing_gateway_lock() {
 
     let result = fixture.adapter.clone().reprobe_live_state(&plan);
 
-    assert!(result.is_err());
+    assert!(result.is_ok());
     assert!(!lock_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_gateway_lock_preview_predicts_the_reserved_parent_without_creating_it() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let imported = import_global(&fixture);
+    let mut plugin = component_at(
+        &imported.components,
+        ComponentKind::Plugin,
+        "config:plugins.enabled.reviewer",
+    );
+    plugin.archived = true;
+    let lock_path = fixture.layout.profile.hermes_home.join("gateway.lock");
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+
+    let mutation = fixture
+        .adapter
+        .plan_native_config(&desired_global(&fixture, vec![plugin]))
+        .unwrap()
+        .unwrap();
+
+    assert!(!lock_path.exists());
+    fs::write(&lock_path, b"").unwrap();
+    let reserved = OsNativeFileSystem::new().snapshot(&config_path).unwrap();
+    assert_eq!(mutation.expected.0.0, *reserved.fingerprint());
 }
 
 #[test]
@@ -3172,7 +3202,8 @@ fn native_adapter_rechecks_gateway_profile_executable_and_digests() {
     )
     .unwrap();
     let mut adapter = live_fixture.adapter.clone();
-    assert!(adapter.reprobe_live_state(&plan).is_err());
+    assert!(adapter.reprobe_live_state(&plan).is_ok());
+    assert!(adapter.compare_approved_digests(&plan).is_err());
 
     for drift in ["version", "path", "hash"] {
         let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
@@ -3201,7 +3232,6 @@ fn managed_bridge_native_plan_binds_before_and_intended_fingerprints() {
     clear_gateway_records(&fixture);
     let (_, desired) = managed_bridge_desired(&fixture);
     let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
-    let before = OsNativeFileSystem::new().snapshot(&config_path).unwrap();
     let before_bytes = fs::read(&config_path).unwrap();
 
     let rendered = fixture.adapter.render(&desired).unwrap();
@@ -3211,8 +3241,12 @@ fn managed_bridge_native_plan_binds_before_and_intended_fingerprints() {
         .plan_native_config(&desired)
         .unwrap()
         .unwrap();
+    let lock_path = fixture.layout.profile.hermes_home.join("gateway.lock");
+    assert!(!lock_path.exists());
+    fs::write(&lock_path, b"").unwrap();
+    let reserved = OsNativeFileSystem::new().snapshot(&config_path).unwrap();
     assert_eq!(mutation.target, test_wire_path(&config_path));
-    assert_eq!(mutation.expected.0.0, *before.fingerprint());
+    assert_eq!(mutation.expected.0.0, *reserved.fingerprint());
     let intended = NativeState::decode_v1(&mutation.content).unwrap();
     assert_eq!(mutation.intended.0.0, intended.fingerprint());
 
@@ -3259,6 +3293,7 @@ fn managed_bridge_restore_preserves_divergent_live_yaml() {
         .plan_native_config(&desired)
         .unwrap()
         .unwrap();
+    fs::write(fixture.layout.profile.hermes_home.join("gateway.lock"), b"").unwrap();
     let nonce = [30; 16];
     let mut native = OsNativeTransactionFileSystem::new(nonce);
     let images = native
@@ -3431,6 +3466,8 @@ fn rollback_restores_all_hermes_targets_and_metadata() {
         .plan_native_gateway_hook(&manifest, Some(&handler))
         .unwrap();
     let mutations = [vec![config, markdown, memory], hooks].concat();
+    let mut plan = hermes_native_plan(&fixture, ApprovalClass::Active, vec![]);
+    plan.mutations = mutations.clone();
     let before = mutations
         .iter()
         .map(|mutation| {
@@ -3445,8 +3482,6 @@ fn rollback_restores_all_hermes_targets_and_metadata() {
             )
         })
         .collect::<Vec<_>>();
-    let mut plan = hermes_native_plan(&fixture, ApprovalClass::Passive, vec![]);
-    plan.mutations = mutations;
     plan.sidecars = vec![SidecarBinding {
         id: SidecarId::RuleSync,
         target: RuntimeTarget::MacosArm64,

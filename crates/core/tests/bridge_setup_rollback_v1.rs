@@ -425,6 +425,45 @@ fn rollback_inverse_restores_the_exact_prior_native_state() {
 }
 
 #[test]
+fn passive_hermes_inverse_preserves_an_absent_gateway_lock_binding() {
+    let path = TempVault::new("bridge-setup-rollback-passive-hermes-lock");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
+    let mut original = plan();
+    original.setup.harness = HarnessId::Hermes;
+    original.setup.executable_path = native_text("/fixture/hermes");
+    original.setup.approval_class = ApprovalClass::Passive;
+    original.setup.expected_native_digests = vec![context_relay_protocol::ExpectedNativeDigest {
+        target: native_text("/fixture/hermes/gateway.lock"),
+        expected_digest: None,
+    }];
+    original.setup.cli_operations.clear();
+    original.cli_mutations.clear();
+    original.sidecars[0].command = SidecarCommand::RuleSyncGenerate {
+        target: RuleSyncTarget::ClaudeCode,
+        features: RuleSyncFeatures::new(&[RuleSyncFeature::Mcp]).unwrap(),
+    };
+    let original = persist(&mut vault, original);
+    BridgeInstallService::persisted(&mut vault)
+        .apply(
+            &original.setup.plan_id,
+            NOW_MS + 1,
+            &mut RecordingExecutor::default(),
+        )
+        .unwrap();
+    let mut rollback_executor = RecordingExecutor::default();
+
+    BridgeInstallService::persisted(&mut vault)
+        .rollback(&original.setup.plan_id, NOW_MS + 2, &mut rollback_executor)
+        .unwrap();
+
+    assert_eq!(
+        rollback_executor.calls[0].setup.expected_native_digests[0].expected_digest, None,
+        "passive apply never provisions the operational gateway lock"
+    );
+}
+
+#[test]
 fn rollback_records_restored_failures_and_divergence_without_replay_writes() {
     let keys = MemoryKeyStore::default();
     for (name, failure, original_lifecycle, inverse_lifecycle) in [

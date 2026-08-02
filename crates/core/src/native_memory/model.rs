@@ -56,6 +56,7 @@ impl NativeMemorySource {
             document_kind,
             &path,
             limits,
+            managed_fence,
         )?;
         Ok(Self {
             id,
@@ -77,6 +78,7 @@ impl NativeMemorySource {
             self.document_kind,
             &self.path,
             self.limits,
+            self.managed_fence,
         )?;
         if expected != self.id {
             return Err(NativeMemoryError::InvalidSource("id"));
@@ -148,11 +150,31 @@ impl NativeMemoryLedger {
             .source
             .as_ref()
             .ok_or(NativeMemoryError::InvalidSource("ledger.source"))?;
-        source.validate()?;
+        source.validate_compatible()?;
         if source.id != self.source_id {
             return Err(NativeMemoryError::InvalidSource("ledger.source_id"));
         }
         Ok(source)
+    }
+}
+
+impl NativeMemorySource {
+    pub(crate) fn validate_compatible(&self) -> Result<(), NativeMemoryError> {
+        if self.validate().is_ok() {
+            return Ok(());
+        }
+        let legacy = derive_legacy_source_id(
+            self.harness,
+            &self.adapter_version,
+            &self.scope,
+            self.document_kind,
+            &self.path,
+            self.limits,
+        )?;
+        if legacy != self.id {
+            return Err(NativeMemoryError::InvalidSource("id"));
+        }
+        Ok(())
     }
 }
 
@@ -188,7 +210,54 @@ fn derive_source_id(
     document_kind: NativeMemoryDocumentKind,
     path: &WireNativeValue,
     limits: NativeMemoryLimits,
+    managed_fence: bool,
 ) -> Result<NativeMemorySourceId, NativeMemoryError> {
+    validate_source_fields(adapter_version, path, limits)?;
+
+    let mut hasher = Sha256::new();
+    add_field(&mut hasher, b"context-relay.native-memory-source.v2");
+    add_source_location_fields(
+        &mut hasher,
+        harness,
+        adapter_version,
+        scope,
+        document_kind,
+        path,
+    );
+    add_field(&mut hasher, &(limits.max_bytes as u64).to_be_bytes());
+    add_field(&mut hasher, &(limits.max_characters as u64).to_be_bytes());
+    add_field(&mut hasher, &[u8::from(managed_fence)]);
+    Ok(NativeMemorySourceId(Sha256Digest(hasher.finalize().into())))
+}
+
+fn derive_legacy_source_id(
+    harness: HarnessId,
+    adapter_version: &str,
+    scope: &ScopeRef,
+    document_kind: NativeMemoryDocumentKind,
+    path: &WireNativeValue,
+    limits: NativeMemoryLimits,
+) -> Result<NativeMemorySourceId, NativeMemoryError> {
+    validate_source_fields(adapter_version, path, limits)?;
+
+    let mut hasher = Sha256::new();
+    add_field(&mut hasher, b"context-relay.native-memory-source.v1");
+    add_source_location_fields(
+        &mut hasher,
+        harness,
+        adapter_version,
+        scope,
+        document_kind,
+        path,
+    );
+    Ok(NativeMemorySourceId(Sha256Digest(hasher.finalize().into())))
+}
+
+fn validate_source_fields(
+    adapter_version: &str,
+    path: &WireNativeValue,
+    limits: NativeMemoryLimits,
+) -> Result<(), NativeMemoryError> {
     if adapter_version.trim().is_empty()
         || adapter_version.len() > MAX_TITLE_BYTES
         || adapter_version.chars().any(char::is_control)
@@ -205,25 +274,32 @@ fn derive_source_id(
     {
         return Err(NativeMemoryError::InvalidSource("limits"));
     }
+    Ok(())
+}
 
-    let mut hasher = Sha256::new();
-    add_field(&mut hasher, b"context-relay.native-memory-source.v1");
-    add_field(&mut hasher, harness_name(harness).as_bytes());
-    add_field(&mut hasher, adapter_version.as_bytes());
+fn add_source_location_fields(
+    hasher: &mut Sha256,
+    harness: HarnessId,
+    adapter_version: &str,
+    scope: &ScopeRef,
+    document_kind: NativeMemoryDocumentKind,
+    path: &WireNativeValue,
+) {
+    add_field(hasher, harness_name(harness).as_bytes());
+    add_field(hasher, adapter_version.as_bytes());
     match scope {
         ScopeRef::Global => {
-            add_field(&mut hasher, b"global");
-            add_field(&mut hasher, b"");
+            add_field(hasher, b"global");
+            add_field(hasher, b"");
         }
         ScopeRef::Project { project_id } => {
-            add_field(&mut hasher, b"project");
-            add_field(&mut hasher, project_id.as_bytes());
+            add_field(hasher, b"project");
+            add_field(hasher, project_id.as_bytes());
         }
     }
-    add_field(&mut hasher, document_kind_name(document_kind).as_bytes());
-    add_field(&mut hasher, platform_name(path.platform).as_bytes());
-    add_field(&mut hasher, &path.bytes);
-    Ok(NativeMemorySourceId(Sha256Digest(hasher.finalize().into())))
+    add_field(hasher, document_kind_name(document_kind).as_bytes());
+    add_field(hasher, platform_name(path.platform).as_bytes());
+    add_field(hasher, &path.bytes);
 }
 
 fn add_field(hasher: &mut Sha256, field: &[u8]) {

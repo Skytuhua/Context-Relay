@@ -284,6 +284,7 @@ fn every_native_memory_descriptor_field_affects_the_v2_hash() {
     changed_fence.native_memory_registrations[0]
         .source
         .managed_fence = false;
+    rebuild_source(&mut changed_fence.native_memory_registrations[0].source);
     assert_ne!(approval_hash_v2(&changed_fence).unwrap(), baseline);
 
     let mut changed_digest = plan();

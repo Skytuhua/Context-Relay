@@ -4,7 +4,8 @@ use std::{panic::AssertUnwindSafe, str::FromStr};
 
 use context_relay_core::{
     native_memory::{
-        NativeMemoryDocumentKind, NativeMemoryLimits, NativeMemoryRegistration, NativeMemorySource,
+        NativeMemoryDocumentKind, NativeMemoryLedger, NativeMemoryLimits, NativeMemoryRegistration,
+        NativeMemorySource,
     },
     native_transaction::{
         ApprovedCliMutation, CanonicalCliDeclaration, NativeTransactionPlan, SidecarBinding,
@@ -25,7 +26,7 @@ use context_relay_protocol::{
 };
 use sha2::{Digest as _, Sha256};
 
-use support::{ID_1, MemoryKeyStore, TempVault, persist_native_terminal};
+use support::{ID_1, ID_2, ID_3, MemoryKeyStore, TempVault, persist_native_terminal};
 
 const NOW_MS: u64 = 1_900_000_000_000;
 
@@ -610,6 +611,130 @@ fn committed_apply_recovery_publishes_the_pre_execution_registration_binding() {
             .lifecycle,
         SetupPlanLifecycle::Applied
     );
+}
+
+#[test]
+fn descriptor_replacement_recovers_and_rolls_back_without_stranding_shared_preexisting_state() {
+    let path = TempVault::new("bridge-setup-descriptor-replacement-recovery");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), "bridge-setup-apply-v1", &keys).unwrap();
+    let original = native_memory_source();
+    let mut preexisting = NativeMemoryLedger::for_source(original.clone());
+    preexisting.last_unmanaged_digest = Some(Sha256Digest([80; 32]));
+    preexisting.initial_preview_complete = true;
+    vault
+        .put_native_memory_candidate(&preexisting, None)
+        .unwrap();
+    let original_registration = NativeMemoryRegistration {
+        source: original.clone(),
+        last_applied_digest: Some(Sha256Digest([81; 32])),
+    };
+
+    let mut first = plan();
+    first.native_memory_registrations = vec![original_registration.clone()];
+    let (first, _) = persist(&mut vault, first);
+    BridgeInstallService::persisted(&mut vault)
+        .apply(
+            &first.setup.plan_id,
+            NOW_MS + 1,
+            &mut RecordingExecutor::default(),
+        )
+        .unwrap();
+
+    let mut shared = plan();
+    shared.setup.plan_id = PlanId::from_str(ID_2).unwrap();
+    shared.native_memory_registrations = vec![original_registration];
+    let (shared, _) = persist(&mut vault, shared);
+    BridgeInstallService::persisted(&mut vault)
+        .apply(
+            &shared.setup.plan_id,
+            NOW_MS + 2,
+            &mut RecordingExecutor::default(),
+        )
+        .unwrap();
+
+    let replacement = NativeMemorySource::new(
+        original.harness,
+        &original.adapter_version,
+        original.scope.clone(),
+        original.document_kind,
+        original.path.clone(),
+        NativeMemoryLimits {
+            max_bytes: 2_048,
+            max_characters: 2_048,
+        },
+        false,
+    )
+    .unwrap();
+    assert_ne!(original.id, replacement.id);
+    let replacement_registration = NativeMemoryRegistration {
+        source: replacement.clone(),
+        last_applied_digest: Some(Sha256Digest([82; 32])),
+    };
+    let mut changed = plan();
+    changed.setup.plan_id = PlanId::from_str(ID_3).unwrap();
+    changed.native_memory_registrations = vec![replacement_registration];
+    let (changed, _) = persist(&mut vault, changed);
+    let crashed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ = BridgeInstallService::persisted(&mut vault).apply(
+            &changed.setup.plan_id,
+            NOW_MS + 3,
+            &mut CrashAfterTerminal(NativeTransactionStatus::Committed),
+        );
+    }));
+    assert!(crashed.is_err());
+    drop(vault);
+
+    let mut reopened = Vault::open(path.path(), "bridge-setup-apply-v1", &keys).unwrap();
+    BridgeInstallService::persisted(&mut reopened)
+        .reconcile_after_native_recovery()
+        .unwrap();
+    assert_eq!(
+        reopened
+            .setup_plan(&changed.setup.plan_id)
+            .unwrap()
+            .unwrap()
+            .lifecycle,
+        SetupPlanLifecycle::Applied
+    );
+    assert!(
+        reopened
+            .native_memory_ledger(&original.id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        reopened
+            .native_memory_ledger(&replacement.id)
+            .unwrap()
+            .is_some()
+    );
+
+    for (plan_id, now_ms) in [
+        (changed.setup.plan_id, NOW_MS + 4),
+        (shared.setup.plan_id, NOW_MS + 5),
+        (first.setup.plan_id, NOW_MS + 6),
+    ] {
+        BridgeInstallService::persisted(&mut reopened)
+            .rollback(&plan_id, now_ms, &mut RecordingExecutor::default())
+            .unwrap();
+    }
+
+    assert!(
+        reopened
+            .native_memory_ledger(&replacement.id)
+            .unwrap()
+            .is_none()
+    );
+    let preserved = reopened
+        .native_memory_ledger(&original.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        preserved.last_unmanaged_digest,
+        Some(Sha256Digest([80; 32]))
+    );
+    assert!(preserved.initial_preview_complete);
 }
 
 #[test]

@@ -419,6 +419,13 @@ fn hermes_bridge_plan_is_structural_idempotent_gated_and_byte_exactly_reversible
     assert!(bridge.get("type").is_none());
     assert!(bridge.get("env").is_none());
 
+    let gateway_lock = fixture.hermes_config.parent().unwrap().join("gateway.lock");
+    assert!(
+        !gateway_lock.exists(),
+        "preview must not create gateway.lock"
+    );
+    fs::write(&gateway_lock, []).unwrap();
+
     let mut native = OsNativeTransactionFileSystem::new([19; 16]);
     let images = native
         .create_before_images(std::slice::from_ref(&mutation))

@@ -258,6 +258,27 @@ fn memory_source() -> NativeMemorySource {
 fn canonical_source_digest(source: &NativeMemorySource) -> Sha256Digest {
     let mut hasher = Sha256::new();
     for field in [
+        b"context-relay.native-memory-source.v2".as_slice(),
+        b"claude_code",
+        b"2.1.214",
+        b"project",
+        project_id().as_bytes(),
+        b"agent",
+        b"macos",
+        source.path.bytes.as_slice(),
+        &(source.limits.max_bytes as u64).to_be_bytes(),
+        &(source.limits.max_characters as u64).to_be_bytes(),
+        &[u8::from(source.managed_fence)],
+    ] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    Sha256Digest(hasher.finalize().into())
+}
+
+fn legacy_source_digest(source: &NativeMemorySource) -> Sha256Digest {
+    let mut hasher = Sha256::new();
+    for field in [
         b"context-relay.native-memory-source.v1".as_slice(),
         b"claude_code",
         b"2.1.214",
@@ -290,14 +311,38 @@ fn reconcile_source_identity_uses_the_versioned_canonical_tuple() {
             source.path.bytes.as_slice(),
             Some("a presentation-only value"),
         ),
+        source.limits,
+        source.managed_fence,
+    )
+    .unwrap();
+    assert_eq!(source.id, same_path_new_display.id);
+
+    let different_limits = NativeMemorySource::new(
+        HarnessId::ClaudeCode,
+        "2.1.214",
+        source.scope.clone(),
+        NativeMemoryDocumentKind::Agent,
+        source.path.clone(),
         NativeMemoryLimits {
             max_bytes: 4_096,
             max_characters: 4_096,
         },
+        source.managed_fence,
+    )
+    .unwrap();
+    assert_ne!(source.id, different_limits.id);
+
+    let different_managed_fence = NativeMemorySource::new(
+        HarnessId::ClaudeCode,
+        "2.1.214",
+        source.scope.clone(),
+        NativeMemoryDocumentKind::Agent,
+        source.path.clone(),
+        source.limits,
         false,
     )
     .unwrap();
-    assert_eq!(source.id, same_path_new_display.id);
+    assert_ne!(source.id, different_managed_fence.id);
 
     let different_path = NativeMemorySource::new(
         HarnessId::ClaudeCode,
@@ -345,6 +390,30 @@ fn reconcile_source_identity_rejects_invalid_version_path_and_limits_before_hash
             },
         ),
         Err(NativeMemoryError::InvalidSource("limits"))
+    );
+}
+
+#[test]
+fn current_descriptor_validation_rejects_a_forged_legacy_id_after_metadata_changes() {
+    let original = memory_source();
+    let mut forged = NativeMemorySource::new(
+        original.harness,
+        &original.adapter_version,
+        original.scope.clone(),
+        original.document_kind,
+        original.path.clone(),
+        NativeMemoryLimits {
+            max_bytes: 4_096,
+            max_characters: 4_096,
+        },
+        false,
+    )
+    .unwrap();
+    forged.id = NativeMemorySourceId(legacy_source_digest(&original));
+
+    assert_eq!(
+        forged.validate(),
+        Err(NativeMemoryError::InvalidSource("id"))
     );
 }
 

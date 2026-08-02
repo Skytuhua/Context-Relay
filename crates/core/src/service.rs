@@ -125,7 +125,10 @@ impl<'a> OfflineWorkspace<'a> {
         &mut self,
         ready: ReadyNativeMemory,
     ) -> Result<Option<MemoryCandidate>, ClientError> {
-        ready.source.validate().map_err(|_| invalid_request())?;
+        ready
+            .source
+            .validate_compatible()
+            .map_err(|_| invalid_request())?;
         let mut ledger = match vault(self.vault.native_memory_ledger(&ready.source.id))? {
             Some(ledger) => {
                 if ledger.source.as_ref() != Some(&ready.source) {

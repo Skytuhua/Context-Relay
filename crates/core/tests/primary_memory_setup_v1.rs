@@ -39,9 +39,10 @@ use context_relay_native_runner::{NativeState, OsNativeFileSystem};
 use context_relay_protocol::{
     ApplyReceipt, CapabilityLevel, ChangeClass, ClassifiedChange, ClassifiedChanges, CliOperation,
     CliOperations, ClientError, ComponentKind, ComponentRecord, DesiredState, DeviceId,
-    DiscoveredScopes, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest, ImportedState,
-    InstallationMethod, NativePlatform, NativeScope, ProbeContext, ProbeReport, ProjectId,
-    RenderedState, ScopeRef, SemanticDiff, Sha256Digest, ValidationReport, WireNativeValue,
+    DiscoveredScopes, ExpectedNativeDigest, HarnessAdapter, HarnessId, HybridLogicalClock,
+    ImportRequest, ImportedState, InstallationMethod, NativePlatform, NativeScope, ProbeContext,
+    ProbeReport, ProjectId, RenderedState, ScopeRef, SemanticDiff, Sha256Digest, ValidationReport,
+    WireNativeValue,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
@@ -448,6 +449,13 @@ impl BridgePreviewHarness for FrozenHarness {
         match self {
             Self::Hermes(adapter) => Some(adapter.profile_name().to_owned()),
             _ => None,
+        }
+    }
+
+    fn bridge_operational_digests(&self) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
+        match self {
+            Self::Hermes(adapter) => BridgePreviewHarness::bridge_operational_digests(adapter),
+            _ => Ok(vec![]),
         }
     }
 
@@ -1005,17 +1013,13 @@ fn hermes_matrix_fixture() -> MatrixFixture {
     let lock_root = root.join("locks");
     fs::create_dir(&lock_root).unwrap();
     let hermes_home = default_hermes_home.join("profiles/coder");
-    materialize_json(&hermes_home, profile["files"].as_object().unwrap());
+    let mut profile_files = profile["files"].as_object().unwrap().clone();
+    profile_files.remove("gateway.pid");
+    profile_files.remove("gateway_state.json");
+    materialize_json(&hermes_home, &profile_files);
     let mut config = profile["configYaml"].as_str().unwrap().to_owned();
     config.push_str(source["nativeMemoryConfigYaml"].as_str().unwrap());
     fs::write(hermes_home.join("config.yaml"), config).unwrap();
-    for name in ["gateway.pid", "gateway_state.json"] {
-        let path = hermes_home.join(name);
-        if path.exists() {
-            fs::remove_file(path).unwrap();
-        }
-    }
-    fs::write(hermes_home.join("gateway.lock"), b"").unwrap();
     let project_root = root.join("project");
     let working_directory = project_root.join("service");
     materialize_json(&project_root, source["project"].as_object().unwrap());
@@ -1208,12 +1212,28 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
         for mutation in &opened.plan.mutations {
             let path = mutation_path(&mutation.target);
             let snapshot = OsNativeFileSystem::new().snapshot(&path).unwrap();
-            assert_eq!(
-                RestorableStateFingerprint(Sha256Digest(*snapshot.fingerprint())),
-                mutation.expected,
-                "{harness_id:?}: preview changed {}",
-                path.display()
-            );
+            let live = RestorableStateFingerprint(Sha256Digest(*snapshot.fingerprint()));
+            if harness_id == HarnessId::Hermes && live != mutation.expected {
+                let lock = opened
+                    .plan
+                    .setup
+                    .expected_native_digests
+                    .iter()
+                    .find(|expected| {
+                        expected.expected_digest.is_none()
+                            && mutation_path(&expected.target).file_name()
+                                == Some(std::ffi::OsStr::new("gateway.lock"))
+                    })
+                    .expect("Hermes post-reservation fingerprint needs an approved absent lock");
+                assert!(!mutation_path(&lock.target).exists());
+            } else {
+                assert_eq!(
+                    live,
+                    mutation.expected,
+                    "{harness_id:?}: preview changed {}",
+                    path.display()
+                );
+            }
         }
         assert!(intended.iter().any(|(_, bytes)| {
             String::from_utf8_lossy(bytes).contains(PRIMARY_MEMORY_INSTRUCTIONS)

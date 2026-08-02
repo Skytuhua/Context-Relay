@@ -17,6 +17,7 @@ use context_relay_protocol::{
     PlanId, ScopeRef, Sha256Digest, WireNativeValue,
 };
 use rusqlite::{Connection, params};
+use sha2::{Digest as _, Sha256};
 
 use support::{ID_1, ID_7, MemoryKeyStore, TempVault};
 
@@ -76,6 +77,55 @@ fn hex(byte: u8) -> String {
 
 fn source_hex(id: NativeMemorySourceId) -> String {
     id.0.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn legacy_source_id(source: &NativeMemorySource) -> NativeMemorySourceId {
+    let mut hasher = Sha256::new();
+    for field in [
+        b"context-relay.native-memory-source.v1".as_slice(),
+        b"codex",
+        b"test-1.0.0",
+        b"global",
+        b"",
+        b"agent",
+        b"macos",
+        source.path.bytes.as_slice(),
+    ] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    NativeMemorySourceId(Sha256Digest(hasher.finalize().into()))
+}
+
+#[test]
+fn legacy_v1_ledger_reopens_and_reconciles_without_weakening_current_identity_validation() {
+    let path = TempVault::new("native-memory-legacy-v1-reopen");
+    let keys = MemoryKeyStore::default();
+    let mut descriptor = source(ScopeRef::Global, HarnessId::Codex, "legacy-v1-reopen");
+    descriptor.id = legacy_source_id(&descriptor);
+    assert!(descriptor.validate().is_err());
+    let ledger = NativeMemoryLedger::for_source(descriptor.clone());
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    vault.put_native_memory_candidate(&ledger, None).unwrap();
+    drop(vault);
+
+    let mut reopened = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(
+        reopened
+            .native_memory_ledger(&descriptor.id)
+            .unwrap()
+            .unwrap()
+            .source,
+        Some(descriptor.clone())
+    );
+    let candidate = OfflineWorkspace::new(&mut reopened, ID_7.parse().unwrap())
+        .reconcile_native_memory(ReadyNativeMemory {
+            source: descriptor,
+            snapshot: NativeMemorySnapshot::Regular(b"legacy fact\n".to_vec()),
+            kind: NativeMemoryObservationKind::InitialPreview,
+        })
+        .unwrap();
+    assert!(candidate.is_some());
 }
 
 #[test]

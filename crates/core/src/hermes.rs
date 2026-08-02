@@ -20,12 +20,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use context_relay_native_runner::OsNativeFileSystem;
 use context_relay_protocol::{
     ApplyReceipt, ApprovalClass, CapabilityLevel, ClassifiedChanges, CliOperations, ClientError,
-    ComponentKind, DesiredState, DeviceId, DiscoveredScopes, ErrorCode, HarnessAdapter, HarnessId,
-    HybridLogicalClock, ImportRequest, ImportedState, InstallationMethod, NativePlatform,
-    NativeScope, ProbeContext, ProbeReport, ProjectId, RenderedState, SemanticDiff, Sha256Digest,
-    ValidationReport, WireNativeValue,
+    ComponentKind, DesiredState, DeviceId, DiscoveredScopes, ErrorCode, ExpectedNativeDigest,
+    HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest, ImportedState,
+    InstallationMethod, NativePlatform, NativeScope, ProbeContext, ProbeReport, ProjectId,
+    RenderedState, SemanticDiff, Sha256Digest, ValidationReport, WireNativeValue,
 };
 use rand_core::{OsRng, RngCore as _};
 use serde_json::Value as JsonValue;
@@ -164,6 +165,19 @@ impl Drop for HermesValidationStage {
 }
 
 impl HermesAdapter {
+    pub(crate) fn gateway_lock_expected_digest(&self) -> Result<ExpectedNativeDigest, ClientError> {
+        let path = self.layout.profile.hermes_home.join("gateway.lock");
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid("Hermes gateway lock cannot be safely inspected"))?;
+        Ok(ExpectedNativeDigest {
+            target: wire_path(&path),
+            expected_digest: snapshot
+                .bytes()
+                .map(|bytes| Sha256Digest(Sha256::digest(bytes).into())),
+        })
+    }
+
     pub fn project_id(&self) -> ProjectId {
         self.project_id
     }
@@ -440,11 +454,6 @@ impl NativeAdapter for HermesAdapter {
         }) {
             return Err(BoundaryError::new("Hermes project binding changed"));
         }
-        if plan.setup.approval_class == ApprovalClass::Active {
-            let lease = gateway::acquire_gateway_idle(&self.layout.profile)
-                .map_err(|_| BoundaryError::new("Hermes gateway blocks active changes"))?;
-            self.gateway_lease = Some(lease);
-        }
         Ok(())
     }
 
@@ -465,6 +474,11 @@ impl NativeAdapter for HermesAdapter {
             if actual != expected.expected_digest {
                 return Err(BoundaryError::new("Hermes native state changed"));
             }
+        }
+        if plan.setup.approval_class == ApprovalClass::Active && self.gateway_lease.is_none() {
+            let lease = gateway::acquire_gateway_idle(&self.layout.profile)
+                .map_err(|_| BoundaryError::new("Hermes gateway blocks active changes"))?;
+            self.gateway_lease = Some(lease);
         }
         Ok(())
     }

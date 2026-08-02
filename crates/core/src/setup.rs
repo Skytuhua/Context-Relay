@@ -311,6 +311,10 @@ pub trait BridgePreviewHarness: HarnessAdapter {
         None
     }
 
+    fn bridge_operational_digests(&self) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
+        Ok(vec![])
+    }
+
     fn bridge_mutations(
         &self,
         desired: &DesiredState,
@@ -466,6 +470,10 @@ impl BridgePreviewHarness for HermesAdapter {
 
     fn bridge_requested_profile(&self) -> Option<String> {
         Some(self.profile_name().to_owned())
+    }
+
+    fn bridge_operational_digests(&self) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
+        Ok(vec![self.gateway_lock_expected_digest()?])
     }
 
     fn bridge_mutations(
@@ -1098,6 +1106,15 @@ fn inverse_plan(
         std::mem::swap(&mut mutation.expected, &mut mutation.intended);
         std::mem::swap(&mut mutation.forward, &mut mutation.rollback);
     }
+    if inverse.setup.harness == HarnessId::Hermes
+        && inverse.setup.approval_class == ApprovalClass::Active
+    {
+        for expected in &mut inverse.setup.expected_native_digests {
+            if expected.expected_digest.is_none() && is_gateway_lock_path(&expected.target) {
+                expected.expected_digest = Some(Sha256Digest(Sha256::digest([]).into()));
+            }
+        }
+    }
     inverse.setup.cli_operations = inverse
         .cli_mutations
         .iter()
@@ -1122,6 +1139,30 @@ fn inverse_plan(
     inverse.setup.batch_hash = approval_hash_v2(&inverse)
         .map_err(|_| invalid("Rollback bridge plan approval cannot be derived"))?;
     Ok((inverse, inverse_rollback_states))
+}
+
+fn is_gateway_lock_path(path: &WireNativeValue) -> bool {
+    #[cfg(windows)]
+    {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
+        if path.platform != NativePlatform::Windows || !path.bytes.len().is_multiple_of(2) {
+            return false;
+        }
+        let wide = path
+            .bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        PathBuf::from(OsString::from_wide(&wide)).file_name()
+            == Some(std::ffi::OsStr::new("gateway.lock"))
+    }
+    #[cfg(not(windows))]
+    {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+        path.platform == NativePlatform::Macos
+            && PathBuf::from(OsString::from_vec(path.bytes.clone())).file_name()
+                == Some(std::ffi::OsStr::new("gateway.lock"))
+    }
 }
 
 fn rollback_plan_id(original: &PlanId) -> Result<PlanId, ClientError> {
@@ -1333,6 +1374,11 @@ where
             .checked_add(PREVIEW_TTL_MS)
             .ok_or_else(|| invalid("Preview expiry is outside the supported range"))?;
         let plan_id = preview_plan_id(harness, &bridge.digest, now_ms)?;
+        let mut expected_native_digests = vec![ExpectedNativeDigest {
+            target: wire_path(&bridge.path),
+            expected_digest: Some(bridge.digest),
+        }];
+        expected_native_digests.extend(self.harness.bridge_operational_digests()?);
         let mut setup = SetupPlan {
             plan_id,
             harness,
@@ -1341,10 +1387,7 @@ where
             executable_hash,
             harness_version,
             target_scopes: desired.scopes.clone(),
-            expected_native_digests: vec![ExpectedNativeDigest {
-                target: wire_path(&bridge.path),
-                expected_digest: Some(bridge.digest),
-            }],
+            expected_native_digests,
             approval_class: approval_class(&classified.0),
             semantic_changes: classified.0,
             cli_operations: cli_mutation
@@ -1405,7 +1448,7 @@ where
         setup.batch_hash = approval_hash;
         plan.setup = setup.clone();
         let native_rollback_states =
-            crate::native_transaction::planner::capture_native_rollback_states(&plan.mutations)
+            crate::native_transaction::planner::capture_native_rollback_states(&plan)
                 .map_err(|_| invalid("Bridge preview rollback state cannot be sealed"))?;
         let (schema_version, sealed) = if plan.mutations.is_empty() {
             (

@@ -5,7 +5,7 @@ use context_relay_native_runner::{
     RuntimeTarget, SidecarCommand, SidecarId, StagePath,
 };
 use context_relay_protocol::{
-    CliOperation, HarnessId, PlanId, SetupPlan, Sha256Digest, WireNativeValue,
+    ApprovalClass, CliOperation, HarnessId, PlanId, SetupPlan, Sha256Digest, WireNativeValue,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -155,26 +155,69 @@ pub fn seal_reversible_plan(
 }
 
 pub(crate) fn capture_native_rollback_states(
-    mutations: &[super::ApprovedMutation],
+    plan: &NativeTransactionPlan,
 ) -> Result<Vec<Vec<u8>>, PlanSealError> {
-    mutations
+    plan.mutations
         .iter()
         .map(|mutation| {
             let path = decode_native_path(&mutation.target)?;
             let snapshot = OsNativeFileSystem::new()
                 .snapshot(&path)
                 .map_err(|_| invalid_envelope("native rollback state cannot be inspected"))?;
-            if Sha256Digest(*snapshot.fingerprint()) != mutation.expected.0 {
+            let state = predicted_hermes_gateway_reserved_state(plan, &path, snapshot.state())?;
+            if Sha256Digest(state.fingerprint()) != mutation.expected.0 {
                 return Err(invalid_envelope(
                     "native rollback state changed during preview",
                 ));
             }
-            snapshot
-                .state()
+            state
                 .encode_v1()
                 .map_err(|_| invalid_envelope("native rollback state is not representable"))
         })
         .collect()
+}
+
+fn predicted_hermes_gateway_reserved_state(
+    plan: &NativeTransactionPlan,
+    path: &std::path::Path,
+    state: &NativeState,
+) -> Result<NativeState, PlanSealError> {
+    if plan.setup.harness != HarnessId::Hermes || plan.setup.approval_class != ApprovalClass::Active
+    {
+        return Ok(state.clone());
+    }
+    let Some(lock_path) = plan
+        .setup
+        .expected_native_digests
+        .iter()
+        .filter(|expected| expected.expected_digest.is_none())
+        .filter_map(|expected| decode_native_path(&expected.target).ok())
+        .find(|candidate| {
+            candidate
+                .file_name()
+                .is_some_and(|name| name == "gateway.lock")
+                && candidate.parent() == path.parent()
+        })
+    else {
+        return Ok(state.clone());
+    };
+    let lock = OsNativeFileSystem::new()
+        .snapshot(&lock_path)
+        .map_err(|_| invalid_envelope("Hermes gateway lock cannot be inspected"))?;
+    if !matches!(lock.state(), NativeState::Absent { .. }) {
+        return Err(invalid_envelope(
+            "Hermes gateway lock changed during preview",
+        ));
+    }
+    let NativeState::RegularFile { bytes, metadata } = state else {
+        return Err(invalid_envelope(
+            "Hermes profile-root creation requires an existing gateway lock",
+        ));
+    };
+    let metadata = metadata
+        .for_absent_sibling_creation(lock.state())
+        .map_err(|_| invalid_envelope("Hermes gateway reservation changed"))?;
+    Ok(NativeState::regular_file(bytes.clone(), metadata))
 }
 
 #[cfg(windows)]

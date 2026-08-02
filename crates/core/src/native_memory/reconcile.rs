@@ -62,7 +62,7 @@ pub fn reconcile_classified(
     bytes: &[u8],
     observation_kind: NativeMemoryObservationKind,
 ) -> Result<ReconcileDecision, NativeMemoryError> {
-    source.validate()?;
+    source.validate_compatible()?;
     if source.id != ledger.source_id {
         return Err(NativeMemoryError::InvalidSource("ledger.source_id"));
     }
@@ -120,7 +120,7 @@ pub(crate) fn build_native_memory_candidate(
     change_kind: NativeMemoryChangeKind,
     device_id: DeviceId,
 ) -> Result<MemoryCandidate, NativeMemoryError> {
-    source.validate()?;
+    source.validate_compatible()?;
     let body_markdown =
         String::from_utf8(candidate_markdown).map_err(|_| NativeMemoryError::InvalidUtf8)?;
     let (candidate_id, memory_id, operation_id) =
