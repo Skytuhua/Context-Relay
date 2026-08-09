@@ -123,3 +123,16 @@ share that request identity. RuleSync/Gitleaks use 35 seconds, Osemgrep uses 95 
 bounds fail closed. Portable/model/source contracts, native-runner remainder, workspace and
 Windows-target strict Clippy/checks, formatting, and diff checks are green. Actual Win32 timeout,
 job cleanup, and hydrated Osemgrep execution remain pending Windows native-isolation CI.
+
+Task 5: complete locally (`85a59ed`, `db55e76`; the initial independent review found that the
+visible whitespace job compared only a clean checkout worktree, and the test-first follow-up now
+checks exact committed event ranges with validated, quoted Git object identities; a fresh review
+approved the full range with no actionable findings). Formatting, strict ordinary-feature lint,
+supported-host tests, daemon ownership, generated bindings and schemas, licensing, dependency
+policy, committed-whitespace policy, four frontend gates, and supported native builds are
+independently visible and cannot be hidden by a lint failure. The candidate-only Semgrep feature
+remains confined to its two exact ignored qualification tests, all ordinary checkouts are
+read-only without persisted credentials, and publication/provenance boundaries are unchanged.
+The controller independently reran all 38 workflow contracts and the follow-up diff check green.
+Actual GitHub-hosted Windows x64/macOS arm64 matrices, the canonical APFS fixture, and workflow
+expansion remain pending the draft-PR run and are not claimed as local passes.
