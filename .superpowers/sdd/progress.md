@@ -102,3 +102,14 @@ all-feature Clippy, formatting, and the default-parallel workspace remainder are
 controller independently reran the real-socket MCP daemon suite outside the desktop sandbox (9/9
 green). Five unchanged macOS APFS/provenance cases and actual Windows execution remain pending the
 native CI jobs and are not claimed as local passes.
+
+Task 4: complete locally (`f5f0eee`, `a1c1db7`; the initial independent review found that strict
+UTF-16 conversion still rejected valid opaque Windows WTF-16 before daemon decoding; the
+test-first follow-up moved forbidden-path filtering to lossless code-unit inspection and a fresh
+review approved the full range with no actionable findings). Host-owned TempDir fixtures replace
+Unix-only paths, setup/export/replay use the exact fail-closed runtime target, sealed approval still
+binds target identity, Windows path fixtures cover drive/UNC/extended/reserved/Unicode/malformed
+forms, and target-only adapter lints are repaired without allowances. Core/contextd affected
+packages, contextd 54/54, strict workspace Clippy, formatting, and the maximum workspace remainder
+are green. Actual Windows x64 execution and five unchanged macOS APFS/provenance gates remain
+pending native CI and are not claimed as passes.
