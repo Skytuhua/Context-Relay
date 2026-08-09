@@ -1029,6 +1029,7 @@ fn command_text_matches_profile(command: &str, profile: &HermesProfile) -> bool 
     argv_matches_profile(&command_tokens(command), profile)
 }
 
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
 fn command_tokens(command: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut token = String::new();

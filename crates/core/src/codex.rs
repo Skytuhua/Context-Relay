@@ -3982,6 +3982,10 @@ fn run_bounded_verified_command_with_hook(
         .revalidate_before_launch()
         .map_err(|_| client_error(ErrorCode::Conflict, "Codex executable changed", false))?;
     before_spawn();
+    #[cfg(windows)]
+    executable
+        .revalidate_before_launch()
+        .map_err(|_| client_error(ErrorCode::Conflict, "Codex executable changed", false))?;
     let launch = executable.prepare_launch()?;
     run_prepared_codex_command(launch, &executable.path, arguments, working_directory)
 }
@@ -3992,6 +3996,14 @@ fn run_prepared_codex_command(
     arguments: &[&str],
     working_directory: &Path,
 ) -> Result<Vec<u8>, ClientError> {
+    #[cfg(windows)]
+    if launch.program.as_path() != original_path {
+        return Err(client_error(
+            ErrorCode::Conflict,
+            "Codex prepared executable identity changed",
+            false,
+        ));
+    }
     let mut command = Command::new(&launch.program);
     command
         .args(arguments)

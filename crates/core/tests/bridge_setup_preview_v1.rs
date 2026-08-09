@@ -8,6 +8,8 @@ use std::{
     str::FromStr,
 };
 
+#[cfg(feature = "test-support")]
+use context_relay_core::native_transaction::{approval_hash_v2, open_plan};
 use context_relay_core::{
     hermes::{HermesAdapter, HermesExecutableKind, HermesLayout, HermesProfile},
     mcp::install::{
@@ -17,6 +19,8 @@ use context_relay_core::{
     setup::{BridgeInstallService, BridgeLocator, BridgeMutationPlan, BridgePreviewHarness},
     vault::{SetupPlanAction, SetupPlanLifecycle, Vault},
 };
+#[cfg(feature = "test-support")]
+use context_relay_native_runner::RuntimeTarget;
 use context_relay_protocol::{
     ApprovalClass, CapabilityLevel, ChangeClass, ClassifiedChanges, CliOperation, CliOperations,
     ClientError, ComponentRecord, DesiredState, DeviceId, DiscoveredScopes, HarnessAdapter,
@@ -215,10 +219,23 @@ impl BridgePreviewHarness for Harness {
 }
 
 fn native_text(value: &str) -> WireNativeValue {
+    #[cfg(not(windows))]
+    use std::os::unix::ffi::OsStrExt as _;
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let value = std::ffi::OsStr::new(value);
     WireNativeValue {
-        platform: NativePlatform::Macos,
+        platform: if cfg!(windows) {
+            NativePlatform::Windows
+        } else {
+            NativePlatform::Macos
+        },
+        #[cfg(not(windows))]
         bytes: value.as_bytes().to_vec(),
-        display: Some(value.to_owned()),
+        #[cfg(windows)]
+        bytes: value.encode_wide().flat_map(u16::to_le_bytes).collect(),
+        display: value.to_str().map(str::to_owned),
     }
 }
 
@@ -294,6 +311,47 @@ fn service<'a>(
         DeviceId::from_str(ID_1).unwrap(),
         clock(NOW_MS),
     )
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn bridge_preview_seals_the_selected_supported_runtime_target() {
+    for target in [RuntimeTarget::MacosArm64, RuntimeTarget::WindowsX86_64] {
+        let root = tempfile::tempdir().unwrap();
+        let bridge_path = root.path().join("context-relay-context-mcp");
+        bridge(&bridge_path);
+        let vault_path = TempVault::new(target.stable_name());
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(vault_path.path(), "bridge-target-v1", &keys).unwrap();
+        let harness = Harness {
+            calls: Rc::new(RefCell::new(Calls::default())),
+            executable: native_text("fixture-codex"),
+            existing: None,
+            prior_declaration: None,
+            reject_prior_declaration: false,
+        };
+
+        let setup = BridgeInstallService::new_for_runtime_target(
+            &mut vault,
+            harness,
+            locator(&bridge_path),
+            DeviceId::from_str(ID_1).unwrap(),
+            clock(NOW_MS),
+            target,
+        )
+        .preview(None, NOW_MS)
+        .unwrap();
+        let stored = vault.setup_plan(&setup.plan_id).unwrap().unwrap();
+        let mut opened = open_plan(&stored.payload).unwrap().plan;
+
+        assert_eq!(opened.sidecars.len(), 1);
+        assert_eq!(opened.sidecars[0].target, target);
+        opened.sidecars[0].target = match target {
+            RuntimeTarget::MacosArm64 => RuntimeTarget::WindowsX86_64,
+            RuntimeTarget::WindowsX86_64 => RuntimeTarget::MacosArm64,
+        };
+        assert_ne!(approval_hash_v2(&opened).unwrap(), setup.batch_hash);
+    }
 }
 
 #[test]

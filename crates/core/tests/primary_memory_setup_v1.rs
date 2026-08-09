@@ -36,7 +36,7 @@ use context_relay_core::{
     },
     vault::{BeforeImagePolicy, NativeSandboxIdentity, SetupPlanAction, SetupPlanLifecycle, Vault},
 };
-use context_relay_native_runner::{NativeState, OsNativeFileSystem};
+use context_relay_native_runner::{NativeState, OsNativeFileSystem, RuntimeTarget};
 use context_relay_protocol::{
     ApplyReceipt, CapabilityLevel, ChangeClass, ClassifiedChange, ClassifiedChanges, CliOperation,
     CliOperations, ClientError, ComponentKind, ComponentRecord, DesiredState, DeviceId,
@@ -1248,6 +1248,10 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
         .unwrap();
         let stored = vault.setup_plan(&setup.plan_id).unwrap().unwrap();
         let opened = open_plan(&stored.payload).unwrap();
+        assert_eq!(
+            opened.plan.sidecars[0].target,
+            RuntimeTarget::current().unwrap()
+        );
         assert_eq!(opened.plan.setup.harness, harness_id);
         assert_eq!(opened.plan.native_memory_registrations.len(), 2);
         assert_eq!(
@@ -1460,6 +1464,10 @@ fn hermes_managed_export_seals_the_full_file_digest_and_recovers_before_activati
         .unwrap();
     let stored = vault.setup_plan(&setup.plan_id).unwrap().unwrap();
     let opened = open_plan(&stored.payload).unwrap();
+    assert_eq!(
+        opened.plan.sidecars[0].target,
+        RuntimeTarget::current().unwrap()
+    );
     assert_eq!(opened.plan.mutations.len(), 1);
     assert_eq!(opened.plan.native_memory_registrations.len(), 1);
     let mutation = &opened.plan.mutations[0];
@@ -1747,6 +1755,10 @@ fn import_only_exact_memory_bindings_apply_and_rollback_as_registration_only_pla
         assert!(setup.cli_operations.is_empty());
         let opened =
             open_plan(&vault.setup_plan(&setup.plan_id).unwrap().unwrap().payload).unwrap();
+        assert_eq!(
+            opened.plan.sidecars[0].target,
+            RuntimeTarget::current().unwrap()
+        );
         assert!(opened.plan.mutations.is_empty());
         assert!(opened.plan.cli_mutations.is_empty());
         assert_eq!(opened.plan.native_memory_registrations.len(), 2);

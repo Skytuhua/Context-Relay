@@ -641,6 +641,7 @@ pub struct BridgeInstallService<'a, H, L> {
     bridge_locator: L,
     origin_device: DeviceId,
     observed_hlc: HybridLogicalClock,
+    runtime_target: Option<RuntimeTarget>,
 }
 
 /// Plans a reviewed Context Relay export into Hermes's managed memory file.
@@ -650,11 +651,24 @@ pub struct BridgeInstallService<'a, H, L> {
 /// plan uses the same persisted native transaction service as harness setup.
 pub struct HermesMemoryExportService<'a> {
     vault: &'a mut Vault,
+    runtime_target: Option<RuntimeTarget>,
 }
 
 impl<'a> HermesMemoryExportService<'a> {
     pub fn new(vault: &'a mut Vault) -> Self {
-        Self { vault }
+        Self {
+            vault,
+            runtime_target: RuntimeTarget::current().ok(),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn new_for_runtime_target(vault: &'a mut Vault, runtime_target: RuntimeTarget) -> Self {
+        Self {
+            vault,
+            runtime_target: Some(runtime_target),
+        }
     }
 
     pub fn preview(
@@ -664,6 +678,9 @@ impl<'a> HermesMemoryExportService<'a> {
         body_markdown: &str,
         now_ms: u64,
     ) -> Result<SetupPlan, ClientError> {
+        let runtime_target = self.runtime_target.ok_or_else(|| {
+            unsupported("Hermes managed memory export is unavailable on this host")
+        })?;
         let report = adapter.probe(&ProbeContext {
             harness: HarnessId::Hermes,
             requested_profile: Some(adapter.profile_name().to_owned()),
@@ -801,11 +818,7 @@ impl<'a> HermesMemoryExportService<'a> {
             helper_hash: digest(b"hermes-memory-export-helper-v1"),
             sidecars: vec![SidecarBinding {
                 id: SidecarId::RuleSync,
-                target: if cfg!(windows) {
-                    RuntimeTarget::WindowsX86_64
-                } else {
-                    RuntimeTarget::MacosArm64
-                },
+                target: runtime_target,
                 version: "hermes-memory-export-v1".to_owned(),
                 closure_hash: digest(b"hermes-memory-export-sidecar-closure-v1"),
                 source_bundle_hash: digest(b"hermes-memory-export-sidecar-source-v1"),
@@ -1623,6 +1636,27 @@ where
             bridge_locator,
             origin_device,
             observed_hlc,
+            runtime_target: RuntimeTarget::current().ok(),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn new_for_runtime_target(
+        vault: &'a mut Vault,
+        harness: H,
+        bridge_locator: L,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        runtime_target: RuntimeTarget,
+    ) -> Self {
+        Self {
+            vault,
+            harness,
+            bridge_locator,
+            origin_device,
+            observed_hlc,
+            runtime_target: Some(runtime_target),
         }
     }
 
@@ -1633,6 +1667,9 @@ where
         registered_project: Option<&RegisteredProject>,
         now_ms: u64,
     ) -> Result<SetupPlan, ClientError> {
+        let runtime_target = self
+            .runtime_target
+            .ok_or_else(|| unsupported("Harness setup is unavailable on this host"))?;
         let harness = self.harness.bridge_harness();
         let setup_capability = self.harness.bridge_setup_capability();
         let located_bridge = if setup_capability == CapabilityLevel::Full {
@@ -1655,7 +1692,12 @@ where
             return Err(conflict("Harness setup capability changed during preview"));
         }
         if report.capability != CapabilityLevel::Full {
-            return self.preview_watch_only_registration(registered_project, report, now_ms);
+            return self.preview_watch_only_registration(
+                registered_project,
+                report,
+                now_ms,
+                runtime_target,
+            );
         }
         let bridge = located_bridge
             .ok_or_else(|| conflict("Full setup is missing its attested bridge executable"))?;
@@ -1848,7 +1890,7 @@ where
             helper_hash: digest(b"bridge-preview-helper-v1"),
             sidecars: vec![SidecarBinding {
                 id: SidecarId::RuleSync,
-                target: RuntimeTarget::MacosArm64,
+                target: runtime_target,
                 version: "bridge-preview-v1".to_owned(),
                 closure_hash: digest(b"bridge-preview-sidecar-closure-v1"),
                 source_bundle_hash: digest(b"bridge-preview-sidecar-source-v1"),
@@ -1911,6 +1953,7 @@ where
         registered_project: Option<&RegisteredProject>,
         report: context_relay_protocol::ProbeReport,
         now_ms: u64,
+        runtime_target: RuntimeTarget,
     ) -> Result<SetupPlan, ClientError> {
         let harness = self.harness.bridge_harness();
         let registrations = self
@@ -1976,7 +2019,7 @@ where
             .collect::<Vec<_>>();
         let sidecars = vec![SidecarBinding {
             id: SidecarId::RuleSync,
-            target: RuntimeTarget::MacosArm64,
+            target: runtime_target,
             version: "bridge-preview-v1".to_owned(),
             closure_hash: digest(b"bridge-preview-sidecar-closure-v1"),
             source_bundle_hash: digest(b"bridge-preview-sidecar-source-v1"),

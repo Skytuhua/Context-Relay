@@ -504,6 +504,8 @@ impl BridgeRestrictedExecutor {
         staged_output_hash: Sha256Digest,
         scanner_result_hash: Sha256Digest,
     ) -> Result<Self, ClientError> {
+        let runtime_target = RuntimeTarget::current()
+            .map_err(|_| unsupported("Persisted bridge execution is unavailable on this host"))?;
         let expected_command = SidecarCommand::RuleSyncGenerate {
             target: match harness {
                 HarnessId::ClaudeCode | HarnessId::Hermes => RuleSyncTarget::ClaudeCode,
@@ -514,7 +516,7 @@ impl BridgeRestrictedExecutor {
         };
         let valid_sidecar = matches!(sidecars.as_slice(), [sidecar]
             if sidecar.id == SidecarId::RuleSync
-                && sidecar.target == RuntimeTarget::MacosArm64
+                && sidecar.target == runtime_target
                 && sidecar.version == "bridge-preview-v1"
                 && sidecar.command == expected_command);
         if !inputs.is_empty() || !valid_sidecar {
@@ -594,6 +596,10 @@ fn invalid(message: &str) -> ClientError {
     client_error(ErrorCode::InvalidRequest, message)
 }
 
+fn unsupported(message: &str) -> ClientError {
+    client_error(ErrorCode::HarnessUnsupported, message)
+}
+
 fn not_found(message: &str) -> ClientError {
     client_error(ErrorCode::NotFound, message)
 }
@@ -620,6 +626,8 @@ fn internal(message: &str) -> ClientError {
 pub(crate) mod tests {
     use std::{collections::HashMap, sync::Mutex};
 
+    use crate::unit_test_support::{TempVault, wire_native_os};
+
     #[cfg(target_os = "macos")]
     use context_relay_core::native_transaction::{ApprovedCliMutation, CanonicalCliDeclaration};
     use context_relay_core::{
@@ -633,8 +641,8 @@ pub(crate) mod tests {
     #[cfg(target_os = "macos")]
     use context_relay_protocol::CliOperation;
     use context_relay_protocol::{
-        ApprovalClass, HarnessId, NativePlatform, NativeScope, NetworkDelta, PermissionDelta,
-        SetupPlan, Sha256Digest, WireNativeValue,
+        ApprovalClass, HarnessId, NativeScope, NetworkDelta, PermissionDelta, SetupPlan,
+        Sha256Digest, WireNativeValue,
     };
     #[cfg(target_os = "macos")]
     use sha2::{Digest as _, Sha256};
@@ -644,9 +652,9 @@ pub(crate) mod tests {
 
     #[test]
     fn terminal_apply_and_rollback_replay_before_any_production_composition() {
-        let path = unique_path("terminal-replay");
+        let path = TempVault::new("task8-terminal-replay");
         let keys = MemoryKeyStore::default();
-        let mut vault = Vault::open(&path, "task8-terminal-replay", &keys).unwrap();
+        let mut vault = Vault::open(path.path(), "task8-terminal-replay", &keys).unwrap();
         let plan = persist_plan(&mut vault);
         let mut executor = RecordingExecutor;
         BridgeInstallService::persisted(&mut vault)
@@ -708,6 +716,44 @@ pub(crate) mod tests {
 
     pub(crate) fn persist_plan(vault: &mut Vault) -> NativeTransactionPlan {
         persist_native_plan(vault, base_plan())
+    }
+
+    #[cfg(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(windows, target_arch = "x86_64")
+    ))]
+    #[test]
+    fn restricted_bridge_plan_accepts_only_the_current_supported_runtime_target() {
+        let target = RuntimeTarget::current().unwrap();
+        let other = match target {
+            RuntimeTarget::MacosArm64 => RuntimeTarget::WindowsX86_64,
+            RuntimeTarget::WindowsX86_64 => RuntimeTarget::MacosArm64,
+        };
+        let plan = base_plan_for_target(target);
+
+        assert!(
+            BridgeRestrictedExecutor::new(
+                plan.setup.harness,
+                plan.staged_inputs.clone(),
+                plan.sidecars.clone(),
+                plan.expected_semantic_output_hash,
+                plan.scanner_result_hash,
+            )
+            .is_ok()
+        );
+
+        let mut mismatched = plan;
+        mismatched.sidecars[0].target = other;
+        let error = BridgeRestrictedExecutor::new(
+            mismatched.setup.harness,
+            mismatched.staged_inputs,
+            mismatched.sidecars,
+            mismatched.expected_semantic_output_hash,
+            mismatched.scanner_result_hash,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
     }
 
     #[cfg(target_os = "macos")]
@@ -773,6 +819,10 @@ pub(crate) mod tests {
     }
 
     fn base_plan() -> NativeTransactionPlan {
+        base_plan_for_target(RuntimeTarget::current().unwrap_or(RuntimeTarget::MacosArm64))
+    }
+
+    fn base_plan_for_target(runtime_target: RuntimeTarget) -> NativeTransactionPlan {
         NativeTransactionPlan {
             setup: SetupPlan {
                 plan_id: PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073991").unwrap(),
@@ -808,7 +858,7 @@ pub(crate) mod tests {
             helper_hash: Sha256Digest([5; 32]),
             sidecars: vec![SidecarBinding {
                 id: SidecarId::RuleSync,
-                target: RuntimeTarget::MacosArm64,
+                target: runtime_target,
                 version: "bridge-preview-v1".into(),
                 closure_hash: Sha256Digest([9; 32]),
                 source_bundle_hash: Sha256Digest([10; 32]),
@@ -852,18 +902,7 @@ pub(crate) mod tests {
     }
 
     fn native_text(value: &str) -> WireNativeValue {
-        WireNativeValue {
-            platform: NativePlatform::Macos,
-            bytes: value.as_bytes().to_vec(),
-            display: Some(value.into()),
-        }
-    }
-
-    fn unique_path(label: &str) -> PathBuf {
-        PathBuf::from("/private/tmp").join(format!(
-            "context-relay-task8-{label}-{}",
-            uuid::Uuid::now_v7()
-        ))
+        wire_native_os(std::ffi::OsStr::new(value))
     }
 
     #[derive(Default)]

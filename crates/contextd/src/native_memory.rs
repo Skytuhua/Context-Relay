@@ -540,31 +540,19 @@ fn safe_snapshot_path(_path: &Path, _max_bytes: usize) -> Result<ObservedSnapsho
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unit_test_support::wire_native_path;
     use context_relay_core::native_memory::{
         NativeMemoryDocumentKind, NativeMemoryLimits, NativeMemorySource,
     };
-    use context_relay_protocol::{HarnessId, ScopeRef, WireNativeValue};
+    use context_relay_protocol::{HarnessId, ScopeRef};
 
     fn source(path: &Path, max_bytes: usize) -> NativeMemorySource {
-        #[cfg(unix)]
-        use std::os::unix::ffi::OsStrExt as _;
         NativeMemorySource::new(
             HarnessId::Codex,
             "0.144.1",
             ScopeRef::Global,
             NativeMemoryDocumentKind::Agent,
-            WireNativeValue {
-                platform: NativePlatform::Macos,
-                #[cfg(unix)]
-                bytes: path.as_os_str().as_bytes().to_vec(),
-                #[cfg(windows)]
-                bytes: path
-                    .to_string_lossy()
-                    .encode_utf16()
-                    .flat_map(u16::to_le_bytes)
-                    .collect(),
-                display: Some(path.display().to_string()),
-            },
+            wire_native_path(path),
             NativeMemoryLimits {
                 max_bytes,
                 max_characters: max_bytes,
@@ -572,6 +560,91 @@ mod tests {
             true,
         )
         .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn windows_source(
+        units: &[u16],
+    ) -> Result<NativeMemorySource, context_relay_core::native_memory::NativeMemoryError> {
+        use context_relay_protocol::WireNativeValue;
+
+        NativeMemorySource::new(
+            HarnessId::Codex,
+            "0.144.1",
+            ScopeRef::Global,
+            NativeMemoryDocumentKind::Agent,
+            WireNativeValue {
+                platform: NativePlatform::Windows,
+                bytes: units.iter().copied().flat_map(u16::to_le_bytes).collect(),
+                display: None,
+            },
+            NativeMemoryLimits {
+                max_bytes: 32,
+                max_characters: 32,
+            },
+            true,
+        )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_paths_preserve_supported_absolute_path_forms() {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        for path in [
+            r"C:\Users\Alice\memory.md",
+            r"\\server\share\memory.md",
+            r"\\?\C:\very-long\memory.md",
+            r"C:\workspace\CON.md",
+            r"C:\文档\🦀.md",
+        ] {
+            let expected = std::ffi::OsStr::new(path).encode_wide().collect::<Vec<_>>();
+            let descriptor = windows_source(&expected).unwrap();
+            let decoded = decode_path(&descriptor).unwrap();
+            assert_eq!(
+                decoded.as_os_str().encode_wide().collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_path_rejects_odd_bytes_and_embedded_nul() {
+        use context_relay_protocol::WireNativeValue;
+
+        let odd = WireNativeValue {
+            platform: NativePlatform::Windows,
+            bytes: vec![b'C', 0, b':'],
+            display: None,
+        };
+        assert!(odd.validate().is_err());
+        let mut descriptor =
+            windows_source(&r"C:\memory.md".encode_utf16().collect::<Vec<_>>()).unwrap();
+        descriptor.path.bytes.pop();
+        assert!(matches!(
+            decode_path(&descriptor),
+            Err(SnapshotError::UnsupportedTopology)
+        ));
+
+        let with_nul = r"C:\memory.md"
+            .encode_utf16()
+            .chain([0])
+            .collect::<Vec<_>>();
+        assert!(windows_source(&with_nul).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_path_preserves_wtf16_isolated_surrogates() {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let mut units = r"C:\workspace\".encode_utf16().collect::<Vec<_>>();
+        units.extend([0xd800, b'.' as u16, b'm' as u16, b'd' as u16]);
+        let descriptor = windows_source(&units).unwrap();
+        let decoded = decode_path(&descriptor).unwrap();
+
+        assert_eq!(decoded.as_os_str().encode_wide().collect::<Vec<_>>(), units);
     }
 
     #[cfg(any(target_os = "macos", windows))]

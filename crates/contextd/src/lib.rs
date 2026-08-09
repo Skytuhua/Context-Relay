@@ -52,6 +52,60 @@ mod native_memory;
 mod pairing;
 mod recovery_enrollment;
 
+#[cfg(test)]
+pub(crate) mod unit_test_support {
+    use std::{
+        ffi::OsStr,
+        path::{Path, PathBuf},
+    };
+
+    use context_relay_protocol::{NativePlatform, WireNativeValue};
+
+    pub(crate) struct TempVault {
+        _root: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl TempVault {
+        pub(crate) fn new(label: &str) -> Self {
+            let root = tempfile::Builder::new()
+                .prefix(&format!("context-relay-{label}-"))
+                .tempdir()
+                .expect("temporary vault directory");
+            let path = root.path().join("vault.db");
+            Self { _root: root, path }
+        }
+
+        pub(crate) fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    pub(crate) fn wire_native_path(path: &Path) -> WireNativeValue {
+        wire_native_os(path.as_os_str())
+    }
+
+    pub(crate) fn wire_native_os(value: &OsStr) -> WireNativeValue {
+        #[cfg(not(windows))]
+        use std::os::unix::ffi::OsStrExt as _;
+        #[cfg(windows)]
+        use std::os::windows::ffi::OsStrExt as _;
+
+        WireNativeValue {
+            platform: if cfg!(windows) {
+                NativePlatform::Windows
+            } else {
+                NativePlatform::Macos
+            },
+            #[cfg(not(windows))]
+            bytes: value.as_bytes().to_vec(),
+            #[cfg(windows)]
+            bytes: value.encode_wide().flat_map(u16::to_le_bytes).collect(),
+            display: value.to_str().map(str::to_owned),
+        }
+    }
+}
+
 use bridge_install::{BridgeInstallEngine, ProductionBridgeInstallEngine};
 use native_memory::{
     NativeMemorySupervisor, NativeMemoryUpdateSender, NoopLifecycleProbe,

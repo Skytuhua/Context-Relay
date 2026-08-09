@@ -1988,6 +1988,14 @@ fn run_prepared_claude_command(
     original_path: &Path,
     arguments: &[&str],
 ) -> Result<Vec<u8>, ClientError> {
+    #[cfg(windows)]
+    if launch.source_path.as_path() != original_path {
+        return Err(client_error(
+            ErrorCode::Conflict,
+            "Claude Code prepared executable identity changed",
+            false,
+        ));
+    }
     launch.revalidate().map_err(|_| {
         client_error(
             ErrorCode::Conflict,
@@ -2244,6 +2252,8 @@ impl VerifiedClaudeExecutable {
 
 struct PreparedClaudeLaunch {
     program: PathBuf,
+    #[cfg(windows)]
+    source_path: PathBuf,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     expected_hash: Sha256Digest,
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2446,6 +2456,8 @@ fn prepare_staged_claude_launch(
     })?;
     Ok(PreparedClaudeLaunch {
         program: path,
+        #[cfg(windows)]
+        source_path: executable.source_path.clone(),
         _directory: directory,
         executable: staged,
     })
@@ -3338,10 +3350,12 @@ mod tests {
     use super::{
         ClaudeCodeAdapter, ClaudeCodeLayout, ClaudeCommand, MAX_MCP_VALIDATION_NAMES, digest_file,
         executable_names, is_native_claude_executable_path, parse_doctor_output,
-        parse_mcp_get_output, parse_mcp_list_output, parse_plugin_list_output, run_bounded_command,
-        run_bounded_command_with_hook, validation_commands, windows_attributes_are_reparse,
-        windows_path_component_attributes_are_safe, windows_reader_is_native_pe,
+        parse_mcp_get_output, parse_mcp_list_output, parse_plugin_list_output, validation_commands,
+        windows_attributes_are_reparse, windows_path_component_attributes_are_safe,
+        windows_reader_is_native_pe,
     };
+    #[cfg(unix)]
+    use super::{run_bounded_command, run_bounded_command_with_hook};
     use context_relay_protocol::{
         ApplyReceipt, DeviceId, ErrorCode, HybridLogicalClock, InstallationMethod, PlanId,
         ProjectId,

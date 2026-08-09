@@ -693,7 +693,10 @@ fn create_validation_stage(config: &[u8]) -> Result<HermesValidationStage, Clien
                 .collect::<String>()
         );
         let candidate = temp_root.join(name);
+        #[cfg(unix)]
         let mut builder = fs::DirBuilder::new();
+        #[cfg(not(unix))]
+        let builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt as _;
@@ -721,7 +724,10 @@ fn create_validation_stage(config: &[u8]) -> Result<HermesValidationStage, Clien
 }
 
 fn create_private_directory(path: &Path) -> Result<(), ClientError> {
+    #[cfg(unix)]
     let mut builder = fs::DirBuilder::new();
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
@@ -1160,14 +1166,16 @@ fn attest_executable(path: &Path) -> Result<AttestedExecutable, ClientError> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|_| invalid("Hermes executable cannot be read"))?;
-    let mut kind = classify_executable_bytes(path, &bytes);
+    let kind = classify_executable_bytes(path, &bytes);
     #[cfg(unix)]
-    {
+    let kind = {
         use std::os::unix::fs::PermissionsExt as _;
         if kind == HermesExecutableKind::Native && metadata.permissions().mode() & 0o111 == 0 {
-            kind = HermesExecutableKind::Unknown;
+            HermesExecutableKind::Unknown
+        } else {
+            kind
         }
-    }
+    };
     Ok(AttestedExecutable {
         snapshot: ExecutableSnapshot {
             kind,
@@ -1505,6 +1513,7 @@ mod tests {
     };
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    #[cfg(unix)]
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
