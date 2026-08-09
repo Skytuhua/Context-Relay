@@ -58,8 +58,11 @@ older valid server snapshot from the newest valid snapshot.
 
 Current evidence is plane-specific: [Tasks 1–10](../verification/tasks-1-10.md),
 [Task 14](../verification/task-14.md), [Task 15](../verification/task-15.md),
-[Task 16](../verification/task-16.md), and the three
-[Task 17](../verification/task-17-pairing.md) ledgers. Historical counts and
+[Task 16](../verification/task-16.md), and the three Task 17 ledgers for
+[pairing](../verification/task-17-pairing.md),
+[recovery-root enrollment](../verification/task-17-recovery-enrollment.md), and
+[fresh-install recovery](../verification/task-17-fresh-install-recovery-core.md).
+Historical counts and
 development-report assertions do not elevate hosted, credentialed,
 physical-device, signing, or deployment claims. Client-visible errors must not
 expose raw OS errors, filesystem contents, credentials, keys, phrases, stack

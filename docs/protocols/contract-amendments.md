@@ -11,7 +11,7 @@ and tested as one synchronized change. Unlisted behavior is not amended.
 - **Amendment:** The v1 product's exact local IPC boundary is protocol 1.3, not the earlier 1.0/1.2 fixtures. Five phase-specific recovery-enrollment methods replace the unused generic recovery routes.
 - **Security rationale:** Begin and confirmation are confined to the trusted native recovery host; ordinary renderer projections are word-free. Exact-version negotiation rejects 1.2 peers before application dispatch instead of silently accepting a phrase-bearing or under-authorized shape.
 - **Compatibility and migration impact:** This is a deliberate pre-release wire break. Protocol 1.2 peers cannot interoperate with 1.3. Generated TypeScript bindings, handshake vectors, runtime-contract hashes, and role allowlists must advance together; no downgrade fallback is allowed.
-- **Required synchronized artifacts:** [protocol constants/DTOs](../../crates/protocol/src/ipc.rs), [generated bindings](../../apps/desktop/src/bindings.ts), [Tauri native host](../../apps/desktop/src-tauri/src/main.rs), [daemon routing](../../crates/contextd/src/recovery_enrollment.rs), [protocol documentation](protocol-v1.md), and [recovery verification](../verification/task-17-recovery-enrollment.md).
+- **Required synchronized artifacts:** [protocol constants/DTOs](../../crates/protocol/src/ipc.rs), [generated bindings](../../apps/desktop/src/bindings.ts), [exact handshake vectors/tests](../../crates/local-ipc/src/handshake_tests.rs), [runtime-contract hashes](../../crates/protocol/tests/fixtures/runtime-contracts-v1.json), [Tauri native host](../../apps/desktop/src-tauri/src/main.rs), [daemon routing](../../crates/contextd/src/recovery_enrollment.rs), [protocol documentation](protocol-v1.md), and [recovery verification](../verification/task-17-recovery-enrollment.md).
 
 ## A-002 — Operation schema v1 and checkpoint schema v2
 
@@ -32,7 +32,8 @@ and tested as one synchronized change. Unlisted behavior is not amended.
 ## Change control
 
 Every future amendment must receive a stable `A-NNN` identifier and record the
-same five fields. The change that adopts it must update every listed artifact,
-add compatibility/fail-closed tests, and update the
+same five fields. Every link in **Required synchronized artifacts** is mandatory;
+the change that adopts an amendment must update or explicitly revalidate each
+listed artifact, add compatibility/fail-closed tests, and update the
 [master-plan audit](../verification/v1-master-plan-audit.md). Removing an
 amendment requires a superseding ledger entry; history is not rewritten.
