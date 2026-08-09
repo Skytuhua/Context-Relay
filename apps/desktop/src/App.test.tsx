@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, within } from '@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import App from './App';
+import { PROTOCOL_VERSION } from './bindings';
 import type { WorkspaceGateway } from './workspace';
 
 const destinations = [
@@ -21,13 +22,20 @@ const destinations = [
 
 const gateway = {
   status: async () => ({
-    protocol: { min: { major: 1, minor: 0 }, max: { major: 1, minor: 0 } },
+    protocol: { min: { major: 1, minor: 3 }, max: { major: 1, minor: 3 } },
     vault: 'unlocked',
     resolvedProject: null,
     sync: 'offline',
     access: { mode: 'default' },
   }),
   projects: async () => [],
+  devices: async () => [],
+  recoveryEnrollmentOverview: async () => ({
+    enrollmentId: null,
+    state: 'idle',
+    createdAtMs: null,
+    transitionedAtMs: null,
+  }),
   memories: async () => [],
   candidates: async () => [],
   tasks: async () => [],
@@ -47,6 +55,11 @@ describe('App', () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+  });
+
+  it('uses the current protocol range in its status fixture', async () => {
+    const status = await gateway.status();
+    expect(status.protocol).toEqual({ min: PROTOCOL_VERSION, max: PROTOCOL_VERSION });
   });
 
   it('exposes every keyboard-reachable workspace destination and focuses selected headings', async () => {
@@ -84,9 +97,11 @@ describe('App', () => {
   });
 
   it('keeps all workspace persistence behind the typed client', () => {
-    for (const file of ['App.tsx', 'workspace.ts', 'local-client.ts']) {
+    for (const file of ['App.tsx', 'devices.tsx', 'workspace.ts', 'local-client.ts']) {
       const source = readFileSync(new URL(file, import.meta.url), 'utf8');
-      expect(source).not.toMatch(/localStorage|sessionStorage|indexedDB/);
+      expect(source).not.toMatch(
+        /localStorage|sessionStorage|indexedDB|navigator\.clipboard|createObjectURL|\bdownload\b/,
+      );
     }
   });
 

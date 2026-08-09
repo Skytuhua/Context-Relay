@@ -3,7 +3,7 @@ use std::str::FromStr;
 use context_relay_core::native_transaction::{
     approval::{APPROVAL_DOMAIN_V1, approval_hash_v1},
     model::{
-        ApprovedInput, ApprovedMutation, MutationKind, NativeTransactionPlan,
+        ApprovedCliMutation, ApprovedInput, ApprovedMutation, MutationKind, NativeTransactionPlan,
         RestorableStateFingerprint, SidecarBinding,
     },
 };
@@ -86,6 +86,7 @@ fn plan() -> NativeTransactionPlan {
     let activation = approved_state(NativeState::absent(0x10, 2));
     NativeTransactionPlan {
         setup: setup_plan(),
+        approval_version: 1,
         helper_policy_version: 1,
         manifest_schema_version: 1,
         manifest_digest: Sha256Digest([54; 32]),
@@ -134,6 +135,8 @@ fn plan() -> NativeTransactionPlan {
                 intended: activation.1,
             },
         ],
+        cli_mutations: vec![],
+        native_memory_registrations: vec![],
         ownership_changes: vec![],
     }
 }
@@ -252,6 +255,23 @@ fn freezes_the_domain_separator_and_golden_hash() {
             255, 230, 229, 47, 129, 201, 245, 241, 53, 168, 68, 198, 251, 90, 131, 110, 85, 210,
             157, 232, 235, 166, 234, 51, 161, 212, 189, 137, 72, 188, 15, 227,
         ])
+    );
+}
+
+#[test]
+fn approval_v1_rejects_nonempty_cli_mutations_as_unbound() {
+    let mut candidate = plan();
+    candidate.cli_mutations.push(ApprovedCliMutation {
+        stable_id: "unbound".to_owned(),
+        expected: None,
+        intended: None,
+        forward: vec![],
+        rollback: vec![],
+    });
+
+    assert_eq!(
+        approval_hash_v1(&candidate).unwrap_err().to_string(),
+        "invalid native plan: approval v1 cannot bind cli mutations"
     );
 }
 
@@ -471,6 +491,31 @@ fn windows_mutation_targets_reject_the_transaction_staging_namespace() {
         let mut candidate = plan();
         candidate.mutations[0].target = native_text(&format!(r"C:\x\{name}"));
         assert!(approval_hash_v1(&candidate).is_err(), "{name}");
+    }
+}
+
+#[test]
+fn windows_mutation_targets_normalize_reserved_pre_extension_basenames() {
+    for name in [
+        "NUL .exe",
+        "COM1 .cmd",
+        "com\u{00b9} .txt",
+        "LPT\u{00b2} .bin",
+    ] {
+        let mut candidate = plan();
+        candidate.mutations[0].target = native_text(&format!(r"C:\x\{name}"));
+        assert!(approval_hash_v1(&candidate).is_err(), "{name}");
+    }
+
+    for name in [
+        "NUL safe.exe",
+        "COM1-safe.cmd",
+        "COM\u{00b9}-safe.txt",
+        "LPT\u{00b2}x.bin",
+    ] {
+        let mut candidate = plan();
+        candidate.mutations[0].target = native_text(&format!(r"C:\x\{name}"));
+        assert!(approval_hash_v1(&candidate).is_ok(), "{name}");
     }
 }
 

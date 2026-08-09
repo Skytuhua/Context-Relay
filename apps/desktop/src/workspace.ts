@@ -7,8 +7,17 @@ import type {
   MemoryId,
   MemoryRecord,
   OperationId,
+  PairingCode,
+  PairingId,
+  PairingSafetyNumber,
   ProjectId,
   ProjectIdentity,
+  RecoveryEnrollmentConfirmParams,
+  RecoveryEnrollmentHostBeginResult,
+  RecoveryEnrollmentHostConfirmResult,
+  RecoveryEnrollmentId,
+  RecoveryEnrollmentStatus,
+  Sha256Digest,
   StatusOutput,
   TaskId,
   TaskRecord,
@@ -17,7 +26,44 @@ import type {
 } from './bindings';
 import { LocalClient } from './local-client';
 
-export interface WorkspaceGateway {
+export type PairingInviteResult = Extract<LocalResult, { kind: 'pairing_invite' }>;
+export type PairingRequestResult = Extract<LocalResult, { kind: 'pairing_request' }>;
+export type PairingApprovalResult = Extract<LocalResult, { kind: 'pairing_approval' }>;
+export type PairingCompletionResult = Extract<LocalResult, { kind: 'pairing_completion' }>;
+export type PairingStatusResult = Extract<
+  LocalResult,
+  | { kind: 'pairing_invite_status' }
+  | { kind: 'pairing_request' }
+  | { kind: 'pairing_approval' }
+  | { kind: 'pairing_completion' }
+>;
+export type PairingDecisionResult = PairingRequestResult | PairingApprovalResult;
+
+export interface DeviceGateway {
+  devices(): Promise<Extract<LocalResult, { kind: 'devices' }>['data']['devices']>;
+  createPairingInvite(): Promise<PairingInviteResult>;
+  joinPairing(code: PairingCode, deviceName: string): Promise<PairingRequestResult>;
+  pairingStatus(pairingId: PairingId): Promise<PairingStatusResult>;
+  decidePairing(
+    pairingId: PairingId,
+    requestDigest: Sha256Digest,
+    approve: boolean,
+  ): Promise<PairingDecisionResult>;
+  confirmPairing(
+    pairingId: PairingId,
+    safetyNumber: PairingSafetyNumber,
+  ): Promise<PairingCompletionResult>;
+  cancelPairing(pairingId: PairingId): Promise<void>;
+  recoveryEnrollmentBegin(): Promise<RecoveryEnrollmentHostBeginResult>;
+  recoveryEnrollmentOverview(): Promise<RecoveryEnrollmentStatus>;
+  recoveryEnrollmentConfirm(
+    params: RecoveryEnrollmentConfirmParams,
+  ): Promise<RecoveryEnrollmentHostConfirmResult>;
+  recoveryEnrollmentStatus(enrollmentId: RecoveryEnrollmentId): Promise<RecoveryEnrollmentStatus>;
+  recoveryEnrollmentCancel(enrollmentId: RecoveryEnrollmentId): Promise<void>;
+}
+
+export interface WorkspaceGateway extends DeviceGateway {
   status(): Promise<StatusOutput>;
   projects(): Promise<ProjectIdentity[]>;
   createProject(name: string, path: string): Promise<ProjectIdentity>;
@@ -48,6 +94,113 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
 
   async status() {
     return statusResult(await this.call({ method: 'sync_status', params: {} }));
+  }
+
+  async devices() {
+    const result = await this.call({ method: 'devices_list', params: {} });
+    return result.kind === 'devices' ? result.data.devices : unexpected(result);
+  }
+
+  async createPairingInvite(): Promise<PairingInviteResult> {
+    const result = await this.call({ method: 'pairing_create', params: {} });
+    return result.kind === 'pairing_invite' && result.data.status === 'pending'
+      ? result
+      : unexpected(result);
+  }
+
+  async joinPairing(code: PairingCode, deviceName: string): Promise<PairingRequestResult> {
+    const result = await this.call({ method: 'pairing_join', params: { code, deviceName } });
+    return result.kind === 'pairing_request' && result.data.status === 'pending'
+      ? result
+      : unexpected(result);
+  }
+
+  async pairingStatus(pairingId: PairingId): Promise<PairingStatusResult> {
+    const result = await this.call({ method: 'pairing_status', params: { pairingId } });
+    switch (result.kind) {
+      case 'pairing_invite_status':
+      case 'pairing_request':
+      case 'pairing_approval':
+      case 'pairing_completion':
+        return result;
+      default:
+        return unexpected(result);
+    }
+  }
+
+  async decidePairing(
+    pairingId: PairingId,
+    requestDigest: Sha256Digest,
+    approve: boolean,
+  ): Promise<PairingDecisionResult> {
+    const result = await this.call({
+      method: 'pairing_decision',
+      params: { pairingId, requestDigest, approve },
+    });
+    if (approve && result.kind === 'pairing_approval') return result;
+    if (!approve && result.kind === 'pairing_request' && result.data.status === 'rejected') {
+      return result;
+    }
+    return unexpected(result);
+  }
+
+  async confirmPairing(
+    pairingId: PairingId,
+    safetyNumber: PairingSafetyNumber,
+  ): Promise<PairingCompletionResult> {
+    const result = await this.call({
+      method: 'pairing_confirm',
+      params: { pairingId, safetyNumber },
+    });
+    return result.kind === 'pairing_completion' ? result : unexpected(result);
+  }
+
+  async cancelPairing(pairingId: PairingId) {
+    const result = await this.call({ method: 'pairing_cancel', params: { pairingId } });
+    if (result.kind !== 'empty') unexpected(result);
+  }
+
+  async recoveryEnrollmentBegin() {
+    const result = await this.client.recoveryEnrollmentBegin();
+    return result.kind === 'challenge' || result.kind === 'status'
+      ? result
+      : unexpectedNativeResult(result);
+  }
+
+  async recoveryEnrollmentOverview() {
+    return recoveryStatusResult(
+      await this.call({ method: 'recovery_enrollment_overview', params: {} }),
+    );
+  }
+
+  async recoveryEnrollmentConfirm(params: RecoveryEnrollmentConfirmParams) {
+    const result = await this.client.recoveryEnrollmentConfirm(params);
+    switch (result.kind) {
+      case 'canceled':
+      case 'complete':
+      case 'status':
+        return result;
+      default:
+        return unexpectedNativeResult(result);
+    }
+  }
+
+  async recoveryEnrollmentStatus(enrollmentId: RecoveryEnrollmentId) {
+    return recoveryStatusResult(
+      await this.call({ method: 'recovery_enrollment_status', params: { enrollmentId } }),
+    );
+  }
+
+  async recoveryEnrollmentCancel(enrollmentId: RecoveryEnrollmentId) {
+    const status = recoveryStatusResult(
+      await this.call({
+        method: 'recovery_enrollment_cancel',
+        params: { enrollmentId },
+      }),
+    );
+    if (status.state !== 'idle' || status.enrollmentId !== null) {
+      throw new Error('Recovery cancellation did not return an idle status.');
+    }
   }
 
   async projects() {
@@ -238,6 +391,12 @@ function statusResult(result: LocalResult) {
   return result.kind === 'status' ? result.data.status : unexpected(result);
 }
 
+function recoveryStatusResult(result: LocalResult) {
+  return result.kind === 'recovery_enrollment_status'
+    ? result.data.status
+    : unexpected(result);
+}
+
 function memoryResult(result: LocalResult) {
   return result.kind === 'memory' && result.data.memory ? result.data.memory : unexpected(result);
 }
@@ -248,6 +407,10 @@ function taskResult(result: LocalResult) {
 
 function unexpected(result: LocalResult): never {
   throw new Error(`Unexpected local result: ${result.kind}`);
+}
+
+function unexpectedNativeResult(result: never): never {
+  throw new Error(`Unexpected native recovery result: ${String(result)}`);
 }
 
 function uuidV7(): UuidV7 {

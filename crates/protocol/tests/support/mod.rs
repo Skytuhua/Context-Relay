@@ -83,7 +83,9 @@ pub fn sync_operation() -> SyncOperationV1 {
 
 pub fn checkpoint() -> CheckpointV1 {
     CheckpointV1 {
-        schema_version: 1,
+        schema_version: CHECKPOINT_SCHEMA_VERSION,
+        account_id: id(ID),
+        workspace_id: id(ID),
         previous_checkpoint_hash: Sha256Digest([9; 32]),
         causal_frontier: vec![DeviceSequence {
             device_id: device(),
@@ -94,6 +96,20 @@ pub fn checkpoint() -> CheckpointV1 {
         creator_device: device(),
         created_hlc: hlc(),
         signature: Ed25519SignatureBytes([11; 64]),
+    }
+}
+
+pub fn pairing_request_fixture() -> PairingRequestV1 {
+    PairingRequestV1 {
+        schema_version: PAIRING_SCHEMA_VERSION,
+        pairing_id: id(ID),
+        request_nonce: PairingRequestNonce([1; 32]),
+        device_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073990"),
+        device_name: "new laptop".into(),
+        platform: NativePlatform::Macos,
+        signing_public_key: Ed25519PublicKeyBytes([3; 32]),
+        wrapping_public_key: X25519PublicKeyBytes([4; 32]),
+        signature: Ed25519SignatureBytes([5; 64]),
     }
 }
 

@@ -1,0 +1,19 @@
+project_id = "context-relay"
+
+[api]
+schemas = ["public", "graphql_public"]
+
+[db]
+major_version = 17
+
+[auth]
+jwt_expiry = 900
+
+[auth.external.github]
+enabled = true
+client_id = "env(SUPABASE_AUTH_GITHUB_CLIENT_ID)"
+secret = "env(SUPABASE_AUTH_GITHUB_SECRET)"
+
+[storage.buckets.ciphertext]
+public = false
+file_size_limit = "33554432"

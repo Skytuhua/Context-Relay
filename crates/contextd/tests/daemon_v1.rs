@@ -70,6 +70,12 @@ fn every_vault_error_maps_to_an_exact_safe_client_error() {
             false,
         ),
         (
+            VaultError::OperationConflict,
+            ErrorCode::Conflict,
+            "The operation ID is already bound to a different mutation",
+            false,
+        ),
+        (
             VaultError::Serialization(canary.into()),
             ErrorCode::Internal,
             "The local service could not complete the request",

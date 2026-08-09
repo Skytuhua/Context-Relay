@@ -164,6 +164,7 @@ fn plan() -> NativeTransactionPlan {
     };
     let mut plan = NativeTransactionPlan {
         setup,
+        approval_version: 1,
         helper_policy_version: 1,
         manifest_schema_version: 1,
         manifest_digest: Sha256Digest([12; 32]),
@@ -198,6 +199,8 @@ fn plan() -> NativeTransactionPlan {
                 40,
             ),
         ],
+        cli_mutations: vec![],
+        native_memory_registrations: vec![],
         ownership_changes: vec![],
     };
     plan.setup.batch_hash = approval_hash_v1(&plan).unwrap();

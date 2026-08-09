@@ -1,6 +1,6 @@
 use context_relay_protocol::{
-    AccountId, ClockError, DeviceId, HybridLogicalClock, JsonRpcRequestV1, ProtocolVersion,
-    ProtocolVersionRange, RecordId, negotiate_version,
+    AccountId, ClockError, DeviceId, HybridLogicalClock, JsonRpcRequestV1, PROTOCOL_VERSION,
+    ProtocolVersion, ProtocolVersionRange, RecordId, negotiate_version,
 };
 use std::str::FromStr;
 
@@ -62,6 +62,22 @@ fn version_negotiation_uses_greatest_shared_minor() {
     assert!(negotiate_version(unsupported, unsupported).is_err());
     let _: AccountId = AccountId::from_str(DEVICE).unwrap();
     let _: RecordId = RecordId::from_str(DEVICE).unwrap();
+}
+
+#[test]
+fn exact_local_wire_versions_do_not_negotiate_across_the_safety_confirmation_break() {
+    let legacy = ProtocolVersionRange {
+        min: ProtocolVersion { major: 1, minor: 2 },
+        max: ProtocolVersion { major: 1, minor: 2 },
+    };
+    let current = ProtocolVersionRange {
+        min: PROTOCOL_VERSION,
+        max: PROTOCOL_VERSION,
+    };
+
+    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 3 });
+    assert!(negotiate_version(legacy, current).is_err());
+    assert_eq!(negotiate_version(current, current), Ok(PROTOCOL_VERSION));
 }
 
 #[test]

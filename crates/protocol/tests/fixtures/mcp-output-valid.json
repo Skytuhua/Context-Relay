@@ -9,5 +9,5 @@
   "context_relay_upsert_task": {"task":{"id":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","projectId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","title":"Task","bodyMarkdown":"Body","status":"open","evidence":[],"revision":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f"}},
   "context_relay_complete_task": {"task":{"id":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","projectId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","title":"Task","bodyMarkdown":"Body","status":"done","evidence":[{"summary":"Done","evidenceKind":"result","reference":null,"recordedHlc":{"physicalMs":"1","logical":0,"node":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f"}}],"revision":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f"}},
   "context_relay_create_handoff": {"handoffId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","payload":{"project":null,"markdown":"# Handoff","memories":[],"decisions":[],"tasks":[],"instructionRefs":[]}},
-  "context_relay_status": {"protocol":{"min":{"major":1,"minor":0},"max":{"major":1,"minor":0}},"vault":"unlocked","resolvedProject":null,"sync":"idle","access":{"mode":"default"}}
+  "context_relay_status": {"protocol":{"min":{"major":1,"minor":3},"max":{"major":1,"minor":3}},"vault":"unlocked","resolvedProject":null,"sync":"idle","access":{"mode":"default"}}
 }

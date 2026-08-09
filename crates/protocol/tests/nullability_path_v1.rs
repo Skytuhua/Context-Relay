@@ -84,7 +84,7 @@ fn required_nullable_shared_and_output_fields_distinguish_omission_from_null() {
     );
     assert_required_nullable::<StatusOutput>(
         json!({
-            "protocol":{"min":{"major":1,"minor":0},"max":{"major":1,"minor":0}},
+            "protocol":{"min":{"major":1,"minor":2},"max":{"major":1,"minor":2}},
             "vault":"unlocked",
             "resolvedProject":null,
             "sync":"idle",
@@ -178,10 +178,6 @@ fn sync_and_local_result_nullable_outputs_require_explicit_null() {
     for (value, field) in [
         (json!({"kind":"memory","data":{"memory":null}}), "memory"),
         (
-            json!({"kind":"recovery","data":{"state":"idle","recoveryPhraseWords":null}}),
-            "recoveryPhraseWords",
-        ),
-        (
             json!({"kind":"account_deletion","data":{"state":"active","purgeDeadline":null,"exportAvailable":false}}),
             "purgeDeadline",
         ),
@@ -192,6 +188,28 @@ fn sync_and_local_result_nullable_outputs_require_explicit_null() {
         assert!(
             serde_json::from_value::<LocalResult>(omitted).is_err(),
             "omitted LocalResult.{field} must fail"
+        );
+    }
+
+    let status = json!({
+        "kind":"recovery_enrollment_status",
+        "data":{"status":{
+            "enrollmentId":null,
+            "state":"idle",
+            "createdAtMs":null,
+            "transitionedAtMs":null
+        }}
+    });
+    assert!(serde_json::from_value::<LocalResult>(status.clone()).is_ok());
+    for field in ["enrollmentId", "createdAtMs", "transitionedAtMs"] {
+        let mut omitted = status.clone();
+        omitted["data"]["status"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(
+            serde_json::from_value::<LocalResult>(omitted).is_err(),
+            "omitted RecoveryEnrollmentStatus.{field} must fail"
         );
     }
 }

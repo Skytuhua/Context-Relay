@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
-    fs,
+    ffi::OsStr,
+    fs::{self, File},
     path::{Path, PathBuf},
 };
 
@@ -162,6 +163,35 @@ impl NativeMetadata {
 
     pub const fn link_count(&self) -> u64 {
         self.link_count
+    }
+
+    /// Rebinds a same-directory template to the parent generation that will
+    /// exist after an absent sibling target is created.
+    pub fn for_absent_sibling_creation(&self, absent: &NativeState) -> Result<Self, RunnerError> {
+        let NativeState::Absent {
+            parent_attributes,
+            parent_link_count,
+        } = absent
+        else {
+            return Err(RunnerError::InvalidNativeState);
+        };
+        if (self.parent_attributes, self.parent_link_count)
+            != (*parent_attributes, *parent_link_count)
+        {
+            return Err(RunnerError::ConcurrentChange);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            macos::metadata_for_absent_sibling_creation(self)
+        }
+        #[cfg(windows)]
+        {
+            Ok(self.clone())
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            Err(RunnerError::UnsupportedTarget)
+        }
     }
 }
 
@@ -500,6 +530,84 @@ impl RecoveryProvenance<'_> {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OsNativeFileSystem;
+
+#[derive(Debug)]
+pub struct PinnedNativeDirectory {
+    path: PathBuf,
+    #[cfg(any(windows, target_os = "macos"))]
+    directory: File,
+}
+
+impl PinnedNativeDirectory {
+    pub fn open(path: &Path) -> Result<Self, RunnerError> {
+        #[cfg(target_os = "macos")]
+        let directory = macos::open_pinned_directory(path)?;
+        #[cfg(windows)]
+        let directory = windows::open_pinned_directory(path)?;
+        #[cfg(not(any(windows, target_os = "macos")))]
+        return Err(RunnerError::UnsupportedTarget);
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            #[cfg(any(windows, target_os = "macos"))]
+            directory,
+        })
+    }
+
+    pub fn verify_path(&self) -> Result<(), RunnerError> {
+        #[cfg(target_os = "macos")]
+        let matches = macos::verify_pinned_directory(&self.directory, &self.path)?;
+        #[cfg(windows)]
+        let matches = windows::verify_pinned_directory(&self.directory, &self.path)?;
+        #[cfg(not(any(windows, target_os = "macos")))]
+        return Err(RunnerError::UnsupportedTarget);
+
+        if matches {
+            Ok(())
+        } else {
+            Err(RunnerError::ConcurrentChange)
+        }
+    }
+
+    pub fn open_or_create_regular_file(&self, name: &str) -> Result<File, RunnerError> {
+        validate_pinned_child_name(name)?;
+        self.verify_path()?;
+        #[cfg(target_os = "macos")]
+        let file = macos::open_or_create_pinned_regular(&self.directory, OsStr::new(name))?;
+        #[cfg(windows)]
+        let file = windows::open_or_create_pinned_regular(&self.directory, OsStr::new(name))?;
+        #[cfg(not(any(windows, target_os = "macos")))]
+        return Err(RunnerError::UnsupportedTarget);
+
+        self.verify_regular_file(name, &file)?;
+        self.verify_path()?;
+        Ok(file)
+    }
+
+    pub fn verify_regular_file(&self, name: &str, file: &File) -> Result<(), RunnerError> {
+        validate_pinned_child_name(name)?;
+        #[cfg(target_os = "macos")]
+        let matches = macos::verify_pinned_regular(&self.directory, OsStr::new(name), file)?;
+        #[cfg(windows)]
+        let matches = windows::verify_pinned_regular(&self.directory, OsStr::new(name), file)?;
+        #[cfg(not(any(windows, target_os = "macos")))]
+        return Err(RunnerError::UnsupportedTarget);
+
+        if matches {
+            Ok(())
+        } else {
+            Err(RunnerError::ConcurrentChange)
+        }
+    }
+}
+
+fn validate_pinned_child_name(name: &str) -> Result<(), RunnerError> {
+    if name.is_empty() || matches!(name, "." | "..") || name.contains(['\0', '/', '\\']) {
+        Err(RunnerError::InvalidPath)
+    } else {
+        Ok(())
+    }
+}
 
 impl OsNativeFileSystem {
     pub const fn new() -> Self {

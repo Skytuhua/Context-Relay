@@ -1,7 +1,7 @@
 use context_relay_protocol::{
     CancelParams, ClientError, ClientRole, DaemonInstanceNonce, EmptyParams, ErrorCode,
     HelloParams, JsonRpcErrorObject, JsonRpcErrorV1, JsonRpcRequestV1, JsonRpcVersion,
-    LocalRequest, LocalResult, PROTOCOL_VERSION, RecordId,
+    LocalRequest, LocalResult, PROTOCOL_VERSION, ProtocolVersion, RecordId,
 };
 use tokio::io::duplex;
 
@@ -111,6 +111,79 @@ async fn authenticated_pair(
     .await
     .unwrap();
     (client, server.await.unwrap().unwrap())
+}
+
+#[tokio::test]
+async fn exact_local_handshake_rejects_legacy_minor_in_both_directions() {
+    const LEGACY_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 2 };
+
+    let (client_io, server_io) = duplex(64 * 1024);
+    let legacy_hello = ServerHelloV1 {
+        protocol: LEGACY_PROTOCOL_VERSION,
+        ..server_hello()
+    };
+    let legacy_server = tokio::spawn(async move {
+        let token = InstallationToken::from_bytes([0x11; 32]);
+        server_handshake(server_io, &token, legacy_hello).await
+    });
+    let token = InstallationToken::from_bytes([0x11; 32]);
+    assert!(matches!(
+        expect_ipc_error(
+            client_handshake(
+                client_io,
+                ClientRole::Desktop,
+                &token,
+                DaemonInstanceNonce::new([0x22; 32]),
+                record_id("018f22e2-79b0-7cc8-98c4-dc0c0c07398f"),
+            )
+            .await
+        ),
+        IpcError::ProtocolVersionUnsupported
+    ));
+    assert!(legacy_server.await.unwrap().is_err());
+
+    let (mut legacy_client_io, server_io) = duplex(64 * 1024);
+    let current_hello = server_hello();
+    let current_server = tokio::spawn(async move {
+        let token = InstallationToken::from_bytes([0x11; 32]);
+        server_handshake(server_io, &token, current_hello).await
+    });
+    let observed: ServerHelloV1 = read_json(&mut legacy_client_io).await.unwrap();
+    let token = InstallationToken::from_bytes([0x11; 32]);
+    let client_nonce = DaemonInstanceNonce::new([0x22; 32]);
+    let transcript = AuthTranscriptV1 {
+        role: ClientRole::Desktop,
+        client_nonce,
+        server_hello: observed,
+    };
+    write_json(
+        &mut legacy_client_io,
+        &JsonRpcRequestV1 {
+            jsonrpc: JsonRpcVersion::V2,
+            id: record_id("018f22e2-79b0-7cc8-98c4-dc0c0c073990"),
+            protocol: LEGACY_PROTOCOL_VERSION,
+            daemon_instance_nonce: observed.daemon_instance_nonce,
+            request: LocalRequest::Hello(HelloParams {
+                client_role: ClientRole::Desktop,
+                client_nonce,
+                session_proof: create_proof(&token, &transcript),
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    let response: JsonRpcErrorV1 = read_json(&mut legacy_client_io).await.unwrap();
+    assert_eq!(
+        response.error.data.code,
+        ErrorCode::ProtocolVersionUnsupported
+    );
+    assert!(matches!(
+        expect_ipc_error(current_server.await.unwrap()),
+        IpcError::ProtocolVersionUnsupported
+    ));
+
+    let (current_client, current_server) = authenticated_pair(ClientRole::Desktop).await;
+    drop((current_client, current_server));
 }
 
 async fn authenticated_pair_with_registry(
@@ -447,7 +520,7 @@ async fn duplicate_hello_param_is_rejected_before_authentication() {
         server_hello: observed,
     };
     let raw = format!(
-        r#"{{"jsonrpc":"2.0","id":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","protocol":{{"major":1,"minor":0}},"daemonInstanceNonce":{},"method":"hello","params":{{"clientRole":"desktop","clientRole":"mcp_bridge","clientNonce":{},"sessionProof":{}}}}}"#,
+        r#"{{"jsonrpc":"2.0","id":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","protocol":{{"major":1,"minor":1}},"daemonInstanceNonce":{},"method":"hello","params":{{"clientRole":"desktop","clientRole":"mcp_bridge","clientNonce":{},"sessionProof":{}}}}}"#,
         serde_json::to_string(&observed.daemon_instance_nonce).unwrap(),
         serde_json::to_string(&transcript.client_nonce).unwrap(),
         serde_json::to_string(&create_proof(&token, &transcript)).unwrap(),
@@ -510,7 +583,7 @@ async fn strict_probe_rejects_duplicate_keys_at_every_object_depth() {
     assert_raw_request_rejected(|hello| {
         let nonce = serde_json::to_string(&hello.daemon_instance_nonce).unwrap();
         format!(
-            r#"{{"jsonrpc":"2.0","id":"018f22e2-79b0-7cc8-98c4-dc0c0c073990","protocol":{{"major":1,"minor":0}},"protocol":{{"major":1,"minor":0}},"daemonInstanceNonce":{},"method":"health","params":{{}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":"018f22e2-79b0-7cc8-98c4-dc0c0c073990","protocol":{{"major":1,"minor":1}},"protocol":{{"major":1,"minor":1}},"daemonInstanceNonce":{},"method":"health","params":{{}}}}"#,
             nonce
         )
     })
@@ -518,7 +591,7 @@ async fn strict_probe_rejects_duplicate_keys_at_every_object_depth() {
     assert_raw_request_rejected(|hello| {
         let nonce = serde_json::to_string(&hello.daemon_instance_nonce).unwrap();
         format!(
-            r#"{{"jsonrpc":"2.0","id":"018f22e2-79b0-7cc8-98c4-dc0c0c073990","protocol":{{"major":1,"minor":0}},"daemonInstanceNonce":{},"method":"health","params":{{}},"params":{{}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":"018f22e2-79b0-7cc8-98c4-dc0c0c073990","protocol":{{"major":1,"minor":1}},"daemonInstanceNonce":{},"method":"health","params":{{}},"params":{{}}}}"#,
             nonce
         )
     })
@@ -526,7 +599,7 @@ async fn strict_probe_rejects_duplicate_keys_at_every_object_depth() {
     assert_raw_request_rejected(|hello| {
         let nonce = serde_json::to_string(&hello.daemon_instance_nonce).unwrap();
         format!(
-            r#"{{"jsonrpc":"2.0","id":"018f22e2-79b0-7cc8-98c4-dc0c0c073990","protocol":{{"major":1,"minor":0}},"daemonInstanceNonce":{},"method":"cancel","params":{{"requestId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","requestId":"018f22e2-79b0-7cc8-98c4-dc0c0c073990"}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":"018f22e2-79b0-7cc8-98c4-dc0c0c073990","protocol":{{"major":1,"minor":1}},"daemonInstanceNonce":{},"method":"cancel","params":{{"requestId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","requestId":"018f22e2-79b0-7cc8-98c4-dc0c0c073990"}}}}"#,
             nonce
         )
     })
@@ -534,7 +607,7 @@ async fn strict_probe_rejects_duplicate_keys_at_every_object_depth() {
     assert_raw_request_rejected(|hello| {
         let nonce = serde_json::to_string(&hello.daemon_instance_nonce).unwrap();
         format!(
-            r#"{{"jsonrpc":"2.0","id":"018f22e2-79b0-7cc8-98c4-dc0c0c073990","protocol":{{"major":1,"minor":0}},"daemonInstanceNonce":{},"method":"project_path_set","params":{{"projectId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","path":{{"platform":"windows","platform":"macos","bytes":"YwA"}}}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":"018f22e2-79b0-7cc8-98c4-dc0c0c073990","protocol":{{"major":1,"minor":1}},"daemonInstanceNonce":{},"method":"project_path_set","params":{{"projectId":"018f22e2-79b0-7cc8-98c4-dc0c0c07398f","path":{{"platform":"windows","platform":"macos","bytes":"YwA"}}}}}}"#,
             nonce
         )
     })
@@ -714,6 +787,113 @@ async fn cancel_on_a_second_connection_marks_a_shared_queued_request() {
         original_call.await.unwrap().unwrap_err().code,
         ErrorCode::Canceled
     );
+    cancel_pump.abort();
+}
+
+#[tokio::test]
+async fn cancel_before_registration_marks_the_later_request_canceled() {
+    let registry = RequestRegistry::default();
+    let (mut original_client, mut original_server) =
+        authenticated_pair_with_registry(ClientRole::Desktop, registry.clone()).await;
+    let (mut cancel_client, mut cancel_server) =
+        authenticated_pair_with_registry(ClientRole::Desktop, registry).await;
+    let target = record_id("018f22e2-79b0-7cc8-98c4-dc0c0c0739a5");
+    let cancel_pump = tokio::spawn(async move { cancel_server.next_request().await });
+
+    assert!(matches!(
+        cancel_client
+            .call(
+                record_id("018f22e2-79b0-7cc8-98c4-dc0c0c0739a6"),
+                LocalRequest::Cancel(CancelParams { request_id: target }),
+            )
+            .await
+            .unwrap(),
+        LocalResult::Empty
+    ));
+
+    let original_call = tokio::spawn(async move {
+        original_client
+            .call(target, LocalRequest::Health(EmptyParams {}))
+            .await
+    });
+    let request = original_server.next_request().await.unwrap();
+    assert!(!request.registration.begin());
+    assert!(request.registration.is_canceled());
+    original_server
+        .respond(
+            request.id,
+            Err(ClientError {
+                code: ErrorCode::Canceled,
+                message: "The request was canceled".into(),
+                field_path: None,
+                retryable: false,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        original_call.await.unwrap().unwrap_err().code,
+        ErrorCode::Canceled
+    );
+    cancel_pump.abort();
+}
+
+#[tokio::test]
+async fn late_cancel_after_completion_does_not_cancel_sequential_reuse() {
+    let registry = RequestRegistry::default();
+    let (mut original_client, mut original_server) =
+        authenticated_pair_with_registry(ClientRole::Desktop, registry.clone()).await;
+    let (mut cancel_client, mut cancel_server) =
+        authenticated_pair_with_registry(ClientRole::Desktop, registry).await;
+    let target = record_id("018f22e2-79b0-7cc8-98c4-dc0c0c0739a7");
+
+    let first_server = tokio::spawn(async move {
+        let request = original_server.next_request().await.unwrap();
+        assert!(request.registration.begin());
+        original_server
+            .respond(request.id, Ok(LocalResult::Empty))
+            .await
+            .unwrap();
+        drop(request);
+        original_server
+    });
+    assert!(matches!(
+        original_client
+            .call(target, LocalRequest::Health(EmptyParams {}))
+            .await
+            .unwrap(),
+        LocalResult::Empty
+    ));
+    let mut original_server = first_server.await.unwrap();
+
+    let cancel_pump = tokio::spawn(async move { cancel_server.next_request().await });
+    assert!(matches!(
+        cancel_client
+            .call(
+                record_id("018f22e2-79b0-7cc8-98c4-dc0c0c0739a8"),
+                LocalRequest::Cancel(CancelParams { request_id: target }),
+            )
+            .await
+            .unwrap(),
+        LocalResult::Empty
+    ));
+
+    let reused_server = tokio::spawn(async move {
+        let request = original_server.next_request().await.unwrap();
+        assert!(request.registration.begin());
+        original_server
+            .respond(request.id, Ok(LocalResult::Empty))
+            .await
+            .unwrap();
+    });
+    assert!(matches!(
+        original_client
+            .call(target, LocalRequest::Health(EmptyParams {}))
+            .await
+            .unwrap(),
+        LocalResult::Empty
+    ));
+    reused_server.await.unwrap();
     cancel_pump.abort();
 }
 

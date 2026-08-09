@@ -1,21 +1,29 @@
 use std::collections::BTreeSet;
 
 use context_relay_native_runner::MacRootIdentity;
-use context_relay_protocol::{ApplyReceipt, PlanId, Sha256Digest, WireNativeValue};
+use context_relay_protocol::{ApplyReceipt, HarnessId, PlanId, Sha256Digest, WireNativeValue};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
+use crate::native_memory::{NativeMemoryLedger, NativeMemoryRegistration};
 use crate::native_transaction::{
     MutationKind, NativeApplyReceipt, NativeObjectToken, NativeReceiptEntry, OwnershipChange,
     RestorableStateFingerprint, TransactionStep,
 };
 
-use super::{BeforeImagePolicy, Vault, VaultError, from_json, sqlite_u64, to_i64, to_json};
+use super::{
+    BeforeImagePolicy, Vault, VaultError, from_json, put_native_memory_ledger, sha256_key,
+    sqlite_u64, to_i64, to_json,
+};
 
 pub use crate::native_transaction::MutationWalState as NativeWalState;
 
 const MAX_BEFORE_IMAGE_BATCH: usize = 4_096;
 const MAX_NATIVE_PLAN_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CLI_DECLARATION_BYTES: usize = 1024 * 1024;
+const MAX_CLI_OPERATIONS_BYTES: usize = 1024 * 1024;
+const MAX_CLI_WAL_ROWS: u32 = 1_024;
 const WINDOWS_MONIKER_PREFIX: &str = "context-relay.native.";
 const MACOS_BUNDLE_PREFIX: &str = "com.contextrelay.native-runner.";
 const MACOS_CONTAINER_DOMAIN: &[u8] = b"context-relay/macos-container/v1\0";
@@ -35,6 +43,92 @@ pub struct NativePlanWrite<'a> {
     pub payload: &'a [u8],
     pub created_ms: u64,
     pub expires_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SetupPlanWrite<'a> {
+    pub plan_id: &'a PlanId,
+    pub schema_version: u32,
+    pub approval_version: u32,
+    pub approval_hash: &'a Sha256Digest,
+    pub payload: &'a [u8],
+    pub created_ms: u64,
+    pub expires_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupPlanLifecycle {
+    Previewed,
+    Applying,
+    Applied,
+    ApplyRestored,
+    RollingBack,
+    RolledBack,
+    RollbackRestored,
+    Conflict,
+    Expired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupPlanAction {
+    Apply,
+    Rollback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupPlanClaim {
+    Claimed,
+    Replay,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupPlanRecord {
+    pub plan_id: PlanId,
+    pub schema_version: u32,
+    pub approval_version: u32,
+    pub approval_hash: Sha256Digest,
+    pub payload: Vec<u8>,
+    pub created_ms: u64,
+    pub expires_ms: u64,
+    pub lifecycle: SetupPlanLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeCliWalState {
+    Prepared,
+    Applied,
+    RestorePrepared,
+    Restored,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NativeCliWalWrite<'a> {
+    pub sequence: u32,
+    pub stable_id: &'a str,
+    pub harness: HarnessId,
+    pub server_name: &'a str,
+    pub expected_declaration: Option<&'a [u8]>,
+    pub expected_fingerprint: Option<&'a Sha256Digest>,
+    pub intended_declaration: Option<&'a [u8]>,
+    pub intended_fingerprint: Option<&'a Sha256Digest>,
+    pub forward_operations: &'a [u8],
+    pub rollback_operations: &'a [u8],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeCliWalRecord {
+    pub sequence: u32,
+    pub stable_id: String,
+    pub harness: HarnessId,
+    pub server_name: String,
+    pub expected_declaration: Option<Vec<u8>>,
+    pub expected_fingerprint: Option<Sha256Digest>,
+    pub intended_declaration: Option<Vec<u8>>,
+    pub intended_fingerprint: Option<Sha256Digest>,
+    pub forward_operations: Vec<u8>,
+    pub rollback_operations: Vec<u8>,
+    pub state: NativeCliWalState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1194,6 +1288,258 @@ fn decode_digest(bytes: Vec<u8>, field: &'static str) -> Result<Sha256Digest, Va
     Ok(Sha256Digest(digest))
 }
 
+fn decode_cli_digest(bytes: Vec<u8>, field: &'static str) -> Result<Sha256Digest, VaultError> {
+    let digest = bytes.try_into().map_err(|_| {
+        VaultError::Validation(format!("{field} fingerprint is not exactly 32 bytes"))
+    })?;
+    Ok(Sha256Digest(digest))
+}
+
+fn cli_harness_name(harness: HarnessId) -> Result<&'static str, VaultError> {
+    match harness {
+        HarnessId::ClaudeCode => Ok("claude_code"),
+        HarnessId::Codex => Ok("codex"),
+        HarnessId::Hermes => Err(VaultError::Validation(
+            "native CLI WAL does not support Hermes".to_owned(),
+        )),
+    }
+}
+
+fn parse_cli_harness(value: &str) -> Result<HarnessId, VaultError> {
+    match value {
+        "claude_code" => Ok(HarnessId::ClaudeCode),
+        "codex" => Ok(HarnessId::Codex),
+        _ => Err(VaultError::Validation(
+            "native CLI WAL harness is invalid".to_owned(),
+        )),
+    }
+}
+
+const fn cli_wal_state_name(state: NativeCliWalState) -> &'static str {
+    match state {
+        NativeCliWalState::Prepared => "prepared",
+        NativeCliWalState::Applied => "applied",
+        NativeCliWalState::RestorePrepared => "restore_prepared",
+        NativeCliWalState::Restored => "restored",
+        NativeCliWalState::Conflict => "conflict",
+    }
+}
+
+fn parse_cli_wal_state(value: &str) -> Result<NativeCliWalState, VaultError> {
+    match value {
+        "prepared" => Ok(NativeCliWalState::Prepared),
+        "applied" => Ok(NativeCliWalState::Applied),
+        "restore_prepared" => Ok(NativeCliWalState::RestorePrepared),
+        "restored" => Ok(NativeCliWalState::Restored),
+        "conflict" => Ok(NativeCliWalState::Conflict),
+        _ => Err(VaultError::Validation(
+            "native CLI WAL state is invalid".to_owned(),
+        )),
+    }
+}
+
+fn validate_cli_declaration(
+    declaration: Option<&[u8]>,
+    fingerprint: Option<&Sha256Digest>,
+    field: &'static str,
+) -> Result<(), VaultError> {
+    match (declaration, fingerprint) {
+        (None, None) => Ok(()),
+        (Some(bytes), Some(expected))
+            if !bytes.is_empty() && bytes.len() <= MAX_CLI_DECLARATION_BYTES =>
+        {
+            std::str::from_utf8(bytes).map_err(|_| {
+                VaultError::Validation(format!("native CLI WAL {field} declaration is not UTF-8"))
+            })?;
+            let actual = Sha256Digest(Sha256::digest(bytes).into());
+            if actual != *expected {
+                return Err(VaultError::Validation(format!(
+                    "native CLI WAL {field} declaration fingerprint does not match"
+                )));
+            }
+            Ok(())
+        }
+        (Some(_), Some(_)) => Err(VaultError::Validation(format!(
+            "native CLI WAL {field} declaration length is invalid"
+        ))),
+        _ => Err(VaultError::Validation(format!(
+            "native CLI WAL {field} declaration and fingerprint must be paired"
+        ))),
+    }
+}
+
+fn validate_native_cli_wal_write(write: &NativeCliWalWrite<'_>) -> Result<(), VaultError> {
+    if write.sequence >= MAX_CLI_WAL_ROWS {
+        return Err(VaultError::Validation(
+            "native CLI WAL sequence exceeds its bound".to_owned(),
+        ));
+    }
+    if write.stable_id.trim().is_empty() || write.stable_id.len() > 512 {
+        return Err(VaultError::Validation(
+            "native CLI WAL stable id length is invalid".to_owned(),
+        ));
+    }
+    cli_harness_name(write.harness)?;
+    if write.server_name != "context-relay" {
+        return Err(VaultError::Validation(
+            "native CLI WAL supports only the context-relay server".to_owned(),
+        ));
+    }
+    validate_cli_declaration(
+        write.expected_declaration,
+        write.expected_fingerprint,
+        "expected",
+    )?;
+    validate_cli_declaration(
+        write.intended_declaration,
+        write.intended_fingerprint,
+        "intended",
+    )?;
+    if write.expected_declaration.is_none() && write.intended_declaration.is_none() {
+        return Err(VaultError::Validation(
+            "native CLI WAL mutation cannot preserve absence".to_owned(),
+        ));
+    }
+    if write.forward_operations.is_empty()
+        || write.forward_operations.len() > MAX_CLI_OPERATIONS_BYTES
+        || write.rollback_operations.is_empty()
+        || write.rollback_operations.len() > MAX_CLI_OPERATIONS_BYTES
+    {
+        return Err(VaultError::Validation(
+            "native CLI WAL operation payload length is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_native_cli_wal_record(
+    connection: &Connection,
+    transaction_id: &str,
+    sequence: u32,
+) -> Result<Option<NativeCliWalRecord>, VaultError> {
+    let raw = connection
+        .query_row(
+            "SELECT sequence, stable_id, harness, server_name,
+                    expected_declaration, expected_fingerprint,
+                    intended_declaration, intended_fingerprint,
+                    forward_operations, rollback_operations, state
+             FROM native_cli_wal
+             WHERE transaction_id = ?1 AND sequence = ?2",
+            params![transaction_id, i64::from(sequence)],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    raw.map(
+        |(
+            sequence,
+            stable_id,
+            harness,
+            server_name,
+            expected_declaration,
+            expected_fingerprint,
+            intended_declaration,
+            intended_fingerprint,
+            forward_operations,
+            rollback_operations,
+            state,
+        )| {
+            let expected_fingerprint = expected_fingerprint
+                .map(|bytes| decode_cli_digest(bytes, "native CLI WAL expected"))
+                .transpose()?;
+            let intended_fingerprint = intended_fingerprint
+                .map(|bytes| decode_cli_digest(bytes, "native CLI WAL intended"))
+                .transpose()?;
+            let record = NativeCliWalRecord {
+                sequence: u32::try_from(sequence).map_err(|_| {
+                    VaultError::Validation("native CLI WAL sequence is outside u32".to_owned())
+                })?,
+                stable_id,
+                harness: parse_cli_harness(&harness)?,
+                server_name,
+                expected_declaration,
+                expected_fingerprint,
+                intended_declaration,
+                intended_fingerprint,
+                forward_operations,
+                rollback_operations,
+                state: parse_cli_wal_state(&state)?,
+            };
+            validate_native_cli_wal_record(&record)?;
+            Ok(record)
+        },
+    )
+    .transpose()
+}
+
+fn load_native_cli_wal(
+    connection: &Connection,
+    transaction_id: &str,
+) -> Result<Vec<NativeCliWalRecord>, VaultError> {
+    let sequences = {
+        let mut statement = connection.prepare(
+            "SELECT sequence FROM native_cli_wal
+             WHERE transaction_id = ?1 ORDER BY sequence",
+        )?;
+        statement
+            .query_map([transaction_id], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    sequences
+        .into_iter()
+        .map(|sequence| {
+            let sequence = u32::try_from(sequence).map_err(|_| {
+                VaultError::Validation("native CLI WAL sequence is outside u32".to_owned())
+            })?;
+            load_native_cli_wal_record(connection, transaction_id, sequence)?.ok_or_else(|| {
+                VaultError::Validation("native CLI WAL row disappeared during query".to_owned())
+            })
+        })
+        .collect()
+}
+
+fn validate_native_cli_wal_record(record: &NativeCliWalRecord) -> Result<(), VaultError> {
+    let write = NativeCliWalWrite {
+        sequence: record.sequence,
+        stable_id: &record.stable_id,
+        harness: record.harness,
+        server_name: &record.server_name,
+        expected_declaration: record.expected_declaration.as_deref(),
+        expected_fingerprint: record.expected_fingerprint.as_ref(),
+        intended_declaration: record.intended_declaration.as_deref(),
+        intended_fingerprint: record.intended_fingerprint.as_ref(),
+        forward_operations: &record.forward_operations,
+        rollback_operations: &record.rollback_operations,
+    };
+    validate_native_cli_wal_write(&write)
+}
+
+fn cli_wal_write_matches(record: &NativeCliWalRecord, write: &NativeCliWalWrite<'_>) -> bool {
+    record.sequence == write.sequence
+        && record.stable_id == write.stable_id
+        && record.harness == write.harness
+        && record.server_name == write.server_name
+        && record.expected_declaration.as_deref() == write.expected_declaration
+        && record.expected_fingerprint.as_ref() == write.expected_fingerprint
+        && record.intended_declaration.as_deref() == write.intended_declaration
+        && record.intended_fingerprint.as_ref() == write.intended_fingerprint
+        && record.forward_operations == write.forward_operations
+        && record.rollback_operations == write.rollback_operations
+}
+
 impl Vault {
     pub fn commit_native_success(
         &mut self,
@@ -1991,7 +2337,942 @@ fn validate_absence_rebind_edge<'a>(
     Ok((existing, later))
 }
 
+fn validate_setup_plan_write(plan: &SetupPlanWrite<'_>) -> Result<(), VaultError> {
+    if plan.schema_version == 0 || plan.approval_version == 0 {
+        return Err(VaultError::Validation(
+            "setup plan envelope versions must be positive".to_owned(),
+        ));
+    }
+    if plan.payload.is_empty() || plan.payload.len() > MAX_NATIVE_PLAN_BYTES {
+        return Err(VaultError::Validation(
+            "setup plan payload length is invalid".to_owned(),
+        ));
+    }
+    if plan.expires_ms < plan.created_ms {
+        return Err(VaultError::Validation(
+            "setup plan expires before it was created".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_native_memory_registrations(
+    registrations: &[NativeMemoryRegistration],
+) -> Result<(Vec<NativeMemoryRegistration>, Vec<u8>), VaultError> {
+    let mut registrations = registrations.to_vec();
+    registrations.sort_by_key(|registration| registration.source.id);
+    let mut unique = BTreeSet::new();
+    for registration in &registrations {
+        registration
+            .source
+            .validate()
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        if !unique.insert(registration.source.id) {
+            return Err(VaultError::Validation(
+                "native memory source is registered more than once".to_owned(),
+            ));
+        }
+    }
+    let canonical = to_json(&registrations)?;
+    Ok((registrations, canonical))
+}
+
+fn load_setup_native_memory_binding(
+    connection: &Connection,
+    plan_id: &PlanId,
+) -> Result<Option<Vec<NativeMemoryRegistration>>, VaultError> {
+    let Some(payload) = connection
+        .query_row(
+            "SELECT payload_json FROM setup_native_memory_bindings WHERE plan_id = ?1",
+            [plan_id.to_string()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let decoded = from_json::<Vec<NativeMemoryRegistration>>(&payload)?;
+    let (registrations, canonical) = canonical_native_memory_registrations(&decoded)?;
+    if canonical != payload {
+        return Err(VaultError::Validation(
+            "native memory registration binding is not canonical".to_owned(),
+        ));
+    }
+    Ok(Some(registrations))
+}
+
+const fn setup_plan_lifecycle_name(state: SetupPlanLifecycle) -> &'static str {
+    match state {
+        SetupPlanLifecycle::Previewed => "previewed",
+        SetupPlanLifecycle::Applying => "applying",
+        SetupPlanLifecycle::Applied => "applied",
+        SetupPlanLifecycle::ApplyRestored => "apply_restored",
+        SetupPlanLifecycle::RollingBack => "rolling_back",
+        SetupPlanLifecycle::RolledBack => "rolled_back",
+        SetupPlanLifecycle::RollbackRestored => "rollback_restored",
+        SetupPlanLifecycle::Conflict => "conflict",
+        SetupPlanLifecycle::Expired => "expired",
+    }
+}
+
+fn parse_setup_plan_lifecycle(value: &str) -> Result<SetupPlanLifecycle, VaultError> {
+    match value {
+        "previewed" => Ok(SetupPlanLifecycle::Previewed),
+        "applying" => Ok(SetupPlanLifecycle::Applying),
+        "applied" => Ok(SetupPlanLifecycle::Applied),
+        "apply_restored" => Ok(SetupPlanLifecycle::ApplyRestored),
+        "rolling_back" => Ok(SetupPlanLifecycle::RollingBack),
+        "rolled_back" => Ok(SetupPlanLifecycle::RolledBack),
+        "rollback_restored" => Ok(SetupPlanLifecycle::RollbackRestored),
+        "conflict" => Ok(SetupPlanLifecycle::Conflict),
+        "expired" => Ok(SetupPlanLifecycle::Expired),
+        _ => Err(VaultError::Validation(
+            "setup plan lifecycle is invalid".to_owned(),
+        )),
+    }
+}
+
+fn load_setup_plan(
+    connection: &Connection,
+    plan_id: &PlanId,
+) -> Result<Option<SetupPlanRecord>, VaultError> {
+    let raw = connection
+        .query_row(
+            "SELECT lifecycle.schema_version, lifecycle.approval_version,
+                    plans.approval_hash, plans.payload, plans.created_ms, plans.expires_ms,
+                    lifecycle.state
+             FROM setup_plan_lifecycle AS lifecycle
+             JOIN native_plans AS plans USING(plan_id)
+             WHERE lifecycle.plan_id = ?1",
+            [plan_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((schema, approval, hash, payload, created, expires, lifecycle)) = raw else {
+        return Ok(None);
+    };
+    Ok(Some(SetupPlanRecord {
+        plan_id: *plan_id,
+        schema_version: u32::try_from(schema).map_err(|_| {
+            VaultError::Validation("setup plan schema version is outside u32".to_owned())
+        })?,
+        approval_version: u32::try_from(approval).map_err(|_| {
+            VaultError::Validation("setup plan approval version is outside u32".to_owned())
+        })?,
+        approval_hash: decode_cli_digest(hash, "setup plan approval")?,
+        payload,
+        created_ms: sqlite_u64(created, "setup plan created timestamp")?,
+        expires_ms: sqlite_u64(expires, "setup plan expiry timestamp")?,
+        lifecycle: parse_setup_plan_lifecycle(&lifecycle)?,
+    }))
+}
+
 impl Vault {
+    pub fn prepare_native_cli_wal(
+        &mut self,
+        transaction_id: &str,
+        write: &NativeCliWalWrite<'_>,
+    ) -> Result<(), VaultError> {
+        if transaction_id.trim().is_empty() {
+            return Err(VaultError::Validation(
+                "native CLI WAL transaction id cannot be empty".to_owned(),
+            ));
+        }
+        validate_native_cli_wal_write(write)?;
+        let transaction = self.connection.transaction()?;
+        let snapshot = load_native_transaction(&transaction, transaction_id)?.ok_or_else(|| {
+            VaultError::Validation("native transaction does not exist".to_owned())
+        })?;
+        if snapshot.status != NativeTransactionStatus::Pending {
+            return Err(VaultError::Validation(
+                "native CLI WAL can only be prepared for a pending transaction".to_owned(),
+            ));
+        }
+        if let Some(existing) =
+            load_native_cli_wal_record(&transaction, transaction_id, write.sequence)?
+        {
+            if cli_wal_write_matches(&existing, write) {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(VaultError::Validation(
+                "native CLI WAL sequence is immutable".to_owned(),
+            ));
+        }
+        let existing = load_native_cli_wal(&transaction, transaction_id)?;
+        if usize::try_from(write.sequence).ok() != Some(existing.len()) {
+            return Err(VaultError::Validation(
+                "native CLI WAL sequence must be contiguous".to_owned(),
+            ));
+        }
+        if existing.iter().any(|record| {
+            record.stable_id == write.stable_id
+                || (record.harness == write.harness && record.server_name == write.server_name)
+        }) {
+            return Err(VaultError::Validation(
+                "native CLI WAL target cannot appear more than once".to_owned(),
+            ));
+        }
+        let expected_fingerprint = write
+            .expected_fingerprint
+            .map(|fingerprint| fingerprint.0.as_slice());
+        let intended_fingerprint = write
+            .intended_fingerprint
+            .map(|fingerprint| fingerprint.0.as_slice());
+        transaction.execute(
+            "INSERT INTO native_cli_wal(
+                 transaction_id, sequence, stable_id, harness, server_name,
+                 expected_declaration, expected_fingerprint,
+                 intended_declaration, intended_fingerprint,
+                 forward_operations, rollback_operations, state
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'prepared'
+             )",
+            params![
+                transaction_id,
+                i64::from(write.sequence),
+                write.stable_id,
+                cli_harness_name(write.harness)?,
+                write.server_name,
+                write.expected_declaration,
+                expected_fingerprint,
+                write.intended_declaration,
+                intended_fingerprint,
+                write.forward_operations,
+                write.rollback_operations,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn transition_native_cli_wal(
+        &mut self,
+        transaction_id: &str,
+        sequence: u32,
+        next: NativeCliWalState,
+    ) -> Result<(), VaultError> {
+        let transaction = self.connection.transaction()?;
+        let existing = load_native_cli_wal_record(&transaction, transaction_id, sequence)?
+            .ok_or_else(|| {
+                VaultError::Validation("native CLI WAL row does not exist".to_owned())
+            })?;
+        if existing.state == next {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let allowed = matches!(
+            (existing.state, next),
+            (NativeCliWalState::Prepared, NativeCliWalState::Applied)
+                | (NativeCliWalState::Prepared, NativeCliWalState::Conflict)
+                | (
+                    NativeCliWalState::Applied,
+                    NativeCliWalState::RestorePrepared | NativeCliWalState::Conflict
+                )
+                | (
+                    NativeCliWalState::RestorePrepared,
+                    NativeCliWalState::Restored | NativeCliWalState::Conflict
+                )
+        );
+        if !allowed {
+            return Err(VaultError::Validation(
+                "native CLI WAL state transition is not monotonic".to_owned(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE native_cli_wal SET state = ?3
+             WHERE transaction_id = ?1 AND sequence = ?2 AND state = ?4",
+            params![
+                transaction_id,
+                i64::from(sequence),
+                cli_wal_state_name(next),
+                cli_wal_state_name(existing.state),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(VaultError::Validation(
+                "native CLI WAL state changed concurrently".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn native_cli_wal(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Vec<NativeCliWalRecord>, VaultError> {
+        if transaction_id.trim().is_empty() {
+            return Err(VaultError::Validation(
+                "native CLI WAL transaction id cannot be empty".to_owned(),
+            ));
+        }
+        load_native_cli_wal(&self.connection, transaction_id)
+    }
+
+    pub fn native_plan_payload_for_recovery(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Vec<u8>, VaultError> {
+        if transaction_id.trim().is_empty() {
+            return Err(VaultError::Validation(
+                "native recovery transaction id cannot be empty".to_owned(),
+            ));
+        }
+        self.connection
+            .query_row(
+                "SELECT plans.payload
+                 FROM native_transactions AS transactions
+                 JOIN native_plans AS plans USING(plan_id)
+                 WHERE transactions.transaction_id = ?1",
+                [transaction_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                VaultError::Validation(
+                    "native recovery transaction or sealed plan is missing".to_owned(),
+                )
+            })
+    }
+
+    pub fn finish_committed_native_cli_cleanup(
+        &mut self,
+        transaction_id: &str,
+    ) -> Result<(), VaultError> {
+        let transaction = self.connection.transaction()?;
+        let snapshot = load_native_transaction(&transaction, transaction_id)?.ok_or_else(|| {
+            VaultError::Validation("native transaction does not exist".to_owned())
+        })?;
+        if snapshot.status != NativeTransactionStatus::Committed || snapshot.current_step != 19 {
+            return Err(VaultError::Validation(
+                "native CLI cleanup requires a durable committed transaction".to_owned(),
+            ));
+        }
+        let unfinished = transaction.query_row(
+            "SELECT count(*) FROM native_cli_wal
+             WHERE transaction_id = ?1 AND state != 'applied'",
+            [transaction_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if unfinished != 0 {
+            return Err(VaultError::Validation(
+                "committed native CLI cleanup requires applied WAL rows".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "DELETE FROM native_cli_wal WHERE transaction_id = ?1",
+            [transaction_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn put_setup_plan(&mut self, plan: SetupPlanWrite<'_>) -> Result<(), VaultError> {
+        validate_setup_plan_write(&plan)?;
+        let plan_id = plan.plan_id.to_string();
+        let created_ms = to_i64(plan.created_ms)?;
+        let expires_ms = to_i64(plan.expires_ms)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO native_plans(
+                 plan_id, approval_hash, payload, created_ms, expires_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(plan_id) DO NOTHING",
+            params![
+                plan_id,
+                plan.approval_hash.0.as_slice(),
+                plan.payload,
+                created_ms,
+                expires_ms,
+            ],
+        )?;
+        let stored = transaction.query_row(
+            "SELECT approval_hash, payload, created_ms, expires_ms
+             FROM native_plans WHERE plan_id = ?1",
+            [&plan_id],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )?;
+        if stored
+            != (
+                plan.approval_hash.0.to_vec(),
+                plan.payload.to_vec(),
+                created_ms,
+                expires_ms,
+            )
+        {
+            return Err(VaultError::Validation(
+                "setup plan id was reused with different canonical bytes".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO setup_plan_lifecycle(
+                 plan_id, schema_version, approval_version, state, updated_ms
+             ) VALUES (?1, ?2, ?3, 'previewed', ?4)
+             ON CONFLICT(plan_id) DO NOTHING",
+            params![
+                plan_id,
+                i64::from(plan.schema_version),
+                i64::from(plan.approval_version),
+                created_ms,
+            ],
+        )?;
+        let versions = transaction.query_row(
+            "SELECT schema_version, approval_version
+             FROM setup_plan_lifecycle WHERE plan_id = ?1",
+            [&plan_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        if versions
+            != (
+                i64::from(plan.schema_version),
+                i64::from(plan.approval_version),
+            )
+        {
+            return Err(VaultError::Validation(
+                "setup plan id was reused with different envelope versions".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn setup_plan(&self, plan_id: &PlanId) -> Result<Option<SetupPlanRecord>, VaultError> {
+        load_setup_plan(&self.connection, plan_id)
+    }
+
+    pub fn incomplete_setup_plans(&self) -> Result<Vec<SetupPlanRecord>, VaultError> {
+        let plan_ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT plan_id FROM setup_plan_lifecycle
+                 WHERE state IN ('applying', 'rolling_back')
+                 ORDER BY updated_ms, plan_id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        plan_ids
+            .into_iter()
+            .map(|plan_id| {
+                let plan_id = plan_id.parse::<PlanId>().map_err(|_| {
+                    VaultError::Validation("setup plan identifier is invalid".to_owned())
+                })?;
+                load_setup_plan(&self.connection, &plan_id)?.ok_or_else(|| {
+                    VaultError::Validation(
+                        "incomplete setup plan disappeared during query".to_owned(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    pub fn claim_setup_plan(
+        &mut self,
+        plan_id: &PlanId,
+        action: SetupPlanAction,
+        now_ms: u64,
+    ) -> Result<SetupPlanClaim, VaultError> {
+        let now_ms = to_i64(now_ms)?;
+        let transaction = self.connection.transaction()?;
+        let stored = transaction
+            .query_row(
+                "SELECT lifecycle.state, plans.expires_ms
+                 FROM setup_plan_lifecycle AS lifecycle
+                 JOIN native_plans AS plans USING(plan_id)
+                 WHERE lifecycle.plan_id = ?1",
+                [plan_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| VaultError::Validation("setup plan does not exist".to_owned()))?;
+        let current = parse_setup_plan_lifecycle(&stored.0)?;
+        let (expected, claimed, replay) = match action {
+            SetupPlanAction::Apply => (
+                SetupPlanLifecycle::Previewed,
+                SetupPlanLifecycle::Applying,
+                SetupPlanLifecycle::Applied,
+            ),
+            SetupPlanAction::Rollback => (
+                SetupPlanLifecycle::Applied,
+                SetupPlanLifecycle::RollingBack,
+                SetupPlanLifecycle::RolledBack,
+            ),
+        };
+        if current == replay {
+            transaction.commit()?;
+            return Ok(SetupPlanClaim::Replay);
+        }
+        if action == SetupPlanAction::Apply
+            && current == SetupPlanLifecycle::Previewed
+            && now_ms >= stored.1
+        {
+            let changed = transaction.execute(
+                "UPDATE setup_plan_lifecycle SET state = 'expired', updated_ms = ?2
+                 WHERE plan_id = ?1 AND state = 'previewed'",
+                params![plan_id.to_string(), now_ms],
+            )?;
+            if changed != 1 {
+                return Err(VaultError::Validation(
+                    "setup plan lifecycle changed concurrently".to_owned(),
+                ));
+            }
+            transaction.commit()?;
+            return Err(VaultError::Validation("setup plan has expired".to_owned()));
+        }
+        if current != expected {
+            return Err(VaultError::Validation(format!(
+                "setup plan cannot be claimed from {}",
+                setup_plan_lifecycle_name(current)
+            )));
+        }
+        let changed = transaction.execute(
+            "UPDATE setup_plan_lifecycle SET state = ?2, updated_ms = ?3
+             WHERE plan_id = ?1 AND state = ?4",
+            params![
+                plan_id.to_string(),
+                setup_plan_lifecycle_name(claimed),
+                now_ms,
+                setup_plan_lifecycle_name(expected),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(VaultError::Validation(
+                "setup plan lifecycle changed concurrently".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(SetupPlanClaim::Claimed)
+    }
+
+    pub fn finish_setup_plan(
+        &mut self,
+        plan_id: &PlanId,
+        next: SetupPlanLifecycle,
+    ) -> Result<(), VaultError> {
+        if next == SetupPlanLifecycle::Applied
+            && self
+                .setup_plan_native_memory_registrations(plan_id)?
+                .is_none()
+        {
+            self.bind_setup_plan_native_memory(plan_id, &[])?;
+        }
+        self.finish_setup_plan_from_native_memory_binding(plan_id, next)
+    }
+
+    /// Persists the exact native-memory descriptor and intended-digest set for
+    /// a claimed setup apply. Call this after deriving the registrations from
+    /// the opened sealed plan and before beginning native execution.
+    pub fn bind_setup_plan_native_memory(
+        &mut self,
+        plan_id: &PlanId,
+        registrations: &[NativeMemoryRegistration],
+    ) -> Result<(), VaultError> {
+        let (_, canonical) = canonical_native_memory_registrations(registrations)?;
+        let transaction = self.connection.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT state FROM setup_plan_lifecycle WHERE plan_id = ?1",
+                [plan_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| VaultError::Validation("setup plan does not exist".to_owned()))
+            .and_then(|value| parse_setup_plan_lifecycle(&value))?;
+        if !matches!(
+            current,
+            SetupPlanLifecycle::Applying | SetupPlanLifecycle::Applied
+        ) {
+            return Err(VaultError::Validation(
+                "native memory registrations require a claimed setup apply".to_owned(),
+            ));
+        }
+        let stored = transaction
+            .query_row(
+                "SELECT payload_json FROM setup_native_memory_bindings WHERE plan_id = ?1",
+                [plan_id.to_string()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        match stored {
+            Some(stored) if stored != canonical => {
+                return Err(VaultError::Validation(
+                    "native memory registration binding changed during setup replay".to_owned(),
+                ));
+            }
+            Some(_) => {}
+            None if current == SetupPlanLifecycle::Applying => {
+                transaction.execute(
+                    "INSERT INTO setup_native_memory_bindings(plan_id, payload_json)
+                     VALUES (?1, ?2)",
+                    params![plan_id.to_string(), canonical],
+                )?;
+            }
+            None => {
+                return Err(VaultError::Validation(
+                    "applied setup plan has no native memory registration binding".to_owned(),
+                ));
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn setup_plan_native_memory_registrations(
+        &self,
+        plan_id: &PlanId,
+    ) -> Result<Option<Vec<NativeMemoryRegistration>>, VaultError> {
+        load_setup_native_memory_binding(&self.connection, plan_id)
+    }
+
+    /// Finishes a successful setup apply and publishes the exact memory-source
+    /// descriptors and intended file digests in the same SQLite transaction.
+    /// Task-level composition derives these registrations only from the opened
+    /// sealed plan; the watcher cannot register paths by itself.
+    pub fn finish_setup_plan_with_native_memory(
+        &mut self,
+        plan_id: &PlanId,
+        next: SetupPlanLifecycle,
+        registrations: &[NativeMemoryRegistration],
+    ) -> Result<(), VaultError> {
+        if !registrations.is_empty() && next != SetupPlanLifecycle::Applied {
+            return Err(VaultError::Validation(
+                "native memory sources require a successful setup apply".to_owned(),
+            ));
+        }
+        if next == SetupPlanLifecycle::Applied {
+            self.bind_setup_plan_native_memory(plan_id, registrations)?;
+        }
+        self.finish_setup_plan_from_native_memory_binding(plan_id, next)
+    }
+
+    fn finish_setup_plan_from_native_memory_binding(
+        &mut self,
+        plan_id: &PlanId,
+        next: SetupPlanLifecycle,
+    ) -> Result<(), VaultError> {
+        let transaction = self.connection.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT state FROM setup_plan_lifecycle WHERE plan_id = ?1",
+                [plan_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| VaultError::Validation("setup plan does not exist".to_owned()))
+            .and_then(|value| parse_setup_plan_lifecycle(&value))?;
+        let registrations = if next == SetupPlanLifecycle::Applied {
+            load_setup_native_memory_binding(&transaction, plan_id)?.ok_or_else(|| {
+                VaultError::Validation(
+                    "setup apply has no native memory registration binding".to_owned(),
+                )
+            })?
+        } else {
+            Vec::new()
+        };
+        if current == next {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let allowed = matches!(
+            (current, next),
+            (
+                SetupPlanLifecycle::Applying,
+                SetupPlanLifecycle::Applied
+                    | SetupPlanLifecycle::ApplyRestored
+                    | SetupPlanLifecycle::Conflict
+            ) | (
+                SetupPlanLifecycle::RollingBack,
+                SetupPlanLifecycle::RolledBack
+                    | SetupPlanLifecycle::RollbackRestored
+                    | SetupPlanLifecycle::Conflict
+            )
+        );
+        if !allowed {
+            return Err(VaultError::Validation(
+                "setup plan lifecycle finish is invalid".to_owned(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE setup_plan_lifecycle SET state = ?2
+             WHERE plan_id = ?1 AND state = ?3",
+            params![
+                plan_id.to_string(),
+                setup_plan_lifecycle_name(next),
+                setup_plan_lifecycle_name(current),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(VaultError::Validation(
+                "setup plan lifecycle changed concurrently".to_owned(),
+            ));
+        }
+        for registration in &registrations {
+            let existing = transaction
+                .query_row(
+                    "SELECT payload_json FROM native_memory_sources WHERE source_id = ?1",
+                    [sha256_key(&registration.source.id.0)],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+                .map(|payload| from_json::<NativeMemoryLedger>(&payload))
+                .transpose()?;
+            let setup_created = existing.is_none();
+            let mut ledger = existing
+                .unwrap_or_else(|| NativeMemoryLedger::for_source(registration.source.clone()));
+            if ledger.source.as_ref() != Some(&registration.source) {
+                return Err(VaultError::Validation(
+                    "native memory source metadata changed after preview".to_owned(),
+                ));
+            }
+            if let Some(last_applied_digest) = registration.last_applied_digest {
+                ledger.last_applied_digest = Some(last_applied_digest);
+            }
+            let canonical = to_json(&ledger)?;
+            put_native_memory_ledger(&transaction, &ledger, &canonical)?;
+            let source_id = sha256_key(&registration.source.id.0);
+            if setup_created {
+                transaction.execute(
+                    "INSERT INTO setup_native_memory_managed_sources(source_id)
+                     VALUES (?1) ON CONFLICT(source_id) DO NOTHING",
+                    [&source_id],
+                )?;
+            }
+            transaction.execute(
+                "INSERT INTO setup_native_memory_source_refs(plan_id, source_id)
+                 VALUES (?1, ?2) ON CONFLICT(plan_id, source_id) DO NOTHING",
+                params![plan_id.to_string(), source_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically persists a freshly sealed inverse plan, claims that inverse
+    /// for apply, and claims the original public plan for rollback.
+    pub fn claim_setup_plan_rollback(
+        &mut self,
+        original_plan_id: &PlanId,
+        inverse: SetupPlanWrite<'_>,
+        now_ms: u64,
+    ) -> Result<SetupPlanClaim, VaultError> {
+        validate_setup_plan_write(&inverse)?;
+        if original_plan_id == inverse.plan_id {
+            return Err(VaultError::Validation(
+                "rollback inverse plan id must differ from the original".to_owned(),
+            ));
+        }
+        let now_ms = to_i64(now_ms)?;
+        let inverse_created_ms = to_i64(inverse.created_ms)?;
+        let inverse_expires_ms = to_i64(inverse.expires_ms)?;
+        let original_id = original_plan_id.to_string();
+        let inverse_id = inverse.plan_id.to_string();
+        let transaction = self.connection.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT state FROM setup_plan_lifecycle WHERE plan_id = ?1",
+                [&original_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| VaultError::Validation("setup plan does not exist".to_owned()))
+            .and_then(|value| parse_setup_plan_lifecycle(&value))?;
+        if current == SetupPlanLifecycle::RolledBack {
+            transaction.commit()?;
+            return Ok(SetupPlanClaim::Replay);
+        }
+        if current != SetupPlanLifecycle::Applied {
+            return Err(VaultError::Validation(format!(
+                "setup plan cannot be claimed from {}",
+                setup_plan_lifecycle_name(current)
+            )));
+        }
+
+        transaction.execute(
+            "INSERT INTO native_plans(
+                 plan_id, approval_hash, payload, created_ms, expires_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(plan_id) DO NOTHING",
+            params![
+                inverse_id,
+                inverse.approval_hash.0.as_slice(),
+                inverse.payload,
+                inverse_created_ms,
+                inverse_expires_ms,
+            ],
+        )?;
+        let stored = transaction.query_row(
+            "SELECT approval_hash, payload, created_ms, expires_ms
+             FROM native_plans WHERE plan_id = ?1",
+            [&inverse_id],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )?;
+        if stored
+            != (
+                inverse.approval_hash.0.to_vec(),
+                inverse.payload.to_vec(),
+                inverse_created_ms,
+                inverse_expires_ms,
+            )
+        {
+            return Err(VaultError::Validation(
+                "rollback inverse plan id was reused with different canonical bytes".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO setup_plan_lifecycle(
+                 plan_id, schema_version, approval_version, state, updated_ms
+             ) VALUES (?1, ?2, ?3, 'applying', ?4)
+             ON CONFLICT(plan_id) DO NOTHING",
+            params![
+                inverse_id,
+                i64::from(inverse.schema_version),
+                i64::from(inverse.approval_version),
+                now_ms,
+            ],
+        )?;
+        let inverse_binding = transaction.query_row(
+            "SELECT schema_version, approval_version, state
+             FROM setup_plan_lifecycle WHERE plan_id = ?1",
+            [&inverse_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        if inverse_binding
+            != (
+                i64::from(inverse.schema_version),
+                i64::from(inverse.approval_version),
+                "applying".to_owned(),
+            )
+        {
+            return Err(VaultError::Validation(
+                "rollback inverse lifecycle binding differs".to_owned(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE setup_plan_lifecycle SET state = 'rolling_back', updated_ms = ?2
+             WHERE plan_id = ?1 AND state = 'applied'",
+            params![original_id, now_ms],
+        )?;
+        if changed != 1 {
+            return Err(VaultError::Validation(
+                "setup plan lifecycle changed concurrently".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(SetupPlanClaim::Claimed)
+    }
+
+    /// Atomically records the terminal outcome for an original rollback and
+    /// its internal inverse apply transaction.
+    pub fn finish_setup_plan_rollback(
+        &mut self,
+        original_plan_id: &PlanId,
+        inverse_plan_id: &PlanId,
+        original_next: SetupPlanLifecycle,
+        inverse_next: SetupPlanLifecycle,
+    ) -> Result<(), VaultError> {
+        let allowed = matches!(
+            (original_next, inverse_next),
+            (SetupPlanLifecycle::RolledBack, SetupPlanLifecycle::Applied)
+                | (
+                    SetupPlanLifecycle::RollbackRestored,
+                    SetupPlanLifecycle::ApplyRestored
+                )
+                | (SetupPlanLifecycle::Conflict, SetupPlanLifecycle::Conflict)
+        );
+        if !allowed || original_plan_id == inverse_plan_id {
+            return Err(VaultError::Validation(
+                "setup rollback terminal lifecycle pair is invalid".to_owned(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        let changed_inverse = transaction.execute(
+            "UPDATE setup_plan_lifecycle SET state = ?2
+             WHERE plan_id = ?1 AND state = 'applying'",
+            params![
+                inverse_plan_id.to_string(),
+                setup_plan_lifecycle_name(inverse_next),
+            ],
+        )?;
+        let changed_original = transaction.execute(
+            "UPDATE setup_plan_lifecycle SET state = ?2
+             WHERE plan_id = ?1 AND state = 'rolling_back'",
+            params![
+                original_plan_id.to_string(),
+                setup_plan_lifecycle_name(original_next),
+            ],
+        )?;
+        if changed_inverse != 1 || changed_original != 1 {
+            return Err(VaultError::Validation(
+                "setup rollback lifecycle changed concurrently".to_owned(),
+            ));
+        }
+        if original_next == SetupPlanLifecycle::RolledBack {
+            let source_ids = {
+                let mut statement = transaction.prepare(
+                    "SELECT source_id FROM setup_native_memory_source_refs
+                     WHERE plan_id = ?1 ORDER BY source_id",
+                )?;
+                statement
+                    .query_map([original_plan_id.to_string()], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            transaction.execute(
+                "DELETE FROM setup_native_memory_source_refs WHERE plan_id = ?1",
+                [original_plan_id.to_string()],
+            )?;
+            for source_id in source_ids {
+                transaction.execute(
+                    "DELETE FROM native_memory_sources
+                     WHERE source_id = ?1
+                       AND EXISTS (
+                           SELECT 1 FROM setup_native_memory_managed_sources managed
+                           WHERE managed.source_id = native_memory_sources.source_id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM setup_native_memory_source_refs refs
+                           WHERE refs.source_id = native_memory_sources.source_id
+                       )",
+                    [source_id],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn begin_native_transaction(
         &mut self,
         transaction_id: &str,
@@ -2055,6 +3336,25 @@ impl Vault {
         {
             return Err(VaultError::Validation(
                 "native plan id was reused with different content".to_owned(),
+            ));
+        }
+        let lifecycle = transaction
+            .query_row(
+                "SELECT state FROM setup_plan_lifecycle WHERE plan_id = ?1",
+                [&plan_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|state| parse_setup_plan_lifecycle(&state))
+            .transpose()?;
+        if lifecycle.is_some_and(|state| {
+            !matches!(
+                state,
+                SetupPlanLifecycle::Applying | SetupPlanLifecycle::RollingBack
+            )
+        }) {
+            return Err(VaultError::Validation(
+                "persisted setup plan must be claimed before native transaction begin".to_owned(),
             ));
         }
 
@@ -2355,6 +3655,15 @@ impl Vault {
         transaction_id: &str,
         conflict: bool,
     ) -> Result<(), VaultError> {
+        self.finish_native_recovery_with_cli_no_write(transaction_id, conflict, &[])
+    }
+
+    pub fn finish_native_recovery_with_cli_no_write(
+        &mut self,
+        transaction_id: &str,
+        conflict: bool,
+        prepared_cli_no_write: &[u32],
+    ) -> Result<(), VaultError> {
         let transaction = self.connection.transaction()?;
         let snapshot = load_native_transaction(&transaction, transaction_id)?.ok_or_else(|| {
             VaultError::Validation("native transaction does not exist".to_owned())
@@ -2374,19 +3683,49 @@ impl Vault {
                 "native transaction is not restoring".to_owned(),
             ));
         }
-        let unfinished = transaction.query_row(
+        let unfinished_native = transaction.query_row(
             "SELECT count(*) FROM native_mutation_wal
              WHERE transaction_id = ?1 AND state NOT IN ('restored', 'conflict')",
             [transaction_id],
             |row| row.get::<_, i64>(0),
         )?;
-        let conflicts = transaction.query_row(
+        let native_conflicts = transaction.query_row(
             "SELECT count(*) FROM native_mutation_wal
              WHERE transaction_id = ?1 AND state = 'conflict'",
             [transaction_id],
             |row| row.get::<_, i64>(0),
         )?;
-        if unfinished != 0 || (conflicts != 0) != conflict {
+        let cli_records = load_native_cli_wal(&transaction, transaction_id)?;
+        let prepared = cli_records
+            .iter()
+            .filter(|record| record.state == NativeCliWalState::Prepared)
+            .map(|record| record.sequence)
+            .collect::<BTreeSet<_>>();
+        let approved_no_write = prepared_cli_no_write
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if prepared != approved_no_write {
+            return Err(VaultError::Validation(
+                "native recovery prepared CLI no-write disposition does not match its WAL"
+                    .to_owned(),
+            ));
+        }
+        let unfinished_cli = cli_records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    NativeCliWalState::Applied | NativeCliWalState::RestorePrepared
+                )
+            })
+            .count();
+        let cli_conflicts = cli_records
+            .iter()
+            .filter(|record| record.state == NativeCliWalState::Conflict)
+            .count();
+        let has_conflict = native_conflicts != 0 || cli_conflicts != 0;
+        if unfinished_native != 0 || unfinished_cli != 0 || has_conflict != conflict {
             return Err(VaultError::Validation(
                 "native recovery outcome does not match its WAL".to_owned(),
             ));
@@ -2445,6 +3784,18 @@ impl Vault {
             }
         };
 
+        if snapshot.status == NativeTransactionStatus::Committed {
+            transaction.execute(
+                "DELETE FROM native_cli_wal WHERE transaction_id = ?1",
+                [transaction_id],
+            )?;
+        } else if snapshot.status == NativeTransactionStatus::Restored {
+            transaction.execute(
+                "DELETE FROM native_cli_wal
+                 WHERE transaction_id = ?1 AND state = 'restored'",
+                [transaction_id],
+            )?;
+        }
         if matches!(
             snapshot.status,
             NativeTransactionStatus::Committed | NativeTransactionStatus::Restored

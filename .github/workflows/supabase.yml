@@ -1,0 +1,49 @@
+name: Supabase
+
+on:
+  pull_request:
+    paths:
+      - 'supabase/**'
+      - 'scripts/check-supabase-contract.mjs'
+      - 'scripts/tests/check-supabase-contract.test.mjs'
+      - 'scripts/verify-supabase-realtime.mjs'
+      - 'scripts/tests/verify-supabase-realtime.test.mjs'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/supabase.yml'
+  push:
+    paths:
+      - 'supabase/**'
+      - 'scripts/check-supabase-contract.mjs'
+      - 'scripts/tests/check-supabase-contract.test.mjs'
+      - 'scripts/verify-supabase-realtime.mjs'
+      - 'scripts/tests/verify-supabase-realtime.test.mjs'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/supabase.yml'
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_AUTH_GITHUB_CLIENT_ID: local-ci-client-id
+      SUPABASE_AUTH_GITHUB_SECRET: local-ci-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check:supabase
+      - run: node --test scripts/tests/check-supabase-contract.test.mjs
+      - run: node --test scripts/tests/verify-supabase-realtime.test.mjs
+      - run: pnpm supabase:start
+      - run: pnpm supabase:reset
+      - run: pnpm supabase:test
+      - run: pnpm supabase:lint
+      - if: always()
+        run: pnpm supabase:stop

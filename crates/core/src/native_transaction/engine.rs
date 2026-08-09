@@ -4,11 +4,12 @@ use context_relay_protocol::{ApplyReceipt, HybridLogicalClock, Sha256Digest, Wir
 use thiserror::Error;
 
 use super::{
-    approval::{ApprovalError, approval_hash_v1},
+    approval::{ApprovalError, approval_hash_v1, approval_hash_v2},
+    cli::{NativeCliExecutor, applied_cli_mutations_in_reverse},
     model::{
-        ApprovedInput, ApprovedMutation, MutationKind, NativeApplyReceipt, NativeObjectToken,
-        NativeReceiptEntry, NativeTransactionPlan, RestorableStateFingerprint, SidecarBinding,
-        TransactionStep,
+        ApprovedCliMutation, ApprovedInput, ApprovedMutation, MutationKind, NativeApplyReceipt,
+        NativeObjectToken, NativeReceiptEntry, NativeTransactionPlan, RestorableStateFingerprint,
+        SidecarBinding, TransactionStep,
     },
 };
 
@@ -26,6 +27,13 @@ impl BoundaryError {
     }
 }
 
+fn remember_boundary_error(slot: &mut Option<BoundaryError>, error: BoundaryError) {
+    *slot = Some(match slot.take() {
+        Some(existing) => BoundaryError::new(format!("{existing}; {error}")),
+        None => error,
+    });
+}
+
 #[derive(Debug, Error)]
 pub enum TransactionError {
     #[error(transparent)]
@@ -36,12 +44,16 @@ pub enum TransactionError {
     Expired,
     #[error("native transaction approval hash changed")]
     ApprovalMismatch,
+    #[error("native transaction approval version {0} is unsupported")]
+    UnsupportedApprovalVersion(u32),
     #[error("staged output differs from the approved output")]
     StagedOutputMismatch,
     #[error("native before-images do not match the approved targets")]
     BeforeImageMismatch,
     #[error("native mutation outcome does not match the approved intended state")]
     MutationOutcomeMismatch,
+    #[error("CLI mutation outcome does not match the approved intended state")]
+    CliMutationOutcomeMismatch,
     #[error("compensation failed after {primary}: {compensation}")]
     Compensation {
         primary: Box<TransactionError>,
@@ -99,6 +111,12 @@ pub trait NativeAdapter {
         &mut self,
         plan: &NativeTransactionPlan,
     ) -> Result<(), BoundaryError>;
+    fn verify_live_state_reservation(
+        &mut self,
+        _plan: &NativeTransactionPlan,
+    ) -> Result<(), BoundaryError> {
+        Ok(())
+    }
     fn validate_staged_output(
         &mut self,
         plan: &NativeTransactionPlan,
@@ -109,6 +127,9 @@ pub trait NativeAdapter {
         plan: &NativeTransactionPlan,
         receipt: &ApplyReceipt,
     ) -> Result<(), BoundaryError>;
+    fn release_live_state_reservation(&mut self) -> Result<(), BoundaryError> {
+        Ok(())
+    }
 }
 
 pub trait RestrictedExecutor {
@@ -217,6 +238,60 @@ pub trait NativeJournal {
         expected_old_token: &NativeObjectToken,
         new_token: &NativeObjectToken,
     ) -> Result<(), BoundaryError>;
+    fn prepare_cli_mutation(
+        &mut self,
+        _index: usize,
+        _mutation: &ApprovedCliMutation,
+    ) -> Result<(), BoundaryError> {
+        Err(BoundaryError::new(
+            "native journal does not support CLI mutations",
+        ))
+    }
+    fn mark_cli_mutation_applied(
+        &mut self,
+        _index: usize,
+        _mutation: &ApprovedCliMutation,
+    ) -> Result<(), BoundaryError> {
+        Err(BoundaryError::new(
+            "native journal does not support CLI mutations",
+        ))
+    }
+    fn mark_cli_mutation_no_write(
+        &mut self,
+        _index: usize,
+        _mutation: &ApprovedCliMutation,
+    ) -> Result<(), BoundaryError> {
+        Err(BoundaryError::new(
+            "native journal does not support CLI mutations",
+        ))
+    }
+    fn prepare_cli_restore(
+        &mut self,
+        _index: usize,
+        _mutation: &ApprovedCliMutation,
+    ) -> Result<(), BoundaryError> {
+        Err(BoundaryError::new(
+            "native journal does not support CLI mutations",
+        ))
+    }
+    fn mark_cli_mutation_restored(
+        &mut self,
+        _index: usize,
+        _mutation: &ApprovedCliMutation,
+    ) -> Result<(), BoundaryError> {
+        Err(BoundaryError::new(
+            "native journal does not support CLI mutations",
+        ))
+    }
+    fn mark_cli_mutation_conflict(
+        &mut self,
+        _index: usize,
+        _mutation: &ApprovedCliMutation,
+    ) -> Result<(), BoundaryError> {
+        Err(BoundaryError::new(
+            "native journal does not support CLI mutations",
+        ))
+    }
     fn prepare_compensation(&mut self) -> Result<(), BoundaryError>;
     fn commit_native_transaction(
         &mut self,
@@ -249,6 +324,9 @@ pub struct NativeTransactionEngine<'a, A, E, F, J, H> {
     filesystem: &'a mut F,
     journal: &'a mut J,
     hook: &'a mut H,
+    cli_executor: Option<&'a mut dyn NativeCliExecutor>,
+    cli_applied: Vec<usize>,
+    active_cli_mutations: Vec<ApprovedCliMutation>,
 }
 
 impl<'a, A, E, F, J, H> NativeTransactionEngine<'a, A, E, F, J, H>
@@ -272,6 +350,32 @@ where
             filesystem,
             journal,
             hook,
+            cli_executor: None,
+            cli_applied: Vec::new(),
+            active_cli_mutations: Vec::new(),
+        }
+    }
+
+    pub fn new_with_cli<C>(
+        adapter: &'a mut A,
+        executor: &'a mut E,
+        filesystem: &'a mut F,
+        journal: &'a mut J,
+        hook: &'a mut H,
+        cli_executor: &'a mut C,
+    ) -> Self
+    where
+        C: NativeCliExecutor + 'a,
+    {
+        Self {
+            adapter,
+            executor,
+            filesystem,
+            journal,
+            hook,
+            cli_executor: Some(cli_executor),
+            cli_applied: Vec::new(),
+            active_cli_mutations: Vec::new(),
         }
     }
 
@@ -281,6 +385,8 @@ where
         now_ms: u64,
         applied_hlc: HybridLogicalClock,
     ) -> Result<NativeApplyReceipt, TransactionError> {
+        self.cli_applied.clear();
+        self.active_cli_mutations.clone_from(&plan.cli_mutations);
         let mut begun = false;
         let transaction_nonce = *plan.setup.plan_id.as_bytes();
 
@@ -418,7 +524,17 @@ where
         attempt!(self.hook.after_step(TransactionStep::ValidateStagedOutput));
 
         attempt!(self.journal.enter_step(TransactionStep::RecomputeApproval));
-        let approval = match approval_hash_v1(plan) {
+        let approval = match match plan.approval_version {
+            1 => approval_hash_v1(plan),
+            2 => approval_hash_v2(plan),
+            version => {
+                return Err(self.compensate(
+                    TransactionError::UnsupportedApprovalVersion(version),
+                    begun,
+                    &transaction_nonce,
+                ));
+            }
+        } {
             Ok(value) => value,
             Err(error) => {
                 return Err(self.compensate(error.into(), begun, &transaction_nonce));
@@ -460,7 +576,23 @@ where
             self.journal
                 .enter_step(TransactionStep::CompareAndSwapTargets)
         );
+        attempt!(self.adapter.verify_live_state_reservation(plan));
         attempt!(self.filesystem.compare_and_swap_targets(&plan.mutations));
+        if !plan.cli_mutations.is_empty() {
+            let cli_executor = match self.cli_executor.as_deref_mut() {
+                Some(cli_executor) => cli_executor,
+                None => {
+                    return Err(self.compensate(
+                        TransactionError::Boundary(BoundaryError::new(
+                            "native CLI mutations require a semantic CLI executor",
+                        )),
+                        begun,
+                        &transaction_nonce,
+                    ));
+                }
+            };
+            attempt!(cli_executor.compare_cli_targets(&plan.cli_mutations));
+        }
         attempt!(
             self.journal
                 .complete_step(TransactionStep::CompareAndSwapTargets)
@@ -501,6 +633,7 @@ where
                                 .journal
                                 .mark_mutation_applied_for_recovery(index, mutation, &token)
                         {
+                            let _ = self.adapter.release_live_state_reservation();
                             return Err(TransactionError::Compensation {
                                 primary: Box::new(primary),
                                 compensation,
@@ -518,6 +651,7 @@ where
                     if let Some(token) = applied_token.as_ref()
                         && let Err(compensation) = self.journal.mark_mutation_conflict(index, token)
                     {
+                        let _ = self.adapter.release_live_state_reservation();
                         return Err(TransactionError::Compensation {
                             primary: Box::new(primary),
                             compensation,
@@ -541,6 +675,72 @@ where
                     applied_token.as_ref(),
                 ));
                 outcomes.push((index, outcome));
+            }
+            if step == TransactionStep::WriteActivationReferences {
+                for (index, mutation) in plan.cli_mutations.iter().enumerate() {
+                    attempt!(self.journal.prepare_cli_mutation(index, mutation));
+                    let outcome = match self
+                        .cli_executor
+                        .as_deref_mut()
+                        .ok_or_else(|| {
+                            BoundaryError::new(
+                                "native CLI mutations require a semantic CLI executor",
+                            )
+                        })
+                        .and_then(|executor| executor.apply_cli_mutation(mutation))
+                    {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            if let Err(compensation) =
+                                self.journal.mark_cli_mutation_conflict(index, mutation)
+                            {
+                                let _ = self.adapter.release_live_state_reservation();
+                                return Err(TransactionError::Compensation {
+                                    primary: Box::new(TransactionError::Boundary(error)),
+                                    compensation,
+                                });
+                            }
+                            return Err(self.compensate(
+                                TransactionError::Boundary(error),
+                                begun,
+                                &transaction_nonce,
+                            ));
+                        }
+                    };
+                    let expected = mutation
+                        .expected
+                        .as_ref()
+                        .map(|declaration| declaration.fingerprint);
+                    let intended = mutation
+                        .intended
+                        .as_ref()
+                        .map(|declaration| declaration.fingerprint);
+                    if let Some(command_error) = outcome.command_error {
+                        if outcome.resulting_fingerprint == expected {
+                            attempt!(self.journal.mark_cli_mutation_no_write(index, mutation));
+                        } else if outcome.resulting_fingerprint == intended {
+                            attempt!(self.journal.mark_cli_mutation_applied(index, mutation));
+                            self.cli_applied.push(index);
+                        } else {
+                            attempt!(self.journal.mark_cli_mutation_conflict(index, mutation));
+                        }
+                        return Err(self.compensate(
+                            TransactionError::Boundary(command_error),
+                            begun,
+                            &transaction_nonce,
+                        ));
+                    }
+                    if outcome.resulting_fingerprint != intended {
+                        attempt!(self.journal.mark_cli_mutation_conflict(index, mutation));
+                        return Err(self.compensate(
+                            TransactionError::CliMutationOutcomeMismatch,
+                            begun,
+                            &transaction_nonce,
+                        ));
+                    }
+                    attempt!(self.journal.mark_cli_mutation_applied(index, mutation));
+                    self.cli_applied.push(index);
+                }
             }
             attempt!(self.journal.complete_step(step));
             attempt!(self.hook.after_step(step));
@@ -594,6 +794,14 @@ where
             .enter_step(TransactionStep::RestoreMatchingAppliedTargets)
             .is_ok()
             && self
+                .cli_executor
+                .as_deref_mut()
+                .map_or(plan.cli_mutations.is_empty(), |executor| {
+                    executor
+                        .finish_committed_cli_mutations(&plan.cli_mutations)
+                        .is_ok()
+                })
+            && self
                 .filesystem
                 .finish_committed_targets(&transaction_nonce)
                 .is_ok()
@@ -604,6 +812,7 @@ where
                 .after_step(TransactionStep::RestoreMatchingAppliedTargets);
         }
 
+        self.adapter.release_live_state_reservation()?;
         Ok(receipt)
     }
 
@@ -614,13 +823,91 @@ where
         transaction_nonce: &[u8; 16],
     ) -> TransactionError {
         if !begun {
-            return primary;
+            return match self.adapter.release_live_state_reservation() {
+                Ok(()) => primary,
+                Err(compensation) => TransactionError::Compensation {
+                    primary: Box::new(primary),
+                    compensation,
+                },
+            };
         }
-        let compensation = self
+        let mut compensation = None;
+        let entered = match self
             .journal
             .enter_step(TransactionStep::RestoreMatchingAppliedTargets)
-            .and_then(|_| self.journal.prepare_compensation())
-            .and_then(|_| {
+        {
+            Ok(()) => true,
+            Err(error) => {
+                remember_boundary_error(&mut compensation, error);
+                false
+            }
+        };
+        let prepared = if entered {
+            match self.journal.prepare_compensation() {
+                Ok(()) => true,
+                Err(error) => {
+                    remember_boundary_error(&mut compensation, error);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if prepared {
+            match applied_cli_mutations_in_reverse(&self.active_cli_mutations, &self.cli_applied) {
+                Ok(mutations) => {
+                    for (index, mutation) in mutations {
+                        if let Err(error) = self.journal.prepare_cli_restore(index, &mutation) {
+                            remember_boundary_error(&mut compensation, error);
+                            if let Err(error) =
+                                self.journal.mark_cli_mutation_conflict(index, &mutation)
+                            {
+                                remember_boundary_error(&mut compensation, error);
+                            }
+                            continue;
+                        }
+                        let outcome = match self.cli_executor.as_deref_mut() {
+                            Some(executor) => executor.restore_cli_mutation_if_matches(&mutation),
+                            None => Err(BoundaryError::new(
+                                "native CLI mutations require a semantic CLI executor",
+                            )),
+                        };
+                        let outcome = match outcome {
+                            Ok(outcome) => outcome,
+                            Err(error) => {
+                                remember_boundary_error(&mut compensation, error);
+                                if let Err(error) =
+                                    self.journal.mark_cli_mutation_conflict(index, &mutation)
+                                {
+                                    remember_boundary_error(&mut compensation, error);
+                                }
+                                continue;
+                            }
+                        };
+                        let expected = mutation
+                            .expected
+                            .as_ref()
+                            .map(|declaration| declaration.fingerprint);
+                        let checkpoint =
+                            if outcome.restored && outcome.resulting_fingerprint == expected {
+                                self.journal.mark_cli_mutation_restored(index, &mutation)
+                            } else {
+                                self.journal.mark_cli_mutation_conflict(index, &mutation)
+                            };
+                        if let Err(error) = checkpoint {
+                            remember_boundary_error(&mut compensation, error);
+                            if let Err(error) =
+                                self.journal.mark_cli_mutation_conflict(index, &mutation)
+                            {
+                                remember_boundary_error(&mut compensation, error);
+                            }
+                        }
+                    }
+                }
+                Err(error) => remember_boundary_error(&mut compensation, error),
+            }
+
+            let native_outcome = {
                 let journal = RefCell::new(&mut *self.journal);
                 self.filesystem.restore_matching_applied_targets(
                     transaction_nonce,
@@ -646,19 +933,34 @@ where
                         )
                     },
                 )
-            })
-            .and_then(|outcome| {
-                self.journal
-                    .complete_step(TransactionStep::RestoreMatchingAppliedTargets)?;
-                self.journal
-                    .finish_compensated(outcome.conflict_target_sequences())
-            });
+            };
+            match native_outcome {
+                Ok(outcome) => {
+                    if let Err(error) = self
+                        .journal
+                        .complete_step(TransactionStep::RestoreMatchingAppliedTargets)
+                    {
+                        remember_boundary_error(&mut compensation, error);
+                    }
+                    if let Err(error) = self
+                        .journal
+                        .finish_compensated(outcome.conflict_target_sequences())
+                    {
+                        remember_boundary_error(&mut compensation, error);
+                    }
+                }
+                Err(error) => remember_boundary_error(&mut compensation, error),
+            }
+        }
         let _ = self
             .hook
             .after_step(TransactionStep::RestoreMatchingAppliedTargets);
+        if let Err(error) = self.adapter.release_live_state_reservation() {
+            remember_boundary_error(&mut compensation, error);
+        }
         match compensation {
-            Ok(()) => primary,
-            Err(compensation) => TransactionError::Compensation {
+            None => primary,
+            Some(compensation) => TransactionError::Compensation {
                 primary: Box::new(primary),
                 compensation,
             },

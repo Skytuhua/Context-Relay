@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     env, fs,
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     str::FromStr,
@@ -21,16 +21,50 @@ use context_relay_protocol::{
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::mcp::install::{
+    BRIDGE_SERVER_NAME, is_canonical_bridge_body, is_managed_bridge_component,
+};
+use crate::native_memory::{
+    NativeMemoryAdapter, NativeMemoryCapabilities, NativeMemoryDisable, NativeMemoryDocumentKind,
+    has_managed_memory_hook_identity, is_primary_memory_instruction_component,
+    merge_managed_memory_hooks,
+};
 use crate::native_transaction::{
+    cli::{CliMutationOutcome, CliRestoreOutcome, NativeCliExecutor},
     engine::{BoundaryError, FrozenOutput, NativeAdapter, RestrictedRun},
-    model::{ApprovedMutation, MutationKind, NativeTransactionPlan, RestorableStateFingerprint},
+    model::{
+        ApprovedCliMutation, ApprovedMutation, CanonicalCliDeclaration, MutationKind,
+        NativeTransactionPlan, RestorableStateFingerprint,
+    },
 };
 
 const SUPPORTED_VERSIONS: [&str; 2] = ["2.1.214", "2.1.213"];
 const CLI_TIMEOUT_MS: u32 = 30_000;
 const CLI_OUTPUT_LIMIT: u64 = 64 * 1024;
+// Each configured name adds one sequential `mcp get` subprocess, so keep
+// effective validation bounded independently of the generic adapter DTO limit.
+const MAX_MCP_VALIDATION_NAMES: usize = 64;
 const MANAGED_START: &str = "<!-- context-relay:start -->";
 const MANAGED_END: &str = "<!-- context-relay:end -->";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BridgeDeclarationProbeError {
+    Conflict,
+    Inspection,
+}
+
+impl From<BridgeDeclarationProbeError> for BoundaryError {
+    fn from(error: BridgeDeclarationProbeError) -> Self {
+        BoundaryError::new(match error {
+            BridgeDeclarationProbeError::Conflict => {
+                "Claude Code prior MCP declaration is disabled or unmanaged"
+            }
+            BridgeDeclarationProbeError::Inspection => {
+                "Claude Code managed bridge state cannot be safely inspected"
+            }
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ClaudeCodeLayout {
@@ -50,6 +84,38 @@ pub struct ClaudeCodeAdapter {
     origin_device: DeviceId,
     observed_hlc: HybridLogicalClock,
     executable_hash: Sha256Digest,
+}
+
+pub trait ClaudeCodeCommandRunner {
+    fn before_launch(&mut self, _arguments: &[String]) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn run(&mut self, command: VerifiedClaudeCommand<'_>) -> Result<Vec<u8>, BoundaryError>;
+}
+
+impl<F> ClaudeCodeCommandRunner for F
+where
+    F: FnMut(&[String]) -> Result<Vec<u8>, BoundaryError>,
+{
+    fn run(&mut self, command: VerifiedClaudeCommand<'_>) -> Result<Vec<u8>, BoundaryError> {
+        self(command.arguments())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ClaudeCodeProcessRunner;
+
+impl ClaudeCodeCommandRunner for ClaudeCodeProcessRunner {
+    fn run(&mut self, command: VerifiedClaudeCommand<'_>) -> Result<Vec<u8>, BoundaryError> {
+        command.execute()
+    }
+}
+
+pub struct ClaudeCodeCliExecutor<'a, O, V> {
+    adapter: &'a ClaudeCodeAdapter,
+    operation_runner: O,
+    validation_runner: V,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,6 +140,10 @@ impl ClaudeCommand {
 }
 
 impl ClaudeCodeAdapter {
+    pub fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+
     pub fn discover(
         project_root: impl Into<PathBuf>,
         project_id: ProjectId,
@@ -172,18 +242,32 @@ impl ClaudeCodeAdapter {
         &self,
         desired: &DesiredState,
     ) -> Result<ApprovedMutation, ClientError> {
-        self.require_apply_supported()?;
-        desired
-            .validate()
-            .map_err(|_| invalid_request("Desired Claude Code state is invalid"))?;
-        let path = self.project_settings_path();
-        let bytes = self.render_settings(
-            &path,
+        self.plan_native_settings_for_scope(
             desired,
             ScopeRef::Project {
                 project_id: self.project_id,
             },
-        )?;
+        )
+    }
+
+    pub fn plan_native_global_settings(
+        &self,
+        desired: &DesiredState,
+    ) -> Result<ApprovedMutation, ClientError> {
+        self.plan_native_settings_for_scope(desired, ScopeRef::Global)
+    }
+
+    fn plan_native_settings_for_scope(
+        &self,
+        desired: &DesiredState,
+        scope: ScopeRef,
+    ) -> Result<ApprovedMutation, ClientError> {
+        self.require_apply_supported()?;
+        desired
+            .validate()
+            .map_err(|_| invalid_request("Desired Claude Code state is invalid"))?;
+        let path = settings_path(self, &scope)?;
+        let bytes = self.render_settings(&path, desired, scope)?;
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid_request("Claude Code settings cannot be safely inspected"))?;
@@ -218,6 +302,19 @@ impl ClaudeCodeAdapter {
         ) {
             return Err(invalid_request("Claude Code file component is invalid"));
         }
+        if is_primary_memory_instruction_component(HarnessId::ClaudeCode, component) {
+            let (path, expected, _, intended) =
+                self.primary_memory_instruction_projection(component)?;
+            return Ok(ApprovedMutation {
+                target: wire_path(&path),
+                kind: MutationKind::Payload,
+                content: intended
+                    .encode_v1()
+                    .map_err(|_| invalid_request("Claude Code Markdown is not representable"))?,
+                expected: RestorableStateFingerprint(Sha256Digest(expected)),
+                intended: RestorableStateFingerprint(Sha256Digest(intended.fingerprint())),
+            });
+        }
         let path = component_path(self, component)?;
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
@@ -242,7 +339,205 @@ impl ClaudeCodeAdapter {
         })
     }
 
-    fn capability(&self) -> CapabilityLevel {
+    fn primary_memory_instruction_projection(
+        &self,
+        component: &ComponentRecord,
+    ) -> Result<(PathBuf, [u8; 32], NativeState, NativeState), ClientError> {
+        let path = component_path(self, component)?;
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid_request("Claude Code Markdown cannot be safely inspected"))?;
+        let current = snapshot.state().clone();
+        let intended = match snapshot.state() {
+            NativeState::RegularFile { bytes, metadata } => NativeState::regular_file(
+                render_managed_markdown(bytes, &component.body_markdown, component.archived)?,
+                metadata.clone(),
+            ),
+            NativeState::Absent { .. } if component.archived => current.clone(),
+            NativeState::Absent { .. } => {
+                let template_path = path.with_file_name(".mcp.json");
+                let template =
+                    OsNativeFileSystem::new()
+                        .snapshot(&template_path)
+                        .map_err(|_| {
+                            invalid_request(
+                                "Claude Code primary instruction metadata template is unavailable",
+                            )
+                        })?;
+                let NativeState::RegularFile { metadata, .. } = template.state() else {
+                    return Err(invalid_request(
+                        "Claude Code primary instruction needs an existing project-root metadata template",
+                    ));
+                };
+                let metadata = metadata
+                    .for_absent_sibling_creation(&current)
+                    .map_err(|_| {
+                        invalid_request(
+                            "Claude Code primary instruction metadata template is not bound to the target parent",
+                        )
+                    })?;
+                NativeState::regular_file(
+                    render_managed_markdown(&[], &component.body_markdown, false)?,
+                    metadata,
+                )
+            }
+        };
+        Ok((path, *snapshot.fingerprint(), current, intended))
+    }
+
+    pub fn plan_bridge_cli_mutation(
+        &self,
+        intended: &ComponentRecord,
+    ) -> Result<ApprovedCliMutation, ClientError> {
+        self.plan_bridge_cli_mutation_with_runner(intended, ClaudeCodeProcessRunner)
+    }
+
+    pub fn plan_bridge_cli_mutation_with_runner(
+        &self,
+        intended: &ComponentRecord,
+        mut validation_runner: impl ClaudeCodeCommandRunner,
+    ) -> Result<ApprovedCliMutation, ClientError> {
+        self.require_apply_supported()?;
+        if !is_managed_bridge_component(HarnessId::ClaudeCode, intended) {
+            return Err(invalid_request(
+                "Claude Code CLI mutation requires the managed bridge",
+            ));
+        }
+        self.recheck_executable_client()?;
+        let expected = self
+            .probe_managed_declaration(&mut validation_runner)
+            .map_err(|error| match error {
+                BridgeDeclarationProbeError::Conflict => client_error(
+                    ErrorCode::Conflict,
+                    "Claude Code managed bridge state cannot be safely inspected",
+                    false,
+                ),
+                BridgeDeclarationProbeError::Inspection => {
+                    invalid_request("Claude Code managed bridge state cannot be safely inspected")
+                }
+            })?;
+        let intended_declaration = canonical_cli_declaration(&intended.body_markdown)?;
+        Ok(ApprovedCliMutation {
+            stable_id: intended.id.to_string(),
+            forward: vec![self.declaration_operation(Some(&intended_declaration))],
+            rollback: vec![self.declaration_operation(expected.as_ref())],
+            expected,
+            intended: Some(intended_declaration),
+        })
+    }
+
+    pub fn cli_executor(
+        &self,
+    ) -> ClaudeCodeCliExecutor<'_, ClaudeCodeProcessRunner, ClaudeCodeProcessRunner> {
+        self.cli_executor_with_runners(ClaudeCodeProcessRunner, ClaudeCodeProcessRunner)
+    }
+
+    pub fn cli_executor_with_runners<O, V>(
+        &self,
+        operation_runner: O,
+        validation_runner: V,
+    ) -> ClaudeCodeCliExecutor<'_, O, V>
+    where
+        O: ClaudeCodeCommandRunner,
+        V: ClaudeCodeCommandRunner,
+    {
+        ClaudeCodeCliExecutor {
+            adapter: self,
+            operation_runner,
+            validation_runner,
+        }
+    }
+
+    fn recheck_executable_client(&self) -> Result<(), ClientError> {
+        if digest_regular_non_link_file(&self.layout.executable)? != self.executable_hash {
+            return Err(client_error(
+                ErrorCode::Conflict,
+                "Claude Code executable changed",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    fn recheck_executable_boundary(&self) -> Result<(), BoundaryError> {
+        if digest_regular_non_link_file_boundary(&self.layout.executable)? != self.executable_hash {
+            return Err(BoundaryError::new("Claude Code executable changed"));
+        }
+        Ok(())
+    }
+
+    fn run_verified(
+        &self,
+        runner: &mut impl ClaudeCodeCommandRunner,
+        arguments: &[String],
+    ) -> Result<Vec<u8>, BoundaryError> {
+        let executable =
+            open_verified_claude_executable(&self.layout.executable, self.executable_hash)?;
+        runner.before_launch(arguments)?;
+        executable.revalidate_before_launch()?;
+        let launch = executable
+            .prepare_launch()
+            .map_err(|_| BoundaryError::new("Claude Code executable cannot be safely prepared"))?;
+        runner.run(VerifiedClaudeCommand {
+            executable: &executable,
+            launch,
+            arguments,
+        })
+    }
+
+    fn declaration_operation(&self, declaration: Option<&CanonicalCliDeclaration>) -> CliOperation {
+        let arguments = match declaration {
+            Some(declaration) => vec![
+                "mcp".to_owned(),
+                "add-json".to_owned(),
+                BRIDGE_SERVER_NAME.to_owned(),
+                declaration.canonical_body.clone(),
+                "--scope".to_owned(),
+                "user".to_owned(),
+            ],
+            None => vec![
+                "mcp".to_owned(),
+                "remove".to_owned(),
+                BRIDGE_SERVER_NAME.to_owned(),
+                "--scope".to_owned(),
+                "user".to_owned(),
+            ],
+        };
+        CliOperation {
+            executable: wire_path(&self.layout.executable),
+            arguments: arguments
+                .into_iter()
+                .map(|argument| wire_text(&argument))
+                .collect(),
+            timeout_ms: CLI_TIMEOUT_MS,
+        }
+    }
+
+    fn probe_managed_declaration(
+        &self,
+        validation_runner: &mut impl ClaudeCodeCommandRunner,
+    ) -> Result<Option<CanonicalCliDeclaration>, BridgeDeclarationProbeError> {
+        let list_argv = vec!["mcp".to_owned(), "list".to_owned()];
+        let listed = self
+            .run_verified(validation_runner, &list_argv)
+            .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
+        let names =
+            parse_mcp_list_output(&listed).map_err(|_| BridgeDeclarationProbeError::Inspection)?;
+        if !names.contains(BRIDGE_SERVER_NAME) {
+            return Ok(None);
+        }
+        let get_argv = vec![
+            "mcp".to_owned(),
+            "get".to_owned(),
+            BRIDGE_SERVER_NAME.to_owned(),
+        ];
+        let output = self
+            .run_verified(validation_runner, &get_argv)
+            .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
+        parse_managed_mcp_get_output(&output)
+    }
+
+    pub(crate) fn capability(&self) -> CapabilityLevel {
         if SUPPORTED_VERSIONS.contains(&self.layout.version.as_str()) {
             CapabilityLevel::Full
         } else {
@@ -288,28 +583,32 @@ impl ClaudeCodeAdapter {
     }
 
     fn validation_commands(&self) -> Result<Vec<ClaudeCommand>, ClientError> {
+        Ok(validation_commands(self.imported_mcp_names()?))
+    }
+
+    fn imported_mcp_names(&self) -> Result<Vec<String>, ClientError> {
+        let mut names = BTreeSet::new();
+        if let Some(bytes) = read_optional_file(&self.layout.state_path)? {
+            let state = parse_object(&bytes, "Claude Code MCP configuration is invalid")?;
+            collect_mcp_names(state.get("mcpServers"), &mut names)?;
+            collect_mcp_names(
+                state
+                    .get("projects")
+                    .and_then(Value::as_object)
+                    .and_then(|projects| {
+                        projects.get(self.layout.project_root.to_string_lossy().as_ref())
+                    })
+                    .and_then(Value::as_object)
+                    .and_then(|project| project.get("mcpServers")),
+                &mut names,
+            )?;
+        }
         let path = self.layout.project_root.join(".mcp.json");
-        let names = match read_optional_file(&path)? {
-            Some(bytes) => {
-                let value = parse_object(&bytes, "Claude Code MCP configuration is invalid")?;
-                let mut names = match value.get("mcpServers") {
-                    Some(servers) => servers
-                        .as_object()
-                        .ok_or_else(|| invalid_request("Claude Code MCP configuration is invalid"))?
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    None => Vec::new(),
-                };
-                for name in &names {
-                    safe_name(name)?;
-                }
-                names.sort();
-                names
-            }
-            None => Vec::new(),
-        };
-        Ok(validation_commands(names))
+        if let Some(bytes) = read_optional_file(&path)? {
+            let value = parse_object(&bytes, "Claude Code MCP configuration is invalid")?;
+            collect_mcp_names(value.get("mcpServers"), &mut names)?;
+        }
+        Ok(names.into_iter().collect())
     }
 
     fn import_scope(
@@ -633,15 +932,24 @@ impl ClaudeCodeAdapter {
                 ComponentKind::Hook => "hooks",
                 _ => continue,
             };
-            if component.archived {
+            if component.kind == ComponentKind::Hook
+                && has_managed_memory_hook_identity(HarnessId::ClaudeCode, component)
+            {
+                if settings.get(key).is_none() && component.archived {
+                    continue;
+                }
+                let intended = merge_managed_memory_hooks(
+                    HarnessId::ClaudeCode,
+                    settings.get(key),
+                    component,
+                )?;
+                settings.insert(key.to_owned(), intended);
+            } else if component.archived {
                 settings.remove(key);
             } else {
-                settings.insert(
-                    key.to_owned(),
-                    serde_json::from_str(&component.body_markdown).map_err(|_| {
-                        invalid_request("Claude Code settings component is invalid")
-                    })?,
-                );
+                let intended = serde_json::from_str(&component.body_markdown)
+                    .map_err(|_| invalid_request("Claude Code settings component is invalid"))?;
+                settings.insert(key.to_owned(), intended);
             }
         }
         serde_json::to_vec(&Value::Object(settings))
@@ -713,6 +1021,368 @@ impl ClaudeCodeAdapter {
                 .collect(),
             timeout_ms: CLI_TIMEOUT_MS,
         }))
+    }
+}
+
+impl NativeMemoryAdapter for ClaudeCodeAdapter {
+    fn native_memory_capabilities(&self) -> Result<NativeMemoryCapabilities, ClientError> {
+        let path = self.project_settings_path();
+        let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str());
+        let snapshot = match OsNativeFileSystem::new().snapshot(&path) {
+            Ok(snapshot) => Some(snapshot),
+            Err(context_relay_native_runner::RunnerError::Io)
+                if safely_missing_project_settings(&self.layout.project_root, &path) =>
+            {
+                None
+            }
+            Err(_) => {
+                return Err(invalid_request(
+                    "Claude Code memory settings cannot be safely inspected",
+                ));
+            }
+        };
+        let (project_settings, metadata) = match snapshot.as_ref().map(|snapshot| snapshot.state())
+        {
+            Some(NativeState::RegularFile { bytes, metadata }) => {
+                let settings = match parse_object(bytes, "Claude Code settings are invalid") {
+                    Ok(settings) => settings,
+                    Err(_) => {
+                        return Ok(NativeMemoryCapabilities {
+                            disable: NativeMemoryDisable::Unavailable,
+                            sources: vec![],
+                        });
+                    }
+                };
+                (Some(settings), Some(metadata.clone()))
+            }
+            Some(NativeState::Absent { .. }) | None => (None, None),
+        };
+        let (effective_settings, managed) =
+            match self.effective_native_memory_settings(project_settings.as_ref()) {
+                Ok(effective) => effective,
+                Err(_) => {
+                    return Ok(NativeMemoryCapabilities {
+                        disable: NativeMemoryDisable::Unavailable,
+                        sources: vec![],
+                    });
+                }
+            };
+        let Some(memory_root) = self.bound_native_memory_root(&effective_settings, supported)?
+        else {
+            return Ok(NativeMemoryCapabilities {
+                disable: NativeMemoryDisable::Unavailable,
+                sources: vec![],
+            });
+        };
+        let sources = self.native_memory_sources(&memory_root)?;
+        if !supported || managed {
+            let capabilities = NativeMemoryCapabilities {
+                disable: NativeMemoryDisable::WatchOnly,
+                sources,
+            };
+            capabilities.validate()?;
+            return Ok(capabilities);
+        }
+        let (mut settings, metadata, expected) = match (project_settings, metadata, snapshot) {
+            (Some(settings), Some(metadata), Some(snapshot)) => {
+                (settings, metadata, *snapshot.fingerprint())
+            }
+            (None, None, Some(snapshot))
+                if matches!(snapshot.state(), NativeState::Absent { .. }) =>
+            {
+                let metadata = missing_project_settings_metadata(&path, snapshot.state())?;
+                (Map::new(), metadata, *snapshot.fingerprint())
+            }
+            _ => {
+                return Ok(NativeMemoryCapabilities {
+                    disable: NativeMemoryDisable::WatchOnly,
+                    sources,
+                });
+            }
+        };
+        let mutations = match settings.get("autoMemoryEnabled") {
+            Some(Value::Bool(false)) => vec![],
+            Some(Value::Bool(true)) | None => {
+                settings.insert("autoMemoryEnabled".to_owned(), Value::Bool(false));
+                let rendered = serde_json::to_vec(&Value::Object(settings)).map_err(|_| {
+                    invalid_request("Claude Code memory settings cannot be rendered")
+                })?;
+                let intended = NativeState::regular_file(rendered, metadata);
+                vec![ApprovedMutation {
+                    target: wire_path(&path),
+                    kind: MutationKind::Payload,
+                    content: intended.encode_v1().map_err(|_| {
+                        invalid_request("Claude Code memory settings are not representable")
+                    })?,
+                    expected: RestorableStateFingerprint(Sha256Digest(expected)),
+                    intended: RestorableStateFingerprint(Sha256Digest(intended.fingerprint())),
+                }]
+            }
+            Some(_) => {
+                let capabilities = NativeMemoryCapabilities {
+                    disable: NativeMemoryDisable::WatchOnly,
+                    sources,
+                };
+                capabilities.validate()?;
+                return Ok(capabilities);
+            }
+        };
+        let capabilities = NativeMemoryCapabilities {
+            disable: NativeMemoryDisable::Supported(mutations),
+            sources,
+        };
+        capabilities.validate()?;
+        Ok(capabilities)
+    }
+}
+
+impl ClaudeCodeAdapter {
+    fn bound_native_memory_root(
+        &self,
+        settings: &Map<String, Value>,
+        supported: bool,
+    ) -> Result<Option<PathBuf>, ClientError> {
+        if let Some(value) = settings.get("autoMemoryDirectory") {
+            let Some(value) = value.as_str() else {
+                return Ok(None);
+            };
+            let configured = Path::new(value);
+            if value.is_empty()
+                || value.len() > 4_096
+                || configured
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Ok(None);
+            }
+            let root = if configured.is_absolute() {
+                configured.to_path_buf()
+            } else {
+                if configured.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::RootDir | std::path::Component::Prefix(_)
+                    )
+                }) {
+                    return Ok(None);
+                }
+                self.layout.project_root.join(configured)
+            };
+            return safe_memory_directory_binding(&root);
+        }
+        if !supported {
+            return Ok(None);
+        }
+        let canonical_project = match fs::canonicalize(&self.layout.project_root) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let key = canonical_project
+            .to_string_lossy()
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        if key.is_empty() || key.len() > 4_096 {
+            return Ok(None);
+        }
+        safe_memory_directory_binding(
+            &self
+                .layout
+                .config_dir
+                .join("projects")
+                .join(key)
+                .join("memory"),
+        )
+    }
+
+    fn native_memory_sources(
+        &self,
+        root: &Path,
+    ) -> Result<Vec<crate::native_memory::NativeMemorySource>, ClientError> {
+        const MAX_TOPIC_FILES: usize = 32;
+
+        let mut sources = vec![crate::native_memory::native_memory_source(
+            HarnessId::ClaudeCode,
+            &self.layout.version,
+            ScopeRef::Project {
+                project_id: self.project_id,
+            },
+            NativeMemoryDocumentKind::Agent,
+            wire_path(&root.join("MEMORY.md")),
+        )?];
+        let mut topics = Vec::new();
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.take(MAX_TOPIC_FILES + 1) {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => continue,
+                };
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(_) => continue,
+                };
+                if !file_type.is_file() || file_type.is_symlink() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let folded = name.to_ascii_lowercase();
+                if name == "MEMORY.md"
+                    || !name.ends_with(".md")
+                    || name.len() > 128
+                    || folded.contains("session")
+                    || folded.contains("history")
+                    || folded.contains("rollout")
+                    || folded.contains("raw_memories")
+                {
+                    continue;
+                }
+                topics.push(entry.path());
+            }
+        }
+        topics.sort();
+        topics.truncate(MAX_TOPIC_FILES);
+        for path in topics {
+            sources.push(crate::native_memory::native_memory_source(
+                HarnessId::ClaudeCode,
+                &self.layout.version,
+                ScopeRef::Project {
+                    project_id: self.project_id,
+                },
+                NativeMemoryDocumentKind::Topic,
+                wire_path(&path),
+            )?);
+        }
+        Ok(sources)
+    }
+
+    fn effective_native_memory_settings(
+        &self,
+        project_settings: Option<&Map<String, Value>>,
+    ) -> Result<(Map<String, Value>, bool), ()> {
+        let mut effective = project_settings.cloned().unwrap_or_default();
+        let mut managed = false;
+        let mut managed_directory = None::<Value>;
+        for path in &self.layout.managed_settings_paths {
+            if !path.is_file() {
+                continue;
+            }
+            let settings = read_optional_file(path)
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|value| value.as_object().cloned())
+                .ok_or(())?;
+            managed |= settings.contains_key("autoMemoryEnabled")
+                || settings.contains_key("autoMemoryDirectory");
+            if let Some(directory) = settings.get("autoMemoryDirectory") {
+                if managed_directory
+                    .as_ref()
+                    .is_some_and(|current| current != directory)
+                {
+                    return Err(());
+                }
+                managed_directory = Some(directory.clone());
+            }
+        }
+        if let Some(directory) = managed_directory {
+            effective.insert("autoMemoryDirectory".to_owned(), directory);
+        }
+        Ok((effective, managed))
+    }
+}
+
+fn safely_missing_project_settings(project_root: &Path, settings_path: &Path) -> bool {
+    let expected_parent = project_root.join(".claude");
+    if settings_path.parent() != Some(expected_parent.as_path())
+        || settings_path
+            .file_name()
+            .is_none_or(|name| name != "settings.json")
+    {
+        return false;
+    }
+    let Ok(project_metadata) = fs::symlink_metadata(project_root) else {
+        return false;
+    };
+    if project_metadata.file_type().is_symlink() || !project_metadata.is_dir() {
+        return false;
+    }
+    let Ok(canonical_project) = fs::canonicalize(project_root) else {
+        return false;
+    };
+    if canonical_project != project_root {
+        return false;
+    }
+    match fs::symlink_metadata(&expected_parent) {
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        Ok(parent_metadata)
+            if parent_metadata.is_dir() && !parent_metadata.file_type().is_symlink() =>
+        {
+            matches!(
+                fs::symlink_metadata(settings_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        }
+        Ok(_) => false,
+    }
+}
+
+fn missing_project_settings_metadata(
+    settings_path: &Path,
+    absent: &NativeState,
+) -> Result<context_relay_native_runner::NativeMetadata, ClientError> {
+    let parent = settings_path
+        .parent()
+        .ok_or_else(|| invalid_request("Claude Code memory settings parent is unavailable"))?;
+    let mut siblings = fs::read_dir(parent)
+        .map_err(|_| invalid_request("Claude Code memory settings parent cannot be inspected"))?
+        .map(|entry| {
+            entry.map(|entry| entry.path()).map_err(|_| {
+                invalid_request("Claude Code memory settings parent cannot be inspected")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    siblings.sort();
+    for sibling in siblings {
+        if sibling == settings_path {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&sibling).map_err(|_| {
+            invalid_request("Claude Code memory settings sibling cannot be inspected")
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        let snapshot = OsNativeFileSystem::new().snapshot(&sibling).map_err(|_| {
+            invalid_request("Claude Code memory settings sibling cannot be safely inspected")
+        })?;
+        let NativeState::RegularFile { metadata, .. } = snapshot.state() else {
+            continue;
+        };
+        return metadata.for_absent_sibling_creation(absent).map_err(|_| {
+            invalid_request("Claude Code memory settings sibling is not bound to the target parent")
+        });
+    }
+    Err(invalid_request(
+        "Claude Code memory settings need an existing same-directory metadata template",
+    ))
+}
+
+fn safe_memory_directory_binding(path: &Path) -> Result<Option<PathBuf>, ClientError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Ok(None),
+        Ok(_) => fs::canonicalize(path)
+            .map(Some)
+            .map_err(|_| invalid_request("Claude Code memory directory cannot be resolved")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(path.to_path_buf())),
+        Err(_) => Ok(None),
     }
 }
 
@@ -819,6 +1489,20 @@ impl HarnessAdapter for ClaudeCodeAdapter {
                     }
                 }
                 ComponentKind::Instruction | ComponentKind::Rule | ComponentKind::Skill => {
+                    if is_primary_memory_instruction_component(HarnessId::ClaudeCode, component) {
+                        let (path, _, current, intended) =
+                            self.primary_memory_instruction_projection(component)?;
+                        if current.fingerprint() != intended.fingerprint()
+                            && let NativeState::RegularFile { bytes, .. } = intended
+                        {
+                            files.push(RenderedFile {
+                                path: wire_path(&path),
+                                bytes_sha256: digest(&bytes),
+                                byte_length: bytes.len() as u64,
+                            });
+                        }
+                        continue;
+                    }
                     if component.archived {
                         continue;
                     }
@@ -892,6 +1576,20 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     }
 
     fn validate_effective(&self, receipt: &ApplyReceipt) -> Result<ValidationReport, ClientError> {
+        self.validate_effective_with(receipt, |command| {
+            let argv = command.argv();
+            let arguments = argv.iter().map(String::as_str).collect::<Vec<_>>();
+            run_bounded_command(&self.layout.executable, &arguments, self.executable_hash)
+        })
+    }
+}
+
+impl ClaudeCodeAdapter {
+    fn validate_effective_with(
+        &self,
+        receipt: &ApplyReceipt,
+        mut execute: impl FnMut(&ClaudeCommand) -> Result<Vec<u8>, ClientError>,
+    ) -> Result<ValidationReport, ClientError> {
         receipt
             .validate()
             .map_err(|_| invalid_request("Claude Code receipt is invalid"))?;
@@ -899,10 +1597,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         let commands = self.validation_commands()?;
         let mut listed_mcp = BTreeSet::new();
         for command in commands {
-            let argv = command.argv();
-            let arguments = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output =
-                run_bounded_command(&self.layout.executable, &arguments, self.executable_hash)?;
+            let output = execute(&command)?;
             match command {
                 ClaudeCommand::Doctor => parse_doctor_output(&output)?,
                 ClaudeCommand::PluginList => parse_plugin_list_output(&output)?,
@@ -991,6 +1686,180 @@ impl NativeAdapter for ClaudeCodeAdapter {
     }
 }
 
+impl<O, V> NativeCliExecutor for ClaudeCodeCliExecutor<'_, O, V>
+where
+    O: ClaudeCodeCommandRunner,
+    V: ClaudeCodeCommandRunner,
+{
+    fn probe_cli_mutation(
+        &mut self,
+        mutation: &ApprovedCliMutation,
+    ) -> Result<Option<Sha256Digest>, BoundaryError> {
+        self.adapter.recheck_executable_boundary()?;
+        self.validate_mutation(mutation)?;
+        let live = self
+            .adapter
+            .probe_managed_declaration(&mut self.validation_runner)?;
+        Ok(declaration_fingerprint(live.as_ref()))
+    }
+
+    fn compare_cli_targets(
+        &mut self,
+        mutations: &[ApprovedCliMutation],
+    ) -> Result<(), BoundaryError> {
+        self.adapter.recheck_executable_boundary()?;
+        for mutation in mutations {
+            self.validate_mutation(mutation)?;
+            let live = self
+                .adapter
+                .probe_managed_declaration(&mut self.validation_runner)?;
+            if declaration_fingerprint(live.as_ref())
+                != declaration_fingerprint(mutation.expected.as_ref())
+            {
+                return Err(BoundaryError::new(
+                    "Claude Code managed bridge declaration changed",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_cli_mutation(
+        &mut self,
+        mutation: &ApprovedCliMutation,
+    ) -> Result<CliMutationOutcome, BoundaryError> {
+        self.adapter.recheck_executable_boundary()?;
+        self.validate_mutation(mutation)?;
+        let live = self
+            .adapter
+            .probe_managed_declaration(&mut self.validation_runner)?;
+        if declaration_fingerprint(live.as_ref())
+            != declaration_fingerprint(mutation.expected.as_ref())
+        {
+            return Ok(CliMutationOutcome {
+                resulting_fingerprint: declaration_fingerprint(live.as_ref()),
+                command_error: None,
+            });
+        }
+        let command_error = self.run_operations(&mutation.forward).err();
+        let resulting = self
+            .adapter
+            .probe_managed_declaration(&mut self.validation_runner)?;
+        Ok(CliMutationOutcome {
+            resulting_fingerprint: declaration_fingerprint(resulting.as_ref()),
+            command_error,
+        })
+    }
+
+    fn restore_cli_mutation_if_matches(
+        &mut self,
+        mutation: &ApprovedCliMutation,
+    ) -> Result<CliRestoreOutcome, BoundaryError> {
+        self.adapter.recheck_executable_boundary()?;
+        self.validate_mutation(mutation)?;
+        let live = self
+            .adapter
+            .probe_managed_declaration(&mut self.validation_runner)?;
+        if declaration_fingerprint(live.as_ref())
+            != declaration_fingerprint(mutation.intended.as_ref())
+        {
+            return Ok(CliRestoreOutcome {
+                restored: false,
+                resulting_fingerprint: declaration_fingerprint(live.as_ref()),
+            });
+        }
+        self.run_operations(&mutation.rollback)?;
+        let resulting = self
+            .adapter
+            .probe_managed_declaration(&mut self.validation_runner)?;
+        Ok(CliRestoreOutcome {
+            restored: declaration_fingerprint(resulting.as_ref())
+                == declaration_fingerprint(mutation.expected.as_ref()),
+            resulting_fingerprint: declaration_fingerprint(resulting.as_ref()),
+        })
+    }
+
+    fn finish_committed_cli_mutations(
+        &mut self,
+        mutations: &[ApprovedCliMutation],
+    ) -> Result<(), BoundaryError> {
+        self.adapter.recheck_executable_boundary()?;
+        for mutation in mutations {
+            self.validate_mutation(mutation)?;
+            let live = self
+                .adapter
+                .probe_managed_declaration(&mut self.validation_runner)?;
+            if declaration_fingerprint(live.as_ref())
+                != declaration_fingerprint(mutation.intended.as_ref())
+            {
+                return Err(BoundaryError::new(
+                    "Claude Code committed bridge declaration changed",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<O, V> ClaudeCodeCliExecutor<'_, O, V>
+where
+    O: ClaudeCodeCommandRunner,
+    V: ClaudeCodeCommandRunner,
+{
+    fn validate_mutation(&self, mutation: &ApprovedCliMutation) -> Result<(), BoundaryError> {
+        if mutation.expected.is_none() && mutation.intended.is_none() {
+            return Err(BoundaryError::new(
+                "Claude Code CLI mutation has no declaration",
+            ));
+        }
+        for declaration in [mutation.expected.as_ref(), mutation.intended.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            validate_cli_declaration(declaration)?;
+        }
+        let expected_forward = vec![
+            self.adapter
+                .declaration_operation(mutation.intended.as_ref()),
+        ];
+        let expected_rollback = vec![
+            self.adapter
+                .declaration_operation(mutation.expected.as_ref()),
+        ];
+        if mutation.forward != expected_forward || mutation.rollback != expected_rollback {
+            return Err(BoundaryError::new(
+                "Claude Code CLI operations differ from the approved declaration",
+            ));
+        }
+        Ok(())
+    }
+
+    fn run_operations(&mut self, operations: &[CliOperation]) -> Result<(), BoundaryError> {
+        for operation in operations {
+            if operation.executable != wire_path(&self.adapter.layout.executable)
+                || operation.timeout_ms != CLI_TIMEOUT_MS
+            {
+                return Err(BoundaryError::new(
+                    "Claude Code CLI operation is not canonical",
+                ));
+            }
+            let arguments = operation
+                .arguments
+                .iter()
+                .map(|argument| {
+                    argument
+                        .display
+                        .clone()
+                        .ok_or_else(|| BoundaryError::new("Claude Code CLI argument is not text"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.adapter
+                .run_verified(&mut self.operation_runner, &arguments)?;
+        }
+        Ok(())
+    }
+}
+
 fn component_path(
     adapter: &ClaudeCodeAdapter,
     component: &ComponentRecord,
@@ -1059,31 +1928,112 @@ fn validation_commands(mcp_names: Vec<String>) -> Vec<ClaudeCommand> {
     commands
 }
 
+fn collect_mcp_names(
+    servers: Option<&Value>,
+    names: &mut BTreeSet<String>,
+) -> Result<(), ClientError> {
+    let Some(servers) = servers else {
+        return Ok(());
+    };
+    let servers = servers
+        .as_object()
+        .ok_or_else(|| invalid_request("Claude Code MCP configuration is invalid"))?;
+    for name in servers.keys() {
+        safe_name(name)?;
+        if names.insert(name.clone()) && names.len() > MAX_MCP_VALIDATION_NAMES {
+            return Err(invalid_request(
+                "Claude Code MCP configuration has too many servers",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn run_bounded_command(
     executable: &Path,
     arguments: &[&str],
     expected_hash: Sha256Digest,
 ) -> Result<Vec<u8>, ClientError> {
-    if digest_file(executable)? != expected_hash {
-        return Err(client_error(
+    run_bounded_command_with_hook(executable, arguments, expected_hash, || {})
+}
+
+fn run_bounded_command_with_hook(
+    executable: &Path,
+    arguments: &[&str],
+    expected_hash: Sha256Digest,
+    before_spawn: impl FnOnce(),
+) -> Result<Vec<u8>, ClientError> {
+    let executable = open_verified_claude_executable(executable, expected_hash)
+        .map_err(|_| client_error(ErrorCode::Conflict, "Claude Code executable changed", false))?;
+    before_spawn();
+    executable
+        .revalidate_before_launch()
+        .map_err(|_| client_error(ErrorCode::Conflict, "Claude Code executable changed", false))?;
+    run_bounded_verified_command(&executable, arguments)
+}
+
+fn run_bounded_verified_command(
+    executable: &VerifiedClaudeExecutable,
+    arguments: &[&str],
+) -> Result<Vec<u8>, ClientError> {
+    executable
+        .revalidate_before_launch()
+        .map_err(|_| client_error(ErrorCode::Conflict, "Claude Code executable changed", false))?;
+    let launch = executable.prepare_launch()?;
+    run_prepared_claude_command(launch, &executable.source_path, arguments)
+}
+
+fn run_prepared_claude_command(
+    launch: PreparedClaudeLaunch,
+    original_path: &Path,
+    arguments: &[&str],
+) -> Result<Vec<u8>, ClientError> {
+    launch.revalidate().map_err(|_| {
+        client_error(
             ErrorCode::Conflict,
-            "Claude Code executable changed",
+            "Claude Code prepared executable changed",
             false,
-        ));
-    }
-    let mut child = Command::new(executable)
+        )
+    })?;
+    let mut command = Command::new(launch.program());
+    command
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| {
-            client_error(
-                ErrorCode::HarnessUnsupported,
-                "Claude Code command failed",
-                true,
-            )
-        })?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        command.arg0(original_path);
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        // SAFETY: the hook performs no work in the child. Its presence forces
+        // fork/exec so the sealed, non-CLOEXEC memfd survives until execve
+        // resolves its descriptor path.
+        unsafe {
+            command.pre_exec(|| Ok(()));
+        }
+    }
+    let mut child = command.spawn().map_err(|_| {
+        client_error(
+            ErrorCode::HarnessUnsupported,
+            "Claude Code command failed",
+            true,
+        )
+    })?;
+    launch.revalidate().map_err(|_| {
+        let _ = child.kill();
+        let _ = child.wait();
+        client_error(
+            ErrorCode::Conflict,
+            "Claude Code prepared executable changed",
+            false,
+        )
+    })?;
     let stdout = child
         .stdout
         .take()
@@ -1132,6 +2082,409 @@ fn run_bounded_command(
         ));
     }
     Ok(stdout)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClaudeFileIdentity {
+    volume: u64,
+    index: u64,
+}
+
+#[derive(Debug)]
+struct VerifiedClaudeExecutable {
+    source_path: PathBuf,
+    file: fs::File,
+    identity: ClaudeFileIdentity,
+    expected_hash: Sha256Digest,
+}
+
+impl VerifiedClaudeExecutable {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn prepare_launch(&self) -> Result<PreparedClaudeLaunch, ClientError> {
+        use std::{
+            ffi::CString,
+            os::fd::{AsRawFd as _, FromRawFd as _},
+        };
+
+        let name = CString::new("context-relay-claude")
+            .map_err(|_| invalid_request("Claude Code executable staging failed"))?;
+        // SAFETY: memfd_create receives a valid NUL-terminated name and returns
+        // a newly owned descriptor on success.
+        let descriptor = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING) };
+        if descriptor < 0 {
+            return Err(invalid_request("Claude Code executable staging failed"));
+        }
+        // SAFETY: the successful memfd_create result is a newly owned descriptor.
+        let mut staged = unsafe { fs::File::from_raw_fd(descriptor) };
+        // SAFETY: descriptor remains owned by `staged`.
+        if unsafe { libc::fchmod(descriptor, 0o700) } < 0 {
+            return Err(invalid_request("Claude Code executable staging failed"));
+        }
+        let mut source = self
+            .file
+            .try_clone()
+            .map_err(|_| invalid_request("Claude Code executable staging failed"))?;
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| invalid_request("Claude Code executable staging failed"))?;
+        std::io::copy(&mut source, &mut staged)
+            .and_then(|_| staged.sync_all())
+            .map_err(|_| invalid_request("Claude Code executable staging failed"))?;
+        if hash_open_file(&staged).ok() != Some(self.expected_hash) {
+            return Err(client_error(
+                ErrorCode::Conflict,
+                "Claude Code staged executable changed",
+                false,
+            ));
+        }
+        let seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+        // SAFETY: descriptor remains owned by `staged`; fcntl mutates or reads
+        // only the kernel seal state of that descriptor.
+        if unsafe { libc::fcntl(descriptor, libc::F_ADD_SEALS, seals) } < 0
+            || unsafe { libc::fcntl(descriptor, libc::F_GET_SEALS) } & seals != seals
+        {
+            return Err(invalid_request("Claude Code executable staging failed"));
+        }
+        let program = if Path::new("/proc/self/fd").is_dir() {
+            PathBuf::from(format!("/proc/self/fd/{}", staged.as_raw_fd()))
+        } else {
+            PathBuf::from(format!("/dev/fd/{}", staged.as_raw_fd()))
+        };
+        Ok(PreparedClaudeLaunch {
+            program,
+            expected_hash: self.expected_hash,
+            descriptor: staged,
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn prepare_launch(&self) -> Result<PreparedClaudeLaunch, ClientError> {
+        prepare_staged_claude_launch(self)
+    }
+
+    fn open(path: &Path) -> Result<Self, ClientError> {
+        if !is_native_claude_executable_path(path, cfg!(windows)) {
+            return Err(invalid_request(
+                "Claude Code executable is not a native executable",
+            ));
+        }
+        validate_executable_path_components(path)
+            .map_err(|_| invalid_request("Claude Code executable topology is unsafe"))?;
+        let metadata = fs::symlink_metadata(path).map_err(|_| {
+            client_error(
+                ErrorCode::NotFound,
+                "Claude Code executable is missing",
+                false,
+            )
+        })?;
+        if !metadata.is_file() || metadata_is_link_or_reparse(&metadata) {
+            return Err(invalid_request("Claude Code executable topology is unsafe"));
+        }
+        let file = open_executable_without_substitution(path)
+            .map_err(|_| invalid_request("Claude Code executable cannot be safely opened"))?;
+        let opened_metadata = file
+            .metadata()
+            .map_err(|_| invalid_request("Claude Code executable cannot be safely inspected"))?;
+        if !opened_metadata.is_file() || metadata_is_link_or_reparse(&opened_metadata) {
+            return Err(invalid_request("Claude Code executable topology is unsafe"));
+        }
+        #[cfg(windows)]
+        if !windows_reader_is_native_pe(
+            file.try_clone().map_err(|_| {
+                invalid_request("Claude Code executable cannot be safely inspected")
+            })?,
+        )
+        .map_err(|_| invalid_request("Claude Code executable cannot be safely inspected"))?
+        {
+            return Err(invalid_request(
+                "Claude Code executable is not a native executable",
+            ));
+        }
+        let identity = claude_file_identity(&file)
+            .map_err(|_| invalid_request("Claude Code executable identity is unavailable"))?;
+        let expected_hash = hash_open_file(&file)
+            .map_err(|_| invalid_request("Claude Code executable cannot be read"))?;
+        Ok(Self {
+            source_path: path.to_path_buf(),
+            file,
+            identity,
+            expected_hash,
+        })
+    }
+
+    fn revalidate_before_launch(&self) -> Result<(), BoundaryError> {
+        validate_executable_path_components(&self.source_path)
+            .map_err(|_| BoundaryError::new("Claude Code executable topology is unsafe"))?;
+        let held_identity = claude_file_identity(&self.file)
+            .map_err(|_| BoundaryError::new("Claude Code executable identity is unavailable"))?;
+        let held_hash = hash_open_file(&self.file)
+            .map_err(|_| BoundaryError::new("Claude Code executable cannot be read"))?;
+        let metadata = fs::symlink_metadata(&self.source_path)
+            .map_err(|_| BoundaryError::new("Claude Code executable is missing"))?;
+        if !metadata.is_file()
+            || metadata_is_link_or_reparse(&metadata)
+            || held_identity != self.identity
+            || held_hash != self.expected_hash
+        {
+            return Err(BoundaryError::new("Claude Code executable changed"));
+        }
+        let reopened = open_executable_without_substitution(&self.source_path)
+            .map_err(|_| BoundaryError::new("Claude Code executable is unsafe"))?;
+        let reopened_identity = claude_file_identity(&reopened)
+            .map_err(|_| BoundaryError::new("Claude Code executable identity is unavailable"))?;
+        let reopened_hash = hash_open_file(&reopened)
+            .map_err(|_| BoundaryError::new("Claude Code executable cannot be read"))?;
+        if reopened_identity != self.identity || reopened_hash != self.expected_hash {
+            return Err(BoundaryError::new("Claude Code executable changed"));
+        }
+        Ok(())
+    }
+}
+
+struct PreparedClaudeLaunch {
+    program: PathBuf,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    expected_hash: Sha256Digest,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    descriptor: fs::File,
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    _directory: tempfile::TempDir,
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    executable: VerifiedClaudeExecutable,
+}
+
+impl PreparedClaudeLaunch {
+    fn program(&self) -> &Path {
+        &self.program
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn revalidate(&self) -> Result<(), BoundaryError> {
+        use std::os::fd::AsRawFd as _;
+
+        let seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+        // SAFETY: `descriptor` owns a valid memfd for the lifetime of `self`.
+        let actual_seals = unsafe { libc::fcntl(self.descriptor.as_raw_fd(), libc::F_GET_SEALS) };
+        let actual_hash = hash_open_file(&self.descriptor)
+            .map_err(|_| BoundaryError::new("Claude Code prepared executable cannot be read"))?;
+        if actual_seals < 0 || actual_seals & seals != seals || actual_hash != self.expected_hash {
+            return Err(BoundaryError::new(
+                "Claude Code prepared executable changed",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn revalidate(&self) -> Result<(), BoundaryError> {
+        self.executable.revalidate_before_launch()
+    }
+}
+
+/// A non-forgeable Claude Code command capability bound to prepared bytes.
+///
+/// Runners can inspect the reviewed argument vector or consume the capability
+/// to execute it, but cannot recover the mutable discovery pathname.
+pub struct VerifiedClaudeCommand<'a> {
+    executable: &'a VerifiedClaudeExecutable,
+    launch: PreparedClaudeLaunch,
+    arguments: &'a [String],
+}
+
+impl VerifiedClaudeCommand<'_> {
+    pub fn arguments(&self) -> &[String] {
+        self.arguments
+    }
+
+    pub fn execute(self) -> Result<Vec<u8>, BoundaryError> {
+        let arguments = self
+            .arguments
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        run_prepared_claude_command(self.launch, &self.executable.source_path, &arguments).map_err(
+            |_| BoundaryError::new("Claude Code command failed at the native transaction boundary"),
+        )
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn prepare_staged_claude_launch(
+    executable: &VerifiedClaudeExecutable,
+) -> Result<PreparedClaudeLaunch, ClientError> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("context-relay-claude-");
+    #[cfg(unix)]
+    builder.permissions(fs::Permissions::from_mode(0o700));
+    let directory = builder.tempdir().map_err(|_| {
+        client_error(
+            ErrorCode::HarnessUnsupported,
+            "Claude Code executable staging failed",
+            true,
+        )
+    })?;
+    let directory_metadata = fs::symlink_metadata(directory.path()).map_err(|_| {
+        client_error(
+            ErrorCode::HarnessUnsupported,
+            "Claude Code executable staging failed",
+            true,
+        )
+    })?;
+    if !directory_metadata.is_dir() || metadata_is_link_or_reparse(&directory_metadata) || {
+        #[cfg(unix)]
+        {
+            directory_metadata.permissions().mode() & 0o777 != 0o700
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    } {
+        return Err(client_error(
+            ErrorCode::HarnessUnsupported,
+            "Claude Code executable staging failed",
+            false,
+        ));
+    }
+
+    let path = directory.path().join(if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    });
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o700);
+    let mut staged_file = options.open(&path).map_err(|_| {
+        client_error(
+            ErrorCode::HarnessUnsupported,
+            "Claude Code executable staging failed",
+            true,
+        )
+    })?;
+    let mut source = executable.file.try_clone().map_err(|_| {
+        client_error(
+            ErrorCode::HarnessUnsupported,
+            "Claude Code executable staging failed",
+            true,
+        )
+    })?;
+    source.seek(SeekFrom::Start(0)).map_err(|_| {
+        client_error(
+            ErrorCode::HarnessUnsupported,
+            "Claude Code executable staging failed",
+            true,
+        )
+    })?;
+    std::io::copy(&mut source, &mut staged_file)
+        .and_then(|_| staged_file.flush())
+        .and_then(|_| staged_file.sync_all())
+        .map_err(|_| {
+            client_error(
+                ErrorCode::HarnessUnsupported,
+                "Claude Code executable staging failed",
+                true,
+            )
+        })?;
+    drop(staged_file);
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(|_| {
+        client_error(
+            ErrorCode::HarnessUnsupported,
+            "Claude Code executable staging failed",
+            true,
+        )
+    })?;
+
+    let staged = VerifiedClaudeExecutable::open(&path).map_err(|_| {
+        client_error(
+            ErrorCode::HarnessUnsupported,
+            "Claude Code executable staging failed",
+            false,
+        )
+    })?;
+    let staged_metadata = fs::symlink_metadata(&path).map_err(|_| {
+        client_error(
+            ErrorCode::HarnessUnsupported,
+            "Claude Code executable staging failed",
+            false,
+        )
+    })?;
+    if staged.expected_hash != executable.expected_hash
+        || !staged_metadata.is_file()
+        || metadata_is_link_or_reparse(&staged_metadata)
+        || {
+            #[cfg(unix)]
+            {
+                staged_metadata.permissions().mode() & 0o777 != 0o700
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        }
+    {
+        return Err(client_error(
+            ErrorCode::Conflict,
+            "Claude Code staged executable changed",
+            false,
+        ));
+    }
+    staged.revalidate_before_launch().map_err(|_| {
+        client_error(
+            ErrorCode::Conflict,
+            "Claude Code staged executable changed",
+            false,
+        )
+    })?;
+    Ok(PreparedClaudeLaunch {
+        program: path,
+        _directory: directory,
+        executable: staged,
+    })
+}
+
+fn open_verified_claude_executable(
+    path: &Path,
+    expected_hash: Sha256Digest,
+) -> Result<VerifiedClaudeExecutable, BoundaryError> {
+    let executable = VerifiedClaudeExecutable::open(path)
+        .map_err(|_| BoundaryError::new("Claude Code executable cannot be safely attested"))?;
+    if executable.expected_hash != expected_hash {
+        return Err(BoundaryError::new("Claude Code executable changed"));
+    }
+    Ok(executable)
+}
+
+#[cfg(unix)]
+fn open_executable_without_substitution(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_executable_without_substitution(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+
+    fs::OpenOptions::new()
+        .read(true)
+        // Permit CreateProcess to read the image while denying concurrent
+        // writers and rename/delete substitution until after spawn.
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
 }
 
 fn read_capped(reader: impl Read) -> std::io::Result<Vec<u8>> {
@@ -1256,6 +2609,80 @@ fn parse_mcp_get_output(bytes: &[u8], expected_name: &str) -> Result<(), ClientE
     Ok(())
 }
 
+fn parse_managed_mcp_get_output(
+    bytes: &[u8],
+) -> Result<Option<CanonicalCliDeclaration>, BridgeDeclarationProbeError> {
+    bounded_utf8(bytes).map_err(|_| BridgeDeclarationProbeError::Inspection)?;
+    let server = serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .ok_or(BridgeDeclarationProbeError::Inspection)?;
+    if server.get("enabled") == Some(&Value::Bool(false)) {
+        return Err(BridgeDeclarationProbeError::Conflict);
+    }
+    if server.len() != 5
+        || server
+            .keys()
+            .any(|key| !["name", "scope", "type", "command", "args"].contains(&key.as_str()))
+    {
+        return Err(if server.contains_key("env") {
+            BridgeDeclarationProbeError::Conflict
+        } else {
+            BridgeDeclarationProbeError::Inspection
+        });
+    }
+    if server.get("name").and_then(Value::as_str) != Some(BRIDGE_SERVER_NAME) {
+        return Err(BridgeDeclarationProbeError::Inspection);
+    }
+    if server.get("scope").and_then(Value::as_str) != Some("user") {
+        return Err(BridgeDeclarationProbeError::Conflict);
+    }
+    if server.get("command").and_then(Value::as_str) == Some("<redacted>") {
+        return Err(BridgeDeclarationProbeError::Inspection);
+    }
+    let body = serde_json::json!({
+        "args": server.get("args").cloned().unwrap_or(Value::Null),
+        "command": server.get("command").cloned().unwrap_or(Value::Null),
+        "type": server.get("type").cloned().unwrap_or(Value::Null),
+    });
+    let canonical_body =
+        canonical_json(&body).map_err(|_| BridgeDeclarationProbeError::Inspection)?;
+    canonical_cli_declaration(&canonical_body)
+        .map(Some)
+        .map_err(|_| BridgeDeclarationProbeError::Conflict)
+}
+
+fn canonical_cli_declaration(body: &str) -> Result<CanonicalCliDeclaration, ClientError> {
+    if !is_canonical_bridge_body(HarnessId::ClaudeCode, body, false) {
+        return Err(invalid_request(
+            "Claude Code declaration is not the managed bridge",
+        ));
+    }
+    Ok(CanonicalCliDeclaration {
+        harness: HarnessId::ClaudeCode,
+        server_name: BRIDGE_SERVER_NAME.to_owned(),
+        canonical_body: body.to_owned(),
+        fingerprint: digest(body.as_bytes()),
+    })
+}
+
+fn validate_cli_declaration(declaration: &CanonicalCliDeclaration) -> Result<(), BoundaryError> {
+    if declaration.harness != HarnessId::ClaudeCode
+        || declaration.server_name != BRIDGE_SERVER_NAME
+        || declaration.fingerprint != digest(declaration.canonical_body.as_bytes())
+        || !is_canonical_bridge_body(HarnessId::ClaudeCode, &declaration.canonical_body, false)
+    {
+        return Err(BoundaryError::new(
+            "Claude Code CLI declaration is not canonical",
+        ));
+    }
+    Ok(())
+}
+
+fn declaration_fingerprint(declaration: Option<&CanonicalCliDeclaration>) -> Option<Sha256Digest> {
+    declaration.map(|declaration| declaration.fingerprint)
+}
+
 fn render_managed_markdown(
     existing: &[u8],
     body: &str,
@@ -1270,33 +2697,45 @@ fn render_managed_markdown(
     }
     let starts = existing.match_indices(MANAGED_START).collect::<Vec<_>>();
     let ends = existing.match_indices(MANAGED_END).collect::<Vec<_>>();
+    let newline = if existing.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let normalized_body = body
+        .replace("\r\n", "\n")
+        .trim_end_matches('\n')
+        .replace('\n', newline);
     let rendered = match (starts.as_slice(), ends.as_slice()) {
         ([], []) if !archived => {
             let mut rendered = existing.to_owned();
-            if !rendered.is_empty() && !rendered.ends_with('\n') {
-                rendered.push('\n');
+            if !rendered.is_empty() && !rendered.ends_with(newline) {
+                rendered.push_str(newline);
             }
             rendered.push_str(MANAGED_START);
-            rendered.push('\n');
-            rendered.push_str(body);
-            if !body.ends_with('\n') {
-                rendered.push('\n');
-            }
+            rendered.push_str(newline);
+            rendered.push_str(&normalized_body);
+            rendered.push_str(newline);
             rendered.push_str(MANAGED_END);
-            rendered.push('\n');
+            rendered.push_str(newline);
             rendered
         }
         ([(start, _)], [(end, _)]) if start < end => {
-            let suffix = end + MANAGED_END.len();
+            let marker_end = end + MANAGED_END.len();
+            let suffix = if existing[marker_end..].starts_with("\r\n") {
+                marker_end + 2
+            } else if existing[marker_end..].starts_with('\n') {
+                marker_end + 1
+            } else {
+                marker_end
+            };
             if archived {
                 format!("{}{}", &existing[..*start], &existing[suffix..])
             } else {
                 let mut rendered = existing[..start + MANAGED_START.len()].to_owned();
-                rendered.push('\n');
-                rendered.push_str(body);
-                if !body.ends_with('\n') {
-                    rendered.push('\n');
-                }
+                rendered.push_str(newline);
+                rendered.push_str(&normalized_body);
+                rendered.push_str(newline);
                 rendered.push_str(&existing[*end..]);
                 rendered
             }
@@ -1599,30 +3038,73 @@ fn digest(bytes: &[u8]) -> Sha256Digest {
 }
 
 fn digest_file(path: &Path) -> Result<Sha256Digest, ClientError> {
-    hash_file(path).map_err(|_| {
-        client_error(
-            ErrorCode::NotFound,
-            "Claude Code executable is missing",
-            false,
-        )
-    })
+    digest_regular_non_link_file(path)
 }
 
 fn digest_file_boundary(path: &Path) -> Result<Sha256Digest, BoundaryError> {
-    hash_file(path).map_err(|_| BoundaryError::new("Claude Code file cannot be read"))
+    digest_regular_non_link_file_boundary(path)
 }
 
-fn hash_file(path: &Path) -> std::io::Result<Sha256Digest> {
-    let mut file = fs::File::open(path)?;
+fn digest_regular_non_link_file(path: &Path) -> Result<Sha256Digest, ClientError> {
+    Ok(VerifiedClaudeExecutable::open(path)?.expected_hash)
+}
+
+fn digest_regular_non_link_file_boundary(path: &Path) -> Result<Sha256Digest, BoundaryError> {
+    VerifiedClaudeExecutable::open(path)
+        .map(|executable| executable.expected_hash)
+        .map_err(|_| BoundaryError::new("Claude Code executable cannot be safely attested"))
+}
+
+fn hash_open_file(file: &fs::File) -> std::io::Result<Sha256Digest> {
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
+            file.seek(SeekFrom::Start(0))?;
             return Ok(Sha256Digest(hasher.finalize().into()));
         }
         hasher.update(&buffer[..read]);
     }
+}
+
+#[cfg(unix)]
+fn claude_file_identity(file: &fs::File) -> std::io::Result<ClaudeFileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    Ok(ClaudeFileIdentity {
+        volume: metadata.dev(),
+        index: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn claude_file_identity(file: &fs::File) -> std::io::Result<ClaudeFileIdentity> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` owns a valid handle and `information` is writable for
+    // the exact structure expected by GetFileInformationByHandle.
+    let succeeded = unsafe {
+        GetFileInformationByHandle(
+            file.as_raw_handle() as HANDLE,
+            std::ptr::from_mut(&mut information),
+        )
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ClaudeFileIdentity {
+        volume: u64::from(information.dwVolumeSerialNumber),
+        index: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    })
 }
 
 fn parse_version(output: &str) -> Option<String> {
@@ -1638,14 +3120,112 @@ fn parse_version(output: &str) -> Option<String> {
 
 fn find_executable() -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
-    let names: &[&str] = if cfg!(windows) {
-        &["claude.exe", "claude.cmd"]
-    } else {
-        &["claude"]
-    };
+    let names = executable_names(cfg!(windows));
     env::split_paths(&path)
         .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| digest_regular_non_link_file(candidate).is_ok())
+}
+
+fn executable_names(windows: bool) -> &'static [&'static str] {
+    if windows {
+        &["claude.exe"]
+    } else {
+        &["claude"]
+    }
+}
+
+fn is_native_claude_executable_path(path: &Path, windows: bool) -> bool {
+    !windows
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+}
+
+#[cfg(any(windows, test))]
+fn windows_reader_is_native_pe(mut reader: impl Read + Seek) -> Result<bool, std::io::Error> {
+    let mut dos_header = [0_u8; 64];
+    if let Err(error) = reader.read_exact(&mut dos_header) {
+        return match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => Ok(false),
+            _ => Err(error),
+        };
+    }
+    if &dos_header[..2] != b"MZ" {
+        return Ok(false);
+    }
+    let pe_offset = u32::from_le_bytes(
+        dos_header[0x3c..0x40]
+            .try_into()
+            .expect("fixed DOS header range"),
+    );
+    reader.seek(SeekFrom::Start(u64::from(pe_offset)))?;
+    let mut signature = [0_u8; 4];
+    if let Err(error) = reader.read_exact(&mut signature) {
+        return match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => Ok(false),
+            _ => Err(error),
+        };
+    }
+    Ok(signature == *b"PE\0\0")
+}
+
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        windows_attributes_are_reparse(metadata.file_attributes())
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+#[cfg(windows)]
+fn validate_executable_path_components(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let mut attributes = Vec::new();
+    for component in absolute.ancestors() {
+        if component.as_os_str().is_empty() {
+            continue;
+        }
+        attributes.push(fs::symlink_metadata(component)?.file_attributes());
+    }
+    if !windows_path_component_attributes_are_safe(&attributes) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Claude Code executable path contains a reparse point",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn validate_executable_path_components(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn windows_attributes_are_reparse(attributes: u32) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(any(windows, test))]
+fn windows_path_component_attributes_are_safe(attributes: &[u32]) -> bool {
+    attributes
+        .iter()
+        .all(|attributes| !windows_attributes_are_reparse(*attributes))
 }
 
 fn installation_method(path: &Path) -> InstallationMethod {
@@ -1756,11 +3336,108 @@ fn client_error(code: ErrorCode, message: &'static str, retryable: bool) -> Clie
 #[cfg(test)]
 mod tests {
     use super::{
-        digest_file, parse_doctor_output, parse_mcp_get_output, parse_mcp_list_output,
-        parse_plugin_list_output, validation_commands,
+        ClaudeCodeAdapter, ClaudeCodeLayout, ClaudeCommand, MAX_MCP_VALIDATION_NAMES, digest_file,
+        executable_names, is_native_claude_executable_path, parse_doctor_output,
+        parse_mcp_get_output, parse_mcp_list_output, parse_plugin_list_output, run_bounded_command,
+        run_bounded_command_with_hook, validation_commands, windows_attributes_are_reparse,
+        windows_path_component_attributes_are_safe, windows_reader_is_native_pe,
+    };
+    use context_relay_protocol::{
+        ApplyReceipt, DeviceId, ErrorCode, HybridLogicalClock, InstallationMethod, PlanId,
+        ProjectId,
     };
     use serde_json::Value;
-    use std::fs;
+    use std::{fs, str::FromStr as _};
+
+    #[test]
+    fn windows_discovery_and_mutation_accept_only_native_claude_exe() {
+        assert_eq!(executable_names(true), &["claude.exe"]);
+        assert!(is_native_claude_executable_path(
+            std::path::Path::new("claude.exe"),
+            true
+        ));
+        for wrapper in ["claude.cmd", "claude.bat", "claude.ps1", "claude"] {
+            assert!(
+                !is_native_claude_executable_path(std::path::Path::new(wrapper), true),
+                "accepted Windows wrapper {wrapper}"
+            );
+        }
+        for wrapper in [
+            b"#!/bin/sh\nexec node claude.js\n".as_slice(),
+            b"@echo off\r\nnode claude.js\r\n".as_slice(),
+        ] {
+            assert!(
+                !windows_reader_is_native_pe(std::io::Cursor::new(wrapper)).unwrap(),
+                "accepted Windows script bytes"
+            );
+        }
+        let mut native_pe = vec![0_u8; 68];
+        native_pe[..2].copy_from_slice(b"MZ");
+        native_pe[0x3c..0x40].copy_from_slice(&64_u32.to_le_bytes());
+        native_pe[64..68].copy_from_slice(b"PE\0\0");
+        assert!(windows_reader_is_native_pe(std::io::Cursor::new(native_pe)).unwrap());
+    }
+
+    #[test]
+    fn windows_reparse_attribute_is_rejected_even_when_not_a_symlink() {
+        assert!(windows_attributes_are_reparse(0x0000_0400));
+        assert!(windows_attributes_are_reparse(0x0000_0420));
+        assert!(!windows_attributes_are_reparse(0x0000_0020));
+    }
+
+    #[test]
+    fn windows_reparse_attribute_is_rejected_on_every_path_component() {
+        assert!(windows_path_component_attributes_are_safe(&[
+            0x0000_0010,
+            0x0000_0010,
+            0x0000_0020,
+        ]));
+        assert!(!windows_path_component_attributes_are_safe(&[
+            0x0000_0010,
+            0x0000_0410,
+            0x0000_0020,
+        ]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_execution_launches_attested_bytes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("claude");
+        fs::write(&executable, b"#!/bin/sh\nprintf '%s\\n' \"$1\"\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let expected_hash = digest_file(&executable).unwrap();
+
+        let output = run_bounded_command(&executable, &["attested"], expected_hash).unwrap();
+
+        assert_eq!(output, b"attested\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_execution_rejects_path_substitution_before_spawn() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("claude");
+        let attested_backup = root.path().join("attested-claude");
+        let replacement = root.path().join("replacement-claude");
+        fs::copy("/bin/echo", &executable).unwrap();
+        fs::write(&replacement, b"#!/bin/sh\nprintf 'replacement\\n'\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+        let expected_hash = digest_file(&executable).unwrap();
+
+        let result =
+            run_bounded_command_with_hook(&executable, &["attested"], expected_hash, || {
+                fs::rename(&executable, &attested_backup).unwrap();
+                fs::rename(&replacement, &executable).unwrap();
+            });
+
+        assert!(result.is_err());
+    }
 
     #[test]
     fn standalone_executable_hashing_is_not_limited_like_configuration() {
@@ -1821,5 +3498,245 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn effective_validation_includes_global_mcp_without_executing_configured_servers() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("claude");
+        let project_root = root.path().join("project");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&project_root).unwrap();
+        let sentinel = root.path().join("configured-bridge-ran");
+        let command = serde_json::to_string(&sentinel.to_string_lossy()).unwrap();
+        let state_path = root.path().join(".claude.json");
+        fs::write(
+            &state_path,
+            format!(
+                r#"{{"mcpServers":{{"context-relay":{{"type":"stdio","command":{command},"args":[]}}}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            project_root.join(".mcp.json"),
+            format!(
+                r#"{{"mcpServers":{{"project-tools":{{"type":"stdio","command":{command},"args":[]}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let executable = root.path().join("claude-bin");
+        fs::write(&executable, b"fixture executable").unwrap();
+        let device = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
+        let adapter = ClaudeCodeAdapter::from_layout(
+            ClaudeCodeLayout {
+                executable,
+                version: "2.1.214".to_owned(),
+                installation_method: InstallationMethod::Manual,
+                config_dir,
+                state_path,
+                project_root,
+                managed_settings_paths: vec![],
+            },
+            ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073981").unwrap(),
+            device,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device),
+        )
+        .unwrap();
+        let receipt = ApplyReceipt {
+            plan_id: PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073984").unwrap(),
+            applied_hlc: HybridLogicalClock::new(1_900_000_000_001, 0, device),
+            resulting_digests: vec![],
+        };
+        let mut commands = Vec::new();
+        let report = adapter
+            .validate_effective_with(&receipt, |command| {
+                commands.push(command.argv());
+                Ok(match command {
+                    ClaudeCommand::Doctor => b"Claude Code diagnostics: OK\n".to_vec(),
+                    ClaudeCommand::PluginList => b"[]".to_vec(),
+                    ClaudeCommand::McpList => {
+                        b"context-relay: local (stdio)\nproject-tools: local (stdio)\n".to_vec()
+                    }
+                    ClaudeCommand::McpGet(name) => serde_json::to_vec(&serde_json::json!({
+                        "name": name,
+                        "type": "stdio",
+                        "url": "stdio://local"
+                    }))
+                    .unwrap(),
+                })
+            })
+            .unwrap();
+        assert!(report.valid);
+        assert_eq!(
+            commands,
+            vec![
+                vec!["doctor"],
+                vec!["plugin", "list", "--json"],
+                vec!["mcp", "list"],
+                vec!["mcp", "get", "context-relay"],
+                vec!["mcp", "get", "project-tools"],
+            ]
+        );
+        assert!(!sentinel.exists());
+    }
+
+    struct McpSourceFixture {
+        _root: tempfile::TempDir,
+        adapter: ClaudeCodeAdapter,
+        receipt: ApplyReceipt,
+    }
+
+    fn mcp_servers(indices: impl IntoIterator<Item = usize>) -> Value {
+        Value::Object(
+            indices
+                .into_iter()
+                .map(|index| {
+                    (
+                        format!("server-{index:04}"),
+                        serde_json::json!({
+                            "type": "stdio",
+                            "command": "never-run",
+                            "args": []
+                        }),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn mcp_source_fixture(
+        global: impl IntoIterator<Item = usize>,
+        project_state: impl IntoIterator<Item = usize>,
+        project_file: impl IntoIterator<Item = usize>,
+    ) -> McpSourceFixture {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("claude");
+        let project_root = root.path().join("project");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&project_root).unwrap();
+        let state_path = root.path().join(".claude.json");
+        let project_key = project_root.to_string_lossy().into_owned();
+        fs::write(
+            &state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "mcpServers": mcp_servers(global),
+                "projects": {
+                    (project_key): {
+                        "mcpServers": mcp_servers(project_state)
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            project_root.join(".mcp.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "mcpServers": mcp_servers(project_file)
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let executable = root.path().join("claude-bin");
+        fs::write(&executable, b"fixture executable").unwrap();
+        let device = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
+        let adapter = ClaudeCodeAdapter::from_layout(
+            ClaudeCodeLayout {
+                executable,
+                version: "2.1.214".to_owned(),
+                installation_method: InstallationMethod::Manual,
+                config_dir,
+                state_path,
+                project_root,
+                managed_settings_paths: vec![],
+            },
+            ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073981").unwrap(),
+            device,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device),
+        )
+        .unwrap();
+        McpSourceFixture {
+            _root: root,
+            adapter,
+            receipt: ApplyReceipt {
+                plan_id: PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073984").unwrap(),
+                applied_hlc: HybridLogicalClock::new(1_900_000_000_001, 0, device),
+                resulting_digests: vec![],
+            },
+        }
+    }
+
+    fn bounded_validation_output(command: &ClaudeCommand, names: &[String]) -> Vec<u8> {
+        match command {
+            ClaudeCommand::Doctor => b"Claude Code diagnostics: OK\n".to_vec(),
+            ClaudeCommand::PluginList => b"[]".to_vec(),
+            ClaudeCommand::McpList => names
+                .iter()
+                .map(|name| format!("{name}: local (stdio)\n"))
+                .collect::<String>()
+                .into_bytes(),
+            ClaudeCommand::McpGet(name) => serde_json::to_vec(&serde_json::json!({
+                "name": name,
+                "type": "stdio",
+                "url": "stdio://local"
+            }))
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn effective_validation_accepts_exactly_the_deduplicated_mcp_name_limit() {
+        let half = MAX_MCP_VALIDATION_NAMES / 2;
+        let quarter = MAX_MCP_VALIDATION_NAMES / 4;
+        let fixture = mcp_source_fixture(
+            0..half,
+            quarter..quarter + half,
+            half..MAX_MCP_VALIDATION_NAMES,
+        );
+        let names = (0..MAX_MCP_VALIDATION_NAMES)
+            .map(|index| format!("server-{index:04}"))
+            .collect::<Vec<_>>();
+        let mut commands = Vec::new();
+        let report = fixture
+            .adapter
+            .validate_effective_with(&fixture.receipt, |command| {
+                commands.push(command.argv());
+                Ok(bounded_validation_output(command, &names))
+            })
+            .unwrap();
+
+        assert!(report.valid);
+        assert_eq!(commands.len(), MAX_MCP_VALIDATION_NAMES + 3);
+        assert_eq!(
+            commands[3..]
+                .iter()
+                .map(|command| command[2].clone())
+                .collect::<Vec<_>>(),
+            names
+        );
+    }
+
+    #[test]
+    fn effective_validation_rejects_the_sixty_fifth_unique_name_before_execution() {
+        let half = MAX_MCP_VALIDATION_NAMES / 2;
+        let quarter = MAX_MCP_VALIDATION_NAMES / 4;
+        let fixture = mcp_source_fixture(
+            0..half,
+            quarter..quarter + half,
+            half..=MAX_MCP_VALIDATION_NAMES,
+        );
+        let mut executions = 0;
+        let error = fixture
+            .adapter
+            .validate_effective_with(&fixture.receipt, |_| {
+                executions += 1;
+                Ok(Vec::new())
+            })
+            .unwrap_err();
+
+        assert_eq!(executions, 0);
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(!error.retryable);
+        assert_eq!(error.field_path, None);
     }
 }

@@ -115,6 +115,8 @@ impl SyncOperationV1 {
 #[ts(rename_all = "camelCase")]
 pub struct CheckpointV1 {
     pub schema_version: u16,
+    pub account_id: AccountId,
+    pub workspace_id: WorkspaceId,
     pub previous_checkpoint_hash: Sha256Digest,
     pub causal_frontier: Vec<DeviceSequence>,
     pub state_hash: Sha256Digest,
@@ -126,7 +128,7 @@ pub struct CheckpointV1 {
 
 impl CheckpointV1 {
     pub fn validate(&self) -> Result<(), crate::ValidationError> {
-        if self.schema_version != crate::SYNC_SCHEMA_VERSION {
+        if self.schema_version != crate::CHECKPOINT_SCHEMA_VERSION {
             return Err(crate::ValidationError::Invalid("schemaVersion"));
         }
         if self.causal_frontier.len() > MAX_BATCH_OPERATIONS {

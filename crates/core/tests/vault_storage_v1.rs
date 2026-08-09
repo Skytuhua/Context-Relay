@@ -4,16 +4,18 @@ use std::{fs, process::Command};
 
 use context_relay_core::{
     search::AllowedSearchScope,
+    service::OfflineWorkspace,
     vault::{BeforeImagePolicy, LATEST_SCHEMA_VERSION, Vault, VaultError},
 };
 use context_relay_protocol::{
-    HarnessAccessPolicy, MutationKind, RecordKind, ScopeRef, Sha256Digest,
+    HarnessAccessPolicy, MAX_EVIDENCE_ITEMS, MemoryCreateParams, MemoryKind, MutationKind,
+    RecordKind, ScopeRef, Sha256Digest, TaskStatus, TaskTransitionParams, TaskUpsertParams,
 };
 use rusqlite::{Connection, params};
 
 use support::{
-    ID_1, ID_2, ID_3, ID_4, ID_5, ID_6, ID_7, MemoryKeyStore, TempVault, basis, candidate,
-    checkpoint, instruction, memory, native_path, operation, receipt, task,
+    ID_1, ID_2, ID_3, ID_4, ID_5, ID_6, ID_7, ID_9, MemoryKeyStore, TempVault, basis, candidate,
+    checkpoint, clock, instruction, memory, native_path, operation, receipt, task,
 };
 
 const CREDENTIAL: &str = "task-6-tests";
@@ -46,6 +48,10 @@ fn decode_key(value: &str) -> [u8; 32] {
         *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap();
     }
     key
+}
+
+fn generated_id(index: u16) -> String {
+    format!("018f22e2-79b0-7cc8-98c4-dc0c0c07{index:04x}")
 }
 
 fn version_at_least(actual: &str, minimum: [u32; 3]) -> bool {
@@ -210,6 +216,596 @@ fn version_one_vault_upgrades_before_images_without_data_loss() {
         .unwrap();
     vault.put_receipt(&pending_receipt, true, true).unwrap();
     assert!(vault.has_before_image("pending").unwrap());
+}
+
+#[test]
+fn version_five_vault_adds_local_operation_results_without_losing_bindings() {
+    let path = TempVault::new("migration-v5-to-v6");
+    let keys = MemoryKeyStore::default();
+    let key = [13; 32];
+    keys.insert(CREDENTIAL, key);
+
+    let raw = open_keyed(path.path(), &key);
+    raw.execute_batch(include_str!("../migrations/0001_vault.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0002_before_image_plans.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0003_native_transactions.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0004_offline_workspace.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!(
+        "../migrations/0005_local_operation_bindings.sql"
+    ))
+    .unwrap();
+    raw.execute(
+        "INSERT INTO local_operation_bindings(
+             operation_id, operation_kind, target_id, expected_revision, canonical_payload
+         ) VALUES (?1, 'memory_create', ?2, NULL, X'7B7D')",
+        [ID_1, ID_1],
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 5).unwrap();
+    drop(raw);
+
+    let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+    assert!(
+        vault
+            .table_names()
+            .unwrap()
+            .iter()
+            .any(|name| name == "local_operation_results")
+    );
+    drop(vault);
+
+    let raw = open_keyed(path.path(), &key);
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM local_operation_bindings WHERE operation_id = ?1",
+            [ID_1],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM local_operation_results", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn version_six_vault_preserves_operation_snapshots_and_accepts_task_bindings() {
+    let path = TempVault::new("migration-v6-to-v7");
+    let keys = MemoryKeyStore::default();
+    let key = [14; 32];
+    keys.insert(CREDENTIAL, key);
+    let legacy_params = MemoryCreateParams {
+        operation_id: ID_1.parse().unwrap(),
+        scope: ScopeRef::Global,
+        kind: MemoryKind::Fact,
+        title: "Preserved memory".to_owned(),
+        body_markdown: "Preserved snapshot".to_owned(),
+        tags: vec!["migration".to_owned()],
+    };
+    let mut legacy_snapshot = memory(
+        ID_1,
+        ScopeRef::Global,
+        "Preserved memory",
+        "Preserved snapshot",
+    );
+    legacy_snapshot.tags = vec!["migration".to_owned()];
+    legacy_snapshot.revision = ID_1.parse().unwrap();
+    let canonical_payload = serde_json::to_vec(&legacy_params).unwrap();
+    let canonical_response = serde_json::to_vec(&legacy_snapshot).unwrap();
+
+    let raw = open_keyed(path.path(), &key);
+    raw.execute_batch(include_str!("../migrations/0001_vault.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0002_before_image_plans.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0003_native_transactions.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0004_offline_workspace.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!(
+        "../migrations/0005_local_operation_bindings.sql"
+    ))
+    .unwrap();
+    raw.execute_batch(include_str!(
+        "../migrations/0006_local_operation_results.sql"
+    ))
+    .unwrap();
+    raw.execute(
+        "INSERT INTO local_operation_bindings(
+             operation_id, operation_kind, target_id, expected_revision, canonical_payload
+         ) VALUES (?1, 'memory_create', ?2, NULL, ?3)",
+        params![ID_1, ID_1, &canonical_payload],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO local_operation_results(operation_id, canonical_response)
+         VALUES (?1, ?2)",
+        params![ID_1, &canonical_response],
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 6).unwrap();
+    drop(raw);
+
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+    let mut workspace = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap());
+    assert_eq!(
+        workspace.create_memory(legacy_params).unwrap(),
+        legacy_snapshot
+    );
+    let task = workspace
+        .upsert_task(TaskUpsertParams {
+            operation_id: ID_2.parse().unwrap(),
+            task_id: None,
+            project_id: ID_7.parse().unwrap(),
+            title: "Migrated task".to_owned(),
+            body_markdown: "Task binding is supported after migration".to_owned(),
+            status: TaskStatus::Open,
+            expected_revision: None,
+        })
+        .unwrap();
+    assert_eq!(task.id.to_string(), ID_2);
+    drop(vault);
+
+    let raw = open_keyed(path.path(), &key);
+    let preserved = raw
+        .query_row(
+            "SELECT binding.operation_kind,
+                    binding.target_id,
+                    binding.expected_revision,
+                    binding.canonical_payload,
+                    result.canonical_response
+             FROM local_operation_bindings AS binding
+             JOIN local_operation_results AS result
+               ON result.operation_id = binding.operation_id
+             WHERE binding.operation_id = ?1",
+            [ID_1],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(preserved.0, "memory_create");
+    assert_eq!(preserved.1, ID_1);
+    assert_eq!(preserved.2, None);
+    assert_eq!(preserved.3, canonical_payload);
+    assert_eq!(preserved.4, canonical_response);
+    assert_eq!(
+        raw.query_row(
+            "SELECT operation_kind FROM local_operation_bindings WHERE operation_id = ?1",
+            [ID_2],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        "task_upsert"
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM local_operation_results WHERE operation_id = ?1",
+            [ID_2],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn version_seven_vault_preserves_task_snapshots_and_accepts_transition_bindings() {
+    let path = TempVault::new("migration-v7-to-v8");
+    let keys = MemoryKeyStore::default();
+    let key = [15; 32];
+    keys.insert(CREDENTIAL, key);
+    let legacy_params = TaskUpsertParams {
+        operation_id: ID_1.parse().unwrap(),
+        task_id: None,
+        project_id: ID_7.parse().unwrap(),
+        title: "Preserved task".to_owned(),
+        body_markdown: "Preserved task snapshot".to_owned(),
+        status: TaskStatus::Open,
+        expected_revision: None,
+    };
+    let mut legacy_snapshot = task();
+    legacy_snapshot.id = ID_1.parse().unwrap();
+    legacy_snapshot.title.clone_from(&legacy_params.title);
+    legacy_snapshot
+        .body_markdown
+        .clone_from(&legacy_params.body_markdown);
+    legacy_snapshot.revision = ID_1.parse().unwrap();
+    let canonical_payload = serde_json::to_vec(&legacy_params).unwrap();
+    let canonical_response = serde_json::to_vec(&legacy_snapshot).unwrap();
+    let mut legacy_decision = memory(
+        ID_3,
+        ScopeRef::Project {
+            project_id: legacy_params.project_id,
+        },
+        "Preserved decision",
+        "Backfill the handoff query projection",
+    );
+    legacy_decision.kind = MemoryKind::Decision;
+    legacy_decision.updated_hlc = clock(77);
+    let decision_response = serde_json::to_vec(&legacy_decision).unwrap();
+
+    let raw = open_keyed(path.path(), &key);
+    raw.execute_batch(include_str!("../migrations/0001_vault.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0002_before_image_plans.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0003_native_transactions.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0004_offline_workspace.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!(
+        "../migrations/0005_local_operation_bindings.sql"
+    ))
+    .unwrap();
+    raw.execute_batch(include_str!(
+        "../migrations/0006_local_operation_results.sql"
+    ))
+    .unwrap();
+    raw.execute_batch(include_str!(
+        "../migrations/0007_task_operation_bindings.sql"
+    ))
+    .unwrap();
+    raw.execute(
+        "INSERT INTO tasks(id, project_id, status, payload_json)
+         VALUES (?1, ?2, 'open', ?3)",
+        params![ID_1, ID_7, &canonical_response],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO records(
+             id, kind, scope_kind, project_id, archived, payload_json
+         ) VALUES (?1, 'memory', 'project', ?2, 0, ?3)",
+        params![ID_3, ID_7, &decision_response],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO local_operation_bindings(
+             operation_id, operation_kind, target_id, expected_revision, canonical_payload
+         ) VALUES (?1, 'task_upsert', ?2, NULL, ?3)",
+        params![ID_1, ID_1, &canonical_payload],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO local_operation_results(operation_id, canonical_response)
+         VALUES (?1, ?2)",
+        params![ID_1, &canonical_response],
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 7).unwrap();
+    drop(raw);
+
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+    assert_eq!(
+        vault
+            .recent_project_decisions(legacy_params.project_id, MAX_EVIDENCE_ITEMS)
+            .unwrap(),
+        vec![legacy_decision]
+    );
+    let transitioned = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
+        .transition_task(TaskTransitionParams {
+            operation_id: ID_2.parse().unwrap(),
+            task_id: legacy_snapshot.id,
+            expected_revision: legacy_snapshot.revision,
+            status: TaskStatus::Blocked,
+        })
+        .unwrap();
+    assert_eq!(transitioned.status, TaskStatus::Blocked);
+    drop(vault);
+
+    let raw = open_keyed(path.path(), &key);
+    let preserved = raw
+        .query_row(
+            "SELECT binding.operation_kind,
+                    binding.canonical_payload,
+                    result.canonical_response
+             FROM local_operation_bindings AS binding
+             JOIN local_operation_results AS result
+               ON result.operation_id = binding.operation_id
+             WHERE binding.operation_id = ?1",
+            [ID_1],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(preserved.0, "task_upsert");
+    assert_eq!(preserved.1, canonical_payload);
+    assert_eq!(preserved.2, canonical_response);
+    assert_eq!(
+        raw.query_row(
+            "SELECT operation_kind FROM local_operation_bindings WHERE operation_id = ?1",
+            [ID_2],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        "task_transition"
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM local_operation_results WHERE operation_id = ?1",
+            [ID_2],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn v8_to_v9_preserves_operation_results_and_native_plan_rows() {
+    let path = TempVault::new("v8-to-v9-preservation");
+    let keys = MemoryKeyStore::default();
+    let key = [19; 32];
+    keys.insert(CREDENTIAL, key);
+    let canonical_payload = br#"{"preserve":"binding"}"#;
+    let canonical_response = br#"{"preserve":"result"}"#;
+    let native_payload = br#"{"preserve":"native-plan"}"#;
+    let approval_hash = [23_u8; 32];
+
+    let raw = open_keyed(path.path(), &key);
+    raw.execute_batch(include_str!("../migrations/0001_vault.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0002_before_image_plans.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0003_native_transactions.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0004_offline_workspace.sql"))
+        .unwrap();
+    raw.execute_batch(include_str!(
+        "../migrations/0005_local_operation_bindings.sql"
+    ))
+    .unwrap();
+    raw.execute_batch(include_str!(
+        "../migrations/0006_local_operation_results.sql"
+    ))
+    .unwrap();
+    raw.execute_batch(include_str!(
+        "../migrations/0007_task_operation_bindings.sql"
+    ))
+    .unwrap();
+    raw.execute_batch(include_str!(
+        "../migrations/0008_task_transitions_and_handoff_queries.sql"
+    ))
+    .unwrap();
+    raw.execute(
+        "INSERT INTO local_operation_bindings(
+             operation_id, operation_kind, target_id, expected_revision, canonical_payload
+         ) VALUES (?1, 'memory_create', ?2, NULL, ?3)",
+        params![ID_1, ID_2, canonical_payload],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO local_operation_results(operation_id, canonical_response)
+         VALUES (?1, ?2)",
+        params![ID_1, canonical_response],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO native_plans(
+             plan_id, approval_hash, payload, created_ms, expires_ms
+         ) VALUES (?1, ?2, ?3, 10, 20)",
+        params![ID_3, approval_hash, native_payload],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO native_transactions(
+             transaction_id, plan_id, status, current_step, entered_step,
+             created_ms, updated_ms, platform, windows_moniker, windows_sid
+         ) VALUES (?1, ?2, 'pending', 0, 0, 10, 10, 'windows', ?3, ?4)",
+        params![
+            "preserved-native-transaction",
+            ID_3,
+            "context-relay.native.0123456789abcdef0123456789abcdef",
+            b"S-1-15-2-preserved".as_slice(),
+        ],
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 8).unwrap();
+    drop(raw);
+
+    let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+    assert!(
+        vault
+            .table_names()
+            .unwrap()
+            .iter()
+            .any(|name| name == "setup_plan_lifecycle")
+    );
+    drop(vault);
+
+    let raw = open_keyed(path.path(), &key);
+    let operation = raw
+        .query_row(
+            "SELECT binding.canonical_payload, result.canonical_response
+             FROM local_operation_bindings AS binding
+             JOIN local_operation_results AS result USING(operation_id)
+             WHERE binding.operation_id = ?1",
+            [ID_1],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(operation.0, canonical_payload);
+    assert_eq!(operation.1, canonical_response);
+    let native = raw
+        .query_row(
+            "SELECT approval_hash, payload FROM native_plans WHERE plan_id = ?1",
+            [ID_3],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(native.0, approval_hash);
+    assert_eq!(native.1, native_payload);
+    assert_eq!(
+        raw.query_row(
+            "SELECT plan_id FROM native_transactions WHERE transaction_id = ?1",
+            ["preserved-native-transaction"],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        ID_3
+    );
+}
+
+#[test]
+fn bounded_handoff_queries_filter_and_limit_records_in_storage() {
+    let path = TempVault::new("bounded-handoff-queries");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let project_id = ID_7.parse().unwrap();
+    let project_scope = ScopeRef::Project { project_id };
+    for index in 0..70_u16 {
+        let record_id = generated_id(100 + index);
+        let mut record = memory(
+            &record_id,
+            project_scope.clone(),
+            &format!("Decision {index}"),
+            "bounded handoff decision",
+        );
+        record.kind = MemoryKind::Decision;
+        record.updated_hlc = clock(u64::from(index));
+        vault
+            .put_local_memory(&record, &basis(usize::from(index) % 384))
+            .unwrap();
+    }
+    let mut fact = memory(
+        &generated_id(99),
+        project_scope,
+        "Not a decision",
+        "must be filtered before the limit",
+    );
+    fact.updated_hlc = clock(u64::MAX);
+    vault.put_local_memory(&fact, &basis(100)).unwrap();
+
+    let mut canceled = task();
+    canceled.id = generated_id(299).parse().unwrap();
+    canceled.status = TaskStatus::Canceled;
+    vault.put_task(&canceled).unwrap();
+    for index in 0..70_u16 {
+        let mut record = task();
+        record.id = generated_id(300 + index).parse().unwrap();
+        record.status = if index % 2 == 0 {
+            TaskStatus::Open
+        } else {
+            TaskStatus::Blocked
+        };
+        vault.put_task(&record).unwrap();
+    }
+
+    let decisions = vault
+        .recent_project_decisions(project_id, MAX_EVIDENCE_ITEMS)
+        .unwrap();
+    let tasks = vault
+        .open_or_blocked_tasks(project_id, MAX_EVIDENCE_ITEMS)
+        .unwrap();
+
+    assert_eq!(decisions.len(), MAX_EVIDENCE_ITEMS);
+    assert_eq!(decisions.first().unwrap().id.to_string(), generated_id(169));
+    assert_eq!(decisions.last().unwrap().id.to_string(), generated_id(106));
+    assert!(
+        decisions
+            .iter()
+            .all(|record| record.kind == MemoryKind::Decision)
+    );
+    assert_eq!(tasks.len(), MAX_EVIDENCE_ITEMS);
+    assert_eq!(tasks.first().unwrap().id.to_string(), generated_id(300));
+    assert_eq!(tasks.last().unwrap().id.to_string(), generated_id(363));
+    assert!(
+        tasks
+            .iter()
+            .all(|record| matches!(record.status, TaskStatus::Open | TaskStatus::Blocked))
+    );
+}
+
+#[test]
+fn instruction_fold_streams_the_full_allowed_corpus_with_bounded_caller_state() {
+    #[derive(Default)]
+    struct Probe {
+        visited: usize,
+        relevant: usize,
+        retained_ids: Vec<context_relay_protocol::RecordId>,
+        peak_retained_candidates: usize,
+    }
+
+    let path = TempVault::new("streaming-instruction-fold");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    for index in 0..180_u16 {
+        let record_id = generated_id(1_000 + index);
+        let value = instruction(
+            &record_id,
+            ScopeRef::Global,
+            &format!("Instruction {index}"),
+            if index < 100 {
+                "unrelated guidance"
+            } else {
+                "later relevant streamneedle"
+            },
+        );
+        vault
+            .put_instruction(
+                &value,
+                &operation(
+                    &generated_id(3_000 + index),
+                    &record_id,
+                    RecordKind::Instruction,
+                ),
+                &basis(usize::from(index) % 384),
+            )
+            .unwrap();
+    }
+    let scope = AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, None).unwrap();
+
+    let probe = vault
+        .fold_instructions(&scope, Probe::default(), |probe, value| {
+            probe.visited += 1;
+            if value.body_markdown.contains("streamneedle") {
+                probe.relevant += 1;
+                if probe.retained_ids.len() < MAX_EVIDENCE_ITEMS {
+                    probe.retained_ids.push(value.id);
+                }
+            }
+            probe.peak_retained_candidates =
+                probe.peak_retained_candidates.max(probe.retained_ids.len());
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(probe.visited, 180);
+    assert_eq!(probe.relevant, 80);
+    assert_eq!(probe.retained_ids.len(), MAX_EVIDENCE_ITEMS);
+    assert!(probe.peak_retained_candidates <= MAX_EVIDENCE_ITEMS);
+    assert_eq!(
+        probe.retained_ids.first().unwrap().to_string(),
+        generated_id(1_100)
+    );
+    assert_eq!(
+        probe.retained_ids.last().unwrap().to_string(),
+        generated_id(1_163)
+    );
 }
 
 #[test]
@@ -573,6 +1169,8 @@ fn bundled_schema_contains_all_required_tables() {
         "tasks",
         "instructions",
         "operations",
+        "local_operation_bindings",
+        "local_operation_results",
         "outbox",
         "checkpoints",
         "conflicts",
@@ -580,9 +1178,31 @@ fn bundled_schema_contains_all_required_tables() {
         "paths",
         "provenance",
         "before_images",
+        "setup_plan_lifecycle",
+        "native_cli_wal",
+        "native_memory_sources",
         "search_documents",
         "embeddings",
         "search_fts",
+        "sync_operation_meta",
+        "sync_device_heads",
+        "sync_record_heads",
+        "sync_record_owners",
+        "sync_cursors",
+        "sync_checkpoint_meta",
+        "signed_sync_checkpoints",
+        "sync_checkpoint_pins",
+        "sync_checkpoint_schedule",
+        "sync_nonces",
+        "sync_quarantine",
+        "sync_rejections",
+        "secret_refs",
+        "components",
+        "device_certificates",
+        "pairing_decisions",
+        "pairing_joins",
+        "pairing_approval_transcripts",
+        "recovery_enrollments",
     ] {
         assert!(names.iter().any(|name| name == required), "{required}");
     }

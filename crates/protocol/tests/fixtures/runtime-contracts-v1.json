@@ -97,7 +97,7 @@
   "memoryCreateRequest": {
     "jsonrpc": "2.0",
     "id": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
-    "protocol": {"major": 1, "minor": 0},
+    "protocol": {"major": 1, "minor": 3},
     "daemonInstanceNonce": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
     "method": "memory_create",
     "params": {
@@ -110,6 +110,14 @@
     }
   },
   "canonicalCbor": {
+    "pairingRequest": {
+      "file": "pairing-request-v1.hex",
+      "sha256": "10043c331e33f6c3f6aec76e346537a4a95966455e0f04125e7f49010b713163"
+    },
+    "pairingRequestSigningPreimage": {
+      "file": "pairing-request-signing-preimage-v1.hex",
+      "sha256": "896f3a685558203dcb79237fee5954ce2a8ca056a41d69219488b9e4c4016247"
+    },
     "syncOperation": {
       "file": "sync-operation-v1.hex",
       "sha256": "dcc2bc452c5be8b463b31cb7ee3007d3a19dc5013292fd91ab8c80517614bb1d"
@@ -120,11 +128,11 @@
     },
     "checkpoint": {
       "file": "checkpoint-v1.hex",
-      "sha256": "596fa2bbc08e0697e50396b87e565db37b6fd9dfb7810ea1727b8398a9bb3284"
+      "sha256": "aae1dcfb4f2e4a56251218c6f24019eed3545f515bcb66ba874f1cc2a02e99ac"
     },
     "checkpointSigningPreimage": {
       "file": "checkpoint-signing-preimage-v1.hex",
-      "sha256": "2213731885c62a78e2e3a8972decc4091faa1296bf3abfeca9a8556f778eb192"
+      "sha256": "82a027960bf6f821079eba6206327f9c396e381bb0d4c494e7335f0b7148dfd5"
     }
   }
 }
