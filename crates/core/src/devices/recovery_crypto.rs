@@ -104,6 +104,32 @@ impl fmt::Debug for RecoveryEnrollmentArtifacts {
     }
 }
 
+pub struct RecoveryEnrollmentBuildRequest<'a> {
+    pub enrollment_id: RecoveryEnrollmentId,
+    pub recovery_root_id: RecoveryRootId,
+    pub certificate_id: DeviceCertificateId,
+    pub certificate: DeviceCertificateV1,
+    pub device_name: String,
+    pub device_platform: NativePlatform,
+    pub recovery_keys: &'a RecoveryKeys,
+    pub device_keys: &'a DeviceKeys,
+    pub material: &'a PairingKeyBundle,
+}
+
+impl fmt::Debug for RecoveryEnrollmentBuildRequest<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveryEnrollmentBuildRequest")
+            .field("enrollment_id", &self.enrollment_id)
+            .field("recovery_root_id", &self.recovery_root_id)
+            .field("certificate_id", &self.certificate_id)
+            .field("device_name", &self.device_name)
+            .field("device_platform", &self.device_platform)
+            .field("certificate_keys_and_material", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Builds the signed recovery record and the first device's sealed workspace material.
 ///
 /// Caller-controlled wrapping randomness is unavailable in normal builds.
@@ -116,46 +142,25 @@ use context_relay_core::devices::recovery_crypto::build_recovery_enrollment_arti
 "#
 )]
 pub fn build_recovery_enrollment_artifacts(
-    enrollment_id: RecoveryEnrollmentId,
-    recovery_root_id: RecoveryRootId,
-    certificate_id: DeviceCertificateId,
-    certificate: DeviceCertificateV1,
-    device_name: String,
-    device_platform: NativePlatform,
-    recovery_keys: &RecoveryKeys,
-    device_keys: &DeviceKeys,
-    material: &PairingKeyBundle,
+    request: RecoveryEnrollmentBuildRequest<'_>,
 ) -> Result<RecoveryEnrollmentArtifacts, RecoveryEnrollmentCryptoError> {
-    build_recovery_enrollment_artifacts_inner(
-        enrollment_id,
-        recovery_root_id,
-        certificate_id,
-        certificate,
-        device_name,
-        device_platform,
-        recovery_keys,
-        device_keys,
-        material,
-        &mut OsRng,
-    )
+    build_recovery_enrollment_artifacts_inner(request, &mut OsRng)
 }
 
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
 pub fn build_recovery_enrollment_artifacts_with_rng<R: CryptoRng + RngCore>(
-    enrollment_id: RecoveryEnrollmentId,
-    recovery_root_id: RecoveryRootId,
-    certificate_id: DeviceCertificateId,
-    certificate: DeviceCertificateV1,
-    device_name: String,
-    device_platform: NativePlatform,
-    recovery_keys: &RecoveryKeys,
-    device_keys: &DeviceKeys,
-    material: &PairingKeyBundle,
+    request: RecoveryEnrollmentBuildRequest<'_>,
     rng: &mut R,
 ) -> Result<RecoveryEnrollmentArtifacts, RecoveryEnrollmentCryptoError> {
-    build_recovery_enrollment_artifacts_inner(
+    build_recovery_enrollment_artifacts_inner(request, rng)
+}
+
+pub(crate) fn build_recovery_enrollment_artifacts_inner<R: CryptoRng + RngCore>(
+    request: RecoveryEnrollmentBuildRequest<'_>,
+    rng: &mut R,
+) -> Result<RecoveryEnrollmentArtifacts, RecoveryEnrollmentCryptoError> {
+    let RecoveryEnrollmentBuildRequest {
         enrollment_id,
         recovery_root_id,
         certificate_id,
@@ -165,23 +170,7 @@ pub fn build_recovery_enrollment_artifacts_with_rng<R: CryptoRng + RngCore>(
         recovery_keys,
         device_keys,
         material,
-        rng,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_recovery_enrollment_artifacts_inner<R: CryptoRng + RngCore>(
-    enrollment_id: RecoveryEnrollmentId,
-    recovery_root_id: RecoveryRootId,
-    certificate_id: DeviceCertificateId,
-    certificate: DeviceCertificateV1,
-    device_name: String,
-    device_platform: NativePlatform,
-    recovery_keys: &RecoveryKeys,
-    device_keys: &DeviceKeys,
-    material: &PairingKeyBundle,
-    rng: &mut R,
-) -> Result<RecoveryEnrollmentArtifacts, RecoveryEnrollmentCryptoError> {
+    } = request;
     validate_builder_bindings(
         &certificate,
         &device_name,

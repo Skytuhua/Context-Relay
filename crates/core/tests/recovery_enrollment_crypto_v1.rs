@@ -9,10 +9,11 @@ use context_relay_core::{
         crypto::PairingKeyBundle,
         recovery_crypto::{
             MAX_RECOVERY_ENROLLMENT_RECORD_BYTES, RECOVERY_ENROLLMENT_SCHEMA_VERSION,
-            RecoveryEnrollmentArtifacts, RecoveryEnrollmentCryptoError,
-            build_recovery_enrollment_artifacts_with_rng, decode_recovery_enrollment_record_v1,
-            encode_recovery_enrollment_record_v1, encode_recovery_enrollment_signing_preimage_v1,
-            open_device_workspace_material, open_recovery_metadata,
+            RecoveryEnrollmentArtifacts, RecoveryEnrollmentBuildRequest,
+            RecoveryEnrollmentCryptoError, build_recovery_enrollment_artifacts_with_rng,
+            decode_recovery_enrollment_record_v1, encode_recovery_enrollment_record_v1,
+            encode_recovery_enrollment_signing_preimage_v1, open_device_workspace_material,
+            open_recovery_metadata,
         },
     },
     sync::SyncScope,
@@ -103,19 +104,22 @@ fn fixture() -> &'static Fixture {
         )
         .unwrap();
         let mut rng = SequenceRng(0x60);
-        let artifacts = build_recovery_enrollment_artifacts_with_rng(
-            id::<RecoveryEnrollmentId>(ENROLLMENT_ID),
-            id::<RecoveryRootId>(RECOVERY_ROOT_ID),
-            id::<DeviceCertificateId>(CERTIFICATE_ID),
+        let request = RecoveryEnrollmentBuildRequest {
+            enrollment_id: id::<RecoveryEnrollmentId>(ENROLLMENT_ID),
+            recovery_root_id: id::<RecoveryRootId>(RECOVERY_ROOT_ID),
+            certificate_id: id::<DeviceCertificateId>(CERTIFICATE_ID),
             certificate,
-            "First Mac".into(),
-            NativePlatform::Macos,
-            &recovery_keys,
-            &device_keys,
-            &material,
-            &mut rng,
-        )
-        .unwrap();
+            device_name: "First Mac".into(),
+            device_platform: NativePlatform::Macos,
+            recovery_keys: &recovery_keys,
+            device_keys: &device_keys,
+            material: &material,
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("[17, 17, 17"));
+        assert!(!debug.contains("[68, 68, 68"));
+        let artifacts = build_recovery_enrollment_artifacts_with_rng(request, &mut rng).unwrap();
         Fixture {
             phrase,
             recovery_keys,
@@ -174,30 +178,34 @@ fn certificate_fields(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_variant(
-    rng_start: u8,
+fn build_request<'a>(
     enrollment_id: RecoveryEnrollmentId,
     recovery_root_id: RecoveryRootId,
     certificate_id: DeviceCertificateId,
     certificate: DeviceCertificateV1,
-    recovery_keys: &RecoveryKeys,
-    device_keys: &DeviceKeys,
-    material: &PairingKeyBundle,
-) -> Result<RecoveryEnrollmentArtifacts, RecoveryEnrollmentCryptoError> {
-    let mut rng = SequenceRng(rng_start);
-    build_recovery_enrollment_artifacts_with_rng(
+    recovery_keys: &'a RecoveryKeys,
+    device_keys: &'a DeviceKeys,
+    material: &'a PairingKeyBundle,
+) -> RecoveryEnrollmentBuildRequest<'a> {
+    RecoveryEnrollmentBuildRequest {
         enrollment_id,
         recovery_root_id,
         certificate_id,
         certificate,
-        "First Mac".into(),
-        NativePlatform::Macos,
+        device_name: "First Mac".into(),
+        device_platform: NativePlatform::Macos,
         recovery_keys,
         device_keys,
         material,
-        &mut rng,
-    )
+    }
+}
+
+fn build_variant(
+    rng_start: u8,
+    request: RecoveryEnrollmentBuildRequest<'_>,
+) -> Result<RecoveryEnrollmentArtifacts, RecoveryEnrollmentCryptoError> {
+    let mut rng = SequenceRng(rng_start);
+    build_recovery_enrollment_artifacts_with_rng(request, &mut rng)
 }
 
 fn assert_transplanted_device_envelope_rejected(
@@ -439,13 +447,15 @@ fn certificate_bundle_and_both_envelope_aads_are_exact() {
 
     let transplanted = build_variant(
         0xd0,
-        id(OTHER_ID),
-        fixture.artifacts.record.recovery_root_id,
-        fixture.artifacts.record.genesis_certificate_id,
-        fixture.artifacts.record.genesis_certificate.clone(),
-        &fixture.recovery_keys,
-        &fixture.device_keys,
-        &fixture.material,
+        build_request(
+            id(OTHER_ID),
+            fixture.artifacts.record.recovery_root_id,
+            fixture.artifacts.record.genesis_certificate_id,
+            fixture.artifacts.record.genesis_certificate.clone(),
+            &fixture.recovery_keys,
+            &fixture.device_keys,
+            &fixture.material,
+        ),
     )
     .unwrap();
     assert!(open_recovery_metadata(&transplanted.record, &fixture.recovery_keys,).is_ok());
@@ -479,13 +489,15 @@ fn builder_rejects_valid_but_mismatched_initial_trust_inputs() {
     assert!(
         build_variant(
             1,
-            enrollment_id,
-            recovery_root_id,
-            certificate_id,
-            other_scope_certificate,
-            &fixture.recovery_keys,
-            &fixture.device_keys,
-            &fixture.material,
+            build_request(
+                enrollment_id,
+                recovery_root_id,
+                certificate_id,
+                other_scope_certificate,
+                &fixture.recovery_keys,
+                &fixture.device_keys,
+                &fixture.material,
+            ),
         )
         .is_err()
     );
@@ -498,13 +510,15 @@ fn builder_rejects_valid_but_mismatched_initial_trust_inputs() {
     assert!(
         build_variant(
             1,
-            enrollment_id,
-            recovery_root_id,
-            certificate_id,
-            epoch_two_certificate,
-            &fixture.recovery_keys,
-            &fixture.device_keys,
-            &fixture.material,
+            build_request(
+                enrollment_id,
+                recovery_root_id,
+                certificate_id,
+                epoch_two_certificate,
+                &fixture.recovery_keys,
+                &fixture.device_keys,
+                &fixture.material,
+            ),
         )
         .is_err()
     );
@@ -518,13 +532,15 @@ fn builder_rejects_valid_but_mismatched_initial_trust_inputs() {
     assert!(
         build_variant(
             1,
-            enrollment_id,
-            recovery_root_id,
-            certificate_id,
-            other_device_certificate,
-            &fixture.recovery_keys,
-            &fixture.device_keys,
-            &fixture.material,
+            build_request(
+                enrollment_id,
+                recovery_root_id,
+                certificate_id,
+                other_device_certificate,
+                &fixture.recovery_keys,
+                &fixture.device_keys,
+                &fixture.material,
+            ),
         )
         .is_err()
     );
@@ -538,13 +554,15 @@ fn builder_rejects_valid_but_mismatched_initial_trust_inputs() {
     assert!(
         build_variant(
             1,
-            enrollment_id,
-            recovery_root_id,
-            certificate_id,
-            device_issued_certificate,
-            &fixture.recovery_keys,
-            &fixture.device_keys,
-            &fixture.material,
+            build_request(
+                enrollment_id,
+                recovery_root_id,
+                certificate_id,
+                device_issued_certificate,
+                &fixture.recovery_keys,
+                &fixture.device_keys,
+                &fixture.material,
+            ),
         )
         .is_err()
     );
@@ -559,13 +577,15 @@ fn builder_rejects_valid_but_mismatched_initial_trust_inputs() {
     assert!(
         build_variant(
             1,
-            enrollment_id,
-            recovery_root_id,
-            certificate_id,
-            wrong_root_certificate,
-            &fixture.recovery_keys,
-            &fixture.device_keys,
-            &fixture.material,
+            build_request(
+                enrollment_id,
+                recovery_root_id,
+                certificate_id,
+                wrong_root_certificate,
+                &fixture.recovery_keys,
+                &fixture.device_keys,
+                &fixture.material,
+            ),
         )
         .is_err()
     );
@@ -575,13 +595,15 @@ fn builder_rejects_valid_but_mismatched_initial_trust_inputs() {
     assert!(
         build_variant(
             1,
-            enrollment_id,
-            recovery_root_id,
-            certificate_id,
-            fixture.artifacts.record.genesis_certificate.clone(),
-            &fixture.recovery_keys,
-            &fixture.device_keys,
-            &wrong_control_material,
+            build_request(
+                enrollment_id,
+                recovery_root_id,
+                certificate_id,
+                fixture.artifacts.record.genesis_certificate.clone(),
+                &fixture.recovery_keys,
+                &fixture.device_keys,
+                &wrong_control_material,
+            ),
         )
         .is_err()
     );
@@ -589,13 +611,15 @@ fn builder_rejects_valid_but_mismatched_initial_trust_inputs() {
     assert!(
         build_variant(
             1,
-            enrollment_id,
-            recovery_root_id,
-            certificate_id,
-            fixture.artifacts.record.genesis_certificate.clone(),
-            &fixture.recovery_keys,
-            &fixture.device_keys,
-            &wrong_key_material,
+            build_request(
+                enrollment_id,
+                recovery_root_id,
+                certificate_id,
+                fixture.artifacts.record.genesis_certificate.clone(),
+                &fixture.recovery_keys,
+                &fixture.device_keys,
+                &wrong_key_material,
+            ),
         )
         .is_err()
     );
@@ -603,30 +627,34 @@ fn builder_rejects_valid_but_mismatched_initial_trust_inputs() {
     let mut rng = SequenceRng(1);
     assert!(
         build_recovery_enrollment_artifacts_with_rng(
-            enrollment_id,
-            recovery_root_id,
-            certificate_id,
-            fixture.artifacts.record.genesis_certificate.clone(),
-            " ".into(),
-            NativePlatform::Macos,
-            &fixture.recovery_keys,
-            &fixture.device_keys,
-            &fixture.material,
+            RecoveryEnrollmentBuildRequest {
+                enrollment_id,
+                recovery_root_id,
+                certificate_id,
+                certificate: fixture.artifacts.record.genesis_certificate.clone(),
+                device_name: " ".into(),
+                device_platform: NativePlatform::Macos,
+                recovery_keys: &fixture.recovery_keys,
+                device_keys: &fixture.device_keys,
+                material: &fixture.material,
+            },
             &mut rng,
         )
         .is_err()
     );
     assert!(
         build_recovery_enrollment_artifacts_with_rng(
-            enrollment_id,
-            recovery_root_id,
-            certificate_id,
-            fixture.artifacts.record.genesis_certificate.clone(),
-            "x".repeat(257),
-            NativePlatform::Macos,
-            &fixture.recovery_keys,
-            &fixture.device_keys,
-            &fixture.material,
+            RecoveryEnrollmentBuildRequest {
+                enrollment_id,
+                recovery_root_id,
+                certificate_id,
+                certificate: fixture.artifacts.record.genesis_certificate.clone(),
+                device_name: "x".repeat(257),
+                device_platform: NativePlatform::Macos,
+                recovery_keys: &fixture.recovery_keys,
+                device_keys: &fixture.device_keys,
+                material: &fixture.material,
+            },
             &mut rng,
         )
         .is_err()
@@ -648,35 +676,41 @@ fn device_envelope_aad_rejects_every_valid_cross_enrollment_binding() {
     let variants = [
         build_variant(
             0x10,
-            id(OTHER_ID),
-            recovery_root_id,
-            certificate_id,
-            certificate.clone(),
-            &fixture.recovery_keys,
-            &fixture.device_keys,
-            &fixture.material,
+            build_request(
+                id(OTHER_ID),
+                recovery_root_id,
+                certificate_id,
+                certificate.clone(),
+                &fixture.recovery_keys,
+                &fixture.device_keys,
+                &fixture.material,
+            ),
         )
         .unwrap(),
         build_variant(
             0x20,
-            enrollment_id,
-            id(OTHER_ID),
-            certificate_id,
-            certificate.clone(),
-            &fixture.recovery_keys,
-            &fixture.device_keys,
-            &fixture.material,
+            build_request(
+                enrollment_id,
+                id(OTHER_ID),
+                certificate_id,
+                certificate.clone(),
+                &fixture.recovery_keys,
+                &fixture.device_keys,
+                &fixture.material,
+            ),
         )
         .unwrap(),
         build_variant(
             0x30,
-            enrollment_id,
-            recovery_root_id,
-            id(OTHER_ID),
-            certificate.clone(),
-            &fixture.recovery_keys,
-            &fixture.device_keys,
-            &fixture.material,
+            build_request(
+                enrollment_id,
+                recovery_root_id,
+                id(OTHER_ID),
+                certificate.clone(),
+                &fixture.recovery_keys,
+                &fixture.device_keys,
+                &fixture.material,
+            ),
         )
         .unwrap(),
     ];
@@ -695,13 +729,15 @@ fn device_envelope_aad_rejects_every_valid_cross_enrollment_binding() {
     .unwrap();
     let changed_certificate = build_variant(
         0x40,
-        enrollment_id,
-        recovery_root_id,
-        certificate_id,
-        changed_certificate,
-        &fixture.recovery_keys,
-        &fixture.device_keys,
-        &fixture.material,
+        build_request(
+            enrollment_id,
+            recovery_root_id,
+            certificate_id,
+            changed_certificate,
+            &fixture.recovery_keys,
+            &fixture.device_keys,
+            &fixture.material,
+        ),
     )
     .unwrap();
     assert_transplanted_device_envelope_rejected(
@@ -719,13 +755,15 @@ fn device_envelope_aad_rejects_every_valid_cross_enrollment_binding() {
     .unwrap();
     let other_root = build_variant(
         0x50,
-        enrollment_id,
-        recovery_root_id,
-        certificate_id,
-        other_root_certificate,
-        &other_recovery,
-        &fixture.device_keys,
-        &fixture.material,
+        build_request(
+            enrollment_id,
+            recovery_root_id,
+            certificate_id,
+            other_root_certificate,
+            &other_recovery,
+            &fixture.device_keys,
+            &fixture.material,
+        ),
     )
     .unwrap();
     assert_transplanted_device_envelope_rejected(
@@ -747,13 +785,15 @@ fn device_envelope_aad_rejects_every_valid_cross_enrollment_binding() {
     .unwrap();
     let other_scope_artifacts = build_variant(
         0x70,
-        enrollment_id,
-        recovery_root_id,
-        certificate_id,
-        other_scope_certificate,
-        &fixture.recovery_keys,
-        &fixture.device_keys,
-        &other_scope_material,
+        build_request(
+            enrollment_id,
+            recovery_root_id,
+            certificate_id,
+            other_scope_certificate,
+            &fixture.recovery_keys,
+            &fixture.device_keys,
+            &other_scope_material,
+        ),
     )
     .unwrap();
     assert_transplanted_device_envelope_rejected(
@@ -781,13 +821,15 @@ fn device_envelope_aad_rejects_every_valid_cross_enrollment_binding() {
     .unwrap();
     let other_workspace_artifacts = build_variant(
         0x71,
-        enrollment_id,
-        recovery_root_id,
-        certificate_id,
-        other_workspace_certificate,
-        &fixture.recovery_keys,
-        &fixture.device_keys,
-        &other_workspace_material,
+        build_request(
+            enrollment_id,
+            recovery_root_id,
+            certificate_id,
+            other_workspace_certificate,
+            &fixture.recovery_keys,
+            &fixture.device_keys,
+            &other_workspace_material,
+        ),
     )
     .unwrap();
     assert_transplanted_device_envelope_rejected(
@@ -803,13 +845,15 @@ fn device_envelope_aad_rejects_every_valid_cross_enrollment_binding() {
     .unwrap();
     let other_device = build_variant(
         0x80,
-        enrollment_id,
-        recovery_root_id,
-        certificate_id,
-        other_device_certificate,
-        &fixture.recovery_keys,
-        &fixture.device_keys,
-        &fixture.material,
+        build_request(
+            enrollment_id,
+            recovery_root_id,
+            certificate_id,
+            other_device_certificate,
+            &fixture.recovery_keys,
+            &fixture.device_keys,
+            &fixture.material,
+        ),
     )
     .unwrap();
     assert_transplanted_device_envelope_rejected(
@@ -826,13 +870,15 @@ fn device_envelope_aad_rejects_every_valid_cross_enrollment_binding() {
     .unwrap();
     let other_device = build_variant(
         0x90,
-        enrollment_id,
-        recovery_root_id,
-        certificate_id,
-        other_device_certificate,
-        &fixture.recovery_keys,
-        &other_device_keys,
-        &fixture.material,
+        build_request(
+            enrollment_id,
+            recovery_root_id,
+            certificate_id,
+            other_device_certificate,
+            &fixture.recovery_keys,
+            &other_device_keys,
+            &fixture.material,
+        ),
     )
     .unwrap();
     assert_transplanted_device_envelope_rejected(

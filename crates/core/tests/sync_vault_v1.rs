@@ -4,7 +4,9 @@ use std::{path::Path, str::FromStr};
 
 use context_relay_core::{
     crypto::{ContentKey, DeviceKeys},
-    sync::{BuiltOperation, OperationBuilder, OperationChainHead, SyncIdentity},
+    sync::{
+        BuiltOperation, OperationBuildRequest, OperationBuilder, OperationChainHead, SyncIdentity,
+    },
     vault::{
         CommitDisposition, LATEST_SCHEMA_VERSION, SyncQuarantineDisposition, SyncQuarantineWrite,
         SyncRejectionDisposition, SyncRejectionWrite, Vault, VaultError,
@@ -110,15 +112,15 @@ fn build_with_project(
         device_keys: &keys,
         content_key: &content_key,
     })
-    .build(
-        id(operation_id),
+    .build(OperationBuildRequest {
+        operation_id: id(operation_id),
         project_id,
         mutation,
-        vec![],
+        causal_frontier: vec![],
         previous,
-        vec![],
-        HybridLogicalClock::new(1_700_000_000_000, 0, id(DEVICE_ID)),
-    )
+        blob_refs: vec![],
+        created_hlc: HybridLogicalClock::new(1_700_000_000_000, 0, id(DEVICE_ID)),
+    })
     .unwrap()
 }
 
@@ -143,15 +145,15 @@ fn build_with_nonce(
         },
         nonce,
     )
-    .build(
-        id(operation_id),
-        project_for(mutation),
+    .build(OperationBuildRequest {
+        operation_id: id(operation_id),
+        project_id: project_for(mutation),
         mutation,
-        vec![],
+        causal_frontier: vec![],
         previous,
-        vec![],
-        HybridLogicalClock::new(1_700_000_000_000, 0, id(DEVICE_ID)),
-    )
+        blob_refs: vec![],
+        created_hlc: HybridLogicalClock::new(1_700_000_000_000, 0, id(DEVICE_ID)),
+    })
     .unwrap()
 }
 

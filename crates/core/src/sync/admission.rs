@@ -79,7 +79,7 @@ impl AdmittedOperation {
 pub enum AdmissionDecision {
     ExactReplay(OperationId),
     Gap(RangeInclusive<u64>),
-    Admitted(AdmittedOperation),
+    Admitted(Box<AdmittedOperation>),
 }
 
 pub fn admit_operation(
@@ -178,12 +178,12 @@ pub fn admit_operation(
     let key = trusted_material.content_key(operation.workspace_id, operation.key_epoch)?;
     let context = trusted_context(&trusted, previous_chain, existing_scope);
     let mutation = verify_operation_envelope(&operation, &context, key)?;
-    Ok(AdmissionDecision::Admitted(AdmittedOperation {
+    Ok(AdmissionDecision::Admitted(Box::new(AdmittedOperation {
         operation,
         mutation,
         canonical_bytes,
         canonical_hash,
-    }))
+    })))
 }
 
 fn validate_active_identity(

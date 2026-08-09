@@ -12,10 +12,10 @@ use context_relay_protocol::{
     CandidateReviewParams, CandidateState, CompletionEvidenceInput, ErrorCode, HarnessId,
     McpBinding, McpScopeSelector, MemoryArchiveParams, MemoryCreateParams, MemoryKind,
     MemoryUpdateParams, NativeHookEvent, NativeHookEventParams, NativePlatform, ProjectIdentity,
-    ProposeMemoryInput, ScopeRef, SearchParams, TaskCompleteParams, TaskId, TaskStatus,
+    ProposeMemoryInput, ScopeRef, SearchParams, TaskCompleteParams, TaskId, TaskRecord, TaskStatus,
     TaskTransitionParams, TaskUpsertParams, WireNativeValue,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 use support::{
     ID_1, ID_2, ID_3, ID_4, ID_5, ID_6, ID_7, ID_8, ID_9, MemoryKeyStore, TempVault, candidate,
@@ -62,7 +62,10 @@ fn open_keyed(path: &std::path::Path, key: &[u8; 32]) -> Connection {
 
 #[test]
 fn migration_v10_through_latest_preserves_existing_workspace_rows() {
-    let fixture = Fixture::new("native-hook-migration-v10");
+    let path = TempVault::new("native-hook-migration-v10");
+    let keys = MemoryKeyStore::default();
+    let key = [0x31; 32];
+    keys.insert(CREDENTIAL, key);
     let project = ProjectIdentity {
         project_id: ID_7.parse().unwrap(),
         github_repository_id: Some(41),
@@ -70,36 +73,52 @@ fn migration_v10_through_latest_preserves_existing_workspace_rows() {
         monorepo_subdirectory: None,
         name: "Preserved project".into(),
     };
-    let task = {
-        let mut vault = fixture.vault();
-        let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap());
-        service.upsert_project(project.clone()).unwrap();
-        service
-            .upsert_task(TaskUpsertParams {
-                operation_id: ID_1.parse().unwrap(),
-                task_id: None,
-                project_id: project.project_id,
-                title: "Preserved task".into(),
-                body_markdown: "Must survive the v11 migration".into(),
-                status: TaskStatus::Open,
-                expected_revision: None,
-            })
-            .unwrap()
+    let task = TaskRecord {
+        id: ID_1.parse().unwrap(),
+        project_id: project.project_id,
+        title: "Preserved task".into(),
+        body_markdown: "Must survive migration from schema v10".into(),
+        status: TaskStatus::Open,
+        evidence: Vec::new(),
+        revision: ID_1.parse().unwrap(),
     };
 
-    let raw = open_keyed(fixture.path.path(), &fixture.keys.key(CREDENTIAL));
-    raw.execute_batch(
-        "DROP TABLE IF EXISTS setup_native_memory_source_refs;
-         DROP TABLE IF EXISTS setup_native_memory_managed_sources;
-         DROP TABLE IF EXISTS setup_native_memory_bindings;
-         DROP TABLE IF EXISTS native_hook_sessions;",
+    let raw = open_keyed(path.path(), &key);
+    for migration in [
+        include_str!("../migrations/0001_vault.sql"),
+        include_str!("../migrations/0002_before_image_plans.sql"),
+        include_str!("../migrations/0003_native_transactions.sql"),
+        include_str!("../migrations/0004_offline_workspace.sql"),
+        include_str!("../migrations/0005_local_operation_bindings.sql"),
+        include_str!("../migrations/0006_local_operation_results.sql"),
+        include_str!("../migrations/0007_task_operation_bindings.sql"),
+        include_str!("../migrations/0008_task_transitions_and_handoff_queries.sql"),
+        include_str!("../migrations/0009_setup_cli_transactions.sql"),
+        include_str!("../migrations/0010_native_memory_reconciliation.sql"),
+    ] {
+        raw.execute_batch(migration).unwrap();
+    }
+    raw.execute(
+        "INSERT INTO projects(id, payload_json) VALUES (?1, ?2)",
+        params![
+            project.project_id.to_string(),
+            serde_json::to_vec(&project).unwrap()
+        ],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO tasks(id, project_id, status, payload_json) VALUES (?1, ?2, 'open', ?3)",
+        params![
+            task.id.to_string(),
+            task.project_id.to_string(),
+            serde_json::to_vec(&task).unwrap()
+        ],
     )
     .unwrap();
     raw.pragma_update(None, "user_version", 10).unwrap();
     drop(raw);
 
-    let vault = fixture.vault();
-    assert_eq!(LATEST_SCHEMA_VERSION, 13);
+    let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
     assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     assert_eq!(vault.projects().unwrap(), vec![project]);
     assert_eq!(vault.task(&task.id).unwrap(), Some(task));

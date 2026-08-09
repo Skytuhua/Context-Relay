@@ -660,8 +660,8 @@ fn remember_call(id: Value) -> Value {
 fn status_output() -> Value {
     json!({
         "protocol": {
-            "min": {"major": 1, "minor": 2},
-            "max": {"major": 1, "minor": 2}
+            "min": {"major": 1, "minor": 3},
+            "max": {"major": 1, "minor": 3}
         },
         "vault": "unlocked",
         "resolvedProject": null,

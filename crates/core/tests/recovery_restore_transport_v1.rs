@@ -9,7 +9,8 @@ use context_relay_core::{
         crypto::PairingKeyBundle,
         memory_recovery_transport::InMemoryRecoveryEnrollmentProvider,
         recovery_crypto::{
-            build_recovery_enrollment_artifacts_with_rng, decode_recovery_enrollment_record_v1,
+            RecoveryEnrollmentBuildRequest, build_recovery_enrollment_artifacts_with_rng,
+            decode_recovery_enrollment_record_v1,
         },
         recovery_restore_crypto::{
             RecoveryDeviceClaimArtifacts, authenticate_recovery_root,
@@ -168,15 +169,17 @@ fn valid_claim_from_another_root_in_the_same_scope() -> RecoveryDeviceClaimArtif
     .unwrap();
     let mut enrollment_rng = SequenceRng(0x90);
     let enrollment = build_recovery_enrollment_artifacts_with_rng(
-        derived_id::<RecoveryEnrollmentId>(0x601),
-        derived_id::<RecoveryRootId>(0x602),
-        derived_id::<DeviceCertificateId>(0x603),
-        certificate,
-        "Other Root".into(),
-        NativePlatform::Macos,
-        &recovery_keys,
-        &genesis_keys,
-        &material,
+        RecoveryEnrollmentBuildRequest {
+            enrollment_id: derived_id::<RecoveryEnrollmentId>(0x601),
+            recovery_root_id: derived_id::<RecoveryRootId>(0x602),
+            certificate_id: derived_id::<DeviceCertificateId>(0x603),
+            certificate,
+            device_name: "Other Root".into(),
+            device_platform: NativePlatform::Macos,
+            recovery_keys: &recovery_keys,
+            device_keys: &genesis_keys,
+            material: &material,
+        },
         &mut enrollment_rng,
     )
     .unwrap();

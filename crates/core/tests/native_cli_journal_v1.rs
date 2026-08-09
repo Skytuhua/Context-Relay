@@ -83,6 +83,33 @@ fn fingerprint(bytes: &[u8]) -> Sha256Digest {
 }
 
 #[test]
+fn temp_vault_paths_are_unique_under_concurrent_construction() {
+    const BUILDERS: usize = 64;
+
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(BUILDERS));
+    let builders = (0..BUILDERS)
+        .map(|_| {
+            let gate = std::sync::Arc::clone(&gate);
+            std::thread::spawn(move || {
+                gate.wait();
+                let vault = TempVault::new("parallel-uniqueness");
+                (vault.path().to_owned(), vault)
+            })
+        })
+        .collect::<Vec<_>>();
+    let vaults = builders
+        .into_iter()
+        .map(|builder| builder.join().unwrap())
+        .collect::<Vec<_>>();
+    let unique_paths = vaults
+        .iter()
+        .map(|(path, _)| path)
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(unique_paths.len(), BUILDERS);
+}
+
+#[test]
 fn cli_wal_round_trips_canonical_bytes_and_allows_only_monotonic_transitions() {
     let (_path, _keys, mut vault) = open_transaction();
     let expected = br#"{"command":"/old","args":[]}"#;

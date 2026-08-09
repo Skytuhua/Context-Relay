@@ -225,7 +225,7 @@ fn decode_native_path(target: &WireNativeValue) -> Result<std::path::PathBuf, Pl
     use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
 
     if target.platform != context_relay_protocol::NativePlatform::Windows
-        || target.bytes.len() % 2 != 0
+        || !target.bytes.len().is_multiple_of(2)
     {
         return Err(invalid_envelope("native rollback target path is invalid"));
     }

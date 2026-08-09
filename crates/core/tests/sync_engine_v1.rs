@@ -7,8 +7,8 @@ use context_relay_core::{
     search::Embedding384,
     sync::{
         CanonicalCheckpoint, CanonicalOperation, CheckpointBuildContext, CheckpointCursor,
-        CheckpointPage, CheckpointReceipt, FaultSchedule, InMemoryTransport, OperationBuilder,
-        OperationChainHead, PullPage, PushReceipt, ReceivedOperation,
+        CheckpointPage, CheckpointReceipt, FaultSchedule, InMemoryTransport, OperationBuildRequest,
+        OperationBuilder, OperationChainHead, PullPage, PushReceipt, ReceivedOperation,
         RepresentativeEmbeddingResolver, RetryRandomSource, SyncEngine, SyncError, SyncIdentity,
         SyncProvider, SyncScope, SyncTransport, TransportError, TrustedDevice, TrustedSyncMaterial,
     },
@@ -3352,15 +3352,15 @@ impl SyncTransport for CursorFaultTransport {
         limit: usize,
     ) -> Result<PullPage, TransportError> {
         let mut page = self.inner.pull_operations(scope, after, limit)?;
-        if !matches!(self.fault, CursorFault::RangeOperationId) {
-            if let Some(row) = page.rows.first_mut() {
-                match self.fault {
-                    CursorFault::OperationId => row.cursor.operation_id = generated_id(900_001),
-                    CursorFault::ReceivedAt => row.cursor.received_at = "bad'cursor".to_owned(),
-                    CursorFault::RangeOperationId => unreachable!(),
-                }
-                page.next_cursor = Some(row.cursor.clone());
+        if !matches!(self.fault, CursorFault::RangeOperationId)
+            && let Some(row) = page.rows.first_mut()
+        {
+            match self.fault {
+                CursorFault::OperationId => row.cursor.operation_id = generated_id(900_001),
+                CursorFault::ReceivedAt => row.cursor.received_at = "bad'cursor".to_owned(),
+                CursorFault::RangeOperationId => unreachable!(),
             }
+            page.next_cursor = Some(row.cursor.clone());
         }
         Ok(page)
     }
@@ -3522,19 +3522,19 @@ fn chain(
             device_keys: &device.keys,
             content_key: &content_key,
         })
-        .build(
-            generated_id(id_start + index),
-            None,
-            &mutation,
-            Vec::new(),
+        .build(OperationBuildRequest {
+            operation_id: generated_id(id_start + index),
+            project_id: None,
+            mutation: &mutation,
+            causal_frontier: Vec::new(),
             previous,
-            Vec::new(),
-            HybridLogicalClock::new(
+            blob_refs: Vec::new(),
+            created_hlc: HybridLogicalClock::new(
                 1_700_000_000_000 + index as u64,
                 0,
                 device.certificate.device_id,
             ),
-        )
+        })
         .unwrap();
         previous = Some(OperationChainHead {
             sequence: built.operation.device_sequence,
@@ -3576,19 +3576,19 @@ fn large_chain(
             device_keys: &device.keys,
             content_key: &content_key,
         })
-        .build(
-            generated_id(id_start + index),
-            None,
-            &mutation,
-            Vec::new(),
+        .build(OperationBuildRequest {
+            operation_id: generated_id(id_start + index),
+            project_id: None,
+            mutation: &mutation,
+            causal_frontier: Vec::new(),
             previous,
-            blob_refs.clone(),
-            HybridLogicalClock::new(
+            blob_refs: blob_refs.clone(),
+            created_hlc: HybridLogicalClock::new(
                 1_700_100_000_000 + index as u64,
                 0,
                 device.certificate.device_id,
             ),
-        )
+        })
         .unwrap();
         previous = Some(OperationChainHead {
             sequence: built.operation.device_sequence,

@@ -4,7 +4,10 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use context_relay_core::{
@@ -38,6 +41,8 @@ pub const ID_6: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073986";
 pub const ID_7: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073987";
 pub const ID_8: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073988";
 pub const ID_9: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073989";
+
+static NEXT_TEMP_VAULT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 pub struct MemoryKeyStore(Mutex<HashMap<String, Vec<u8>>>);
@@ -87,12 +92,13 @@ pub struct TempVault(PathBuf);
 impl TempVault {
     pub fn new(name: &str) -> Self {
         let unique = format!(
-            "context-relay-{name}-{}-{}.db",
+            "context-relay-{name}-{}-{}-{}.db",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEMP_VAULT.fetch_add(1, Ordering::Relaxed),
         );
         Self(std::env::temp_dir().join(unique))
     }

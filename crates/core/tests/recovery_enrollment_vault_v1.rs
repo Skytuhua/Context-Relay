@@ -6,7 +6,10 @@ use context_relay_core::{
     crypto::{CertificateFieldsV1, DeviceCertificateV1, DeviceKeys, RecoveryKeys, RecoveryPhrase},
     devices::{
         crypto::{PairingKeyBundle, SignedPairingRequest},
-        recovery_crypto::{RecoveryEnrollmentArtifacts, build_recovery_enrollment_artifacts},
+        recovery_crypto::{
+            RecoveryEnrollmentArtifacts, RecoveryEnrollmentBuildRequest,
+            build_recovery_enrollment_artifacts,
+        },
         recovery_transport::RecoveryEnrollmentReceipt,
     },
     sync::SyncScope,
@@ -67,17 +70,17 @@ fn fixture() -> Fixture {
         &recovery_keys,
     )
     .unwrap();
-    let artifacts = build_recovery_enrollment_artifacts(
-        id::<RecoveryEnrollmentId>(ENROLLMENT_ID),
-        id::<RecoveryRootId>(RECOVERY_ROOT_ID),
-        id::<DeviceCertificateId>(CERTIFICATE_ID),
+    let artifacts = build_recovery_enrollment_artifacts(RecoveryEnrollmentBuildRequest {
+        enrollment_id: id::<RecoveryEnrollmentId>(ENROLLMENT_ID),
+        recovery_root_id: id::<RecoveryRootId>(RECOVERY_ROOT_ID),
+        certificate_id: id::<DeviceCertificateId>(CERTIFICATE_ID),
         certificate,
-        "First Mac".into(),
-        NativePlatform::Macos,
-        &recovery_keys,
-        &device_keys,
-        &material,
-    )
+        device_name: "First Mac".into(),
+        device_platform: NativePlatform::Macos,
+        recovery_keys: &recovery_keys,
+        device_keys: &device_keys,
+        material: &material,
+    })
     .unwrap();
     Fixture {
         device_keys,

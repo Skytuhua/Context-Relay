@@ -5,8 +5,8 @@ use std::{cell::Cell, collections::BTreeMap, str::FromStr};
 use context_relay_core::{
     crypto::{CertificateIssuerV1, ContentKey, DeviceCertificateV1, DeviceKeys},
     sync::{
-        AdmissionDecision, OperationBuilder, OperationChainHead, SyncError, SyncIdentity,
-        TrustedDevice, TrustedSyncMaterial, admit_operation,
+        AdmissionDecision, OperationBuildRequest, OperationBuilder, OperationChainHead, SyncError,
+        SyncIdentity, TrustedDevice, TrustedSyncMaterial, admit_operation,
     },
     vault::Vault,
 };
@@ -23,6 +23,15 @@ use support::{ID_1, ID_2, ID_3, ID_4, ID_5, ID_6, ID_7, ID_8, MemoryKeyStore, Te
 const CREDENTIAL: &str = "sync-admission-v1";
 const CONTROL_EPOCH: u32 = 5;
 const KEY_EPOCH: u32 = 11;
+
+#[test]
+fn admission_decision_is_not_dominated_by_the_admitted_payload() {
+    assert!(
+        std::mem::size_of::<AdmissionDecision>() <= 32,
+        "AdmissionDecision grew to {} bytes",
+        std::mem::size_of::<AdmissionDecision>()
+    );
+}
 
 struct DeviceFixture {
     keys: DeviceKeys,
@@ -441,15 +450,15 @@ fn build(
         device_keys: &device.keys,
         content_key: key,
     })
-    .build(
-        id::<OperationId>(operation_id),
-        None,
+    .build(OperationBuildRequest {
+        operation_id: id::<OperationId>(operation_id),
+        project_id: None,
         mutation,
-        frontier,
+        causal_frontier: frontier,
         previous,
-        vec![],
-        HybridLogicalClock::new(1_700_000_000_000, 0, device.certificate.device_id),
-    )
+        blob_refs: vec![],
+        created_hlc: HybridLogicalClock::new(1_700_000_000_000, 0, device.certificate.device_id),
+    })
     .unwrap()
 }
 

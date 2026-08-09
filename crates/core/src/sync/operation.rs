@@ -112,6 +112,16 @@ pub struct OperationBuilder<'a> {
     fixed_nonce: Option<XChaChaNonce>,
 }
 
+pub struct OperationBuildRequest<'a> {
+    pub operation_id: OperationId,
+    pub project_id: Option<ProjectId>,
+    pub mutation: &'a RecordMutationV1,
+    pub causal_frontier: Vec<DeviceSequence>,
+    pub previous: Option<OperationChainHead>,
+    pub blob_refs: Vec<BlobRef>,
+    pub created_hlc: HybridLogicalClock,
+}
+
 impl<'a> OperationBuilder<'a> {
     pub const fn new(identity: SyncIdentity<'a>) -> Self {
         Self {
@@ -129,16 +139,16 @@ impl<'a> OperationBuilder<'a> {
         }
     }
 
-    pub fn build(
-        &self,
-        operation_id: OperationId,
-        project_id: Option<ProjectId>,
-        mutation: &RecordMutationV1,
-        mut causal_frontier: Vec<DeviceSequence>,
-        previous: Option<OperationChainHead>,
-        blob_refs: Vec<BlobRef>,
-        created_hlc: HybridLogicalClock,
-    ) -> Result<BuiltOperation, SyncError> {
+    pub fn build(&self, request: OperationBuildRequest<'_>) -> Result<BuiltOperation, SyncError> {
+        let OperationBuildRequest {
+            operation_id,
+            project_id,
+            mutation,
+            mut causal_frontier,
+            previous,
+            blob_refs,
+            created_hlc,
+        } = request;
         mutation
             .validate()
             .map_err(|_| SyncError::InvalidMutation)?;
@@ -472,7 +482,7 @@ mod tests {
 
     use crate::{
         crypto::{ContentKey, DeviceKeys},
-        sync::{OperationBuilder, OperationChainHead, SyncIdentity},
+        sync::{OperationBuildRequest, OperationBuilder, OperationChainHead, SyncIdentity},
     };
 
     #[test]
@@ -493,11 +503,11 @@ mod tests {
             record_kind: RecordKind::Memory,
         };
         let built = OperationBuilder::with_nonce_for_test(identity, XChaChaNonce([13; 24]))
-            .build(
-                id("018f22e2-79b0-7cc8-98c4-dc0c0c073985"),
-                Some(id("018f22e2-79b0-7cc8-98c4-dc0c0c073986")),
-                &mutation,
-                vec![
+            .build(OperationBuildRequest {
+                operation_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073985"),
+                project_id: Some(id("018f22e2-79b0-7cc8-98c4-dc0c0c073986")),
+                mutation: &mutation,
+                causal_frontier: vec![
                     DeviceSequence {
                         device_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073988"),
                         sequence: 29,
@@ -507,21 +517,21 @@ mod tests {
                         sequence: 31,
                     },
                 ],
-                Some(OperationChainHead {
+                previous: Some(OperationChainHead {
                     sequence: 36,
                     canonical_hash: Sha256Digest([15; 32]),
                 }),
-                vec![BlobRef {
+                blob_refs: vec![BlobRef {
                     digest: Sha256Digest([19; 32]),
                     ciphertext_bytes: 4_096,
                     storage_id: "blob-fixed-v1".into(),
                 }],
-                HybridLogicalClock::new(
+                created_hlc: HybridLogicalClock::new(
                     1_700_000_000_123,
                     5,
                     id("018f22e2-79b0-7cc8-98c4-dc0c0c073983"),
                 ),
-            )
+            })
             .unwrap();
 
         assert_eq!(built.operation.device_sequence, 37);

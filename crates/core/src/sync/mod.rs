@@ -31,8 +31,8 @@ pub use memory::{FaultSchedule, InMemoryTransport};
 pub use merge::{MergeDecision, RepresentativeEmbeddingResolver, decide_merge};
 pub(crate) use operation::scope_matches;
 pub use operation::{
-    BuiltOperation, OperationBuilder, OperationDecryptor, SyncError, TrustedOperationContext,
-    verify_operation_envelope,
+    BuiltOperation, OperationBuildRequest, OperationBuilder, OperationDecryptor, SyncError,
+    TrustedOperationContext, verify_operation_envelope,
 };
 pub use transport::{
     CanonicalCheckpoint, CanonicalOperation, CheckpointCursor, CheckpointPage, CheckpointReceipt,

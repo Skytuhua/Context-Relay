@@ -6,8 +6,8 @@ use context_relay_core::{
         EncryptedPayload, SecretBytes,
     },
     sync::{
-        OperationBuilder, OperationChainHead, OperationDecryptor, SyncIdentity,
-        TrustedOperationContext, verify_operation_envelope,
+        OperationBuildRequest, OperationBuilder, OperationChainHead, OperationDecryptor,
+        SyncIdentity, TrustedOperationContext, verify_operation_envelope,
     },
 };
 use context_relay_protocol::{
@@ -255,15 +255,15 @@ fn builder_rejects_project_tombstone_routed_under_another_project() {
 
     assert!(
         builder
-            .build(
-                id(FLIPPED_ID),
-                Some(id(OTHER_ID)),
-                &mutation,
-                vec![],
-                None,
-                vec![],
-                HybridLogicalClock::new(1_700_000_000_100, 0, id(PRIMARY_ID)),
-            )
+            .build(OperationBuildRequest {
+                operation_id: id(FLIPPED_ID),
+                project_id: Some(id(OTHER_ID)),
+                mutation: &mutation,
+                causal_frontier: vec![],
+                previous: None,
+                blob_refs: vec![],
+                created_hlc: HybridLogicalClock::new(1_700_000_000_100, 0, id(PRIMARY_ID)),
+            })
             .is_err()
     );
 }
@@ -278,11 +278,11 @@ fn builder_sorts_frontier_and_rejects_duplicate_devices() {
     let later: DeviceId = id(OTHER_ID);
 
     let built = builder
-        .build(
-            id(OTHER_ID),
-            None,
-            &mutation(),
-            vec![
+        .build(OperationBuildRequest {
+            operation_id: id(OTHER_ID),
+            project_id: None,
+            mutation: &mutation(),
+            causal_frontier: vec![
                 DeviceSequence {
                     device_id: later,
                     sequence: 3,
@@ -292,21 +292,21 @@ fn builder_sorts_frontier_and_rejects_duplicate_devices() {
                     sequence: 2,
                 },
             ],
-            None,
-            vec![],
-            HybridLogicalClock::new(1_700_000_000_100, 0, id(PRIMARY_ID)),
-        )
+            previous: None,
+            blob_refs: vec![],
+            created_hlc: HybridLogicalClock::new(1_700_000_000_100, 0, id(PRIMARY_ID)),
+        })
         .unwrap();
     assert_eq!(built.operation.causal_frontier[0].device_id, earlier);
     assert_eq!(built.operation.causal_frontier[1].device_id, later);
 
     assert!(
         builder
-            .build(
-                id(OTHER_ID),
-                None,
-                &mutation(),
-                vec![
+            .build(OperationBuildRequest {
+                operation_id: id(OTHER_ID),
+                project_id: None,
+                mutation: &mutation(),
+                causal_frontier: vec![
                     DeviceSequence {
                         device_id: earlier,
                         sequence: 2,
@@ -316,10 +316,10 @@ fn builder_sorts_frontier_and_rejects_duplicate_devices() {
                         sequence: 3,
                     },
                 ],
-                None,
-                vec![],
-                HybridLogicalClock::new(1_700_000_000_100, 0, id(PRIMARY_ID)),
-            )
+                previous: None,
+                blob_refs: vec![],
+                created_hlc: HybridLogicalClock::new(1_700_000_000_100, 0, id(PRIMARY_ID)),
+            })
             .is_err()
     );
 }
@@ -331,22 +331,22 @@ fn fixture() -> Fixture {
     let mutation = mutation();
     let identity = identity(&keys, &content_key);
     let built = OperationBuilder::new(identity)
-        .build(
-            id(OTHER_ID),
-            None,
-            &mutation,
-            vec![DeviceSequence {
+        .build(OperationBuildRequest {
+            operation_id: id(OTHER_ID),
+            project_id: None,
+            mutation: &mutation,
+            causal_frontier: vec![DeviceSequence {
                 device_id: id(OTHER_ID),
                 sequence: 7,
             }],
-            None,
-            vec![BlobRef {
+            previous: None,
+            blob_refs: vec![BlobRef {
                 digest: Sha256Digest([41; 32]),
                 ciphertext_bytes: 512,
                 storage_id: "blob-1".into(),
             }],
-            HybridLogicalClock::new(1_700_000_000_100, 2, id(PRIMARY_ID)),
-        )
+            created_hlc: HybridLogicalClock::new(1_700_000_000_100, 2, id(PRIMARY_ID)),
+        })
         .unwrap();
     Fixture {
         content_key,
@@ -369,15 +369,15 @@ fn tombstone_fixture(
         record_kind,
     };
     let built = OperationBuilder::new(identity(&keys, &content_key))
-        .build(
-            id(FLIPPED_ID),
+        .build(OperationBuildRequest {
+            operation_id: id(FLIPPED_ID),
             project_id,
-            &mutation,
-            vec![],
-            None,
-            vec![],
-            HybridLogicalClock::new(1_700_000_000_100, 0, id(PRIMARY_ID)),
-        )
+            mutation: &mutation,
+            causal_frontier: vec![],
+            previous: None,
+            blob_refs: vec![],
+            created_hlc: HybridLogicalClock::new(1_700_000_000_100, 0, id(PRIMARY_ID)),
+        })
         .unwrap();
     Fixture {
         content_key,

@@ -6,10 +6,10 @@ use context_relay_core::{
     crypto::{CertificateIssuerV1, ContentKey, DeviceCertificateV1, DeviceKeys},
     search::{AllowedSearchScope, Embedding384},
     sync::{
-        AdmissionDecision, AdmittedOperation, CausalOrder, MergeDecision, OperationBuilder,
-        OperationChainHead, RepresentativeEmbeddingResolver, SyncError, SyncIdentity,
-        TrustedDevice, TrustedSyncMaterial, admit_operation, compare_operations, decide_merge,
-        missing_range,
+        AdmissionDecision, AdmittedOperation, CausalOrder, MergeDecision, OperationBuildRequest,
+        OperationBuilder, OperationChainHead, RepresentativeEmbeddingResolver, SyncError,
+        SyncIdentity, TrustedDevice, TrustedSyncMaterial, admit_operation, compare_operations,
+        decide_merge, missing_range,
     },
     vault::{StoredDeviceHead, StoredRecordHead, Vault},
 };
@@ -25,6 +25,12 @@ const CREDENTIAL: &str = "sync-merge-v1";
 const CONTROL_EPOCH: u32 = 5;
 const KEY_EPOCH: u32 = 11;
 const CONTENT_KEY: [u8; 32] = [55; 32];
+type SearchMergeState = (
+    String,
+    Vec<OperationId>,
+    Option<(OperationId, OperationId)>,
+    Vec<String>,
+);
 
 struct DeviceFixture {
     keys: DeviceKeys,
@@ -726,15 +732,7 @@ fn partial_dominance_keeps_only_maximal_heads_and_rehydrates_existing_representa
     }
 }
 
-fn apply_memory_order(
-    name: &str,
-    operations: [&AdmittedOperation; 2],
-) -> (
-    String,
-    Vec<OperationId>,
-    Option<(OperationId, OperationId)>,
-    Vec<String>,
-) {
+fn apply_memory_order(name: &str, operations: [&AdmittedOperation; 2]) -> SearchMergeState {
     let path = TempVault::new(name);
     let keys = MemoryKeyStore::default();
     let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
@@ -766,15 +764,7 @@ fn apply_memory_order(
     (title, heads, conflict, semantic)
 }
 
-fn apply_instruction_order(
-    name: &str,
-    operations: [&AdmittedOperation; 2],
-) -> (
-    String,
-    Vec<OperationId>,
-    Option<(OperationId, OperationId)>,
-    Vec<String>,
-) {
+fn apply_instruction_order(name: &str, operations: [&AdmittedOperation; 2]) -> SearchMergeState {
     let path = TempVault::new(name);
     let keys = MemoryKeyStore::default();
     let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
@@ -881,7 +871,7 @@ fn admit(
     trust: &Trust,
 ) -> AdmittedOperation {
     match admit_operation(vault, &built.canonical_bytes, trust).unwrap() {
-        AdmissionDecision::Admitted(admitted) => admitted,
+        AdmissionDecision::Admitted(admitted) => *admitted,
         other => panic!("expected admitted operation, got {other:?}"),
     }
 }
@@ -928,15 +918,15 @@ fn build(
         device_keys: &device.keys,
         content_key: &key,
     })
-    .build(
-        id(operation_id),
-        None,
+    .build(OperationBuildRequest {
+        operation_id: id(operation_id),
+        project_id: None,
         mutation,
-        frontier,
+        causal_frontier: frontier,
         previous,
-        vec![],
-        HybridLogicalClock::new(9_000_000_000_000, 0, device.certificate.device_id),
-    )
+        blob_refs: vec![],
+        created_hlc: HybridLogicalClock::new(9_000_000_000_000, 0, device.certificate.device_id),
+    })
     .unwrap()
 }
 

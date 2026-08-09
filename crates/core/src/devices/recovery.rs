@@ -18,7 +18,10 @@ use crate::{
     crypto::{CertificateFieldsV1, DeviceCertificateV1, DeviceKeys, RecoveryKeys, RecoveryPhrase},
     devices::{
         crypto::PairingKeyBundle,
-        recovery_crypto::{RecoveryEnrollmentArtifacts, build_recovery_enrollment_artifacts_inner},
+        recovery_crypto::{
+            RecoveryEnrollmentArtifacts, RecoveryEnrollmentBuildRequest,
+            build_recovery_enrollment_artifacts_inner,
+        },
         recovery_transport::{
             RecoveryEnrollmentReceipt, RecoveryEnrollmentTransport, RecoveryRootStatus,
             RecoveryTransportError,
@@ -233,15 +236,17 @@ where
         .map_err(|_| RecoveryEnrollmentCycleError::Invalid)?;
         let mut rng = EntropyRng(&self.entropy);
         let artifacts = build_recovery_enrollment_artifacts_inner(
-            enrollment_id,
-            recovery_root_id,
-            certificate_id,
-            certificate,
-            device_name,
-            platform,
-            &recovery_keys,
-            device_keys,
-            &material,
+            RecoveryEnrollmentBuildRequest {
+                enrollment_id,
+                recovery_root_id,
+                certificate_id,
+                certificate,
+                device_name,
+                device_platform: platform,
+                recovery_keys: &recovery_keys,
+                device_keys,
+                material: &material,
+            },
             &mut rng,
         )
         .map_err(|_| RecoveryEnrollmentCycleError::Transient)?;

@@ -7,8 +7,8 @@ use context_relay_core::{
     search::Embedding384,
     sync::{
         AdmissionDecision, CanonicalCheckpoint, CanonicalOperation, CheckpointCursor,
-        CheckpointPage, CheckpointReceipt, FaultSchedule, InMemoryTransport, OperationBuilder,
-        OperationChainHead, PullPage, PushReceipt, ReceivedOperation,
+        CheckpointPage, CheckpointReceipt, FaultSchedule, InMemoryTransport, OperationBuildRequest,
+        OperationBuilder, OperationChainHead, PullPage, PushReceipt, ReceivedOperation,
         RepresentativeEmbeddingResolver, SyncEngine, SyncError, SyncIdentity, SyncProvider,
         SyncScope, SyncTransport, TransportError, TrustedDevice, TrustedSyncMaterial,
         admit_operation,
@@ -1851,19 +1851,19 @@ impl RandomizedScenario {
             device_keys: &replica.device.keys,
             content_key: &content_key,
         })
-        .build(
+        .build(OperationBuildRequest {
             operation_id,
-            None,
-            &mutation,
-            frontier,
+            project_id: None,
+            mutation: &mutation,
+            causal_frontier: frontier,
             previous,
-            Vec::new(),
-            HybridLogicalClock::new(
+            blob_refs: Vec::new(),
+            created_hlc: HybridLogicalClock::new(
                 1_800_000_000_000 + operation_number,
                 0,
                 replica.device.certificate.device_id,
             ),
-        )
+        })
         .unwrap();
         replica
             .vault_mut()
@@ -2386,19 +2386,19 @@ fn build_broken_chain_operation(
         device_keys: &device.keys,
         content_key: &content_key,
     })
-    .build(
-        generated_id(0xf00 + sequence),
-        None,
-        &mutation,
-        Vec::new(),
+    .build(OperationBuildRequest {
+        operation_id: generated_id(0xf00 + sequence),
+        project_id: None,
+        mutation: &mutation,
+        causal_frontier: Vec::new(),
         previous,
-        Vec::new(),
-        HybridLogicalClock::new(
+        blob_refs: Vec::new(),
+        created_hlc: HybridLogicalClock::new(
             4_100_000_000_000 + sequence,
             0,
             device.certificate.device_id,
         ),
-    )
+    })
     .unwrap()
 }
 
@@ -2430,15 +2430,15 @@ fn build_operation_in_scope(
         device_keys: &device.keys,
         content_key: &content_key,
     })
-    .build(
+    .build(OperationBuildRequest {
         operation_id,
-        mutation_project_id(mutation),
+        project_id: mutation_project_id(mutation),
         mutation,
-        frontier,
+        causal_frontier: frontier,
         previous,
-        Vec::new(),
-        HybridLogicalClock::new(4_200_000_000_000, 0, device.certificate.device_id),
-    )
+        blob_refs: Vec::new(),
+        created_hlc: HybridLogicalClock::new(4_200_000_000_000, 0, device.certificate.device_id),
+    })
     .unwrap()
 }
 

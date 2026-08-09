@@ -10,7 +10,7 @@ use context_relay_core::{
         memory_recovery_transport::InMemoryRecoveryEnrollmentProvider,
         recovery_crypto::{
             MAX_RECOVERY_ENROLLMENT_RECORD_BYTES, RecoveryEnrollmentArtifacts,
-            build_recovery_enrollment_artifacts_with_rng,
+            RecoveryEnrollmentBuildRequest, build_recovery_enrollment_artifacts_with_rng,
         },
         recovery_transport::{
             RecoveryEnrollmentReceipt, RecoveryEnrollmentTransport, RecoveryTransportError,
@@ -107,15 +107,17 @@ fn fixture(
     .unwrap();
     let mut rng = SequenceRng(rng_start);
     let artifacts = build_recovery_enrollment_artifacts_with_rng(
-        derived_id::<RecoveryEnrollmentId>(id_base),
-        derived_id::<RecoveryRootId>(id_base + 1),
-        derived_id::<DeviceCertificateId>(id_base + 3),
-        certificate,
-        format!("Device {id_base}"),
-        NativePlatform::Macos,
-        &recovery,
-        &device,
-        &material,
+        RecoveryEnrollmentBuildRequest {
+            enrollment_id: derived_id::<RecoveryEnrollmentId>(id_base),
+            recovery_root_id: derived_id::<RecoveryRootId>(id_base + 1),
+            certificate_id: derived_id::<DeviceCertificateId>(id_base + 3),
+            certificate,
+            device_name: format!("Device {id_base}"),
+            device_platform: NativePlatform::Macos,
+            recovery_keys: &recovery,
+            device_keys: &device,
+            material: &material,
+        },
         &mut rng,
     )
     .unwrap();
