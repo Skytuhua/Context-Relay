@@ -197,8 +197,78 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - run: git diff --check
+      - name: Check committed whitespace
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          readonly zero_sha=0000000000000000000000000000000000000000
+
+          require_sha() {
+            local label="$1"
+            local value="$2"
+            if [[ ! "$value" =~ ^[0-9a-f]{40}$ ]]; then
+              printf 'invalid %s: expected a lowercase 40-hex SHA\n' "$label" >&2
+              exit 1
+            fi
+          }
+
+          require_commit() {
+            local label="$1"
+            local value="$2"
+            require_sha "$label" "$value"
+            if ! git cat-file -e "${value}^{commit}" 2>/dev/null; then
+              printf 'missing %s commit: %s\n' "$label" "$value" >&2
+              exit 1
+            fi
+          }
+
+          check_latest_commit() {
+            local head="$1"
+            local parent
+            if parent="$(git rev-parse --verify "${head}^" 2>/dev/null)"; then
+              require_commit DERIVED_PARENT_SHA "$parent"
+              git diff --check "$parent" "$head"
+            else
+              git diff-tree -r --check --root --no-commit-id "$head"
+            fi
+          }
+
+          require_commit CURRENT_SHA "$CURRENT_SHA"
+          case "$EVENT_NAME" in
+            pull_request)
+              require_commit PR_BASE_SHA "$PR_BASE_SHA"
+              require_commit PR_HEAD_SHA "$PR_HEAD_SHA"
+              git diff --check "$PR_BASE_SHA" "$PR_HEAD_SHA"
+              ;;
+            push)
+              require_sha PUSH_BEFORE_SHA "$PUSH_BEFORE_SHA"
+              if [[ "$PUSH_BEFORE_SHA" == "$zero_sha" ]]; then
+                if git rev-parse --verify "${CURRENT_SHA}^" >/dev/null 2>&1; then
+                  printf 'zero PUSH_BEFORE_SHA has no exact non-root comparison range\n' >&2
+                  exit 1
+                fi
+                git diff-tree -r --check --root --no-commit-id "$CURRENT_SHA"
+              else
+                require_commit PUSH_BEFORE_SHA "$PUSH_BEFORE_SHA"
+                git diff --check "$PUSH_BEFORE_SHA" "$CURRENT_SHA"
+              fi
+              ;;
+            workflow_dispatch|workflow_call)
+              check_latest_commit "$CURRENT_SHA"
+              ;;
+            *)
+              printf 'unsupported whitespace event: %s\n' "$EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
 
   frontend:
     name: Frontend (${{ matrix.gate }})
