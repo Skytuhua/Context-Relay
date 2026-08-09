@@ -88,3 +88,8 @@ Task 1: complete (`224ba8d`, `61babf0`; independent task review approved after t
 protocol-handshake/runtime-contract checklist and Task 17 evidence links were completed; the
 master-plan matrix covers T01–T24 and all eight release-blocker categories; Graphify remains a
 navigation aid with its recorded integrity limitations, not completion evidence).
+
+Task 2: complete (`fc0f262`; independent task review approved with no findings; Supabase actions
+are immutable and least-privilege, checkout credentials are not persisted, the exact reviewed
+secret-fingerprint file is hash/length locked, and a fresh Gitleaks 8.30.1 full-history run
+reported zero findings).
