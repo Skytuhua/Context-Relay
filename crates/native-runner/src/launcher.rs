@@ -22,13 +22,6 @@ impl WindowsProcessDeadline {
         Self::from_runtime_ms(RunLimits::for_command(request.command()).timeout_ms())
     }
 
-    #[cfg(windows)]
-    fn for_default_sidecar() -> Result<Self, RunnerError> {
-        Self::from_runtime_ms(
-            RunLimits::for_command(&SidecarCommand::GitleaksScanPackage).timeout_ms(),
-        )
-    }
-
     fn from_runtime_ms(runtime_ms: u32) -> Result<Self, RunnerError> {
         if runtime_ms == 0 {
             return Err(RunnerError::LimitExceeded);
@@ -284,7 +277,7 @@ mod windows_adapter {
             .and_then(|sequence| sequence.attest_zero_capability_token())
             .and_then(|sequence| sequence.resume_once())
             .map_err(map_launch_error)?;
-        let output = match running.exchange_helper_request(helper_request) {
+        let output = match running.exchange(helper_request) {
             Ok(output) => output,
             Err(LaunchError::ProcessTimedOut) => {
                 return Ok(RunResponse::failed(FailureCode::TimedOut));

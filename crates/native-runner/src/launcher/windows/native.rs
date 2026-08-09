@@ -291,22 +291,11 @@ impl Win32LaunchBackend {
         Ok(unsafe { CompareObjectHandles(parent_handle as HANDLE, raw_handle(&duplicate)) } != 0)
     }
 
-    fn exchange(&mut self, input: &[u8]) -> Result<Win32SandboxOutput, LaunchError> {
-        let deadline = WindowsProcessDeadline::for_default_sidecar()
-            .map_err(|_| LaunchError::InvalidSecurityPlan)?;
-        self.exchange_with_deadline(input, deadline)
-    }
-
-    fn exchange_helper_request(
-        &mut self,
-        helper_request: &HelperRunRequest,
-    ) -> Result<Win32SandboxOutput, LaunchError> {
-        let request = helper_request.request();
-        let deadline = WindowsProcessDeadline::for_request(request)
+    fn exchange(&mut self, request: &HelperRunRequest) -> Result<Win32SandboxOutput, LaunchError> {
+        let deadline = WindowsProcessDeadline::for_request(request.request())
             .map_err(|_| LaunchError::InvalidSecurityPlan)?;
         let mut input = Vec::new();
-        write_helper_request(&mut input, helper_request)
-            .map_err(|_| LaunchError::InvalidSecurityPlan)?;
+        write_helper_request(&mut input, request).map_err(|_| LaunchError::InvalidSecurityPlan)?;
         self.exchange_with_deadline(&input, deadline)
     }
 
@@ -1131,15 +1120,11 @@ impl LaunchSequence<Win32LaunchBackend, Suspended> {
 }
 
 impl LaunchSequence<Win32LaunchBackend, Running> {
-    pub fn exchange(&mut self, input: &[u8]) -> Result<Win32SandboxOutput, LaunchError> {
-        self.backend.exchange(input)
-    }
-
-    pub(crate) fn exchange_helper_request(
+    pub fn exchange(
         &mut self,
         request: &HelperRunRequest,
     ) -> Result<Win32SandboxOutput, LaunchError> {
-        self.backend.exchange_helper_request(request)
+        self.backend.exchange(request)
     }
 
     pub fn audit(&self) -> &Win32LaunchAudit {
