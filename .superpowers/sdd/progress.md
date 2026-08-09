@@ -93,3 +93,12 @@ Task 2: complete (`fc0f262`; independent task review approved with no findings; 
 are immutable and least-privilege, checkout credentials are not persisted, the exact reviewed
 secret-fingerprint file is hash/length locked, and a fresh Gitleaks 8.30.1 full-history run
 reported zero findings).
+
+Task 3: complete (`4b57cbc`; independent review approved with no actionable findings; typed
+recovery and operation requests preserve canonical behavior, admission payloads are boxed without
+changing the capability boundary, current protocol fixtures are synchronized at 1.3, and the
+parallel TempVault plus genuine-v10 migration regressions are repaired). Focused suites, strict
+all-feature Clippy, formatting, and the default-parallel workspace remainder are green. The
+controller independently reran the real-socket MCP daemon suite outside the desktop sandbox (9/9
+green). Five unchanged macOS APFS/provenance cases and actual Windows execution remain pending the
+native CI jobs and are not claimed as local passes.
