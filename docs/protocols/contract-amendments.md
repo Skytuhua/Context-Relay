@@ -1,6 +1,6 @@
 # Context Relay v1 contract amendments
 
-Ledger version: **1.0.0**. This is a pre-release normative companion to the v1
+Ledger version: **1.1.0**. This is a pre-release normative companion to the v1
 master plan. The master plan remains product and security authority; this ledger
 records later reviewed contract hardening that must be implemented, documented,
 and tested as one synchronized change. Unlisted behavior is not amended.
@@ -28,6 +28,14 @@ and tested as one synchronized change. Unlisted behavior is not amended.
 - **Security rationale:** A fresh joiner has no issuer trust anchor. Provider acceptance, locator possession, or a provider-returned certificate therefore cannot install trust. The safety transcript binds the pairing ID, exact signed request, and canonical approved payload; substitution changes the value, and the joiner never receives its independently computed expected number.
 - **Compatibility and migration impact:** The locator display remains `XXXXX-XXXXX`, with the existing ten-minute/five-attempt limits, but locator-only clients are incompatible and must fail closed. Pairing persistence, IPC, daemon state, and UI add an `awaiting_confirmation` phase and full five-group entry before atomic certificate/key installation.
 - **Required synchronized artifacts:** [pairing protocol](../../crates/protocol/src/pairing.rs), [pairing cryptography](../../crates/core/src/devices/crypto.rs), [coordinator](../../crates/core/src/devices/pairing.rs), [desktop Devices screen](../../apps/desktop/src/devices.tsx), [pairing request fixture](../../crates/protocol/tests/fixtures/pairing-request-v1.hex), [threat model](../security/threat-model.md), and [pairing verification](../verification/task-17-pairing.md).
+
+## A-004 — Ordinary-feature CI coverage and candidate-verifier confinement
+
+- **Authority:** The v1 master plan's supported-host lint/test requirement, the [CI workflow](../../.github/workflows/ci.yml), and the [native CI contract](../../scripts/native-ci-workflow.test.mjs).
+- **Amendment:** “All-feature” CI means every ordinary product and test-support surface, not every release-qualification-only feature. Both Windows x64 and macOS arm64 lint and test `context-relay-core/test-support`, `context-relay-local-ipc/test-support`, `context-relay-contextd/test-support`, and `context-relay-context-mcp/test-support`. `context-relay-native-runner/ci-candidate-sidecar-smoke` remains excluded from workspace-wide builds and is enabled only for the two exact registered, ignored Semgrep candidate smoke tests.
+- **Security rationale:** The candidate verifier deliberately accepts a disabled, non-publishable Semgrep target whose final corresponding-source and native-build evidence is still pending. Broad Cargo `--all-features` would compile that exceptional boundary into ordinary workspace tests and production-like builds, weakening the evidence that it is reachable only inside the exact qualification smokes. Explicit ordinary features provide complete test-support coverage while keeping candidate acceptance fail-closed everywhere else.
+- **Compatibility and evidence impact:** This changes no runtime protocol, schema, or production feature default. Existing `rust` check compatibility is retained while lint, tests, policy, generated-artifact, license, frontend, whitespace, and native-build evidence become independently visible. A real remote Windows/macOS run is still required before CI can be marked verified. The source lock's identical, nonzero `workflowGitBlob` values remain sealed historical evidence and are not rewritten for ordinary CI edits; current native authority remains bound by the exact source-lock digest and `native-ci-provenance` action, runner, and toolchain pins.
+- **Required synchronized artifacts:** [CI workflow](../../.github/workflows/ci.yml), [independent-gate contract](../../scripts/ci-gates-workflow.test.mjs), [native candidate/provenance contract](../../scripts/native-ci-workflow.test.mjs), and [master-plan audit](../verification/v1-master-plan-audit.md).
 
 ## Change control
 

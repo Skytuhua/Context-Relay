@@ -32,66 +32,233 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  ORDINARY_RUST_FEATURES: context-relay-core/test-support,context-relay-local-ipc/test-support,context-relay-contextd/test-support,context-relay-context-mcp/test-support
 
 jobs:
   rust:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version-file: .node-version
-      - run: npm install --global pnpm@11.9.0
-      - run: rustup show
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: node --test scripts/check-daemon-boundary.test.mjs
-      - run: node scripts/check-daemon-boundary.mjs
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm check:bindings
-      - run: pnpm check:schemas
-      - run: pnpm license:check
-      - run: cargo install cargo-deny --version 0.20.2 --locked
-      - run: cargo deny check
-      - run: git diff --check
-
-  frontend:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: rustup show
+      - run: cargo fmt --all -- --check
+
+  rust-lint:
+    name: Rust lint (${{ matrix.host }})
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: windows-x64
+            os: windows-2025
+          - host: macos-arm64
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: if ($env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 runner is required' }
+      - if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: test "$(uname -m)" = arm64
+      - run: rustup show
+      - run: cargo clippy --workspace --all-targets --features "${{ env.ORDINARY_RUST_FEATURES }}" -- -D warnings
+
+  rust-tests:
+    name: Rust tests (${{ matrix.host }})
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: windows-x64
+            os: windows-2025
+          - host: macos-arm64
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: if ($env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 runner is required' }
+      - if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: test "$(uname -m)" = arm64
+      - if: ${{ runner.os == 'macOS' }}
+        name: Canonicalize the macOS temporary root
+        shell: bash
+        run: echo "TMPDIR=$(cd "${TMPDIR:-$RUNNER_TEMP}" && pwd -P)/" >> "$GITHUB_ENV"
+      - name: Mount canonical case-sensitive APFS root
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$RUNNER_TEMP/context-relay-workspace-tests-case-sensitive.sparseimage"
+          mount="$RUNNER_TEMP/context-relay-workspace-tests-case-sensitive"
+          mkdir "$mount"
+          hdiutil create -size 4g -fs 'Case-sensitive APFS' -volname ContextRelayWorkspaceTests -type SPARSE "$image"
+          hdiutil attach -nobrowse -owners on -mountpoint "$mount" "$image"
+          printf x > "$mount/CaseProbe"
+          printf y > "$mount/caseprobe"
+          test "$(find "$mount" -maxdepth 1 -type f -iname caseprobe | wc -l | tr -d ' ')" = 2
+          rm "$mount/CaseProbe" "$mount/caseprobe"
+          root="$(cd "$mount" && pwd -P)"
+          printf 'CONTEXT_RELAY_CASE_SENSITIVE_APFS_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
+      - run: rustup show
+      - if: ${{ runner.os == 'macOS' }}
+        run: cargo test --manifest-path crates/native-runner/tests/macos-launcher-harness/Cargo.toml --test guardian_native -- --nocapture
+      - run: cargo test --workspace --all-targets --features "${{ env.ORDINARY_RUST_FEATURES }}"
+
+  daemon-boundary:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+      - run: node --test scripts/check-daemon-boundary.test.mjs
+      - run: node scripts/check-daemon-boundary.mjs
+
+  bindings:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .node-version
       - run: npm install --global pnpm@11.9.0
       - run: pnpm install --frozen-lockfile
-      - run: pnpm lint
-      - run: pnpm typecheck
-      - run: pnpm test --run
-      - run: pnpm build
+      - run: pnpm check:bindings
 
-  native:
+  schemas:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+      - run: npm install --global pnpm@11.9.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check:schemas
+
+  licenses:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+      - run: npm install --global pnpm@11.9.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm license:check
+
+  dependency-policy:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: cargo install cargo-deny --version 0.20.2 --locked
+      - run: cargo deny check
+
+  whitespace:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: git diff --check
+
+  frontend:
+    name: Frontend (${{ matrix.gate }})
+    permissions:
+      contents: read
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - gate: lint
+            command: pnpm lint
+          - gate: typecheck
+            command: pnpm typecheck
+          - gate: tests
+            command: pnpm test --run
+          - gate: build
+            command: pnpm build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+      - run: npm install --global pnpm@11.9.0
+      - run: pnpm install --frozen-lockfile
+      - run: ${{ matrix.command }}
+
+  native:
+    name: Native build (${{ matrix.host }})
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: windows-x64
+            os: windows-2025
             target: x86_64-pc-windows-msvc
-          - os: macos-14
+          - host: macos-arm64
+            os: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: .node-version
       - run: npm install --global pnpm@11.9.0
+      - if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: if ($env:RUNNER_ARCH -ne 'X64') { throw 'Windows x64 runner is required' }
+      - if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: test "$(uname -m)" = arm64
       - run: rustup target add ${{ matrix.target }}
       - run: pnpm install --frozen-lockfile
-      - if: ${{ matrix.os == 'macos-14' }}
-        run: cargo test --manifest-path crates/native-runner/tests/macos-launcher-harness/Cargo.toml --test guardian_native -- --nocapture
-      - run: cargo test -p context-relay-protocol --all-features
-      - run: cargo test -p context-relay-local-ipc --target ${{ matrix.target }} --all-features
-      - run: cargo test -p context-relay-contextd --target ${{ matrix.target }} --all-features
       - run: pnpm --filter @context-relay/desktop tauri build --target ${{ matrix.target }}
 
   semgrep-materials:
