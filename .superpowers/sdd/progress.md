@@ -79,3 +79,12 @@ and scoped Clippy. The final full-range correctness/security inspection found no
 Critical or Important issue. Trusted native phrase entry, hosted provider deployment, account
 reassociation, revocation/rotation, credential-backed multi-install verification, and Apple
 signing/notarization remain separate; no remote or paid service was mutated.
+
+# Context Relay v1 Recovery Progress
+
+Recovery base: `3c2a371aef74f4962af64d0fe71545557244f21a`
+
+Task 1: complete (`224ba8d`, `61babf0`; independent task review approved after the required
+protocol-handshake/runtime-contract checklist and Task 17 evidence links were completed; the
+master-plan matrix covers T01–T24 and all eight release-blocker categories; Graphify remains a
+navigation aid with its recorded integrity limitations, not completion evidence).
