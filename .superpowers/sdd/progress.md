@@ -113,3 +113,13 @@ forms, and target-only adapter lints are repaired without allowances. Core/conte
 packages, contextd 54/54, strict workspace Clippy, formatting, and the maximum workspace remainder
 are green. Actual Windows x64 execution and five unchanged macOS APFS/provenance gates remain
 pending native CI and are not claimed as passes.
+
+Task 4b: complete locally (`8261053`, `981fa58`; the initial independent review found a public raw
+exchange path that could still submit serialized Osemgrep under the default 35-second deadline;
+the test-first follow-up removed the raw/default path and a fresh review approved the full range
+with no actionable findings). Every public Win32 running-launcher exchange now requires the exact
+`HelperRunRequest`; command-specific sealed limits, serialization, staging, and response binding
+share that request identity. RuleSync/Gitleaks use 35 seconds, Osemgrep uses 95 seconds, and invalid
+bounds fail closed. Portable/model/source contracts, native-runner remainder, workspace and
+Windows-target strict Clippy/checks, formatting, and diff checks are green. Actual Win32 timeout,
+job cleanup, and hydrated Osemgrep execution remain pending Windows native-isolation CI.
