@@ -541,6 +541,8 @@ fn safe_snapshot_path(_path: &Path, _max_bytes: usize) -> Result<ObservedSnapsho
 mod tests {
     use super::*;
     use crate::unit_test_support::wire_native_path;
+    #[cfg(windows)]
+    use context_relay_core::native_memory::{NativeMemoryCapabilities, NativeMemoryDisable};
     use context_relay_core::native_memory::{
         NativeMemoryDocumentKind, NativeMemoryLimits, NativeMemorySource,
     };
@@ -645,6 +647,38 @@ mod tests {
         let decoded = decode_path(&descriptor).unwrap();
 
         assert_eq!(decoded.as_os_str().encode_wide().collect::<Vec<_>>(), units);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wtf16_source_reaches_the_native_snapshot_boundary() {
+        use std::{
+            ffi::OsString,
+            os::windows::ffi::{OsStrExt as _, OsStringExt as _},
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let mut name = "memory-".encode_utf16().collect::<Vec<_>>();
+        name.extend([0xd800, b'.' as u16, b'm' as u16, b'd' as u16]);
+        let path = canonical_root.join(OsString::from_wide(&name));
+        std::fs::write(&path, b"remember me").unwrap();
+        let mut descriptor =
+            windows_source(&path.as_os_str().encode_wide().collect::<Vec<_>>()).unwrap();
+        descriptor.path.display = Some(r"C:\sessions\history.sqlite".to_owned());
+        NativeMemoryCapabilities {
+            disable: NativeMemoryDisable::WatchOnly,
+            sources: vec![descriptor.clone()],
+        }
+        .validate()
+        .unwrap();
+
+        let decoded = decode_path(&descriptor).unwrap();
+        assert_eq!(decoded, path);
+        assert!(matches!(
+            safe_snapshot(&descriptor).unwrap().snapshot,
+            NativeMemorySnapshot::Regular(bytes) if bytes == b"remember me"
+        ));
     }
 
     #[cfg(any(target_os = "macos", windows))]
