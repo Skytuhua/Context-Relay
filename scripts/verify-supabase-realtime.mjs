@@ -1,6 +1,7 @@
 import { randomBytes as nodeRandomBytes } from 'node:crypto';
 import { constants as filesystemConstants } from 'node:fs';
 import * as nodeFilesystem from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -13,6 +14,7 @@ export const REALTIME_HINT = Object.freeze({
 });
 
 const STATE_VERSION = 1;
+const VERIFIER_TEMP_ROOT = path.resolve(tmpdir());
 const LABELS = ['a', 'b'];
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const REQUIRED_ENVIRONMENT = [
@@ -100,10 +102,10 @@ function safeError(label, error, redactor) {
 
 function verifierStatePath(stateFile) {
   requiredString(stateFile, 'state file');
-  if (!path.isAbsolute(stateFile)) throw new Error('state file must be an absolute path under /private/tmp');
+  if (!path.isAbsolute(stateFile)) throw new Error(`state file must be an absolute path under ${VERIFIER_TEMP_ROOT}`);
   const normalized = path.normalize(stateFile);
-  if (path.dirname(normalized) !== '/private/tmp' || path.basename(normalized) === '') {
-    throw new Error('state file must be a direct child of /private/tmp');
+  if (path.dirname(normalized) !== VERIFIER_TEMP_ROOT || path.basename(normalized) === '') {
+    throw new Error(`state file must be a direct child of ${VERIFIER_TEMP_ROOT}`);
   }
   return normalized;
 }
@@ -709,7 +711,7 @@ export async function runRealtimeVerifierMode(options) {
 function parseCommandLine(arguments_) {
   const [mode, flag, stateFile, ...extra] = arguments_;
   if (!['prepare', 'verify', 'cleanup'].includes(mode) || flag !== '--state-file' || !stateFile || extra.length > 0) {
-    throw new Error('usage: verify-supabase-realtime.mjs <prepare|verify|cleanup> --state-file /private/tmp/<file>');
+    throw new Error(`usage: verify-supabase-realtime.mjs <prepare|verify|cleanup> --state-file ${VERIFIER_TEMP_ROOT}${path.sep}<file>`);
   }
   return { mode, stateFile };
 }

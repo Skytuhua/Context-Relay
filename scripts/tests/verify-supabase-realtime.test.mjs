@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { appendFile, chmod, link, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
@@ -20,11 +21,12 @@ const UUIDS = [
   '10000000-0000-4000-8000-000000000005',
   '10000000-0000-4000-8000-000000000006',
 ];
+const VERIFIER_TEMP_ROOT = path.resolve(tmpdir());
 let stateFileSequence = 0;
 
 function directStateFile(t, label = 'state') {
   stateFileSequence += 1;
-  const target = `/private/tmp/context-relay-realtime-${process.pid}-${stateFileSequence}-${label}.json`;
+  const target = path.join(VERIFIER_TEMP_ROOT, `context-relay-realtime-${process.pid}-${stateFileSequence}-${label}.json`);
   t.after(() => rm(target, { force: true }));
   return target;
 }
@@ -349,7 +351,24 @@ test('requires every hosted credential and has no credential defaults', () => {
   assert.equal(loaded.password, 'password');
 });
 
-test('prepare creates two unique confirmed users and writes only required IDs and access tokens to a 0600 /private/tmp file', async (t) => {
+test('prepare accepts a direct child of the runtime temporary directory', async (t) => {
+  stateFileSequence += 1;
+  const stateFile = path.join(VERIFIER_TEMP_ROOT, `context-relay-realtime-${process.pid}-${stateFileSequence}-portable.json`);
+  t.after(() => rm(stateFile, { force: true }));
+  const verifierConfig = config();
+  const backend = new BehavioralRealtimeBackend(verifierConfig);
+  backend.stateFile = stateFile;
+
+  await prepareRealtimeVerifier({
+    stateFile,
+    config: verifierConfig,
+    ...dependencies(backend, []),
+  });
+
+  assert.equal((await stat(stateFile)).mode & 0o777, 0o600);
+});
+
+test('prepare creates two unique confirmed users and writes only required IDs and access tokens to a 0600 temporary file', async (t) => {
   const fixture = await preparedFixture(t);
   const fileStat = await stat(fixture.stateFile);
   assert.equal(fileStat.mode & 0o777, 0o600);
@@ -406,17 +425,17 @@ test('prepare rejects unsafe paths and refuses to overwrite an existing private 
   const backend = new BehavioralRealtimeBackend(verifierConfig);
   const deps = dependencies(backend, []);
   await assert.rejects(
-    prepareRealtimeVerifier({ stateFile: '/tmp/not-explicitly-private.json', config: verifierConfig, ...deps }),
-    /\/private\/tmp/,
+    prepareRealtimeVerifier({ stateFile: 'not-an-absolute-path.json', config: verifierConfig, ...deps }),
+    /absolute path/,
   );
-  const directory = await mkdtemp('/private/tmp/context-relay-realtime-test-');
+  const directory = await mkdtemp(path.join(VERIFIER_TEMP_ROOT, 'context-relay-realtime-test-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const nestedStateFile = path.join(directory, 'nested.json');
   await assert.rejects(
     prepareRealtimeVerifier({ stateFile: nestedStateFile, config: verifierConfig, ...deps }),
     /direct child/,
   );
-  const swappableParent = `/private/tmp/context-relay-parent-link-${process.pid}-${stateFileSequence}`;
+  const swappableParent = path.join(VERIFIER_TEMP_ROOT, `context-relay-parent-link-${process.pid}-${stateFileSequence}`);
   t.after(() => rm(swappableParent, { force: true }));
   await symlink(directory, swappableParent);
   await assert.rejects(
@@ -620,7 +639,7 @@ test('state-file parse and permission errors never include secret file contents'
   );
 });
 
-test('verify and cleanup reject symbolic-link state files under /private/tmp', async (t) => {
+test('verify and cleanup reject symbolic-link state files under the runtime temporary directory', async (t) => {
   const target = directStateFile(t, 'target');
   const stateFile = directStateFile(t, 'symlink');
   await writeFile(target, '{}', { mode: 0o600 });
