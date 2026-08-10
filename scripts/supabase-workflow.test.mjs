@@ -34,6 +34,43 @@ const databaseOnlyExcludes = [
   'supavisor',
 ].join(',');
 
+function sqlCallArgumentCounts(source, callName) {
+  const counts = [];
+  const callPattern = new RegExp(`\\b${callName}\\s*\\(`, 'g');
+  for (const match of source.matchAll(callPattern)) {
+    let depth = 1;
+    let commas = 0;
+    let index = match.index + match[0].length;
+    while (index < source.length && depth > 0) {
+      if (source[index] === "'") {
+        for (index += 1; index < source.length; index += 1) {
+          if (source[index] !== "'") continue;
+          if (source[index + 1] === "'") index += 1;
+          else { index += 1; break; }
+        }
+        continue;
+      }
+      const dollar = source.slice(index).match(/^\$[A-Za-z0-9_]*\$/)?.[0];
+      if (dollar) {
+        const close = source.indexOf(dollar, index + dollar.length);
+        assert.notEqual(close, -1, `unterminated SQL dollar quote at byte ${index}`);
+        index = close + dollar.length;
+        continue;
+      }
+      if (source[index] === '(') depth += 1;
+      else if (source[index] === ')') depth -= 1;
+      else if (source[index] === ',' && depth === 1) commas += 1;
+      index += 1;
+    }
+    assert.equal(depth, 0, `unterminated ${callName} call at byte ${match.index}`);
+    counts.push({
+      count: commas + 1,
+      line: source.slice(0, match.index).split('\n').length,
+    });
+  }
+  return counts;
+}
+
 test('Supabase workflow uses least-privilege immutable actions', async () => {
   const source = await readFile(workflowUrl, 'utf8');
 
@@ -101,6 +138,13 @@ test('pgTAP runs only the planned suite and compares catalog text with one colla
       'every text cast compared by pgTAP must pin the same deterministic collation',
     );
   }
+  assert.ok(sqlCallArgumentCounts(suite, 'throws_ok').length > 0);
+  assert.ok(
+    sqlCallArgumentCounts(suite, 'throws_ok').every(({ count }) => count >= 3),
+    `throws_ok descriptions must not occupy the expected-error-message slot: ${JSON.stringify(
+      sqlCallArgumentCounts(suite, 'throws_ok').filter(({ count }) => count < 3),
+    )}`,
+  );
 
   const membershipAssertion = suite.indexOf(
     "'Context Relay owner has no runtime-capability role memberships'",

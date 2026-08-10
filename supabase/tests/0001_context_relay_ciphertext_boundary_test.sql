@@ -1124,7 +1124,7 @@ select pg_catalog.set_config(
 
 set local role service_role;
 
-select throws_ok(command.sql, format('blob reservation rejects %s', command.description))
+select throws_ok(command.sql, null, null, format('blob reservation rejects %s', command.description))
 from (values
   ($$select public.service_reserve_blob_upload('20000000-0000-7000-8000-000000000005', '50000000-0000-7000-8000-000000000051', 'a0000000-0000-7000-8000-000000000001', decode(repeat('01', 31), 'hex'), array[1::bigint], now() + interval '1 hour')$$, 'a digest other than 32 bytes'),
   ($$select public.service_reserve_blob_upload('20000000-0000-7000-8000-000000000005', '50000000-0000-7000-8000-000000000051', 'a0000000-0000-7000-8000-000000000002', decode(repeat('02', 32), 'hex'), array[]::bigint[], now() + interval '1 hour')$$, 'an empty part list'),
@@ -1156,7 +1156,7 @@ where id = '20000000-0000-7000-8000-000000000005';
 
 set local role service_role;
 select throws_ok(
-  $$select public.service_reserve_blob_upload('20000000-0000-7000-8000-000000000005', '50000000-0000-7000-8000-000000000051', 'a0000000-0000-7000-8000-00000000000c', decode(repeat('0c', 32), 'hex'), array[1::bigint], now() + interval '1 hour')$$,
+  $$select public.service_reserve_blob_upload('20000000-0000-7000-8000-000000000005', '50000000-0000-7000-8000-000000000051', 'a0000000-0000-7000-8000-00000000000c', decode(repeat('0c', 32), 'hex'), array[1::bigint], now() + interval '1 hour')$$, null, null,
   'blob reservation rejects a pending-delete account'
 );
 reset role;
@@ -1189,7 +1189,7 @@ select results_eq(
 
 set local role service_role;
 select throws_ok(
-  $$select public.service_reserve_blob_upload('20000000-0000-7000-8000-000000000005', '50000000-0000-7000-8000-000000000051', 'a0000000-0000-7000-8000-00000000000e', decode(repeat('0e', 32), 'hex'), array[1::bigint], now() + interval '1 hour')$$,
+  $$select public.service_reserve_blob_upload('20000000-0000-7000-8000-000000000005', '50000000-0000-7000-8000-000000000051', 'a0000000-0000-7000-8000-00000000000e', decode(repeat('0e', 32), 'hex'), array[1::bigint], now() + interval '1 hour')$$, null, null,
   'reservation rejects one byte beyond the exact remaining quota'
 );
 reset role;
@@ -1210,7 +1210,7 @@ select lives_ok(
   'a small valid reservation succeeds after the boundary refund'
 );
 select throws_ok(
-  $$select public.service_reserve_blob_upload('20000000-0000-7000-8000-000000000005', '50000000-0000-7000-8000-000000000051', 'a0000000-0000-7000-8000-00000000000f', decode(repeat('0f', 32), 'hex'), array[7::bigint], now() + interval '1 hour')$$,
+  $$select public.service_reserve_blob_upload('20000000-0000-7000-8000-000000000005', '50000000-0000-7000-8000-000000000051', 'a0000000-0000-7000-8000-00000000000f', decode(repeat('0f', 32), 'hex'), array[7::bigint], now() + interval '1 hour')$$, null, null,
   'duplicate reservation storage IDs fail rather than replaying'
 );
 reset role;
@@ -1249,7 +1249,7 @@ insert into public.device_certificates (
 
 set local role service_role;
 select throws_ok(
-  $$select public.service_reserve_blob_upload('20000000-0000-7000-8000-000000000005', '50000000-0000-7000-8000-000000000051', 'a0000000-0000-7000-8000-000000000010', decode(repeat('10', 32), 'hex'), array[1::bigint], now() + interval '1 hour')$$,
+  $$select public.service_reserve_blob_upload('20000000-0000-7000-8000-000000000005', '50000000-0000-7000-8000-000000000051', 'a0000000-0000-7000-8000-000000000010', decode(repeat('10', 32), 'hex'), array[1::bigint], now() + interval '1 hour')$$, null, null,
   'reservation rejects an ambiguous device certificate instead of choosing a workspace'
 );
 reset role;
@@ -1380,7 +1380,7 @@ select is(
   'an uploaded but unfinalized reserved object is unreadable to the client'
 );
 
-select throws_ok(command.sql, format('authenticated Storage policy rejects %s', command.description))
+select throws_ok(command.sql, null, null, format('authenticated Storage policy rejects %s', command.description))
 from (values
   ($$insert into storage.objects (id, bucket_id, name, owner_id, metadata) values ('b2000000-0000-7000-8000-000000000002', 'ciphertext', '20000000-0000-7000-8000-000000000004/a1000000-0000-7000-8000-000000000001/00000000.bin', '10000000-0000-0000-0000-000000000005', '{"size":4}'::jsonb)$$, 'a cross-account path'),
   ($$insert into storage.objects (id, bucket_id, name, owner_id, metadata) values ('b2000000-0000-7000-8000-000000000003', 'ciphertext', '20000000-0000-7000-8000-000000000005/a1000000-0000-7000-8000-000000000001/00000001.bin', '10000000-0000-0000-0000-000000000005', '{"size":4}'::jsonb)$$, 'an extra part index'),
@@ -1395,7 +1395,7 @@ select throws_ok(
     '20000000-0000-7000-8000-000000000005/a1000000-0000-7000-8000-000000000001/00000000.bin',
     '10000000-0000-0000-0000-000000000005',
     '{"size":4}'::jsonb
-  ) on conflict (bucket_id, name) do update set metadata = excluded.metadata$$,
+  ) on conflict (bucket_id, name) do update set metadata = excluded.metadata$$, null, null,
   'authenticated cannot duplicate or upsert a ciphertext part'
 );
 reset role;
@@ -1412,7 +1412,7 @@ select throws_ok(
   pg_catalog.format(
     'select public.service_finalize_blob_upload(%L::uuid)',
     invalid.storage_id
-  ),
+  ), null, null,
   format('finalization rejects %s', invalid.description)
 )
 from (values
@@ -1511,7 +1511,7 @@ where storage_id = 'a1000000-0000-7000-8000-000000000002';
 
 set local role service_role;
 select throws_ok(
-  $$select public.service_finalize_blob_upload('a1000000-0000-7000-8000-000000000002')$$,
+  $$select public.service_finalize_blob_upload('a1000000-0000-7000-8000-000000000002')$$, null, null,
   'finalization replay rejects a manifest whose digest disagrees with the reservation'
 );
 reset role;
@@ -1522,7 +1522,7 @@ where storage_id = 'a1000000-0000-7000-8000-000000000002';
 
 set local role service_role;
 select throws_ok(
-  $$select public.service_release_blob_upload('a1000000-0000-7000-8000-000000000002', 'cancelled')$$,
+  $$select public.service_release_blob_upload('a1000000-0000-7000-8000-000000000002', 'cancelled')$$, null, null,
   'release cannot refund an already-finalized reservation'
 );
 select lives_ok(
@@ -1539,7 +1539,7 @@ select lives_ok(
   'explicit cancellation refunds all failed-finalization reservations exactly once'
 );
 select throws_ok(
-  $$select public.service_release_blob_upload('a1000000-0000-7000-8000-000000000009', 'expired')$$,
+  $$select public.service_release_blob_upload('a1000000-0000-7000-8000-000000000009', 'expired')$$, null, null,
   'an unexpired reserved upload cannot be released as expired'
 );
 select lives_ok(
@@ -1551,7 +1551,7 @@ select lives_ok(
   'same-terminal cancelled replay is a no-op'
 );
 select throws_ok(
-  $$select public.service_release_blob_upload('a1000000-0000-7000-8000-000000000009', 'expired')$$,
+  $$select public.service_release_blob_upload('a1000000-0000-7000-8000-000000000009', 'expired')$$, null, null,
   'different-terminal release replay is rejected'
 );
 reset role;
@@ -1562,7 +1562,7 @@ where storage_id = 'a1000000-0000-7000-8000-00000000000a';
 
 set local role service_role;
 select throws_ok(
-  $$select public.service_finalize_blob_upload('a1000000-0000-7000-8000-00000000000a')$$,
+  $$select public.service_finalize_blob_upload('a1000000-0000-7000-8000-00000000000a')$$, null, null,
   'expired reservation cannot finalize and remains reserved until explicit expiry release'
 );
 select lives_ok(
@@ -1574,7 +1574,7 @@ select lives_ok(
   'same-terminal expired replay is a no-op'
 );
 select throws_ok(
-  $$select public.service_release_blob_upload('a1000000-0000-7000-8000-00000000000a', 'cancelled')$$,
+  $$select public.service_release_blob_upload('a1000000-0000-7000-8000-00000000000a', 'cancelled')$$, null, null,
   'expired reservation cannot be replayed as cancelled'
 );
 reset role;
@@ -1706,7 +1706,7 @@ select throws_ok(
     '20000000-0000-7000-8000-000000000004/a1000000-0000-7000-8000-00000000000b/00000000.bin',
     '10000000-0000-0000-0000-000000000004',
     '{"size":1}'::jsonb
-  )$$,
+  )$$, null, null,
   'pending-delete authenticated upload fails through the actual INSERT policy'
 );
 reset role;
@@ -2047,17 +2047,15 @@ as $$
   )
 $$;
 
-set local role context_relay_rls_owner;
-
 select throws_ok(
-  $$select pg_temp.insert_sync_operation('9a000000-0000-7000-8000-000000000001', p_ciphertext => decode(repeat('ee', 4194305), 'hex'))$$,
+  $$select pg_temp.insert_sync_operation('9a000000-0000-7000-8000-000000000001', p_ciphertext => decode(repeat('ee', 4194305), 'hex'))$$, null, null,
   'SyncOperationV1 rejects ciphertext above 4194304 bytes'
 );
 
 select throws_ok(pg_catalog.format(
   'select pg_temp.insert_sync_operation(''9a000000-0000-7000-8000-000000000002'', %s => decode(repeat(''e1'', %s), ''hex''))',
   invalid.argument_name, invalid.byte_count
-), format('SyncOperationV1 rejects a %s with the wrong byte width', invalid.description))
+), null, null, format('SyncOperationV1 rejects a %s with the wrong byte width', invalid.description))
 from (values
   ('p_previous_hash', 31, 'previous-device hash'),
   ('p_nonce', 23, 'nonce'),
@@ -2068,7 +2066,7 @@ from (values
 select throws_ok(pg_catalog.format(
   'select pg_temp.insert_sync_checkpoint(''9a000000-0000-7000-8000-000000000003'', %s => decode(repeat(''e2'', %s), ''hex''))',
   invalid.argument_name, invalid.byte_count
-), format('CheckpointV1 rejects a %s with the wrong byte width', invalid.description))
+), null, null, format('CheckpointV1 rejects a %s with the wrong byte width', invalid.description))
 from (values
   ('p_previous_hash', 31, 'previous-checkpoint hash'),
   ('p_state_hash', 31, 'state hash'),
@@ -2092,13 +2090,13 @@ select throws_ok(pg_catalog.format(
   case when invalid.key_name = 'issuer' then 'decode(repeat(''e3'', 31), ''hex'')' else 'issuer_signing_public_key' end,
   case when invalid.key_name = 'signing' then 'decode(repeat(''e3'', 31), ''hex'')' else 'device_signing_public_key' end,
   case when invalid.key_name = 'wrapping' then 'decode(repeat(''e3'', 31), ''hex'')' else 'device_wrapping_public_key' end
-), format('device certificate rejects a wrong-width %s key', invalid.key_name))
+), null, null, format('device certificate rejects a wrong-width %s key', invalid.key_name))
 from (values ('recovery'), ('issuer'), ('signing'), ('wrapping')) as invalid(key_name);
 
 select throws_ok(pg_catalog.format(
   'select pg_temp.%s(''9a000000-0000-7000-8000-000000000004'', %s => %s)',
   invalid.helper_name, invalid.argument_name, invalid.invalid_value
-), format('%s rejects negative %s', invalid.envelope_name, invalid.description))
+), null, null, format('%s rejects negative %s', invalid.envelope_name, invalid.description))
 from (values
   ('insert_sync_operation', 'p_device_sequence', '-1', 'SyncOperationV1', 'device sequence'),
   ('insert_sync_operation', 'p_control_epoch', '-1', 'SyncOperationV1', 'control epoch'),
@@ -2113,14 +2111,14 @@ select throws_ok(
   $$select pg_temp.insert_sync_operation(
     '9a000000-0000-7000-8000-000000000012',
     p_device_sequence => 1.5
-  )$$,
+  )$$, null, null,
   'SyncOperationV1 rejects a fractional device sequence instead of rounding it'
 );
 
 select throws_ok(pg_catalog.format(
   'select pg_temp.insert_sync_operation(''9a000000-0000-7000-8000-000000000005'', %s => %s)',
   invalid.argument_name, invalid.invalid_value
-), format('SyncOperationV1 rejects %s above its unsigned width', invalid.description))
+), null, null, format('SyncOperationV1 rejects %s above its unsigned width', invalid.description))
 from (values
   ('p_device_sequence', '18446744073709551616', 'device sequence'),
   ('p_control_epoch', '4294967296', 'control epoch')
@@ -2129,7 +2127,7 @@ from (values
 select throws_ok(pg_catalog.format(
   'select pg_temp.%s(''9a000000-0000-7000-8000-000000000006'', p_schema_version => 2)',
   invalid.helper_name
-), format('%s rejects schema versions other than one', invalid.envelope_name))
+), null, null, format('%s rejects schema versions other than one', invalid.envelope_name))
 from (values
   ('insert_sync_operation', 'SyncOperationV1'),
   ('insert_sync_checkpoint', 'CheckpointV1')
@@ -2138,7 +2136,7 @@ from (values
 select throws_ok(pg_catalog.format(
   'select pg_temp.insert_sync_operation(''9a000000-0000-7000-8000-000000000007'', %s => ''invalid'')',
   invalid.argument_name
-), format('SyncOperationV1 rejects an invalid %s', invalid.description))
+), null, null, format('SyncOperationV1 rejects an invalid %s', invalid.description))
 from (values
   ('p_record_kind', 'record kind'),
   ('p_mutation_kind', 'mutation kind')
@@ -2147,7 +2145,7 @@ from (values
 select throws_ok(pg_catalog.format(
   'select pg_temp.%s(''9a000000-0000-7000-8000-000000000008'', %s => %L::jsonb)',
   invalid.helper_name, invalid.argument_name, invalid.json_value
-), format('%s rejects a noncanonical %s shape', invalid.envelope_name, invalid.description))
+), null, null, format('%s rejects a noncanonical %s shape', invalid.envelope_name, invalid.description))
 from (values
   ('insert_sync_operation', 'p_causal_frontier', '[{"deviceId":"50000000-0000-7000-8000-000000000003"}]', 'SyncOperationV1', 'causal frontier'),
   ('insert_sync_operation', 'p_blob_refs', '[{"digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ciphertextBytes":"1","storageId":"x","extra":true}]', 'SyncOperationV1', 'blob reference'),
@@ -2171,7 +2169,7 @@ select throws_ok(
       'deviceId', '5a000000-0000-7000-8000-' || pg_catalog.lpad(value::text, 12, '0'),
       'sequence', '0'
     )) from pg_catalog.generate_series(1, 10001) as series(value))
-  )$$,
+  )$$, null, null,
   'SyncOperationV1 rejects a causal frontier above 10000 items'
 );
 
@@ -2181,7 +2179,7 @@ select throws_ok(
     p_blob_refs => (select pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
       'digest', repeat('aa', 32), 'ciphertextBytes', '1', 'storageId', value::text
     )) from pg_catalog.generate_series(1, 10001) as series(value))
-  )$$,
+  )$$, null, null,
   'SyncOperationV1 rejects blob references above 10000 items'
 );
 
@@ -2192,7 +2190,7 @@ select throws_ok(
       'deviceId', '5b000000-0000-7000-8000-' || pg_catalog.lpad(value::text, 12, '0'),
       'sequence', '0'
     )) from pg_catalog.generate_series(1, 10001) as series(value))
-  )$$,
+  )$$, null, null,
   'CheckpointV1 rejects a causal frontier above 10000 items'
 );
 
@@ -2203,12 +2201,12 @@ select pg_catalog.set_config(
 );
 
 select throws_ok(
-  $$select pg_temp.insert_sync_operation('90000000-0000-7000-8000-000000000003')$$,
+  $$select pg_temp.insert_sync_operation('90000000-0000-7000-8000-000000000003')$$, null, null,
   'duplicate operation IDs fail'
 );
 
 select throws_ok(
-  $$select pg_temp.insert_sync_operation('9a000000-0000-7000-8000-00000000000c', p_device_sequence => 18446744073709551615)$$,
+  $$select pg_temp.insert_sync_operation('9a000000-0000-7000-8000-00000000000c', p_device_sequence => 18446744073709551615)$$, null, null,
   'duplicate account-device-sequence tuples fail'
 );
 
@@ -2222,7 +2220,7 @@ select throws_ok(
   $$select pg_temp.insert_sync_operation(
     '9a000000-0000-7000-8000-00000000000d',
     p_account_id => '20000000-0000-7000-8000-000000000001'
-  )$$,
+  )$$, null, null,
   'operation compound certificate reference rejects cross-account attachment'
 );
 
@@ -2230,11 +2228,9 @@ select throws_ok(
   $$select pg_temp.insert_sync_checkpoint(
     '9a000000-0000-7000-8000-00000000000e',
     p_account_id => '20000000-0000-7000-8000-000000000001'
-  )$$,
+  )$$, null, null,
   'checkpoint compound certificate reference rejects cross-account attachment'
 );
-
-reset role;
 
 set local role context_relay_rls_owner;
 update public.accounts
@@ -2256,7 +2252,7 @@ select throws_ok(
     '9a000000-0000-7000-8000-00000000000f',
     p_device_sequence => 1,
     p_ciphertext => decode('eeee', 'hex')
-  )$$,
+  )$$, null, null,
   'operation ciphertext exceeding the exact remaining quota by one byte fails'
 );
 reset role;
@@ -2294,7 +2290,7 @@ select throws_ok(
     '9a000000-0000-7000-8000-000000000011',
     p_device_sequence => 2,
     p_ciphertext => decode('f0', 'hex')
-  )$$,
+  )$$, null, null,
   'operation insert fails on a quota-exhausted account'
 );
 reset role;
@@ -2388,7 +2384,7 @@ select throws_ok(
       true,
       pg_catalog.now(),
       pg_catalog.now()
-    )$$,
+    )$$, null, null,
   'authenticated cannot INSERT a client Broadcast send row'
 );
 select pg_catalog.set_config('realtime.topic', 'account:20000000-0000-7000-8000-000000000002:sync', true);
@@ -2494,7 +2490,7 @@ select results_eq(
   'user A can keyset-page its read-only checkpoints by receipt and ID'
 );
 
-select throws_ok(command.sql, format('user A cannot %s', command.description))
+select throws_ok(command.sql, null, null, format('user A cannot %s', command.description))
 from (values
   ('select pg_temp.insert_sync_operation(''9b000000-0000-7000-8000-000000000001'', p_account_id => ''20000000-0000-7000-8000-000000000001'', p_workspace_id => ''70000000-0000-7000-8000-000000000001'', p_project_id => null, p_device_id => ''50000000-0000-7000-8000-000000000001'', p_certificate_id => ''60000000-0000-7000-8000-000000000001'', p_device_sequence => 1)', 'INSERT a legitimate operation'),
   ('update public.sync_operations set signature = signature where id = ''90000000-0000-7000-8000-000000000001''', 'UPDATE its operation'),
@@ -2542,7 +2538,7 @@ select results_eq(
   'user B can keyset-page its read-only checkpoints by receipt and ID'
 );
 
-select throws_ok(command.sql, format('user B cannot %s', command.description))
+select throws_ok(command.sql, null, null, format('user B cannot %s', command.description))
 from (values
   ('select pg_temp.insert_sync_operation(''9b000000-0000-7000-8000-000000000003'', p_account_id => ''20000000-0000-7000-8000-000000000002'', p_workspace_id => ''70000000-0000-7000-8000-000000000002'', p_project_id => null, p_device_id => ''50000000-0000-7000-8000-000000000005'', p_certificate_id => ''60000000-0000-7000-8000-000000000002'', p_device_sequence => 1)', 'INSERT a legitimate operation'),
   ('update public.sync_operations set signature = signature where id = ''90000000-0000-7000-8000-000000000002''', 'UPDATE its operation'),
@@ -2564,7 +2560,7 @@ select pg_catalog.set_config('request.jwt.claims', '{"sub":"10000000-0000-0000-0
 select results_eq('select (select count(*) from public.accounts), (select count(*) from public.device_bindings), (select count(*) from public.device_certificates), (select count(*) from public.sync_operations), (select count(*) from public.sync_checkpoints), (select count(*) from public.blob_manifests)', 'values (0::bigint, 0::bigint, 0::bigint, 0::bigint, 0::bigint, 0::bigint)', 'expired binding sees no rows on all six read relations');
 
 select pg_catalog.set_config('request.jwt.claims', '{"sub":"10000000-0000-0000-0000-000000000001","role":"authenticated","session_id":"40000000-0000-0000-0000-000000000001"}', true);
-select throws_ok(command.sql, format('authenticated cannot %s %s', command.verb, relation.qualified_name))
+select throws_ok(command.sql, null, null, format('authenticated cannot %s %s', command.verb, relation.qualified_name))
 from (values
   ('public.accounts'), ('public.device_bindings'), ('public.device_certificates'),
   ('public.sync_operations'), ('public.sync_checkpoints'), ('public.blob_manifests'),
@@ -2581,13 +2577,13 @@ cross join lateral (values
 reset role;
 
 set local role anon;
-select throws_ok(format('select * from %s', relation.qualified_name), format('anon cannot read %s', relation.qualified_name))
+select throws_ok(format('select * from %s', relation.qualified_name), null, null, format('anon cannot read %s', relation.qualified_name))
 from (values
   ('public.accounts'), ('public.device_bindings'), ('public.device_certificates'),
   ('public.sync_operations'), ('public.sync_checkpoints'), ('public.blob_manifests')
 ) as relation(qualified_name);
 
-select throws_ok(command.sql, format('anon cannot %s %s', command.verb, relation.qualified_name))
+select throws_ok(command.sql, null, null, format('anon cannot %s %s', command.verb, relation.qualified_name))
 from (values
   ('public.accounts'), ('public.device_bindings'), ('public.device_certificates'),
   ('public.sync_operations'), ('public.sync_checkpoints'), ('public.blob_manifests'),
@@ -2640,7 +2636,7 @@ select throws_ok(
     p_device_id => '50000000-0000-7000-8000-000000000006',
     p_certificate_id => '60000000-0000-7000-8000-000000000004',
     p_device_sequence => 1
-  )$$,
+  )$$, null, null,
   'privileged operation insert fails while the account is pending delete'
 );
 reset role;
@@ -2703,7 +2699,7 @@ select is(
   'a new deletion lifecycle reuses the cancelled request record'
 );
 select throws_ok(
-  $$select public.service_cancel_account_deletion('20000000-0000-7000-8000-000000000002')$$,
+  $$select public.service_cancel_account_deletion('20000000-0000-7000-8000-000000000002')$$, null, null,
   'cancellation fails when no deletion request exists'
 );
 reset role;
@@ -2737,7 +2733,7 @@ where id = '20000000-0000-7000-8000-000000000004';
 
 set local role service_role;
 select throws_ok(
-  $$select public.service_cancel_account_deletion('20000000-0000-7000-8000-000000000004')$$,
+  $$select public.service_cancel_account_deletion('20000000-0000-7000-8000-000000000004')$$, null, null,
   'cancellation fails after the grace deadline'
 );
 reset role;
@@ -2756,22 +2752,22 @@ where id = '20000000-0000-7000-8000-000000000004';
 
 set local role service_role;
 select throws_ok(
-  $$select public.service_cancel_account_deletion('20000000-0000-7000-8000-000000000004')$$,
+  $$select public.service_cancel_account_deletion('20000000-0000-7000-8000-000000000004')$$, null, null,
   'cancellation never changes purged state'
 );
 select throws_ok(
-  $$select public.service_begin_account_deletion('20000000-0000-7000-8000-000000000004')$$,
+  $$select public.service_begin_account_deletion('20000000-0000-7000-8000-000000000004')$$, null, null,
   'begin deletion never reopens purged state'
 );
 reset role;
 
 set local role service_role;
 select throws_ok(
-  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000001', '50000000-0000-7000-8000-000000000004', 1, decode(repeat('91', 32), 'hex'), decode(repeat('92', 64), 'hex'))$$,
+  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000001', '50000000-0000-7000-8000-000000000004', 1, decode(repeat('91', 32), 'hex'), decode(repeat('92', 64), 'hex'))$$, null, null,
   'revocation rejects an expired active binding'
 );
 select throws_ok(
-  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000004', '50000000-0000-7000-8000-000000000006', 1, decode(repeat('93', 32), 'hex'), decode(repeat('94', 64), 'hex'))$$,
+  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000004', '50000000-0000-7000-8000-000000000006', 1, decode(repeat('93', 32), 'hex'), decode(repeat('94', 64), 'hex'))$$, null, null,
   'revocation rejects a target on a purged account'
 );
 reset role;
@@ -2801,11 +2797,11 @@ select results_eq(
 
 set local role service_role;
 select throws_ok(
-  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000002', '50000000-0000-7000-8000-000000000005', 6, decode(repeat('b1', 32), 'hex'), decode(repeat('b2', 64), 'hex'))$$,
+  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000002', '50000000-0000-7000-8000-000000000005', 6, decode(repeat('b1', 32), 'hex'), decode(repeat('b2', 64), 'hex'))$$, null, null,
   'cutoff below historical maximum is stale and fails'
 );
 select throws_ok(
-  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000002', '50000000-0000-7000-8000-000000000005', 7, decode(repeat('b1', 32), 'hex'), decode(repeat('b2', 64), 'hex'))$$,
+  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000002', '50000000-0000-7000-8000-000000000005', 7, decode(repeat('b1', 32), 'hex'), decode(repeat('b2', 64), 'hex'))$$, null, null,
   'equal-sequence conflicting historical cutoff fails'
 );
 reset role;
@@ -2846,19 +2842,19 @@ select results_eq(
 
 set local role service_role;
 select throws_ok(
-  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000001', '50000000-0000-7000-8000-000000000001', -1, decode(repeat('81', 32), 'hex'), decode(repeat('82', 64), 'hex'))$$,
+  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000001', '50000000-0000-7000-8000-000000000001', -1, decode(repeat('81', 32), 'hex'), decode(repeat('82', 64), 'hex'))$$, null, null,
   'revocation rejects a negative cutoff sequence'
 );
 select throws_ok(
-  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000001', '50000000-0000-7000-8000-000000000001', 9, decode(repeat('81', 31), 'hex'), decode(repeat('82', 64), 'hex'))$$,
+  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000001', '50000000-0000-7000-8000-000000000001', 9, decode(repeat('81', 31), 'hex'), decode(repeat('82', 64), 'hex'))$$, null, null,
   'revocation rejects an invalid cutoff hash width'
 );
 select throws_ok(
-  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000001', '50000000-0000-7000-8000-000000000001', 9, decode(repeat('81', 32), 'hex'), decode(repeat('82', 63), 'hex'))$$,
+  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000001', '50000000-0000-7000-8000-000000000001', 9, decode(repeat('81', 32), 'hex'), decode(repeat('82', 63), 'hex'))$$, null, null,
   'revocation rejects an invalid cutoff signature width'
 );
 select throws_ok(
-  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000001', '50000000-0000-7000-8000-000000000002', 9, decode(repeat('81', 32), 'hex'), decode(repeat('82', 64), 'hex'))$$,
+  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000001', '50000000-0000-7000-8000-000000000002', 9, decode(repeat('81', 32), 'hex'), decode(repeat('82', 64), 'hex'))$$, null, null,
   'revocation rejects a pending binding rather than treating it as live active'
 );
 reset role;
@@ -2887,7 +2883,7 @@ select lives_ok(
   'exact revocation replay is idempotent'
 );
 select throws_ok(
-  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000001', '50000000-0000-7000-8000-000000000001', 10, decode(repeat('81', 32), 'hex'), decode(repeat('82', 64), 'hex'))$$,
+  $$select public.service_revoke_device_binding('20000000-0000-7000-8000-000000000001', '50000000-0000-7000-8000-000000000001', 10, decode(repeat('81', 32), 'hex'), decode(repeat('82', 64), 'hex'))$$, null, null,
   'conflicting revocation replay fails'
 );
 reset role;
