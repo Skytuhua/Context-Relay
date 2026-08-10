@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -10,6 +14,95 @@ import {
 
 test('keeps the real workspace dependency graph behind the daemon boundary', () => {
   assert.deepEqual(checkWorkspace(), []);
+});
+
+test('exports daemon authority adapters only with test-support', () => {
+  const workspace = resolve(import.meta.dirname, '..');
+  const fixture = mkdtempSync(join(tmpdir(), 'context-relay-daemon-api-'));
+  try {
+    mkdirSync(join(fixture, 'src'));
+    writeFileSync(
+      join(fixture, 'Cargo.toml'),
+      `[package]
+name = "context-relay-daemon-api-contract"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+
+[features]
+daemon-test-support = ["context-relay-contextd/test-support"]
+
+[dependencies]
+context-relay-contextd = { path = ${JSON.stringify(join(workspace, 'crates/contextd'))} }
+`,
+    );
+    writeFileSync(
+      join(fixture, 'src/main.rs'),
+      `use context_relay_contextd::test_support::{
+    TestCodexBridgeInstallEngine,
+    TestCodexBridgeInstallFixture,
+    TestCodexBridgeInstallRequest,
+    TestDaemonConfig,
+    TestNativeMemoryRegistration,
+    TestNativeMemorySource,
+    TestSetupPlanSummary,
+    test_primary_memory_instruction_component,
+};
+
+fn main() {
+    let _ = std::mem::size_of::<TestCodexBridgeInstallFixture>();
+    let _ = std::mem::size_of::<TestCodexBridgeInstallRequest>();
+    let _ = std::mem::size_of::<TestNativeMemoryRegistration>();
+    let _ = std::mem::size_of::<TestNativeMemorySource>();
+    let _ = std::mem::size_of::<TestSetupPlanSummary>();
+    let _ = test_primary_memory_instruction_component;
+    let _ = TestDaemonConfig::native_memory_preview_complete;
+    let _ = TestDaemonConfig::setup_plan_summary;
+    let _ = TestDaemonConfig::setup_plan_applied;
+    let _ = TestDaemonConfig::native_transaction_committed;
+    let _ = TestCodexBridgeInstallEngine::from_request;
+}
+`,
+    );
+    const cargo = (features = []) =>
+      spawnSync(
+        'cargo',
+        ['check', '--quiet', ...features],
+        {
+          cwd: fixture,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            CARGO_TARGET_DIR: join(workspace, 'target/daemon-api-contract'),
+          },
+          maxBuffer: 16 * 1024 * 1024,
+        },
+      );
+
+    const production = cargo();
+    assert.notEqual(production.status, 0, 'production build exposed test authority');
+    for (const symbol of [
+      'TestCodexBridgeInstallFixture',
+      'TestCodexBridgeInstallRequest',
+      'TestNativeMemoryRegistration',
+      'TestNativeMemorySource',
+      'TestSetupPlanSummary',
+      'test_primary_memory_instruction_component',
+      'native_memory_preview_complete',
+      'setup_plan_summary',
+      'setup_plan_applied',
+      'native_transaction_committed',
+      'from_request',
+    ]) {
+      assert.match(production.stderr, new RegExp(symbol));
+    }
+
+    const testSupport = cargo(['--features', 'daemon-test-support']);
+    assert.equal(testSupport.status, 0, testSupport.stderr);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
 });
 
 test('reports the complete forbidden dependency path', () => {

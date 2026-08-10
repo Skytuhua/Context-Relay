@@ -1925,12 +1925,9 @@ pub mod test_support {
     #[cfg(feature = "test-support")]
     use context_relay_core::vault::TestVaultCell;
     use context_relay_core::{
-        codex::{CodexAdapter, CodexExecutableKind, CodexLayout},
-        mcp::install::{BRIDGE_SERVER_NAME, BridgeExecutable, attest_bridge_executable},
-        native_memory::{
-            NativeMemoryAdapter, NativeMemoryLedger, NativeMemorySource, NativeMemorySourceId,
-            primary_memory_instruction_component,
-        },
+        codex::CodexAdapter,
+        mcp::install::{BRIDGE_SERVER_NAME, BridgeExecutable},
+        native_memory::{NativeMemoryLedger, NativeMemorySource, NativeMemorySourceId},
         native_transaction::{
             ApprovedCliMutation, ApprovedInput, CanonicalCliDeclaration, NativeTransactionPlan,
             SidecarBinding,
@@ -1946,18 +1943,24 @@ pub mod test_support {
             BridgeInstallService, BridgeLocator, BridgeMutationPlan, BridgePreviewHarness,
             NativeEngineBridgePlanExecutor, PrimaryMemoryMutationPlan, RegisteredProject,
         },
-        vault::{
-            BeforeImagePolicy, DatabaseKeyStore, NativeSandboxIdentity, NativeTransactionStatus,
-            SetupPlanLifecycle, Vault, VaultError,
-        },
+        vault::{BeforeImagePolicy, DatabaseKeyStore, NativeSandboxIdentity, Vault, VaultError},
+    };
+    #[cfg(feature = "test-support")]
+    use context_relay_core::{
+        codex::{CodexExecutableKind, CodexLayout},
+        mcp::install::attest_bridge_executable,
+        native_memory::{NativeMemoryAdapter, primary_memory_instruction_component},
+        vault::{NativeTransactionStatus, SetupPlanLifecycle},
     };
     use context_relay_local_ipc::{InstallationToken, RuntimeConfig};
+    #[cfg(feature = "test-support")]
+    use context_relay_protocol::InstallationMethod;
     use context_relay_protocol::{
         ApplyReceipt, ClassifiedChanges, CliOperations, ClientError, ComponentRecord, DesiredState,
         DeviceId, DiscoveredScopes, ErrorCode, HarnessAdapter, HarnessId, HarnessParams,
-        HybridLogicalClock, ImportRequest, ImportedState, InstallationMethod, MemoryCandidate,
-        PlanId, PlanParams, ProbeContext, ProbeReport, ProjectId, RenderedState, SemanticDiff,
-        SetupPlan, Sha256Digest, ValidationReport, WireNativeValue,
+        HybridLogicalClock, ImportRequest, ImportedState, MemoryCandidate, PlanId, PlanParams,
+        ProbeContext, ProbeReport, ProjectId, RenderedState, SemanticDiff, SetupPlan, Sha256Digest,
+        ValidationReport, WireNativeValue,
     };
     #[cfg(any(windows, target_os = "macos"))]
     use context_relay_protocol::{HarnessAccessPolicy, ProjectIdentity};
@@ -1969,12 +1972,14 @@ pub mod test_support {
         VaultConfig, WorkerHook,
     };
 
+    #[cfg(feature = "test-support")]
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct TestNativeMemoryRegistration {
         pub source_id: Sha256Digest,
         pub has_last_applied_digest: bool,
     }
 
+    #[cfg(feature = "test-support")]
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct TestSetupPlanSummary {
         pub previewed: bool,
@@ -1983,6 +1988,7 @@ pub mod test_support {
         pub native_memory_registrations: Vec<TestNativeMemoryRegistration>,
     }
 
+    #[cfg(feature = "test-support")]
     pub fn test_primary_memory_instruction_component(
         harness: HarnessId,
         project_id: ProjectId,
@@ -2137,6 +2143,7 @@ pub mod test_support {
             vault.native_memory_ledger(source_id)
         }
 
+        #[cfg(feature = "test-support")]
         pub fn native_memory_preview_complete(
             &self,
             source_id: Sha256Digest,
@@ -2145,6 +2152,7 @@ pub mod test_support {
                 .map(|ledger| ledger.is_some_and(|ledger| ledger.initial_preview_complete))
         }
 
+        #[cfg(feature = "test-support")]
         pub fn setup_plan_summary(
             &self,
             plan_id: &PlanId,
@@ -2172,6 +2180,7 @@ pub mod test_support {
             })
         }
 
+        #[cfg(feature = "test-support")]
         pub fn setup_plan_applied(&self, plan_id: &PlanId) -> Result<bool, VaultError> {
             self.with_vault(|vault| {
                 vault.setup_plan(plan_id).map(|plan| {
@@ -2180,6 +2189,7 @@ pub mod test_support {
             })
         }
 
+        #[cfg(feature = "test-support")]
         pub fn native_transaction_committed(
             &self,
             transaction_id: &str,
@@ -2398,6 +2408,7 @@ pub mod test_support {
     /// acceptance tests. Adapter planning and native transactions are
     /// production code; only external CLI and restricted-run boundaries are
     /// represented by in-memory test state.
+    #[cfg(feature = "test-support")]
     pub struct TestCodexBridgeInstallRequest {
         pub executable: PathBuf,
         pub bridge_path: PathBuf,
@@ -2414,12 +2425,14 @@ pub mod test_support {
         pub lock_root: PathBuf,
     }
 
+    #[cfg(feature = "test-support")]
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct TestNativeMemorySource {
         pub id: Sha256Digest,
         pub path: WireNativeValue,
     }
 
+    #[cfg(feature = "test-support")]
     pub struct TestCodexBridgeInstallFixture {
         pub engine: Arc<TestCodexBridgeInstallEngine>,
         pub sources: Vec<TestNativeMemorySource>,
@@ -2434,6 +2447,7 @@ pub mod test_support {
     }
 
     impl TestCodexBridgeInstallEngine {
+        #[cfg(feature = "test-support")]
         pub fn from_request(
             request: TestCodexBridgeInstallRequest,
         ) -> Result<TestCodexBridgeInstallFixture, ClientError> {
