@@ -418,7 +418,9 @@ fn decode_path(source: &NativeMemorySource) -> Result<PathBuf, SnapshotError> {
 fn decode_path(source: &NativeMemorySource) -> Result<PathBuf, SnapshotError> {
     use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
 
-    if source.path.platform != NativePlatform::Windows || source.path.bytes.len() % 2 != 0 {
+    if source.path.platform != NativePlatform::Windows
+        || !source.path.bytes.len().is_multiple_of(2)
+    {
         return Err(SnapshotError::UnsupportedTopology);
     }
     let units = source
