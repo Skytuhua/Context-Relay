@@ -1203,14 +1203,16 @@ fn attest_regular_executable(path: &Path) -> Result<AttestedExecutable, ClientEr
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|_| invalid("Hermes executable cannot be read"))?;
-    let mut kind = classify_executable_bytes(path, &bytes);
+    let kind = classify_executable_bytes(path, &bytes);
     #[cfg(unix)]
-    {
+    let kind = {
         use std::os::unix::fs::PermissionsExt as _;
         if kind == HermesExecutableKind::Native && metadata.permissions().mode() & 0o111 == 0 {
-            kind = HermesExecutableKind::Unknown;
+            HermesExecutableKind::Unknown
+        } else {
+            kind
         }
-    }
+    };
     Ok(AttestedExecutable {
         snapshot: ExecutableSnapshot {
             kind,

@@ -14,6 +14,8 @@ const ordinaryFeatures = [
   'context-relay-contextd/test-support',
   'context-relay-context-mcp/test-support',
 ].join(',');
+const checkoutNode24 = 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1';
+const setupNode24 = 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020';
 
 function job(source, name) {
   const jobsStart = source.indexOf('\njobs:\n');
@@ -144,6 +146,31 @@ test('required CI gates are independently visible and cannot be masked by Rust l
   assert.match(check, /git diff --check "\$PR_BASE_SHA" "\$PR_HEAD_SHA"/);
   assert.match(check, /git diff --check "\$PUSH_BEFORE_SHA" "\$CURRENT_SHA"/);
   assert.match(check, /git diff-tree -r --check --root/);
+});
+
+test('ordinary CI gates use the reviewed Node 24 action revisions', async () => {
+  const source = await readFile(ciWorkflowUrl, 'utf8');
+  const required = [
+    'rust',
+    'rust-lint',
+    'rust-tests',
+    'daemon-boundary',
+    'bindings',
+    'schemas',
+    'licenses',
+    'dependency-policy',
+    'node-dependency-policy',
+    'whitespace',
+    'frontend',
+    'native',
+  ];
+  for (const name of required) {
+    const body = job(source, name);
+    assert.match(body, new RegExp(checkoutNode24.replace('/', '\\/')));
+    if (body.includes('actions/setup-node@')) {
+      assert.match(body, new RegExp(setupNode24.replace('/', '\\/')));
+    }
+  }
 });
 
 test('whitespace gate checks committed event ranges and fails on a real defect', async () => {

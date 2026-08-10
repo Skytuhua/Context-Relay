@@ -79,12 +79,12 @@ test('Supabase workflow uses least-privilege immutable actions', async () => {
   const uses = [...source.matchAll(/^\s+- uses:\s*(\S+?)(?:\s+#.*)?\s*$/gm)]
     .map((match) => match[1]);
   assert.deepEqual(uses, [
-    'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683',
-    'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020',
+    'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+    'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020',
   ]);
   assert.match(
     source,
-    /actions\/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n\s+with:\n\s+persist-credentials:\s*false/,
+    /actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n\s+with:\n\s+persist-credentials:\s*false/,
   );
 });
 
@@ -93,7 +93,7 @@ test('Supabase workflow uses the repository Node and pnpm toolchain', async () =
 
   assert.match(
     source,
-    /actions\/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020\n\s+with:\n\s+node-version-file:\s*\.node-version/,
+    /actions\/setup-node@820762786026740c76f36085b0efc47a31fe5020\n\s+with:\n\s+node-version-file:\s*\.node-version/,
   );
   assert.doesNotMatch(source, /pnpm\/action-setup/);
   assert.doesNotMatch(source, /^\s+cache:\s*pnpm\s*$/m);
