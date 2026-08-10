@@ -842,6 +842,12 @@ values
   ('10000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'd@example.test', '', now(), now(), now(), '{}'::jsonb, '{}'::jsonb),
   ('10000000-0000-0000-0000-000000000005', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'storage@example.test', '', now(), now(), now(), '{}'::jsonb, '{}'::jsonb);
 
+-- The CLI 2.113 pg_prove runner intentionally lacks inherited access to the
+-- NOLOGIN table owner. Add only transaction-local fixture authority after the
+-- membership-denial assertions, then remove it before the test transaction
+-- rolls back. Role-switched client and service assertions remain isolated.
+grant context_relay_rls_owner to current_user with inherit true, set true;
+
 insert into public.accounts (id, owner_user_id, deletion_state, deletion_requested_at, deletion_scheduled_for)
 values
   ('20000000-0000-7000-8000-000000000001', '10000000-0000-0000-0000-000000000001', 'active', null, null),
@@ -2896,6 +2902,8 @@ set local role authenticated;
 select pg_catalog.set_config('request.jwt.claims', '{"sub":"10000000-0000-0000-0000-000000000001","role":"authenticated","session_id":"40000000-0000-0000-0000-000000000001"}', true);
 select results_eq('select (select count(*) from public.accounts), (select count(*) from public.device_bindings), (select count(*) from public.device_certificates), (select count(*) from public.sync_operations), (select count(*) from public.sync_checkpoints), (select count(*) from public.blob_manifests)', 'values (0::bigint, 0::bigint, 0::bigint, 0::bigint, 0::bigint, 0::bigint)', 'fresh policy evaluation immediately denies the revoked session on all six relations');
 reset role;
+
+revoke context_relay_rls_owner from current_user granted by current_user;
 
 select * from finish();
 rollback;

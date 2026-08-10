@@ -101,6 +101,20 @@ test('pgTAP runs only the planned suite and compares catalog text with one colla
       'every text cast compared by pgTAP must pin the same deterministic collation',
     );
   }
+
+  const membershipAssertion = suite.indexOf(
+    "'Context Relay owner has no runtime-capability role memberships'",
+  );
+  const harnessGrant = suite.indexOf(
+    'grant context_relay_rls_owner to current_user with inherit true, set true;',
+  );
+  const fixtureSeed = suite.indexOf('insert into public.accounts');
+  const harnessRevoke = suite.lastIndexOf(
+    'revoke context_relay_rls_owner from current_user granted by current_user;',
+  );
+  const finish = suite.indexOf('select * from finish();');
+  assert.ok(membershipAssertion < harnessGrant && harnessGrant < fixtureSeed);
+  assert.ok(fixtureSeed < harnessRevoke && harnessRevoke < finish);
 });
 
 test('Supabase workflow preserves triggers and the local contract lifecycle', async () => {
