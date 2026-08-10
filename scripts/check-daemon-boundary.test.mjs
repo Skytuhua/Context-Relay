@@ -72,19 +72,23 @@ fn main() {
 }
 `,
     );
-    const cargo = (features = [], locked = false) =>
+    const cargoOptions = {
+      cwd: fixture,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        CARGO_TARGET_DIR: join(workspace, 'target/daemon-api-contract'),
+      },
+      maxBuffer: 16 * 1024 * 1024,
+    };
+    const preparedLock = spawnSync('cargo', ['generate-lockfile'], cargoOptions);
+    assert.equal(preparedLock.status, 0, preparedLock.stderr);
+
+    const cargo = (features = []) =>
       spawnSync(
         'cargo',
-        ['check', ...(locked ? ['--locked'] : []), '--quiet', ...features],
-        {
-          cwd: fixture,
-          encoding: 'utf8',
-          env: {
-            ...process.env,
-            CARGO_TARGET_DIR: join(workspace, 'target/daemon-api-contract'),
-          },
-          maxBuffer: 16 * 1024 * 1024,
-        },
+        ['check', '--locked', '--quiet', ...features],
+        cargoOptions,
       );
 
     const production = cargo();
@@ -105,7 +109,7 @@ fn main() {
       assert.match(production.stderr, new RegExp(symbol));
     }
 
-    const testSupport = cargo(['--features', 'daemon-test-support'], true);
+    const testSupport = cargo(['--features', 'daemon-test-support']);
     assert.equal(testSupport.status, 0, testSupport.stderr);
   } finally {
     rmSync(fixture, { recursive: true, force: true });
