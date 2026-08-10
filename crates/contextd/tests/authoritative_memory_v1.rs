@@ -70,6 +70,7 @@ async fn applied_setup_keeps_primary_memory_and_task_contract_alive_without_a_de
         .call(LocalRequest::HarnessPreview(HarnessParams {
             harness: HarnessId::Codex,
             project_id: Some(fixture.project.project_id),
+            hermes_profile: None,
         }))
         .await
         .unwrap()
@@ -377,6 +378,7 @@ async fn import_only_codex_setup_activates_exact_watchers_without_native_mutatio
         .call(LocalRequest::HarnessPreview(HarnessParams {
             harness: HarnessId::Codex,
             project_id: Some(project.project_id),
+            hermes_profile: None,
         }))
         .await
         .unwrap()
@@ -661,7 +663,7 @@ struct AcceptanceFixture {
 
 impl AcceptanceFixture {
     fn supported(label: &str) -> Self {
-        let materialized = MaterializedCodex::new(label, "0.144.1");
+        let materialized = MaterializedCodex::new_with_requirements(label, "0.144.1", false);
         let capabilities = materialized.capabilities();
         let NativeMemoryDisable::Supported(disable) = &capabilities.disable else {
             panic!("the frozen Codex fixture must support native-memory disable")
@@ -739,6 +741,10 @@ struct MaterializedCodex {
 
 impl MaterializedCodex {
     fn new(label: &str, version: &str) -> Self {
+        Self::new_with_requirements(label, version, true)
+    }
+
+    fn new_with_requirements(label: &str, version: &str, active_requirements: bool) -> Self {
         let fixture: Value =
             serde_json::from_str(include_str!("../../core/tests/fixtures/codex-0.144.1.json"))
                 .unwrap();
@@ -759,7 +765,9 @@ impl MaterializedCodex {
         materialize(&project_root, fixture["project"].as_object().unwrap());
         fs::create_dir_all(&working_directory).unwrap();
         let requirements = root.join("requirements.toml");
-        fs::write(&requirements, fixture["requirements"].as_str().unwrap()).unwrap();
+        if active_requirements {
+            fs::write(&requirements, fixture["requirements"].as_str().unwrap()).unwrap();
+        }
         let executable = root.join(if cfg!(windows) { "codex.exe" } else { "codex" });
         fs::write(&executable, b"\x7fELFfixture executable").unwrap();
         let project_id = ProjectId::from_str(PROJECT_ID).unwrap();

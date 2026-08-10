@@ -617,6 +617,7 @@ where
                     continue;
                 }
                 attempt!(self.journal.prepare_mutation(index, mutation));
+                attempt!(self.adapter.verify_live_state_reservation(plan));
                 let outcome = match self.filesystem.apply_mutation(
                     &transaction_nonce,
                     mutation,

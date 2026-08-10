@@ -2,7 +2,7 @@ use std::io::Write;
 
 use context_relay_protocol::MAX_IPC_FRAME_BYTES;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
 use crate::BridgeError;
@@ -100,10 +100,6 @@ pub(crate) fn error(id: Option<RpcId>, code: i64, message: &'static str) -> Valu
         "id": id.map_or(Value::Null, |id| serde_json::to_value(id).expect("RPC ID serializes")),
         "error": {"code": code, "message": message}
     })
-}
-
-pub(crate) fn empty_params(params: Option<&Value>) -> bool {
-    params.is_none_or(|value| value.as_object().is_some_and(Map::is_empty))
 }
 
 pub fn encode_message(message: &Value) -> Result<Vec<u8>, BridgeError> {

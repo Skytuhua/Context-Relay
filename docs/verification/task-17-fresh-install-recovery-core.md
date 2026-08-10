@@ -38,7 +38,8 @@ key, plaintext workspace key, raw envelope, or pairing safety number is reproduc
 | `recovery-device-claim-signing-preimage-v1.hex` | 671 | `d82790c08aef156bb9cd61b41fc8364cad7b8ba454f41981c4c87f9d1dc2a436` |
 | Referenced `recovery-enrollment-record-v1.hex` | 710 | `5a9a470d35924a44e599b9d9f753ad54e2dc8b967c22a88363e87daf2535e999` |
 
-- The local IPC protocol remains exactly 1.3; this core slice adds no IPC DTO or renderer result.
+- This core slice originally left the local IPC protocol at 1.3. The later A-005 strengthening
+  amendment advances the current boundary to 1.4 without changing these recovery bytes.
 - The forward-only encrypted Vault schema advances from 22 to 23.
 - The recovery-device claim schema is version 1 and is bounded at 32 KiB.
 - Recovery IDs, certificate IDs, and device IDs are distinct strict UUIDv7 types.
@@ -120,7 +121,7 @@ epoch key, or protected device private seed.
 | Gate | Result |
 | --- | --- |
 | Sixteen focused core targets | Green: 176/176. Restore crypto 6, transport 6, Vault 9, e2e 13; enrollment crypto 6, transport 6, Vault 6, e2e 12; pairing crypto 11, transport 8, Vault 13, e2e 9; signed-sync e2e 16 across 256/256 seeds, backoff 4, checkpoint 8, engine 43. The clean-process convergence test took 199.43 s. |
-| `cargo test -p context-relay-protocol --all-features` | Green: 110/110 integration tests; unit/bin/doc targets also green. Protocol remains 1.3. |
+| `cargo test -p context-relay-protocol --all-features` | Historical capture: green at 110/110 integration tests while the protocol was 1.3. Current 1.4 evidence is recorded in Task 13. |
 | `cargo test -p context-relay-local-ipc` | Green outside the filesystem sandbox: 40 unit + 28 integration = 68/68. The first sandbox run passed all 40 unit and 24 integration tests; only four expected macOS socket operations failed with `Operation not permitted`. |
 | `cargo test -p context-relay-contextd` | Green outside the filesystem sandbox: 86/86 — 53 lib, 1 main, 4 authoritative, 2 daemon, 10 harness, 6 hook, and 10 watcher tests. The first sandbox run failed only 17 socket-bearing lib cases. |
 | `cargo check --workspace --all-targets --all-features` | Green. A separate normal-build core library check is also green. |

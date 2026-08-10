@@ -1633,6 +1633,7 @@ fn native_digest_plan(target: &Path, digest: Sha256Digest) -> NativeTransactionP
         setup: SetupPlan {
             plan_id: PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073984").unwrap(),
             harness: HarnessId::ClaudeCode,
+            harness_profile: None,
             adapter_version: 1,
             executable_path: test_wire_path(target),
             executable_hash: digest,

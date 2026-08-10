@@ -103,7 +103,12 @@ fn adapter_fixture() -> AdapterFixture {
     let user_skills_dir = root.path().join("home/.agents/skills");
     fs::create_dir_all(&codex_home).unwrap();
     fs::create_dir_all(&user_skills_dir).unwrap();
-    fs::write(codex_home.join("config.toml"), b"").unwrap();
+    let quoted_project = serde_json::to_string(&project_root.to_string_lossy()).unwrap();
+    fs::write(
+        codex_home.join("config.toml"),
+        format!("[projects.{quoted_project}]\ntrust_level = \"trusted\"\n"),
+    )
+    .unwrap();
     let codex_executable = root.path().join("codex-bin");
     fs::write(&codex_executable, b"\x7fELFfixture codex executable").unwrap();
     let codex = CodexAdapter::from_layout(

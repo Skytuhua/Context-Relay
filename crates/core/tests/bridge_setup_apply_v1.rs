@@ -142,6 +142,7 @@ fn plan() -> NativeTransactionPlan {
         setup: SetupPlan {
             plan_id: PlanId::from_str(ID_1).unwrap(),
             harness: HarnessId::Codex,
+            harness_profile: None,
             adapter_version: 1,
             executable_path: native_text("/fixture/codex"),
             executable_hash: Sha256Digest([1; 32]),

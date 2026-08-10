@@ -646,6 +646,30 @@ impl OsNativeFileSystem {
         }
     }
 
+    /// Derives the restorable metadata for a new daemon-owned private file.
+    ///
+    /// The target must be absent. The platform implementation pins and
+    /// revalidates the full parent topology and produces a `0600`-equivalent
+    /// file state without creating a preview-time filesystem object.
+    pub fn metadata_for_new_private_file(
+        &self,
+        path: &Path,
+    ) -> Result<NativeMetadata, RunnerError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::metadata_for_new_private_file(path)
+        }
+        #[cfg(windows)]
+        {
+            windows::metadata_for_new_private_file(path)
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            let _ = path;
+            Err(RunnerError::UnsupportedTarget)
+        }
+    }
+
     pub fn recover_interrupted_replace(
         &self,
         path: &Path,
@@ -1522,6 +1546,21 @@ mod provenance_tests {
         assert_eq!(
             outcome.snapshot().object_token(),
             Some(&concurrent_snapshot)
+        );
+    }
+}
+
+#[cfg(all(test, not(any(windows, target_os = "macos"))))]
+mod private_creation_metadata_unsupported_tests {
+    use super::{OsNativeFileSystem, RunnerError};
+    use std::path::Path;
+
+    #[test]
+    fn private_creation_metadata_is_unavailable_off_supported_native_targets() {
+        assert_eq!(
+            OsNativeFileSystem::new()
+                .metadata_for_new_private_file(Path::new("/tmp/context-relay-new-file")),
+            Err(RunnerError::UnsupportedTarget)
         );
     }
 }

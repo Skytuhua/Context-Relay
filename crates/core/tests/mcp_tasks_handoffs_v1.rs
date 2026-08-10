@@ -683,7 +683,7 @@ fn handoff_enriches_ordered_selections_recent_decisions_tasks_evidence_and_instr
         TaskStatus::Open,
         Vec::new(),
     );
-    fixture.insert_task(
+    let canceled = fixture.insert_task(
         23,
         fixture.project.project_id,
         "Canceled omitted",
@@ -716,7 +716,7 @@ fn handoff_enriches_ordered_selections_recent_decisions_tasks_evidence_and_instr
         1,
         &[&second.id.to_string(), &first.id.to_string()],
         &[&selected_decision.id.to_string()],
-        &[&done.id.to_string()],
+        &[&done.id.to_string(), &canceled.id.to_string()],
         "Continue the daemon bridge.",
     );
     let first_output = fixture
@@ -760,9 +760,10 @@ fn handoff_enriches_ordered_selections_recent_decisions_tasks_evidence_and_instr
         .map(|value| value["id"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(task_ids[0], done.id.to_string());
+    assert_eq!(task_ids[1], canceled.id.to_string());
     assert!(task_ids.contains(&blocked.id.to_string().as_str()));
     assert!(task_ids.contains(&open.id.to_string().as_str()));
-    assert!(!task_ids.contains(&id(23).as_str()));
+    assert!(task_ids.contains(&id(23).as_str()));
     assert_eq!(
         payload["tasks"][0]["evidence"][0]["summary"],
         "workspace tests passed"
@@ -783,11 +784,32 @@ fn handoff_enriches_ordered_selections_recent_decisions_tasks_evidence_and_instr
         "## Selected memories",
         "## Recent decisions",
         "## Open and blocked tasks",
+        "## Selected terminal tasks",
         "## Completion evidence",
         "## Relevant instructions",
     ] {
         assert!(markdown.contains(heading), "{heading}");
     }
+    let open_section = markdown
+        .split_once("## Open and blocked tasks\n\n")
+        .unwrap()
+        .1
+        .split_once("\n## Selected terminal tasks")
+        .unwrap()
+        .0;
+    let terminal_section = markdown
+        .split_once("## Selected terminal tasks\n\n")
+        .unwrap()
+        .1
+        .split_once("\n## Completion evidence")
+        .unwrap()
+        .0;
+    assert!(open_section.contains("Open auto"));
+    assert!(open_section.contains("Blocked auto"));
+    assert!(!open_section.contains("Done selected"));
+    assert!(!open_section.contains("Canceled omitted"));
+    assert!(terminal_section.contains("Done selected"));
+    assert!(terminal_section.contains("Canceled omitted"));
     assert!(markdown.contains("workspace tests passed"));
     assert!(!first_output.to_string().contains("transcript"));
     assert!(serde_json::to_vec(&first_output).unwrap().len() <= MAX_IPC_FRAME_BYTES / 4);
@@ -903,6 +925,93 @@ fn handoff_rejects_secret_like_text_without_echoing_it() {
     assert_error(&error, ErrorCode::InvalidRequest);
     assert!(!error.message.contains("must-not-echo"));
     assert!(!error.message.contains(secret));
+}
+
+#[test]
+fn handoff_rejects_an_ascii_armored_pgp_private_key_without_echoing_it() {
+    let mut fixture = Fixture::new("handoff-pgp-private-key", HarnessAccessPolicy::Default);
+    let marker = "-----BEGIN PGP PRIVATE KEY BLOCK-----";
+    let memory = fixture.insert_memory(
+        10,
+        ScopeRef::Project {
+            project_id: fixture.project.project_id,
+        },
+        MemoryKind::Fact,
+        "Sensitive",
+        marker,
+        1,
+    );
+
+    let error = fixture
+        .call(
+            "context_relay_create_handoff",
+            handoff_input(1, &[&memory.id.to_string()], &[], &[], "summary"),
+        )
+        .unwrap_err();
+
+    assert_error(&error, ErrorCode::InvalidRequest);
+    assert_eq!(error.message, "The handoff contains secret-like text");
+    assert!(!error.message.contains(marker));
+}
+
+#[test]
+fn handoff_rejects_a_bare_slack_session_token_without_echoing_it() {
+    let mut fixture = Fixture::new("handoff-slack-session-token", HarnessAccessPolicy::Default);
+    let token = "xoxs-abcdefghijklmnopqrstuvwxyz0123456789";
+    let memory = fixture.insert_memory(
+        10,
+        ScopeRef::Project {
+            project_id: fixture.project.project_id,
+        },
+        MemoryKind::Fact,
+        "Sensitive",
+        token,
+        1,
+    );
+
+    let error = fixture
+        .call(
+            "context_relay_create_handoff",
+            handoff_input(1, &[&memory.id.to_string()], &[], &[], "summary"),
+        )
+        .unwrap_err();
+
+    assert_error(&error, ErrorCode::InvalidRequest);
+    assert_eq!(error.message, "The handoff contains secret-like text");
+    assert!(!error.message.contains(token));
+}
+
+#[test]
+fn handoff_accepts_a_bearer_environment_placeholder() {
+    let mut fixture = Fixture::new(
+        "handoff-bearer-environment-placeholder",
+        HarnessAccessPolicy::Default,
+    );
+    let placeholder = "Bearer ${CONTEXT_RELAY_ACCESS_TOKEN}";
+    let memory = fixture.insert_memory(
+        10,
+        ScopeRef::Project {
+            project_id: fixture.project.project_id,
+        },
+        MemoryKind::Fact,
+        "Environment-backed authorization",
+        placeholder,
+        1,
+    );
+
+    let output = fixture
+        .call(
+            "context_relay_create_handoff",
+            handoff_input(1, &[&memory.id.to_string()], &[], &[], "summary"),
+        )
+        .unwrap();
+
+    assert!(
+        output["payload"]["markdown"]
+            .as_str()
+            .unwrap()
+            .contains(placeholder)
+    );
 }
 
 #[test]

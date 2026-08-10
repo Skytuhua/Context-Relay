@@ -139,6 +139,7 @@ fn plan_with_approval(
     let setup = SetupPlan {
         plan_id: PlanId::from_str(ID).unwrap(),
         harness: HarnessId::Codex,
+        harness_profile: None,
         adapter_version: 1,
         executable_path: value("/fixture/codex"),
         executable_hash: Sha256Digest([1; 32]),
@@ -1184,6 +1185,7 @@ fn file_only_engine_keeps_the_frozen_twenty_step_order() {
 fn file_only_hermes_plan_recomputes_its_explicit_v2_approval() {
     let mut plan = plan_with_approval(0, false, 2);
     plan.setup.harness = HarnessId::Hermes;
+    plan.setup.harness_profile = Some("coder".to_owned());
     plan.setup.batch_hash = approval_hash_v2(&plan).unwrap();
     let state = Rc::new(RefCell::new(SharedState::new(
         0,

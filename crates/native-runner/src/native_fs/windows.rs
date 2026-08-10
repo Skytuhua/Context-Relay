@@ -15,27 +15,40 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 use windows_sys::Win32::{
     Foundation::{
-        ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF,
-        ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, GENERIC_READ,
-        GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, OBJ_CASE_INSENSITIVE,
-        OBJ_DONT_REPARSE, RtlNtStatusToDosError, STATUS_REPARSE_POINT_ENCOUNTERED,
-        STATUS_STOPPED_ON_SYMLINK, UNICODE_STRING,
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND,
+        ERROR_HANDLE_EOF, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND,
+        ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, HLOCAL,
+        INVALID_HANDLE_VALUE, LocalFree, NTSTATUS, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE,
+        RtlNtStatusToDosError, STATUS_REPARSE_POINT_ENCOUNTERED, STATUS_STOPPED_ON_SYMLINK,
+        UNICODE_STRING,
     },
     Security::{
-        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetKernelObjectSecurity,
-        OWNER_SECURITY_INFORMATION, SetKernelObjectSecurity,
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx,
+        Authorization::{GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo},
+        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetLengthSid,
+        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorGroup,
+        GetSecurityDescriptorLength, GetSecurityDescriptorOwner, GetTokenInformation,
+        InitializeAcl, InitializeSecurityDescriptor, IsValidAcl, IsValidSecurityDescriptor,
+        IsValidSid, MakeSelfRelativeSD, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+        SE_SELF_RELATIVE, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
+        SetSecurityDescriptorDacl, SetSecurityDescriptorGroup, SetSecurityDescriptorOwner,
+        TOKEN_PRIMARY_GROUP, TOKEN_QUERY, TOKEN_USER, TokenPrimaryGroup, TokenUser,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
     },
     Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_DISPOSITION_FLAG_DELETE,
-        FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-        FILE_DISPOSITION_INFO_EX, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO,
-        FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_STREAM_INFO, FILE_TRAVERSE,
-        FileAttributeTagInfo, FileBasicInfo, FileDispositionInfoEx, FileIdInfo, FileStandardInfo,
-        FileStreamInfo, FlushFileBuffers, GetFileInformationByHandle, GetFileInformationByHandleEx,
-        SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_STREAM_INFO,
+        FILE_TRAVERSE, FileAttributeTagInfo, FileBasicInfo, FileDispositionInfoEx, FileIdInfo,
+        FileStandardInfo, FileStreamInfo, FlushFileBuffers, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
+        WRITE_OWNER,
     },
+    System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
 
 use super::{
@@ -55,6 +68,7 @@ const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const SECURITY_DESCRIPTOR_REVISION_V1: u32 = 1;
 #[cfg(test)]
 static PRE_RENAME_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
     std::sync::Mutex::new(None);
@@ -77,6 +91,9 @@ static RECOVERY_PRE_DESTRUCTIVE_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnc
     std::sync::Mutex::new(None);
 #[cfg(test)]
 static PRE_ROLLBACK_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static CREATION_METADATA_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
     std::sync::Mutex::new(None);
 #[cfg(test)]
 static PRE_RENAME_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -153,6 +170,20 @@ fn run_pre_rollback_test_hook() {
         hook();
     }
 }
+
+#[cfg(test)]
+fn run_creation_metadata_test_hook() {
+    if let Some(hook) = CREATION_METADATA_TEST_HOOK
+        .lock()
+        .expect("test hook lock")
+        .take()
+    {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_creation_metadata_test_hook() {}
 
 #[repr(C)]
 union IoStatusValue {
@@ -598,6 +629,31 @@ impl CapturedNode {
 
 pub(super) fn snapshot(path: &Path) -> Result<NativeSnapshot, RunnerError> {
     snapshot_held(&HeldPath::new(path)?)
+}
+
+pub(super) fn metadata_for_new_private_file(path: &Path) -> Result<NativeMetadata, RunnerError> {
+    let held = HeldPath::new(path)?;
+    let before = held.parent_node()?;
+    validate_target_missing(&held)?;
+    run_creation_metadata_test_hook();
+    let reopened = open_absolute_directory(&held.parent_path)?;
+    let after = held.parent_node()?;
+    validate_target_missing(&held)?;
+    if !raw_node_unchanged(&before, &after) || identity(held.parent()?)? != identity(&reopened)? {
+        return Err(RunnerError::ConcurrentChange);
+    }
+    Ok(NativeMetadata {
+        file_attributes: FILE_ATTRIBUTE_NORMAL,
+        creation_time: before.basic.CreationTime,
+        last_access_time: before.basic.LastAccessTime,
+        last_write_time: before.basic.LastWriteTime,
+        change_time: before.basic.ChangeTime,
+        security_descriptor: current_user_private_file_security_descriptor()?,
+        alternate_streams: Vec::new(),
+        link_count: 1,
+        parent_attributes: before.attributes,
+        parent_link_count: before.links,
+    })
 }
 
 #[cfg(test)]
@@ -2199,25 +2255,144 @@ fn alternate_streams(
 fn security_descriptor(file: &File) -> Result<Vec<u8>, RunnerError> {
     let information =
         OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
-    let mut needed = 0;
-    unsafe {
-        GetKernelObjectSecurity(
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    let result = unsafe {
+        GetSecurityInfo(
             file.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
             information,
             null_mut(),
-            0,
-            &mut needed,
-        );
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if result != ERROR_SUCCESS {
+        return Err(RunnerError::Io);
     }
+    let allocation = LocalSecurityDescriptor::new(descriptor)?;
+    let length = unsafe { GetSecurityDescriptorLength(allocation.as_ptr()) };
+    if length == 0 {
+        return Err(RunnerError::Io);
+    }
+    let descriptor = unsafe {
+        std::slice::from_raw_parts(allocation.as_ptr().cast::<u8>(), length as usize).to_vec()
+    };
+    restorable_security_descriptor(&descriptor)?;
+    Ok(descriptor)
+}
+
+struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+impl LocalSecurityDescriptor {
+    fn new(descriptor: PSECURITY_DESCRIPTOR) -> Result<Self, RunnerError> {
+        if descriptor.is_null() {
+            return Err(RunnerError::Io);
+        }
+        Ok(Self(descriptor))
+    }
+
+    const fn as_ptr(&self) -> PSECURITY_DESCRIPTOR {
+        self.0
+    }
+}
+
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        unsafe {
+            LocalFree(self.0.cast::<c_void>() as HLOCAL);
+        }
+    }
+}
+
+fn current_user_private_file_security_descriptor() -> Result<Vec<u8>, RunnerError> {
+    let mut token: HANDLE = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(RunnerError::Io);
+    }
+    let result = (|| {
+        let user = token_information(token, TokenUser)?;
+        let primary_group = token_information(token, TokenPrimaryGroup)?;
+        let owner = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let group = unsafe { (*primary_group.as_ptr().cast::<TOKEN_PRIMARY_GROUP>()).PrimaryGroup };
+        if owner.is_null()
+            || group.is_null()
+            || unsafe { IsValidSid(owner) } == 0
+            || unsafe { IsValidSid(group) } == 0
+        {
+            return Err(RunnerError::Io);
+        }
+
+        let owner_length = unsafe { GetLengthSid(owner) };
+        let acl_length = size_of::<ACL>()
+            .checked_add(size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>())
+            .and_then(|length| length.checked_add(owner_length as usize))
+            .ok_or(RunnerError::LimitExceeded)?;
+        let acl_words = acl_length
+            .div_ceil(size_of::<u32>())
+            .max(size_of::<ACL>().div_ceil(size_of::<u32>()));
+        let mut acl_storage = vec![0_u32; acl_words];
+        let acl = acl_storage.as_mut_ptr().cast::<ACL>();
+        let acl_capacity = u32::try_from(acl_storage.len() * size_of::<u32>())
+            .map_err(|_| RunnerError::LimitExceeded)?;
+        if unsafe { InitializeAcl(acl, acl_capacity, ACL_REVISION) } == 0
+            || unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, 0, FILE_ALL_ACCESS, owner) } == 0
+        {
+            return Err(RunnerError::Io);
+        }
+
+        let mut absolute = SECURITY_DESCRIPTOR::default();
+        let absolute_pointer = (&mut absolute as *mut SECURITY_DESCRIPTOR).cast();
+        if unsafe {
+            InitializeSecurityDescriptor(absolute_pointer, SECURITY_DESCRIPTOR_REVISION_V1)
+        } == 0
+            || unsafe { SetSecurityDescriptorOwner(absolute_pointer, owner, 0) } == 0
+            || unsafe { SetSecurityDescriptorGroup(absolute_pointer, group, 0) } == 0
+            || unsafe { SetSecurityDescriptorDacl(absolute_pointer, 1, acl, 0) } == 0
+            || unsafe {
+                SetSecurityDescriptorControl(absolute_pointer, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+            } == 0
+        {
+            return Err(RunnerError::Io);
+        }
+
+        let mut needed = 0;
+        unsafe { MakeSelfRelativeSD(absolute_pointer, null_mut(), &mut needed) };
+        if needed == 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+            return Err(RunnerError::Io);
+        }
+        let mut descriptor = vec![0_u8; needed as usize];
+        if unsafe {
+            MakeSelfRelativeSD(
+                absolute_pointer,
+                descriptor.as_mut_ptr().cast(),
+                &mut needed,
+            )
+        } == 0
+        {
+            return Err(RunnerError::Io);
+        }
+        descriptor.truncate(needed as usize);
+        Ok(descriptor)
+    })();
+    let _ = unsafe { CloseHandle(token) };
+    result
+}
+
+fn token_information(token: HANDLE, information_class: i32) -> Result<Vec<usize>, RunnerError> {
+    let mut needed = 0;
+    unsafe { GetTokenInformation(token, information_class, null_mut(), 0, &mut needed) };
     if needed == 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
         return Err(RunnerError::Io);
     }
-    let mut descriptor = vec![0_u8; needed as usize];
+    let words = (needed as usize).div_ceil(size_of::<usize>());
+    let mut information = vec![0_usize; words];
     if unsafe {
-        GetKernelObjectSecurity(
-            file.as_raw_handle() as HANDLE,
-            information,
-            descriptor.as_mut_ptr().cast(),
+        GetTokenInformation(
+            token,
+            information_class,
+            information.as_mut_ptr().cast(),
             needed,
             &mut needed,
         )
@@ -2225,8 +2400,7 @@ fn security_descriptor(file: &File) -> Result<Vec<u8>, RunnerError> {
     {
         return Err(RunnerError::Io);
     }
-    descriptor.truncate(needed as usize);
-    Ok(descriptor)
+    Ok(information)
 }
 
 #[cfg(test)]
@@ -2235,6 +2409,14 @@ mod pre_rename_tests {
 
     use super::*;
     use crate::{NativeRecoveryDisposition, NativeState, OsNativeFileSystem, RunnerError};
+    use windows_sys::Win32::{
+        Security::{
+            ACCESS_ALLOWED_ACE, EqualSid, GetAce, GetSecurityDescriptorControl,
+            GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, INHERITED_ACE,
+            OBJECT_INHERIT_ACE, SE_DACL_PRESENT, SE_DACL_PROTECTED,
+        },
+        Storage::FileSystem::FILE_ALL_ACCESS,
+    };
 
     const TEST_NONCE: [u8; 16] = [0x3c; 16];
     const TEMP_ABORT_PATH_ENV: &str = "CONTEXT_RELAY_TEMP_ABORT_PATH";
@@ -2251,6 +2433,165 @@ mod pre_rename_tests {
         ));
         fs::create_dir(&root).unwrap();
         root
+    }
+
+    fn descriptor_has_inheritable_world_access(descriptor: &[u8]) -> bool {
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = null_mut();
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor.as_ptr().cast_mut().cast(),
+                &mut present,
+                &mut dacl,
+                &mut defaulted,
+            )
+        } == 0
+            || present == 0
+            || dacl.is_null()
+        {
+            return false;
+        }
+        let world_sid = [0x0000_0101_u32, 0x0100_0000, 0];
+        for index in 0..unsafe { (*dacl).AceCount } as u32 {
+            let mut raw_ace = null_mut();
+            if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 || raw_ace.is_null() {
+                return false;
+            }
+            let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let sid = (&raw const ace.SidStart).cast_mut().cast();
+            if ace.Header.AceType == 0
+                && u32::from(ace.Header.AceFlags) & OBJECT_INHERIT_ACE != 0
+                && unsafe { EqualSid(sid, world_sid.as_ptr().cast_mut().cast()) } != 0
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn assert_owner_only_file_descriptor(descriptor: &[u8]) {
+        let mut control = 0;
+        let mut revision = 0;
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorControl(
+                    descriptor.as_ptr().cast_mut().cast(),
+                    &mut control,
+                    &mut revision,
+                )
+            },
+            0
+        );
+        assert_ne!(control & SE_DACL_PRESENT, 0);
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+
+        let mut owner = null_mut();
+        let mut owner_defaulted = 0;
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorOwner(
+                    descriptor.as_ptr().cast_mut().cast(),
+                    &mut owner,
+                    &mut owner_defaulted,
+                )
+            },
+            0
+        );
+        assert!(!owner.is_null());
+
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = null_mut();
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    descriptor.as_ptr().cast_mut().cast(),
+                    &mut present,
+                    &mut dacl,
+                    &mut defaulted,
+                )
+            },
+            0
+        );
+        assert_ne!(present, 0);
+        assert!(!dacl.is_null());
+        assert_eq!(unsafe { (*dacl).AceCount }, 1);
+
+        let mut raw_ace = null_mut();
+        assert_ne!(unsafe { GetAce(dacl, 0, &mut raw_ace) }, 0);
+        assert!(!raw_ace.is_null());
+        let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+        assert_eq!(ace.Header.AceType, 0);
+        assert_eq!(u32::from(ace.Header.AceFlags) & INHERITED_ACE, 0);
+        assert_eq!(ace.Mask, FILE_ALL_ACCESS);
+        let sid = (&raw const ace.SidStart).cast_mut().cast();
+        assert_ne!(unsafe { EqualSid(owner, sid) }, 0);
+    }
+
+    #[test]
+    fn private_creation_replaces_permissive_inherited_acl_with_owner_only_dacl() {
+        let _serial = PRE_RENAME_TEST_SERIAL.lock().unwrap();
+        let root = test_root("private-creation-owner-only-dacl");
+        let status = Command::new("icacls")
+            .arg(&root)
+            .args(["/inheritance:e", "/grant", "*S-1-1-0:(OI)(CI)F"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to install permissive parent ACL");
+
+        let path = root.join("AGENTS.md");
+        let held = HeldPath::new(&path).unwrap();
+        assert!(descriptor_has_inheritable_world_access(
+            &security_descriptor(held.parent().unwrap()).unwrap()
+        ));
+        drop(held);
+
+        let before = snapshot(&path).unwrap();
+        let metadata = metadata_for_new_private_file(&path).unwrap();
+        let desired = NativeState::regular_file(b"managed\r\n".to_vec(), metadata);
+        let created = cas(&path, before.fingerprint(), &desired).unwrap();
+        assert_owner_only_file_descriptor(
+            created.snapshot().metadata().unwrap().security_descriptor(),
+        );
+
+        let rolled_back = cas(&path, created.snapshot().fingerprint(), before.state()).unwrap();
+        assert_eq!(rolled_back.snapshot().fingerprint(), before.fingerprint());
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_creation_metadata_rejects_parent_identity_change() {
+        let _serial = PRE_RENAME_TEST_SERIAL.lock().unwrap();
+        let root = test_root("private-creation-parent-race");
+        let path = root.join("AGENTS.md");
+        let held = HeldPath::new(&path).unwrap();
+        let parent = held.open_flushable_parent().unwrap();
+        let original = raw_node(&parent).unwrap().basic;
+        let changed = FILE_BASIC_INFO {
+            FileAttributes: original.FileAttributes | 0x2,
+            ..original
+        };
+        *CREATION_METADATA_TEST_HOOK.lock().unwrap() = Some(Box::new(move || {
+            set_basic_info(&parent, &changed).unwrap();
+            flush_handle(&parent).unwrap();
+        }));
+        drop(held);
+
+        assert_eq!(
+            metadata_for_new_private_file(&path),
+            Err(RunnerError::ConcurrentChange)
+        );
+        assert!(!path.exists());
+
+        let held = HeldPath::new(&path).unwrap();
+        let parent = held.open_flushable_parent().unwrap();
+        set_basic_info(&parent, &original).unwrap();
+        flush_handle(&parent).unwrap();
+        drop(parent);
+        drop(held);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn simulate_crash_gap(path: &Path, before: &NativeSnapshot) -> PathBuf {
@@ -3056,18 +3397,110 @@ mod pre_rename_tests {
 }
 
 fn set_security_descriptor(file: &File, descriptor: &[u8]) -> Result<(), RunnerError> {
-    if descriptor.is_empty() {
+    let parts = restorable_security_descriptor(descriptor)?;
+    if unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
+            parts.information,
+            parts.owner,
+            parts.group,
+            parts.dacl,
+            null_mut(),
+        )
+    } != ERROR_SUCCESS
+    {
         return Err(RunnerError::Io);
     }
-    let information =
-        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    Ok(())
+}
+
+struct RestorableSecurityDescriptor {
+    information: u32,
+    owner: PSID,
+    group: PSID,
+    dacl: *mut ACL,
+}
+
+fn restorable_security_descriptor(
+    descriptor: &[u8],
+) -> Result<RestorableSecurityDescriptor, RunnerError> {
+    validate_self_relative_security_descriptor(descriptor)?;
+    let mut control = 0;
+    let mut revision = 0;
     if unsafe {
-        SetKernelObjectSecurity(
-            file.as_raw_handle() as HANDLE,
-            information,
+        GetSecurityDescriptorControl(
             descriptor.as_ptr().cast_mut().cast(),
+            &mut control,
+            &mut revision,
         )
     } == 0
+    {
+        return Err(RunnerError::Io);
+    }
+    let descriptor = descriptor.as_ptr().cast_mut().cast();
+    let mut owner: PSID = null_mut();
+    let mut owner_defaulted = 0;
+    let mut group: PSID = null_mut();
+    let mut group_defaulted = 0;
+    let mut dacl = null_mut();
+    let mut dacl_present = 0;
+    let mut dacl_defaulted = 0;
+    if unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut owner_defaulted) } == 0
+        || unsafe { GetSecurityDescriptorGroup(descriptor, &mut group, &mut group_defaulted) } == 0
+        || unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor,
+                &mut dacl_present,
+                &mut dacl,
+                &mut dacl_defaulted,
+            )
+        } == 0
+        || owner.is_null()
+        || group.is_null()
+        || dacl_present == 0
+        || (!owner.is_null() && unsafe { IsValidSid(owner) } == 0)
+        || (!group.is_null() && unsafe { IsValidSid(group) } == 0)
+        || (dacl_present != 0 && !dacl.is_null() && unsafe { IsValidAcl(dacl) } == 0)
+    {
+        return Err(RunnerError::Io);
+    }
+    let mut information = 0;
+    if !owner.is_null() {
+        information |= OWNER_SECURITY_INFORMATION;
+    }
+    if !group.is_null() {
+        information |= GROUP_SECURITY_INFORMATION;
+    }
+    if dacl_present != 0 {
+        information |= DACL_SECURITY_INFORMATION;
+        information |= if control & SE_DACL_PROTECTED != 0 {
+            PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            UNPROTECTED_DACL_SECURITY_INFORMATION
+        };
+    }
+    Ok(RestorableSecurityDescriptor {
+        information,
+        owner,
+        group,
+        dacl,
+    })
+}
+
+fn validate_self_relative_security_descriptor(descriptor: &[u8]) -> Result<(), RunnerError> {
+    const SECURITY_DESCRIPTOR_RELATIVE_HEADER_BYTES: usize = 20;
+    if descriptor.len() < SECURITY_DESCRIPTOR_RELATIVE_HEADER_BYTES {
+        return Err(RunnerError::Io);
+    }
+    let descriptor_pointer = descriptor.as_ptr().cast_mut().cast();
+    let mut control = 0;
+    let mut revision = 0;
+    if unsafe { IsValidSecurityDescriptor(descriptor_pointer) } == 0
+        || unsafe { GetSecurityDescriptorControl(descriptor_pointer, &mut control, &mut revision) }
+            == 0
+        || control & SE_SELF_RELATIVE == 0
+        || unsafe { GetSecurityDescriptorLength(descriptor_pointer) } as usize != descriptor.len()
     {
         return Err(RunnerError::Io);
     }

@@ -188,8 +188,8 @@ const nullAtPath = (value: unknown, path: readonly PropertyKey[]) => {
 };
 
 describe('generated protocol version', () => {
-  it('advertises recovery enrollment as v1.3', () => {
-    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 3 });
+  it('advertises the profile-bound local contract as v1.4', () => {
+    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 4 });
   });
 });
 
@@ -306,7 +306,7 @@ describe('protocol schemas', () => {
     }
   });
 
-  it('accepts only status protocol ranges containing v1.3', () => {
+  it('accepts only the exact status protocol range for v1.4', () => {
     const ajv = createProtocolSchemaValidator();
     const validate = ajv.compile(load('schemas/context_relay_status-output-v1.json'));
     const fixture = load('crates/protocol/tests/fixtures/mcp-output-valid.json').context_relay_status;

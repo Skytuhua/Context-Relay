@@ -3,11 +3,11 @@ use context_relay_protocol::{
 };
 
 #[test]
-fn status_output_requires_a_range_containing_supported_v1() {
+fn status_output_requires_the_exact_supported_local_version() {
     let mut output = serde_json::json!({
         "protocol": {
-            "min": { "major": 1, "minor": 3 },
-            "max": { "major": 1, "minor": 3 }
+            "min": { "major": 1, "minor": 4 },
+            "max": { "major": 1, "minor": 4 }
         },
         "vault": "unlocked",
         "resolvedProject": null,

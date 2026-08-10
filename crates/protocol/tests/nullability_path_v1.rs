@@ -84,7 +84,7 @@ fn required_nullable_shared_and_output_fields_distinguish_omission_from_null() {
     );
     assert_required_nullable::<StatusOutput>(
         json!({
-            "protocol":{"min":{"major":1,"minor":3},"max":{"major":1,"minor":3}},
+            "protocol":{"min":{"major":1,"minor":4},"max":{"major":1,"minor":4}},
             "vault":"unlocked",
             "resolvedProject":null,
             "sync":"idle",
@@ -304,10 +304,10 @@ fn every_other_nullable_protocol_property_remains_required() {
     for field in ["taskId", "expectedRevision"] {
         assert_required_nullable::<TaskUpsertParams>(task_upsert.clone(), field);
     }
-    assert_required_nullable::<HarnessParams>(
-        json!({"harness":"codex","projectId":null}),
-        "projectId",
-    );
+    let harness = json!({"harness":"codex","projectId":null,"hermesProfile":null});
+    for field in ["projectId", "hermesProfile"] {
+        assert_required_nullable::<HarnessParams>(harness.clone(), field);
+    }
     assert_required_nullable::<ExportParams>(
         json!({"projectId":null,"includeArchived":false}),
         "projectId",

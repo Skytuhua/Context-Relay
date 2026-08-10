@@ -42,6 +42,7 @@
   "setupPlan": {
     "planId": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
     "harness": "codex",
+    "harnessProfile": null,
     "adapterVersion": 1,
     "executablePath": {"platform": "windows", "bytes": "YwA", "display": "c"},
     "executableHash": "0101010101010101010101010101010101010101010101010101010101010101",
@@ -97,7 +98,7 @@
   "memoryCreateRequest": {
     "jsonrpc": "2.0",
     "id": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
-    "protocol": {"major": 1, "minor": 3},
+    "protocol": {"major": 1, "minor": 4},
     "daemonInstanceNonce": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
     "method": "memory_create",
     "params": {

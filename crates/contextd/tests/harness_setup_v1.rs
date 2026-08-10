@@ -38,7 +38,7 @@ const ROLLBACK_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073990";
 #[derive(Default)]
 struct RecordingEngine {
     reconciles: AtomicUsize,
-    previews: Mutex<Vec<HarnessId>>,
+    previews: Mutex<Vec<(HarnessId, Option<String>)>>,
     applied: Mutex<BTreeSet<PlanId>>,
     rolled_back: Mutex<BTreeSet<PlanId>>,
     writes: AtomicUsize,
@@ -69,7 +69,9 @@ impl BridgeInstallEngine for RegisteringEngine {
         _device_id: DeviceId,
         params: HarnessParams,
     ) -> Result<SetupPlan, ClientError> {
-        Ok(plan(params.harness))
+        let mut plan = plan(params.harness);
+        plan.harness_profile = params.hermes_profile;
+        Ok(plan)
     }
 
     fn apply(
@@ -189,8 +191,13 @@ impl BridgeInstallEngine for RecordingEngine {
         _device_id: DeviceId,
         params: HarnessParams,
     ) -> Result<SetupPlan, ClientError> {
-        self.previews.lock().unwrap().push(params.harness);
-        Ok(plan(params.harness))
+        self.previews
+            .lock()
+            .unwrap()
+            .push((params.harness, params.hermes_profile.clone()));
+        let mut plan = plan(params.harness);
+        plan.harness_profile = params.hermes_profile;
+        Ok(plan)
     }
 
     fn apply(
@@ -229,19 +236,30 @@ async fn preview_returns_plan_for_every_harness_and_decline_does_not_write_or_la
     let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
 
     for harness in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Hermes] {
+        let hermes_profile = (harness == HarnessId::Hermes).then(|| "coder".to_owned());
         let result = client
             .call(LocalRequest::HarnessPreview(HarnessParams {
                 harness,
                 project_id: None,
+                hermes_profile: hermes_profile.clone(),
             }))
             .await
             .unwrap();
-        assert!(matches!(result, LocalResult::Plan { plan } if plan.harness == harness));
+        assert!(matches!(result, LocalResult::Plan { plan }
+            if plan.harness == harness && plan.harness_profile == hermes_profile));
     }
 
     assert_eq!(fixture.engine.writes.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.engine.bridge_launches.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.engine.previews.lock().unwrap().len(), 3);
+    assert_eq!(
+        fixture.engine.previews.lock().unwrap().as_slice(),
+        [
+            (HarnessId::ClaudeCode, None),
+            (HarnessId::Codex, None),
+            (HarnessId::Hermes, Some("coder".to_owned())),
+        ]
+    );
     fixture.stop().await;
 }
 
@@ -312,6 +330,7 @@ async fn digest_change_rejects_apply_without_write_and_repair_stays_unsupported(
         .call(LocalRequest::HarnessRepair(HarnessParams {
             harness: HarnessId::Codex,
             project_id: None,
+            hermes_profile: None,
         }))
         .await
         .unwrap_err();
@@ -329,6 +348,7 @@ async fn setup_is_authorized_before_routing_and_canceled_queue_items_do_not_exec
         .call(LocalRequest::HarnessPreview(HarnessParams {
             harness: HarnessId::Codex,
             project_id: None,
+            hermes_profile: None,
         }))
         .await
         .unwrap_err();
@@ -341,6 +361,7 @@ async fn setup_is_authorized_before_routing_and_canceled_queue_items_do_not_exec
             .call(LocalRequest::HarnessPreview(HarnessParams {
                 harness: HarnessId::ClaudeCode,
                 project_id: None,
+                hermes_profile: None,
             }))
             .await
     });
@@ -355,6 +376,7 @@ async fn setup_is_authorized_before_routing_and_canceled_queue_items_do_not_exec
                 LocalRequest::HarnessPreview(HarnessParams {
                     harness: HarnessId::Hermes,
                     project_id: None,
+                    hermes_profile: Some("default".to_owned()),
                 }),
             )
             .await
@@ -379,7 +401,7 @@ async fn setup_is_authorized_before_routing_and_canceled_queue_items_do_not_exec
     );
     assert_eq!(
         *fixture.engine.previews.lock().unwrap(),
-        vec![HarnessId::ClaudeCode]
+        vec![(HarnessId::ClaudeCode, None)]
     );
     fixture.stop().await;
 }
@@ -750,6 +772,7 @@ fn plan(harness: HarnessId) -> SetupPlan {
     SetupPlan {
         plan_id: PlanId::from_str(PLAN).unwrap(),
         harness,
+        harness_profile: (harness == HarnessId::Hermes).then(|| "default".to_owned()),
         adapter_version: 1,
         executable_path: native_text("/fixture/harness"),
         executable_hash: Sha256Digest([1; 32]),

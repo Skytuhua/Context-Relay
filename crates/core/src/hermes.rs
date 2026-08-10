@@ -54,10 +54,16 @@ pub enum HermesExecutableKind {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ExecutableSnapshot {
     kind: HermesExecutableKind,
     digest: Sha256Digest,
+}
+
+impl ExecutableSnapshot {
+    fn runnable(&self) -> bool {
+        self.kind == HermesExecutableKind::Native
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,6 +119,7 @@ pub struct HermesAdapter {
     #[allow(dead_code)]
     observed_hlc: HybridLogicalClock,
     executable_hash: Sha256Digest,
+    executable_snapshot: Box<ExecutableSnapshot>,
     gateway_profile: Option<gateway::GatewayProfileReservation>,
     gateway_lease: Option<gateway::GatewayLease>,
 }
@@ -125,6 +132,7 @@ impl Clone for HermesAdapter {
             origin_device: self.origin_device,
             observed_hlc: self.observed_hlc,
             executable_hash: self.executable_hash,
+            executable_snapshot: self.executable_snapshot.clone(),
             gateway_profile: None,
             gateway_lease: None,
         }
@@ -261,7 +269,10 @@ impl HermesAdapter {
         layout.executable = fs::canonicalize(&layout.executable)
             .map_err(|_| invalid("Hermes executable cannot be safely resolved"))?;
         let executable = snapshot_executable(&layout.executable)?;
-        if expected_snapshot.is_some_and(|expected| executable != expected) {
+        if expected_snapshot
+            .as_ref()
+            .is_some_and(|expected| &executable != expected)
+        {
             return Err(conflict("Hermes executable changed"));
         }
         require_directory(&layout.project_root, "Hermes project root was not found")?;
@@ -292,6 +303,7 @@ impl HermesAdapter {
             origin_device,
             observed_hlc,
             executable_hash: executable.digest,
+            executable_snapshot: Box::new(executable),
             gateway_profile: None,
             gateway_lease: None,
         })
@@ -336,9 +348,7 @@ impl HermesAdapter {
             return Err(invalid("Hermes staged config topology is unsupported"));
         }
         let attested = attest_executable(&self.layout.executable)?;
-        if attested.snapshot.kind != HermesExecutableKind::Native
-            || attested.snapshot.digest != self.executable_hash
-        {
+        if attested.snapshot != *self.executable_snapshot {
             return Err(conflict("Hermes executable changed"));
         }
         let executable_stage = stage_executable(&attested)?;
@@ -356,7 +366,7 @@ impl HermesAdapter {
 
     pub(crate) fn capability(&self) -> CapabilityLevel {
         if SUPPORTED_VERSIONS.contains(&self.layout.version.as_str())
-            && self.layout.executable_kind == HermesExecutableKind::Native
+            && self.executable_snapshot.runnable()
             && self.yaml_topology_supported()
         {
             CapabilityLevel::Full
@@ -381,9 +391,7 @@ impl HermesAdapter {
             return Err(conflict("Hermes profile binding changed"));
         }
         let executable = snapshot_executable(&self.layout.executable)?;
-        if executable.kind != HermesExecutableKind::Native
-            || executable.digest != self.executable_hash
-        {
+        if executable != *self.executable_snapshot {
             return Err(conflict("Hermes executable changed"));
         }
         let project_root = fs::canonicalize(&self.layout.project_root)
@@ -427,7 +435,11 @@ impl HermesAdapter {
         if !yaml::topology_supported(&parsed) {
             return Err(invalid("Hermes config topology is unsupported"));
         }
-        import::validation_config_projection(&parsed, &self.layout.profile.name)
+        import::validation_config_projection(
+            &parsed,
+            &self.layout.profile.name,
+            &self.layout.version,
+        )
     }
 }
 
@@ -553,6 +565,27 @@ impl NativeAdapter for HermesAdapter {
         if receipt.plan_id != plan.setup.plan_id || receipt.resulting_digests != intended {
             return Err(BoundaryError::new(
                 "Hermes effective state differs from the plan",
+            ));
+        }
+        if plan.mutations.is_empty() && plan.cli_mutations.is_empty() {
+            return Ok(());
+        }
+        let config_target = wire_path(&self.layout.profile.hermes_home.join("config.yaml"));
+        if !plan
+            .mutations
+            .iter()
+            .any(|mutation| mutation.target == config_target)
+        {
+            self.revalidate_effective_sources()
+                .map_err(|_| BoundaryError::new("Hermes effective configuration is invalid"))?;
+            return Ok(());
+        }
+        let report = self
+            .validate_effective_with(receipt, run_validation)
+            .map_err(|_| BoundaryError::new("Hermes effective configuration is invalid"))?;
+        if !report.valid {
+            return Err(BoundaryError::new(
+                "Hermes effective configuration is invalid",
             ));
         }
         Ok(())
@@ -1147,6 +1180,10 @@ fn snapshot_executable(path: &Path) -> Result<ExecutableSnapshot, ClientError> {
 }
 
 fn attest_executable(path: &Path) -> Result<AttestedExecutable, ClientError> {
+    attest_regular_executable(path)
+}
+
+fn attest_regular_executable(path: &Path) -> Result<AttestedExecutable, ClientError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1166,16 +1203,14 @@ fn attest_executable(path: &Path) -> Result<AttestedExecutable, ClientError> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|_| invalid("Hermes executable cannot be read"))?;
-    let kind = classify_executable_bytes(path, &bytes);
+    let mut kind = classify_executable_bytes(path, &bytes);
     #[cfg(unix)]
-    let kind = {
+    {
         use std::os::unix::fs::PermissionsExt as _;
         if kind == HermesExecutableKind::Native && metadata.permissions().mode() & 0o111 == 0 {
-            HermesExecutableKind::Unknown
-        } else {
-            kind
+            kind = HermesExecutableKind::Unknown;
         }
-    };
+    }
     Ok(AttestedExecutable {
         snapshot: ExecutableSnapshot {
             kind,
@@ -1186,6 +1221,9 @@ fn attest_executable(path: &Path) -> Result<AttestedExecutable, ClientError> {
 }
 
 fn stage_executable(attested: &AttestedExecutable) -> Result<StagedExecutable, ClientError> {
+    if !attested.snapshot.runnable() {
+        return Err(invalid("Hermes wrapper execution is unsupported"));
+    }
     let mut builder = tempfile::Builder::new();
     builder.prefix("context-relay-hermes-");
     #[cfg(unix)]
@@ -1240,8 +1278,14 @@ fn classify_executable_bytes(path: &Path, bytes: &[u8]) -> HermesExecutableKind 
     if matches!(extension.as_deref(), Some("cmd" | "bat" | "ps1")) {
         return HermesExecutableKind::Wrapper;
     }
+    // A setuptools/distlib Python console launcher is itself a PE image. Without
+    // an immutable reviewed Windows artifact manifest, PE magic cannot prove
+    // that this is a standalone Hermes implementation. Keep every PE candidate
+    // import-only, including one renamed to omit the `.exe` suffix.
+    if bytes.starts_with(b"MZ") {
+        return HermesExecutableKind::Wrapper;
+    }
     if bytes.starts_with(b"\x7fELF")
-        || bytes.starts_with(b"MZ")
         || bytes.starts_with(&[0xfe, 0xed, 0xfa, 0xce])
         || bytes.starts_with(&[0xfe, 0xed, 0xfa, 0xcf])
         || bytes.starts_with(&[0xce, 0xfa, 0xed, 0xfe])
@@ -1280,14 +1324,14 @@ fn discover_executable_version_with_boundaries(
     mut execute: impl FnMut(&Path, ExecutableSnapshot) -> Result<Vec<u8>, ClientError>,
 ) -> Result<(ExecutableSnapshot, String), ClientError> {
     let attested = attest_executable(executable)?;
-    let version = if attested.snapshot.kind == HermesExecutableKind::Native {
+    let version = if attested.snapshot.runnable() {
         after_snapshot();
         if snapshot_executable(executable)? != attested.snapshot {
             return Err(conflict("Hermes executable changed"));
         }
         let staged = stage_executable(&attested)?;
         after_staging(executable, &staged.path);
-        let output = execute(&staged.path, staged.snapshot)?;
+        let output = execute(&staged.path, staged.snapshot.clone())?;
         if snapshot_executable(&staged.path)? != staged.snapshot {
             return Err(conflict("Hermes staged executable changed"));
         }
@@ -1302,6 +1346,9 @@ fn run_version(
     executable: &Path,
     expected_snapshot: ExecutableSnapshot,
 ) -> Result<Vec<u8>, ClientError> {
+    if !expected_snapshot.runnable() {
+        return Err(invalid("Hermes wrapper execution is unsupported"));
+    }
     if snapshot_executable(executable)? != expected_snapshot {
         return Err(conflict("Hermes executable changed"));
     }
@@ -1513,8 +1560,6 @@ mod tests {
     };
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    #[cfg(unix)]
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn default_home_resolution_matches_windows_priority_and_fallback() {
@@ -1719,6 +1764,39 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn write_official_launcher_chain(root: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let bin = root.join("hermes-agent/venv/bin");
+        let command_bin = root.join("command-bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&command_bin).unwrap();
+        fs::write(root.join("hermes-agent/venv/pyvenv.cfg"), "home = pinned\n").unwrap();
+        let interpreter = bin.join("python");
+        fs::write(&interpreter, b"\xcf\xfa\xed\xfeofficial python").unwrap();
+        fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+        let python_launcher = bin.join("hermes");
+        let launcher = format!(
+            "#!{}\n# -*- coding: utf-8 -*-\nimport sys\nfrom hermes_cli.main import main\nif __name__ == \"__main__\":\n    if sys.argv[0].endswith(\"-script.pyw\"):\n        sys.argv[0] = sys.argv[0][:-11]\n    elif sys.argv[0].endswith(\".exe\"):\n        sys.argv[0] = sys.argv[0][:-4]\n    sys.exit(main())\n",
+            interpreter.display()
+        )
+        .into_bytes();
+        fs::write(&python_launcher, &launcher).unwrap();
+        fs::set_permissions(&python_launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        let shim = command_bin.join("hermes");
+        fs::write(
+            &shim,
+            format!(
+                "#!/usr/bin/env bash\nunset PYTHONPATH\nunset PYTHONHOME\nexec \"{}\" \"$@\"\n",
+                python_launcher.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+        (shim, interpreter, launcher)
+    }
+
     #[test]
     fn effective_validation_uses_only_isolated_nonsecret_home() {
         let fixture = validation_fixture("0.18.2");
@@ -1788,6 +1866,15 @@ mod tests {
         ] {
             assert!(imported_approval.body_markdown.contains(preserved));
         }
+        let live_config = fs::read(fixture.layout.profile.hermes_home.join("config.yaml")).unwrap();
+        let live_config = yaml::parse_config(&live_config).unwrap();
+        let expected_projection = import::validation_config_projection(
+            &live_config,
+            &fixture.layout.profile.name,
+            &fixture.layout.version,
+        )
+        .unwrap();
+        let expected_projection = serde_yaml_ng::to_value(expected_projection).unwrap();
         let stages = RefCell::new(Vec::new());
         for _ in 0..2 {
             let report = fixture
@@ -1827,10 +1914,17 @@ mod tests {
                     stages.borrow_mut().push(request.staged_hermes_home.clone());
                     let staged =
                         fs::read_to_string(request.staged_hermes_home.join("config.yaml")).unwrap();
-                    assert_eq!(staged, "{}\n");
+                    assert!(staged.contains("approvals:"));
+                    assert!(staged.contains("mode: \"smart\""));
+                    assert!(staged.contains("command_allowlist:"));
+                    assert!(staged.contains("plugins:"));
+                    assert!(staged.contains("mcp_servers:"));
+                    assert!(staged.contains("safe-command"));
+                    assert!(staged.contains("https://example.com/mcp"));
+                    assert!(staged.contains("hooks:"));
+                    assert!(staged.contains("configured-hook-command"));
                     let parsed = yaml::parse_config(staged.as_bytes()).unwrap();
-                    let expected: serde_yaml_ng::Value = serde_yaml_ng::from_str("{}\n").unwrap();
-                    assert_eq!(parsed.value, expected);
+                    assert_eq!(parsed.value, expected_projection);
                     for excluded in [
                         "must-not-stage",
                         "provider:",
@@ -1838,27 +1932,11 @@ mod tests {
                         "authorization",
                         "headers:",
                         "env:",
-                        "command_allowlist:",
-                        "cargo test",
-                        "plugins:",
-                        "mcp_servers:",
-                        "hooks:",
-                        "safe-command",
-                        "--serve",
-                        "https://example.com/mcp",
-                        "${mcp_token}",
-                        "configured-hook-command",
-                        "--audit",
-                        "arbitrary-extension-value",
-                        "smart",
-                        "extension:",
-                        "approval-command",
-                        "--approval-arg",
-                        "https://example.com/approval",
-                        "${approval_token}",
-                        "approval-extension-value",
                     ] {
-                        assert!(!staged.to_ascii_lowercase().contains(excluded));
+                        assert!(
+                            !staged.to_ascii_lowercase().contains(excluded),
+                            "staged projection exposed excluded marker {excluded}: {staged}"
+                        );
                     }
                     assert!(request.staged_hermes_home.join("memories").is_dir());
                     for forbidden in [
@@ -2101,43 +2179,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn version_probe_clears_caller_environment_and_uses_stage_directory() {
+    fn direct_wrapper_version_runner_rejects_before_process_creation() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let _guard = ENV_LOCK.lock().unwrap();
         let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
-            "context-relay-hermes-version-process-{}-{}",
+            "context-relay-hermes-direct-wrapper-{}-{}",
             std::process::id(),
             NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&root).unwrap();
         let executable = root.join("hermes");
-        let canary = root.join("inherited-environment");
-        let observed_cwd = root.join("observed-cwd");
+        let canary = root.join("wrapper-ran");
         fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nif [ -n \"$CONTEXT_RELAY_HERMES_VERSION_CANARY\" ]; then /usr/bin/touch '{}'; fi\n/bin/pwd > '{}'\nprintf 'hermes 0.18.2\\n'\n",
-                canary.display(),
-                observed_cwd.display()
+                "#!/bin/sh\n/usr/bin/touch '{}'\nprintf 'hermes 0.18.2\\n'\n",
+                canary.display()
             ),
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        // SAFETY: this test serializes its temporary process-environment mutation.
-        unsafe { env::set_var("CONTEXT_RELAY_HERMES_VERSION_CANARY", "must-not-inherit") };
-
         let snapshot = snapshot_executable(&executable).unwrap();
-        let output = run_version(&executable, snapshot).unwrap();
 
-        // SAFETY: this test serializes its temporary process-environment mutation.
-        unsafe { env::remove_var("CONTEXT_RELAY_HERMES_VERSION_CANARY") };
-        assert_eq!(parse_version(&output).as_deref(), Some("0.18.2"));
-        assert!(!canary.exists());
         assert_eq!(
-            fs::read_to_string(&observed_cwd).unwrap().trim(),
-            root.to_string_lossy()
+            run_version(&executable, snapshot).unwrap_err().code,
+            ErrorCode::InvalidRequest
         );
+        assert!(!canary.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2170,6 +2238,352 @@ mod tests {
         assert_eq!(snapshot.kind, HermesExecutableKind::Unknown);
         assert_eq!(version, "unknown");
         assert_eq!(calls.get(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malicious_official_shaped_python_venv_is_import_only_and_never_executed() {
+        let fixture = validation_fixture("0.18.2");
+        let venv_root = fixture.root.join("malicious-official-shape");
+        let (executable, _, _) = write_official_launcher_chain(&venv_root);
+        let package =
+            venv_root.join("hermes-agent/venv/lib/python3.13/site-packages/hermes_cli/main.py");
+        fs::create_dir_all(package.parent().unwrap()).unwrap();
+        let package_canary = fixture.root.join("malicious-hermes-package-ran");
+        fs::write(
+            &package,
+            format!(
+                "from pathlib import Path\nPath({:?}).write_text('executed')\ndef main(): return 0\n",
+                package_canary
+            ),
+        )
+        .unwrap();
+
+        let version_calls = Cell::new(0);
+        let (_, version) = discover_executable_version_after_snapshot(
+            &executable,
+            || {},
+            |_, _| {
+                version_calls.set(version_calls.get() + 1);
+                fs::write(&package_canary, b"version probe executed malicious package").unwrap();
+                Ok(b"hermes 0.18.2\n".to_vec())
+            },
+        )
+        .unwrap();
+        assert_eq!(version, "unknown");
+        assert_eq!(version_calls.get(), 0);
+        assert!(!package_canary.exists());
+
+        let mut layout = fixture.layout.clone();
+        layout.executable = executable;
+        layout.executable_kind = HermesExecutableKind::Wrapper;
+        let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
+        let adapter = HermesAdapter::from_layout(
+            layout,
+            fixture.project_id,
+            device_id,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+        )
+        .unwrap();
+        assert_eq!(adapter.capability(), CapabilityLevel::ImportOnly);
+        let validation_calls = Cell::new(0);
+        let error = adapter
+            .validate_effective_with(&validation_receipt(), |_| {
+                validation_calls.set(validation_calls.get() + 1);
+                fs::write(&package_canary, b"validation executed malicious package").unwrap();
+                Ok(config_check_output("0.18.2"))
+            })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::HarnessUnsupported);
+        assert_eq!(validation_calls.get(), 0);
+        assert!(!package_canary.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn official_python_launcher_is_import_only_without_a_pinned_package_closure() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for version in SUPPORTED_VERSIONS {
+            let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+                "context-relay-hermes-official-python-{}-{}",
+                std::process::id(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            let bin = root.join("hermes-agent/venv/bin");
+            fs::create_dir_all(&bin).unwrap();
+            fs::write(root.join("hermes-agent/venv/pyvenv.cfg"), "home = pinned\n").unwrap();
+            let interpreter = bin.join("python");
+            fs::write(&interpreter, b"\xcf\xfa\xed\xfeofficial python").unwrap();
+            fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+            let executable = bin.join("hermes");
+            let launcher = format!(
+                "#!{}\n# -*- coding: utf-8 -*-\nimport sys\nfrom hermes_cli.main import main\nif __name__ == \"__main__\":\n    if sys.argv[0].endswith(\"-script.pyw\"):\n        sys.argv[0] = sys.argv[0][:-11]\n    elif sys.argv[0].endswith(\".exe\"):\n        sys.argv[0] = sys.argv[0][:-4]\n    sys.exit(main())\n",
+                interpreter.display()
+            );
+            fs::write(&executable, launcher.as_bytes()).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            let calls = Cell::new(0);
+
+            let (snapshot, discovered) = discover_executable_version_after_snapshot(
+                &executable,
+                || {},
+                |_, _| {
+                    calls.set(calls.get() + 1);
+                    Ok(format!("hermes {version}\n").into_bytes())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(snapshot.kind, HermesExecutableKind::Wrapper);
+            assert_eq!(discovered, "unknown");
+            assert_eq!(calls.get(), 0);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn official_bash_shim_is_import_only_without_a_pinned_package_closure() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-hermes-official-shim-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let bin = root.join("hermes-agent/venv/bin");
+        let command_bin = root.join("command-bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&command_bin).unwrap();
+        fs::write(root.join("hermes-agent/venv/pyvenv.cfg"), "home = pinned\n").unwrap();
+        let interpreter = bin.join("python");
+        fs::write(&interpreter, b"\xcf\xfa\xed\xfeofficial python").unwrap();
+        fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+        let python_launcher = bin.join("hermes");
+        let launcher = format!(
+            "#!{}\n# -*- coding: utf-8 -*-\nimport sys\nfrom hermes_cli.main import main\nif __name__ == \"__main__\":\n    if sys.argv[0].endswith(\"-script.pyw\"):\n        sys.argv[0] = sys.argv[0][:-11]\n    elif sys.argv[0].endswith(\".exe\"):\n        sys.argv[0] = sys.argv[0][:-4]\n    sys.exit(main())\n",
+            interpreter.display()
+        );
+        fs::write(&python_launcher, launcher.as_bytes()).unwrap();
+        fs::set_permissions(&python_launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = command_bin.join("hermes");
+        let shim = format!(
+            "#!/usr/bin/env bash\nunset PYTHONPATH\nunset PYTHONHOME\nexec \"{}\" \"$@\"\n",
+            python_launcher.display()
+        );
+        fs::write(&executable, shim.as_bytes()).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let calls = Cell::new(0);
+
+        let (snapshot, version) = discover_executable_version_after_snapshot(
+            &executable,
+            || {},
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(b"hermes 0.18.2\n".to_vec())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.kind, HermesExecutableKind::Wrapper);
+        assert_eq!(version, "unknown");
+        assert_eq!(calls.get(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn official_launcher_shape_never_reaches_full_or_validation() {
+        let fixture = validation_fixture("0.18.2");
+        let (executable, _, _) = write_official_launcher_chain(&fixture.root.join("official"));
+        let mut layout = fixture.layout.clone();
+        layout.executable = executable;
+        layout.executable_kind = HermesExecutableKind::Wrapper;
+        let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
+        let adapter = HermesAdapter::from_layout(
+            layout,
+            fixture.project_id,
+            device_id,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+        )
+        .unwrap();
+
+        assert_eq!(adapter.capability(), CapabilityLevel::ImportOnly);
+        let calls = Cell::new(0);
+        let error = adapter
+            .validate_effective_with(&validation_receipt(), |_| {
+                calls.set(calls.get() + 1);
+                Ok(config_check_output("0.18.2"))
+            })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::HarnessUnsupported);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn official_wrapper_never_reaches_the_staging_boundary() {
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-hermes-official-staging-race-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let (executable, _, _) = write_official_launcher_chain(&root);
+        let staged = Cell::new(0);
+        let calls = Cell::new(0);
+
+        let (_, version) = discover_executable_version_with_boundaries(
+            &executable,
+            || {},
+            |_, _| {
+                staged.set(staged.get() + 1);
+            },
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(b"hermes 0.18.2\n".to_vec())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(version, "unknown");
+        assert_eq!(staged.get(), 0);
+        assert_eq!(calls.get(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn arbitrary_shebangs_and_modified_python_launchers_are_never_executed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for variant in [
+            "shell",
+            "wrong-topology",
+            "wrong-interpreter",
+            "modified-body",
+        ] {
+            let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+                "context-relay-hermes-untrusted-wrapper-{}-{}",
+                std::process::id(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            let bin = if variant == "wrong-topology" {
+                root.join("bin")
+            } else {
+                root.join("hermes-agent/venv/bin")
+            };
+            fs::create_dir_all(&bin).unwrap();
+            if let Some(venv) = bin.parent().filter(|parent| parent.ends_with("venv")) {
+                fs::write(venv.join("pyvenv.cfg"), "home = pinned\n").unwrap();
+            }
+            let sibling_interpreter = bin.join("python");
+            fs::write(&sibling_interpreter, b"\xcf\xfa\xed\xfeofficial python").unwrap();
+            fs::set_permissions(&sibling_interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+            let outside_interpreter = root.join("outside-python");
+            fs::write(&outside_interpreter, b"\xcf\xfa\xed\xfeoutside python").unwrap();
+            fs::set_permissions(&outside_interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+            let executable = bin.join("hermes");
+            let bytes = match variant {
+                "shell" => b"#!/bin/sh\nprintf 'hermes 0.18.2\\n'\n".to_vec(),
+                _ => {
+                    let interpreter = if variant == "wrong-interpreter" {
+                        &outside_interpreter
+                    } else {
+                        &sibling_interpreter
+                    };
+                    let extra = if variant == "modified-body" {
+                        "print('unreviewed')\n"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "#!{}\n# -*- coding: utf-8 -*-\nimport sys\nfrom hermes_cli.main import main\nif __name__ == \"__main__\":\n    if sys.argv[0].endswith(\"-script.pyw\"):\n        sys.argv[0] = sys.argv[0][:-11]\n    elif sys.argv[0].endswith(\".exe\"):\n        sys.argv[0] = sys.argv[0][:-4]\n    sys.exit(main())\n{extra}",
+                        interpreter.display()
+                    )
+                    .into_bytes()
+                }
+            };
+            fs::write(&executable, bytes).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            let calls = Cell::new(0);
+
+            let (snapshot, version) = discover_executable_version_after_snapshot(
+                &executable,
+                || {},
+                |_, _| {
+                    calls.set(calls.get() + 1);
+                    Ok(b"hermes 0.18.2\n".to_vec())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(snapshot.kind, HermesExecutableKind::Wrapper, "{variant}");
+            assert_eq!(version, "unknown", "{variant}");
+            assert_eq!(calls.get(), 0, "{variant}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn windows_distlib_console_launcher_shape_is_not_a_native_hermes_binary() {
+        let launcher =
+            b"MZ\x90\0distlib.exe\0#!python.exe\r\nfrom hermes_cli.main import main\r\nPK\x03\x04";
+        assert_eq!(
+            classify_executable_bytes(Path::new("hermes.exe"), launcher),
+            HermesExecutableKind::Wrapper
+        );
+    }
+
+    #[test]
+    fn windows_pe_launcher_magic_remains_import_only_when_renamed() {
+        let launcher =
+            b"MZ\x90\0distlib.exe\0#!python.exe\r\nfrom hermes_cli.main import main\r\nPK\x03\x04";
+        assert_eq!(
+            classify_executable_bytes(Path::new("hermes"), launcher),
+            HermesExecutableKind::Wrapper
+        );
+    }
+
+    #[test]
+    fn windows_hermes_exe_launcher_is_import_only_and_never_version_probed() {
+        let root = fs::canonicalize(env::temp_dir()).unwrap().join(format!(
+            "context-relay-hermes-windows-launcher-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("hermes.exe");
+        fs::write(
+            &executable,
+            b"MZ\x90\0distlib.exe\0#!python.exe\r\nfrom hermes_cli.main import main\r\nPK\x03\x04",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let canary = root.join("windows-python-launcher-ran");
+        let calls = Cell::new(0);
+
+        let (snapshot, version) = discover_executable_version_after_snapshot(
+            &executable,
+            || {},
+            |_, _| {
+                calls.set(calls.get() + 1);
+                fs::write(&canary, b"executed").unwrap();
+                Ok(b"hermes 0.18.2\n".to_vec())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.kind, HermesExecutableKind::Wrapper);
+        assert_eq!(version, "unknown");
+        assert_eq!(calls.get(), 0);
+        assert!(!canary.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

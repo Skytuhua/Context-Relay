@@ -371,6 +371,14 @@ fn owned_replacement_path(path: &[String]) -> bool {
             "approvals" | "command_allowlist" | "plugins" | "mcp_servers" | "hooks" | "memory"
         ),
         [root, _] if root == "approvals" || root == "mcp_servers" || root == "hooks" => true,
+        [root, _, tail @ ..]
+            if matches!(root.as_str(), "mcp_servers" | "hooks")
+                && !tail.is_empty()
+                && tail.iter().all(|key| !secret_key(key))
+                && !credential_container(tail) =>
+        {
+            true
+        }
         [root, state] if root == "plugins" && matches!(state.as_str(), "enabled" | "disabled") => {
             true
         }

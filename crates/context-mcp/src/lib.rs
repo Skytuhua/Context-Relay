@@ -14,7 +14,9 @@ pub use hook::{
     parse_invocation, project_hook_input, read_hook_input, run_hook_stdio,
 };
 pub use protocol::{MCP_COMPAT_REVISION, MCP_REVISION, RpcId, encode_message};
-pub use server::{MAX_IN_FLIGHT_TOOL_CALLS, Server};
+pub use server::{
+    MAX_IN_FLIGHT_TOOL_CALLS, Server, TOOL_CALL_RATE_BURST, TOOL_CALL_RATE_REFILL_PER_SECOND,
+};
 
 pub fn parse_harness(arguments: impl IntoIterator<Item = OsString>) -> Option<HarnessId> {
     match parse_invocation(arguments) {

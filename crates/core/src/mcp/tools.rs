@@ -28,11 +28,27 @@ const MCP_TOOL_OUTPUT_MAX_BYTES: usize = MAX_IPC_FRAME_BYTES / 4;
 pub struct McpWorkspace<'a> {
     vault: &'a mut Vault,
     device_id: DeviceId,
+    vault_state: VaultState,
+    sync_state: SyncState,
 }
 
 impl<'a> McpWorkspace<'a> {
     pub const fn new(vault: &'a mut Vault, device_id: DeviceId) -> Self {
-        Self { vault, device_id }
+        Self::with_service_status(vault, device_id, VaultState::Unlocked, SyncState::Offline)
+    }
+
+    pub const fn with_service_status(
+        vault: &'a mut Vault,
+        device_id: DeviceId,
+        vault_state: VaultState,
+        sync_state: SyncState,
+    ) -> Self {
+        Self {
+            vault,
+            device_id,
+            vault_state,
+            sync_state,
+        }
     }
 
     pub fn call(&mut self, params: McpCallParams) -> Result<Value, ClientError> {
@@ -403,12 +419,12 @@ impl<'a> McpWorkspace<'a> {
                 min: PROTOCOL_VERSION,
                 max: PROTOCOL_VERSION,
             },
-            vault: VaultState::Unlocked,
+            vault: self.vault_state,
             resolved_project: resolved
                 .active_project
                 .as_ref()
                 .map(|project| project.project_id),
-            sync: SyncState::Offline,
+            sync: self.sync_state,
             access: resolved.policy.clone(),
         })
     }

@@ -50,6 +50,7 @@ fn setup_plan() -> SetupPlan {
     SetupPlan {
         plan_id: PlanId::from_str(PLAN_ID).unwrap(),
         harness: HarnessId::Codex,
+        harness_profile: None,
         adapter_version: 7,
         executable_path: native_value(br"C:\Program Files\Codex\codex.exe"),
         executable_hash: Sha256Digest([1; 32]),
@@ -252,8 +253,8 @@ fn freezes_the_domain_separator_and_golden_hash() {
     assert_eq!(
         approval_hash_v1(&plan()).unwrap(),
         Sha256Digest([
-            255, 230, 229, 47, 129, 201, 245, 241, 53, 168, 68, 198, 251, 90, 131, 110, 85, 210,
-            157, 232, 235, 166, 234, 51, 161, 212, 189, 137, 72, 188, 15, 227,
+            78, 90, 221, 53, 204, 146, 247, 106, 164, 206, 72, 119, 245, 242, 148, 123, 62, 160,
+            49, 158, 58, 72, 97, 37, 70, 73, 135, 213, 129, 62, 163, 42,
         ])
     );
 }

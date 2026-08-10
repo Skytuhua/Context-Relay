@@ -115,7 +115,7 @@ async fn authenticated_pair(
 
 #[tokio::test]
 async fn exact_local_handshake_rejects_legacy_minor_in_both_directions() {
-    const LEGACY_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 2 };
+    const LEGACY_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
 
     let (client_io, server_io) = duplex(64 * 1024);
     let legacy_hello = ServerHelloV1 {

@@ -30,12 +30,14 @@ use super::{
     import, invalid, profile, wire_path,
 };
 
-const LOSSY_REASONS: [&str; 5] = [
+const LOSSY_REASONS: [&str; 7] = [
     "approval_mode_not_portable",
+    "approval_timeout_not_portable",
     "deny_pattern_not_portable",
     "permanent_allowlist_not_portable",
     "cron_permission_not_portable",
     "confirmation_switch_not_portable",
+    "unknown_permission_semantics",
 ];
 
 impl HermesAdapter {
@@ -382,9 +384,14 @@ impl HermesAdapter {
                 {
                     return Err(invalid("Hermes permission change target is invalid"));
                 }
-                match (parts[2], parts[4]) {
-                    ("exact", "-") => {}
-                    ("lossy", reason) if LOSSY_REASONS.contains(&reason) => {
+                let (fidelity, reason) = import::permission_mapping(&self.layout.version, parts[3])
+                    .ok_or_else(|| invalid("Hermes permission change target is invalid"))?;
+                if parts[2] != fidelity || parts[4] != reason {
+                    return Err(invalid("Hermes permission change target is invalid"));
+                }
+                match fidelity {
+                    "exact" if reason == "native_equivalent" => {}
+                    "lossy" if LOSSY_REASONS.contains(&reason) => {
                         classified.class = ChangeClass::Conflict;
                         classified.summary = format!("lossy Hermes permission mapping: {reason}");
                     }
@@ -553,8 +560,9 @@ impl HermesAdapter {
                             "Hermes permission location does not match its native path",
                         ));
                     }
-                    let (fidelity, reason) = import::permission_mapping(&path)
-                        .ok_or_else(|| invalid("Hermes permission path is invalid"))?;
+                    let (fidelity, reason) =
+                        import::permission_mapping(&self.layout.version, &path)
+                            .ok_or_else(|| invalid("Hermes permission path is invalid"))?;
                     if metadata(component, "mappingFidelity") != Some(fidelity)
                         || metadata(component, "mappingReason") != Some(reason)
                     {
@@ -637,7 +645,38 @@ impl HermesAdapter {
                 if unchanged {
                     continue;
                 }
-                return Err(invalid("Redacted Hermes configuration cannot be rendered"));
+                let (root, name) = match component.kind {
+                    ComponentKind::McpServer => (
+                        "mcp_servers",
+                        config_child_name(location, "config:mcp_servers.")?,
+                    ),
+                    ComponentKind::Hook if location.starts_with("config:hooks.") => {
+                        ("hooks", config_child_name(location, "config:hooks.")?)
+                    }
+                    _ => {
+                        return Err(invalid("Redacted Hermes configuration cannot be rendered"));
+                    }
+                };
+                let native = native.ok_or_else(|| {
+                    invalid("Redacted Hermes configuration is not bound to native state")
+                })?;
+                let current_body = serde_json::from_str::<JsonValue>(&native.body_markdown)
+                    .map_err(|_| invalid("Native Hermes reviewed projection is invalid"))?;
+                let mut desired_body = serde_json::from_str::<JsonValue>(&component.body_markdown)
+                    .map_err(|_| invalid("Hermes component body must be an object"))?;
+                if component.archived {
+                    desired_body
+                        .as_object_mut()
+                        .ok_or_else(|| invalid("Hermes component body must be an object"))?
+                        .insert("enabled".into(), JsonValue::Bool(false));
+                }
+                collect_redacted_scalar_edits(
+                    Some(&current_body),
+                    Some(&desired_body),
+                    &mut vec![root.into(), name.into()],
+                    &mut replacements,
+                )?;
+                continue;
             }
             super::yaml::scan_text_secret(
                 component.body_markdown.as_bytes(),
@@ -651,7 +690,8 @@ impl HermesAdapter {
                     let fidelity = native
                         .and_then(|current| metadata(current, "mappingFidelity"))
                         .or_else(|| {
-                            import::permission_mapping(&native_path).map(|(fidelity, _)| fidelity)
+                            import::permission_mapping(&self.layout.version, &native_path)
+                                .map(|(fidelity, _)| fidelity)
                         })
                         .ok_or_else(|| invalid("Hermes permission path is invalid"))?;
                     if fidelity == "lossy" {
@@ -942,15 +982,15 @@ impl HermesAdapter {
             "Hermes config must be a regular file",
         )?;
         let parsed = super::yaml::parse_config(&bytes)?;
-        Ok(
-            import::project_reviewed_config(&parsed, &self.layout.profile.name)?
-                .into_iter()
-                .filter(|component| component.kind == ComponentKind::PermissionDeclaration)
-                .filter_map(|component| {
-                    metadata(&component, "nativePermissionPath").map(str::to_owned)
-                })
-                .collect(),
-        )
+        Ok(import::project_reviewed_config(
+            &parsed,
+            &self.layout.profile.name,
+            &self.layout.version,
+        )?
+        .into_iter()
+        .filter(|component| component.kind == ComponentKind::PermissionDeclaration)
+        .filter_map(|component| metadata(&component, "nativePermissionPath").map(str::to_owned))
+        .collect())
     }
 }
 
@@ -1398,6 +1438,70 @@ fn merge_reviewed_mapping(
         merged.insert(YamlValue::String("enabled".into()), YamlValue::Bool(false));
     }
     Ok(YamlValue::Mapping(merged))
+}
+
+fn collect_redacted_scalar_edits(
+    current: Option<&JsonValue>,
+    desired: Option<&JsonValue>,
+    path: &mut Vec<String>,
+    replacements: &mut BTreeMap<Vec<String>, Option<YamlValue>>,
+) -> Result<(), ClientError> {
+    if current == desired {
+        return Ok(());
+    }
+    match (current, desired) {
+        (Some(JsonValue::Object(current)), Some(JsonValue::Object(desired))) => {
+            let keys = current
+                .keys()
+                .chain(desired.keys())
+                .collect::<BTreeSet<_>>();
+            for key in keys {
+                path.push(key.clone());
+                collect_redacted_scalar_edits(
+                    current.get(key),
+                    desired.get(key),
+                    path,
+                    replacements,
+                )?;
+                path.pop();
+            }
+            Ok(())
+        }
+        (Some(JsonValue::Object(current)), None) => {
+            for (key, value) in current {
+                path.push(key.clone());
+                collect_redacted_scalar_edits(Some(value), None, path, replacements)?;
+                path.pop();
+            }
+            Ok(())
+        }
+        (None, Some(JsonValue::Object(_)))
+        | (Some(JsonValue::Object(_)), Some(_))
+        | (Some(_), Some(JsonValue::Object(_)))
+        | (Some(JsonValue::Array(_)), _)
+        | (_, Some(JsonValue::Array(_))) => Err(invalid(
+            "Redacted Hermes collection changes cannot be rendered safely",
+        )),
+        (Some(_), None) => {
+            replacements.insert(path.clone(), None);
+            Ok(())
+        }
+        (None, Some(_)) => Err(invalid(
+            "Redacted Hermes configuration cannot add unreviewed scalar leaves",
+        )),
+        (Some(_), Some(value)) => {
+            let value = serde_yaml_ng::to_value(value)
+                .map_err(|_| invalid("Hermes reviewed scalar is invalid"))?;
+            if matches!(value, YamlValue::Mapping(_) | YamlValue::Sequence(_)) {
+                return Err(invalid(
+                    "Redacted Hermes collection changes cannot be rendered safely",
+                ));
+            }
+            replacements.insert(path.clone(), Some(value));
+            Ok(())
+        }
+        (None, None) => Ok(()),
+    }
 }
 
 fn set_mapping_bool(value: &mut YamlValue, key: &str, enabled: bool) -> Result<(), ClientError> {

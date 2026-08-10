@@ -25,13 +25,17 @@ use crate::{
     BridgeError, Daemon,
     protocol::{
         INVALID_PARAMS, INVALID_REQUEST, MCP_COMPAT_REVISION, MCP_REVISION, METHOD_NOT_FOUND,
-        PARSE_ERROR, ParsedMessage, Request, RpcId, empty_params, encode_message, error,
-        parse_message, read_message, success,
+        PARSE_ERROR, ParsedMessage, Request, RpcId, encode_message, error, parse_message,
+        read_message, success,
     },
 };
 
 pub const MAX_IN_FLIGHT_TOOL_CALLS: usize = 64;
+pub const TOOL_CALL_RATE_BURST: usize = 64;
+pub const TOOL_CALL_RATE_REFILL_PER_SECOND: usize = 16;
 const WRITER_QUEUE_CAPACITY: usize = MAX_IN_FLIGHT_TOOL_CALLS + 16;
+const TOOLS_PAGE_SIZE: usize = 8;
+const TOOLS_SECOND_PAGE_CURSOR: &str = "context-relay-tools-v1:8";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Lifecycle {
@@ -47,6 +51,7 @@ pub struct Server<D> {
     active: Arc<Mutex<HashMap<RpcId, ActiveCall>>>,
     call_permits: Arc<Semaphore>,
     cancel_permits: Arc<Semaphore>,
+    rate_limit: Mutex<ToolCallRateLimit>,
 }
 
 impl<D: Daemon> Server<D> {
@@ -58,6 +63,7 @@ impl<D: Daemon> Server<D> {
             active: Arc::default(),
             call_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOOL_CALLS)),
             cancel_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOOL_CALLS)),
+            rate_limit: Mutex::new(ToolCallRateLimit::new(Instant::now())),
         }
     }
 
@@ -240,9 +246,9 @@ impl<D: Daemon> Server<D> {
         let Some(params) = parse_params::<InitializeParams>(request.params) else {
             return Some(error(Some(id), INVALID_PARAMS, "Invalid initialize params"));
         };
-        if !params.capabilities.is_object()
-            || params.client_info.name.is_empty()
-            || params.client_info.version.is_empty()
+        if !valid_request_meta(params.meta.as_ref())
+            || !params.capabilities.is_object()
+            || !params.client_info.is_valid()
         {
             return Some(error(Some(id), INVALID_PARAMS, "Invalid initialize params"));
         }
@@ -279,7 +285,9 @@ impl<D: Daemon> Server<D> {
                 "Initialized must be a notification",
             ));
         }
-        if self.lifecycle == Lifecycle::AwaitInitialized && empty_params(request.params.as_ref()) {
+        if self.lifecycle == Lifecycle::AwaitInitialized
+            && parse_empty_request_params(request.params).is_some()
+        {
             self.lifecycle = Lifecycle::Ready;
         }
         None
@@ -293,8 +301,12 @@ impl<D: Daemon> Server<D> {
                 "Cancelled must be a notification",
             ));
         }
-        if let Some(CancelledParams { request_id, reason }) =
-            parse_params::<CancelledParams>(request.params)
+        if let Some(CancelledParams {
+            request_id,
+            reason,
+            meta,
+        }) = parse_params::<CancelledParams>(request.params)
+            && valid_request_meta(meta.as_ref())
         {
             let _ = reason;
             let cancellation = {
@@ -339,7 +351,7 @@ impl<D: Daemon> Server<D> {
 
     fn ping(&self, request: Request) -> Option<Value> {
         let id = request.id?;
-        if !empty_params(request.params.as_ref()) {
+        if parse_empty_request_params(request.params).is_none() {
             return Some(error(Some(id), INVALID_PARAMS, "Invalid ping params"));
         }
         match self.lifecycle {
@@ -357,10 +369,20 @@ impl<D: Daemon> Server<D> {
         if self.lifecycle != Lifecycle::Ready {
             return Some(error(Some(id), INVALID_REQUEST, "Tools are not ready"));
         }
-        if !empty_params(request.params.as_ref()) {
+        let Some(params) = parse_optional_params::<ListToolsParams>(request.params) else {
+            return Some(error(Some(id), INVALID_PARAMS, "Invalid tools/list params"));
+        };
+        if !valid_request_meta(params.meta.as_ref()) {
             return Some(error(Some(id), INVALID_PARAMS, "Invalid tools/list params"));
         }
-        let tools = MCP_TOOL_NAMES
+        let (start, next_cursor) = match params.cursor.as_deref() {
+            None => (0, Some(TOOLS_SECOND_PAGE_CURSOR)),
+            Some(TOOLS_SECOND_PAGE_CURSOR) => (TOOLS_PAGE_SIZE, None),
+            Some(_) => {
+                return Some(error(Some(id), INVALID_PARAMS, "Invalid tools/list cursor"));
+            }
+        };
+        let tools = MCP_TOOL_NAMES[start..MCP_TOOL_NAMES.len().min(start + TOOLS_PAGE_SIZE)]
             .iter()
             .map(|name| {
                 let schema = mcp_schema(name).expect("frozen tool has schema");
@@ -371,7 +393,11 @@ impl<D: Daemon> Server<D> {
                 })
             })
             .collect::<Vec<_>>();
-        Some(success(id, json!({"tools": tools})))
+        let mut result = json!({"tools": tools});
+        if let Some(next_cursor) = next_cursor {
+            result["nextCursor"] = Value::String(next_cursor.to_owned());
+        }
+        Some(success(id, result))
     }
 
     fn call_tool(
@@ -387,11 +413,17 @@ impl<D: Daemon> Server<D> {
         let Some(params) = parse_params::<CallToolParams>(request.params) else {
             return Some(error(Some(id), INVALID_PARAMS, "Invalid tools/call params"));
         };
+        if !valid_request_meta(params.meta.as_ref()) {
+            return Some(error(Some(id), INVALID_PARAMS, "Invalid tools/call params"));
+        }
         let arguments = Value::Object(params.arguments);
         if mcp_schema(&params.name).is_none()
             || validate_mcp_fixture(&params.name, true, &arguments).is_err()
         {
             return Some(error(Some(id), INVALID_PARAMS, "Invalid tools/call params"));
+        }
+        if !self.rate_limit.lock().unwrap().admit(Instant::now()) {
+            return Some(tool_error(id, &busy_error()));
         }
         let request_id = RecordId::new(Uuid::now_v7()).expect("UUIDv7 generator");
         let call = McpCallParams {
@@ -446,6 +478,37 @@ impl<D: Daemon> Server<D> {
             .await;
         });
         None
+    }
+}
+
+struct ToolCallRateLimit {
+    credit_nanos: u128,
+    last_refill: Instant,
+}
+
+impl ToolCallRateLimit {
+    const TOKEN_NANOS: u128 = 1_000_000_000;
+
+    fn new(now: Instant) -> Self {
+        Self {
+            credit_nanos: TOOL_CALL_RATE_BURST as u128 * Self::TOKEN_NANOS,
+            last_refill: now,
+        }
+    }
+
+    fn admit(&mut self, now: Instant) -> bool {
+        let elapsed_nanos = now.duration_since(self.last_refill).as_nanos();
+        let refill = elapsed_nanos.saturating_mul(TOOL_CALL_RATE_REFILL_PER_SECOND as u128);
+        self.credit_nanos = self
+            .credit_nanos
+            .saturating_add(refill)
+            .min(TOOL_CALL_RATE_BURST as u128 * Self::TOKEN_NANOS);
+        self.last_refill = now;
+        if self.credit_nanos < Self::TOKEN_NANOS {
+            return false;
+        }
+        self.credit_nanos -= Self::TOKEN_NANOS;
+        true
     }
 }
 
@@ -551,6 +614,8 @@ fn invalid_output_error() -> BridgeError {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct InitializeParams {
+    #[serde(default, rename = "_meta")]
+    meta: Option<Map<String, Value>>,
     protocol_version: String,
     capabilities: Value,
     client_info: ClientInfo,
@@ -560,14 +625,81 @@ struct InitializeParams {
 #[serde(deny_unknown_fields)]
 struct ClientInfo {
     name: String,
+    #[serde(default)]
+    title: Option<String>,
     version: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    icons: Option<Vec<ClientIcon>>,
+    #[serde(default, rename = "websiteUrl")]
+    website_url: Option<String>,
+}
+
+impl ClientInfo {
+    fn is_valid(&self) -> bool {
+        !self.name.is_empty()
+            && self.title.as_ref().is_none_or(|title| !title.is_empty())
+            && !self.version.is_empty()
+            && self
+                .description
+                .as_ref()
+                .is_none_or(|description| !description.contains('\0'))
+            && self
+                .website_url
+                .as_ref()
+                .is_none_or(|website_url| !website_url.is_empty())
+            && self
+                .icons
+                .as_ref()
+                .is_none_or(|icons| icons.iter().all(ClientIcon::is_valid))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClientIcon {
+    src: String,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    sizes: Option<Vec<String>>,
+    #[serde(default)]
+    theme: Option<String>,
+}
+
+impl ClientIcon {
+    fn is_valid(&self) -> bool {
+        !self.src.is_empty()
+            && self.mime_type.as_ref().is_none_or(|mime| !mime.is_empty())
+            && self
+                .sizes
+                .as_ref()
+                .is_none_or(|sizes| sizes.iter().all(|size| !size.is_empty()))
+            && self
+                .theme
+                .as_deref()
+                .is_none_or(|theme| matches!(theme, "light" | "dark"))
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ListToolsParams {
+    #[serde(default, rename = "_meta")]
+    meta: Option<Map<String, Value>>,
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CallToolParams {
     name: String,
+    #[serde(default)]
     arguments: Map<String, Value>,
+    #[serde(default, rename = "_meta")]
+    meta: Option<Map<String, Value>>,
 }
 
 #[derive(Deserialize)]
@@ -576,10 +708,38 @@ struct CancelledParams {
     request_id: RpcId,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default, rename = "_meta")]
+    meta: Option<Map<String, Value>>,
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(params: Option<Value>) -> Option<T> {
     serde_json::from_value(params?).ok()
+}
+
+fn parse_optional_params<T: for<'de> Deserialize<'de> + Default>(
+    params: Option<Value>,
+) -> Option<T> {
+    params.map_or_else(
+        || Some(T::default()),
+        |params| serde_json::from_value(params).ok(),
+    )
+}
+
+fn parse_empty_request_params(params: Option<Value>) -> Option<()> {
+    let params = parse_optional_params::<EmptyRequestParams>(params)?;
+    valid_request_meta(params.meta.as_ref()).then_some(())
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyRequestParams {
+    #[serde(default, rename = "_meta")]
+    meta: Option<Map<String, Value>>,
+}
+
+fn valid_request_meta(meta: Option<&Map<String, Value>>) -> bool {
+    meta.and_then(|meta| meta.get("progressToken"))
+        .is_none_or(|token| token.is_string() || token.is_number())
 }
 
 fn tool_error(id: RpcId, error: &BridgeError) -> Value {

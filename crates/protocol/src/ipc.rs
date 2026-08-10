@@ -130,7 +130,9 @@ params!(HandoffParams { operation_id:OperationId,memory_ids:Vec<MemoryId>,decisi
 params!(HarnessParams {
     harness: HarnessId,
     #[serde(deserialize_with = "crate::required_nullable")]
-    project_id: Option<ProjectId>
+    project_id: Option<ProjectId>,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    hermes_profile: Option<String>
 });
 params!(McpBinding {
     harness: HarnessId,
@@ -662,6 +664,12 @@ impl LocalRequest {
                 summary: p.summary.clone(),
             }
             .validate(),
+            Self::HarnessProbe(p) | Self::HarnessPreview(p) | Self::HarnessRepair(p) => {
+                validate_harness_profile(p)
+            }
+            Self::AccessGet(p) if p.hermes_profile.is_some() => {
+                Err(ValidationError::Invalid("accessGet.hermesProfile"))
+            }
             Self::DeviceRename(p) => required_text(&p.name, "name", MAX_TITLE_BYTES),
             Self::PairingJoin(p) => required_text(&p.device_name, "deviceName", MAX_TITLE_BYTES),
             Self::RecoveryEnrollmentConfirm(p) => p.validate(),
@@ -669,6 +677,19 @@ impl LocalRequest {
                 required_text(&p.confirmation, "confirmation", MAX_TITLE_BYTES)
             }
             _ => Ok(()),
+        }
+    }
+}
+
+fn validate_harness_profile(params: &HarnessParams) -> Result<(), ValidationError> {
+    match (params.harness, params.hermes_profile.as_deref()) {
+        (HarnessId::Hermes, Some(profile)) => {
+            required_text(profile, "harness.hermesProfile", MAX_TITLE_BYTES)
+        }
+        (HarnessId::Hermes, None) => Err(ValidationError::EmptyRequired("harness.hermesProfile")),
+        (HarnessId::ClaudeCode | HarnessId::Codex, None) => Ok(()),
+        (HarnessId::ClaudeCode | HarnessId::Codex, Some(_)) => {
+            Err(ValidationError::Invalid("harness.hermesProfile"))
         }
     }
 }

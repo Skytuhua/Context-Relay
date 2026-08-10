@@ -21,7 +21,7 @@ use context_relay_core::{
         approval_hash_v1,
         engine::{
             BeforeImage, BoundaryError, FaultHook, MutationOutcome, NativeAdapter,
-            NativeFileSystem, NativeJournal, NativeTransactionEngine, RestrictedExecutor,
+            NativeFileSystem, NativeJournal, NativeTransactionEngine, NoFault, RestrictedExecutor,
             RestrictedRun,
         },
         filesystem::OsNativeTransactionFileSystem,
@@ -426,6 +426,7 @@ fn hermes_native_plan(
             executable_path: test_wire_path(&fixture.layout.executable),
             executable_hash: test_file_digest(&fixture.layout.executable),
             harness_version: fixture.layout.version.clone(),
+            harness_profile: Some(fixture.layout.profile.name.clone()),
             target_scopes: vec![
                 NativeScope::Global,
                 NativeScope::Project {
@@ -1049,19 +1050,13 @@ fn yaml_patch_preserves_unowned_bytes_comments_order_and_scalar_style() {
     )
     .unwrap();
     let imported = import_global(&fixture);
-    let mut permission = component_at(
-        &imported.components,
-        ComponentKind::PermissionDeclaration,
-        "config:approvals.timeout",
-    );
-    permission.body_markdown = "2".into();
     let mut plugin = component_at(
         &imported.components,
         ComponentKind::Plugin,
         "config:plugins.enabled.reviewer",
     );
     plugin.archived = true;
-    let desired = desired_global(&fixture, vec![permission, plugin]);
+    let desired = desired_global(&fixture, vec![plugin]);
     let mutation = fixture
         .adapter
         .plan_native_config(&desired)
@@ -1081,7 +1076,6 @@ fn yaml_patch_preserves_unowned_bytes_comments_order_and_scalar_style() {
             "lost exact bytes: {unchanged:?}"
         );
     }
-    assert!(rendered.contains("  timeout: 2\r\n"));
     assert!(!rendered.replace("\r\n", "").contains('\n'));
     assert!(rendered.contains("  disabled:\r\n    - legacy\r\n    - reviewer\r\n"));
 }
@@ -1361,20 +1355,12 @@ fn unsupported_permission_mappings_are_visible_in_probe_and_preview() {
     let classified = fixture
         .adapter
         .classify(&SemanticDiff {
-            changes: vec![
-                ClassifiedChange {
-                    class: ChangeClass::Update,
-                    target:
-                        "hermes-permission|coder|lossy|approvals.mode|approval_mode_not_portable"
-                            .into(),
-                    summary: "must-not-preview-native-value".into(),
-                },
-                ClassifiedChange {
-                    class: ChangeClass::Update,
-                    target: "hermes-permission|coder|exact|approvals.mode|-".into(),
-                    summary: "exact native change".into(),
-                },
-            ],
+            changes: vec![ClassifiedChange {
+                class: ChangeClass::Update,
+                target: "hermes-permission|coder|lossy|approvals.mode|approval_mode_not_portable"
+                    .into(),
+                summary: "must-not-preview-native-value".into(),
+            }],
             conflicts: vec![],
         })
         .unwrap();
@@ -1388,7 +1374,54 @@ fn unsupported_permission_mappings_are_visible_in_probe_and_preview() {
             .summary
             .contains("must-not-preview-native-value")
     );
-    assert_eq!(classified.0[1].class, ChangeClass::Update);
+    let forged = fixture.adapter.classify(&SemanticDiff {
+        changes: vec![ClassifiedChange {
+            class: ChangeClass::Update,
+            target: "hermes-permission|coder|exact|approvals.mode|-".into(),
+            summary: "forged exact native change".into(),
+        }],
+        conflicts: vec![],
+    });
+    assert_eq!(forged.unwrap_err().code, ErrorCode::InvalidRequest);
+}
+
+#[test]
+fn permission_fidelity_comes_from_the_supported_version_allowlist() {
+    for source in [
+        include_str!("fixtures/hermes-0.18.2.json"),
+        include_str!("fixtures/hermes-0.18.1.json"),
+    ] {
+        let fixture = fixture(source);
+        clear_gateway_records(&fixture);
+        let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+        fs::write(&config_path, "approvals:\n  invented_semantics: true\n").unwrap();
+        let imported = import_global(&fixture);
+        let permission = component_at(
+            &imported.components,
+            ComponentKind::PermissionDeclaration,
+            "config:approvals.invented_semantics",
+        );
+        assert_eq!(metadata(&permission, "mappingFidelity"), Some("lossy"));
+        assert_eq!(
+            metadata(&permission, "mappingReason"),
+            Some("unknown_permission_semantics")
+        );
+        assert!(
+            probe(&fixture.adapter, Some("coder"))
+                .policy_conflicts
+                .contains(&"unknown_permission_semantics".to_owned())
+        );
+
+        let forged = fixture.adapter.classify(&SemanticDiff {
+            changes: vec![ClassifiedChange {
+                class: ChangeClass::Update,
+                target: "hermes-permission|coder|exact|approvals.invented_semantics|-".into(),
+                summary: "caller-forged semantics".into(),
+            }],
+            conflicts: vec![],
+        });
+        assert_eq!(forged.unwrap_err().code, ErrorCode::InvalidRequest);
+    }
 }
 
 #[test]
@@ -1488,6 +1521,210 @@ fn caller_cannot_remove_native_redaction_metadata() {
             assert!(!diagnostic.contains("must-not-render"));
         }
     }
+}
+
+#[test]
+fn redacted_mcp_owned_scalars_can_change_without_reserializing_secret_containers() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    let original = concat!(
+        "mcp_servers:\n",
+        "  guarded:\n",
+        "    url: https://example.com/mcp\n",
+        "    enabled: true\n",
+        "    timeout: 30\n",
+        "    headers:\n",
+        "      Authorization: 'native-only-header-value' # preserve-secret-style\n",
+        "      X-Token: ${NATIVE_ONLY_TOKEN}\n",
+    );
+    fs::write(&config_path, original).unwrap();
+    let imported = import_global(&fixture);
+    let mut component = component_at(
+        &imported.components,
+        ComponentKind::McpServer,
+        "config:mcp_servers.guarded",
+    );
+    assert_eq!(metadata(&component, "redacted"), Some("true"));
+    assert!(!component.body_markdown.contains("native-only"));
+    let mut body: Value = serde_json::from_str(&component.body_markdown).unwrap();
+    body.as_object_mut().unwrap().remove("url");
+    body["enabled"] = Value::Bool(false);
+    body["timeout"] = Value::from(45);
+    component.body_markdown = serde_json::to_string(&body).unwrap();
+
+    let mutation = fixture
+        .adapter
+        .plan_native_config(&desired_global(&fixture, vec![component]))
+        .unwrap()
+        .expect("reviewed MCP scalar edits should produce one mutation");
+    let NativeState::RegularFile { bytes, .. } = NativeState::decode_v1(&mutation.content).unwrap()
+    else {
+        panic!("Hermes MCP config mutation must remain a regular file");
+    };
+    let rendered = String::from_utf8(bytes).unwrap();
+    assert!(!rendered.contains("    url:"));
+    assert!(rendered.contains("    enabled: false\n"));
+    assert!(rendered.contains("    timeout: 45\n"));
+    assert!(
+        rendered
+            .contains("      Authorization: 'native-only-header-value' # preserve-secret-style\n")
+    );
+    assert!(rendered.contains("      X-Token: ${NATIVE_ONLY_TOKEN}\n"));
+}
+
+#[test]
+fn redacted_mcp_cannot_add_an_unreviewed_scalar_leaf() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    let original = concat!(
+        "mcp_servers:\n",
+        "  guarded:\n",
+        "    command: safe-runner\n",
+        "    enabled: true\n",
+        "    headers:\n",
+        "      Authorization: 'native-only-unreviewed-mcp-secret'\n",
+    );
+    fs::write(&config_path, original).unwrap();
+    let imported = import_global(&fixture);
+    let mut component = component_at(
+        &imported.components,
+        ComponentKind::McpServer,
+        "config:mcp_servers.guarded",
+    );
+    assert_eq!(metadata(&component, "redacted"), Some("true"));
+    let mut body: Value = serde_json::from_str(&component.body_markdown).unwrap();
+    assert!(body.get("timeout").is_none());
+    body["timeout"] = Value::from(45);
+    component.body_markdown = serde_json::to_string(&body).unwrap();
+
+    let error = fixture
+        .adapter
+        .plan_native_config(&desired_global(&fixture, vec![component]))
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidRequest);
+    assert!(!format!("{error:?}").contains("native-only-unreviewed-mcp-secret"));
+    assert_eq!(fs::read_to_string(config_path).unwrap(), original);
+}
+
+#[test]
+fn redacted_mcp_collection_changes_remain_rejected_without_secret_exposure() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    clear_gateway_records(&fixture);
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    let original = concat!(
+        "mcp_servers:\n",
+        "  guarded:\n",
+        "    command: safe-runner\n",
+        "    enabled: true\n",
+        "    headers:\n",
+        "      Authorization: 'native-only-collection-secret'\n",
+    );
+    fs::write(&config_path, original).unwrap();
+    let imported = import_global(&fixture);
+    let mut component = component_at(
+        &imported.components,
+        ComponentKind::McpServer,
+        "config:mcp_servers.guarded",
+    );
+    assert_eq!(metadata(&component, "redacted"), Some("true"));
+    let mut body: Value = serde_json::from_str(&component.body_markdown).unwrap();
+    body["args"] = serde_json::json!(["--changed"]);
+    component.body_markdown = serde_json::to_string(&body).unwrap();
+
+    let error = fixture
+        .adapter
+        .plan_native_config(&desired_global(&fixture, vec![component]))
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidRequest);
+    assert!(!format!("{error:?}").contains("native-only-collection-secret"));
+    assert_eq!(fs::read_to_string(config_path).unwrap(), original);
+}
+
+#[test]
+fn redacted_hook_owned_scalars_can_change_without_reserializing_secret_containers() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.1.json"));
+    clear_gateway_records(&fixture);
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    let original = concat!(
+        "hooks:\n",
+        "  guarded:\n",
+        "    enabled: true\n",
+        "    timeout: 45\n",
+        "    credentials:\n",
+        "      client_secret: 'native-only-hook-value' # preserve-hook-secret-style\n",
+        "    post_tool:\n",
+        "      command: safe-hook-command\n",
+    );
+    fs::write(&config_path, original).unwrap();
+    let imported = import_global(&fixture);
+    let mut component = component_at(
+        &imported.components,
+        ComponentKind::Hook,
+        "config:hooks.guarded",
+    );
+    assert_eq!(metadata(&component, "redacted"), Some("true"));
+    assert!(!component.body_markdown.contains("native-only"));
+    let mut body: Value = serde_json::from_str(&component.body_markdown).unwrap();
+    body["enabled"] = Value::Bool(false);
+    body["timeout"] = Value::from(60);
+    component.body_markdown = serde_json::to_string(&body).unwrap();
+
+    let mutation = fixture
+        .adapter
+        .plan_native_config(&desired_global(&fixture, vec![component]))
+        .unwrap()
+        .expect("reviewed hook scalar edits should produce one mutation");
+    let NativeState::RegularFile { bytes, .. } = NativeState::decode_v1(&mutation.content).unwrap()
+    else {
+        panic!("Hermes hook config mutation must remain a regular file");
+    };
+    let rendered = String::from_utf8(bytes).unwrap();
+    assert!(rendered.contains("    enabled: false\n"));
+    assert!(rendered.contains("    timeout: 60\n"));
+    assert!(
+        rendered.contains(
+            "      client_secret: 'native-only-hook-value' # preserve-hook-secret-style\n"
+        )
+    );
+    assert!(rendered.contains("      command: safe-hook-command\n"));
+}
+
+#[test]
+fn redacted_hook_cannot_add_an_unreviewed_scalar_leaf() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.1.json"));
+    clear_gateway_records(&fixture);
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    let original = concat!(
+        "hooks:\n",
+        "  guarded:\n",
+        "    enabled: true\n",
+        "    credentials:\n",
+        "      client_secret: 'native-only-unreviewed-hook-secret'\n",
+        "    post_tool:\n",
+        "      command: safe-hook-command\n",
+    );
+    fs::write(&config_path, original).unwrap();
+    let imported = import_global(&fixture);
+    let mut component = component_at(
+        &imported.components,
+        ComponentKind::Hook,
+        "config:hooks.guarded",
+    );
+    assert_eq!(metadata(&component, "redacted"), Some("true"));
+    let mut body: Value = serde_json::from_str(&component.body_markdown).unwrap();
+    assert!(body.get("timeout").is_none());
+    body["timeout"] = Value::from(60);
+    component.body_markdown = serde_json::to_string(&body).unwrap();
+
+    let error = fixture
+        .adapter
+        .plan_native_config(&desired_global(&fixture, vec![component]))
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidRequest);
+    assert!(!format!("{error:?}").contains("native-only-unreviewed-hook-secret"));
+    assert_eq!(fs::read_to_string(config_path).unwrap(), original);
 }
 
 #[test]
@@ -2476,11 +2713,13 @@ fn secret_bearing_yaml_fields_are_removed_before_component_creation() {
 #[test]
 fn embedded_secret_text_is_removed_from_mcp_and_hook_components() {
     let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let bearer_header = ["Author", "ization: Bearer "].concat();
     fs::write(
         fixture.layout.profile.hermes_home.join("config.yaml"),
-        r#"mcp_servers:
+        format!(
+            r#"mcp_servers:
   authorization:
-    command: "curl -H 'Authorization: Bearer must-not-import-mcp-authorization'"
+    command: "curl -H '{bearer_header}must-not-import-mcp-authorization'"
     enabled: true
   basic:
     args:
@@ -2499,12 +2738,13 @@ fn embedded_secret_text_is_removed_from_mcp_and_hook_components() {
 hooks:
   scalar_guard:
     enabled: true
-    preflight: "runner --header 'Authorization: Bearer must-not-import-hook-authorization'"
+    preflight: "runner --header '{bearer_header}must-not-import-hook-authorization'"
     fallback: "runner --header Basic must-not-import-hook-basic"
     loader: "loader prefix-----BEGIN OPENSSH PRIVATE KEY-----must-not-import-hook-private"
     notifier: "runner --token=prefix:github_pat_must-not-import-hook-token"
     callback: "proxy=https://must-not-import-hook-user:must-not-import-hook-password@example.com/callback"
 "#,
+        ),
     )
     .unwrap();
 
@@ -3331,6 +3571,13 @@ fn unknown_versions_and_wrappers_are_import_only() {
             HybridLogicalClock::new(1_900_000_000_000, 0, DeviceId::from_str(DEVICE_ID).unwrap()),
         )
         .unwrap();
+        let imported = adapter
+            .import(&ImportRequest {
+                scopes: vec![NativeScope::Global],
+                include_disabled: true,
+            })
+            .unwrap();
+        assert!(!imported.components.is_empty());
         assert_eq!(
             probe(&adapter, Some("coder")).capability,
             CapabilityLevel::ImportOnly
@@ -3631,19 +3878,118 @@ fn native_adapter_rejects_staged_hash_and_receipt_changes() {
         assert!(adapter.validate_staged_output(&plan, &invalid).is_err());
     }
 
-    let intended = plan
-        .mutations
-        .iter()
-        .map(|mutation| mutation.intended.0)
-        .collect::<Vec<_>>();
+    let mut receipt_only_plan = plan.clone();
+    receipt_only_plan.mutations.clear();
     let mut receipt = validation_receipt();
-    receipt.resulting_digests = intended;
-    assert!(NativeAdapter::validate_effective(&mut adapter, &plan, &receipt).is_ok());
+    assert!(NativeAdapter::validate_effective(&mut adapter, &receipt_only_plan, &receipt).is_ok());
     receipt.plan_id = PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073985").unwrap();
-    assert!(NativeAdapter::validate_effective(&mut adapter, &plan, &receipt).is_err());
-    receipt.plan_id = plan.setup.plan_id;
+    assert!(NativeAdapter::validate_effective(&mut adapter, &receipt_only_plan, &receipt).is_err());
+    receipt.plan_id = receipt_only_plan.setup.plan_id;
     receipt.resulting_digests = vec![Sha256Digest([92; 32])];
-    assert!(NativeAdapter::validate_effective(&mut adapter, &plan, &receipt).is_err());
+    assert!(NativeAdapter::validate_effective(&mut adapter, &receipt_only_plan, &receipt).is_err());
+}
+
+#[test]
+fn invalid_effective_config_is_compensated_before_receipt_commit() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let mut plan = hermes_native_plan(&fixture, ApprovalClass::Passive, vec![]);
+    plan.sidecars = vec![SidecarBinding {
+        id: SidecarId::RuleSync,
+        target: RuntimeTarget::MacosArm64,
+        version: plan.setup.rulesync_version.clone(),
+        closure_hash: Sha256Digest([45; 32]),
+        source_bundle_hash: Sha256Digest([46; 32]),
+        build_toolchain_hash: Sha256Digest([47; 32]),
+        command_template_digest: Sha256Digest([48; 32]),
+        command: SidecarCommand::RuleSyncGenerate {
+            target: RuleSyncTarget::CodexCli,
+            features: RuleSyncFeatures::new(&[RuleSyncFeature::Rules]).unwrap(),
+        },
+    }];
+    plan.setup.batch_hash = approval_hash_v1(&plan).unwrap();
+    let config_path = fixture.layout.profile.hermes_home.join("config.yaml");
+    fs::write(fixture.layout.profile.hermes_home.join("gateway.lock"), b"").unwrap();
+    let before = fs::read(&config_path).unwrap();
+    let nonce = *plan.setup.plan_id.as_bytes();
+    let mut adapter = fixture.adapter.clone();
+    let mut executor = RollbackExecutor {
+        run: RestrictedRun {
+            staged_output_hash: plan.expected_semantic_output_hash,
+            scanner_result_hash: plan.scanner_result_hash,
+        },
+    };
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let mut journal = RollbackJournal::default();
+    let mut fault = NoFault;
+
+    let result = NativeTransactionEngine::new(
+        &mut adapter,
+        &mut executor,
+        &mut native,
+        &mut journal,
+        &mut fault,
+    )
+    .apply(&plan, 1_900_000_000_000, validation_receipt().applied_hlc);
+
+    let error = format!("{:?}", result.unwrap_err());
+    assert!(
+        error.contains("Hermes effective configuration is invalid"),
+        "unexpected transaction failure: {error}"
+    );
+    assert!(journal.compensated);
+    assert_eq!(fs::read(config_path).unwrap(), before);
+}
+
+#[test]
+fn memory_only_write_revalidates_sources_without_starting_config_check() {
+    let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
+    let mut plan = hermes_native_plan(&fixture, ApprovalClass::Passive, vec![]);
+    let memory = fixture
+        .adapter
+        .plan_native_memory(HermesMemoryKind::Agent, "validated memory-only export")
+        .unwrap()
+        .unwrap();
+    let memory_path = PathBuf::from(memory.target.display.as_ref().unwrap());
+    plan.mutations = vec![memory];
+    plan.sidecars = vec![SidecarBinding {
+        id: SidecarId::RuleSync,
+        target: RuntimeTarget::MacosArm64,
+        version: plan.setup.rulesync_version.clone(),
+        closure_hash: Sha256Digest([45; 32]),
+        source_bundle_hash: Sha256Digest([46; 32]),
+        build_toolchain_hash: Sha256Digest([47; 32]),
+        command_template_digest: Sha256Digest([48; 32]),
+        command: SidecarCommand::RuleSyncGenerate {
+            target: RuleSyncTarget::CodexCli,
+            features: RuleSyncFeatures::new(&[RuleSyncFeature::Rules]).unwrap(),
+        },
+    }];
+    plan.setup.batch_hash = approval_hash_v1(&plan).unwrap();
+    let nonce = *plan.setup.plan_id.as_bytes();
+    let mut adapter = fixture.adapter.clone();
+    let mut executor = RollbackExecutor {
+        run: RestrictedRun {
+            staged_output_hash: plan.expected_semantic_output_hash,
+            scanner_result_hash: plan.scanner_result_hash,
+        },
+    };
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let mut journal = RollbackJournal::default();
+    let mut fault = NoFault;
+
+    NativeTransactionEngine::new(
+        &mut adapter,
+        &mut executor,
+        &mut native,
+        &mut journal,
+        &mut fault,
+    )
+    .apply(&plan, 1_900_000_000_000, validation_receipt().applied_hlc)
+    .expect("a memory-only write must not require the unchanged config child check");
+
+    let rendered = fs::read_to_string(memory_path).unwrap();
+    assert!(rendered.contains("validated memory-only export"));
+    assert!(!journal.compensated);
 }
 
 #[test]

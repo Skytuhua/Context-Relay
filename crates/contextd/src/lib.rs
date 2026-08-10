@@ -851,9 +851,10 @@ async fn serve_request(
         RoutedRequest::Health => {
             let result = begin_immediate(&registration).and_then(|()| {
                 if service.worker.is_alive() {
+                    let status = service.worker.status();
                     Ok(LocalResult::Health {
                         protocol: PROTOCOL_VERSION,
-                        vault_locked: false,
+                        vault_locked: status.vault == VaultState::Locked,
                     })
                 } else {
                     Err(service_internal_error())
@@ -916,6 +917,7 @@ enum RoutedRequest {
 
 #[derive(Debug)]
 enum VaultCommand {
+    Unlock,
     ProjectPathSet(ProjectPathParams),
     MemoryGet(MemoryParams),
     Workspace(LocalRequest),
@@ -947,7 +949,7 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         LocalRequest::Cancel(_) => RoutedRequest::Immediate(Err(invalid_request_error())),
         LocalRequest::Shutdown(_) => RoutedRequest::Shutdown,
         LocalRequest::Health(_) => RoutedRequest::Health,
-        LocalRequest::Unlock(_) => RoutedRequest::Immediate(Ok(LocalResult::Empty)),
+        LocalRequest::Unlock(_) => RoutedRequest::Work(VaultCommand::Unlock),
         LocalRequest::ProjectPathSet(params) => {
             RoutedRequest::Work(VaultCommand::ProjectPathSet(params))
         }
@@ -1105,6 +1107,7 @@ struct WorkerClient {
     sender: mpsc::WeakSender<WorkItem>,
     admission: Arc<Mutex<bool>>,
     worker_hook: Option<Arc<dyn WorkerHook>>,
+    status: Arc<ServiceStatus>,
 }
 
 impl WorkerClient {
@@ -1112,6 +1115,10 @@ impl WorkerClient {
         self.sender
             .upgrade()
             .is_some_and(|sender| !sender.is_closed())
+    }
+
+    fn status(&self) -> ServiceStatusSnapshot {
+        self.status.snapshot()
     }
 
     fn try_submit(
@@ -1157,6 +1164,35 @@ struct VaultWorker {
     admission: Arc<Mutex<bool>>,
     worker_hook: Option<Arc<dyn WorkerHook>>,
     native_memory_ledgers: Option<Vec<context_relay_core::native_memory::NativeMemoryLedger>>,
+    status: Arc<ServiceStatus>,
+}
+
+#[derive(Clone, Copy)]
+struct ServiceStatusSnapshot {
+    vault: VaultState,
+    sync: SyncState,
+}
+
+struct ServiceStatus(Mutex<ServiceStatusSnapshot>);
+
+impl ServiceStatus {
+    fn new() -> Self {
+        Self(Mutex::new(ServiceStatusSnapshot {
+            vault: VaultState::Unlocked,
+            sync: SyncState::Offline,
+        }))
+    }
+
+    fn snapshot(&self) -> ServiceStatusSnapshot {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn set_vault(&self, vault: VaultState) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .vault = vault;
+    }
 }
 
 struct StoredExport {
@@ -1178,6 +1214,105 @@ struct WorkspaceState {
     pairing_identity: Option<PairingIdentity>,
 }
 
+enum VaultWorkerState {
+    Locked(VaultConfig),
+    Open(WorkspaceState),
+}
+
+enum WorkspaceOpenError {
+    Locked,
+    Fatal(DaemonError),
+}
+
+fn open_workspace(
+    config: &mut VaultConfig,
+) -> Result<
+    (
+        WorkspaceState,
+        Vec<context_relay_core::native_memory::NativeMemoryLedger>,
+    ),
+    WorkspaceOpenError,
+> {
+    let parent = config
+        .path
+        .parent()
+        .ok_or(WorkspaceOpenError::Fatal(DaemonError::Startup))?;
+    std::fs::create_dir_all(parent).map_err(|_| WorkspaceOpenError::Fatal(DaemonError::Startup))?;
+    let mut vault = match Vault::open(
+        &config.path,
+        &config.credential_id,
+        config.key_store.as_ref(),
+    ) {
+        Ok(vault) => vault,
+        Err(VaultError::MissingKey | VaultError::WrongKey | VaultError::Credential(_)) => {
+            return Err(WorkspaceOpenError::Locked);
+        }
+        Err(_) => return Err(WorkspaceOpenError::Fatal(DaemonError::Startup)),
+    };
+
+    #[cfg(test)]
+    if let Some(recovery) = &config.startup_recovery {
+        recovery(&mut vault).map_err(WorkspaceOpenError::Fatal)?;
+    } else {
+        recover_startup_native_transactions(&mut vault, &config.path, config.device_id)
+            .map_err(WorkspaceOpenError::Fatal)?;
+    }
+    #[cfg(not(test))]
+    recover_startup_native_transactions(&mut vault, &config.path, config.device_id)
+        .map_err(WorkspaceOpenError::Fatal)?;
+
+    config
+        .bridge_install
+        .reconcile_after_native_recovery(&mut vault, &config.path, config.device_id)
+        .map_err(|_| WorkspaceOpenError::Fatal(DaemonError::Startup))?;
+    let ledgers = vault
+        .native_memory_ledgers()
+        .map_err(|_| WorkspaceOpenError::Fatal(DaemonError::Startup))?;
+    let pairing_identity =
+        if config.pairing_service.is_some() || config.recovery_enrollment_service.is_some() {
+            let keys = config
+                .device_keys
+                .as_ref()
+                .ok_or(WorkspaceOpenError::Fatal(DaemonError::Startup))?;
+            if let Some(service) = &config.recovery_enrollment_service {
+                service
+                    .resume_prepared(&mut vault, keys)
+                    .map_err(|_| WorkspaceOpenError::Fatal(DaemonError::Startup))?;
+            }
+            if let Some(service) = &config.pairing_service {
+                service
+                    .resume_prepared_decisions(&mut vault)
+                    .map_err(|_| WorkspaceOpenError::Fatal(DaemonError::Startup))?;
+            }
+            Some(PairingIdentity {
+                device_id: config.device_id,
+                device_name: config.device_name.clone(),
+                platform: config.platform,
+                keys: config
+                    .device_keys
+                    .take()
+                    .expect("device keys remain available until recovery succeeds"),
+            })
+        } else {
+            None
+        };
+    Ok((
+        WorkspaceState {
+            vault,
+            vault_path: config.path.clone(),
+            device_id: config.device_id,
+            exports: BTreeMap::new(),
+            deletion: AccountDeletionState::Active,
+            bridge_install: config.bridge_install.clone(),
+            native_memory_updates: config.native_memory_updates.clone(),
+            pairing_service: config.pairing_service.clone(),
+            recovery_enrollment_service: config.recovery_enrollment_service.clone(),
+            pairing_identity,
+        },
+        ledgers,
+    ))
+}
+
 impl VaultWorker {
     async fn spawn(config: VaultConfig) -> Result<Self, DaemonError> {
         let mut config = config.load_device_identity()?;
@@ -1186,99 +1321,36 @@ impl VaultWorker {
         let (exit_sender, exit_receiver) = oneshot::channel();
         let admission = Arc::new(Mutex::new(true));
         let worker_hook = config.worker_hook.clone();
+        let thread_worker_hook = worker_hook.clone();
+        let status = Arc::new(ServiceStatus::new());
+        let worker_status = status.clone();
         let thread = std::thread::Builder::new()
             .name("context-relay-vault".into())
             .spawn(move || {
-                let opened = config
-                    .path
-                    .parent()
-                    .ok_or(DaemonError::Startup)
-                    .and_then(|parent| {
-                        std::fs::create_dir_all(parent).map_err(|_| DaemonError::Startup)
-                    })
-                    .and_then(|()| {
-                        Vault::open(
-                            &config.path,
-                            &config.credential_id,
-                            config.key_store.as_ref(),
-                        )
-                        .map_err(|_| DaemonError::Startup)
-                    });
-                let opened = opened.and_then(|mut vault| {
-                    #[cfg(test)]
-                    if let Some(recovery) = &config.startup_recovery {
-                        recovery(&mut vault)?;
-                    } else {
-                        recover_startup_native_transactions(
-                            &mut vault,
-                            &config.path,
-                            config.device_id,
-                        )?;
+                let (state, ledgers) = match open_workspace(&mut config) {
+                    Ok((workspace, ledgers)) => {
+                        worker_status.set_vault(VaultState::Unlocked);
+                        (VaultWorkerState::Open(workspace), ledgers)
                     }
-                    #[cfg(not(test))]
-                    recover_startup_native_transactions(
-                        &mut vault,
-                        &config.path,
-                        config.device_id,
-                    )?;
-                    config
-                        .bridge_install
-                        .reconcile_after_native_recovery(&mut vault, &config.path, config.device_id)
-                        .map_err(|_| DaemonError::Startup)?;
-                    let pairing_identity = if config.pairing_service.is_some()
-                        || config.recovery_enrollment_service.is_some()
-                    {
-                        let keys = config.device_keys.take().ok_or(DaemonError::Startup)?;
-                        if let Some(service) = &config.recovery_enrollment_service {
-                            service
-                                .resume_prepared(&mut vault, &keys)
-                                .map_err(|_| DaemonError::Startup)?;
-                        }
-                        if let Some(service) = &config.pairing_service {
-                            service
-                                .resume_prepared_decisions(&mut vault)
-                                .map_err(|_| DaemonError::Startup)?;
-                        }
-                        Some(PairingIdentity {
-                            device_id: config.device_id,
-                            device_name: config.device_name.clone(),
-                            platform: config.platform,
-                            keys,
-                        })
-                    } else {
-                        None
-                    };
-                    let ledgers = vault
-                        .native_memory_ledgers()
-                        .map_err(|_| DaemonError::Startup)?;
-                    Ok((vault, ledgers, pairing_identity))
-                });
-                match opened {
-                    Ok((vault, ledgers, pairing_identity)) => {
-                        if ready_sender.send(Ok(ledgers)).is_err() {
-                            return;
-                        }
-                        run_vault_worker(
-                            WorkspaceState {
-                                vault,
-                                vault_path: config.path,
-                                device_id: config.device_id,
-                                exports: BTreeMap::new(),
-                                deletion: AccountDeletionState::Active,
-                                bridge_install: config.bridge_install,
-                                native_memory_updates: config.native_memory_updates,
-                                pairing_service: config.pairing_service,
-                                recovery_enrollment_service: config.recovery_enrollment_service,
-                                pairing_identity,
-                            },
-                            &mut receiver,
-                            config.worker_hook.as_deref(),
-                        );
+                    Err(WorkspaceOpenError::Locked) => {
+                        worker_status.set_vault(VaultState::Locked);
+                        (VaultWorkerState::Locked(config), Vec::new())
                     }
-                    Err(error) => {
+                    Err(WorkspaceOpenError::Fatal(error)) => {
                         let _ = ready_sender.send(Err(error));
+                        let _ = exit_sender.send(());
+                        return;
                     }
+                };
+                if ready_sender.send(Ok(ledgers)).is_err() {
+                    return;
                 }
+                run_vault_worker(
+                    state,
+                    &mut receiver,
+                    thread_worker_hook.as_deref(),
+                    &worker_status,
+                );
                 let _ = exit_sender.send(());
             })
             .map_err(|_| DaemonError::Startup)?;
@@ -1289,6 +1361,7 @@ impl VaultWorker {
             admission,
             worker_hook,
             native_memory_ledgers: None,
+            status,
         };
         match ready_receiver.await {
             Ok(Ok(ledgers)) => {
@@ -1315,6 +1388,7 @@ impl VaultWorker {
                 .downgrade(),
             admission: self.admission.clone(),
             worker_hook: self.worker_hook.clone(),
+            status: self.status.clone(),
         }
     }
 
@@ -1354,9 +1428,10 @@ impl VaultWorker {
 }
 
 fn run_vault_worker(
-    mut state: WorkspaceState,
+    mut state: VaultWorkerState,
     receiver: &mut mpsc::Receiver<WorkItem>,
     worker_hook: Option<&dyn WorkerHook>,
+    status: &ServiceStatus,
 ) {
     while let Some(item) = receiver.blocking_recv() {
         let WorkItem {
@@ -1368,7 +1443,7 @@ fn run_vault_worker(
             if let Some(worker_hook) = worker_hook {
                 worker_hook.before_execute();
             }
-            execute_vault_command(&mut state, command)
+            execute_vault_command(&mut state, command, status)
         } else {
             Err(canceled_error())
         };
@@ -1378,10 +1453,32 @@ fn run_vault_worker(
 }
 
 fn execute_vault_command(
-    state: &mut WorkspaceState,
+    state: &mut VaultWorkerState,
     command: VaultCommand,
+    status: &ServiceStatus,
 ) -> Result<LocalResult, ClientError> {
+    if matches!(&command, VaultCommand::Unlock) {
+        let VaultWorkerState::Locked(config) = state else {
+            return Ok(LocalResult::Empty);
+        };
+        let (workspace, ledgers) = match open_workspace(config) {
+            Ok(opened) => opened,
+            Err(WorkspaceOpenError::Locked) => return Err(ClientError::vault_locked()),
+            Err(WorkspaceOpenError::Fatal(_)) => return Err(service_internal_error()),
+        };
+        if let Some(updates) = &workspace.native_memory_updates {
+            updates.send_replace(ledgers);
+        }
+        *state = VaultWorkerState::Open(workspace);
+        status.set_vault(VaultState::Unlocked);
+        return Ok(LocalResult::Empty);
+    }
+
+    let VaultWorkerState::Open(state) = state else {
+        return Err(ClientError::vault_locked());
+    };
     match command {
+        VaultCommand::Unlock => unreachable!("unlock is handled before open-state dispatch"),
         VaultCommand::ProjectPathSet(params) => state
             .vault
             .put_path(&params.project_id.to_string(), &params.path)
@@ -1392,7 +1489,7 @@ fn execute_vault_command(
             .memory(&params.memory_id)
             .map(|memory| LocalResult::Memory { memory })
             .map_err(client_error_from_vault),
-        VaultCommand::Workspace(request) => execute_workspace_request(state, request),
+        VaultCommand::Workspace(request) => execute_workspace_request(state, request, status),
         VaultCommand::Pairing(request) => execute_pairing_request(state, request),
         VaultCommand::Recovery(request) => execute_recovery_enrollment_request(state, request),
         VaultCommand::HarnessSetup(request) => execute_harness_setup(state, request),
@@ -1491,13 +1588,20 @@ fn execute_harness_setup(
 fn execute_workspace_request(
     state: &mut WorkspaceState,
     request: LocalRequest,
+    service_status: &ServiceStatus,
 ) -> Result<LocalResult, ClientError> {
     match request {
         LocalRequest::McpCall(params) => {
             let name = params.name.clone();
-            McpWorkspace::new(&mut state.vault, state.device_id)
-                .call(params)
-                .map(|output| LocalResult::McpOutput { name, output })
+            let status = service_status.snapshot();
+            McpWorkspace::with_service_status(
+                &mut state.vault,
+                state.device_id,
+                status.vault,
+                status.sync,
+            )
+            .call(params)
+            .map(|output| LocalResult::McpOutput { name, output })
         }
         LocalRequest::NativeHookEvent(params) => {
             let resolved = context_relay_core::mcp::binding::resolve_hook_binding(
@@ -1594,22 +1698,25 @@ fn execute_workspace_request(
             .map(|()| LocalResult::Access {
                 policy: params.policy,
             }),
-        LocalRequest::SyncStatus(_) => state
-            .vault
-            .access_policy(HarnessId::Codex)
-            .map_err(client_error_from_vault)
-            .map(|access| LocalResult::Status {
-                status: context_relay_protocol::StatusOutput {
-                    protocol: ProtocolVersionRange {
-                        min: PROTOCOL_VERSION,
-                        max: PROTOCOL_VERSION,
+        LocalRequest::SyncStatus(_) => {
+            let status = service_status.snapshot();
+            state
+                .vault
+                .access_policy(HarnessId::Codex)
+                .map_err(client_error_from_vault)
+                .map(|access| LocalResult::Status {
+                    status: context_relay_protocol::StatusOutput {
+                        protocol: ProtocolVersionRange {
+                            min: PROTOCOL_VERSION,
+                            max: PROTOCOL_VERSION,
+                        },
+                        vault: status.vault,
+                        resolved_project: None,
+                        sync: status.sync,
+                        access,
                     },
-                    vault: VaultState::Unlocked,
-                    resolved_project: None,
-                    sync: SyncState::Offline,
-                    access,
-                },
-            }),
+                })
+        }
         LocalRequest::DevicesList(_) => {
             pairing::all_device_summaries(&state.vault, state.device_id)
                 .map(|devices| LocalResult::Devices { devices })
@@ -2668,6 +2775,10 @@ pub mod test_support {
             HarnessId::Codex
         }
 
+        fn bridge_setup_capability(&self) -> context_relay_protocol::CapabilityLevel {
+            BridgePreviewHarness::bridge_setup_capability(&self.adapter)
+        }
+
         fn bridge_project_id(&self) -> Option<ProjectId> {
             Some(self.adapter.project_id())
         }
@@ -3060,7 +3171,7 @@ mod tests {
         collections::HashMap,
         sync::{
             Arc, Condvar, Mutex,
-            atomic::{AtomicU64, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
     };
 
@@ -3545,13 +3656,13 @@ mod tests {
 
     #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
-    async fn vault_open_failure_releases_singleton_and_never_publishes_endpoint() {
+    async fn invalid_vault_parent_releases_singleton_and_never_publishes_endpoint() {
         let runtime = test_runtime("open-failure");
         let provider = Arc::new(FixedTokenProvider::default());
         let keys = Arc::new(MemoryKeyStore::default());
-        let path = unique_temp_path("open-failure").join("vault.db");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, []).unwrap();
+        let parent = unique_temp_path("open-failure");
+        std::fs::write(&parent, b"not a directory").unwrap();
+        let path = parent.join("vault.db");
         let config = test_config(runtime.clone(), path, keys, provider);
 
         assert!(matches!(
@@ -5226,6 +5337,84 @@ mod tests {
 
     #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
+    async fn locked_vault_keeps_the_authenticated_endpoint_alive_until_desktop_unlocks_it() {
+        let runtime = test_runtime("daemon-locked-vault");
+        let provider = Arc::new(FixedTokenProvider::default());
+        let keys = Arc::new(MemoryKeyStore::default());
+        let root = canonical_test_directory("daemon-locked-vault-data");
+        let path = root.join("vault.db");
+        drop(Vault::open(&path, "test-vault-key", keys.as_ref()).unwrap());
+        keys.set_locked(true);
+
+        let daemon = Daemon::start(test_config(runtime.clone(), path, keys.clone(), provider))
+            .await
+            .unwrap();
+        let handle = daemon.handle();
+        let owner = tokio::spawn(daemon.run());
+        let mut desktop = RawClient::connect(&runtime, ClientRole::Desktop).await;
+        let mut mcp = RawClient::connect(&runtime, ClientRole::McpBridge).await;
+
+        assert_eq!(
+            desktop
+                .call(LocalRequest::Health(EmptyParams {}))
+                .await
+                .unwrap(),
+            LocalResult::Health {
+                protocol: PROTOCOL_VERSION,
+                vault_locked: true,
+            }
+        );
+        let locked = mcp
+            .call(mcp_request(
+                &root,
+                "context_relay_status",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(locked, ClientError::vault_locked());
+
+        keys.set_locked(false);
+        assert_eq!(
+            desktop
+                .call(LocalRequest::Unlock(EmptyParams {}))
+                .await
+                .unwrap(),
+            LocalResult::Empty
+        );
+        assert_eq!(
+            desktop
+                .call(LocalRequest::Health(EmptyParams {}))
+                .await
+                .unwrap(),
+            LocalResult::Health {
+                protocol: PROTOCOL_VERSION,
+                vault_locked: false,
+            }
+        );
+        let LocalResult::Status { status } = desktop
+            .call(LocalRequest::SyncStatus(EmptyParams {}))
+            .await
+            .unwrap()
+        else {
+            panic!("expected authoritative service status");
+        };
+        assert_eq!(status.vault, VaultState::Unlocked);
+        assert_eq!(status.sync, SyncState::Offline);
+
+        assert_eq!(
+            desktop
+                .call(LocalRequest::Shutdown(EmptyParams {}))
+                .await
+                .unwrap(),
+            LocalResult::Empty
+        );
+        assert_eq!(owner.await.unwrap(), Ok(()));
+        assert_eq!(handle.state(), DaemonState::Stopped);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
     async fn daemon_routes_real_and_deferred_methods_then_flushes_shutdown() {
         let runtime = test_runtime("daemon-e2e");
         let provider = Arc::new(FixedTokenProvider::default());
@@ -5774,7 +5963,8 @@ mod tests {
             .to_owned();
         let digest = "11".repeat(32);
         let empty = || serde_json::json!({});
-        let harness = || serde_json::json!({"harness": "codex", "projectId": null});
+        let harness =
+            || serde_json::json!({"harness": "codex", "projectId": null, "hermesProfile": null});
 
         vec![
             (
@@ -6854,6 +7044,7 @@ mod tests {
         values: Mutex<HashMap<String, Vec<u8>>>,
         loads: AtomicUsize,
         stores: AtomicUsize,
+        locked: AtomicBool,
         block: Option<Arc<(Mutex<BlockState>, Condvar)>>,
         entered: Mutex<Option<oneshot::Sender<()>>>,
         entered_rx: Mutex<Option<oneshot::Receiver<()>>>,
@@ -6865,6 +7056,10 @@ mod tests {
     }
 
     impl MemoryKeyStore {
+        fn set_locked(&self, locked: bool) {
+            self.locked.store(locked, Ordering::SeqCst);
+        }
+
         fn blocking() -> Self {
             let (entered, entered_rx) = oneshot::channel();
             Self {
@@ -6894,6 +7089,9 @@ mod tests {
     impl DatabaseKeyStore for MemoryKeyStore {
         fn load_key(&self, credential_id: &str) -> Result<Option<Zeroizing<Vec<u8>>>, VaultError> {
             self.loads.fetch_add(1, Ordering::SeqCst);
+            if self.locked.load(Ordering::SeqCst) {
+                return Err(VaultError::Credential("credential store is locked".into()));
+            }
             if let Some(sender) = self.entered.lock().unwrap().take() {
                 let _ = sender.send(());
             }
@@ -6915,6 +7113,9 @@ mod tests {
 
         fn store_key(&self, credential_id: &str, key: &[u8]) -> Result<(), VaultError> {
             self.stores.fetch_add(1, Ordering::SeqCst);
+            if self.locked.load(Ordering::SeqCst) {
+                return Err(VaultError::Credential("credential store is locked".into()));
+            }
             self.values
                 .lock()
                 .unwrap()

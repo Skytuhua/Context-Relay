@@ -24,6 +24,7 @@ const MAX_TREE_ENTRIES: usize = 256;
 pub(super) fn project_reviewed_config(
     parsed: &ParsedHermesYaml,
     profile: &str,
+    version: &str,
 ) -> Result<Vec<ComponentRecord>, ClientError> {
     let root = parsed
         .value
@@ -38,7 +39,7 @@ pub(super) fn project_reviewed_config(
                     .as_str()
                     .ok_or_else(|| invalid("Hermes approval key is invalid"))?;
                 let path = format!("approvals.{key}");
-                let (fidelity, reason) = permission_mapping(&path)
+                let (fidelity, reason) = permission_mapping(version, &path)
                     .ok_or_else(|| invalid("Hermes permission path is invalid"))?;
                 push_permission_component(
                     &mut components,
@@ -50,7 +51,7 @@ pub(super) fn project_reviewed_config(
                 )?;
             }
         } else {
-            let (fidelity, reason) = permission_mapping("approvals")
+            let (fidelity, reason) = permission_mapping(version, "approvals")
                 .ok_or_else(|| invalid("Hermes permission path is invalid"))?;
             push_permission_component(
                 &mut components,
@@ -64,7 +65,7 @@ pub(super) fn project_reviewed_config(
     }
 
     if let Some(value) = get(root, "command_allowlist") {
-        let (fidelity, reason) = permission_mapping("command_allowlist")
+        let (fidelity, reason) = permission_mapping(version, "command_allowlist")
             .ok_or_else(|| invalid("Hermes permission path is invalid"))?;
         push_permission_component(
             &mut components,
@@ -182,8 +183,9 @@ pub(super) fn project_reviewed_config(
 pub(super) fn reviewed_config_projection(
     parsed: &ParsedHermesYaml,
     profile: &str,
+    version: &str,
 ) -> Result<JsonValue, ClientError> {
-    let components = project_reviewed_config(parsed, profile)?;
+    let components = project_reviewed_config(parsed, profile, version)?;
     let mut root = BTreeMap::<String, JsonValue>::new();
     let mut approvals = BTreeMap::<String, JsonValue>::new();
     let mut plugins_enabled = BTreeSet::new();
@@ -280,15 +282,26 @@ pub(super) fn reviewed_config_projection(
 pub(super) fn validation_config_projection(
     parsed: &ParsedHermesYaml,
     profile: &str,
+    version: &str,
 ) -> Result<JsonValue, ClientError> {
-    let reviewed = reviewed_config_projection(parsed, profile)?;
+    let reviewed = reviewed_config_projection(parsed, profile, version)?;
     if !reviewed.is_object() {
         return Err(invalid("Hermes reviewed config projection is invalid"));
     }
-    Ok(JsonValue::Object(Default::default()))
+    Ok(reviewed)
 }
 
-pub(super) fn permission_mapping(path: &str) -> Option<(&'static str, &'static str)> {
+pub(super) fn permission_mapping(
+    version: &str,
+    path: &str,
+) -> Option<(&'static str, &'static str)> {
+    if !matches!(version, "0.18.2" | "0.18.1") {
+        return (matches!(path, "approvals" | "command_allowlist")
+            || path
+                .strip_prefix("approvals.")
+                .is_some_and(|key| !key.is_empty() && !key.contains('.')))
+        .then_some(("lossy", "unknown_permission_semantics"));
+    }
     match path {
         "approvals" => Some(("lossy", "confirmation_switch_not_portable")),
         "command_allowlist" => Some(("lossy", "permanent_allowlist_not_portable")),
@@ -299,12 +312,13 @@ pub(super) fn permission_mapping(path: &str) -> Option<(&'static str, &'static s
             }
             Some(match key {
                 "mode" => ("lossy", "approval_mode_not_portable"),
+                "timeout" => ("lossy", "approval_timeout_not_portable"),
                 "deny" => ("lossy", "deny_pattern_not_portable"),
-                "cron" => ("lossy", "cron_permission_not_portable"),
-                "confirm" | "confirmation" | "require_confirmation" => {
+                "cron_mode" => ("lossy", "cron_permission_not_portable"),
+                "mcp_reload_confirm" | "destructive_slash_confirm" => {
                     ("lossy", "confirmation_switch_not_portable")
                 }
-                _ => ("exact", "native_equivalent"),
+                _ => ("lossy", "unknown_permission_semantics"),
             })
         }
     }
@@ -341,7 +355,8 @@ impl HermesAdapter {
         &self,
         parsed: &ParsedHermesYaml,
     ) -> Result<Vec<ComponentRecord>, ClientError> {
-        let mut components = project_reviewed_config(parsed, &self.layout.profile.name)?;
+        let mut components =
+            project_reviewed_config(parsed, &self.layout.profile.name, &self.layout.version)?;
         for component in &mut components {
             self.finish_component(component)?;
         }
@@ -355,31 +370,29 @@ impl HermesAdapter {
         let Ok(parsed) = yaml::parse_config(&bytes) else {
             return Vec::new();
         };
-        let Some(root) = parsed.value.as_mapping() else {
+        let Ok(components) =
+            project_reviewed_config(&parsed, &self.layout.profile.name, &self.layout.version)
+        else {
             return Vec::new();
         };
-        let mut conflicts = BTreeSet::new();
-        if let Some(approvals) = get(root, "approvals").and_then(YamlValue::as_mapping) {
-            if get(approvals, "mode").is_some() {
-                conflicts.insert("approval_mode_not_portable".to_owned());
-            }
-            if get(approvals, "deny").is_some() {
-                conflicts.insert("deny_pattern_not_portable".to_owned());
-            }
-            if ["confirm", "confirmation", "require_confirmation"]
-                .iter()
-                .any(|key| get(approvals, key).is_some())
-            {
-                conflicts.insert("confirmation_switch_not_portable".to_owned());
-            }
-            if get(approvals, "cron").is_some() {
-                conflicts.insert("cron_permission_not_portable".to_owned());
-            }
-        }
-        if get(root, "command_allowlist").is_some() {
-            conflicts.insert("permanent_allowlist_not_portable".to_owned());
-        }
-        conflicts.into_iter().collect()
+        components
+            .into_iter()
+            .filter(|component| component.kind == ComponentKind::PermissionDeclaration)
+            .filter_map(|component| {
+                let lossy = component
+                    .metadata
+                    .iter()
+                    .any(|(key, value)| key == "mappingFidelity" && value == "lossy");
+                lossy.then(|| {
+                    component
+                        .metadata
+                        .into_iter()
+                        .find_map(|(key, value)| (key == "mappingReason").then_some(value))
+                })?
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     pub(super) fn import_scope(
@@ -396,7 +409,11 @@ impl HermesAdapter {
                 let bytes = read_required_reviewed_file(root, &config_path, "profile:config.yaml")?;
                 let parsed = yaml::parse_config(&bytes)?;
                 digests.insert(digest(&parsed.source));
-                let projected = project_reviewed_config(&parsed, &self.layout.profile.name)?;
+                let projected = project_reviewed_config(
+                    &parsed,
+                    &self.layout.profile.name,
+                    &self.layout.version,
+                )?;
                 let enabled_plugins = projected
                     .iter()
                     .filter(|component| {

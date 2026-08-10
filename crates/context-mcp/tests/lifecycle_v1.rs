@@ -34,8 +34,8 @@ impl Daemon for FakeDaemon {
         ready(Ok(match call.name.as_str() {
             "context_relay_status" => json!({
                 "protocol": {
-                    "min": {"major": 1, "minor": 3},
-                    "max": {"major": 1, "minor": 3}
+                    "min": {"major": 1, "minor": 4},
+                    "max": {"major": 1, "minor": 4}
                 },
                 "vault": "unlocked",
                 "resolvedProject": null,
@@ -145,12 +145,20 @@ fn parse_stdout_lines(output: &[u8]) -> Vec<Value> {
 async fn initializes_then_lists_exact_frozen_tools() {
     let run = run_server(
         FakeDaemon::default(),
-        ready_input([json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list",
-            "params": {}
-        })]),
+        ready_input([
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/list",
+                "params": {"cursor": "context-relay-tools-v1:8"}
+            }),
+        ]),
     )
     .await;
 
@@ -161,7 +169,16 @@ async fn initializes_then_lists_exact_frozen_tools() {
         messages[0]["result"]["capabilities"]["tools"]["listChanged"],
         false
     );
-    let tools = messages[1]["result"]["tools"].as_array().unwrap();
+    assert_eq!(
+        messages[1]["result"]["nextCursor"],
+        "context-relay-tools-v1:8"
+    );
+    let tools = messages[1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(messages[2]["result"]["tools"].as_array().unwrap())
+        .collect::<Vec<_>>();
     let names = tools
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
@@ -189,6 +206,92 @@ async fn compatibility_revision_is_negotiated_exactly() {
         messages[0]["result"]["protocolVersion"],
         MCP_COMPAT_REVISION
     );
+}
+
+#[tokio::test]
+async fn official_initialize_envelopes_accept_client_title_and_request_metadata() {
+    for revision in [MCP_COMPAT_REVISION, MCP_REVISION] {
+        let run = run_server(
+            FakeDaemon::default(),
+            lines([json!({
+                "jsonrpc": "2.0",
+                "id": revision,
+                "method": "initialize",
+                "params": {
+                    "_meta": {
+                        "progressToken": format!("initialize-{revision}"),
+                        "com.example/clientTrace": "opaque"
+                    },
+                    "protocolVersion": revision,
+                    "capabilities": {"experimental": {"com.example/feature": {}}},
+                    "clientInfo": {
+                        "name": "test",
+                        "title": "Context Relay conformance client",
+                        "version": "1",
+                        "description": "Official MCP client metadata",
+                        "icons": [{
+                            "src": "https://example.test/icon.png",
+                            "mimeType": "image/png",
+                            "sizes": ["48x48"],
+                            "theme": "dark"
+                        }],
+                        "websiteUrl": "https://example.test"
+                    }
+                }
+            })]),
+        )
+        .await;
+
+        assert_eq!(run.result, Ok(()));
+        let messages = parse_stdout_lines(&run.output);
+        assert_eq!(messages[0]["id"], revision);
+        assert_eq!(messages[0]["result"]["protocolVersion"], revision);
+    }
+}
+
+#[tokio::test]
+async fn tools_list_uses_an_opaque_cursor_and_call_arguments_default_to_empty_object() {
+    let daemon = FakeDaemon::default();
+    let run = run_server(
+        daemon.clone(),
+        ready_input([
+            json!({
+                "jsonrpc": "2.0",
+                "id": "first-page",
+                "method": "tools/list",
+                "params": {
+                    "_meta": {"progressToken": 17, "com.example/trace": true}
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "second-page",
+                "method": "tools/list",
+                "params": {"cursor": "context-relay-tools-v1:8"}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "status",
+                "method": "tools/call",
+                "params": {
+                    "_meta": {"progressToken": "status", "com.example/trace": true},
+                    "name": "context_relay_status"
+                }
+            }),
+        ]),
+    )
+    .await;
+
+    assert_eq!(run.result, Ok(()));
+    let messages = parse_stdout_lines(&run.output);
+    let first = &messages[1]["result"];
+    assert_eq!(first["tools"].as_array().unwrap().len(), 8);
+    assert_eq!(first["nextCursor"], "context-relay-tools-v1:8");
+    let second = &messages[2]["result"];
+    assert_eq!(second["tools"].as_array().unwrap().len(), 3);
+    assert!(second.get("nextCursor").is_none());
+    assert_eq!(daemon.call_count(), 1);
+    assert_eq!(messages[3]["result"]["isError"], false);
 }
 
 #[tokio::test]

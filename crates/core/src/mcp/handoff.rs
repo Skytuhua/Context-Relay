@@ -275,19 +275,13 @@ fn render_markdown(
     markdown.push("\n## Recent decisions\n\n")?;
     render_memories(&mut markdown, decisions)?;
     markdown.push("\n## Open and blocked tasks\n\n")?;
-    if tasks.is_empty() {
-        markdown.push("_None._\n")?;
-    } else {
-        for task in tasks {
-            markdown.push(&format!(
-                "- {} (`{}`; {}): {}\n",
-                task.title,
-                task.id,
-                task_status(task.status),
-                task.body_markdown
-            ))?;
-        }
-    }
+    render_tasks(&mut markdown, tasks, |status| {
+        !matches!(status, TaskStatus::Done | TaskStatus::Canceled)
+    })?;
+    markdown.push("\n## Selected terminal tasks\n\n")?;
+    render_tasks(&mut markdown, tasks, |status| {
+        matches!(status, TaskStatus::Done | TaskStatus::Canceled)
+    })?;
     markdown.push("\n## Completion evidence\n\n")?;
     let mut evidence_count = 0;
     for task in tasks {
@@ -315,6 +309,28 @@ fn render_markdown(
         }
     }
     Ok(markdown.value)
+}
+
+fn render_tasks(
+    markdown: &mut Markdown,
+    tasks: &[TaskRecord],
+    include: impl Fn(TaskStatus) -> bool,
+) -> Result<(), ClientError> {
+    let mut rendered = 0;
+    for task in tasks.iter().filter(|task| include(task.status)) {
+        rendered += 1;
+        markdown.push(&format!(
+            "- {} (`{}`; {}): {}\n",
+            task.title,
+            task.id,
+            task_status(task.status),
+            task.body_markdown
+        ))?;
+    }
+    if rendered == 0 {
+        markdown.push("_None._\n")?;
+    }
+    Ok(())
 }
 
 fn render_memories(markdown: &mut Markdown, memories: &[MemoryRecord]) -> Result<(), ClientError> {

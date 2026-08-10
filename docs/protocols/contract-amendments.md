@@ -1,6 +1,6 @@
 # Context Relay v1 contract amendments
 
-Ledger version: **1.1.0**. This is a pre-release normative companion to the v1
+Ledger version: **1.2.0**. This is a pre-release normative companion to the v1
 master plan. The master plan remains product and security authority; this ledger
 records later reviewed contract hardening that must be implemented, documented,
 and tested as one synchronized change. Unlisted behavior is not amended.
@@ -8,9 +8,9 @@ and tested as one synchronized change. Unlisted behavior is not amended.
 ## A-001 — Local protocol 1.3 recovery enrollment
 
 - **Authority:** [recovery-enrollment design](../superpowers/specs/2026-08-09-recovery-root-enrollment-design.md), [implementation plan](../superpowers/plans/2026-08-09-recovery-root-enrollment.md), and the implemented [protocol contract](protocol-v1.md).
-- **Amendment:** The v1 product's exact local IPC boundary is protocol 1.3, not the earlier 1.0/1.2 fixtures. Five phase-specific recovery-enrollment methods replace the unused generic recovery routes.
+- **Amendment:** At adoption, the exact local IPC boundary advanced to protocol 1.3 from the earlier 1.0/1.2 fixtures. Five phase-specific recovery-enrollment methods replaced the unused generic recovery routes. A-005 later advances the current boundary to 1.4 while retaining these recovery shapes.
 - **Security rationale:** Begin and confirmation are confined to the trusted native recovery host; ordinary renderer projections are word-free. Exact-version negotiation rejects 1.2 peers before application dispatch instead of silently accepting a phrase-bearing or under-authorized shape.
-- **Compatibility and migration impact:** This is a deliberate pre-release wire break. Protocol 1.2 peers cannot interoperate with 1.3. Generated TypeScript bindings, handshake vectors, runtime-contract hashes, and role allowlists must advance together; no downgrade fallback is allowed.
+- **Compatibility and migration impact:** This was a deliberate pre-release wire break. Protocol 1.2 peers cannot interoperate with 1.3, and A-005 now makes 1.3 a legacy peer of 1.4. Generated TypeScript bindings, handshake vectors, runtime-contract hashes, and role allowlists must advance together; no downgrade fallback is allowed.
 - **Required synchronized artifacts:** [protocol constants/DTOs](../../crates/protocol/src/ipc.rs), [generated bindings](../../apps/desktop/src/bindings.ts), [exact handshake vectors/tests](../../crates/local-ipc/src/handshake_tests.rs), [runtime-contract hashes](../../crates/protocol/tests/fixtures/runtime-contracts-v1.json), [Tauri native host](../../apps/desktop/src-tauri/src/main.rs), [daemon routing](../../crates/contextd/src/recovery_enrollment.rs), [protocol documentation](protocol-v1.md), and [recovery verification](../verification/task-17-recovery-enrollment.md).
 
 ## A-002 — Operation schema v1 and checkpoint schema v2
@@ -37,6 +37,14 @@ and tested as one synchronized change. Unlisted behavior is not amended.
 - **Compatibility and evidence impact:** This changes no runtime protocol, schema, or production feature default. Existing `rust` check compatibility is retained while lint, tests, policy, generated-artifact, license, frontend, whitespace, and native-build evidence become independently visible. A real remote Windows/macOS run is still required before CI can be marked verified. The source lock's identical, nonzero `workflowGitBlob` values remain sealed historical evidence and are not rewritten for ordinary CI edits; current native authority remains bound by the exact source-lock digest and `native-ci-provenance` action, runner, and toolchain pins.
 - **Required synchronized artifacts:** [CI workflow](../../.github/workflows/ci.yml), [independent-gate contract](../../scripts/ci-gates-workflow.test.mjs), [native candidate/provenance contract](../../scripts/native-ci-workflow.test.mjs), and [master-plan audit](../verification/v1-master-plan-audit.md).
 
+## A-005 — Local protocol 1.4 explicit Hermes profile binding
+
+- **Authority:** The v1 master plan's exact-file transaction, multi-profile Hermes, typed IPC, and fail-closed compatibility requirements; the [Task 13 verification](../verification/task-13.md); and the implemented [protocol contract](protocol-v1.md).
+- **Amendment:** The exact local IPC boundary advances from protocol 1.3 to 1.4. `HarnessParams.hermesProfile` and `SetupPlan.harnessProfile` are required-nullable wire fields. Hermes requests and plans require a nonempty explicit profile; Claude Code and Codex require null. The chosen profile is carried through preview and the sealed production plan used by apply, recovery, and rollback.
+- **Security rationale:** Ambient or hard-coded `default` profile selection could preview one native target and later mutate another. Binding the profile into typed input, validation, the approval hash, and persisted sealed bytes makes profile substitution and silent fallback fail closed.
+- **Compatibility and migration impact:** This is a deliberate pre-release strict-wire break. Protocol 1.3 peers cannot interoperate with 1.4, omitted fields fail strict decoding, and exact-version handshake tests reject both downgrade directions before dispatch. There is no released plan migration. Any pre-release persisted 1.3 plan must be discarded and previewed again under 1.4; it must not be inferred or upgraded from ambient profile state.
+- **Required synchronized artifacts:** [protocol version constant](../../crates/protocol/src/lib.rs), [IPC DTO and validation](../../crates/protocol/src/ipc.rs), [sealed setup-plan DTO](../../crates/protocol/src/adapters.rs), [current-protocol MCP status contract](../../crates/protocol/src/mcp.rs), [generated TypeScript bindings](../../apps/desktop/src/bindings.ts), [generated JSON Schemas](../../schemas), [desktop runtime validation](../../apps/desktop/src/protocol-validation.ts), [desktop protocol contract tests](../../apps/desktop/src/protocol-contracts.test.ts), [runtime-contract fixture and hashes](../../crates/protocol/tests/fixtures/runtime-contracts-v1.json), [MCP status fixture](../../crates/protocol/tests/fixtures/mcp-output-valid.json), [exact local-version compatibility tests](../../crates/protocol/tests/protocol_v1.rs), [MCP schema parity tests](../../crates/protocol/tests/mcp_schema_parity_v1.rs), [exact handshake vectors/tests](../../crates/local-ipc/src/handshake_tests.rs), [frozen HMAC vectors](../../crates/local-ipc/tests/ipc_v1.rs), [production daemon bridge routing](../../crates/contextd/src/bridge_install.rs), [profile compatibility tests](../../crates/protocol/tests/hermes_profile_v1.rs), [protocol documentation](protocol-v1.md), [Task 13 verification](../verification/task-13.md), and [master-plan audit](../verification/v1-master-plan-audit.md).
+
 ## Change control
 
 Every future amendment must receive a stable `A-NNN` identifier and record the
@@ -45,3 +53,9 @@ the change that adopts an amendment must update or explicitly revalidate each
 listed artifact, add compatibility/fail-closed tests, and update the
 [master-plan audit](../verification/v1-master-plan-audit.md). Removing an
 amendment requires a superseding ledger entry; history is not rewritten.
+
+For every local wire-version amendment, change control must explicitly check off both the
+[runtime-contract fixture and hashes](../../crates/protocol/tests/fixtures/runtime-contracts-v1.json)
+and the [exact handshake vectors/tests](../../crates/local-ipc/src/handshake_tests.rs), including
+any frozen proof vectors owned by those tests. This closes the A-001 checklist gap: DTOs or
+bindings alone are never sufficient compatibility evidence.

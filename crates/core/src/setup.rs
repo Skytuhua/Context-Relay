@@ -426,7 +426,7 @@ impl BridgePreviewHarness for CodexAdapter {
     }
 
     fn bridge_setup_capability(&self) -> CapabilityLevel {
-        self.capability()
+        self.setup_capability()
     }
 
     fn bridge_project_id(&self) -> Option<ProjectId> {
@@ -777,6 +777,7 @@ impl<'a> HermesMemoryExportService<'a> {
         let mut setup = SetupPlan {
             plan_id,
             harness: HarnessId::Hermes,
+            harness_profile: Some(adapter.profile_name().to_owned()),
             adapter_version: BridgePreviewHarness::bridge_adapter_version(adapter),
             executable_path,
             executable_hash,
@@ -1854,6 +1855,7 @@ where
         let mut setup = SetupPlan {
             plan_id,
             harness,
+            harness_profile: report.active_profile.clone(),
             adapter_version: self.harness.bridge_adapter_version(),
             executable_path,
             executable_hash,
@@ -2037,6 +2039,7 @@ where
         let mut setup = SetupPlan {
             plan_id,
             harness,
+            harness_profile: report.active_profile.clone(),
             adapter_version: self.harness.bridge_adapter_version(),
             executable_path: executable_path.clone(),
             executable_hash,

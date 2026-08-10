@@ -28,6 +28,7 @@ const MAX_SNAPSHOT_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_SECURITY_BYTES: usize = 1024 * 1024;
 const MAX_XATTRS: usize = 128;
 const QUARANTINE_XATTR: &[u8] = b"com.apple.quarantine";
+const PROVENANCE_XATTR: &[u8] = b"com.apple.provenance";
 type ExtendedAttributes = Vec<(Vec<u8>, Vec<u8>)>;
 #[cfg(test)]
 type TestHook = Box<dyn FnOnce() + Send>;
@@ -49,6 +50,9 @@ static PRE_ROLLBACK_MOVE_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + S
     std::sync::Mutex::new(None);
 #[cfg(test)]
 static RECOVERY_AFTER_PARENT_CHECK_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static CREATION_METADATA_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
@@ -100,6 +104,16 @@ fn run_recovery_after_parent_check_test_hook() {
     }
 }
 
+#[cfg(test)]
+fn run_creation_metadata_test_hook() {
+    if let Some(hook) = take_test_hook(&CREATION_METADATA_TEST_HOOK) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_creation_metadata_test_hook() {}
+
 unsafe extern "C" {
     fn acl_free(object: *mut c_void) -> libc::c_int;
     fn acl_init(count: libc::c_int) -> *mut c_void;
@@ -135,6 +149,69 @@ pub(super) fn snapshot(path: &Path) -> Result<NativeSnapshot, RunnerError> {
         return Err(RunnerError::ConcurrentChange);
     }
     Ok(snapshot)
+}
+
+pub(super) fn metadata_for_new_private_file(path: &Path) -> Result<NativeMetadata, RunnerError> {
+    let parent = OpenParent::new(path)?;
+    let before = raw_node(&parent.directory)?;
+    if !before.directory() {
+        return Err(RunnerError::UnsafeTopology);
+    }
+    match raw_at(&parent.directory, &parent.name) {
+        Err(RunnerError::Io) if last_errno() == libc::ENOENT => {}
+        Ok(_) => return Err(RunnerError::ConcurrentChange),
+        Err(error) => return Err(error),
+    }
+    run_creation_metadata_test_hook();
+    let final_parent_links = before
+        .links
+        .checked_add(1)
+        .ok_or(RunnerError::LimitExceeded)?;
+    let inherited_provenance = xattrs(&parent.directory)?
+        .into_iter()
+        .filter(|(name, _)| name.as_slice() == PROVENANCE_XATTR)
+        .collect();
+    let security = PosixSecurity {
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+        mode: MODE_REGULAR | 0o600,
+        flags: 0,
+        acl: Vec::new(),
+        xattrs: inherited_provenance,
+        parent_uid: before.uid,
+        parent_gid: before.gid,
+        parent_mode: before.mode,
+        parent_flags: before.flags,
+        parent_links: final_parent_links,
+    };
+    let after = raw_node(&parent.directory)?;
+    match raw_at(&parent.directory, &parent.name) {
+        Err(RunnerError::Io) if last_errno() == libc::ENOENT => {}
+        Ok(_) => return Err(RunnerError::ConcurrentChange),
+        Err(error) => return Err(error),
+    }
+    if !before.same_snapshot(&after) || !identity_matches_path(&parent.directory, &parent.path)? {
+        return Err(RunnerError::ConcurrentChange);
+    }
+    let (parent_attributes, parent_link_count) = parent_marker_fields(
+        before.mode,
+        before.flags,
+        before.uid,
+        before.gid,
+        final_parent_links,
+    );
+    Ok(NativeMetadata {
+        file_attributes: 0,
+        creation_time: timestamp(before.birth_seconds, before.birth_nanoseconds)?,
+        last_access_time: timestamp(before.access_seconds, before.access_nanoseconds)?,
+        last_write_time: timestamp(before.write_seconds, before.write_nanoseconds)?,
+        change_time: timestamp(before.change_seconds, before.change_nanoseconds)?,
+        security_descriptor: security.encode()?,
+        alternate_streams: Vec::new(),
+        link_count: 1,
+        parent_attributes,
+        parent_link_count,
+    })
 }
 
 pub(super) fn compare_and_swap_with_provenance(
@@ -2401,7 +2478,31 @@ mod guarded_mutation_tests {
                 .as_nanos()
         ));
         fs::create_dir(&root).unwrap();
-        root
+        fs::canonicalize(root).unwrap()
+    }
+
+    #[test]
+    fn private_creation_metadata_rejects_parent_identity_change() {
+        let _serial = SERIAL.lock().unwrap();
+        let root = test_root("private-creation-parent-race");
+        let path = root.join("AGENTS.md");
+        let moved = root.with_extension("moved");
+        let changed = root.clone();
+        let changed_moved = moved.clone();
+        *CREATION_METADATA_TEST_HOOK.lock().unwrap() = Some(Box::new(move || {
+            fs::rename(&changed, &changed_moved).unwrap();
+            fs::create_dir(&changed).unwrap();
+        }));
+
+        assert_eq!(
+            metadata_for_new_private_file(&path),
+            Err(RunnerError::ConcurrentChange)
+        );
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+        if moved.exists() {
+            fs::remove_dir_all(moved).unwrap();
+        }
     }
 
     #[test]

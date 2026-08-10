@@ -22,7 +22,7 @@ const destinations = [
 
 const gateway = {
   status: async () => ({
-    protocol: { min: { major: 1, minor: 3 }, max: { major: 1, minor: 3 } },
+    protocol: { min: { major: 1, minor: 4 }, max: { major: 1, minor: 4 } },
     vault: 'unlocked',
     resolvedProject: null,
     sync: 'offline',

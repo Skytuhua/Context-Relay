@@ -255,7 +255,7 @@ fn challenged_hmac_matches_frozen_vector() {
 
     assert_eq!(
         serde_json::to_string(&proof).unwrap(),
-        r#""-IMDiwOXbaGWjUWL0SAtWoihCRNA1DptUp4ckW6rUfE""#
+        r#""vIjLF221NRLHOpwHDx9ZmjSsNW7Xx7keDPG46cCNS7M""#
     );
     assert!(
         verify_proof(
@@ -460,7 +460,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
 
     assert_eq!(
         serde_json::to_string(&server_proof).unwrap(),
-        r#""Ug4ao9Ys4Oy1SkDU82fO5ZbVisVd8jvtLHMmoyusC70""#
+        r#""5waUUOCuxRderadzSuNDDkVDFB1kLnOdSZahgcMbtxA""#
     );
     assert!(
         verify_server_proof(
@@ -668,7 +668,8 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
     let bytes32 = URL_SAFE_NO_PAD.encode([0x11; 32]);
     let digest = "11".repeat(32);
     let empty = || serde_json::json!({});
-    let harness = || serde_json::json!({"harness": "codex", "projectId": null});
+    let harness =
+        || serde_json::json!({"harness": "codex", "projectId": null, "hermesProfile": null});
 
     vec![
         (

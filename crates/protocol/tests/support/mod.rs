@@ -127,6 +127,7 @@ pub fn setup_plan() -> SetupPlan {
     SetupPlan {
         plan_id: id(ID),
         harness: HarnessId::Codex,
+        harness_profile: None,
         adapter_version: 1,
         executable_path: WireNativeValue {
             platform: NativePlatform::Windows,

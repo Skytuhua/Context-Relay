@@ -149,9 +149,14 @@ impl BridgeInstallEngine for ProductionBridgeInstallEngine {
         params: HarnessParams,
     ) -> Result<SetupPlan, ClientError> {
         let now_ms = now_ms()?;
-        let binding = project_binding(vault, params.project_id)?;
+        let HarnessParams {
+            harness,
+            project_id,
+            hermes_profile,
+        } = params;
+        let binding = project_binding(vault, project_id)?;
         let observed_hlc = HybridLogicalClock::new(now_ms, 0, device_id);
-        match params.harness {
+        match harness {
             HarnessId::ClaudeCode => BridgeInstallService::new(
                 vault,
                 ClaudeCodeAdapter::discover(
@@ -179,21 +184,26 @@ impl BridgeInstallEngine for ProductionBridgeInstallEngine {
                 observed_hlc,
             )
             .preview(binding.registered.as_ref(), now_ms),
-            HarnessId::Hermes => BridgeInstallService::new(
-                vault,
-                HermesAdapter::discover(
-                    &binding.root,
-                    &binding.root,
-                    "default",
-                    binding.project_id,
+            HarnessId::Hermes => {
+                let profile = hermes_profile
+                    .as_deref()
+                    .ok_or_else(|| invalid("Hermes setup requires an explicit profile"))?;
+                BridgeInstallService::new(
+                    vault,
+                    HermesAdapter::discover(
+                        &binding.root,
+                        &binding.root,
+                        profile,
+                        binding.project_id,
+                        device_id,
+                        observed_hlc,
+                    )?,
+                    self.bridge.clone(),
                     device_id,
                     observed_hlc,
-                )?,
-                self.bridge.clone(),
-                device_id,
-                observed_hlc,
-            )
-            .preview(binding.registered.as_ref(), now_ms),
+                )
+                .preview(binding.registered.as_ref(), now_ms)
+            }
         }
     }
 
@@ -332,10 +342,15 @@ impl ProductionBridgePlanExecutor<'_> {
                 executor.execute(vault, plan, sealed_plan, created_ms, now_ms)
             }
             HarnessId::Hermes => {
+                let profile = plan
+                    .setup
+                    .harness_profile
+                    .as_deref()
+                    .ok_or_else(|| invalid("Persisted Hermes setup profile is unavailable"))?;
                 let mut adapter = HermesAdapter::discover(
                     &root,
                     &root,
-                    "default",
+                    profile,
                     project_id,
                     self.device_id,
                     observed_hlc,
@@ -827,6 +842,7 @@ pub(crate) mod tests {
             setup: SetupPlan {
                 plan_id: PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073991").unwrap(),
                 harness: HarnessId::Codex,
+                harness_profile: None,
                 adapter_version: 1,
                 executable_path: native_text("/definitely/missing/codex"),
                 executable_hash: Sha256Digest([1; 32]),

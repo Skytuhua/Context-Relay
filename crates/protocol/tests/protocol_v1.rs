@@ -65,17 +65,17 @@ fn version_negotiation_uses_greatest_shared_minor() {
 }
 
 #[test]
-fn exact_local_wire_versions_do_not_negotiate_across_the_safety_confirmation_break() {
+fn exact_local_wire_versions_do_not_negotiate_across_the_hermes_profile_break() {
     let legacy = ProtocolVersionRange {
-        min: ProtocolVersion { major: 1, minor: 2 },
-        max: ProtocolVersion { major: 1, minor: 2 },
+        min: ProtocolVersion { major: 1, minor: 3 },
+        max: ProtocolVersion { major: 1, minor: 3 },
     };
     let current = ProtocolVersionRange {
         min: PROTOCOL_VERSION,
         max: PROTOCOL_VERSION,
     };
 
-    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 3 });
+    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 4 });
     assert!(negotiate_version(legacy, current).is_err());
     assert_eq!(negotiate_version(current, current), Ok(PROTOCOL_VERSION));
 }

@@ -146,6 +146,7 @@ fn plan() -> NativeTransactionPlan {
         setup: SetupPlan {
             plan_id: PlanId::from_str(ID_1).unwrap(),
             harness: HarnessId::Codex,
+            harness_profile: None,
             adapter_version: 1,
             executable_path: native_text("/fixture/codex"),
             executable_hash: Sha256Digest([1; 32]),
@@ -342,6 +343,7 @@ fn rollback_inverse_restores_the_exact_prior_native_state() {
     let intended_bytes = intended.encode_v1().unwrap();
     let mut original = plan();
     original.setup.harness = HarnessId::Hermes;
+    original.setup.harness_profile = Some("coder".to_owned());
     original.setup.executable_path = native_text("/fixture/hermes");
     original.setup.cli_operations.clear();
     original.cli_mutations.clear();
@@ -431,6 +433,7 @@ fn passive_hermes_inverse_preserves_an_absent_gateway_lock_binding() {
     let mut vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
     let mut original = plan();
     original.setup.harness = HarnessId::Hermes;
+    original.setup.harness_profile = Some("coder".to_owned());
     original.setup.executable_path = native_text("/fixture/hermes");
     original.setup.approval_class = ApprovalClass::Passive;
     original.setup.expected_native_digests = vec![context_relay_protocol::ExpectedNativeDigest {

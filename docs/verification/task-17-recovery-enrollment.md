@@ -41,8 +41,8 @@ phrase, private key, workspace key, raw envelope, or safety number is reproduced
 | Frozen encrypted recovery-metadata envelope | 195 | `ed7eefc978b02ccd581f040138980d6cac5ae0db84be4ab95ed07bcfbf052bf0` |
 | Frozen device-workspace-material envelope | 195 | `a27aaac830e16cf7cf605c15992e173e7943bd0c0252c4ebfa312252dc4d51cc` |
 
-- The local IPC protocol boundary is exactly 1.3. Older exact-version peers fail before
-  application dispatch.
+- Recovery enrollment introduced the exact 1.3 boundary. A-005 now advances the current local
+  boundary to 1.4; 1.3 and older exact-version peers fail before application dispatch.
 - The forward-only encrypted Vault schema is version 22.
 - The recovery record schema remains version 1 and is bounded at 32 KiB.
 - The one-time phrase is BIP39 English with 24 words generated from 256 bits of OS randomness.
@@ -83,7 +83,8 @@ phrase, private key, workspace key, raw envelope, or safety number is reproduced
 
 1. Protocol work began with absent IDs, request/result DTOs, role separation, and generated
    bindings. REDs also caught protocol 1.2 still being accepted and phrase-bearing Debug surfaces.
-   Protocol 1.3 now has strict phase-specific messages and word-free host results.
+   Protocol 1.3 introduced strict phase-specific messages and word-free host results; protocol
+   1.4 retains those shapes and adds the independent Hermes-profile wire break.
 2. Crypto work began with absent recovery record, codec, derivation, and envelope APIs. Frozen
    vectors and mutation tests then drove canonical map validation, record and certificate
    signatures, independent signing/wrapping derivations, complete AADs, weak-key rejection, and

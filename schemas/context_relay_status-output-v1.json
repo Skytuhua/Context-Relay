@@ -105,9 +105,7 @@
               "const": 1
             },
             "minor": {
-              "maximum": 65535,
-              "minimum": 3,
-              "type": "integer"
+              "const": 4
             }
           },
           "required": [
@@ -123,9 +121,7 @@
               "const": 1
             },
             "minor": {
-              "maximum": 3,
-              "minimum": 0,
-              "type": "integer"
+              "const": 4
             }
           },
           "required": [

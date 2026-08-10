@@ -460,10 +460,16 @@ impl CodexAdapter {
         {
             return Err(not_found("Codex installation or project is missing"));
         }
-        layout.project_root = fs::canonicalize(&layout.project_root)
-            .map_err(|_| invalid("Codex project root cannot be safely resolved"))?;
-        layout.working_directory = fs::canonicalize(&layout.working_directory)
-            .map_err(|_| invalid("Codex working directory cannot be safely resolved"))?;
+        layout.executable = canonical_existing_path(&layout.executable)?;
+        layout.codex_home = canonical_existing_directory(&layout.codex_home)?;
+        layout.user_skills_dir = canonical_directory_or_absent_path(&layout.user_skills_dir)?;
+        layout.project_root = canonical_existing_directory(&layout.project_root)?;
+        layout.working_directory = canonical_existing_directory(&layout.working_directory)?;
+        layout.requirements_paths = layout
+            .requirements_paths
+            .into_iter()
+            .map(|path| canonical_file_or_absent_path(&path))
+            .collect::<Result<_, _>>()?;
         if !layout.working_directory.starts_with(&layout.project_root) {
             return Err(invalid(
                 "Codex working directory is outside the project root",
@@ -563,6 +569,9 @@ impl CodexAdapter {
     }
 
     fn recheck_executable_boundary(&self) -> Result<(), BoundaryError> {
+        if self.setup_capability() != CapabilityLevel::Full {
+            return Err(BoundaryError::new("Codex setup is blocked"));
+        }
         open_verified_codex_executable(&self.layout.executable, self.executable_hash)?;
         Ok(())
     }
@@ -572,9 +581,29 @@ impl CodexAdapter {
         runner: &mut impl CodexCommandRunner,
         arguments: &[String],
     ) -> Result<Vec<u8>, BoundaryError> {
+        self.run_verified_with_policy(runner, arguments, false)
+    }
+
+    fn run_authoritative(
+        &self,
+        runner: &mut impl CodexCommandRunner,
+        arguments: &[String],
+    ) -> Result<Vec<u8>, BoundaryError> {
+        self.run_verified_with_policy(runner, arguments, true)
+    }
+
+    fn run_verified_with_policy(
+        &self,
+        runner: &mut impl CodexCommandRunner,
+        arguments: &[String],
+        authoritative: bool,
+    ) -> Result<Vec<u8>, BoundaryError> {
         let executable =
             open_verified_codex_executable(&self.layout.executable, self.executable_hash)?;
         runner.before_launch(arguments)?;
+        if authoritative && self.setup_capability() != CapabilityLevel::Full {
+            return Err(BoundaryError::new("Codex setup is blocked"));
+        }
         executable.revalidate_before_launch()?;
         let launch = executable
             .prepare_launch()
@@ -691,15 +720,25 @@ impl CodexAdapter {
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid("Codex config cannot be safely inspected"))?;
-        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
-            return Err(invalid("Codex config must be a regular file"));
+        let (bytes, metadata) = match snapshot.state() {
+            NativeState::RegularFile { bytes, metadata } => {
+                (bytes.as_slice(), Some(metadata.clone()))
+            }
+            NativeState::Absent { .. } => (&[][..], None),
         };
         let rendered = self.render_config(bytes, desired, &path)?;
-        self.approved_file(
-            &path,
-            snapshot.fingerprint(),
-            NativeState::regular_file(rendered, metadata.clone()),
-        )
+        let intended = if metadata.is_none() && rendered.is_empty() {
+            snapshot.state().clone()
+        } else {
+            let metadata = match metadata {
+                Some(metadata) => metadata,
+                None => OsNativeFileSystem::new()
+                    .metadata_for_new_private_file(&path)
+                    .map_err(|_| invalid("Codex config creation metadata is unavailable"))?,
+            };
+            NativeState::regular_file(rendered, metadata)
+        };
+        self.approved_file(&path, snapshot.fingerprint(), intended)
     }
 
     pub fn plan_native_markdown(
@@ -707,6 +746,7 @@ impl CodexAdapter {
         component: &ComponentRecord,
     ) -> Result<ApprovedMutation, ClientError> {
         self.require_apply_supported()?;
+        ensure_reviewed_text(&component.body_markdown)?;
         if !matches!(
             component.kind,
             ComponentKind::Instruction | ComponentKind::Rule | ComponentKind::Skill
@@ -745,7 +785,14 @@ impl CodexAdapter {
         &self,
         component: &ComponentRecord,
     ) -> Result<(PathBuf, [u8; 32], NativeState, NativeState), ClientError> {
-        let path = self.markdown_path(component)?;
+        let standard = self.markdown_path(component)?;
+        let override_path = standard.with_file_name("AGENTS.override.md");
+        self.validate_project_path(&override_path)?;
+        let path = if nonempty_file(&override_path)? {
+            override_path
+        } else {
+            standard
+        };
         self.validate_project_path(&path)?;
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
@@ -758,41 +805,11 @@ impl CodexAdapter {
             ),
             NativeState::Absent { .. } if component.archived => current.clone(),
             NativeState::Absent { .. } => {
-                let candidates = std::iter::once("AGENTS.override.md".to_owned())
-                    .chain(self.project_doc_fallback_filenames()?)
-                    .collect::<Vec<_>>();
-                let mut metadata = None;
-                for name in candidates {
-                    let template_path = path.with_file_name(name);
-                    self.validate_project_path(&template_path)?;
-                    let template =
-                        OsNativeFileSystem::new()
-                            .snapshot(&template_path)
-                            .map_err(|_| {
-                                invalid("Codex primary instruction metadata template is unsafe")
-                            })?;
-                    if let NativeState::RegularFile {
-                        metadata: candidate,
-                        ..
-                    } = template.state()
-                    {
-                        metadata = Some(
-                            candidate
-                                .for_absent_sibling_creation(&current)
-                                .map_err(|_| {
-                                    invalid(
-                                        "Codex primary instruction metadata template is not bound to the target parent",
-                                    )
-                                })?,
-                        );
-                        break;
-                    }
-                }
-                let metadata = metadata.ok_or_else(|| {
-                    invalid(
-                        "Codex primary instruction needs an existing project-root metadata template",
-                    )
-                })?;
+                let metadata = OsNativeFileSystem::new()
+                    .metadata_for_new_private_file(&path)
+                    .map_err(|_| {
+                        invalid("Codex primary instruction creation metadata is unavailable")
+                    })?;
                 NativeState::regular_file(
                     render_managed_markdown(&[], &component.body_markdown, false)?,
                     metadata,
@@ -807,6 +824,7 @@ impl CodexAdapter {
         component: &ComponentRecord,
     ) -> Result<ApprovedMutation, ClientError> {
         self.require_apply_supported()?;
+        ensure_reviewed_text(&component.body_markdown)?;
         if component.kind != ComponentKind::Hook {
             return Err(invalid("Codex hooks component is invalid"));
         }
@@ -820,14 +838,17 @@ impl CodexAdapter {
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid("Codex hooks cannot be safely inspected"))?;
-        let NativeState::RegularFile {
-            bytes: existing,
-            metadata,
-        } = snapshot.state()
-        else {
-            return Err(invalid("Codex hooks must be a regular file"));
+        let (existing, metadata) = match snapshot.state() {
+            NativeState::RegularFile { bytes, metadata } => {
+                (bytes.as_slice(), Some(metadata.clone()))
+            }
+            NativeState::Absent { .. } => (&[][..], None),
         };
-        let mut object = parse_object(existing, "Codex hooks are invalid")?;
+        let mut object = if existing.is_empty() {
+            Map::new()
+        } else {
+            parse_object(existing, "Codex hooks are invalid")?
+        };
         if has_managed_memory_hook_identity(HarnessId::Codex, component) {
             if object.get("hooks").is_some() || !component.archived {
                 let hooks =
@@ -843,11 +864,18 @@ impl CodexAdapter {
         }
         let bytes = serde_json::to_vec(&Value::Object(object))
             .map_err(|_| invalid("Codex hooks cannot be rendered"))?;
-        self.approved_file(
-            &path,
-            snapshot.fingerprint(),
-            NativeState::regular_file(bytes, metadata.clone()),
-        )
+        let intended = if metadata.is_none() && component.archived && bytes == b"{}" {
+            snapshot.state().clone()
+        } else {
+            let metadata = match metadata {
+                Some(metadata) => metadata,
+                None => OsNativeFileSystem::new()
+                    .metadata_for_new_private_file(&path)
+                    .map_err(|_| invalid("Codex hooks creation metadata is unavailable"))?,
+            };
+            NativeState::regular_file(bytes, metadata)
+        };
+        self.approved_file(&path, snapshot.fingerprint(), intended)
     }
 
     fn approved_file(
@@ -877,10 +905,28 @@ impl CodexAdapter {
         }
     }
 
+    pub(crate) fn setup_capability(&self) -> CapabilityLevel {
+        let base = self.capability();
+        if base != CapabilityLevel::Full {
+            return base;
+        }
+        if self.managed_requirements_active().unwrap_or(true)
+            || self.project_is_trusted().ok() != Some(true)
+        {
+            CapabilityLevel::Blocked
+        } else {
+            CapabilityLevel::Full
+        }
+    }
+
     fn require_apply_supported(&self) -> Result<(), ClientError> {
-        (self.capability() == CapabilityLevel::Full)
-            .then_some(())
-            .ok_or_else(|| unsupported("This Codex installation is import-only"))
+        match self.setup_capability() {
+            CapabilityLevel::Full => Ok(()),
+            CapabilityLevel::Blocked => Err(unsupported("This Codex setup is blocked")),
+            CapabilityLevel::ImportOnly | CapabilityLevel::Missing => {
+                Err(unsupported("This Codex installation is import-only"))
+            }
+        }
     }
 
     fn policy_conflicts(&self) -> Result<Vec<String>, ClientError> {
@@ -890,12 +936,7 @@ impl CodexAdapter {
         {
             conflicts.push("global_instructions_shadowed".into());
         }
-        if self
-            .layout
-            .requirements_paths
-            .iter()
-            .any(|path| path.is_file())
-        {
+        if self.managed_requirements_active()? {
             conflicts.push("managed_requirements_active".into());
         }
         if self.project_instruction_shadowed()? {
@@ -907,6 +948,15 @@ impl CodexAdapter {
         conflicts.sort();
         conflicts.dedup();
         Ok(conflicts)
+    }
+
+    fn managed_requirements_active(&self) -> Result<bool, ClientError> {
+        for path in &self.layout.requirements_paths {
+            if read_optional_file(path)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn project_instruction_shadowed(&self) -> Result<bool, ClientError> {
@@ -1225,6 +1275,7 @@ impl CodexAdapter {
     ) -> Result<Vec<u8>, ClientError> {
         let mut document = bytes_to_document(existing)?;
         for component in &desired.components {
+            ensure_reviewed_text(&component.body_markdown)?;
             let Some(component_path) = self.config_component_path(component)? else {
                 continue;
             };
@@ -1515,6 +1566,7 @@ impl CodexAdapter {
         };
         let body =
             String::from_utf8(bytes.clone()).map_err(|_| invalid("Codex Markdown is not UTF-8"))?;
+        ensure_reviewed_text(&body)?;
         digests.insert(digest(&bytes));
         let mut component = self.component(scope, kind, name, body, location)?;
         if let Some(precedence) = precedence {
@@ -1552,6 +1604,7 @@ impl CodexAdapter {
                     synthetic_toml_item(key, item)?,
                     &format!("{location}{key}"),
                 )?;
+                ensure_reviewed_text(&component.body_markdown)?;
                 component
                     .metadata
                     .push(("tomlItemKind".into(), toml_item_kind(item)?.into()));
@@ -1566,6 +1619,7 @@ impl CodexAdapter {
                 synthetic_toml_item("hooks", hooks)?,
                 &format!("{location}hooks"),
             )?;
+            ensure_reviewed_text(&component.body_markdown)?;
             component
                 .metadata
                 .push(("tomlItemKind".into(), toml_item_kind(hooks)?.into()));
@@ -1631,13 +1685,15 @@ impl CodexAdapter {
         digests.insert(digest(&bytes));
         if let Some(hooks) = object.get("hooks") {
             let location = format!("{}#hooks", self.hooks_location_for_path(path, &scope)?);
-            components.push(self.component(
+            let component = self.component(
                 scope,
                 ComponentKind::Hook,
                 "hooks.json",
                 canonical_json(hooks)?,
                 &location,
-            )?);
+            )?;
+            ensure_reviewed_text(&component.body_markdown)?;
+            components.push(component);
         }
         Ok(())
     }
@@ -1749,16 +1805,24 @@ impl NativeMemoryAdapter for CodexAdapter {
                 wire_path(&memory_root.join("memory_summary.md")),
             )?,
         ];
-        if !SUPPORTED_VERSIONS.contains(&self.layout.version.as_str())
-            || self.layout.executable_kind != CodexExecutableKind::Native
-            || self.native_memory_setting_is_managed()
-        {
-            let capabilities = NativeMemoryCapabilities {
-                disable: NativeMemoryDisable::WatchOnly,
-                sources,
-            };
-            capabilities.validate()?;
-            return Ok(capabilities);
+        match self.setup_capability() {
+            CapabilityLevel::Blocked | CapabilityLevel::Missing => {
+                let capabilities = NativeMemoryCapabilities {
+                    disable: NativeMemoryDisable::Unavailable,
+                    sources: vec![],
+                };
+                capabilities.validate()?;
+                return Ok(capabilities);
+            }
+            CapabilityLevel::ImportOnly => {
+                let capabilities = NativeMemoryCapabilities {
+                    disable: NativeMemoryDisable::WatchOnly,
+                    sources,
+                };
+                capabilities.validate()?;
+                return Ok(capabilities);
+            }
+            CapabilityLevel::Full => {}
         }
 
         let path = self.layout.codex_home.join("config.toml");
@@ -1841,22 +1905,6 @@ impl NativeMemoryAdapter for CodexAdapter {
     }
 }
 
-impl CodexAdapter {
-    fn native_memory_setting_is_managed(&self) -> bool {
-        self.layout.requirements_paths.iter().any(|path| {
-            if !path.is_file() {
-                return false;
-            }
-            fs::read_to_string(path).map_or(true, |contents| {
-                let folded = contents.to_ascii_lowercase();
-                folded.contains("generate_memories")
-                    || folded.contains("use_memories")
-                    || folded.contains("[memories]")
-            })
-        })
-    }
-}
-
 impl HarnessAdapter for CodexAdapter {
     fn probe(&self, context: &ProbeContext) -> Result<ProbeReport, ClientError> {
         context
@@ -1877,7 +1925,7 @@ impl HarnessAdapter for CodexAdapter {
             ],
             active_profile: context.requested_profile.clone(),
             policy_conflicts: self.policy_conflicts()?,
-            capability: self.capability(),
+            capability: self.setup_capability(),
         })
     }
 
@@ -2015,15 +2063,19 @@ impl HarnessAdapter for CodexAdapter {
             }
         }
         for path in config_paths {
-            let existing = read_required_regular(&path, "Codex config must already exist")?;
+            let existing = read_optional_file(&path)?.unwrap_or_default();
             files.push(rendered_file(
                 path.clone(),
                 &self.render_config(&existing, desired, &path)?,
             ));
         }
         for (path, component) in hook_components {
-            let existing = read_required_regular(&path, "Codex hooks must already exist")?;
-            let mut object = parse_object(&existing, "Codex hooks are invalid")?;
+            let existing = read_optional_file(&path)?.unwrap_or_default();
+            let mut object = if existing.is_empty() {
+                Map::new()
+            } else {
+                parse_object(&existing, "Codex hooks are invalid")?
+            };
             if has_managed_memory_hook_identity(HarnessId::Codex, component) {
                 if object.get("hooks").is_some() || !component.archived {
                     let hooks = merge_managed_memory_hooks(
@@ -2117,26 +2169,32 @@ impl CodexAdapter {
             .validate()
             .map_err(|_| invalid("Codex receipt is invalid"))?;
         self.require_apply_supported()?;
-        let commands = [CodexCommand::PluginList, CodexCommand::McpList];
-        let mut configured = BTreeSet::new();
-        for command in commands {
-            let output = execute(&command)?;
-            match command {
-                CodexCommand::PluginList => parse_plugin_list_json(&output)?,
-                CodexCommand::McpList => configured = parse_mcp_list_json(&output)?,
-                CodexCommand::McpGet(_) => unreachable!(),
-            };
+        let installed_plugins = parse_plugin_list_json(&execute(&CodexCommand::PluginList)?)?;
+        if installed_plugins != self.imported_plugin_states()? {
+            return Ok(ValidationReport {
+                valid: false,
+                findings: vec!["configured_plugin_state_mismatch".into()],
+            });
         }
-        for name in self.imported_mcp_names()? {
-            if !configured.contains(&name) {
-                return Ok(ValidationReport {
-                    valid: false,
-                    findings: vec!["configured_mcp_server_missing".into()],
-                });
-            }
+        let configured = parse_mcp_list_json(&execute(&CodexCommand::McpList)?)?;
+        let expected = self.imported_mcp_declarations()?;
+        let expected_names = expected.keys().cloned().collect::<BTreeSet<_>>();
+        if configured != expected_names {
+            return Ok(ValidationReport {
+                valid: false,
+                findings: vec!["configured_mcp_server_state_mismatch".into()],
+            });
+        }
+        for (name, expected_declaration) in expected {
             let command = CodexCommand::McpGet(name.clone());
             let output = execute(&command)?;
-            parse_mcp_get_json(&output, &name)?;
+            let actual_declaration = parse_mcp_get_json(&output, &name)?;
+            if actual_declaration != expected_declaration {
+                return Ok(ValidationReport {
+                    valid: false,
+                    findings: vec!["configured_mcp_server_declaration_mismatch".into()],
+                });
+            }
         }
         Ok(ValidationReport {
             valid: true,
@@ -2199,17 +2257,45 @@ impl CodexAdapter {
         }))
     }
 
-    fn imported_mcp_names(&self) -> Result<Vec<String>, ClientError> {
-        let mut names = BTreeSet::new();
-        let mut paths = vec![(self.layout.codex_home.join("config.toml"), false)];
-        if self.project_is_trusted()? {
-            paths.extend(
-                self.project_layers()?
-                    .into_iter()
-                    .map(|layer| (layer.join(".codex/config.toml"), true)),
-            );
+    fn imported_plugin_states(&self) -> Result<BTreeMap<String, bool>, ClientError> {
+        let mut states = BTreeMap::new();
+        for (path, is_project) in self.effective_config_paths()? {
+            if is_project {
+                self.validate_project_path(&path)?;
+            }
+            let Some(bytes) = read_optional_file(&path)? else {
+                continue;
+            };
+            let document = bytes_to_document(&bytes)?;
+            if let Some(plugins) = document.get("plugins") {
+                let plugins = plugins
+                    .as_table()
+                    .ok_or_else(|| invalid("Codex plugin configuration is invalid"))?;
+                for (name, item) in plugins {
+                    safe_name(name)?;
+                    let table = item
+                        .as_table()
+                        .ok_or_else(|| invalid("Codex plugin configuration is invalid"))?;
+                    let enabled = match table.get("enabled") {
+                        Some(enabled) => enabled
+                            .as_bool()
+                            .ok_or_else(|| invalid("Codex plugin configuration is invalid"))?,
+                        None => true,
+                    };
+                    if enabled {
+                        states.insert(name.to_owned(), true);
+                    } else {
+                        states.remove(name);
+                    }
+                }
+            }
         }
-        for (path, is_project) in paths {
+        Ok(states)
+    }
+
+    fn imported_mcp_declarations(&self) -> Result<BTreeMap<String, Value>, ClientError> {
+        let mut declarations = BTreeMap::new();
+        for (path, is_project) in self.effective_config_paths()? {
             if is_project {
                 self.validate_project_path(&path)?;
             }
@@ -2233,14 +2319,26 @@ impl CodexAdapter {
                         None => true,
                     };
                     if enabled {
-                        names.insert(name.to_owned());
+                        declarations.insert(name.to_owned(), normalize_config_mcp(table)?);
                     } else {
-                        names.remove(name);
+                        declarations.remove(name);
                     }
                 }
             }
         }
-        Ok(names.into_iter().collect())
+        Ok(declarations)
+    }
+
+    fn effective_config_paths(&self) -> Result<Vec<(PathBuf, bool)>, ClientError> {
+        let mut paths = vec![(self.layout.codex_home.join("config.toml"), false)];
+        if self.project_is_trusted()? {
+            paths.extend(
+                self.project_layers()?
+                    .into_iter()
+                    .map(|layer| (layer.join(".codex/config.toml"), true)),
+            );
+        }
+        Ok(paths)
     }
 }
 
@@ -2249,7 +2347,7 @@ impl NativeAdapter for CodexAdapter {
         let executable_matches =
             open_verified_codex_executable(&self.layout.executable, plan.setup.executable_hash)
                 .is_ok();
-        if self.capability() != CapabilityLevel::Full
+        if self.setup_capability() != CapabilityLevel::Full
             || plan.setup.harness != HarnessId::Codex
             || plan.setup.harness_version != self.layout.version
             || plan.setup.executable_path != wire_path(&self.layout.executable)
@@ -2278,6 +2376,12 @@ impl NativeAdapter for CodexAdapter {
             }
         }
         Ok(())
+    }
+    fn verify_live_state_reservation(
+        &mut self,
+        plan: &NativeTransactionPlan,
+    ) -> Result<(), BoundaryError> {
+        self.reprobe_live_state(plan)
     }
     fn validate_staged_output(
         &mut self,
@@ -2489,7 +2593,7 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             self.adapter
-                .run_verified(&mut self.operation_runner, &arguments)?;
+                .run_authoritative(&mut self.operation_runner, &arguments)?;
         }
         Ok(())
     }
@@ -2513,6 +2617,7 @@ fn render_mcp_add(name: &str, value: &Value) -> Result<Vec<String>, ClientError>
             .any(|key| !["url", "bearer_token_env_var"].contains(&key.as_str()))
             || contains_control(value)
             || contains_redaction(value)
+            || value_contains_secret_like(value)
         {
             return Err(invalid("Codex MCP transport is unsupported"));
         }
@@ -2543,6 +2648,7 @@ fn render_mcp_add(name: &str, value: &Value) -> Result<Vec<String>, ClientError>
         .any(|key| !["type", "command", "args", "env"].contains(&key.as_str()))
         || contains_control(value)
         || contains_redaction(value)
+        || value_contains_secret_like(value)
     {
         return Err(invalid("Codex MCP transport is unsupported"));
     }
@@ -2599,7 +2705,7 @@ fn render_mcp_add(name: &str, value: &Value) -> Result<Vec<String>, ClientError>
     Ok(rendered)
 }
 
-fn parse_plugin_list_json(bytes: &[u8]) -> Result<(), ClientError> {
+fn parse_plugin_list_json(bytes: &[u8]) -> Result<BTreeMap<String, bool>, ClientError> {
     if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
         return Err(invalid("Codex plugin output is invalid"));
     }
@@ -2622,6 +2728,7 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<(), ClientError> {
         return Err(invalid("Codex plugin output is invalid"));
     }
     let mut ids = BTreeSet::new();
+    let mut installed_states = BTreeMap::new();
     for (plugin, expected_installed) in installed
         .iter()
         .map(|plugin| (plugin, true))
@@ -2663,9 +2770,12 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<(), ClientError> {
         string_field("version")?;
         let install_policy = string_field("installPolicy")?;
         let auth_policy = string_field("authPolicy")?;
+        let enabled = plugin
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
         if !ids.insert(id)
             || plugin.get("installed").and_then(Value::as_bool) != Some(expected_installed)
-            || plugin.get("enabled").and_then(Value::as_bool).is_none()
             || install_policy != "AVAILABLE"
             || !["ON_USE", "ON_INSTALL"].contains(&auth_policy)
         {
@@ -2676,8 +2786,11 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<(), ClientError> {
                 .get("source")
                 .ok_or_else(|| invalid("Codex plugin output is invalid"))?,
         )?;
+        if expected_installed {
+            installed_states.insert(id.to_owned(), enabled);
+        }
     }
-    Ok(())
+    Ok(installed_states)
 }
 
 fn parse_mcp_list_json(bytes: &[u8]) -> Result<BTreeSet<String>, ClientError> {
@@ -2706,7 +2819,7 @@ fn parse_mcp_list_states(bytes: &[u8]) -> Result<BTreeMap<String, bool>, ClientE
     Ok(states)
 }
 
-fn parse_mcp_get_json(bytes: &[u8], expected_name: &str) -> Result<(), ClientError> {
+fn parse_mcp_get_json(bytes: &[u8], expected_name: &str) -> Result<Value, ClientError> {
     if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
         return Err(invalid("Codex MCP output is invalid"));
     }
@@ -2718,7 +2831,7 @@ fn parse_mcp_get_json(bytes: &[u8], expected_name: &str) -> Result<(), ClientErr
     if parsed.name != expected_name || !parsed.enabled {
         return Err(invalid("Codex MCP output is invalid"));
     }
-    Ok(())
+    Ok(parsed.declaration)
 }
 
 fn parse_managed_mcp_get_json(
@@ -2793,6 +2906,7 @@ enum McpOutputKind {
 struct ParsedMcpServer {
     name: String,
     enabled: bool,
+    declaration: Value,
 }
 
 fn parse_mcp_server(
@@ -2880,10 +2994,122 @@ fn parse_mcp_server(
             )?;
         }
     }
+    let declaration = normalize_live_mcp(object)?;
     Ok(ParsedMcpServer {
         name: name.to_owned(),
         enabled,
+        declaration,
     })
+}
+
+fn normalize_live_mcp(object: &Map<String, Value>) -> Result<Value, ClientError> {
+    let mut declaration = Map::new();
+    for key in [
+        "transport",
+        "enabled_tools",
+        "disabled_tools",
+        "startup_timeout_sec",
+        "tool_timeout_sec",
+    ] {
+        if let Some(value) = object.get(key) {
+            declaration.insert(key.into(), value.clone());
+        }
+    }
+    Ok(redact_sensitive(Value::Object(declaration)))
+}
+
+fn normalize_config_mcp(table: &toml_edit::Table) -> Result<Value, ClientError> {
+    let is_http = table.get("url").is_some();
+    let transport_keys: &[&str] = if is_http {
+        &[
+            "type",
+            "url",
+            "bearer_token_env_var",
+            "http_headers",
+            "env_http_headers",
+        ]
+    } else {
+        &["type", "command", "args", "env", "env_vars", "cwd"]
+    };
+    let common_keys = [
+        "enabled",
+        "enabled_tools",
+        "disabled_tools",
+        "startup_timeout_sec",
+        "tool_timeout_sec",
+    ];
+    if table
+        .iter()
+        .any(|(key, _)| !transport_keys.contains(&key) && !common_keys.contains(&key))
+    {
+        return Err(invalid("Codex MCP configuration is invalid"));
+    }
+
+    let mut transport = Map::new();
+    let kind = if is_http { "streamable_http" } else { "stdio" };
+    match table.get("type").map(toml_item_json) {
+        Some(Value::String(configured)) if configured == kind => {}
+        None => {}
+        _ => return Err(invalid("Codex MCP configuration is invalid")),
+    }
+    transport.insert("type".into(), Value::String(kind.into()));
+    if is_http {
+        insert_required_config_value(table, &mut transport, "url")?;
+        insert_optional_config_value(table, &mut transport, "bearer_token_env_var", Value::Null);
+        insert_optional_config_value(table, &mut transport, "http_headers", Value::Null);
+        insert_optional_config_value(table, &mut transport, "env_http_headers", Value::Null);
+    } else {
+        insert_required_config_value(table, &mut transport, "command")?;
+        insert_optional_config_value(table, &mut transport, "args", Value::Array(vec![]));
+        insert_optional_config_value(table, &mut transport, "env", Value::Object(Map::new()));
+        insert_optional_config_value(table, &mut transport, "env_vars", Value::Array(vec![]));
+        insert_optional_config_value(table, &mut transport, "cwd", Value::Null);
+    }
+    parse_mcp_transport(&transport)?;
+
+    let mut declaration = Map::new();
+    declaration.insert("transport".into(), Value::Object(transport));
+    for key in [
+        "enabled_tools",
+        "disabled_tools",
+        "startup_timeout_sec",
+        "tool_timeout_sec",
+    ] {
+        declaration.insert(
+            key.into(),
+            table.get(key).map(toml_item_json).unwrap_or(Value::Null),
+        );
+    }
+    parse_nullable_string_array(&declaration["enabled_tools"])?;
+    parse_nullable_string_array(&declaration["disabled_tools"])?;
+    parse_timeout(&declaration["startup_timeout_sec"])?;
+    parse_timeout(&declaration["tool_timeout_sec"])?;
+    Ok(redact_sensitive(Value::Object(declaration)))
+}
+
+fn insert_required_config_value(
+    table: &toml_edit::Table,
+    target: &mut Map<String, Value>,
+    key: &'static str,
+) -> Result<(), ClientError> {
+    let value = table
+        .get(key)
+        .map(toml_item_json)
+        .ok_or_else(|| invalid("Codex MCP configuration is invalid"))?;
+    target.insert(key.into(), value);
+    Ok(())
+}
+
+fn insert_optional_config_value(
+    table: &toml_edit::Table,
+    target: &mut Map<String, Value>,
+    key: &'static str,
+    default: Value,
+) {
+    target.insert(
+        key.into(),
+        table.get(key).map(toml_item_json).unwrap_or(default),
+    );
 }
 
 fn parse_plugin_source(value: &Value) -> Result<(), ClientError> {
@@ -3244,18 +3470,96 @@ fn reviewed_skill_files(root: &Path) -> Result<Vec<PathBuf>, ClientError> {
     Ok(files)
 }
 
-fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(invalid("Codex configuration cannot be inspected")),
-    };
-    if !metadata.is_file() || project_metadata_is_link(&metadata) || metadata.len() > 1024 * 1024 {
-        return Err(invalid("Codex configuration has unsafe topology or size"));
+fn canonical_existing_path(path: &Path) -> Result<PathBuf, ClientError> {
+    fs::canonicalize(path).map_err(|_| invalid("Codex path cannot be safely resolved"))
+}
+
+fn canonical_existing_directory(path: &Path) -> Result<PathBuf, ClientError> {
+    let canonical = canonical_existing_path(path)?;
+    canonical
+        .is_dir()
+        .then_some(canonical)
+        .ok_or_else(|| invalid("Codex directory cannot be safely resolved"))
+}
+
+fn canonical_directory_or_absent_path(path: &Path) -> Result<PathBuf, ClientError> {
+    if path.is_dir() {
+        return canonical_existing_directory(path);
     }
-    fs::read(path)
-        .map(Some)
-        .map_err(|_| invalid("Codex configuration cannot be read"))
+    if path.exists()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(invalid("Codex directory cannot be safely resolved"));
+    }
+
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    while !ancestor.exists() {
+        let name = ancestor
+            .file_name()
+            .ok_or_else(|| invalid("Codex directory cannot be safely resolved"))?;
+        suffix.push(name.to_owned());
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| invalid("Codex directory cannot be safely resolved"))?;
+    }
+    let mut canonical = canonical_existing_directory(ancestor)?;
+    for component in suffix.into_iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
+}
+
+fn canonical_file_or_absent_path(path: &Path) -> Result<PathBuf, ClientError> {
+    if path.exists() {
+        let canonical = canonical_existing_path(path)?;
+        return canonical
+            .is_file()
+            .then_some(canonical)
+            .ok_or_else(|| invalid("Codex requirements path cannot be safely resolved"));
+    }
+    canonical_directory_or_absent_path(path)
+}
+
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("Codex configuration path has no parent"))?;
+    if !parent.is_dir() {
+        let mut current = parent;
+        loop {
+            match fs::symlink_metadata(current) {
+                Ok(metadata) if metadata.is_dir() && !project_metadata_is_link(&metadata) => {
+                    return Ok(None);
+                }
+                Ok(_) => {
+                    return Err(invalid("Codex configuration has unsafe topology or state"));
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    current = current.parent().ok_or_else(|| {
+                        invalid("Codex configuration has unsafe topology or state")
+                    })?;
+                }
+                Err(_) => {
+                    return Err(invalid("Codex configuration has unsafe topology or state"));
+                }
+            }
+        }
+    }
+    let snapshot = OsNativeFileSystem::new()
+        .snapshot(path)
+        .map_err(|_| invalid("Codex configuration has unsafe topology or state"))?;
+    match snapshot.state() {
+        NativeState::Absent { .. } => Ok(None),
+        NativeState::RegularFile { bytes, .. } if bytes.len() <= 1024 * 1024 => {
+            Ok(Some(bytes.clone()))
+        }
+        NativeState::RegularFile { .. } => {
+            Err(invalid("Codex configuration has unsafe topology or size"))
+        }
+    }
 }
 fn read_required_regular(path: &Path, message: &'static str) -> Result<Vec<u8>, ClientError> {
     read_optional_file(path)?.ok_or_else(|| invalid(message))
@@ -3391,6 +3695,33 @@ fn toml_value_json(value: &TomlValue) -> Value {
         ),
     }
 }
+fn ensure_reviewed_text(text: &str) -> Result<(), ClientError> {
+    if secret_like_text(text) {
+        Err(invalid("Codex reviewed content contains secret-like text"))
+    } else {
+        Ok(())
+    }
+}
+fn secret_like_text(text: &str) -> bool {
+    crate::mcp::contains_secret_like(text) || contains_url_user_info(text)
+}
+fn contains_url_user_info(text: &str) -> bool {
+    text.split_ascii_whitespace().any(|candidate| {
+        candidate.split_once("://").is_some_and(|(_, rest)| {
+            rest.split(['/', '?', '#'])
+                .next()
+                .is_some_and(|authority| authority.contains('@'))
+        })
+    })
+}
+fn value_contains_secret_like(value: &Value) -> bool {
+    match value {
+        Value::String(value) => secret_like_text(value),
+        Value::Array(values) => values.iter().any(value_contains_secret_like),
+        Value::Object(values) => values.values().any(value_contains_secret_like),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
 fn redact_sensitive(value: Value) -> Value {
     match value {
         Value::Object(values) => Value::Object(
@@ -3411,6 +3742,7 @@ fn redact_sensitive(value: Value) -> Value {
                 .collect(),
         ),
         Value::Array(values) => Value::Array(values.into_iter().map(redact_sensitive).collect()),
+        Value::String(value) if secret_like_text(&value) => Value::String("<redacted>".into()),
         value => value,
     }
 }
@@ -3441,6 +3773,7 @@ fn redact_plugin_sensitive(value: Value) -> Value {
             Value::Array(values.into_iter().map(redact_plugin_sensitive).collect())
         }
         Value::Null => Value::Null,
+        Value::String(value) if secret_like_text(&value) => Value::String("<redacted>".into()),
         _ => Value::String("<redacted>".into()),
     }
 }
@@ -4161,15 +4494,37 @@ fn platform_candidates(home: &Path, local_app_data: Option<&Path>, windows: bool
     }
 }
 fn installation_method(path: &Path) -> InstallationMethod {
-    let value = path.to_string_lossy().to_ascii_lowercase();
-    if value.contains("node_modules")
-        || value.contains("npm")
-        || value.contains("homebrew")
-        || value.contains("winget")
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let parts = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let ends_with = |suffix: &[&str]| parts.ends_with(suffix);
+    let contains_sequence = |sequence: &[&str]| {
+        parts
+            .windows(sequence.len())
+            .any(|candidate| candidate == sequence)
+    };
+
+    if ends_with(&["chatgpt.app", "contents", "resources", "codex"])
+        || ends_with(&["programs", "chatgpt", "resources", "codex.exe"])
+    {
+        InstallationMethod::Bundled
+    } else if parts.contains(&"node_modules")
+        || contains_sequence(&["homebrew", "cellar"])
+        || contains_sequence(&["opt", "homebrew"])
+        || contains_sequence(&["microsoft", "winget", "packages"])
     {
         InstallationMethod::PackageManager
-    } else {
+    } else if ends_with(&[".local", "bin", "codex"])
+        || ends_with(&["programs", "openai", "codex", "bin", "codex.exe"])
+    {
         InstallationMethod::Manual
+    } else {
+        InstallationMethod::Unknown
     }
 }
 fn home_dir() -> Option<PathBuf> {
@@ -4466,30 +4821,58 @@ mod tests {
         }
     }
 
-    fn effective_validation_output(command: &CodexCommand, enabled_names: &[&str]) -> Vec<u8> {
-        match command {
-            CodexCommand::PluginList => br#"{"installed":[],"available":[]}"#.to_vec(),
+    fn effective_validation_output(
+        fixture: &EffectiveValidationFixture,
+        command: &CodexCommand,
+        enabled_names: &[&str],
+    ) -> Result<Vec<u8>, ClientError> {
+        if matches!(command, CodexCommand::PluginList) {
+            return Ok(br#"{"installed":[],"available":[]}"#.to_vec());
+        }
+        let declarations = fixture.adapter.imported_mcp_declarations()?;
+        let live_server = |name: &str, list: bool| {
+            let declaration = declarations.get(name);
+            let transport = declaration
+                .and_then(|value| value.get("transport"))
+                .cloned()
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "type": "stdio",
+                        "command": "unexpected",
+                        "args": [],
+                        "env": {},
+                        "env_vars": [],
+                        "cwd": null
+                    })
+                });
+            let mut server = serde_json::json!({
+                "name": name,
+                "enabled": true,
+                "disabled_reason": null,
+                "transport": transport,
+                "startup_timeout_sec": declaration.and_then(|value| value.get("startup_timeout_sec")).cloned().unwrap_or(Value::Null),
+                "tool_timeout_sec": declaration.and_then(|value| value.get("tool_timeout_sec")).cloned().unwrap_or(Value::Null)
+            });
+            if list {
+                server["auth_status"] = Value::String("unsupported".into());
+            } else {
+                server["enabled_tools"] = declaration
+                    .and_then(|value| value.get("enabled_tools"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                server["disabled_tools"] = declaration
+                    .and_then(|value| value.get("disabled_tools"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+            server
+        };
+        Ok(match command {
+            CodexCommand::PluginList => unreachable!(),
             CodexCommand::McpList => serde_json::to_vec(
                 &enabled_names
                     .iter()
-                    .map(|name| {
-                        serde_json::json!({
-                            "name": name,
-                            "enabled": true,
-                            "disabled_reason": null,
-                            "transport": {
-                                "type": "stdio",
-                                "command": "never-run",
-                                "args": [],
-                                "env": {},
-                                "env_vars": [],
-                                "cwd": null
-                            },
-                            "startup_timeout_sec": null,
-                            "tool_timeout_sec": null,
-                            "auth_status": "unsupported"
-                        })
-                    })
+                    .map(|name| live_server(name, true))
                     .chain(std::iter::once(serde_json::json!({
                         "name": "listed-disabled",
                         "enabled": false,
@@ -4509,25 +4892,8 @@ mod tests {
                     .collect::<Vec<_>>(),
             )
             .unwrap(),
-            CodexCommand::McpGet(name) => serde_json::to_vec(&serde_json::json!({
-                "name": name,
-                "enabled": true,
-                "disabled_reason": null,
-                "transport": {
-                    "type": "stdio",
-                    "command": "never-run",
-                    "args": [],
-                    "env": {},
-                    "env_vars": [],
-                    "cwd": null
-                },
-                "enabled_tools": null,
-                "disabled_tools": null,
-                "startup_timeout_sec": null,
-                "tool_timeout_sec": null
-            }))
-            .unwrap(),
-        }
+            CodexCommand::McpGet(name) => serde_json::to_vec(&live_server(name, false)).unwrap(),
+        })
     }
 
     fn validate_with_frozen_outputs(
@@ -4540,7 +4906,7 @@ mod tests {
                 .adapter
                 .validate_effective_with(&effective_validation_receipt(), |command| {
                     commands.push(command.argv());
-                    Ok(effective_validation_output(command, enabled_names))
+                    effective_validation_output(fixture, command, enabled_names)
                 });
         (result, commands)
     }
@@ -4570,27 +4936,22 @@ mod tests {
         )
         .unwrap();
         let (untrusted, commands) = validate_with_frozen_outputs(&fixture, &["docs"]);
-        assert!(untrusted.unwrap().valid);
-        assert_eq!(
-            commands,
-            vec![
-                vec!["plugin", "list", "--json"],
-                vec!["mcp", "list", "--json"],
-                vec!["mcp", "get", "docs", "--json"],
-            ]
-        );
+        assert_eq!(untrusted.unwrap_err().code, ErrorCode::HarnessUnsupported);
+        assert!(commands.is_empty());
 
         fs::write(&fixture.global_config, trusted_config).unwrap();
         let (missing, commands) = validate_with_frozen_outputs(&fixture, &["docs", "root"]);
         let missing = missing.unwrap();
         assert!(!missing.valid);
-        assert_eq!(missing.findings, vec!["configured_mcp_server_missing"]);
+        assert_eq!(
+            missing.findings,
+            vec!["configured_mcp_server_state_mismatch"]
+        );
         assert_eq!(
             commands,
             vec![
                 vec!["plugin", "list", "--json"],
                 vec!["mcp", "list", "--json"],
-                vec!["mcp", "get", "docs", "--json"],
             ]
         );
         assert!(!fixture.sentinel.exists());
@@ -4653,6 +5014,63 @@ mod tests {
     }
 
     #[test]
+    fn effective_validation_rejects_missing_plugins_extra_servers_and_mcp_body_drift() {
+        let fixture = effective_validation_fixture();
+        fs::write(
+            &fixture.global_config,
+            format!(
+                "{}\n[plugins.\"formatter@team\"]\nenabled = true\n",
+                fs::read_to_string(&fixture.global_config).unwrap()
+            ),
+        )
+        .unwrap();
+        let missing_plugin = validate_with_frozen_outputs(&fixture, &["docs", "nested", "root"])
+            .0
+            .unwrap();
+        assert!(!missing_plugin.valid);
+        assert_eq!(
+            missing_plugin.findings,
+            vec!["configured_plugin_state_mismatch"]
+        );
+
+        fs::write(
+            &fixture.global_config,
+            fs::read_to_string(&fixture.global_config)
+                .unwrap()
+                .replace("\n[plugins.\"formatter@team\"]\nenabled = true\n", ""),
+        )
+        .unwrap();
+        let extra_server =
+            validate_with_frozen_outputs(&fixture, &["docs", "nested", "root", "unexpected"])
+                .0
+                .unwrap();
+        assert!(!extra_server.valid);
+        assert_eq!(
+            extra_server.findings,
+            vec!["configured_mcp_server_state_mismatch"]
+        );
+
+        let drifted = fixture
+            .adapter
+            .validate_effective_with(&effective_validation_receipt(), |command| {
+                let mut output =
+                    effective_validation_output(&fixture, command, &["docs", "nested", "root"])?;
+                if matches!(command, CodexCommand::McpGet(name) if name == "docs") {
+                    let mut value: Value = serde_json::from_slice(&output).unwrap();
+                    value["transport"]["command"] = Value::String("drifted-command".into());
+                    output = serde_json::to_vec(&value).unwrap();
+                }
+                Ok(output)
+            })
+            .unwrap();
+        assert!(!drifted.valid);
+        assert_eq!(
+            drifted.findings,
+            vec!["configured_mcp_server_declaration_mismatch"]
+        );
+    }
+
+    #[test]
     fn validation_commands_never_start_mcp_servers() {
         assert_eq!(
             [
@@ -4683,6 +5101,49 @@ mod tests {
         assert_eq!(
             classify_executable_magic(b"text"),
             CodexExecutableKind::Unknown
+        );
+    }
+    #[test]
+    fn installation_method_uses_exact_distribution_path_shapes() {
+        assert_eq!(
+            installation_method(Path::new(
+                "/Applications/ChatGPT.app/Contents/Resources/codex"
+            )),
+            InstallationMethod::Bundled
+        );
+        assert_eq!(
+            installation_method(Path::new(
+                r"C:\Users\person\AppData\Local\Programs\ChatGPT\resources\codex.exe"
+            )),
+            InstallationMethod::Bundled
+        );
+        assert_eq!(
+            installation_method(Path::new("/opt/homebrew/Cellar/codex/0.144.1/bin/codex")),
+            InstallationMethod::PackageManager
+        );
+        assert_eq!(
+            installation_method(Path::new(
+                "/usr/local/lib/node_modules/@openai/codex/bin/codex"
+            )),
+            InstallationMethod::PackageManager
+        );
+        assert_eq!(
+            installation_method(Path::new("/Users/person/.local/bin/codex")),
+            InstallationMethod::Manual
+        );
+        assert_eq!(
+            installation_method(Path::new(
+                r"C:\Users\person\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe"
+            )),
+            InstallationMethod::Manual
+        );
+        assert_eq!(
+            installation_method(Path::new("/custom/npm-backup/bin/codex")),
+            InstallationMethod::Unknown
+        );
+        assert_eq!(
+            installation_method(Path::new("/custom/tools/codex")),
+            InstallationMethod::Unknown
         );
     }
     #[cfg(unix)]

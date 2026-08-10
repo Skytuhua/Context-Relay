@@ -5,10 +5,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(unix)]
+use context_relay_core::codex::{CodexCommandRunner, VerifiedCodexCommand};
 use context_relay_core::{
-    codex::{
-        CodexAdapter, CodexCommandRunner, CodexExecutableKind, CodexLayout, VerifiedCodexCommand,
-    },
+    codex::{CodexAdapter, CodexExecutableKind, CodexLayout},
     mcp::install::bridge_component,
     native_memory::{
         NativeMemoryAdapter, NativeMemoryDisable, NativeMemoryDocumentKind,
@@ -56,6 +56,10 @@ impl Drop for Fixture {
 }
 
 fn fixture(source: &str) -> Fixture {
+    fixture_with_requirements(source, false)
+}
+
+fn fixture_with_requirements(source: &str, bind_requirements: bool) -> Fixture {
     let fixture: Value = serde_json::from_str(source).unwrap();
     let root = fs::canonicalize(std::env::temp_dir())
         .unwrap()
@@ -103,7 +107,10 @@ fn fixture(source: &str) -> Fixture {
         user_skills_dir: home.join(".agents/skills"),
         project_root: project_root.clone(),
         working_directory,
-        requirements_paths: vec![requirements],
+        requirements_paths: bind_requirements
+            .then_some(requirements)
+            .into_iter()
+            .collect(),
     };
     let adapter = CodexAdapter::from_layout(
         layout.clone(),
@@ -144,19 +151,22 @@ fn materialize_substituting(root: &Path, files: &Map<String, Value>, project: &P
 }
 
 fn import_everything(fixture: &Fixture) -> context_relay_protocol::ImportedState {
-    fixture
-        .adapter
-        .import(&ImportRequest {
-            scopes: vec![
-                NativeScope::Global,
-                NativeScope::Project {
-                    project_id: fixture.project_id,
-                    root: fixture.adapter.project_root_wire(),
-                },
-            ],
-            include_disabled: true,
-        })
-        .unwrap()
+    import_everything_result(fixture).unwrap()
+}
+
+fn import_everything_result(
+    fixture: &Fixture,
+) -> Result<context_relay_protocol::ImportedState, context_relay_protocol::ClientError> {
+    fixture.adapter.import(&ImportRequest {
+        scopes: vec![
+            NativeScope::Global,
+            NativeScope::Project {
+                project_id: fixture.project_id,
+                root: fixture.adapter.project_root_wire(),
+            },
+        ],
+        include_disabled: true,
+    })
 }
 
 fn import_project(
@@ -258,6 +268,7 @@ fn codex_native_plan(
     let setup = SetupPlan {
         plan_id: PlanId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073984").unwrap(),
         harness: HarnessId::Codex,
+        harness_profile: None,
         adapter_version: 1,
         executable_path: test_wire_path(&fixture.layout.executable),
         executable_hash: test_file_digest(&fixture.layout.executable),
@@ -923,27 +934,22 @@ fn native_memory_disable_rolls_back_true_false_and_absent_codex_values_exactly()
 
 #[test]
 fn native_memory_codex_policy_conflicts_and_unsupported_values_never_write() {
-    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let blocked_fixture =
+        fixture_with_requirements(include_str!("fixtures/codex-0.144.1.json"), true);
     fs::write(
-        &fixture.layout.requirements_paths[0],
+        &blocked_fixture.layout.requirements_paths[0],
         "[memories]\ngenerate_memories = true\n",
     )
     .unwrap();
-    assert!(matches!(
-        fixture
-            .adapter
-            .native_memory_capabilities()
-            .unwrap()
-            .disable,
-        NativeMemoryDisable::WatchOnly
-    ));
+    let blocked = blocked_fixture
+        .adapter
+        .native_memory_capabilities()
+        .unwrap();
+    assert_eq!(blocked.disable, NativeMemoryDisable::Unavailable);
+    assert!(blocked.sources.is_empty());
 
-    fs::write(
-        &fixture.layout.requirements_paths[0],
-        "allowed_approval_policies = [\"on-request\"]\n",
-    )
-    .unwrap();
-    let config_path = fixture.codex_home.join("config.toml");
+    let unsupported = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let config_path = unsupported.codex_home.join("config.toml");
     let config = fs::read_to_string(&config_path).unwrap().replace(
         "[memories]\ngenerate_memories = true\nuse_memories = true\n\n",
         "memories = \"unsupported\"\n\n",
@@ -951,7 +957,7 @@ fn native_memory_codex_policy_conflicts_and_unsupported_values_never_write() {
     fs::write(&config_path, config).unwrap();
     let before = fs::read(&config_path).unwrap();
     assert!(matches!(
-        fixture
+        unsupported
             .adapter
             .native_memory_capabilities()
             .unwrap()
@@ -1193,7 +1199,7 @@ fn instructions_follow_global_root_to_cwd_precedence() {
 
 #[test]
 fn shadowed_instructions_and_managed_requirements_are_reported() {
-    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let fixture = fixture_with_requirements(include_str!("fixtures/codex-0.144.1.json"), true);
     assert_eq!(
         fixture
             .adapter
@@ -3297,14 +3303,9 @@ fn markdown_components_round_trip_to_exact_global_and_nested_paths() {
                 && matches!(component.scope, ScopeRef::Project { .. })
         })
         .unwrap();
-    assert!(
-        fixture
-            .adapter
-            .plan_native_markdown(project_instruction)
-            .is_ok()
-    );
-    assert!(fixture.adapter.plan_native_markdown(project_skill).is_ok());
-    assert!(fixture.adapter.plan_native_markdown(project_rule).is_err());
+    for component in [project_instruction, project_skill, project_rule] {
+        assert!(fixture.adapter.plan_native_markdown(component).is_err());
+    }
 }
 
 #[test]
@@ -3347,6 +3348,442 @@ fn unsafe_markdown_structural_locations_are_rejected() {
             "accepted unsafe location {location}"
         );
     }
+}
+
+#[test]
+fn managed_requirements_and_untrusted_projects_report_blocked_capability() {
+    let managed = fixture_with_requirements(include_str!("fixtures/codex-0.144.1.json"), true);
+    assert_eq!(
+        managed
+            .adapter
+            .probe(&ProbeContext {
+                harness: HarnessId::Codex,
+                requested_profile: None,
+            })
+            .unwrap()
+            .capability,
+        CapabilityLevel::Blocked
+    );
+
+    let untrusted = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let config_path = untrusted.codex_home.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("trust_level = \"trusted\"", "trust_level = \"untrusted\"");
+    fs::write(config_path, config).unwrap();
+    assert_eq!(
+        untrusted
+            .adapter
+            .probe(&ProbeContext {
+                harness: HarnessId::Codex,
+                requested_profile: None,
+            })
+            .unwrap()
+            .capability,
+        CapabilityLevel::Blocked
+    );
+}
+
+fn assert_blocked_policy_rejects_mutation_paths(
+    mut fixture: Fixture,
+    activate_policy: impl FnOnce(&Fixture),
+) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    let native_plan = codex_native_plan(&fixture, vec![]);
+    let bridge = executable_bridge(&fixture, "blocked-policy-bridge");
+    let cli_mutation = {
+        let mut validation = |argv: &[String]| {
+            Ok(match argv {
+                [plugin, list, json]
+                    if (plugin.as_str(), list.as_str(), json.as_str())
+                        == ("plugin", "list", "--json") =>
+                {
+                    br#"{"installed":[],"available":[]}"#.to_vec()
+                }
+                [mcp, list, json]
+                    if (mcp.as_str(), list.as_str(), json.as_str())
+                        == ("mcp", "list", "--json") =>
+                {
+                    b"[]".to_vec()
+                }
+                _ => panic!("unexpected validation argv: {argv:?}"),
+            })
+        };
+        fixture
+            .adapter
+            .plan_bridge_cli_mutation_with_runner(&bridge, &mut validation)
+            .unwrap()
+    };
+
+    activate_policy(&fixture);
+    assert_eq!(
+        fixture
+            .adapter
+            .probe(&ProbeContext {
+                harness: HarnessId::Codex,
+                requested_profile: None,
+            })
+            .unwrap()
+            .capability,
+        CapabilityLevel::Blocked
+    );
+
+    let planning_error = fixture
+        .adapter
+        .plan_native_markdown(&component(
+            fixture.project_id,
+            ScopeRef::Global,
+            ComponentKind::Instruction,
+            "AGENTS.override.md",
+            "must not be planned",
+        ))
+        .unwrap_err();
+    assert_eq!(planning_error.code, ErrorCode::HarnessUnsupported);
+    assert_eq!(
+        fixture
+            .adapter
+            .native_memory_capabilities()
+            .unwrap()
+            .disable,
+        NativeMemoryDisable::Unavailable
+    );
+    assert_eq!(
+        NativeAdapter::reprobe_live_state(&mut fixture.adapter, &native_plan)
+            .unwrap_err()
+            .to_string(),
+        "Codex installation changed"
+    );
+    assert_eq!(
+        NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, &native_plan)
+            .unwrap_err()
+            .to_string(),
+        "Codex installation changed"
+    );
+
+    let operation_count = Arc::new(AtomicU64::new(0));
+    let operation_count_for_runner = Arc::clone(&operation_count);
+    let operation = move |_: &[String]| {
+        operation_count_for_runner.fetch_add(1, Ordering::Relaxed);
+        Ok(Vec::new())
+    };
+    let validation = |argv: &[String]| {
+        Ok(match argv {
+            [plugin, list, json]
+                if (plugin.as_str(), list.as_str(), json.as_str())
+                    == ("plugin", "list", "--json") =>
+            {
+                br#"{"installed":[],"available":[]}"#.to_vec()
+            }
+            [mcp, list, json]
+                if (mcp.as_str(), list.as_str(), json.as_str()) == ("mcp", "list", "--json") =>
+            {
+                b"[]".to_vec()
+            }
+            _ => panic!("unexpected validation argv: {argv:?}"),
+        })
+    };
+    let mut executor = fixture
+        .adapter
+        .cli_executor_with_runners(operation, validation);
+    assert_eq!(
+        executor
+            .apply_cli_mutation(&cli_mutation)
+            .unwrap_err()
+            .to_string(),
+        "Codex setup is blocked"
+    );
+    assert_eq!(operation_count.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn managed_requirements_block_mutation_planning_and_apply_reprobe() {
+    let fixture = fixture_with_requirements(include_str!("fixtures/codex-0.144.1.json"), true);
+    let requirements = fixture.layout.requirements_paths[0].clone();
+    fs::remove_file(&requirements).unwrap();
+    assert_blocked_policy_rejects_mutation_paths(fixture, |fixture| {
+        fs::write(
+            &fixture.layout.requirements_paths[0],
+            "[policy]\nmode = \"managed\"\n",
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn requirements_flip_after_cli_probe_blocks_the_first_authoritative_operation() {
+    let fixture = fixture_with_requirements(include_str!("fixtures/codex-0.144.1.json"), true);
+    let requirements = fixture.layout.requirements_paths[0].clone();
+    fs::remove_file(&requirements).unwrap();
+    let bridge = executable_bridge(&fixture, "policy-race-bridge");
+    let mutation = {
+        let validation = |argv: &[String]| {
+            Ok(match argv {
+                [plugin, list, json]
+                    if (plugin.as_str(), list.as_str(), json.as_str())
+                        == ("plugin", "list", "--json") =>
+                {
+                    br#"{"installed":[],"available":[]}"#.to_vec()
+                }
+                [mcp, list, json]
+                    if (mcp.as_str(), list.as_str(), json.as_str())
+                        == ("mcp", "list", "--json") =>
+                {
+                    b"[]".to_vec()
+                }
+                _ => panic!("unexpected validation argv: {argv:?}"),
+            })
+        };
+        fixture
+            .adapter
+            .plan_bridge_cli_mutation_with_runner(&bridge, validation)
+            .unwrap()
+    };
+
+    let operation_count = AtomicU64::new(0);
+    let operation = |_: &[String]| {
+        operation_count.fetch_add(1, Ordering::Relaxed);
+        Ok(Vec::new())
+    };
+    let validation = |argv: &[String]| {
+        Ok(match argv {
+            [plugin, list, json]
+                if (plugin.as_str(), list.as_str(), json.as_str())
+                    == ("plugin", "list", "--json") =>
+            {
+                br#"{"installed":[],"available":[]}"#.to_vec()
+            }
+            [mcp, list, json]
+                if (mcp.as_str(), list.as_str(), json.as_str()) == ("mcp", "list", "--json") =>
+            {
+                fs::write(&requirements, "[policy]\nmode = \"managed\"\n").unwrap();
+                b"[]".to_vec()
+            }
+            _ => panic!("unexpected validation argv: {argv:?}"),
+        })
+    };
+    let mut executor = fixture
+        .adapter
+        .cli_executor_with_runners(operation, validation);
+
+    let outcome = executor.apply_cli_mutation(&mutation).unwrap();
+    assert_eq!(
+        outcome.command_error.unwrap().to_string(),
+        "Codex setup is blocked"
+    );
+    assert_eq!(operation_count.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn untrusted_project_blocks_mutation_planning_and_apply_reprobe() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    assert_blocked_policy_rejects_mutation_paths(fixture, |fixture| {
+        let config_path = fixture.codex_home.join("config.toml");
+        let config = fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("trust_level = \"trusted\"", "trust_level = \"untrusted\"");
+        fs::write(config_path, config).unwrap();
+    });
+}
+
+#[test]
+fn primary_memory_targets_the_effective_override_and_empty_roots_are_creatable() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
+    let managed = primary_memory_instruction_component(
+        HarnessId::Codex,
+        fixture.project_id,
+        device_id,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+    )
+    .unwrap();
+    let standard = fixture.layout.project_root.join("AGENTS.md");
+    let override_path = fixture.layout.project_root.join("AGENTS.override.md");
+    fs::write(&override_path, "# Effective override\n").unwrap();
+
+    let mutation = fixture.adapter.plan_native_markdown(&managed).unwrap();
+    assert_eq!(mutation.target, test_wire_path(&override_path));
+    let NativeState::RegularFile { bytes, .. } = NativeState::decode_v1(&mutation.content).unwrap()
+    else {
+        panic!("effective override remains a regular file")
+    };
+    assert!(
+        String::from_utf8(bytes)
+            .unwrap()
+            .contains(PRIMARY_MEMORY_INSTRUCTIONS)
+    );
+    assert!(
+        !fs::read_to_string(&standard)
+            .unwrap()
+            .contains(PRIMARY_MEMORY_INSTRUCTIONS)
+    );
+
+    fs::remove_file(&override_path).unwrap();
+    fs::remove_file(&standard).unwrap();
+    let created = fixture.adapter.plan_native_markdown(&managed).unwrap();
+    assert_eq!(created.target, test_wire_path(&standard));
+    let nonce = [73; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native
+        .create_before_images(std::slice::from_ref(&created))
+        .unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native
+        .compare_and_swap_targets(std::slice::from_ref(&created))
+        .unwrap();
+    native.apply_mutation(&nonce, &created).unwrap();
+    assert!(standard.is_file());
+    native.restore_matching_applied_targets(&nonce).unwrap();
+    assert!(!standard.exists());
+}
+
+#[test]
+fn missing_project_config_and_global_hooks_are_created_and_rollback_to_absence() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let config_path = fixture.layout.project_root.join(".codex/config.toml");
+    let hooks_path = fixture.codex_home.join("hooks.json");
+    fs::remove_file(&config_path).unwrap();
+    fs::remove_file(&hooks_path).unwrap();
+
+    let scope = ScopeRef::Project {
+        project_id: fixture.project_id,
+    };
+    let desired = DesiredState {
+        components: vec![component(
+            fixture.project_id,
+            scope.clone(),
+            ComponentKind::PermissionDeclaration,
+            "permissions",
+            "\"full\"",
+        )],
+        scopes: vec![NativeScope::Project {
+            project_id: fixture.project_id,
+            root: fixture.adapter.project_root_wire(),
+        }],
+    };
+    let config = fixture.adapter.plan_native_config(&desired, scope).unwrap();
+    let hooks = managed_memory_hooks(
+        HarnessId::Codex,
+        &test_wire_path(&fixture.root.join("context-relay-context-mcp")),
+    )
+    .unwrap()
+    .remove(0);
+    let hooks = fixture.adapter.plan_native_hooks_json(&hooks).unwrap();
+
+    for (index, (mutation, path)) in [(&config, &config_path), (&hooks, &hooks_path)]
+        .into_iter()
+        .enumerate()
+    {
+        let nonce = [74 + index as u8; 16];
+        let mut native = OsNativeTransactionFileSystem::new(nonce);
+        let images = native
+            .create_before_images(std::slice::from_ref(mutation))
+            .unwrap();
+        native.record_native_metadata(&images).unwrap();
+        native
+            .compare_and_swap_targets(std::slice::from_ref(mutation))
+            .unwrap();
+        native.apply_mutation(&nonce, mutation).unwrap();
+        assert!(path.is_file());
+        native.restore_matching_applied_targets(&nonce).unwrap();
+        assert!(!path.exists());
+    }
+}
+
+#[test]
+fn secret_bearing_text_and_credential_urls_never_leave_the_import_boundary() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let instruction = fixture.codex_home.join("AGENTS.override.md");
+    fs::write(
+        &instruction,
+        "api_key = must-not-import-instruction-secret\n",
+    )
+    .unwrap();
+    let error = import_everything_result(&fixture).unwrap_err();
+    assert!(!error.message.contains("must-not-import-instruction-secret"));
+
+    fs::write(&instruction, "# Safe instructions\n").unwrap();
+    let config_path = fixture.codex_home.join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+        "https://example.com/mcp",
+        "https://must-not-import-user:must-not-import-password@example.com/mcp",
+    );
+    fs::write(config_path, config).unwrap();
+    let imported = import_everything_result(&fixture).unwrap();
+    let serialized = serde_json::to_string(&imported).unwrap();
+    assert!(!serialized.contains("must-not-import-user"));
+    assert!(!serialized.contains("must-not-import-password"));
+    assert!(serialized.contains("<redacted>"));
+
+    let credential_url = component(
+        fixture.project_id,
+        ScopeRef::Global,
+        ComponentKind::McpServer,
+        "docs",
+        r#"{"url":"https://user:password@example.com/mcp"}"#,
+    );
+    assert!(
+        fixture
+            .adapter
+            .render(&DesiredState {
+                components: vec![credential_url],
+                scopes: vec![NativeScope::Global],
+            })
+            .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn hardlinked_reviewed_files_are_rejected_without_reading_their_secret() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let external = fixture.root.join("external-secret.rules");
+    let reviewed = fixture.codex_home.join("rules/hardlinked.rules");
+    fs::write(&external, "api_key = hardlink-must-not-import\n").unwrap();
+    fs::hard_link(&external, &reviewed).unwrap();
+
+    let error = import_everything_result(&fixture).unwrap_err();
+    assert!(!error.message.contains("hardlink-must-not-import"));
+}
+
+#[cfg(unix)]
+#[test]
+fn custom_codex_and_user_skill_roots_are_canonicalized_before_binding() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let codex_alias = fixture.root.join("codex-alias");
+    let skills_alias = fixture.root.join("skills-alias");
+    symlink(&fixture.layout.codex_home, &codex_alias).unwrap();
+    symlink(&fixture.layout.user_skills_dir, &skills_alias).unwrap();
+    let mut layout = fixture.layout.clone();
+    layout.codex_home = codex_alias;
+    layout.user_skills_dir = skills_alias;
+    let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
+    let adapter = CodexAdapter::from_layout(
+        layout,
+        fixture.project_id,
+        device_id,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+    )
+    .unwrap();
+    let report = adapter
+        .probe(&ProbeContext {
+            harness: HarnessId::Codex,
+            requested_profile: None,
+        })
+        .unwrap();
+    assert_eq!(
+        report.config_roots[0].display.as_deref(),
+        fixture.layout.codex_home.to_str()
+    );
+    assert_eq!(
+        report.config_roots[1].display.as_deref(),
+        fixture.layout.user_skills_dir.to_str()
+    );
 }
 
 fn metadata<'a>(component: &'a ComponentRecord, key: &str) -> Option<&'a str> {

@@ -665,6 +665,7 @@ async fn production_setup_watcher_review_and_actual_mcp_form_one_chain() {
         .call(LocalRequest::HarnessPreview(HarnessParams {
             harness: HarnessId::Codex,
             project_id: Some(project.project_id),
+            hermes_profile: None,
         }))
         .await
         .unwrap()
@@ -749,6 +750,50 @@ async fn production_setup_watcher_review_and_actual_mcp_form_one_chain() {
 
     bridge.close().await;
     stop_daemon(handle, owner).await;
+}
+
+#[tokio::test]
+async fn managed_requirements_block_production_bridge_preview_without_native_authority() {
+    let fixture = Fixture::new();
+    let project = project_identity("blocked managed requirements");
+    let materialized =
+        MaterializedCodexE2e::new_with_requirements(&fixture, project.project_id, true);
+    let config = fixture
+        .daemon
+        .clone()
+        .with_bridge_install_engine(materialized.engine.clone());
+    config
+        .seed_mcp_project(
+            &project,
+            &fixture.project_root,
+            &[(HarnessId::Codex, HarnessAccessPolicy::Default)],
+        )
+        .unwrap();
+    let before = [
+        std::fs::read(&materialized.memory_path).unwrap(),
+        std::fs::read(&materialized.config_path).unwrap(),
+        std::fs::read(&materialized.instruction_path).unwrap(),
+    ];
+
+    let (handle, owner) = start_daemon(&config).await;
+    let mut desktop = DesktopIpcClient::connect(&config).await;
+    let error = desktop
+        .call(LocalRequest::HarnessPreview(HarnessParams {
+            harness: HarnessId::Codex,
+            project_id: Some(project.project_id),
+            hermes_profile: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::HarnessUnsupported);
+    stop_daemon(handle, owner).await;
+
+    assert_eq!(std::fs::read(&materialized.memory_path).unwrap(), before[0]);
+    assert_eq!(std::fs::read(&materialized.config_path).unwrap(), before[1]);
+    assert_eq!(
+        std::fs::read(&materialized.instruction_path).unwrap(),
+        before[2]
+    );
 }
 
 #[tokio::test]
@@ -1297,6 +1342,14 @@ struct MaterializedCodexE2e {
 
 impl MaterializedCodexE2e {
     fn new(fixture: &Fixture, project_id: ProjectId) -> Self {
+        Self::new_with_requirements(fixture, project_id, false)
+    }
+
+    fn new_with_requirements(
+        fixture: &Fixture,
+        project_id: ProjectId,
+        active_requirements: bool,
+    ) -> Self {
         let frozen: Value =
             serde_json::from_str(include_str!("../../core/tests/fixtures/codex-0.144.1.json"))
                 .unwrap();
@@ -1317,7 +1370,9 @@ impl MaterializedCodexE2e {
         materialize_json(&project_root, frozen["project"].as_object().unwrap());
         std::fs::create_dir_all(&working_directory).unwrap();
         let requirements = root.join("requirements.toml");
-        std::fs::write(&requirements, frozen["requirements"].as_str().unwrap()).unwrap();
+        if active_requirements {
+            std::fs::write(&requirements, frozen["requirements"].as_str().unwrap()).unwrap();
+        }
         let executable = test_executable(root.join(if cfg!(windows) {
             "codex-bin.exe"
         } else {

@@ -1,6 +1,6 @@
 # Context Relay protocol version 1
 
-Context Relay protocol version 1.3 is identified by `PROTOCOL_MAJOR = 1` and `PROTOCOL_MINOR = 3`. Sync operations use schema version 1; scope-bound signed checkpoints use the independent checkpoint schema version 2. Local IPC frames are limited to 8 MiB.
+Context Relay protocol version 1.4 is identified by `PROTOCOL_MAJOR = 1` and `PROTOCOL_MINOR = 4`. Sync operations use schema version 1; scope-bound signed checkpoints use the independent checkpoint schema version 2. Local IPC frames are limited to 8 MiB.
 
 Version negotiation requires matching major versions and selects the greatest minor version present in both advertised ranges. A major mismatch or disjoint minor range returns `protocol_version_unsupported`. No caller may fall back to an unknown major.
 
@@ -49,7 +49,7 @@ Task 4 defines DTOs and validation only. It does not implement storage, merging,
 
 ## Setup and package contracts
 
-A setup plan records the exact executable path bytes and digest, adapter and harness versions, target scopes, expected native digests, semantic changes, CLI argument arrays, package artifacts, permission delta, typed network endpoint delta, scanner report hash, RuleSync version and hash, approval class, expiry, and batch hash. A later task serializes the canonical approval preimage from every accepted plan field except `batchHash`, including the resolved dependency closure, permission and network delta, scanner result, and versions. `batchHash` is the SHA-256 digest of that canonical preimage. Task 4 does not compute or approve the hash.
+A setup plan records the exact executable path bytes and digest, adapter and harness versions, the required-nullable selected Hermes profile, target scopes, expected native digests, semantic changes, CLI argument arrays, package artifacts, permission delta, typed network endpoint delta, scanner report hash, RuleSync version and hash, approval class, expiry, and batch hash. Hermes preview requests and plans require a nonempty explicit profile; Claude Code and Codex require null. The selected profile is sealed into the approval preimage and reused for apply, startup recovery, and rollback, so execution cannot silently fall back to another profile. A later task serializes the canonical approval preimage from every accepted plan field except `batchHash`, including the resolved dependency closure, permission and network delta, scanner result, and versions. `batchHash` is the SHA-256 digest of that canonical preimage. Task 4 does not compute or approve the hash.
 
 An expected native digest may be absent, which means the approved precondition is that the target does not yet exist. Package artifact entries bind an immutable source reference and resolved commit, archive digest, installed artifact path and digest, and the transitive dependency closure.
 
@@ -59,7 +59,7 @@ JSON-RPC errors use numeric JSON-RPC codes. Context Relay stable snake-case erro
 
 ## Recovery enrollment boundary
 
-Protocol 1.3 replaces the unused generic recovery routes with five phase-specific enrollment
+Protocol 1.3 introduced five phase-specific enrollment
 methods: begin, overview, confirm, status, and cancel. Enrollment and recovery-root identifiers are
 distinct UUIDv7 types. Confirmation carries exactly four lowercase words at strictly increasing
 one-based positions in 1 through 24; the request owns and zeroizes those strings and redacts them
@@ -75,3 +75,11 @@ result unions are closed, word-free projections, so phrase words cannot enter a 
 result. Idle status requires every optional enrollment field to be null. Awaiting confirmation
 requires an ID and creation time but no transition time; submitting, complete, and conflict also
 require a transition time.
+
+## Explicit Hermes profile boundary
+
+Protocol 1.4 adds required-nullable `hermesProfile` to `HarnessParams` and `harnessProfile` to
+`SetupPlan`. This is a deliberate pre-release strict-wire break: exact-version local handshakes
+reject 1.3 peers before request decoding, and 1.4 decoders reject omitted profile fields. No
+downgrade fallback is allowed. The change prevents previewing one Hermes profile and later applying
+or recovering the transaction against `default` or another ambient profile.

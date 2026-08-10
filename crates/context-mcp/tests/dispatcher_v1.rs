@@ -11,7 +11,8 @@ use std::{
 };
 
 use context_relay_context_mcp::{
-    BridgeError, Daemon, MAX_IN_FLIGHT_TOOL_CALLS, MCP_REVISION, Server,
+    BridgeError, Daemon, MAX_IN_FLIGHT_TOOL_CALLS, MCP_REVISION, Server, TOOL_CALL_RATE_BURST,
+    TOOL_CALL_RATE_REFILL_PER_SECOND,
 };
 use context_relay_local_ipc::{REQUEST_TIMEOUT, SHUTDOWN_TIMEOUT};
 use context_relay_protocol::{
@@ -660,8 +661,8 @@ fn remember_call(id: Value) -> Value {
 fn status_output() -> Value {
     json!({
         "protocol": {
-            "min": {"major": 1, "minor": 3},
-            "max": {"major": 1, "minor": 3}
+            "min": {"major": 1, "minor": 4},
+            "max": {"major": 1, "minor": 4}
         },
         "vault": "unlocked",
         "resolvedProject": null,
@@ -705,6 +706,39 @@ async fn sixty_fifth_call_is_busy_and_concurrent_responses_remain_whole_lines() 
         response_ids,
         (0..MAX_IN_FLIGHT_TOOL_CALLS as i64).collect::<Vec<_>>()
     );
+    assert_eq!(server.close().await, Ok(()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn per_bridge_rate_limit_has_a_frozen_burst_and_deterministic_refill() {
+    let daemon = ImmediateDaemon::new(Ok(status_output()));
+    let mut server = StartedServer::start(daemon.clone()).await;
+
+    for id in 0..TOOL_CALL_RATE_BURST {
+        server.send(status_call(json!(id))).await;
+        assert_eq!(server.receive().await["result"]["isError"], false);
+    }
+    server.send(status_call(json!("burst-exhausted"))).await;
+    let exhausted = server.receive().await;
+    assert_eq!(exhausted["result"]["isError"], true);
+    assert_eq!(exhausted["result"]["_meta"]["contextRelay"]["code"], "busy");
+    assert_eq!(daemon.call_count(), TOOL_CALL_RATE_BURST);
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    for id in 0..TOOL_CALL_RATE_REFILL_PER_SECOND {
+        server
+            .send(status_call(json!(format!("refill-{id}"))))
+            .await;
+        assert_eq!(server.receive().await["result"]["isError"], false);
+    }
+    server.send(status_call(json!("refill-exhausted"))).await;
+    let exhausted = server.receive().await;
+    assert_eq!(exhausted["result"]["isError"], true);
+    assert_eq!(
+        daemon.call_count(),
+        TOOL_CALL_RATE_BURST + TOOL_CALL_RATE_REFILL_PER_SECOND
+    );
+
     assert_eq!(server.close().await, Ok(()));
 }
 

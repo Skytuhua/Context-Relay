@@ -142,6 +142,7 @@ fn plan() -> NativeTransactionPlan {
         setup: SetupPlan {
             plan_id: PlanId::from_str(PLAN_ID).unwrap(),
             harness: HarnessId::Codex,
+            harness_profile: None,
             adapter_version: 7,
             executable_path: native_text("/fixture/codex"),
             executable_hash: Sha256Digest([1; 32]),
@@ -638,6 +639,7 @@ fn operation_timeouts_are_exactly_bounded() {
 fn hermes_and_non_managed_targets_reject() {
     let mut hermes = plan();
     hermes.setup.harness = HarnessId::Hermes;
+    hermes.setup.harness_profile = Some("coder".to_owned());
     assert_rejects(&hermes, "Hermes");
 
     let mut wrong_harness = plan();

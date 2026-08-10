@@ -578,7 +578,24 @@ impl NativeAdapter for FrozenHarness {
             Self::Codex { adapter, .. } => {
                 NativeAdapter::validate_effective(adapter, plan, receipt)
             }
-            Self::Hermes(adapter) => NativeAdapter::validate_effective(adapter, plan, receipt),
+            Self::Hermes(adapter) => {
+                receipt
+                    .validate()
+                    .map_err(|_| BoundaryError::new("Hermes effective receipt is invalid"))?;
+                adapter
+                    .import(&ImportRequest {
+                        scopes: vec![
+                            NativeScope::Global,
+                            NativeScope::Project {
+                                project_id: adapter.project_id(),
+                                root: adapter.project_root_wire(),
+                            },
+                        ],
+                        include_disabled: true,
+                    })
+                    .map_err(|_| BoundaryError::new("Hermes effective configuration is invalid"))?;
+                Ok(())
+            }
         }
     }
 
@@ -990,8 +1007,6 @@ fn codex_matrix_fixture_with_version(version: &str) -> MatrixFixture {
     );
     materialize_json(&project_root, source["project"].as_object().unwrap());
     fs::create_dir_all(&working_directory).unwrap();
-    let requirements = root.join("requirements.toml");
-    fs::write(&requirements, source["requirements"].as_str().unwrap()).unwrap();
     let executable = executable(&root.join("codex-bin"), b"\x7fELFfixture codex executable");
     let raw_files = [
         codex_home.join("sessions/2026/session.jsonl"),
@@ -1016,7 +1031,7 @@ fn codex_matrix_fixture_with_version(version: &str) -> MatrixFixture {
             user_skills_dir: home.join(".agents/skills"),
             project_root: project_root.clone(),
             working_directory,
-            requirements_paths: vec![requirements],
+            requirements_paths: vec![],
         },
         project_id,
         device_id,
