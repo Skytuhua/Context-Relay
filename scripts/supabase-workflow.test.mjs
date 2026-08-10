@@ -94,6 +94,13 @@ test('pgTAP runs only the planned suite and compares catalog text with one colla
     suite,
     /'ciphertext_objects_authenticated_insert'::text collate "C", 'a'::text collate "C", 'authenticated'::text collate "C"/,
   );
+  for (const [block] of suite.matchAll(/select results_eq\([\s\S]*?\n\);/g)) {
+    assert.doesNotMatch(
+      block,
+      /::text(?! collate "C")/,
+      'every text cast compared by pgTAP must pin the same deterministic collation',
+    );
+  }
 });
 
 test('Supabase workflow preserves triggers and the local contract lifecycle', async () => {

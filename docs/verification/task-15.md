@@ -257,7 +257,8 @@ security boundary are unchanged.
 | Local executable identity | `supabase --version` reports exactly `2.113.0`. |
 | Fresh local database start/reset | Green in recovery run [31353437071](https://github.com/Skytuhua/Context-Relay/actions/runs/31353437071), job [93348456664](https://github.com/Skytuhua/Context-Relay/actions/runs/31353437071/job/93348456664); the prior backend crash no longer occurs. |
 | First pgTAP execution on the fixed image | Reached 119/502 before PostgreSQL rejected an indeterminate catalog-text collation. CLI `2.113.0` also discovered two included fixture files as standalone suites with no TAP plan. |
-| pgTAP compatibility repair | The runner now names only the planned suite. The affected catalog-text and expected-text fields use the same explicit `C` collation. Static RED/GREEN is recorded; fresh GitHub-hosted execution is pending. |
+| First pgTAP compatibility repair | The runner now names only the planned suite. The first affected catalog-text and expected-text fields use the same explicit `C` collation. Recovery runs [31353663192](https://github.com/Skytuhua/Context-Relay/actions/runs/31353663192) and [31353661559](https://github.com/Skytuhua/Context-Relay/actions/runs/31353661559) proved fixture discovery was fixed and advanced the suite from 119 to 123 assertions before exposing the next unpinned catalog-text comparison at test line 823. |
+| Complete pgTAP collation repair | Every text cast compared by `results_eq` now pins the same deterministic `C` collation; direct text and JSON-text projections in those comparisons are pinned explicitly too. A repository regression scans every multiline `results_eq` block and rejects an unpinned text cast. Focused static RED/GREEN is recorded; fresh GitHub-hosted execution is pending. |
 
 No paid action was performed. No secret, private key, service key, OAuth secret,
 database password, access token, or refresh token is recorded in this ledger.

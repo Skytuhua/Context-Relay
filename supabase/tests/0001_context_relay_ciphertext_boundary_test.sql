@@ -705,11 +705,11 @@ select ok(
 
 select results_eq(
   $$
-    select id::text, name::text, public, file_size_limit
+    select id::text collate "C", name::text collate "C", public, file_size_limit
     from storage.buckets
     where id = 'ciphertext'
   $$,
-  $$values ('ciphertext'::text, 'ciphertext'::text, false, 33554432::bigint)$$,
+  $$values ('ciphertext'::text collate "C", 'ciphertext'::text collate "C", false, 33554432::bigint)$$,
   'ciphertext bucket is private and capped at exactly 33554432 bytes per object'
 );
 
@@ -800,7 +800,7 @@ select ok(
 
 select results_eq(
   $$
-    select relation.relname::text, count(*)::bigint
+    select relation.relname::text collate "C", count(*)::bigint
     from pg_catalog.pg_policy policy
     join pg_catalog.pg_class relation on relation.oid = policy.polrelid
     join pg_catalog.pg_namespace namespace on namespace.oid = relation.relnamespace
@@ -812,12 +812,12 @@ select results_eq(
     order by relation.relname
   $$,
   $$values
-    ('accounts'::text, 1::bigint),
-    ('blob_manifests'::text, 1::bigint),
-    ('device_bindings'::text, 1::bigint),
-    ('device_certificates'::text, 1::bigint),
-    ('sync_checkpoints'::text, 1::bigint),
-    ('sync_operations'::text, 1::bigint)
+    ('accounts'::text collate "C", 1::bigint),
+    ('blob_manifests'::text collate "C", 1::bigint),
+    ('device_bindings'::text collate "C", 1::bigint),
+    ('device_certificates'::text collate "C", 1::bigint),
+    ('sync_checkpoints'::text collate "C", 1::bigint),
+    ('sync_operations'::text collate "C", 1::bigint)
   $$,
   'each exact read relation has one authenticated SELECT policy'
 );
@@ -1422,7 +1422,7 @@ reset role;
 
 select results_eq(
   $$
-    select storage_id, state::text
+    select storage_id, state::text collate "C"
     from context_relay_private.blob_upload_reservations
     where storage_id in (
       'a1000000-0000-7000-8000-000000000003',
@@ -1436,13 +1436,13 @@ select results_eq(
     order by storage_id
   $$,
   $$values
-    ('a1000000-0000-7000-8000-000000000003'::uuid, 'reserved'::text),
-    ('a1000000-0000-7000-8000-000000000004'::uuid, 'reserved'::text),
-    ('a1000000-0000-7000-8000-000000000005'::uuid, 'reserved'::text),
-    ('a1000000-0000-7000-8000-000000000006'::uuid, 'reserved'::text),
-    ('a1000000-0000-7000-8000-000000000007'::uuid, 'reserved'::text),
-    ('a1000000-0000-7000-8000-000000000008'::uuid, 'reserved'::text),
-    ('a1000000-0000-7000-8000-00000000000e'::uuid, 'reserved'::text)
+    ('a1000000-0000-7000-8000-000000000003'::uuid, 'reserved'::text collate "C"),
+    ('a1000000-0000-7000-8000-000000000004'::uuid, 'reserved'::text collate "C"),
+    ('a1000000-0000-7000-8000-000000000005'::uuid, 'reserved'::text collate "C"),
+    ('a1000000-0000-7000-8000-000000000006'::uuid, 'reserved'::text collate "C"),
+    ('a1000000-0000-7000-8000-000000000007'::uuid, 'reserved'::text collate "C"),
+    ('a1000000-0000-7000-8000-000000000008'::uuid, 'reserved'::text collate "C"),
+    ('a1000000-0000-7000-8000-00000000000e'::uuid, 'reserved'::text collate "C")
   $$,
   'every object-set validation failure leaves the reservation durably reserved for explicit release'
 );
@@ -1587,10 +1587,10 @@ select results_eq(
 set local role authenticated;
 select pg_catalog.set_config('request.jwt.claims', '{"sub":"10000000-0000-0000-0000-000000000005","role":"authenticated","session_id":"40000000-0000-0000-0000-000000000051"}', true);
 select results_eq(
-  $$select name from storage.objects where name like '20000000-0000-7000-8000-000000000005/a1000000-0000-7000-8000-000000000002/%' order by name$$,
+  $$select name collate "C" from storage.objects where name like '20000000-0000-7000-8000-000000000005/a1000000-0000-7000-8000-000000000002/%' order by name$$,
   $$values
-    ('20000000-0000-7000-8000-000000000005/a1000000-0000-7000-8000-000000000002/00000000.bin'::text),
-    ('20000000-0000-7000-8000-000000000005/a1000000-0000-7000-8000-000000000002/00000001.bin'::text)
+    ('20000000-0000-7000-8000-000000000005/a1000000-0000-7000-8000-000000000002/00000000.bin'::text collate "C"),
+    ('20000000-0000-7000-8000-000000000005/a1000000-0000-7000-8000-000000000002/00000001.bin'::text collate "C")
   $$,
   'active owner can read exactly the finalized ciphertext parts'
 );
@@ -1605,8 +1605,8 @@ exception
 end
 $$;
 select results_eq(
-  $$select metadata->>'eTag' from storage.objects where id = 'b1000000-0000-7000-8000-000000000001'$$,
-  $$values ('fixture-valid-0'::text)$$,
+  $$select (metadata->>'eTag') collate "C" from storage.objects where id = 'b1000000-0000-7000-8000-000000000001'$$,
+  $$values ('fixture-valid-0'::text collate "C")$$,
   'an authenticated UPDATE attempt leaves finalized object metadata unchanged'
 );
 
@@ -1626,10 +1626,10 @@ select is(
 
 select pg_catalog.set_config('request.jwt.claims', '{"sub":"10000000-0000-0000-0000-000000000005","role":"authenticated","session_id":"40000000-0000-0000-0000-000000000055"}', true);
 select results_eq(
-  $$select name from storage.objects where name like '20000000-0000-7000-8000-000000000005/a1000000-0000-7000-8000-000000000002/%' order by name$$,
+  $$select name collate "C" from storage.objects where name like '20000000-0000-7000-8000-000000000005/a1000000-0000-7000-8000-000000000002/%' order by name$$,
   $$values
-    ('20000000-0000-7000-8000-000000000005/a1000000-0000-7000-8000-000000000002/00000000.bin'::text),
-    ('20000000-0000-7000-8000-000000000005/a1000000-0000-7000-8000-000000000002/00000001.bin'::text)
+    ('20000000-0000-7000-8000-000000000005/a1000000-0000-7000-8000-000000000002/00000000.bin'::text collate "C"),
+    ('20000000-0000-7000-8000-000000000005/a1000000-0000-7000-8000-000000000002/00000001.bin'::text collate "C")
   $$,
   'a second active device in the account may read all finalized ciphertext parts'
 );
@@ -1723,12 +1723,12 @@ select throws_ok(
 reset role;
 
 select results_eq(
-  $$select account.reserved_bytes, reservation.state::text
+  $$select account.reserved_bytes, reservation.state::text collate "C"
     from public.accounts account
     join context_relay_private.blob_upload_reservations reservation
       on reservation.account_id = account.id
     where reservation.storage_id = 'a1000000-0000-7000-8000-00000000000b'$$,
-  $$values (1::bigint, 'reserved'::text)$$,
+  $$values (1::bigint, 'reserved'::text collate "C")$$,
   'pending-delete finalization failure keeps exact quota reserved until explicit release'
 );
 
@@ -1740,12 +1740,12 @@ select lives_ok(
 reset role;
 
 select results_eq(
-  $$select account.deletion_state::text, account.reserved_bytes, reservation.state::text
+  $$select account.deletion_state::text collate "C", account.reserved_bytes, reservation.state::text collate "C"
     from public.accounts account
     join context_relay_private.blob_upload_reservations reservation
       on reservation.account_id = account.id
     where reservation.storage_id = 'a1000000-0000-7000-8000-00000000000b'$$,
-  $$values ('pending_delete'::text, 0::bigint, 'cancelled'::text)$$,
+  $$values ('pending_delete'::text collate "C", 0::bigint, 'cancelled'::text collate "C")$$,
   'pending-delete cleanup refunds quota and records the terminal reservation state'
 );
 
@@ -1790,12 +1790,12 @@ select throws_ok(
 reset role;
 
 select results_eq(
-  $$select account.reserved_bytes, reservation.state::text
+  $$select account.reserved_bytes, reservation.state::text collate "C"
     from public.accounts account
     join context_relay_private.blob_upload_reservations reservation
       on reservation.account_id = account.id
     where reservation.storage_id = 'a1000000-0000-7000-8000-00000000000c'$$,
-  $$values (2::bigint, 'reserved'::text)$$,
+  $$values (2::bigint, 'reserved'::text collate "C")$$,
   'revoked-device finalization failure keeps exact quota reserved until explicit release'
 );
 
@@ -1807,12 +1807,12 @@ select lives_ok(
 reset role;
 
 select results_eq(
-  $$select account.reserved_bytes, reservation.state::text
+  $$select account.reserved_bytes, reservation.state::text collate "C"
     from public.accounts account
     join context_relay_private.blob_upload_reservations reservation
       on reservation.account_id = account.id
     where reservation.storage_id = 'a1000000-0000-7000-8000-00000000000c'$$,
-  $$values (0::bigint, 'cancelled'::text)$$,
+  $$values (0::bigint, 'cancelled'::text collate "C")$$,
   'post-revocation release refunds quota exactly once without a live identity'
 );
 
@@ -1829,7 +1829,7 @@ where id = '30000000-0000-0000-0000-000000000006';
 select results_eq(
   $$
     select schema_version, id, account_id, workspace_id, project_id, record_id,
-      record_kind, mutation_kind, device_id, device_sequence::text,
+      record_kind collate "C", mutation_kind collate "C", device_id, device_sequence::text collate "C",
       causal_frontier, control_epoch, key_epoch, previous_device_hash, nonce,
       pg_catalog.octet_length(ciphertext), ciphertext_hash, blob_refs,
       created_hlc, signature
@@ -1840,8 +1840,8 @@ select results_eq(
     1, '90000000-0000-7000-8000-000000000001'::uuid,
     '20000000-0000-7000-8000-000000000001'::uuid,
     '70000000-0000-7000-8000-000000000001'::uuid, null::uuid,
-    '91000000-0000-7000-8000-000000000001'::uuid, 'memory'::text,
-    'upsert'::text, '50000000-0000-7000-8000-000000000001'::uuid, '0'::text,
+    '91000000-0000-7000-8000-000000000001'::uuid, 'memory'::text collate "C",
+    'upsert'::text collate "C", '50000000-0000-7000-8000-000000000001'::uuid, '0'::text collate "C",
     '[{"deviceId":"50000000-0000-7000-8000-000000000001","sequence":"0"}]'::jsonb,
     0::bigint, 0::bigint, decode(repeat('30', 32), 'hex'),
     decode(repeat('31', 24), 'hex'), 1, decode(repeat('33', 32), 'hex'),
@@ -1933,20 +1933,20 @@ select is(
 
 select results_eq(
   $$
-    select device_sequence::text, (causal_frontier->0->>'sequence')::text,
+    select device_sequence::text collate "C", (causal_frontier->0->>'sequence')::text collate "C",
       control_epoch, key_epoch, pg_catalog.octet_length(previous_device_hash),
       pg_catalog.octet_length(nonce), pg_catalog.octet_length(ciphertext),
-      pg_catalog.octet_length(ciphertext_hash), blob_refs->0->>'ciphertextBytes',
+      pg_catalog.octet_length(ciphertext_hash), (blob_refs->0->>'ciphertextBytes') collate "C",
       pg_catalog.octet_length(blob_refs->0->>'storageId'),
-      created_hlc->>'physicalMs', (created_hlc->>'logical')::bigint,
+      (created_hlc->>'physicalMs') collate "C", (created_hlc->>'logical')::bigint,
       pg_catalog.octet_length(signature)
     from public.sync_operations
     where id = '90000000-0000-7000-8000-000000000003'
   $$,
   $$values (
-    '18446744073709551615'::text, '18446744073709551615'::text,
+    '18446744073709551615'::text collate "C", '18446744073709551615'::text collate "C",
     4294967295::bigint, 4294967295::bigint, 32, 24, 4194304, 32,
-    '524288000'::text, 512, '18446744073709551615'::text,
+    '524288000'::text collate "C", 512, '18446744073709551615'::text collate "C",
     4294967295::bigint, 64
   )$$,
   'maximum legal SyncOperationV1 widths and unsigned values round-trip without truncation or ciphertext output'
@@ -1954,16 +1954,16 @@ select results_eq(
 
 select results_eq(
   $$
-    select (causal_frontier->0->>'sequence')::text, key_epoch,
+    select (causal_frontier->0->>'sequence')::text collate "C", key_epoch,
       pg_catalog.octet_length(previous_checkpoint_hash),
-      pg_catalog.octet_length(state_hash), created_hlc->>'physicalMs',
+      pg_catalog.octet_length(state_hash), (created_hlc->>'physicalMs') collate "C",
       (created_hlc->>'logical')::bigint, pg_catalog.octet_length(signature)
     from public.sync_checkpoints
     where id = '93000000-0000-7000-8000-000000000003'
   $$,
   $$values (
-    '18446744073709551615'::text, 4294967295::bigint, 32, 32,
-    '18446744073709551615'::text, 4294967295::bigint, 64
+    '18446744073709551615'::text collate "C", 4294967295::bigint, 32, 32,
+    '18446744073709551615'::text collate "C", 4294967295::bigint, 64
   )$$,
   'maximum legal CheckpointV1 widths and unsigned values round-trip without truncation'
 );
@@ -2771,13 +2771,13 @@ select throws_ok(
 reset role;
 
 select results_eq(
-  $$select state::text, cutoff_device_sequence, cutoff_hash, cutoff_signature, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000004'$$,
-  $$values ('active'::text, null::bigint, null::bytea, null::bytea, 0::bigint, 0::bigint)$$,
+  $$select state::text collate "C", cutoff_device_sequence, cutoff_hash, cutoff_signature, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000004'$$,
+  $$values ('active'::text collate "C", null::bigint, null::bytea, null::bytea, 0::bigint, 0::bigint)$$,
   'expired-target rejection leaves its binding, cutoff, and account epochs unchanged'
 );
 select results_eq(
-  $$select device_bindings.state::text, cutoff_device_sequence, cutoff_hash, cutoff_signature, deletion_state::text, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000006'$$,
-  $$values ('active'::text, null::bigint, null::bytea, null::bytea, 'purged'::text, 0::bigint, 0::bigint)$$,
+  $$select device_bindings.state::text collate "C", cutoff_device_sequence, cutoff_hash, cutoff_signature, deletion_state::text collate "C", control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000006'$$,
+  $$values ('active'::text collate "C", null::bigint, null::bytea, null::bytea, 'purged'::text collate "C", 0::bigint, 0::bigint)$$,
   'purged-account rejection leaves its binding, cutoff, state, and epochs unchanged'
 );
 
@@ -2788,8 +2788,8 @@ select lives_ok(
 );
 reset role;
 select results_eq(
-  $$select state::text, cutoff_device_sequence, cutoff_hash, cutoff_signature, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000005'$$,
-  $$values ('active'::text, null::bigint, null::bytea, null::bytea, 0::bigint, 0::bigint)$$,
+  $$select state::text collate "C", cutoff_device_sequence, cutoff_hash, cutoff_signature, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000005'$$,
+  $$values ('active'::text collate "C", null::bigint, null::bytea, null::bytea, 0::bigint, 0::bigint)$$,
   'historical replay leaves the active replacement and epochs unchanged'
 );
 
@@ -2804,8 +2804,8 @@ select throws_ok(
 );
 reset role;
 select results_eq(
-  $$select state::text, cutoff_device_sequence, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000005'$$,
-  $$values ('active'::text, null::bigint, 0::bigint, 0::bigint)$$,
+  $$select state::text collate "C", cutoff_device_sequence, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000005'$$,
+  $$values ('active'::text collate "C", null::bigint, 0::bigint, 0::bigint)$$,
   'stale and conflicting history leave the replacement and epochs unchanged'
 );
 
@@ -2816,8 +2816,8 @@ select lives_ok(
 );
 reset role;
 select results_eq(
-  $$select state::text, cutoff_device_sequence, cutoff_hash, cutoff_signature, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000005'$$,
-  $$values ('revoked'::text, 8::bigint, decode(repeat('b1', 32), 'hex'), decode(repeat('b2', 64), 'hex'), 1::bigint, 1::bigint)$$,
+  $$select state::text collate "C", cutoff_device_sequence, cutoff_hash, cutoff_signature, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000005'$$,
+  $$values ('revoked'::text collate "C", 8::bigint, decode(repeat('b1', 32), 'hex'), decode(repeat('b2', 64), 'hex'), 1::bigint, 1::bigint)$$,
   'higher replacement cutoff is stored and advances both epochs exactly once'
 );
 set local role service_role;
@@ -2833,8 +2833,8 @@ select results_eq(
 );
 
 select results_eq(
-  $$select state::text, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000001'$$,
-  $$values ('active'::text, 0::bigint, 0::bigint)$$,
+  $$select state::text collate "C", control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000001'$$,
+  $$values ('active'::text collate "C", 0::bigint, 0::bigint)$$,
   'revocation fixture begins active at zero epochs'
 );
 
@@ -2858,8 +2858,8 @@ select throws_ok(
 reset role;
 
 select results_eq(
-  $$select state::text, cutoff_device_sequence, cutoff_hash, cutoff_signature, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000001'$$,
-  $$values ('active'::text, null::bigint, null::bytea, null::bytea, 0::bigint, 0::bigint)$$,
+  $$select state::text collate "C", cutoff_device_sequence, cutoff_hash, cutoff_signature, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000001'$$,
+  $$values ('active'::text collate "C", null::bigint, null::bytea, null::bytea, 0::bigint, 0::bigint)$$,
   'invalid revocation attempts leave binding cutoff and account epochs unchanged'
 );
 
@@ -2870,8 +2870,8 @@ select lives_ok(
 );
 reset role;
 select results_eq(
-  $$select state::text, cutoff_device_sequence, cutoff_hash, cutoff_signature, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000001'$$,
-  $$values ('revoked'::text, 9::bigint, decode(repeat('81', 32), 'hex'), decode(repeat('82', 64), 'hex'), 1::bigint, 1::bigint)$$,
+  $$select state::text collate "C", cutoff_device_sequence, cutoff_hash, cutoff_signature, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000001'$$,
+  $$values ('revoked'::text collate "C", 9::bigint, decode(repeat('81', 32), 'hex'), decode(repeat('82', 64), 'hex'), 1::bigint, 1::bigint)$$,
   'revocation atomically stores the full cutoff and advances both epochs exactly once'
 );
 
@@ -2887,8 +2887,8 @@ select throws_ok(
 reset role;
 
 select results_eq(
-  $$select state::text, cutoff_device_sequence, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000001'$$,
-  $$values ('revoked'::text, 9::bigint, 1::bigint, 1::bigint)$$,
+  $$select state::text collate "C", cutoff_device_sequence, control_epoch, key_epoch from public.device_bindings join public.accounts on accounts.id = device_bindings.account_id where device_bindings.id = '30000000-0000-0000-0000-000000000001'$$,
+  $$values ('revoked'::text collate "C", 9::bigint, 1::bigint, 1::bigint)$$,
   'replays do not advance epochs or replace the signed cutoff'
 );
 
