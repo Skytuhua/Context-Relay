@@ -2246,7 +2246,6 @@ select pg_catalog.set_config(
   true
 );
 
-set local role context_relay_rls_owner;
 select throws_ok(
   $$select pg_temp.insert_sync_operation(
     '9a000000-0000-7000-8000-00000000000f',
@@ -2255,7 +2254,6 @@ select throws_ok(
   )$$, null, null,
   'operation ciphertext exceeding the exact remaining quota by one byte fails'
 );
-reset role;
 
 select results_eq(
   $$select used_bytes, reserved_bytes from public.accounts where id = '20000000-0000-7000-8000-000000000003'$$,
@@ -2264,7 +2262,6 @@ select results_eq(
   'quota rejection preserves counters containing finalized blob and reservation bytes'
 );
 
-set local role context_relay_rls_owner;
 select lives_ok(
   $$select pg_temp.insert_sync_operation(
     '9a000000-0000-7000-8000-000000000010',
@@ -2273,7 +2270,6 @@ select lives_ok(
   )$$,
   'operation ciphertext may consume the exact final quota byte'
 );
-reset role;
 
 select results_eq(
   $$select used_bytes, reserved_bytes, quota_limit_bytes from public.accounts where id = '20000000-0000-7000-8000-000000000003'$$,
@@ -2284,7 +2280,6 @@ select results_eq(
   'exact-boundary append increments only used bytes and reaches used plus reserved equal to quota'
 );
 
-set local role context_relay_rls_owner;
 select throws_ok(
   $$select pg_temp.insert_sync_operation(
     '9a000000-0000-7000-8000-000000000011',
@@ -2293,7 +2288,6 @@ select throws_ok(
   )$$, null, null,
   'operation insert fails on a quota-exhausted account'
 );
-reset role;
 
 select ok(
   (select used_bytes + reserved_bytes = quota_limit_bytes
@@ -2626,7 +2620,6 @@ select ok(
   'begin deletion atomically stores one database-timestamped seven-day request and account state'
 );
 
-set local role context_relay_rls_owner;
 select throws_ok(
   $$select pg_temp.insert_sync_operation(
     '9c000000-0000-7000-8000-000000000004',
@@ -2639,7 +2632,6 @@ select throws_ok(
   )$$, null, null,
   'privileged operation insert fails while the account is pending delete'
 );
-reset role;
 
 set local role authenticated;
 select pg_catalog.set_config('request.jwt.claims', '{"sub":"10000000-0000-0000-0000-000000000004","role":"authenticated","session_id":"40000000-0000-0000-0000-000000000006"}', true);

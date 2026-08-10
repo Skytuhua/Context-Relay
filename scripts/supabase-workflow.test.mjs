@@ -145,6 +145,17 @@ test('pgTAP runs only the planned suite and compares catalog text with one colla
       sqlCallArgumentCounts(suite, 'throws_ok').filter(({ count }) => count < 3),
     )}`,
   );
+  for (const [index, block] of [
+    ...suite.matchAll(
+      /set local role context_relay_rls_owner;([\s\S]*?)(?:reset role;|$)/g,
+    ),
+  ].entries()) {
+    assert.doesNotMatch(
+      block[1],
+      /\b(?:throws_ok|lives_ok|results_eq|is|ok)\s*\(/,
+      `owner-role block ${index + 1} must not hide pgTAP assertions from the session test identity`,
+    );
+  }
 
   const membershipAssertion = suite.indexOf(
     "'Context Relay owner has no runtime-capability role memberships'",
