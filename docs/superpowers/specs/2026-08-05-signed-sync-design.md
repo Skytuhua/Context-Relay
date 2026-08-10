@@ -1,7 +1,7 @@
 # Signed Synchronization Design
 
-**Date:** 2026-08-05  
-**Status:** Approved direction derived from the frozen Context Relay v1 plan  
+**Date:** 2026-08-05\
+**Status:** Approved direction derived from the frozen Context Relay v1 plan\
 **Scope:** Task 16 — signed end-to-end encrypted synchronization
 
 ## Goal
