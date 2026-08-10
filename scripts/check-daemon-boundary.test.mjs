@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync,
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
@@ -37,6 +43,7 @@ daemon-test-support = ["context-relay-contextd/test-support"]
 context-relay-contextd = { path = ${JSON.stringify(join(workspace, 'crates/contextd'))} }
 `,
     );
+    copyFileSync(join(workspace, 'Cargo.lock'), join(fixture, 'Cargo.lock'));
     writeFileSync(
       join(fixture, 'src/main.rs'),
       `use context_relay_contextd::test_support::{
@@ -65,10 +72,10 @@ fn main() {
 }
 `,
     );
-    const cargo = (features = []) =>
+    const cargo = (features = [], locked = false) =>
       spawnSync(
         'cargo',
-        ['check', '--quiet', ...features],
+        ['check', ...(locked ? ['--locked'] : []), '--quiet', ...features],
         {
           cwd: fixture,
           encoding: 'utf8',
@@ -98,7 +105,7 @@ fn main() {
       assert.match(production.stderr, new RegExp(symbol));
     }
 
-    const testSupport = cargo(['--features', 'daemon-test-support']);
+    const testSupport = cargo(['--features', 'daemon-test-support'], true);
     assert.equal(testSupport.status, 0, testSupport.stderr);
   } finally {
     rmSync(fixture, { recursive: true, force: true });
