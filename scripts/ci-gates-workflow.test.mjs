@@ -100,6 +100,7 @@ test('required CI gates are independently visible and cannot be masked by Rust l
     'schemas',
     'licenses',
     'dependency-policy',
+    'node-dependency-policy',
     'whitespace',
     'frontend',
     'native',
@@ -121,6 +122,8 @@ test('required CI gates are independently visible and cannot be masked by Rust l
   assert.match(job(source, 'licenses'), /pnpm license:check/);
   assert.match(job(source, 'dependency-policy'), /cargo install cargo-deny --version 0\.20\.2 --locked/);
   assert.match(job(source, 'dependency-policy'), /cargo deny check/);
+  assert.match(job(source, 'node-dependency-policy'), /node --test scripts\/dependency-policy\.test\.mjs/);
+  assert.match(job(source, 'node-dependency-policy'), /pnpm audit --audit-level low/);
 
   const whitespace = job(source, 'whitespace');
   assert.match(whitespace, /actions\/checkout@[0-9a-f]{40}[\s\S]+fetch-depth:\s*0/);
