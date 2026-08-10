@@ -66,6 +66,15 @@ test('Supabase workflow uses the repository Node and pnpm toolchain', async () =
   );
 });
 
+test('Supabase CLI excludes the known current_user role-grant crash', async () => {
+  const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  const lockfile = await readFile(new URL('../pnpm-lock.yaml', import.meta.url), 'utf8');
+
+  assert.equal(packageJson.devDependencies.supabase, '2.113.0');
+  assert.match(lockfile, /^\s+supabase:\n\s+specifier: 2\.113\.0\n\s+version: 2\.113\.0$/m);
+  assert.doesNotMatch(lockfile, /(?:supabase|@supabase\/cli-[^@\s]+)@2\.110\.0/);
+});
+
 test('Supabase workflow preserves triggers and the local contract lifecycle', async () => {
   const source = await readFile(workflowUrl, 'utf8');
   const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));

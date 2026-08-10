@@ -228,5 +228,34 @@ limitations rather than accepted source findings.
 | Independent security and correctness review dispositions | `verified` | Full Task 15 diff | Correctness is approved after the `b9a4b8c` RPC/CI fixes. Independent security review of `f147c712..b9a4b8c` found no validated exploitable issue; all earlier focused security reviews also remain approved. | 2026-08-05. |
 | Full workspace regression-gate results | `partial / environment-blocked` | Local workspace and CI-capable runners | Task 15 Node gates and all four desktop gates are green. The full Node discovery is 282/288 with six unchanged Cargo-dependent sidecar failures; Cargo-backed and fresh local-database gates cannot run on this host. | 2026-08-05: Cargo, Docker, `psql`, and runnable local Supabase CLI unavailable. |
 
+### PR #12 recovery addendum (2026-08-10)
+
+The `2.110.0` references above are retained as the exact historical Task 15
+execution record. They are not the current repository toolchain. PR recovery
+run [31352707006](https://github.com/Skytuhua/Context-Relay/actions/runs/31352707006),
+job [93346355675](https://github.com/Skytuhua/Context-Relay/actions/runs/31352707006/job/93346355675),
+reproduced a database backend connection loss at
+`grant context_relay_rls_owner to current_user with inherit false, set true`
+while starting the local PostgreSQL 17 stack from Supabase CLI `2.110.0`.
+
+Upstream confirmed that the `supautils` version in the corresponding
+`supabase/postgres:17.6.1.143` image dereferences a null special-role name and
+crashes the backend for `GRANT` or `REVOKE ... current_user`. The fix is
+[supabase/supautils#205](https://github.com/supabase/supautils/pull/205),
+released in
+[`supautils` 3.2.3](https://github.com/supabase/supautils/releases/tag/v3.2.3).
+The repository now pins Supabase CLI `2.113.0`; the official embedded manifest
+for that release uses `supabase/postgres:17.6.1.158`, after the fixed
+`supautils` release. A repository regression rejects the vulnerable `2.110.0`
+CLI package family in the lockfile. The migration and its temporary-owner
+security boundary are unchanged.
+
+| Recovery gate | Result |
+| --- | --- |
+| Dependency/lock contract RED | `3/4` Supabase workflow tests; exact expected mismatch `2.110.0` versus `2.113.0`. |
+| Dependency/lock contract GREEN | `4/4`; package and all platform CLI packages resolve to `2.113.0`, with no `2.110.0` CLI entry. |
+| Local executable identity | `supabase --version` reports exactly `2.113.0`. |
+| Fresh local database execution | Pending the next GitHub-hosted Ubuntu run; Docker remains unavailable on this host. |
+
 No paid action was performed. No secret, private key, service key, OAuth secret,
 database password, access token, or refresh token is recorded in this ledger.
