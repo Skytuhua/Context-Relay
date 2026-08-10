@@ -75,6 +75,27 @@ test('Supabase CLI excludes the known current_user role-grant crash', async () =
   assert.doesNotMatch(lockfile, /(?:supabase|@supabase\/cli-[^@\s]+)@2\.110\.0/);
 });
 
+test('pgTAP runs only the planned suite and compares catalog text with one collation', async () => {
+  const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  const suite = await readFile(
+    new URL('../supabase/tests/0001_context_relay_ciphertext_boundary_test.sql', import.meta.url),
+    'utf8',
+  );
+
+  assert.equal(
+    packageJson.scripts['supabase:test'],
+    'supabase test db supabase/tests/0001_context_relay_ciphertext_boundary_test.sql',
+  );
+  assert.match(
+    suite,
+    /select policy\.polname::text collate "C", policy\.polcmd::text collate "C", role_name\.rolname::text collate "C"/,
+  );
+  assert.match(
+    suite,
+    /'ciphertext_objects_authenticated_insert'::text collate "C", 'a'::text collate "C", 'authenticated'::text collate "C"/,
+  );
+});
+
 test('Supabase workflow preserves triggers and the local contract lifecycle', async () => {
   const source = await readFile(workflowUrl, 'utf8');
   const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));

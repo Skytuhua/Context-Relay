@@ -255,7 +255,9 @@ security boundary are unchanged.
 | Dependency/lock contract RED | `3/4` Supabase workflow tests; exact expected mismatch `2.110.0` versus `2.113.0`. |
 | Dependency/lock contract GREEN | `4/4`; package and all platform CLI packages resolve to `2.113.0`, with no `2.110.0` CLI entry. |
 | Local executable identity | `supabase --version` reports exactly `2.113.0`. |
-| Fresh local database execution | Pending the next GitHub-hosted Ubuntu run; Docker remains unavailable on this host. |
+| Fresh local database start/reset | Green in recovery run [31353437071](https://github.com/Skytuhua/Context-Relay/actions/runs/31353437071), job [93348456664](https://github.com/Skytuhua/Context-Relay/actions/runs/31353437071/job/93348456664); the prior backend crash no longer occurs. |
+| First pgTAP execution on the fixed image | Reached 119/502 before PostgreSQL rejected an indeterminate catalog-text collation. CLI `2.113.0` also discovered two included fixture files as standalone suites with no TAP plan. |
+| pgTAP compatibility repair | The runner now names only the planned suite. The affected catalog-text and expected-text fields use the same explicit `C` collation. Static RED/GREEN is recorded; fresh GitHub-hosted execution is pending. |
 
 No paid action was performed. No secret, private key, service key, OAuth secret,
 database password, access token, or refresh token is recorded in this ledger.

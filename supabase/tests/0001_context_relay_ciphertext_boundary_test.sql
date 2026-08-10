@@ -715,7 +715,7 @@ select results_eq(
 
 select results_eq(
   $$
-    select policy.polname::text, policy.polcmd::text, role_name.rolname::text
+    select policy.polname::text collate "C", policy.polcmd::text collate "C", role_name.rolname::text collate "C"
     from pg_catalog.pg_policy policy
     join pg_catalog.pg_class relation on relation.oid = policy.polrelid
     join pg_catalog.pg_namespace namespace on namespace.oid = relation.relnamespace
@@ -727,9 +727,9 @@ select results_eq(
     order by policy.polname
   $$,
   $$values
-    ('ciphertext_objects_authenticated_insert'::text, 'a'::text, 'authenticated'::text),
-    ('ciphertext_objects_authenticated_select'::text, 'r'::text, 'authenticated'::text),
-    ('ciphertext_objects_rls_owner_select'::text, 'r'::text, 'context_relay_rls_owner'::text)
+    ('ciphertext_objects_authenticated_insert'::text collate "C", 'a'::text collate "C", 'authenticated'::text collate "C"),
+    ('ciphertext_objects_authenticated_select'::text collate "C", 'r'::text collate "C", 'authenticated'::text collate "C"),
+    ('ciphertext_objects_rls_owner_select'::text collate "C", 'r'::text collate "C", 'context_relay_rls_owner'::text collate "C")
   $$,
   'Storage has only the two authenticated object policies plus narrow owner metadata read'
 );

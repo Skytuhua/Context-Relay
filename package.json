@@ -11,7 +11,7 @@
     "supabase:start": "supabase start",
     "supabase:start:ci": "supabase start --exclude gotrue,realtime,storage-api,imgproxy,kong,mailpit,postgrest,postgres-meta,studio,edge-runtime,logflare,vector,supavisor",
     "supabase:reset": "supabase db reset --local",
-    "supabase:test": "supabase test db",
+    "supabase:test": "supabase test db supabase/tests/0001_context_relay_ciphertext_boundary_test.sql",
     "supabase:lint": "supabase db lint --local --level warning --fail-on error",
     "supabase:stop": "supabase stop --no-backup",
     "lint": "pnpm --filter @context-relay/desktop lint",
