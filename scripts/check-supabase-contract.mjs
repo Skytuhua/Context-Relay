@@ -1538,7 +1538,7 @@ function validateWorkflow(workflow, violations) {
     'pnpm check:supabase',
     'node --test scripts/tests/check-supabase-contract.test.mjs',
     'node --test scripts/tests/verify-supabase-realtime.test.mjs',
-    'pnpm supabase:start',
+    'pnpm supabase:start:ci',
     'pnpm supabase:reset',
     'pnpm supabase:test',
     'pnpm supabase:lint',

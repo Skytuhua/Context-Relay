@@ -18,6 +18,22 @@ const expectedPaths = [
   '.github/workflows/supabase.yml',
 ];
 
+const databaseOnlyExcludes = [
+  'gotrue',
+  'realtime',
+  'storage-api',
+  'imgproxy',
+  'kong',
+  'mailpit',
+  'postgrest',
+  'postgres-meta',
+  'studio',
+  'edge-runtime',
+  'logflare',
+  'vector',
+  'supavisor',
+].join(',');
+
 test('Supabase workflow uses least-privilege immutable actions', async () => {
   const source = await readFile(workflowUrl, 'utf8');
 
@@ -52,6 +68,7 @@ test('Supabase workflow uses the repository Node and pnpm toolchain', async () =
 
 test('Supabase workflow preserves triggers and the local contract lifecycle', async () => {
   const source = await readFile(workflowUrl, 'utf8');
+  const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 
   const paths = [...source.matchAll(/^\s{6}- '([^']+)'\s*$/gm)]
     .map((match) => match[1]);
@@ -68,7 +85,7 @@ test('Supabase workflow preserves triggers and the local contract lifecycle', as
     'pnpm check:supabase',
     'node --test scripts/tests/check-supabase-contract.test.mjs',
     'node --test scripts/tests/verify-supabase-realtime.test.mjs',
-    'pnpm supabase:start',
+    'pnpm supabase:start:ci',
     'pnpm supabase:reset',
     'pnpm supabase:test',
     'pnpm supabase:lint',
@@ -77,4 +94,9 @@ test('Supabase workflow preserves triggers and the local contract lifecycle', as
     source,
     /^\s+- if:\s*always\(\)\s*\n\s+run:\s*pnpm supabase:stop\s*$/m,
   );
+  assert.equal(
+    packageJson.scripts['supabase:start:ci'],
+    `supabase start --exclude ${databaseOnlyExcludes}`,
+  );
+  assert.doesNotMatch(packageJson.scripts['supabase:start:ci'], /ignore-health-check|--debug/);
 });

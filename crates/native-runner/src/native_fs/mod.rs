@@ -1,16 +1,19 @@
 use std::{
     collections::BTreeSet,
-    ffi::OsStr,
     fs::{self, File},
     path::{Path, PathBuf},
 };
 
+#[cfg(any(windows, target_os = "macos"))]
+use std::ffi::OsStr;
+
 use minicbor::{Decoder, Encoder};
 use sha2::{Digest, Sha256};
 
+#[cfg(any(windows, target_os = "macos"))]
+use crate::validate_path_set;
 use crate::{
     ContentFrame, RunLimits, RunnerError, RuntimeTarget, StageDirectory, StageLayout, StagePath,
-    validate_path_set,
 };
 
 const MAX_STATE_BYTES: usize = 200 * 1024 * 1024;
@@ -533,23 +536,22 @@ pub struct OsNativeFileSystem;
 
 #[derive(Debug)]
 pub struct PinnedNativeDirectory {
+    #[cfg(any(windows, target_os = "macos"))]
     path: PathBuf,
     #[cfg(any(windows, target_os = "macos"))]
     directory: File,
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 impl PinnedNativeDirectory {
     pub fn open(path: &Path) -> Result<Self, RunnerError> {
         #[cfg(target_os = "macos")]
         let directory = macos::open_pinned_directory(path)?;
         #[cfg(windows)]
         let directory = windows::open_pinned_directory(path)?;
-        #[cfg(not(any(windows, target_os = "macos")))]
-        return Err(RunnerError::UnsupportedTarget);
 
         Ok(Self {
             path: path.to_path_buf(),
-            #[cfg(any(windows, target_os = "macos"))]
             directory,
         })
     }
@@ -559,8 +561,6 @@ impl PinnedNativeDirectory {
         let matches = macos::verify_pinned_directory(&self.directory, &self.path)?;
         #[cfg(windows)]
         let matches = windows::verify_pinned_directory(&self.directory, &self.path)?;
-        #[cfg(not(any(windows, target_os = "macos")))]
-        return Err(RunnerError::UnsupportedTarget);
 
         if matches {
             Ok(())
@@ -576,8 +576,6 @@ impl PinnedNativeDirectory {
         let file = macos::open_or_create_pinned_regular(&self.directory, OsStr::new(name))?;
         #[cfg(windows)]
         let file = windows::open_or_create_pinned_regular(&self.directory, OsStr::new(name))?;
-        #[cfg(not(any(windows, target_os = "macos")))]
-        return Err(RunnerError::UnsupportedTarget);
 
         self.verify_regular_file(name, &file)?;
         self.verify_path()?;
@@ -590,14 +588,33 @@ impl PinnedNativeDirectory {
         let matches = macos::verify_pinned_regular(&self.directory, OsStr::new(name), file)?;
         #[cfg(windows)]
         let matches = windows::verify_pinned_regular(&self.directory, OsStr::new(name), file)?;
-        #[cfg(not(any(windows, target_os = "macos")))]
-        return Err(RunnerError::UnsupportedTarget);
 
         if matches {
             Ok(())
         } else {
             Err(RunnerError::ConcurrentChange)
         }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+impl PinnedNativeDirectory {
+    pub fn open(_path: &Path) -> Result<Self, RunnerError> {
+        Err(RunnerError::UnsupportedTarget)
+    }
+
+    pub fn verify_path(&self) -> Result<(), RunnerError> {
+        Err(RunnerError::UnsupportedTarget)
+    }
+
+    pub fn open_or_create_regular_file(&self, name: &str) -> Result<File, RunnerError> {
+        validate_pinned_child_name(name)?;
+        Err(RunnerError::UnsupportedTarget)
+    }
+
+    pub fn verify_regular_file(&self, name: &str, _file: &File) -> Result<(), RunnerError> {
+        validate_pinned_child_name(name)?;
+        Err(RunnerError::UnsupportedTarget)
     }
 }
 
@@ -1043,7 +1060,7 @@ fn inspect_native_tree_with_limits(
 ) -> Result<NativeTreeInventory, RunnerError> {
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = (root, target);
+        let _ = (root, target, limits);
         return Err(RunnerError::UnsupportedTarget);
     }
     #[cfg(any(windows, target_os = "macos"))]

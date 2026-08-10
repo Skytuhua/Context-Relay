@@ -1,12 +1,15 @@
 use std::{
-    cell::Cell,
     fs,
     path::{Path, PathBuf},
-    rc::Rc,
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(unix)]
+use std::{cell::Cell, rc::Rc};
+
+#[cfg(unix)]
+use context_relay_core::native_transaction::engine::CompensationOutcome;
 use context_relay_core::{
     hermes::{HermesAdapter, HermesExecutableKind, HermesLayout, HermesMemoryKind, HermesProfile},
     mcp::install::bridge_component,
@@ -17,9 +20,9 @@ use context_relay_core::{
     native_transaction::{
         approval_hash_v1,
         engine::{
-            BeforeImage, BoundaryError, CompensationOutcome, FaultHook, MutationOutcome,
-            NativeAdapter, NativeFileSystem, NativeJournal, NativeTransactionEngine,
-            RestrictedExecutor, RestrictedRun,
+            BeforeImage, BoundaryError, FaultHook, MutationOutcome, NativeAdapter,
+            NativeFileSystem, NativeJournal, NativeTransactionEngine, RestrictedExecutor,
+            RestrictedRun,
         },
         filesystem::OsNativeTransactionFileSystem,
         model::{
@@ -3223,7 +3226,7 @@ fn invalid_nested_symlinked_and_case_colliding_profiles_are_ignored() {
     .unwrap();
     #[cfg(windows)]
     let _ = std::os::windows::fs::symlink_dir(
-        &fixture.profiles_root.join("writer"),
+        fixture.profiles_root.join("writer"),
         fixture.profiles_root.join("linked"),
     );
     let discovered = HermesAdapter::discover_profiles(&fixture.default_home).unwrap();

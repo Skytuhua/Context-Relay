@@ -43,7 +43,7 @@ jobs:
       - run: pnpm check:supabase
       - run: node --test scripts/tests/check-supabase-contract.test.mjs
       - run: node --test scripts/tests/verify-supabase-realtime.test.mjs
-      - run: pnpm supabase:start
+      - run: pnpm supabase:start:ci
       - run: pnpm supabase:reset
       - run: pnpm supabase:test
       - run: pnpm supabase:lint
