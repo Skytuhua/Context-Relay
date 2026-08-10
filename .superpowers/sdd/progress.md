@@ -136,3 +136,14 @@ read-only without persisted credentials, and publication/provenance boundaries a
 The controller independently reran all 38 workflow contracts and the follow-up diff check green.
 Actual GitHub-hosted Windows x64/macOS arm64 matrices, the canonical APFS fixture, and workflow
 expansion remain pending the draft-PR run and are not claimed as local passes.
+
+Task 6: complete locally (`7a3bc8c`; independent security review approved with no actionable
+finding). Every one of the eleven immutable secret-scan fingerprints has an exact tracked
+rationale tied to its historical Git object: two production detector literals and nine synthetic
+negative-test fixtures, with no copied payload or broad exclusion. The captured PR #12
+stabilization ledger preserves the original base/head/tree identities, the additive repair
+sequence, Graphify integrity caveat, reproduced blockers, review fixes, toolchains, and explicit
+execution-plane limits. The controller independently reran 40/40 workflow contracts and Gitleaks
+8.30.1 across all refs with zero findings; the ignore file remains 1,103 bytes at SHA-256
+`651da29e101f61580d789284520431ca8aaf944f933394b86130149b865d6032`. T03 remains `partial` until
+the repaired stack completes every GitHub-hosted Windows/macOS/APFS gate without hidden skips.
