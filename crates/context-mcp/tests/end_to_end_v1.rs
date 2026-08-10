@@ -13,18 +13,10 @@ use context_relay_context_mcp::{
 use context_relay_contextd::{
     DaemonHandle, DaemonState,
     test_support::{
-        TestCodexBridgeInstallEngine, TestDaemonConfig, TestRecordingBridgeInstallEngine,
-        TestWorkerGate,
+        TestCodexBridgeInstallEngine, TestCodexBridgeInstallRequest, TestDaemonConfig,
+        TestRecordingBridgeInstallEngine, TestWorkerGate,
+        test_primary_memory_instruction_component,
     },
-};
-use context_relay_core::{
-    codex::{CodexAdapter, CodexExecutableKind, CodexLayout},
-    mcp::install::{BridgeExecutable, attest_bridge_executable},
-    native_memory::{
-        NativeMemoryAdapter, NativeMemorySource, primary_memory_instruction_component,
-    },
-    native_transaction::open_plan,
-    vault::{NativeTransactionStatus, SetupPlanLifecycle},
 };
 use context_relay_local_ipc::{
     AuthAcceptedV1, AuthTranscriptV1, ConnectedStream, InstallationToken, REQUEST_TIMEOUT,
@@ -36,7 +28,7 @@ use context_relay_protocol::{
     HybridLogicalClock, InstallationMethod, JsonRpcErrorV1, JsonRpcRequestV1, JsonRpcSuccessV1,
     JsonRpcVersion, ListTasksOutput, LocalRequest, LocalResult, McpBinding, McpCallParams,
     MemoryCandidate, NativePlatform, OperationId, PlanParams, ProjectId, ProjectIdentity, RecordId,
-    SearchOutput, TaskStatus, UpsertTaskOutput, WireNativeValue,
+    SearchOutput, Sha256Digest, TaskStatus, UpsertTaskOutput, WireNativeValue,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
@@ -126,14 +118,12 @@ async fn wait_for_native_candidates(config: &TestDaemonConfig, count: usize) {
     panic!("native memory candidate count did not reach {count}")
 }
 
-async fn wait_for_native_previews(config: &TestDaemonConfig, sources: &[NativeMemorySource]) {
+async fn wait_for_native_previews(config: &TestDaemonConfig, sources: &[Sha256Digest]) {
     for _ in 0..120 {
-        if sources.iter().all(|source| {
-            config
-                .native_memory_ledger(&source.id)
-                .unwrap()
-                .is_some_and(|ledger| ledger.initial_preview_complete)
-        }) {
+        if sources
+            .iter()
+            .all(|source| config.native_memory_preview_complete(*source).unwrap())
+        {
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -657,14 +647,10 @@ async fn production_setup_watcher_review_and_actual_mcp_form_one_chain() {
     let fixture = Fixture::new();
     let project = project_identity("authoritative native memory");
     let materialized = MaterializedCodexE2e::new(&fixture, project.project_id);
-    let engine = Arc::new(TestCodexBridgeInstallEngine::new(
-        materialized.adapter.clone(),
-        materialized.bridge.clone(),
-        project.project_id,
-        fixture.project_root.clone(),
-        materialized.lock_root.clone(),
-    ));
-    let config = fixture.daemon.clone().with_bridge_install_engine(engine);
+    let config = fixture
+        .daemon
+        .clone()
+        .with_bridge_install_engine(materialized.engine.clone());
     config
         .seed_mcp_project(
             &project,
@@ -685,27 +671,20 @@ async fn production_setup_watcher_review_and_actual_mcp_form_one_chain() {
     else {
         panic!("real Codex setup must return a plan")
     };
-    config
-        .with_vault(|vault| {
-            let stored = vault.setup_plan(&plan.plan_id)?.unwrap();
-            assert_eq!(stored.lifecycle, SetupPlanLifecycle::Previewed);
-            let opened = open_plan(&stored.payload).unwrap();
-            assert_eq!(&opened.plan.setup, plan.as_ref());
-            assert_eq!(opened.plan.mutations.len(), 3);
-            assert_eq!(opened.plan.native_memory_registrations.len(), 2);
-            assert!(
-                opened
-                    .plan
-                    .native_memory_registrations
-                    .iter()
-                    .all(
-                        |registration| materialized.sources.contains(&registration.source)
-                            && registration.last_applied_digest.is_none()
-                    )
-            );
-            Ok(())
-        })
-        .unwrap();
+    let stored = config.setup_plan_summary(&plan.plan_id).unwrap().unwrap();
+    assert!(stored.previewed);
+    assert_eq!(&stored.setup, plan.as_ref());
+    assert_eq!(stored.mutation_count, 3);
+    assert_eq!(stored.native_memory_registrations.len(), 2);
+    assert!(
+        stored
+            .native_memory_registrations
+            .iter()
+            .all(|registration| {
+                materialized.sources.contains(&registration.source_id)
+                    && !registration.has_last_applied_digest
+            })
+    );
     desktop
         .call(LocalRequest::HarnessApply(PlanParams {
             plan_id: plan.plan_id,
@@ -713,22 +692,12 @@ async fn production_setup_watcher_review_and_actual_mcp_form_one_chain() {
         .await
         .unwrap();
     wait_for_native_previews(&config, &materialized.sources).await;
-    config
-        .with_vault(|vault| {
-            assert_eq!(
-                vault.setup_plan(&plan.plan_id)?.unwrap().lifecycle,
-                SetupPlanLifecycle::Applied
-            );
-            assert_eq!(
-                vault
-                    .native_transaction(&format!("bridge-setup-{}", plan.plan_id))?
-                    .unwrap()
-                    .status,
-                NativeTransactionStatus::Committed
-            );
-            Ok(())
-        })
-        .unwrap();
+    assert!(config.setup_plan_applied(&plan.plan_id).unwrap());
+    assert!(
+        config
+            .native_transaction_committed(&format!("bridge-setup-{}", plan.plan_id))
+            .unwrap()
+    );
     assert!(
         std::fs::read_to_string(&materialized.config_path)
             .unwrap()
@@ -808,7 +777,7 @@ async fn claude_and_codex_primary_instructions_reach_same_session_task_evidence(
         (HarnessId::ClaudeCode, "claude-code"),
         (HarnessId::Codex, "codex"),
     ] {
-        let instruction = primary_memory_instruction_component(
+        let instruction = test_primary_memory_instruction_component(
             harness,
             project.project_id,
             device_id,
@@ -1319,13 +1288,11 @@ async fn real_timeout_reports_unknown_outcome_without_retrying() {
 }
 
 struct MaterializedCodexE2e {
-    adapter: CodexAdapter,
-    bridge: BridgeExecutable,
-    sources: Vec<NativeMemorySource>,
+    engine: Arc<TestCodexBridgeInstallEngine>,
+    sources: Vec<Sha256Digest>,
     memory_path: PathBuf,
     config_path: PathBuf,
     instruction_path: PathBuf,
-    lock_root: PathBuf,
 }
 
 impl MaterializedCodexE2e {
@@ -1361,40 +1328,34 @@ impl MaterializedCodexE2e {
         } else {
             "context-relay-context-mcp"
         }));
-        let bridge = attest_bridge_executable(&bridge_path).unwrap();
         let lock_root = root.join("native-locks");
         std::fs::create_dir_all(&lock_root).unwrap();
         let device_id: DeviceId = record_id().to_string().parse().unwrap();
-        let adapter = CodexAdapter::from_layout(
-            CodexLayout {
-                executable,
-                executable_kind: CodexExecutableKind::Native,
-                version: "0.144.1".into(),
-                installation_method: InstallationMethod::PackageManager,
-                codex_home: codex_home.clone(),
-                user_skills_dir: home.join(".agents/skills"),
-                project_root: project_root.clone(),
-                working_directory,
-                requirements_paths: vec![requirements],
-            },
+        let bridge = TestCodexBridgeInstallEngine::from_request(TestCodexBridgeInstallRequest {
+            executable,
+            bridge_path,
+            version: "0.144.1".into(),
+            installation_method: InstallationMethod::PackageManager,
+            codex_home: codex_home.clone(),
+            user_skills_dir: home.join(".agents/skills"),
+            project_root,
+            working_directory,
+            requirements_paths: vec![requirements],
             project_id,
-            device_id,
-            HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
-        )
+            origin_device: device_id,
+            observed_hlc: HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+            lock_root,
+        })
         .unwrap();
-        let capabilities = adapter.native_memory_capabilities().unwrap();
-        let sources = capabilities.sources;
-        for source in &sources {
+        for source in &bridge.sources {
             std::fs::write(wire_path_to_path(&source.path), b"").unwrap();
         }
         Self {
-            adapter,
-            bridge,
-            sources,
+            engine: bridge.engine,
+            sources: bridge.sources.into_iter().map(|source| source.id).collect(),
             memory_path: codex_home.join("memories/MEMORY.md"),
             config_path: codex_home.join("config.toml"),
-            instruction_path: project_root.join("AGENTS.md"),
-            lock_root,
+            instruction_path: fixture.project_root.join("AGENTS.md"),
         }
     }
 }

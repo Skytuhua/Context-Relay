@@ -1925,9 +1925,12 @@ pub mod test_support {
     #[cfg(feature = "test-support")]
     use context_relay_core::vault::TestVaultCell;
     use context_relay_core::{
-        codex::CodexAdapter,
-        mcp::install::{BRIDGE_SERVER_NAME, BridgeExecutable},
-        native_memory::{NativeMemoryLedger, NativeMemorySource, NativeMemorySourceId},
+        codex::{CodexAdapter, CodexExecutableKind, CodexLayout},
+        mcp::install::{BRIDGE_SERVER_NAME, BridgeExecutable, attest_bridge_executable},
+        native_memory::{
+            NativeMemoryAdapter, NativeMemoryLedger, NativeMemorySource, NativeMemorySourceId,
+            primary_memory_instruction_component,
+        },
         native_transaction::{
             ApprovedCliMutation, ApprovedInput, CanonicalCliDeclaration, NativeTransactionPlan,
             SidecarBinding,
@@ -1943,15 +1946,18 @@ pub mod test_support {
             BridgeInstallService, BridgeLocator, BridgeMutationPlan, BridgePreviewHarness,
             NativeEngineBridgePlanExecutor, PrimaryMemoryMutationPlan, RegisteredProject,
         },
-        vault::{BeforeImagePolicy, DatabaseKeyStore, NativeSandboxIdentity, Vault, VaultError},
+        vault::{
+            BeforeImagePolicy, DatabaseKeyStore, NativeSandboxIdentity, NativeTransactionStatus,
+            SetupPlanLifecycle, Vault, VaultError,
+        },
     };
     use context_relay_local_ipc::{InstallationToken, RuntimeConfig};
     use context_relay_protocol::{
         ApplyReceipt, ClassifiedChanges, CliOperations, ClientError, ComponentRecord, DesiredState,
         DeviceId, DiscoveredScopes, ErrorCode, HarnessAdapter, HarnessId, HarnessParams,
-        HybridLogicalClock, ImportRequest, ImportedState, MemoryCandidate, PlanId, PlanParams,
-        ProbeContext, ProbeReport, ProjectId, RenderedState, SemanticDiff, SetupPlan, Sha256Digest,
-        ValidationReport, WireNativeValue,
+        HybridLogicalClock, ImportRequest, ImportedState, InstallationMethod, MemoryCandidate,
+        PlanId, PlanParams, ProbeContext, ProbeReport, ProjectId, RenderedState, SemanticDiff,
+        SetupPlan, Sha256Digest, ValidationReport, WireNativeValue,
     };
     #[cfg(any(windows, target_os = "macos"))]
     use context_relay_protocol::{HarnessAccessPolicy, ProjectIdentity};
@@ -1962,6 +1968,29 @@ pub mod test_support {
         BridgeInstallEngine, Daemon, DaemonConfig, DaemonError, InstallationTokenProvider,
         VaultConfig, WorkerHook,
     };
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct TestNativeMemoryRegistration {
+        pub source_id: Sha256Digest,
+        pub has_last_applied_digest: bool,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct TestSetupPlanSummary {
+        pub previewed: bool,
+        pub setup: SetupPlan,
+        pub mutation_count: usize,
+        pub native_memory_registrations: Vec<TestNativeMemoryRegistration>,
+    }
+
+    pub fn test_primary_memory_instruction_component(
+        harness: HarnessId,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        created_hlc: HybridLogicalClock,
+    ) -> Result<ComponentRecord, ClientError> {
+        primary_memory_instruction_component(harness, project_id, origin_device, created_hlc)
+    }
 
     #[derive(Clone)]
     pub struct TestDaemonConfig {
@@ -2106,6 +2135,62 @@ pub mod test_support {
                 self.keys.as_ref(),
             )?;
             vault.native_memory_ledger(source_id)
+        }
+
+        pub fn native_memory_preview_complete(
+            &self,
+            source_id: Sha256Digest,
+        ) -> Result<bool, VaultError> {
+            self.native_memory_ledger(&NativeMemorySourceId(source_id))
+                .map(|ledger| ledger.is_some_and(|ledger| ledger.initial_preview_complete))
+        }
+
+        pub fn setup_plan_summary(
+            &self,
+            plan_id: &PlanId,
+        ) -> Result<Option<TestSetupPlanSummary>, VaultError> {
+            self.with_vault(|vault| {
+                let Some(stored) = vault.setup_plan(plan_id)? else {
+                    return Ok(None);
+                };
+                let opened = open_plan(&stored.payload)
+                    .map_err(|error| VaultError::Serialization(error.to_string()))?;
+                Ok(Some(TestSetupPlanSummary {
+                    previewed: stored.lifecycle == SetupPlanLifecycle::Previewed,
+                    setup: opened.plan.setup,
+                    mutation_count: opened.plan.mutations.len(),
+                    native_memory_registrations: opened
+                        .plan
+                        .native_memory_registrations
+                        .into_iter()
+                        .map(|registration| TestNativeMemoryRegistration {
+                            source_id: registration.source.id.0,
+                            has_last_applied_digest: registration.last_applied_digest.is_some(),
+                        })
+                        .collect(),
+                }))
+            })
+        }
+
+        pub fn setup_plan_applied(&self, plan_id: &PlanId) -> Result<bool, VaultError> {
+            self.with_vault(|vault| {
+                vault.setup_plan(plan_id).map(|plan| {
+                    plan.is_some_and(|plan| plan.lifecycle == SetupPlanLifecycle::Applied)
+                })
+            })
+        }
+
+        pub fn native_transaction_committed(
+            &self,
+            transaction_id: &str,
+        ) -> Result<bool, VaultError> {
+            self.with_vault(|vault| {
+                vault.native_transaction(transaction_id).map(|transaction| {
+                    transaction.is_some_and(|transaction| {
+                        transaction.status == NativeTransactionStatus::Committed
+                    })
+                })
+            })
         }
 
         pub fn native_memory_candidates(&self) -> Result<Vec<MemoryCandidate>, VaultError> {
@@ -2313,6 +2398,33 @@ pub mod test_support {
     /// acceptance tests. Adapter planning and native transactions are
     /// production code; only external CLI and restricted-run boundaries are
     /// represented by in-memory test state.
+    pub struct TestCodexBridgeInstallRequest {
+        pub executable: PathBuf,
+        pub bridge_path: PathBuf,
+        pub version: String,
+        pub installation_method: InstallationMethod,
+        pub codex_home: PathBuf,
+        pub user_skills_dir: PathBuf,
+        pub project_root: PathBuf,
+        pub working_directory: PathBuf,
+        pub requirements_paths: Vec<PathBuf>,
+        pub project_id: ProjectId,
+        pub origin_device: DeviceId,
+        pub observed_hlc: HybridLogicalClock,
+        pub lock_root: PathBuf,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct TestNativeMemorySource {
+        pub id: Sha256Digest,
+        pub path: WireNativeValue,
+    }
+
+    pub struct TestCodexBridgeInstallFixture {
+        pub engine: Arc<TestCodexBridgeInstallEngine>,
+        pub sources: Vec<TestNativeMemorySource>,
+    }
+
     pub struct TestCodexBridgeInstallEngine {
         harness: Mutex<TestCodexHarness>,
         bridge: BridgeExecutable,
@@ -2322,6 +2434,47 @@ pub mod test_support {
     }
 
     impl TestCodexBridgeInstallEngine {
+        pub fn from_request(
+            request: TestCodexBridgeInstallRequest,
+        ) -> Result<TestCodexBridgeInstallFixture, ClientError> {
+            let adapter = CodexAdapter::from_layout(
+                CodexLayout {
+                    executable: request.executable,
+                    executable_kind: CodexExecutableKind::Native,
+                    version: request.version,
+                    installation_method: request.installation_method,
+                    codex_home: request.codex_home,
+                    user_skills_dir: request.user_skills_dir,
+                    project_root: request.project_root.clone(),
+                    working_directory: request.working_directory,
+                    requirements_paths: request.requirements_paths,
+                },
+                request.project_id,
+                request.origin_device,
+                request.observed_hlc,
+            )?;
+            let sources = adapter
+                .native_memory_capabilities()?
+                .sources
+                .into_iter()
+                .map(|source| TestNativeMemorySource {
+                    id: source.id.0,
+                    path: source.path,
+                })
+                .collect();
+            let bridge = attest_bridge_executable(&request.bridge_path)?;
+            Ok(TestCodexBridgeInstallFixture {
+                engine: Arc::new(Self::new(
+                    adapter,
+                    bridge,
+                    request.project_id,
+                    request.project_root,
+                    request.lock_root,
+                )),
+                sources,
+            })
+        }
+
         pub fn new(
             adapter: CodexAdapter,
             bridge: BridgeExecutable,

@@ -3,9 +3,14 @@ import test from 'node:test';
 
 import {
   checkMetadata,
+  checkWorkspace,
   findForbiddenPath,
   findInstallationTokenWriterViolations,
 } from './check-daemon-boundary.mjs';
+
+test('keeps the real workspace dependency graph behind the daemon boundary', () => {
+  assert.deepEqual(checkWorkspace(), []);
+});
 
 test('reports the complete forbidden dependency path', () => {
   const metadata = {

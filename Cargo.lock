@@ -663,7 +663,6 @@ name = "context-relay-context-mcp"
 version = "0.1.0"
 dependencies = [
  "context-relay-contextd",
- "context-relay-core",
  "context-relay-local-ipc",
  "context-relay-protocol",
  "serde",
