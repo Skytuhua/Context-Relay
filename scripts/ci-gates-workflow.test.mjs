@@ -267,6 +267,8 @@ test('strict lint and complete ordinary-feature tests run on both supported host
   const workspaceTests = tests.indexOf('cargo test --workspace --all-targets');
   assert.ok(apfsMount >= 0 && workspaceTests > apfsMount);
   assert.match(tests, /hdiutil create[^\n]+-fs 'Case-sensitive APFS'/);
+  assert.match(tests, /image="\$RUNNER_TEMP\/cr-ws-cs\.sparseimage"/);
+  assert.match(tests, /mount="\$RUNNER_TEMP\/cr-ws-cs"/);
   assert.match(tests, /CONTEXT_RELAY_CASE_SENSITIVE_APFS_ROOT/);
 });
 

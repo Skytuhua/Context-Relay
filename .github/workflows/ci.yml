@@ -104,8 +104,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          image="$RUNNER_TEMP/context-relay-workspace-tests-case-sensitive.sparseimage"
-          mount="$RUNNER_TEMP/context-relay-workspace-tests-case-sensitive"
+          # Keep descendants below macOS's fixed AF_UNIX SUN_LEN limit.
+          image="$RUNNER_TEMP/cr-ws-cs.sparseimage"
+          mount="$RUNNER_TEMP/cr-ws-cs"
           mkdir "$mount"
           hdiutil create -size 4g -fs 'Case-sensitive APFS' -volname ContextRelayWorkspaceTests -type SPARSE "$image"
           hdiutil attach -nobrowse -owners on -mountpoint "$mount" "$image"
