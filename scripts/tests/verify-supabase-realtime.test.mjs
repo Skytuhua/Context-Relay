@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { appendFile, chmod, link, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
@@ -10,6 +9,7 @@ import {
   loadRealtimeVerifierConfig,
   prepareRealtimeVerifier,
   runRealtimeVerifierMode,
+  verifierTempRoot,
   verifyRealtimeVerifier,
 } from '../verify-supabase-realtime.mjs';
 
@@ -21,7 +21,7 @@ const UUIDS = [
   '10000000-0000-4000-8000-000000000005',
   '10000000-0000-4000-8000-000000000006',
 ];
-const VERIFIER_TEMP_ROOT = path.resolve(tmpdir());
+const VERIFIER_TEMP_ROOT = verifierTempRoot();
 let stateFileSequence = 0;
 
 function directStateFile(t, label = 'state') {
@@ -351,7 +351,20 @@ test('requires every hosted credential and has no credential defaults', () => {
   assert.equal(loaded.password, 'password');
 });
 
-test('prepare accepts a direct child of the runtime temporary directory', async (t) => {
+test('verifier recovery roots are fixed per supported platform and reject unsupported hosts', () => {
+  const originalTempDirectory = process.env.TMPDIR;
+  process.env.TMPDIR = '../attacker-controlled-relative-path';
+  try {
+    assert.equal(verifierTempRoot('darwin'), '/private/tmp');
+    assert.equal(verifierTempRoot('linux'), '/tmp');
+    assert.throws(() => verifierTempRoot('win32'), /unsupported verifier platform: win32/);
+  } finally {
+    if (originalTempDirectory === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTempDirectory;
+  }
+});
+
+test('prepare accepts a direct child of the fixed platform recovery directory', async (t) => {
   stateFileSequence += 1;
   const stateFile = path.join(VERIFIER_TEMP_ROOT, `context-relay-realtime-${process.pid}-${stateFileSequence}-portable.json`);
   t.after(() => rm(stateFile, { force: true }));
@@ -639,7 +652,7 @@ test('state-file parse and permission errors never include secret file contents'
   );
 });
 
-test('verify and cleanup reject symbolic-link state files under the runtime temporary directory', async (t) => {
+test('verify and cleanup reject symbolic-link state files under the fixed platform recovery directory', async (t) => {
   const target = directStateFile(t, 'target');
   const stateFile = directStateFile(t, 'symlink');
   await writeFile(target, '{}', { mode: 0o600 });
