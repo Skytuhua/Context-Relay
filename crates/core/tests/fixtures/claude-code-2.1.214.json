@@ -1,6 +1,10 @@
 {
   "version": "2.1.214",
   "lifecycleHookEvents": ["SessionStart", "Stop", "TaskCompleted"],
+  "contextRelayCompatibleLifecycleHookEvents": ["SessionStart", "Stop"],
+  "contextRelayUnreviewedLifecycleHookEvents": {
+    "TaskCompleted": "Payload compatibility is not captured or proven; disabled until a reviewed bounded schema is frozen."
+  },
   "doctorOutput": "Claude Code diagnostics: OK\n",
   "pluginListJson": [
     {

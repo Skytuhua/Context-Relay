@@ -327,6 +327,12 @@ git commit -m "feat: persist native memory review state"
 
 ### Task 4: Render the shared primary-memory instruction contract
 
+The 2026-08-10 strengthening amendment treats native task completion as
+compatible only when a frozen payload supplies an explicit current Context
+Relay task ID and bounded evidence. Until such a bounded payload schema is
+captured and reviewed, every harness uses the typed MCP completion instruction
+and no model supplies a session ID or bridge path.
+
 **Files:**
 
 - Create: `crates/core/src/native_memory/instruction.rs`
@@ -355,8 +361,11 @@ pub fn primary_memory_instruction_component(
 
 Assert the rendered block contains all and only the required behaviors:
 session-start search, primary-memory statement, remember, propose, and the
-three task-ledger tools. Assert the shared constant is byte-identical across
-harnesses.
+three task-ledger tools. Task completion uses the typed
+`context_relay_complete_task` tool with an explicit current Context Relay task
+ID and bounded evidence; the instruction contains no bridge executable,
+session-ID placeholder, or vendor task identifier. Assert the shared constant
+is byte-identical across harnesses.
 
 - [ ] **Step 2: Implement the shared instruction component**
 
@@ -509,10 +518,14 @@ pub fn managed_memory_hooks(
 
 - [ ] **Step 1: Write RED exact-hook tests**
 
-Claude full versions render `SessionStart`, `Stop`, and `TaskCompleted`. Codex
-renders `SessionStart` and `Stop`. Hermes renders only events present in its
-frozen fixture contract. Unsupported events are absent, not emulated through a
-different trigger.
+Claude full versions render `SessionStart` and `Stop`. Their frozen fixtures
+record the vendor `TaskCompleted` event separately from the Context
+Relay-compatible event allowlist. Its bounded payload schema has not been
+captured or reviewed, so compatibility is not proven and the event remains
+disabled. Codex renders `SessionStart` and `Stop`. Hermes renders only
+compatible events present in its frozen fixture contract. Unsupported events
+are absent, not emulated through a different trigger; task completion remains
+available through the typed MCP instruction.
 
 - [ ] **Step 2: Implement canonical argv generation**
 

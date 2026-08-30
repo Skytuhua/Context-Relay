@@ -421,15 +421,81 @@ fn current_descriptor_validation_rejects_a_forged_legacy_id_after_metadata_chang
 fn reconcile_classifies_the_last_applied_full_digest_as_a_self_export() {
     let source = memory_source();
     let bytes = format!("native\n{START}\nowned\n{END}\n");
-    let full_digest = extract_managed_markdown(bytes.as_bytes())
-        .unwrap()
-        .full_digest;
+    let extracted = extract_managed_markdown(bytes.as_bytes()).unwrap();
+    let full_digest = extracted.full_digest;
+    let managed_digest = Some(Sha256Digest(
+        Sha256::digest(extracted.managed_body.unwrap()).into(),
+    ));
     let mut ledger = NativeMemoryLedger::new(source.id);
     ledger.last_applied_digest = Some(full_digest);
 
     assert_eq!(
         reconcile(&source, &ledger, bytes.as_bytes()).unwrap(),
-        ReconcileDecision::SelfExport { full_digest }
+        ReconcileDecision::SelfExport {
+            full_digest,
+            managed_digest,
+        }
+    );
+}
+
+#[test]
+fn reconcile_rejects_a_modified_managed_owned_block() {
+    let source = memory_source();
+    let original = format!("{START}\nowned\n{END}\n");
+    let original = extract_managed_markdown(original.as_bytes()).unwrap();
+    let mut ledger = NativeMemoryLedger::new(source.id);
+    ledger.last_applied_digest = Some(original.full_digest);
+    ledger.last_applied_managed_digest = Some(Sha256Digest(
+        Sha256::digest(original.managed_body.unwrap()).into(),
+    ));
+    let modified = format!("{START}\nuser changed owned\n{END}\n");
+
+    assert_eq!(
+        reconcile(&source, &ledger, modified.as_bytes()),
+        Err(NativeMemoryError::ManagedContentModified)
+    );
+}
+
+#[test]
+fn reconcile_rejects_managed_fence_removal_before_the_owned_digest_is_bound() {
+    let source = memory_source();
+    let original = format!("{START}\nowned\n{END}\n");
+    let mut ledger = NativeMemoryLedger::new(source.id);
+    ledger.last_applied_digest = Some(
+        extract_managed_markdown(original.as_bytes())
+            .unwrap()
+            .full_digest,
+    );
+
+    assert_eq!(
+        reconcile(&source, &ledger, b"owned without its fence\n"),
+        Err(NativeMemoryError::ManagedContentModified)
+    );
+}
+
+#[test]
+fn reconcile_imports_unmanaged_edits_when_the_owned_block_is_unchanged() {
+    let source = memory_source();
+    let original = format!("{START}\nowned\n{END}\n");
+    let original = extract_managed_markdown(original.as_bytes()).unwrap();
+    let mut ledger = NativeMemoryLedger::new(source.id);
+    ledger.last_applied_digest = Some(original.full_digest);
+    ledger.last_applied_managed_digest = Some(Sha256Digest(
+        Sha256::digest(original.managed_body.unwrap()).into(),
+    ));
+    ledger.initial_preview_complete = true;
+    let edited = format!("{START}\nowned\n{END}\nnative addition\n");
+    let extracted = extract_managed_markdown(edited.as_bytes()).unwrap();
+
+    assert_eq!(
+        reconcile(&source, &ledger, edited.as_bytes()).unwrap(),
+        ReconcileDecision::Pending {
+            source_id: source.id,
+            full_digest: extracted.full_digest,
+            unmanaged_digest: extracted.unmanaged_digest,
+            candidate_markdown: b"native addition\n".to_vec(),
+            change_kind: NativeMemoryChangeKind::LiveEdit,
+        }
     );
 }
 

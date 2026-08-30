@@ -190,6 +190,9 @@ impl<'a> OfflineWorkspace<'a> {
                                 NativeMemoryError::MalformedManagedFence => {
                                     NativeMemoryDiagnosticClass::MalformedManagedFence
                                 }
+                                NativeMemoryError::ManagedContentModified => {
+                                    NativeMemoryDiagnosticClass::ManagedContentModified
+                                }
                                 NativeMemoryError::InvalidSource(_) => unreachable!(),
                             };
                             let digest = Sha256Digest(Sha256::digest(&bytes).into());
@@ -239,8 +242,12 @@ impl<'a> OfflineWorkspace<'a> {
                         ledger.initial_preview_complete = true;
                         None
                     }
-                    ReconcileDecision::SelfExport { full_digest } => {
+                    ReconcileDecision::SelfExport {
+                        full_digest,
+                        managed_digest,
+                    } => {
                         ledger.last_observed_digest = Some(full_digest);
+                        ledger.last_applied_managed_digest = managed_digest;
                         ledger.initial_preview_complete = true;
                         None
                     }

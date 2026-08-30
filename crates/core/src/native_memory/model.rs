@@ -120,6 +120,7 @@ pub enum NativeMemoryDiagnosticClass {
     SensitiveText,
     TooLarge,
     MalformedManagedFence,
+    ManagedContentModified,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -140,6 +141,8 @@ pub struct NativeMemoryLedger {
     pub last_unmanaged_digest: Option<Sha256Digest>,
     pub last_imported_digest: Option<Sha256Digest>,
     pub last_applied_digest: Option<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_applied_managed_digest: Option<Sha256Digest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_diagnostic: Option<NativeMemoryDiagnostic>,
     pub initial_preview_complete: bool,
@@ -164,6 +167,7 @@ impl NativeMemoryLedger {
             last_unmanaged_digest: None,
             last_imported_digest: None,
             last_applied_digest: None,
+            last_applied_managed_digest: None,
             last_diagnostic: None,
             initial_preview_complete: false,
         }
@@ -224,6 +228,7 @@ pub enum NativeMemoryError {
     SensitiveText,
     TooLarge,
     MalformedManagedFence,
+    ManagedContentModified,
 }
 
 impl fmt::Display for NativeMemoryError {
@@ -237,6 +242,9 @@ impl fmt::Display for NativeMemoryError {
             Self::TooLarge => formatter.write_str("native memory exceeds its declared limit"),
             Self::MalformedManagedFence => {
                 formatter.write_str("native memory managed markers are malformed")
+            }
+            Self::ManagedContentModified => {
+                formatter.write_str("native memory managed content was modified")
             }
         }
     }

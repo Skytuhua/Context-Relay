@@ -1,12 +1,14 @@
 use std::collections::BTreeSet;
 
 use context_relay_native_runner::MacRootIdentity;
-use context_relay_protocol::{ApplyReceipt, HarnessId, PlanId, Sha256Digest, WireNativeValue};
+use context_relay_protocol::{
+    ApplyReceipt, HarnessId, NativePlatform, PlanId, Sha256Digest, WireNativeValue,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::native_memory::{NativeMemoryLedger, NativeMemoryRegistration};
+use crate::native_memory::{NativeMemoryLedger, NativeMemoryRegistration, NativeMemorySource};
 use crate::native_transaction::{
     MutationKind, NativeApplyReceipt, NativeObjectToken, NativeReceiptEntry, OwnershipChange,
     RestorableStateFingerprint, TransactionStep,
@@ -2401,6 +2403,278 @@ fn load_setup_native_memory_binding(
     Ok(Some(registrations))
 }
 
+#[derive(Eq, PartialEq)]
+enum NativeMemoryPathIdentity {
+    Macos(Vec<u8>),
+    Windows(Vec<u16>),
+}
+
+enum NativeMemoryPathRelation {
+    Equal,
+    Distinct,
+    AmbiguousWindowsCase,
+}
+
+fn ambiguous_windows_native_path() -> VaultError {
+    VaultError::Validation("ambiguous Windows native path identity".to_owned())
+}
+
+fn windows_ascii_fold(unit: u16) -> u16 {
+    if unit <= 0x7f && (unit as u8).is_ascii_lowercase() {
+        unit - u16::from(b'a' - b'A')
+    } else {
+        unit
+    }
+}
+
+fn windows_units_start_with_ascii(units: &[u16], expected: &[u8]) -> bool {
+    units.len() >= expected.len()
+        && units.iter().zip(expected).all(|(&unit, &ascii)| {
+            windows_ascii_fold(unit) == u16::from(ascii.to_ascii_uppercase())
+        })
+}
+
+fn windows_component_has_short_name_alias(component: &[u16]) -> bool {
+    let Some(tilde) = component.iter().position(|unit| *unit == u16::from(b'~')) else {
+        return false;
+    };
+    let suffix = &component[tilde + 1..];
+    let ordinal_end = suffix
+        .iter()
+        .position(|unit| *unit == u16::from(b'.'))
+        .unwrap_or(suffix.len());
+    let ordinal = &suffix[..ordinal_end];
+    (1..=6).contains(&ordinal.len())
+        && ordinal
+            .iter()
+            .all(|unit| (u16::from(b'0')..=u16::from(b'9')).contains(unit))
+}
+
+fn normalized_windows_native_path_identity(bytes: &[u8]) -> Result<Vec<u16>, VaultError> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(ambiguous_windows_native_path());
+    }
+    let units = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    if units.contains(&0) {
+        return Err(ambiguous_windows_native_path());
+    }
+    let extended_unc = windows_units_start_with_ascii(&units, br"\\?\UNC\");
+    let extended = extended_unc || windows_units_start_with_ascii(&units, br"\\?\");
+    if extended && units.contains(&u16::from(b'/')) {
+        return Err(ambiguous_windows_native_path());
+    }
+    let separators = units
+        .into_iter()
+        .map(|unit| {
+            if unit == u16::from(b'/') {
+                u16::from(b'\\')
+            } else {
+                unit
+            }
+        })
+        .collect::<Vec<_>>();
+    let path = if extended_unc {
+        [u16::from(b'\\'), u16::from(b'\\')]
+            .into_iter()
+            .chain(separators[8..].iter().copied())
+            .collect::<Vec<_>>()
+    } else if extended {
+        separators[4..].to_vec()
+    } else if windows_units_start_with_ascii(&separators, br"\\?\")
+        || windows_units_start_with_ascii(&separators, br"\\.\")
+        || windows_units_start_with_ascii(&separators, br"\??\")
+    {
+        return Err(ambiguous_windows_native_path());
+    } else {
+        separators
+    };
+
+    let slash = u16::from(b'\\');
+    let (prefix, tail, required_components) = if let Some(tail) = path.strip_prefix(&[slash, slash])
+    {
+        (vec![slash, slash], tail, 2_usize)
+    } else {
+        if path.len() < 3
+            || path[0] > 0x7f
+            || !(path[0] as u8).is_ascii_alphabetic()
+            || path[1] != u16::from(b':')
+            || path[2] != slash
+        {
+            return Err(ambiguous_windows_native_path());
+        }
+        (
+            vec![windows_ascii_fold(path[0]), u16::from(b':'), slash],
+            &path[3..],
+            0_usize,
+        )
+    };
+
+    let mut components = Vec::new();
+    for raw_component in tail
+        .split(|unit| *unit == slash)
+        .filter(|component| !component.is_empty())
+    {
+        if raw_component == [u16::from(b'.')] && !extended {
+            continue;
+        }
+        if raw_component == [u16::from(b'.')]
+            || raw_component == [u16::from(b'.'), u16::from(b'.')]
+            || raw_component.contains(&u16::from(b':'))
+        {
+            return Err(ambiguous_windows_native_path());
+        }
+        let component_end = if extended {
+            raw_component.len()
+        } else {
+            raw_component
+                .iter()
+                .rposition(|unit| *unit != u16::from(b' ') && *unit != u16::from(b'.'))
+                .map_or(0, |index| index + 1)
+        };
+        let component = &raw_component[..component_end];
+        if component.is_empty() || windows_component_has_short_name_alias(component) {
+            return Err(ambiguous_windows_native_path());
+        }
+        components.push(
+            component
+                .iter()
+                .copied()
+                .map(windows_ascii_fold)
+                .collect::<Vec<_>>(),
+        );
+    }
+    if components.len() < required_components {
+        return Err(ambiguous_windows_native_path());
+    }
+
+    let mut normalized = prefix;
+    for (index, component) in components.into_iter().enumerate() {
+        if index > 0 {
+            normalized.push(slash);
+        }
+        normalized.extend(component);
+    }
+    Ok(normalized)
+}
+
+fn native_memory_path_identity(
+    path: &WireNativeValue,
+) -> Result<NativeMemoryPathIdentity, VaultError> {
+    match path.platform {
+        NativePlatform::Macos => Ok(NativeMemoryPathIdentity::Macos(path.bytes.clone())),
+        NativePlatform::Windows => normalized_windows_native_path_identity(&path.bytes)
+            .map(NativeMemoryPathIdentity::Windows),
+    }
+}
+
+fn windows_unicode_case_projection(units: &[u16]) -> Vec<u32> {
+    let mut projection = Vec::with_capacity(units.len());
+    for decoded in char::decode_utf16(units.iter().copied()) {
+        match decoded {
+            Ok(character) => {
+                projection.extend(character.to_uppercase().map(u32::from));
+            }
+            Err(error) => {
+                projection.push(0x11_0000 + u32::from(error.unpaired_surrogate()));
+            }
+        }
+    }
+    projection
+}
+
+fn native_memory_path_relation(
+    left: &NativeMemoryPathIdentity,
+    right: &NativeMemoryPathIdentity,
+) -> NativeMemoryPathRelation {
+    if left == right {
+        return NativeMemoryPathRelation::Equal;
+    }
+    if let (NativeMemoryPathIdentity::Windows(left), NativeMemoryPathIdentity::Windows(right)) =
+        (left, right)
+        && windows_unicode_case_projection(left) == windows_unicode_case_projection(right)
+    {
+        return NativeMemoryPathRelation::AmbiguousWindowsCase;
+    }
+    NativeMemoryPathRelation::Distinct
+}
+
+fn native_memory_upgrade_matches(left: &NativeMemorySource, right: &NativeMemorySource) -> bool {
+    left.harness == right.harness
+        && left.scope == right.scope
+        && left.document_kind == right.document_kind
+}
+
+fn active_native_memory_ledgers(
+    transaction: &Transaction<'_>,
+) -> Result<Vec<NativeMemoryLedger>, VaultError> {
+    let payloads = {
+        let mut statement = transaction.prepare(
+            "SELECT source.payload_json
+             FROM native_memory_sources source
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM native_memory_source_supersessions supersession
+                 WHERE supersession.prior_source_id = source.source_id
+             )
+             ORDER BY source.source_id",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    payloads
+        .into_iter()
+        .map(|payload| {
+            let ledger = from_json::<NativeMemoryLedger>(&payload)?;
+            ledger
+                .validated_persisted_source()
+                .map_err(|error| VaultError::Validation(error.to_string()))?;
+            Ok(ledger)
+        })
+        .collect()
+}
+
+fn native_memory_predecessor(
+    transaction: &Transaction<'_>,
+    replacement: &NativeMemorySource,
+) -> Result<Option<NativeMemoryLedger>, VaultError> {
+    let replacement_identity = native_memory_path_identity(&replacement.path)?;
+    let mut predecessor = None;
+    for ledger in active_native_memory_ledgers(transaction)? {
+        let source = ledger
+            .source
+            .as_ref()
+            .ok_or_else(|| VaultError::Validation("native memory source is missing".to_owned()))?;
+        let source_identity = native_memory_path_identity(&source.path)?;
+        if source.id == replacement.id {
+            continue;
+        }
+        match native_memory_path_relation(&source_identity, &replacement_identity) {
+            NativeMemoryPathRelation::Distinct => continue,
+            NativeMemoryPathRelation::AmbiguousWindowsCase => {
+                return Err(VaultError::Validation(
+                    "ambiguous Windows native path case identity".to_owned(),
+                ));
+            }
+            NativeMemoryPathRelation::Equal => {}
+        }
+        if !native_memory_upgrade_matches(source, replacement) {
+            return Err(VaultError::Validation(
+                "native path is already owned by a different logical source".to_owned(),
+            ));
+        }
+        if predecessor.is_some() {
+            return Err(VaultError::Validation(
+                "native path has multiple active adapter descriptors".to_owned(),
+            ));
+        }
+        predecessor = Some(ledger);
+    }
+    Ok(predecessor)
+}
+
 const fn setup_plan_lifecycle_name(state: SetupPlanLifecycle) -> &'static str {
     match state {
         SetupPlanLifecycle::Previewed => "previewed",
@@ -3025,29 +3299,64 @@ impl Vault {
             ));
         }
         for registration in &registrations {
+            let source_id = sha256_key(&registration.source.id.0);
             let existing = transaction
                 .query_row(
                     "SELECT payload_json FROM native_memory_sources WHERE source_id = ?1",
-                    [sha256_key(&registration.source.id.0)],
+                    [&source_id],
                     |row| row.get::<_, Vec<u8>>(0),
                 )
                 .optional()?
                 .map(|payload| from_json::<NativeMemoryLedger>(&payload))
                 .transpose()?;
-            let setup_created = existing.is_none();
-            let mut ledger = existing
-                .unwrap_or_else(|| NativeMemoryLedger::for_source(registration.source.clone()));
-            if ledger.source.as_ref() != Some(&registration.source) {
+            if existing.is_some()
+                && transaction.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM native_memory_source_supersessions
+                         WHERE prior_source_id = ?1
+                     )",
+                    [&source_id],
+                    |row| row.get::<_, bool>(0),
+                )?
+            {
                 return Err(VaultError::Validation(
-                    "native memory source metadata changed after preview".to_owned(),
+                    "superseded native memory descriptor cannot be re-registered; roll back its active successor"
+                        .to_owned(),
                 ));
             }
+            let predecessor = native_memory_predecessor(&transaction, &registration.source)?;
+            if existing.is_some() && predecessor.is_some() {
+                return Err(VaultError::Validation(
+                    "native path has multiple active adapter descriptors".to_owned(),
+                ));
+            }
+            let setup_created = existing.is_none();
+            let predecessor_id = predecessor.as_ref().map(|ledger| ledger.source_id);
+            let mut ledger = match (existing, predecessor) {
+                (Some(ledger), None) => {
+                    if ledger.source.as_ref() != Some(&registration.source) {
+                        return Err(VaultError::Validation(
+                            "native memory source metadata changed after preview".to_owned(),
+                        ));
+                    }
+                    ledger
+                }
+                (None, Some(mut ledger)) => {
+                    ledger.source_id = registration.source.id;
+                    ledger.source = Some(registration.source.clone());
+                    if let Some(diagnostic) = &mut ledger.last_diagnostic {
+                        diagnostic.source_id = registration.source.id;
+                    }
+                    ledger
+                }
+                (None, None) => NativeMemoryLedger::for_source(registration.source.clone()),
+                (Some(_), Some(_)) => unreachable!("active descriptor ambiguity rejected above"),
+            };
             if let Some(last_applied_digest) = registration.last_applied_digest {
                 ledger.last_applied_digest = Some(last_applied_digest);
             }
             let canonical = to_json(&ledger)?;
             put_native_memory_ledger(&transaction, &ledger, &canonical)?;
-            let source_id = sha256_key(&registration.source.id.0);
             if setup_created {
                 transaction.execute(
                     "INSERT INTO setup_native_memory_managed_sources(source_id)
@@ -3060,6 +3369,18 @@ impl Vault {
                  VALUES (?1, ?2) ON CONFLICT(plan_id, source_id) DO NOTHING",
                 params![plan_id.to_string(), source_id],
             )?;
+            if let Some(predecessor_id) = predecessor_id {
+                transaction.execute(
+                    "INSERT INTO native_memory_source_supersessions(
+                         prior_source_id, replacement_source_id, setup_plan_id
+                     ) VALUES (?1, ?2, ?3)",
+                    params![
+                        sha256_key(&predecessor_id.0),
+                        sha256_key(&registration.source.id.0),
+                        plan_id.to_string(),
+                    ],
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(())
@@ -3103,6 +3424,22 @@ impl Vault {
                 "setup plan cannot be claimed from {}",
                 setup_plan_lifecycle_name(current)
             )));
+        }
+        let has_active_successor = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM setup_native_memory_source_refs source_ref
+                 JOIN native_memory_source_supersessions supersession
+                   ON supersession.prior_source_id = source_ref.source_id
+                 WHERE source_ref.plan_id = ?1
+             )",
+            [&original_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_active_successor {
+            return Err(VaultError::Validation(
+                "superseded setup plan cannot roll back before its active successor".to_owned(),
+            ));
         }
 
         transaction.execute(

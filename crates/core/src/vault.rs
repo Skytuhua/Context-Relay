@@ -34,7 +34,7 @@ pub use recovery_restore::*;
 mod sync;
 pub use sync::*;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 23;
+pub const LATEST_SCHEMA_VERSION: u32 = 25;
 pub const MAX_NATIVE_HOOK_SESSIONS: usize = 256;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
@@ -782,7 +782,7 @@ impl Vault {
                 "SELECT harness, scope_kind, project_id, document_kind,
                         last_observed_digest, last_unmanaged_digest,
                         last_imported_digest, last_applied_digest,
-                        initial_preview_complete, payload_json
+                        last_applied_managed_digest, initial_preview_complete, payload_json
                  FROM native_memory_sources WHERE source_id = ?1",
                 [sha256_key(&id.0)],
                 |row| {
@@ -795,8 +795,9 @@ impl Vault {
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
-                        row.get::<_, i64>(8)?,
-                        row.get::<_, Vec<u8>>(9)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, Vec<u8>>(10)?,
                     ))
                 },
             )
@@ -810,6 +811,7 @@ impl Vault {
             stored_unmanaged,
             stored_imported,
             stored_applied,
+            stored_applied_managed,
             stored_initial_preview_complete,
             payload,
         )) = row
@@ -828,6 +830,8 @@ impl Vault {
             || optional_sha256_key(ledger.last_unmanaged_digest.as_ref()) != stored_unmanaged
             || optional_sha256_key(ledger.last_imported_digest.as_ref()) != stored_imported
             || optional_sha256_key(ledger.last_applied_digest.as_ref()) != stored_applied
+            || optional_sha256_key(ledger.last_applied_managed_digest.as_ref())
+                != stored_applied_managed
             || ledger.initial_preview_complete
                 != sqlite_bool(
                     stored_initial_preview_complete,
@@ -844,7 +848,13 @@ impl Vault {
     pub fn native_memory_ledgers(&self) -> Result<Vec<NativeMemoryLedger>, VaultError> {
         let payloads: Vec<NativeMemoryLedger> = load_json_list(
             &self.connection,
-            "SELECT payload_json FROM native_memory_sources ORDER BY source_id",
+            "SELECT source.payload_json
+             FROM native_memory_sources source
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM native_memory_source_supersessions supersession
+                 WHERE supersession.prior_source_id = source.source_id
+             )
+             ORDER BY source.source_id",
             [],
         )?;
         payloads
@@ -2030,6 +2040,30 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }
+    if found < 24 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0024_native_memory_source_supersessions.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 24))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 25 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0025_native_memory_managed_digest.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 25))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
     Ok(())
 }
 
@@ -2550,8 +2584,9 @@ pub(super) fn put_native_memory_ledger(
         "INSERT INTO native_memory_sources(
              source_id, harness, scope_kind, project_id, document_kind,
              last_observed_digest, last_unmanaged_digest, last_imported_digest,
-             last_applied_digest, initial_preview_complete, payload_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             last_applied_digest, last_applied_managed_digest,
+             initial_preview_complete, payload_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(source_id) DO UPDATE SET
              harness = excluded.harness,
              scope_kind = excluded.scope_kind,
@@ -2561,6 +2596,7 @@ pub(super) fn put_native_memory_ledger(
              last_unmanaged_digest = excluded.last_unmanaged_digest,
              last_imported_digest = excluded.last_imported_digest,
              last_applied_digest = excluded.last_applied_digest,
+             last_applied_managed_digest = excluded.last_applied_managed_digest,
              initial_preview_complete = excluded.initial_preview_complete,
              payload_json = excluded.payload_json",
         params![
@@ -2573,6 +2609,7 @@ pub(super) fn put_native_memory_ledger(
             optional_sha256_key(ledger.last_unmanaged_digest.as_ref()),
             optional_sha256_key(ledger.last_imported_digest.as_ref()),
             optional_sha256_key(ledger.last_applied_digest.as_ref()),
+            optional_sha256_key(ledger.last_applied_managed_digest.as_ref()),
             i64::from(ledger.initial_preview_complete),
             canonical_ledger,
         ],

@@ -291,22 +291,7 @@ fn scan_sources(
         {
             pending.remove(source_id);
         }
-        if !watched.initial_preview_complete {
-            pending.insert(
-                *source_id,
-                PendingReady {
-                    ready: ReadyNativeMemory {
-                        source: watched.source.as_source().clone(),
-                        snapshot: observed.snapshot,
-                        kind: NativeMemoryObservationKind::InitialPreview,
-                    },
-                    digest: observed.digest,
-                    stable: None,
-                },
-            );
-            continue;
-        }
-        if watched.baseline == Some(observed.digest) {
+        if watched.initial_preview_complete && watched.baseline == Some(observed.digest) {
             continue;
         }
         if let Some(stable) = observe(debounce, *source_id, observed.digest, now_ms) {
@@ -316,7 +301,11 @@ fn scan_sources(
                     ready: ReadyNativeMemory {
                         source: watched.source.as_source().clone(),
                         snapshot: observed.snapshot,
-                        kind: NativeMemoryObservationKind::LiveEdit,
+                        kind: if watched.initial_preview_complete {
+                            NativeMemoryObservationKind::LiveEdit
+                        } else {
+                            NativeMemoryObservationKind::InitialPreview
+                        },
                     },
                     digest: observed.digest,
                     stable: Some(stable),
@@ -388,13 +377,15 @@ fn watched_source_from_persisted_ledger(
 ) -> Option<(NativeMemorySourceId, WatchedSource)> {
     let source = ledger.validated_persisted_source().ok()?;
     let source_id = source.as_source().id;
+    let managed_digest_is_bound = !source.as_source().managed_fence
+        || ledger.last_applied_digest.is_none()
+        || ledger.last_applied_managed_digest.is_some();
     Some((
         source_id,
         WatchedSource {
             source,
             initial_preview_complete: ledger.initial_preview_complete,
-            baseline: ledger
-                .initial_preview_complete
+            baseline: (ledger.initial_preview_complete && managed_digest_is_bound)
                 .then_some(ledger.last_observed_digest),
         },
     ))
@@ -689,6 +680,72 @@ mod tests {
         let mut ledger = NativeMemoryLedger::for_source(source);
         ledger.initial_preview_complete = true;
         BTreeMap::from([watched_source_from_persisted_ledger(ledger).unwrap()])
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn initial_preview_waits_for_one_stable_window_and_keeps_the_latest_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let path = canonical_root.join("memory.md");
+        std::fs::write(&path, b"partial preview").unwrap();
+        let descriptor = source(&path, 32);
+        let source_id = descriptor.id;
+        let ledger = NativeMemoryLedger::for_source(descriptor);
+        let mut sources = BTreeMap::from([watched_source_from_persisted_ledger(ledger).unwrap()]);
+        let mut debounce = DebounceState::default();
+        let mut pending = BTreeMap::new();
+        let in_flight = BTreeSet::new();
+
+        scan_sources(&mut sources, &mut debounce, &mut pending, &in_flight, 0);
+        assert!(!pending.contains_key(&source_id));
+        scan_sources(&mut sources, &mut debounce, &mut pending, &in_flight, 749);
+        assert!(!pending.contains_key(&source_id));
+
+        std::fs::write(&path, b"final preview").unwrap();
+        scan_sources(&mut sources, &mut debounce, &mut pending, &in_flight, 750);
+        assert!(!pending.contains_key(&source_id));
+        scan_sources(&mut sources, &mut debounce, &mut pending, &in_flight, 1_499);
+        assert!(!pending.contains_key(&source_id));
+        scan_sources(&mut sources, &mut debounce, &mut pending, &in_flight, 1_500);
+
+        let ready = pending.get(&source_id).unwrap();
+        assert!(ready.stable.is_some());
+        assert_eq!(
+            ready.ready.kind,
+            NativeMemoryObservationKind::InitialPreview
+        );
+        assert_eq!(
+            ready.ready.snapshot,
+            NativeMemorySnapshot::Regular(b"final preview".to_vec())
+        );
+    }
+
+    #[test]
+    fn non_fenced_export_without_a_managed_digest_keeps_its_restart_baseline() {
+        let root = tempfile::tempdir().unwrap();
+        let descriptor = NativeMemorySource::new(
+            HarnessId::Codex,
+            "0.144.1",
+            ScopeRef::Global,
+            NativeMemoryDocumentKind::Agent,
+            wire_native_path(&root.path().join("memory.md")),
+            NativeMemoryLimits {
+                max_bytes: 32,
+                max_characters: 32,
+            },
+            false,
+        )
+        .unwrap();
+        let observed = Sha256Digest([42; 32]);
+        let mut ledger = NativeMemoryLedger::for_source(descriptor);
+        ledger.initial_preview_complete = true;
+        ledger.last_applied_digest = Some(observed);
+        ledger.last_observed_digest = Some(observed);
+
+        let (_, watched) = watched_source_from_persisted_ledger(ledger).unwrap();
+
+        assert_eq!(watched.baseline, Some(Some(observed)));
     }
 
     #[cfg(any(target_os = "macos", windows))]

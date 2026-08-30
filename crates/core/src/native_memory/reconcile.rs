@@ -36,6 +36,7 @@ pub enum ReconcileDecision {
     },
     SelfExport {
         full_digest: Sha256Digest,
+        managed_digest: Option<Sha256Digest>,
     },
 }
 
@@ -77,15 +78,28 @@ pub fn reconcile_classified(
         return Err(NativeMemoryError::TooLarge);
     }
 
-    let full_digest = digest(bytes);
-    if ledger.last_applied_digest == Some(full_digest) {
-        return Ok(ReconcileDecision::SelfExport { full_digest });
-    }
-
     if !source.managed_fence && (text.contains(MANAGED_START) || text.contains(MANAGED_END)) {
         return Err(NativeMemoryError::MalformedManagedFence);
     }
     let extracted = extract_managed_markdown(bytes)?;
+    let managed_digest = extracted.managed_body.as_deref().map(digest);
+    let full_digest = extracted.full_digest;
+    if ledger.last_applied_digest == Some(full_digest) {
+        return Ok(ReconcileDecision::SelfExport {
+            full_digest,
+            managed_digest,
+        });
+    }
+    if let Some(expected) = ledger.last_applied_managed_digest {
+        if managed_digest != Some(expected) {
+            return Err(NativeMemoryError::ManagedContentModified);
+        }
+    } else if source.managed_fence && ledger.last_applied_digest.is_some() {
+        // Ledgers written before the managed-body binding cannot prove that a
+        // changed full file preserved the owned block. Require a clean export
+        // observation to establish that binding instead of trusting drift.
+        return Err(NativeMemoryError::ManagedContentModified);
+    }
     if extracted.unmanaged_body.is_empty()
         || std::str::from_utf8(&extracted.unmanaged_body)
             .expect("validated source bytes remain UTF-8")

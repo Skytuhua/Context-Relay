@@ -797,7 +797,7 @@ async fn managed_requirements_block_production_bridge_preview_without_native_aut
 }
 
 #[tokio::test]
-async fn claude_and_codex_primary_instructions_reach_same_session_task_evidence() {
+async fn claude_and_codex_primary_instructions_complete_tasks_through_typed_mcp() {
     let fixture = Fixture::new();
     let project = project_identity("primary instruction task evidence");
     fixture
@@ -829,18 +829,17 @@ async fn claude_and_codex_primary_instructions_reach_same_session_task_evidence(
             HybridLogicalClock::new(1_900_001_100_000, 0, device_id),
         )
         .unwrap();
-        assert!(instruction.body_markdown.contains(&format!(
-            "context-relay-context-mcp --hook-event task-evidence --harness {harness_name}"
-        )));
+        assert!(!instruction.body_markdown.contains("--hook-event"));
+        assert!(!instruction.body_markdown.contains("session_id"));
         assert!(
             instruction
                 .body_markdown
-                .contains("<current harness session ID>")
+                .contains("typed `context_relay_complete_task` tool")
         );
         assert!(
             instruction
                 .body_markdown
-                .contains("<current Context Relay task ID>")
+                .contains("current Context Relay task ID")
         );
         assert!(
             instruction
@@ -849,7 +848,7 @@ async fn claude_and_codex_primary_instructions_reach_same_session_task_evidence(
         );
 
         let binding = fixture.binding_for(harness, &fixture.project_root);
-        let mut bridge = StartedServer::start(fixture.local_daemon(), binding.clone()).await;
+        let mut bridge = StartedServer::start(fixture.local_daemon(), binding).await;
         bridge
             .send(json!({
                 "jsonrpc": "2.0",
@@ -872,49 +871,32 @@ async fn claude_and_codex_primary_instructions_reach_same_session_task_evidence(
         let created: UpsertTaskOutput =
             serde_json::from_value(created_response["result"]["structuredContent"].clone())
                 .unwrap();
-        bridge.close().await;
-
-        let session_id = format!("same-lifecycle-session-{harness_name}");
-        let start = serde_json::to_vec(&json!({"session_id": session_id})).unwrap();
+        let evidence_summary = format!("Reached {harness_name} through typed MCP.");
+        bridge
+            .send(json!({
+                "jsonrpc": "2.0",
+                "id": format!("complete-{harness_name}-task"),
+                "method": "tools/call",
+                "params": {
+                    "name": "context_relay_complete_task",
+                    "arguments": {
+                        "operationId": record_id(),
+                        "taskId": created.task.id,
+                        "expectedRevision": created.task.revision,
+                        "evidence": [{
+                            "summary": evidence_summary,
+                            "kind": "test",
+                            "reference": null
+                        }]
+                    }
+                }
+            }))
+            .await;
+        let completed_response = bridge.receive().await;
         assert_eq!(
-            execute_hook(
-                fixture.local_daemon(),
-                harness,
-                HookInvocationKind::SessionStart,
-                &start,
-                &fixture.project_root,
-                1_900_001_100_100,
-            )
-            .await
-            .unwrap(),
-            SESSION_START_REMINDER
+            completed_response["result"]["structuredContent"]["task"]["status"],
+            "done"
         );
-        let evidence_summary = format!("Reached {harness_name} through the current session.");
-        let evidence = serde_json::to_vec(&json!({
-            "session_id": session_id,
-            "task_id": created.task.id,
-            "evidence": [{
-                "summary": evidence_summary,
-                "kind": "test",
-                "reference": null
-            }]
-        }))
-        .unwrap();
-        assert_eq!(
-            execute_hook(
-                fixture.local_daemon(),
-                harness,
-                HookInvocationKind::TaskEvidence,
-                &evidence,
-                &fixture.project_root,
-                1_900_001_100_200,
-            )
-            .await
-            .unwrap(),
-            ""
-        );
-
-        let mut bridge = StartedServer::start(fixture.local_daemon(), binding).await;
         bridge
             .send(json!({
                 "jsonrpc": "2.0",
@@ -933,14 +915,14 @@ async fn claude_and_codex_primary_instructions_reach_same_session_task_evidence(
             .tasks
             .iter()
             .find(|task| task.id == created.task.id)
-            .expect("current Context Relay task must be reachable after task evidence");
+            .expect("current Context Relay task must be reachable after typed completion");
         assert_eq!(completed.status, TaskStatus::Done);
         assert_eq!(completed.evidence.len(), 1);
         assert_eq!(completed.evidence[0].summary, evidence_summary);
         bridge.close().await;
     }
 
-    assert_eq!(config.native_hook_session_count().unwrap(), 2);
+    assert_eq!(config.native_hook_session_count().unwrap(), 0);
     stop_daemon(handle, owner).await;
 }
 

@@ -1319,6 +1319,13 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
         assert!(intended.iter().any(|(_, bytes)| {
             String::from_utf8_lossy(bytes).contains(PRIMARY_MEMORY_INSTRUCTIONS)
         }));
+        assert!(intended.iter().any(|(_, bytes)| {
+            String::from_utf8_lossy(bytes).contains("typed `context_relay_complete_task` tool")
+        }));
+        assert!(intended.iter().all(|(_, bytes)| {
+            let text = String::from_utf8_lossy(bytes);
+            !text.contains("--hook-event task-evidence") && !text.contains("session_id")
+        }));
         match harness_id {
             HarnessId::ClaudeCode => {
                 assert_eq!(intended.len(), 3);
@@ -1331,10 +1338,6 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
                     let text = String::from_utf8_lossy(bytes);
                     text.contains("--hook-event session-start --harness claude-code")
                         && text.contains("--hook-event session-stop --harness claude-code")
-                }));
-                assert!(intended.iter().any(|(_, bytes)| {
-                    String::from_utf8_lossy(bytes)
-                        .contains("--hook-event task-evidence --harness claude-code")
                 }));
             }
             HarnessId::Codex => {
@@ -1349,10 +1352,6 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
                     text.contains("--hook-event session-start --harness codex")
                         && text.contains("--hook-event session-stop --harness codex")
                         && !text.contains("task-evidence")
-                }));
-                assert!(intended.iter().any(|(_, bytes)| {
-                    String::from_utf8_lossy(bytes)
-                        .contains("--hook-event task-evidence --harness codex")
                 }));
             }
             HarnessId::Hermes => {

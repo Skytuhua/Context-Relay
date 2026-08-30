@@ -16,7 +16,13 @@ the implementation plan's Task 14 checkpoint.
 | Full setup fails closed without an exact native-memory binding | `primary_memory_setup_v1::full_claude_setup_rejects_unavailable_native_memory_before_persisting_any_plan` covers malformed settings and an unsafe supported-version binding. It proves no bridge/instruction/hook plan, native write, CLI declaration, or ledger is persisted, while the import-only exact-binding matrix remains accepted. |
 | Managed Hermes exports remain Passive and CAS-bound | `primary_memory_setup_v1::passive_hermes_export_rejects_concurrent_target_change_and_preserves_live_bytes` freezes the Passive approval class and proves a post-preview target edit is rejected, restored to a terminal lifecycle, and never overwritten or activated. |
 | Applied export digests are monotonic across setup replay | `native_memory_vault_v1::setup_none_and_terminal_replays_preserve_the_newest_export_digest` proves registration-only setup cannot clear a prior export digest and terminal replay cannot overwrite a newer export digest. |
-| Task evidence is explicit and session-bound | `offline_service_v1::native_hook_task_evidence_completes_only_the_explicit_current_project_task` rejects missing-session, wrong-project, before-start, and after-stop fresh evidence; permits an exact recorded replay after stop; and still requires the persisted session binding. `end_to_end_v1::claude_and_codex_primary_instructions_reach_same_session_task_evidence` uses each generated instruction, a real daemon, actual typed MCP task creation/listing, and matching session IDs plus current Context Relay task IDs. Neither adapter invents a vendor task-completion hook or substitutes a vendor task ID. |
+| Managed task completion is typed and needs no session identifier | `end_to_end_v1::claude_and_codex_primary_instructions_complete_tasks_through_typed_mcp` proves both generated instructions contain the typed `context_relay_complete_task` fallback and no hook command or session-ID placeholder, then creates, completes, and lists each task through the actual MCP server and daemon. The instruction requires the current Context Relay task ID and explicit bounded evidence and never substitutes a vendor task ID. |
+| Native hook evidence remains explicit and session-bound | `offline_service_v1::native_hook_task_evidence_completes_only_the_explicit_current_project_task` rejects missing-session, wrong-project, before-start, and after-stop fresh evidence; permits an exact recorded replay after stop; and still requires the persisted session binding. `end_to_end_v1::native_hooks_persist_only_allowlisted_fields_across_every_output_boundary` exercises the fail-closed task-evidence bridge boundary independently of the managed task instruction. |
+| Unreviewed vendor completion events are disabled, not guessed | The Claude `2.1.213`/`2.1.214` fixtures record native `TaskCompleted` availability separately from `contextRelayCompatibleLifecycleHookEvents`. They state only the evidence actually captured: payload compatibility is not proven because no reviewed bounded schema is frozen. `claude_code_adapter_v1::memory_hooks_render_only_frozen_context_relay_compatible_events_with_literal_arguments` proves setup renders only `SessionStart` and `Stop` and never maps `TaskCompleted` or a vendor task ID. |
+| Adapter upgrades preserve one active logical source | `native_memory_vault_v1::adapter_upgrade_supersedes_one_active_source_and_rolls_back_with_ledger_continuity` proves an adapter-version source-ID change supersedes the prior active source while preserving preview completion plus every observed, unmanaged, imported, applied full-file, and applied managed-body ownership digest; rollback removes the successor and restores the predecessor ledger exactly. `native_memory_vault_v1::superseded_setup_cannot_roll_back_before_its_active_successor` rejects predecessor rollback at claim time before inverse sealing or execution, then proves successor-first rollback restores and permits the original rollback. |
+| One native path has one logical project owner | `native_memory_vault_v1::different_projects_cannot_claim_the_same_logical_native_path` exercises Claude's lossy project-key collision case and proves a second project scope cannot claim the same native path. `windows_case_and_extended_prefix_aliases_cannot_cross_project_ownership` portably proves ASCII case-only and ordinary-equivalent `\\?\` Windows spellings cannot bypass that boundary. `plausible_non_ascii_windows_case_alias_is_denied_across_projects` proves a lossless comparison fails closed for plausible Unicode case aliases; `exact_non_ascii_windows_path_supersedes_and_rolls_back` proves exact Unicode wire units still retain upgrade continuity. `opaque_windows_wtf16_registers_and_does_not_block_an_unrelated_source` proves an isolated-surrogate filename remains lossless and cannot poison later setup. `exact_opaque_windows_wtf16_supersedes_and_rolls_back_losslessly` proves exact opaque code units retain upgrade continuity and rollback. `extended_trailing_dot_path_remains_distinct_across_projects` and `extended_trailing_space_path_does_not_supersede_same_project_ordinary_path` prove extended-only names are not collapsed into ordinary Win32 identities. `windows_alias_spelling_preserves_same_project_supersession_and_exact_rollback` separately proves normalized ASCII aliases carry ledger state and restore the exact predecessor. |
+| Initial preview observes the full stability window | `contextd::native_memory::tests::initial_preview_waits_for_one_stable_window_and_keeps_the_latest_bytes` proves an unpreviewed source is not submitted at 0 ms or 749 ms, restarts its debounce when bytes change at 750 ms, and submits only the final bytes after they remain stable through 1,500 ms. |
+| Managed-block drift is a durable conflict | `native_memory_engine_v1::reconcile_rejects_a_modified_managed_owned_block` and `reconcile_rejects_managed_fence_removal_before_the_owned_digest_is_bound` reject owned-body edits and the legacy/bootstrap race. `native_memory_owned_drift_v1::managed_owned_block_drift_is_a_durable_conflict_after_restart` proves the managed-body digest and redacted diagnostic survive encrypted-vault reopen without importing or acknowledging drift as user memory. `native_memory_watch_v1::managed_owned_block_drift_is_reported_after_restart` exercises the same boundary through the production watcher. |
 | Unsafe source text remains redacted and retry-bounded | `native_memory_watch_v1::rejected_text_records_only_redacted_digest_diagnostics_and_recovers_after_correction` proves diagnostic persistence contains only class, source identity, and digest, acknowledges the rejected digest without hot retry, and clears the diagnostic after a corrected stable edit. |
 | Documentation placeholders are not false-positive secrets | `mcp::secret_text::tests::empty_environment_and_redacted_sensitive_assignments_are_documentation` accepts empty/comment, environment-provided, environment-variable, and redacted placeholder assignments with either separator. `mcp::secret_text::tests::short_nonempty_sensitive_assignments_are_secret_like` proves every other nonempty sensitive-key assignment is rejected, including short and quoted values. |
 | Hook input is allowlisted | `end_to_end_v1::native_hooks_persist_only_allowlisted_fields_across_every_output_boundary` delivers real start, task-evidence, and stop hooks containing unique sentinels in every excluded field. It scans every plaintext cell from every test-vault table/column, native file contents, captured stdout/stderr, serialized IPC fixtures, and typed MCP task output. No sentinel appears. The raw session fixture's SHA-256 and bytes remain unchanged. |
@@ -31,55 +37,60 @@ the implementation plan's Task 14 checkpoint.
 - The daemon observes only adapter-declared high-level Markdown. A digest must
   remain stable for 750 ms before reconciliation.
 - Context Relay managed exports are identified by the transactional applied
-  digest and never become candidates.
+  digest and never become candidates. Their managed-body ownership digest is
+  durable; user edits to an owned block become a redacted conflict.
 - Hook IPC contains only validated lifecycle/task fields. Conversation content,
   transcripts, and tool payloads are excluded.
+- Managed instructions complete tasks through typed MCP without bridge-path or
+  lifecycle-session placeholders. Frozen vendor completion events are rendered
+  only when their payload is explicitly Context Relay-compatible.
+- Active source registrations are superseded by logical adapter identity with
+  ledger continuity, and a native path cannot be active under two project
+  scopes.
 - The daemon and MCP bridge continue independently of the desktop renderer.
 
 ## Verification commands
 
-Focused acceptance completed during TDD:
+Fresh scoped acceptance for the 2026-08-10 strengthening amendment and adjacent
+native-memory repairs:
 
 ```text
-cargo test -p context-relay-contextd --test authoritative_memory_v1 --features test-support
+cargo test -p context-relay-core --test claude_code_adapter_v1 -- --test-threads=1
 cargo test -p context-relay-core --test primary_memory_setup_v1
+cargo test -p context-relay-core --test native_memory_vault_v1 -- --test-threads=1
+cargo test -p context-relay-core --test native_memory_engine_v1
+cargo test -p context-relay-core --test native_memory_owned_drift_v1
+cargo test -p context-relay-contextd native_memory::tests --lib
 cargo test -p context-relay-contextd --test native_memory_watch_v1 --features test-support
-cargo test -p context-relay-context-mcp --test end_to_end_v1 --features test-support production_setup_watcher_review_and_actual_mcp_form_one_chain -- --exact
-cargo test -p context-relay-context-mcp --test end_to_end_v1 --features test-support native_hooks_persist_only_allowlisted_fields_across_every_output_boundary -- --exact
-vitest --run src/offline-workflow.test.tsx
+cargo test -p context-relay-context-mcp --test end_to_end_v1 --features test-support -- --test-threads=1
+cargo clippy -p context-relay-core --test claude_code_adapter_v1 --test primary_memory_setup_v1 --all-features -- -D warnings
+cargo clippy -p context-relay-context-mcp --test end_to_end_v1 --features test-support -- -D warnings
 ```
 
 ## Final gate results
 
-Implementation, blocking review-finding remediation, and local verification are
-complete. Independent ordinary specification and correctness reviews passed
-after all validated findings were fixed.
+These fresh results cover the scoped local repair at the current shared tree.
+They do not restate historical package/workspace counts that were not rerun.
 
 | Command | Result |
 | --- | --- |
+| `cargo test -p context-relay-core --test claude_code_adapter_v1 -- --test-threads=1` | 37 passed |
 | `cargo test -p context-relay-core --test primary_memory_setup_v1` | 8 passed |
-| `cargo test -p context-relay-core --test native_memory_vault_v1` | 17 passed |
-| `cargo test -p context-relay-core --test offline_service_v1` | 15 passed |
-| `cargo test -p context-relay-core --lib mcp::secret_text::tests::` | 3 passed |
-| `cargo test -p context-relay-contextd --test authoritative_memory_v1 --features test-support` | 4 passed |
-| `cargo test -p context-relay-contextd --test native_memory_watch_v1 --features test-support` | 10 passed |
-| `cargo test -p context-relay-context-mcp --test end_to_end_v1 --features test-support` | 9 passed |
-| `cargo test -p context-relay-protocol` | 88 passed |
-| `cargo test -p context-relay-local-ipc` | 64 passed |
-| `cargo test -p context-relay-core -- --test-threads=1` | 544 passed, 1 release-only performance test ignored |
-| `cargo test -p context-relay-context-mcp --features test-support -- --test-threads=1` | 63 passed |
-| `cargo test -p context-relay-contextd --features test-support -- --test-threads=1` | 71 passed |
-| `vitest --run` in `apps/desktop` | 28 passed across 5 files |
-| `eslint .` in `apps/desktop` | Passed with no diagnostics |
-| `tsc --noEmit` in `apps/desktop` | Passed with no diagnostics |
-| `cargo check --workspace --all-targets` | Passed |
-| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Passed with no warnings |
-| `cargo fmt --all -- --check` | Passed |
+| `cargo test -p context-relay-core --test native_memory_vault_v1 -- --test-threads=1` | 28 passed |
+| `cargo test -p context-relay-core --test native_memory_engine_v1` | 26 passed |
+| `cargo test -p context-relay-core --test native_memory_owned_drift_v1` | 2 passed |
+| `cargo test -p context-relay-contextd native_memory::tests --lib` | 9 passed |
+| `cargo test -p context-relay-contextd --test native_memory_watch_v1 --features test-support -- --test-threads=1` | 11 passed |
+| `cargo test -p context-relay-context-mcp --test end_to_end_v1 --features test-support -- --test-threads=1` | 10 passed |
+| Focused core and context-MCP strict Clippy commands above | Passed with no warnings |
+| `rustfmt --edition 2024 --check` on the four changed Rust files | Passed |
 | `git diff --check` | Passed |
 
-The core suite was serialized because its pre-existing native CLI journal
-fixtures share a named temporary vault when tests start concurrently. `TMPDIR`
-was pinned to `/private/tmp` so macOS topology validation does not traverse the
-platform `/var` compatibility symlink. The isolated native filesystem target
-passed 9/9 before the complete serialized package run; no Task 14 source
-behavior was changed for either fixture condition.
+All results above are local macOS arm64 evidence using frozen/synthetic harness
+fixtures and test-owned installations. They do not replace the master plan's
+required physical validation against clean installed Claude Code, Codex, and
+Hermes releases on macOS arm64 and Windows x64. A macOS-to-Windows strict
+Clippy attempt was also not counted: the cross build stopped in `onig_sys` and
+vendored OpenSSL before reaching repository code because this host lacks the
+Windows C/OpenSSL build environment. Current public Windows CI or a physical
+Windows host must run that gate.

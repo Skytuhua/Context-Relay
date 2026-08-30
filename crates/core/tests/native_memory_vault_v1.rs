@@ -42,9 +42,18 @@ fn open_keyed(path: &std::path::Path, key: &[u8; 32]) -> Connection {
 }
 
 fn source(scope: ScopeRef, harness: HarnessId, suffix: &str) -> NativeMemorySource {
+    source_with_version(scope, harness, "test-1.0.0", suffix)
+}
+
+fn source_with_version(
+    scope: ScopeRef,
+    harness: HarnessId,
+    adapter_version: &str,
+    suffix: &str,
+) -> NativeMemorySource {
     NativeMemorySource::new(
         harness,
-        "test-1.0.0",
+        adapter_version,
         scope,
         NativeMemoryDocumentKind::Agent,
         WireNativeValue {
@@ -61,12 +70,45 @@ fn source(scope: ScopeRef, harness: HarnessId, suffix: &str) -> NativeMemorySour
     .unwrap()
 }
 
+fn windows_source_with_units(
+    scope: ScopeRef,
+    adapter_version: &str,
+    units: &[u16],
+) -> NativeMemorySource {
+    NativeMemorySource::new(
+        HarnessId::ClaudeCode,
+        adapter_version,
+        scope,
+        NativeMemoryDocumentKind::Agent,
+        WireNativeValue {
+            platform: NativePlatform::Windows,
+            bytes: units.iter().flat_map(|unit| unit.to_le_bytes()).collect(),
+            display: None,
+        },
+        NativeMemoryLimits {
+            max_bytes: 4_096,
+            max_characters: 4_096,
+        },
+        true,
+    )
+    .unwrap()
+}
+
+fn windows_source(scope: ScopeRef, adapter_version: &str, path: &str) -> NativeMemorySource {
+    windows_source_with_units(
+        scope,
+        adapter_version,
+        &path.encode_utf16().collect::<Vec<_>>(),
+    )
+}
+
 fn ledger(source: NativeMemorySource, byte: u8) -> NativeMemoryLedger {
     let mut ledger = NativeMemoryLedger::for_source(source);
     ledger.last_observed_digest = Some(Sha256Digest([byte; 32]));
     ledger.last_unmanaged_digest = Some(Sha256Digest([byte + 1; 32]));
     ledger.last_imported_digest = Some(Sha256Digest([byte + 2; 32]));
     ledger.last_applied_digest = Some(Sha256Digest([byte + 3; 32]));
+    ledger.last_applied_managed_digest = Some(Sha256Digest([byte + 4; 32]));
     ledger.initial_preview_complete = true;
     ledger
 }
@@ -563,6 +605,660 @@ fn rollback_unregisters_only_the_last_plan_owned_native_memory_source() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn adapter_upgrade_supersedes_one_active_source_and_rolls_back_with_ledger_continuity() {
+    const ORIGINAL: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074001";
+    const UPGRADE: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074002";
+    const ROLLBACK: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074003";
+    let path = TempVault::new("native-memory-adapter-upgrade");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let original = source_with_version(
+        ScopeRef::Project {
+            project_id: ID_7.parse().unwrap(),
+        },
+        HarnessId::ClaudeCode,
+        "claude-1.0.0",
+        "same-project-memory",
+    );
+    let upgraded = source_with_version(
+        original.scope.clone(),
+        HarnessId::ClaudeCode,
+        "claude-2.0.0",
+        "same-project-memory",
+    );
+    assert_ne!(original.id, upgraded.id);
+
+    apply_registered_source(
+        &mut vault,
+        ORIGINAL,
+        &NativeMemoryRegistration {
+            source: original.clone(),
+            last_applied_digest: None,
+        },
+        81,
+    );
+    let continuity = ledger(original.clone(), 82);
+    vault
+        .put_native_memory_candidate(&continuity, None)
+        .unwrap();
+
+    apply_registered_source(
+        &mut vault,
+        UPGRADE,
+        &NativeMemoryRegistration {
+            source: upgraded.clone(),
+            last_applied_digest: None,
+        },
+        83,
+    );
+
+    let active = vault.native_memory_ledgers().unwrap();
+    assert_eq!(active.len(), 1);
+    let upgraded_ledger = &active[0];
+    assert_eq!(upgraded_ledger.source.as_ref(), Some(&upgraded));
+    assert_eq!(
+        upgraded_ledger.last_observed_digest,
+        continuity.last_observed_digest
+    );
+    assert_eq!(
+        upgraded_ledger.last_unmanaged_digest,
+        continuity.last_unmanaged_digest
+    );
+    assert_eq!(
+        upgraded_ledger.last_imported_digest,
+        continuity.last_imported_digest
+    );
+    assert_eq!(
+        upgraded_ledger.last_applied_digest,
+        continuity.last_applied_digest
+    );
+    assert_eq!(
+        upgraded_ledger.last_applied_managed_digest,
+        continuity.last_applied_managed_digest
+    );
+    assert!(upgraded_ledger.initial_preview_complete);
+    assert_eq!(
+        vault
+            .native_memory_ledger(&original.id)
+            .unwrap()
+            .unwrap()
+            .last_observed_digest,
+        continuity.last_observed_digest
+    );
+
+    rollback_registered_source(&mut vault, UPGRADE, ROLLBACK, 84);
+
+    assert!(vault.native_memory_ledger(&upgraded.id).unwrap().is_none());
+    assert_eq!(
+        vault.native_memory_ledgers().unwrap(),
+        vec![continuity.clone()]
+    );
+}
+
+#[test]
+fn different_projects_cannot_claim_the_same_logical_native_path() {
+    const FIRST_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074004";
+    const SECOND_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074005";
+    const OTHER_PROJECT: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074006";
+    let path = TempVault::new("native-memory-cross-project-path-collision");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+
+    // Claude's lossy project-key projection can map distinct project roots to
+    // this same file. The vault boundary must reject the second logical owner.
+    let first = source_with_version(
+        ScopeRef::Project {
+            project_id: ID_7.parse().unwrap(),
+        },
+        HarnessId::ClaudeCode,
+        "claude-1.0.0",
+        "lossy-project-key-memory",
+    );
+    let second = source_with_version(
+        ScopeRef::Project {
+            project_id: OTHER_PROJECT.parse().unwrap(),
+        },
+        HarnessId::ClaudeCode,
+        "claude-1.0.0",
+        "lossy-project-key-memory",
+    );
+    assert_eq!(first.path, second.path);
+    assert_ne!(first.id, second.id);
+    apply_registered_source(
+        &mut vault,
+        FIRST_PLAN,
+        &NativeMemoryRegistration {
+            source: first.clone(),
+            last_applied_digest: None,
+        },
+        85,
+    );
+
+    let second_plan = SECOND_PLAN.parse::<PlanId>().unwrap();
+    let approval_hash = Sha256Digest([86; 32]);
+    vault
+        .put_setup_plan(SetupPlanWrite {
+            plan_id: &second_plan,
+            schema_version: 2,
+            approval_version: 2,
+            approval_hash: &approval_hash,
+            payload: b"second-project-collision",
+            created_ms: 10,
+            expires_ms: 100,
+        })
+        .unwrap();
+    vault
+        .claim_setup_plan(&second_plan, SetupPlanAction::Apply, 11)
+        .unwrap();
+
+    assert!(matches!(
+        vault.finish_setup_plan_with_native_memory(
+            &second_plan,
+            SetupPlanLifecycle::Applied,
+            &[NativeMemoryRegistration {
+                source: second.clone(),
+                last_applied_digest: None,
+            }],
+        ),
+        Err(VaultError::Validation(message))
+            if message.contains("native path") && message.contains("different logical source")
+    ));
+    assert_eq!(
+        vault.setup_plan(&second_plan).unwrap().unwrap().lifecycle,
+        SetupPlanLifecycle::Applying
+    );
+    assert!(vault.native_memory_ledger(&second.id).unwrap().is_none());
+    assert_eq!(
+        vault.native_memory_ledgers().unwrap(),
+        vec![NativeMemoryLedger::for_source(first)]
+    );
+}
+
+#[test]
+fn superseded_setup_cannot_roll_back_before_its_active_successor() {
+    const ORIGINAL: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074007";
+    const UPGRADE: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074008";
+    const BLOCKED_ROLLBACK: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074009";
+    const UPGRADE_ROLLBACK: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074010";
+    const ORIGINAL_ROLLBACK: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074011";
+    let path = TempVault::new("native-memory-superseded-rollback-order");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let original = source_with_version(
+        ScopeRef::Global,
+        HarnessId::Codex,
+        "codex-1.0.0",
+        "rollback-order",
+    );
+    let upgraded = source_with_version(
+        ScopeRef::Global,
+        HarnessId::Codex,
+        "codex-2.0.0",
+        "rollback-order",
+    );
+    apply_registered_source(
+        &mut vault,
+        ORIGINAL,
+        &NativeMemoryRegistration {
+            source: original.clone(),
+            last_applied_digest: None,
+        },
+        87,
+    );
+    apply_registered_source(
+        &mut vault,
+        UPGRADE,
+        &NativeMemoryRegistration {
+            source: upgraded,
+            last_applied_digest: None,
+        },
+        88,
+    );
+
+    let original_plan = ORIGINAL.parse::<PlanId>().unwrap();
+    let blocked_inverse = BLOCKED_ROLLBACK.parse::<PlanId>().unwrap();
+    let approval_hash = Sha256Digest([89; 32]);
+    assert!(matches!(
+        vault.claim_setup_plan_rollback(
+            &original_plan,
+            SetupPlanWrite {
+                plan_id: &blocked_inverse,
+                schema_version: 2,
+                approval_version: 2,
+                approval_hash: &approval_hash,
+                payload: b"blocked-out-of-order-rollback",
+                created_ms: 20,
+                expires_ms: 100,
+            },
+            21,
+        ),
+        Err(VaultError::Validation(message)) if message.contains("active successor")
+    ));
+    assert_eq!(
+        vault.setup_plan(&original_plan).unwrap().unwrap().lifecycle,
+        SetupPlanLifecycle::Applied
+    );
+    assert!(vault.setup_plan(&blocked_inverse).unwrap().is_none());
+
+    rollback_registered_source(&mut vault, UPGRADE, UPGRADE_ROLLBACK, 90);
+    rollback_registered_source(&mut vault, ORIGINAL, ORIGINAL_ROLLBACK, 91);
+    assert!(vault.native_memory_ledger(&original.id).unwrap().is_none());
+}
+
+#[test]
+fn windows_case_and_extended_prefix_aliases_cannot_cross_project_ownership() {
+    const FIRST_PLANS: [&str; 2] = [
+        "018f22e2-79b0-7cc8-98c4-dc0c0c074012",
+        "018f22e2-79b0-7cc8-98c4-dc0c0c074013",
+    ];
+    const SECOND_PLANS: [&str; 2] = [
+        "018f22e2-79b0-7cc8-98c4-dc0c0c074014",
+        "018f22e2-79b0-7cc8-98c4-dc0c0c074015",
+    ];
+    const OTHER_PROJECT: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074016";
+    let aliases = [r"c:\memory\memory.md", r"\\?\C:\Memory\MEMORY.md"];
+
+    for (index, alias) in aliases.into_iter().enumerate() {
+        let path = TempVault::new(&format!("native-memory-windows-alias-{index}"));
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+        let first = windows_source(
+            ScopeRef::Project {
+                project_id: ID_7.parse().unwrap(),
+            },
+            "claude-1.0.0",
+            r"C:\Memory\MEMORY.md",
+        );
+        let alias = windows_source(
+            ScopeRef::Project {
+                project_id: OTHER_PROJECT.parse().unwrap(),
+            },
+            "claude-1.0.0",
+            alias,
+        );
+        apply_registered_source(
+            &mut vault,
+            FIRST_PLANS[index],
+            &NativeMemoryRegistration {
+                source: first,
+                last_applied_digest: None,
+            },
+            92 + index as u8,
+        );
+
+        let second_plan = SECOND_PLANS[index].parse::<PlanId>().unwrap();
+        let approval_hash = Sha256Digest([94 + index as u8; 32]);
+        vault
+            .put_setup_plan(SetupPlanWrite {
+                plan_id: &second_plan,
+                schema_version: 2,
+                approval_version: 2,
+                approval_hash: &approval_hash,
+                payload: b"windows-native-path-alias",
+                created_ms: 10,
+                expires_ms: 100,
+            })
+            .unwrap();
+        vault
+            .claim_setup_plan(&second_plan, SetupPlanAction::Apply, 11)
+            .unwrap();
+        assert!(matches!(
+            vault.finish_setup_plan_with_native_memory(
+                &second_plan,
+                SetupPlanLifecycle::Applied,
+                &[NativeMemoryRegistration {
+                    source: alias,
+                    last_applied_digest: None,
+                }],
+            ),
+            Err(VaultError::Validation(message))
+                if message.contains("native path") && message.contains("different logical source")
+        ));
+    }
+}
+
+#[test]
+fn windows_alias_spelling_preserves_same_project_supersession_and_exact_rollback() {
+    const ORIGINAL: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074017";
+    const UPGRADE: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074018";
+    const ROLLBACK: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074019";
+    let path = TempVault::new("native-memory-windows-alias-upgrade");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let scope = ScopeRef::Project {
+        project_id: ID_7.parse().unwrap(),
+    };
+    let original = windows_source(scope.clone(), "claude-1.0.0", r"C:\Memory\MEMORY.md");
+    let upgraded = windows_source(scope, "claude-2.0.0", r"\\?\c:\memory\memory.md");
+    apply_registered_source(
+        &mut vault,
+        ORIGINAL,
+        &NativeMemoryRegistration {
+            source: original.clone(),
+            last_applied_digest: None,
+        },
+        96,
+    );
+    let continuity = ledger(original.clone(), 97);
+    vault
+        .put_native_memory_candidate(&continuity, None)
+        .unwrap();
+    apply_registered_source(
+        &mut vault,
+        UPGRADE,
+        &NativeMemoryRegistration {
+            source: upgraded.clone(),
+            last_applied_digest: None,
+        },
+        98,
+    );
+    assert_eq!(vault.native_memory_ledgers().unwrap().len(), 1);
+    assert_eq!(
+        vault.native_memory_ledgers().unwrap()[0].source.as_ref(),
+        Some(&upgraded)
+    );
+
+    rollback_registered_source(&mut vault, UPGRADE, ROLLBACK, 99);
+    assert_eq!(vault.native_memory_ledgers().unwrap(), vec![continuity]);
+}
+
+#[test]
+fn opaque_windows_wtf16_registers_and_does_not_block_an_unrelated_source() {
+    const OPAQUE_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074020";
+    const UNRELATED_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074021";
+    const OTHER_PROJECT: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074022";
+    let path = TempVault::new("native-memory-opaque-wtf16-registration");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let mut units = r"C:\Memory\".encode_utf16().collect::<Vec<_>>();
+    units.push(0xd800);
+    units.extend(".md".encode_utf16());
+    let opaque = windows_source_with_units(
+        ScopeRef::Project {
+            project_id: ID_7.parse().unwrap(),
+        },
+        "claude-1.0.0",
+        &units,
+    );
+    let unrelated = windows_source(
+        ScopeRef::Project {
+            project_id: OTHER_PROJECT.parse().unwrap(),
+        },
+        "claude-1.0.0",
+        r"D:\Other\MEMORY.md",
+    );
+
+    apply_registered_source(
+        &mut vault,
+        OPAQUE_PLAN,
+        &NativeMemoryRegistration {
+            source: opaque.clone(),
+            last_applied_digest: None,
+        },
+        100,
+    );
+    apply_registered_source(
+        &mut vault,
+        UNRELATED_PLAN,
+        &NativeMemoryRegistration {
+            source: unrelated.clone(),
+            last_applied_digest: None,
+        },
+        101,
+    );
+
+    let active = vault.native_memory_ledgers().unwrap();
+    assert_eq!(active.len(), 2);
+    assert!(
+        active
+            .iter()
+            .any(|ledger| ledger.source.as_ref() == Some(&opaque))
+    );
+    assert!(
+        active
+            .iter()
+            .any(|ledger| ledger.source.as_ref() == Some(&unrelated))
+    );
+}
+
+#[test]
+fn exact_opaque_windows_wtf16_supersedes_and_rolls_back_losslessly() {
+    const ORIGINAL: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074023";
+    const UPGRADE: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074024";
+    const ROLLBACK: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074025";
+    let path = TempVault::new("native-memory-opaque-wtf16-upgrade");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let mut units = r"C:\Memory\".encode_utf16().collect::<Vec<_>>();
+    units.push(0xd800);
+    units.extend(".md".encode_utf16());
+    let scope = ScopeRef::Project {
+        project_id: ID_7.parse().unwrap(),
+    };
+    let original = windows_source_with_units(scope.clone(), "claude-1.0.0", &units);
+    let upgraded = windows_source_with_units(scope, "claude-2.0.0", &units);
+    apply_registered_source(
+        &mut vault,
+        ORIGINAL,
+        &NativeMemoryRegistration {
+            source: original.clone(),
+            last_applied_digest: None,
+        },
+        102,
+    );
+    let continuity = ledger(original.clone(), 103);
+    vault
+        .put_native_memory_candidate(&continuity, None)
+        .unwrap();
+
+    apply_registered_source(
+        &mut vault,
+        UPGRADE,
+        &NativeMemoryRegistration {
+            source: upgraded.clone(),
+            last_applied_digest: None,
+        },
+        104,
+    );
+    let active = vault.native_memory_ledgers().unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].source.as_ref(), Some(&upgraded));
+    assert_eq!(
+        active[0].last_observed_digest,
+        continuity.last_observed_digest
+    );
+
+    rollback_registered_source(&mut vault, UPGRADE, ROLLBACK, 105);
+    assert_eq!(vault.native_memory_ledgers().unwrap(), vec![continuity]);
+}
+
+#[test]
+fn plausible_non_ascii_windows_case_alias_is_denied_across_projects() {
+    const FIRST_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074026";
+    const SECOND_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074027";
+    const OTHER_PROJECT: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074028";
+    let path = TempVault::new("native-memory-windows-unicode-case-alias");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let first = windows_source(
+        ScopeRef::Project {
+            project_id: ID_7.parse().unwrap(),
+        },
+        "claude-1.0.0",
+        r"C:\Memory\RÉSUMÉ.md",
+    );
+    let alias = windows_source(
+        ScopeRef::Project {
+            project_id: OTHER_PROJECT.parse().unwrap(),
+        },
+        "claude-1.0.0",
+        r"c:\memory\résumé.md",
+    );
+    apply_registered_source(
+        &mut vault,
+        FIRST_PLAN,
+        &NativeMemoryRegistration {
+            source: first,
+            last_applied_digest: None,
+        },
+        106,
+    );
+    let second_plan = SECOND_PLAN.parse::<PlanId>().unwrap();
+    let approval_hash = Sha256Digest([107; 32]);
+    vault
+        .put_setup_plan(SetupPlanWrite {
+            plan_id: &second_plan,
+            schema_version: 2,
+            approval_version: 2,
+            approval_hash: &approval_hash,
+            payload: b"unicode-case-alias",
+            created_ms: 10,
+            expires_ms: 100,
+        })
+        .unwrap();
+    vault
+        .claim_setup_plan(&second_plan, SetupPlanAction::Apply, 11)
+        .unwrap();
+
+    assert!(matches!(
+        vault.finish_setup_plan_with_native_memory(
+            &second_plan,
+            SetupPlanLifecycle::Applied,
+            &[NativeMemoryRegistration {
+                source: alias,
+                last_applied_digest: None,
+            }],
+        ),
+        Err(VaultError::Validation(message))
+            if message.contains("ambiguous Windows native path case")
+    ));
+    assert_eq!(vault.native_memory_ledgers().unwrap().len(), 1);
+}
+
+#[test]
+fn exact_non_ascii_windows_path_supersedes_and_rolls_back() {
+    const ORIGINAL: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074029";
+    const UPGRADE: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074030";
+    const ROLLBACK: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074031";
+    let path = TempVault::new("native-memory-windows-exact-unicode-upgrade");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let scope = ScopeRef::Project {
+        project_id: ID_7.parse().unwrap(),
+    };
+    let original = windows_source(scope.clone(), "claude-1.0.0", r"C:\Memory\Résumé.md");
+    let upgraded = windows_source(scope, "claude-2.0.0", r"C:\Memory\Résumé.md");
+    apply_registered_source(
+        &mut vault,
+        ORIGINAL,
+        &NativeMemoryRegistration {
+            source: original.clone(),
+            last_applied_digest: None,
+        },
+        108,
+    );
+    let continuity = ledger(original.clone(), 109);
+    vault
+        .put_native_memory_candidate(&continuity, None)
+        .unwrap();
+    apply_registered_source(
+        &mut vault,
+        UPGRADE,
+        &NativeMemoryRegistration {
+            source: upgraded.clone(),
+            last_applied_digest: None,
+        },
+        110,
+    );
+    assert_eq!(vault.native_memory_ledgers().unwrap().len(), 1);
+    assert_eq!(
+        vault.native_memory_ledgers().unwrap()[0].source.as_ref(),
+        Some(&upgraded)
+    );
+
+    rollback_registered_source(&mut vault, UPGRADE, ROLLBACK, 111);
+    assert_eq!(vault.native_memory_ledgers().unwrap(), vec![continuity]);
+}
+
+#[test]
+fn extended_trailing_dot_path_remains_distinct_across_projects() {
+    const ORDINARY_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074032";
+    const EXTENDED_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074033";
+    const OTHER_PROJECT: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074034";
+    let path = TempVault::new("native-memory-windows-extended-trailing-cross-project");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let ordinary = windows_source(
+        ScopeRef::Project {
+            project_id: ID_7.parse().unwrap(),
+        },
+        "claude-1.0.0",
+        r"C:\Memory\memory.md",
+    );
+    let extended = windows_source(
+        ScopeRef::Project {
+            project_id: OTHER_PROJECT.parse().unwrap(),
+        },
+        "claude-1.0.0",
+        r"\\?\C:\Memory\memory.md.",
+    );
+
+    apply_registered_source(
+        &mut vault,
+        ORDINARY_PLAN,
+        &NativeMemoryRegistration {
+            source: ordinary,
+            last_applied_digest: None,
+        },
+        112,
+    );
+    apply_registered_source(
+        &mut vault,
+        EXTENDED_PLAN,
+        &NativeMemoryRegistration {
+            source: extended,
+            last_applied_digest: None,
+        },
+        113,
+    );
+    assert_eq!(vault.native_memory_ledgers().unwrap().len(), 2);
+}
+
+#[test]
+fn extended_trailing_space_path_does_not_supersede_same_project_ordinary_path() {
+    const ORDINARY_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074035";
+    const EXTENDED_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074036";
+    let path = TempVault::new("native-memory-windows-extended-trailing-same-project");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let scope = ScopeRef::Project {
+        project_id: ID_7.parse().unwrap(),
+    };
+    let ordinary = windows_source(scope.clone(), "claude-1.0.0", r"C:\Memory\memory.md");
+    let extended = windows_source(scope, "claude-2.0.0", r"\\?\C:\Memory\memory.md ");
+
+    apply_registered_source(
+        &mut vault,
+        ORDINARY_PLAN,
+        &NativeMemoryRegistration {
+            source: ordinary,
+            last_applied_digest: None,
+        },
+        114,
+    );
+    apply_registered_source(
+        &mut vault,
+        EXTENDED_PLAN,
+        &NativeMemoryRegistration {
+            source: extended,
+            last_applied_digest: None,
+        },
+        115,
+    );
+    assert_eq!(vault.native_memory_ledgers().unwrap().len(), 2);
 }
 
 #[test]

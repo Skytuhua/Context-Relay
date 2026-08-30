@@ -7,10 +7,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(unix)]
+use context_relay_core::claude_code::{ClaudeCodeCommandRunner, VerifiedClaudeCommand};
 use context_relay_core::{
-    claude_code::{
-        ClaudeCodeAdapter, ClaudeCodeCommandRunner, ClaudeCodeLayout, VerifiedClaudeCommand,
-    },
+    claude_code::{ClaudeCodeAdapter, ClaudeCodeLayout},
     mcp::install::bridge_component,
     native_memory::{
         NativeMemoryAdapter, NativeMemoryDisable, NativeMemoryDocumentKind,
@@ -194,7 +194,7 @@ fn supported_release_fixtures_import_the_reviewed_surfaces_without_secrets() {
 }
 
 #[test]
-fn memory_hooks_render_only_the_frozen_lifecycle_events_with_literal_arguments() {
+fn memory_hooks_render_only_frozen_context_relay_compatible_events_with_literal_arguments() {
     for source in [
         include_str!("fixtures/claude-code-2.1.214.json"),
         include_str!("fixtures/claude-code-2.1.213.json"),
@@ -211,15 +211,11 @@ fn memory_hooks_render_only_the_frozen_lifecycle_events_with_literal_arguments()
         let components = managed_memory_hooks(HarnessId::ClaudeCode, &bridge_wire).unwrap();
         assert_eq!(components.len(), 1);
         let hooks: Value = serde_json::from_str(&components[0].body_markdown).unwrap();
-        let expected = contract["lifecycleHookEvents"]
+        let expected = contract["contextRelayCompatibleLifecycleHookEvents"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|event| match event.as_str().unwrap() {
-                "SessionStart" | "Stop" => event.as_str(),
-                "TaskCompleted" => None,
-                _ => panic!("unsupported frozen Claude hook event"),
-            })
+            .map(|event| event.as_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(hooks.as_object().unwrap().len(), expected.len());
         for native_event in expected {
@@ -239,6 +235,20 @@ fn memory_hooks_render_only_the_frozen_lifecycle_events_with_literal_arguments()
                 "Context Relay memory lifecycle"
             );
         }
+        let unreviewed = contract["contextRelayUnreviewedLifecycleHookEvents"]
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            unreviewed["TaskCompleted"],
+            "Payload compatibility is not captured or proven; disabled until a reviewed bounded schema is frozen."
+        );
+        assert!(
+            contract["lifecycleHookEvents"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("TaskCompleted"))
+        );
+        assert!(hooks.get("TaskCompleted").is_none());
         let serialized = serde_json::to_string(&hooks).unwrap();
         assert!(!serialized.contains("TaskCompleted"));
         assert!(!serialized.contains("task-evidence"));
@@ -849,38 +859,39 @@ fn primary_memory_semantic_contract_is_shared_byte_for_byte() {
 - Treat Context Relay results as the primary memory for decisions, project knowledge, and ongoing work. Native harness memory is only an import and recovery surface.\n\
 - Save explicit user or project decisions with `context_relay_remember`.\n\
 - Submit inferred knowledge with `context_relay_propose_memory` so it enters review instead of becoming authoritative immediately.\n\
-- Keep the shared task ledger current with `context_relay_list_tasks`, `context_relay_upsert_task`, and `context_relay_complete_task`.\n";
+- Keep the shared task ledger current with `context_relay_list_tasks`, `context_relay_upsert_task`, and `context_relay_complete_task`.\n\
+- When completing the current Context Relay task, use the typed `context_relay_complete_task` tool with the current Context Relay task ID returned by `context_relay_list_tasks` and explicit bounded evidence; never infer or substitute a vendor task identifier.\n";
 
     assert_eq!(PRIMARY_MEMORY_INSTRUCTIONS, expected);
     assert!(components.iter().all(|component| {
         component.kind == ComponentKind::Instruction
             && component.scope == ScopeRef::Project { project_id }
-            && component.body_markdown.starts_with(expected)
+            && component.body_markdown == expected
     }));
-    for (component, harness) in components[..2].iter().zip(["claude-code", "codex"]) {
-        assert!(component.body_markdown.contains(&format!(
-            "context-relay-context-mcp --hook-event task-evidence --harness {harness}"
-        )));
-        assert!(component.body_markdown.contains("\"session_id\""));
-        assert!(component.body_markdown.contains("\"task_id\""));
-        assert!(component.body_markdown.contains("\"evidence\""));
+    for component in &components {
+        assert!(!component.body_markdown.contains("--hook-event"));
+        assert!(!component.body_markdown.contains("session_id"));
+        assert!(
+            component
+                .body_markdown
+                .contains("typed `context_relay_complete_task` tool")
+        );
+        assert!(
+            component
+                .body_markdown
+                .contains("explicit bounded evidence")
+        );
         assert!(
             component
                 .body_markdown
                 .contains("current Context Relay task ID")
         );
+        assert!(
+            component
+                .body_markdown
+                .contains("never infer or substitute a vendor task identifier")
+        );
     }
-    assert!(!components[2].body_markdown.contains("--hook-event"));
-    assert!(
-        components[2]
-            .body_markdown
-            .contains("typed `context_relay_complete_task` tool")
-    );
-    assert!(
-        components[2]
-            .body_markdown
-            .contains("current Context Relay task ID")
-    );
     assert_eq!(components[0].name, "CLAUDE.md");
     assert_eq!(components[1].name, "AGENTS.md");
     assert_eq!(components[2].name, ".hermes.md");

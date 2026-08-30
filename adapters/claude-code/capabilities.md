@@ -23,12 +23,16 @@ scanned.
 ## Managed hooks and privacy
 
 Supported frozen versions use managed `SessionStart` and `Stop` commands.
-Explicit task evidence uses the managed task instruction until Claude Code
-exposes a stable task-completion hook. The bridge projects vendor JSON onto
-session ID, project binding, locally generated event time, and explicit task
-ID/evidence only. Prompt and response text, transcript paths, last assistant
-messages, tool input/output, and unknown fields are ignored and never opened
-or forwarded.
+Their frozen fixtures also record the vendor `TaskCompleted` event, but no
+bounded sanitized payload schema has been captured, so Context Relay
+compatibility is not proven. The event remains disabled until such a schema is
+reviewed and frozen; it is never rendered or mapped from a vendor task
+identifier. Explicit task completion uses the typed
+`context_relay_complete_task` MCP tool from the managed instruction. The bridge
+projects compatible vendor JSON onto session ID, project binding, locally
+generated event time, and explicit task ID/evidence only. Prompt and response
+text, transcript paths, last assistant messages, tool input/output, and unknown
+fields are ignored and never opened or forwarded.
 
 Session start emits only a fixed reminder to query Context Relay. Stop and task
 evidence emit no conversation text. Hook delivery updates local operational

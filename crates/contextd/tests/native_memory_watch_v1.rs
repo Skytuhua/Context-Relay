@@ -359,6 +359,50 @@ async fn applied_export_is_ignored_across_restart_then_only_unmanaged_bytes_are_
 }
 
 #[tokio::test]
+async fn managed_owned_block_drift_is_reported_after_restart() {
+    let fixture = Fixture::new("owned-drift");
+    let path = fixture.root.join("memory.md");
+    let managed = b"<!-- context-relay:start -->\nowned memory\n<!-- context-relay:end -->\n";
+    std::fs::write(&path, managed).unwrap();
+    let source = source(&path, 4_096);
+    let applied_digest = context_relay_protocol::Sha256Digest(Sha256::digest(managed).into());
+    fixture
+        .config
+        .seed_native_memory_source(&source, Some(applied_digest))
+        .unwrap();
+
+    let daemon = fixture.config.start().await.unwrap();
+    wait_for_preview(&fixture.config, [&source]).await;
+    drop(daemon);
+
+    let daemon = fixture.config.start().await.unwrap();
+    std::fs::write(
+        &path,
+        b"<!-- context-relay:start -->\nuser changed owned memory\n<!-- context-relay:end -->\n",
+    )
+    .unwrap();
+    wait_for_diagnostic(&fixture.config, &source).await;
+    drop(daemon);
+
+    let ledger = fixture
+        .config
+        .native_memory_ledger(&source.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ledger.last_diagnostic.unwrap().error_class,
+        NativeMemoryDiagnosticClass::ManagedContentModified
+    );
+    assert!(
+        fixture
+            .config
+            .native_memory_candidates()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn rejected_text_records_only_redacted_digest_diagnostics_and_recovers_after_correction() {
     let fixture = Fixture::new("redacted-diagnostics");
     let invalid_path = fixture.root.join("invalid.md");

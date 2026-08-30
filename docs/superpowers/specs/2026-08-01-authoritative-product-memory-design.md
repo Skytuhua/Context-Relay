@@ -77,11 +77,27 @@ fence in the project instruction file (`CLAUDE.md`, `AGENTS.md`, or
   review instead of becoming authoritative immediately.
 - Keep the shared task ledger current with `context_relay_list_tasks`,
   `context_relay_upsert_task`, and `context_relay_complete_task`.
+- When completing the current Context Relay task, use the typed
+  `context_relay_complete_task` tool with the current Context Relay task ID
+  returned by `context_relay_list_tasks` and explicit bounded evidence; never
+  infer or substitute a vendor task identifier.
 ```
 
 The wording is a shared constant owned by `core::native_memory`; adapters
 select only the native target and newline style. This prevents the three
 renderers from drifting.
+
+### Task-completion strengthening amendment — 2026-08-10
+
+A vendor hook name is not sufficient evidence that its payload is compatible
+with Context Relay task completion. Compatibility additionally requires an
+explicit current Context Relay task ID and bounded completion evidence. The
+frozen contracts do not capture a reviewed bounded completion-payload schema,
+so compatibility is not proven. The shared instruction therefore uses the
+typed MCP completion tool for every harness and contains neither a bridge
+executable nor a model-supplied lifecycle-session identifier. Frozen fixtures
+record observed vendor events separately from the narrower Context
+Relay-compatible event allowlist.
 
 ## Options Considered
 
@@ -152,6 +168,20 @@ contract-version | harness | adapter-version | scope | document-kind | wire-path
 The wire path is already bound by the adapter and is never accepted directly
 from hook input. The digest is the persisted key, while the path remains in the
 adapter-owned runtime descriptor.
+
+Source IDs retain the exact lossless wire bytes, but setup ownership compares a
+separate logical path identity so adapter-version changes cannot create parallel
+watchers for the same native file. Adapters resolve existing source roots before
+sealing; the vault normalizes residual wire aliases. macOS identity remains
+byte-exact. Windows identity operates directly on lossless UTF-16 code units,
+preserving opaque WTF-16 name units such as isolated surrogates. It folds only
+unambiguous ASCII case and separator syntax. A separate, lossless comparison
+projection rejects plausible non-ASCII case aliases without replacing opaque
+UTF-16 units. Drive/UNC and ordinary-equivalent `\\?\` spellings normalize to
+one identity, while extended-only trailing-dot and trailing-space names remain
+distinct. Ambiguous namespace, relative, ADS, and short-name forms are rejected.
+A same-scope adapter upgrade supersedes the prior descriptor transactionally;
+another project scope is denied.
 
 `NativeMemorySource` contains:
 
@@ -324,13 +354,15 @@ write API while still observing reviewed high-level Markdown files.
 
 ### Invocation
 
-Extend the installed `context-relay-mcp` executable with a hook mode while
-preserving the existing strict MCP invocation:
+The installed `context-relay-context-mcp` bridge retains a hook mode while
+preserving the existing strict MCP invocation. Managed hooks always render the
+attested absolute executable; the forms below use a placeholder for that exact
+path:
 
 ```text
-context-relay-mcp --hook-event session-start --harness <harness>
-context-relay-mcp --hook-event session-stop --harness <harness>
-context-relay-mcp --hook-event task-evidence --harness <harness>
+<attested-context-relay-context-mcp> --hook-event session-start --harness <harness>
+<attested-context-relay-context-mcp> --hook-event session-stop --harness <harness>
+<attested-context-relay-context-mcp> --hook-event task-evidence --harness <harness>
 ```
 
 The hook reads at most the existing bounded arbitrary-input limit from stdin,
@@ -339,6 +371,13 @@ projects supported vendor fields into `NativeHookEvent`, and sends
 local IPC. The command is best effort and produces no conversation text for
 stop/evidence events. Session start returns only a fixed, bounded reminder to
 query Context Relay; it does not inject memory bodies.
+
+The current frozen adapters do not render or instruct a `task-evidence` hook.
+That mode remains a fail-closed bridge boundary for a future frozen native
+payload that supplies both an explicit Context Relay task ID and bounded
+completion evidence. Until then, every harness uses the typed
+`context_relay_complete_task` MCP tool and needs no lifecycle-session ID for
+task completion.
 
 ### Allowlisted event DTO
 
@@ -363,13 +402,15 @@ is acknowledged but not persisted.
 
 ### Rendered hooks by harness
 
-- Claude Code: managed command hooks for `SessionStart`, `Stop`, and
-  `TaskCompleted` where the frozen version supports them.
+- Claude Code: managed command hooks for `SessionStart` and `Stop`. The frozen
+  versions expose a vendor `TaskCompleted` event, but no reviewed bounded
+  payload schema has been captured, so compatibility is not proven. The
+  fixture classifies it as unreviewed and setup does not render it.
 - Codex: managed command hooks for `SessionStart` and `Stop`; explicit task
-  evidence uses the hook command invoked by the managed task instruction until
-  Codex exposes a stable task-completion hook.
+  completion uses the typed MCP tool until Codex exposes a stable compatible
+  task-completion payload.
 - Hermes: render only lifecycle hooks present in the frozen 0.18.x fixture. If
-  no equivalent event exists, the instruction/MCP path remains active and no
+  no equivalent event exists, typed MCP task completion remains active and no
   hook key is invented.
 
 Hook mutations use the existing adapter-native transaction planner and preserve

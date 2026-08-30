@@ -83,11 +83,13 @@ drifted declaration fails validation. Validation never starts configured MCP
 servers.
 
 Supported frozen versions use managed `SessionStart` and `Stop` commands.
-Explicit task evidence uses the managed task instruction until Codex exposes a
-stable task-completion hook. The bridge projects vendor JSON onto session ID,
-project binding, locally generated event time, and explicit task ID/evidence
-only. Prompt/response text, transcript paths, assistant messages, and tool
-input/output are ignored and never opened or forwarded.
+Explicit task completion uses the typed `context_relay_complete_task` MCP tool
+from the managed instruction until Codex exposes a stable compatible
+task-completion payload. No bridge executable or lifecycle-session identifier
+is placed in the instruction. The bridge projects compatible vendor JSON onto
+session ID, project binding, locally generated event time, and explicit task
+ID/evidence only. Prompt/response text, transcript paths, assistant messages,
+and tool input/output are ignored and never opened or forwarded.
 
 ## Discovery classification
 

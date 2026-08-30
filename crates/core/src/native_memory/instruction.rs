@@ -11,26 +11,11 @@ pub const PRIMARY_MEMORY_INSTRUCTIONS: &str = "## Context Relay memory\n\n\
 - Treat Context Relay results as the primary memory for decisions, project knowledge, and ongoing work. Native harness memory is only an import and recovery surface.\n\
 - Save explicit user or project decisions with `context_relay_remember`.\n\
 - Submit inferred knowledge with `context_relay_propose_memory` so it enters review instead of becoming authoritative immediately.\n\
-- Keep the shared task ledger current with `context_relay_list_tasks`, `context_relay_upsert_task`, and `context_relay_complete_task`.\n";
+- Keep the shared task ledger current with `context_relay_list_tasks`, `context_relay_upsert_task`, and `context_relay_complete_task`.\n\
+- When completing the current Context Relay task, use the typed `context_relay_complete_task` tool with the current Context Relay task ID returned by `context_relay_list_tasks` and explicit bounded evidence; never infer or substitute a vendor task identifier.\n";
 
-fn primary_memory_instructions(harness: HarnessId) -> String {
-    match harness {
-        HarnessId::ClaudeCode | HarnessId::Codex => {
-            let harness = match harness {
-                HarnessId::ClaudeCode => "claude-code",
-                HarnessId::Codex => "codex",
-                HarnessId::Hermes => unreachable!(),
-            };
-            format!(
-                "{PRIMARY_MEMORY_INSTRUCTIONS}\
-- When completing the current Context Relay task from a harness without a compatible native completion payload, send only `{{\"session_id\":\"<current harness session ID>\",\"task_id\":\"<current Context Relay task ID>\",\"evidence\":[{{\"summary\":\"<bounded summary>\",\"kind\":\"<test|artifact|review>\",\"reference\":null}}]}}` to `context-relay-context-mcp --hook-event task-evidence --harness {harness}`. Use the current Context Relay task ID returned by `context_relay_list_tasks`; never infer or substitute a vendor task identifier.\n"
-            )
-        }
-        HarnessId::Hermes => format!(
-            "{PRIMARY_MEMORY_INSTRUCTIONS}\
-- Hermes has no compatible native completion or lifecycle-session payload. Complete the current task with the typed `context_relay_complete_task` tool, using the current Context Relay task ID returned by `context_relay_list_tasks` and explicit bounded evidence; never infer or substitute a Hermes task identifier.\n"
-        ),
-    }
+fn primary_memory_instructions(_: HarnessId) -> String {
+    PRIMARY_MEMORY_INSTRUCTIONS.to_owned()
 }
 
 pub fn primary_memory_instruction_component(

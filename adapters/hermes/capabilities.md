@@ -32,10 +32,12 @@ themselves. Unknown versions never receive guessed disable settings: an exact,
 safely bound source remains watch-only and any ambiguous source is unavailable.
 
 Hermes renders only lifecycle hooks present in its frozen fixture; it does not
-invent missing hook keys. Hook projection forwards session ID, project binding,
-locally generated event time, and explicit task evidence only. Prompts,
-responses, transcript paths, last assistant messages, tool input/output, and
-unknown fields are never forwarded or persisted.
+invent missing hook keys. Explicit task completion uses the typed
+`context_relay_complete_task` MCP tool from the managed instruction and never
+requires a lifecycle-session identifier. Hook projection forwards session ID,
+project binding, locally generated event time, and explicit task evidence only.
+Prompts, responses, transcript paths, last assistant messages, tool
+input/output, and unknown fields are never forwarded or persisted.
 
 ## Supported installations and profile binding
 
