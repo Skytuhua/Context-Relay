@@ -176,6 +176,40 @@ production topology validation or merely change the expected error to pass.
 The 20 dispatcher tests before this suite passed; later workspace binaries did
 not run after Cargo stopped at this failure.
 
+### UPDATE 2026-08-31 (second pass): both failures diagnosed and repaired at `a3c5982`
+
+PR #12 head advanced additively to
+[`a3c5982`](https://github.com/Skytuhua/Context-Relay/commit/a3c5982a6f29461fc4e6b5f03dfdc5d2005bdb50)
+(“fix: accept canonical verbatim Windows paths”). Both failures were reproduced
+on a real Windows x64 host and have one root-cause class: two independent
+Windows path policies rejected the `\\?\` verbatim prefix that
+`std::fs::canonicalize` produces on Windows, so every canonicalized Codex
+layout path failed:
+
+1. `native-runner` `validated_components` (`HeldPath::new`) →
+   `OsNativeFileSystem::snapshot` returned `InvalidPath`; `codex.rs`
+   `read_optional_file` surfaced `InvalidRequest "Codex configuration has
+   unsafe topology or state"` (line 685) and masked the blocked-capability
+   `HarnessUnsupported` mapping (line 802).
+2. `core` `native_transaction::approval::windows_target_key` → after repair 1,
+   the chain moved to `approval_hash_v2`, which rejected verbatim mutation
+   targets (`InvalidRequest "Bridge preview plan is invalid"`).
+
+Both boundaries now accept exactly the `\\?\` prefix; device (`\\.\`) and UNC
+forms, traversal, reserved names, reparse checks, and deduplication remain
+fail-closed (verbatim/plain forms of one path still collide as duplicates).
+The verbatim form skips Win32 normalization, so acceptance is strictly safer.
+
+Local Windows runtime evidence: failing regression tests were added first for
+each boundary; `context-mcp end_to_end_v1` passes **10/10** on Windows;
+`native_approval_v1` 22, `native_approval_v2` 18, `native-runner` pre-rename
+25 (with the machine-specific `icacls` test skipped — see ledger); scoped
+clippy `-D warnings` and `cargo fmt --check` clean. Full details, exact
+commands, and host limitations are recorded in the
+[stabilization ledger](../../verification/pr-12-stabilization.md). Clean-
+checkout CI on `a3c5982` (runs 33424905936/33424905907/33424905774) remains
+the mandatory gate; do not treat this local evidence as green.
+
 Prior run [33357305605](https://github.com/Skytuhua/Context-Relay/actions/runs/33357305605)
 at `89d832b` had a six-hour Windows ordinary-test timeout and failed Windows
 native-isolation. Those are the reasons for `435367d`; prior green native builds
