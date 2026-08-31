@@ -33,7 +33,8 @@ normalized during preservation; the pending functionality was not completed.
 
 ## Fresh preservation verification
 
-Host: macOS arm64; Rust 1.97.1; bundled Node 24.14.0. No hosted credentials used.
+Host: macOS arm64; Rust 1.97.1; bundled Node 24.19.0 (repository/CI pin:
+24.14.0). No hosted credentials used.
 
 | Command | Result |
 | --- | --- |
@@ -46,6 +47,19 @@ Host: macOS arm64; Rust 1.97.1; bundled Node 24.14.0. No hosted credentials used
 These 26 focused tests do not execute the migration, exercise real OAuth, prove
 cross-account isolation on a hosted project, or enable production deletion.
 The Node SQL assertions inspect source text, not PostgreSQL behavior.
+
+### First public preservation run
+
+[Draft PR #13](https://github.com/Skytuhua/Context-Relay/pull/13) preserves this
+slice at `485886c2d3ad5105c5ea5114851d18045c25fc74`.
+GitHub's disposable local Supabase stack in
+[run 33385426361](https://github.com/Skytuhua/Context-Relay/actions/runs/33385426361)
+successfully reset through the migration, then reproduced the expected legacy
+test incompatibility: assertion 122 failed, and line 2703 aborted with permission
+denied for `service_begin_account_deletion`. The suite ran 469 of 518 planned
+assertions, with one failed assertion and 49 not run. This is CI-container
+execution evidence, not hosted project deployment or proof that the new wrappers
+are correct. Database lint was not reached. Secret Scan passed on the new head.
 
 ## Known unfinished integration — start here
 
@@ -67,9 +81,10 @@ The Node SQL assertions inspect source text, not PostgreSQL behavior.
 4. The ordinary daemon still constructs `UnavailableAccountLifecycleTransport`.
    Production authenticated-session ownership, provisioning, transport injection,
    refresh/expiry handling, and lifecycle UI freshness UX are not implemented.
-5. The newest signed AMR entry must currently be `method: "oauth"` and at most
-   300 seconds old. Verify the real supported GitHub OAuth claim shape before
-   activation; refreshing a JWT must not manufacture fresh credential evidence.
+5. The first signed AMR entry (`claims.amr[0]`, currently assumed newest) must
+   be `method: "oauth"` and at most 300 seconds old. Verify the real supported
+   GitHub OAuth claim shape and ordering before activation; refreshing a JWT
+   must not manufacture fresh credential evidence.
 6. New request IDs survive retries within a transport call. Define and test
    caller retry/crash behavior before claiming full user-operation idempotency.
 7. This slice does not implement the final purge scheduler, export product flow,
