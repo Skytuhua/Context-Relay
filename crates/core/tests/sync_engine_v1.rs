@@ -1271,6 +1271,7 @@ fn schema_17_retires_unbound_checkpoints_and_requests_a_fresh_scoped_pin() {
     let legacy_payload = decode_hex(include_str!("fixtures/checkpoint-schema17-v1.hex"));
     let legacy_hash = Sha256Digest(Sha256::digest(&legacy_payload).into());
     let raw = open_keyed(path.path(), &database_key);
+    support::remove_native_memory_migrations_after_schema_23(&raw);
     raw.execute_batch("DROP TABLE sync_checkpoint_scans;")
         .unwrap();
     raw.execute(

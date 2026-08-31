@@ -393,6 +393,7 @@ fn schema_13_upgrades_reopens_and_preserves_legacy_json_operations() {
     drop(vault);
 
     let raw = open_keyed(path.path(), &key);
+    support::remove_native_memory_migrations_after_schema_23(&raw);
     raw.execute_batch(
         "DROP TABLE recovery_restores;
          DROP TABLE recovery_enrollments;
@@ -829,6 +830,7 @@ fn schema_15_upgrades_to_latest_without_losing_existing_quarantine() {
     drop(vault);
 
     let raw = open_keyed(path.path(), &key);
+    support::remove_native_memory_migrations_after_schema_23(&raw);
     raw.execute_batch(
         "DROP TABLE recovery_restores;
          DROP TABLE recovery_enrollments;

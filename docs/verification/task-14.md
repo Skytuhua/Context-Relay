@@ -94,3 +94,17 @@ Clippy attempt was also not counted: the cross build stopped in `onig_sys` and
 vendored OpenSSL before reaching repository code because this host lacks the
 Windows C/OpenSSL build environment. Current public Windows CI or a physical
 Windows host must run that gate.
+
+## Schema 24/25 downgrade-fixture reconciliation
+
+The 2026-08-31 Task 16 broad sync run exposed stale historical-migration fixtures after the Task 14
+schema additions. RED evidence was deterministic: schema-16 and schema-17 upgrade tests replayed
+migration 24 into an already-present `native_memory_source_supersessions` table. The schema-16 test
+now constructs a genuine encrypted schema-16 database by applying migrations 1–16 in order. Tests
+that deliberately preserve later-created rows while emulating schemas 13–22 share one exact helper
+that removes the schema-24 supersession table and schema-25 managed-digest column before lowering
+`user_version`; it is never called by production code or a current-schema test.
+
+Focused GREEN includes the schema-16 checkpoint upgrade, schema-17 checkpoint retirement, all
+schema-filtered pairing/recovery/sync-Vault migrations, and the signed-sync schema-18 upgrade. This
+repair changes no production migration or Vault behavior.

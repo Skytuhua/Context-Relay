@@ -556,6 +556,7 @@ fn schema_21_rows_survive_schema_22_upgrade_and_material_plaintext_is_absent() {
     drop(vault);
     let key = keys.key(CREDENTIAL);
     let raw = open_keyed(path.path(), &key);
+    support::remove_native_memory_migrations_after_schema_23(&raw);
     raw.execute_batch(
         "DROP TABLE recovery_restores;
          DROP TABLE recovery_enrollments;",

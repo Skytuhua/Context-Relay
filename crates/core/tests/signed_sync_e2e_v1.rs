@@ -1016,6 +1016,7 @@ fn legacy_pending_typed_rehydration_covers_every_non_memory_upsert_kind() {
             .unwrap();
         drop(mismatch);
         let raw = open_keyed_vault(mismatch_path.path(), &mismatch_keys.key(CREDENTIAL));
+        support::remove_native_memory_migrations_after_schema_23(&raw);
         replace_materialized_payload(&raw, &changed_typed_mutation(mutation.clone()));
         raw.execute_batch(
             "DROP TABLE recovery_restores;
@@ -1263,6 +1264,7 @@ fn schema_18_upgrade_does_not_let_stale_sync_heads_claim_later_local_records() {
     drop(vault);
 
     let raw = open_keyed_vault(path.path(), &keys.key(CREDENTIAL));
+    support::remove_native_memory_migrations_after_schema_23(&raw);
     raw.execute_batch(
         "DROP TABLE recovery_restores;
          DROP TABLE recovery_enrollments;
@@ -2486,6 +2488,7 @@ fn open_keyed_vault(path: &std::path::Path, key: &[u8; 32]) -> Connection {
 
 fn downgrade_to_schema_18(path: &std::path::Path, keys: &MemoryKeyStore) {
     let raw = open_keyed_vault(path, &keys.key(CREDENTIAL));
+    support::remove_native_memory_migrations_after_schema_23(&raw);
     raw.execute_batch(
         "DROP TABLE recovery_restores;
          DROP TABLE recovery_enrollments;

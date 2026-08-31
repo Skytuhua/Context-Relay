@@ -30,6 +30,7 @@ use context_relay_protocol::{
     ScopeRef, Sha256Digest, SyncOperationV1, TaskId, TaskRecord, TaskStatus, WireNativeValue,
     WorkspaceId, XChaChaNonce,
 };
+use rusqlite::Connection;
 use zeroize::Zeroizing;
 
 pub const ID_1: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073981";
@@ -118,6 +119,15 @@ impl Drop for TempVault {
             let _ = fs::remove_file(format!("{}{}", self.0.display(), suffix));
         }
     }
+}
+
+pub fn remove_native_memory_migrations_after_schema_23(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP TABLE native_memory_source_supersessions;
+             ALTER TABLE native_memory_sources DROP COLUMN last_applied_managed_digest;",
+        )
+        .unwrap();
 }
 
 pub fn clock(physical_ms: u64) -> HybridLogicalClock {

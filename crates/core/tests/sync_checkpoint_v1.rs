@@ -413,24 +413,29 @@ fn schema_16_upgrades_through_workspace_checkpoints_and_durable_scans() {
     let keys = MemoryKeyStore::default();
     let key = [44; 32];
     keys.insert(CREDENTIAL, key);
-    drop(Vault::open(path.path(), CREDENTIAL, &keys).unwrap());
 
     let raw = open_keyed(path.path(), &key);
-    raw.execute_batch(
-        "DROP TABLE recovery_restores;
-         DROP TABLE recovery_enrollments;
-         DROP TABLE pairing_approval_transcripts;
-         DROP TABLE pairing_joins;
-         DROP TABLE pairing_decisions;
-         DROP TABLE device_certificates;
-         DROP TABLE sync_checkpoint_scans;
-         DROP TABLE sync_record_owners;
-         DROP TABLE sync_checkpoint_schedule;
-         DROP TABLE sync_checkpoint_pins;
-         DROP TABLE signed_sync_checkpoints;
-         PRAGMA user_version = 16;",
-    )
-    .unwrap();
+    for (version, migration) in (1_i64..).zip([
+        include_str!("../migrations/0001_vault.sql"),
+        include_str!("../migrations/0002_before_image_plans.sql"),
+        include_str!("../migrations/0003_native_transactions.sql"),
+        include_str!("../migrations/0004_offline_workspace.sql"),
+        include_str!("../migrations/0005_local_operation_bindings.sql"),
+        include_str!("../migrations/0006_local_operation_results.sql"),
+        include_str!("../migrations/0007_task_operation_bindings.sql"),
+        include_str!("../migrations/0008_task_transitions_and_handoff_queries.sql"),
+        include_str!("../migrations/0009_setup_cli_transactions.sql"),
+        include_str!("../migrations/0010_native_memory_reconciliation.sql"),
+        include_str!("../migrations/0011_native_hook_sessions.sql"),
+        include_str!("../migrations/0012_setup_native_memory_bindings.sql"),
+        include_str!("../migrations/0013_setup_native_memory_ownership.sql"),
+        include_str!("../migrations/0014_signed_sync.sql"),
+        include_str!("../migrations/0015_sync_quarantine.sql"),
+        include_str!("../migrations/0016_sync_rejections.sql"),
+    ]) {
+        raw.execute_batch(migration).unwrap();
+        raw.pragma_update(None, "user_version", version).unwrap();
+    }
     drop(raw);
 
     let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();

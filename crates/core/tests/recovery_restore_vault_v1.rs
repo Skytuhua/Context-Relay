@@ -444,6 +444,7 @@ fn schema_22_real_rows_migrate_forward_without_rewrite() {
     drop(Vault::open(path.path(), CREDENTIAL, &keys).unwrap());
 
     let raw = open_keyed(path.path(), &key);
+    support::remove_native_memory_migrations_after_schema_23(&raw);
     raw.execute(
         "INSERT INTO records(id, kind, scope_kind, project_id, archived, payload_json)
          VALUES ('legacy-record', 'memory', 'global', NULL, 0, x'010203')",

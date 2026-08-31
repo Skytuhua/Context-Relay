@@ -920,6 +920,7 @@ fn schema_19_reopens_to_latest_without_losing_existing_tables() {
     drop(Vault::open(path.path(), CREDENTIAL, &keys).unwrap());
 
     let raw = open_keyed(path.path(), &key);
+    support::remove_native_memory_migrations_after_schema_23(&raw);
     raw.execute_batch(
         "DROP TABLE recovery_restores;
          DROP TABLE recovery_enrollments;
@@ -961,6 +962,7 @@ fn schema_20_pairing_rows_become_terminal_legacy_unconfirmed_transcripts() {
     let decision_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073991";
     let join_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073992";
     let raw = open_keyed(path.path(), &key);
+    support::remove_native_memory_migrations_after_schema_23(&raw);
     raw.execute_batch(
         "PRAGMA foreign_keys = OFF;
          DROP TABLE recovery_restores;
@@ -1046,6 +1048,7 @@ fn schema_20_cross_role_pairing_collision_aborts_migration() {
 
     let pairing_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073993";
     let raw = open_keyed(path.path(), &key);
+    support::remove_native_memory_migrations_after_schema_23(&raw);
     raw.execute_batch(
         "PRAGMA foreign_keys = OFF;
          DROP TABLE recovery_restores;
