@@ -20,6 +20,28 @@ fn ntfs_security_metadata_uses_the_documented_file_object_apis() {
 }
 
 #[test]
+fn private_creation_acl_fixture_opens_a_security_read_handle() {
+    let source = include_str!("../src/native_fs/windows.rs");
+    let fixture = source
+        .split_once("fn private_creation_replaces_permissive_inherited_acl_with_owner_only_dacl()")
+        .and_then(|(_, suffix)| suffix.split_once("#[test]"))
+        .map(|(fixture, _)| fixture.split_whitespace().collect::<String>())
+        .expect("private creation ACL fixture source");
+
+    assert!(
+        fixture.contains(concat!(
+            "open_absolute_directory_with_access(&root,",
+            "FILE_TRAVERSE|FILE_READ_ATTRIBUTES|READ_CONTROL,)"
+        )),
+        "parent ACL inspection must explicitly open a handle with READ_CONTROL"
+    );
+    assert!(
+        !fixture.contains("security_descriptor(held.parent()"),
+        "traversal-only parent handles cannot be used to inspect ACLs"
+    );
+}
+
+#[test]
 fn ntfs_restore_preserves_optional_descriptor_components_and_validates_layout() {
     let source = include_str!("../src/native_fs/windows.rs");
     let capture = source

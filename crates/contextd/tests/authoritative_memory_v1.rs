@@ -1024,16 +1024,21 @@ fn materialize(root: &Path, files: &Map<String, Value>) {
 }
 
 fn materialize_substituting(root: &Path, files: &Map<String, Value>, project: &Path) {
+    let project = project.to_string_lossy();
     for (relative, body) in files {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            path,
-            body.as_str()
-                .unwrap()
-                .replace("$PROJECT", &project.to_string_lossy()),
-        )
-        .unwrap();
+        let body = body.as_str().unwrap();
+        let body = if relative.ends_with(".toml") {
+            // The quoted TOML key needs string escaping, unlike plain-text paths.
+            body.replace(
+                "\"$PROJECT\"",
+                &serde_json::to_string(project.as_ref()).unwrap(),
+            )
+        } else {
+            body.replace("$PROJECT", project.as_ref())
+        };
+        fs::write(path, body).unwrap();
     }
 }
 

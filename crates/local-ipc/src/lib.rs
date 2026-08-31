@@ -1,6 +1,8 @@
 mod auth;
 mod connection;
 mod frame;
+#[cfg(any(windows, test))]
+mod pipe_connect;
 mod transport;
 
 #[cfg(test)]

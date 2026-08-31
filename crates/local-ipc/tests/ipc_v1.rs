@@ -1462,6 +1462,37 @@ mod windows_transport_tests {
     }
 
     #[tokio::test]
+    async fn windows_transport_busy_instance_waits_for_the_next_accept() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let runtime = runtime();
+        let mut instance = InstanceGuard::acquire(&runtime).unwrap();
+        let mut listener = Listener::bind(&runtime, &mut instance).unwrap();
+        let _first = connect(&runtime).await.unwrap();
+
+        // The single published instance is occupied. A second connection must
+        // yield until accept publishes its replacement, not report permanent IO.
+        let second = connect(&runtime);
+        tokio::pin!(second);
+        assert!(
+            timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err()
+        );
+        let _accepted_first = listener.accept().await.unwrap();
+        let mut second = timeout(Duration::from_secs(5), second)
+            .await
+            .expect("replacement listener should become available")
+            .unwrap();
+        let mut accepted_second = listener.accept().await.unwrap();
+        second.write_all(b"next").await.unwrap();
+        let mut bytes = [0; 4];
+        accepted_second.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"next");
+    }
+
+    #[tokio::test]
     async fn windows_transport_round_trip_has_sid_name_and_protected_dacl() {
         let runtime = runtime();
         let endpoint = runtime.endpoint_name().unwrap();

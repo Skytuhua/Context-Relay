@@ -114,7 +114,7 @@ ignore-file byte count and digest above remain independently locked by workflow 
   Failing range and SHA-validation regressions preceded
   `db55e76aeb7f3b2e0ea42fe2caf64f7987f1bcad`; fresh review approved the full range.
 
-## Explicit execution-plane limits
+## Initial execution-plane limits (2026-08-10)
 
 - The repaired stack has not yet run on GitHub-hosted Windows x64 or macOS arm64. Workflow
   expansion, actual Win32 behavior, hydrated Osemgrep timing/cleanup, the canonical APFS fixture,
@@ -129,3 +129,67 @@ ignore-file byte count and digest above remain independently locked by workflow 
   release evidence was created by this stabilization work.
 - This ledger establishes local pre-publication evidence only. It does not complete Tasks 15–24,
   clear any release blocker, authorize a push/merge, or replace two clean physical release runs.
+
+## Windows follow-up (2026-08-31)
+
+The initial remote-execution gap above is superseded by
+[run 33357305605](https://github.com/Skytuhua/Context-Relay/actions/runs/33357305605)
+at `89d832b`. Both native builds, both strict Rust lint jobs, macOS Rust tests,
+macOS native isolation, and both candidate native Semgrep builds passed. Windows
+Rust tests and Windows native isolation failed; downstream native publication
+was skipped. This is not an all-green run, and PR #12 must remain draft.
+
+### Root causes and focused repairs
+
+| Boundary | Reproduction | Repair |
+| --- | --- | --- |
+| Windows IPC under concurrent connection load | The transport called `ClientOptions::open` once and mapped `ERROR_PIPE_BUSY` to permanent `Io`. The real 64-call test then waited without a deadline for calls that never reached the worker. Two portable regressions failed before the retry implementation. | Retry only busy opens at 50 ms intervals under one five-second deadline; preserve missing/denied errors and never replay an authenticated request. Add a Windows test that occupies one pipe instance and connects the next client while accept publishes the replacement. Bound the 64-call test's enqueue/completion waits and release its worker on panic. |
+| Codex setup fixtures | Both Windows setup-chain tests failed in the incomplete Rust run. Independently, parsing the frozen fixture after inserting `C:\Users\runner\project with spaces` failed with an invalid Unicode escape. | Serialize the complete quoted TOML project key rather than inserting unescaped path bytes. Preserve plain-text substitution. Regressions cover drive, verbatim, UNC, Unicode, spaces, quoted paths, and silently misdecoded escape sequences in both core fixture helpers. |
+| Windows ACL inspection fixture | Job `99395540076` first failed at `windows.rs:2546`: `security_descriptor(held.parent().unwrap())`, before private-file creation. Seven later failures were mutex-poison cascades. | Open a separate test-only parent handle with `READ_CONTROL` for `GetSecurityInfo`. Keep production traversal handles and owner-only creation checks unchanged. A source-contract regression failed before this repair. |
+
+The pipe behavior is documented by
+[Tokio's client options](https://docs.rs/tokio/latest/tokio/net/windows/named_pipe/struct.ClientOptions.html#method.open).
+The ACL handle requirement is documented by
+[Microsoft's GetSecurityInfo contract](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo).
+Context7 returned the same Tokio busy-pipe guidance; no authentication configuration was changed.
+
+Local verification is macOS execution plus Windows cross-compilation, not Win32
+runtime evidence. The first post-repair macOS MCP end-to-end run passed all ten
+tests, including real sockets, setup/watch/review, cancellation, and the 64-call
+case. Both local IPC and native-runner Windows all-target checks passed. The
+three native ACL source contracts passed. The full candidate's clean Windows
+runtime checks remain a mandatory next gate; no tests or security checks were
+disabled to obtain these results.
+
+The complete local IPC suite subsequently passed 46 unit tests and 28 integration
+tests on macOS, including six portable retry/cancellation regressions. Strict
+Windows-target Clippy passed for local IPC and native-runner; macOS all-target
+Clippy passed for MCP/native-runner with the ordinary MCP test-support feature.
+An independent scoped review found no actionable issues and approved the changes
+for candidate CI only, explicitly not for merge. T07 is returned to `partial`
+until the Windows runtime repair has authoritative evidence.
+
+Final targeted results (Rust 1.97.1, macOS arm64):
+
+| Command after `cargo +1.97.1` | Passed |
+| --- | ---: |
+| `test -p context-relay-local-ipc --all-targets --features test-support` | 46 unit + 28 integration |
+| `test -p context-relay-core --features test-support --test codex_adapter_v1 --test primary_memory_setup_v1` | 66 + 9 |
+| `test -p context-relay-context-mcp --features test-support --test end_to_end_v1 -- --nocapture` | 10 |
+| `test -p context-relay-contextd --features test-support --test authoritative_memory_v1 -- --nocapture` | 4 |
+| `test -p context-relay-native-runner --test native_fs_windows_security_api_v1` | 3 |
+
+These are 166 distinct targeted cases, not a clean full-workspace or release
+claim. The daemon memory suite initially had three `Transport` failures inside
+the restricted sandbox; its unchanged rerun with real local-socket access
+passed all four cases. Its printed simulated Hermes-commit panic is intentional
+fault injection and the test passes. The MCP suite was repeated after all four
+fixture helpers were repaired and again passed all ten cases. Scoped formatting
+and whitespace checks passed. Pending local Task 17 edits were present during
+these runs but will not be included in this repair commit; clean-checkout CI
+must verify the committed candidate independently.
+
+The unfinished Task 17 hosted account-lifecycle implementation is deliberately
+excluded from these stabilization changes. No hosted migration, production
+configuration, signing, publication, or release action is authorized by this
+evidence.

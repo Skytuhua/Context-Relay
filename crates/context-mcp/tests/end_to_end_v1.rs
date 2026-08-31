@@ -191,6 +191,16 @@ struct StartedServer {
     task: JoinHandle<Result<(), BridgeError>>,
 }
 
+// A failed assertion must not leave the blocking vault worker held while the
+// Tokio test runtime waits for it during teardown.
+struct ReleaseWorkerOnDrop(Arc<TestWorkerGate>);
+
+impl Drop for ReleaseWorkerOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 impl StartedServer {
     async fn start(daemon: LocalDaemon, binding: McpBinding) -> Self {
         let (input, input_reader) = tokio::io::duplex(256 * 1024);
@@ -230,7 +240,11 @@ impl StartedServer {
 
     async fn receive(&mut self) -> Value {
         let mut line = String::new();
-        assert_ne!(self.output.read_line(&mut line).await.unwrap(), 0);
+        let read = tokio::time::timeout(REQUEST_TIMEOUT, self.output.read_line(&mut line))
+            .await
+            .expect("the MCP server must return a response before the test deadline")
+            .unwrap();
+        assert_ne!(read, 0);
         assert!(line.ends_with('\n'));
         assert!(!line.contains('\r'));
         serde_json::from_str(&line).unwrap()
@@ -1145,6 +1159,7 @@ async fn native_hooks_persist_only_allowlisted_fields_across_every_output_bounda
 async fn sixty_four_real_calls_and_cancellations_fit_below_the_daemon_cap() {
     let fixture = Fixture::new();
     let gate = Arc::new(TestWorkerGate::new());
+    let _release_worker = ReleaseWorkerOnDrop(gate.clone());
     let gated = fixture.daemon.clone().with_worker_gate(gate.clone());
     let (handle, owner) = start_daemon(&gated).await;
     let local = fixture.local_daemon();
@@ -1153,7 +1168,12 @@ async fn sixty_four_real_calls_and_cancellations_fit_below_the_daemon_cap() {
     for id in 0..MAX_IN_FLIGHT_TOOL_CALLS {
         server.send(status_call(json!(id))).await;
     }
-    gate.wait_until_enqueued(MAX_IN_FLIGHT_TOOL_CALLS).await;
+    tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        gate.wait_until_enqueued(MAX_IN_FLIGHT_TOOL_CALLS),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("only {} of 64 calls reached the daemon", gate.enqueued()));
     assert_eq!(gate.enqueued(), MAX_IN_FLIGHT_TOOL_CALLS);
     for id in 0..MAX_IN_FLIGHT_TOOL_CALLS {
         server
@@ -1171,9 +1191,12 @@ async fn sixty_four_real_calls_and_cancellations_fit_below_the_daemon_cap() {
     .await;
 
     gate.release();
-    local
-        .wait_for_test_call_completions(MAX_IN_FLIGHT_TOOL_CALLS)
-        .await;
+    tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        local.wait_for_test_call_completions(MAX_IN_FLIGHT_TOOL_CALLS),
+    )
+    .await
+    .expect("all admitted MCP calls must complete after releasing the worker");
     server.close().await;
     stop_daemon(handle, owner).await;
     all_canceled.expect("the daemon connection cap must admit every cancellation");
@@ -1406,17 +1429,21 @@ fn materialize_json(root: &Path, files: &Map<String, Value>) {
 }
 
 fn materialize_json_substituting(root: &Path, files: &Map<String, Value>, project: &Path) {
+    let project = project.to_string_lossy();
     for (relative, contents) in files {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            path,
-            contents
-                .as_str()
-                .unwrap()
-                .replace("$PROJECT", &project.to_string_lossy()),
-        )
-        .unwrap();
+        let contents = contents.as_str().unwrap();
+        let contents = if relative.ends_with(".toml") {
+            // The quoted TOML key needs string escaping, unlike plain-text paths.
+            contents.replace(
+                "\"$PROJECT\"",
+                &serde_json::to_string(project.as_ref()).unwrap(),
+            )
+        } else {
+            contents.replace("$PROJECT", project.as_ref())
+        };
+        std::fs::write(path, contents).unwrap();
     }
 }
 

@@ -1130,12 +1130,55 @@ fn materialize_json(root: &Path, files: &Map<String, Value>) {
 }
 
 fn materialize_json_substituting(root: &Path, files: &Map<String, Value>, project: &Path) {
+    let project = project.to_string_lossy();
     for (relative, body) in files {
-        let body = body
-            .as_str()
-            .unwrap()
-            .replace("$PROJECT", &project.display().to_string());
+        let body = body.as_str().unwrap();
+        let body = if relative.ends_with(".toml") {
+            // The quoted TOML key needs string escaping, unlike plain-text paths.
+            body.replace(
+                "\"$PROJECT\"",
+                &serde_json::to_string(project.as_ref()).unwrap(),
+            )
+        } else {
+            body.replace("$PROJECT", project.as_ref())
+        };
         seed(root.join(relative), body.as_bytes());
+    }
+}
+
+#[test]
+fn fixture_project_substitution_preserves_windows_paths_in_toml() {
+    let frozen: Value = serde_json::from_str(include_str!("fixtures/codex-0.144.1.json")).unwrap();
+    let mut files = frozen["codexHome"].as_object().unwrap().clone();
+    files.insert("project.txt".to_owned(), json!("Project: \"$PROJECT\"\n"));
+    for project in [
+        r"C:\Users\runner\project with spaces",
+        r"C:\temp\repo",
+        r"\\?\C:\Users\runner\project with spaces",
+        r"\\server\share\project",
+        r"\\?\UNC\server\share\專案",
+        r"C:\使用者\專案 α",
+        "/tmp/project with \"quotes\"",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        materialize_json_substituting(temp.path(), &files, Path::new(project));
+        let config = fs::read_to_string(temp.path().join("config.toml")).unwrap();
+        let document = config
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap_or_else(|error| panic!("fixture TOML must parse for {project:?}: {error}"));
+        let projects = document["projects"].as_table().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(
+            projects
+                .get(project)
+                .and_then(|entry| entry["trust_level"].as_str()),
+            Some("trusted"),
+            "project key must round-trip exactly for {project:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("project.txt")).unwrap(),
+            format!("Project: \"{project}\"\n")
+        );
     }
 }
 

@@ -2415,7 +2415,7 @@ mod pre_rename_tests {
             GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, INHERITED_ACE,
             OBJECT_INHERIT_ACE, SE_DACL_PRESENT, SE_DACL_PROTECTED,
         },
-        Storage::FileSystem::FILE_ALL_ACCESS,
+        Storage::FileSystem::{FILE_ALL_ACCESS, READ_CONTROL},
     };
 
     const TEST_NONCE: [u8; 16] = [0x3c; 16];
@@ -2541,11 +2541,17 @@ mod pre_rename_tests {
         assert!(status.success(), "failed to install permissive parent ACL");
 
         let path = root.join("AGENTS.md");
-        let held = HeldPath::new(&path).unwrap();
+        // GetSecurityInfo requires READ_CONTROL; HeldPath's traversal handles
+        // deliberately carry only traversal and file-attribute read access.
+        let parent = open_absolute_directory_with_access(
+            &root,
+            FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL,
+        )
+        .expect("open parent for ACL inspection");
         assert!(descriptor_has_inheritable_world_access(
-            &security_descriptor(held.parent().unwrap()).unwrap()
+            &security_descriptor(&parent).expect("read permissive parent ACL")
         ));
-        drop(held);
+        drop(parent);
 
         let before = snapshot(&path).unwrap();
         let metadata = metadata_for_new_private_file(&path).unwrap();
