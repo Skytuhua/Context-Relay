@@ -15,4 +15,3 @@ const dependencies = createSupabaseAccountLifecycleDependencies({
 const handler = createAccountLifecycleEdgeHandler(dependencies);
 
 Deno.serve(handler);
-
