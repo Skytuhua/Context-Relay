@@ -395,7 +395,14 @@ fn validated_components(
 
 fn validate_name(name: &OsStr, require_nfc: bool) -> Result<(), RunnerError> {
     let units = name.encode_wide().collect::<Vec<_>>();
-    let text = String::from_utf16(&units).map_err(|_| RunnerError::InvalidPath)?;
+    // A WTF-16 name that is not valid Unicode (isolated surrogates) is a
+    // legal NTFS filename and must reach the snapshot boundary: it has no
+    // alternative normalization form, and it cannot equal a pure-ASCII
+    // reserved stem or internal recovery pattern. The lossy text below
+    // replaces such units with U+FFFD, so the ASCII-only pattern checks
+    // still fail closed for them.
+    let text = String::from_utf16_lossy(&units);
+    let is_lossless = String::from_utf16(&units).is_ok();
     if units.is_empty()
         || units.len() > 255
         || units.contains(&0)
@@ -419,7 +426,7 @@ fn validate_name(name: &OsStr, require_nfc: bool) -> Result<(), RunnerError> {
         || text == "."
         || text == ".."
         || internal_recovery_name(&text)
-        || (require_nfc && text.nfc().ne(text.chars()))
+        || (require_nfc && is_lossless && text.nfc().ne(text.chars()))
         || reserved_windows_name(&text)
     {
         return Err(RunnerError::InvalidPath);
@@ -3596,11 +3603,57 @@ fn stream_object_name(file_name: &OsStr, stream_name: &str) -> Result<OsString, 
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::OsStr,
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
+
+    #[test]
+    fn validate_name_accepts_wtf16_non_scalar_names_and_keeps_ascii_gates() {
+        use std::{
+            ffi::OsString,
+            os::windows::ffi::{OsStrExt as _, OsStringExt as _},
+        };
+
+        let wide = |units: &[u16]| OsString::from_wide(units);
+        let lone_surrogate = wide(&[
+            b'm' as u16,
+            b'e' as u16,
+            b'm' as u16,
+            0xd800,
+            b'.' as u16,
+            b'm' as u16,
+            b'd' as u16,
+        ]);
+        assert_eq!(validate_name(lone_surrogate.as_os_str(), true), Ok(()));
+
+        let paired = OsStr::new("memory-\u{1f600}.md");
+        assert_eq!(validate_name(paired, true), Ok(()));
+
+        // Security gates stay unit-based and independent of Unicode
+        // validity: control characters, forbidden punctuation, trailing
+        // separators, traversal, and reserved stems reject regardless of
+        // surrogates.
+        let with_control = wide(&[b'a' as u16, 0xd800, 0x01, b'.' as u16, b'm' as u16]);
+        assert_eq!(
+            validate_name(with_control.as_os_str(), true),
+            Err(RunnerError::InvalidPath)
+        );
+        let with_forbidden = wide(&[b'a' as u16, 0xd800, b'|' as u16, b'.' as u16, b'm' as u16]);
+        assert_eq!(
+            validate_name(with_forbidden.as_os_str(), true),
+            Err(RunnerError::InvalidPath)
+        );
+        let traversal = wide(&[b'.' as u16, b'.' as u16]);
+        assert_eq!(
+            validate_name(traversal.as_os_str(), true),
+            Err(RunnerError::InvalidPath)
+        );
+        // Keep the wide encoder import exercised for future unit edits.
+        let _ = lone_surrogate.as_os_str().encode_wide().count();
+    }
 
     #[test]
     fn pinned_directory_opens_and_verifies_a_handle_relative_child() {
