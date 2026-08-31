@@ -210,6 +210,34 @@ commands, and host limitations are recorded in the
 checkout CI on `a3c5982` (runs 33424905936/33424905907/33424905774) remains
 the mandatory gate; do not treat this local evidence as green.
 
+### UPDATE 2026-08-31 (third pass): newly exposed WTF-16 failure repaired at `a69f47c`
+
+Hosted CI on `a3c5982` confirmed the repair: `end_to_end_v1` passed 10/10 on
+Windows and Secret Scan plus Supabase contract runs were green. The verifier
+then advanced exactly as the handoff predicted — with `context-mcp` no longer
+stopping the run, later workspace binaries executed for the first time, and
+one latent failure surfaced in the `contextd` lib suite:
+
+`native_memory::tests::windows_wtf16_source_reaches_the_native_snapshot_boundary`
+failed with `UnsupportedTopology`. This test has no passing Windows CI history
+(it never ran at `435367d`; the failure reproduces on that baseline). Root
+cause: `native-runner` `validate_name` rejected every non-scalar WTF-16 name
+(isolated surrogates are legal NTFS filenames) via `String::from_utf16`.
+
+PR #12 head advanced additively to `a69f47c` (“fix: accept WTF-16 non-scalar
+component names in native path policy”). `validate_name` now applies the NFC
+check only when the units are valid Unicode; a non-scalar name has no
+alternative normalization form and cannot equal a pure-ASCII reserved stem or
+internal recovery pattern. All unit-level gates are unchanged: control
+characters, forbidden punctuation, embedded NUL, over-length names, trailing
+dot/space, and traversal still reject. Local Windows runtime evidence: the
+contextd lib suite passes **57/57** on this host (it failed 56+1 on CI at
+`a3c5982`), and a focused regression pins both acceptance and the unchanged
+ASCII gates. Ledger updated in the same commits. Subsequent clean-checkout CI
+on `a69f47c` is the mandatory gate; further never-reached Windows suites may
+still surface similar latent failures — same diagnose/fix/verify pattern
+applies.
+
 Prior run [33357305605](https://github.com/Skytuhua/Context-Relay/actions/runs/33357305605)
 at `89d832b` had a six-hour Windows ordinary-test timeout and failed Windows
 native-isolation. Those are the reasons for `435367d`; prior green native builds

@@ -193,3 +193,37 @@ The unfinished Task 17 hosted account-lifecycle implementation is deliberately
 excluded from these stabilization changes. No hosted migration, production
 configuration, signing, publication, or release action is authorized by this
 evidence.
+
+## Windows follow-up: WTF-16 component name repair (2026-08-31, third pass)
+
+Hosted confirmation of the second pass at `a3c5982` (run 33424905936):
+`end_to_end_v1` passed **10/10** on Windows, Secret Scan and Supabase contract
+runs green; the only failure was one newly reached suite. With the run no
+longer stopping at `context-mcp`, later workspace binaries executed for the
+first time, and `contextd` lib test
+`windows_wtf16_source_reaches_the_native_snapshot_boundary` failed with
+`UnsupportedTopology`. The failure reproduces on the unmodified `435367d`
+tree (verified in a temporary worktree), so it is a latent gap newly exposed,
+not a regression of the verbatim repair.
+
+Root cause: `native-runner` `validate_name` began with
+`String::from_utf16(...).map_err(|_| InvalidPath)`, rejecting every
+non-scalar WTF-16 name. Isolated surrogates are legal NTFS filenames, and the
+daemon's own contract test requires such a native memory file to reach the
+snapshot boundary with its bytes preserved.
+
+Repair (`a69f47c`): `validate_name` converts once with a lossy conversion and
+applies the NFC check only when the units are valid Unicode. A non-scalar
+name has no alternative normalization form, and it cannot equal a pure-ASCII
+reserved stem or internal recovery pattern, so no additional unit-level check
+is required to keep those gates closed. All other gates are unchanged:
+control characters, forbidden punctuation, embedded NUL, over-length names,
+trailing dot/space, `.`/`..`, and reserved/internal ASCII names still reject.
+
+Windows x64 runtime evidence: contextd lib suite passes **57/57** locally
+(failed 56+1 on CI at `a3c5982`); new regression
+`validate_name_accepts_wtf16_non_scalar_names_and_keeps_ascii_gates` pins
+both lone-surrogate acceptance (plus a valid paired emoji name) and unchanged
+rejection of control characters, forbidden punctuation, and traversal under
+surrogates. Clean-checkout CI on `a69f47c` remains the mandatory gate;
+further never-reached Windows suites may still expose similar latent failures.
