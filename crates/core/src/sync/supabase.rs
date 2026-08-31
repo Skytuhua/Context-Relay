@@ -55,6 +55,24 @@ pub struct SupabaseHttpRequest {
     body: Vec<u8>,
 }
 
+impl SupabaseHttpRequest {
+    pub(crate) fn new(
+        method: SupabaseHttpMethod,
+        url: String,
+        headers: Vec<(String, String)>,
+        timeout: Duration,
+        body: Vec<u8>,
+    ) -> Self {
+        Self {
+            method,
+            url,
+            headers,
+            timeout,
+            body,
+        }
+    }
+}
+
 #[cfg(feature = "test-support")]
 impl SupabaseHttpRequest {
     pub const fn method(&self) -> SupabaseHttpMethod {
@@ -92,6 +110,16 @@ impl Drop for SupabaseHttpRequest {
 pub struct SupabaseHttpResponse {
     status: u16,
     body: Vec<u8>,
+}
+
+impl SupabaseHttpResponse {
+    pub(crate) const fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub(crate) fn body(&self) -> &[u8] {
+        &self.body
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -153,13 +181,15 @@ impl SupabaseRetryRuntime for SystemRetryRuntime {
     }
 }
 
-struct ReqwestHttpClient {
+pub(crate) struct ReqwestHttpClient {
     client: Client,
 }
 
 impl ReqwestHttpClient {
-    fn new() -> Result<Self, TransportError> {
+    pub(crate) fn new() -> Result<Self, TransportError> {
         let client = Client::builder()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .tls_backend_rustls()
@@ -271,6 +301,18 @@ impl SupabaseTransportConfig {
             publishable_key: Zeroizing::new(publishable_key),
             access_token: Zeroizing::new(access_token),
         })
+    }
+
+    pub(crate) fn project_url(&self) -> &Url {
+        &self.project_url
+    }
+
+    pub(crate) fn publishable_key(&self) -> &str {
+        &self.publishable_key
+    }
+
+    pub(crate) fn access_token(&self) -> &str {
+        &self.access_token
     }
 }
 

@@ -1,3 +1,4 @@
+pub mod account_lifecycle;
 pub mod crypto;
 pub mod identity;
 #[cfg(feature = "test-support")]
@@ -10,4 +11,5 @@ pub mod recovery_restore;
 pub mod recovery_restore_crypto;
 pub mod recovery_restore_transport;
 pub mod recovery_transport;
+pub mod supabase_account_lifecycle;
 pub mod transport;
