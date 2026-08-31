@@ -617,3 +617,35 @@ fn windows_mutation_targets_do_not_apply_full_unicode_case_expansion() {
     distinct.mutations.insert(1, double_s);
     assert!(approval_hash_v1(&distinct).is_ok());
 }
+
+#[test]
+fn windows_mutation_targets_accept_the_canonical_verbatim_prefix() {
+    // Layouts are canonicalized with std::fs::canonicalize, which carries the
+    // \\?\ verbatim prefix on Windows. A plan built from those canonical paths
+    // must approve exactly like its plain drive form.
+    let mut candidate = plan();
+    candidate.mutations[0].target = native_text(r"\\?\C:\Users\test\.codex\AGENTS.md");
+    assert!(approval_hash_v1(&candidate).is_ok());
+
+    // The verbatim and plain forms of one path are the same target: mixed
+    // plans must still fail closed as duplicates.
+    let mut alias = plan();
+    alias.mutations[0].target = native_text(r"C:\Users\test\.codex\AGENTS.md");
+    let mut mixed = candidate;
+    mixed.mutations.insert(1, alias.mutations.remove(0));
+    assert!(approval_hash_v1(&mixed).is_err());
+}
+
+#[test]
+fn windows_mutation_targets_reject_the_verbatim_device_and_unc_forms() {
+    // \\.\ device paths were never canonical filesystem targets and stay
+    // rejected; UNC canonicalization remains out of scope and rejected.
+    for target in [
+        r"\\.\C:\Users\test\.codex\AGENTS.md",
+        r"\\?\UNC\server\share\AGENTS.md",
+    ] {
+        let mut candidate = plan();
+        candidate.mutations[0].target = native_text(target);
+        assert!(approval_hash_v1(&candidate).is_err(), "{target}");
+    }
+}

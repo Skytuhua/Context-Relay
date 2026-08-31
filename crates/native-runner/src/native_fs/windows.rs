@@ -352,8 +352,18 @@ fn validated_components(
     path: &Path,
     require_nfc: bool,
 ) -> Result<(PathBuf, Vec<OsString>), RunnerError> {
-    let raw = path.as_os_str().encode_wide().collect::<Vec<_>>();
-    if raw.len() < 4
+    let owned_raw = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let mut raw = owned_raw.as_slice();
+    // std::fs::canonicalize produces \\?\-prefixed drive paths. Layouts are
+    // canonicalized before they reach this boundary, so accept exactly that
+    // verbatim form alongside the plain drive form; it skips Win32
+    // normalization, which is strictly safer, not less. Device paths (\\.\)
+    // and UNC forms stay rejected.
+    const VERBATIM_PREFIX: [u16; 4] = [0x5C, 0x5C, 0x3F, 0x5C]; // \, \, ?, \
+    if raw.len() >= VERBATIM_PREFIX.len() && raw[..VERBATIM_PREFIX.len()] == VERBATIM_PREFIX {
+        raw = &raw[VERBATIM_PREFIX.len()..];
+    }
+    if raw.len() < 3
         || raw.len() > MAX_WIN32_PATH_UNITS
         || !(u16::from(b'A')..=u16::from(b'Z')).contains(&raw[0])
         || raw[1] != u16::from(b':')
@@ -2788,6 +2798,53 @@ mod pre_rename_tests {
         drop(parent);
         drop(held);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn canonical_verbatim_paths_snapshot_like_plain_paths() {
+        let _serial = PRE_RENAME_TEST_SERIAL.lock().unwrap();
+        let plain_root = test_root("verbatim-canonical-path");
+        // Layouts are built from std::fs::canonicalize output, which carries
+        // the \\?\ verbatim prefix on Windows. The snapshot boundary must
+        // accept that canonical form exactly like the plain drive form.
+        let root = fs::canonicalize(&plain_root).unwrap();
+        assert_eq!(
+            root.as_os_str().encode_wide().take(4).collect::<Vec<_>>(),
+            [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16],
+            "canonicalize must produce a verbatim path for this regression to bind"
+        );
+
+        let path = root.join("config.toml");
+        fs::write(&path, b"[projects]\n").unwrap();
+        let captured = snapshot(&path).unwrap();
+        let NativeState::RegularFile { bytes, .. } = captured.state() else {
+            panic!("verbatim snapshot must read the regular file")
+        };
+        assert_eq!(bytes, b"[projects]\n");
+
+        let absent = root.join("AGENTS.override.md");
+        let snapshot_absent = snapshot(&absent).unwrap();
+        assert!(matches!(
+            snapshot_absent.state(),
+            NativeState::Absent { .. }
+        ));
+
+        // The verbatim device form must stay rejected: it is not a canonical
+        // filesystem path and was never accepted by the snapshot boundary.
+        let device = PathBuf::from(format!(
+            "\\\\.\\{}",
+            root.to_string_lossy().trim_start_matches(r"\\?\")
+        ));
+        assert!(matches!(
+            HeldPath::new(&device),
+            Err(RunnerError::InvalidPath)
+        ));
+
+        // Plain drive paths keep working.
+        let plain = plain_root.join("config.toml");
+        assert!(snapshot(&plain).is_ok());
+
+        fs::remove_dir_all(&plain_root).unwrap();
     }
 
     #[test]

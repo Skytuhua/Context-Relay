@@ -717,6 +717,18 @@ fn windows_target_key(bytes: &[u8]) -> Result<String, ApprovalError> {
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect::<Vec<_>>();
+    // Layouts and mutation targets are canonicalized with
+    // std::fs::canonicalize, which carries the \\?\ verbatim prefix on
+    // Windows. Accept exactly that prefix (it skips Win32 normalization and is
+    // strictly safer); device (\\.\) and UNC forms stay rejected.
+    const VERBATIM_PREFIX: [u16; 4] = [0x5C, 0x5C, 0x3F, 0x5C]; // \, \, ?, \
+    let units = if units.len() >= VERBATIM_PREFIX.len()
+        && units[..VERBATIM_PREFIX.len()] == VERBATIM_PREFIX
+    {
+        units[VERBATIM_PREFIX.len()..].to_vec()
+    } else {
+        units
+    };
     if units.len() < 4
         || units.len() > 259
         || !(u16::from(b'A')..=u16::from(b'Z')).contains(&units[0])

@@ -193,3 +193,64 @@ The unfinished Task 17 hosted account-lifecycle implementation is deliberately
 excluded from these stabilization changes. No hosted migration, production
 configuration, signing, publication, or release action is authorized by this
 evidence.
+
+## Windows follow-up: canonical verbatim path repair (2026-08-31, second pass)
+
+Diagnosis of the two remaining `context-mcp/end_to_end_v1` Windows failures at
+`435367d` (run 33384463445, job 99463842162) was completed on a real Windows
+x64 host (Rust 1.97.1 MSVC), which reproduced both failures locally before any
+repair. Both have one class of root cause: two independent Windows path-policy
+implementations rejected the `\\?\` verbatim prefix that
+`std::fs::canonicalize` produces. Adapter layouts are canonicalized before
+they reach these boundaries, so every canonical Codex layout path failed.
+
+| Boundary | Failure at `435367d` | Repair |
+| --- | --- | --- |
+| `native-runner` `validated_components` (`HeldPath::new`) | `OsNativeFileSystem::snapshot` returned `InvalidPath` for verbatim paths; `codex.rs` `read_optional_file` mapped it to `InvalidRequest "Codex configuration has unsafe topology or state"`, which surfaced both as the line-685 unwrap and as `InvalidRequest` instead of `HarnessUnsupported` at line 802 (the same read error preceded the blocked-capability mapping). | Accept exactly the `\\?\` prefix before the drive-letter check. Device (`\\.\`), UNC, traversal, reserved-name, reparse, and all name checks are unchanged; verbatim form skips Win32 normalization, so acceptance is strictly safer. |
+| `core` `native_transaction::approval::windows_target_key` | After the first repair, `production_setup_watcher…` moved past topology reads and failed with `InvalidRequest "Bridge preview plan is invalid"`: mutation targets carry verbatim paths and `approval_hash_v2` rejected them as "mutation target is not a canonical absolute path". | Same prefix acceptance; verbatim and plain forms of one path now normalize to the same deduplication key, so mixed-form plans still fail closed as duplicates. Device and UNC forms remain rejected. |
+
+Regression evidence, all executed on the Windows x64 host:
+
+- New `native-runner` test `canonical_verbatim_paths_snapshot_like_plain_paths`
+  failed (`InvalidPath`) before the repair and passes after, including absent
+  targets under verbatim parents, `\\.\` rejection, and plain-path parity.
+- New `native_approval_v1` tests
+  `windows_mutation_targets_accept_the_canonical_verbatim_prefix` (verbatim
+  plan approved; verbatim/plain aliasing still detected as duplicate) and
+  `windows_mutation_targets_reject_the_verbatim_device_and_unc_forms` failed
+  before the approval repair and pass after.
+- `cargo test -p context-relay-context-mcp --features
+  context-relay-context-mcp/test-support --test end_to_end_v1` now passes
+  **10/10** on Windows, including both previously failing cases. Before the
+  repairs it failed 8 passed / 2 failed with the CI messages; after repair #1
+  only, it was 9 passed / 1 failed with `InvalidRequest "Bridge preview plan
+  is invalid"`.
+- `native_approval_v1` 22 passed; `native_approval_v2` 18 passed;
+  `native-runner` pre-rename suite 25 passed with
+  `--skip private_creation_replaces_permissive_inherited_acl_with_owner_only_dacl`;
+  core `codex::tests::effective_validation…` passes on Windows.
+- `cargo fmt --all -- --check` clean; scoped `cargo clippy -p
+  context-relay-native-runner --all-targets -- -D warnings` clean.
+
+Host-specific limits of the local run, recorded to prevent over-claiming:
+
+- `private_creation_replaces_permissive_inherited_acl_with_owner_only_dacl`
+  (`icacls`-driven) fails on this host even on the unmodified `435367d` tree
+  and poisons the shared test mutex, cascading to seven later cases. It is a
+  pre-existing local-environment limitation, not a product regression; the
+  repair commit does not touch ACL code. Windows CI remains authoritative for
+  it.
+- Three `claude_code::tests::effective_validation…` cases also fail on the
+  unmodified baseline on this host: their fixture writes a `claude-bin` file
+  without an `.exe` extension or PE bytes, which the Windows-only native
+  executable checks correctly reject. This is a pre-existing test-fixture gap
+  in the Claude Code adapter's own test module, out of scope for this repair.
+- The vendored SQLCipher/OpenSSL build on this host requires Strawberry perl
+  (`export PATH="/c/Strawberry/perl/bin:$PATH"`); recorded because plain
+  git-bash perl cannot configure OpenSSL.
+
+The run at `435367d` only executed the `context-mcp` test binaries before
+stopping, so core/contextd suites have no Windows execution evidence there;
+the repairs above provide the first targeted Windows runtime evidence for
+those paths. Clean-checkout CI on the repair commit remains the mandatory
+gate; local runs do not replace it.
