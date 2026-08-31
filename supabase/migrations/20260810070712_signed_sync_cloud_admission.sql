@@ -15,6 +15,46 @@ begin
 end;
 $$;
 
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_catalog.pg_roles
+    where rolname = 'context_relay_rls_owner'
+  ) then
+    raise exception using
+      errcode = '42704',
+      message = 'context_relay_rls_owner is missing';
+  end if;
+
+  if exists (
+    select 1
+    from pg_catalog.pg_roles as owner_role
+    where owner_role.rolname = 'context_relay_rls_owner'
+      and (
+        owner_role.rolcanlogin
+        or owner_role.rolinherit
+        or owner_role.rolsuper
+        or owner_role.rolbypassrls
+        or owner_role.rolcreatedb
+        or owner_role.rolcreaterole
+        or owner_role.rolreplication
+      )
+  ) then
+    raise exception using
+      errcode = '42501',
+      message = 'context_relay_rls_owner has unsafe attributes';
+  end if;
+end
+$$;
+
+grant context_relay_rls_owner to current_user with inherit false, set true;
+grant create on schema public to context_relay_rls_owner;
+grant usage on schema realtime to context_relay_rls_owner;
+grant execute on function realtime.send(jsonb, text, text, boolean)
+to context_relay_rls_owner;
+set local role context_relay_rls_owner;
+
 alter table public.sync_operations
   add column canonical_sha256 bytea;
 alter table public.sync_operations
@@ -1138,10 +1178,6 @@ from public, anon, authenticated, service_role;
 grant execute on function public.service_append_sync_checkpoint(uuid, uuid, jsonb)
 to service_role;
 
-grant usage on schema realtime to context_relay_rls_owner;
-grant execute on function realtime.send(jsonb, text, text, boolean)
-to context_relay_rls_owner;
-
 create function public.service_send_sync_hint(p_account_id uuid)
 returns jsonb
 language plpgsql
@@ -1179,3 +1215,7 @@ revoke all on function public.service_send_sync_hint(uuid)
 from public, anon, authenticated, service_role;
 grant execute on function public.service_send_sync_hint(uuid)
 to service_role;
+
+reset role;
+revoke create on schema public from context_relay_rls_owner;
+revoke context_relay_rls_owner from current_user;

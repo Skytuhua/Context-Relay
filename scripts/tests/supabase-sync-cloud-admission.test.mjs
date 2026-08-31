@@ -12,6 +12,28 @@ async function admissionMigration() {
   return readFile(new URL(names[0], migrationDirectory), "utf8");
 }
 
+test("cloud admission acquires and releases the existing table-owner role", async () => {
+  const sql = await admissionMigration();
+
+  const ownerGrant = sql.search(
+    /grant context_relay_rls_owner to current_user with inherit false, set true;/i,
+  );
+  const publicCreateGrant = sql.search(
+    /grant create on schema public to context_relay_rls_owner;/i,
+  );
+  const ownerRole = sql.search(/set local role context_relay_rls_owner;/i);
+  const firstTableAlter = sql.search(/alter table public\.sync_operations/i);
+
+  assert.ok(ownerGrant >= 0, "the migration runner must reacquire SET authority");
+  assert.ok(publicCreateGrant > ownerGrant, "function creation authority must be explicit");
+  assert.ok(ownerRole > publicCreateGrant && ownerRole < firstTableAlter);
+  assert.match(
+    sql,
+    /reset role;\s*revoke create on schema public from context_relay_rls_owner;\s*revoke context_relay_rls_owner from current_user;\s*$/i,
+    "temporary migration authority must be removed at the transaction boundary",
+  );
+});
+
 test("cloud admission has one service-only identity and append boundary", async () => {
   const sql = await admissionMigration();
 

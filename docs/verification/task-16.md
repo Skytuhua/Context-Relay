@@ -213,7 +213,7 @@ hosted boundary without changing `SyncTransport` or exposing a renderer-facing A
 | Gate | Result |
 | --- | --- |
 | `cargo test -p context-relay-core --test supabase_sync_transport_v1 --all-features` | Green: 9/9 transport contracts, including authenticated opaque push, stable idempotency/retry, adaptive byte-safe pull/range reconstruction, checkpoint-v2, strict UTC cursor parsing, canonical-hash rejection, pagination, and sanitized errors. |
-| Task 16 Edge/admission/workflow/Rust-boundary Node suites | Green: 41/41. Covers pre-auth size limits, strict ownership-free request JSON, signature/certificate/epoch validation, duplicate request identifiers, receipt injection, checkpoint append/tip continuity, blob reserve/finalize/release, post-lock fresh-snapshot revocation, private hints, the test-only credential-observing seam, workflow pinning, and database contract text. |
+| Task 16 Edge/admission/workflow/Rust-boundary Node suites | Green: 42/42. Covers pre-auth size limits, strict ownership-free request JSON, signature/certificate/epoch validation, duplicate request identifiers, receipt injection, checkpoint append/tip continuity, blob reserve/finalize/release, post-lock fresh-snapshot revocation, private hints, the temporary table-owner migration-role lifecycle, the test-only credential-observing seam, workflow pinning, and database contract text. |
 | `node scripts/check-supabase-contract.mjs` | Green against the complete local migration/fixture/config set. |
 | Strict core all-target/all-feature Clippy | Green after the recovery transport changes. |
 | `git diff --check` | Green. |
