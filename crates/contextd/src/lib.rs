@@ -34,11 +34,10 @@ use context_relay_local_ipc::{
     load_installation_token, role_allows,
 };
 use context_relay_protocol::{
-    AccountDeletionState, BoundedBytes, ClientError, ClientRole, DaemonInstanceNonce, DeviceId,
-    ErrorCode, ExportId, ExportPayload, HandoffPayload, HarnessId, HybridLogicalClock,
-    LocalRequest, LocalResult, MAX_ARBITRARY_BYTES, MemoryKind, MemoryParams, NativePlatform,
-    PROTOCOL_VERSION, ProjectPathParams, ProtocolVersionRange, ScopeRef, Sha256Digest, SyncState,
-    VaultState,
+    BoundedBytes, ClientError, ClientRole, DaemonInstanceNonce, DeviceId, ErrorCode, ExportId,
+    ExportPayload, HandoffPayload, HarnessId, HybridLogicalClock, LocalRequest, LocalResult,
+    MAX_ARBITRARY_BYTES, MemoryKind, MemoryParams, NativePlatform, PROTOCOL_VERSION,
+    ProjectPathParams, ProtocolVersionRange, ScopeRef, Sha256Digest, SyncState, VaultState,
 };
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -1206,7 +1205,6 @@ struct WorkspaceState {
     vault_path: PathBuf,
     device_id: DeviceId,
     exports: BTreeMap<ExportId, StoredExport>,
-    deletion: AccountDeletionState,
     bridge_install: Arc<dyn BridgeInstallEngine>,
     native_memory_updates: Option<NativeMemoryUpdateSender>,
     pairing_service: Option<Arc<dyn PairingService>>,
@@ -1302,7 +1300,6 @@ fn open_workspace(
             vault_path: config.path.clone(),
             device_id: config.device_id,
             exports: BTreeMap::new(),
-            deletion: AccountDeletionState::Active,
             bridge_install: config.bridge_install.clone(),
             native_memory_updates: config.native_memory_updates.clone(),
             pairing_service: config.pairing_service.clone(),
@@ -1725,18 +1722,9 @@ fn execute_workspace_request(
         LocalRequest::ExportChunk(params) => {
             export_chunk(state, params.export_id, params.chunk_index)
         }
-        LocalRequest::AccountDeletionBegin(params) => {
-            if !params.confirmation.eq_ignore_ascii_case("delete") {
-                return Err(invalid_request_error());
-            }
-            state.deletion = AccountDeletionState::PendingDelete;
-            Ok(account_deletion_result(state.deletion))
-        }
-        LocalRequest::AccountDeletionStatus(_) => Ok(account_deletion_result(state.deletion)),
-        LocalRequest::AccountDeletionCancel(_) => {
-            state.deletion = AccountDeletionState::Active;
-            Ok(account_deletion_result(state.deletion))
-        }
+        LocalRequest::AccountDeletionBegin(_)
+        | LocalRequest::AccountDeletionStatus(_)
+        | LocalRequest::AccountDeletionCancel(_) => Err(account_lifecycle_unavailable_error()),
         _ => Err(invalid_request_error()),
     }
 }
@@ -1906,11 +1894,14 @@ fn export_record_count(vault: &Vault) -> Result<u32, ClientError> {
     u32::try_from(count).map_err(|_| service_internal_error())
 }
 
-fn account_deletion_result(state: AccountDeletionState) -> LocalResult {
-    LocalResult::AccountDeletion {
-        state,
-        purge_deadline: None,
-        export_available: state == AccountDeletionState::PendingDelete,
+fn account_lifecycle_unavailable_error() -> ClientError {
+    ClientError {
+        code: ErrorCode::HarnessUnsupported,
+        message:
+            "Account lifecycle needs the hosted workspace service and is not available in this build."
+                .into(),
+        field_path: None,
+        retryable: false,
     }
 }
 
@@ -4816,6 +4807,40 @@ mod tests {
             output["access"],
             serde_json::json!({"mode": "active_project_only", "readOnly": true})
         );
+        worker.shutdown_and_join();
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn unconfigured_account_lifecycle_never_simulates_remote_deletion() {
+        let path = unique_temp_path("account-lifecycle-unavailable").join("vault.db");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut worker = VaultWorker::spawn(VaultConfig::new(path, "test-vault-key", keys))
+            .await
+            .unwrap();
+        let client = worker.client();
+        let requests = [
+            LocalRequest::AccountDeletionBegin(context_relay_protocol::AccountDeletionParams {
+                confirmation: "delete".into(),
+            }),
+            LocalRequest::AccountDeletionStatus(EmptyParams {}),
+            LocalRequest::AccountDeletionCancel(EmptyParams {}),
+        ];
+
+        for request in requests {
+            let error = client
+                .try_submit(VaultCommand::Workspace(request), TestAdmission(true))
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::HarnessUnsupported);
+            assert!(!error.retryable);
+            assert_eq!(
+                error.message,
+                "Account lifecycle needs the hosted workspace service and is not available in this build."
+            );
+        }
         worker.shutdown_and_join();
     }
 
