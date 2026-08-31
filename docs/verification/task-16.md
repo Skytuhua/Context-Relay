@@ -1,9 +1,11 @@
 # Task 16 signed-sync replica-core verification
 
-Date: 2026-08-09
+Date: 2026-08-31
 
-Status: local in-memory replica-core checkpoint verified. Task 16 is **not hosted-complete**;
-the credential-dependent Supabase work listed below remains outstanding.
+Status: local replica core, concrete Supabase transport, cloud-admission migration, and Edge
+boundary are implemented and locally verified. Task 16 is **not hosted-complete**: the migration
+has not been applied to a hosted project, credentialed multi-account/device behavior has not been
+executed, and daemon wiring awaits the authenticated session/key lifecycle completed by Task 17.
 
 ## Exact repository checkpoints
 
@@ -129,7 +131,7 @@ every replica, every captured provider ingress/egress envelope and checkpoint, a
 harness-captured safe log string. No scan contains the canary. No plaintext, key, nonce secret,
 credential, or private signing material is written to this ledger.
 
-## Local gates
+## Historical Task 16.7 local gates
 
 | Gate | Result |
 | --- | --- |
@@ -149,8 +151,10 @@ credential, or private signing material is written to this ledger.
 | `cargo clippy -p context-relay-core --features test-support --test signed_sync_e2e_v1 -- -D warnings -A clippy::large-enum-variant -A clippy::too-many-arguments` | Green. |
 | `git diff --check` | Green. |
 
-The no-feature workspace and strict workspace-clippy blockers reproduce independently of the
-Task 16.7 files and are recorded rather than masked by unrelated changes.
+These are preserved historical Task 16.7 results, not the current branch state. The recorded
+feature-gating and strict-Clippy blockers were repaired during PR stabilization (including the
+boxed admission payload and typed operation request); current recovery-pass gates are recorded
+below.
 
 ## Independent review
 
@@ -165,19 +169,75 @@ Task 16.7 files and are recorded rather than masked by unrelated changes.
   reported no finding at any severity; Ready: yes.
 - No Critical finding was reported in any review pass.
 
+## Recovery completion: concrete Supabase transport and admission boundary
+
+The 2026-08-31 recovery pass added the concrete daemon-side transport implementation and the
+hosted boundary without changing `SyncTransport` or exposing a renderer-facing API:
+
+- `SupabaseTransport` pushes signed opaque operations in bounded chunks with stable
+  idempotency, pulls stable cursor pages and exact hash ranges, and pushes/pulls checkpoint-v2
+  rows. It reconstructs canonical bytes from Data API rows and verifies `canonical_sha256` before
+  returning data to the replica core.
+- Provider responses and failures are converted to bounded sanitized receipts/errors. Access
+  tokens and API keys are zeroized and excluded from `Debug`; temporary authorization-header
+  copies are zeroized on drop. The credential-observing custom HTTP seam is available only under
+  `test-support`, and no transport credential is accepted from the renderer.
+- Retry uses the existing sealed exponential-backoff policy with full jitter and an injectable
+  test-only runtime. Operation batches remain below the Edge 8 MiB request limit.
+- The `sync` Edge boundary verifies the platform JWT through `getClaims`, derives account/device
+  ownership from the verified subject and session, bounds streaming input before authentication,
+  verifies canonical CBOR, certificate chains, epochs, prior hashes, and Ed25519 signatures before
+  append, and emits only a post-commit opaque private-Realtime hint.
+- Migration `20260810070712_signed_sync_cloud_admission.sql` adds service-only operation,
+  checkpoint, blob-ticket, and hint boundaries. Every mutation serializes on the account row and
+  revalidates the session after acquiring that lock, closing the concurrent-revocation stale-write
+  race. The identity resolvers are `VOLATILE`, so PostgreSQL takes fresh snapshots rather than
+  reusing the calling query's pre-lock `STABLE` snapshot. Checkpoint continuity selects the unique
+  unreferenced chain tip rather than relying on timestamp uniqueness, and fails closed on missing or
+  branched tips. Checkpoint pagination has an index matching
+  `(account_id, workspace_id, schema_version, received_at, canonical_sha256)`.
+- Blob reservations use conflict-safe insertion and derive exact Storage ownership from the
+  verified session. Operation/checkpoint insertion timestamps are assigned after account
+  serialization so a committed row cannot fall behind a previously issued pull cursor.
+- Duplicate operation identifiers within one request are rejected before hosted mutation, avoiding
+  a committed append followed by a receipt-validation failure.
+- A focused Codex Security diff scan found that a 256-row Data API request could exceed the fixed
+  20 MiB response cap with only three valid maximum-size ciphertext rows. The transport now treats
+  the cap as a distinct signal, halves normal operation pages, and retries range repair in bounded
+  subranges without weakening the cap or losing exact ordered-range semantics. Both paths have
+  RED/GREEN regressions; the sealed pre-fix report is retained outside the repository as scan
+  `5f81c78e-ef6e-4600-84bb-cbb5a874e3ef`.
+
+### Recovery-pass local evidence
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p context-relay-core --test supabase_sync_transport_v1 --all-features` | Green: 9/9 transport contracts, including authenticated opaque push, stable idempotency/retry, adaptive byte-safe pull/range reconstruction, checkpoint-v2, strict UTC cursor parsing, canonical-hash rejection, pagination, and sanitized errors. |
+| Task 16 Edge/admission/workflow/Rust-boundary Node suites | Green: 41/41. Covers pre-auth size limits, strict ownership-free request JSON, signature/certificate/epoch validation, duplicate request identifiers, receipt injection, checkpoint append/tip continuity, blob reserve/finalize/release, post-lock fresh-snapshot revocation, private hints, the test-only credential-observing seam, workflow pinning, and database contract text. |
+| `node scripts/check-supabase-contract.mjs` | Green against the complete local migration/fixture/config set. |
+| Strict core all-target/all-feature Clippy | Green after the recovery transport changes. |
+| `git diff --check` | Green. |
+
+The SQL test plan was extended to 518 assertions, including the private locked identity helper,
+fresh-snapshot resolver volatility, checkpoint cursor/tip indexes, and ownership/privilege
+contracts. It is implemented but **not executed locally** because this host
+has no Docker/Postgres service; static Node contract checks are not a substitute for pgTAP.
+
 ## Remaining hosted and credential-dependent work
 
-This checkpoint proves only the local in-memory ciphertext transport and local encrypted Vaults.
-It does **not** complete hosted Task 16. Remaining work includes:
+Task 16 is implemented locally but remains **partial** until the following evidence is collected:
 
-- implement and deploy the real Supabase cloud admission/transport path with the version-2
-  checkpoint partition and conditional endpoint proof;
-- exercise hosted RLS/Auth identity, revoked-session, quota, Storage, and private Realtime behavior
-  with suitable service/user credentials;
-- verify multi-device upload/pull/range repair, checkpoint retention/freshness, and reconnect against
-  the hosted provider;
+- apply the migration to an explicitly approved hosted Supabase project and run the 518-assertion
+  pgTAP suite plus database advisors;
+- exercise live RLS/Auth identity, JWT expiry, concurrent revocation, quota, private Storage, and
+  private Realtime behavior with at least two accounts and multiple devices;
+- verify multi-device upload/pull/range repair, checkpoint retention/freshness, reconnect, and
+  provider-outage behavior against the hosted service;
+- connect `SupabaseTransport` to `contextd` only after Task 17 supplies a trusted authenticated
+  session and device key/certificate lifecycle. The current daemon correctly remains offline and
+  does not accept environment- or renderer-supplied transport credentials;
 - collect hosted logs/advisors and repeat the plaintext-canary scan across the real provider and
   credential boundary.
 
-No hosted project was selected, linked, created, or mutated for Task 16.7, and no private
-credential was requested or recorded.
+No hosted project was selected, linked, created, migrated, or otherwise mutated by this recovery
+pass, and no private credential was requested or recorded.

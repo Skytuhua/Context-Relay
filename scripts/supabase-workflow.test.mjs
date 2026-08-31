@@ -13,6 +13,7 @@ const expectedPaths = [
   'scripts/tests/check-supabase-contract.test.mjs',
   'scripts/verify-supabase-realtime.mjs',
   'scripts/tests/verify-supabase-realtime.test.mjs',
+  'scripts/tests/supabase-sync-*.test.mjs',
   'package.json',
   'pnpm-lock.yaml',
   '.github/workflows/supabase.yml',
@@ -75,6 +76,10 @@ test('Supabase workflow uses least-privilege immutable actions', async () => {
   const source = await readFile(workflowUrl, 'utf8');
 
   assert.match(source, /^permissions:\s*\n  contents:\s*read$/m);
+  assert.match(
+    source,
+    /^  contract:\s*\n    runs-on: ubuntu-latest\s*\n    timeout-minutes: 60$/m,
+  );
 
   const uses = [...source.matchAll(/^\s+- uses:\s*(\S+?)(?:\s+#.*)?\s*$/gm)]
     .map((match) => match[1]);
@@ -191,6 +196,7 @@ test('Supabase workflow preserves triggers and the local contract lifecycle', as
     'pnpm check:supabase',
     'node --test scripts/tests/check-supabase-contract.test.mjs',
     'node --test scripts/tests/verify-supabase-realtime.test.mjs',
+    'node --test scripts/tests/supabase-sync-*.test.mjs',
     'pnpm supabase:start:ci',
     'pnpm supabase:reset',
     'pnpm supabase:test',

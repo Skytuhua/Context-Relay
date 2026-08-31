@@ -11,8 +11,10 @@ rust-version.workspace = true
 test-support = []
 
 [dependencies]
+base64.workspace = true
 bip39.workspace = true
 chacha20poly1305.workspace = true
+chrono.workspace = true
 context-relay-native-runner = { version = "0.1.0", path = "../native-runner" }
 context-relay-protocol = { version = "0.1.0", path = "../protocol" }
 ed25519-dalek.workspace = true
@@ -22,6 +24,7 @@ hmac.workspace = true
 keyring.workspace = true
 minicbor.workspace = true
 rand_core.workspace = true
+reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

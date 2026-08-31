@@ -8,6 +8,7 @@ on:
       - 'scripts/tests/check-supabase-contract.test.mjs'
       - 'scripts/verify-supabase-realtime.mjs'
       - 'scripts/tests/verify-supabase-realtime.test.mjs'
+      - 'scripts/tests/supabase-sync-*.test.mjs'
       - 'package.json'
       - 'pnpm-lock.yaml'
       - '.github/workflows/supabase.yml'
@@ -18,6 +19,7 @@ on:
       - 'scripts/tests/check-supabase-contract.test.mjs'
       - 'scripts/verify-supabase-realtime.mjs'
       - 'scripts/tests/verify-supabase-realtime.test.mjs'
+      - 'scripts/tests/supabase-sync-*.test.mjs'
       - 'package.json'
       - 'pnpm-lock.yaml'
       - '.github/workflows/supabase.yml'
@@ -28,6 +30,7 @@ permissions:
 jobs:
   contract:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       SUPABASE_AUTH_GITHUB_CLIENT_ID: local-ci-client-id
       SUPABASE_AUTH_GITHUB_SECRET: local-ci-secret
@@ -43,6 +46,7 @@ jobs:
       - run: pnpm check:supabase
       - run: node --test scripts/tests/check-supabase-contract.test.mjs
       - run: node --test scripts/tests/verify-supabase-realtime.test.mjs
+      - run: node --test scripts/tests/supabase-sync-*.test.mjs
       - run: pnpm supabase:start:ci
       - run: pnpm supabase:reset
       - run: pnpm supabase:test

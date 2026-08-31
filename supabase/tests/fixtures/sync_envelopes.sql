@@ -22,6 +22,7 @@ insert into public.sync_operations (
   blob_refs,
   created_hlc,
   signature,
+  canonical_sha256,
   received_at
 )
 values
@@ -47,6 +48,7 @@ values
     '[]'::jsonb,
     '{"physicalMs":"0","logical":0,"node":"50000000-0000-7000-8000-000000000001"}'::jsonb,
     decode(repeat('34', 64), 'hex'),
+    decode(repeat('35', 32), 'hex'),
     '2026-08-04 00:00:01+00'::timestamptz
   ),
   (
@@ -71,6 +73,7 @@ values
     '[{"digest":"4444444444444444444444444444444444444444444444444444444444444444","ciphertextBytes":"1","storageId":"opaque-b-storage-id"}]'::jsonb,
     '{"physicalMs":"1","logical":1,"node":"50000000-0000-7000-8000-000000000005"}'::jsonb,
     decode(repeat('44', 64), 'hex'),
+    decode(repeat('45', 32), 'hex'),
     '2026-08-04 00:00:02+00'::timestamptz
   ),
   (
@@ -95,6 +98,7 @@ values
     '[]'::jsonb,
     '{"physicalMs":"2","logical":2,"node":"50000000-0000-7000-8000-000000000006"}'::jsonb,
     decode(repeat('54', 64), 'hex'),
+    decode(repeat('55', 32), 'hex'),
     '2026-08-04 00:00:04+00'::timestamptz
   );
 
@@ -111,6 +115,7 @@ insert into public.sync_checkpoints (
   key_epoch,
   created_hlc,
   signature,
+  canonical_sha256,
   received_at
 )
 values
@@ -120,13 +125,14 @@ values
     '70000000-0000-7000-8000-000000000001',
     '50000000-0000-7000-8000-000000000001',
     '60000000-0000-7000-8000-000000000001',
-    1,
+    2,
     decode(repeat('60', 32), 'hex'),
     '[{"deviceId":"50000000-0000-7000-8000-000000000001","sequence":"0"}]'::jsonb,
     decode(repeat('61', 32), 'hex'),
     0,
     '{"physicalMs":"0","logical":0,"node":"50000000-0000-7000-8000-000000000001"}'::jsonb,
     decode(repeat('62', 64), 'hex'),
+    decode(repeat('69', 32), 'hex'),
     '2026-08-04 00:00:01+00'::timestamptz
   ),
   (
@@ -135,13 +141,14 @@ values
     '70000000-0000-7000-8000-000000000002',
     '50000000-0000-7000-8000-000000000005',
     '60000000-0000-7000-8000-000000000002',
-    1,
+    2,
     decode(repeat('63', 32), 'hex'),
     '[]'::jsonb,
     decode(repeat('64', 32), 'hex'),
     0,
     '{"physicalMs":"1","logical":1,"node":"50000000-0000-7000-8000-000000000005"}'::jsonb,
     decode(repeat('65', 64), 'hex'),
+    decode(repeat('6a', 32), 'hex'),
     '2026-08-04 00:00:02+00'::timestamptz
   ),
   (
@@ -150,13 +157,14 @@ values
     '70000000-0000-7000-8000-000000000004',
     '50000000-0000-7000-8000-000000000006',
     '60000000-0000-7000-8000-000000000004',
-    1,
+    2,
     decode(repeat('66', 32), 'hex'),
     '[]'::jsonb,
     decode(repeat('67', 32), 'hex'),
     0,
     '{"physicalMs":"2","logical":2,"node":"50000000-0000-7000-8000-000000000006"}'::jsonb,
     decode(repeat('68', 64), 'hex'),
+    decode(repeat('6b', 32), 'hex'),
     '2026-08-04 00:00:04+00'::timestamptz
   );
 

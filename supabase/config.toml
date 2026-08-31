@@ -17,3 +17,9 @@ secret = "env(SUPABASE_AUTH_GITHUB_SECRET)"
 [storage.buckets.ciphertext]
 public = false
 file_size_limit = "33554432"
+
+# New publishable/secret API keys are not JWTs. The sync function verifies the
+# caller's Supabase Auth access token with auth.getClaims() before any decode,
+# trusted-certificate lookup, or service RPC.
+[functions.sync]
+verify_jwt = false

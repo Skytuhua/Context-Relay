@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = public, extensions;
 
-select plan(502);
+select plan(518);
 
 select has_schema('context_relay_private', 'private Context Relay schema exists');
 
@@ -68,7 +68,7 @@ select ok(
      'device_bindings_session_id_key',
      'device_bindings_account_device_binding_key',
      'device_certificates_account_workspace_device_certificate_key',
-     'sync_operations_account_device_sequence_key',
+     'sync_operations_account_workspace_device_sequence_key',
      'sync_checkpoints_account_workspace_checkpoint_key',
      'blob_manifests_account_workspace_storage_key',
      'blob_upload_reservations_account_workspace_storage_key'
@@ -406,6 +406,8 @@ select has_index('public', relation_name, index_name, format('%s exists', index_
 from (values
   ('sync_operations', 'sync_operations_account_workspace_received_idx'),
   ('sync_checkpoints', 'sync_checkpoints_account_workspace_received_idx'),
+  ('sync_checkpoints', 'sync_checkpoints_account_workspace_received_hash_idx'),
+  ('sync_checkpoints', 'sync_checkpoints_account_workspace_previous_hash_idx'),
   ('sync_checkpoints', 'sync_checkpoints_creator_received_idx'),
   ('sync_checkpoints', 'sync_checkpoints_causal_frontier_idx'),
   ('blob_manifests', 'blob_manifests_account_storage_idx')
@@ -551,6 +553,99 @@ select ok(
 select has_function('public', 'service_revoke_device_binding', array['uuid', 'uuid', 'bigint', 'bytea', 'bytea']::text[], 'service revocation wrapper exists with the exact signature');
 select has_function('public', 'service_begin_account_deletion', array['uuid']::text[], 'service deletion-begin wrapper exists with the exact signature');
 select has_function('public', 'service_cancel_account_deletion', array['uuid']::text[], 'service deletion-cancel wrapper exists with the exact signature');
+select has_function(
+  'context_relay_private',
+  'locked_sync_identity_context',
+  array['uuid', 'uuid', 'uuid', 'uuid']::text[],
+  'private sync identity revalidation helper exists with the exact signature'
+);
+
+select ok(
+  (select function_row.prosecdef
+          and function_row.provolatile = 'v'
+          and function_row.proowner = 'context_relay_rls_owner'::regrole
+          and function_row.proconfig = array['search_path=""']::text[]
+          and pg_catalog.has_function_privilege('context_relay_rls_owner', function_row.oid, 'execute')
+          and not pg_catalog.has_function_privilege('anon', function_row.oid, 'execute')
+          and not pg_catalog.has_function_privilege('authenticated', function_row.oid, 'execute')
+          and not pg_catalog.has_function_privilege('service_role', function_row.oid, 'execute')
+   from pg_catalog.pg_proc as function_row
+   join pg_catalog.pg_namespace as function_namespace on function_namespace.oid = function_row.pronamespace
+   where function_namespace.nspname = 'context_relay_private'
+     and function_row.proname = 'locked_sync_identity_context'),
+  'only the relation owner can execute the volatile locked sync identity helper'
+);
+
+select ok(
+  (select pg_catalog.count(*) = 2
+          and pg_catalog.bool_and(function_row.provolatile = 'v')
+   from pg_catalog.pg_proc as function_row
+   join pg_catalog.pg_namespace as function_namespace
+     on function_namespace.oid = function_row.pronamespace
+   where function_namespace.nspname = 'public'
+     and function_row.proname in (
+       'service_sync_identity_context',
+       'service_sync_session_context'
+     )),
+  'sync identity resolvers use fresh volatile snapshots for post-lock revocation checks'
+);
+
+select has_function('public', wrapper.function_name, wrapper.arguments, format('%s exists with the exact signature', wrapper.function_name))
+from (values
+  ('service_sync_identity_context', array['uuid', 'uuid', 'uuid', 'uuid']::text[]),
+  ('service_sync_session_context', array['uuid', 'uuid', 'uuid']::text[]),
+  ('service_reserve_blob_upload_for_session', array['uuid', 'uuid', 'uuid', 'uuid', 'bytea', 'bigint[]', 'timestamp with time zone']::text[]),
+  ('service_finalize_blob_upload_for_session', array['uuid', 'uuid', 'uuid']::text[]),
+  ('service_release_blob_upload_for_session', array['uuid', 'uuid', 'uuid']::text[]),
+  ('service_append_sync_operations', array['uuid', 'uuid', 'jsonb']::text[]),
+  ('service_append_sync_checkpoint', array['uuid', 'uuid', 'jsonb']::text[]),
+  ('service_send_sync_hint', array['uuid']::text[])
+) as wrapper(function_name, arguments);
+
+select ok(
+  (select pg_catalog.count(*) = 8
+          and pg_catalog.bool_and(
+            function_row.prosecdef
+            and function_row.proowner = 'context_relay_rls_owner'::regrole
+            and function_row.proconfig = array['search_path=""']::text[]
+            and pg_catalog.has_function_privilege('service_role', function_row.oid, 'execute')
+            and not pg_catalog.has_function_privilege('anon', function_row.oid, 'execute')
+            and not pg_catalog.has_function_privilege('authenticated', function_row.oid, 'execute')
+          )
+   from pg_catalog.pg_proc as function_row
+   join pg_catalog.pg_namespace as function_namespace on function_namespace.oid = function_row.pronamespace
+   where function_namespace.nspname = 'public'
+     and function_row.proname in (
+       'service_sync_identity_context',
+       'service_sync_session_context',
+       'service_reserve_blob_upload_for_session',
+       'service_finalize_blob_upload_for_session',
+       'service_release_blob_upload_for_session',
+       'service_append_sync_operations',
+       'service_append_sync_checkpoint',
+       'service_send_sync_hint'
+     ))
+  and not exists (
+    select 1
+    from pg_catalog.pg_proc as function_row
+    join pg_catalog.pg_namespace as function_namespace on function_namespace.oid = function_row.pronamespace
+    cross join lateral pg_catalog.aclexplode(coalesce(function_row.proacl, pg_catalog.acldefault('f', function_row.proowner))) as privilege
+    where function_namespace.nspname = 'public'
+      and function_row.proname in (
+        'service_sync_identity_context',
+        'service_sync_session_context',
+        'service_reserve_blob_upload_for_session',
+        'service_finalize_blob_upload_for_session',
+        'service_release_blob_upload_for_session',
+        'service_append_sync_operations',
+        'service_append_sync_checkpoint',
+        'service_send_sync_hint'
+      )
+      and privilege.grantee = 0
+      and pg_catalog.lower(privilege.privilege_type) = 'execute'
+  ),
+  'only service_role can execute the eight hardened hosted-sync wrappers'
+);
 
 select ok(
   (select pg_catalog.bool_and(
@@ -1838,7 +1933,7 @@ select results_eq(
       record_kind collate "C", mutation_kind collate "C", device_id, device_sequence::text collate "C",
       causal_frontier, control_epoch, key_epoch, previous_device_hash, nonce,
       pg_catalog.octet_length(ciphertext), ciphertext_hash, blob_refs,
-      created_hlc, signature
+      created_hlc, signature, canonical_sha256
     from public.sync_operations
     where id = '90000000-0000-7000-8000-000000000001'
   $$,
@@ -1853,7 +1948,7 @@ select results_eq(
     decode(repeat('31', 24), 'hex'), 1, decode(repeat('33', 32), 'hex'),
     '[]'::jsonb,
     '{"physicalMs":"0","logical":0,"node":"50000000-0000-7000-8000-000000000001"}'::jsonb,
-    decode(repeat('34', 64), 'hex')
+    decode(repeat('34', 64), 'hex'), decode(repeat('35', 32), 'hex')
   )$$,
   'SyncOperationV1 fixture round-trips every protocol field without printing ciphertext'
 );
@@ -1861,17 +1956,17 @@ select results_eq(
 select results_eq(
   $$
     select schema_version, previous_checkpoint_hash, causal_frontier, state_hash,
-      key_epoch, creator_device_id, created_hlc, signature
+      key_epoch, creator_device_id, created_hlc, signature, canonical_sha256
     from public.sync_checkpoints
     where id = '93000000-0000-7000-8000-000000000001'
   $$,
   $$values (
-    1, decode(repeat('60', 32), 'hex'),
+    2, decode(repeat('60', 32), 'hex'),
     '[{"deviceId":"50000000-0000-7000-8000-000000000001","sequence":"0"}]'::jsonb,
     decode(repeat('61', 32), 'hex'), 0::bigint,
     '50000000-0000-7000-8000-000000000001'::uuid,
     '{"physicalMs":"0","logical":0,"node":"50000000-0000-7000-8000-000000000001"}'::jsonb,
-    decode(repeat('62', 64), 'hex')
+    decode(repeat('62', 64), 'hex'), decode(repeat('69', 32), 'hex')
   )$$,
   'CheckpointV1 fixture round-trips every protocol field'
 );
@@ -1888,7 +1983,7 @@ insert into public.sync_operations (
   mutation_kind, device_id, device_certificate_id, schema_version,
   device_sequence, causal_frontier, control_epoch, key_epoch,
   previous_device_hash, nonce, ciphertext, ciphertext_hash, blob_refs,
-  created_hlc, signature, received_at
+  created_hlc, signature, canonical_sha256, received_at
 ) values (
   '90000000-0000-7000-8000-000000000003',
   '20000000-0000-7000-8000-000000000003',
@@ -1909,24 +2004,26 @@ insert into public.sync_operations (
   )),
   '{"physicalMs":"18446744073709551615","logical":4294967295,"node":"50000000-0000-7000-8000-000000000003"}'::jsonb,
   decode(repeat('a5', 64), 'hex'),
+  decode(repeat('a6', 32), 'hex'),
   '2026-08-04 00:00:03+00'::timestamptz
 );
 
 insert into public.sync_checkpoints (
   id, account_id, workspace_id, creator_device_id, device_certificate_id,
   schema_version, previous_checkpoint_hash, causal_frontier, state_hash,
-  key_epoch, created_hlc, signature, received_at
+  key_epoch, created_hlc, signature, canonical_sha256, received_at
 ) values (
   '93000000-0000-7000-8000-000000000003',
   '20000000-0000-7000-8000-000000000003',
   '70000000-0000-7000-8000-000000000003',
   '50000000-0000-7000-8000-000000000003',
   '60000000-0000-7000-8000-000000000003',
-  1, decode(repeat('b0', 32), 'hex'),
+  2, decode(repeat('b0', 32), 'hex'),
   '[{"deviceId":"50000000-0000-7000-8000-000000000003","sequence":"18446744073709551615"}]'::jsonb,
   decode(repeat('b1', 32), 'hex'), 4294967295,
   '{"physicalMs":"18446744073709551615","logical":4294967295,"node":"50000000-0000-7000-8000-000000000003"}'::jsonb,
   decode(repeat('b2', 64), 'hex'),
+  decode(repeat('b3', 32), 'hex'),
   '2026-08-04 00:00:03+00'::timestamptz
 );
 reset role;
@@ -1996,7 +2093,8 @@ create function pg_temp.insert_sync_operation(
   p_ciphertext_hash bytea default decode(repeat('c3', 32), 'hex'),
   p_blob_refs jsonb default '[]'::jsonb,
   p_created_hlc jsonb default '{"physicalMs":"3","logical":3,"node":"50000000-0000-7000-8000-000000000003"}'::jsonb,
-  p_signature bytea default decode(repeat('c4', 64), 'hex')
+  p_signature bytea default decode(repeat('c4', 64), 'hex'),
+  p_canonical_sha256 bytea default decode(repeat('c5', 32), 'hex')
 )
 returns void
 language sql
@@ -2007,14 +2105,14 @@ as $$
     mutation_kind, device_id, device_certificate_id, schema_version,
     device_sequence, causal_frontier, control_epoch, key_epoch,
     previous_device_hash, nonce, ciphertext, ciphertext_hash, blob_refs,
-    created_hlc, signature
+    created_hlc, signature, canonical_sha256
   ) values (
     p_id, p_account_id, p_workspace_id, p_project_id,
     '91000000-0000-7000-8000-000000000030', p_record_kind,
     p_mutation_kind, p_device_id, p_certificate_id, p_schema_version,
     p_device_sequence, p_causal_frontier, p_control_epoch, p_key_epoch,
     p_previous_hash, p_nonce, p_ciphertext, p_ciphertext_hash, p_blob_refs,
-    p_created_hlc, p_signature
+    p_created_hlc, p_signature, p_canonical_sha256
   )
 $$;
 
@@ -2024,13 +2122,14 @@ create function pg_temp.insert_sync_checkpoint(
   p_workspace_id uuid default '70000000-0000-7000-8000-000000000003',
   p_device_id uuid default '50000000-0000-7000-8000-000000000003',
   p_certificate_id uuid default '60000000-0000-7000-8000-000000000003',
-  p_schema_version integer default 1,
+  p_schema_version integer default 2,
   p_previous_hash bytea default decode(repeat('d0', 32), 'hex'),
   p_causal_frontier jsonb default '[]'::jsonb,
   p_state_hash bytea default decode(repeat('d1', 32), 'hex'),
   p_key_epoch bigint default 0,
   p_created_hlc jsonb default '{"physicalMs":"3","logical":3,"node":"50000000-0000-7000-8000-000000000003"}'::jsonb,
-  p_signature bytea default decode(repeat('d2', 64), 'hex')
+  p_signature bytea default decode(repeat('d2', 64), 'hex'),
+  p_canonical_sha256 bytea default decode(repeat('d3', 32), 'hex')
 )
 returns void
 language sql
@@ -2039,11 +2138,11 @@ as $$
   insert into public.sync_checkpoints (
     id, account_id, workspace_id, creator_device_id, device_certificate_id,
     schema_version, previous_checkpoint_hash, causal_frontier, state_hash,
-    key_epoch, created_hlc, signature
+    key_epoch, created_hlc, signature, canonical_sha256
   ) values (
     p_id, p_account_id, p_workspace_id, p_device_id, p_certificate_id,
     p_schema_version, p_previous_hash, p_causal_frontier, p_state_hash,
-    p_key_epoch, p_created_hlc, p_signature
+    p_key_epoch, p_created_hlc, p_signature, p_canonical_sha256
   )
 $$;
 
@@ -2060,7 +2159,8 @@ from (values
   ('p_previous_hash', 31, 'previous-device hash'),
   ('p_nonce', 23, 'nonce'),
   ('p_ciphertext_hash', 31, 'ciphertext hash'),
-  ('p_signature', 63, 'signature')
+  ('p_signature', 63, 'signature'),
+  ('p_canonical_sha256', 31, 'canonical hash')
 ) as invalid(argument_name, byte_count, description);
 
 select throws_ok(pg_catalog.format(
@@ -2070,7 +2170,8 @@ select throws_ok(pg_catalog.format(
 from (values
   ('p_previous_hash', 31, 'previous-checkpoint hash'),
   ('p_state_hash', 31, 'state hash'),
-  ('p_signature', 63, 'signature')
+  ('p_signature', 63, 'signature'),
+  ('p_canonical_sha256', 31, 'canonical hash')
 ) as invalid(argument_name, byte_count, description);
 
 select throws_ok(pg_catalog.format(
@@ -2125,13 +2226,14 @@ from (values
 ) as invalid(argument_name, invalid_value, description);
 
 select throws_ok(pg_catalog.format(
-  'select pg_temp.%s(''9a000000-0000-7000-8000-000000000006'', p_schema_version => 2)',
-  invalid.helper_name
-), null, null, format('%s rejects schema versions other than one', invalid.envelope_name))
+  'select pg_temp.%s(''9a000000-0000-7000-8000-000000000006'', p_schema_version => %s)',
+  invalid.helper_name,
+  invalid.invalid_version
+), null, null, format('%s rejects unsupported schema version %s', invalid.envelope_name, invalid.invalid_version))
 from (values
-  ('insert_sync_operation', 'SyncOperationV1'),
-  ('insert_sync_checkpoint', 'CheckpointV1')
-) as invalid(helper_name, envelope_name);
+  ('insert_sync_operation', 2, 'SyncOperationV1'),
+  ('insert_sync_checkpoint', 1, 'CheckpointV1')
+) as invalid(helper_name, invalid_version, envelope_name);
 
 select throws_ok(pg_catalog.format(
   'select pg_temp.insert_sync_operation(''9a000000-0000-7000-8000-000000000007'', %s => ''invalid'')',
