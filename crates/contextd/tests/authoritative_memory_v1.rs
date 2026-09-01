@@ -636,11 +636,16 @@ fn unknown_exact_codex_binding_is_watch_only_and_never_synthesizes_disable_keys(
     assert_eq!(capabilities.sources[0].scope, ScopeRef::Global);
     assert_eq!(
         capabilities.sources[0].path,
-        wire_path(&materialized.codex_home.join("memories/MEMORY.md"))
+        wire_path(&materialized.codex_home.join("memories").join("MEMORY.md"))
     );
     assert_eq!(
         capabilities.sources[1].path,
-        wire_path(&materialized.codex_home.join("memories/memory_summary.md"))
+        wire_path(
+            &materialized
+                .codex_home
+                .join("memories")
+                .join("memory_summary.md")
+        )
     );
     assert_eq!(fs::read(&materialized.config_path).unwrap(), before);
     let config = String::from_utf8(before).unwrap();
@@ -1115,7 +1120,10 @@ fn unique_temp_path(label: &str) -> PathBuf {
         &Uuid::now_v7().simple().to_string()[..12]
     ));
     fs::create_dir_all(&path).unwrap();
-    path
+    // Adapter layouts and profile lock roots must be canonical exactly as
+    // std::fs::canonicalize reports them (the verbatim prefix on Windows);
+    // production validates both against that exact form.
+    fs::canonicalize(&path).unwrap()
 }
 
 fn short_runtime_root() -> PathBuf {
