@@ -29,7 +29,11 @@ async fn hook_routes_through_the_worker_and_uses_the_longest_registered_project_
     let working = nested.join("src");
     std::fs::create_dir_all(&working).unwrap();
 
-    let runtime = RuntimeConfig::for_test("native-hook", Some(short_runtime_root())).unwrap();
+    let runtime = RuntimeConfig::for_test(
+        &format!("native-hook-{}", unique_token()),
+        Some(short_runtime_root()),
+    )
+    .unwrap();
     let gate = Arc::new(TestWorkerGate::new());
     let config = TestDaemonConfig::new(
         runtime.clone(),
@@ -135,7 +139,11 @@ async fn no_project_match_is_an_acknowledged_no_op_and_ambiguous_roots_are_rejec
     let root = unique_temp_path("native-hook-ambiguous");
     let working = root.join("project");
     std::fs::create_dir_all(&working).unwrap();
-    let runtime = RuntimeConfig::for_test("native-hook", Some(short_runtime_root())).unwrap();
+    let runtime = RuntimeConfig::for_test(
+        &format!("native-hook-{}", unique_token()),
+        Some(short_runtime_root()),
+    )
+    .unwrap();
     let config = TestDaemonConfig::new(
         runtime.clone(),
         root.join("vault.db"),
@@ -177,7 +185,11 @@ async fn task_evidence_is_completed_by_the_resolved_workspace_handler() {
     let root = unique_temp_path("native-hook-task");
     let project_root = root.join("project");
     std::fs::create_dir_all(&project_root).unwrap();
-    let runtime = RuntimeConfig::for_test("native-hook", Some(short_runtime_root())).unwrap();
+    let runtime = RuntimeConfig::for_test(
+        &format!("native-hook-{}", unique_token()),
+        Some(short_runtime_root()),
+    )
+    .unwrap();
     let config = TestDaemonConfig::new(
         runtime.clone(),
         root.join("vault.db"),
@@ -340,7 +352,11 @@ async fn hook_events_enforce_the_project_read_and_write_policy_matrix() {
         let root = unique_temp_path(case.label);
         let project_root = root.join("project");
         std::fs::create_dir_all(&project_root).unwrap();
-        let runtime = RuntimeConfig::for_test("native-hook", Some(short_runtime_root())).unwrap();
+        let runtime = RuntimeConfig::for_test(
+            &format!("native-hook-{}", unique_token()),
+            Some(short_runtime_root()),
+        )
+        .unwrap();
         let config = TestDaemonConfig::new(
             runtime.clone(),
             root.join("vault.db"),
@@ -466,7 +482,11 @@ async fn selected_project_unmatched_hook_is_no_op_but_wrong_matched_project_is_d
     for path in [&selected_root, &other_root, &unmatched] {
         std::fs::create_dir_all(path).unwrap();
     }
-    let runtime = RuntimeConfig::for_test("native-hook", Some(short_runtime_root())).unwrap();
+    let runtime = RuntimeConfig::for_test(
+        &format!("native-hook-{}", unique_token()),
+        Some(short_runtime_root()),
+    )
+    .unwrap();
     let config = TestDaemonConfig::new(
         runtime.clone(),
         root.join("vault.db"),
@@ -540,7 +560,11 @@ struct Fixture {
 impl Fixture {
     async fn start(label: &str) -> Self {
         let root = unique_temp_path(label);
-        let runtime = RuntimeConfig::for_test("native-hook", Some(short_runtime_root())).unwrap();
+        let runtime = RuntimeConfig::for_test(
+            &format!("native-hook-{}", unique_token()),
+            Some(short_runtime_root()),
+        )
+        .unwrap();
         let config = TestDaemonConfig::new(
             runtime.clone(),
             root.join("vault.db"),

@@ -238,19 +238,18 @@ async fn delete_recreate_and_atomic_rename_are_reconciled_without_raw_file_chang
 
 #[tokio::test]
 async fn bounded_worker_busy_observation_is_retained_until_worker_accepts_it() {
-    let root = PathBuf::from("/private/tmp").join(format!(
-        "crnm-busy-{}",
-        &Uuid::now_v7().simple().to_string()[..12]
-    ));
+    #[cfg(windows)]
+    let base = std::env::temp_dir();
+    #[cfg(not(windows))]
+    let base = PathBuf::from("/private/tmp");
+    let root = base.join(format!("crnm-busy-{}", uuid_v7_tail()));
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("memory.md");
     std::fs::write(&path, b"queued native bytes\n").unwrap();
     let source = source(&path, 4_096);
-    let runtime = RuntimeConfig::for_test(
-        format!("nm-{}", &Uuid::now_v7().simple().to_string()[..12]),
-        Some(root.join("runtime")),
-    )
-    .unwrap();
+    let runtime =
+        RuntimeConfig::for_test(format!("nm-{}", uuid_v7_tail()), Some(root.join("runtime")))
+            .unwrap();
     let gate = Arc::new(TestWorkerGate::new());
     let config = TestDaemonConfig::new(
         runtime,
@@ -502,16 +501,15 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        let root = PathBuf::from("/private/tmp").join(format!(
-            "crnm-{label}-{}",
-            &Uuid::now_v7().simple().to_string()[..12]
-        ));
+        #[cfg(windows)]
+        let base = std::env::temp_dir();
+        #[cfg(not(windows))]
+        let base = PathBuf::from("/private/tmp");
+        let root = base.join(format!("crnm-{label}-{}", uuid_v7_tail()));
         std::fs::create_dir_all(&root).unwrap();
-        let runtime = RuntimeConfig::for_test(
-            format!("nm-{}", &Uuid::now_v7().simple().to_string()[..12]),
-            Some(root.join("runtime")),
-        )
-        .unwrap();
+        let runtime =
+            RuntimeConfig::for_test(format!("nm-{}", uuid_v7_tail()), Some(root.join("runtime")))
+                .unwrap();
         let config = TestDaemonConfig::new(
             runtime,
             root.join("vault.db"),
@@ -567,19 +565,24 @@ async fn wait_for_diagnostic(config: &TestDaemonConfig, source: &NativeMemorySou
 fn source(path: &Path, max_bytes: usize) -> NativeMemorySource {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt as _;
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStrExt as _;
     NativeMemorySource::new(
         HarnessId::Codex,
         "0.144.1",
         ScopeRef::Global,
         NativeMemoryDocumentKind::Agent,
         WireNativeValue {
+            #[cfg(unix)]
             platform: NativePlatform::Macos,
+            #[cfg(windows)]
+            platform: NativePlatform::Windows,
             #[cfg(unix)]
             bytes: path.as_os_str().as_bytes().to_vec(),
             #[cfg(windows)]
             bytes: path
-                .to_string_lossy()
-                .encode_utf16()
+                .as_os_str()
+                .encode_wide()
                 .flat_map(u16::to_le_bytes)
                 .collect(),
             display: Some(path.display().to_string()),
@@ -615,4 +618,13 @@ fn legacy_source_id(source: &NativeMemorySource) -> NativeMemorySourceId {
     NativeMemorySourceId(context_relay_protocol::Sha256Digest(
         hasher.finalize().into(),
     ))
+}
+
+// The random tail of a UUIDv7 carries per-call entropy; the leading
+// characters encode only the millisecond timestamp, which collides across
+// parallel tests. Runtime suffixes name per-user global singletons on
+// Windows, so they need the tail.
+fn uuid_v7_tail() -> String {
+    let uuid = Uuid::now_v7().simple().to_string();
+    uuid[uuid.len() - 12..].to_owned()
 }

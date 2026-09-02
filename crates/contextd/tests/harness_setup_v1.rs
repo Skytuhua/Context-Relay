@@ -522,19 +522,28 @@ async fn setup_apply_and_rollback_refresh_the_live_descriptor_set_without_watche
     std::fs::write(&memory_path, b"registered while daemon runs\n").unwrap();
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt as _;
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStrExt as _;
     let source = NativeMemorySource::new(
         HarnessId::Codex,
         "0.144.1",
         context_relay_protocol::ScopeRef::Global,
         NativeMemoryDocumentKind::Agent,
         WireNativeValue {
+            // The wire platform must match the encoding below: UTF-8 bytes
+            // on macOS, UTF-16LE units on Windows. The previous hardcoded
+            // Macos platform paired with UTF-16 bytes failed validation
+            // through the embedded NUL check.
+            #[cfg(unix)]
             platform: NativePlatform::Macos,
+            #[cfg(windows)]
+            platform: NativePlatform::Windows,
             #[cfg(unix)]
             bytes: memory_path.as_os_str().as_bytes().to_vec(),
             #[cfg(windows)]
             bytes: memory_path
-                .to_string_lossy()
-                .encode_utf16()
+                .as_os_str()
+                .encode_wide()
                 .flat_map(u16::to_le_bytes)
                 .collect(),
             display: Some(memory_path.display().to_string()),
@@ -825,5 +834,10 @@ fn unique_temp_path(label: &str) -> PathBuf {
 }
 
 fn unique_token() -> String {
-    Uuid::now_v7().simple().to_string()[..12].to_owned()
+    // The random tail of a UUIDv7 carries per-call entropy; the leading
+    // characters encode only the millisecond timestamp, which collides
+    // across parallel tests. Runtime suffixes name per-user global
+    // singletons on Windows, so they need the tail.
+    let uuid = Uuid::now_v7().simple().to_string();
+    uuid[uuid.len() - 12..].to_owned()
 }
