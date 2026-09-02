@@ -30,7 +30,7 @@ async fn hook_routes_through_the_worker_and_uses_the_longest_registered_project_
     std::fs::create_dir_all(&working).unwrap();
 
     let runtime = RuntimeConfig::for_test(
-        &format!("native-hook-{}", unique_token()),
+        format!("native-hook-{}", unique_token()),
         Some(short_runtime_root()),
     )
     .unwrap();
@@ -140,7 +140,7 @@ async fn no_project_match_is_an_acknowledged_no_op_and_ambiguous_roots_are_rejec
     let working = root.join("project");
     std::fs::create_dir_all(&working).unwrap();
     let runtime = RuntimeConfig::for_test(
-        &format!("native-hook-{}", unique_token()),
+        format!("native-hook-{}", unique_token()),
         Some(short_runtime_root()),
     )
     .unwrap();
@@ -186,7 +186,7 @@ async fn task_evidence_is_completed_by_the_resolved_workspace_handler() {
     let project_root = root.join("project");
     std::fs::create_dir_all(&project_root).unwrap();
     let runtime = RuntimeConfig::for_test(
-        &format!("native-hook-{}", unique_token()),
+        format!("native-hook-{}", unique_token()),
         Some(short_runtime_root()),
     )
     .unwrap();
@@ -353,7 +353,7 @@ async fn hook_events_enforce_the_project_read_and_write_policy_matrix() {
         let project_root = root.join("project");
         std::fs::create_dir_all(&project_root).unwrap();
         let runtime = RuntimeConfig::for_test(
-            &format!("native-hook-{}", unique_token()),
+            format!("native-hook-{}", unique_token()),
             Some(short_runtime_root()),
         )
         .unwrap();
@@ -483,7 +483,7 @@ async fn selected_project_unmatched_hook_is_no_op_but_wrong_matched_project_is_d
         std::fs::create_dir_all(path).unwrap();
     }
     let runtime = RuntimeConfig::for_test(
-        &format!("native-hook-{}", unique_token()),
+        format!("native-hook-{}", unique_token()),
         Some(short_runtime_root()),
     )
     .unwrap();
@@ -561,7 +561,7 @@ impl Fixture {
     async fn start(label: &str) -> Self {
         let root = unique_temp_path(label);
         let runtime = RuntimeConfig::for_test(
-            &format!("native-hook-{}", unique_token()),
+            format!("native-hook-{}", unique_token()),
             Some(short_runtime_root()),
         )
         .unwrap();

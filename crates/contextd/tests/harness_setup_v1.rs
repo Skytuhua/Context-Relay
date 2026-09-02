@@ -518,6 +518,11 @@ async fn failed_startup_never_launches_native_memory_supervision() {
 async fn setup_apply_and_rollback_refresh_the_live_descriptor_set_without_watcher_leaks() {
     let root = unique_temp_path("live-native-registration");
     std::fs::create_dir_all(&root).unwrap();
+    // CI temp directories contain 8.3 short components (RUNNER~1); persisted
+    // source paths must be the canonical long form the production adapters
+    // produce, so canonicalize after creation exactly as
+    // std::fs::canonicalize reports it.
+    let root = std::fs::canonicalize(&root).unwrap();
     let memory_path = root.join("memory.md");
     std::fs::write(&memory_path, b"registered while daemon runs\n").unwrap();
     #[cfg(unix)]
