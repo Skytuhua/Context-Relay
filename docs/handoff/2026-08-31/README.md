@@ -244,6 +244,58 @@ native-isolation. Those are the reasons for `435367d`; prior green native builds
 do not verify the repaired runtime tests. CodeRabbit's draft-skip success is not
 a substantive code-review approval.
 
+### UPDATE 2026-09-02 (fourth pass): fixture isolation and SD canonicalization at `a9f8f0e` + `d09d113`
+
+Hosted CI on `a9f8f0e`'s predecessor exposed the next class: all contextd and
+native-runner suites now execute on Windows, and their first executions
+surfaced four fixture-only defects plus one production defect. All are
+repaired with additive commits; no security check was weakened.
+
+**Fixture-only repairs (`a9f8f0e`, test code):**
+
+1. Runtime suffixes derived from the leading characters of a UUIDv7 encode
+   the millisecond timestamp, so parallel tests minted identical suffixes.
+   Windows IPC singletons are named by per-user SID plus suffix alone (global
+   mutex and named pipe), unlike macOS where the lock lives under each
+   runtime root, so identical suffixes lost the `InstanceGuard` race
+   (`AlreadyRunning`). Suffixes now use the random tail.
+2. `native_hook_v1` gave every test the same literal suffix — only the first
+   starters could ever bind. Each test now gets its own.
+3. `native_memory_watch_v1` built roots under `/private/tmp`, which is not
+   absolute on Windows (no drive prefix), so source paths failed
+   `decode_path` absolute validation and previews never completed.
+4. The same suite and `harness_setup_v1` hardcoded `NativePlatform::Macos`
+   with cfg-branch bytes; the Windows branch's UTF-16LE encoding contains
+   NUL high bytes that the macOS NUL check rejects (`InvalidSource("path")`).
+   The platform is now cfg-branched to match the encoding.
+
+**Production repair (`d09d113`, one file + regression):**
+
+`native-isolation-windows-x64` failed on a single real test
+(`private_creation_replaces_permissive_inherited_acl_with_owner_only_dacl`),
+with 7 cascading `PoisonError`s from the shared serial mutex. The failure is
+deterministic on every Windows environment: `compare_and_swap`'s staged
+verify compares fingerprints, but the desired security descriptor is
+serialized by `MakeSelfRelativeSD` while the staged read-back is serialized
+by `GetSecurityInfo` — two producers lay out self-relative sections
+differently, so semantically identical descriptors hashed differently and
+the fail-closed recheck rejected every private creation.
+
+`stable_security_descriptor` (Windows) now re-serializes canonically before
+hashing (fixed section order, revision, control minus the auto-inherited
+class, raw SID and ACE bytes in stored order). Access decisions, restorable
+validation, and the `SetSecurityInfo` write path still use raw bytes; only
+the fingerprint input is normalized. A regression test hashes two
+byte-different but semantically identical descriptors and asserts equality.
+
+**Windows x64 evidence:** all 7 contextd binaries pass (exit 0) including
+`harness_setup_v1` 10/10 across three runs and `native_hook_v1` 6/6 twice;
+`native-runner` lib passes **40/40 with zero skips** — the ACL test that
+failed on every Windows host now passes, and the local `--skip` caveat is
+obsolete. `cargo fmt --check` clean. Clean-checkout CI on `d09d113` is the
+mandatory gate; the ledger will be updated with hosted results once the run
+completes.
+
 ### PR #13, head `485886c`
 
 [CI run 33385426512](https://github.com/Skytuhua/Context-Relay/actions/runs/33385426512)
