@@ -1508,13 +1508,103 @@ fn stable_security_descriptor(descriptor: &[u8]) -> Vec<u8> {
 
 #[cfg(windows)]
 fn stable_security_descriptor(descriptor: &[u8]) -> Vec<u8> {
-    let mut stable = descriptor.to_vec();
-    if stable.len() >= 4 {
-        let mut control = u16::from_le_bytes([stable[2], stable[3]]);
-        control &= !0x0f00;
-        stable[2..4].copy_from_slice(&control.to_le_bytes());
+    // Self-relative security descriptors are not byte-canonical across
+    // producers: MakeSelfRelativeSD and GetSecurityInfo order and pad the
+    // owner, group, and ACL sections differently, so two descriptors with
+    // identical semantics hash differently if the raw bytes are used. The
+    // fingerprint therefore hashes a canonical re-serialization: fixed
+    // header, revision, stability-relevant control bits, and the raw SID
+    // and ACL sections in a fixed order. ACE order is preserved because it
+    // is access-order significant; only the container layout varies.
+    canonical_security_descriptor(descriptor).unwrap_or_else(|| descriptor.to_vec())
+}
+
+#[cfg(windows)]
+fn canonical_security_descriptor(descriptor: &[u8]) -> Option<Vec<u8>> {
+    if descriptor.len() < 20 || descriptor[0] != 1 {
+        return None;
     }
-    stable
+    let control = u16::from_le_bytes([descriptor[2], descriptor[3]]);
+    // SECURITY_DESCRIPTOR_RELATIVE header: revision (0), control (2), then
+    // owner, group, SACL, and DACL offsets at 4, 8, 12, and 16.
+    let offset = |start: usize| -> Option<usize> {
+        let raw = u32::from_le_bytes(descriptor[start..start + 4].try_into().ok()?);
+        usize::try_from(raw).ok()
+    };
+    let owner = offset(4)?;
+    let group = offset(8)?;
+    let sacl = offset(12)?;
+    let dacl = offset(16)?;
+    if owner > descriptor.len() || group > descriptor.len() {
+        return None;
+    }
+
+    let revision = [descriptor[0], descriptor[1]];
+    let control_stable = control & !0x0f00;
+    let mut stable = Vec::with_capacity(descriptor.len());
+    stable.extend_from_slice(b"cr-sd\0");
+    stable.extend_from_slice(&revision);
+    stable.extend_from_slice(&control_stable.to_le_bytes());
+    stable.extend_from_slice(&sid_section(&descriptor[owner..])?);
+    stable.extend_from_slice(&sid_section(&descriptor[group..])?);
+    stable.extend_from_slice(&acl_section(
+        sacl,
+        control & 0x0008 != 0, // SE_SACL_PRESENT
+        descriptor,
+    )?);
+    stable.extend_from_slice(&acl_section(
+        dacl,
+        control & 0x0004 != 0, // SE_DACL_PRESENT
+        descriptor,
+    )?);
+    Some(stable)
+}
+
+#[cfg(windows)]
+fn sid_length_at(descriptor: &[u8], start: usize) -> Option<usize> {
+    if start + 8 > descriptor.len() {
+        return None;
+    }
+    let sub_authorities = usize::from(descriptor[start + 1]);
+    let length = 8 + sub_authorities * 4;
+    (start + length <= descriptor.len()).then_some(length)
+}
+
+#[cfg(windows)]
+fn sid_section(section: &[u8]) -> Option<Vec<u8>> {
+    let length = sid_length_at(section, 0)?;
+    Some(section[..length].to_vec())
+}
+
+#[cfg(windows)]
+fn acl_section(offset: usize, present: bool, descriptor: &[u8]) -> Option<Vec<u8>> {
+    if !present || offset == 0 {
+        return Some(Vec::new());
+    }
+    if offset + 8 > descriptor.len() {
+        return None;
+    }
+    let acl = &descriptor[offset..];
+    let ace_count = usize::from(u16::from_le_bytes([acl[4], acl[5]]));
+    let acl_bytes = usize::from(u16::from_le_bytes([acl[2], acl[3]]));
+    if offset + acl_bytes > descriptor.len() {
+        return None;
+    }
+    let mut stable = Vec::new();
+    stable.extend_from_slice(&(ace_count as u32).to_le_bytes());
+    let mut cursor = 8usize;
+    for _ in 0..ace_count {
+        if cursor + 4 > acl.len() {
+            return None;
+        }
+        let ace_size = usize::from(u16::from_le_bytes([acl[cursor + 2], acl[cursor + 3]]));
+        if ace_size < 4 || cursor + ace_size > acl.len() {
+            return None;
+        }
+        stable.extend_from_slice(&acl[cursor..cursor + ace_size]);
+        cursor += ace_size;
+    }
+    Some(stable)
 }
 
 #[cfg(test)]
@@ -1522,6 +1612,66 @@ mod provenance_tests {
     use super::{
         NativeMutationOutcome, NativeObjectToken, NativeSnapshot, NativeState, fingerprint,
     };
+
+    #[cfg(windows)]
+    #[test]
+    fn security_descriptor_fingerprint_is_layout_canonical() {
+        // Build a self-relative descriptor the way MakeSelfRelativeSD does
+        // (owner at 0x14, group at 0x30, DACL at 0x4c) and an equivalent
+        // descriptor the way GetSecurityInfo returns one (owner first with
+        // different padding). Both must hash identically because the
+        // semantics are identical; the raw byte layouts are not.
+        let make_layout = |owner: usize, group: usize, dacl: usize, total: usize| {
+            let mut descriptor = vec![0_u8; total];
+            descriptor[0] = 1; // revision
+            descriptor[2] = 0x04; // SE_DACL_PRESENT
+            descriptor[3] = 0x94; // SE_DACL_PROTECTED | SE_SELF_RELATIVE
+            descriptor[4..8].copy_from_slice(&(owner as u32).to_le_bytes());
+            descriptor[8..12].copy_from_slice(&(group as u32).to_le_bytes());
+            descriptor[12..16].copy_from_slice(&0_u32.to_le_bytes());
+            descriptor[16..20].copy_from_slice(&(dacl as u32).to_le_bytes());
+            descriptor
+        };
+        // Owner and group SIDs: S-1-5-21-A (identical in both layouts).
+        let sid: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0];
+        let ace = |offset: usize| {
+            let mut acl_header_and_ace = [0_u8; 16];
+            acl_header_and_ace[0] = 2; // ACL_REVISION
+            acl_header_and_ace[2..4].copy_from_slice(&16_u16.to_le_bytes());
+            acl_header_and_ace[4..6].copy_from_slice(&1_u16.to_le_bytes());
+            acl_header_and_ace[8] = 0x00; // ACCESS_ALLOWED_ACE_TYPE
+            acl_header_and_ace[9] = 0x00; // flags
+            acl_header_and_ace[10..12].copy_from_slice(&8_u16.to_le_bytes());
+            acl_header_and_ace[12..16].copy_from_slice(&0x001F01FF_u32.to_le_bytes());
+            let _ = offset;
+            acl_header_and_ace
+        };
+        let mut first = make_layout(0x14, 0x30, 0x4c, 0x6c);
+        first[0x14..0x14 + 12].copy_from_slice(&sid);
+        first[0x30..0x30 + 12].copy_from_slice(&sid);
+        first[0x4c..0x4c + 16].copy_from_slice(&ace(0x4c));
+        let mut second = make_layout(0x14, 0x2c, 0x44, 0x64);
+        second[0x14..0x14 + 12].copy_from_slice(&sid);
+        second[0x2c..0x2c + 12].copy_from_slice(&sid);
+        second[0x44..0x44 + 16].copy_from_slice(&ace(0x44));
+
+        let state = |descriptor: &[u8]| NativeState::RegularFile {
+            bytes: b"payload\n".to_vec(),
+            metadata: super::NativeMetadata {
+                file_attributes: 0x80,
+                creation_time: 1,
+                last_access_time: 2,
+                last_write_time: 3,
+                change_time: 4,
+                security_descriptor: descriptor.to_vec(),
+                alternate_streams: Vec::new(),
+                link_count: 1,
+                parent_attributes: 0,
+                parent_link_count: 1,
+            },
+        };
+        assert_eq!(fingerprint(&state(&first)), fingerprint(&state(&second)));
+    }
 
     fn token(object: u8) -> NativeObjectToken {
         NativeObjectToken::from_parts(7, [object; 16], 0, 11, [3; 16])
