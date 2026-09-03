@@ -94,7 +94,21 @@ fn fixture(source: &str) -> Fixture {
     } else {
         "claude"
     });
-    fs::write(&executable, b"fixture executable").unwrap();
+    // `VerifiedClaudeExecutable::open` verifies the executable is a native
+    // PE image on Windows, so the fixture carries a minimal MZ/PE stub
+    // there; other platforms accept placeholder bytes.
+    let executable_bytes = if cfg!(windows) {
+        let mut bytes = vec![0_u8; 0x44];
+        bytes[0] = b'M';
+        bytes[1] = b'Z';
+        let pe_offset: u32 = 0x40;
+        bytes[0x3c..0x40].copy_from_slice(&pe_offset.to_le_bytes());
+        bytes[0x40..0x44].copy_from_slice(b"PE\0\0");
+        bytes
+    } else {
+        b"fixture executable".to_vec()
+    };
+    fs::write(&executable, executable_bytes).unwrap();
 
     let project_id = ProjectId::from_str(PROJECT_ID).unwrap();
     let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
@@ -2030,15 +2044,24 @@ fn cli_executor_rechecks_non_link_harness_executable_before_any_runner() {
         b"replacement executable",
     )
     .unwrap();
-    fs::remove_file(fixture.root.join("claude")).unwrap();
+    let harness_name = if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    };
     #[cfg(unix)]
-    std::os::unix::fs::symlink(
-        fixture.root.join("replacement claude"),
-        fixture.root.join("claude"),
-    )
-    .unwrap();
+    {
+        fs::remove_file(fixture.root.join("claude")).unwrap();
+        std::os::unix::fs::symlink(
+            fixture.root.join("replacement claude"),
+            fixture.root.join("claude"),
+        )
+        .unwrap();
+    }
     #[cfg(windows)]
-    fs::write(fixture.root.join("claude"), b"changed executable").unwrap();
+    // Symlink creation is privileged on Windows; tamper the attested
+    // executable's content instead, which the digest recheck must catch.
+    fs::write(fixture.root.join(harness_name), b"changed executable").unwrap();
     let runner_calls = Rc::new(Cell::new(0));
     let operation_calls = Rc::clone(&runner_calls);
     let validation_calls = Rc::clone(&runner_calls);
@@ -2069,7 +2092,15 @@ fn cli_executor_rechecks_harness_executable_digest_before_any_runner() {
         .adapter
         .plan_bridge_cli_mutation_with_runner(&intended, &mut planning_runner)
         .unwrap();
-    fs::write(fixture.root.join("claude"), b"changed executable").unwrap();
+    fs::write(
+        fixture.root.join(if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        }),
+        b"changed executable",
+    )
+    .unwrap();
     let runner_calls = Rc::new(Cell::new(0));
     let operation_calls = Rc::clone(&runner_calls);
     let validation_calls = Rc::clone(&runner_calls);
