@@ -4143,13 +4143,13 @@ fn rollback_restores_all_hermes_targets_and_metadata() {
 #[test]
 fn windows_junction_profile_paths_are_rejected() {
     fn junction(link: &Path, target: &Path) {
+        // Passing each token as a separate argument avoids cmd /C quote
+        // mangling, which corrupts the classic single-string
+        // `mklink /J "link" "target"` invocation.
         let status = std::process::Command::new("cmd")
-            .arg("/C")
-            .arg(format!(
-                "mklink /J \"{}\" \"{}\"",
-                link.display(),
-                target.display()
-            ))
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
             .status()
             .unwrap();
         assert!(status.success());
