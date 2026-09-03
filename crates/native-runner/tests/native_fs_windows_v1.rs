@@ -290,8 +290,18 @@ fn snapshot_rejects_dotdot_verbatim_and_long_path_forms() {
             .snapshot(&directory.join("..\\directory\\settings.json"))
             .is_err()
     );
+    // The verbatim form is accepted with plain-form parity since the
+    // canonical verbatim repair: `std::fs::canonicalize` produces it for
+    // every adapter layout, so rejection here would contradict production.
+    // Dot-dot, device, UNC, traversal, and reserved-name rejections above
+    // are unchanged.
     let verbatim = PathBuf::from(format!(r"\\?\{}", path.display()));
-    assert!(native.snapshot(&verbatim).is_err());
+    let plain_snapshot = native.snapshot(&path).unwrap();
+    let verbatim_snapshot = native.snapshot(&verbatim).unwrap();
+    assert_eq!(
+        plain_snapshot.fingerprint(),
+        verbatim_snapshot.fingerprint()
+    );
 
     let mut long_directory = root.clone();
     while long_directory.as_os_str().encode_wide().count() < 270 {
