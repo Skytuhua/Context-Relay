@@ -1,0 +1,1602 @@
+{
+  "nodes": [
+    {
+      "id": "_github_dependabot_dependency_updates",
+      "label": "Dependency Updates",
+      "file_type": "document",
+      "source_file": ".github/dependabot.yml",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "_github_pull_request_template_contribution_checklist",
+      "label": "Pull Request Contribution Checklist",
+      "file_type": "document",
+      "source_file": ".github/pull_request_template.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "_github_workflows_ci_continuous_integration",
+      "label": "Continuous Integration",
+      "file_type": "document",
+      "source_file": ".github/workflows/ci.yml",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "_github_workflows_ci_native_semgrep_build",
+      "label": "Native Semgrep Build Qualification",
+      "file_type": "concept",
+      "source_file": ".github/workflows/ci.yml",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "_github_workflows_publish_semgrep_native_semgrep_native_release",
+      "label": "Semgrep Native Release Publication",
+      "file_type": "document",
+      "source_file": ".github/workflows/publish-semgrep-native.yml",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "_github_workflows_semgrep_release_qualification_release_qualification",
+      "label": "Semgrep Release Qualification",
+      "file_type": "document",
+      "source_file": ".github/workflows/semgrep-release-qualification.yml",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "_github_workflows_supabase_supabase_contract_ci",
+      "label": "Supabase Contract CI",
+      "file_type": "document",
+      "source_file": ".github/workflows/supabase.yml",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "contributing_contributor_workflow",
+      "label": "Contributor Workflow",
+      "file_type": "document",
+      "source_file": "CONTRIBUTING.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "readme_context_relay",
+      "label": "Context Relay",
+      "file_type": "document",
+      "source_file": "README.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "readme_authoritative_memory_contract",
+      "label": "Authoritative Memory Contract",
+      "file_type": "concept",
+      "source_file": "README.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "security_security_policy",
+      "label": "Security Policy",
+      "file_type": "document",
+      "source_file": "SECURITY.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "third_party_notices_sidecar_hydration",
+      "label": "Sidecar Hydration",
+      "file_type": "concept",
+      "source_file": "THIRD_PARTY_NOTICES.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "trademarks_trademark_policy",
+      "label": "Trademark Policy",
+      "file_type": "document",
+      "source_file": "TRADEMARKS.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "adapters_claude_code_capabilities_claude_code_memory_contract",
+      "label": "Claude Code Memory Contract",
+      "file_type": "concept",
+      "source_file": "adapters/claude-code/capabilities.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "adapters_codex_capabilities_codex_memory_contract",
+      "label": "Codex Memory Contract",
+      "file_type": "concept",
+      "source_file": "adapters/codex/capabilities.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "adapters_hermes_capabilities_hermes_memory_contract",
+      "label": "Hermes Memory Contract",
+      "file_type": "concept",
+      "source_file": "adapters/hermes/capabilities.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "adapters_hermes_capabilities_isolated_effective_validation",
+      "label": "Isolated Effective Validation",
+      "file_type": "rationale",
+      "source_file": "adapters/hermes/capabilities.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "Hermes validates only an attested executable in a sterile staged environment so live profile secrets and code do not enter child validation."
+    },
+    {
+      "id": "apps_desktop_index_desktop_entrypoint",
+      "label": "Desktop Application Entrypoint",
+      "file_type": "code",
+      "source_file": "apps/desktop/index.html",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "crates_core_tests_fixtures_crypto_v1_crypto_v1_fixture",
+      "label": "Crypto V1 Test Fixture",
+      "file_type": "document",
+      "source_file": "crates/core/tests/fixtures/crypto-v1.txt",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_protocols_cbor_v1_canonical_cbor_contracts",
+      "label": "Canonical CBOR Contracts",
+      "file_type": "concept",
+      "source_file": "docs/protocols/cbor-v1.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_protocols_cbor_v1_sync_operation_v1",
+      "label": "Sync Operation V1 Encoding",
+      "file_type": "concept",
+      "source_file": "docs/protocols/cbor-v1.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_protocols_cbor_v1_scoped_checkpoint_v2",
+      "label": "Scoped Checkpoint V2 Encoding",
+      "file_type": "concept",
+      "source_file": "docs/protocols/cbor-v1.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_protocols_protocol_v1_protocol_v1",
+      "label": "Protocol Version 1",
+      "file_type": "concept",
+      "source_file": "docs/protocols/protocol-v1.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_protocols_protocol_v1_recovery_enrollment_boundary",
+      "label": "Recovery Enrollment Boundary",
+      "file_type": "rationale",
+      "source_file": "docs/protocols/protocol-v1.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "Phase-specific recovery methods and roles prevent recovery phrase words from leaking into ordinary desktop and Tauri result surfaces."
+    },
+    {
+      "id": "docs_repository_settings_repository_security_settings",
+      "label": "Repository Security Settings",
+      "file_type": "document",
+      "source_file": "docs/repository-settings.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_security_threat_model_v1_threat_model",
+      "label": "V1 Threat Model",
+      "file_type": "rationale",
+      "source_file": "docs/security/threat-model.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "The system treats cloud storage, harness inputs, packages, and local boundaries as untrusted, while accepting limits of same-user malware and offline device compromise."
+    },
+    {
+      "id": "docs_superpowers_plans_2026_07_19_offline_desktop_shell_offline_desktop_shell",
+      "label": "Offline Desktop Shell Plan",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-07-19-offline-desktop-shell.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_plans_2026_07_20_durable_absence_edge_checkpoint_durable_absence_edge_checkpoint",
+      "label": "Durable Absence-Edge Checkpoint",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-07-20-durable-absence-edge-checkpoint.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_plans_2026_07_20_isolated_native_runner_isolated_native_runner",
+      "label": "Isolated Native Runner and Transaction Engine",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-07-20-isolated-native-runner.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_plans_2026_07_20_native_transaction_profile_lock_native_transaction_profile_lock",
+      "label": "Native Transaction Profile Lock",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-07-20-native-transaction-profile-lock.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_plans_2026_07_26_tasks_1_through_10_completion_tasks_1_through_10_completion",
+      "label": "Tasks 1 Through 10 Completion",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-07-26-tasks-1-through-10-completion.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_plans_2026_07_27_codex_adapter_v1_codex_adapter_v1",
+      "label": "Codex Adapter V1",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-07-27-codex-adapter-v1.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_plans_2026_07_29_hermes_adapter_v1_hermes_adapter_v1",
+      "label": "Hermes Adapter V1",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-07-29-hermes-adapter-v1.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_plans_2026_07_30_mcp_memory_tasks_handoffs_mcp_memory_tasks_handoffs",
+      "label": "Scoped MCP Memory Tasks and Handoffs",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-07-30-mcp-memory-tasks-handoffs.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_plans_2026_07_31_transactional_mcp_adapter_install_transactional_mcp_adapter_install",
+      "label": "Transactional MCP Adapter Installation",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-07-31-transactional-mcp-adapter-install.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_plans_2026_08_01_authoritative_product_memory_authoritative_product_memory",
+      "label": "Authoritative Product Memory",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-08-01-authoritative-product-memory.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_plans_2026_08_04_supabase_schema_rls_supabase_ciphertext_boundary",
+      "label": "Supabase Ciphertext Boundary",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-08-04-supabase-schema-rls.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_plans_2026_08_05_signed_sync_replica_core_signed_sync_replica_core",
+      "label": "Signed Sync Replica Core",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-08-05-signed-sync-replica-core.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_plans_2026_08_09_device_pairing_existing_device_pairing",
+      "label": "Existing-Device Pairing",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-08-09-device-pairing.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_plans_2026_08_09_fresh_install_recovery_core_fresh_install_recovery_core",
+      "label": "Fresh-Install Recovery Core",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-08-09-fresh-install-recovery-core.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_plans_2026_08_09_recovery_root_enrollment_recovery_root_enrollment",
+      "label": "Recovery-Root Enrollment and First-Device Bootstrap",
+      "file_type": "document",
+      "source_file": "docs/superpowers/plans/2026-08-09-recovery-root-enrollment.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_specs_2026_07_19_offline_desktop_shell_design_offline_desktop_shell",
+      "label": "Offline Desktop Shell Design",
+      "file_type": "document",
+      "source_file": "docs/superpowers/specs/2026-07-19-offline-desktop-shell-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_specs_2026_07_20_isolated_native_runner_design_isolated_native_runner",
+      "label": "Isolated Native Runner Design",
+      "file_type": "document",
+      "source_file": "docs/superpowers/specs/2026-07-20-isolated-native-runner-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_specs_2026_07_26_tasks_1_through_10_completion_design_tasks_1_through_10_completion",
+      "label": "Tasks 1 Through 10 Completion Design",
+      "file_type": "document",
+      "source_file": "docs/superpowers/specs/2026-07-26-tasks-1-through-10-completion-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_specs_2026_07_29_hermes_adapter_v1_design_hermes_adapter_v1",
+      "label": "Hermes Adapter V1 Design",
+      "file_type": "document",
+      "source_file": "docs/superpowers/specs/2026-07-29-hermes-adapter-v1-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_specs_2026_07_30_mcp_memory_tasks_handoffs_design_mcp_memory_tasks_handoffs",
+      "label": "Scoped MCP Memory Tasks and Handoffs Design",
+      "file_type": "document",
+      "source_file": "docs/superpowers/specs/2026-07-30-mcp-memory-tasks-handoffs-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_specs_2026_07_31_transactional_mcp_adapter_install_design_transactional_mcp_adapter_install",
+      "label": "Transactional MCP Adapter Installation Design",
+      "file_type": "document",
+      "source_file": "docs/superpowers/specs/2026-07-31-transactional-mcp-adapter-install-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_superpowers_specs_2026_08_04_supabase_schema_rls_design_supabase_ciphertext_boundary",
+      "label": "Supabase Ciphertext Boundary",
+      "file_type": "concept",
+      "source_file": "docs/superpowers/specs/2026-08-04-supabase-schema-rls-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "Supabase stores only signed ciphertext and routing metadata; clients retain cryptographic truth and authorization validation."
+    },
+    {
+      "id": "docs_superpowers_specs_2026_08_04_supabase_schema_rls_design_session_device_binding",
+      "label": "Session-to-Device Binding",
+      "file_type": "rationale",
+      "source_file": "docs/superpowers/specs/2026-08-04-supabase-schema-rls-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "Authorization derives account and device solely from authenticated user and JWT session claims, preventing caller-selected identity."
+    },
+    {
+      "id": "docs_superpowers_specs_2026_08_04_supabase_schema_rls_design_private_write_services",
+      "label": "Private Write Services",
+      "file_type": "rationale",
+      "source_file": "docs/superpowers/specs/2026-08-04-supabase-schema-rls-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "Authenticated clients receive account-scoped read access while authoritative mutations remain behind narrowly granted service wrappers."
+    },
+    {
+      "id": "docs_superpowers_specs_2026_08_05_signed_sync_design_signed_synchronization",
+      "label": "Signed Synchronization",
+      "file_type": "concept",
+      "source_file": "docs/superpowers/specs/2026-08-05-signed-sync-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "A local deterministic core encrypts, signs, validates, and reconciles operations before narrow cloud transport adapters are used."
+    },
+    {
+      "id": "docs_superpowers_specs_2026_08_05_signed_sync_design_deterministic_merge",
+      "label": "Deterministic Merge",
+      "file_type": "rationale",
+      "source_file": "docs/superpowers/specs/2026-08-05-signed-sync-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "Causal dominance and canonical operation-ID ordering make conflict representation independent of physical arrival time."
+    },
+    {
+      "id": "docs_superpowers_specs_2026_08_05_signed_sync_design_cloud_admission_boundary",
+      "label": "Cloud Admission Boundary",
+      "file_type": "rationale",
+      "source_file": "docs/superpowers/specs/2026-08-05-signed-sync-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "A JWT-protected Edge Function verifies canonical signed envelopes and invokes service-only database procedures before emitting pull hints."
+    },
+    {
+      "id": "docs_superpowers_specs_2026_08_09_device_pairing_design_existing_device_pairing",
+      "label": "Existing-Device Pairing",
+      "file_type": "concept",
+      "source_file": "docs/superpowers/specs/2026-08-09-device-pairing-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "An active device approves an exact signed request and securely transfers encrypted workspace material to a joining device."
+    },
+    {
+      "id": "docs_superpowers_specs_2026_08_09_device_pairing_design_pairing_grant",
+      "label": "Pairing Grant",
+      "file_type": "concept",
+      "source_file": "docs/superpowers/specs/2026-08-09-device-pairing-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "The grant combines public certificate material with a request-bound encrypted key bundle and requires an independent safety-number comparison."
+    },
+    {
+      "id": "docs_superpowers_specs_2026_08_09_device_pairing_design_pairing_transport",
+      "label": "Pairing Transport Boundary",
+      "file_type": "rationale",
+      "source_file": "docs/superpowers/specs/2026-08-09-device-pairing-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "Transport stores bounded public request state and encrypted grants while the Vault remains the authority for local trust decisions."
+    },
+    {
+      "id": "docs_superpowers_specs_2026_08_09_fresh_install_recovery_core_design_fresh_install_recovery",
+      "label": "Fresh-Install Recovery",
+      "file_type": "concept",
+      "source_file": "docs/superpowers/specs/2026-08-09-fresh-install-recovery-core-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "A fresh Vault authenticates a recovery phrase against an exact retained root, then atomically activates a recovered device and material."
+    },
+    {
+      "id": "docs_superpowers_specs_2026_08_09_fresh_install_recovery_core_design_recovery_device_claim",
+      "label": "Recovery-Device Claim",
+      "file_type": "concept",
+      "source_file": "docs/superpowers/specs/2026-08-09-fresh-install-recovery-core-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "A recovery-root-signed claim is published under provider compare-and-set and then verified by exact lookup before trust activation."
+    },
+    {
+      "id": "docs_superpowers_specs_2026_08_09_recovery_root_enrollment_design_recovery_root_enrollment",
+      "label": "Recovery-Root Enrollment",
+      "file_type": "concept",
+      "source_file": "docs/superpowers/specs/2026-08-09-recovery-root-enrollment-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "A one-time phrase establishes a recoverable trust root and first-device bootstrap without persisting the phrase or recovery private keys."
+    },
+    {
+      "id": "docs_superpowers_specs_2026_08_09_recovery_root_enrollment_design_recovery_enrollment_record",
+      "label": "Recovery Enrollment Record",
+      "file_type": "concept",
+      "source_file": "docs/superpowers/specs/2026-08-09-recovery-root-enrollment-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "Canonical signed public root data and encrypted key material are registered by exact-byte compare-and-set, then atomically activated locally."
+    },
+    {
+      "id": "docs_superpowers_specs_2026_08_09_recovery_root_enrollment_design_native_phrase_confirmation",
+      "label": "Native Phrase Confirmation",
+      "file_type": "rationale",
+      "source_file": "docs/superpowers/specs/2026-08-09-recovery-root-enrollment-design.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "The phrase and permanent confirmation are confined to a trusted native host; renderer and generic IPC routes cannot request them."
+    },
+    {
+      "id": "docs_verification_task_14_task_14_verification",
+      "label": "Task 14 Verification",
+      "file_type": "document",
+      "source_file": "docs/verification/task-14.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_verification_task_15_task_15_verification",
+      "label": "Task 15 Verification",
+      "file_type": "document",
+      "source_file": "docs/verification/task-15.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_verification_task_16_task_16_verification",
+      "label": "Task 16 Verification",
+      "file_type": "document",
+      "source_file": "docs/verification/task-16.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_verification_task_17_fresh_install_recovery_core_task_17_fresh_recovery_verification",
+      "label": "Task 17 Fresh-Recovery Verification",
+      "file_type": "document",
+      "source_file": "docs/verification/task-17-fresh-install-recovery-core.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_verification_task_17_pairing_task_17_pairing_verification",
+      "label": "Task 17 Pairing Verification",
+      "file_type": "document",
+      "source_file": "docs/verification/task-17-pairing.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_verification_task_17_recovery_enrollment_task_17_recovery_enrollment_verification",
+      "label": "Task 17 Recovery Enrollment Verification",
+      "file_type": "document",
+      "source_file": "docs/verification/task-17-recovery-enrollment.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "docs_verification_tasks_1_10_tasks_1_10_verification",
+      "label": "Tasks 1–10 Verification",
+      "file_type": "document",
+      "source_file": "docs/verification/tasks-1-10.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "pnpm_workspace_workspace_packages",
+      "label": "Workspace Package Layout",
+      "file_type": "code",
+      "source_file": "pnpm-workspace.yaml",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "third_party_sidecars_licenses_gitleaks_mit_gitleaks_mit_license",
+      "label": "Gitleaks MIT License",
+      "file_type": "document",
+      "source_file": "third_party/sidecars/licenses/gitleaks-MIT.txt",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "third_party_sidecars_licenses_rulesync_mit_rulesync_mit_license",
+      "label": "RuleSync MIT License",
+      "file_type": "document",
+      "source_file": "third_party/sidecars/licenses/rulesync-MIT.txt",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "third_party_sidecars_licenses_semgrep_lgpl_2_1_or_later_semgrep_lgpl_license",
+      "label": "Semgrep LGPL License",
+      "file_type": "document",
+      "source_file": "third_party/sidecars/licenses/semgrep-LGPL-2.1-or-later.txt",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "third_party_sidecars_licenses_tree_sitter_mit_tree_sitter_mit_license",
+      "label": "Tree-sitter MIT License",
+      "file_type": "document",
+      "source_file": "third_party/sidecars/licenses/tree-sitter-MIT.txt",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "third_party_sidecars_policies_semgrep_package_semgrep_package_policy",
+      "label": "Semgrep Package Policy",
+      "file_type": "code",
+      "source_file": "third_party/sidecars/policies/semgrep-package.yml",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "The package policy supplies a scan canary and rejects Python runtime artifacts from native Semgrep packages."
+    },
+    {
+      "id": "third_party_sidecars_semgrep_manifest_sha256_deterministic_source_manifest",
+      "label": "Deterministic Semgrep Source Manifest",
+      "file_type": "document",
+      "source_file": "third_party/sidecars/semgrep/MANIFEST.sha256.md",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "The manifest defines a reproducible, verified Semgrep corresponding-source bundle and its deferred release qualification."
+    },
+    {
+      "id": "apps_desktop_src_tauri_app_icon_app_icon",
+      "label": "Context Relay Desktop App Icon",
+      "file_type": "image",
+      "source_file": "apps/desktop/src-tauri/app-icon.svg",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "apps_desktop_src_tauri_app_icon_relay_connection_motif",
+      "label": "Relay Connection Motif",
+      "file_type": "concept",
+      "source_file": "apps/desktop/src-tauri/app-icon.svg",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "apps_desktop_src_tauri_app_icon_endpoint_link_rationale",
+      "label": "Endpoint Link Visual Rationale",
+      "file_type": "rationale",
+      "source_file": "apps/desktop/src-tauri/app-icon.svg",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "The icon depicts two circular endpoints connected by a horizontal line, visually expressing a relay or transfer between distinct parties."
+    },
+    {
+      "id": "apps_desktop_src_tauri_icons_icon_primary_icon",
+      "label": "Context Relay Desktop Icon",
+      "file_type": "image",
+      "source_file": "apps/desktop/src-tauri/icons/icon.png",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null
+    },
+    {
+      "id": "apps_desktop_src_tauri_icons_icon_connected_endpoints",
+      "label": "Connected Endpoints",
+      "file_type": "concept",
+      "source_file": "apps/desktop/src-tauri/icons/icon.png",
+      "source_location": null,
+      "source_url": null,
+      "captured_at": null,
+      "author": null,
+      "contributor": null,
+      "rationale": "The icon visibly depicts two contrasting circular endpoints joined by a horizontal connector, expressing relay or connection."
+    }
+  ],
+  "edges": [
+    {
+      "source": "_github_workflows_ci_continuous_integration",
+      "target": "contributing_contributor_workflow",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "CONTRIBUTING.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "_github_pull_request_template_contribution_checklist",
+      "target": "contributing_contributor_workflow",
+      "relation": "conceptually_related_to",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": ".github/pull_request_template.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "_github_workflows_ci_native_semgrep_build",
+      "target": "_github_workflows_publish_semgrep_native_semgrep_native_release",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": ".github/workflows/publish-semgrep-native.yml",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "_github_workflows_semgrep_release_qualification_release_qualification",
+      "target": "_github_workflows_ci_continuous_integration",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": ".github/workflows/semgrep-release-qualification.yml",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "third_party_notices_sidecar_hydration",
+      "target": "_github_workflows_ci_native_semgrep_build",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "THIRD_PARTY_NOTICES.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "readme_context_relay",
+      "target": "readme_authoritative_memory_contract",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "adapters_claude_code_capabilities_claude_code_memory_contract",
+      "target": "readme_authoritative_memory_contract",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "adapters_codex_capabilities_codex_memory_contract",
+      "target": "readme_authoritative_memory_contract",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "adapters_hermes_capabilities_hermes_memory_contract",
+      "target": "readme_authoritative_memory_contract",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "adapters_hermes_capabilities_isolated_effective_validation",
+      "target": "docs_security_threat_model_v1_threat_model",
+      "relation": "rationale_for",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "adapters/hermes/capabilities.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_protocols_cbor_v1_sync_operation_v1",
+      "target": "docs_protocols_cbor_v1_canonical_cbor_contracts",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/protocols/cbor-v1.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_protocols_cbor_v1_scoped_checkpoint_v2",
+      "target": "docs_protocols_cbor_v1_canonical_cbor_contracts",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/protocols/cbor-v1.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_protocols_protocol_v1_protocol_v1",
+      "target": "docs_protocols_cbor_v1_sync_operation_v1",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/protocols/protocol-v1.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_protocols_protocol_v1_protocol_v1",
+      "target": "docs_protocols_cbor_v1_scoped_checkpoint_v2",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/protocols/protocol-v1.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "crates_core_tests_fixtures_crypto_v1_crypto_v1_fixture",
+      "target": "docs_protocols_protocol_v1_protocol_v1",
+      "relation": "references",
+      "confidence": "INFERRED",
+      "confidence_score": 0.75,
+      "source_file": "crates/core/tests/fixtures/crypto-v1.txt",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_protocols_protocol_v1_recovery_enrollment_boundary",
+      "target": "docs_security_threat_model_v1_threat_model",
+      "relation": "rationale_for",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "docs/protocols/protocol-v1.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_repository_settings_repository_security_settings",
+      "target": "security_security_policy",
+      "relation": "conceptually_related_to",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/repository-settings.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_repository_settings_repository_security_settings",
+      "target": "_github_dependabot_dependency_updates",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": ".github/dependabot.yml",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "_github_workflows_supabase_supabase_contract_ci",
+      "target": "docs_security_threat_model_v1_threat_model",
+      "relation": "semantically_similar_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.65,
+      "source_file": ".github/workflows/supabase.yml",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "apps_desktop_index_desktop_entrypoint",
+      "target": "readme_context_relay",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.95,
+      "source_file": "apps/desktop/index.html",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_plans_2026_07_19_offline_desktop_shell_offline_desktop_shell",
+      "target": "apps_desktop_index_desktop_entrypoint",
+      "relation": "references",
+      "confidence": "INFERRED",
+      "confidence_score": 0.75,
+      "source_file": "docs/superpowers/plans/2026-07-19-offline-desktop-shell.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_plans_2026_07_20_isolated_native_runner_isolated_native_runner",
+      "target": "docs_superpowers_specs_2026_07_20_isolated_native_runner_design_isolated_native_runner",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/plans/2026-07-20-isolated-native-runner.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_plans_2026_07_26_tasks_1_through_10_completion_tasks_1_through_10_completion",
+      "target": "docs_superpowers_specs_2026_07_26_tasks_1_through_10_completion_design_tasks_1_through_10_completion",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/plans/2026-07-26-tasks-1-through-10-completion.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_plans_2026_07_29_hermes_adapter_v1_hermes_adapter_v1",
+      "target": "docs_superpowers_specs_2026_07_29_hermes_adapter_v1_design_hermes_adapter_v1",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/plans/2026-07-29-hermes-adapter-v1.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_plans_2026_07_30_mcp_memory_tasks_handoffs_mcp_memory_tasks_handoffs",
+      "target": "docs_superpowers_specs_2026_07_30_mcp_memory_tasks_handoffs_design_mcp_memory_tasks_handoffs",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/plans/2026-07-30-mcp-memory-tasks-handoffs.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_plans_2026_07_31_transactional_mcp_adapter_install_transactional_mcp_adapter_install",
+      "target": "docs_superpowers_specs_2026_07_31_transactional_mcp_adapter_install_design_transactional_mcp_adapter_install",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/plans/2026-07-31-transactional-mcp-adapter-install.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_plans_2026_07_20_durable_absence_edge_checkpoint_durable_absence_edge_checkpoint",
+      "target": "docs_superpowers_specs_2026_07_20_isolated_native_runner_design_isolated_native_runner",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "docs/superpowers/plans/2026-07-20-durable-absence-edge-checkpoint.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_plans_2026_07_20_native_transaction_profile_lock_native_transaction_profile_lock",
+      "target": "docs_superpowers_plans_2026_07_20_isolated_native_runner_isolated_native_runner",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "docs/superpowers/plans/2026-07-20-native-transaction-profile-lock.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_plans_2026_07_27_codex_adapter_v1_codex_adapter_v1",
+      "target": "docs_superpowers_plans_2026_07_31_transactional_mcp_adapter_install_transactional_mcp_adapter_install",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "docs/superpowers/plans/2026-07-27-codex-adapter-v1.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_plans_2026_07_30_mcp_memory_tasks_handoffs_mcp_memory_tasks_handoffs",
+      "target": "docs_superpowers_plans_2026_07_31_transactional_mcp_adapter_install_transactional_mcp_adapter_install",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "docs/superpowers/plans/2026-07-30-mcp-memory-tasks-handoffs.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_plans_2026_08_01_authoritative_product_memory_authoritative_product_memory",
+      "target": "docs_superpowers_plans_2026_07_30_mcp_memory_tasks_handoffs_mcp_memory_tasks_handoffs",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "docs/superpowers/plans/2026-08-01-authoritative-product-memory.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_plans_2026_08_04_supabase_schema_rls_supabase_ciphertext_boundary",
+      "target": "docs_superpowers_plans_2026_08_05_signed_sync_replica_core_signed_sync_replica_core",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "docs/superpowers/plans/2026-08-04-supabase-schema-rls.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_plans_2026_08_09_recovery_root_enrollment_recovery_root_enrollment",
+      "target": "docs_superpowers_plans_2026_08_09_fresh_install_recovery_core_fresh_install_recovery_core",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.95,
+      "source_file": "docs/superpowers/plans/2026-08-09-recovery-root-enrollment.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_plans_2026_08_09_fresh_install_recovery_core_fresh_install_recovery_core",
+      "target": "docs_superpowers_plans_2026_08_09_device_pairing_existing_device_pairing",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.95,
+      "source_file": "docs/superpowers/plans/2026-08-09-fresh-install-recovery-core.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_specs_2026_07_19_offline_desktop_shell_design_offline_desktop_shell",
+      "target": "docs_superpowers_plans_2026_07_26_tasks_1_through_10_completion_tasks_1_through_10_completion",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.75,
+      "source_file": "docs/superpowers/specs/2026-07-19-offline-desktop-shell-design.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_specs_2026_08_04_supabase_schema_rls_design_session_device_binding",
+      "target": "docs_superpowers_specs_2026_08_04_supabase_schema_rls_design_supabase_ciphertext_boundary",
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/specs/2026-08-04-supabase-schema-rls-design.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_specs_2026_08_04_supabase_schema_rls_design_private_write_services",
+      "target": "docs_superpowers_specs_2026_08_04_supabase_schema_rls_design_supabase_ciphertext_boundary",
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/specs/2026-08-04-supabase-schema-rls-design.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_specs_2026_08_05_signed_sync_design_cloud_admission_boundary",
+      "target": "docs_superpowers_specs_2026_08_04_supabase_schema_rls_design_supabase_ciphertext_boundary",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/specs/2026-08-05-signed-sync-design.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_specs_2026_08_05_signed_sync_design_deterministic_merge",
+      "target": "docs_superpowers_specs_2026_08_05_signed_sync_design_signed_synchronization",
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/specs/2026-08-05-signed-sync-design.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_specs_2026_08_09_device_pairing_design_pairing_grant",
+      "target": "docs_superpowers_specs_2026_08_09_device_pairing_design_existing_device_pairing",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/specs/2026-08-09-device-pairing-design.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_specs_2026_08_09_device_pairing_design_pairing_transport",
+      "target": "docs_superpowers_specs_2026_08_09_device_pairing_design_existing_device_pairing",
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/specs/2026-08-09-device-pairing-design.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_specs_2026_08_09_device_pairing_design_pairing_transport",
+      "target": "docs_superpowers_specs_2026_08_04_supabase_schema_rls_design_supabase_ciphertext_boundary",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/specs/2026-08-09-device-pairing-design.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_specs_2026_08_09_fresh_install_recovery_core_design_recovery_device_claim",
+      "target": "docs_superpowers_specs_2026_08_09_fresh_install_recovery_core_design_fresh_install_recovery",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/specs/2026-08-09-fresh-install-recovery-core-design.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_specs_2026_08_09_fresh_install_recovery_core_design_fresh_install_recovery",
+      "target": "docs_superpowers_specs_2026_08_09_recovery_root_enrollment_design_recovery_enrollment_record",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/specs/2026-08-09-fresh-install-recovery-core-design.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_specs_2026_08_09_recovery_root_enrollment_design_recovery_enrollment_record",
+      "target": "docs_superpowers_specs_2026_08_09_recovery_root_enrollment_design_recovery_root_enrollment",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/specs/2026-08-09-recovery-root-enrollment-design.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_specs_2026_08_09_recovery_root_enrollment_design_native_phrase_confirmation",
+      "target": "docs_superpowers_specs_2026_08_09_recovery_root_enrollment_design_recovery_root_enrollment",
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/specs/2026-08-09-recovery-root-enrollment-design.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_superpowers_specs_2026_08_09_recovery_root_enrollment_design_recovery_root_enrollment",
+      "target": "docs_superpowers_specs_2026_08_09_device_pairing_design_existing_device_pairing",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/superpowers/specs/2026-08-09-recovery-root-enrollment-design.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_verification_task_15_task_15_verification",
+      "target": "docs_superpowers_specs_2026_08_04_supabase_schema_rls_design_supabase_ciphertext_boundary",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.95,
+      "source_file": "docs/verification/task-15.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_verification_task_16_task_16_verification",
+      "target": "docs_superpowers_specs_2026_08_05_signed_sync_design_signed_synchronization",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.95,
+      "source_file": "docs/verification/task-16.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_verification_task_17_fresh_install_recovery_core_task_17_fresh_recovery_verification",
+      "target": "docs_superpowers_specs_2026_08_09_fresh_install_recovery_core_design_fresh_install_recovery",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.95,
+      "source_file": "docs/verification/task-17-fresh-install-recovery-core.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_verification_task_17_pairing_task_17_pairing_verification",
+      "target": "docs_superpowers_specs_2026_08_09_device_pairing_design_existing_device_pairing",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.95,
+      "source_file": "docs/verification/task-17-pairing.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_verification_task_17_recovery_enrollment_task_17_recovery_enrollment_verification",
+      "target": "docs_superpowers_specs_2026_08_09_recovery_root_enrollment_design_recovery_root_enrollment",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.95,
+      "source_file": "docs/verification/task-17-recovery-enrollment.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "docs_verification_tasks_1_10_tasks_1_10_verification",
+      "target": "third_party_sidecars_semgrep_manifest_sha256_deterministic_source_manifest",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/verification/tasks-1-10.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "third_party_sidecars_policies_semgrep_package_semgrep_package_policy",
+      "target": "third_party_sidecars_semgrep_manifest_sha256_deterministic_source_manifest",
+      "relation": "semantically_similar_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.75,
+      "source_file": "third_party/sidecars/policies/semgrep-package.yml",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "apps_desktop_src_tauri_app_icon_app_icon",
+      "target": "apps_desktop_src_tauri_app_icon_relay_connection_motif",
+      "relation": "conceptually_related_to",
+      "confidence": "INFERRED",
+      "confidence_score": 0.95,
+      "source_file": "apps/desktop/src-tauri/app-icon.svg",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "apps_desktop_src_tauri_app_icon_endpoint_link_rationale",
+      "target": "apps_desktop_src_tauri_app_icon_relay_connection_motif",
+      "relation": "rationale_for",
+      "confidence": "INFERRED",
+      "confidence_score": 0.95,
+      "source_file": "apps/desktop/src-tauri/app-icon.svg",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "apps_desktop_src_tauri_icons_icon_primary_icon",
+      "target": "apps_desktop_src_tauri_icons_icon_connected_endpoints",
+      "relation": "conceptually_related_to",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "apps/desktop/src-tauri/icons/icon.png",
+      "source_location": null,
+      "weight": 1.0
+    }
+  ],
+  "hyperedges": [
+    {
+      "id": "managed_harness_memory_contract",
+      "label": "Managed Harness Memory Contract",
+      "nodes": [
+        "readme_authoritative_memory_contract",
+        "adapters_claude_code_capabilities_claude_code_memory_contract",
+        "adapters_codex_capabilities_codex_memory_contract",
+        "adapters_hermes_capabilities_hermes_memory_contract"
+      ],
+      "relation": "implement",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "README.md"
+    },
+    {
+      "id": "canonical_protocol_encoding",
+      "label": "Canonical Protocol Encoding",
+      "nodes": [
+        "docs_protocols_protocol_v1_protocol_v1",
+        "docs_protocols_cbor_v1_canonical_cbor_contracts",
+        "docs_protocols_cbor_v1_sync_operation_v1",
+        "docs_protocols_cbor_v1_scoped_checkpoint_v2"
+      ],
+      "relation": "form",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "docs/protocols/protocol-v1.md"
+    },
+    {
+      "id": "native_semgrep_release_chain",
+      "label": "Native Semgrep Release Chain",
+      "nodes": [
+        "_github_workflows_ci_native_semgrep_build",
+        "_github_workflows_semgrep_release_qualification_release_qualification",
+        "_github_workflows_publish_semgrep_native_semgrep_native_release",
+        "third_party_notices_sidecar_hydration"
+      ],
+      "relation": "participate_in",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": ".github/workflows/ci.yml"
+    },
+    {
+      "id": "native_transaction_durability",
+      "label": "Native Transaction Durability",
+      "nodes": [
+        "docs_superpowers_plans_2026_07_20_isolated_native_runner_isolated_native_runner",
+        "docs_superpowers_plans_2026_07_20_durable_absence_edge_checkpoint_durable_absence_edge_checkpoint",
+        "docs_superpowers_plans_2026_07_20_native_transaction_profile_lock_native_transaction_profile_lock"
+      ],
+      "relation": "participate_in",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "docs/superpowers/plans/2026-07-20-isolated-native-runner.md"
+    },
+    {
+      "id": "mcp_adapter_installation",
+      "label": "MCP Adapter Installation",
+      "nodes": [
+        "docs_superpowers_plans_2026_07_27_codex_adapter_v1_codex_adapter_v1",
+        "docs_superpowers_plans_2026_07_29_hermes_adapter_v1_hermes_adapter_v1",
+        "docs_superpowers_plans_2026_07_30_mcp_memory_tasks_handoffs_mcp_memory_tasks_handoffs",
+        "docs_superpowers_plans_2026_07_31_transactional_mcp_adapter_install_transactional_mcp_adapter_install"
+      ],
+      "relation": "participate_in",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "docs/superpowers/plans/2026-07-31-transactional-mcp-adapter-install.md"
+    },
+    {
+      "id": "recovery_device_lifecycle",
+      "label": "Recovery and Device Lifecycle",
+      "nodes": [
+        "docs_superpowers_plans_2026_08_09_recovery_root_enrollment_recovery_root_enrollment",
+        "docs_superpowers_plans_2026_08_09_fresh_install_recovery_core_fresh_install_recovery_core",
+        "docs_superpowers_plans_2026_08_09_device_pairing_existing_device_pairing"
+      ],
+      "relation": "form",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "docs/superpowers/plans/2026-08-09-fresh-install-recovery-core.md"
+    },
+    {
+      "id": "recovery_trust_lifecycle",
+      "label": "Recovery Trust Lifecycle",
+      "nodes": [
+        "docs_superpowers_specs_2026_08_09_recovery_root_enrollment_design_recovery_root_enrollment",
+        "docs_superpowers_specs_2026_08_09_fresh_install_recovery_core_design_fresh_install_recovery",
+        "docs_superpowers_specs_2026_08_09_device_pairing_design_existing_device_pairing"
+      ],
+      "relation": "participate_in",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "docs/superpowers/specs/2026-08-09-recovery-root-enrollment-design.md"
+    },
+    {
+      "id": "hosted_ciphertext_service_boundary",
+      "label": "Hosted Ciphertext Service Boundary",
+      "nodes": [
+        "docs_superpowers_specs_2026_08_04_supabase_schema_rls_design_supabase_ciphertext_boundary",
+        "docs_superpowers_specs_2026_08_05_signed_sync_design_cloud_admission_boundary",
+        "docs_superpowers_specs_2026_08_09_device_pairing_design_pairing_transport"
+      ],
+      "relation": "form",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "docs/superpowers/specs/2026-08-05-signed-sync-design.md"
+    },
+    {
+      "id": "apps_desktop_src_tauri_app_icon_relay_symbolism",
+      "label": "Relay Symbolism",
+      "nodes": [
+        "apps_desktop_src_tauri_app_icon_app_icon",
+        "apps_desktop_src_tauri_app_icon_relay_connection_motif",
+        "apps_desktop_src_tauri_app_icon_endpoint_link_rationale"
+      ],
+      "relation": "form",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "apps/desktop/src-tauri/app-icon.svg"
+    }
+  ],
+  "input_tokens": 0,
+  "output_tokens": 0
+}

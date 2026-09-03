@@ -1,0 +1,822 @@
+{
+  "version": 1,
+  "capturedAt": "2026-08-31",
+  "sourceHead": "435367d8d8ba24aac413a094a4b8b5bc61d52d22",
+  "implementationCheckpoint": "485886c2d3ad5105c5ea5114851d18045c25fc74",
+  "notes": [
+    "SHA-256 is integrity evidence, not a security audit or proof of historical claims.",
+    "Original hashes identify the pre-normalization local bytes; stored hashes identify this portable archive.",
+    "Normalization changes machine paths, archive notices, trailing whitespace and final newline only; the graph is stale navigation data.",
+    "Compressed files were decoded and scanned before publication."
+  ],
+  "files": [
+    {
+      "source": "user-attachment/master-implementation-plan",
+      "path": "references/master-implementation-plan.md",
+      "originalBytes": 59494,
+      "originalSha256": "4069106968355abb425bd0c093282f465cf5a0317ebcff6182b1fa531110bb88",
+      "decodedBytes": 59873,
+      "decodedSha256": "8bae70a821b4673d3b22b9490a3f471c2dbf60e5d5b665cc9c28e51ec9ecb7b3",
+      "storedBytes": 59873,
+      "storedSha256": "8bae70a821b4673d3b22b9490a3f471c2dbf60e5d5b665cc9c28e51ec9ecb7b3",
+      "compression": null
+    },
+    {
+      "source": "user-attachment/development-report",
+      "path": "references/development-report-historical.md",
+      "originalBytes": 19797,
+      "originalSha256": "006294647120be477058184546afe8d672ca57fb4b3b66e5e2b04f1caad2236e",
+      "decodedBytes": 20019,
+      "decodedSha256": "dc30990ca1d266fac82c310a99163f3f96a81ccdd058bc4a81546264f7ff458e",
+      "storedBytes": 20019,
+      "storedSha256": "dc30990ca1d266fac82c310a99163f3f96a81ccdd058bc4a81546264f7ff458e",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/task-1-brief.md",
+      "path": "audit-notes/task-1-brief.md",
+      "originalBytes": 3752,
+      "originalSha256": "e7b3b354d5b7daf5e54d6ab9313f3da39cba58ae7632093184062777afde6664",
+      "decodedBytes": 3978,
+      "decodedSha256": "abba1b004084c49413c766b114f834ed80814af3b682c77d906ffa81af1a4470",
+      "storedBytes": 3978,
+      "storedSha256": "abba1b004084c49413c766b114f834ed80814af3b682c77d906ffa81af1a4470",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/task-1-report.md",
+      "path": "audit-notes/task-1-report.md",
+      "originalBytes": 2549,
+      "originalSha256": "457c831417c8331b67d429b3694000ac27861d9214d86e5edd65edf69ca62c7a",
+      "decodedBytes": 2970,
+      "decodedSha256": "ba7b62449fdf6403cad73fb756b160a25126d0f3a74d8989f0bad1edc3582d0f",
+      "storedBytes": 2970,
+      "storedSha256": "ba7b62449fdf6403cad73fb756b160a25126d0f3a74d8989f0bad1edc3582d0f",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/task-2-brief.md",
+      "path": "audit-notes/task-2-brief.md",
+      "originalBytes": 4020,
+      "originalSha256": "f587d7e678a2c201c8806ca539b6fef02087e900653b928be78030027e035a31",
+      "decodedBytes": 4441,
+      "decodedSha256": "e372f7a8f65f4a4d9289d7290f3194a03b42d992c4fea4192c1f1596bb3dc707",
+      "storedBytes": 4441,
+      "storedSha256": "e372f7a8f65f4a4d9289d7290f3194a03b42d992c4fea4192c1f1596bb3dc707",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/task-2-report.md",
+      "path": "audit-notes/task-2-report.md",
+      "originalBytes": 2557,
+      "originalSha256": "27805fee19368dbb00961c3a6a9a273722a38f3ad1e83fb3c090688a4b6cef96",
+      "decodedBytes": 2976,
+      "decodedSha256": "1bcb45efd2b18d671dc8cd446c4da052f953da853bae41a087946f81d067f1d5",
+      "storedBytes": 2976,
+      "storedSha256": "1bcb45efd2b18d671dc8cd446c4da052f953da853bae41a087946f81d067f1d5",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/task-3-brief.md",
+      "path": "audit-notes/task-3-brief.md",
+      "originalBytes": 4619,
+      "originalSha256": "58baba275d7479e5302c11558d309c0c0d12e6f1e16dcac09d06e3c12e9bc363",
+      "decodedBytes": 5040,
+      "decodedSha256": "c6b9c02331c09737116d81f94e04f8d4681cd11caf8281e8b66b473c4eedeb63",
+      "storedBytes": 5040,
+      "storedSha256": "c6b9c02331c09737116d81f94e04f8d4681cd11caf8281e8b66b473c4eedeb63",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/task-3-report.md",
+      "path": "audit-notes/task-3-report.md",
+      "originalBytes": 10029,
+      "originalSha256": "6aaec85c6e97fcc0dc5fca78569583b74b97ea98c9623cfb01eb34cdafe2fb19",
+      "decodedBytes": 10450,
+      "decodedSha256": "e90c63c5d079da85ae23c2c4d478392b442150ec7a9b38bb27c7e5a53f917eff",
+      "storedBytes": 10450,
+      "storedSha256": "e90c63c5d079da85ae23c2c4d478392b442150ec7a9b38bb27c7e5a53f917eff",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/task-4-brief.md",
+      "path": "audit-notes/task-4-brief.md",
+      "originalBytes": 4706,
+      "originalSha256": "d06fb2df9920a1a3b72edcdac722925ebe161f271f9c73d63b5c99ec72bfec57",
+      "decodedBytes": 5127,
+      "decodedSha256": "c5461808ff56577a905c5c15a911f8eba8ff2f6db63f4b3ba688818d0a8cd102",
+      "storedBytes": 5127,
+      "storedSha256": "c5461808ff56577a905c5c15a911f8eba8ff2f6db63f4b3ba688818d0a8cd102",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/task-4-report.md",
+      "path": "audit-notes/task-4-report.md",
+      "originalBytes": 11771,
+      "originalSha256": "8d191c1ef01b4960562cd314c16c109792b25354eb28d89e4f37f68f75da6401",
+      "decodedBytes": 12192,
+      "decodedSha256": "888c71379d3271dee218ba459d085686fcbca6d8ec65e6cc35cc1f1fe1ae3e8c",
+      "storedBytes": 12192,
+      "storedSha256": "888c71379d3271dee218ba459d085686fcbca6d8ec65e6cc35cc1f1fe1ae3e8c",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/task-4b-brief.md",
+      "path": "audit-notes/task-4b-brief.md",
+      "originalBytes": 2974,
+      "originalSha256": "433b2582c449685a25b83888db53368d0ba2db9a6a9d6c1fbf57d3a6ad7b6b64",
+      "decodedBytes": 3395,
+      "decodedSha256": "ab9cff00650fd045c4590898a360032e72d248b76abb1fd904222aef851a4bcb",
+      "storedBytes": 3395,
+      "storedSha256": "ab9cff00650fd045c4590898a360032e72d248b76abb1fd904222aef851a4bcb",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/task-4b-report.md",
+      "path": "audit-notes/task-4b-report.md",
+      "originalBytes": 5366,
+      "originalSha256": "d496560ceb7dc3430d71b3063b82894b04297ee2f9fcbd540b03a54eb7ef3dfe",
+      "decodedBytes": 5787,
+      "decodedSha256": "c40048c9f1ecb002306c92fc3255876aea5ad0a6d1f59fb760f2a0d455aec3f5",
+      "storedBytes": 5787,
+      "storedSha256": "c40048c9f1ecb002306c92fc3255876aea5ad0a6d1f59fb760f2a0d455aec3f5",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/task-5-brief.md",
+      "path": "audit-notes/task-5-brief.md",
+      "originalBytes": 5287,
+      "originalSha256": "bc03d36f36dee4537d208e6d31983673cfd418335d544b661363e97353d313ac",
+      "decodedBytes": 5708,
+      "decodedSha256": "2eecba934891501d3e577ca3c38fdb9897f6e676408aa499e216e5caca72fc6b",
+      "storedBytes": 5708,
+      "storedSha256": "2eecba934891501d3e577ca3c38fdb9897f6e676408aa499e216e5caca72fc6b",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/task-5-report.md",
+      "path": "audit-notes/task-5-report.md",
+      "originalBytes": 8957,
+      "originalSha256": "bb337f0edb5f1032c5a0d228d5fd14c5aa71f0b6fb333b647d4a1a1cbcb627c5",
+      "decodedBytes": 9378,
+      "decodedSha256": "21491cb70b661af0011d67f21e3ef2e44ee79c217e11f343d66cdb844e951757",
+      "storedBytes": 9378,
+      "storedSha256": "21491cb70b661af0011d67f21e3ef2e44ee79c217e11f343d66cdb844e951757",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/task-6-brief.md",
+      "path": "audit-notes/task-6-brief.md",
+      "originalBytes": 2584,
+      "originalSha256": "106239bee2bd315acb0c09b1994f181d5364f0a0f799402be0b48ae4cbbd87a6",
+      "decodedBytes": 3005,
+      "decodedSha256": "e9763ba5b35810d7f5b984c7c43f17587041e5192882aca318bb96d08c34b19c",
+      "storedBytes": 3005,
+      "storedSha256": "e9763ba5b35810d7f5b984c7c43f17587041e5192882aca318bb96d08c34b19c",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/task-6-report.md",
+      "path": "audit-notes/task-6-report.md",
+      "originalBytes": 4448,
+      "originalSha256": "c8d2cf2beb3ded9c0096a6508daa2af903c48d337fcd19c178749ef0743d8b1f",
+      "decodedBytes": 4867,
+      "decodedSha256": "af79ac678e208b7c917e541544ef39bf62eb577b4eb2b24e74e43835f6c56fad",
+      "storedBytes": 4867,
+      "storedSha256": "af79ac678e208b7c917e541544ef39bf62eb577b4eb2b24e74e43835f6c56fad",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_analysis.json",
+      "path": "graphify/analysis.json.gz",
+      "originalBytes": 887473,
+      "originalSha256": "6a3acde7bda4c36adceed2a0500e497195cce25eab71adb70ba5a3cf36ae9e48",
+      "decodedBytes": 887474,
+      "decodedSha256": "011b9da890ef6ba6d59928c08a85740d4a242d9a74413af26a023fa4115a6de0",
+      "storedBytes": 113891,
+      "storedSha256": "907e1ce8228b53f3fdfe52780726eb34a1a9177a6ab5415b17350d846e506df0",
+      "compression": "gzip"
+    },
+    {
+      "source": "graphify-out/.graphify_ast.json",
+      "path": "graphify/ast.json.gz",
+      "originalBytes": 18898379,
+      "originalSha256": "7d48031913952bd5fe8fcc45607ef17b6f4ac6876531a134bae0df8af162576c",
+      "decodedBytes": 18898380,
+      "decodedSha256": "e2f505e83b375fa5b423c9d96f34f13647ac16d5e819aefb6ed4d9303626a140",
+      "storedBytes": 728127,
+      "storedSha256": "f2832252f0c374681736ce15f9047f44e7b53c077affcfb4825f4cc15b72dc48",
+      "compression": "gzip"
+    },
+    {
+      "source": "graphify-out/.graphify_chunk_01.json",
+      "path": "graphify/chunk_01.json",
+      "originalBytes": 18920,
+      "originalSha256": "3e334e14c9a60deb97df5ae44ba0ccdd8d055ad9f305a52bc617e71cd127ae09",
+      "decodedBytes": 14228,
+      "decodedSha256": "518361ec5bed31920114db0d0a61ea6c1aed557874d6f757cd87b31bf797ad66",
+      "storedBytes": 14228,
+      "storedSha256": "518361ec5bed31920114db0d0a61ea6c1aed557874d6f757cd87b31bf797ad66",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_chunk_01.txt",
+      "path": "graphify/chunk_01.txt",
+      "originalBytes": 2553,
+      "originalSha256": "77abb49e175f31a44724074eef967be7f3cbd146f8d9ea384a7caf0c0677a5fe",
+      "decodedBytes": 622,
+      "decodedSha256": "6cbbf52feefcbc5c7b7a981bf8516ce825e65942c1749d34dd751a5c993459f7",
+      "storedBytes": 622,
+      "storedSha256": "6cbbf52feefcbc5c7b7a981bf8516ce825e65942c1749d34dd751a5c993459f7",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_chunk_02.json",
+      "path": "graphify/chunk_02.json",
+      "originalBytes": 17369,
+      "originalSha256": "7d27c2d406b75f7298302d3c98a40d0adb8d26a080213c8817b125083ea4ccf9",
+      "decodedBytes": 13965,
+      "decodedSha256": "c0cab21bdd1439849f8194ef14438477f78cf92afd67552805aa955ad7b2fc3e",
+      "storedBytes": 13965,
+      "storedSha256": "c0cab21bdd1439849f8194ef14438477f78cf92afd67552805aa955ad7b2fc3e",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_chunk_02.txt",
+      "path": "graphify/chunk_02.txt",
+      "originalBytes": 3293,
+      "originalSha256": "9aa11bd4694be6fdd144fed894365cb5f70dd196cccdb7b83254eb2d3df9e98c",
+      "decodedBytes": 1362,
+      "decodedSha256": "9b4787a07bcf4b81a5d5775bd473c8bdf266cebb334138632640fc820e24a89b",
+      "storedBytes": 1362,
+      "storedSha256": "9b4787a07bcf4b81a5d5775bd473c8bdf266cebb334138632640fc820e24a89b",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_chunk_03.json",
+      "path": "graphify/chunk_03.json",
+      "originalBytes": 23422,
+      "originalSha256": "6efe3cabc86a5184e57785ea0580dbadf4f48ef887ca781c83d4faef98a69ffe",
+      "decodedBytes": 18914,
+      "decodedSha256": "b0e1c75c4b48b6cb38436d3e58cafcfa35d684b3d410c227c0bbae818df0e344",
+      "storedBytes": 18914,
+      "storedSha256": "b0e1c75c4b48b6cb38436d3e58cafcfa35d684b3d410c227c0bbae818df0e344",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_chunk_03.txt",
+      "path": "graphify/chunk_03.txt",
+      "originalBytes": 2785,
+      "originalSha256": "38360b30eb92eddde48fefd09f900d3d16ed6f44e3f640c3d6686fed7770bc4e",
+      "decodedBytes": 946,
+      "decodedSha256": "e4dc27871a8a630c87020153007aa22c77a1246f7b848e1013cd460899cc798b",
+      "storedBytes": 946,
+      "storedSha256": "e4dc27871a8a630c87020153007aa22c77a1246f7b848e1013cd460899cc798b",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_chunk_04.json",
+      "path": "graphify/chunk_04.json",
+      "originalBytes": 2531,
+      "originalSha256": "27352220dc6c7da59afe5a3d8c5f3a4f3c55a2c8897f2439dd79063bb723fc92",
+      "decodedBytes": 1979,
+      "decodedSha256": "814f2da05c5dbb2f374a763e4a99230c553d4ac7156b856af3451b972eef8e54",
+      "storedBytes": 1979,
+      "storedSha256": "814f2da05c5dbb2f374a763e4a99230c553d4ac7156b856af3451b972eef8e54",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_chunk_04.txt",
+      "path": "graphify/chunk_04.txt",
+      "originalBytes": 127,
+      "originalSha256": "5d26182c13095e23564974af90505494c79f7afb03078acfc375860e5349715e",
+      "decodedBytes": 36,
+      "decodedSha256": "70fd751c142c6fa9d1588906baccd72038dd5eeeddec985e02a0e1b42d421dd3",
+      "storedBytes": 36,
+      "storedSha256": "70fd751c142c6fa9d1588906baccd72038dd5eeeddec985e02a0e1b42d421dd3",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_chunk_05.json",
+      "path": "graphify/chunk_05.json",
+      "originalBytes": 1311,
+      "originalSha256": "2b7017e81a1414298b1ccc3c30e05a4ac7f1978f6a059c7840f9acc898b7f887",
+      "decodedBytes": 1035,
+      "decodedSha256": "3ec1beff15ffabb71be28a937709fdaef4c2351955fce81cbaabefd233d242f3",
+      "storedBytes": 1035,
+      "storedSha256": "3ec1beff15ffabb71be28a937709fdaef4c2351955fce81cbaabefd233d242f3",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_chunk_05.txt",
+      "path": "graphify/chunk_05.txt",
+      "originalBytes": 129,
+      "originalSha256": "818431a754f4bbb8620b556d13955b8aa092755e1bf01d3fe7f554f75893100f",
+      "decodedBytes": 38,
+      "decodedSha256": "54c6d142adf5c03e52568d842c912dfd98b1ab6dceb43316c51af1b1f9b47725",
+      "storedBytes": 38,
+      "storedSha256": "54c6d142adf5c03e52568d842c912dfd98b1ab6dceb43316c51af1b1f9b47725",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_detect.json",
+      "path": "graphify/detect.json",
+      "originalBytes": 70005,
+      "originalSha256": "893c6b2684382267204a7b960756d748e58df6913f281c4708de8e51b7713f8d",
+      "decodedBytes": 23835,
+      "decodedSha256": "a3d6a5dfdf2d634f912f0a029b3079232050ab82578ee60a8fafdf65646d3dce",
+      "storedBytes": 23835,
+      "storedSha256": "a3d6a5dfdf2d634f912f0a029b3079232050ab82578ee60a8fafdf65646d3dce",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_extract.json",
+      "path": "graphify/extract.json.gz",
+      "originalBytes": 18973329,
+      "originalSha256": "da06afc9ef1900a2799a0abf23e379061013fc24ef6e446f056bc42125812744",
+      "decodedBytes": 18959898,
+      "decodedSha256": "54e201b390ab2a7bd9e59794a090c155122bd35c063f408bb76491504ad6a223",
+      "storedBytes": 734467,
+      "storedSha256": "dca1471f80ea4391ada9c27864041fc7e55fe5c889433ceb227fb564088d5242",
+      "compression": "gzip"
+    },
+    {
+      "source": "graphify-out/.graphify_labels.json",
+      "path": "graphify/labels.json",
+      "originalBytes": 11206,
+      "originalSha256": "2c8f869418daf338f1a94ddd62303ecd2945bd743142b2c3309d32e5e9324321",
+      "decodedBytes": 11207,
+      "decodedSha256": "1b0530f7c4ca0b87a3c183b5fbfd734c4f7afaaef84a8f7a3222ac752de75726",
+      "storedBytes": 11207,
+      "storedSha256": "1b0530f7c4ca0b87a3c183b5fbfd734c4f7afaaef84a8f7a3222ac752de75726",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_learning.json",
+      "path": "graphify/learning.json",
+      "originalBytes": 88,
+      "originalSha256": "b3b2935c09455e8c7a2f2a39168b48844c465c0d00b05ffb57faeace123ea9f7",
+      "decodedBytes": 88,
+      "decodedSha256": "b3b2935c09455e8c7a2f2a39168b48844c465c0d00b05ffb57faeace123ea9f7",
+      "storedBytes": 88,
+      "storedSha256": "b3b2935c09455e8c7a2f2a39168b48844c465c0d00b05ffb57faeace123ea9f7",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_semantic.json",
+      "path": "graphify/semantic.json",
+      "originalBytes": 75029,
+      "originalSha256": "1c7934cd96e6b3fa26cdb1792f3000704e434e4d01b12bb57016c72075a8ec69",
+      "decodedBytes": 61598,
+      "decodedSha256": "0cdada32ad41d77a85fa411cfa7be8110125d8d61e9c763b389bea8a00432bbe",
+      "storedBytes": 61598,
+      "storedSha256": "0cdada32ad41d77a85fa411cfa7be8110125d8d61e9c763b389bea8a00432bbe",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_semantic_new.json",
+      "path": "graphify/semantic_new.json",
+      "originalBytes": 75029,
+      "originalSha256": "1c7934cd96e6b3fa26cdb1792f3000704e434e4d01b12bb57016c72075a8ec69",
+      "decodedBytes": 61598,
+      "decodedSha256": "0cdada32ad41d77a85fa411cfa7be8110125d8d61e9c763b389bea8a00432bbe",
+      "storedBytes": 61598,
+      "storedSha256": "0cdada32ad41d77a85fa411cfa7be8110125d8d61e9c763b389bea8a00432bbe",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/.graphify_uncached.txt",
+      "path": "graphify/uncached.txt",
+      "originalBytes": 8891,
+      "originalSha256": "863aae4089ba7018db1c7c670cced1406fa90c89201599460e9844fcf0eaf27b",
+      "decodedBytes": 3004,
+      "decodedSha256": "dbc23b03f2741e17106be0b067cc7b9f568d34b5c43dcd23ef0b20da3c7b9ee9",
+      "storedBytes": 3004,
+      "storedSha256": "dbc23b03f2741e17106be0b067cc7b9f568d34b5c43dcd23ef0b20da3c7b9ee9",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/GRAPH_REPORT.md",
+      "path": "graphify/GRAPH_REPORT.md",
+      "originalBytes": 105653,
+      "originalSha256": "01c86cffe7e9df7900b3d35377045c5846a4c4da1416cefdfec11ca16684bf30",
+      "decodedBytes": 105575,
+      "decodedSha256": "f45efc7b69c77fc45ee3f4f9a6e6500e19ba72433c502cbb3788b5854aec6e9e",
+      "storedBytes": 105575,
+      "storedSha256": "f45efc7b69c77fc45ee3f4f9a6e6500e19ba72433c502cbb3788b5854aec6e9e",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/cost.json",
+      "path": "graphify/cost.json",
+      "originalBytes": 206,
+      "originalSha256": "3720f7ddc2cffab61208e2c582e266332de612c16a6825fc8b1510e3d5d19c92",
+      "decodedBytes": 207,
+      "decodedSha256": "4a32556a99b6692c080bd418f50bdff4d8a01db82d63012b893e700dcd33346a",
+      "storedBytes": 207,
+      "storedSha256": "4a32556a99b6692c080bd418f50bdff4d8a01db82d63012b893e700dcd33346a",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/graph.html",
+      "path": "graphify/graph.html",
+      "originalBytes": 493330,
+      "originalSha256": "aecea448f38f495895816330366b1297c14f0e6abdab06c84083bcc18c8309c6",
+      "decodedBytes": 493331,
+      "decodedSha256": "9e0839fca73fa0075faaa31007cc1c2ccae481b76031f17fb605ba30b0714860",
+      "storedBytes": 493331,
+      "storedSha256": "9e0839fca73fa0075faaa31007cc1c2ccae481b76031f17fb605ba30b0714860",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/graph.json",
+      "path": "graphify/graph.json.gz",
+      "originalBytes": 19680873,
+      "originalSha256": "02e53e0dc19175f77e50553299b60afcb317add46a78dd4fd0890526317083be",
+      "decodedBytes": 19680874,
+      "decodedSha256": "5e1846fc7b4b26df7b3150b19e32de1c8cefee817ffeb2269a6152f093604cf6",
+      "storedBytes": 774147,
+      "storedSha256": "fc58922317d28d0d5fd024c5ddc5cc8324b548051c3536acbf9011cdace40d6c",
+      "compression": "gzip"
+    },
+    {
+      "source": "graphify-out/manifest.json",
+      "path": "graphify/manifest.json",
+      "originalBytes": 89105,
+      "originalSha256": "f502379ccfff3364da447a02762947e4b54988ee906fe65295a59a0908f20b0c",
+      "decodedBytes": 89106,
+      "decodedSha256": "c8b29fafd4d1c636705548a1a88ceff83a855edb25660b35696875111cad439b",
+      "storedBytes": 89106,
+      "storedSha256": "c8b29fafd4d1c636705548a1a88ceff83a855edb25660b35696875111cad439b",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/memory/query_20260831_105345_windows_64_call_cancellation_and_acl_fixture_failu.md",
+      "path": "graphify/memory/query_20260831_105345_windows_64_call_cancellation_and_acl_fixture_failu.md",
+      "originalBytes": 1096,
+      "originalSha256": "82248eac9313dedbd8f12be23aec39b5ec83b25a0d2b090acaca8fb39a0440f0",
+      "decodedBytes": 1097,
+      "decodedSha256": "a21bc207dfc17d51b62cdcfa8af48cf864c8399f2e736991078f84415b7427d5",
+      "storedBytes": 1097,
+      "storedSha256": "a21bc207dfc17d51b62cdcfa8af48cf864c8399f2e736991078f84415b7427d5",
+      "compression": null
+    },
+    {
+      "source": "graphify-out/reflections/LESSONS.md",
+      "path": "graphify/reflections/LESSONS.md",
+      "originalBytes": 329,
+      "originalSha256": "be34d36a0a616a8aede42f5a3ff0d3b98acd9f15f4aa1515d0361038a2afb75a",
+      "decodedBytes": 329,
+      "decodedSha256": "be34d36a0a616a8aede42f5a3ff0d3b98acd9f15f4aa1515d0361038a2afb75a",
+      "storedBytes": 329,
+      "storedSha256": "be34d36a0a616a8aede42f5a3ff0d3b98acd9f15f4aa1515d0361038a2afb75a",
+      "compression": null
+    },
+    {
+      "source": ".superpowers/sdd/review-3c2a371..224ba8d.diff",
+      "path": "audit-notes/review-patches/review-3c2a371..224ba8d.diff.gz",
+      "originalBytes": 31097,
+      "originalSha256": "cea4cf77fd06dfd62b41c4049f05c87fa202af7071b2f9e58c4697189a7d5dcc",
+      "decodedBytes": 31091,
+      "decodedSha256": "541dba94189c1f2e480672ac4a48b14cb2bee8a821d3765183ad852872ffc903",
+      "storedBytes": 10679,
+      "storedSha256": "5877f64665208721dce5bd70e13a772dbdcf3c54e8e8b54d62eac4caf7083ba2",
+      "compression": "gzip"
+    },
+    {
+      "source": ".superpowers/sdd/review-3c2a371..61babf0.diff",
+      "path": "audit-notes/review-patches/review-3c2a371..61babf0.diff.gz",
+      "originalBytes": 31590,
+      "originalSha256": "4ab5a5b8d92caa5b85dae4e22f35765417fc4ac7aac2210daa560be81f2ba864",
+      "decodedBytes": 31584,
+      "decodedSha256": "da929bad1902b062d9d6b7e7808df0ce1c930b137161ef7fb933e8ff88e7947f",
+      "storedBytes": 10789,
+      "storedSha256": "482f8a71db19a4001b118b9653891a2a136b5467f12a24144fdb27f4741e042c",
+      "compression": "gzip"
+    },
+    {
+      "source": ".superpowers/sdd/review-593c9d2..fc0f262.diff",
+      "path": "audit-notes/review-patches/review-593c9d2..fc0f262.diff.gz",
+      "originalBytes": 12550,
+      "originalSha256": "69395332c5ea4b120dd6b3fe30adaa8be7a69ce6cc98bcd6ec6c30de7b065aa0",
+      "decodedBytes": 12540,
+      "decodedSha256": "a9ea78e81ece73a1ba12bc6bf49ef7d880e668d2d0dff345a5a1ee406799f497",
+      "storedBytes": 3370,
+      "storedSha256": "5748487c11a739cd2752bc9c8a1b749a5046c83856e5a3697391017e0a952155",
+      "compression": "gzip"
+    },
+    {
+      "source": ".superpowers/sdd/review-593c9d2fc..fc0f262.diff",
+      "path": "audit-notes/review-patches/review-593c9d2fc..fc0f262.diff.gz",
+      "originalBytes": 113,
+      "originalSha256": "c7427bedc16805c6ff321b577f2f2ce8c5dbcd67bebf9eefbf6177ff23908787",
+      "decodedBytes": 113,
+      "decodedSha256": "c7427bedc16805c6ff321b577f2f2ce8c5dbcd67bebf9eefbf6177ff23908787",
+      "storedBytes": 118,
+      "storedSha256": "661fff234a1a3450ed7df465c2fca1b4ec2f15d55e5c9a9e31ded95e03ea3d8d",
+      "compression": "gzip"
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/review-task-3-ab7b3b2..4b57cbc.diff",
+      "path": "audit-notes/review-patches/v1-review-task-3-ab7b3b2..4b57cbc.diff.gz",
+      "originalBytes": 96611,
+      "originalSha256": "394c8546723141d0b441451f2946c7040f2a4b09f9beda4c76adcbd16690b360",
+      "decodedBytes": 96498,
+      "decodedSha256": "69fb520d5355c197e232772ac93cecc48fbc6fec6dae9eab63dab3a2ad6b4afc",
+      "storedBytes": 17246,
+      "storedSha256": "9c342678c0d1204336447259b5fcf1ca5c2843de3aacea034fca0198ca8306e1",
+      "compression": "gzip"
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/review-task-4-38331da..f5f0eee.diff",
+      "path": "audit-notes/review-patches/v1-review-task-4-38331da..f5f0eee.diff.gz",
+      "originalBytes": 49212,
+      "originalSha256": "ef08b6b95bb7ba7827a9275793f715ea4e3c5e4834a591278a123b00f5b2fd01",
+      "decodedBytes": 49162,
+      "decodedSha256": "4fd988da7e2c7abc2dc39114de828787a6fb141d6084decff2617db74d23e42b",
+      "storedBytes": 11503,
+      "storedSha256": "192e503513aeac4cc5b48f1196e905a6e44c92dbb51d3177f1a407ae100e15b7",
+      "compression": "gzip"
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/review-task-4-fix-f5f0eee..a1c1db7.diff",
+      "path": "audit-notes/review-patches/v1-review-task-4-fix-f5f0eee..a1c1db7.diff.gz",
+      "originalBytes": 11549,
+      "originalSha256": "13d2d5be3d4d73aa0d87dce9b69a2482a3234582aad1cab72bb38ffe303eae09",
+      "decodedBytes": 11537,
+      "decodedSha256": "e88d59e0eecb8ad230ef269e149c10f24af1526dc0dd309954e87ef6dd18e4c9",
+      "storedBytes": 3142,
+      "storedSha256": "2b5487db3865d4a3121838e77ceb6d975aff4414e28155f664f98dec0122c955",
+      "compression": "gzip"
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/review-task-4b-2daee6d..8261053.diff",
+      "path": "audit-notes/review-patches/v1-review-task-4b-2daee6d..8261053.diff.gz",
+      "originalBytes": 17020,
+      "originalSha256": "336556b2a85c132d10251d077e9b8f72e3e6ac85f9b16ea4c1ef739731a1257b",
+      "decodedBytes": 16998,
+      "decodedSha256": "b3c9777e9e809acb4bc8ab4f7f7f2ba7b301dbcdc31286e25e449e69e82a875a",
+      "storedBytes": 4692,
+      "storedSha256": "0e19afa198ba766bd82a258e3468cbadb13ba1f024d802e6232961247a97f89b",
+      "compression": "gzip"
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/review-task-4b-fix-8261053..981fa58.diff",
+      "path": "audit-notes/review-patches/v1-review-task-4b-fix-8261053..981fa58.diff.gz",
+      "originalBytes": 14306,
+      "originalSha256": "31437e4a9e659e8edc5c4d6c747f6307f29a93c18793a5454c5d017232b04f3e",
+      "decodedBytes": 14287,
+      "decodedSha256": "9e924007e29c6d9089fa12589cac83554e2ea8e3c22fbebd3db8e960d433fb0e",
+      "storedBytes": 4025,
+      "storedSha256": "9ecf439b41415b37d96459251f10ed5bd40afe5422d84bc23898a52504d8bffd",
+      "compression": "gzip"
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/review-task-5-3599b7b..85a59ed.diff",
+      "path": "audit-notes/review-patches/v1-review-task-5-3599b7b..85a59ed.diff.gz",
+      "originalBytes": 33950,
+      "originalSha256": "a5d42efe6798faed3ddb7a4f0a8d662762ff44697eb60f4a600bc3d99a362c09",
+      "decodedBytes": 33935,
+      "decodedSha256": "98e1787c5440fc32f51393d37708ae737a851a74abe6cd9cff043acb74512045",
+      "storedBytes": 9503,
+      "storedSha256": "2f6ddccfaa4c88da68d87618b00703540fe8062a90f74142b1431748ce7802c8",
+      "compression": "gzip"
+    }
+  ],
+  "reviewPatches": [
+    {
+      "source": ".superpowers/sdd/review-3c2a371..224ba8d.diff",
+      "archivedPath": "audit-notes/review-patches/review-3c2a371..224ba8d.diff.gz",
+      "originalBytes": 31097,
+      "originalSha256": "cea4cf77fd06dfd62b41c4049f05c87fa202af7071b2f9e58c4697189a7d5dcc",
+      "preservedBy": "Complete portable review package archived, including historical header/context; endpoints also exist in public PR #12 history.",
+      "header": "# Review package: 3c2a371aef74f4962af64d0fe71545557244f21a..224ba8df8c270644f24198fa551fd6485fb949f9\n\n## Commits\n224ba8d docs: establish v1 audit baseline\n\n## Files changed\n docs/protocols/contract-amendments.md     | 38 ++++++++++++++++\n docs/security/threat-model.md             | 65 +++++++++++++++++++++++++---\n docs/verification/v1-master-plan-audit.md | 72 +++++++++++++++++++++++++++++++\n 3 files changed, 169 insertions(+), 6 deletions(-)\n\n## Diff\n",
+      "range": "3c2a371aef74f4962af64d0fe71545557244f21a..224ba8df8c270644f24198fa551fd6485fb949f9",
+      "paths": [
+        "docs/protocols/contract-amendments.md",
+        "docs/security/threat-model.md",
+        "docs/verification/v1-master-plan-audit.md"
+      ],
+      "regenerationCommand": "git diff 3c2a371aef74f4962af64d0fe71545557244f21a..224ba8df8c270644f24198fa551fd6485fb949f9 -- \"docs/protocols/contract-amendments.md\" \"docs/security/threat-model.md\" \"docs/verification/v1-master-plan-audit.md\"",
+      "exactRegeneration": false,
+      "exactDiffBody": true,
+      "sameDiffBodyIgnoringTrailingWhitespace": true,
+      "regeneratedSha256": "42b628efd39f0b2b219229d0da272ac14c6ef8d43d47d956296656d2ea44e082"
+    },
+    {
+      "source": ".superpowers/sdd/review-3c2a371..61babf0.diff",
+      "archivedPath": "audit-notes/review-patches/review-3c2a371..61babf0.diff.gz",
+      "originalBytes": 31590,
+      "originalSha256": "4ab5a5b8d92caa5b85dae4e22f35765417fc4ac7aac2210daa560be81f2ba864",
+      "preservedBy": "Complete portable review package archived, including historical header/context; endpoints also exist in public PR #12 history.",
+      "header": "# Review package: 3c2a371aef74f4962af64d0fe71545557244f21a..61babf07cbce29393e4971e749bf4135b9f14d04\n\n## Commits\n61babf0 docs: complete audit evidence links\n224ba8d docs: establish v1 audit baseline\n\n## Files changed\n docs/protocols/contract-amendments.md     | 39 +++++++++++++++++\n docs/security/threat-model.md             | 68 ++++++++++++++++++++++++++---\n docs/verification/v1-master-plan-audit.md | 72 +++++++++++++++++++++++++++++++\n 3 files changed, 173 insertions(+), 6 deletions(-)\n\n## Diff\n",
+      "range": "3c2a371aef74f4962af64d0fe71545557244f21a..61babf07cbce29393e4971e749bf4135b9f14d04",
+      "paths": [
+        "docs/protocols/contract-amendments.md",
+        "docs/security/threat-model.md",
+        "docs/verification/v1-master-plan-audit.md"
+      ],
+      "regenerationCommand": "git diff 3c2a371aef74f4962af64d0fe71545557244f21a..61babf07cbce29393e4971e749bf4135b9f14d04 -- \"docs/protocols/contract-amendments.md\" \"docs/security/threat-model.md\" \"docs/verification/v1-master-plan-audit.md\"",
+      "exactRegeneration": false,
+      "exactDiffBody": true,
+      "sameDiffBodyIgnoringTrailingWhitespace": true,
+      "regeneratedSha256": "88761406b1f7ebc1d7b593909f68bd7e1bf8b99f36ace7322a91662a2e455548"
+    },
+    {
+      "source": ".superpowers/sdd/review-593c9d2..fc0f262.diff",
+      "archivedPath": "audit-notes/review-patches/review-593c9d2..fc0f262.diff.gz",
+      "originalBytes": 12550,
+      "originalSha256": "69395332c5ea4b120dd6b3fe30adaa8be7a69ce6cc98bcd6ec6c30de7b065aa0",
+      "preservedBy": "Complete portable review package archived, including historical header/context; endpoints also exist in public PR #12 history.",
+      "header": "# Review package: 593c9d2f8965a26f59790a61821007c0acea99e0..fc0f262220b95687f5ad89eee02fe40a4d7a65b9\n\n## Commits\nfc0f262 ci: harden Supabase and secret scan workflows\n\n## Files changed\n .github/repository.gitleaksignore     |  5 +++\n .github/workflows/secret-scan.yml     |  4 +-\n .github/workflows/supabase.yml        | 14 +++---\n scripts/secret-scan-workflow.test.mjs | 22 +++++++++-\n scripts/supabase-workflow.test.mjs    | 80 +++++++++++++++++++++++++++++++++++\n 5 files changed, 115 insertions(+), 10 deletions(-)\n\n## Diff\n",
+      "range": "593c9d2f8965a26f59790a61821007c0acea99e0..fc0f262220b95687f5ad89eee02fe40a4d7a65b9",
+      "paths": [
+        ".github/repository.gitleaksignore",
+        ".github/workflows/secret-scan.yml",
+        ".github/workflows/supabase.yml",
+        "scripts/secret-scan-workflow.test.mjs",
+        "scripts/supabase-workflow.test.mjs"
+      ],
+      "regenerationCommand": "git diff 593c9d2f8965a26f59790a61821007c0acea99e0..fc0f262220b95687f5ad89eee02fe40a4d7a65b9 -- \".github/repository.gitleaksignore\" \".github/workflows/secret-scan.yml\" \".github/workflows/supabase.yml\" \"scripts/secret-scan-workflow.test.mjs\" \"scripts/supabase-workflow.test.mjs\"",
+      "exactRegeneration": false,
+      "exactDiffBody": false,
+      "sameDiffBodyIgnoringTrailingWhitespace": false,
+      "regeneratedSha256": "41c8f7f0687ef267033c7cb9488b2a7ef9f9f8e2c5b6821e08af756b1ce1de67"
+    },
+    {
+      "source": ".superpowers/sdd/review-593c9d2fc..fc0f262.diff",
+      "archivedPath": "audit-notes/review-patches/review-593c9d2fc..fc0f262.diff.gz",
+      "originalBytes": 113,
+      "originalSha256": "c7427bedc16805c6ff321b577f2f2ce8c5dbcd67bebf9eefbf6177ff23908787",
+      "preservedBy": "Complete scratch header archived; contains no patch/source body and its historical starting ref is invalid.",
+      "header": "# Review package: 593c9d2fc31f696fbcd12becfa4a42614e845f2b..fc0f262220b95687f5ad89eee02fe40a4d7a65b9\n\n## Commits\n"
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/review-task-3-ab7b3b2..4b57cbc.diff",
+      "archivedPath": "audit-notes/review-patches/v1-review-task-3-ab7b3b2..4b57cbc.diff.gz",
+      "originalBytes": 96611,
+      "originalSha256": "394c8546723141d0b441451f2946c7040f2a4b09f9beda4c76adcbd16690b360",
+      "preservedBy": "Complete portable review package archived, including historical header/context; endpoints also exist in public PR #12 history.",
+      "header": "# Review package: ab7b3b2..4b57cbc\n\n## Commits\n4b57cbc refactor: restore strict Rust contracts\n\n## Files changed\n crates/context-mcp/tests/dispatcher_v1.rs          |   4 +-\n crates/context-mcp/tests/lifecycle_v1.rs           |   4 +-\n crates/core/src/devices/recovery.rs                |  25 +-\n crates/core/src/devices/recovery_crypto.rs         |  87 +++--\n crates/core/src/native_transaction/planner.rs      |   2 +-\n crates/core/src/sync/admission.rs                  |   6 +-\n crates/core/src/sync/mod.rs                        |   4 +-\n crates/core/src/sync/operation.rs                  |  50 +--\n crates/core/tests/mcp_memory_tools_v1.rs           |   4 +-\n crates/core/tests/native_cli_journal_v1.rs         |  27 ++\n crates/core/tests/offline_service_v1.rs            |  71 ++--\n crates/core/tests/recovery_enrollment_crypto_v1.rs | 378 ++++++++++++---------\n .../core/tests/recovery_enrollment_transport_v1.rs |  22 +-\n crates/core/tests/recovery_enrollment_vault_v1.rs  |  25 +-\n crates/core/tests/recovery_restore_transport_v1.rs |  23 +-\n crates/core/tests/signed_sync_e2e_v1.rs            |  46 +--\n crates/core/tests/support/mod.rs                   |  12 +-\n crates/core/tests/sync_admission_v1.rs             |  27 +-\n crates/core/tests/sync_engine_v1.rs                |  52 +--\n crates/core/tests/sync_merge_v1.rs                 |  50 ++-\n crates/core/tests/sync_operation_v1.rs             |  92 ++---\n crates/core/tests/sync_vault_v1.rs                 |  30 +-\n crates/protocol/tests/nullability_path_v1.rs       |   2 +-\n 23 files changed, 577 insertions(+), 466 deletions(-)\n\n## Diff\n",
+      "range": "ab7b3b2417d7a2b66f073fed0c695e9f55e688d5..4b57cbc9a176bea55a8212b9aff286a49269fbc3",
+      "paths": [
+        "crates/context-mcp/tests/dispatcher_v1.rs",
+        "crates/context-mcp/tests/lifecycle_v1.rs",
+        "crates/core/src/devices/recovery.rs",
+        "crates/core/src/devices/recovery_crypto.rs",
+        "crates/core/src/native_transaction/planner.rs",
+        "crates/core/src/sync/admission.rs",
+        "crates/core/src/sync/mod.rs",
+        "crates/core/src/sync/operation.rs",
+        "crates/core/tests/mcp_memory_tools_v1.rs",
+        "crates/core/tests/native_cli_journal_v1.rs",
+        "crates/core/tests/offline_service_v1.rs",
+        "crates/core/tests/recovery_enrollment_crypto_v1.rs",
+        "crates/core/tests/recovery_enrollment_transport_v1.rs",
+        "crates/core/tests/recovery_enrollment_vault_v1.rs",
+        "crates/core/tests/recovery_restore_transport_v1.rs",
+        "crates/core/tests/signed_sync_e2e_v1.rs",
+        "crates/core/tests/support/mod.rs",
+        "crates/core/tests/sync_admission_v1.rs",
+        "crates/core/tests/sync_engine_v1.rs",
+        "crates/core/tests/sync_merge_v1.rs",
+        "crates/core/tests/sync_operation_v1.rs",
+        "crates/core/tests/sync_vault_v1.rs",
+        "crates/protocol/tests/nullability_path_v1.rs"
+      ],
+      "regenerationCommand": "git diff ab7b3b2417d7a2b66f073fed0c695e9f55e688d5..4b57cbc9a176bea55a8212b9aff286a49269fbc3 -- \"crates/context-mcp/tests/dispatcher_v1.rs\" \"crates/context-mcp/tests/lifecycle_v1.rs\" \"crates/core/src/devices/recovery.rs\" \"crates/core/src/devices/recovery_crypto.rs\" \"crates/core/src/native_transaction/planner.rs\" \"crates/core/src/sync/admission.rs\" \"crates/core/src/sync/mod.rs\" \"crates/core/src/sync/operation.rs\" \"crates/core/tests/mcp_memory_tools_v1.rs\" \"crates/core/tests/native_cli_journal_v1.rs\" \"crates/core/tests/offline_service_v1.rs\" \"crates/core/tests/recovery_enrollment_crypto_v1.rs\" \"crates/core/tests/recovery_enrollment_transport_v1.rs\" \"crates/core/tests/recovery_enrollment_vault_v1.rs\" \"crates/core/tests/recovery_restore_transport_v1.rs\" \"crates/core/tests/signed_sync_e2e_v1.rs\" \"crates/core/tests/support/mod.rs\" \"crates/core/tests/sync_admission_v1.rs\" \"crates/core/tests/sync_engine_v1.rs\" \"crates/core/tests/sync_merge_v1.rs\" \"crates/core/tests/sync_operation_v1.rs\" \"crates/core/tests/sync_vault_v1.rs\" \"crates/protocol/tests/nullability_path_v1.rs\"",
+      "exactRegeneration": false,
+      "exactDiffBody": false,
+      "sameDiffBodyIgnoringTrailingWhitespace": false,
+      "regeneratedSha256": "7910631b7a3b44188178a3a8beec3c3ed8100d39791958e6fd18a9eb4b7af332"
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/review-task-4-38331da..f5f0eee.diff",
+      "archivedPath": "audit-notes/review-patches/v1-review-task-4-38331da..f5f0eee.diff.gz",
+      "originalBytes": 49212,
+      "originalSha256": "ef08b6b95bb7ba7827a9275793f715ea4e3c5e4834a591278a123b00f5b2fd01",
+      "preservedBy": "Complete portable review package archived, including historical header/context; endpoints also exist in public PR #12 history.",
+      "header": "# Review package: 38331da..f5f0eee\n\n## Commits\nf5f0eee fix native Windows path and target parity\n\n## Files changed\n crates/contextd/src/bridge_install.rs        |  75 ++++++++++++++-----\n crates/contextd/src/lib.rs                   |  54 ++++++++++++++\n crates/contextd/src/native_memory.rs         | 103 +++++++++++++++++++++++----\n crates/core/src/claude_code.rs               |  20 +++++-\n crates/core/src/codex.rs                     |  12 ++++\n crates/core/src/hermes.rs                    |  17 +++--\n crates/core/src/hermes/gateway.rs            |   1 +\n crates/core/src/setup.rs                     |  61 +++++++++++++---\n crates/core/tests/bridge_setup_preview_v1.rs |  62 +++++++++++++++-\n crates/core/tests/primary_memory_setup_v1.rs |  14 +++-\n 10 files changed, 367 insertions(+), 52 deletions(-)\n\n## Diff\n",
+      "range": "38331da30bdf935cf5c09afc9cc517c819b3c7b9..f5f0eee49c12aaf140bc74b8d7f0473b2a3fa3f4",
+      "paths": [
+        "crates/contextd/src/bridge_install.rs",
+        "crates/contextd/src/lib.rs",
+        "crates/contextd/src/native_memory.rs",
+        "crates/core/src/claude_code.rs",
+        "crates/core/src/codex.rs",
+        "crates/core/src/hermes.rs",
+        "crates/core/src/hermes/gateway.rs",
+        "crates/core/src/setup.rs",
+        "crates/core/tests/bridge_setup_preview_v1.rs",
+        "crates/core/tests/primary_memory_setup_v1.rs"
+      ],
+      "regenerationCommand": "git diff 38331da30bdf935cf5c09afc9cc517c819b3c7b9..f5f0eee49c12aaf140bc74b8d7f0473b2a3fa3f4 -- \"crates/contextd/src/bridge_install.rs\" \"crates/contextd/src/lib.rs\" \"crates/contextd/src/native_memory.rs\" \"crates/core/src/claude_code.rs\" \"crates/core/src/codex.rs\" \"crates/core/src/hermes.rs\" \"crates/core/src/hermes/gateway.rs\" \"crates/core/src/setup.rs\" \"crates/core/tests/bridge_setup_preview_v1.rs\" \"crates/core/tests/primary_memory_setup_v1.rs\"",
+      "exactRegeneration": false,
+      "exactDiffBody": false,
+      "sameDiffBodyIgnoringTrailingWhitespace": false,
+      "regeneratedSha256": "b176448c7b686e6f39659f64f8ba585fbbb007317915f3c31d2663dd7c8d8f40"
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/review-task-4-fix-f5f0eee..a1c1db7.diff",
+      "archivedPath": "audit-notes/review-patches/v1-review-task-4-fix-f5f0eee..a1c1db7.diff.gz",
+      "originalBytes": 11549,
+      "originalSha256": "13d2d5be3d4d73aa0d87dce9b69a2482a3234582aad1cab72bb38ffe303eae09",
+      "preservedBy": "Complete portable review package archived, including historical header/context; endpoints also exist in public PR #12 history.",
+      "header": "# Review package: f5f0eee..a1c1db7\n\n## Commits\na1c1db7 fix Windows WTF-16 capability validation\n\n## Files changed\n crates/contextd/src/native_memory.rs        |  34 ++++++\n crates/core/src/native_memory/capability.rs | 158 +++++++++++++++++++++++-----\n 2 files changed, 168 insertions(+), 24 deletions(-)\n\n## Diff\n",
+      "range": "f5f0eee49c12aaf140bc74b8d7f0473b2a3fa3f4..a1c1db7f2d24a9fabddaeac5def3256e623033a1",
+      "paths": [
+        "crates/contextd/src/native_memory.rs",
+        "crates/core/src/native_memory/capability.rs"
+      ],
+      "regenerationCommand": "git diff f5f0eee49c12aaf140bc74b8d7f0473b2a3fa3f4..a1c1db7f2d24a9fabddaeac5def3256e623033a1 -- \"crates/contextd/src/native_memory.rs\" \"crates/core/src/native_memory/capability.rs\"",
+      "exactRegeneration": false,
+      "exactDiffBody": false,
+      "sameDiffBodyIgnoringTrailingWhitespace": false,
+      "regeneratedSha256": "a547403e652fbc2153c0d46314e30f833f5f3cec951ed8bf564325994e2b31cb"
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/review-task-4b-2daee6d..8261053.diff",
+      "archivedPath": "audit-notes/review-patches/v1-review-task-4b-2daee6d..8261053.diff.gz",
+      "originalBytes": 17020,
+      "originalSha256": "336556b2a85c132d10251d077e9b8f72e3e6ac85f9b16ea4c1ef739731a1257b",
+      "preservedBy": "Complete portable review package archived, including historical header/context; endpoints also exist in public PR #12 history.",
+      "header": "# Review package: 2daee6d..8261053\n\n## Commits\n8261053 fix Windows helper timeout envelope\n\n## Files changed\n crates/native-runner/src/launcher.rs               | 133 +++++++++++++++++++--\n .../native-runner/src/launcher/windows/native.rs   |  36 +++++-\n .../tests/adapter_native.rs                        |   4 +-\n .../tests/windows_timeout_contract_v1.rs           |  18 +++\n 4 files changed, 178 insertions(+), 13 deletions(-)\n\n## Diff\n",
+      "range": "2daee6dffb719e959935955b22987d2aceb5b84b..8261053475431a304f2177935d7a5ed4d027a60e",
+      "paths": [
+        "crates/native-runner/src/launcher.rs",
+        "crates/native-runner/src/launcher/windows/native.rs",
+        "crates/native-runner/tests/windows-launcher-harness/tests/adapter_native.rs",
+        "crates/native-runner/tests/windows_timeout_contract_v1.rs"
+      ],
+      "regenerationCommand": "git diff 2daee6dffb719e959935955b22987d2aceb5b84b..8261053475431a304f2177935d7a5ed4d027a60e -- \"crates/native-runner/src/launcher.rs\" \"crates/native-runner/src/launcher/windows/native.rs\" \"crates/native-runner/tests/windows-launcher-harness/tests/adapter_native.rs\" \"crates/native-runner/tests/windows_timeout_contract_v1.rs\"",
+      "exactRegeneration": false,
+      "exactDiffBody": false,
+      "sameDiffBodyIgnoringTrailingWhitespace": false,
+      "regeneratedSha256": "c8def52dadb7d50ef83f4fc2fa60fe52242bd808015882afe598c02ddbe982f3"
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/review-task-4b-fix-8261053..981fa58.diff",
+      "archivedPath": "audit-notes/review-patches/v1-review-task-4b-fix-8261053..981fa58.diff.gz",
+      "originalBytes": 14306,
+      "originalSha256": "31437e4a9e659e8edc5c4d6c747f6307f29a93c18793a5454c5d017232b04f3e",
+      "preservedBy": "Complete portable review package archived, including historical header/context; endpoints also exist in public PR #12 history.",
+      "header": "# Review package: 8261053..981fa58\n\n## Commits\n981fa58 fix seal Windows helper exchange API\n\n## Files changed\n crates/native-runner/src/launcher.rs               |  9 +---\n .../native-runner/src/launcher/windows/native.rs   | 25 +++--------\n .../src/bin/windows_sandbox_probe.rs               |  8 ++--\n .../tests/launch_native.rs                         | 50 +++++++++++++++++-----\n .../tests/windows_timeout_contract_v1.rs           | 17 +++++++-\n 5 files changed, 66 insertions(+), 43 deletions(-)\n\n## Diff\n",
+      "range": "8261053475431a304f2177935d7a5ed4d027a60e..981fa58deec0e49520f25728c8e245e8726d62d7",
+      "paths": [
+        "crates/native-runner/src/launcher.rs",
+        "crates/native-runner/src/launcher/windows/native.rs",
+        "crates/native-runner/tests/windows-launcher-harness/src/bin/windows_sandbox_probe.rs",
+        "crates/native-runner/tests/windows-launcher-harness/tests/launch_native.rs",
+        "crates/native-runner/tests/windows_timeout_contract_v1.rs"
+      ],
+      "regenerationCommand": "git diff 8261053475431a304f2177935d7a5ed4d027a60e..981fa58deec0e49520f25728c8e245e8726d62d7 -- \"crates/native-runner/src/launcher.rs\" \"crates/native-runner/src/launcher/windows/native.rs\" \"crates/native-runner/tests/windows-launcher-harness/src/bin/windows_sandbox_probe.rs\" \"crates/native-runner/tests/windows-launcher-harness/tests/launch_native.rs\" \"crates/native-runner/tests/windows_timeout_contract_v1.rs\"",
+      "exactRegeneration": false,
+      "exactDiffBody": false,
+      "sameDiffBodyIgnoringTrailingWhitespace": false,
+      "regeneratedSha256": "bd180be77cf9edf3eab0468394c2a1e91239bac152b39e156f981509f93ed728"
+    },
+    {
+      "source": ".superpowers/sdd/v1-recovery/review-task-5-3599b7b..85a59ed.diff",
+      "archivedPath": "audit-notes/review-patches/v1-review-task-5-3599b7b..85a59ed.diff.gz",
+      "originalBytes": 33950,
+      "originalSha256": "a5d42efe6798faed3ddb7a4f0a8d662762ff44697eb60f4a600bc3d99a362c09",
+      "preservedBy": "Complete portable review package archived, including historical header/context; endpoints also exist in public PR #12 history.",
+      "header": "# Review package: 3599b7b..85a59ed\n\n## Commits\n85a59ed ci: split required gates by responsibility\n\n## Files changed\n .github/workflows/ci.yml                  | 201 +++++++++++++++++++++++++++---\n docs/protocols/contract-amendments.md     |  10 +-\n docs/verification/v1-master-plan-audit.md |   4 +-\n scripts/ci-gates-workflow.test.mjs        | 190 ++++++++++++++++++++++++++++\n scripts/native-ci-workflow.test.mjs       |  17 +--\n 5 files changed, 394 insertions(+), 28 deletions(-)\n\n## Diff\n",
+      "range": "3599b7b4b60d0da700f15608d124fb4c4b348780..85a59ed519b5bd24b78e9af384c347626a2e4d5b",
+      "paths": [
+        ".github/workflows/ci.yml",
+        "docs/protocols/contract-amendments.md",
+        "docs/verification/v1-master-plan-audit.md",
+        "scripts/ci-gates-workflow.test.mjs",
+        "scripts/native-ci-workflow.test.mjs"
+      ],
+      "regenerationCommand": "git diff 3599b7b4b60d0da700f15608d124fb4c4b348780..85a59ed519b5bd24b78e9af384c347626a2e4d5b -- \".github/workflows/ci.yml\" \"docs/protocols/contract-amendments.md\" \"docs/verification/v1-master-plan-audit.md\" \"scripts/ci-gates-workflow.test.mjs\" \"scripts/native-ci-workflow.test.mjs\"",
+      "exactRegeneration": false,
+      "exactDiffBody": false,
+      "sameDiffBodyIgnoringTrailingWhitespace": false,
+      "regeneratedSha256": "44e5a158878e8fd5eb999f88711ea9f2ba5579c824c02fd64b47fe7317d5d080"
+    }
+  ],
+  "excluded": [
+    {
+      "source": "graphify-out/.graphify_python",
+      "reason": "Machine-specific runtime location; reconstruct for the new device, never install archived host paths."
+    },
+    {
+      "source": "graphify-out/.graphify_root",
+      "reason": "Machine-specific runtime location; reconstruct for the new device, never install archived host paths."
+    },
+    {
+      "source": "graphify-out/cache and input-cache/cache",
+      "reason": "Regenerable stat and extraction caches; complete final graph, AST, extraction, semantic chunks, labels, analysis and query notes are archived."
+    },
+    {
+      "source": "node_modules, pnpm store, target directories, desktop dist, generated Tauri schemas and launcher scratch Cargo.lock",
+      "reason": "Build/dependency/generated caches are reproducible from committed manifests, locks and workflows; not project source."
+    },
+    {
+      "source": "Credentials, user vaults, environment files and machine-specific harness configuration",
+      "reason": "Not appropriate for a public repository; no credential transfer or source deletion was performed."
+    }
+  ]
+}
