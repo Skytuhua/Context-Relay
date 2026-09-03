@@ -226,7 +226,7 @@ fn import_everything(
                 !diagnostic.contains("must-not-import"),
                 "Hermes import error exposed a secret canary"
             );
-            panic!("Hermes import unexpectedly failed with {:?}", error.code);
+            panic!("Hermes import unexpectedly failed: {diagnostic}");
         }
     }
 }
@@ -2374,7 +2374,13 @@ fn install_non_execution_sentinels(fixture: &Fixture) -> Vec<PathBuf> {
         .unwrap()
         .replace(
             "command: node",
-            &format!("command: \"touch {}\"", mcp.display()),
+            // Forward slashes keep the sentinel path out of YAML double-quote
+            // escape processing; backslashes would be read as invalid
+            // `\U`-style escapes on Windows and corrupt the config.
+            &format!(
+                "command: \"touch {}\"",
+                mcp.to_string_lossy().replace('\\', "/")
+            ),
         );
     fs::write(profile.join("config.yaml"), config).unwrap();
     fs::write(
