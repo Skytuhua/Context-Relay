@@ -17,7 +17,7 @@ test('Node dependency floor excludes every open patched advisory', async () => {
   assert.equal(desktop.devDependencies.vitest, '3.2.6');
   assert.match(
     workspace,
-    /overrides:\n  'brace-expansion@1\.1\.16': '1\.1\.18'\n  'brace-expansion@2\.1\.2': '2\.1\.4'\n  'esbuild@0\.27\.7': '0\.28\.1'\n  'browserslist@4\.28\.6': '4\.28\.7'\n  'fast-uri@3\.1\.3': '3\.1\.5'\n  'js-yaml@4\.3\.0': '4\.3\.1'\n  'nanoid@3\.3\.16': '3\.3\.18'\n  'postcss@8\.5\.19': '8\.5\.23'/,
+    /overrides:\n  'brace-expansion@1\.1\.16': '1\.1\.18'\n  'brace-expansion@2\.1\.2': '2\.1\.4'\n  'esbuild@0\.27\.7': '0\.28\.1'\n  'browserslist@4\.28\.6': '4\.28\.7'\n  'fast-uri@3\.1\.3': '3\.1\.6'\n  'js-yaml@4\.3\.0': '4\.3\.1'\n  'nanoid@3\.3\.16': '3\.3\.18'\n  'postcss@8\.5\.19': '8\.5\.23'/,
   );
 
   for (const fixed of [
@@ -26,7 +26,7 @@ test('Node dependency floor excludes every open patched advisory', async () => {
     'brace-expansion@1.1.18',
     'brace-expansion@2.1.4',
     'esbuild@0.28.1',
-    'fast-uri@3.1.5',
+    'fast-uri@3.1.6',
     'js-yaml@4.3.1',
     'nanoid@3.3.18',
     'postcss@8.5.23',
@@ -41,6 +41,6 @@ test('Node dependency floor excludes every open patched advisory', async () => {
 
   assert.doesNotMatch(
     resolvedLockfile,
-    /(?:ajv@8\.17\.1|brace-expansion@1\.1\.1[0-7]|brace-expansion@2\.1\.[0-3]|esbuild@0\.27\.|fast-uri@3\.1\.[0-4]|js-yaml@4\.[0-2]\.|js-yaml@4\.3\.0|nanoid@3\.3\.(?:[0-9]|1[0-7])|postcss@8\.5\.(?:[0-9]|1[0-9]|2[0-2])|vite@7\.[0-2]\.|vite@7\.3\.[0-4]|vitest@3\.2\.[0-5])(?=:|\()/,
+    /(?:ajv@8\.17\.1|brace-expansion@1\.1\.1[0-7]|brace-expansion@2\.1\.[0-3]|esbuild@0\.27\.|fast-uri@3\.1\.[0-5]|js-yaml@4\.[0-2]\.|js-yaml@4\.3\.0|nanoid@3\.3\.(?:[0-9]|1[0-7])|postcss@8\.5\.(?:[0-9]|1[0-9]|2[0-2])|vite@7\.[0-2]\.|vite@7\.3\.[0-4]|vitest@3\.2\.[0-5])(?=:|\()/,
   );
 });
