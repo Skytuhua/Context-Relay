@@ -17,11 +17,12 @@ test('Node dependency floor excludes every open patched advisory', async () => {
   assert.equal(desktop.devDependencies.vitest, '3.2.6');
   assert.match(
     workspace,
-    /overrides:\n  'brace-expansion@1\.1\.16': '1\.1\.18'\n  'brace-expansion@2\.1\.2': '2\.1\.4'\n  'esbuild@0\.27\.7': '0\.28\.1'\n  'fast-uri@3\.1\.3': '3\.1\.5'\n  'js-yaml@4\.3\.0': '4\.3\.1'\n  'nanoid@3\.3\.16': '3\.3\.18'\n  'postcss@8\.5\.19': '8\.5\.23'/,
+    /overrides:\n  'brace-expansion@1\.1\.16': '1\.1\.18'\n  'brace-expansion@2\.1\.2': '2\.1\.4'\n  'esbuild@0\.27\.7': '0\.28\.1'\n  'browserslist@4\.28\.6': '4\.28\.7'\n  'fast-uri@3\.1\.3': '3\.1\.5'\n  'js-yaml@4\.3\.0': '4\.3\.1'\n  'nanoid@3\.3\.16': '3\.3\.18'\n  'postcss@8\.5\.19': '8\.5\.23'/,
   );
 
   for (const fixed of [
     'ajv@8.18.0',
+    'browserslist@4.28.7',
     'brace-expansion@1.1.18',
     'brace-expansion@2.1.4',
     'esbuild@0.28.1',
