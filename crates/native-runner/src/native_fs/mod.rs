@@ -1506,6 +1506,15 @@ fn stable_security_descriptor(descriptor: &[u8]) -> Vec<u8> {
     descriptor.to_vec()
 }
 
+/// Compares two self-relative security descriptors for semantic equality,
+/// applying the same canonicalization the fingerprint uses. NT sets
+/// layout/inheritance bookkeeping bits (e.g. SE_DACL_AUTO_INHERITED) and
+/// reorders sections per producer, so raw bytes can differ while the
+/// descriptor means the same thing.
+pub fn equivalent_security_descriptors(a: &[u8], b: &[u8]) -> bool {
+    stable_security_descriptor(a) == stable_security_descriptor(b)
+}
+
 #[cfg(windows)]
 fn stable_security_descriptor(descriptor: &[u8]) -> Vec<u8> {
     // Self-relative security descriptors are not byte-canonical across

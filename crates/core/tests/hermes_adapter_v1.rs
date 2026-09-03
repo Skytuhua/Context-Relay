@@ -2297,9 +2297,11 @@ fn concurrent_native_edit_invalidates_planned_config_and_memory() {
         restored_metadata.last_write_time(),
         before_metadata.last_write_time()
     );
-    assert_eq!(
-        restored_metadata.security_descriptor(),
-        before_metadata.security_descriptor()
+    assert!(
+        context_relay_native_runner::equivalent_security_descriptors(
+            restored_metadata.security_descriptor(),
+            before_metadata.security_descriptor()
+        )
     );
     assert_eq!(
         restored_metadata.alternate_streams(),
@@ -4142,9 +4144,11 @@ fn rollback_restores_all_hermes_targets_and_metadata() {
             restored_metadata.change_time(),
             expected_metadata.change_time()
         );
-        assert_eq!(
-            restored_metadata.security_descriptor(),
-            expected_metadata.security_descriptor()
+        assert!(
+            context_relay_native_runner::equivalent_security_descriptors(
+                restored_metadata.security_descriptor(),
+                expected_metadata.security_descriptor()
+            )
         );
         assert_eq!(
             restored_metadata.alternate_streams(),
