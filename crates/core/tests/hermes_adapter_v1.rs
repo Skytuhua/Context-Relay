@@ -4121,9 +4121,17 @@ fn rollback_restores_all_hermes_targets_and_metadata() {
             restored_metadata.creation_time(),
             expected_metadata.creation_time()
         );
+        // NTFS updates last_access on every open (where access tracking is
+        // enabled), so any read after the restore — including this very
+        // snapshot — shifts it. Rollback cannot and need not freeze that
+        // field; content, attributes, creation, last_write, and the security
+        // descriptor remain exact checks.
+        #[cfg(not(windows))]
         assert_eq!(
             restored_metadata.last_access_time(),
-            expected_metadata.last_access_time()
+            expected_metadata.last_access_time(),
+            "last_access drift for {}",
+            path.display()
         );
         assert_eq!(
             restored_metadata.last_write_time(),
