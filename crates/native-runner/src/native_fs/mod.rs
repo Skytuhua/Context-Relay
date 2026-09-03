@@ -156,6 +156,25 @@ impl NativeMetadata {
         self.last_access_time
     }
 
+    /// Equality modulo `last_access_time`. NTFS updates last access on
+    /// every open (where access tracking is enabled), so two snapshots of
+    /// an untouched file legitimately differ in that field; it is not a
+    /// stability-relevant property, matching how the fingerprint treats
+    /// it. All other metadata - attributes, creation, write and change
+    /// times, security descriptor, streams, and link counts - must match
+    /// exactly.
+    pub fn stability_equivalent(&self, other: &Self) -> bool {
+        self.file_attributes == other.file_attributes
+            && self.creation_time == other.creation_time
+            && self.last_write_time == other.last_write_time
+            && self.change_time == other.change_time
+            && self.security_descriptor == other.security_descriptor
+            && self.alternate_streams == other.alternate_streams
+            && self.link_count == other.link_count
+            && self.parent_attributes == other.parent_attributes
+            && self.parent_link_count == other.parent_link_count
+    }
+
     pub const fn last_write_time(&self) -> i64 {
         self.last_write_time
     }

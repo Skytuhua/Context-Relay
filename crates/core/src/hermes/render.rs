@@ -841,9 +841,9 @@ impl HermesAdapter {
         else {
             return Err(invalid("Hermes native state is not a regular file"));
         };
-        if metadata == *current_metadata {
+        if metadata.stability_equivalent(current_metadata) {
             metadata.clone_from(reserved_metadata);
-        } else if metadata != *reserved_metadata {
+        } else if !metadata.stability_equivalent(reserved_metadata) {
             return Err(invalid(
                 "Hermes native metadata does not match the gateway reservation",
             ));
