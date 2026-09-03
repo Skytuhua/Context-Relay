@@ -3347,6 +3347,28 @@ fn client_error(code: ErrorCode, message: &'static str, retryable: bool) -> Clie
 
 #[cfg(test)]
 mod tests {
+    // `VerifiedClaudeExecutable::open` enforces the native-executable policy
+    // on every platform: Windows additionally requires the `.exe` extension
+    // and a PE image header. Fixtures therefore carry the platform suffix
+    // and a minimal MZ/PE stub on Windows; other platforms keep the plain
+    // placeholder bytes.
+    fn fixture_executable_bytes() -> Vec<u8> {
+        #[cfg(windows)]
+        {
+            let mut bytes = vec![0_u8; 0x44];
+            bytes[0] = b'M';
+            bytes[1] = b'Z';
+            let pe_offset: u32 = 0x40;
+            bytes[0x3c..0x40].copy_from_slice(&pe_offset.to_le_bytes());
+            bytes[0x40..0x44].copy_from_slice(b"PE\0\0");
+            bytes
+        }
+        #[cfg(not(windows))]
+        {
+            b"fixture executable".to_vec()
+        }
+    }
+
     use super::{
         ClaudeCodeAdapter, ClaudeCodeLayout, ClaudeCommand, MAX_MCP_VALIDATION_NAMES, digest_file,
         executable_names, is_native_claude_executable_path, parse_doctor_output,
@@ -3455,11 +3477,14 @@ mod tests {
 
     #[test]
     fn standalone_executable_hashing_is_not_limited_like_configuration() {
+        let mut bytes = fixture_executable_bytes();
+        bytes.resize(1024 * 1024 + 1, 0);
         let path = std::env::temp_dir().join(format!(
-            "context-relay-claude-code-large-executable-{}",
-            std::process::id()
+            "context-relay-claude-code-large-executable-{}{}",
+            std::process::id(),
+            std::env::consts::EXE_SUFFIX,
         ));
-        fs::write(&path, vec![0; 1024 * 1024 + 1]).unwrap();
+        fs::write(&path, bytes).unwrap();
         let result = digest_file(&path);
         let _ = fs::remove_file(path);
         assert!(result.is_ok());
@@ -3538,8 +3563,10 @@ mod tests {
             ),
         )
         .unwrap();
-        let executable = root.path().join("claude-bin");
-        fs::write(&executable, b"fixture executable").unwrap();
+        let executable = root
+            .path()
+            .join(format!("claude-bin{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&executable, fixture_executable_bytes()).unwrap();
         let device = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
         let adapter = ClaudeCodeAdapter::from_layout(
             ClaudeCodeLayout {
@@ -3651,8 +3678,10 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let executable = root.path().join("claude-bin");
-        fs::write(&executable, b"fixture executable").unwrap();
+        let executable = root
+            .path()
+            .join(format!("claude-bin{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&executable, fixture_executable_bytes()).unwrap();
         let device = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
         let adapter = ClaudeCodeAdapter::from_layout(
             ClaudeCodeLayout {
