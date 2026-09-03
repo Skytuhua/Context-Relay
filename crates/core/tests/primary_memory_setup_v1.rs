@@ -949,7 +949,26 @@ fn claude_matrix_fixture_with_version(version: &str) -> MatrixFixture {
         serde_json::to_vec(&source["managedSettings"]).unwrap(),
     )
     .unwrap();
-    let executable = executable(&root.join("claude-bin"), b"fixture claude executable");
+    // `VerifiedClaudeExecutable::open` verifies the executable is a native
+    // PE image on Windows, so the fixture carries the `.exe` suffix and a
+    // minimal MZ header with a PE signature there. The path derives from
+    // the plain tempdir (not the verbatim canonical root): the transaction
+    // engine requires the canonical lock root, while the Claude topology
+    // validator rejects verbatim `\\?\` components — both paths denote the
+    // same directory.
+    let claude_path = temp
+        .path()
+        .join(format!("claude-bin{}", std::env::consts::EXE_SUFFIX));
+    let mut claude_bytes = b"fixture claude executable".to_vec();
+    if cfg!(windows) {
+        claude_bytes = vec![0_u8; 0x44];
+        claude_bytes[0] = b'M';
+        claude_bytes[1] = b'Z';
+        let pe_offset: u32 = 0x40;
+        claude_bytes[0x3c..0x40].copy_from_slice(&pe_offset.to_le_bytes());
+        claude_bytes[0x40..0x44].copy_from_slice(b"PE\0\0");
+    }
+    let executable = executable(&claude_path, &claude_bytes);
     let raw_files = raw_sentinels(&config_dir);
     let project_id = ProjectId::from_str(ID_2).unwrap();
     let device_id = DeviceId::from_str(ID_1).unwrap();

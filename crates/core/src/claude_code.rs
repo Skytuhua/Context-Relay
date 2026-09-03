@@ -2467,8 +2467,12 @@ fn open_verified_claude_executable(
     path: &Path,
     expected_hash: Sha256Digest,
 ) -> Result<VerifiedClaudeExecutable, BoundaryError> {
-    let executable = VerifiedClaudeExecutable::open(path)
-        .map_err(|_| BoundaryError::new("Claude Code executable cannot be safely attested"))?;
+    let executable = VerifiedClaudeExecutable::open(path).map_err(|error| {
+        BoundaryError::new(format!(
+            "Claude Code executable cannot be safely attested ({}): {error:?}",
+            path.display()
+        ))
+    })?;
     if executable.expected_hash != expected_hash {
         return Err(BoundaryError::new("Claude Code executable changed"));
     }
@@ -3058,13 +3062,39 @@ fn digest_file_boundary(path: &Path) -> Result<Sha256Digest, BoundaryError> {
 }
 
 fn digest_regular_non_link_file(path: &Path) -> Result<Sha256Digest, ClientError> {
-    Ok(VerifiedClaudeExecutable::open(path)?.expected_hash)
+    // Digests are taken for every native target (config, settings, and the
+    // executable alike), so this must not apply the executable-only policy
+    // (`.exe` + PE image) that `VerifiedClaudeExecutable::open` enforces.
+    // The safety requirements are the same subset that applies to any
+    // regular file: no symlink, no reparse point, opened without
+    // write/share substitution, then hashed.
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| invalid_request("Claude Code native file is missing"))?;
+    if !metadata.is_file() || metadata_is_link_or_reparse(&metadata) {
+        return Err(invalid_request(
+            "Claude Code native file topology is unsafe",
+        ));
+    }
+    let file = open_executable_without_substitution(path)
+        .map_err(|_| invalid_request("Claude Code native file cannot be safely opened"))?;
+    let opened = file
+        .metadata()
+        .map_err(|_| invalid_request("Claude Code native file cannot be safely inspected"))?;
+    if !opened.is_file() || metadata_is_link_or_reparse(&opened) {
+        return Err(invalid_request(
+            "Claude Code native file topology is unsafe",
+        ));
+    }
+    hash_open_file(&file).map_err(|_| invalid_request("Claude Code native file cannot be read"))
 }
 
 fn digest_regular_non_link_file_boundary(path: &Path) -> Result<Sha256Digest, BoundaryError> {
-    VerifiedClaudeExecutable::open(path)
-        .map(|executable| executable.expected_hash)
-        .map_err(|_| BoundaryError::new("Claude Code executable cannot be safely attested"))
+    digest_regular_non_link_file(path).map_err(|error| {
+        BoundaryError::new(format!(
+            "Claude Code executable cannot be safely attested ({}): {error:?}",
+            path.display()
+        ))
+    })
 }
 
 fn hash_open_file(file: &fs::File) -> std::io::Result<Sha256Digest> {
