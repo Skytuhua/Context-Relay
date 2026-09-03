@@ -81,7 +81,13 @@ fn main() {
       },
       maxBuffer: 16 * 1024 * 1024,
     };
-    const preparedLock = spawnSync('cargo', ['generate-lockfile'], cargoOptions);
+    // Update the copied lock for the fixture package only. `cargo
+    // generate-lockfile` would re-resolve every dependency to its latest
+    // compatible version, discarding the workspace's pins — tinyvec 1.13.0
+    // (published with a no_std `vec!` scoping break) then breaks the build
+    // on the runner. `--workspace` adds the fixture while preserving the
+    // locked dependency versions.
+    const preparedLock = spawnSync('cargo', ['update', '--workspace'], cargoOptions);
     assert.equal(preparedLock.status, 0, preparedLock.stderr);
 
     const cargo = (features = []) =>
