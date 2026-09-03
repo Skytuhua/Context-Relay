@@ -767,3 +767,47 @@ master plan's detailed checks and explicit external-action approval gates.
 If a new permission, credential, hardware target, or external service is needed,
 state the exact blocker and ask. Do not infer authority from repeated “continue”
 messages or fabricate successful evidence to complete the handoff.
+
+## 13. PR #12 Windows stabilization status (2026-09-03, branch codex/context-relay-review)
+
+Continuation of the PR #12 campaign. After the verbatim-path and SD
+canonicalization repairs, hosted Windows CI began executing test suites that
+had never run on Windows, exposing a chain of defects. All were diagnosed on a
+real Windows x64 host (reproduced locally first), fixed additively, and pushed
+in commit order `81267ad` -> `18a810c` -> `2c11aed` -> `15f50af`/`9c248ec` ->
+`820469d` -> `4949253` -> `2189b77` -> `a26907e` -> `070d9fa` -> `f045d37`
+(head at the time of writing). Full per-commit table lives in
+`docs/verification/pr-12-stabilization.md` on the PR branch.
+
+Two are genuine production defects, not test gaps:
+
+1. `digest_regular_non_link_file` (`070d9fa`) applied the Claude executable
+   policy (`.exe` + native PE image) to every native target it digested, so
+   comparing approved digests for ordinary config/settings files failed on
+   Windows. Digesting now enforces only regular-file safety (no symlink, no
+   reparse point, no-substitution open, handle re-validation, hash);
+   executable attestation is unchanged and remains strict.
+2. Hermes gateway reservation compared `NativeMetadata` exactly
+   (`f045d37`). NTFS updates `last_access_time` on every open, so the
+   verification read itself made untouched files appear changed.
+   `NativeMetadata::stability_equivalent` compares equality modulo last
+   access; every other property stays exact. This is the third fix embodying
+   the same principle: last access time is not a stability-relevant property
+   on Windows.
+
+Windows-only policy hardened, never weakened: fixtures now satisfy the
+`.exe`+PE executable requirement with minimal stubs; the verbatim `\?\`
+prefix, device/UNC/traversal/reserved-name/reparse checks, and the SD
+canonicalization semantics are unchanged throughout.
+
+Local Windows x64 evidence at `f045d37`: `primary_memory_setup_v1` 9/9,
+`hermes_adapter_v1` 72/72, `claude_code_adapter_v1` 36/36,
+`mcp_bridge_install_v1` 5/5, core lib 72/72, scoped clippy `-D warnings`
+clean (core needs `--features context-relay-core/test-support` to match CI's
+`ORDINARY_RUST_FEATURES`), fmt clean. Hosted CI verdict on `f045d37` (run
+33800888519) is the remaining gate; ledger on the PR branch is updated with
+the full table and will record the final run verdict.
+
+Build prerequisite reminder for this host: `export
+PATH="/c/Strawberry/perl/bin:$PATH"` before any cargo command touching
+core/contextd (vendored OpenSSL via libsqlite3-sys bundled-sqlcipher).
