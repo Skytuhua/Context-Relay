@@ -2051,6 +2051,7 @@ fn cli_executor_rechecks_non_link_harness_executable_before_any_runner() {
     };
     #[cfg(unix)]
     {
+        let _ = harness_name;
         fs::remove_file(fixture.root.join("claude")).unwrap();
         std::os::unix::fs::symlink(
             fixture.root.join("replacement claude"),
