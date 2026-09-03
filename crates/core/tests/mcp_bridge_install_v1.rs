@@ -81,8 +81,21 @@ fn adapter_fixture() -> AdapterFixture {
     fs::create_dir_all(&claude_config).unwrap();
     let claude_state = root.path().join(".claude.json");
     fs::write(&claude_state, b"{}").unwrap();
-    let claude_executable = root.path().join("claude-bin");
-    fs::write(&claude_executable, b"fixture claude executable").unwrap();
+    let claude_executable = root
+        .path()
+        .join(format!("claude-bin{}", std::env::consts::EXE_SUFFIX));
+    // `VerifiedClaudeExecutable::open` verifies the executable is a native
+    // PE image on Windows, so the fixture carries a minimal MZ header with
+    // a PE\0\0 signature there; other platforms accept placeholder bytes.
+    let mut claude_bytes = vec![0_u8; 0x44];
+    if cfg!(windows) {
+        claude_bytes[0] = b'M';
+        claude_bytes[1] = b'Z';
+        let pe_offset: u32 = 0x40;
+        claude_bytes[0x3c..0x40].copy_from_slice(&pe_offset.to_le_bytes());
+        claude_bytes[0x40..0x44].copy_from_slice(b"PE\0\0");
+    }
+    fs::write(&claude_executable, &claude_bytes).unwrap();
     let claude = ClaudeCodeAdapter::from_layout(
         ClaudeCodeLayout {
             executable: claude_executable,
@@ -103,7 +116,8 @@ fn adapter_fixture() -> AdapterFixture {
     let user_skills_dir = root.path().join("home/.agents/skills");
     fs::create_dir_all(&codex_home).unwrap();
     fs::create_dir_all(&user_skills_dir).unwrap();
-    let quoted_project = serde_json::to_string(&project_root.to_string_lossy()).unwrap();
+    let quoted_project =
+        serde_json::to_string(fs::canonicalize(&project_root).unwrap().to_str().unwrap()).unwrap();
     fs::write(
         codex_home.join("config.toml"),
         format!("[projects.{quoted_project}]\ntrust_level = \"trusted\"\n"),
