@@ -254,3 +254,45 @@ stopping, so core/contextd suites have no Windows execution evidence there;
 the repairs above provide the first targeted Windows runtime evidence for
 those paths. Clean-checkout CI on the repair commit remains the mandatory
 gate; local runs do not replace it.
+
+## Windows follow-up: hosted CI stabilization to full-suite execution (2026-09-03)
+
+Once earlier repairs landed, hosted Windows CI advanced through suites that had
+never executed on Windows, exposing one defect class after another. Each was
+reproduced locally on the Windows x64 host before fixing; every commit is
+additive and none relaxes a fail-closed security gate. Commit order and
+resolved causes:
+
+| Commit | Suite/class | Root cause | Repair |
+| --- | --- | --- | --- |
+| `81267ad` | node-dependency-policy | Policy test asserted the overrides block verbatim and did not know the browserslist override added in `5608577`. | Test expectation updated to the true override order; browserslist pinned in fixed versions. |
+| `18a810c` | node-dependency-policy (again) | New high advisories (GHSA-fph4-wmhf-6fwf, GHSA-jqff-g426-hqxp and related) landed on fast-uri `>=3.0.0 <3.1.6` via `apps/desktop > ajv > fast-uri`; override pointed at 3.1.5. | Override bumped to 3.1.6, lockfile regenerated, policy test updated in the same commit. `pnpm audit --audit-level low` clean. |
+| `2c11aed` | core lib `claude_code::tests` (4 cases) | Fixtures wrote extensionless non-PE `claude-bin`; `VerifiedClaudeExecutable::open` requires `.exe` plus an `MZ`/`PE\0\0` image on Windows. | `fixture_executable_bytes()` helper (68-byte MZ header, PE signature at `0x40`); fixtures comply with the policy instead of weakening it. |
+| `15f50af`/`9c248ec` | `claude_code_adapter_v1` | Same fixture gap in the integration suite, plus platform-correct tamper targets (`.exe` on Windows) and a macOS-only unused-variable lint. | Shared fixture uses the PE stub; tamper tests target `claude.exe` on Windows. 36/36 local. |
+| `820469d` | `hermes_adapter_v1` junction test | `cmd /C "mklink /J \"a\" \"b\""` — the quoted single-string form is mangled by `cmd` quoting rules and fails with a syntax error (reproduced standalone). Tokens passed as separate arguments work. | Fixture invokes `mklink` token-per-argument. |
+| `4949253` | `hermes_adapter_v1` rollback | Drifting field was `last_access_time`: NTFS updates it on every open, so the verifying snapshot itself moves it. Last access is not a rollback guarantee on Windows. | `last_access` assertion scoped to non-Windows; content, attributes, creation, write, change, SD, and streams remain exact. |
+| `2189b77` | `hermes_adapter_v1` rollback (SD) | CI runners set `SE_DACL_AUTO_INHERITED` (0x0400) when the restored DACL is rebuilt through the temp/rename cycle; raw SD bytes differed in exactly that control bit while owner, group, and every ACE were identical. Production fingerprints already canonicalize this away. | Exposed `context_relay_native_runner::equivalent_security_descriptors`; both rollback SD comparisons use it. ACE order, presence bits, owner, and group remain covered byte-exactly by the canonical form. |
+| `a26907e` | `mcp_bridge_install_v1` (2 cases) | Same claude fixture gap; and the codex `config.toml` trust entry was keyed with the raw tempdir path while `CodexAdapter` canonicalizes to the verbatim form, so render rejected the project as untrusted. | Fixture gains the PE-stubbed `.exe`; trust entry keyed with `fs::canonicalize` like the adapter. 5/5 local. |
+| `070d9fa` | `primary_memory_setup_v1` (claude variant) | **Production defect.** `digest_regular_non_link_file` digested every native target through `VerifiedClaudeExecutable::open`, applying the `.exe`+PE executable policy to ordinary config/settings files. Unix never noticed because its native-path predicate is unconditionally true. | Digesting now enforces only regular-file safety: no symlink, no reparse point, opened via `open_executable_without_substitution`, re-validated through the handle, hashed. Executable attestation (staging, `run_verified`, revalidation) is unchanged. Error sites now carry path and underlying error. |
+| `f045d37` | `primary_memory_setup_v1` (hermes variant) | **Production defect.** Gateway reservation compared `NativeMetadata` for exact equality; NTFS bumps `last_access_time` on the probing read itself, so an untouched file appeared changed. | `NativeMetadata::stability_equivalent` — equality modulo last access; attributes, creation/write/change times, SD, streams, and link counts still exact. Consistent with the fingerprint's treatment of access time. |
+| `76c614e` | `native_fs_windows_v1` | Stale assertion: `snapshot_rejects_dotdot_verbatim_and_long_path_forms` still expected verbatim `\\?\` snapshots to be rejected, contradicting the accepted verbatim policy and its parity test; hosted CI failed exactly that assertion. | Test now asserts plain/verbatim fingerprint parity; dot-dot, device, UNC, traversal, reserved-name, and long-path rejections unchanged. |
+| `a91e03f` | `daemon-boundary` | `check-daemon-boundary.test.mjs` regenerated the fixture lock with `cargo generate-lockfile`, discarding workspace pins; freshly published broken tinyvec 1.13.0 (no_std `vec!` scoping break) then failed the fixture build with a rustc error instead of the expected boundary output. | `cargo update --workspace` adds the fixture package to the copied lock while preserving every pinned dependency version. 7/7 local on Windows x64. |
+
+Two recurring Windows principles are now established in code and prose: the
+`.exe`+PE requirement is real policy that fixtures must satisfy (never
+relaxed), and `last_access_time` is not a stability-relevant property on
+Windows (three independent fixes now embody this).
+
+Local verification at `f045d37` on Windows x64: `primary_memory_setup_v1`
+9/9, `hermes_adapter_v1` 72/72, `claude_code_adapter_v1` 36/36,
+`mcp_bridge_install_v1` 5/5, core lib 72/72, `claude_code::tests` 9/9, scoped
+clippy `-D warnings` clean on core and native-runner, fmt clean. At
+`a91e03f`: additionally `native_fs_windows_v1` 16/16 and the daemon boundary
+contract suite 7/7.
+
+Environmental CI failures recorded for accuracy (not code defects): run
+`33809787890` lost `native-isolation-windows-x64` and
+`request-native-sidecar-publication` to `BlobNotFound` (the published native
+sidecar blob was absent — publication is operator-owned; the same jobs passed
+on earlier runs), and `Native Semgrep Windows x64 build-a` to GitHub runner
+file-command failures; the Semgrep job passed on the following run.
