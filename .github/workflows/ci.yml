@@ -205,7 +205,16 @@ jobs:
       - run: npm install --global pnpm@11.9.0
       - run: pnpm install --frozen-lockfile
       - run: node --test scripts/dependency-policy.test.mjs
-      - run: pnpm audit --audit-level low
+      # The audit endpoint is a remote registry call that intermittently
+      # times out on hosted runners; retry before failing the gate. The
+      # gate itself is unchanged - any attempt that completes must pass.
+      - run: |
+          for attempt in 1 2 3; do
+            if pnpm audit --audit-level low; then exit 0; fi
+            echo "audit attempt $attempt failed; retrying after backoff"
+            sleep $((attempt * 15))
+          done
+          pnpm audit --audit-level low
 
   whitespace:
     permissions:
