@@ -1,16 +1,22 @@
 # Context Relay
 
+[![CI](https://github.com/Skytuhua/Context-Relay/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Skytuhua/Context-Relay/actions/workflows/ci.yml)
+[![Secret Scan](https://github.com/Skytuhua/Context-Relay/actions/workflows/secret-scan.yml/badge.svg?branch=main)](https://github.com/Skytuhua/Context-Relay/actions/workflows/secret-scan.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 Context Relay keeps one encrypted memory and configuration workspace in sync across Claude Code, Codex, and Hermes on Windows and macOS.
 
 > **Status:** Pre-alpha. The repository is under active development and is not ready for production use.
 
 ## Planned v1 support
 
-- Claude Code, Codex, and Hermes
-- Windows 11 24H2 or newer on x64
-- macOS 14 or newer on Apple Silicon
+| Harness | Platform |
+| --- | --- |
+| Claude Code | Windows 11 24H2+ (x64), macOS 14+ (Apple Silicon) |
+| Codex | Windows 11 24H2+ (x64), macOS 14+ (Apple Silicon) |
+| Hermes | Windows 11 24H2+ (x64), macOS 14+ (Apple Silicon) |
 
-## Primary memory contract
+## How it works
 
 Context Relay is the authoritative local memory and shared task ledger for its
 configured harnesses. Managed project instructions tell each harness to search
@@ -38,13 +44,57 @@ Exact per-version settings and source bindings are documented in the
 [Codex](adapters/codex/capabilities.md), and
 [Hermes](adapters/hermes/capabilities.md) capability pages.
 
+### Components
+
+| Component | Crate / app | Role |
+| --- | --- | --- |
+| Desktop UI | `apps/desktop` (Tauri) | Review queue, approvals, setup previews |
+| Daemon | `crates/contextd` | Filesystem observation, native memory watch, ledger |
+| MCP bridge | `crates/context-mcp` | The local MCP server the harnesses connect to |
+| Core | `crates/core` | Adapters, setup planning, semantic diffing, native transactions |
+| Native runner | `crates/native-runner` | Sandboxed filesystem and CLI execution for transactions |
+| Protocol | `crates/protocol` | Wire types, bindings, and schema export |
+| Local IPC | `crates/local-ipc` | Daemon ⇄ desktop/bridge transport |
+
 ## Development
 
-Sidecar hydration is a developer/CI build-time command. Running `npm run hydrate:sidecars` requires the repository's pinned Rust toolchain and a trusted `cargo` executable on `PATH`; hydration invokes the fixed native installer from this workspace with Cargo.
+Requirements:
+
+- Node.js `24` (see `.node-version`) and pnpm `11.9`
+- The pinned Rust toolchain (see `rust-toolchain.toml`; currently `1.97.1` with
+  `clippy` and `rustfmt`)
+- Windows: MSVC toolchain and Strawberry Perl on `PATH` for the vendored
+  OpenSSL/SQLCipher build
+
+```sh
+pnpm install
+npm run hydrate:sidecars   # developer/CI build-time sidecar hydration
+pnpm tauri:dev             # run the desktop app against a local daemon
+```
+
+Sidecar hydration is a developer/CI build-time command. Running
+`npm run hydrate:sidecars` requires the repository's pinned Rust toolchain and
+a trusted `cargo` executable on `PATH`; hydration invokes the fixed native
+installer from this workspace with Cargo.
+
+Common checks:
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+pnpm typecheck && pnpm test
+pnpm license:check
+```
 
 ## Security
 
 Please report security issues through [GitHub private vulnerability reporting](https://github.com/Skytuhua/Context-Relay/security/advisories/new). Do not open a public issue for a suspected vulnerability.
+
+Every push is scanned with the hash-pinned Gitleaks release (see
+`docs/repository-settings.md`). Sync credentials live only in the OS keyring
+through the direct local-ipc dependency; the daemon is the only component
+allowed to write the installation-token credential.
 
 ## License
 
