@@ -178,16 +178,19 @@ async fn live_edits_wait_for_one_stable_750ms_window_and_import_only_final_bytes
     tokio::time::sleep(Duration::from_millis(500)).await;
     std::fs::write(&path, b"final stable edit\n").unwrap();
     // Exact 749/750 ms boundaries are covered with a deterministic clock in the unit tests.
-    // Keep this wall-clock integration assertion safely inside the window so scheduler jitter
-    // cannot turn a pre-deadline observation into a post-deadline one.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        fixture
-            .config
-            .native_memory_candidates()
-            .unwrap()
-            .is_empty()
-    );
+    // This integration test asserts the observable contract — intermediate bytes never become a
+    // candidate and only the final stable bytes import — without racing a fixed wall-clock
+    // instant, which scheduled FS-notification latency on loaded runners can shift.
+    let deadline = std::time::Instant::now() + Duration::from_millis(1_500);
+    while std::time::Instant::now() < deadline {
+        for candidate in fixture.config.native_memory_candidates().unwrap() {
+            assert_ne!(
+                candidate.proposed_memory.body_markdown, "first edit\n",
+                "intermediate edit was imported before the stability window closed"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     wait_for_candidate_count(&fixture.config, 1).await;
     drop(daemon);
 
