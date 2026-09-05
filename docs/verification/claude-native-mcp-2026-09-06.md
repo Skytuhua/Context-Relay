@@ -159,3 +159,28 @@ warnings denied. Independent review found no actionable scoped issue and
 confirmed the context is retained by inverse plans, compensation and production
 recovery. Graphify was refreshed; SQL and OCaml extraction remain unavailable
 because their optional parsers are absent.
+
+## Nonempty plugin evidence for the next compatibility correction
+
+Using the same pinned executable, a fresh temporary configuration and an inert
+local marketplace, official plugin validate/add/install/list commands succeeded.
+The fixture follows Claude's [local marketplace format](https://code.claude.com/docs/en/plugin-marketplaces#walkthrough-create-a-local-marketplace)
+and contains only a static skill note, without hooks, MCP servers or executable
+code. No model session or normal configuration was used. Manifest validation
+reported only missing optional author/description warnings.
+
+The actual `plugin list --json` entry has `id`, `version`, `scope`, `enabled`,
+`installPath`, `installedAt` and `lastUpdated`. It omits `errors` when none exist.
+The current production parser instead requires exactly `id`, `version`,
+`enabled`, `errors`, so it would reject this normal installed-plugin result.
+This parser is not corrected by the command-context patch. Bounded embedded
+source inspection also shows optional `projectPath`, `mcpServers`, `errors`,
+`notes`, and session-scoped records; those forms need appropriate qualification
+before changing validation. In particular, optional MCP details may contain
+configuration that must not be exposed in user-facing errors.
+
+Evidence is in `qualify-claude-plugin.mjs`, `claude-plugin-help.log` and
+`claude-plugin-nonempty.log` in the local evidence directory. The synthetic
+installation is contained under the temporary root ending `4jft8y` and is
+retained as evidence. This experiment is not a confinement or general plugin
+execution-safety proof.

@@ -278,3 +278,13 @@ different configuration/state/project, and legacy unbound operations need a new
 preview. Sealing, tamper rejection, legacy readability and the existing synthetic
 transaction/recovery suites pass. This closes the omitted command-context field;
 real installed transaction recovery and full harness qualification remain open.
+
+The locked installer rebuilt from production source `24038b9` at
+2026-09-06 03:06:27: `Context Relay_0.1.0_x64-setup.exe`, 10,893,198 bytes,
+SHA-256 `b02ca151f4a512963415d8574300af116d728462c75c8d4b037ca2221d291ea9`,
+Authenticode NotSigned. It includes passive MCP inspection, selected command
+context, Windows project lookup and persisted approval/recovery binding.
+Packaging completed successfully; the candidate was not installed or visually
+verified. The nonempty plugin experiment found another existing validation
+schema mismatch, recorded in the Claude evidence document. Full harness support
+and release acceptance remain unfinished.
