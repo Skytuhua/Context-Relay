@@ -299,3 +299,10 @@ core/daemon all-target test-support Clippy. The 24038b9 installer above predates
 this patch. Native memory location/settings, hooks and real transaction recovery
 remain open; no Full support or installed acceptance is claimed. See the Claude
 qualification document for evidence and the newly identified memory mismatch.
+
+The memory-key follow-up corrects Windows canonical-prefix handling, UTF-16
+replacement and Claude's long-key suffix, using vectors from the pinned native
+artifact's pure string helpers. All 94 core library, 47 Claude adapter and 11
+memory setup tests pass, as does core/daemon all-target Clippy. Independent review
+approved the scoped correction. Repository/worktree selection, relative explicit
+directories, settings precedence and full connection qualification remain open.

@@ -1027,6 +1027,7 @@ fn frozen_claude_default_binding_is_exact_and_invalid_explicit_paths_are_unavail
     let project_root = fixture.root.join("project with spaces");
     let project_key = project_root
         .to_string_lossy()
+        .trim_start_matches(r"\\?\")
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '-' {
@@ -1185,6 +1186,7 @@ fn native_memory_claude_supported_absent_project_settings_plans_exact_creation_a
     let project_root = fixture.root.join("project with spaces");
     let project_key = project_root
         .to_string_lossy()
+        .trim_start_matches(r"\\?\")
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '-' {
@@ -1263,6 +1265,7 @@ fn native_memory_claude_absent_project_settings_parent_watches_without_creating_
     let project_root = fixture.root.join("project with spaces");
     let project_key = project_root
         .to_string_lossy()
+        .trim_start_matches(r"\\?\")
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '-' {

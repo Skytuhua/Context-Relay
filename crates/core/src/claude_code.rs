@@ -25,6 +25,7 @@ mod mcp_state;
 use mcp_state::McpConfiguration;
 mod command_context;
 use command_context::ClaudeCommandContext;
+mod memory_path;
 
 use crate::mcp::install::{
     BRIDGE_SERVER_NAME, is_canonical_bridge_body, is_managed_bridge_component,
@@ -1147,20 +1148,9 @@ impl ClaudeCodeAdapter {
             Ok(path) => path,
             Err(_) => return Ok(None),
         };
-        let key = canonical_project
-            .to_string_lossy()
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || character == '-' {
-                    character
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>();
-        if key.is_empty() || key.len() > 4_096 {
+        let Some(key) = memory_path::directory_key(&canonical_project) else {
             return Ok(None);
-        }
+        };
         safe_memory_directory_binding(
             &self
                 .layout

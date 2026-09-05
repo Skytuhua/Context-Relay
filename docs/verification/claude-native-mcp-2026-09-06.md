@@ -229,3 +229,28 @@ fixtures resolve them against the project. The source also resolves settings
 precedence/trust, repository/worktree roots, Windows path spelling and long
 project keys differently from the adapter's simple canonical-path substitution.
 These findings are not yet corrected here and do not establish a full connection.
+
+## Follow-up: correct memory directory-key encoding
+
+The key-encoding part of that gap is now corrected. Rust's canonical Windows
+prefix is removed before encoding the ordinary drive/UNC path. Replacement uses
+UTF-16 units, including two hyphens for a supplementary character, and long keys
+use Claude's 200-unit prefix plus absolute signed wrapping hash in base36.
+Non-Unicode paths are rejected instead of silently changing their identity.
+
+The checked-in 2.1.202 memory-key vectors were generated from only the three pure
+string helpers in the digest-pinned executable. They were evaluated in a VM
+without module initialization, process, filesystem or network access. They cover
+spaces, accented/Chinese/supplementary characters and both sides of the length
+boundary. Two regressions reproduced the extra Windows prefix and supplementary
+character mismatch before correction. All 94 ordinary core library, 47 Claude
+adapter and 11 primary-memory setup tests pass; core/daemon all-target
+test-support Clippy passes. Independent read-only review approved the translation.
+
+This corrects encoding of an already selected path. It does not yet correct
+repository/worktree root selection, relative explicit directory values, settings
+precedence/trust or override environments. Those remain required qualification
+work before Full support. Evidence: `qualify-claude-memory-key.mjs`,
+`claude-memory-key-vectors.log`, `claude-memory-key-red.log`,
+`claude-memory-key-suites.log` and `claude-memory-key-clippy.log` in the local
+evidence directory. The fixture records the executable digest and evidence scope.
