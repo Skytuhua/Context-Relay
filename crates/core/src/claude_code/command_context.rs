@@ -21,9 +21,10 @@ impl ClaudeCommandContext {
         config_dir: &Path,
         state_path: &Path,
         project_root: &Path,
+        user_home: &Path,
     ) -> Result<Self, ClientError> {
         let error = || invalid_request("Claude Code configuration and state paths do not agree");
-        if [config_dir, state_path, project_root]
+        if [config_dir, state_path, project_root, user_home]
             .into_iter()
             .any(|path| !path.is_absolute() || path.to_str().is_none())
         {
@@ -37,7 +38,7 @@ impl ClaudeCommandContext {
         {
             return Err(error());
         }
-        let home = state_path.parent().ok_or_else(error)?;
+        let home = user_home;
         let overridden = state_path == config_dir.join(".claude.json");
         if !overridden
             && (config_dir != home.join(".claude") || state_path != home.join(".claude.json"))
@@ -55,10 +56,15 @@ impl ClaudeCommandContext {
 
     pub(super) fn validate(&self) -> Result<(), ClientError> {
         let error = || invalid_request("Claude Code configuration binding changed or is unsafe");
-        for path in [&self.config_dir, &self.state_path, &self.project_root] {
+        for path in [
+            &self.config_dir,
+            &self.state_path,
+            &self.project_root,
+            &self.home,
+        ] {
             super::mcp_state::validate_config_path(path, true).map_err(|_| error())?;
         }
-        if !self.project_root.is_dir() {
+        if !self.project_root.is_dir() || !self.home.is_dir() {
             return Err(error());
         }
         // The installed CLI gives this legacy file precedence over .claude.json.
@@ -71,10 +77,11 @@ impl ClaudeCommandContext {
     }
 
     pub(super) fn approval_binding(&self) -> crate::native_transaction::CliExecutionContext {
-        crate::native_transaction::CliExecutionContext::ClaudeCodeV1 {
+        crate::native_transaction::CliExecutionContext::ClaudeCodeV2 {
             config_dir: super::wire_path(&self.config_dir),
             state_path: super::wire_path(&self.state_path),
             project_root: super::wire_path(&self.project_root),
+            user_home: super::wire_path(&self.home),
         }
     }
 
@@ -154,15 +161,19 @@ mod tests {
         for overridden in [false, true] {
             let home = root_path.join(if overridden { "override" } else { "home" });
             let config = if overridden {
-                home.clone()
+                home.join("custom configuration")
             } else {
                 home.join(".claude")
             };
-            let state = home.join(".claude.json");
+            let state = if overridden {
+                config.join(".claude.json")
+            } else {
+                home.join(".claude.json")
+            };
             let project = root_path.join("selected project 專案");
             fs::create_dir_all(&config).unwrap();
             fs::create_dir_all(&project).unwrap();
-            let context = ClaudeCommandContext::new(&config, &state, &project).unwrap();
+            let context = ClaudeCommandContext::new(&config, &state, &project, &home).unwrap();
             let mut command = Command::new(std::env::current_exe().unwrap());
             command
                 .args([
@@ -231,11 +242,15 @@ mod tests {
         for overridden in [false, true] {
             let home = physical.join(if overridden { "override" } else { "home" });
             let config = if overridden {
-                home.clone()
+                home.join("custom configuration")
             } else {
                 home.join(".claude")
             };
-            let state = home.join(".claude.json");
+            let state = if overridden {
+                config.join(".claude.json")
+            } else {
+                home.join(".claude.json")
+            };
             let project = physical.join(if overridden {
                 "override project 專案"
             } else {
@@ -243,7 +258,7 @@ mod tests {
             });
             fs::create_dir_all(&config).unwrap();
             fs::create_dir_all(&project).unwrap();
-            let context = ClaudeCommandContext::new(&config, &state, &project).unwrap();
+            let context = ClaudeCommandContext::new(&config, &state, &project, &home).unwrap();
             let body = json!({"type":"stdio", "command": physical.join("inert-missing-bridge.exe"), "args":["--harness","claude-code"]});
             let encoded = serde_json::to_string(&body).unwrap();
             super::super::run_bounded_command(
@@ -335,13 +350,110 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an explicitly selected, digest-pinned installed Claude CLI and rustc"]
+    fn pinned_claude_cli_executes_generated_windows_startup_hook() {
+        use context_relay_protocol::HarnessId;
+        use sha2::{Digest as _, Sha256};
+        use std::os::windows::process::CommandExt as _;
+
+        let executable = PathBuf::from(
+            env::var_os("CONTEXT_RELAY_TEST_CLAUDE_EXE").expect("explicit Claude executable"),
+        );
+        let expected =
+            env::var("CONTEXT_RELAY_TEST_CLAUDE_SHA256").expect("explicit Claude digest");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(fs::read(&executable).unwrap())),
+            expected
+        );
+        let hash = super::super::digest_file(&executable).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let physical = fs::canonicalize(root.path()).unwrap();
+        let bridge = physical.join("bridge $HOME O'Brien 專案.exe");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude-hook-capture.rs");
+        let compiled = Command::new("rustc")
+            .arg(source)
+            .args(["--crate-name", "hook_capture", "-o"])
+            .arg(&bridge)
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let component = crate::native_memory::managed_memory_hooks(
+            HarnessId::ClaudeCode,
+            &super::super::wire_path(&bridge),
+        )
+        .unwrap()
+        .remove(0);
+        let hooks: Value = serde_json::from_str(&component.body_markdown).unwrap();
+        let captured = physical.join("hook-input.json");
+        for overridden in [false, true] {
+            let home = physical.join(if overridden { "override" } else { "home" });
+            let config = home.join(if overridden {
+                "custom configuration"
+            } else {
+                ".claude"
+            });
+            let state = if overridden {
+                config.join(".claude.json")
+            } else {
+                home.join(".claude.json")
+            };
+            let project = home.join("selected project 專案");
+            fs::create_dir_all(&config).unwrap();
+            fs::create_dir_all(&project).unwrap();
+            fs::write(
+                config.join("settings.json"),
+                serde_json::to_vec(&json!({"hooks": hooks})).unwrap(),
+            )
+            .unwrap();
+            let context = ClaudeCommandContext::new(&config, &state, &project, &home).unwrap();
+            // This version's init-only mode runs startup hooks and exits without
+            // authentication or a model request. A zero exit alone is insufficient:
+            // Claude can exit successfully even when a hook failed to launch.
+            super::super::run_bounded_command(&executable, &["--init-only"], hash, &context)
+                .unwrap();
+            let event: Value =
+                serde_json::from_slice(&fs::read(&captured).expect("generated hook must execute"))
+                    .unwrap();
+            assert_eq!(event["hook_event_name"], "SessionStart");
+            assert_eq!(event["source"], "startup");
+            assert!(!event["session_id"].as_str().unwrap().is_empty());
+            assert_eq!(
+                fs::canonicalize(event["cwd"].as_str().unwrap()).unwrap(),
+                project
+            );
+            // init-only reports a future transcript path without creating its
+            // directory. Check its selected configuration without reading it.
+            let ordinary_config =
+                Path::new(config.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
+            let transcript = event["transcript_path"].as_str().unwrap();
+            let transcript = transcript.strip_prefix(r"\\?\").unwrap_or(transcript);
+            assert!(
+                Path::new(transcript).starts_with(ordinary_config.join("projects")),
+                "unexpected fixture transcript path: {transcript}; config: {ordinary_config:?}"
+            );
+            fs::remove_file(&captured).unwrap();
+            println!(
+                "Real pinned Claude executed the generated Windows startup hook with {} configuration",
+                if overridden { "override" } else { "default" }
+            );
+        }
+    }
+
     #[test]
     fn commands_reject_an_unrepresentable_configuration_binding() {
         let root = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(root.path()).unwrap();
         let config = root.join("custom");
         let state = root.join("elsewhere/.claude.json");
-        assert!(ClaudeCommandContext::new(&config, &state, &root).is_err());
+        assert!(ClaudeCommandContext::new(&config, &state, &root, &root).is_err());
     }
 
     #[test]
@@ -349,7 +461,24 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(root.path()).unwrap();
         let config = root.join("cafe\u{301}");
-        assert!(ClaudeCommandContext::new(&config, &config.join(".claude.json"), &root).is_err());
+        assert!(
+            ClaudeCommandContext::new(&config, &config.join(".claude.json"), &root, &root).is_err()
+        );
+    }
+
+    #[test]
+    fn default_configuration_must_agree_with_the_selected_home() {
+        let root = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(root.path()).unwrap();
+        assert!(
+            ClaudeCommandContext::new(
+                &root.join(".claude"),
+                &root.join(".claude.json"),
+                &root,
+                &root.join("different-home")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -359,7 +488,7 @@ mod tests {
         let config = root.join(".claude");
         fs::create_dir(&config).unwrap();
         let context =
-            ClaudeCommandContext::new(&config, &root.join(".claude.json"), &root).unwrap();
+            ClaudeCommandContext::new(&config, &root.join(".claude.json"), &root, &root).unwrap();
         fs::write(config.join(".config.json"), b"{}").unwrap();
         let mut command = Command::new("must-not-run");
         assert!(

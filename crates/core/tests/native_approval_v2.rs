@@ -238,10 +238,11 @@ fn claude_context_plan() -> NativeTransactionPlan {
         "/fixture/claude",
         &["mcp", "remove", "context-relay", "--scope", "user"],
     )];
-    mutation.execution_context = Some(CliExecutionContext::ClaudeCodeV1 {
+    mutation.execution_context = Some(CliExecutionContext::ClaudeCodeV2 {
         config_dir: native_text("/fixture/home/.claude"),
         state_path: native_text("/fixture/home/.claude.json"),
         project_root: native_text("/fixture/project"),
+        user_home: native_text("/fixture/home"),
     });
     candidate.setup.cli_operations = mutation.forward.clone();
     candidate
@@ -258,12 +259,13 @@ fn claude_execution_context_is_approval_bound_and_survives_sealing() {
         candidate.cli_mutations
     );
 
-    for field in 0..3 {
+    for field in 0..4 {
         let mut changed = candidate.clone();
-        let Some(CliExecutionContext::ClaudeCodeV1 {
+        let Some(CliExecutionContext::ClaudeCodeV2 {
             config_dir,
             state_path,
             project_root,
+            user_home,
         }) = &mut changed.cli_mutations[0].execution_context
         else {
             unreachable!()
@@ -274,7 +276,8 @@ fn claude_execution_context_is_approval_bound_and_survives_sealing() {
                 *state_path = native_text("/fixture/other/.claude.json");
             }
             1 => *state_path = native_text("/fixture/home/.claude/.claude.json"),
-            _ => *project_root = native_text("/fixture/other-project"),
+            2 => *project_root = native_text("/fixture/other-project"),
+            _ => *user_home = native_text("/fixture/other-home"),
         }
         assert_ne!(approval_hash_v2(&changed).unwrap(), approved);
     }
@@ -296,7 +299,7 @@ fn claude_execution_context_rejects_wrong_harness_and_invalid_paths() {
         .clone();
     assert!(approval_hash_v2(&wrong_harness).is_err());
     let mut bad_path = claude_context_plan();
-    let Some(CliExecutionContext::ClaudeCodeV1 { project_root, .. }) =
+    let Some(CliExecutionContext::ClaudeCodeV2 { project_root, .. }) =
         &mut bad_path.cli_mutations[0].execution_context
     else {
         unreachable!()
@@ -319,6 +322,44 @@ fn legacy_cli_envelopes_remain_readable_without_an_execution_context_field() {
             .is_none()
     );
     assert_eq!(open_plan(&sealed).unwrap().plan, candidate);
+}
+
+#[test]
+fn legacy_claude_v1_context_envelopes_remain_readable_without_a_home_field() {
+    let mut candidate = claude_context_plan();
+    let modern_hash = approval_hash_v2(&candidate).unwrap();
+    let Some(CliExecutionContext::ClaudeCodeV2 {
+        config_dir,
+        state_path,
+        project_root,
+        ..
+    }) = candidate.cli_mutations[0].execution_context.take()
+    else {
+        unreachable!()
+    };
+    candidate.cli_mutations[0].execution_context = Some(CliExecutionContext::ClaudeCodeV1 {
+        config_dir,
+        state_path,
+        project_root,
+    });
+    let approved = approval_hash_v2(&candidate).unwrap();
+    assert_ne!(approved, modern_hash);
+    candidate.setup.batch_hash = approved;
+    let sealed = seal_plan(&candidate, approved).unwrap();
+    assert_eq!(
+        open_plan(&sealed).unwrap().plan.cli_mutations,
+        candidate.cli_mutations
+    );
+    let value: serde_json::Value = serde_json::from_slice(&sealed).unwrap();
+    assert_eq!(
+        value["nativePlan"]["cliMutations"][0]["executionContext"]["kind"],
+        "claude-code-v1"
+    );
+    assert!(
+        value["nativePlan"]["cliMutations"][0]["executionContext"]
+            .get("userHome")
+            .is_none()
+    );
 }
 
 #[test]

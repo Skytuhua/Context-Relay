@@ -33,7 +33,7 @@ fn application_info() -> ApplicationInfo {
 #[tauri::command]
 async fn choose_project_folder(app: AppHandle) -> Result<Option<String>, &'static str> {
     // The native picker runs off the UI thread. Selecting a folder does not
-    // register it, read its contents, or grant an AI app access to it.
+    // register it, read its contents, or grant a harness access to it.
     app.dialog()
         .file()
         .set_title("Choose your project folder")

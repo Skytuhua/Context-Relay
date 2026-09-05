@@ -873,6 +873,7 @@ pub(crate) mod tests {
         vault: &mut Vault,
         executable: &Path,
         bridge_executable: &Path,
+        execution_context: context_relay_core::native_transaction::CliExecutionContext,
     ) -> NativeTransactionPlan {
         let mut plan = base_plan();
         plan.setup.harness = HarnessId::ClaudeCode;
@@ -880,6 +881,17 @@ pub(crate) mod tests {
         plan.setup.executable_hash =
             Sha256Digest(Sha256::digest(fs::read(executable).unwrap()).into());
         plan.setup.harness_version = "2.1.214".into();
+        let context_relay_core::native_transaction::CliExecutionContext::ClaudeCodeV2 {
+            project_root,
+            ..
+        } = &execution_context
+        else {
+            panic!("fixture needs an explicit Claude context");
+        };
+        plan.setup.target_scopes.push(NativeScope::Project {
+            project_id: global_project_id().unwrap(),
+            root: project_root.clone(),
+        });
         plan.sidecars[0].command = SidecarCommand::RuleSyncGenerate {
             target: RuleSyncTarget::ClaudeCode,
             features: RuleSyncFeatures::new(&[RuleSyncFeature::Mcp]).unwrap(),
@@ -921,7 +933,7 @@ pub(crate) mod tests {
         };
         plan.setup.cli_operations = vec![forward.clone()];
         plan.cli_mutations = vec![ApprovedCliMutation {
-            execution_context: None,
+            execution_context: Some(execution_context),
             stable_id: "f4a4f9a2-0e8d-720e-8df4-a5a68da3e9c7".into(),
             expected: None,
             intended: Some(intended),

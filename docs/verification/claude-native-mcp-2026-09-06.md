@@ -254,3 +254,63 @@ work before Full support. Evidence: `qualify-claude-memory-key.mjs`,
 `claude-memory-key-vectors.log`, `claude-memory-key-red.log`,
 `claude-memory-key-suites.log` and `claude-memory-key-clippy.log` in the local
 evidence directory. The fixture records the executable digest and evidence scope.
+
+## Follow-up: explicit home and working Windows startup hooks
+
+Claude's selected user home is now independent of a custom configuration
+directory. The layout retains it, the command environment uses it, and the
+ClaudeCodeV2 execution context binds it into approval and the sealed plan.
+Apply, rollback and recovery reject a changed home just as they reject changed
+configuration or project paths. V1 envelopes remain readable but require a new
+preview before execution. The child-process regression reproduced the previous
+incorrect HOME. The pinned CLI's MCP/plugin qualification also passed with the
+custom configuration below a separate home (73.47 seconds).
+
+Real 2.1.202 `--init-only` qualification found that Windows command hooks run
+through Git Bash. Old double-quoted verbatim executable paths failed to launch;
+literal `$HOME` in a double-quoted filename expanded. Claude still returned zero
+when the hook failed. The Claude-specific renderer now validates the Windows
+path before removing its verbatim prefix, uses forward slashes and Bash single
+quotes, and escapes apostrophes. Codex's Windows renderer is unchanged. New
+components reject the old syntax; merging still recognizes exact older managed
+entries for replacement and archival without removing unrelated hooks.
+
+The opt-in test `pinned_claude_cli_executes_generated_windows_startup_hook`
+compiles an inert local capture executable whose path contains spaces, `$HOME`,
+an apostrophe and Chinese characters. It installs the production-generated hook
+only in temporary configurations, invokes the digest-pinned CLI through the core
+launcher and verifies the captured SessionStart event, arguments and project.
+It passed both default and overridden configurations in 12.48 seconds. No normal
+configuration, model request or Context Relay service was used. The test checks
+hook execution rather than relying on CLI exit status. Initial test assertions
+incorrectly assumed that the future transcript directory existed and that its
+path omitted the Windows verbatim prefix; those assertions were corrected.
+
+Validation passes 98 ordinary core library tests (two explicit runtime tests
+ignored in the ordinary suite), 48 Claude adapter, 64 Codex adapter, 22 approval,
+5 bridge-install, 11 primary-memory setup and 58 Windows daemon tests. Core and daemon all-target
+test-support Clippy passes with warnings denied. Independent review approved
+the production changes and the explicit-home binding; its cross-platform test
+lint finding was fixed. Graphify was refreshed (14,955 nodes, 43,107 edges).
+
+The macOS recovery fixture also needed updating after hosted job 101364841165
+failed on 71d5c73: it emitted a bare version, simulated get/list responses and
+seeded an unbound CLI plan. It now writes native `.claude.json` state, seals V2
+home/configuration/project paths and accepts only the exact version and rollback
+remove commands. Its three prepared/committed recovery cases and nonlaunching
+bridge canary are retained. Independent review approved the fixture correction;
+its macOS execution still needs the next hosted run.
+
+Evidence: `claude-user-home-red.log`, `claude-user-home-final-suites.log`,
+`claude-user-home-real.log`, `claude-bash-hook-red.log`,
+`claude-init-hook-literal-dollar.log`, `claude-init-hook-verbatim.log`,
+`claude-init-hook-bash-quote.log`, `claude-bash-hook-real-complete.log`,
+`claude-home-hooks-suites.log`, `claude-home-hooks-clippy.log` and
+`ci-71-macos-rust-failure.log` in the local evidence directory. The first local
+release test build used a different target cache and was stopped during OpenSSL
+compilation; the completed real test uses the x64 static-CRT release target.
+
+This qualifies startup command rendering and event delivery, not Stop events,
+full memory setup, real transaction/crash recovery or installed acceptance.
+Memory settings precedence, directory selection and repository/worktree binding
+remain open. No Full support was enabled for the installed 2.1.202 runtime.

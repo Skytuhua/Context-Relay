@@ -115,6 +115,7 @@ fn fixture(source: &str) -> Fixture {
             executable,
             version: fixture["version"].as_str().unwrap().to_owned(),
             installation_method: InstallationMethod::PackageManager,
+            user_home: root.clone(),
             config_dir,
             state_path: state_path.clone(),
             project_root,
@@ -239,7 +240,16 @@ fn memory_hooks_render_only_frozen_context_relay_compatible_events_with_literal_
             let command = hooks[native_event][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap();
-            assert!(command.contains(bridge.to_string_lossy().as_ref()));
+            let bridge_path = bridge.to_str().unwrap();
+            #[cfg(windows)]
+            let bridge_path = bridge_path
+                .strip_prefix(r"\\?\")
+                .unwrap_or(bridge_path)
+                .replace('\\', "/");
+            #[cfg(windows)]
+            assert!(command.contains(&bridge_path));
+            #[cfg(not(windows))]
+            assert!(command.contains(bridge_path));
             assert!(command.ends_with(&format!(" --hook-event {event} --harness claude-code")));
             assert_eq!(hooks[native_event][0]["hooks"][0]["type"], "command");
             assert_eq!(
@@ -2094,24 +2104,30 @@ fn cli_executor_detects_a_command_that_did_not_write_the_intended_declaration() 
 }
 
 #[test]
-fn cli_executor_rejects_a_different_configuration_or_project_after_preview() {
+fn cli_executor_rejects_a_different_configuration_project_or_home_after_preview() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
     let intended = bridge(&fixture, &bridge_path);
     let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
-    for change_config in [false, true] {
-        let config = fixture.root.join(if change_config {
+    for change in 0..3 {
+        let config = fixture.root.join(if change == 0 {
             "other config"
         } else {
             "custom claude config"
         });
-        let project = fixture.root.join(if change_config {
-            "project with spaces"
-        } else {
+        let project = fixture.root.join(if change == 1 {
             "other project"
+        } else {
+            "project with spaces"
         });
+        let home = if change == 2 {
+            fixture.root.join("other home")
+        } else {
+            fixture.root.clone()
+        };
         fs::create_dir_all(&config).unwrap();
         fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&home).unwrap();
         let device = DeviceId::from_str(DEVICE_ID).unwrap();
         let adapter = ClaudeCodeAdapter::from_layout(
             ClaudeCodeLayout {
@@ -2122,6 +2138,7 @@ fn cli_executor_rejects_a_different_configuration_or_project_after_preview() {
                 }),
                 version: "2.1.214".into(),
                 installation_method: InstallationMethod::PackageManager,
+                user_home: home,
                 state_path: config.join(".claude.json"),
                 config_dir: config,
                 project_root: project,
@@ -2182,6 +2199,37 @@ fn claude_reprobe_and_executor_reject_legacy_unbound_cli_mutations() {
             .finish_committed_cli_mutations(&[mutation])
             .is_err()
     );
+}
+
+#[test]
+fn claude_executor_rejects_legacy_inferred_home_context_before_launch() {
+    use context_relay_core::native_transaction::CliExecutionContext;
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    let mut mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+    let Some(CliExecutionContext::ClaudeCodeV2 {
+        config_dir,
+        state_path,
+        project_root,
+        ..
+    }) = mutation.execution_context.take()
+    else {
+        panic!("new preview must bind home")
+    };
+    mutation.execution_context = Some(CliExecutionContext::ClaudeCodeV1 {
+        config_dir,
+        state_path,
+        project_root,
+    });
+    let mut executor = fixture.adapter.cli_executor_with_runner(
+        |_: &[String]| -> Result<Vec<u8>, BoundaryError> {
+            panic!("legacy inferred home must not launch")
+        },
+    );
+    assert!(executor.probe_cli_mutation(&mutation).is_err());
+    assert!(executor.apply_cli_mutation(&mutation).is_err());
+    assert!(executor.restore_cli_mutation_if_matches(&mutation).is_err());
 }
 
 #[test]

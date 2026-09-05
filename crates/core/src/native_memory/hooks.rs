@@ -26,7 +26,7 @@ pub fn managed_memory_hooks(
     if harness == HarnessId::Hermes {
         return Ok(Vec::new());
     }
-    let executable = literal_executable(bridge_executable)?;
+    let executable = literal_executable(harness, bridge_executable)?;
     let events = managed_events(harness);
     let harness_name = harness_cli_name(harness);
     let mut hooks = serde_json::Map::new();
@@ -135,11 +135,16 @@ fn valid_managed_hook_body(harness: HarnessId, body: &str) -> bool {
         let [entry] = entries.as_slice() else {
             return false;
         };
-        is_managed_hook_entry(harness, native_event, entry)
+        is_managed_hook_entry(harness, native_event, entry, false)
     })
 }
 
-fn is_managed_hook_entry(harness: HarnessId, native_event: &str, entry: &Value) -> bool {
+fn is_managed_hook_entry(
+    harness: HarnessId,
+    native_event: &str,
+    entry: &Value,
+    allow_legacy: bool,
+) -> bool {
     let Some((_, hook_event)) = managed_events(harness)
         .iter()
         .find(|(candidate, _)| *candidate == native_event)
@@ -170,27 +175,48 @@ fn is_managed_hook_entry(harness: HarnessId, native_event: &str, entry: &Value) 
         && !command.contains(['\n', '\r'])
         && command
             .strip_suffix(&suffix)
-            .is_some_and(canonical_literal_executable)
+            .is_some_and(|literal| canonical_literal_executable(harness, literal, allow_legacy))
+}
+
+fn bash_literal_path(literal: &str) -> Option<String> {
+    let inner = literal
+        .strip_prefix('\'')
+        .and_then(|literal| literal.strip_suffix('\''))?;
+    let segments = inner.split("'\\''").collect::<Vec<_>>();
+    if segments.iter().any(|segment| segment.contains('\'')) {
+        return None;
+    }
+    Some(segments.join("'"))
+}
+
+fn bash_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
 }
 
 #[cfg(not(windows))]
-fn canonical_literal_executable(literal: &str) -> bool {
-    let Some(inner) = literal
-        .strip_prefix('\'')
-        .and_then(|literal| literal.strip_suffix('\''))
-    else {
-        return false;
-    };
-    let segments = inner.split("'\\''").collect::<Vec<_>>();
-    if segments.iter().any(|segment| segment.contains('\'')) {
-        return false;
-    }
-    let path = segments.join("'");
-    Path::new(&path).is_absolute() && format!("'{}'", path.replace('\'', "'\\''")) == literal
+fn canonical_literal_executable(_: HarnessId, literal: &str, _: bool) -> bool {
+    bash_literal_path(literal)
+        .is_some_and(|path| Path::new(&path).is_absolute() && bash_quote(&path) == literal)
 }
 
 #[cfg(windows)]
-fn canonical_literal_executable(literal: &str) -> bool {
+fn canonical_literal_executable(harness: HarnessId, literal: &str, allow_legacy: bool) -> bool {
+    if harness == HarnessId::ClaudeCode {
+        if let Some(path) = bash_literal_path(literal) {
+            let bytes = path
+                .replace('/', "\\")
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            return crate::native_transaction::approval::windows_target_key(&bytes)
+                .is_ok_and(|path| bash_quote(&path.replace('\\', "/")) == literal);
+        }
+        // Old Context Relay entries must remain recognizable for replacement
+        // and archival, but cannot be approved as newly generated commands.
+        if !allow_legacy {
+            return false;
+        }
+    }
     let Some(path) = literal
         .strip_prefix('"')
         .and_then(|literal| literal.strip_suffix('"'))
@@ -243,7 +269,7 @@ pub(crate) fn merge_managed_memory_hooks(
             }
         };
         let before = entries.len();
-        entries.retain(|entry| !is_managed_hook_entry(harness, event, entry));
+        entries.retain(|entry| !is_managed_hook_entry(harness, event, entry, true));
         let removed = entries.len() != before;
         if component.archived {
             if removed && entries.is_empty() {
@@ -284,7 +310,7 @@ fn managed_hook_record_id(harness: HarnessId) -> Result<RecordId, ClientError> {
 }
 
 #[cfg(not(windows))]
-fn literal_executable(value: &WireNativeValue) -> Result<String, ClientError> {
+fn literal_executable(_: HarnessId, value: &WireNativeValue) -> Result<String, ClientError> {
     if value.platform != NativePlatform::Macos || value.bytes.contains(&0) {
         return Err(invalid("Product memory hook executable is invalid"));
     }
@@ -293,15 +319,22 @@ fn literal_executable(value: &WireNativeValue) -> Result<String, ClientError> {
     if !Path::new(path).is_absolute() {
         return Err(invalid("Product memory hook executable must be absolute"));
     }
-    Ok(format!("'{}'", path.replace('\'', "'\\''")))
+    Ok(bash_quote(path))
 }
 
 #[cfg(windows)]
-fn literal_executable(value: &WireNativeValue) -> Result<String, ClientError> {
+fn literal_executable(harness: HarnessId, value: &WireNativeValue) -> Result<String, ClientError> {
     use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
 
     if value.platform != NativePlatform::Windows || !value.bytes.len().is_multiple_of(2) {
         return Err(invalid("Product memory hook executable is invalid"));
+    }
+    if harness == HarnessId::ClaudeCode {
+        // Claude executes Windows hooks through Bash. Validate the native path
+        // before removing its verbatim prefix so Win32 aliases cannot change it.
+        let path = crate::native_transaction::approval::windows_target_key(&value.bytes)
+            .map_err(|_| invalid("Product memory hook executable is unsafe"))?;
+        return Ok(bash_quote(&path.replace('\\', "/")));
     }
     let path = OsString::from_wide(
         &value
@@ -329,5 +362,74 @@ fn invalid(message: &'static str) -> ClientError {
         message: message.to_owned(),
         field_path: None,
         retryable: false,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    fn wire(path: &str) -> WireNativeValue {
+        WireNativeValue {
+            platform: NativePlatform::Windows,
+            bytes: path.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+            display: None,
+        }
+    }
+
+    #[test]
+    fn claude_hooks_use_bash_literals_for_canonical_windows_paths() {
+        let component = managed_memory_hooks(
+            HarnessId::ClaudeCode,
+            &wire(r"\\?\C:\Users\A $HOME\O'Brien\bridge.exe"),
+        )
+        .unwrap()
+        .remove(0);
+        let body: Value = serde_json::from_str(&component.body_markdown).unwrap();
+        assert_eq!(
+            body["SessionStart"][0]["hooks"][0]["command"],
+            "'C:/Users/A $HOME/O'\\''Brien/bridge.exe' --hook-event session-start --harness claude-code"
+        );
+        assert!(is_managed_memory_hook_component(
+            HarnessId::ClaudeCode,
+            &component
+        ));
+    }
+
+    #[test]
+    fn legacy_claude_windows_quotes_are_only_accepted_for_cleanup() {
+        let component =
+            managed_memory_hooks(HarnessId::ClaudeCode, &wire(r"\\?\C:\Fixture\bridge.exe"))
+                .unwrap()
+                .remove(0);
+        let mut old_body: Value = serde_json::from_str(&component.body_markdown).unwrap();
+        old_body["SessionStart"][0]["hooks"][0]["command"] =
+            json!(r#""\\?\C:\Fixture\old.exe" --hook-event session-start --harness claude-code"#);
+        let mut old_component = component.clone();
+        old_component.body_markdown = serde_json::to_string(&old_body).unwrap();
+        assert!(!is_managed_memory_hook_component(
+            HarnessId::ClaudeCode,
+            &old_component
+        ));
+        let merged =
+            merge_managed_memory_hooks(HarnessId::ClaudeCode, Some(&old_body), &component).unwrap();
+        let desired: Value = serde_json::from_str(&component.body_markdown).unwrap();
+        assert_eq!(merged, desired);
+    }
+
+    #[test]
+    fn claude_hook_paths_reject_windows_aliases_before_removing_verbatim_prefix() {
+        for path in [
+            r"\\?\C:\Fixture\bridge.exe.",
+            r"\\?\C:\Fixture\bridge.exe ",
+            r"\\?\C:\Fixture\NUL.exe",
+            r"\\?\C:\Fixture\..\bridge.exe",
+            r"\\?\UNC\server\share\bridge.exe",
+        ] {
+            assert!(
+                managed_memory_hooks(HarnessId::ClaudeCode, &wire(path)).is_err(),
+                "{path}"
+            );
+        }
     }
 }

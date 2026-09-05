@@ -72,3 +72,11 @@ claims must update this matrix and the linked evidence ledger in the same
 change; a test count alone does not change a status.
 
 2026-09-05 Codex qualification update: isolated 0.144.6 app-server reads reproduce trusted-project memory overrides and native hook trust remaining untrusted. The adapter now plans and revalidates active project memory settings with exact rollback coverage. This does not complete T11/T20: full real CLI setup/rollback must account for MCP rewriting the same global config file, native hook trust/execution, installed acceptance and durable setup recovery. See the [Windows acceptance evidence](windows-app-release.md).
+
+2026-09-06 Claude qualification update: real pinned 2.1.202 startup now executes
+the production-generated Windows hook in default and custom configurations,
+including special-character executable paths. The actual home is separately
+bound into execution, approval and recovery. This does not complete T10/T14/T20:
+effective memory settings/root selection, Stop delivery, full native setup and
+installed recovery remain open. The [Claude evidence](claude-native-mcp-2026-09-06.md)
+records the scoped tests and the macOS recovery-fixture CI correction.

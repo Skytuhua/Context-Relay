@@ -165,12 +165,18 @@ pub struct ApprovedCliMutation {
     deny_unknown_fields
 )]
 pub enum CliExecutionContext {
-    /// Versioned configuration-selection and environment policy. Home and the
-    /// presence of CLAUDE_CONFIG_DIR are derived from these exact paths.
+    /// Legacy binding retained for reading sealed plans. Its inferred home is
+    /// insufficient for custom configurations; new execution requires V2.
     ClaudeCodeV1 {
         config_dir: WireNativeValue,
         state_path: WireNativeValue,
         project_root: WireNativeValue,
+    },
+    ClaudeCodeV2 {
+        config_dir: WireNativeValue,
+        state_path: WireNativeValue,
+        project_root: WireNativeValue,
+        user_home: WireNativeValue,
     },
 }
 

@@ -3451,19 +3451,20 @@ mod tests {
             let bin = root.join("bin");
             let home = root.join("home");
             let config_root = root.join("claude-config");
-            let state_path = root.join("live-state");
-            let get_path = root.join("mcp-get.json");
+            let project = root.join("project");
+            let state_path = config_root.join(".claude.json");
             std::fs::create_dir_all(&bin).unwrap();
             std::fs::create_dir_all(&home).unwrap();
             std::fs::create_dir_all(&config_root).unwrap();
-            std::fs::write(&state_path, initial).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            let home = std::fs::canonicalize(home).unwrap();
+            let config_root = std::fs::canonicalize(config_root).unwrap();
+            let project = std::fs::canonicalize(project).unwrap();
             let executable = bin.join("claude");
             std::fs::write(
                 &executable,
                 format!(
-                    "#!/bin/sh\ncase \"$*\" in\n  --version) printf '2.1.214\\n' ;;\n  doctor) printf 'Claude Code diagnostics: OK\\n' ;;\n  'mcp list') if [ \"$(/bin/cat '{}')\" = present ]; then printf 'context-relay: local (stdio)\\n'; fi ;;\n  'mcp get context-relay') /bin/cat '{}' ;;\n  'mcp remove context-relay --scope user') printf absent > '{}' ;;\n  *) exit 9 ;;\nesac\n",
-                    state_path.display(),
-                    get_path.display(),
+                    "#!/bin/sh\ncase \"$*\" in\n  --version) printf '2.1.214 (Claude Code)\\n' ;;\n  'mcp remove context-relay --scope user') printf '{{}}' > '{}' ;;\n  *) exit 9 ;;\nesac\n",
                     state_path.display(),
                 ),
             )
@@ -3484,15 +3485,21 @@ mod tests {
             std::fs::set_permissions(&bridge_executable, std::fs::Permissions::from_mode(0o700))
                 .unwrap();
             let bridge_executable = std::fs::canonicalize(bridge_executable).unwrap();
-            std::fs::write(
-                &get_path,
-                serde_json::to_vec(&serde_json::json!({
-                    "name": "context-relay",
-                    "scope": "user",
+            let present_state = serde_json::json!({
+                "mcpServers": { "context-relay": {
                     "type": "stdio",
                     "command": bridge_executable.to_str().unwrap(),
                     "args": ["--harness", "claude-code"],
-                }))
+                }}
+            });
+            let absent_state = serde_json::json!({});
+            std::fs::write(
+                &state_path,
+                serde_json::to_vec(if initial == "present" {
+                    &present_state
+                } else {
+                    &absent_state
+                })
                 .unwrap(),
             )
             .unwrap();
@@ -3509,6 +3516,14 @@ mod tests {
                 keys.as_ref(),
                 &executable,
                 &bridge_executable,
+                context_relay_core::native_transaction::CliExecutionContext::ClaudeCodeV2 {
+                    config_dir: unit_test_support::wire_native_path(&config_root),
+                    state_path: unit_test_support::wire_native_path(
+                        &config_root.join(".claude.json"),
+                    ),
+                    project_root: unit_test_support::wire_native_path(&project),
+                    user_home: unit_test_support::wire_native_path(&home),
+                },
                 committed,
             );
 
@@ -3537,8 +3552,13 @@ mod tests {
                 "{label}",
             );
             assert_eq!(
-                std::fs::read_to_string(&state_path).unwrap(),
-                final_state,
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&state_path).unwrap())
+                    .unwrap(),
+                if final_state == "present" {
+                    present_state
+                } else {
+                    serde_json::json!({})
+                },
                 "{label}",
             );
             assert!(!bridge_canary.exists(), "{label}");
@@ -6445,6 +6465,7 @@ mod tests {
         keys: &dyn DatabaseKeyStore,
         executable: &Path,
         bridge_executable: &Path,
+        execution_context: context_relay_core::native_transaction::CliExecutionContext,
         committed: bool,
     ) -> (PlanId, String) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -6453,6 +6474,7 @@ mod tests {
             &mut vault,
             executable,
             bridge_executable,
+            execution_context,
         );
         let plan_id = plan.setup.plan_id;
         vault

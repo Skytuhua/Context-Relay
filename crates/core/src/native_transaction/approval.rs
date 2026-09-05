@@ -260,22 +260,34 @@ fn validate_cli_context(
     plan: &NativeTransactionPlan,
     mutation: &ApprovedCliMutation,
 ) -> Result<(), ApprovalError> {
-    let Some(CliExecutionContext::ClaudeCodeV1 {
-        config_dir,
-        state_path,
-        project_root,
-    }) = &mutation.execution_context
-    else {
+    let Some(context) = &mutation.execution_context else {
         // Preserve the hash of existing plans. The Claude executor separately
         // refuses legacy unbound operations and requires a fresh preview.
         return Ok(());
+    };
+    let paths = match context {
+        CliExecutionContext::ClaudeCodeV1 {
+            config_dir,
+            state_path,
+            project_root,
+        } => {
+            vec![config_dir, state_path, project_root]
+        }
+        CliExecutionContext::ClaudeCodeV2 {
+            config_dir,
+            state_path,
+            project_root,
+            user_home,
+        } => {
+            vec![config_dir, state_path, project_root, user_home]
+        }
     };
     if plan.setup.harness != HarnessId::ClaudeCode {
         return Err(ApprovalError::Invalid(
             "CLI context harness differs from setup plan".into(),
         ));
     }
-    for path in [config_dir, state_path, project_root] {
+    for path in paths {
         if path.platform != plan.setup.executable_path.platform {
             return Err(ApprovalError::Invalid(
                 "CLI context platform differs from setup plan".into(),
@@ -748,7 +760,7 @@ fn target_key(target: &WireNativeValue) -> Result<TargetKey, ApprovalError> {
     }
 }
 
-fn windows_target_key(bytes: &[u8]) -> Result<String, ApprovalError> {
+pub(crate) fn windows_target_key(bytes: &[u8]) -> Result<String, ApprovalError> {
     let units = bytes
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))

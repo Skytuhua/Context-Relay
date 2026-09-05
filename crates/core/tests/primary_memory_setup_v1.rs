@@ -1042,6 +1042,7 @@ fn claude_matrix_fixture_with_version(version: &str) -> MatrixFixture {
     let device_id = DeviceId::from_str(ID_1).unwrap();
     let adapter = ClaudeCodeAdapter::from_layout(
         ClaudeCodeLayout {
+            user_home: root.to_path_buf(),
             executable,
             version: version.to_owned(),
             installation_method: InstallationMethod::PackageManager,

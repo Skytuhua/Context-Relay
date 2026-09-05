@@ -98,6 +98,7 @@ fn adapter_fixture() -> AdapterFixture {
     fs::write(&claude_executable, &claude_bytes).unwrap();
     let claude = ClaudeCodeAdapter::from_layout(
         ClaudeCodeLayout {
+            user_home: root.path().to_path_buf(),
             executable: claude_executable,
             version: "2.1.214".to_owned(),
             installation_method: InstallationMethod::Manual,

@@ -76,6 +76,7 @@ pub struct ClaudeCodeLayout {
     pub executable: PathBuf,
     pub version: String,
     pub installation_method: InstallationMethod,
+    pub user_home: PathBuf,
     pub config_dir: PathBuf,
     pub state_path: PathBuf,
     pub project_root: PathBuf,
@@ -180,7 +181,8 @@ impl ClaudeCodeAdapter {
         } else {
             home.join(".claude.json")
         };
-        let command_context = ClaudeCommandContext::new(&config_dir, &state_path, &project_root)?;
+        let command_context =
+            ClaudeCommandContext::new(&config_dir, &state_path, &project_root, &home)?;
         let executable_hash = digest_file(&executable)?;
         let version = discover_version_with(|arguments| {
             run_bounded_command(&executable, arguments, executable_hash, &command_context)
@@ -188,6 +190,7 @@ impl ClaudeCodeAdapter {
         Self::from_layout(
             ClaudeCodeLayout {
                 installation_method: installation_method(&executable),
+                user_home: home,
                 executable,
                 version,
                 config_dir,
@@ -233,6 +236,7 @@ impl ClaudeCodeAdapter {
             &self.layout.config_dir,
             &self.layout.state_path,
             &self.layout.project_root,
+            &self.layout.user_home,
         )
     }
 
@@ -3547,6 +3551,7 @@ mod tests {
             &physical.join(".claude"),
             &physical.join(".claude.json"),
             &physical,
+            &physical,
         )
         .unwrap();
         let output =
@@ -3574,6 +3579,7 @@ mod tests {
         let context = super::ClaudeCommandContext::new(
             &physical.join(".claude"),
             &physical.join(".claude.json"),
+            &physical,
             &physical,
         )
         .unwrap();
@@ -3705,6 +3711,7 @@ mod tests {
                 executable,
                 version: "2.1.214".to_owned(),
                 installation_method: InstallationMethod::Manual,
+                user_home: physical_root.clone(),
                 config_dir,
                 state_path,
                 project_root,
@@ -3804,6 +3811,7 @@ mod tests {
                 executable,
                 version: "2.1.214".to_owned(),
                 installation_method: InstallationMethod::Manual,
+                user_home: physical_root.clone(),
                 config_dir,
                 state_path,
                 project_root,

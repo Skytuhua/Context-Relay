@@ -314,3 +314,15 @@ Authenticode NotSigned. Packaging completed successfully. This candidate include
 the noninteractive validation and memory-key corrections, plus prior harness
 wording, discovery, record-action and command-context fixes. It was not installed
 or visually verified and does not enable Full support for the installed runtimes.
+
+The next Claude correction binds the actual user home separately from a custom
+configuration directory in both process execution and saved-plan approval.
+It also fixes Windows startup hook commands: the real harness uses Git Bash,
+so the former double-quoted verbatim paths could fail or expand path text.
+The production-generated command now passed actual pinned-CLI startup in both
+default and custom temporary configurations, including a path with `$HOME`, an
+apostrophe, spaces and Chinese characters. Older managed commands remain
+recognizable for replacement. See the Claude qualification document for the
+exact runtime scope, regression checks and macOS recovery-fixture follow-up.
+The 47266f7 installer above predates these changes; full connection and installed
+acceptance remain open.
