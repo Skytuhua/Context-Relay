@@ -9,3 +9,4 @@ d7855f58669beb6f6814d6450253761448edd5b5:crates/protocol/tests/packages_v1.rs:pr
 6b144104d8a315038785dfdeaccdb13cdbca730d:crates/core/tests/hermes_adapter_v1.rs:curl-auth-header:399
 f98444a51754f5deaba2da9aa86f4463129a3380:crates/core/src/hermes/yaml.rs:private-key:94
 3c2a371aef74f4962af64d0fe71545557244f21a:crates/core/tests/hermes_adapter_v1.rs:curl-auth-header:2480
+b357b29ad4379fae191a288fb653dd55e69f340c:crates/core/src/hermes/yaml.rs:private-key:464
