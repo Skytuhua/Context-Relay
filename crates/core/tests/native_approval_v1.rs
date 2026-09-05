@@ -263,6 +263,7 @@ fn freezes_the_domain_separator_and_golden_hash() {
 fn approval_v1_rejects_nonempty_cli_mutations_as_unbound() {
     let mut candidate = plan();
     candidate.cli_mutations.push(ApprovedCliMutation {
+        execution_context: None,
         stable_id: "unbound".to_owned(),
         expected: None,
         intended: None,

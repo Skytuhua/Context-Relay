@@ -235,6 +235,20 @@ impl ClaudeCodeAdapter {
         )
     }
 
+    fn validate_cli_context(&self, mutation: &ApprovedCliMutation) -> Result<(), BoundaryError> {
+        let context = self
+            .command_context()
+            .map_err(|_| BoundaryError::new("Claude Code configuration binding is invalid"))?;
+        if mutation.execution_context.as_ref() != Some(&context.approval_binding()) {
+            return Err(BoundaryError::new(
+                "Claude Code command context differs from the approved setup; request a new preview",
+            ));
+        }
+        context
+            .validate()
+            .map_err(|_| BoundaryError::new("Claude Code configuration binding changed"))
+    }
+
     pub fn project_settings_path(&self) -> PathBuf {
         self.layout
             .project_root
@@ -415,6 +429,7 @@ impl ClaudeCodeAdapter {
             })?;
         let intended_declaration = canonical_cli_declaration(&intended.body_markdown)?;
         Ok(ApprovedCliMutation {
+            execution_context: Some(self.command_context()?.approval_binding()),
             stable_id: intended.id.to_string(),
             forward: vec![self.declaration_operation(Some(&intended_declaration))],
             rollback: vec![self.declaration_operation(expected.as_ref())],
@@ -1583,6 +1598,9 @@ impl NativeAdapter for ClaudeCodeAdapter {
         {
             return Err(BoundaryError::new("Claude Code installation changed"));
         }
+        for mutation in &plan.cli_mutations {
+            self.validate_cli_context(mutation)?;
+        }
         Ok(())
     }
 
@@ -1744,6 +1762,7 @@ where
     O: ClaudeCodeCommandRunner,
 {
     fn validate_mutation(&self, mutation: &ApprovedCliMutation) -> Result<(), BoundaryError> {
+        self.adapter.validate_cli_context(mutation)?;
         if mutation.expected.is_none() && mutation.intended.is_none() {
             return Err(BoundaryError::new(
                 "Claude Code CLI mutation has no declaration",

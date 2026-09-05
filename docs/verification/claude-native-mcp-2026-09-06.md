@@ -125,3 +125,37 @@ Clippy with test-support and warnings denied passes. The project-lookup and NFC
 regressions failed before their fixes. Independent review found a Windows-only
 closure that would fail non-Windows Clippy; it was moved into its conditional
 block. macOS/Linux execution remains a hosted/physical follow-up.
+
+## Follow-up: persist the approved command context
+
+A regression reproduced reusing a Claude preview with a different configuration
+or project, because the previous sealed operations bound only the executable,
+arguments and declaration. `ApprovedCliMutation` now carries an optional typed
+`ClaudeCodeV1` execution context with exact configuration, state-file and
+project-root paths. Its presence and contents are part of approval v2 and the
+sealed envelope. All Claude executor entrypoints and native apply-time reprobe
+require the current adapter context to match before inspecting or mutating a
+declaration. The default and overridden state locations are distinct bindings.
+
+The absent field retains the legacy v2 preimage and envelope representation.
+Old plans remain readable, but unbound Claude operations cannot execute; a fresh
+preview is required. Inverse plans and recovery retain the original context.
+Discovery of a different context refuses recovery rather than silently changing
+its target. The WAL still selects its mutation from the authenticated sealed
+plan; it does not become a second authority for launch paths. This change does
+not add arbitrary environment variables, expand supported versions or claim
+atomic filesystem/context identity across a command.
+
+The wrong-context replay test failed before correction. Approval roundtrip and
+wrong-harness tests also failed before implementation. Current checks include
+47 Claude adapter tests, 22 approval-v1 and 21 approval-v2 tests, 14 CLI
+transaction tests, 9 CLI recovery/crash tests, 34 bridge preview/apply/rollback
+tests, and 11 primary-memory setup tests. These recovery tests use synthetic
+CLI executors; they do not establish real installed CLI crash recovery.
+
+Final library checks pass all 58 daemon and 88 core tests (one opt-in runtime
+test ignored). Core and daemon all-target test-support Clippy passes with
+warnings denied. Independent review found no actionable scoped issue and
+confirmed the context is retained by inverse plans, compensation and production
+recovery. Graphify was refreshed; SQL and OCaml extraction remain unavailable
+because their optional parsers are absent.

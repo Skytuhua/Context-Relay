@@ -148,10 +148,30 @@ pub struct CanonicalCliDeclaration {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovedCliMutation {
     pub stable_id: String,
+    /// Persisted launch target. None is retained only for legacy plans and
+    /// harnesses that do not yet have a qualified explicit context contract.
+    pub execution_context: Option<CliExecutionContext>,
     pub expected: Option<CanonicalCliDeclaration>,
     pub intended: Option<CanonicalCliDeclaration>,
     pub forward: Vec<CliOperation>,
     pub rollback: Vec<CliOperation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum CliExecutionContext {
+    /// Versioned configuration-selection and environment policy. Home and the
+    /// presence of CLAUDE_CONFIG_DIR are derived from these exact paths.
+    ClaudeCodeV1 {
+        config_dir: WireNativeValue,
+        state_path: WireNativeValue,
+        project_root: WireNativeValue,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

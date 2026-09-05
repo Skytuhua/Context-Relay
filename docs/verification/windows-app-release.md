@@ -271,3 +271,10 @@ primary-memory setup, 5 bridge-install and 17 ordinary Claude unit tests pass,
 as does core all-target test-support Clippy with warnings denied. This still
 does not enable Full support, qualify persisted command-context recovery, or
 change the installed app. The latest local installer remains the 3cbe619 build.
+
+The subsequent saved-plan correction now persists a typed Claude command context
+in the approval and sealed envelope. Apply, rollback and recovery refuse a
+different configuration/state/project, and legacy unbound operations need a new
+preview. Sealing, tamper rejection, legacy readability and the existing synthetic
+transaction/recovery suites pass. This closes the omitted command-context field;
+real installed transaction recovery and full harness qualification remain open.

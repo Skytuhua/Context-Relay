@@ -89,6 +89,7 @@ pub struct CanonicalCliDeclaration {
 
 pub struct ApprovedCliMutation {
     pub stable_id: String,
+    pub execution_context: Option<CliExecutionContext>,
     pub expected: Option<CanonicalCliDeclaration>,
     pub intended: Option<CanonicalCliDeclaration>,
     pub forward: Vec<CliOperation>,
@@ -113,7 +114,24 @@ binds:
 - the complete existing v1 plan preimage;
 - ordered CLI stable IDs and harness/server targets;
 - expected and intended declarations and fingerprints;
-- ordered forward and rollback operations.
+- ordered forward and rollback operations;
+- the versioned command context, when present.
+
+Claude previews include `ClaudeCodeV1`, carrying exact native configuration,
+state-file and project-root paths. This variant binds the explicit environment
+and default-versus-override selection policy implemented by the launcher; it
+does not accept arbitrary environment variables. All three paths are included
+in the approval preimage and sealed envelope. Apply-time reprobe and every
+Claude CLI executor entrypoint compare them with the validated adapter layout
+before inspection or execution, including compensation and recovery.
+
+For legacy envelopes, an absent context remains absent when serialized and
+does not change the existing v2 preimage. Legacy Claude CLI operations remain
+readable but cannot execute without a fresh context-bound preview. Rollback and
+recovery retain the context from the sealed forward plan; they do not infer a
+new target from the daemon environment. A changed discovery context fails
+closed. Codex's separate staged-generation work remains unfinished and has no
+qualified context variant yet.
 
 Validation rejects duplicate stable IDs or targets, mismatched fingerprints,
 operations using a different executable than the attested harness executable,

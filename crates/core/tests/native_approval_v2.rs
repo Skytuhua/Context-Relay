@@ -5,8 +5,8 @@ use context_relay_core::{
         NativeMemoryDocumentKind, NativeMemoryLimits, NativeMemoryRegistration, NativeMemorySource,
     },
     native_transaction::{
-        APPROVAL_DOMAIN_V2, ApprovedCliMutation, CanonicalCliDeclaration, NativeTransactionPlan,
-        SidecarBinding, approval_hash_v2,
+        APPROVAL_DOMAIN_V2, ApprovedCliMutation, CanonicalCliDeclaration, CliExecutionContext,
+        NativeTransactionPlan, SidecarBinding, approval_hash_v2, open_plan, seal_plan,
     },
 };
 use context_relay_native_runner::{
@@ -62,6 +62,7 @@ fn operation(executable: &str, arguments: &[&str]) -> CliOperation {
 
 fn mutation() -> ApprovedCliMutation {
     ApprovedCliMutation {
+        execution_context: None,
         stable_id: "b5be495e-d4ee-7a2e-a29e-b589ebc5d7fd".to_owned(),
         expected: Some(declaration(
             HarnessId::Codex,
@@ -207,6 +208,117 @@ fn assert_rejects(plan: &NativeTransactionPlan, expected: &str) {
 #[test]
 fn freezes_the_v2_domain_separator() {
     assert_eq!(APPROVAL_DOMAIN_V2, b"context-relay/native-plan/v2\0");
+}
+
+fn claude_context_plan() -> NativeTransactionPlan {
+    let mut candidate = plan();
+    candidate.setup.harness = HarnessId::ClaudeCode;
+    candidate.setup.executable_path = native_text("/fixture/claude");
+    candidate.native_memory_registrations.clear();
+    let mutation = &mut candidate.cli_mutations[0];
+    mutation.stable_id = "f4a4f9a2-0e8d-720e-8df4-a5a68da3e9c7".into();
+    mutation.expected = None;
+    mutation.intended = Some(declaration(
+        HarnessId::ClaudeCode,
+        "context-relay",
+        "/opt/context-relay",
+    ));
+    mutation.forward = vec![operation(
+        "/fixture/claude",
+        &[
+            "mcp",
+            "add-json",
+            "context-relay",
+            &mutation.intended.as_ref().unwrap().canonical_body,
+            "--scope",
+            "user",
+        ],
+    )];
+    mutation.rollback = vec![operation(
+        "/fixture/claude",
+        &["mcp", "remove", "context-relay", "--scope", "user"],
+    )];
+    mutation.execution_context = Some(CliExecutionContext::ClaudeCodeV1 {
+        config_dir: native_text("/fixture/home/.claude"),
+        state_path: native_text("/fixture/home/.claude.json"),
+        project_root: native_text("/fixture/project"),
+    });
+    candidate.setup.cli_operations = mutation.forward.clone();
+    candidate
+}
+
+#[test]
+fn claude_execution_context_is_approval_bound_and_survives_sealing() {
+    let mut candidate = claude_context_plan();
+    let approved = approval_hash_v2(&candidate).unwrap();
+    candidate.setup.batch_hash = approved;
+    let sealed = seal_plan(&candidate, approved).unwrap();
+    assert_eq!(
+        open_plan(&sealed).unwrap().plan.cli_mutations,
+        candidate.cli_mutations
+    );
+
+    for field in 0..3 {
+        let mut changed = candidate.clone();
+        let Some(CliExecutionContext::ClaudeCodeV1 {
+            config_dir,
+            state_path,
+            project_root,
+        }) = &mut changed.cli_mutations[0].execution_context
+        else {
+            unreachable!()
+        };
+        match field {
+            0 => {
+                *config_dir = native_text("/fixture/other/.claude");
+                *state_path = native_text("/fixture/other/.claude.json");
+            }
+            1 => *state_path = native_text("/fixture/home/.claude/.claude.json"),
+            _ => *project_root = native_text("/fixture/other-project"),
+        }
+        assert_ne!(approval_hash_v2(&changed).unwrap(), approved);
+    }
+    let mut missing = candidate.clone();
+    missing.cli_mutations[0].execution_context = None;
+    assert_ne!(approval_hash_v2(&missing).unwrap(), approved);
+
+    let mut tampered: serde_json::Value = serde_json::from_slice(&sealed).unwrap();
+    tampered["nativePlan"]["cliMutations"][0]["executionContext"]["statePath"] =
+        serde_json::to_value(native_text("/fixture/home/.claude/.claude.json")).unwrap();
+    assert!(open_plan(&serde_json::to_vec(&tampered).unwrap()).is_err());
+}
+
+#[test]
+fn claude_execution_context_rejects_wrong_harness_and_invalid_paths() {
+    let mut wrong_harness = plan();
+    wrong_harness.cli_mutations[0].execution_context = claude_context_plan().cli_mutations[0]
+        .execution_context
+        .clone();
+    assert!(approval_hash_v2(&wrong_harness).is_err());
+    let mut bad_path = claude_context_plan();
+    let Some(CliExecutionContext::ClaudeCodeV1 { project_root, .. }) =
+        &mut bad_path.cli_mutations[0].execution_context
+    else {
+        unreachable!()
+    };
+    *project_root = native_text("../other");
+    assert!(approval_hash_v2(&bad_path).is_err());
+}
+
+#[test]
+fn legacy_cli_envelopes_remain_readable_without_an_execution_context_field() {
+    let mut candidate = claude_context_plan();
+    candidate.cli_mutations[0].execution_context = None;
+    let approved = approval_hash_v2(&candidate).unwrap();
+    candidate.setup.batch_hash = approved;
+    let sealed = seal_plan(&candidate, approved).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&sealed).unwrap();
+    assert!(
+        value["nativePlan"]["cliMutations"][0]
+            .get("executionContext")
+            .is_none()
+    );
+    assert_eq!(open_plan(&sealed).unwrap().plan, candidate);
 }
 
 #[test]

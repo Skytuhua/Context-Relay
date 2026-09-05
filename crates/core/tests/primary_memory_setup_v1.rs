@@ -107,6 +107,7 @@ impl Harness {
             timeout_ms: 30_000,
         };
         ApprovedCliMutation {
+            execution_context: None,
             stable_id: intended.id.to_string(),
             expected: None,
             intended: Some(declaration),

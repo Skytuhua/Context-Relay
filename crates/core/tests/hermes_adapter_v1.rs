@@ -3845,6 +3845,7 @@ fn native_adapter_rejects_every_cli_mutation_surface() {
     let fixture = fixture(include_str!("fixtures/hermes-0.18.2.json"));
     let mut plan = hermes_native_plan(&fixture, ApprovalClass::Passive, vec![]);
     plan.cli_mutations.push(ApprovedCliMutation {
+        execution_context: None,
         stable_id: "must-not-run-through-hermes-cli".into(),
         expected: None,
         intended: None,

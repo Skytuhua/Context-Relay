@@ -127,6 +127,7 @@ fn operation(command: &str) -> CliOperation {
 
 fn plan() -> NativeTransactionPlan {
     let cli = ApprovedCliMutation {
+        execution_context: None,
         stable_id: "b5be495e-d4ee-7a2e-a29e-b589ebc5d7fd".to_owned(),
         expected: None,
         intended: Some(declaration("/opt/context-relay")),

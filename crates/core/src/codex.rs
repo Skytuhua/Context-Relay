@@ -542,6 +542,7 @@ impl CodexAdapter {
             })?;
         let intended_declaration = canonical_cli_declaration(&intended.body_markdown)?;
         Ok(ApprovedCliMutation {
+            execution_context: None,
             stable_id: intended.id.to_string(),
             forward: vec![self.declaration_operation(Some(&intended_declaration))?],
             rollback: vec![self.declaration_operation(expected.as_ref())?],

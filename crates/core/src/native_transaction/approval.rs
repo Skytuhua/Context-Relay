@@ -13,8 +13,8 @@ use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
 use super::model::{
-    ApprovedCliMutation, ApprovedInput, CanonicalCliDeclaration, NativeTransactionPlan,
-    OwnershipChange, SidecarBinding,
+    ApprovedCliMutation, ApprovedInput, CanonicalCliDeclaration, CliExecutionContext,
+    NativeTransactionPlan, OwnershipChange, SidecarBinding,
 };
 
 pub const APPROVAL_DOMAIN_V1: &[u8] = b"context-relay/native-plan/v1\0";
@@ -217,6 +217,7 @@ fn validate_cli_mutations(plan: &NativeTransactionPlan) -> Result<(), ApprovalEr
 
     let mut targets = Vec::with_capacity(plan.cli_mutations.len());
     for mutation in &plan.cli_mutations {
+        validate_cli_context(plan, mutation)?;
         validate_stable_id(&mutation.stable_id)?;
         let target = validate_cli_declarations(plan, mutation)?;
         if targets.contains(&target) {
@@ -251,6 +252,36 @@ fn validate_cli_mutations(plan: &NativeTransactionPlan) -> Result<(), ApprovalEr
         return Err(ApprovalError::Invalid(
             "flattened cli forward operations do not match SetupPlan.cli_operations".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_cli_context(
+    plan: &NativeTransactionPlan,
+    mutation: &ApprovedCliMutation,
+) -> Result<(), ApprovalError> {
+    let Some(CliExecutionContext::ClaudeCodeV1 {
+        config_dir,
+        state_path,
+        project_root,
+    }) = &mutation.execution_context
+    else {
+        // Preserve the hash of existing plans. The Claude executor separately
+        // refuses legacy unbound operations and requires a fresh preview.
+        return Ok(());
+    };
+    if plan.setup.harness != HarnessId::ClaudeCode {
+        return Err(ApprovalError::Invalid(
+            "CLI context harness differs from setup plan".into(),
+        ));
+    }
+    for path in [config_dir, state_path, project_root] {
+        if path.platform != plan.setup.executable_path.platform {
+            return Err(ApprovalError::Invalid(
+                "CLI context platform differs from setup plan".into(),
+            ));
+        }
+        target_key(path)?;
     }
     Ok(())
 }
@@ -462,7 +493,7 @@ fn cli_approval_value(plan: &NativeTransactionPlan) -> Result<Value, ApprovalErr
         .cli_mutations
         .iter()
         .map(|mutation| {
-            Ok(json!({
+            let mut value = json!({
                 "stableId": mutation.stable_id,
                 "expected": declaration_value(mutation.expected.as_ref()),
                 "intended": declaration_value(mutation.intended.as_ref()),
@@ -470,7 +501,12 @@ fn cli_approval_value(plan: &NativeTransactionPlan) -> Result<Value, ApprovalErr
                     .map_err(|error| ApprovalError::Serialization(error.to_string()))?,
                 "rollback": serde_json::to_value(&mutation.rollback)
                     .map_err(|error| ApprovalError::Serialization(error.to_string()))?,
-            }))
+            });
+            if let Some(context) = &mutation.execution_context {
+                value["executionContext"] = serde_json::to_value(context)
+                    .map_err(|error| ApprovalError::Serialization(error.to_string()))?;
+            }
+            Ok(value)
         })
         .collect::<Result<Vec<_>, ApprovalError>>()?;
     Ok(Value::Array(mutations))

@@ -2091,6 +2091,97 @@ fn cli_executor_detects_a_command_that_did_not_write_the_intended_declaration() 
 }
 
 #[test]
+fn cli_executor_rejects_a_different_configuration_or_project_after_preview() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+    for change_config in [false, true] {
+        let config = fixture.root.join(if change_config {
+            "other config"
+        } else {
+            "custom claude config"
+        });
+        let project = fixture.root.join(if change_config {
+            "project with spaces"
+        } else {
+            "other project"
+        });
+        fs::create_dir_all(&config).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let device = DeviceId::from_str(DEVICE_ID).unwrap();
+        let adapter = ClaudeCodeAdapter::from_layout(
+            ClaudeCodeLayout {
+                executable: fixture.root.join(if cfg!(windows) {
+                    "claude.exe"
+                } else {
+                    "claude"
+                }),
+                version: "2.1.214".into(),
+                installation_method: InstallationMethod::PackageManager,
+                state_path: config.join(".claude.json"),
+                config_dir: config,
+                project_root: project,
+                managed_settings_paths: vec![fixture.root.join("managed-settings.json")],
+            },
+            fixture.project_id,
+            device,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device),
+        )
+        .unwrap();
+        let mut executor =
+            adapter.cli_executor_with_runner(|_: &[String]| -> Result<Vec<u8>, BoundaryError> {
+                panic!("a different command context must not launch the CLI")
+            });
+        assert!(
+            executor
+                .compare_cli_targets(std::slice::from_ref(&mutation))
+                .is_err()
+        );
+        assert!(executor.apply_cli_mutation(&mutation).is_err());
+        assert!(executor.restore_cli_mutation_if_matches(&mutation).is_err());
+    }
+}
+
+#[test]
+fn claude_reprobe_and_executor_reject_legacy_unbound_cli_mutations() {
+    let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    let mut mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+    let executable = fixture.root.join(if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    });
+    let hash = Sha256Digest(Sha256::digest(fs::read(&executable).unwrap()).into());
+    let mut plan = native_digest_plan(&executable, hash);
+    plan.cli_mutations = vec![mutation.clone()];
+    fixture.adapter.reprobe_live_state(&plan).unwrap();
+    mutation.execution_context = None;
+    plan.cli_mutations = vec![mutation.clone()];
+    assert!(fixture.adapter.reprobe_live_state(&plan).is_err());
+    let mut executor = fixture.adapter.cli_executor_with_runner(
+        |_: &[String]| -> Result<Vec<u8>, BoundaryError> {
+            panic!("legacy unbound mutation must not launch the CLI")
+        },
+    );
+    assert!(executor.probe_cli_mutation(&mutation).is_err());
+    assert!(
+        executor
+            .compare_cli_targets(std::slice::from_ref(&mutation))
+            .is_err()
+    );
+    assert!(executor.apply_cli_mutation(&mutation).is_err());
+    assert!(executor.restore_cli_mutation_if_matches(&mutation).is_err());
+    assert!(
+        executor
+            .finish_committed_cli_mutations(&[mutation])
+            .is_err()
+    );
+}
+
+#[test]
 fn cli_executor_restores_only_while_live_declaration_equals_intended() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");

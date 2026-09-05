@@ -70,6 +70,14 @@ impl ClaudeCommandContext {
         Ok(())
     }
 
+    pub(super) fn approval_binding(&self) -> crate::native_transaction::CliExecutionContext {
+        crate::native_transaction::CliExecutionContext::ClaudeCodeV1 {
+            config_dir: super::wire_path(&self.config_dir),
+            state_path: super::wire_path(&self.state_path),
+            project_root: super::wire_path(&self.project_root),
+        }
+    }
+
     pub(super) fn configure(
         &self,
         command: &mut Command,

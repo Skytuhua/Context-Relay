@@ -921,6 +921,7 @@ pub(crate) mod tests {
         };
         plan.setup.cli_operations = vec![forward.clone()];
         plan.cli_mutations = vec![ApprovedCliMutation {
+            execution_context: None,
             stable_id: "f4a4f9a2-0e8d-720e-8df4-a5a68da3e9c7".into(),
             expected: None,
             intended: Some(intended),
