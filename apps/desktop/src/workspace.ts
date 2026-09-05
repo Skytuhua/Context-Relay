@@ -430,12 +430,15 @@ function nativePath(path: string) {
   const macos = navigator.userAgent.includes('Mac');
   const bytes = macos
     ? new TextEncoder().encode(path)
-    : Uint8Array.from(
-        [...path].flatMap((character) => {
-          const code = character.charCodeAt(0);
-          return [code & 0xff, code >> 8];
-        }),
-      );
+    : new Uint8Array(path.length * 2);
+  if (!macos) {
+    const view = new DataView(bytes.buffer);
+    // Windows paths carry UTF-16 code units, including surrogate pairs and
+    // unpaired surrogates. Iterating code points would drop the second unit.
+    for (let index = 0; index < path.length; index += 1) {
+      view.setUint16(index * 2, path.charCodeAt(index), true);
+    }
+  }
   const binary = [...bytes].map((byte) => String.fromCharCode(byte)).join('');
   return {
     platform: macos ? ('macos' as const) : ('windows' as const),
