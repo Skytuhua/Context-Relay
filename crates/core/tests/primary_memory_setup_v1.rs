@@ -485,13 +485,7 @@ impl BridgePreviewHarness for FrozenHarness {
         intended: &ComponentRecord,
     ) -> Result<BridgeMutationPlan, ClientError> {
         let cli = match self {
-            Self::Claude { adapter, cli } => {
-                let cli = cli.clone();
-                Some(adapter.plan_bridge_cli_mutation_with_runner(
-                    intended,
-                    move |arguments: &[String]| claude_cli_output(arguments, cli.borrow().as_ref()),
-                )?)
-            }
+            Self::Claude { adapter, .. } => Some(adapter.plan_bridge_cli_mutation(intended)?),
             Self::Codex { adapter, cli } => {
                 let cli = cli.clone();
                 Some(adapter.plan_bridge_cli_mutation_with_runner(
@@ -614,33 +608,6 @@ impl NativeAdapter for FrozenHarness {
             Self::Codex { adapter, .. } => NativeAdapter::release_live_state_reservation(adapter),
             Self::Hermes(adapter) => NativeAdapter::release_live_state_reservation(adapter),
         }
-    }
-}
-
-fn claude_cli_output(
-    arguments: &[String],
-    live: Option<&CanonicalCliDeclaration>,
-) -> Result<Vec<u8>, BoundaryError> {
-    match arguments {
-        [mcp, list] if (mcp.as_str(), list.as_str()) == ("mcp", "list") => Ok(live
-            .map(|_| b"context-relay: local (stdio)\n".to_vec())
-            .unwrap_or_default()),
-        [mcp, get, name]
-            if (mcp.as_str(), get.as_str(), name.as_str())
-                == ("mcp", "get", BRIDGE_SERVER_NAME) =>
-        {
-            let declaration = live.ok_or_else(|| BoundaryError::new("missing declaration"))?;
-            let body: Value = serde_json::from_str(&declaration.canonical_body).unwrap();
-            Ok(serde_json::to_vec(&json!({
-                "name": BRIDGE_SERVER_NAME,
-                "scope": "user",
-                "type": body["type"],
-                "command": body["command"],
-                "args": body["args"],
-            }))
-            .unwrap())
-        }
-        _ => Err(BoundaryError::new("unexpected Claude CLI inspection")),
     }
 }
 

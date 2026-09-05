@@ -1,8 +1,6 @@
 use std::{
-    cell::Cell,
     fs,
     path::{Path, PathBuf},
-    rc::Rc,
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -1595,29 +1593,6 @@ fn bridge(_fixture: &Fixture, path: &Path) -> ComponentRecord {
     .unwrap()
 }
 
-fn validation_output(argv: &[String], declaration: Option<&str>) -> Result<Vec<u8>, BoundaryError> {
-    match argv {
-        [mcp, list] if mcp == "mcp" && list == "list" => Ok(declaration
-            .map(|_| b"context-relay: local (stdio)\n".to_vec())
-            .unwrap_or_default()),
-        [mcp, get, name] if mcp == "mcp" && get == "get" && name == "context-relay" => {
-            let body: Value = serde_json::from_str(
-                declaration.ok_or_else(|| BoundaryError::new("missing declaration"))?,
-            )
-            .unwrap();
-            Ok(serde_json::to_vec(&json!({
-                "name": "context-relay",
-                "scope": "user",
-                "type": body["type"],
-                "command": body["command"],
-                "args": body["args"],
-            }))
-            .unwrap())
-        }
-        _ => Err(BoundaryError::new("unexpected validation argv")),
-    }
-}
-
 fn displays(operation: &context_relay_protocol::CliOperation) -> Vec<String> {
     operation
         .arguments
@@ -1704,20 +1679,72 @@ fn native_digest_plan(target: &Path, digest: Sha256Digest) -> NativeTransactionP
 }
 
 #[test]
+fn bridge_preview_reads_saved_configuration_without_launching_a_harness() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "context relay bridge", b"bridge v1");
+    let intended = bridge(&fixture, &bridge_path);
+    let before = fs::read(&fixture.state_path).unwrap();
+
+    // The fixture executable is intentionally not runnable. Preview needs no
+    // subprocess: Claude's real mcp list/get commands start configured servers.
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+
+    assert_eq!(mutation.expected, None);
+    assert_eq!(fs::read(&fixture.state_path).unwrap(), before);
+}
+
+#[test]
+fn bridge_preview_preserves_exact_saved_argument_boundaries() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let old_path = executable_bridge(&fixture, "old bridge 專案", b"old bridge");
+    let new_path = executable_bridge(&fixture, "new bridge", b"new bridge");
+    let prior = bridge(&fixture, &old_path).body_markdown;
+    let intended = bridge(&fixture, &new_path);
+    let mut state: Value = serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+    state["mcpServers"] = json!({"context-relay": serde_json::from_str::<Value>(&prior).unwrap()});
+    fs::write(&fixture.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+    assert_eq!(mutation.expected.unwrap().canonical_body, prior);
+
+    state["mcpServers"]["context-relay"]["args"] = json!(["--harness claude-code"]);
+    fs::write(&fixture.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let error = fixture
+        .adapter
+        .plan_bridge_cli_mutation(&intended)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+}
+
+fn set_saved_bridge(fixture: &Fixture, body: Option<&str>) {
+    let mut state: Value = serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+    let servers = state
+        .as_object_mut()
+        .unwrap()
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .unwrap();
+    match body {
+        Some(body) => {
+            servers.insert(
+                "context-relay".to_owned(),
+                serde_json::from_str(body).unwrap(),
+            );
+        }
+        None => {
+            servers.remove("context-relay");
+        }
+    }
+    fs::write(&fixture.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+}
+
+#[test]
 fn bridge_cli_plan_binds_exact_declarations_fingerprints_and_user_scope_argv() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let bridge_path = executable_bridge(&fixture, "context relay bridge", b"bridge v1");
     let intended = bridge(&fixture, &bridge_path);
-    let mut validation_argv = Vec::new();
-
-    let mutation = fixture
-        .adapter
-        .plan_bridge_cli_mutation_with_runner(&intended, |argv: &[String]| {
-            validation_argv.push(argv.to_vec());
-            validation_output(argv, None)
-        })
-        .unwrap();
-
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
     assert_eq!(mutation.stable_id, intended.id.to_string());
     assert_eq!(mutation.expected, None);
     let declaration = mutation.intended.unwrap();
@@ -1728,7 +1755,6 @@ fn bridge_cli_plan_binds_exact_declarations_fingerprints_and_user_scope_argv() {
         declaration.fingerprint,
         Sha256Digest(Sha256::digest(declaration.canonical_body.as_bytes()).into())
     );
-    assert_eq!(validation_argv, vec![vec!["mcp", "list"]]);
     assert_eq!(
         displays(&mutation.forward[0]),
         vec![
@@ -1753,25 +1779,13 @@ fn bridge_cli_plan_restores_the_exact_secret_free_managed_prior_declaration() {
     let new_path = executable_bridge(&fixture, "new bridge", b"new bridge");
     let prior = bridge(&fixture, &old_path).body_markdown;
     let intended = bridge(&fixture, &new_path);
-    let mut validation_argv = Vec::new();
-
-    let mutation = fixture
-        .adapter
-        .plan_bridge_cli_mutation_with_runner(&intended, |argv: &[String]| {
-            validation_argv.push(argv.to_vec());
-            validation_output(argv, Some(&prior))
-        })
-        .unwrap();
-
+    set_saved_bridge(&fixture, Some(&prior));
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
     let expected = mutation.expected.unwrap();
     assert_eq!(expected.canonical_body, prior);
     assert_eq!(
         expected.fingerprint,
-        Sha256Digest(Sha256::digest(expected.canonical_body.as_bytes()).into())
-    );
-    assert_eq!(
-        validation_argv,
-        vec![vec!["mcp", "list"], vec!["mcp", "get", "context-relay"]]
+        Sha256Digest(Sha256::digest(prior.as_bytes()).into())
     );
     assert_eq!(
         displays(&mutation.rollback[0]),
@@ -1779,7 +1793,7 @@ fn bridge_cli_plan_restores_the_exact_secret_free_managed_prior_declaration() {
             "mcp",
             "add-json",
             "context-relay",
-            expected.canonical_body.as_str(),
+            prior.as_str(),
             "--scope",
             "user",
         ]
@@ -1787,151 +1801,182 @@ fn bridge_cli_plan_restores_the_exact_secret_free_managed_prior_declaration() {
 }
 
 #[test]
-fn bridge_cli_plan_reports_disabled_and_unmanaged_prior_declarations_as_conflicts() {
+fn bridge_cli_plan_rejects_disabled_secret_bearing_and_unmanaged_saved_declarations() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
-    let old_path = executable_bridge(&fixture, "old bridge", b"old bridge");
-    let intended_path = executable_bridge(&fixture, "intended bridge", b"intended bridge");
-    let old: Value = serde_json::from_str(&bridge(&fixture, &old_path).body_markdown).unwrap();
-    let intended = bridge(&fixture, &intended_path);
-    let rejected = [
-        json!({
-            "name": "context-relay",
-            "scope": "user",
-            "type": "stdio",
-            "command": old["command"],
-            "args": ["--harness", "codex"],
-        }),
-        json!({
-            "name": "context-relay",
-            "scope": "user",
-            "type": "stdio",
-            "command": old["command"],
-            "args": ["--harness", "claude-code"],
-            "enabled": false,
-        }),
-    ];
-
-    for prior in rejected {
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    for (key, value) in [
+        ("args", json!(["--harness", "codex"])),
+        ("args", json!(["--harness claude-code"])),
+        ("enabled", json!(false)),
+        ("env", json!({"TOKEN": "synthetic-secret"})),
+        ("env", json!({})),
+        ("type", json!("http")),
+        ("command", json!("<redacted>")),
+        ("command", json!("relative-bridge")),
+        ("cwd", json!("elsewhere")),
+    ] {
+        let mut prior: Value = serde_json::from_str(&intended.body_markdown).unwrap();
+        prior[key] = value;
+        set_saved_bridge(&fixture, Some(&serde_json::to_string(&prior).unwrap()));
+        let before = fs::read(&fixture.state_path).unwrap();
         let error = fixture
             .adapter
-            .plan_bridge_cli_mutation_with_runner(&intended, |argv: &[String]| match argv {
-                [mcp, list] if (mcp.as_str(), list.as_str()) == ("mcp", "list") => {
-                    Ok(b"context-relay: local (stdio)\n".to_vec())
-                }
-                [mcp, get, name]
-                    if (mcp.as_str(), get.as_str(), name.as_str())
-                        == ("mcp", "get", "context-relay") =>
-                {
-                    Ok(serde_json::to_vec(&prior).unwrap())
-                }
-                _ => panic!("unexpected validation argv: {argv:?}"),
-            })
+            .plan_bridge_cli_mutation(&intended)
             .unwrap_err();
-
-        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(error.code, ErrorCode::Conflict, "{key}");
+        assert_eq!(fs::read(&fixture.state_path).unwrap(), before);
     }
 }
 
 #[test]
-fn bridge_cli_plan_rejects_malformed_redacted_secret_bearing_and_unmanaged_prior_state() {
+fn bridge_cli_plan_rejects_malformed_or_duplicate_native_json() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
-    let bridge_path = executable_bridge(&fixture, "intended bridge", b"bridge");
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
     let intended = bridge(&fixture, &bridge_path);
-    let invalid_get_outputs = [
-        (b"not-json".to_vec(), ErrorCode::InvalidRequest),
-        (
-            serde_json::to_vec(&json!({
-                "name": "context-relay",
-                "scope": "user",
-                "type": "stdio",
-                "command": "<redacted>",
-                "args": ["--harness", "claude-code"],
-            }))
-            .unwrap(),
-            ErrorCode::InvalidRequest,
-        ),
-        (
-            serde_json::to_vec(&json!({
-                "name": "context-relay",
-                "scope": "user",
-                "type": "stdio",
-                "command": "/old/bridge",
-                "args": ["--harness", "claude-code"],
-                "env": {"TOKEN": "secret"},
-            }))
-            .unwrap(),
-            ErrorCode::Conflict,
-        ),
-        (
-            serde_json::to_vec(&json!({
-                "name": "context-relay",
-                "scope": "user",
-                "type": "http",
-                "command": "/old/bridge",
-                "args": ["--harness", "claude-code"],
-            }))
-            .unwrap(),
-            ErrorCode::Conflict,
-        ),
-    ];
-
-    for (get_output, expected_code) in invalid_get_outputs {
-        let mut calls = 0;
+    for state in [
+        "not-json",
+        "[]",
+        r#"{"mcpServers":null}"#,
+        r#"{"projects":[]}"#,
+        r#"{"mcpServers":{},"mcpServers":{}}"#,
+        r#"{"mcpServers":{"context-relay":{},"context-relay":{}}}"#,
+        r#"{"mcpServers":{"context-relay":{"command":"first","command":"second"}}}"#,
+    ] {
+        fs::write(&fixture.state_path, state).unwrap();
         let error = fixture
             .adapter
-            .plan_bridge_cli_mutation_with_runner(&intended, |argv: &[String]| {
-                calls += 1;
-                match argv {
-                    [mcp, list] if mcp == "mcp" && list == "list" => {
-                        Ok(b"context-relay: local (stdio)\n".to_vec())
-                    }
-                    [mcp, get, name] if mcp == "mcp" && get == "get" && name == "context-relay" => {
-                        Ok(get_output.clone())
-                    }
-                    _ => Err(BoundaryError::new("unexpected validation argv")),
-                }
-            })
+            .plan_bridge_cli_mutation(&intended)
             .unwrap_err();
-
-        assert_eq!(calls, 2);
-        assert_eq!(error.code, expected_code);
+        assert_eq!(error.code, ErrorCode::InvalidRequest, "{state}");
         assert!(!error.retryable);
     }
 }
 
 #[test]
-fn cli_executor_runs_only_exact_approved_argv_and_read_only_validation() {
+fn bridge_cli_plan_rejects_project_and_local_shadowing_without_modifying_them() {
+    for project_file in [false, true] {
+        let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+        let intended = bridge(&fixture, &bridge_path);
+        set_saved_bridge(&fixture, Some(&intended.body_markdown));
+        let declaration: Value = serde_json::from_str(&intended.body_markdown).unwrap();
+        let path = if project_file {
+            let path = fixture.root.join("project with spaces/.mcp.json");
+            fs::write(
+                &path,
+                serde_json::to_vec(&json!({"mcpServers":{"context-relay":declaration}})).unwrap(),
+            )
+            .unwrap();
+            path
+        } else {
+            let mut state: Value =
+                serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+            let project = state["projects"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .next()
+                .unwrap();
+            project["mcpServers"]["context-relay"] = declaration;
+            fs::write(&fixture.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+            fixture.state_path.clone()
+        };
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            fixture
+                .adapter
+                .plan_bridge_cli_mutation(&intended)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn bridge_cli_plan_bounds_native_configuration_and_rejects_non_files() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    fs::write(&fixture.state_path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+    assert!(fixture.adapter.plan_bridge_cli_mutation(&intended).is_err());
+    fs::remove_file(&fixture.state_path).unwrap();
+    // Absent state is a valid first connection, not an inspection error.
+    assert_eq!(
+        fixture
+            .adapter
+            .plan_bridge_cli_mutation(&intended)
+            .unwrap()
+            .expected,
+        None
+    );
+    fs::create_dir(&fixture.state_path).unwrap();
+    assert!(fixture.adapter.plan_bridge_cli_mutation(&intended).is_err());
+}
+
+#[test]
+fn bridge_preview_does_not_mistake_ignored_user_settings_for_managed_mcp_state() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    set_saved_bridge(&fixture, Some(&intended.body_markdown));
+    let policy = fixture.root.join("managed-mcp.json");
+    fs::write(&policy, br#"{"mcpServers":{}}"#).unwrap();
+    assert!(fixture.adapter.plan_bridge_cli_mutation(&intended).is_err());
+    fs::remove_file(&policy).unwrap();
+    fs::create_dir(&policy).unwrap();
+    assert!(fixture.adapter.plan_bridge_cli_mutation(&intended).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_preview_detects_the_local_scope_key_written_by_windows_claude() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    let mut state: Value = serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+    let projects = state["projects"].as_object_mut().unwrap();
+    let native_key = projects.keys().next().unwrap().clone();
+    let mut project = projects.remove(&native_key).unwrap();
+    project["mcpServers"]["context-relay"] = serde_json::from_str(&intended.body_markdown).unwrap();
+    // Captured from actual Claude 2.1.202 local-scope add-json on Windows.
+    let cli_key = native_key
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&native_key)
+        .replace('\\', "/");
+    projects.insert(cli_key, project);
+    fs::write(&fixture.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    assert_eq!(
+        fixture
+            .adapter
+            .plan_bridge_cli_mutation(&intended)
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+}
+
+#[test]
+fn cli_executor_runs_only_approved_mutations_and_reads_back_the_saved_declaration() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");
     let intended = bridge(&fixture, &bridge_path);
-    let mut planning_runner = |argv: &[String]| validation_output(argv, None);
-    let mutation = fixture
-        .adapter
-        .plan_bridge_cli_mutation_with_runner(&intended, &mut planning_runner)
-        .unwrap();
-    let mut operation_argv = Vec::new();
-    let mut validation_argv = Vec::new();
-    let body = intended.body_markdown.clone();
-    let applied = Rc::new(Cell::new(false));
-    let operation_applied = Rc::clone(&applied);
-    let validation_applied = Rc::clone(&applied);
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+    let before: Value = serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+    let mut operations = Vec::new();
     let (probed, outcome) = {
-        let mut executor = fixture.adapter.cli_executor_with_runners(
-            |argv: &[String]| {
-                operation_argv.push(argv.to_vec());
-                operation_applied.set(true);
-                Ok::<Vec<u8>, BoundaryError>(Vec::new())
-            },
-            |argv: &[String]| {
-                validation_argv.push(argv.to_vec());
-                validation_output(argv, validation_applied.get().then_some(body.as_str()))
-            },
-        );
-        let probed = executor.probe_cli_mutation(&mutation).unwrap();
-        let outcome = executor.apply_cli_mutation(&mutation).unwrap();
-        (probed, outcome)
+        let mut executor = fixture.adapter.cli_executor_with_runner(|argv: &[String]| {
+            operations.push(argv.to_vec());
+            set_saved_bridge(&fixture, Some(&argv[3]));
+            Ok::<Vec<u8>, BoundaryError>(Vec::new())
+        });
+        (
+            executor.probe_cli_mutation(&mutation).unwrap(),
+            executor.apply_cli_mutation(&mutation).unwrap(),
+        )
     };
-
     assert_eq!(probed, None);
     assert_eq!(outcome.command_error, None);
     assert_eq!(
@@ -1939,25 +1984,32 @@ fn cli_executor_runs_only_exact_approved_argv_and_read_only_validation() {
         mutation.intended.as_ref().map(|value| value.fingerprint)
     );
     assert_eq!(
-        operation_argv,
+        operations,
         vec![vec![
             "mcp",
             "add-json",
             "context-relay",
             intended.body_markdown.as_str(),
             "--scope",
-            "user",
+            "user"
         ]]
     );
-    assert!(
-        validation_argv
-            .iter()
-            .all(|argv| { argv == &["mcp", "list"] || argv == &["mcp", "get", "context-relay"] })
-    );
-    assert!(operation_argv.iter().chain(&validation_argv).all(|argv| {
-        argv.first()
-            .is_some_and(|program| program != bridge_path.to_str().unwrap())
-    }));
+    let saved: Value = serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+    assert_eq!(saved["oauthAccount"], before["oauthAccount"]);
+    assert_eq!(saved["projects"], before["projects"]);
+}
+
+#[test]
+fn cli_executor_detects_a_command_that_did_not_write_the_intended_declaration() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+    let mut executor = fixture.adapter.cli_executor_with_runner(|_: &[String]| {
+        Ok::<_, BoundaryError>(b"Added stdio MCP server context-relay to user config\n".to_vec())
+    });
+    let outcome = executor.apply_cli_mutation(&mutation).unwrap();
+    assert_eq!(outcome.resulting_fingerprint, None);
 }
 
 #[test]
@@ -1966,26 +2018,16 @@ fn cli_executor_restores_only_while_live_declaration_equals_intended() {
     let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");
     let divergent_path = executable_bridge(&fixture, "divergent bridge", b"divergent");
     let intended = bridge(&fixture, &bridge_path);
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
     let divergent = bridge(&fixture, &divergent_path).body_markdown;
-    let mut planning_runner = |argv: &[String]| validation_output(argv, None);
-    let mutation = fixture
-        .adapter
-        .plan_bridge_cli_mutation_with_runner(&intended, &mut planning_runner)
-        .unwrap();
-    let mut operation_calls = 0;
-    let outcome = {
-        let mut executor = fixture.adapter.cli_executor_with_runners(
-            |_: &[String]| {
-                operation_calls += 1;
-                Ok::<Vec<u8>, BoundaryError>(Vec::new())
-            },
-            |argv: &[String]| validation_output(argv, Some(&divergent)),
-        );
-        executor.restore_cli_mutation_if_matches(&mutation).unwrap()
-    };
-
+    set_saved_bridge(&fixture, Some(&divergent));
+    let mut executor = fixture.adapter.cli_executor_with_runner(
+        |_: &[String]| -> Result<Vec<u8>, BoundaryError> {
+            panic!("divergent state must not execute a command")
+        },
+    );
+    let outcome = executor.restore_cli_mutation_if_matches(&mutation).unwrap();
     assert!(!outcome.restored);
-    assert_eq!(operation_calls, 0);
     assert_eq!(
         outcome.resulting_fingerprint,
         Some(Sha256Digest(Sha256::digest(divergent.as_bytes()).into()))
@@ -1997,102 +2039,31 @@ fn cli_executor_runs_the_exact_rollback_after_intended_state_matches() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");
     let intended = bridge(&fixture, &bridge_path);
-    let mut planning_runner = |argv: &[String]| validation_output(argv, None);
-    let mutation = fixture
-        .adapter
-        .plan_bridge_cli_mutation_with_runner(&intended, &mut planning_runner)
-        .unwrap();
-    let present = Rc::new(Cell::new(true));
-    let operation_present = Rc::clone(&present);
-    let validation_present = Rc::clone(&present);
-    let rollback_argv = Rc::new(std::cell::RefCell::new(Vec::new()));
-    let recorded_argv = Rc::clone(&rollback_argv);
-    let body = intended.body_markdown.clone();
-    let mut executor = fixture.adapter.cli_executor_with_runners(
-        |argv: &[String]| {
-            recorded_argv.borrow_mut().push(argv.to_vec());
-            operation_present.set(false);
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+    set_saved_bridge(&fixture, Some(&intended.body_markdown));
+    let mut operations = Vec::new();
+    let outcome = {
+        let mut executor = fixture.adapter.cli_executor_with_runner(|argv: &[String]| {
+            operations.push(argv.to_vec());
+            set_saved_bridge(&fixture, None);
             Ok::<Vec<u8>, BoundaryError>(Vec::new())
-        },
-        |argv: &[String]| {
-            validation_output(argv, validation_present.get().then_some(body.as_str()))
-        },
-    );
-
-    let outcome = executor.restore_cli_mutation_if_matches(&mutation).unwrap();
-
+        });
+        executor.restore_cli_mutation_if_matches(&mutation).unwrap()
+    };
     assert!(outcome.restored);
     assert_eq!(outcome.resulting_fingerprint, None);
     assert_eq!(
-        rollback_argv.borrow().as_slice(),
-        &[vec!["mcp", "remove", "context-relay", "--scope", "user"]]
+        operations,
+        vec![vec!["mcp", "remove", "context-relay", "--scope", "user"]]
     );
 }
 
 #[test]
-fn cli_executor_rechecks_non_link_harness_executable_before_any_runner() {
+fn cli_executor_rechecks_harness_executable_before_any_mutation() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");
     let intended = bridge(&fixture, &bridge_path);
-    let mut planning_runner = |argv: &[String]| validation_output(argv, None);
-    let mutation = fixture
-        .adapter
-        .plan_bridge_cli_mutation_with_runner(&intended, &mut planning_runner)
-        .unwrap();
-    fs::write(
-        fixture.root.join("replacement claude"),
-        b"replacement executable",
-    )
-    .unwrap();
-    let harness_name = if cfg!(windows) {
-        "claude.exe"
-    } else {
-        "claude"
-    };
-    #[cfg(unix)]
-    {
-        let _ = harness_name;
-        fs::remove_file(fixture.root.join("claude")).unwrap();
-        std::os::unix::fs::symlink(
-            fixture.root.join("replacement claude"),
-            fixture.root.join("claude"),
-        )
-        .unwrap();
-    }
-    #[cfg(windows)]
-    // Symlink creation is privileged on Windows; tamper the attested
-    // executable's content instead, which the digest recheck must catch.
-    fs::write(fixture.root.join(harness_name), b"changed executable").unwrap();
-    let runner_calls = Rc::new(Cell::new(0));
-    let operation_calls = Rc::clone(&runner_calls);
-    let validation_calls = Rc::clone(&runner_calls);
-    let comparison = {
-        let mut executor = fixture.adapter.cli_executor_with_runners(
-            |_: &[String]| {
-                operation_calls.set(operation_calls.get() + 1);
-                Ok::<Vec<u8>, BoundaryError>(Vec::new())
-            },
-            |_: &[String]| {
-                validation_calls.set(validation_calls.get() + 1);
-                Ok::<Vec<u8>, BoundaryError>(Vec::new())
-            },
-        );
-        executor.compare_cli_targets(std::slice::from_ref(&mutation))
-    };
-    assert!(comparison.is_err());
-    assert_eq!(runner_calls.get(), 0);
-}
-
-#[test]
-fn cli_executor_rechecks_harness_executable_digest_before_any_runner() {
-    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
-    let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");
-    let intended = bridge(&fixture, &bridge_path);
-    let mut planning_runner = |argv: &[String]| validation_output(argv, None);
-    let mutation = fixture
-        .adapter
-        .plan_bridge_cli_mutation_with_runner(&intended, &mut planning_runner)
-        .unwrap();
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
     fs::write(
         fixture.root.join(if cfg!(windows) {
             "claude.exe"
@@ -2102,80 +2073,67 @@ fn cli_executor_rechecks_harness_executable_digest_before_any_runner() {
         b"changed executable",
     )
     .unwrap();
-    let runner_calls = Rc::new(Cell::new(0));
-    let operation_calls = Rc::clone(&runner_calls);
-    let validation_calls = Rc::clone(&runner_calls);
-    let comparison = {
-        let mut executor = fixture.adapter.cli_executor_with_runners(
-            |_: &[String]| {
-                operation_calls.set(operation_calls.get() + 1);
-                Ok::<Vec<u8>, BoundaryError>(Vec::new())
-            },
-            |_: &[String]| {
-                validation_calls.set(validation_calls.get() + 1);
-                Ok::<Vec<u8>, BoundaryError>(Vec::new())
-            },
-        );
-        executor.compare_cli_targets(std::slice::from_ref(&mutation))
-    };
-    assert!(comparison.is_err());
-    assert_eq!(runner_calls.get(), 0);
+    let mut executor = fixture.adapter.cli_executor_with_runner(
+        |_: &[String]| -> Result<Vec<u8>, BoundaryError> {
+            panic!("changed executable reached mutation")
+        },
+    );
+    assert!(
+        executor
+            .compare_cli_targets(std::slice::from_ref(&mutation))
+            .is_err()
+    );
+    assert!(executor.apply_cli_mutation(&mutation).is_err());
 }
 
 #[cfg(unix)]
 #[test]
 fn verified_runner_rejects_path_substitution_before_execution() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    };
-
     struct SubstitutingRunner {
         executable: PathBuf,
         original: PathBuf,
         replacement: PathBuf,
-        executions: Arc<AtomicU64>,
     }
-
     impl ClaudeCodeCommandRunner for SubstitutingRunner {
         fn before_launch(&mut self, _: &[String]) -> Result<(), BoundaryError> {
-            fs::rename(&self.executable, &self.original)
-                .map_err(|_| BoundaryError::new("fixture rename failed"))?;
-            fs::rename(&self.replacement, &self.executable)
-                .map_err(|_| BoundaryError::new("fixture substitution failed"))
+            fs::rename(&self.executable, &self.original).unwrap();
+            fs::rename(&self.replacement, &self.executable).unwrap();
+            Ok(())
         }
-
         fn run(&mut self, _: VerifiedClaudeCommand<'_>) -> Result<Vec<u8>, BoundaryError> {
-            self.executions.fetch_add(1, Ordering::Relaxed);
-            Ok(Vec::new())
+            panic!("substituted executable reached launch")
         }
     }
-
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");
     let intended = bridge(&fixture, &bridge_path);
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
     let executable = fixture.root.join("claude");
     let replacement = fixture.root.join("replacement claude");
     fs::write(&replacement, fs::read(&executable).unwrap()).unwrap();
-    let executions = Arc::new(AtomicU64::new(0));
     let runner = SubstitutingRunner {
-        executable: executable.clone(),
+        executable,
         original: fixture.root.join("original claude"),
         replacement,
-        executions: Arc::clone(&executions),
     };
+    let outcome = fixture
+        .adapter
+        .cli_executor_with_runner(runner)
+        .apply_cli_mutation(&mutation)
+        .unwrap();
+    assert!(outcome.command_error.is_some());
+    assert_eq!(outcome.resulting_fingerprint, None);
+}
 
-    assert!(
-        fixture
-            .adapter
-            .plan_bridge_cli_mutation_with_runner(&intended, runner)
-            .is_err()
-    );
-    assert_eq!(
-        executions.load(Ordering::Relaxed),
-        0,
-        "substituted executable reached the runner launch boundary"
-    );
+#[cfg(unix)]
+#[test]
+fn passive_preview_rejects_a_link_instead_of_treating_it_as_absence() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    fs::remove_file(&fixture.state_path).unwrap();
+    std::os::unix::fs::symlink(fixture.root.join("missing"), &fixture.state_path).unwrap();
+    assert!(fixture.adapter.plan_bridge_cli_mutation(&intended).is_err());
 }
 
 #[test]

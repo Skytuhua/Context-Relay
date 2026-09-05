@@ -21,6 +21,9 @@ use context_relay_protocol::{
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+mod mcp_state;
+use mcp_state::McpConfiguration;
+
 use crate::mcp::install::{
     BRIDGE_SERVER_NAME, is_canonical_bridge_body, is_managed_bridge_component,
 };
@@ -41,8 +44,7 @@ use crate::native_transaction::{
 const SUPPORTED_VERSIONS: [&str; 2] = ["2.1.214", "2.1.213"];
 const CLI_TIMEOUT_MS: u32 = 30_000;
 const CLI_OUTPUT_LIMIT: u64 = 64 * 1024;
-// Each configured name adds one sequential `mcp get` subprocess, so keep
-// effective validation bounded independently of the generic adapter DTO limit.
+// Bound the combined native MCP inventory independently of the adapter DTO limit.
 const MAX_MCP_VALIDATION_NAMES: usize = 64;
 const MANAGED_START: &str = "<!-- context-relay:start -->";
 const MANAGED_END: &str = "<!-- context-relay:end -->";
@@ -112,18 +114,15 @@ impl ClaudeCodeCommandRunner for ClaudeCodeProcessRunner {
     }
 }
 
-pub struct ClaudeCodeCliExecutor<'a, O, V> {
+pub struct ClaudeCodeCliExecutor<'a, O> {
     adapter: &'a ClaudeCodeAdapter,
     operation_runner: O,
-    validation_runner: V,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ClaudeCommand {
     Doctor,
     PluginList,
-    McpList,
-    McpGet(String),
 }
 
 impl ClaudeCommand {
@@ -133,8 +132,6 @@ impl ClaudeCommand {
             Self::PluginList => {
                 vec!["plugin".to_owned(), "list".to_owned(), "--json".to_owned()]
             }
-            Self::McpList => vec!["mcp".to_owned(), "list".to_owned()],
-            Self::McpGet(name) => vec!["mcp".to_owned(), "get".to_owned(), name.clone()],
         }
     }
 }
@@ -378,14 +375,6 @@ impl ClaudeCodeAdapter {
         &self,
         intended: &ComponentRecord,
     ) -> Result<ApprovedCliMutation, ClientError> {
-        self.plan_bridge_cli_mutation_with_runner(intended, ClaudeCodeProcessRunner)
-    }
-
-    pub fn plan_bridge_cli_mutation_with_runner(
-        &self,
-        intended: &ComponentRecord,
-        mut validation_runner: impl ClaudeCodeCommandRunner,
-    ) -> Result<ApprovedCliMutation, ClientError> {
         self.require_apply_supported()?;
         if !is_managed_bridge_component(HarnessId::ClaudeCode, intended) {
             return Err(invalid_request(
@@ -394,7 +383,7 @@ impl ClaudeCodeAdapter {
         }
         self.recheck_executable_client()?;
         let expected = self
-            .probe_managed_declaration(&mut validation_runner)
+            .probe_managed_declaration()
             .map_err(|error| match error {
                 BridgeDeclarationProbeError::Conflict => client_error(
                     ErrorCode::Conflict,
@@ -415,25 +404,17 @@ impl ClaudeCodeAdapter {
         })
     }
 
-    pub fn cli_executor(
-        &self,
-    ) -> ClaudeCodeCliExecutor<'_, ClaudeCodeProcessRunner, ClaudeCodeProcessRunner> {
-        self.cli_executor_with_runners(ClaudeCodeProcessRunner, ClaudeCodeProcessRunner)
+    pub fn cli_executor(&self) -> ClaudeCodeCliExecutor<'_, ClaudeCodeProcessRunner> {
+        self.cli_executor_with_runner(ClaudeCodeProcessRunner)
     }
 
-    pub fn cli_executor_with_runners<O, V>(
-        &self,
-        operation_runner: O,
-        validation_runner: V,
-    ) -> ClaudeCodeCliExecutor<'_, O, V>
+    pub fn cli_executor_with_runner<O>(&self, operation_runner: O) -> ClaudeCodeCliExecutor<'_, O>
     where
         O: ClaudeCodeCommandRunner,
-        V: ClaudeCodeCommandRunner,
     {
         ClaudeCodeCliExecutor {
             adapter: self,
             operation_runner,
-            validation_runner,
         }
     }
 
@@ -504,26 +485,10 @@ impl ClaudeCodeAdapter {
 
     fn probe_managed_declaration(
         &self,
-        validation_runner: &mut impl ClaudeCodeCommandRunner,
     ) -> Result<Option<CanonicalCliDeclaration>, BridgeDeclarationProbeError> {
-        let list_argv = vec!["mcp".to_owned(), "list".to_owned()];
-        let listed = self
-            .run_verified(validation_runner, &list_argv)
-            .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
-        let names =
-            parse_mcp_list_output(&listed).map_err(|_| BridgeDeclarationProbeError::Inspection)?;
-        if !names.contains(BRIDGE_SERVER_NAME) {
-            return Ok(None);
-        }
-        let get_argv = vec![
-            "mcp".to_owned(),
-            "get".to_owned(),
-            BRIDGE_SERVER_NAME.to_owned(),
-        ];
-        let output = self
-            .run_verified(validation_runner, &get_argv)
-            .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
-        parse_managed_mcp_get_output(&output)
+        McpConfiguration::read(&self.layout)
+            .map_err(|_| BridgeDeclarationProbeError::Inspection)?
+            .managed_declaration()
     }
 
     pub(crate) fn capability(&self) -> CapabilityLevel {
@@ -572,32 +537,12 @@ impl ClaudeCodeAdapter {
     }
 
     fn validation_commands(&self) -> Result<Vec<ClaudeCommand>, ClientError> {
-        Ok(validation_commands(self.imported_mcp_names()?))
+        self.imported_mcp_names()?;
+        Ok(validation_commands())
     }
 
     fn imported_mcp_names(&self) -> Result<Vec<String>, ClientError> {
-        let mut names = BTreeSet::new();
-        if let Some(bytes) = read_optional_file(&self.layout.state_path)? {
-            let state = parse_object(&bytes, "Claude Code MCP configuration is invalid")?;
-            collect_mcp_names(state.get("mcpServers"), &mut names)?;
-            collect_mcp_names(
-                state
-                    .get("projects")
-                    .and_then(Value::as_object)
-                    .and_then(|projects| {
-                        projects.get(self.layout.project_root.to_string_lossy().as_ref())
-                    })
-                    .and_then(Value::as_object)
-                    .and_then(|project| project.get("mcpServers")),
-                &mut names,
-            )?;
-        }
-        let path = self.layout.project_root.join(".mcp.json");
-        if let Some(bytes) = read_optional_file(&path)? {
-            let value = parse_object(&bytes, "Claude Code MCP configuration is invalid")?;
-            collect_mcp_names(value.get("mcpServers"), &mut names)?;
-        }
-        Ok(names.into_iter().collect())
+        McpConfiguration::read(&self.layout)?.names()
     }
 
     fn import_scope(
@@ -1584,22 +1529,11 @@ impl ClaudeCodeAdapter {
             .map_err(|_| invalid_request("Claude Code receipt is invalid"))?;
         self.require_apply_supported()?;
         let commands = self.validation_commands()?;
-        let mut listed_mcp = BTreeSet::new();
         for command in commands {
             let output = execute(&command)?;
             match command {
                 ClaudeCommand::Doctor => parse_doctor_output(&output)?,
                 ClaudeCommand::PluginList => parse_plugin_list_output(&output)?,
-                ClaudeCommand::McpList => listed_mcp = parse_mcp_list_output(&output)?,
-                ClaudeCommand::McpGet(name) => {
-                    if !listed_mcp.contains(&name) {
-                        return Ok(ValidationReport {
-                            valid: false,
-                            findings: vec!["configured_mcp_server_missing".to_owned()],
-                        });
-                    }
-                    parse_mcp_get_output(&output, &name)?;
-                }
             }
         }
         Ok(ValidationReport {
@@ -1675,10 +1609,9 @@ impl NativeAdapter for ClaudeCodeAdapter {
     }
 }
 
-impl<O, V> NativeCliExecutor for ClaudeCodeCliExecutor<'_, O, V>
+impl<O> NativeCliExecutor for ClaudeCodeCliExecutor<'_, O>
 where
     O: ClaudeCodeCommandRunner,
-    V: ClaudeCodeCommandRunner,
 {
     fn probe_cli_mutation(
         &mut self,
@@ -1686,9 +1619,7 @@ where
     ) -> Result<Option<Sha256Digest>, BoundaryError> {
         self.adapter.recheck_executable_boundary()?;
         self.validate_mutation(mutation)?;
-        let live = self
-            .adapter
-            .probe_managed_declaration(&mut self.validation_runner)?;
+        let live = self.adapter.probe_managed_declaration()?;
         Ok(declaration_fingerprint(live.as_ref()))
     }
 
@@ -1699,9 +1630,7 @@ where
         self.adapter.recheck_executable_boundary()?;
         for mutation in mutations {
             self.validate_mutation(mutation)?;
-            let live = self
-                .adapter
-                .probe_managed_declaration(&mut self.validation_runner)?;
+            let live = self.adapter.probe_managed_declaration()?;
             if declaration_fingerprint(live.as_ref())
                 != declaration_fingerprint(mutation.expected.as_ref())
             {
@@ -1719,9 +1648,7 @@ where
     ) -> Result<CliMutationOutcome, BoundaryError> {
         self.adapter.recheck_executable_boundary()?;
         self.validate_mutation(mutation)?;
-        let live = self
-            .adapter
-            .probe_managed_declaration(&mut self.validation_runner)?;
+        let live = self.adapter.probe_managed_declaration()?;
         if declaration_fingerprint(live.as_ref())
             != declaration_fingerprint(mutation.expected.as_ref())
         {
@@ -1731,9 +1658,7 @@ where
             });
         }
         let command_error = self.run_operations(&mutation.forward).err();
-        let resulting = self
-            .adapter
-            .probe_managed_declaration(&mut self.validation_runner)?;
+        let resulting = self.adapter.probe_managed_declaration()?;
         Ok(CliMutationOutcome {
             resulting_fingerprint: declaration_fingerprint(resulting.as_ref()),
             command_error,
@@ -1746,9 +1671,7 @@ where
     ) -> Result<CliRestoreOutcome, BoundaryError> {
         self.adapter.recheck_executable_boundary()?;
         self.validate_mutation(mutation)?;
-        let live = self
-            .adapter
-            .probe_managed_declaration(&mut self.validation_runner)?;
+        let live = self.adapter.probe_managed_declaration()?;
         if declaration_fingerprint(live.as_ref())
             != declaration_fingerprint(mutation.intended.as_ref())
         {
@@ -1758,9 +1681,7 @@ where
             });
         }
         self.run_operations(&mutation.rollback)?;
-        let resulting = self
-            .adapter
-            .probe_managed_declaration(&mut self.validation_runner)?;
+        let resulting = self.adapter.probe_managed_declaration()?;
         Ok(CliRestoreOutcome {
             restored: declaration_fingerprint(resulting.as_ref())
                 == declaration_fingerprint(mutation.expected.as_ref()),
@@ -1775,9 +1696,7 @@ where
         self.adapter.recheck_executable_boundary()?;
         for mutation in mutations {
             self.validate_mutation(mutation)?;
-            let live = self
-                .adapter
-                .probe_managed_declaration(&mut self.validation_runner)?;
+            let live = self.adapter.probe_managed_declaration()?;
             if declaration_fingerprint(live.as_ref())
                 != declaration_fingerprint(mutation.intended.as_ref())
             {
@@ -1790,10 +1709,9 @@ where
     }
 }
 
-impl<O, V> ClaudeCodeCliExecutor<'_, O, V>
+impl<O> ClaudeCodeCliExecutor<'_, O>
 where
     O: ClaudeCodeCommandRunner,
-    V: ClaudeCodeCommandRunner,
 {
     fn validate_mutation(&self, mutation: &ApprovedCliMutation) -> Result<(), BoundaryError> {
         if mutation.expected.is_none() && mutation.intended.is_none() {
@@ -1907,14 +1825,8 @@ fn settings_path(adapter: &ClaudeCodeAdapter, scope: &ScopeRef) -> Result<PathBu
     }
 }
 
-fn validation_commands(mcp_names: Vec<String>) -> Vec<ClaudeCommand> {
-    let mut commands = vec![
-        ClaudeCommand::Doctor,
-        ClaudeCommand::PluginList,
-        ClaudeCommand::McpList,
-    ];
-    commands.extend(mcp_names.into_iter().map(ClaudeCommand::McpGet));
-    commands
+fn validation_commands() -> Vec<ClaudeCommand> {
+    vec![ClaudeCommand::Doctor, ClaudeCommand::PluginList]
 }
 
 fn collect_mcp_names(
@@ -2557,104 +2469,6 @@ fn parse_plugin_list_output(bytes: &[u8]) -> Result<(), ClientError> {
         }
     }
     Ok(())
-}
-
-fn parse_mcp_list_output(bytes: &[u8]) -> Result<BTreeSet<String>, ClientError> {
-    let output = bounded_utf8(bytes)?;
-    let mut names = BTreeSet::new();
-    for line in output.lines() {
-        let (name, detail) = line
-            .split_once(": ")
-            .ok_or_else(|| invalid_request("Claude Code MCP list output is invalid"))?;
-        safe_name(name)?;
-        let (endpoint, kind) = detail
-            .rsplit_once(" (")
-            .filter(|(_, kind)| kind.ends_with(')'))
-            .ok_or_else(|| invalid_request("Claude Code MCP list output is invalid"))?;
-        if endpoint.is_empty()
-            || endpoint.len() > 2_048
-            || endpoint.chars().any(char::is_control)
-            || kind.len() < 2
-            || kind.len() > 33
-            || !kind[..kind.len() - 1]
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            || !names.insert(name.to_owned())
-        {
-            return Err(invalid_request("Claude Code MCP list output is invalid"));
-        }
-    }
-    Ok(names)
-}
-
-fn parse_mcp_get_output(bytes: &[u8], expected_name: &str) -> Result<(), ClientError> {
-    bounded_utf8(bytes)?;
-    let server = serde_json::from_slice::<Value>(bytes)
-        .ok()
-        .and_then(|value| value.as_object().cloned())
-        .ok_or_else(|| invalid_request("Claude Code MCP get output is invalid"))?;
-    if server
-        .keys()
-        .any(|key| !["name", "type", "url"].contains(&key.as_str()))
-        || server.len() != 3
-        || server.get("name").and_then(Value::as_str) != Some(expected_name)
-    {
-        return Err(invalid_request("Claude Code MCP get output is invalid"));
-    }
-    safe_name(expected_name)?;
-    for key in ["type", "url"] {
-        let value = server
-            .get(key)
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_request("Claude Code MCP get output is invalid"))?;
-        if value.is_empty() || value.len() > 2_048 || value.chars().any(char::is_control) {
-            return Err(invalid_request("Claude Code MCP get output is invalid"));
-        }
-    }
-    Ok(())
-}
-
-fn parse_managed_mcp_get_output(
-    bytes: &[u8],
-) -> Result<Option<CanonicalCliDeclaration>, BridgeDeclarationProbeError> {
-    bounded_utf8(bytes).map_err(|_| BridgeDeclarationProbeError::Inspection)?;
-    let server = serde_json::from_slice::<Value>(bytes)
-        .ok()
-        .and_then(|value| value.as_object().cloned())
-        .ok_or(BridgeDeclarationProbeError::Inspection)?;
-    if server.get("enabled") == Some(&Value::Bool(false)) {
-        return Err(BridgeDeclarationProbeError::Conflict);
-    }
-    if server.len() != 5
-        || server
-            .keys()
-            .any(|key| !["name", "scope", "type", "command", "args"].contains(&key.as_str()))
-    {
-        return Err(if server.contains_key("env") {
-            BridgeDeclarationProbeError::Conflict
-        } else {
-            BridgeDeclarationProbeError::Inspection
-        });
-    }
-    if server.get("name").and_then(Value::as_str) != Some(BRIDGE_SERVER_NAME) {
-        return Err(BridgeDeclarationProbeError::Inspection);
-    }
-    if server.get("scope").and_then(Value::as_str) != Some("user") {
-        return Err(BridgeDeclarationProbeError::Conflict);
-    }
-    if server.get("command").and_then(Value::as_str) == Some("<redacted>") {
-        return Err(BridgeDeclarationProbeError::Inspection);
-    }
-    let body = serde_json::json!({
-        "args": server.get("args").cloned().unwrap_or(Value::Null),
-        "command": server.get("command").cloned().unwrap_or(Value::Null),
-        "type": server.get("type").cloned().unwrap_or(Value::Null),
-    });
-    let canonical_body =
-        canonical_json(&body).map_err(|_| BridgeDeclarationProbeError::Inspection)?;
-    canonical_cli_declaration(&canonical_body)
-        .map(Some)
-        .map_err(|_| BridgeDeclarationProbeError::Conflict)
 }
 
 fn canonical_cli_declaration(body: &str) -> Result<CanonicalCliDeclaration, ClientError> {
@@ -3479,9 +3293,8 @@ mod tests {
     use super::{
         ClaudeCodeAdapter, ClaudeCodeLayout, ClaudeCommand, MAX_MCP_VALIDATION_NAMES, digest_file,
         executable_names, is_native_claude_executable_path, parse_doctor_output,
-        parse_mcp_get_output, parse_mcp_list_output, parse_plugin_list_output, validation_commands,
-        windows_attributes_are_reparse, windows_path_component_attributes_are_safe,
-        windows_reader_is_native_pe,
+        parse_plugin_list_output, validation_commands, windows_attributes_are_reparse,
+        windows_path_component_attributes_are_safe, windows_reader_is_native_pe,
     };
     #[cfg(unix)]
     use super::{run_bounded_command, run_bounded_command_with_hook};
@@ -3676,7 +3489,7 @@ mod tests {
         let fixture: Value =
             serde_json::from_str(include_str!("../tests/fixtures/claude-code-2.1.214.json"))
                 .unwrap();
-        let commands = validation_commands(vec!["docs".to_owned()]);
+        let commands = validation_commands();
         assert_eq!(
             commands
                 .into_iter()
@@ -3685,8 +3498,6 @@ mod tests {
             vec![
                 vec!["doctor".to_owned()],
                 vec!["plugin".to_owned(), "list".to_owned(), "--json".to_owned()],
-                vec!["mcp".to_owned(), "list".to_owned()],
-                vec!["mcp".to_owned(), "get".to_owned(), "docs".to_owned()],
             ]
         );
         parse_doctor_output(fixture["doctorOutput"].as_str().unwrap().as_bytes()).unwrap();
@@ -3696,40 +3507,25 @@ mod tests {
                 .as_slice(),
         )
         .unwrap();
-        parse_mcp_list_output(fixture["mcpListOutput"].as_str().unwrap().as_bytes()).unwrap();
-        parse_mcp_get_output(
-            serde_json::to_vec(&fixture["mcpGetOutput"])
-                .unwrap()
-                .as_slice(),
-            "docs",
-        )
-        .unwrap();
     }
 
     #[test]
     fn validation_rejects_unbounded_malformed_or_secret_output() {
         assert!(parse_doctor_output(&vec![b'x'; 65 * 1024]).is_err());
         assert!(parse_plugin_list_output(br#"[{"id":"ok","token":"secret"}]"#).is_err());
-        assert!(parse_mcp_list_output(b"not a reviewed line").is_err());
-        assert!(
-            parse_mcp_get_output(
-                br#"{"name":"docs","type":"http","url":"https://example.com","headers":{"Authorization":"secret"}}"#,
-                "docs",
-            )
-            .is_err()
-        );
     }
 
     #[test]
     fn effective_validation_includes_global_mcp_without_executing_configured_servers() {
         let root = tempfile::tempdir().unwrap();
-        let config_dir = root.path().join("claude");
-        let project_root = root.path().join("project");
+        let physical_root = fs::canonicalize(root.path()).unwrap();
+        let config_dir = physical_root.join("claude");
+        let project_root = physical_root.join("project");
         fs::create_dir_all(&config_dir).unwrap();
         fs::create_dir_all(&project_root).unwrap();
-        let sentinel = root.path().join("configured-bridge-ran");
+        let sentinel = physical_root.join("configured-bridge-ran");
         let command = serde_json::to_string(&sentinel.to_string_lossy()).unwrap();
-        let state_path = root.path().join(".claude.json");
+        let state_path = physical_root.join(".claude.json");
         fs::write(
             &state_path,
             format!(
@@ -3744,9 +3540,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let executable = root
-            .path()
-            .join(format!("claude-bin{}", std::env::consts::EXE_SUFFIX));
+        let executable = physical_root.join(format!("claude-bin{}", std::env::consts::EXE_SUFFIX));
         fs::write(&executable, fixture_executable_bytes()).unwrap();
         let device = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
         let adapter = ClaudeCodeAdapter::from_layout(
@@ -3776,28 +3570,13 @@ mod tests {
                 Ok(match command {
                     ClaudeCommand::Doctor => b"Claude Code diagnostics: OK\n".to_vec(),
                     ClaudeCommand::PluginList => b"[]".to_vec(),
-                    ClaudeCommand::McpList => {
-                        b"context-relay: local (stdio)\nproject-tools: local (stdio)\n".to_vec()
-                    }
-                    ClaudeCommand::McpGet(name) => serde_json::to_vec(&serde_json::json!({
-                        "name": name,
-                        "type": "stdio",
-                        "url": "stdio://local"
-                    }))
-                    .unwrap(),
                 })
             })
             .unwrap();
         assert!(report.valid);
         assert_eq!(
             commands,
-            vec![
-                vec!["doctor"],
-                vec!["plugin", "list", "--json"],
-                vec!["mcp", "list"],
-                vec!["mcp", "get", "context-relay"],
-                vec!["mcp", "get", "project-tools"],
-            ]
+            vec![vec!["doctor"], vec!["plugin", "list", "--json"],]
         );
         assert!(!sentinel.exists());
     }
@@ -3832,11 +3611,12 @@ mod tests {
         project_file: impl IntoIterator<Item = usize>,
     ) -> McpSourceFixture {
         let root = tempfile::tempdir().unwrap();
-        let config_dir = root.path().join("claude");
-        let project_root = root.path().join("project");
+        let physical_root = fs::canonicalize(root.path()).unwrap();
+        let config_dir = physical_root.join("claude");
+        let project_root = physical_root.join("project");
         fs::create_dir_all(&config_dir).unwrap();
         fs::create_dir_all(&project_root).unwrap();
-        let state_path = root.path().join(".claude.json");
+        let state_path = physical_root.join(".claude.json");
         let project_key = project_root.to_string_lossy().into_owned();
         fs::write(
             &state_path,
@@ -3859,9 +3639,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let executable = root
-            .path()
-            .join(format!("claude-bin{}", std::env::consts::EXE_SUFFIX));
+        let executable = physical_root.join(format!("claude-bin{}", std::env::consts::EXE_SUFFIX));
         fs::write(&executable, fixture_executable_bytes()).unwrap();
         let device = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
         let adapter = ClaudeCodeAdapter::from_layout(
@@ -3890,24 +3668,6 @@ mod tests {
         }
     }
 
-    fn bounded_validation_output(command: &ClaudeCommand, names: &[String]) -> Vec<u8> {
-        match command {
-            ClaudeCommand::Doctor => b"Claude Code diagnostics: OK\n".to_vec(),
-            ClaudeCommand::PluginList => b"[]".to_vec(),
-            ClaudeCommand::McpList => names
-                .iter()
-                .map(|name| format!("{name}: local (stdio)\n"))
-                .collect::<String>()
-                .into_bytes(),
-            ClaudeCommand::McpGet(name) => serde_json::to_vec(&serde_json::json!({
-                "name": name,
-                "type": "stdio",
-                "url": "stdio://local"
-            }))
-            .unwrap(),
-        }
-    }
-
     #[test]
     fn effective_validation_accepts_exactly_the_deduplicated_mcp_name_limit() {
         let half = MAX_MCP_VALIDATION_NAMES / 2;
@@ -3925,19 +3685,16 @@ mod tests {
             .adapter
             .validate_effective_with(&fixture.receipt, |command| {
                 commands.push(command.argv());
-                Ok(bounded_validation_output(command, &names))
+                Ok(match command {
+                    ClaudeCommand::Doctor => b"Claude Code diagnostics: OK\n".to_vec(),
+                    ClaudeCommand::PluginList => b"[]".to_vec(),
+                })
             })
             .unwrap();
 
         assert!(report.valid);
-        assert_eq!(commands.len(), MAX_MCP_VALIDATION_NAMES + 3);
-        assert_eq!(
-            commands[3..]
-                .iter()
-                .map(|command| command[2].clone())
-                .collect::<Vec<_>>(),
-            names
-        );
+        assert_eq!(commands.len(), 2);
+        assert_eq!(fixture.adapter.imported_mcp_names().unwrap(), names);
     }
 
     #[test]

@@ -246,3 +246,15 @@ Authenticode NotSigned. It includes the harness terminology, feedback, bundled
 Claude discovery and record-action changes above. This candidate was not
 installed or visually verified; full connection and release acceptance remain
 open.
+
+## 2026-09-06: passive Claude MCP inspection correction
+
+Real bundled Claude 2.1.202 qualification showed that MCP list/get return plain
+text and start configured servers. A synthetic marker experiment confirmed get
+starts its target and list also starts an unrelated server. Connection preview
+and transaction readback now inspect bounded, duplicate-free native JSON;
+official add/remove, approval fingerprints, WAL and conditional rollback remain.
+Windows local-project key spelling, project shadowing and exclusive managed MCP
+policy are checked. See the [qualification evidence](claude-native-mcp-2026-09-06.md)
+for exact scope and remaining gates. This is source progress; 2.1.202 remains
+ImportOnly, and the previously recorded installer does not include this patch.
