@@ -350,3 +350,11 @@ predates this frontend change.
 Hosted CI run 33989730248 also passed the corrected macOS Rust tests, macOS lint
 and macOS native build. Windows Rust tests were still running at this check;
 this is not a claim that every required CI or native qualification gate passed.
+
+The locked installer rebuilt from production source `11d6740` at
+2026-09-06 04:50:37: `Context Relay_0.1.0_x64-setup.exe`, 10,910,977 bytes,
+SHA-256 `a18e2051f1fc30a9d7cf66dec71ac747f6f54facf03485fa826447d233d326bf`,
+Authenticode NotSigned. Packaging completed successfully. It includes the
+revised first-use frontend and the prior Claude home/hook corrections. It was
+not installed or tested through native desktop control. Full harness connection
+and release acceptance remain unfinished.
