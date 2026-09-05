@@ -51,8 +51,8 @@ use context_relay_protocol::{
     CliOperations, ClientError, ComponentKind, ComponentRecord, DesiredState, DeviceId,
     DiscoveredScopes, ExpectedNativeDigest, HarnessAdapter, HarnessId, HybridLogicalClock,
     ImportRequest, ImportedState, InstallationMethod, NativePlatform, NativeScope, ProbeContext,
-    ProbeReport, ProjectId, RenderedState, ScopeRef, SemanticDiff, Sha256Digest, ValidationReport,
-    WireNativeValue,
+    ProbeReport, ProjectId, RenderedState, ScopeRef, SemanticDiff, SetupPlan, Sha256Digest,
+    ValidationReport, WireNativeValue,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
@@ -438,6 +438,16 @@ impl HarnessAdapter for FrozenHarness {
 }
 
 impl BridgePreviewHarness for FrozenHarness {
+    fn watch_only_memory_digests(&self) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
+        match self {
+            Self::Claude { adapter, .. } => {
+                BridgePreviewHarness::watch_only_memory_digests(adapter)
+            }
+            Self::Codex { adapter, .. } => BridgePreviewHarness::watch_only_memory_digests(adapter),
+            Self::Hermes(adapter) => BridgePreviewHarness::watch_only_memory_digests(adapter),
+        }
+    }
+
     fn bridge_harness(&self) -> HarnessId {
         self.id()
     }
@@ -967,6 +977,34 @@ impl BridgePlanExecutor for CrashAfterCommit<'_> {
 }
 
 struct MustNotExecute;
+
+struct RegistrationVerifier<'a> {
+    harness: &'a FrozenHarness,
+    calls: usize,
+}
+
+impl BridgePlanExecutor for RegistrationVerifier<'_> {
+    fn verify_watch_only_registration(
+        &mut self,
+        plan: &NativeTransactionPlan,
+        now_ms: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        self.calls += 1;
+        context_relay_core::setup::verify_watch_only_registration(self.harness, plan, now_ms)
+            .map_err(|error| BridgeExecutionError::restored(error.message))
+    }
+
+    fn execute(
+        &mut self,
+        _: &mut Vault,
+        _: &NativeTransactionPlan,
+        _: &[u8],
+        _: u64,
+        _: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        panic!("registration must never execute a native transaction");
+    }
+}
 
 impl BridgePlanExecutor for MustNotExecute {
     fn execute(
@@ -1984,9 +2022,20 @@ fn import_only_exact_memory_bindings_apply_and_rollback_as_registration_only_pla
             );
         }
 
+        let before_tree = snapshot_tree(fixture._temp.path());
+        let mut verifier = RegistrationVerifier {
+            harness: &fixture.harness,
+            calls: 0,
+        };
         BridgeInstallService::persisted(&mut vault)
-            .apply(&setup.plan_id, NOW_MS + 1, &mut MustNotExecute)
+            .apply(&setup.plan_id, NOW_MS + 1, &mut verifier)
             .unwrap();
+        assert_eq!(verifier.calls, 1);
+        // A committed replay neither discovers nor re-registers the sources.
+        BridgeInstallService::persisted(&mut vault)
+            .apply(&setup.plan_id, NOW_MS + 2, &mut verifier)
+            .unwrap();
+        assert_eq!(verifier.calls, 1);
         for registration in &opened.plan.native_memory_registrations {
             assert_eq!(
                 vault
@@ -2009,6 +2058,7 @@ fn import_only_exact_memory_bindings_apply_and_rollback_as_registration_only_pla
             );
         }
         assert_raw_unchanged(&fixture);
+        assert_eq!(snapshot_tree(fixture._temp.path()), before_tree);
 
         let recovery_setup = BridgeInstallService::new(
             &mut vault,
@@ -2048,23 +2098,267 @@ fn import_only_exact_memory_bindings_apply_and_rollback_as_registration_only_pla
                 .unwrap()
                 .unwrap()
                 .lifecycle,
-            SetupPlanLifecycle::Applied
+            SetupPlanLifecycle::ApplyRestored
         );
         for registration in &recovery_opened.plan.native_memory_registrations {
-            assert_eq!(
+            assert!(
                 vault
                     .native_memory_ledger(&registration.source.id)
                     .unwrap()
-                    .unwrap()
-                    .source,
-                Some(registration.source.clone())
+                    .is_none()
             );
         }
-        BridgeInstallService::persisted(&mut vault)
-            .rollback(&recovery_setup.plan_id, NOW_MS + 12, &mut MustNotExecute)
-            .unwrap();
+        assert!(
+            BridgeInstallService::persisted(&mut vault)
+                .apply(&recovery_setup.plan_id, NOW_MS + 12, &mut MustNotExecute)
+                .is_err()
+        );
         assert_raw_unchanged(&fixture);
     }
+}
+
+#[test]
+fn import_only_registration_requires_live_validation_before_publishing_sources() {
+    let fixture = claude_matrix_fixture_with_version("2.1.215");
+    let vault_path = TempVault::new("watch-only-no-verifier");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+    let setup = BridgeInstallService::new(
+        &mut vault,
+        fixture.harness.clone(),
+        Locator {
+            bridge: fixture.bridge.clone(),
+            calls: Rc::new(Cell::new(0)),
+        },
+        DeviceId::from_str(ID_1).unwrap(),
+        clock(NOW_MS),
+    )
+    .preview(
+        Some(&RegisteredProject {
+            project_id: fixture.project_id,
+            root: wire_path(&fixture.project_root),
+        }),
+        NOW_MS,
+    )
+    .unwrap();
+    let before = snapshot_tree(fixture._temp.path());
+    assert!(
+        BridgeInstallService::persisted(&mut vault)
+            .apply(&setup.plan_id, NOW_MS + 1, &mut MustNotExecute)
+            .is_err()
+    );
+    assert!(vault.native_memory_ledgers().unwrap().is_empty());
+    assert_eq!(snapshot_tree(fixture._temp.path()), before);
+}
+
+#[test]
+fn import_only_recovery_does_not_publish_an_unverified_registration() {
+    let fixture = claude_matrix_fixture_with_version("2.1.215");
+    let vault_path = TempVault::new("watch-only-unverified-recovery");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+    let setup = BridgeInstallService::new(
+        &mut vault,
+        fixture.harness.clone(),
+        Locator {
+            bridge: fixture.bridge.clone(),
+            calls: Rc::new(Cell::new(0)),
+        },
+        DeviceId::from_str(ID_1).unwrap(),
+        clock(NOW_MS),
+    )
+    .preview(
+        Some(&RegisteredProject {
+            project_id: fixture.project_id,
+            root: wire_path(&fixture.project_root),
+        }),
+        NOW_MS,
+    )
+    .unwrap();
+    vault
+        .claim_setup_plan(&setup.plan_id, SetupPlanAction::Apply, NOW_MS + 1)
+        .unwrap();
+    fs::write(
+        fixture.project_root.join(".claude/settings.local.json"),
+        br#"{"autoMemoryDirectory":"~/changed memory"}"#,
+    )
+    .unwrap();
+    let before = snapshot_tree(fixture._temp.path());
+    BridgeInstallService::persisted(&mut vault)
+        .reconcile_after_native_recovery()
+        .unwrap();
+    assert!(vault.native_memory_ledgers().unwrap().is_empty());
+    assert_eq!(
+        vault.setup_plan(&setup.plan_id).unwrap().unwrap().lifecycle,
+        SetupPlanLifecycle::ApplyRestored
+    );
+    assert_eq!(snapshot_tree(fixture._temp.path()), before);
+}
+
+fn watch_preview(vault: &mut Vault, fixture: &MatrixFixture) -> SetupPlan {
+    BridgeInstallService::new(
+        vault,
+        fixture.harness.clone(),
+        Locator {
+            bridge: fixture.bridge.clone(),
+            calls: Rc::new(Cell::new(0)),
+        },
+        DeviceId::from_str(ID_1).unwrap(),
+        clock(NOW_MS),
+    )
+    .preview(
+        Some(&RegisteredProject {
+            project_id: fixture.project_id,
+            root: wire_path(&fixture.project_root),
+        }),
+        NOW_MS,
+    )
+    .unwrap()
+}
+
+#[test]
+fn import_only_apply_and_resume_reject_changed_sources_settings_and_executables() {
+    for resumed in [false, true] {
+        for change in [
+            "directory",
+            "enabled",
+            "user",
+            "managed",
+            "topic",
+            "executable",
+        ] {
+            let fixture = claude_matrix_fixture_with_version("2.1.215");
+            let vault_path = TempVault::new(&format!("watch-drift-{resumed}-{change}"));
+            let keys = MemoryKeyStore::default();
+            let mut vault =
+                Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+            let setup = watch_preview(&mut vault, &fixture);
+            if resumed {
+                vault
+                    .claim_setup_plan(&setup.plan_id, SetupPlanAction::Apply, NOW_MS + 1)
+                    .unwrap();
+            }
+            let root = fixture.project_root.parent().unwrap();
+            let (path, bytes): (PathBuf, &[u8]) = match change {
+                "directory" => (
+                    fixture.project_root.join(".claude/settings.local.json"),
+                    br#"{"autoMemoryDirectory":"~/changed memory"}"#,
+                ),
+                "enabled" => (
+                    fixture.project_root.join(".claude/settings.local.json"),
+                    br#"{"autoMemoryEnabled":true}"#,
+                ),
+                "user" => (root.join("claude/settings.json"), b"{}"),
+                "managed" => (
+                    root.join("managed-settings.json"),
+                    br#"{"autoMemoryEnabled":true}"#,
+                ),
+                "topic" => (
+                    fixture
+                        .project_root
+                        .join(".claude/native-memory/new-topic.md"),
+                    b"new topic\n",
+                ),
+                "executable" => (
+                    mutation_path(&setup.executable_path),
+                    b"replaced executable",
+                ),
+                _ => unreachable!(),
+            };
+            fs::write(path, bytes).unwrap();
+            let before = snapshot_tree(fixture._temp.path());
+            let mut verifier = RegistrationVerifier {
+                harness: &fixture.harness,
+                calls: 0,
+            };
+            assert!(
+                BridgeInstallService::persisted(&mut vault)
+                    .apply(&setup.plan_id, NOW_MS + 2, &mut verifier)
+                    .is_err(),
+                "{resumed}/{change}"
+            );
+            assert_eq!(verifier.calls, 1);
+            assert!(vault.native_memory_ledgers().unwrap().is_empty());
+            assert_eq!(
+                vault.setup_plan(&setup.plan_id).unwrap().unwrap().lifecycle,
+                SetupPlanLifecycle::ApplyRestored
+            );
+            assert_eq!(
+                snapshot_tree(fixture._temp.path()),
+                before,
+                "{resumed}/{change}"
+            );
+        }
+    }
+}
+
+#[test]
+fn import_only_resume_verifies_current_sources_and_expiry_before_commit() {
+    for expired in [false, true] {
+        let fixture = claude_matrix_fixture_with_version("2.1.215");
+        let vault_path = TempVault::new(&format!("watch-resume-expiry-{expired}"));
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+        let setup = watch_preview(&mut vault, &fixture);
+        vault
+            .claim_setup_plan(&setup.plan_id, SetupPlanAction::Apply, NOW_MS + 1)
+            .unwrap();
+        let mut verifier = RegistrationVerifier {
+            harness: &fixture.harness,
+            calls: 0,
+        };
+        let result = BridgeInstallService::persisted(&mut vault).apply(
+            &setup.plan_id,
+            if expired {
+                setup.expires_at
+            } else {
+                NOW_MS + 2
+            },
+            &mut verifier,
+        );
+        if expired {
+            assert!(result.is_err());
+            assert_eq!(verifier.calls, 0);
+            assert!(vault.native_memory_ledgers().unwrap().is_empty());
+        } else {
+            result.unwrap();
+            assert_eq!(verifier.calls, 1);
+            assert_eq!(vault.native_memory_ledgers().unwrap().len(), 2);
+        }
+    }
+}
+
+#[test]
+fn import_only_verifier_rejects_legacy_dependencies_expiry_and_wrong_bindings() {
+    let fixture = claude_matrix_fixture_with_version("2.1.215");
+    let vault_path = TempVault::new("watch-sealed-binding");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+    let setup = watch_preview(&mut vault, &fixture);
+    let opened = open_plan(&vault.setup_plan(&setup.plan_id).unwrap().unwrap().payload).unwrap();
+    let check = |plan: &NativeTransactionPlan, now| {
+        context_relay_core::setup::verify_watch_only_registration(&fixture.harness, plan, now)
+    };
+    check(&opened.plan, NOW_MS + 1).unwrap();
+    assert!(check(&opened.plan, setup.expires_at).is_err());
+    for change in ["legacy", "version", "profile", "project"] {
+        let mut plan = opened.plan.clone();
+        match change {
+            "legacy" => plan.setup.expected_native_digests.truncate(1),
+            "version" => plan.setup.harness_version = "2.1.216".to_owned(),
+            "profile" => plan.setup.harness_profile = Some("other".to_owned()),
+            "project" => {
+                for scope in &mut plan.setup.target_scopes {
+                    if let NativeScope::Project { root, .. } = scope {
+                        *root = wire_path(fixture._temp.path());
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        assert!(check(&plan, NOW_MS + 1).is_err(), "{change}");
+    }
+    assert!(vault.native_memory_ledgers().unwrap().is_empty());
 }
 
 #[test]

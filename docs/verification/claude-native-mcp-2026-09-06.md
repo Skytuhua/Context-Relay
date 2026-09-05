@@ -384,9 +384,9 @@ between writes and during final validation. A newly added local override or
 changed managed setting invalidates the reviewed plan. Files modified by the
 plan use exact restorable fingerprints so global hook updates and inverse
 transactions can pass through their two reviewed states. Legacy Full plans
-without these dependencies require a new preview. ImportOnly registration-only
-plans still use the pre-existing registration path; their preview-to-apply
-settings revalidation remains open.
+without these dependencies require a new preview. The subsequent
+[read-only registration correction](read-only-memory-registration-2026-09-06.md)
+also covers ImportOnly preview-to-apply settings revalidation and startup recovery.
 
 Review also reproduced an absent-to-present Windows directory spelling change.
 Missing roots now bind through their nearest canonical existing ancestor, so
@@ -417,3 +417,13 @@ repository/worktree defaults, native Stop events and full real setup/recovery
 remain open. No additional version was enabled. The existing unsigned installer
 from source 11d6740 does not include this change or the preceding configured-path
 correction; it has not been installed or tested through native desktop control.
+
+## Read-only registration follow-up
+
+ImportOnly preview now seals the same memory-selection file dependencies.
+Apply/resume checks the current installation, settings and exact source list
+without launching the harness. Startup no longer publishes an interrupted,
+unverified registration. The [cross-harness evidence](read-only-memory-registration-2026-09-06.md)
+records the production canary, recovery/Undo matrix and Windows path correction.
+This closes the registration revalidation gap above, not full runtime connection
+qualification. No additional version is enabled and the installer is unchanged.

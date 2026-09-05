@@ -305,6 +305,15 @@ struct ProductionBridgePlanExecutor<'a> {
 }
 
 impl BridgePlanExecutor for ProductionBridgePlanExecutor<'_> {
+    fn verify_watch_only_registration(
+        &mut self,
+        plan: &context_relay_core::native_transaction::NativeTransactionPlan,
+        _now_ms: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        self.verify_registration_inner(plan)
+            .map_err(|error| BridgeExecutionError::restored(error.message))
+    }
+
     fn execute(
         &mut self,
         vault: &mut Vault,
@@ -335,6 +344,64 @@ impl From<ClientError> for ProductionExecutionError {
 }
 
 impl ProductionBridgePlanExecutor<'_> {
+    fn verify_registration_inner(
+        &self,
+        plan: &context_relay_core::native_transaction::NativeTransactionPlan,
+    ) -> Result<(), ClientError> {
+        let (root, project_id) = sealed_project_binding(plan)?;
+        if plan.setup.target_scopes.iter().any(|scope| match scope {
+            NativeScope::Global => false,
+            NativeScope::Project { root: approved, .. } => {
+                !decode_wire_path(approved).is_ok_and(|approved| approved == root)
+            }
+        }) {
+            return Err(invalid("The approved registration project root changed"));
+        }
+        let observed_hlc = HybridLogicalClock::new(now_ms()?, 0, self.device_id);
+        // This branch never constructs a restricted executor, native filesystem,
+        // journal, CLI writer, gateway lease, or bridge executable.
+        match plan.setup.harness {
+            HarnessId::ClaudeCode => {
+                let adapter = ClaudeCodeAdapter::discover_for_registration(
+                    &root,
+                    project_id,
+                    self.device_id,
+                    observed_hlc,
+                    &plan.setup,
+                )?;
+                context_relay_core::setup::verify_watch_only_registration(&adapter, plan, now_ms()?)
+            }
+            HarnessId::Codex => {
+                let adapter = CodexAdapter::discover_for_registration(
+                    &root,
+                    &root,
+                    project_id,
+                    self.device_id,
+                    observed_hlc,
+                    &plan.setup,
+                )?;
+                context_relay_core::setup::verify_watch_only_registration(&adapter, plan, now_ms()?)
+            }
+            HarnessId::Hermes => {
+                let profile = plan
+                    .setup
+                    .harness_profile
+                    .as_deref()
+                    .ok_or_else(|| invalid("Persisted Hermes setup profile is unavailable"))?;
+                let adapter = HermesAdapter::discover_for_registration(
+                    &root,
+                    &root,
+                    profile,
+                    project_id,
+                    self.device_id,
+                    observed_hlc,
+                    &plan.setup,
+                )?;
+                context_relay_core::setup::verify_watch_only_registration(&adapter, plan, now_ms()?)
+            }
+        }
+    }
+
     fn execute_inner(
         &mut self,
         vault: &mut Vault,
@@ -717,6 +784,298 @@ pub(crate) mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+
+    fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+        let command = std::process::Command::new(program);
+        #[cfg(windows)]
+        let command = {
+            use std::os::windows::process::CommandExt as _;
+            let mut command = command;
+            command.creation_flags(0x0800_0000);
+            command
+        };
+        command
+    }
+
+    #[test]
+    fn production_registration_discovery_never_launches_approved_or_changed_harnesses() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let canary = root.join(format!("watch-canary{}", std::env::consts::EXE_SUFFIX));
+        let fallback_marker = root.join("unexpected-launch-with-cleared-environment");
+        let output = hidden_command(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/watch-registration-canary.rs"),
+            )
+            .env("CONTEXT_RELAY_TEST_WATCH_FALLBACK", &fallback_marker)
+            .arg("-o")
+            .arg(&canary)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let marker = root.join("positive-control");
+        let output = hidden_command(&canary)
+            .env("CONTEXT_RELAY_TEST_WATCH_MARKER", &marker)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(marker.is_file(), "the canary must detect an actual launch");
+        for harness in ["claude", "codex", "hermes"] {
+            for change in ["unchanged", "bytes", "path", "project"] {
+                let case = root.join(format!("{harness}-{change}"));
+                let bin = case.join("bin");
+                let other_bin = case.join("other-bin");
+                let home = case.join("home");
+                let user_home = PathBuf::from(home.to_str().unwrap().trim_start_matches(r"\\?\"));
+                for directory in [&bin, &other_bin, &home] {
+                    fs::create_dir_all(directory).unwrap();
+                }
+                let name = format!("{harness}{}", std::env::consts::EXE_SUFFIX);
+                fs::copy(&canary, bin.join(&name)).unwrap();
+                fs::copy(&canary, other_bin.join(&name)).unwrap();
+                let child_marker = case.join("unexpected-launch");
+                let search_path = if change == "path" { &other_bin } else { &bin };
+                let search_path =
+                    PathBuf::from(search_path.to_str().unwrap().trim_start_matches(r"\\?\"));
+                let mut child = hidden_command(std::env::current_exe().unwrap());
+                child
+                    .env_clear()
+                    .args([
+                        "--exact",
+                        "bridge_install::tests::registration_discovery_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("CONTEXT_RELAY_TEST_WATCH_ROOT", &case)
+                    .env("CONTEXT_RELAY_TEST_WATCH_HARNESS", harness)
+                    .env("CONTEXT_RELAY_TEST_WATCH_CHANGE", change)
+                    .env("CONTEXT_RELAY_TEST_WATCH_MARKER", &child_marker)
+                    .env("PATH", &search_path)
+                    .env("HOME", &user_home)
+                    .env("USERPROFILE", &user_home)
+                    .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+                    .env("CODEX_HOME", home.join("codex"))
+                    .env("HERMES_HOME", home.join("hermes"))
+                    .current_dir(&case);
+                for key in ["SystemRoot", "WINDIR", "TEMP", "TMP"] {
+                    if let Some(value) = std::env::var_os(key) {
+                        child.env(key, value);
+                    }
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    !child_marker.exists() && !fallback_marker.exists(),
+                    "{harness}/{change} launched a harness"
+                );
+                assert!(
+                    output.status.success(),
+                    "{harness}/{change}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "only invoked in an isolated child environment by the production registration canary"]
+    fn registration_discovery_child() {
+        use context_relay_core::{
+            claude_code::ClaudeCodeLayout,
+            codex::{CodexExecutableKind, CodexLayout},
+            hermes::{HermesExecutableKind, HermesLayout, HermesProfile},
+        };
+        let root = PathBuf::from(std::env::var_os("CONTEXT_RELAY_TEST_WATCH_ROOT").unwrap());
+        let harness = std::env::var("CONTEXT_RELAY_TEST_WATCH_HARNESS").unwrap();
+        let change = std::env::var("CONTEXT_RELAY_TEST_WATCH_CHANGE").unwrap();
+        let home = root.join("home");
+        // Use the ordinary Windows home spelling used by the native runtime.
+        let user_home = PathBuf::from(home.to_str().unwrap().trim_start_matches(r"\\?\"));
+        let project = root.join("project");
+        for path in [
+            project.join(".claude"),
+            home.join("claude"),
+            home.join("codex"),
+            home.join("hermes"),
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(
+            project.join(".claude/settings.json"),
+            br#"{"autoMemoryDirectory":"~/memory"}"#,
+        )
+        .unwrap();
+        fs::write(home.join("claude/settings.json"), b"{}").unwrap();
+        fs::write(home.join("claude/.claude.json"), b"{}").unwrap();
+        fs::write(home.join("codex/config.toml"), b"").unwrap();
+        fs::write(home.join("hermes/config.yaml"), b"{}\n").unwrap();
+        let project = fs::canonicalize(project).unwrap();
+        let executable = root
+            .join("bin")
+            .join(format!("{harness}{}", std::env::consts::EXE_SUFFIX));
+        let executable = PathBuf::from(executable.to_str().unwrap().trim_start_matches(r"\\?\"));
+        let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073990").unwrap();
+        let project_id = global_project_id().unwrap();
+        let now = now_ms().unwrap();
+        let clock = HybridLogicalClock::new(now, 0, device_id);
+        let vault_path = root.join("vault.db");
+        let mut vault = Vault::open(
+            &vault_path,
+            "watch-production-canary",
+            &MemoryKeyStore::default(),
+        )
+        .unwrap();
+        fn preview(
+            vault: &mut Vault,
+            adapter: impl context_relay_core::setup::BridgePreviewHarness,
+            project: &Path,
+            device: DeviceId,
+            clock: HybridLogicalClock,
+            now: u64,
+        ) -> NativeTransactionPlan {
+            let setup = BridgeInstallService::new(
+                vault,
+                adapter,
+                ProductionBridgeInstallEngine::with_daemon_executable("unused").bridge,
+                device,
+                clock,
+            )
+            .preview(
+                Some(&RegisteredProject {
+                    project_id: global_project_id().unwrap(),
+                    root: crate::unit_test_support::wire_native_path(project),
+                }),
+                now,
+            )
+            .unwrap();
+            context_relay_core::native_transaction::open_plan(
+                &vault.setup_plan(&setup.plan_id).unwrap().unwrap().payload,
+            )
+            .unwrap()
+            .plan
+        }
+        let installation_method = context_relay_protocol::InstallationMethod::PackageManager;
+        let mut plan = match harness.as_str() {
+            "claude" => preview(
+                &mut vault,
+                ClaudeCodeAdapter::from_layout(
+                    ClaudeCodeLayout {
+                        executable: executable.clone(),
+                        version: "9.9.9".into(),
+                        installation_method,
+                        user_home,
+                        config_dir: home.join("claude"),
+                        state_path: home.join("claude/.claude.json"),
+                        project_root: project.clone(),
+                        managed_settings_paths: if cfg!(windows) {
+                            vec![]
+                        } else if cfg!(target_os = "macos") {
+                            vec![PathBuf::from(
+                                "/Library/Application Support/ClaudeCode/managed-settings.json",
+                            )]
+                        } else {
+                            vec![PathBuf::from("/etc/claude-code/managed-settings.json")]
+                        },
+                    },
+                    project_id,
+                    device_id,
+                    clock,
+                )
+                .unwrap(),
+                &project,
+                device_id,
+                clock,
+                now,
+            ),
+            "codex" => preview(
+                &mut vault,
+                CodexAdapter::from_layout(
+                    CodexLayout {
+                        executable: executable.clone(),
+                        executable_kind: CodexExecutableKind::Native,
+                        version: "9.9.9".into(),
+                        installation_method,
+                        codex_home: home.join("codex"),
+                        user_skills_dir: home.join(".agents/skills"),
+                        project_root: project.clone(),
+                        working_directory: project.clone(),
+                        requirements_paths: vec![],
+                    },
+                    project_id,
+                    device_id,
+                    clock,
+                )
+                .unwrap(),
+                &project,
+                device_id,
+                clock,
+                now,
+            ),
+            "hermes" => preview(
+                &mut vault,
+                HermesAdapter::from_layout(
+                    HermesLayout {
+                        executable: executable.clone(),
+                        executable_kind: HermesExecutableKind::Native,
+                        version: "9.9.9".into(),
+                        installation_method,
+                        default_hermes_home: home.join("hermes"),
+                        profile: HermesProfile {
+                            name: "default".into(),
+                            hermes_home: fs::canonicalize(home.join("hermes")).unwrap(),
+                        },
+                        project_root: project.clone(),
+                        working_directory: project.clone(),
+                    },
+                    project_id,
+                    device_id,
+                    clock,
+                )
+                .unwrap(),
+                &project,
+                device_id,
+                clock,
+                now,
+            ),
+            _ => unreachable!(),
+        };
+        if change == "bytes" {
+            use std::io::Write as _;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&executable)
+                .unwrap()
+                .write_all(b"changed")
+                .unwrap();
+        }
+        if change == "project" {
+            // A noncanonical project claim must be rejected before discovery.
+            let separator = std::path::MAIN_SEPARATOR;
+            let noncanonical = PathBuf::from(format!(
+                "{}{separator}..{separator}project",
+                project.display()
+            ));
+            plan.setup.target_scopes = vec![NativeScope::Project {
+                project_id,
+                root: crate::unit_test_support::wire_native_path(&noncanonical),
+            }];
+        }
+        let mut executor = ProductionBridgePlanExecutor {
+            vault_path: &vault_path,
+            device_id,
+        };
+        let result = executor.verify_watch_only_registration(&plan, now);
+        if change == "unchanged" {
+            result.unwrap();
+        } else {
+            assert!(result.is_err());
+        }
+    }
 
     #[test]
     fn cli_recovery_uses_the_sealed_project_instead_of_the_vault_directory() {

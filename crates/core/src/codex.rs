@@ -359,8 +359,44 @@ impl CodexAdapter {
         origin_device: DeviceId,
         observed_hlc: HybridLogicalClock,
     ) -> Result<Self, ClientError> {
-        let project_root = project_root.into();
-        let working_directory = working_directory.into();
+        Self::discover_inner(
+            project_root.into(),
+            working_directory.into(),
+            project_id,
+            origin_device,
+            observed_hlc,
+            None,
+        )
+    }
+
+    /// Resolves the installed candidate and configuration without a version
+    /// subprocess; only the exact executable approved in preview can bind.
+    pub fn discover_for_registration(
+        project_root: impl Into<PathBuf>,
+        working_directory: impl Into<PathBuf>,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        approved: &context_relay_protocol::SetupPlan,
+    ) -> Result<Self, ClientError> {
+        Self::discover_inner(
+            project_root.into(),
+            working_directory.into(),
+            project_id,
+            origin_device,
+            observed_hlc,
+            Some(approved),
+        )
+    }
+
+    fn discover_inner(
+        project_root: PathBuf,
+        working_directory: PathBuf,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        approved: Option<&context_relay_protocol::SetupPlan>,
+    ) -> Result<Self, ClientError> {
         let home = home_dir().ok_or_else(|| not_found("Codex home was not found"))?;
         let codex_home = match env::var_os("CODEX_HOME") {
             Some(value) => {
@@ -383,11 +419,30 @@ impl CodexAdapter {
         )?;
         #[cfg(not(windows))]
         let expected_standalone_version: Option<String> = None;
-        let (executable_snapshot, version) = discover_executable_version(
-            &executable,
-            &working_directory,
-            expected_standalone_version.as_deref(),
-        )?;
+        let (executable_snapshot, version) = match approved {
+            Some(approved) => {
+                let snapshot = snapshot_executable(&executable)?;
+                let approved_path = canonical_existing_path(&executable)?;
+                let version = crate::setup::approved_registration_version(
+                    approved,
+                    HarnessId::Codex,
+                    &wire_path(&approved_path),
+                    snapshot.digest,
+                )?;
+                if expected_standalone_version
+                    .as_ref()
+                    .is_some_and(|expected| *expected != version)
+                {
+                    return Err(invalid("Codex standalone version binding changed"));
+                }
+                (snapshot, version)
+            }
+            None => discover_executable_version(
+                &executable,
+                &working_directory,
+                expected_standalone_version.as_deref(),
+            )?,
+        };
         Self::from_discovered_layout_after_version(
             CodexLayout {
                 installation_method,
@@ -577,7 +632,7 @@ impl CodexAdapter {
         }
     }
 
-    fn recheck_executable_client(&self) -> Result<(), ClientError> {
+    pub(crate) fn recheck_executable_client(&self) -> Result<(), ClientError> {
         open_verified_codex_executable(&self.layout.executable, self.executable_hash)
             .map_err(|_| client_error(ErrorCode::Conflict, "Codex executable changed", false))?;
         Ok(())

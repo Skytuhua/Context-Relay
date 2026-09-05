@@ -200,11 +200,66 @@ impl HermesAdapter {
         origin_device: DeviceId,
         observed_hlc: HybridLogicalClock,
     ) -> Result<Self, ClientError> {
+        Self::discover_inner(
+            project_root.into(),
+            working_directory.into(),
+            requested_profile,
+            project_id,
+            origin_device,
+            observed_hlc,
+            None,
+        )
+    }
+
+    /// Rechecks the selected profile and executable without launching Hermes.
+    pub fn discover_for_registration(
+        project_root: impl Into<PathBuf>,
+        working_directory: impl Into<PathBuf>,
+        requested_profile: &str,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        approved: &context_relay_protocol::SetupPlan,
+    ) -> Result<Self, ClientError> {
+        Self::discover_inner(
+            project_root.into(),
+            working_directory.into(),
+            requested_profile,
+            project_id,
+            origin_device,
+            observed_hlc,
+            Some(approved),
+        )
+    }
+
+    fn discover_inner(
+        project_root: PathBuf,
+        working_directory: PathBuf,
+        requested_profile: &str,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        approved: Option<&context_relay_protocol::SetupPlan>,
+    ) -> Result<Self, ClientError> {
         let default_hermes_home = default_hermes_home()?;
         let profile = profile::select_profile(&default_hermes_home, requested_profile)?;
         let executable =
             find_executable().ok_or_else(|| not_found("Hermes executable was not found"))?;
-        let (snapshot, version) = discover_executable_version(&executable)?;
+        let (snapshot, version) = match approved {
+            Some(approved) => {
+                let snapshot = snapshot_executable(&executable)?;
+                let approved_path = fs::canonicalize(&executable)
+                    .map_err(|_| invalid("Hermes executable cannot be safely resolved"))?;
+                let version = crate::setup::approved_registration_version(
+                    approved,
+                    HarnessId::Hermes,
+                    &wire_path(&approved_path),
+                    snapshot.digest,
+                )?;
+                (snapshot, version)
+            }
+            None => discover_executable_version(&executable)?,
+        };
         let installation_method = installation_method(&executable);
         Self::from_attested_layout(
             HermesLayout {
@@ -214,8 +269,8 @@ impl HermesAdapter {
                 installation_method,
                 default_hermes_home,
                 profile,
-                project_root: project_root.into(),
-                working_directory: working_directory.into(),
+                project_root,
+                working_directory,
             },
             project_id,
             origin_device,
@@ -383,7 +438,7 @@ impl HermesAdapter {
             .is_some_and(|parsed| yaml::topology_supported(&parsed))
     }
 
-    fn revalidate_bound_installation(&self) -> Result<(), ClientError> {
+    pub(crate) fn revalidate_bound_installation(&self) -> Result<(), ClientError> {
         profile::validate_profile_binding(&self.layout.default_hermes_home, &self.layout.profile)?;
         let selected =
             profile::select_profile(&self.layout.default_hermes_home, &self.layout.profile.name)?;

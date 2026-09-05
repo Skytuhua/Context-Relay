@@ -373,6 +373,17 @@ Full setup binds settings dependencies and revalidates them during apply and
 undo; missing memory folders retain stable Windows source IDs when created.
 Local checks pass 100 core, 58 Claude adapter and 11 primary-memory setup tests,
 including the recovery/undo-to-absence case. The [Claude evidence](claude-native-mcp-2026-09-06.md)
-records the boundaries: ImportOnly registration revalidation, runtime
-flags/environment/trust, other managed sources and full installed acceptance
-remain open. The 11d6740 installer also predates this source-only correction.
+records the boundaries: runtime flags/environment/trust, other managed sources
+and full installed acceptance remain open. ImportOnly registration revalidation
+is covered by the follow-up below. The 11d6740 installer also predates this
+source-only correction.
+
+Read-only registration now checks the approved harness installation, memory
+settings and source list before committing. Startup ends interrupted attempts
+without registering stale sources. A production-path canary verifies that all
+three harnesses remain unlaunched during verification, including changed PATH
+and executable cases. Windows ordinary/canonical path mismatches are covered.
+All 322 selected core tests and 59 daemon tests pass; the
+[registration evidence](read-only-memory-registration-2026-09-06.md) describes
+scope and recovery/Undo coverage. This source change neither enables Full
+connection nor updates the 11d6740 installer. Installed acceptance remains open.

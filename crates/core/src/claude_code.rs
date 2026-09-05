@@ -151,7 +151,40 @@ impl ClaudeCodeAdapter {
         origin_device: DeviceId,
         observed_hlc: HybridLogicalClock,
     ) -> Result<Self, ClientError> {
-        let project_root = project_root.into();
+        Self::discover_inner(
+            project_root.into(),
+            project_id,
+            origin_device,
+            observed_hlc,
+            None,
+        )
+    }
+
+    /// Rechecks discovery without launching the harness. The saved version is
+    /// valid only for the exact executable path and bytes approved in preview.
+    pub fn discover_for_registration(
+        project_root: impl Into<PathBuf>,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        approved: &context_relay_protocol::SetupPlan,
+    ) -> Result<Self, ClientError> {
+        Self::discover_inner(
+            project_root.into(),
+            project_id,
+            origin_device,
+            observed_hlc,
+            Some(approved),
+        )
+    }
+
+    fn discover_inner(
+        project_root: PathBuf,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        approved: Option<&context_relay_protocol::SetupPlan>,
+    ) -> Result<Self, ClientError> {
         let executable = find_executable().ok_or_else(|| {
             client_error(
                 ErrorCode::NotFound,
@@ -184,10 +217,18 @@ impl ClaudeCodeAdapter {
         let command_context =
             ClaudeCommandContext::new(&config_dir, &state_path, &project_root, &home)?;
         let executable_hash = digest_file(&executable)?;
-        let version = discover_version_with(|arguments| {
-            run_bounded_command(&executable, arguments, executable_hash, &command_context)
-        })?;
-        Self::from_layout(
+        let version = match approved {
+            Some(approved) => crate::setup::approved_registration_version(
+                approved,
+                HarnessId::ClaudeCode,
+                &wire_path(&executable),
+                executable_hash,
+            )?,
+            None => discover_version_with(|arguments| {
+                run_bounded_command(&executable, arguments, executable_hash, &command_context)
+            })?,
+        };
+        let adapter = Self::from_layout(
             ClaudeCodeLayout {
                 installation_method: installation_method(&executable),
                 user_home: home,
@@ -201,7 +242,17 @@ impl ClaudeCodeAdapter {
             project_id,
             origin_device,
             observed_hlc,
-        )
+        )?;
+        if let Some(approved) = approved {
+            crate::setup::approved_registration_version(
+                approved,
+                HarnessId::ClaudeCode,
+                &wire_path(&adapter.layout.executable),
+                adapter.executable_hash,
+            )?;
+            adapter.revalidate_memory_binding()?;
+        }
+        Ok(adapter)
     }
 
     pub fn from_layout(
@@ -466,6 +517,11 @@ impl ClaudeCodeAdapter {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn revalidate_memory_binding(&self) -> Result<(), ClientError> {
+        self.command_context()?.validate()?;
+        self.recheck_executable_client()
     }
 
     fn recheck_executable_boundary(&self) -> Result<(), BoundaryError> {
