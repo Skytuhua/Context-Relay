@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import App from './App';
@@ -54,7 +54,55 @@ describe('App', () => {
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it('keeps a failed startup visible across navigation and retries without restarting the app', async () => {
+    let unavailable = true;
+    const reconnectingGateway = {
+      ...gateway,
+      status: async () => {
+        if (unavailable) throw new Error('private startup details');
+        return gateway.status();
+      },
+    };
+    render(<App gateway={reconnectingGateway} />);
+    expect(await screen.findByRole('alert')).not.toHaveTextContent('private startup details');
+    fireEvent.click(screen.getByRole('button', { name: 'Projects' }));
+    fireEvent.change(screen.getByLabelText('Project name'), { target: { value: 'Unsaved project' } });
+    expect(screen.getByRole('alert')).toBeVisible();
+    unavailable = false;
+    fireEvent.click(screen.getByRole('button', { name: 'Retry connection' }));
+    await act(async () => {});
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Project name')).toHaveValue('Unsaved project');
+    fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+    expect(screen.getByText('Offline')).toBeVisible();
+    expect(screen.getByText('Vault: unlocked')).toBeVisible();
+  });
+
+  it('bounds a stalled startup and ignores its late response after a successful retry', async () => {
+    vi.useFakeTimers();
+    let finishOldStatus!: (status: Awaited<ReturnType<WorkspaceGateway['status']>>) => void;
+    let stalled = true;
+    const reconnectingGateway = {
+      ...gateway,
+      status: () => stalled
+        ? new Promise<Awaited<ReturnType<WorkspaceGateway['status']>>>((resolve) => { finishOldStatus = resolve; })
+        : gateway.status(),
+    };
+    render(<App gateway={reconnectingGateway} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(45_000); });
+    expect(screen.queryByText('Connecting')).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toBeVisible();
+    stalled = false;
+    fireEvent.click(screen.getByRole('button', { name: 'Retry connection' }));
+    await act(async () => {});
+    expect(screen.getByText('Vault: unlocked')).toBeVisible();
+    await act(async () => { finishOldStatus({ ...await gateway.status(), vault: 'locked' }); });
+    expect(screen.getByText('Vault: unlocked')).toBeVisible();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('uses the current protocol range in its status fixture', async () => {

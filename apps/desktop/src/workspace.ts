@@ -448,6 +448,9 @@ function uuidV7(): UuidV7 {
 
 function nativePath(path: string) {
   const macos = navigator.userAgent.includes('Mac');
+  // Explorer's Copy as path wraps Windows paths in quotes. These cannot be
+  // filename characters on Windows, but they are valid on macOS.
+  if (!macos && path.startsWith('"') && path.endsWith('"')) path = path.slice(1, -1);
   const bytes = macos
     ? new TextEncoder().encode(path)
     : new Uint8Array(path.length * 2);

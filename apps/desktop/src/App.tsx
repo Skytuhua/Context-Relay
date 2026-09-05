@@ -38,10 +38,13 @@ const SCREENS: ReadonlyArray<{ id: ScreenId; label: string; summary: string }> =
 ];
 
 const DEFAULT_GATEWAY = new LocalWorkspaceGateway();
+const STARTUP_TIMEOUT_MS = 45_000;
 
 export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: WorkspaceGateway }) {
   const [activeScreen, setActiveScreen] = useState<ScreenId>('home');
   const [status, setStatus] = useState<StatusOutput | null>(null);
+  const [connectionState, setConnectionState] = useState<'connecting' | 'ready' | 'failed'>('connecting');
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
   const [projects, setProjects] = useState<ProjectIdentity[]>([]);
   const [activeProject, setActiveProject] = useState<ProjectIdentity | null>(null);
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
@@ -62,14 +65,33 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const currentScreen = SCREENS.find((screen) => screen.id === activeScreen);
 
   useEffect(() => {
+    let active = true;
+    setConnectionState('connecting');
+    // Bound the initial reads even if the native bridge never settles. Retrying
+    // these reads must not replay any workspace mutation or accept stale results.
+    const timeout = window.setTimeout(() => {
+      active = false;
+      setConnectionState('failed');
+    }, STARTUP_TIMEOUT_MS);
     void Promise.all([gateway.status(), gateway.projects()])
       .then(([nextStatus, nextProjects]) => {
+        if (!active) return;
+        window.clearTimeout(timeout);
         setStatus(nextStatus);
         setProjects(nextProjects);
-        setActiveProject(nextProjects[0] ?? null);
+        setActiveProject((current) => nextProjects.find((project) => project.projectId === current?.projectId) ?? nextProjects[0] ?? null);
+        setConnectionState('ready');
       })
-      .catch(() => setError('The local service is unavailable.'));
-  }, [gateway]);
+      .catch(() => {
+        if (!active) return;
+        window.clearTimeout(timeout);
+        setConnectionState('failed');
+      });
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+    };
+  }, [gateway, connectionAttempt]);
 
   useEffect(() => {
     if (hasNavigatedRef.current) headingRef.current?.focus();
@@ -255,10 +277,10 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           <section className="screen-content" aria-labelledby="home-status-title">
             <h2 id="home-status-title">Local workspace posture</h2>
             <p role="status">
-              {status?.sync === 'offline' ? 'Offline' : status ? status.sync : 'Connecting'}
+              {connectionState === 'failed' ? 'Connection unavailable' : connectionState === 'connecting' ? 'Connecting' : status?.sync === 'offline' ? 'Offline' : status?.sync}
             </p>
             <ul aria-label="Local capability status">
-              <li>Vault: {status?.vault ?? 'checking'}</li>
+              <li>Vault: {connectionState === 'failed' ? 'unavailable' : status?.vault ?? 'checking'}</li>
               <li>Projects, memory, review, and tasks use the authenticated local daemon.</li>
               <li>Hosted synchronization is not configured.</li>
             </ul>
@@ -465,6 +487,12 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
             <p>{currentScreen.summary}</p>
             {activeProject && <p className="context-label">Active project: {activeProject.name}</p>}
           </header>
+          {connectionState === 'failed' && (
+            <div className="form-error" role="alert">
+              <p>Could not connect to the local workspace. Retry the connection to continue.</p>
+              <button onClick={() => setConnectionAttempt((attempt) => attempt + 1)} type="button">Retry connection</button>
+            </div>
+          )}
           {error && <p className="form-error" id="workspace-error" role="alert">{error}</p>}
           {notice && <p className="notice" role="status">{notice}</p>}
           {renderScreen(activeScreen)}
