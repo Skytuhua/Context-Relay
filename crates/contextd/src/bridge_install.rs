@@ -427,7 +427,7 @@ impl ProductionBridgePlanExecutor<'_> {
     }
 }
 
-fn sealed_project_binding(
+pub(crate) fn sealed_project_binding(
     plan: &context_relay_core::native_transaction::NativeTransactionPlan,
 ) -> Result<(PathBuf, ProjectId), ClientError> {
     let mut projects = plan.setup.target_scopes.iter().filter_map(|scope| {
@@ -717,6 +717,50 @@ pub(crate) mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+
+    #[test]
+    fn cli_recovery_uses_the_sealed_project_instead_of_the_vault_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let vault_root = root.join("vault");
+        let project_root = root.join("project with spaces");
+        fs::create_dir(&vault_root).unwrap();
+        fs::create_dir(&project_root).unwrap();
+        let project_id = ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073981").unwrap();
+        let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073990").unwrap();
+        let recovery = crate::ProductionBridgeCliRecoveryIo {
+            root: vault_root.clone(),
+            project_id: global_project_id().unwrap(),
+            device_id,
+            observed_hlc: HybridLogicalClock::new(1, 0, device_id),
+        };
+        let mut plan = base_plan();
+        plan.setup.target_scopes.push(NativeScope::Project {
+            project_id,
+            root: crate::unit_test_support::wire_native_path(&project_root),
+        });
+        let mut bound = context_relay_core::native_transaction::recovery::BoundCliRecoveryPlan {
+            plan,
+            mutations: vec![],
+        };
+        assert_eq!(
+            recovery.project_binding(&bound).unwrap(),
+            (project_root.clone(), project_id)
+        );
+        bound.plan.setup.target_scopes.push(NativeScope::Project {
+            project_id: global_project_id().unwrap(),
+            root: crate::unit_test_support::wire_native_path(&vault_root),
+        });
+        assert!(
+            recovery.project_binding(&bound).is_err(),
+            "ambiguous project scopes cannot select a recovery root"
+        );
+        bound.plan.setup.target_scopes = vec![NativeScope::Global];
+        assert_eq!(
+            recovery.project_binding(&bound).unwrap(),
+            (vault_root, global_project_id().unwrap())
+        );
+    }
 
     #[test]
     fn terminal_apply_and_rollback_replay_before_any_production_composition() {

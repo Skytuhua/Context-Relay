@@ -22,19 +22,28 @@ use context_relay_core::{
     native_transaction::{
         ApprovedCliMutation, ApprovedInput, ApprovedMutation, CanonicalCliDeclaration,
         MutationKind, NativeTransactionPlan, RestorableStateFingerprint, SidecarBinding,
+        TransactionStep,
         cli::{CliMutationOutcome, CliRestoreOutcome, NativeCliExecutor},
         engine::{
-            BoundaryError, FrozenOutput, NativeAdapter, NoFault, RestrictedExecutor, RestrictedRun,
+            BoundaryError, FaultHook, FrozenOutput, NativeAdapter, NoFault, RestrictedExecutor,
+            RestrictedRun,
         },
         filesystem::OsNativeTransactionFileSystem,
         open_plan,
+        recovery::{
+            CliRecoveryRestore, NativeCliRecoveryIo, OsNativeRecoveryIo, bind_cli_recovery_plan,
+            recover_native_transactions_with_cli,
+        },
     },
     setup::{
         BridgeExecutionError, BridgeInstallService, BridgeLocator, BridgeMutationPlan,
         BridgePlanExecutor, BridgePreviewHarness, HermesMemoryExportService,
         NativeEngineBridgePlanExecutor, PrimaryMemoryMutationPlan, RegisteredProject,
     },
-    vault::{BeforeImagePolicy, NativeSandboxIdentity, SetupPlanAction, SetupPlanLifecycle, Vault},
+    vault::{
+        BeforeImagePolicy, NativeCliWalRecord, NativeSandboxIdentity, SetupPlanAction,
+        SetupPlanLifecycle, Vault,
+    },
 };
 use context_relay_native_runner::{NativeState, OsNativeFileSystem, RuntimeTarget};
 use context_relay_protocol::{
@@ -834,6 +843,20 @@ impl BridgePlanExecutor for MatrixExecutor<'_> {
         created_ms: u64,
         now_ms: u64,
     ) -> Result<(), BridgeExecutionError> {
+        self.execute_with_hook(vault, plan, sealed_plan, created_ms, now_ms, &mut NoFault)
+    }
+}
+
+impl MatrixExecutor<'_> {
+    fn execute_with_hook(
+        &mut self,
+        vault: &mut Vault,
+        plan: &NativeTransactionPlan,
+        sealed_plan: &[u8],
+        created_ms: u64,
+        now_ms: u64,
+        hook: &mut impl FaultHook,
+    ) -> Result<(), BridgeExecutionError> {
         let mut restricted = MatrixRestricted {
             inputs: plan.staged_inputs.clone(),
             sidecars: plan.sidecars.clone(),
@@ -843,7 +866,6 @@ impl BridgePlanExecutor for MatrixExecutor<'_> {
             },
         };
         let mut filesystem = OsNativeTransactionFileSystem::new(*plan.setup.plan_id.as_bytes());
-        let mut hook = NoFault;
         let mut cli = MatrixCli {
             live: self.live.clone(),
         };
@@ -851,7 +873,7 @@ impl BridgePlanExecutor for MatrixExecutor<'_> {
             &mut *self.harness,
             &mut restricted,
             &mut filesystem,
-            &mut hook,
+            hook,
             &mut cli,
             &self.lock_root,
             NativeSandboxIdentity::Windows {
@@ -862,6 +884,84 @@ impl BridgePlanExecutor for MatrixExecutor<'_> {
             HybridLogicalClock::new(now_ms, 0, DeviceId::from_str(ID_1).unwrap()),
         )
         .execute(vault, plan, sealed_plan, created_ms, now_ms)
+    }
+}
+
+struct CrashBeforeNativeCleanup<'a>(MatrixExecutor<'a>);
+
+struct CommitCrash;
+
+impl FaultHook for CommitCrash {
+    fn after_step(&mut self, step: TransactionStep) -> Result<(), BoundaryError> {
+        if step == TransactionStep::CommitOwnershipAndReceipt {
+            panic!("simulated exit with committed native and CLI WAL still present");
+        }
+        Ok(())
+    }
+}
+
+impl BridgePlanExecutor for CrashBeforeNativeCleanup<'_> {
+    fn execute(
+        &mut self,
+        vault: &mut Vault,
+        plan: &NativeTransactionPlan,
+        sealed_plan: &[u8],
+        created_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        self.0.execute_with_hook(
+            vault,
+            plan,
+            sealed_plan,
+            created_ms,
+            now_ms,
+            &mut CommitCrash,
+        )
+    }
+}
+
+struct BoundMatrixCliRecovery<'a> {
+    harness: &'a mut FrozenHarness,
+    cli: MatrixCli,
+}
+
+impl NativeCliRecoveryIo for BoundMatrixCliRecovery<'_> {
+    fn probe_cli_declaration(
+        &mut self,
+        sealed: &[u8],
+        row: &NativeCliWalRecord,
+    ) -> Result<Option<Sha256Digest>, BoundaryError> {
+        let bound = bind_cli_recovery_plan(sealed, std::slice::from_ref(row))?;
+        NativeAdapter::reprobe_live_state(self.harness, &bound.plan)?;
+        self.cli.probe_cli_mutation(&bound.mutations[0])
+    }
+
+    fn restore_cli_mutation_if_matches(
+        &mut self,
+        sealed: &[u8],
+        row: &NativeCliWalRecord,
+    ) -> Result<CliRecoveryRestore, BoundaryError> {
+        let bound = bind_cli_recovery_plan(sealed, std::slice::from_ref(row))?;
+        NativeAdapter::reprobe_live_state(self.harness, &bound.plan)?;
+        self.cli
+            .restore_cli_mutation_if_matches(&bound.mutations[0])
+            .map(|outcome| {
+                if outcome.restored {
+                    CliRecoveryRestore::Restored
+                } else {
+                    CliRecoveryRestore::Conflict
+                }
+            })
+    }
+
+    fn finish_committed_cli_mutations(
+        &mut self,
+        sealed: &[u8],
+        rows: &[NativeCliWalRecord],
+    ) -> Result<(), BoundaryError> {
+        let bound = bind_cli_recovery_plan(sealed, rows)?;
+        NativeAdapter::reprobe_live_state(self.harness, &bound.plan)?;
+        self.cli.finish_committed_cli_mutations(&bound.mutations)
     }
 }
 
@@ -1457,7 +1557,7 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
 
         let live = fixture.harness.cli_state();
         let crashed = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let mut executor = CrashAfterCommit(MatrixExecutor {
+            let mut executor = CrashBeforeNativeCleanup(MatrixExecutor {
                 harness: &mut fixture.harness,
                 live: live.clone(),
                 lock_root: fixture.lock_root.clone(),
@@ -1473,6 +1573,19 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
             vault.setup_plan(&setup.plan_id).unwrap().unwrap().lifecycle,
             SetupPlanLifecycle::Applying
         );
+        if !opened.plan.cli_mutations.is_empty() {
+            let wal = vault
+                .native_cli_wal(&format!("bridge-setup-{}", setup.plan_id))
+                .unwrap();
+            assert!(!wal.is_empty());
+            let bound = context_relay_core::native_transaction::recovery::bind_cli_recovery_plan(
+                &stored.payload,
+                &wal,
+            )
+            .unwrap();
+            assert_eq!(bound.plan, opened.plan);
+            assert_eq!(bound.mutations, opened.plan.cli_mutations);
+        }
         for (path, bytes) in &intended {
             assert_eq!(fs::read(path).unwrap(), *bytes, "{}", path.display());
         }
@@ -1487,6 +1600,19 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
         }
         assert_raw_unchanged(&fixture);
 
+        let mut recovery_io = OsNativeRecoveryIo::new(|_, _| Ok(()));
+        let mut cli_recovery = BoundMatrixCliRecovery {
+            harness: &mut fixture.harness,
+            cli: MatrixCli { live: live.clone() },
+        };
+        recover_native_transactions_with_cli(&mut vault, &mut recovery_io, &mut cli_recovery)
+            .unwrap();
+        assert!(
+            vault
+                .native_cli_wal(&format!("bridge-setup-{}", setup.plan_id))
+                .unwrap()
+                .is_empty()
+        );
         BridgeInstallService::persisted(&mut vault)
             .reconcile_after_native_recovery()
             .unwrap();

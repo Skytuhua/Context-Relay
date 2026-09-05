@@ -1901,6 +1901,48 @@ fn native_staged_output_validation_rejects_either_changed_hash() {
 }
 
 #[test]
+fn native_memory_reprobe_rejects_a_different_codex_home_even_when_memory_is_disabled() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    let mut plan = codex_native_plan(&fixture, vec![]);
+    let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+        panic!("supported disable")
+    };
+    plan.mutations = mutations;
+    plan.approval_version = 2;
+    plan.native_memory_registrations = capabilities
+        .sources
+        .into_iter()
+        .map(|source| NativeMemoryRegistration {
+            source,
+            last_applied_digest: None,
+        })
+        .collect();
+    plan.setup.batch_hash =
+        context_relay_core::native_transaction::approval_hash_v2(&plan).unwrap();
+    let mut layout = fixture.layout.clone();
+    layout.codex_home = fixture.root.join("different-codex-home");
+    fs::create_dir(&layout.codex_home).unwrap();
+    let config = fs::read_to_string(fixture.codex_home.join("config.toml"))
+        .unwrap()
+        .replace("generate_memories = true", "generate_memories = false")
+        .replace("use_memories = true", "use_memories = false");
+    fs::write(layout.codex_home.join("config.toml"), config).unwrap();
+    let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
+    let mut changed = CodexAdapter::from_layout(
+        layout,
+        fixture.project_id,
+        device_id,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+    )
+    .unwrap();
+    assert!(
+        NativeAdapter::reprobe_live_state(&mut changed, &plan).is_err(),
+        "recovery must remain bound to the approved native memory home"
+    );
+}
+
+#[test]
 fn native_memory_final_validation_rejects_reverted_forward_values_but_accepts_rollback() {
     let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
     let capabilities = fixture.adapter.native_memory_capabilities().unwrap();

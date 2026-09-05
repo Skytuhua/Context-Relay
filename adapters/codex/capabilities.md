@@ -114,6 +114,19 @@ substring.
 
 ## Remaining qualification
 
+Full memory setup includes explicit memory overrides in active trusted project
+layers, and rechecks them before writes and at final validation. It preserves
+inherited project settings, comments and exact rollback images. Recovery of a
+project-bound plan reconstructs its sealed project scope; native memory source
+descriptors must still match the resolved Codex home.
+
+Mixed native/CLI plans can bind their exact sealed CLI WAL for recovery, but
+this does not authorize rebasing file fingerprints or adopting replacement
+objects. Real Codex MCP commands rewrite the same global configuration file
+as native memory setup. Full shared-file apply/rollback remains unqualified;
+the [staged MCP design](../../docs/superpowers/specs/2026-09-05-codex-staged-mcp-design.md)
+describes the required follow-up implementation and sandbox evidence.
+
 The frozen/synthetic adapter and macOS native boundary are covered in CI. A
 release still requires the master plan's credentialed real-install matrix on
 clean macOS arm64 and Windows x64 machines, including Windows execution of the

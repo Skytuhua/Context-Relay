@@ -2368,6 +2368,14 @@ impl CodexAdapter {
         let capabilities = self
             .native_memory_capabilities()
             .map_err(|_| BoundaryError::new("Codex memory settings cannot be inspected"))?;
+        if plan.native_memory_registrations.len() != capabilities.sources.len()
+            || plan
+                .native_memory_registrations
+                .iter()
+                .any(|registration| !capabilities.sources.contains(&registration.source))
+        {
+            return Err(BoundaryError::new("Codex native memory location changed"));
+        }
         let NativeMemoryDisable::Supported(required) = capabilities.disable else {
             return Err(BoundaryError::new("Codex memory settings changed"));
         };

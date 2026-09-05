@@ -368,6 +368,23 @@ struct ProductionBridgeCliRecoveryIo {
 }
 
 impl ProductionBridgeCliRecoveryIo {
+    fn project_binding(
+        &self,
+        bound: &BoundCliRecoveryPlan,
+    ) -> Result<(PathBuf, context_relay_protocol::ProjectId), BoundaryError> {
+        if bound
+            .plan
+            .setup
+            .target_scopes
+            .iter()
+            .any(|scope| matches!(scope, context_relay_protocol::NativeScope::Project { .. }))
+        {
+            return bridge_install::sealed_project_binding(&bound.plan)
+                .map_err(|error| BoundaryError::new(error.message));
+        }
+        Ok((self.root.clone(), self.project_id))
+    }
+
     fn with_executor<R>(
         &self,
         bound: &BoundCliRecoveryPlan,
@@ -376,11 +393,12 @@ impl ProductionBridgeCliRecoveryIo {
             &[context_relay_core::native_transaction::ApprovedCliMutation],
         ) -> Result<R, BoundaryError>,
     ) -> Result<R, BoundaryError> {
+        let (root, project_id) = self.project_binding(bound)?;
         match bound.plan.setup.harness {
             HarnessId::ClaudeCode => {
                 let mut adapter = context_relay_core::claude_code::ClaudeCodeAdapter::discover(
-                    &self.root,
-                    self.project_id,
+                    &root,
+                    project_id,
                     self.device_id,
                     self.observed_hlc,
                 )
@@ -391,9 +409,9 @@ impl ProductionBridgeCliRecoveryIo {
             }
             HarnessId::Codex => {
                 let mut adapter = context_relay_core::codex::CodexAdapter::discover(
-                    &self.root,
-                    &self.root,
-                    self.project_id,
+                    &root,
+                    &root,
+                    project_id,
                     self.device_id,
                     self.observed_hlc,
                 )

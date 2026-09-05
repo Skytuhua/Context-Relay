@@ -8,8 +8,9 @@ use context_relay_core::{
         NativeMemorySource,
     },
     native_transaction::{
-        ApprovedCliMutation, CanonicalCliDeclaration, NativeTransactionPlan, SidecarBinding,
-        approval_hash_v2, recovery::bind_cli_recovery_plan, seal_plan,
+        ApprovedCliMutation, ApprovedMutation, CanonicalCliDeclaration, MutationKind,
+        NativeTransactionPlan, RestorableStateFingerprint, SidecarBinding, approval_hash_v2,
+        recovery::bind_cli_recovery_plan, seal_plan, seal_reversible_plan,
     },
     setup::{BridgeExecutionError, BridgeInstallService, BridgePlanExecutor},
     vault::{
@@ -18,7 +19,8 @@ use context_relay_core::{
     },
 };
 use context_relay_native_runner::{
-    RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand, SidecarId,
+    NativeState, RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand,
+    SidecarId,
 };
 use context_relay_protocol::{
     ApprovalClass, CliOperation, ErrorCode, HarnessId, NativePlatform, NativeScope, NetworkDelta,
@@ -250,52 +252,75 @@ fn cli_wal(plan: &NativeTransactionPlan) -> NativeCliWalRecord {
 
 #[test]
 fn cli_recovery_binding_accepts_only_exact_sealed_plan_wal_bytes() {
-    let path = TempVault::new("bridge-cli-recovery-binding");
-    let keys = MemoryKeyStore::default();
-    let mut vault = Vault::open(path.path(), "bridge-setup-apply-v1", &keys).unwrap();
-    let (plan, sealed) = persist(&mut vault, plan());
-    let exact = cli_wal(&plan);
+    for mixed in [false, true] {
+        let mut source_plan = plan();
+        let prior = NativeState::absent(0, 2);
+        if mixed {
+            let intended = NativeState::absent(0, 1);
+            source_plan.mutations.push(ApprovedMutation {
+                target: native_text("/fixture/AGENTS.md"),
+                kind: MutationKind::Payload,
+                content: intended.encode_v1().unwrap(),
+                expected: RestorableStateFingerprint(Sha256Digest(prior.fingerprint())),
+                intended: RestorableStateFingerprint(Sha256Digest(intended.fingerprint())),
+            });
+        }
+        source_plan.setup.batch_hash = approval_hash_v2(&source_plan).unwrap();
+        let sealed = if mixed {
+            seal_reversible_plan(
+                &source_plan,
+                source_plan.setup.batch_hash,
+                &[prior.encode_v1().unwrap()],
+                None,
+            )
+            .unwrap()
+        } else {
+            seal_plan(&source_plan, source_plan.setup.batch_hash).unwrap()
+        };
+        let plan = source_plan;
+        let exact = cli_wal(&plan);
 
-    let bound = bind_cli_recovery_plan(&sealed, std::slice::from_ref(&exact)).unwrap();
-    assert_eq!(bound.plan, plan);
-    assert_eq!(bound.mutations, plan.cli_mutations);
+        let bound = bind_cli_recovery_plan(&sealed, std::slice::from_ref(&exact)).unwrap();
+        assert_eq!(bound.plan, plan);
+        assert_eq!(bound.mutations, plan.cli_mutations);
 
-    let mut tampered = Vec::new();
-    let mut sequence = exact.clone();
-    sequence.sequence = 1;
-    tampered.push(sequence);
-    let mut stable_id = exact.clone();
-    stable_id.stable_id.push('x');
-    tampered.push(stable_id);
-    let mut harness = exact.clone();
-    harness.harness = HarnessId::ClaudeCode;
-    tampered.push(harness);
-    let mut server = exact.clone();
-    server.server_name.push('x');
-    tampered.push(server);
-    let mut declaration = exact.clone();
-    declaration
-        .intended_declaration
-        .as_mut()
-        .unwrap()
-        .push(b' ');
-    tampered.push(declaration);
-    let mut fingerprint = exact.clone();
-    fingerprint.intended_fingerprint = Some(Sha256Digest([99; 32]));
-    tampered.push(fingerprint);
-    let mut forward = exact.clone();
-    forward.forward_operations.push(b' ');
-    tampered.push(forward);
-    let mut rollback = exact.clone();
-    rollback.rollback_operations.push(b' ');
-    tampered.push(rollback);
-    for row in tampered {
-        assert!(bind_cli_recovery_plan(&sealed, &[row]).is_err());
+        let mut tampered = Vec::new();
+        let mut sequence = exact.clone();
+        sequence.sequence = 1;
+        tampered.push(sequence);
+        let mut stable_id = exact.clone();
+        stable_id.stable_id.push('x');
+        tampered.push(stable_id);
+        let mut harness = exact.clone();
+        harness.harness = HarnessId::ClaudeCode;
+        tampered.push(harness);
+        let mut server = exact.clone();
+        server.server_name.push('x');
+        tampered.push(server);
+        let mut declaration = exact.clone();
+        declaration
+            .intended_declaration
+            .as_mut()
+            .unwrap()
+            .push(b' ');
+        tampered.push(declaration);
+        let mut fingerprint = exact.clone();
+        fingerprint.intended_fingerprint = Some(Sha256Digest([99; 32]));
+        tampered.push(fingerprint);
+        let mut forward = exact.clone();
+        forward.forward_operations.push(b' ');
+        tampered.push(forward);
+        let mut rollback = exact.clone();
+        rollback.rollback_operations.push(b' ');
+        tampered.push(rollback);
+        for row in tampered {
+            assert!(bind_cli_recovery_plan(&sealed, &[row]).is_err());
+        }
+
+        let mut approval_mismatch = sealed.clone();
+        *approval_mismatch.last_mut().unwrap() ^= 1;
+        assert!(bind_cli_recovery_plan(&approval_mismatch, &[exact]).is_err());
     }
-
-    let mut approval_mismatch = sealed.clone();
-    *approval_mismatch.last_mut().unwrap() ^= 1;
-    assert!(bind_cli_recovery_plan(&approval_mismatch, &[exact]).is_err());
 }
 
 #[test]
