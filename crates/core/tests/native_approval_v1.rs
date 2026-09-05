@@ -3,7 +3,7 @@ use std::str::FromStr;
 use context_relay_core::native_transaction::{
     approval::{APPROVAL_DOMAIN_V1, approval_hash_v1},
     model::{
-        ApprovedInput, ApprovedMutation, MutationKind, NativeTransactionPlan,
+        ApprovedCliMutation, ApprovedInput, ApprovedMutation, MutationKind, NativeTransactionPlan,
         RestorableStateFingerprint, SidecarBinding,
     },
 };
@@ -50,6 +50,7 @@ fn setup_plan() -> SetupPlan {
     SetupPlan {
         plan_id: PlanId::from_str(PLAN_ID).unwrap(),
         harness: HarnessId::Codex,
+        harness_profile: None,
         adapter_version: 7,
         executable_path: native_value(br"C:\Program Files\Codex\codex.exe"),
         executable_hash: Sha256Digest([1; 32]),
@@ -86,6 +87,7 @@ fn plan() -> NativeTransactionPlan {
     let activation = approved_state(NativeState::absent(0x10, 2));
     NativeTransactionPlan {
         setup: setup_plan(),
+        approval_version: 1,
         helper_policy_version: 1,
         manifest_schema_version: 1,
         manifest_digest: Sha256Digest([54; 32]),
@@ -134,6 +136,8 @@ fn plan() -> NativeTransactionPlan {
                 intended: activation.1,
             },
         ],
+        cli_mutations: vec![],
+        native_memory_registrations: vec![],
         ownership_changes: vec![],
     }
 }
@@ -249,9 +253,26 @@ fn freezes_the_domain_separator_and_golden_hash() {
     assert_eq!(
         approval_hash_v1(&plan()).unwrap(),
         Sha256Digest([
-            255, 230, 229, 47, 129, 201, 245, 241, 53, 168, 68, 198, 251, 90, 131, 110, 85, 210,
-            157, 232, 235, 166, 234, 51, 161, 212, 189, 137, 72, 188, 15, 227,
+            78, 90, 221, 53, 204, 146, 247, 106, 164, 206, 72, 119, 245, 242, 148, 123, 62, 160,
+            49, 158, 58, 72, 97, 37, 70, 73, 135, 213, 129, 62, 163, 42,
         ])
+    );
+}
+
+#[test]
+fn approval_v1_rejects_nonempty_cli_mutations_as_unbound() {
+    let mut candidate = plan();
+    candidate.cli_mutations.push(ApprovedCliMutation {
+        stable_id: "unbound".to_owned(),
+        expected: None,
+        intended: None,
+        forward: vec![],
+        rollback: vec![],
+    });
+
+    assert_eq!(
+        approval_hash_v1(&candidate).unwrap_err().to_string(),
+        "invalid native plan: approval v1 cannot bind cli mutations"
     );
 }
 
@@ -475,6 +496,31 @@ fn windows_mutation_targets_reject_the_transaction_staging_namespace() {
 }
 
 #[test]
+fn windows_mutation_targets_normalize_reserved_pre_extension_basenames() {
+    for name in [
+        "NUL .exe",
+        "COM1 .cmd",
+        "com\u{00b9} .txt",
+        "LPT\u{00b2} .bin",
+    ] {
+        let mut candidate = plan();
+        candidate.mutations[0].target = native_text(&format!(r"C:\x\{name}"));
+        assert!(approval_hash_v1(&candidate).is_err(), "{name}");
+    }
+
+    for name in [
+        "NUL safe.exe",
+        "COM1-safe.cmd",
+        "COM\u{00b9}-safe.txt",
+        "LPT\u{00b2}x.bin",
+    ] {
+        let mut candidate = plan();
+        candidate.mutations[0].target = native_text(&format!(r"C:\x\{name}"));
+        assert!(approval_hash_v1(&candidate).is_ok(), "{name}");
+    }
+}
+
+#[test]
 fn windows_transaction_staging_namespace_match_is_exact() {
     for name in [
         format!(".context-relay-{}-{}.tmp", "a".repeat(63), "b".repeat(32)),
@@ -570,4 +616,36 @@ fn windows_mutation_targets_do_not_apply_full_unicode_case_expansion() {
     double_s.target = native_text("C:\\x\\ss.md");
     distinct.mutations.insert(1, double_s);
     assert!(approval_hash_v1(&distinct).is_ok());
+}
+
+#[test]
+fn windows_mutation_targets_accept_the_canonical_verbatim_prefix() {
+    // Layouts are canonicalized with std::fs::canonicalize, which carries the
+    // \\?\ verbatim prefix on Windows. A plan built from those canonical paths
+    // must approve exactly like its plain drive form.
+    let mut candidate = plan();
+    candidate.mutations[0].target = native_text(r"\\?\C:\Users\test\.codex\AGENTS.md");
+    assert!(approval_hash_v1(&candidate).is_ok());
+
+    // The verbatim and plain forms of one path are the same target: mixed
+    // plans must still fail closed as duplicates.
+    let mut alias = plan();
+    alias.mutations[0].target = native_text(r"C:\Users\test\.codex\AGENTS.md");
+    let mut mixed = candidate;
+    mixed.mutations.insert(1, alias.mutations.remove(0));
+    assert!(approval_hash_v1(&mixed).is_err());
+}
+
+#[test]
+fn windows_mutation_targets_reject_the_verbatim_device_and_unc_forms() {
+    // \\.\ device paths were never canonical filesystem targets and stay
+    // rejected; UNC canonicalization remains out of scope and rejected.
+    for target in [
+        r"\\.\C:\Users\test\.codex\AGENTS.md",
+        r"\\?\UNC\server\share\AGENTS.md",
+    ] {
+        let mut candidate = plan();
+        candidate.mutations[0].target = native_text(target);
+        assert!(approval_hash_v1(&candidate).is_err(), "{target}");
+    }
 }

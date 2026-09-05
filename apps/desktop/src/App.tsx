@@ -8,6 +8,7 @@ import type {
   TaskRecord,
   TaskStatus,
 } from './bindings';
+import { DevicesScreen } from './devices';
 import { LocalWorkspaceGateway, type WorkspaceGateway } from './workspace';
 
 type ScreenId =
@@ -409,7 +410,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       case 'activity':
         return <Deferred title="Local audit activity" text="Completed local writes are durable in the encrypted vault." />;
       case 'devices':
-        return <Deferred title="Trusted device" text="This offline workspace is bound to the current installation." />;
+        return <DevicesScreen gateway={gateway} />;
       case 'settings':
         return (
           <section className="screen-content">

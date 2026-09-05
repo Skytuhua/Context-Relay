@@ -8,7 +8,9 @@ pub mod ids;
 pub mod ipc;
 pub mod mcp;
 pub mod packages;
+pub mod pairing;
 pub mod sync;
+pub mod sync_payload;
 pub mod validation;
 
 pub use adapters::*;
@@ -21,15 +23,18 @@ pub use ids::*;
 pub use ipc::*;
 pub use mcp::*;
 pub use packages::*;
+pub use pairing::*;
 pub use sync::*;
+pub use sync_payload::*;
 pub use validation::*;
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 4;
 pub const SYNC_SCHEMA_VERSION: u16 = 1;
+pub const CHECKPOINT_SCHEMA_VERSION: u16 = 2;
 pub const MAX_IPC_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]

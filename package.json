@@ -6,6 +6,14 @@
   "repository": "https://github.com/Skytuhua/Context-Relay",
   "packageManager": "pnpm@11.9.0",
   "scripts": {
+    "check:supabase": "node scripts/check-supabase-contract.mjs",
+    "verify:supabase-realtime": "node scripts/verify-supabase-realtime.mjs",
+    "supabase:start": "supabase start",
+    "supabase:start:ci": "supabase start --exclude gotrue,realtime,storage-api,imgproxy,kong,mailpit,postgrest,postgres-meta,studio,edge-runtime,logflare,vector,supavisor",
+    "supabase:reset": "supabase db reset --local",
+    "supabase:test": "supabase test db supabase/tests/0001_context_relay_ciphertext_boundary_test.sql",
+    "supabase:lint": "supabase db lint --local --level warning --fail-on error",
+    "supabase:stop": "supabase stop --no-backup",
     "lint": "pnpm --filter @context-relay/desktop lint",
     "typecheck": "pnpm --filter @context-relay/desktop typecheck",
     "test": "pnpm --filter @context-relay/desktop test",
@@ -19,5 +27,9 @@
     "tauri:dev": "pnpm --filter @context-relay/desktop tauri dev",
     "tauri:build": "pnpm --filter @context-relay/desktop tauri build",
     "license:check": "node scripts/check-license-metadata.mjs"
+  },
+  "devDependencies": {
+    "@supabase/supabase-js": "2.112.0",
+    "supabase": "2.113.0"
   }
 }

@@ -22,6 +22,7 @@ export type Ed25519PublicKeyBase64Url = Base64Url & {{ readonly __ed25519PublicK
 export type X25519PublicKeyBase64Url = Base64Url & {{ readonly __x25519PublicKey: unique symbol }};\n\
 export type InstallationTokenProofBase64Url = Base64Url & {{ readonly __installationTokenProof: unique symbol }};\n\
 export type DecimalU64 = string & {{ readonly __decimalU64: unique symbol }};\nexport type PairingCodeString = string & {{ readonly __pairingCode: unique symbol }};\n\
+export type PairingSafetyNumberString = string & {{ readonly __pairingSafetyNumber: unique symbol }};\n\
 export type AccountId = UuidV7 & {{ readonly __accountId: unique symbol }};\n\
 export type WorkspaceId = UuidV7 & {{ readonly __workspaceId: unique symbol }};\n\
 export type ProjectId = UuidV7 & {{ readonly __projectId: unique symbol }};\n\
@@ -32,6 +33,9 @@ export type SecretRefId = UuidV7 & {{ readonly __secretRefId: unique symbol }};\
 export type OperationId = UuidV7 & {{ readonly __operationId: unique symbol }};\n\
 export type RecordId = UuidV7 & {{ readonly __recordId: unique symbol }};\n\
 export type PairingId = UuidV7 & {{ readonly __pairingId: unique symbol }};\n\
+export type RecoveryEnrollmentId = UuidV7 & {{ readonly __recoveryEnrollmentId: unique symbol }};\n\
+export type RecoveryRootId = UuidV7 & {{ readonly __recoveryRootId: unique symbol }};\n\
+export type DeviceCertificateId = UuidV7 & {{ readonly __deviceCertificateId: unique symbol }};\n\
 export type DeviceId = UuidV7 & {{ readonly __deviceId: unique symbol }};\n\
 export type PlanId = UuidV7 & {{ readonly __planId: unique symbol }};\n\
 export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexport type ExportId = UuidV7 & {{ readonly __exportId: unique symbol }};\n\n"
@@ -76,6 +80,7 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         BlobRef,
         SyncOperationV1,
         CheckpointV1,
+        PairingRequestV1,
         ErrorCode,
         ClientError,
         NativePlatform,
@@ -123,11 +128,17 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         TaskUpsertParams,
         HandoffParams,
         HarnessParams,
+        McpBinding,
+        McpCallParams,
+        NativeHookEvent,
+        NativeHookEventParams,
         PlanParams,
         PackageParams,
         RetryParams,
         ExportParams,
-        RecoveryParams,
+        RecoveryEnrollmentIdParams,
+        RecoveryWordConfirmation,
+        RecoveryEnrollmentConfirmParams,
         DeviceRevokeParams,
         DeviceRenameParams,
         CancelParams,
@@ -135,19 +146,31 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         PairingJoinParams,
         PairingIdParams,
         PairingDecisionParams,
+        PairingConfirmParams,
         AccessSetParams,
         ExportChunkParams,
         AccountDeletionParams,
         RecoveryPhraseWords,
+        RecoveryEnrollmentPhrase,
+        RecoveryEnrollmentChallenge,
+        RecoveryEnrollmentStatus,
+        RecoveryEnrollmentComplete,
+        RecoveryEnrollmentHostBeginResult,
+        RecoveryEnrollmentHostConfirmResult,
         PairingCode,
+        PairingSafetyNumber,
+        PairingInviteInfo,
+        PairingInviteStatusInfo,
         PairingRequestInfo,
+        PairingApprovalInfo,
+        PairingCompletionInfo,
         DecimalTimestamp,
         ExportPayload,
         ClientRole,
         DeviceSummary,
         McpScopeSelector,
         DeviceState,
-        RecoveryState,
+        RecoveryEnrollmentState,
         AccountDeletionState,
         LocalRequest,
         JsonRpcRequestV1,

@@ -11,6 +11,7 @@
 /.pnpm-store/
 
 # Supabase local state
+# Supabase CLI runtime state and local environment overrides only.
 /supabase/.temp/
 /supabase/.branches/
 /supabase/.local/
@@ -46,3 +47,4 @@ Desktop.ini
 
 # Local development workflow state
 /.superpowers/
+/.worktrees/

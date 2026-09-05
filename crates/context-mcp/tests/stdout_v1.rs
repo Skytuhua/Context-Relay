@@ -1,14 +1,122 @@
-use std::process::{Command, Stdio};
+use std::{
+    io::Write,
+    process::{Command, Output, Stdio},
+};
 
 #[test]
 fn shell_exits_without_writing_mcp_stdout() {
-    let output = Command::new(env!("CARGO_BIN_EXE_context-relay-context-mcp"))
+    for harness in ["claude-code", "codex", "hermes"] {
+        let output = command(&["--harness", harness]);
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"");
+        assert_eq!(output.stderr, b"");
+    }
+}
+
+#[test]
+fn missing_repeated_and_unknown_bindings_exit_two_without_stdout() {
+    for arguments in [
+        vec![],
+        vec!["--harness"],
+        vec!["--harness", "codex", "--harness", "hermes"],
+        vec!["--harness", "unknown"],
+        vec!["--unknown", "codex"],
+    ] {
+        let output = command(&arguments);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.stdout, b"");
+    }
+}
+
+#[test]
+fn every_stdout_line_is_one_compact_json_rpc_object() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_context-relay-context-mcp"))
+        .args(["--harness", "claude-code"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":"list","method":"tools/list","params":{}}
+"#,
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(output.stderr, b"");
+    assert!(!output.stdout.is_empty());
+    assert!(output.stdout.ends_with(b"\n"));
+    for line in output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        assert!(!line.contains(&b'\r'));
+        let value: serde_json::Value = serde_json::from_slice(line).unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert!(value.is_object());
+    }
+}
+
+#[test]
+fn malformed_hook_input_uses_one_redacted_stderr_line_and_no_stdout() {
+    let sentinel = "HOOK_PRIVATE_INPUT_SENTINEL_234bb9";
+    let output = command_with_input(
+        &["--hook-event", "session-start", "--harness", "codex"],
+        format!(r#"{{"prompt":"{sentinel}"}}"#).as_bytes(),
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        output.stderr,
+        b"Context Relay hook stopped: A hook event was invalid\n"
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(sentinel));
+}
+
+#[test]
+fn oversized_hook_input_is_bounded_and_redacted_without_stdout() {
+    let input = vec![b'X'; context_relay_context_mcp::MAX_HOOK_INPUT_BYTES + 512];
+    let output = command_with_input(
+        &["--hook-event", "session-start", "--harness", "claude-code"],
+        &input,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        output.stderr,
+        b"Context Relay hook stopped: A hook event exceeded the size limit\n"
+    );
+}
+
+fn command(arguments: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_context-relay-context-mcp"))
+        .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .unwrap();
+        .unwrap()
+}
 
-    assert!(output.status.success());
-    assert_eq!(output.stdout, b"");
+fn command_with_input(arguments: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_context-relay-context-mcp"))
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
 }

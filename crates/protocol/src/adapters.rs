@@ -753,6 +753,7 @@ validated_adapter_dto!(NetworkDelta, NetworkDeltaWire, NetworkDeltaWireRef {
 pub struct SetupPlan {
     pub plan_id: PlanId,
     pub harness: HarnessId,
+    pub harness_profile: Option<String>,
     pub adapter_version: u32,
     pub executable_path: WireNativeValue,
     pub executable_hash: Sha256Digest,
@@ -778,6 +779,8 @@ pub struct SetupPlan {
 struct SetupPlanWire {
     plan_id: PlanId,
     harness: HarnessId,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    harness_profile: Option<String>,
     adapter_version: u32,
     executable_path: WireNativeValue,
     executable_hash: Sha256Digest,
@@ -804,6 +807,7 @@ impl Serialize for SetupPlan {
         SetupPlanWire {
             plan_id: self.plan_id,
             harness: self.harness,
+            harness_profile: self.harness_profile.clone(),
             adapter_version: self.adapter_version,
             executable_path: self.executable_path.clone(),
             executable_hash: self.executable_hash,
@@ -832,6 +836,7 @@ impl TryFrom<SetupPlanWire> for SetupPlan {
         let plan = Self {
             plan_id: value.plan_id,
             harness: value.harness,
+            harness_profile: value.harness_profile,
             adapter_version: value.adapter_version,
             executable_path: value.executable_path,
             executable_hash: value.executable_hash,
@@ -865,6 +870,18 @@ impl<'de> Deserialize<'de> for SetupPlan {
 
 impl SetupPlan {
     pub fn validate(&self) -> Result<(), ValidationError> {
+        match (self.harness, self.harness_profile.as_deref()) {
+            (HarnessId::Hermes, Some(profile)) => {
+                required_text(profile, "harnessProfile", MAX_TITLE_BYTES)?;
+            }
+            (HarnessId::Hermes, None) => {
+                return Err(ValidationError::EmptyRequired("harnessProfile"));
+            }
+            (HarnessId::ClaudeCode | HarnessId::Codex, None) => {}
+            (HarnessId::ClaudeCode | HarnessId::Codex, Some(_)) => {
+                return Err(ValidationError::Invalid("harnessProfile"));
+            }
+        }
         self.executable_path.validate()?;
         required_text(&self.harness_version, "harnessVersion", MAX_TITLE_BYTES)?;
         required_text(&self.rulesync_version, "rulesyncVersion", MAX_TITLE_BYTES)?;

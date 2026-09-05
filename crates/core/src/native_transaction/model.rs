@@ -1,5 +1,9 @@
 use context_relay_native_runner::{RuntimeTarget, SidecarCommand, SidecarId, StagePath};
-use context_relay_protocol::{ApplyReceipt, SetupPlan, Sha256Digest, WireNativeValue};
+use context_relay_protocol::{
+    ApplyReceipt, CliOperation, HarnessId, SetupPlan, Sha256Digest, WireNativeValue,
+};
+
+use crate::native_memory::NativeMemoryRegistration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -134,6 +138,23 @@ pub struct ApprovedMutation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalCliDeclaration {
+    pub harness: HarnessId,
+    pub server_name: String,
+    pub canonical_body: String,
+    pub fingerprint: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovedCliMutation {
+    pub stable_id: String,
+    pub expected: Option<CanonicalCliDeclaration>,
+    pub intended: Option<CanonicalCliDeclaration>,
+    pub forward: Vec<CliOperation>,
+    pub rollback: Vec<CliOperation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnershipChange {
     pub stable_id: String,
     pub structural_location: String,
@@ -144,6 +165,8 @@ pub struct OwnershipChange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeTransactionPlan {
     pub setup: SetupPlan,
+    /// Approval hash version recorded by the sealed plan envelope.
+    pub approval_version: u32,
     pub helper_policy_version: u32,
     pub manifest_schema_version: u32,
     pub manifest_digest: Sha256Digest,
@@ -154,6 +177,10 @@ pub struct NativeTransactionPlan {
     pub expected_semantic_output_hash: Sha256Digest,
     pub scanner_result_hash: Sha256Digest,
     pub mutations: Vec<ApprovedMutation>,
+    pub cli_mutations: Vec<ApprovedCliMutation>,
+    /// Exact native fallback source descriptors activated only after this
+    /// sealed setup plan commits successfully.
+    pub native_memory_registrations: Vec<NativeMemoryRegistration>,
     pub ownership_changes: Vec<OwnershipChange>,
 }
 

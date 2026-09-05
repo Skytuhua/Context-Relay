@@ -1,15 +1,19 @@
 use std::{
     collections::BTreeSet,
-    fs,
+    fs::{self, File},
     path::{Path, PathBuf},
 };
+
+#[cfg(any(windows, target_os = "macos"))]
+use std::ffi::OsStr;
 
 use minicbor::{Decoder, Encoder};
 use sha2::{Digest, Sha256};
 
+#[cfg(any(windows, target_os = "macos"))]
+use crate::validate_path_set;
 use crate::{
     ContentFrame, RunLimits, RunnerError, RuntimeTarget, StageDirectory, StageLayout, StagePath,
-    validate_path_set,
 };
 
 const MAX_STATE_BYTES: usize = 200 * 1024 * 1024;
@@ -152,6 +156,25 @@ impl NativeMetadata {
         self.last_access_time
     }
 
+    /// Equality modulo `last_access_time`. NTFS updates last access on
+    /// every open (where access tracking is enabled), so two snapshots of
+    /// an untouched file legitimately differ in that field; it is not a
+    /// stability-relevant property, matching how the fingerprint treats
+    /// it. All other metadata - attributes, creation, write and change
+    /// times, security descriptor, streams, and link counts - must match
+    /// exactly.
+    pub fn stability_equivalent(&self, other: &Self) -> bool {
+        self.file_attributes == other.file_attributes
+            && self.creation_time == other.creation_time
+            && self.last_write_time == other.last_write_time
+            && self.change_time == other.change_time
+            && self.security_descriptor == other.security_descriptor
+            && self.alternate_streams == other.alternate_streams
+            && self.link_count == other.link_count
+            && self.parent_attributes == other.parent_attributes
+            && self.parent_link_count == other.parent_link_count
+    }
+
     pub const fn last_write_time(&self) -> i64 {
         self.last_write_time
     }
@@ -162,6 +185,35 @@ impl NativeMetadata {
 
     pub const fn link_count(&self) -> u64 {
         self.link_count
+    }
+
+    /// Rebinds a same-directory template to the parent generation that will
+    /// exist after an absent sibling target is created.
+    pub fn for_absent_sibling_creation(&self, absent: &NativeState) -> Result<Self, RunnerError> {
+        let NativeState::Absent {
+            parent_attributes,
+            parent_link_count,
+        } = absent
+        else {
+            return Err(RunnerError::InvalidNativeState);
+        };
+        if (self.parent_attributes, self.parent_link_count)
+            != (*parent_attributes, *parent_link_count)
+        {
+            return Err(RunnerError::ConcurrentChange);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            macos::metadata_for_absent_sibling_creation(self)
+        }
+        #[cfg(windows)]
+        {
+            Ok(self.clone())
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            Err(RunnerError::UnsupportedTarget)
+        }
     }
 }
 
@@ -501,6 +553,98 @@ impl RecoveryProvenance<'_> {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OsNativeFileSystem;
 
+#[derive(Debug)]
+pub struct PinnedNativeDirectory {
+    #[cfg(any(windows, target_os = "macos"))]
+    path: PathBuf,
+    #[cfg(any(windows, target_os = "macos"))]
+    directory: File,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl PinnedNativeDirectory {
+    pub fn open(path: &Path) -> Result<Self, RunnerError> {
+        #[cfg(target_os = "macos")]
+        let directory = macos::open_pinned_directory(path)?;
+        #[cfg(windows)]
+        let directory = windows::open_pinned_directory(path)?;
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            directory,
+        })
+    }
+
+    pub fn verify_path(&self) -> Result<(), RunnerError> {
+        #[cfg(target_os = "macos")]
+        let matches = macos::verify_pinned_directory(&self.directory, &self.path)?;
+        #[cfg(windows)]
+        let matches = windows::verify_pinned_directory(&self.directory, &self.path)?;
+
+        if matches {
+            Ok(())
+        } else {
+            Err(RunnerError::ConcurrentChange)
+        }
+    }
+
+    pub fn open_or_create_regular_file(&self, name: &str) -> Result<File, RunnerError> {
+        validate_pinned_child_name(name)?;
+        self.verify_path()?;
+        #[cfg(target_os = "macos")]
+        let file = macos::open_or_create_pinned_regular(&self.directory, OsStr::new(name))?;
+        #[cfg(windows)]
+        let file = windows::open_or_create_pinned_regular(&self.directory, OsStr::new(name))?;
+
+        self.verify_regular_file(name, &file)?;
+        self.verify_path()?;
+        Ok(file)
+    }
+
+    pub fn verify_regular_file(&self, name: &str, file: &File) -> Result<(), RunnerError> {
+        validate_pinned_child_name(name)?;
+        #[cfg(target_os = "macos")]
+        let matches = macos::verify_pinned_regular(&self.directory, OsStr::new(name), file)?;
+        #[cfg(windows)]
+        let matches = windows::verify_pinned_regular(&self.directory, OsStr::new(name), file)?;
+
+        if matches {
+            Ok(())
+        } else {
+            Err(RunnerError::ConcurrentChange)
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+impl PinnedNativeDirectory {
+    pub fn open(_path: &Path) -> Result<Self, RunnerError> {
+        Err(RunnerError::UnsupportedTarget)
+    }
+
+    pub fn verify_path(&self) -> Result<(), RunnerError> {
+        Err(RunnerError::UnsupportedTarget)
+    }
+
+    pub fn open_or_create_regular_file(&self, name: &str) -> Result<File, RunnerError> {
+        validate_pinned_child_name(name)?;
+        Err(RunnerError::UnsupportedTarget)
+    }
+
+    pub fn verify_regular_file(&self, name: &str, _file: &File) -> Result<(), RunnerError> {
+        validate_pinned_child_name(name)?;
+        Err(RunnerError::UnsupportedTarget)
+    }
+}
+
+fn validate_pinned_child_name(name: &str) -> Result<(), RunnerError> {
+    if name.is_empty() || matches!(name, "." | "..") || name.contains(['\0', '/', '\\']) {
+        Err(RunnerError::InvalidPath)
+    } else {
+        Ok(())
+    }
+}
+
 impl OsNativeFileSystem {
     pub const fn new() -> Self {
         Self
@@ -518,6 +662,30 @@ impl OsNativeFileSystem {
         #[cfg(not(any(windows, target_os = "macos")))]
         {
             snapshot(path)
+        }
+    }
+
+    /// Derives the restorable metadata for a new daemon-owned private file.
+    ///
+    /// The target must be absent. The platform implementation pins and
+    /// revalidates the full parent topology and produces a `0600`-equivalent
+    /// file state without creating a preview-time filesystem object.
+    pub fn metadata_for_new_private_file(
+        &self,
+        path: &Path,
+    ) -> Result<NativeMetadata, RunnerError> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::metadata_for_new_private_file(path)
+        }
+        #[cfg(windows)]
+        {
+            windows::metadata_for_new_private_file(path)
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            let _ = path;
+            Err(RunnerError::UnsupportedTarget)
         }
     }
 
@@ -935,7 +1103,7 @@ fn inspect_native_tree_with_limits(
 ) -> Result<NativeTreeInventory, RunnerError> {
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = (root, target);
+        let _ = (root, target, limits);
         return Err(RunnerError::UnsupportedTarget);
     }
     #[cfg(any(windows, target_os = "macos"))]
@@ -1357,15 +1525,114 @@ fn stable_security_descriptor(descriptor: &[u8]) -> Vec<u8> {
     descriptor.to_vec()
 }
 
+/// Compares two self-relative security descriptors for semantic equality,
+/// applying the same canonicalization the fingerprint uses. NT sets
+/// layout/inheritance bookkeeping bits (e.g. SE_DACL_AUTO_INHERITED) and
+/// reorders sections per producer, so raw bytes can differ while the
+/// descriptor means the same thing.
+pub fn equivalent_security_descriptors(a: &[u8], b: &[u8]) -> bool {
+    stable_security_descriptor(a) == stable_security_descriptor(b)
+}
+
 #[cfg(windows)]
 fn stable_security_descriptor(descriptor: &[u8]) -> Vec<u8> {
-    let mut stable = descriptor.to_vec();
-    if stable.len() >= 4 {
-        let mut control = u16::from_le_bytes([stable[2], stable[3]]);
-        control &= !0x0f00;
-        stable[2..4].copy_from_slice(&control.to_le_bytes());
+    // Self-relative security descriptors are not byte-canonical across
+    // producers: MakeSelfRelativeSD and GetSecurityInfo order and pad the
+    // owner, group, and ACL sections differently, so two descriptors with
+    // identical semantics hash differently if the raw bytes are used. The
+    // fingerprint therefore hashes a canonical re-serialization: fixed
+    // header, revision, stability-relevant control bits, and the raw SID
+    // and ACL sections in a fixed order. ACE order is preserved because it
+    // is access-order significant; only the container layout varies.
+    canonical_security_descriptor(descriptor).unwrap_or_else(|| descriptor.to_vec())
+}
+
+#[cfg(windows)]
+fn canonical_security_descriptor(descriptor: &[u8]) -> Option<Vec<u8>> {
+    if descriptor.len() < 20 || descriptor[0] != 1 {
+        return None;
     }
-    stable
+    let control = u16::from_le_bytes([descriptor[2], descriptor[3]]);
+    // SECURITY_DESCRIPTOR_RELATIVE header: revision (0), control (2), then
+    // owner, group, SACL, and DACL offsets at 4, 8, 12, and 16.
+    let offset = |start: usize| -> Option<usize> {
+        let raw = u32::from_le_bytes(descriptor[start..start + 4].try_into().ok()?);
+        usize::try_from(raw).ok()
+    };
+    let owner = offset(4)?;
+    let group = offset(8)?;
+    let sacl = offset(12)?;
+    let dacl = offset(16)?;
+    if owner > descriptor.len() || group > descriptor.len() {
+        return None;
+    }
+
+    let revision = [descriptor[0], descriptor[1]];
+    let control_stable = control & !0x0f00;
+    let mut stable = Vec::with_capacity(descriptor.len());
+    stable.extend_from_slice(b"cr-sd\0");
+    stable.extend_from_slice(&revision);
+    stable.extend_from_slice(&control_stable.to_le_bytes());
+    stable.extend_from_slice(&sid_section(&descriptor[owner..])?);
+    stable.extend_from_slice(&sid_section(&descriptor[group..])?);
+    stable.extend_from_slice(&acl_section(
+        sacl,
+        control & 0x0008 != 0, // SE_SACL_PRESENT
+        descriptor,
+    )?);
+    stable.extend_from_slice(&acl_section(
+        dacl,
+        control & 0x0004 != 0, // SE_DACL_PRESENT
+        descriptor,
+    )?);
+    Some(stable)
+}
+
+#[cfg(windows)]
+fn sid_length_at(descriptor: &[u8], start: usize) -> Option<usize> {
+    if start + 8 > descriptor.len() {
+        return None;
+    }
+    let sub_authorities = usize::from(descriptor[start + 1]);
+    let length = 8 + sub_authorities * 4;
+    (start + length <= descriptor.len()).then_some(length)
+}
+
+#[cfg(windows)]
+fn sid_section(section: &[u8]) -> Option<Vec<u8>> {
+    let length = sid_length_at(section, 0)?;
+    Some(section[..length].to_vec())
+}
+
+#[cfg(windows)]
+fn acl_section(offset: usize, present: bool, descriptor: &[u8]) -> Option<Vec<u8>> {
+    if !present || offset == 0 {
+        return Some(Vec::new());
+    }
+    if offset + 8 > descriptor.len() {
+        return None;
+    }
+    let acl = &descriptor[offset..];
+    let ace_count = usize::from(u16::from_le_bytes([acl[4], acl[5]]));
+    let acl_bytes = usize::from(u16::from_le_bytes([acl[2], acl[3]]));
+    if offset + acl_bytes > descriptor.len() {
+        return None;
+    }
+    let mut stable = Vec::new();
+    stable.extend_from_slice(&(ace_count as u32).to_le_bytes());
+    let mut cursor = 8usize;
+    for _ in 0..ace_count {
+        if cursor + 4 > acl.len() {
+            return None;
+        }
+        let ace_size = usize::from(u16::from_le_bytes([acl[cursor + 2], acl[cursor + 3]]));
+        if ace_size < 4 || cursor + ace_size > acl.len() {
+            return None;
+        }
+        stable.extend_from_slice(&acl[cursor..cursor + ace_size]);
+        cursor += ace_size;
+    }
+    Some(stable)
 }
 
 #[cfg(test)]
@@ -1373,6 +1640,66 @@ mod provenance_tests {
     use super::{
         NativeMutationOutcome, NativeObjectToken, NativeSnapshot, NativeState, fingerprint,
     };
+
+    #[cfg(windows)]
+    #[test]
+    fn security_descriptor_fingerprint_is_layout_canonical() {
+        // Build a self-relative descriptor the way MakeSelfRelativeSD does
+        // (owner at 0x14, group at 0x30, DACL at 0x4c) and an equivalent
+        // descriptor the way GetSecurityInfo returns one (owner first with
+        // different padding). Both must hash identically because the
+        // semantics are identical; the raw byte layouts are not.
+        let make_layout = |owner: usize, group: usize, dacl: usize, total: usize| {
+            let mut descriptor = vec![0_u8; total];
+            descriptor[0] = 1; // revision
+            descriptor[2] = 0x04; // SE_DACL_PRESENT
+            descriptor[3] = 0x94; // SE_DACL_PROTECTED | SE_SELF_RELATIVE
+            descriptor[4..8].copy_from_slice(&(owner as u32).to_le_bytes());
+            descriptor[8..12].copy_from_slice(&(group as u32).to_le_bytes());
+            descriptor[12..16].copy_from_slice(&0_u32.to_le_bytes());
+            descriptor[16..20].copy_from_slice(&(dacl as u32).to_le_bytes());
+            descriptor
+        };
+        // Owner and group SIDs: S-1-5-21-A (identical in both layouts).
+        let sid: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0];
+        let ace = |offset: usize| {
+            let mut acl_header_and_ace = [0_u8; 16];
+            acl_header_and_ace[0] = 2; // ACL_REVISION
+            acl_header_and_ace[2..4].copy_from_slice(&16_u16.to_le_bytes());
+            acl_header_and_ace[4..6].copy_from_slice(&1_u16.to_le_bytes());
+            acl_header_and_ace[8] = 0x00; // ACCESS_ALLOWED_ACE_TYPE
+            acl_header_and_ace[9] = 0x00; // flags
+            acl_header_and_ace[10..12].copy_from_slice(&8_u16.to_le_bytes());
+            acl_header_and_ace[12..16].copy_from_slice(&0x001F01FF_u32.to_le_bytes());
+            let _ = offset;
+            acl_header_and_ace
+        };
+        let mut first = make_layout(0x14, 0x30, 0x4c, 0x6c);
+        first[0x14..0x14 + 12].copy_from_slice(&sid);
+        first[0x30..0x30 + 12].copy_from_slice(&sid);
+        first[0x4c..0x4c + 16].copy_from_slice(&ace(0x4c));
+        let mut second = make_layout(0x14, 0x2c, 0x44, 0x64);
+        second[0x14..0x14 + 12].copy_from_slice(&sid);
+        second[0x2c..0x2c + 12].copy_from_slice(&sid);
+        second[0x44..0x44 + 16].copy_from_slice(&ace(0x44));
+
+        let state = |descriptor: &[u8]| NativeState::RegularFile {
+            bytes: b"payload\n".to_vec(),
+            metadata: super::NativeMetadata {
+                file_attributes: 0x80,
+                creation_time: 1,
+                last_access_time: 2,
+                last_write_time: 3,
+                change_time: 4,
+                security_descriptor: descriptor.to_vec(),
+                alternate_streams: Vec::new(),
+                link_count: 1,
+                parent_attributes: 0,
+                parent_link_count: 1,
+            },
+        };
+        assert_eq!(fingerprint(&state(&first)), fingerprint(&state(&second)));
+    }
 
     fn token(object: u8) -> NativeObjectToken {
         NativeObjectToken::from_parts(7, [object; 16], 0, 11, [3; 16])
@@ -1397,6 +1724,21 @@ mod provenance_tests {
         assert_eq!(
             outcome.snapshot().object_token(),
             Some(&concurrent_snapshot)
+        );
+    }
+}
+
+#[cfg(all(test, not(any(windows, target_os = "macos"))))]
+mod private_creation_metadata_unsupported_tests {
+    use super::{OsNativeFileSystem, RunnerError};
+    use std::path::Path;
+
+    #[test]
+    fn private_creation_metadata_is_unavailable_off_supported_native_targets() {
+        assert_eq!(
+            OsNativeFileSystem::new()
+                .metadata_for_new_private_file(Path::new("/tmp/context-relay-new-file")),
+            Err(RunnerError::UnsupportedTarget)
         );
     }
 }

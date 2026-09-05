@@ -356,6 +356,9 @@ fn open_directory_at(parent: &File, name: &CStr) -> Result<File, RunnerError> {
             0,
         )
     };
+    if fd < 0 && matches!(last_errno(), libc::ELOOP | libc::ENOTDIR) {
+        return Err(RunnerError::UnsafeTopology);
+    }
     file_from_fd(fd)
 }
 

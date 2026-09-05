@@ -149,8 +149,10 @@ const endpoint = (value: unknown, field: string) => {
 };
 
 export const assertSetupPlan = (value: unknown): asserts value is SetupPlan => {
-  const item = object(value, ['planId', 'harness', 'adapterVersion', 'executablePath', 'executableHash', 'harnessVersion', 'targetScopes', 'expectedNativeDigests', 'semanticChanges', 'cliOperations', 'packageArtifacts', 'permissionDelta', 'networkDelta', 'scannerReportHash', 'rulesyncVersion', 'rulesyncHash', 'approvalClass', 'expiresAt', 'batchHash'], 'setupPlan');
+  const item = object(value, ['planId', 'harness', 'harnessProfile', 'adapterVersion', 'executablePath', 'executableHash', 'harnessVersion', 'targetScopes', 'expectedNativeDigests', 'semanticChanges', 'cliOperations', 'packageArtifacts', 'permissionDelta', 'networkDelta', 'scannerReportHash', 'rulesyncVersion', 'rulesyncHash', 'approvalClass', 'expiresAt', 'batchHash'], 'setupPlan');
   id(item.planId, 'setupPlan.planId'); choice(item.harness, ['claude_code', 'codex', 'hermes'], 'setupPlan.harness'); uint(item.adapterVersion, 0xffff_ffff, 'setupPlan.adapterVersion');
+  if (item.harness === 'hermes') text(item.harnessProfile, 512, 'setupPlan.harnessProfile');
+  else if (item.harnessProfile !== null) fail('setupPlan.harnessProfile');
   native(item.executablePath, 'setupPlan.executablePath'); sha(item.executableHash, 'setupPlan.executableHash'); text(item.harnessVersion, 512, 'setupPlan.harnessVersion');
   for (const value of list(item.targetScopes, adapterCollectionLimit, 'setupPlan.targetScopes')) nativeScope(value, 'setupPlan.targetScopes');
   for (const value of list(item.expectedNativeDigests, adapterCollectionLimit, 'setupPlan.expectedNativeDigests')) { const nested = object(value, ['target', 'expectedDigest'], 'setupPlan.expectedNativeDigests'); native(nested.target, 'setupPlan.expectedNativeDigests.target'); if (nested.expectedDigest !== null) sha(nested.expectedDigest, 'setupPlan.expectedNativeDigests.expectedDigest'); }

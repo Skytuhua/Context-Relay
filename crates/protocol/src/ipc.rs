@@ -9,13 +9,15 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     BoundedBytes, CandidateId, ClientError, CompletionEvidenceInput, CreateHandoffInput, DeviceId,
-    Ed25519PublicKeyBytes, ExportId, HandoffPayload, HarnessAccessPolicy, HarnessId,
-    InstallationTokenProof, MAX_MARKDOWN_BYTES, MAX_TAG_BYTES, MAX_TAGS, MAX_TITLE_BYTES,
-    MemoryCandidate, MemoryId, MemoryKind, MemoryRecord, NativePlatform, OperationId, PairingId,
-    PairingRequestNonce, PlanId, ProbeReport, ProjectId, ProjectIdentity, ProtocolVersion,
-    RecordId, ScopeRef, SetupPlan, Sha256Digest, StatusOutput, TaskId, TaskRecord, TaskStatus,
-    ValidationError, WireNativeValue, X25519PublicKeyBytes, decimal_u64, required_text,
+    ExportId, HandoffPayload, HarnessAccessPolicy, HarnessId, InstallationTokenProof,
+    MAX_MARKDOWN_BYTES, MAX_TAG_BYTES, MAX_TAGS, MAX_TITLE_BYTES, MemoryCandidate, MemoryId,
+    MemoryKind, MemoryRecord, NativePlatform, OperationId, PairingId, PlanId, ProbeReport,
+    ProjectId, ProjectIdentity, ProtocolVersion, RecordId, RecoveryEnrollmentId, ScopeRef,
+    SetupPlan, Sha256Digest, StatusOutput, TaskId, TaskRecord, TaskStatus, ValidationError,
+    WireNativeValue, decimal_u64, required_text,
 };
+
+pub const RECOVERY_ENROLLMENT_SESSION_MS: u64 = 600_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub enum JsonRpcVersion {
@@ -128,7 +130,44 @@ params!(HandoffParams { operation_id:OperationId,memory_ids:Vec<MemoryId>,decisi
 params!(HarnessParams {
     harness: HarnessId,
     #[serde(deserialize_with = "crate::required_nullable")]
-    project_id: Option<ProjectId>
+    project_id: Option<ProjectId>,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    hermes_profile: Option<String>
+});
+params!(McpBinding {
+    harness: HarnessId,
+    working_directory: WireNativeValue
+});
+params!(McpCallParams {
+    binding: McpBinding,
+    name: String,
+    #[ts(type = "unknown")]
+    arguments: serde_json::Value
+});
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[ts(tag = "kind", rename_all = "snake_case")]
+pub enum NativeHookEvent {
+    SessionStart {
+        session_id: String,
+    },
+    SessionStop {
+        session_id: String,
+    },
+    TaskEvidence {
+        session_id: String,
+        task_id: TaskId,
+        evidence: Vec<CompletionEvidenceInput>,
+    },
+}
+
+params!(NativeHookEventParams {
+    binding: McpBinding,
+    event: NativeHookEvent,
+    #[serde(with = "decimal_u64")]
+    #[ts(type = "DecimalU64")]
+    occurred_at_ms: u64
 });
 params!(PlanParams { plan_id: PlanId });
 params!(PackageParams {
@@ -147,8 +186,8 @@ params!(ExportChunkParams {
     export_id: ExportId,
     chunk_index: u32
 });
-params!(RecoveryParams {
-    recovery_phrase_words: RecoveryPhraseWords
+params!(RecoveryEnrollmentIdParams {
+    enrollment_id: RecoveryEnrollmentId
 });
 params!(DeviceRevokeParams {
     device_id: DeviceId
@@ -168,12 +207,7 @@ params!(HelloParams {
 });
 params!(PairingJoinParams {
     code: PairingCode,
-    device_id: DeviceId,
-    device_name: String,
-    platform: NativePlatform,
-    request_nonce: PairingRequestNonce,
-    signing_public_key: Ed25519PublicKeyBytes,
-    wrapping_public_key: X25519PublicKeyBytes
+    device_name: String
 });
 params!(PairingIdParams {
     pairing_id: PairingId
@@ -182,6 +216,10 @@ params!(PairingDecisionParams {
     pairing_id: PairingId,
     request_digest: Sha256Digest,
     approve: bool
+});
+params!(PairingConfirmParams {
+    pairing_id: PairingId,
+    safety_number: PairingSafetyNumber
 });
 params!(AccessSetParams {
     operation_id: OperationId,
@@ -237,9 +275,104 @@ impl<'de> Deserialize<'de> for RecoveryPhraseWords {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, TS)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct RecoveryWordConfirmation {
+    pub position: u8,
+    pub word: String,
+}
+
+impl fmt::Debug for RecoveryWordConfirmation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveryWordConfirmation")
+            .field("position", &self.position)
+            .field("word", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for RecoveryWordConfirmation {
+    fn drop(&mut self) {
+        self.word.zeroize();
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct RecoveryEnrollmentConfirmParams {
+    pub enrollment_id: RecoveryEnrollmentId,
+    pub confirmations: Vec<RecoveryWordConfirmation>,
+}
+
+impl fmt::Debug for RecoveryEnrollmentConfirmParams {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveryEnrollmentConfirmParams")
+            .field("enrollment_id", &self.enrollment_id)
+            .field("confirmation_count", &self.confirmations.len())
+            .field(
+                "positions",
+                &self
+                    .confirmations
+                    .iter()
+                    .map(|confirmation| confirmation.position)
+                    .collect::<Vec<_>>(),
+            )
+            .field("words", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl RecoveryEnrollmentConfirmParams {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.confirmations.len() != 4 {
+            return Err(ValidationError::Invalid("recoveryEnrollment.confirmations"));
+        }
+
+        let mut previous = 0;
+        for confirmation in &self.confirmations {
+            if !(1..=24).contains(&confirmation.position)
+                || confirmation.position <= previous
+                || confirmation.word.is_empty()
+                || confirmation.word.len() > 32
+                || !confirmation
+                    .word
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase())
+            {
+                return Err(ValidationError::Invalid("recoveryEnrollment.confirmations"));
+            }
+            previous = confirmation.position;
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_confirmation_positions(positions: &[u8]) -> Result<(), ValidationError> {
+    if positions.len() != 4
+        || positions.iter().enumerate().any(|(index, position)| {
+            !(1..=24).contains(position) || index > 0 && positions[index - 1] >= *position
+        })
+    {
+        return Err(ValidationError::Invalid(
+            "recoveryEnrollment.confirmationPositions",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Eq, PartialEq, TS)]
 #[ts(type = "PairingCodeString")]
 pub struct PairingCode(String);
+impl fmt::Debug for PairingCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairingCode([REDACTED])")
+    }
+}
 impl PairingCode {
     pub fn new(value: String) -> Result<Self, &'static str> {
         let valid=value.len()==11&&value.as_bytes()[5]==b'-'&&value.bytes().enumerate().all(|(index,byte)|index==5||matches!(byte,b'0'..=b'9'|b'A'..=b'H'|b'J'..=b'K'|b'M'..=b'N'|b'P'..=b'T'|b'V'..=b'Z'));
@@ -262,9 +395,63 @@ impl<'de> Deserialize<'de> for PairingCode {
     }
 }
 
-params!(PairingRequestInfo {
+#[derive(Clone, Eq, PartialEq, TS)]
+#[ts(type = "PairingSafetyNumberString")]
+pub struct PairingSafetyNumber(String);
+
+impl PairingSafetyNumber {
+    pub fn new(value: String) -> Result<Self, &'static str> {
+        let valid = value.len() == 24
+            && value.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 4 | 9 | 14 | 19) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_digit() || matches!(byte, b'A'..=b'F')
+                }
+            });
+        valid
+            .then_some(Self(value))
+            .ok_or("pairing safety number must contain five uppercase hexadecimal groups")
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PairingSafetyNumber {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairingSafetyNumber([REDACTED])")
+    }
+}
+
+impl Serialize for PairingSafetyNumber {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for PairingSafetyNumber {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+params!(PairingInviteInfo {
     pairing_id: PairingId,
     code: PairingCode,
+    created_at: DecimalTimestamp,
+    expires_at: DecimalTimestamp
+});
+
+params!(PairingInviteStatusInfo {
+    pairing_id: PairingId,
+    created_at: DecimalTimestamp,
+    expires_at: DecimalTimestamp
+});
+
+params!(PairingRequestInfo {
+    pairing_id: PairingId,
     device_name: String,
     platform: NativePlatform,
     requested_at: DecimalTimestamp,
@@ -277,6 +464,16 @@ impl PairingRequestInfo {
         required_text(&self.device_name, "pairing.deviceName", MAX_TITLE_BYTES)
     }
 }
+
+params!(PairingApprovalInfo {
+    request: PairingRequestInfo,
+    safety_number: PairingSafetyNumber
+});
+
+params!(PairingCompletionInfo {
+    pairing_id: PairingId,
+    device: DeviceSummary
+});
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, TS)]
 #[ts(type = "DecimalU64")]
@@ -320,6 +517,7 @@ impl ExportPayload {
 #[serde(rename_all = "snake_case")]
 pub enum ClientRole {
     Desktop,
+    DesktopRecoveryHost,
     McpBridge,
     Installer,
 }
@@ -337,6 +535,8 @@ pub enum LocalRequest {
     Cancel(CancelParams),
     Shutdown(EmptyParams),
     Health(EmptyParams),
+    McpCall(McpCallParams),
+    NativeHookEvent(NativeHookEventParams),
     Unlock(EmptyParams),
     ProjectsList(EmptyParams),
     ProjectUpsert(ProjectUpsertParams),
@@ -372,9 +572,13 @@ pub enum LocalRequest {
     PairingJoin(PairingJoinParams),
     PairingStatus(PairingIdParams),
     PairingDecision(PairingDecisionParams),
+    PairingConfirm(PairingConfirmParams),
     PairingCancel(PairingIdParams),
-    RecoveryBegin(EmptyParams),
-    RecoveryComplete(RecoveryParams),
+    RecoveryEnrollmentBegin(EmptyParams),
+    RecoveryEnrollmentOverview(EmptyParams),
+    RecoveryEnrollmentConfirm(RecoveryEnrollmentConfirmParams),
+    RecoveryEnrollmentStatus(RecoveryEnrollmentIdParams),
+    RecoveryEnrollmentCancel(RecoveryEnrollmentIdParams),
     ExportRecords(ExportParams),
     ExportChunk(ExportChunkParams),
     AccountDeletionBegin(AccountDeletionParams),
@@ -403,6 +607,14 @@ impl LocalRequest {
         match self {
             Self::ProjectUpsert(p) => p.project.validate(),
             Self::ProjectPathSet(p) => p.path.validate(),
+            Self::McpCall(p) => {
+                p.binding.working_directory.validate()?;
+                crate::validate_mcp_fixture(&p.name, true, &p.arguments)
+            }
+            Self::NativeHookEvent(p) => {
+                p.binding.working_directory.validate()?;
+                p.event.validate()
+            }
             Self::MemorySearch(p) => required_text(&p.query, "query", MAX_MARKDOWN_BYTES),
             Self::MemoryCreate(p) => {
                 required_text(&p.title, "title", MAX_TITLE_BYTES)?;
@@ -452,13 +664,77 @@ impl LocalRequest {
                 summary: p.summary.clone(),
             }
             .validate(),
+            Self::HarnessProbe(p) | Self::HarnessPreview(p) | Self::HarnessRepair(p) => {
+                validate_harness_profile(p)
+            }
+            Self::AccessGet(p) if p.hermes_profile.is_some() => {
+                Err(ValidationError::Invalid("accessGet.hermesProfile"))
+            }
             Self::DeviceRename(p) => required_text(&p.name, "name", MAX_TITLE_BYTES),
             Self::PairingJoin(p) => required_text(&p.device_name, "deviceName", MAX_TITLE_BYTES),
+            Self::RecoveryEnrollmentConfirm(p) => p.validate(),
             Self::AccountDeletionBegin(p) => {
                 required_text(&p.confirmation, "confirmation", MAX_TITLE_BYTES)
             }
             _ => Ok(()),
         }
+    }
+}
+
+fn validate_harness_profile(params: &HarnessParams) -> Result<(), ValidationError> {
+    match (params.harness, params.hermes_profile.as_deref()) {
+        (HarnessId::Hermes, Some(profile)) => {
+            required_text(profile, "harness.hermesProfile", MAX_TITLE_BYTES)
+        }
+        (HarnessId::Hermes, None) => Err(ValidationError::EmptyRequired("harness.hermesProfile")),
+        (HarnessId::ClaudeCode | HarnessId::Codex, None) => Ok(()),
+        (HarnessId::ClaudeCode | HarnessId::Codex, Some(_)) => {
+            Err(ValidationError::Invalid("harness.hermesProfile"))
+        }
+    }
+}
+
+impl NativeHookEvent {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let (session_id, evidence) = match self {
+            Self::SessionStart { session_id } | Self::SessionStop { session_id } => {
+                (session_id, None)
+            }
+            Self::TaskEvidence {
+                session_id,
+                evidence,
+                ..
+            } => (session_id, Some(evidence)),
+        };
+        required_text(session_id, "nativeHook.sessionId", MAX_TITLE_BYTES)?;
+
+        let Some(evidence) = evidence else {
+            return Ok(());
+        };
+        if evidence.is_empty() {
+            return Err(ValidationError::EmptyRequired("evidence"));
+        }
+        if evidence.len() > crate::MAX_EVIDENCE_ITEMS {
+            return Err(ValidationError::TooLarge {
+                field: "evidence",
+                limit: crate::MAX_EVIDENCE_ITEMS,
+            });
+        }
+        for item in evidence {
+            required_text(&item.summary, "evidence.summary", crate::MAX_EVIDENCE_BYTES)?;
+            required_text(&item.kind, "evidence.kind", 128)?;
+            if item
+                .reference
+                .as_ref()
+                .is_some_and(|value| value.len() > crate::MAX_EVIDENCE_BYTES)
+            {
+                return Err(ValidationError::TooLarge {
+                    field: "evidence.reference",
+                    limit: crate::MAX_EVIDENCE_BYTES,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -539,10 +815,171 @@ impl DeviceSummary {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
-pub enum RecoveryState {
+pub enum RecoveryEnrollmentState {
     Idle,
-    AwaitingPhrase,
+    AwaitingConfirmation,
+    Submitting,
     Complete,
+    Conflict,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
+#[ts(rename_all = "camelCase")]
+pub struct RecoveryEnrollmentPhrase {
+    pub enrollment_id: RecoveryEnrollmentId,
+    pub recovery_phrase_words: RecoveryPhraseWords,
+    pub confirmation_positions: Vec<u8>,
+    pub created_at_ms: DecimalTimestamp,
+    pub expires_at_ms: DecimalTimestamp,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(
+    remote = "RecoveryEnrollmentPhrase",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
+struct RecoveryEnrollmentPhraseSerde {
+    enrollment_id: RecoveryEnrollmentId,
+    recovery_phrase_words: RecoveryPhraseWords,
+    confirmation_positions: Vec<u8>,
+    created_at_ms: DecimalTimestamp,
+    expires_at_ms: DecimalTimestamp,
+}
+
+impl RecoveryEnrollmentPhrase {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_confirmation_positions(&self.confirmation_positions)?;
+        validate_recovery_enrollment_window(self.created_at_ms, self.expires_at_ms)
+    }
+}
+
+impl Serialize for RecoveryEnrollmentPhrase {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        RecoveryEnrollmentPhraseSerde::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RecoveryEnrollmentPhrase {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = RecoveryEnrollmentPhraseSerde::deserialize(deserializer)?;
+        value.validate().map_err(D::Error::custom)?;
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, TS)]
+#[ts(rename_all = "camelCase")]
+pub struct RecoveryEnrollmentChallenge {
+    pub enrollment_id: RecoveryEnrollmentId,
+    pub confirmation_positions: Vec<u8>,
+    pub created_at_ms: DecimalTimestamp,
+    pub expires_at_ms: DecimalTimestamp,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(
+    remote = "RecoveryEnrollmentChallenge",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
+struct RecoveryEnrollmentChallengeSerde {
+    enrollment_id: RecoveryEnrollmentId,
+    confirmation_positions: Vec<u8>,
+    created_at_ms: DecimalTimestamp,
+    expires_at_ms: DecimalTimestamp,
+}
+
+impl RecoveryEnrollmentChallenge {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_confirmation_positions(&self.confirmation_positions)?;
+        validate_recovery_enrollment_window(self.created_at_ms, self.expires_at_ms)
+    }
+}
+
+impl Serialize for RecoveryEnrollmentChallenge {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        RecoveryEnrollmentChallengeSerde::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RecoveryEnrollmentChallenge {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = RecoveryEnrollmentChallengeSerde::deserialize(deserializer)?;
+        value.validate().map_err(D::Error::custom)?;
+        Ok(value)
+    }
+}
+
+fn validate_recovery_enrollment_window(
+    created_at_ms: DecimalTimestamp,
+    expires_at_ms: DecimalTimestamp,
+) -> Result<(), ValidationError> {
+    (created_at_ms.0.checked_add(RECOVERY_ENROLLMENT_SESSION_MS) == Some(expires_at_ms.0))
+        .then_some(())
+        .ok_or(ValidationError::Invalid("recoveryEnrollment.expiresAtMs"))
+}
+
+params!(RecoveryEnrollmentStatus {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    enrollment_id: Option<RecoveryEnrollmentId>,
+    state: RecoveryEnrollmentState,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    created_at_ms: Option<DecimalTimestamp>,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    transitioned_at_ms: Option<DecimalTimestamp>
+});
+
+impl RecoveryEnrollmentStatus {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let valid = match self.state {
+            RecoveryEnrollmentState::Idle => {
+                self.enrollment_id.is_none()
+                    && self.created_at_ms.is_none()
+                    && self.transitioned_at_ms.is_none()
+            }
+            RecoveryEnrollmentState::AwaitingConfirmation => {
+                self.enrollment_id.is_some()
+                    && self.created_at_ms.is_some()
+                    && self.transitioned_at_ms.is_none()
+            }
+            RecoveryEnrollmentState::Submitting
+            | RecoveryEnrollmentState::Complete
+            | RecoveryEnrollmentState::Conflict => {
+                self.enrollment_id.is_some()
+                    && self.created_at_ms.is_some()
+                    && self.transitioned_at_ms.is_some()
+            }
+        };
+
+        valid
+            .then_some(())
+            .ok_or(ValidationError::Invalid("recoveryEnrollment.status"))
+    }
+}
+
+params!(RecoveryEnrollmentComplete {
+    enrollment_id: RecoveryEnrollmentId,
+    device: DeviceSummary
+});
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+#[ts(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum RecoveryEnrollmentHostBeginResult {
+    Challenge(RecoveryEnrollmentChallenge),
+    Status(RecoveryEnrollmentStatus),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+#[ts(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum RecoveryEnrollmentHostConfirmResult {
+    Canceled,
+    Complete(RecoveryEnrollmentComplete),
+    Status(RecoveryEnrollmentStatus),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -563,6 +1000,11 @@ pub enum LocalResult {
     Health {
         protocol: ProtocolVersion,
         vault_locked: bool,
+    },
+    McpOutput {
+        name: String,
+        #[ts(type = "unknown")]
+        output: serde_json::Value,
     },
     Projects {
         projects: Vec<ProjectIdentity>,
@@ -595,13 +1037,32 @@ pub enum LocalResult {
     Devices {
         devices: Vec<DeviceSummary>,
     },
-    Pairing {
+    PairingInvite {
+        invite: PairingInviteInfo,
+        status: PairingState,
+    },
+    PairingInviteStatus {
+        invite: PairingInviteStatusInfo,
+        status: PairingState,
+    },
+    PairingRequest {
         request: PairingRequestInfo,
         status: PairingState,
     },
-    Recovery {
-        state: RecoveryState,
-        recovery_phrase_words: Option<RecoveryPhraseWords>,
+    PairingApproval {
+        approval: PairingApprovalInfo,
+    },
+    PairingCompletion {
+        completion: PairingCompletionInfo,
+    },
+    RecoveryEnrollmentPhrase {
+        phrase: RecoveryEnrollmentPhrase,
+    },
+    RecoveryEnrollmentStatus {
+        status: RecoveryEnrollmentStatus,
+    },
+    RecoveryEnrollmentComplete {
+        completion: RecoveryEnrollmentComplete,
     },
     Export {
         payload: ExportPayload,
@@ -631,6 +1092,10 @@ enum LocalResultSerde {
         protocol: ProtocolVersion,
         vault_locked: bool,
     },
+    McpOutput {
+        name: String,
+        output: serde_json::Value,
+    },
     Projects {
         projects: Vec<ProjectIdentity>,
     },
@@ -663,14 +1128,32 @@ enum LocalResultSerde {
     Devices {
         devices: Vec<DeviceSummary>,
     },
-    Pairing {
+    PairingInvite {
+        invite: PairingInviteInfo,
+        status: PairingState,
+    },
+    PairingInviteStatus {
+        invite: PairingInviteStatusInfo,
+        status: PairingState,
+    },
+    PairingRequest {
         request: PairingRequestInfo,
         status: PairingState,
     },
-    Recovery {
-        state: RecoveryState,
-        #[serde(deserialize_with = "crate::required_nullable")]
-        recovery_phrase_words: Option<RecoveryPhraseWords>,
+    PairingApproval {
+        approval: PairingApprovalInfo,
+    },
+    PairingCompletion {
+        completion: PairingCompletionInfo,
+    },
+    RecoveryEnrollmentPhrase {
+        phrase: RecoveryEnrollmentPhrase,
+    },
+    RecoveryEnrollmentStatus {
+        status: RecoveryEnrollmentStatus,
+    },
+    RecoveryEnrollmentComplete {
+        completion: RecoveryEnrollmentComplete,
     },
     Export {
         payload: ExportPayload,
@@ -689,16 +1172,14 @@ enum LocalResultSerde {
 impl LocalResult {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
-            Self::Empty
-            | Self::Recovery { .. }
-            | Self::AccountDeletion { .. }
-            | Self::Access { .. } => Ok(()),
+            Self::Empty | Self::AccountDeletion { .. } | Self::Access { .. } => Ok(()),
             Self::Health { protocol, .. } => {
                 if protocol.major != crate::PROTOCOL_MAJOR {
                     return Err(ValidationError::Invalid("health.protocol"));
                 }
                 Ok(())
             }
+            Self::McpOutput { name, output } => crate::validate_mcp_fixture(name, false, output),
             Self::Projects { projects } => {
                 for project in projects {
                     project.validate()?;
@@ -739,7 +1220,13 @@ impl LocalResult {
                 }
                 Ok(())
             }
-            Self::Pairing { request, .. } => request.validate(),
+            Self::PairingInvite { .. } | Self::PairingInviteStatus { .. } => Ok(()),
+            Self::PairingRequest { request, .. } => request.validate(),
+            Self::PairingApproval { approval } => approval.request.validate(),
+            Self::PairingCompletion { completion } => completion.device.validate(),
+            Self::RecoveryEnrollmentPhrase { phrase } => phrase.validate(),
+            Self::RecoveryEnrollmentStatus { status } => status.validate(),
+            Self::RecoveryEnrollmentComplete { completion } => completion.device.validate(),
             Self::Export { payload } => payload.validate(),
         }
     }

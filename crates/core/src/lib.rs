@@ -1,8 +1,15 @@
 pub mod claude_code;
+pub mod codex;
 pub mod crypto;
+pub mod devices;
+pub mod hermes;
+pub mod mcp;
+pub mod native_memory;
 pub mod native_transaction;
 pub mod search;
 pub mod service;
+pub mod setup;
+pub mod sync;
 pub mod vault;
 
 use context_relay_protocol::{PROTOCOL_VERSION, ProtocolVersion};

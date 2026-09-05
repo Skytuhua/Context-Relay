@@ -1,5 +1,5 @@
 use std::{
-    ffi::{CStr, CString, c_void},
+    ffi::{CStr, CString, OsStr, c_void},
     fs::{self, File},
     io::Read,
     mem::{size_of, zeroed},
@@ -28,6 +28,7 @@ const MAX_SNAPSHOT_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_SECURITY_BYTES: usize = 1024 * 1024;
 const MAX_XATTRS: usize = 128;
 const QUARANTINE_XATTR: &[u8] = b"com.apple.quarantine";
+const PROVENANCE_XATTR: &[u8] = b"com.apple.provenance";
 type ExtendedAttributes = Vec<(Vec<u8>, Vec<u8>)>;
 #[cfg(test)]
 type TestHook = Box<dyn FnOnce() + Send>;
@@ -49,6 +50,9 @@ static PRE_ROLLBACK_MOVE_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + S
     std::sync::Mutex::new(None);
 #[cfg(test)]
 static RECOVERY_AFTER_PARENT_CHECK_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static CREATION_METADATA_TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
@@ -100,6 +104,16 @@ fn run_recovery_after_parent_check_test_hook() {
     }
 }
 
+#[cfg(test)]
+fn run_creation_metadata_test_hook() {
+    if let Some(hook) = take_test_hook(&CREATION_METADATA_TEST_HOOK) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_creation_metadata_test_hook() {}
+
 unsafe extern "C" {
     fn acl_free(object: *mut c_void) -> libc::c_int;
     fn acl_init(count: libc::c_int) -> *mut c_void;
@@ -135,6 +149,69 @@ pub(super) fn snapshot(path: &Path) -> Result<NativeSnapshot, RunnerError> {
         return Err(RunnerError::ConcurrentChange);
     }
     Ok(snapshot)
+}
+
+pub(super) fn metadata_for_new_private_file(path: &Path) -> Result<NativeMetadata, RunnerError> {
+    let parent = OpenParent::new(path)?;
+    let before = raw_node(&parent.directory)?;
+    if !before.directory() {
+        return Err(RunnerError::UnsafeTopology);
+    }
+    match raw_at(&parent.directory, &parent.name) {
+        Err(RunnerError::Io) if last_errno() == libc::ENOENT => {}
+        Ok(_) => return Err(RunnerError::ConcurrentChange),
+        Err(error) => return Err(error),
+    }
+    run_creation_metadata_test_hook();
+    let final_parent_links = before
+        .links
+        .checked_add(1)
+        .ok_or(RunnerError::LimitExceeded)?;
+    let inherited_provenance = xattrs(&parent.directory)?
+        .into_iter()
+        .filter(|(name, _)| name.as_slice() == PROVENANCE_XATTR)
+        .collect();
+    let security = PosixSecurity {
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+        mode: MODE_REGULAR | 0o600,
+        flags: 0,
+        acl: Vec::new(),
+        xattrs: inherited_provenance,
+        parent_uid: before.uid,
+        parent_gid: before.gid,
+        parent_mode: before.mode,
+        parent_flags: before.flags,
+        parent_links: final_parent_links,
+    };
+    let after = raw_node(&parent.directory)?;
+    match raw_at(&parent.directory, &parent.name) {
+        Err(RunnerError::Io) if last_errno() == libc::ENOENT => {}
+        Ok(_) => return Err(RunnerError::ConcurrentChange),
+        Err(error) => return Err(error),
+    }
+    if !before.same_snapshot(&after) || !identity_matches_path(&parent.directory, &parent.path)? {
+        return Err(RunnerError::ConcurrentChange);
+    }
+    let (parent_attributes, parent_link_count) = parent_marker_fields(
+        before.mode,
+        before.flags,
+        before.uid,
+        before.gid,
+        final_parent_links,
+    );
+    Ok(NativeMetadata {
+        file_attributes: 0,
+        creation_time: timestamp(before.birth_seconds, before.birth_nanoseconds)?,
+        last_access_time: timestamp(before.access_seconds, before.access_nanoseconds)?,
+        last_write_time: timestamp(before.write_seconds, before.write_nanoseconds)?,
+        change_time: timestamp(before.change_seconds, before.change_nanoseconds)?,
+        security_descriptor: security.encode()?,
+        alternate_streams: Vec::new(),
+        link_count: 1,
+        parent_attributes,
+        parent_link_count,
+    })
 }
 
 pub(super) fn compare_and_swap_with_provenance(
@@ -235,6 +312,46 @@ pub(super) fn create_new_file(path: &Path) -> Result<File, RunnerError> {
     )?;
     flush_directory(&parent.directory)?;
     Ok(file)
+}
+
+pub(super) fn open_pinned_directory(path: &Path) -> Result<File, RunnerError> {
+    let directory = open_path(path, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    if raw_node(&directory)?.directory() {
+        Ok(directory)
+    } else {
+        Err(RunnerError::UnsafeTopology)
+    }
+}
+
+pub(super) fn verify_pinned_directory(directory: &File, path: &Path) -> Result<bool, RunnerError> {
+    Ok(raw_node(directory)?.directory() && identity_matches_path(directory, path)?)
+}
+
+pub(super) fn open_or_create_pinned_regular(
+    directory: &File,
+    name: &OsStr,
+) -> Result<File, RunnerError> {
+    let name = CString::new(name.as_bytes()).map_err(|_| RunnerError::InvalidPath)?;
+    openat(
+        directory,
+        &name,
+        libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    )
+}
+
+pub(super) fn verify_pinned_regular(
+    directory: &File,
+    name: &OsStr,
+    file: &File,
+) -> Result<bool, RunnerError> {
+    let name = CString::new(name.as_bytes()).map_err(|_| RunnerError::InvalidPath)?;
+    let held = raw_node(file)?;
+    let named = raw_at(directory, &name)?;
+    Ok(held.regular()
+        && held.links == 1
+        && held.uid == unsafe { libc::geteuid() }
+        && held.same_identity(&named))
 }
 
 pub(super) fn identity_matches_path(file: &File, path: &Path) -> Result<bool, RunnerError> {
@@ -1329,6 +1446,27 @@ fn validate_metadata(
     Ok(())
 }
 
+pub(super) fn metadata_for_absent_sibling_creation(
+    template: &NativeMetadata,
+) -> Result<NativeMetadata, RunnerError> {
+    let mut security = PosixSecurity::decode(&template.security_descriptor)?;
+    validate_metadata(template, &security)?;
+    security.parent_links = security
+        .parent_links
+        .checked_add(1)
+        .ok_or(RunnerError::LimitExceeded)?;
+    let mut metadata = template.clone();
+    (metadata.parent_attributes, metadata.parent_link_count) = parent_marker_fields(
+        security.parent_mode,
+        security.parent_flags,
+        security.parent_uid,
+        security.parent_gid,
+        security.parent_links,
+    );
+    metadata.security_descriptor = security.encode()?;
+    Ok(metadata)
+}
+
 fn verify_expected(
     parent: &OpenParent,
     expected: Option<&NativeObjectToken>,
@@ -2340,7 +2478,55 @@ mod guarded_mutation_tests {
                 .as_nanos()
         ));
         fs::create_dir(&root).unwrap();
-        root
+        fs::canonicalize(root).unwrap()
+    }
+
+    #[test]
+    fn private_creation_metadata_rejects_parent_identity_change() {
+        let _serial = SERIAL.lock().unwrap();
+        let root = test_root("private-creation-parent-race");
+        let path = root.join("AGENTS.md");
+        let moved = root.with_extension("moved");
+        let changed = root.clone();
+        let changed_moved = moved.clone();
+        *CREATION_METADATA_TEST_HOOK.lock().unwrap() = Some(Box::new(move || {
+            fs::rename(&changed, &changed_moved).unwrap();
+            fs::create_dir(&changed).unwrap();
+        }));
+
+        assert_eq!(
+            metadata_for_new_private_file(&path),
+            Err(RunnerError::ConcurrentChange)
+        );
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+        if moved.exists() {
+            fs::remove_dir_all(moved).unwrap();
+        }
+    }
+
+    #[test]
+    fn pinned_directory_opens_children_relative_and_detects_path_replacement() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = test_root("pinned-directory");
+        let profile = root.join("profile");
+        let replacement = root.join("replacement");
+        let parked = root.join("parked");
+        fs::create_dir(&profile).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let directory = open_pinned_directory(&profile).unwrap();
+        let lock = open_or_create_pinned_regular(&directory, OsStr::new("gateway.lock")).unwrap();
+        assert!(verify_pinned_regular(&directory, OsStr::new("gateway.lock"), &lock).unwrap());
+
+        fs::rename(&profile, &parked).unwrap();
+        std::os::unix::fs::symlink(&replacement, &profile).unwrap();
+
+        assert!(verify_pinned_directory(&directory, &profile).is_err());
+        assert!(!replacement.join("gateway.lock").exists());
+        fs::remove_file(&profile).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

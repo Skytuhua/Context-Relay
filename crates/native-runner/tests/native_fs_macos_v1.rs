@@ -428,6 +428,49 @@ fn compare_and_swap_create_delete_and_post_enumeration_swap_are_exact() {
 }
 
 #[test]
+fn empty_parent_derives_private_creation_metadata_with_exact_rollback() {
+    let root = scratch(&default_root(), "empty-private-creation");
+    let path = root.join("AGENTS.md");
+    let native = OsNativeFileSystem::new();
+    let absent = native.snapshot(&path).unwrap();
+    let metadata = native.metadata_for_new_private_file(&path).unwrap();
+    let desired = NativeState::regular_file(b"managed\n".to_vec(), metadata);
+
+    let created = native
+        .compare_and_swap(&path, absent.fingerprint(), &desired, &TEST_NONCE)
+        .unwrap();
+    assert!(created.wrote());
+    assert_eq!(created.snapshot().fingerprint(), &desired.fingerprint());
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
+
+    let rolled_back = native
+        .compare_and_swap(
+            &path,
+            created.snapshot().fingerprint(),
+            absent.state(),
+            &TEST_NONCE,
+        )
+        .unwrap();
+    assert!(rolled_back.wrote());
+    assert_eq!(rolled_back.snapshot().fingerprint(), absent.fingerprint());
+    assert!(!path.exists());
+    cleanup(&root);
+}
+
+#[test]
+fn private_creation_metadata_rejects_redirected_parent_topology() {
+    let root = scratch(&default_root(), "private-creation-redirect");
+    let real = root.join("real");
+    fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, root.join("redirected")).unwrap();
+    assert_eq!(
+        OsNativeFileSystem::new().metadata_for_new_private_file(&root.join("redirected/AGENTS.md")),
+        Err(RunnerError::UnsafeTopology)
+    );
+    cleanup(&root);
+}
+
+#[test]
 fn private_stage_uses_create_new_read_only_inputs_on_both_apfs_modes() {
     for parent in [default_case_insensitive_root(), case_sensitive_apfs_root()] {
         let root = scratch(&parent, "stage-parent");

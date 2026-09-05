@@ -68,8 +68,9 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::environment::windows_directory;
+use crate::{HelperRunRequest, environment::windows_directory, write_helper_request};
 
+use super::super::WindowsProcessDeadline;
 use super::profile::{OwnedSid, derive_owned_sid, last_error};
 use super::{
     LaunchBackend, LaunchError, LaunchSequence, ProfileIdentity, Running, SecurityAttributePlan,
@@ -128,7 +129,6 @@ const MAX_HELPER_BYTES: i64 = 512 * 1024 * 1024;
 const MAX_TOKEN_INFORMATION_BYTES: u32 = 1024 * 1024;
 const MAX_STDOUT_BYTES: usize = crate::MAX_WIRE_PAYLOAD_BYTES + 12;
 const MAX_STDERR_BYTES: usize = 4 * 1024 * 1024;
-const PROCESS_TIMEOUT_MS: u32 = 30_000;
 const DROP_WAIT_MS: u32 = 5_000;
 const FORCED_EXIT_CODE: u32 = 0x4352_0009;
 const RESUME_FAILED: u32 = u32::MAX;
@@ -291,7 +291,19 @@ impl Win32LaunchBackend {
         Ok(unsafe { CompareObjectHandles(parent_handle as HANDLE, raw_handle(&duplicate)) } != 0)
     }
 
-    fn exchange(&mut self, input: &[u8]) -> Result<Win32SandboxOutput, LaunchError> {
+    fn exchange(&mut self, request: &HelperRunRequest) -> Result<Win32SandboxOutput, LaunchError> {
+        let deadline = WindowsProcessDeadline::for_request(request.request())
+            .map_err(|_| LaunchError::InvalidSecurityPlan)?;
+        let mut input = Vec::new();
+        write_helper_request(&mut input, request).map_err(|_| LaunchError::InvalidSecurityPlan)?;
+        self.exchange_with_deadline(&input, deadline)
+    }
+
+    fn exchange_with_deadline(
+        &mut self,
+        input: &[u8],
+        deadline: WindowsProcessDeadline,
+    ) -> Result<Win32SandboxOutput, LaunchError> {
         let stdout = self.pipes.take_stdout()?;
         let stderr = self.pipes.take_stderr()?;
         let stdout_reader = thread::spawn(move || drain_bounded(stdout, MAX_STDOUT_BYTES));
@@ -310,7 +322,7 @@ impl Win32LaunchBackend {
         }
 
         let process = self.process_handle()?;
-        let wait = unsafe { WaitForSingleObject(process, PROCESS_TIMEOUT_MS) };
+        let wait = unsafe { WaitForSingleObject(process, deadline.milliseconds()) };
         if wait == WAIT_TIMEOUT {
             self.force_terminate();
             let _ = stdout_reader.join();
@@ -1108,8 +1120,11 @@ impl LaunchSequence<Win32LaunchBackend, Suspended> {
 }
 
 impl LaunchSequence<Win32LaunchBackend, Running> {
-    pub fn exchange(&mut self, input: &[u8]) -> Result<Win32SandboxOutput, LaunchError> {
-        self.backend.exchange(input)
+    pub fn exchange(
+        &mut self,
+        request: &HelperRunRequest,
+    ) -> Result<Win32SandboxOutput, LaunchError> {
+        self.backend.exchange(request)
     }
 
     pub fn audit(&self) -> &Win32LaunchAudit {

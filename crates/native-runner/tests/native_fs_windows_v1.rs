@@ -161,6 +161,52 @@ fn native_tree_rejects_real_symlinks_when_windows_allows_creating_them() {
 }
 
 #[test]
+fn empty_parent_derives_private_creation_metadata_with_exact_rollback() {
+    let root = scratch("empty-private-creation");
+    let path = root.join("AGENTS.md");
+    let native = OsNativeFileSystem::new();
+    let absent = native.snapshot(&path).unwrap();
+    let metadata = native.metadata_for_new_private_file(&path).unwrap();
+    let desired = NativeState::regular_file(b"managed\r\n".to_vec(), metadata);
+
+    let created = native
+        .compare_and_swap(&path, absent.fingerprint(), &desired, &TEST_NONCE)
+        .unwrap();
+    assert!(created.wrote());
+    assert_eq!(created.snapshot().fingerprint(), &desired.fingerprint());
+
+    let rolled_back = native
+        .compare_and_swap(
+            &path,
+            created.snapshot().fingerprint(),
+            absent.state(),
+            &TEST_NONCE,
+        )
+        .unwrap();
+    assert!(rolled_back.wrote());
+    assert_eq!(rolled_back.snapshot().fingerprint(), absent.fingerprint());
+    assert!(!path.exists());
+    cleanup(&root);
+}
+
+#[test]
+fn private_creation_metadata_rejects_redirected_parent_topology() {
+    let root = scratch("private-creation-redirect");
+    let real = root.join("real");
+    fs::create_dir(&real).unwrap();
+    let redirected = root.join("redirected");
+    match std::os::windows::fs::symlink_dir(&real, &redirected) {
+        Ok(()) => assert_eq!(
+            OsNativeFileSystem::new().metadata_for_new_private_file(&redirected.join("AGENTS.md")),
+            Err(RunnerError::UnsafeTopology)
+        ),
+        Err(error) if error.raw_os_error() == Some(1314) => {}
+        Err(error) => panic!("failed to create Windows redirect: {error}"),
+    }
+    cleanup(&root);
+}
+
+#[test]
 fn snapshot_and_cas_reject_every_junction_ancestor_without_touching_moved_targets() {
     let native = OsNativeFileSystem::new();
 
@@ -244,8 +290,18 @@ fn snapshot_rejects_dotdot_verbatim_and_long_path_forms() {
             .snapshot(&directory.join("..\\directory\\settings.json"))
             .is_err()
     );
+    // The verbatim form is accepted with plain-form parity since the
+    // canonical verbatim repair: `std::fs::canonicalize` produces it for
+    // every adapter layout, so rejection here would contradict production.
+    // Dot-dot, device, UNC, traversal, and reserved-name rejections above
+    // are unchanged.
     let verbatim = PathBuf::from(format!(r"\\?\{}", path.display()));
-    assert!(native.snapshot(&verbatim).is_err());
+    let plain_snapshot = native.snapshot(&path).unwrap();
+    let verbatim_snapshot = native.snapshot(&verbatim).unwrap();
+    assert_eq!(
+        plain_snapshot.fingerprint(),
+        verbatim_snapshot.fingerprint()
+    );
 
     let mut long_directory = root.clone();
     while long_directory.as_os_str().encode_wide().count() < 270 {

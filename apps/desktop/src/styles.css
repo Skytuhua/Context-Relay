@@ -132,7 +132,7 @@ button {
   font-weight: 700;
 }
 
-:where(a, button, input, textarea):focus-visible,
+:where(a, button, input, select, textarea):focus-visible,
 h1:focus {
   outline: 3px solid var(--color-primary-strong);
   outline-offset: 3px;
@@ -413,6 +413,187 @@ dialog p {
   margin: 0;
 }
 
+.devices-screen {
+  display: grid;
+  gap: 2rem;
+}
+
+.trusted-devices > h2,
+.recovery-workspace h2,
+.recovery-workspace h3,
+.pairing-workspace h2,
+.pairing-workspace h3,
+.device-row h3,
+.device-row p,
+.pairing-step h3,
+.pairing-step p,
+.compact-form h3,
+.compact-form p {
+  margin: 0;
+}
+
+.device-list {
+  display: grid;
+  gap: 0;
+  margin: 1rem 0 0;
+  padding: 0;
+  border-top: 1px solid var(--color-surface-strong);
+  list-style: none;
+}
+
+.device-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 0;
+  border-bottom: 1px solid var(--color-surface-strong);
+}
+
+.device-meta {
+  color: var(--color-muted);
+}
+
+.device-tag {
+  flex: 0 0 auto;
+  border: 1px solid var(--color-primary);
+  border-radius: 8px;
+  padding: 0.25rem 0.5rem;
+  color: var(--color-primary-strong);
+  font-size: 0.875rem;
+  font-weight: 700;
+}
+
+.pairing-workspace {
+  display: grid;
+  gap: 1.5rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--color-surface-strong);
+}
+
+.recovery-workspace {
+  display: grid;
+  gap: 1.25rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--color-surface-strong);
+}
+
+.recovery-workspace > div:first-child > p,
+.recovery-challenge > p {
+  max-width: 64ch;
+  color: var(--color-muted);
+}
+
+.recovery-challenge {
+  max-width: 40rem;
+  padding: 1.25rem;
+  border: 1px solid var(--color-surface-strong);
+  border-radius: 8px;
+  background: var(--color-surface);
+}
+
+.recovery-word-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.recovery-status {
+  margin: 0;
+  width: fit-content;
+  border: 1px solid var(--color-primary);
+  border-radius: 8px;
+  background: color-mix(in oklch, var(--color-primary) 7%, var(--color-canvas));
+  padding: 0.625rem 0.75rem;
+  color: var(--color-primary-strong);
+  font-weight: 700;
+}
+
+.recovery-workspace h2:focus {
+  outline: 3px solid var(--color-primary-strong);
+  outline-offset: 3px;
+}
+
+.pairing-workspace > div:first-child > p,
+.pairing-actions p,
+.pairing-step > p {
+  max-width: 64ch;
+  color: var(--color-muted);
+}
+
+.pairing-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.5rem;
+}
+
+.pairing-actions > div,
+.pairing-actions > form {
+  display: grid;
+  align-content: start;
+  gap: 1rem;
+  padding-top: 1rem;
+  border-top: 2px solid var(--color-surface-strong);
+}
+
+.compact-form {
+  max-width: none;
+}
+
+.pairing-step {
+  display: grid;
+  gap: 1rem;
+  max-width: 40rem;
+  padding: 1.25rem;
+  border: 1px solid var(--color-surface-strong);
+  border-radius: 8px;
+  background: var(--color-surface);
+}
+
+.pairing-code,
+.pairing-safety {
+  width: fit-content;
+  max-width: 100%;
+  color: var(--color-ink);
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-weight: 750;
+  overflow-wrap: anywhere;
+}
+
+.pairing-code {
+  font-size: clamp(1.5rem, 5vw, 2.25rem);
+  letter-spacing: 0.08em;
+}
+
+.pairing-safety {
+  font-size: clamp(1.125rem, 4vw, 1.5rem);
+  letter-spacing: 0.045em;
+}
+
+.pairing-status {
+  margin: 0;
+  border-left: 3px solid var(--color-primary);
+  padding: 0.625rem 0.75rem;
+  color: var(--color-primary-strong);
+  font-weight: 700;
+}
+
+.pairing-review code {
+  overflow-wrap: anywhere;
+}
+
+.pairing-dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
 @media (max-width: 46rem) {
   .app-shell {
     grid-template-columns: minmax(0, 1fr);
@@ -460,6 +641,19 @@ dialog p {
   .security-facts > div {
     grid-template-columns: minmax(0, 1fr);
     gap: 0.25rem;
+  }
+
+  .pairing-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .recovery-word-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .device-row {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 

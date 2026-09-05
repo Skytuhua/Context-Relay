@@ -12,8 +12,9 @@ use chacha20poly1305::{
 };
 use context_relay_protocol::{
     AccountId, CheckpointV1, DeviceId, Ed25519PublicKeyBytes, Ed25519SignatureBytes,
-    PairingRequestNonce, RecoveryPhraseWords, SyncOperationV1, WorkspaceId, X25519PublicKeyBytes,
-    XChaChaNonce, encode_checkpoint_signing_preimage_v1, encode_sync_operation_signing_preimage_v1,
+    PairingRequestNonce, PairingRequestV1, RecoveryPhraseWords, SyncOperationV1, WorkspaceId,
+    X25519PublicKeyBytes, XChaChaNonce, encode_checkpoint_signing_preimage_v1,
+    encode_pairing_request_signing_preimage_v1, encode_sync_operation_signing_preimage_v1,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
@@ -28,6 +29,7 @@ const RECOVERY_WRAPPING_LABEL: &[u8] = b"context-relay/recovery/wrapping/v1";
 const X25519_WRAP_LABEL: &[u8] = b"context-relay/x25519-wrap/v1";
 const CERTIFICATE_DOMAIN: &[u8] = b"context-relay/device-certificate/v1\0";
 const NONCE_KEY_DOMAIN: &[u8] = b"context-relay/nonce-key-id/v1\0";
+const ED25519_FIELD_MODULUS_LOW_BYTE: u8 = 0xed;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CryptoError {
@@ -60,6 +62,17 @@ impl Error for CryptoError {}
 /// use context_relay_core::crypto::RecoveryPhrase;
 /// let _ = RecoveryPhrase::from_entropy([0; 32]);
 /// ```
+#[cfg_attr(
+    not(feature = "test-support"),
+    doc = r#"
+The deterministic test-support constructor is also absent from normal builds.
+
+```compile_fail
+use context_relay_core::crypto::RecoveryPhrase;
+let _ = RecoveryPhrase::from_entropy_for_test([0; 32]);
+```
+"#
+)]
 pub struct RecoveryPhrase {
     sentence: Zeroizing<String>,
 }
@@ -73,7 +86,7 @@ impl RecoveryPhrase {
         Self::from_entropy(*entropy)
     }
 
-    fn from_entropy(mut entropy: [u8; 32]) -> Result<Self, CryptoError> {
+    pub(crate) fn from_entropy(mut entropy: [u8; 32]) -> Result<Self, CryptoError> {
         let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)
             .map_err(|_| CryptoError::InvalidPhrase);
         entropy.zeroize();
@@ -81,6 +94,12 @@ impl RecoveryPhrase {
         Ok(Self {
             sentence: Zeroizing::new(mnemonic.to_string()),
         })
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn from_entropy_for_test(entropy: [u8; 32]) -> Result<Self, CryptoError> {
+        Self::from_entropy(entropy)
     }
 
     pub fn from_words(words: RecoveryPhraseWords) -> Result<Self, CryptoError> {
@@ -145,6 +164,14 @@ impl RecoveryKeys {
         unwrap_x25519(&self.wrapping_secret, envelope, aad)
     }
 
+    pub(crate) fn sign_enrollment_record(&self, preimage: &[u8]) -> Ed25519SignatureBytes {
+        self.sign(preimage)
+    }
+
+    pub(crate) fn sign_restore_claim(&self, preimage: &[u8]) -> Ed25519SignatureBytes {
+        self.sign(preimage)
+    }
+
     fn sign(&self, message: &[u8]) -> Ed25519SignatureBytes {
         sign(&self.signing_secret, message)
     }
@@ -162,6 +189,17 @@ impl fmt::Debug for RecoveryKeys {
 /// use context_relay_core::crypto::DeviceKeys;
 /// let _ = DeviceKeys::from_seeds([0; 32], [1; 32]);
 /// ```
+#[cfg_attr(
+    not(feature = "test-support"),
+    doc = r#"
+The deterministic test-support constructor is also absent from normal builds.
+
+```compile_fail
+use context_relay_core::crypto::DeviceKeys;
+let _ = DeviceKeys::from_seeds_for_test([0; 32], [1; 32]);
+```
+"#
+)]
 pub struct DeviceKeys {
     signing_secret: Zeroizing<[u8; 32]>,
     wrapping_secret: Zeroizing<[u8; 32]>,
@@ -175,13 +213,33 @@ impl DeviceKeys {
             .try_fill_bytes(&mut *signing)
             .and_then(|_| OsRng.try_fill_bytes(&mut *wrapping))
             .map_err(|_| CryptoError::RandomnessUnavailable)?;
-        Ok(Self::from_seeds(*signing, *wrapping))
+        Ok(Self::from_zeroizing_seeds(signing, wrapping))
     }
 
-    fn from_seeds(signing_secret: [u8; 32], wrapping_secret: [u8; 32]) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_seeds(signing_secret: [u8; 32], wrapping_secret: [u8; 32]) -> Self {
+        Self::from_zeroizing_seeds(
+            Zeroizing::new(signing_secret),
+            Zeroizing::new(wrapping_secret),
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn from_seeds_for_test(signing_secret: [u8; 32], wrapping_secret: [u8; 32]) -> Self {
+        Self::from_zeroizing_seeds(
+            Zeroizing::new(signing_secret),
+            Zeroizing::new(wrapping_secret),
+        )
+    }
+
+    pub(crate) fn from_zeroizing_seeds(
+        signing_secret: Zeroizing<[u8; 32]>,
+        wrapping_secret: Zeroizing<[u8; 32]>,
+    ) -> Self {
         Self {
-            signing_secret: Zeroizing::new(signing_secret),
-            wrapping_secret: Zeroizing::new(wrapping_secret),
+            signing_secret,
+            wrapping_secret,
         }
     }
 
@@ -227,6 +285,24 @@ impl DeviceKeys {
         verify_signature(self.signing_public_key(), &preimage, checkpoint.signature)
     }
 
+    pub fn sign_pairing_request(&self, request: &mut PairingRequestV1) -> Result<(), CryptoError> {
+        if request.signing_public_key != self.signing_public_key() {
+            return Err(CryptoError::AuthenticationFailed);
+        }
+        validate_pairing_algorithm_keys(request)?;
+        let preimage = encode_pairing_request_signing_preimage_v1(request)
+            .map_err(|_| CryptoError::InvalidProtocolValue)?;
+        request.signature = self.sign(&preimage);
+        Ok(())
+    }
+
+    pub fn verify_pairing_request(&self, request: &PairingRequestV1) -> Result<(), CryptoError> {
+        if request.signing_public_key != self.signing_public_key() {
+            return Err(CryptoError::AuthenticationFailed);
+        }
+        verify_pairing_request_signature(request)
+    }
+
     fn sign(&self, message: &[u8]) -> Ed25519SignatureBytes {
         sign(&self.signing_secret, message)
     }
@@ -243,11 +319,67 @@ pub fn verify_signature(
     message: &[u8],
     signature: Ed25519SignatureBytes,
 ) -> Result<(), CryptoError> {
-    let verifying_key =
-        VerifyingKey::from_bytes(&public_key.0).map_err(|_| CryptoError::InvalidKey)?;
+    let verifying_key = validate_ed25519_public_key(public_key)?;
     verifying_key
         .verify_strict(message, &Signature::from_bytes(&signature.0))
         .map_err(|_| CryptoError::AuthenticationFailed)
+}
+
+pub(crate) fn verify_enrollment_record_signature(
+    signing_public_key: Ed25519PublicKeyBytes,
+    preimage: &[u8],
+    signature: Ed25519SignatureBytes,
+) -> Result<(), CryptoError> {
+    verify_signature(signing_public_key, preimage, signature)
+}
+
+pub(crate) fn verify_pairing_request_signature(
+    request: &PairingRequestV1,
+) -> Result<(), CryptoError> {
+    validate_pairing_algorithm_keys(request)?;
+    let preimage = encode_pairing_request_signing_preimage_v1(request)
+        .map_err(|_| CryptoError::InvalidProtocolValue)?;
+    verify_signature(request.signing_public_key, &preimage, request.signature)
+}
+
+fn validate_pairing_algorithm_keys(request: &PairingRequestV1) -> Result<(), CryptoError> {
+    if request.signing_public_key.0 == request.wrapping_public_key.0 {
+        return Err(CryptoError::InvalidKey);
+    }
+    validate_ed25519_public_key(request.signing_public_key)?;
+    validate_x25519_public_key(request.wrapping_public_key)
+}
+
+pub(crate) fn validate_ed25519_public_key(
+    public_key: Ed25519PublicKeyBytes,
+) -> Result<VerifyingKey, CryptoError> {
+    // Ed25519 encodes y little-endian with the sign bit in the high bit. Require y < 2^255 - 19
+    // before applying dalek's intentionally more permissive ZIP-215 point validation.
+    let mut compressed_y = public_key.0;
+    compressed_y[31] &= 0x7f;
+    if compressed_y[31] == 0x7f
+        && compressed_y[1..31].iter().all(|byte| *byte == 0xff)
+        && compressed_y[0] >= ED25519_FIELD_MODULUS_LOW_BYTE
+    {
+        return Err(CryptoError::InvalidKey);
+    }
+    let verifying_key =
+        VerifyingKey::from_bytes(&public_key.0).map_err(|_| CryptoError::InvalidKey)?;
+    if verifying_key.is_weak() {
+        return Err(CryptoError::InvalidKey);
+    }
+    Ok(verifying_key)
+}
+
+pub(crate) fn validate_x25519_public_key(
+    public_key: X25519PublicKeyBytes,
+) -> Result<(), CryptoError> {
+    let validation_secret = StaticSecret::from([0x42; 32]);
+    let shared = validation_secret.diffie_hellman(&X25519PublicKey::from(public_key.0));
+    shared
+        .was_contributory()
+        .then_some(())
+        .ok_or(CryptoError::InvalidKey)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -277,6 +409,15 @@ impl ContentKey {
 
     pub fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<EncryptedPayload, CryptoError> {
         self.encrypt_with_rng(plaintext, aad, &mut OsRng)
+    }
+
+    pub(crate) fn encrypt_with_nonce(
+        &self,
+        plaintext: &[u8],
+        aad: &[u8],
+        nonce: XChaChaNonce,
+    ) -> Result<EncryptedPayload, CryptoError> {
+        encrypt_xchacha_with_nonce(&self.bytes, plaintext, aad, nonce.0)
     }
 
     pub fn decrypt(
@@ -332,12 +473,13 @@ pub fn wrap_secret(
     wrap_secret_with_rng(recipient_public_key, plaintext, aad, &mut OsRng)
 }
 
-fn wrap_secret_with_rng<R: CryptoRng + RngCore>(
+pub(crate) fn wrap_secret_with_rng<R: CryptoRng + RngCore>(
     recipient_public_key: X25519PublicKeyBytes,
     plaintext: &[u8],
     aad: &[u8],
     rng: &mut R,
 ) -> Result<WrappedKeyEnvelope, CryptoError> {
+    validate_x25519_public_key(recipient_public_key)?;
     let mut ephemeral_bytes = Zeroizing::new([0_u8; 32]);
     rng.try_fill_bytes(&mut *ephemeral_bytes)
         .map_err(|_| CryptoError::RandomnessUnavailable)?;
@@ -522,6 +664,7 @@ fn unwrap_x25519(
     envelope: &WrappedKeyEnvelope,
     aad: &[u8],
 ) -> Result<SecretBytes, CryptoError> {
+    validate_x25519_public_key(envelope.ephemeral_public_key)?;
     let recipient_secret = StaticSecret::from(*recipient_secret);
     let recipient_public = X25519PublicKey::from(&recipient_secret);
     let ephemeral_public = X25519PublicKey::from(envelope.ephemeral_public_key.0);
@@ -564,6 +707,15 @@ fn encrypt_xchacha_with_rng<R: CryptoRng + RngCore>(
     let mut nonce = [0_u8; 24];
     rng.try_fill_bytes(&mut nonce)
         .map_err(|_| CryptoError::RandomnessUnavailable)?;
+    encrypt_xchacha_with_nonce(key, plaintext, aad, nonce)
+}
+
+fn encrypt_xchacha_with_nonce(
+    key: &[u8; 32],
+    plaintext: &[u8],
+    aad: &[u8],
+    nonce: [u8; 24],
+) -> Result<EncryptedPayload, CryptoError> {
     reserve_nonce(key, nonce)?;
     let cipher = XChaCha20Poly1305::new(key.into());
     let ciphertext = cipher

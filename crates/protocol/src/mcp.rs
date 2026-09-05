@@ -209,9 +209,8 @@ impl HandoffPayload {
 
 impl StatusOutput {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.protocol.min.major != crate::PROTOCOL_MAJOR
-            || self.protocol.max.major != crate::PROTOCOL_MAJOR
-            || !(self.protocol.min.minor..=self.protocol.max.minor).contains(&crate::PROTOCOL_MINOR)
+        if self.protocol.min != crate::PROTOCOL_VERSION
+            || self.protocol.max != crate::PROTOCOL_VERSION
         {
             return Err(ValidationError::Invalid("status.protocol"));
         }
@@ -612,9 +611,8 @@ fn readable_record() -> Value {
     json!({"oneOf":[{"type":"object","properties":{"kind":{"const":"memory"},"record":memory()},"required":["kind","record"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"instruction"},"record":instruction()},"required":["kind","record"],"additionalProperties":false}]})
 }
 fn protocol_range() -> Value {
-    let min = json!({"type":"object","properties":{"major":{"const":crate::PROTOCOL_MAJOR},"minor":{"type":"integer","minimum":0,"maximum":crate::PROTOCOL_MINOR}},"required":["major","minor"],"additionalProperties":false});
-    let max = json!({"type":"object","properties":{"major":{"const":crate::PROTOCOL_MAJOR},"minor":{"type":"integer","minimum":crate::PROTOCOL_MINOR,"maximum":65535}},"required":["major","minor"],"additionalProperties":false});
-    json!({"type":"object","properties":{"min":min,"max":max},"required":["min","max"],"additionalProperties":false})
+    let version = json!({"type":"object","properties":{"major":{"const":crate::PROTOCOL_MAJOR},"minor":{"const":crate::PROTOCOL_MINOR}},"required":["major","minor"],"additionalProperties":false});
+    json!({"type":"object","properties":{"min":version.clone(),"max":version},"required":["min","max"],"additionalProperties":false})
 }
 
 fn decimal_u64() -> Value {

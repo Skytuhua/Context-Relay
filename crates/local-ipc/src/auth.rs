@@ -185,30 +185,32 @@ pub fn verify_server_proof(
 }
 
 pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
-    use ClientRole::{Desktop, Installer, McpBridge};
+    use ClientRole::{Desktop, DesktopRecoveryHost, Installer, McpBridge};
 
     match request {
         LocalRequest::Hello(_) => false,
         LocalRequest::Cancel(_) => true,
         LocalRequest::Shutdown(_) => matches!(role, Desktop),
-        LocalRequest::Health(_) => true,
+        LocalRequest::Health(_) => matches!(role, Desktop | McpBridge | Installer),
+        LocalRequest::McpCall(_) => matches!(role, Desktop | McpBridge),
+        LocalRequest::NativeHookEvent(_) => matches!(role, Desktop | McpBridge),
         LocalRequest::Unlock(_) => matches!(role, Desktop),
         LocalRequest::ProjectsList(_) => matches!(role, Desktop),
         LocalRequest::ProjectUpsert(_) => matches!(role, Desktop),
         LocalRequest::ProjectPathSet(_) => matches!(role, Desktop),
-        LocalRequest::MemoryGet(_) => matches!(role, Desktop | McpBridge),
+        LocalRequest::MemoryGet(_) => matches!(role, Desktop),
         LocalRequest::MemoryList(_) => matches!(role, Desktop),
-        LocalRequest::MemorySearch(_) => matches!(role, Desktop | McpBridge),
-        LocalRequest::MemoryCreate(_) => matches!(role, Desktop | McpBridge),
-        LocalRequest::MemoryUpdate(_) => matches!(role, Desktop | McpBridge),
-        LocalRequest::MemoryArchive(_) => matches!(role, Desktop | McpBridge),
+        LocalRequest::MemorySearch(_) => matches!(role, Desktop),
+        LocalRequest::MemoryCreate(_) => matches!(role, Desktop),
+        LocalRequest::MemoryUpdate(_) => matches!(role, Desktop),
+        LocalRequest::MemoryArchive(_) => matches!(role, Desktop),
         LocalRequest::CandidatesList(_) => matches!(role, Desktop),
         LocalRequest::CandidateReview(_) => matches!(role, Desktop),
-        LocalRequest::TasksList(_) => matches!(role, Desktop | McpBridge),
-        LocalRequest::TaskUpsert(_) => matches!(role, Desktop | McpBridge),
-        LocalRequest::TaskComplete(_) => matches!(role, Desktop | McpBridge),
+        LocalRequest::TasksList(_) => matches!(role, Desktop),
+        LocalRequest::TaskUpsert(_) => matches!(role, Desktop),
+        LocalRequest::TaskComplete(_) => matches!(role, Desktop),
         LocalRequest::TaskTransition(_) => matches!(role, Desktop),
-        LocalRequest::HandoffCreate(_) => matches!(role, Desktop | McpBridge),
+        LocalRequest::HandoffCreate(_) => matches!(role, Desktop),
         LocalRequest::AccessGet(_) => matches!(role, Desktop | Installer),
         LocalRequest::AccessSet(_) => matches!(role, Desktop | Installer),
         LocalRequest::HarnessProbe(_) => matches!(role, Desktop | Installer),
@@ -218,7 +220,7 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::HarnessRollback(_) => matches!(role, Desktop | Installer),
         LocalRequest::PackageImport(_) => matches!(role, Desktop | Installer),
         LocalRequest::PackageExport(_) => matches!(role, Desktop | Installer),
-        LocalRequest::SyncStatus(_) => matches!(role, Desktop | McpBridge),
+        LocalRequest::SyncStatus(_) => matches!(role, Desktop),
         LocalRequest::SyncRetry(_) => matches!(role, Desktop),
         LocalRequest::DevicesList(_) => matches!(role, Desktop),
         LocalRequest::DeviceRename(_) => matches!(role, Desktop),
@@ -227,9 +229,15 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::PairingJoin(_) => matches!(role, Desktop),
         LocalRequest::PairingStatus(_) => matches!(role, Desktop),
         LocalRequest::PairingDecision(_) => matches!(role, Desktop),
+        LocalRequest::PairingConfirm(_) => matches!(role, Desktop),
         LocalRequest::PairingCancel(_) => matches!(role, Desktop),
-        LocalRequest::RecoveryBegin(_) => matches!(role, Desktop),
-        LocalRequest::RecoveryComplete(_) => matches!(role, Desktop),
+        LocalRequest::RecoveryEnrollmentBegin(_) => matches!(role, DesktopRecoveryHost),
+        LocalRequest::RecoveryEnrollmentOverview(_) => matches!(role, Desktop),
+        LocalRequest::RecoveryEnrollmentConfirm(_) => matches!(role, DesktopRecoveryHost),
+        LocalRequest::RecoveryEnrollmentStatus(_) => matches!(role, Desktop),
+        LocalRequest::RecoveryEnrollmentCancel(_) => {
+            matches!(role, Desktop | DesktopRecoveryHost)
+        }
         LocalRequest::ExportRecords(_) => matches!(role, Desktop),
         LocalRequest::ExportChunk(_) => matches!(role, Desktop),
         LocalRequest::AccountDeletionBegin(_) => matches!(role, Desktop),
@@ -282,6 +290,7 @@ const fn role_tag(role: ClientRole) -> u8 {
         ClientRole::Desktop => 0x01,
         ClientRole::McpBridge => 0x02,
         ClientRole::Installer => 0x03,
+        ClientRole::DesktopRecoveryHost => 0x04,
     }
 }
 

@@ -3,12 +3,13 @@
 use std::{
     env,
     ffi::OsString,
-    io::{Read, Write},
+    io::Write,
     net::{SocketAddr, TcpStream},
     os::windows::ffi::OsStringExt,
     path::PathBuf,
     time::Duration,
 };
+use context_relay_native_runner::read_helper_request;
 use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
 
 fn main() {
@@ -17,8 +18,9 @@ fn main() {
     stdout.write_all(b"READY\n").unwrap();
     stdout.flush().unwrap();
 
-    let mut request = String::new();
-    std::io::stdin().read_to_string(&mut request).unwrap();
+    let helper_request = read_helper_request(&mut std::io::stdin().lock()).unwrap();
+    assert_eq!(helper_request.request().inputs().len(), 1);
+    let request = std::str::from_utf8(helper_request.request().inputs()[0].bytes()).unwrap();
     let mut lines = request.lines();
     if lines.next() == Some("RUNTIME-SEAL") {
         assert_eq!(lines.next(), None);

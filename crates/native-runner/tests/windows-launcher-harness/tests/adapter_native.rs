@@ -203,8 +203,8 @@ fn timeout_terminates_the_job_before_profile_cleanup() {
         .unwrap(),
         RunResponse::failed(FailureCode::TimedOut)
     );
-    assert!(started.elapsed() >= Duration::from_secs(29));
-    assert!(started.elapsed() < Duration::from_secs(40));
+    assert!(started.elapsed() >= Duration::from_secs(34));
+    assert!(started.elapsed() < Duration::from_secs(50));
     assert_eq!(journal.events().last(), Some(&"deleted"));
 }
 

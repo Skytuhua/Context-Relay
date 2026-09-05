@@ -9,6 +9,7 @@ import type {
   StatusOutput,
   TaskRecord,
 } from './bindings';
+import { PROTOCOL_VERSION } from './bindings';
 import type { WorkspaceGateway } from './workspace';
 
 const id = (suffix: string) => `018f22e2-79b0-7cc8-98c4-dc0c0c0739${suffix}`;
@@ -43,13 +44,62 @@ class FakeWorkspaceGateway implements WorkspaceGateway {
 
   async status(): Promise<StatusOutput> {
     return {
-      protocol: { min: { major: 1, minor: 0 }, max: { major: 1, minor: 0 } },
+      protocol: { min: { major: 1, minor: 4 }, max: { major: 1, minor: 4 } },
       vault: 'unlocked',
       resolvedProject: null,
       sync: 'offline',
       access: { mode: 'default' },
     };
   }
+
+  async devices() {
+    return [];
+  }
+
+  async createPairingInvite(): Promise<never> {
+    throw new Error('not used in this workflow');
+  }
+
+  async joinPairing(): Promise<never> {
+    throw new Error('not used in this workflow');
+  }
+
+  async pairingStatus(): Promise<never> {
+    throw new Error('not used in this workflow');
+  }
+
+  async decidePairing(): Promise<never> {
+    throw new Error('not used in this workflow');
+  }
+
+  async confirmPairing(): Promise<never> {
+    throw new Error('not used in this workflow');
+  }
+
+  async cancelPairing() {}
+
+  async recoveryEnrollmentBegin(): Promise<never> {
+    throw new Error('not used in this workflow');
+  }
+
+  async recoveryEnrollmentOverview() {
+    return {
+      enrollmentId: null,
+      state: 'idle' as const,
+      createdAtMs: null,
+      transitionedAtMs: null,
+    };
+  }
+
+  async recoveryEnrollmentConfirm(): Promise<never> {
+    throw new Error('not used in this workflow');
+  }
+
+  async recoveryEnrollmentStatus(): Promise<never> {
+    throw new Error('not used in this workflow');
+  }
+
+  async recoveryEnrollmentCancel() {}
 
   async projects() {
     return this.projectsValue;
@@ -177,7 +227,12 @@ class FakeWorkspaceGateway implements WorkspaceGateway {
 
 afterEach(cleanup);
 
-it('completes project, memory, review, and task work with networking disabled', async () => {
+it('uses the current protocol range in the offline status fixture', async () => {
+  const status = await new FakeWorkspaceGateway().status();
+  expect(status.protocol).toEqual({ min: PROTOCOL_VERSION, max: PROTOCOL_VERSION });
+});
+
+it('keeps daemon-owned project, review, and task state after the offline desktop closes', async () => {
   HTMLDialogElement.prototype.showModal = function showModal() {
     this.setAttribute('open', '');
   };
@@ -255,5 +310,14 @@ it('completes project, memory, review, and task work with networking disabled', 
   fireEvent.click(screen.getByRole('button', { name: 'Complete Verify offline workflow' }));
   expect(await screen.findByText('Done')).toBeVisible();
   expect(await screen.findByText('All checks passed')).toBeVisible();
+  expect(gateway.networkCalls).toBe(0);
+
+  cleanup();
+  expect((await gateway.projects()).map((project) => project.name)).toEqual(['Context Relay']);
+  expect(await gateway.candidates()).toEqual([]);
+  expect((await gateway.tasks())[0]).toMatchObject({
+    title: 'Verify offline workflow',
+    status: 'done',
+  });
   expect(gateway.networkCalls).toBe(0);
 });

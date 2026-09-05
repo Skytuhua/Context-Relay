@@ -128,6 +128,7 @@ fn plan() -> NativeTransactionPlan {
     let setup = SetupPlan {
         plan_id: PlanId::from_str(ID).unwrap(),
         harness: HarnessId::Codex,
+        harness_profile: None,
         adapter_version: 1,
         executable_path: native_value(r"C:\fixture\codex.exe"),
         executable_hash: Sha256Digest([1; 32]),
@@ -164,6 +165,7 @@ fn plan() -> NativeTransactionPlan {
     };
     let mut plan = NativeTransactionPlan {
         setup,
+        approval_version: 1,
         helper_policy_version: 1,
         manifest_schema_version: 1,
         manifest_digest: Sha256Digest([12; 32]),
@@ -198,6 +200,8 @@ fn plan() -> NativeTransactionPlan {
                 40,
             ),
         ],
+        cli_mutations: vec![],
+        native_memory_registrations: vec![],
         ownership_changes: vec![],
     };
     plan.setup.batch_hash = approval_hash_v1(&plan).unwrap();
@@ -288,6 +292,53 @@ impl NativeAdapter for RejectingAdapter {
         _receipt: &ApplyReceipt,
     ) -> Result<(), BoundaryError> {
         unreachable!()
+    }
+}
+
+struct RevocableAdapter {
+    revoked: Rc<Cell<bool>>,
+}
+
+impl NativeAdapter for RevocableAdapter {
+    fn reprobe_live_state(&mut self, _plan: &NativeTransactionPlan) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn compare_approved_digests(
+        &mut self,
+        _plan: &NativeTransactionPlan,
+    ) -> Result<(), BoundaryError> {
+        Ok(())
+    }
+
+    fn verify_live_state_reservation(
+        &mut self,
+        _plan: &NativeTransactionPlan,
+    ) -> Result<(), BoundaryError> {
+        if self.revoked.get() {
+            Err(BoundaryError::new("native authority was revoked"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_staged_output(
+        &mut self,
+        plan: &NativeTransactionPlan,
+        run: &RestrictedRun,
+    ) -> Result<FrozenOutput, BoundaryError> {
+        Ok(FrozenOutput {
+            staged_output_hash: plan.expected_semantic_output_hash,
+            scanner_result_hash: run.scanner_result_hash,
+        })
+    }
+
+    fn validate_effective(
+        &mut self,
+        _plan: &NativeTransactionPlan,
+        _receipt: &ApplyReceipt,
+    ) -> Result<(), BoundaryError> {
+        Ok(())
     }
 }
 
@@ -747,6 +798,11 @@ struct Hook {
 
 struct CrashHook(TransactionStep);
 
+struct RevocationHook {
+    state: Shared,
+    revoked: Rc<Cell<bool>>,
+}
+
 impl FaultHook for CrashHook {
     fn after_step(&mut self, step: TransactionStep) -> Result<(), BoundaryError> {
         if step == self.0 {
@@ -764,6 +820,16 @@ impl FaultHook for Hook {
         } else {
             Ok(())
         }
+    }
+}
+
+impl FaultHook for RevocationHook {
+    fn after_step(&mut self, step: TransactionStep) -> Result<(), BoundaryError> {
+        self.state.borrow_mut().completed.push(step);
+        if step == TransactionStep::CompareAndSwapTargets {
+            self.revoked.set(true);
+        }
+        Ok(())
     }
 }
 
@@ -852,6 +918,48 @@ fn engine_acquires_the_external_profile_lock_as_its_first_journal_call() {
     let (state, result) = run(&plan(), true, None, 1_900_000_000_000);
     assert!(result.is_ok());
     assert!(state.borrow().journal_lock_acquired);
+}
+
+#[test]
+fn policy_revocation_after_preflight_blocks_the_first_native_write() {
+    let plan = plan();
+    let state = Rc::new(RefCell::new(State::default()));
+    let revoked = Rc::new(Cell::new(false));
+    let mut adapter = RevocableAdapter {
+        revoked: Rc::clone(&revoked),
+    };
+    let mut executor = Executor {
+        run: RestrictedRun {
+            staged_output_hash: plan.expected_semantic_output_hash,
+            scanner_result_hash: plan.scanner_result_hash,
+        },
+    };
+    let mut filesystem = FileSystem {
+        state: Rc::clone(&state),
+        changed: true,
+        before_image_fault: BeforeImageFault::None,
+        outcome_fault: OutcomeFault::None,
+    };
+    let mut journal = Journal {
+        state: Rc::clone(&state),
+    };
+    let mut hook = RevocationHook {
+        state: Rc::clone(&state),
+        revoked,
+    };
+    let mut engine = NativeTransactionEngine::new(
+        &mut adapter,
+        &mut executor,
+        &mut filesystem,
+        &mut journal,
+        &mut hook,
+    );
+
+    let result = engine.apply(&plan, 1_900_000_000_000, clock());
+
+    assert!(matches!(result, Err(TransactionError::Boundary(_))));
+    assert_eq!(state.borrow().apply_calls, 0);
+    assert_eq!(state.borrow().live_writes, 0);
 }
 
 #[test]

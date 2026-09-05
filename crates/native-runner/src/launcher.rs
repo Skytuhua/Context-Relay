@@ -1,5 +1,47 @@
 use crate::{RunRequest, RunResponse, RunnerError, VerifiedClosure};
 
+#[cfg(any(windows, test))]
+use crate::{RunLimits, SidecarCommand};
+
+#[cfg(any(windows, test))]
+const WINDOWS_HELPER_SHUTDOWN_GRACE_MS: u32 = 5_000;
+#[cfg(any(windows, test))]
+const WINDOWS_MAX_SEALED_RUNTIME_MS: u32 =
+    RunLimits::for_command(&SidecarCommand::OsemgrepScanPackage).timeout_ms();
+#[cfg(any(windows, test))]
+const WINDOWS_MAX_PROCESS_DEADLINE_MS: u32 =
+    WINDOWS_MAX_SEALED_RUNTIME_MS + WINDOWS_HELPER_SHUTDOWN_GRACE_MS;
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsProcessDeadline(u32);
+
+#[cfg(any(windows, test))]
+impl WindowsProcessDeadline {
+    fn for_request(request: &RunRequest) -> Result<Self, RunnerError> {
+        Self::from_runtime_ms(RunLimits::for_command(request.command()).timeout_ms())
+    }
+
+    fn from_runtime_ms(runtime_ms: u32) -> Result<Self, RunnerError> {
+        if runtime_ms == 0 {
+            return Err(RunnerError::LimitExceeded);
+        }
+        let deadline_ms = runtime_ms
+            .checked_add(WINDOWS_HELPER_SHUTDOWN_GRACE_MS)
+            .ok_or(RunnerError::LimitExceeded)?;
+        if runtime_ms > WINDOWS_MAX_SEALED_RUNTIME_MS
+            || deadline_ms > WINDOWS_MAX_PROCESS_DEADLINE_MS
+        {
+            return Err(RunnerError::LimitExceeded);
+        }
+        Ok(Self(deadline_ms))
+    }
+
+    const fn milliseconds(self) -> u32 {
+        self.0
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(windows)]
@@ -11,6 +53,78 @@ pub trait SandboxLauncher {
         closure: &VerifiedClosure,
         request: &RunRequest,
     ) -> Result<RunResponse, RunnerError>;
+}
+
+#[cfg(test)]
+mod windows_process_deadline_tests {
+    use super::WindowsProcessDeadline;
+    use crate::{
+        ContentFrame, RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RunRequest, RunnerError,
+        SidecarCommand, StagePath,
+    };
+
+    #[test]
+    fn default_sidecar_requests_receive_thirty_seconds_plus_shutdown_grace() {
+        let rulesync = request(
+            SidecarCommand::RuleSyncGenerate {
+                target: RuleSyncTarget::ClaudeCode,
+                features: RuleSyncFeatures::new(&[RuleSyncFeature::Rules]).unwrap(),
+            },
+            "input/.rulesync/rules/probe.md",
+        );
+        let gitleaks = request(
+            SidecarCommand::GitleaksScanPackage,
+            "input/gitleaks-scan/payload/probe.txt",
+        );
+
+        assert_eq!(
+            WindowsProcessDeadline::for_request(&rulesync)
+                .unwrap()
+                .milliseconds(),
+            35_000
+        );
+        assert_eq!(
+            WindowsProcessDeadline::for_request(&gitleaks)
+                .unwrap()
+                .milliseconds(),
+            35_000
+        );
+    }
+
+    #[test]
+    fn osemgrep_request_receives_ninety_seconds_plus_shutdown_grace() {
+        let request = request(
+            SidecarCommand::OsemgrepScanPackage,
+            "input/semgrep-target/probe.rs",
+        );
+
+        assert_eq!(
+            WindowsProcessDeadline::for_request(&request)
+                .unwrap()
+                .milliseconds(),
+            95_000
+        );
+    }
+
+    #[test]
+    fn invalid_runtime_deadlines_fail_closed() {
+        for runtime_ms in [0, 90_001, u32::MAX] {
+            assert_eq!(
+                WindowsProcessDeadline::from_runtime_ms(runtime_ms),
+                Err(RunnerError::LimitExceeded)
+            );
+        }
+    }
+
+    fn request(command: SidecarCommand, path: &str) -> RunRequest {
+        RunRequest::new(
+            [0x11; 16],
+            [0x22; 32],
+            command,
+            vec![ContentFrame::new(StagePath::try_from(path).unwrap(), b"safe".to_vec()).unwrap()],
+        )
+        .unwrap()
+    }
 }
 
 #[cfg(windows)]
@@ -32,7 +146,6 @@ mod windows_adapter {
     use crate::{
         ClosureMaterial, FailureCode, HelperRunRequest, RunRequest, RunResponse, RunnerError,
         RuntimeTarget, SidecarCommand, StagePath, VerifiedClosure, read_run_response_for,
-        write_helper_request,
     };
 
     pub struct WindowsSandboxLauncher<J> {
@@ -110,15 +223,12 @@ mod windows_adapter {
                 request.clone(),
                 staged_runtime_materials(request.command(), closure)?,
             )?;
-            let mut protocol = Vec::new();
-            write_helper_request(&mut protocol, &helper_request)?;
 
             run_in_profile(
                 &Win32ProfileApi::new(),
                 lease.identity(),
                 closure,
-                request,
-                &protocol,
+                &helper_request,
                 &self.helper_template,
                 self.helper_sha256,
             )
@@ -141,11 +251,11 @@ mod windows_adapter {
         profiles: &Win32ProfileApi,
         identity: &crate::windows::ProfileIdentity,
         closure: &VerifiedClosure,
-        request: &RunRequest,
-        protocol: &[u8],
+        helper_request: &HelperRunRequest,
         helper_template: &Path,
         helper_sha256: [u8; 32],
     ) -> Result<RunResponse, RunnerError> {
+        let request = helper_request.request();
         let layout = Win32ProfileLayout::initialize(
             profiles
                 .profile_folder(identity)
@@ -167,7 +277,7 @@ mod windows_adapter {
             .and_then(|sequence| sequence.attest_zero_capability_token())
             .and_then(|sequence| sequence.resume_once())
             .map_err(map_launch_error)?;
-        let output = match running.exchange(protocol) {
+        let output = match running.exchange(helper_request) {
             Ok(output) => output,
             Err(LaunchError::ProcessTimedOut) => {
                 return Ok(RunResponse::failed(FailureCode::TimedOut));

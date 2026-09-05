@@ -11,6 +11,10 @@ use context_relay_windows_launcher_harness::windows::{
     CreateProfileOutcome, LaunchSequence, ProfileApi, ProfileIdentity, ProfileMoniker,
     Win32LaunchBackend, Win32ProfileApi, Win32ProfileLayout,
 };
+use context_relay_windows_launcher_harness::{
+    ClosureMaterial, ContentFrame, HelperRunRequest, RunRequest, SidecarCommand, StagePath,
+    closure_material_digest,
+};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::{
     Foundation::HANDLE, Security::SECURITY_ATTRIBUTES, System::Threading::CreateEventW,
@@ -68,16 +72,15 @@ fn native_launch_is_suspended_attested_pipe_only_and_bounded() {
     let bound = suspended.bind_kill_on_close_job().unwrap();
     let attested = bound.attest_zero_capability_token().unwrap();
     let mut running = attested.resume_once().unwrap();
-    let output = running
-        .exchange(
-            format!(
-                "DENY={}\nCONNECT={}\nPING\n",
-                home_canary.display(),
-                network_canary_address
-            )
-            .as_bytes(),
+    let request = helper_request(
+        format!(
+            "DENY={}\nCONNECT={}\nPING\n",
+            home_canary.display(),
+            network_canary_address
         )
-        .unwrap();
+        .as_bytes(),
+    );
+    let output = running.exchange(&request).unwrap();
 
     assert_eq!(output.exit_code(), 0);
     assert_eq!(output.stdout(), b"READY\nINPUT-OK\n");
@@ -144,7 +147,8 @@ fn closure_runtime_acl_denies_writes_allows_execution_and_host_cleanup() {
         .unwrap()
         .resume_once()
         .unwrap();
-    let output = running.exchange(b"RUNTIME-SEAL\n").unwrap();
+    let request = helper_request(b"RUNTIME-SEAL\n");
+    let output = running.exchange(&request).unwrap();
 
     assert_eq!(
         output.exit_code(),
@@ -192,6 +196,32 @@ fn inheritable_event() -> OwnedHandle {
     let raw = unsafe { CreateEventW(&attributes, 1, 0, std::ptr::null()) };
     assert!(!raw.is_null());
     unsafe { OwnedHandle::from_raw_handle(raw as *mut _) }
+}
+
+fn helper_request(input: &[u8]) -> HelperRunRequest {
+    let closure = vec![
+        ClosureMaterial::new(
+            StagePath::try_from("bin/gitleaks.exe").unwrap(),
+            1,
+            [0x31; 32],
+            true,
+        )
+        .unwrap(),
+    ];
+    let request = RunRequest::new(
+        [0x41; 16],
+        closure_material_digest(&closure).unwrap(),
+        SidecarCommand::GitleaksScanPackage,
+        vec![
+            ContentFrame::new(
+                StagePath::try_from("input/gitleaks-scan/payload/probe.txt").unwrap(),
+                input.to_vec(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    HelperRunRequest::new(request, closure).unwrap()
 }
 
 trait RawHandleValue {

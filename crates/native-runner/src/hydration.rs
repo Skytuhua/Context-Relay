@@ -236,6 +236,32 @@ mod tests {
         fs::remove_dir_all(workspace).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn redirected_cache_ancestor_is_reported_as_unsafe_topology() {
+        let _serial = TEST_SERIAL.lock().unwrap();
+        let workspace = scratch("redirected-cache-ancestor");
+        let outside = scratch("redirected-cache-ancestor-outside");
+        let target = workspace.join("target");
+        std::os::unix::fs::symlink(&outside, &target).unwrap();
+
+        assert_eq!(
+            install_hydrated_closure(
+                &workspace,
+                TARGET,
+                [0x34; 32],
+                [0x56; 16],
+                vec![file("fixture/fixture.exe", b"payload", true)],
+            ),
+            Err(RunnerError::UnsafeTopology),
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+
+        fs::remove_file(target).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
     #[test]
     fn ancestor_swap_at_the_bound_handle_cannot_touch_the_external_tree() {
         let _serial = TEST_SERIAL.lock().unwrap();
