@@ -66,7 +66,7 @@ it('discards discovery after selection changes without requesting the obsolete p
   });
   open(); preview();
   await waitFor(() => expect(requests).toHaveLength(1));
-  fireEvent.change(screen.getByRole('combobox', { name: 'AI app' }), { target: { value: 'claude_code' } });
+  fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'claude_code' } });
   await act(async () => resolve(response({ ...report, capability: 'full' })));
   expect(requests).toEqual([{ method: 'harness_probe', params }]);
   expect(screen.queryByRole('heading', { name: 'Review connection changes' })).not.toBeInTheDocument();
@@ -80,12 +80,55 @@ it('binds Hermes discovery and approval to its canonical profile name', async ()
     return { kind: 'plan', data: { plan: { ...fixture, harness: 'hermes', harnessProfile: 'coder', expiresAt: String(Date.now() + 60_000), targetScopes: [{ scope: 'project', projectId, root: fixture.executablePath }] } } };
   });
   open();
-  fireEvent.change(screen.getByRole('combobox', { name: 'AI app' }), { target: { value: 'hermes' } });
+  fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'hermes' } });
   fireEvent.change(screen.getByRole('textbox', { name: 'Hermes profile' }), { target: { value: ' Coder ' } });
   preview();
   expect(await screen.findByRole('heading', { name: 'Review connection changes' })).toBeVisible();
   expect(requests).toEqual(['harness_probe', 'harness_preview'].map(method => ({ method, params: { harness: 'hermes', projectId, hermesProfile: 'coder' } })));
   expect(screen.getByRole('checkbox', { name: /I reviewed/ })).toBeEnabled();
+});
+
+it('offers the default Hermes profile and explains that a folder path is invalid', async () => {
+  open();
+  fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'hermes' } });
+  expect(screen.getByRole('textbox', { name: 'Hermes profile' })).toHaveValue('default');
+  expect(screen.getByText(/Use a profile name, such as default or coder/)).toBeVisible();
+  fireEvent.change(screen.getByRole('textbox', { name: 'Hermes profile' }), { target: { value: 'C:\\Users\\User\\AppData\\Local\\hermes' } });
+  expect(screen.getByRole('button', { name: 'Check connection' })).toBeDisabled();
+  expect(screen.getByRole('textbox', { name: 'Hermes profile' })).toHaveAttribute('aria-invalid', 'true');
+  fireEvent.submit(screen.getByRole('form', { name: 'Check harness connection' }));
+  expect(requests).toEqual([]);
+});
+
+it('explains a confirmed missing Claude Code executable instead of blaming setup preview', async () => {
+  invoke.mockRejectedValue({ code: 'not_found', message: 'Claude Code executable was not found', fieldPath: null, retryable: false });
+  open();
+  fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'claude_code' } });
+  preview();
+  expect(await screen.findByRole('alert')).toHaveTextContent('Claude Code command-line executable was not found');
+  expect(screen.getByRole('alert')).toHaveTextContent('Install the native Claude Code CLI');
+  expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+});
+
+it('explains an unqualified Hermes launcher without calling it a supported version', async () => {
+  invoke.mockResolvedValue(response({ ...report, activeProfile: 'default', harnessVersion: 'unknown' }));
+  open();
+  fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'hermes' } });
+  fireEvent.change(screen.getByRole('textbox', { name: 'Hermes profile' }), { target: { value: 'default' } });
+  preview();
+  expect(await screen.findByText(/Hermes was found, but this launcher cannot connect automatically yet/)).toBeVisible();
+  expect(screen.queryByText('Hermes unknown')).not.toBeInTheDocument();
+  expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+});
+
+it('explains an unavailable Hermes home separately from a missing executable', async () => {
+  invoke.mockRejectedValue({ code: 'not_found', message: 'Hermes default profile was not found', fieldPath: null, retryable: false });
+  open();
+  fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'hermes' } });
+  fireEvent.change(screen.getByRole('textbox', { name: 'Hermes profile' }), { target: { value: 'default' } });
+  preview();
+  expect(await screen.findByRole('alert')).toHaveTextContent('Hermes home folder is unavailable');
+  expect(screen.getByRole('alert')).not.toHaveTextContent('executable was not found');
 });
 
 it.each([

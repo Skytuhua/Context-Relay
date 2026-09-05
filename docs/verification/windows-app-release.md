@@ -185,3 +185,64 @@ source succeeded. `Context Relay_0.1.0_x64-setup.exe` is 10,866,780 bytes, SHA-2
 Authenticode NotSigned. This replaces the previous local candidate and includes
 the staged host merger and record-editing fixes, but no working staged generator.
 It remains uninstalled; the normal installation is still the earlier b45 build.
+
+2026-09-06, user screenshot follow-up: the user explicitly requests “harness”
+terminology. Navigation, field labels, onboarding and other desktop copy now use
+that term. Hermes starts with the `default` profile and explains that this input
+is a name, not a folder path. Invalid names cannot send a probe. Known missing
+executable/profile/home errors receive fixed guidance rather than raw native
+messages; an unqualified Hermes launcher is described separately from a known
+unsupported version.
+
+An authenticated read-only probe of the existing installed daemon returned
+`NotFound: Claude Code executable was not found`, and Hermes `ImportOnly` with
+profile `default` and version `unknown`. It used the production installation
+credential without printing it and never started/stopped the daemon or applied
+setup. Successful current-protocol authentication also supersedes the older
+assumption that the user's running installation still uses protocol 1.4; its
+exact installed source revision has not been established. The screenshot's
+`Installer verification 專案 🚀` is the project created during the earlier
+documented installation/persistence tests, not an application setting.
+
+Further inspection found the actual Claude desktop-bundled Code executable in
+`%LOCALAPPDATA%/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/claude-code/2.1.202/claude.exe`.
+It is 252,038,816 bytes, SHA-256
+`7ff0787ebdc19fc509ccea8886ebf6a53ad8213407fa3a2b7c6d1446efc419f6`.
+With an empty synthetic configuration, `--version` returns `2.1.202 (Claude
+Code)` and `doctor` times out after ten seconds without output. Discovery now
+preserves PATH priority, checks the native user's `.local/bin` fallback and known
+desktop Code cache roots, sorts valid numeric release directories, and rejects
+reparse/non-PE candidates. Unsupported versions do not run interactive doctor
+just to report availability. The Full allowlist and its existing strict doctor
+gate remain unchanged. The actual updated adapter successfully discovered this
+binary and returned `ImportOnly`, version `2.1.202`, using a synthetic config;
+this was not an installation, native setup or full connection test.
+
+Hermes's installed launcher is a Python console wrapper. Its local source
+metadata says 0.17.0; this is not an executed or attested runtime version. The
+adapter deliberately does not execute this unqualified wrapper. Runtime support
+remains unfinished, as does Codex 0.144.6's staged-generation support. The UI and
+discovery fixes must not be described as completed harness connections.
+
+Record action fixes in this same candidate extend the existing synchronous
+save guard to Start, Complete, Archive, Accept and Reject. Repeated/competing
+actions and navigation are disabled until acknowledgment, progress is visible,
+uncertain errors retain completion evidence and avoid false conflict claims,
+and archiving clears that record's editor only after acknowledgment.
+
+Verification: six new record-action regressions, four harness feedback cases
+and three native Claude discovery regressions failed before correction. All
+135 frontend tests pass, with type checking and lint; 12 Claude unit tests,
+36 Claude adapter tests and 11 primary-memory setup tests pass. Core all-target
+Clippy with test-support passes with warnings denied. Independent review approved
+the scoped changes. Temporary diagnostic examples were preserved in the local
+scratch evidence directory and removed from release source. No normal harness
+configuration or project records were modified during this follow-up.
+
+The locked Windows candidate rebuilt successfully at 2026-09-06 01:42:55:
+`Context Relay_0.1.0_x64-setup.exe`, 10,875,686 bytes, SHA-256
+`f7d0ec6a49385f6cf29f8e1cf29e15feb95140d1f2dbd31bbf807e95118215df`,
+Authenticode NotSigned. It includes the harness terminology, feedback, bundled
+Claude discovery and record-action changes above. This candidate was not
+installed or visually verified; full connection and release acceptance remain
+open.

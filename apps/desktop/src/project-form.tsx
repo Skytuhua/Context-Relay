@@ -60,7 +60,7 @@ export function ProjectForm({ gateway, ready, onSaved, onBusy }: {
 
   return <form aria-label="Add project" aria-describedby={error ? 'project-error' : 'project-help'} className="capture-form" onSubmit={save}>
     <h2>Add a project folder</h2>
-    <p id="project-help">Choose the folder where you work with your AI app. Context Relay keeps its saved context and tasks together.</p>
+    <p id="project-help">Choose the folder where you work with your harness. Context Relay keeps its saved context and tasks together.</p>
     <button className="secondary-action" type="button" disabled={!!busy} onClick={() => void chooseFolder()}>{busy === 'folder' ? 'Choosing folder…' : 'Choose folder…'}</button>
     <div className="field">
       <label htmlFor="project-folder">Project folder</label>

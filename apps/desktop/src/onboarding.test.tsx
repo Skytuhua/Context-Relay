@@ -37,7 +37,7 @@ it('guides a first project from folder selection to the next useful actions with
   fireEvent.click(screen.getByRole('button', { name: 'Home' }));
   expect(form).toBeVisible();
   await act(async () => { finish(project); });
-  expect(screen.getByRole('button', { name: 'Connect an AI app' })).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Connect a harness' })).toBeVisible();
   expect(screen.getByRole('button', { name: 'Save your first context' })).toBeVisible();
 });
 
@@ -49,7 +49,7 @@ it('connects the newly added project even when another project already exists', 
   fireEvent.change(screen.getByLabelText('Project name'), { target: { value: second.name } });
   fireEvent.change(screen.getByLabelText('Project folder'), { target: { value: 'C:\\Work\\Website' } });
   fireEvent.submit(screen.getByRole('form', { name: 'Add project' }));
-  fireEvent.click(await screen.findByRole('button', { name: 'Connect an AI app' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Connect a harness' }));
   expect(screen.getByRole('combobox', { name: 'Project' })).toHaveValue(second.projectId);
 });
 
@@ -107,12 +107,12 @@ it('uses the current project after selecting a different AI project and switchin
   const second = { ...project, projectId: '018f22e2-79b0-7cc8-98c4-dc0c0c073981', name: 'Website' } as ProjectIdentity;
   render(<App gateway={{ ...gateway, projects: async () => [project, second] }} />);
   await screen.findByText('Ready on this computer');
-  fireEvent.click(screen.getByRole('button', { name: 'Connect an AI app' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Connect a harness' }));
   fireEvent.change(screen.getByRole('combobox', { name: 'Project' }), { target: { value: second.projectId } });
   fireEvent.click(screen.getByRole('button', { name: 'Home' }));
   fireEvent.change(screen.getByRole('combobox', { name: 'Current project' }), { target: { value: second.projectId } });
   fireEvent.change(screen.getByRole('combobox', { name: 'Current project' }), { target: { value: project.projectId } });
-  fireEvent.click(screen.getByRole('button', { name: 'Connect an AI app' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Connect a harness' }));
   expect(screen.getByRole('combobox', { name: 'Project' })).toHaveValue(project.projectId);
 });
 
@@ -146,7 +146,7 @@ it('keeps an unsaved context draft and explains a failed save without exposing n
   let reject!: (error: unknown) => void;
   const createMemory = vi.fn(() => new Promise<never>((_, fail) => { reject = fail; }));
   render(<App gateway={{ ...gateway, projects: async () => [project], createMemory }} />);
-  await screen.findByRole('button', { name: 'Connect an AI app' });
+  await screen.findByRole('button', { name: 'Connect a harness' });
   fireEvent.click(screen.getByRole('button', { name: 'Saved context' }));
   await act(async () => {});
   const form = screen.getByRole('form', { name: 'New context' });

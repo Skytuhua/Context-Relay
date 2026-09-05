@@ -13,7 +13,7 @@ const destinations = [
   'Saved context',
   'Suggestions',
   'Tasks',
-  'AI apps',
+  'Harnesses',
   'Devices',
   'Settings',
 ] as const;

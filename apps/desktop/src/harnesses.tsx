@@ -10,8 +10,9 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   const [selectedProjectId, setProjectId] = useState<string | null>(null);
   const projectId = preferredProjectId ?? selectedProjectId ?? projects[0]?.projectId ?? '';
   const [harness, setHarness] = useState<HarnessId>('codex');
-  const [profile, setProfile] = useState('');
+  const [profile, setProfile] = useState('default');
   const canonicalProfile = profile.trim().replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+  const validProfile = /^[a-z0-9][a-z0-9_-]{0,63}$/.test(canonicalProfile);
   const [review, setReview] = useState<ReviewedPlan | null>(null);
   const [discovery, setDiscovery] = useState<{ harness: HarnessId; report: ProbeReport } | null>(null);
   const [approved, setApproved] = useState(false);
@@ -84,7 +85,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   }
 
   async function previewSetup() {
-    if (!project || (harness === 'hermes' && !profile.trim()) || !start('preview')) return;
+    if (!project || (harness === 'hermes' && !validProfile) || !start('preview')) return;
     clearReview();
     const revision = generation.current;
     const params: HarnessParams = { harness, projectId: project.projectId, hermesProfile: harness === 'hermes' ? canonicalProfile : null };
@@ -100,9 +101,9 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
       setNow(Date.now());
       // Keep the reviewed contents and their selection together for apply and rollback.
       setReview({ plan: structuredClone(result), params, projectName: project.name });
-    } catch {
+    } catch (error) {
       if (mounted.current && revision === generation.current) {
-        setError('Setup preview could not be loaded. Check the local service, installed AI app and project folder, then request a new preview.');
+        setError(setupError(error, params.harness));
       }
     } finally { finish(); }
   }
@@ -142,11 +143,11 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   }
 
   return (
-    <section className="screen-content" aria-label="AI app connection" style={{ overflowWrap: 'anywhere', minWidth: 0 }}>
-      <form className="capture-form" aria-label="Check AI app connection" onSubmit={(event) => { event.preventDefault(); void previewSetup(); }}>
-        <h2>Connect an AI app</h2>
-        <p>Choose the app you use for this project. We will check its installed version and show any changes before you connect it.</p>
-        {projects.length === 0 && <p>Add your project folder in Projects first, then return here to connect your AI app.</p>}
+    <section className="screen-content" aria-label="Harness connection" style={{ overflowWrap: 'anywhere', minWidth: 0 }}>
+      <form className="capture-form" aria-label="Check harness connection" onSubmit={(event) => { event.preventDefault(); void previewSetup(); }}>
+        <h2>Connect a harness</h2>
+        <p>Choose the harness you use for this project. We will check its installed version and show any changes before you connect it.</p>
+        {projects.length === 0 && <p>Add your project folder in Projects first, then return here to connect your harness.</p>}
         <div className="field">
           <label htmlFor="harness-project">Project</label>
           <select id="harness-project" value={projectId} disabled={busy === 'apply' || busy === 'rollback'} onChange={(event) => { clearReview(); if (onProjectChange) onProjectChange(event.target.value); else setProjectId(event.target.value); }}>
@@ -155,30 +156,33 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
           </select>
         </div>
         <div className="field">
-          <label htmlFor="harness-kind">AI app</label>
+          <label htmlFor="harness-kind">Harness</label>
           <select id="harness-kind" value={harness} disabled={busy === 'apply' || busy === 'rollback'} onChange={(event) => { clearReview(); setHarness(event.target.value as HarnessId); }}>
             {Object.entries(harnessNames).map(([id, name]) => <option key={id} value={id}>{name}</option>)}
           </select>
         </div>
         {harness === 'hermes' && <div className="field">
           <label htmlFor="hermes-profile">Hermes profile</label>
-          <input id="hermes-profile" value={profile} maxLength={512} required disabled={busy === 'apply' || busy === 'rollback'} onChange={(event) => { clearReview(); setProfile(event.target.value); }} />
+          <input id="hermes-profile" value={profile} maxLength={64} required aria-invalid={!validProfile} aria-describedby="hermes-profile-help" disabled={busy === 'apply' || busy === 'rollback'} onChange={(event) => { clearReview(); setProfile(event.target.value); }} />
+          <p id="hermes-profile-help">Use a profile name, such as default or coder. Leave default selected unless you created another profile. Folder paths are not profile names.</p>
         </div>}
-        <button className="primary-action" type="submit" disabled={!!busy || !project || (harness === 'hermes' && !profile.trim())}>{busy === 'preview' ? 'Checking app…' : 'Check connection'}</button>
+        <button className="primary-action" type="submit" disabled={!!busy || !project || (harness === 'hermes' && !validProfile)}>{busy === 'preview' ? 'Checking harness…' : 'Check connection'}</button>
       </form>
       {error && <p className="form-error" role="alert">{error}</p>}
       {notice && <p className="notice" role="status">{notice}</p>}
-      {discovery && <section className="record-card" aria-label="AI app availability">
-        <h2>{harnessNames[discovery.harness]}{discovery.report.harnessVersion ? ` ${discovery.report.harnessVersion}` : ''}</h2>
+      {discovery && <section className="record-card" aria-label="Harness availability">
+        <h2>{harnessNames[discovery.harness]}{discovery.report.harnessVersion && discovery.report.harnessVersion !== 'unknown' ? ` ${discovery.report.harnessVersion}` : ''}</h2>
         {discovery.report.executable && <p>Executable: {nativeText(discovery.report.executable)}</p>}
         <p role="status">{discovery.report.capability === 'missing'
           ? `${harnessNames[discovery.harness]} was not found. Install a supported version, restart Context Relay and request a new preview.`
           : discovery.report.capability === 'blocked'
-            ? 'Local policy prevents automatic setup. Review the AI app policy before requesting a new preview.'
-            : 'This version cannot connect automatically yet. You can still save context and tasks in Context Relay while support for this version is completed.'}</p>
-        <p>The app is not connected. No setup changes were made.</p>
+            ? 'Local policy prevents automatic setup. Review the harness policy before requesting a new preview.'
+            : discovery.harness === 'hermes' && discovery.report.harnessVersion === 'unknown'
+              ? 'Hermes was found, but this launcher cannot connect automatically yet. Context Relay cannot verify its version and runtime. You can still save context and tasks while launcher support is completed.'
+              : 'This version cannot connect automatically yet. You can still save context and tasks in Context Relay while support for this version is completed.'}</p>
+        <p>The harness is not connected. No setup changes were made.</p>
       </section>}
-      {busy && <p role="status">{busy === 'preview' ? 'Checking the installed AI app…' : busy === 'apply' ? 'Applying the reviewed plan…' : 'Rolling back the confirmed plan…'}</p>}
+      {busy && <p role="status">{busy === 'preview' ? 'Checking the installed harness…' : busy === 'apply' ? 'Applying the reviewed plan…' : 'Rolling back the confirmed plan…'}</p>}
       {review && <section className="record-card" aria-labelledby="harness-review-title">
         <h2 id="harness-review-title">Review connection changes</h2>
         <p>{label(review)}</p>
@@ -207,6 +211,25 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
       </section>}
     </section>
   );
+}
+
+function setupError(error: unknown, harness: HarnessId) {
+  // Map only known daemon errors to fixed guidance. Never display raw native output.
+  if (error && typeof error === 'object' && 'code' in error && 'message' in error && error.code === 'not_found') {
+    if (harness === 'claude_code' && error.message === 'Claude Code executable was not found') {
+      return 'The Claude Code command-line executable was not found. Install the native Claude Code CLI and restart Context Relay, then check the connection again.';
+    }
+    if (harness === 'hermes' && error.message === 'Hermes profile was not found') {
+      return 'That Hermes profile was not found. Enter the name of an existing profile, or use default for your main Hermes profile.';
+    }
+    if (harness === 'hermes' && error.message === 'Hermes default profile was not found') {
+      return 'The Hermes home folder is unavailable. Open Hermes to check its setup, then check the connection again. The profile field takes a name such as default, not the home folder path.';
+    }
+    if (harness === 'hermes' && error.message === 'Hermes executable was not found') {
+      return 'The Hermes command-line executable was not found. Check your Hermes installation and restart Context Relay, then check the connection again.';
+    }
+  }
+  return 'Setup preview could not be loaded. Check the local service, installed harness and project folder, then request a new preview.';
 }
 
 function label(item: ReviewedPlan) {

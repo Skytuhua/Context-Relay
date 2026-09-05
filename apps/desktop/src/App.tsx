@@ -25,17 +25,24 @@ type ScreenId =
 
 const SCREENS: ReadonlyArray<{ id: ScreenId; label: string; summary: string }> = [
   { id: 'home', label: 'Home', summary: 'Keep useful context between AI sessions.' },
-  { id: 'projects', label: 'Projects', summary: 'Choose the folders you work on with your AI apps.' },
+  { id: 'projects', label: 'Projects', summary: 'Choose the folders you work on with your harnesses.' },
   { id: 'memory', label: 'Saved context', summary: 'Save decisions, preferences and notes for future AI sessions.' },
-  { id: 'review', label: 'Suggestions', summary: 'Choose which notes from your AI apps are worth keeping.' },
+  { id: 'review', label: 'Suggestions', summary: 'Choose which notes from your harnesses are worth keeping.' },
   { id: 'tasks', label: 'Tasks', summary: 'Keep track of what to do next and what is finished.' },
-  { id: 'harnesses', label: 'AI apps', summary: 'Connect a supported AI app to your project context.' },
+  { id: 'harnesses', label: 'Harnesses', summary: 'Connect a supported harness to your project context.' },
   { id: 'devices', label: 'Devices', summary: 'Review trusted local devices.' },
   { id: 'settings', label: 'Settings', summary: 'Review local security settings.' },
 ];
 
 const DEFAULT_GATEWAY = new LocalWorkspaceGateway();
 const STARTUP_TIMEOUT_MS = 45_000;
+type SaveAction = 'memory' | 'task' | 'memory-edit' | 'task-edit' | 'archive' | 'review' | 'task-status' | 'task-complete';
+const SAVE_MESSAGES: Partial<Record<SaveAction, string>> = {
+  archive: 'Archiving context…',
+  review: 'Saving your review…',
+  'task-status': 'Starting task…',
+  'task-complete': 'Completing task…',
+};
 
 export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: WorkspaceGateway }) {
   const [activeScreen, setActiveScreen] = useState<ScreenId>('home');
@@ -53,7 +60,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const [evidence, setEvidence] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [saving, setSaving] = useState<'memory' | 'task' | 'memory-edit' | 'task-edit' | null>(null);
+  const [saving, setSaving] = useState<SaveAction | null>(null);
   const savingRef = useRef(false);
   const [projectBusy, setProjectBusy] = useState(false);
   const projectBusyRef = useRef(false);
@@ -156,6 +163,22 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     }).finally(() => { if (generation === readGeneration.current) setRecordsLoading(false); });
   }
 
+  function beginSave(action: SaveAction) {
+    if (savingRef.current || projectBusyRef.current || connectionState !== 'ready') return false;
+    savingRef.current = true;
+    readGeneration.current += 1;
+    setRecordsLoading(false);
+    setSaving(action);
+    setError(null);
+    setNotice(null);
+    return true;
+  }
+
+  function finishSave() {
+    savingRef.current = false;
+    setSaving(null);
+  }
+
   async function submitMemory(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (savingRef.current || connectionState !== 'ready') return;
@@ -165,12 +188,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     const body = String(data.get('body') ?? '').trim();
     if (!title) return setError('Enter a title.');
     if (!body) return setError('Enter memory text.');
-    savingRef.current = true;
-    readGeneration.current += 1;
-    setRecordsLoading(false);
-    setSaving('memory');
-    setError(null);
-    setNotice(null);
+    if (!beginSave('memory')) return;
     try {
       const memory = await gateway.createMemory(activeProject?.projectId ?? null, title, body);
       setMemories((current) => [memory, ...current]);
@@ -180,7 +198,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       refreshSavedRecords('memory', activeProject?.projectId ?? null);
     } catch {
       setError('We could not confirm the save. Your draft is still here. Check Saved context before trying again.');
-    } finally { savingRef.current = false; setSaving(null); }
+    } finally { finishSave(); }
   }
 
   async function submitMemoryEdit(event: FormEvent<HTMLFormElement>) {
@@ -190,12 +208,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     const title = String(data.get('title') ?? '').trim();
     const body = String(data.get('body') ?? '').trim();
     if (!title || !body) return setError('Enter a title and memory text.');
-    savingRef.current = true;
-    readGeneration.current += 1;
-    setRecordsLoading(false);
-    setSaving('memory-edit');
-    setError(null);
-    setNotice(null);
+    if (!beginSave('memory-edit')) return;
     try {
       const memory = await gateway.updateMemory(editingMemory, title, body);
       setMemories((current) => replaceRecord(current, memory));
@@ -205,20 +218,19 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       refreshSavedRecords('memory', activeProject?.projectId ?? null);
     } catch {
       setError('We could not confirm the update. Your draft is still here. Check Saved context before trying again.');
-    } finally { savingRef.current = false; setSaving(null); }
+    } finally { finishSave(); }
   }
 
   async function archiveMemory(memory: MemoryRecord) {
-    if (savingRef.current) return;
-    readGeneration.current += 1;
-    setRecordsLoading(false);
+    if (!beginSave('archive')) return;
     try {
       await gateway.archiveMemory(memory);
       setMemories((current) => current.filter((item) => item.id !== memory.id));
+      setEditingMemory((current) => current?.id === memory.id ? null : current);
       setNotice('Memory archived');
     } catch {
-      setError('The memory changed before it could be archived.');
-    }
+      setError('We could not confirm the archive. Reload Saved context to check before trying again.');
+    } finally { finishSave(); }
   }
 
   function openArchive(memory: MemoryRecord, trigger: HTMLButtonElement) {
@@ -245,13 +257,14 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   }
 
   async function review(candidate: MemoryCandidate, accepted: boolean) {
+    if (!beginSave('review')) return;
     try {
       await gateway.reviewCandidate(candidate, accepted);
       setCandidates((current) => current.filter((item) => item.id !== candidate.id));
       setNotice(accepted ? 'Candidate accepted' : 'Candidate rejected');
     } catch {
-      setError('The candidate was already reviewed.');
-    }
+      setError('We could not confirm your review. Reload Suggestions to check before trying again.');
+    } finally { finishSave(); }
   }
 
   async function submitTask(event: FormEvent<HTMLFormElement>) {
@@ -264,12 +277,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     const body = String(data.get('body') ?? '').trim();
     if (!title) return setError('Enter a task title.');
     if (!body) return setError('Enter task details.');
-    savingRef.current = true;
-    readGeneration.current += 1;
-    setRecordsLoading(false);
-    setSaving('task');
-    setError(null);
-    setNotice(null);
+    if (!beginSave('task')) return;
     try {
       const task = await gateway.createTask(activeProject.projectId, title, body);
       setTasks((current) => [task, ...current]);
@@ -279,7 +287,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       refreshSavedRecords('task', activeProject.projectId);
     } catch {
       setError('We could not confirm the save. Your draft is still here. Check the task list before trying again.');
-    } finally { savingRef.current = false; setSaving(null); }
+    } finally { finishSave(); }
   }
 
   async function submitTaskEdit(event: FormEvent<HTMLFormElement>) {
@@ -289,12 +297,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     const title = String(data.get('title') ?? '').trim();
     const body = String(data.get('body') ?? '').trim();
     if (!title || !body) return setError('Enter a title and task details.');
-    savingRef.current = true;
-    readGeneration.current += 1;
-    setRecordsLoading(false);
-    setSaving('task-edit');
-    setError(null);
-    setNotice(null);
+    if (!beginSave('task-edit')) return;
     try {
       const task = await gateway.updateTask(editingTask, title, body);
       setTasks((current) => replaceRecord(current, task));
@@ -303,35 +306,33 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       refreshSavedRecords('task', activeProject.projectId);
     } catch {
       setError('We could not confirm the update. Your draft is still here. Check the task list before trying again.');
-    } finally { savingRef.current = false; setSaving(null); }
+    } finally { finishSave(); }
   }
 
   async function transitionTask(task: TaskRecord, next: TaskStatus) {
-    if (savingRef.current) return;
-    readGeneration.current += 1;
-    setRecordsLoading(false);
+    if (!beginSave('task-status')) return;
     try {
       const updated = await gateway.transitionTask(task, next);
       setTasks((current) => replaceRecord(current, updated));
+      setNotice(next === 'in_progress' ? 'Task started' : 'Task updated');
     } catch {
-      setError('The task changed before it could be updated.');
-    }
+      setError('We could not confirm the task status. Reload Tasks to check before trying again.');
+    } finally { finishSave(); }
   }
 
   async function completeTask(task: TaskRecord) {
     if (savingRef.current) return;
     const summary = evidence[task.id]?.trim();
     if (!summary) return setError(`Enter completion evidence for ${task.title}.`);
-    readGeneration.current += 1;
-    setRecordsLoading(false);
+    if (!beginSave('task-complete')) return;
     try {
       const updated = await gateway.completeTask(task, summary);
       setTasks((current) => replaceRecord(current, updated));
       setNotice('Task completed');
       setError(null);
     } catch {
-      setError('The task changed before it could be completed.');
-    }
+      setError('We could not confirm completion. Your evidence is still here. Reload Tasks to check before trying again.');
+    } finally { finishSave(); }
   }
 
   function renderScreen(screen: ScreenId) {
@@ -340,9 +341,9 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
         return (
           <section className="screen-content home-guide" aria-labelledby="home-start-title">
             <h2 id="home-start-title">{activeProject ? 'Continue with your project' : 'Start with a project folder'}</h2>
-            <p>Context Relay stores notes and tasks on this computer so a connected AI app can use them in later sessions.</p>
+            <p>Context Relay stores notes and tasks on this computer so a connected harness can use them in later sessions.</p>
             {!activeProject ? <>
-              <p>Choose a folder you already work in. Give it a name, then connect your AI app or save your first note.</p>
+              <p>Choose a folder you already work in. Give it a name, then connect your harness or save your first note.</p>
               <button className="primary-action" type="button" disabled={connectionState !== 'ready'} onClick={() => void selectScreen('projects')}>Add your project folder</button>
             </> : <NextSteps onConnect={() => void selectScreen('harnesses')} onContext={() => void selectScreen('memory')} />}
             <p className="workspace-status" role="status">{connectionState === 'failed' ? 'Local workspace unavailable' : connectionState === 'connecting' ? 'Opening your workspace…' : status?.vault === 'unlocked' ? 'Ready on this computer' : 'Workspace locked'}</p>
@@ -402,7 +403,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
                   <h3>{memory.title}</h3>
                   <p>{memory.bodyMarkdown}</p>
                   <button aria-label={`Edit ${memory.title}`} disabled={!!saving} onClick={() => setEditingMemory(memory)} type="button">Edit</button>
-                  <button aria-label={`Archive ${memory.title}`} disabled={!!saving} onClick={(event) => openArchive(memory, event.currentTarget)} type="button">Archive</button>
+                  <button aria-label={`Archive ${memory.title}`} disabled={!!saving || connectionState !== 'ready'} onClick={(event) => openArchive(memory, event.currentTarget)} type="button">Archive</button>
                 </li>
               ))}
             </RecordList>
@@ -415,6 +416,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
               <p>{archiveTarget?.title}</p>
               <button
                 className="primary-action"
+                disabled={!!saving || connectionState !== 'ready'}
                 onClick={() => {
                   if (archiveTarget) void archiveMemory(archiveTarget);
                   archiveDialogRef.current?.close();
@@ -431,17 +433,17 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       case 'review':
         return (
           <section className="screen-content">
-            <h2>Suggestions from AI apps</h2>
-            <p>AI apps can suggest notes to remember. Review each one before it becomes saved context.</p>
+            <h2>Suggestions from harnesses</h2>
+            <p>Harnesses can suggest notes to remember. Review each one before it becomes saved context.</p>
             <ul className="record-list">
-              {candidates.length === 0 && <li className="empty-message">No suggestions to review. Suggestions from a connected AI app will appear here.</li>}
+              {candidates.length === 0 && <li className="empty-message">No suggestions to review. Suggestions from a connected harness will appear here.</li>}
               {candidates.map((candidate) => (
                 <li className="record-card" key={candidate.id}>
                   <h3>{candidate.proposedMemory.title}</h3>
                   <p>{candidate.proposedMemory.bodyMarkdown}</p>
                   <p>{candidate.evidenceSummary}</p>
-                  <button aria-label={`Accept ${candidate.proposedMemory.title}`} onClick={() => void review(candidate, true)} type="button">Accept</button>
-                  <button aria-label={`Reject ${candidate.proposedMemory.title}`} onClick={() => void review(candidate, false)} type="button">Reject</button>
+                  <button aria-label={`Accept ${candidate.proposedMemory.title}`} disabled={!!saving || connectionState !== 'ready'} onClick={() => void review(candidate, true)} type="button">Accept</button>
+                  <button aria-label={`Reject ${candidate.proposedMemory.title}`} disabled={!!saving || connectionState !== 'ready'} onClick={() => void review(candidate, false)} type="button">Reject</button>
                 </li>
               ))}
             </ul>
@@ -457,7 +459,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           <section className="screen-content">
             <form aria-describedby={error ? 'workspace-error' : undefined} aria-label="New task" className="capture-form" onSubmit={submitTask}>
               <h2>New task</h2>
-              <p>Write down the next piece of work so you or your AI app can pick it up later.</p>
+              <p>Write down the next piece of work so you or your harness can pick it up later.</p>
               <Field label="Task title" name="title" disabled={!!saving} placeholder="For example, Fix the sign-in page" />
               <Field label="Task details" name="body" multiline disabled={!!saving} />
               <button className="primary-action" type="submit" disabled={!!saving || connectionState !== 'ready'}>{saving === 'task' ? 'Saving…' : 'Save task'}</button>
@@ -480,7 +482,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
                   <button aria-label={`Edit ${task.title}`} disabled={!!saving} onClick={() => setEditingTask(task)} type="button">Edit</button>
                   {task.status !== 'done' && (
                     <>
-                      <button aria-label={`Start ${task.title}`} disabled={!!saving} onClick={() => void transitionTask(task, 'in_progress')} type="button">Start</button>
+                      <button aria-label={`Start ${task.title}`} disabled={!!saving || connectionState !== 'ready'} onClick={() => void transitionTask(task, 'in_progress')} type="button">Start</button>
                       <label htmlFor={`evidence-${task.id}`}>Evidence for {task.title}</label>
                       <input
                         id={`evidence-${task.id}`}
@@ -489,7 +491,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
                         type="text"
                         value={evidence[task.id] ?? ''}
                       />
-                      <button aria-label={`Complete ${task.title}`} disabled={!!saving} onClick={() => void completeTask(task)} type="button">Complete</button>
+                      <button aria-label={`Complete ${task.title}`} disabled={!!saving || connectionState !== 'ready'} onClick={() => void completeTask(task)} type="button">Complete</button>
                     </>
                   )}
                   {task.evidence.map((item) => <p key={`${task.id}-${item.summary}`}>{item.summary}</p>)}
@@ -536,7 +538,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
         <aside className="sidebar">
           <div className="brand-block">
             <p className="brand-name">Context Relay</p>
-            <p>Context for your AI apps</p>
+            <p>Context for your harnesses</p>
           </div>
           <nav aria-label="Workspace">
             {SCREENS.map((screen) => (
@@ -572,6 +574,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           )}
           {error && <p className="form-error" id="workspace-error" role="alert">{error}</p>}
           {notice && <p className="notice" role="status">{notice}</p>}
+          {saving && SAVE_MESSAGES[saving] && <p role="status">{SAVE_MESSAGES[saving]}</p>}
           {recordsLoading && <p role="status">Loading your saved records…</p>}
           {renderScreen(activeScreen)}
           <div hidden={activeScreen !== 'harnesses'}>
@@ -625,7 +628,7 @@ function RecordList({ children, title }: { children: React.ReactNode; title: str
 
 function NextSteps({ onConnect, onContext }: { onConnect: () => void; onContext: () => void }) {
   return <div className="next-steps" aria-label="Next steps">
-    <div><h3>Connect your AI app</h3><p>Check the installed version and review the changes needed to connect it.</p><button className="primary-action" type="button" onClick={onConnect}>Connect an AI app</button></div>
+    <div><h3>Connect your harness</h3><p>Check the installed version and review the changes needed to connect it.</p><button className="primary-action" type="button" onClick={onConnect}>Connect a harness</button></div>
     <div><h3>Save useful context</h3><p>Keep a preference, decision or note. You can do this before connecting an app.</p><button className="secondary-action" type="button" onClick={onContext}>Save your first context</button></div>
   </div>;
 }
