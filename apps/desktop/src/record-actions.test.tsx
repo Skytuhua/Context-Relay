@@ -90,9 +90,9 @@ it('clears the editor only after archiving that context is acknowledged', async 
   fireEvent.click(await screen.findByRole('button', { name: 'Edit Project decision' }));
   prepareArchiveDialog();
   await clickAction(actions[2]);
-  expect(screen.getByRole('form', { name: 'Edit memory' })).toBeVisible();
+  expect(screen.getByRole('form', { name: 'Edit context' })).toBeVisible();
   await act(async () => { finish(memory); });
-  expect(screen.queryByRole('form', { name: 'Edit memory' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('form', { name: 'Edit context' })).not.toBeInTheDocument();
   expect(screen.queryByRole('button', { name: 'Edit Project decision' })).not.toBeInTheDocument();
 });
 

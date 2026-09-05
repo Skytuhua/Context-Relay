@@ -4,9 +4,10 @@ import { type HarnessGateway, validateHarnessPlan, validateHarnessProbe } from '
 
 const harnessNames: Record<HarnessId, string> = { claude_code: 'Claude Code', codex: 'Codex', hermes: 'Hermes' };
 type ReviewedPlan = { plan: SetupPlan; params: HarnessParams; projectName: string };
+type AppliedPlan = ReviewedPlan & { connectionNumber: number; connectedAt: number };
 type BusyAction = 'preview' | 'apply' | 'rollback' | null;
 
-export function HarnessesScreen({ gateway, projects, preferredProjectId, onProjectChange, active = true }: { gateway: HarnessGateway; projects: ProjectIdentity[]; preferredProjectId?: string; onProjectChange?: (id: string) => void; active?: boolean }) {
+export function HarnessesScreen({ gateway, projects, preferredProjectId, onProjectChange, onAddProject, onSaveContext, active = true }: { gateway: HarnessGateway; projects: ProjectIdentity[]; preferredProjectId?: string; onProjectChange?: (id: string) => void; onAddProject?: () => void; onSaveContext?: () => void; active?: boolean }) {
   const [selectedProjectId, setProjectId] = useState<string | null>(null);
   const projectId = preferredProjectId ?? selectedProjectId ?? projects[0]?.projectId ?? '';
   const [harness, setHarness] = useState<HarnessId>('codex');
@@ -16,7 +17,8 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   const [review, setReview] = useState<ReviewedPlan | null>(null);
   const [discovery, setDiscovery] = useState<{ harness: HarnessId; report: ProbeReport } | null>(null);
   const [approved, setApproved] = useState(false);
-  const [applied, setApplied] = useState<ReviewedPlan[]>([]);
+  const [applied, setApplied] = useState<AppliedPlan[]>([]);
+  const nextConnectionNumber = useRef(1);
   const [rollbackTarget, setRollbackTarget] = useState<PlanId | null>(null);
   const [busy, setBusy] = useState<BusyAction>(null);
   const [error, setError] = useState<string | null>(null);
@@ -116,13 +118,14 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
     try {
       await gateway.harnessApply(approvedReview.plan.planId);
       if (!mounted.current) return;
-      setApplied((items) => [...items.filter((item) => item.plan.planId !== approvedReview.plan.planId), approvedReview]);
+      const connection = { ...approvedReview, connectionNumber: nextConnectionNumber.current++, connectedAt: Date.now() };
+      setApplied((items) => [...items.filter((item) => item.plan.planId !== approvedReview.plan.planId), connection]);
       setReview(null);
-      setNotice(`Setup applied: ${label(approvedReview)}.`);
+      setNotice(`Connected: ${label(approvedReview)}.`);
     } catch {
       if (mounted.current) {
         setReview(null);
-        setError('Setup could not be confirmed. The local service may have rejected a changed or expired plan. Check the local service and request a fresh preview before trying again.');
+        setError('The connection could not be confirmed. Check the connection again to review the latest changes before retrying.');
       }
     } finally { finish(); }
   }
@@ -136,18 +139,24 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
       if (!mounted.current) return;
       setApplied((items) => items.filter((current) => current.plan.planId !== item.plan.planId));
       setReview(null);
-      setNotice(`Rollback completed: ${label(item)}.`);
+      setNotice(`Connection changes undone: ${label(item)}.`);
     } catch {
-      if (mounted.current) setError('Rollback could not be confirmed. Check the local service and review the applied plan before confirming a retry.');
+      if (mounted.current) setError('Undo could not be confirmed. Check the harness configuration before trying to undo these changes again.');
     } finally { finish(); }
   }
 
+  if (projects.length === 0) return <section className="screen-content empty-state" aria-label="Harness connection">
+    <h2>Add a project first</h2>
+    <p>Choose the folder whose context you want to share with your harness.</p>
+    {onAddProject ? <button className="primary-action" type="button" onClick={onAddProject}>Add a project</button>
+      : <p>Open Projects to add your folder, then return here.</p>}
+  </section>;
+
   return (
-    <section className="screen-content" aria-label="Harness connection" style={{ overflowWrap: 'anywhere', minWidth: 0 }}>
+    <section className="screen-content harness-connection" aria-label="Harness connection">
       <form className="capture-form" aria-label="Check harness connection" onSubmit={(event) => { event.preventDefault(); void previewSetup(); }}>
         <h2>Connect a harness</h2>
-        <p>Choose the harness you use for this project. We will check its installed version and show any changes before you connect it.</p>
-        {projects.length === 0 && <p>Add your project folder in Projects first, then return here to connect your harness.</p>}
+        <p>Choose your project and harness. Check compatibility, then review the changes before connecting.</p>
         <div className="field">
           <label htmlFor="harness-project">Project</label>
           <select id="harness-project" value={projectId} disabled={busy === 'apply' || busy === 'rollback'} onChange={(event) => { clearReview(); if (onProjectChange) onProjectChange(event.target.value); else setProjectId(event.target.value); }}>
@@ -170,42 +179,44 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
       </form>
       {error && <p className="form-error" role="alert">{error}</p>}
       {notice && <p className="notice" role="status">{notice}</p>}
-      {discovery && <section className="record-card" aria-label="Harness availability">
+      {discovery && <section className="connection-result" aria-label="Harness availability">
         <h2>{harnessNames[discovery.harness]}{discovery.report.harnessVersion && discovery.report.harnessVersion !== 'unknown' ? ` ${discovery.report.harnessVersion}` : ''}</h2>
-        {discovery.report.executable && <p>Executable: {nativeText(discovery.report.executable)}</p>}
         <p role="status">{discovery.report.capability === 'missing'
-          ? `${harnessNames[discovery.harness]} was not found. Install a supported version, restart Context Relay and request a new preview.`
+          ? `${harnessNames[discovery.harness]} was not found. Install it, restart Context Relay and check the connection again.`
           : discovery.report.capability === 'blocked'
-            ? 'Local policy prevents automatic setup. Review the harness policy before requesting a new preview.'
+            ? 'Local policy prevents automatic setup. Check the restrictions configured for this harness before trying again.'
             : discovery.harness === 'hermes' && discovery.report.harnessVersion === 'unknown'
               ? 'Hermes was found, but this launcher cannot connect automatically yet. Context Relay cannot verify its version and runtime. You can still save context and tasks while launcher support is completed.'
               : 'This version cannot connect automatically yet. You can still save context and tasks in Context Relay while support for this version is completed.'}</p>
         <p>The harness is not connected. No setup changes were made.</p>
+        {onSaveContext && <button className="secondary-action" type="button" disabled={!!busy} onClick={onSaveContext}>Save context</button>}
+        {discovery.report.executable && <details className="technical-details"><summary>Technical details</summary><p>Executable: {nativeText(discovery.report.executable)}</p></details>}
       </section>}
-      {busy && <p role="status">{busy === 'preview' ? 'Checking the installed harness…' : busy === 'apply' ? 'Applying the reviewed plan…' : 'Rolling back the confirmed plan…'}</p>}
+      {busy && <p role="status">{busy === 'preview' ? 'Checking the installed harness…' : busy === 'apply' ? 'Connecting your harness…' : 'Undoing connection changes…'}</p>}
       {review && <section className="record-card" aria-labelledby="harness-review-title">
         <h2 id="harness-review-title">Review connection changes</h2>
         <p>{label(review)}</p>
-        <PlanDetails plan={review.plan} />
-        {expired && <p className="form-error">This plan has expired. Request a new preview.</p>}
-        {conflicts && <p className="form-error">Resolve conflicts before requesting a new preview. This plan cannot be applied.</p>}
-        {!matching && <p className="form-error">The plan no longer matches the selection. Request a new preview.</p>}
+        <PlanDetails plan={review.plan} projectName={review.projectName} />
+        {expired && <p className="form-error">This connection check has expired. Check the connection again.</p>}
+        {conflicts && <p className="form-error">Resolve the conflicting settings shown above, then check the connection again.</p>}
+        {!matching && <p className="form-error">The project or harness changed. Check the connection again.</p>}
         <label>
           <input type="checkbox" checked={approved} disabled={!!busy || expired || conflicts || !matching} onChange={(event) => setApproved(event.target.checked)} />
-          I reviewed the targets, permissions, network changes and operations in this plan.
+          I reviewed and approve these connection changes.
         </label>
-        <button className="primary-action" type="button" disabled={!canApply} onClick={() => void applySetup()}>{busy === 'apply' ? 'Applying reviewed plan…' : 'Apply reviewed plan'}</button>
+        <button className="primary-action" type="button" disabled={!canApply} onClick={() => void applySetup()}>{busy === 'apply' ? 'Connecting…' : 'Connect harness'}</button>
       </section>}
-      {applied.length > 0 && <section aria-label="Applied setup plans">
-        <h2>Applied setup plans</h2>
+      {applied.length > 0 && <section aria-label="Recent connections">
+        <h2>Recent connections</h2>
         <ul className="record-list">{applied.map((item) => <li className="record-card" key={item.plan.planId}>
           <h3>{label(item)}</h3>
-          <p>Applied plan: {item.plan.planId}</p>
-          <button className="secondary-action" type="button" disabled={!!busy} onClick={() => setRollbackTarget(item.plan.planId)}>Roll back {label(item)}</button>
+          <p className="help-text">Connection {item.connectionNumber} · {new Date(item.connectedAt).toLocaleString()} · Version {item.plan.harnessVersion}</p>
+          <details className="connection-history-details"><summary>View these connection changes</summary><PlanDetails plan={item.plan} projectName={item.projectName} /></details>
+          <button className="secondary-action" type="button" disabled={!!busy} onClick={() => setRollbackTarget(item.plan.planId)}>Undo connection {item.connectionNumber} for {label(item)}</button>
           {rollbackTarget === item.plan.planId && <div role="group" aria-label={`Confirm rollback of ${label(item)}`}>
-            <p>Roll back this applied plan? The local service checks whether the saved changes can be safely restored.</p>
-            <button type="button" className="primary-action" disabled={!!busy} onClick={() => void rollbackSetup(item)}>Confirm rollback</button>
-            <button type="button" className="secondary-action" disabled={!!busy} onClick={() => setRollbackTarget(null)}>Cancel rollback</button>
+            <p>Restore the configuration from before this connection? Context Relay will check for changes made since then.</p>
+            <button type="button" className="primary-action" disabled={!!busy} onClick={() => void rollbackSetup(item)}>Undo connection changes</button>
+            <button type="button" className="secondary-action" disabled={!!busy} onClick={() => setRollbackTarget(null)}>Keep connection</button>
           </div>}
         </li>)}</ul>
       </section>}
@@ -229,7 +240,7 @@ function setupError(error: unknown, harness: HarnessId) {
       return 'The Hermes command-line executable was not found. Check your Hermes installation and restart Context Relay, then check the connection again.';
     }
   }
-  return 'Setup preview could not be loaded. Check the local service, installed harness and project folder, then request a new preview.';
+  return 'Could not check this connection. Try again. If it still fails, restart Context Relay and make sure the project folder is available.';
 }
 
 function label(item: ReviewedPlan) {
@@ -247,41 +258,42 @@ function expiryText(value: string) {
     : `${value} milliseconds since Unix epoch`;
 }
 
-function PlanDetails({ plan }: { plan: SetupPlan }) {
-  return <>
+function PlanDetails({ plan, projectName }: { plan: SetupPlan; projectName: string }) {
+  return <div className="connection-plan">
+    <section>
+    <h3>Where changes apply</h3>
+    <ul>{plan.targetScopes.map((scope, index) => <li key={index}>{scope.scope === 'global' ? 'Harness settings for this user account' : `${projectName}: ${nativeText(scope.root)}`}</li>)}</ul>
+    </section>
+    <section>
+    <h3>Changes and targets</h3>
+    {plan.semanticChanges.length ? <ul>{plan.semanticChanges.map((change, index) => <li key={index}><strong>{change.class}: {change.target}</strong><p>{change.summary}</p></li>)}</ul> : <p>No configuration changes.</p>}
+    </section>
+    <Delta title="Permission changes" added={plan.permissionDelta.added} removed={plan.permissionDelta.removed} />
+    <Delta title="Network changes" added={plan.networkDelta.added.map((endpoint) => `${endpoint.scheme}://${endpoint.host}:${endpoint.port}`)} removed={plan.networkDelta.removed.map((endpoint) => `${endpoint.scheme}://${endpoint.host}:${endpoint.port}`)} />
+    {plan.packageArtifacts.length ? <section><h3>Packages to install</h3><ul>{plan.packageArtifacts.map((artifact, index) => <li key={index}>
+      <p>{nativeText(artifact.artifactPath)}</p><p>Source: {artifact.immutableSourceRef}</p><p>Commit: {artifact.resolvedCommit}</p>
+      {artifact.dependencies.length > 0 && <ul>{artifact.dependencies.map((dependency, childIndex) => <li key={childIndex}>{dependency.name} {dependency.version} — {dependency.immutableSourceRef}</li>)}</ul>}
+    </li>)}</ul></section> : <p>No packages to install.</p>}
+    <details className="technical-details">
+    <summary>Technical verification details</summary>
     <p>Executable: {nativeText(plan.executablePath)}</p>
     <p>Version: {plan.harnessVersion}</p>
     <p>Review level: {plan.approvalClass}</p>
     <p>Expires: {expiryText(plan.expiresAt)}</p>
-    <h3>Where changes apply</h3>
-    <ul>{plan.targetScopes.map((scope, index) => <li key={index}>{scope.scope === 'global' ? 'Global' : `Project ${scope.projectId}: ${nativeText(scope.root)}`}</li>)}</ul>
-    <h3>Changes and targets</h3>
-    {plan.semanticChanges.length ? <ul>{plan.semanticChanges.map((change, index) => <li key={index}><strong>{change.class}: {change.target}</strong><p>{change.summary}</p></li>)}</ul> : <p>No configuration changes.</p>}
     {plan.expectedNativeDigests.length > 0 && <ul>{plan.expectedNativeDigests.map((item, index) => <li key={index}>{nativeText(item.target)} — {item.expectedDigest === null ? 'Must not exist' : 'Existing content must match its reviewed digest'}</li>)}</ul>}
-    <h3>Permission changes</h3>
-    <Delta added={plan.permissionDelta.added} removed={plan.permissionDelta.removed} />
-    <h3>Network changes</h3>
-    <Delta added={plan.networkDelta.added.map((endpoint) => `${endpoint.scheme}://${endpoint.host}:${endpoint.port}`)} removed={plan.networkDelta.removed.map((endpoint) => `${endpoint.scheme}://${endpoint.host}:${endpoint.port}`)} />
     <h3>Commands to run</h3>
     {plan.cliOperations.length ? <ol>{plan.cliOperations.map((operation, index) => <li key={index}>
       <p>{nativeText(operation.executable)}</p>
       <ol aria-label="Arguments">{operation.arguments.map((argument, argumentIndex) => <li key={argumentIndex}>{nativeText(argument)}</li>)}</ol>
       <p>Timeout: {operation.timeoutMs} ms</p>
     </li>)}</ol> : <p>No Commands to run.</p>}
-    <h3>Packages to install</h3>
-    {plan.packageArtifacts.length ? <ul>{plan.packageArtifacts.map((artifact, index) => <li key={index}>
-      <p>{nativeText(artifact.artifactPath)}</p><p>Source: {artifact.immutableSourceRef}</p><p>Commit: {artifact.resolvedCommit}</p>
-      {artifact.dependencies.length > 0 && <ul>{artifact.dependencies.map((dependency, childIndex) => <li key={childIndex}>{dependency.name} {dependency.version} — {dependency.immutableSourceRef}</li>)}</ul>}
-    </li>)}</ul> : <p>No packages to install.</p>}
-    <details>
-      <summary>Technical verification details</summary>
       <pre style={{ whiteSpace: 'pre-wrap' }}>{JSON.stringify({ planId: plan.planId, adapterVersion: plan.adapterVersion, executablePath: plan.executablePath, executableHash: plan.executableHash, expectedNativeDigests: plan.expectedNativeDigests, scannerReportHash: plan.scannerReportHash, rulesyncVersion: plan.rulesyncVersion, rulesyncHash: plan.rulesyncHash, batchHash: plan.batchHash, packageArtifacts: plan.packageArtifacts }, null, 2)}</pre>
     </details>
-  </>;
+  </div>;
 }
 
-function Delta({ added, removed }: { added: string[]; removed: string[] }) {
-  if (!added.length && !removed.length) return <p>No changes.</p>;
-  return <>{added.length > 0 && <><p>Added</p><ul>{added.map((value, index) => <li key={index}>{value}</li>)}</ul></>}
-    {removed.length > 0 && <><p>Removed</p><ul>{removed.map((value, index) => <li key={index}>{value}</li>)}</ul></>}</>;
+function Delta({ title, added, removed }: { title: string; added: string[]; removed: string[] }) {
+  if (!added.length && !removed.length) return <p><strong>{title}:</strong> None.</p>;
+  return <section><h3>{title}</h3>{added.length > 0 && <><p>Added</p><ul>{added.map((value, index) => <li key={index}>{value}</li>)}</ul></>}
+    {removed.length > 0 && <><p>Removed</p><ul>{removed.map((value, index) => <li key={index}>{value}</li>)}</ul></>}</section>;
 }

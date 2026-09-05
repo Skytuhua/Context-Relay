@@ -333,3 +333,20 @@ SHA-256 `57199e121b7319d0d62398b36b3a02849bc197e14dd57d6e17f1b4266a84b197`,
 Authenticode NotSigned. Packaging completed successfully. It includes the
 explicit-home and Windows startup-hook corrections. This candidate was not
 installed or visually verified; Full support and release acceptance remain open.
+
+## 2026-09-06: clearer first-use flow
+
+The frontend now leads through choosing a project, saving context and connecting
+a harness. Navigation is grouped and wraps in narrow windows. Empty and
+unavailable connection states have a useful next action. Technical details are
+expandable, while consent-relevant changes remain visible. Repeated connections
+retain distinct Undo targets and the original change review. All 140 frontend
+tests, type checking, lint and the production build pass. Eight isolated
+headless Edge screenshots and the first-use interaction flow were checked;
+this does not exercise the installed native app. See the
+[first-use evidence](first-use-ui-2026-09-06.md). The 5d92f4f candidate above
+predates this frontend change.
+
+Hosted CI run 33989730248 also passed the corrected macOS Rust tests, macOS lint
+and macOS native build. Windows Rust tests were still running at this check;
+this is not a claim that every required CI or native qualification gate passed.

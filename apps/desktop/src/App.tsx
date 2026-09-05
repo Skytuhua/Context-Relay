@@ -24,14 +24,20 @@ type ScreenId =
   | 'settings';
 
 const SCREENS: ReadonlyArray<{ id: ScreenId; label: string; summary: string }> = [
-  { id: 'home', label: 'Home', summary: 'Keep useful context between AI sessions.' },
+  { id: 'home', label: 'Home', summary: 'Keep useful context for your next session.' },
   { id: 'projects', label: 'Projects', summary: 'Choose the folders you work on with your harnesses.' },
   { id: 'memory', label: 'Saved context', summary: 'Save decisions, preferences and notes for future AI sessions.' },
   { id: 'review', label: 'Suggestions', summary: 'Choose which notes from your harnesses are worth keeping.' },
   { id: 'tasks', label: 'Tasks', summary: 'Keep track of what to do next and what is finished.' },
-  { id: 'harnesses', label: 'Harnesses', summary: 'Connect a supported harness to your project context.' },
+  { id: 'harnesses', label: 'Harnesses', summary: 'Let Codex, Claude Code or Hermes use your saved context.' },
   { id: 'devices', label: 'Devices', summary: 'Review trusted local devices.' },
   { id: 'settings', label: 'Settings', summary: 'Review local security settings.' },
+];
+
+const NAV_GROUPS: ReadonlyArray<{ label: string; screens: ScreenId[] }> = [
+  { label: 'Your work', screens: ['home', 'projects', 'memory', 'review', 'tasks'] },
+  { label: 'Connections', screens: ['harnesses', 'devices'] },
+  { label: 'App', screens: ['settings'] },
 ];
 
 const DEFAULT_GATEWAY = new LocalWorkspaceGateway();
@@ -148,6 +154,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     readGeneration.current += 1;
     setProjects((current) => [...current.filter((item) => item.projectId !== project.projectId), project]);
     setActiveProject(project);
+    setActiveScreen('home');
     setNotice('Project added');
     setError(null);
   }
@@ -340,21 +347,24 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       case 'home':
         return (
           <section className="screen-content home-guide" aria-labelledby="home-start-title">
-            <h2 id="home-start-title">{activeProject ? 'Continue with your project' : 'Start with a project folder'}</h2>
-            <p>Context Relay stores notes and tasks on this computer so a connected harness can use them in later sessions.</p>
+            <h2 id="home-start-title">{activeProject ? 'What would you like to remember?' : 'Stop explaining the same things again'}</h2>
+            <p>Save a decision, preference or project note once. A connected harness can find it when you start your next session.</p>
             {!activeProject ? <>
-              <p>Choose a folder you already work in. Give it a name, then connect your harness or save your first note.</p>
+              <ol className="how-it-works" aria-label="How Context Relay works">
+                <li><h3>Choose a project</h3><p>Pick the folder you work in. Its notes and tasks stay together.</p></li>
+                <li><h3>Save useful context</h3><p>Add a preference or decision you want to keep, such as “Use TypeScript.”</p></li>
+                <li><h3>Connect a harness</h3><p>Connect Codex, Claude Code or Hermes so it can retrieve those notes.</p></li>
+              </ol>
               <button className="primary-action" type="button" disabled={connectionState !== 'ready'} onClick={() => void selectScreen('projects')}>Add your project folder</button>
             </> : <NextSteps onConnect={() => void selectScreen('harnesses')} onContext={() => void selectScreen('memory')} />}
             <p className="workspace-status" role="status">{connectionState === 'failed' ? 'Local workspace unavailable' : connectionState === 'connecting' ? 'Opening your workspace…' : status?.vault === 'unlocked' ? 'Ready on this computer' : 'Workspace locked'}</p>
-            <p className="help-text">You can save context and tasks without an AI connection. Sync between computers is not configured yet.</p>
+            <p className="help-text">Saved on this computer. You can add notes and tasks before connecting a harness.</p>
           </section>
         );
       case 'projects':
         return (
           <section className="screen-content">
             <ProjectForm gateway={gateway} ready={connectionState === 'ready'} onSaved={projectSaved} onBusy={(value) => { projectBusyRef.current = value; setProjectBusy(value); }} />
-            {notice === 'Project added' && <NextSteps onConnect={() => void selectScreen('harnesses')} onContext={() => void selectScreen('memory')} />}
             <RecordList title="Projects">
               {projects.map((project) => (
                 <li key={project.projectId}>
@@ -375,28 +385,27 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       case 'memory':
         return (
           <section className="screen-content">
-            <form aria-label="Context search" role="search" className="inline-form" onSubmit={searchMemory}>
-              <label htmlFor="memory-query">Search saved context</label>
-              <input id="memory-query" name="query" type="search" disabled={!!saving} />
-              <button className="secondary-action" type="submit" disabled={!!saving}>Search</button>
-            </form>
             <form aria-describedby={error ? 'workspace-error' : undefined} aria-label="New context" className="capture-form" onSubmit={submitMemory}>
               <h2>Save something worth remembering</h2>
               <p>For example: “Use TypeScript for this project” or a decision you do not want to explain again.</p>
               <Field label="Title" name="title" disabled={!!saving} placeholder="For example, Writing preferences" />
-              <Field label="What should your AI remember?" name="body" multiline disabled={!!saving} />
+              <Field label="What should your harness remember?" name="body" multiline disabled={!!saving} placeholder="A decision, preference or detail to use next time…" />
               <button className="primary-action" type="submit" disabled={!!saving || connectionState !== 'ready'}>{saving === 'memory' ? 'Saving…' : 'Save context'}</button>
             </form>
             {editingMemory && (
-              <form key={editingMemory.id} aria-describedby={error ? 'workspace-error' : undefined} aria-label="Edit memory" className="capture-form edit-form" onSubmit={submitMemoryEdit}>
-                <h2>Edit memory</h2>
+              <form key={editingMemory.id} aria-describedby={error ? 'workspace-error' : undefined} aria-label="Edit context" className="capture-form edit-form" onSubmit={submitMemoryEdit}>
+                <h2>Edit context</h2>
                 <Field label="Edit title" name="title" defaultValue={editingMemory.title} disabled={!!saving} />
-                <Field label="Edit memory" name="body" defaultValue={editingMemory.bodyMarkdown} multiline disabled={!!saving} />
-                <button className="primary-action" type="submit" disabled={!!saving || connectionState !== 'ready'}>{saving === 'memory-edit' ? 'Saving changes…' : 'Update memory'}</button>
+                <Field label="Edit context" name="body" defaultValue={editingMemory.bodyMarkdown} multiline disabled={!!saving} />
+                <button className="primary-action" type="submit" disabled={!!saving || connectionState !== 'ready'}>{saving === 'memory-edit' ? 'Saving changes…' : 'Update context'}</button>
                 <button className="secondary-action" disabled={!!saving} onClick={() => setEditingMemory(null)} type="button">Cancel edit</button>
               </form>
             )}
-            <RecordList title="Saved context">
+            <RecordList title="Saved context" tools={<form aria-label="Context search" role="search" className="inline-form" onSubmit={searchMemory}>
+                <label htmlFor="memory-query">Search saved context</label>
+                <input id="memory-query" name="query" type="search" disabled={!!saving} />
+                <button className="secondary-action" type="submit" disabled={!!saving}>Search</button>
+              </form>}>
               {memories.length === 0 && <li className="empty-message">Saved notes will appear here. Add one above, or try another search.</li>}
               {memories.map((memory) => (
                 <li className="record-card" key={memory.id}>
@@ -412,7 +421,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
               onClose={() => archiveTriggerRef.current?.focus()}
               ref={archiveDialogRef}
             >
-              <h2 id="archive-dialog-title">Archive memory?</h2>
+              <h2 id="archive-dialog-title">Archive context?</h2>
               <p>{archiveTarget?.title}</p>
               <button
                 className="primary-action"
@@ -541,7 +550,9 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
             <p>Context for your harnesses</p>
           </div>
           <nav aria-label="Workspace">
-            {SCREENS.map((screen) => (
+            {NAV_GROUPS.map((group) => <div className="nav-group" key={group.label} role="group" aria-label={group.label}>
+              <p className="nav-group-label">{group.label}</p>
+              {SCREENS.filter((screen) => group.screens.includes(screen.id)).map((screen) => (
               <button
                 aria-current={activeScreen === screen.id ? 'page' : undefined}
                 key={screen.id}
@@ -551,14 +562,15 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
               >
                 {screen.label}
               </button>
-            ))}
+              ))}
+            </div>)}
           </nav>
         </aside>
         <main id="workspace-main">
           <header className="screen-header">
             <h1 ref={headingRef} tabIndex={-1}>{currentScreen.label}</h1>
             <p>{currentScreen.summary}</p>
-            {activeScreen !== 'harnesses' && projects.length > 0 && <div className="field project-switcher">
+            {['home', 'memory', 'review', 'tasks'].includes(activeScreen) && projects.length > 0 && <div className="field project-switcher">
               <label htmlFor="active-project">Current project</label>
               <select id="active-project" value={activeProject?.projectId ?? ''} disabled={!!saving || projectBusy} onChange={(event) => {
                 const project = projects.find((item) => item.projectId === event.target.value);
@@ -573,7 +585,9 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
             </div>
           )}
           {error && <p className="form-error" id="workspace-error" role="alert">{error}</p>}
-          {notice && <p className="notice" role="status">{notice}</p>}
+          {notice && <div className="notice" role="status"><p>{notice}</p>
+            {notice === 'Context saved' && activeProject && <button className="secondary-action" type="button" onClick={() => void selectScreen('harnesses')}>Connect a harness</button>}
+          </div>}
           {saving && SAVE_MESSAGES[saving] && <p role="status">{SAVE_MESSAGES[saving]}</p>}
           {recordsLoading && <p role="status">Loading your saved records…</p>}
           {renderScreen(activeScreen)}
@@ -581,7 +595,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
             <HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
               const project = projects.find((item) => item.projectId === id);
               if (project) setActiveProject(project);
-            }} active={activeScreen === 'harnesses'} />
+            }} onAddProject={() => void selectScreen('projects')} onSaveContext={() => void selectScreen('memory')} active={activeScreen === 'harnesses'} />
           </div>
         </main>
       </div>
@@ -617,19 +631,20 @@ function Field({
   );
 }
 
-function RecordList({ children, title }: { children: React.ReactNode; title: string }) {
+function RecordList({ children, title, tools }: { children: React.ReactNode; title: string; tools?: React.ReactNode }) {
   return (
     <section className="records" aria-labelledby={`records-${title.replaceAll(' ', '-')}`}>
       <h2 id={`records-${title.replaceAll(' ', '-')}`}>{title}</h2>
+      {tools}
       <ul className="record-list">{children}</ul>
     </section>
   );
 }
 
 function NextSteps({ onConnect, onContext }: { onConnect: () => void; onContext: () => void }) {
-  return <div className="next-steps" aria-label="Next steps">
-    <div><h3>Connect your harness</h3><p>Check the installed version and review the changes needed to connect it.</p><button className="primary-action" type="button" onClick={onConnect}>Connect a harness</button></div>
-    <div><h3>Save useful context</h3><p>Keep a preference, decision or note. You can do this before connecting an app.</p><button className="secondary-action" type="button" onClick={onContext}>Save your first context</button></div>
+  return <div className="next-steps" role="group" aria-label="Next steps">
+    <div><h3>Save useful context</h3><p>Keep a writing preference, project decision or useful detail for next time.</p><button className="primary-action" type="button" onClick={onContext}>Save context</button></div>
+    <div><h3>Connect a harness when you’re ready</h3><p>Check whether Codex, Claude Code or Hermes can connect to this project.</p><button className="secondary-action" type="button" onClick={onConnect}>Connect a harness</button></div>
   </div>;
 }
 

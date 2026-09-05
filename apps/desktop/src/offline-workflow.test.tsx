@@ -272,7 +272,7 @@ it('keeps daemon-owned project, review, and task state after the offline desktop
   fireEvent.change(screen.getByRole('textbox', { name: 'Title' }), {
     target: { value: 'Portable validator' },
   });
-  fireEvent.change(screen.getByRole('textbox', { name: 'What should your AI remember?' }), {
+  fireEvent.change(screen.getByRole('textbox', { name: 'What should your harness remember?' }), {
     target: { value: 'Keep platform output strict' },
   });
   fireEvent.submit(screen.getByRole('form', { name: 'New context' }));
@@ -282,7 +282,7 @@ it('keeps daemon-owned project, review, and task state after the offline desktop
   fireEvent.change(screen.getByRole('textbox', { name: 'Edit title' }), {
     target: { value: 'Portable report validator' },
   });
-  fireEvent.submit(screen.getByRole('form', { name: 'Edit memory' }));
+  fireEvent.submit(screen.getByRole('form', { name: 'Edit context' }));
   expect(await screen.findByText('Portable report validator')).toBeVisible();
 
   fireEvent.change(screen.getByRole('searchbox', { name: 'Search saved context' }), {

@@ -15,7 +15,7 @@ const gateway = {
   tasks: async () => [first, second],
 } as unknown as WorkspaceGateway;
 const screens = [
-  { page: 'Saved context', form: 'Edit memory', title: 'Edit title', body: 'Edit memory', update: 'updateMemory', create: 'Save context' },
+  { page: 'Saved context', form: 'Edit context', title: 'Edit title', body: 'Edit context', update: 'updateMemory', create: 'Save context' },
   { page: 'Tasks', form: 'Edit task', title: 'Edit task title', body: 'Edit task details', update: 'updateTask', create: 'Save task' },
 ] as const;
 
@@ -78,14 +78,14 @@ it('keeps an acknowledged edit visible when an older search finishes later', asy
   fireEvent.change(screen.getByLabelText('Search saved context'), { target: { value: 'First' } });
   fireEvent.submit(screen.getByRole('search', { name: 'Context search' }));
   fireEvent.change(screen.getByLabelText('Edit title'), { target: { value: updated.title } });
-  fireEvent.change(screen.getByRole('textbox', { name: 'Edit memory' }), { target: { value: updated.bodyMarkdown } });
-  fireEvent.submit(screen.getByRole('form', { name: 'Edit memory' }));
+  fireEvent.change(screen.getByRole('textbox', { name: 'Edit context' }), { target: { value: updated.bodyMarkdown } });
+  fireEvent.submit(screen.getByRole('form', { name: 'Edit context' }));
   await screen.findByText('Memory updated');
   await act(async () => { finishSearch([first]); });
   expect(screen.getByText(updated.title)).toBeVisible();
   expect(screen.getByText(updated.bodyMarkdown)).toBeVisible();
   expect(screen.queryByText(first.title)).not.toBeInTheDocument();
-  expect(screen.queryByRole('form', { name: 'Edit memory' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('form', { name: 'Edit context' })).not.toBeInTheDocument();
   expect(screen.queryByText('Loading your saved records…')).not.toBeInTheDocument();
 });
 
@@ -101,7 +101,7 @@ it.each(['start', 'complete', 'archive'] as const)('does not let an edit refresh
   fireEvent.click(screen.getByRole('button', { name: action === 'archive' ? 'Saved context' : 'Tasks' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Edit First record' }));
   fireEvent.change(screen.getByLabelText(action === 'archive' ? 'Edit title' : 'Edit task title'), { target: { value: edited.title } });
-  fireEvent.submit(screen.getByRole('form', { name: action === 'archive' ? 'Edit memory' : 'Edit task' }));
+  fireEvent.submit(screen.getByRole('form', { name: action === 'archive' ? 'Edit context' : 'Edit task' }));
   await screen.findByText(action === 'archive' ? 'Memory updated' : 'Task updated');
   if (action === 'archive') {
     const dialog = screen.getByRole('dialog', { hidden: true }) as HTMLDialogElement;

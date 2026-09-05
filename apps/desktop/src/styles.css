@@ -44,7 +44,16 @@ textarea {
 
 button {
   cursor: pointer;
+  min-height: 44px;
+  border: 1px solid color-mix(in oklch, var(--color-ink) 24%, var(--color-canvas));
+  border-radius: 8px;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  padding: 0.55rem 0.85rem;
+  font-weight: 600;
 }
+
+button:hover { background: var(--color-surface); }
 
 .skip-link {
   position: fixed;
@@ -66,18 +75,20 @@ button {
 
 .app-shell {
   display: grid;
-  grid-template-columns: minmax(13rem, 16rem) minmax(0, 1fr);
+  grid-template-columns: 14rem minmax(0, 1fr);
   min-height: 100vh;
 }
 
 .sidebar {
+  display: flex;
+  flex-direction: column;
   position: sticky;
   top: 0;
   align-self: start;
   height: 100vh;
   overflow-y: auto;
   border-right: 1px solid color-mix(in oklch, var(--color-ink) 14%, var(--color-surface-strong));
-  background: var(--color-surface-strong);
+  background: var(--color-surface);
   padding: 1.5rem 1rem;
 }
 
@@ -105,16 +116,22 @@ button {
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
+  flex: 1;
 }
 
+.nav-group { display: grid; gap: 0.25rem; margin-bottom: 1.25rem; }
+.nav-group:last-child { margin-top: auto; margin-bottom: 0; }
+.nav-group-label { margin: 0 0 0.25rem; padding: 0 0.75rem; color: var(--color-muted); font-size: 0.8125rem; font-weight: 600; }
+
 .sidebar nav button {
-  min-height: 40px;
+  min-height: 44px;
   border: 0;
   border-radius: 8px;
   background: transparent;
   color: var(--color-ink);
   padding: 0.5rem 0.75rem;
   text-align: left;
+  font-weight: 500;
   transition: background-color 150ms cubic-bezier(0.25, 1, 0.5, 1);
 }
 
@@ -143,7 +160,7 @@ h1:focus-visible {
   max-width: 72rem;
   min-width: 0;
   margin: 0 auto;
-  padding: 3.5rem min(5vw, 4rem);
+  padding: 2.5rem min(5vw, 3rem);
 }
 
 .screen-header {
@@ -152,7 +169,7 @@ h1:focus-visible {
 
 .screen-header h1 {
   margin: 0 0 0.375rem;
-  font-size: 2rem;
+  font-size: 1.75rem;
   letter-spacing: -0.025em;
   line-height: 1.15;
   text-wrap: balance;
@@ -162,7 +179,7 @@ h1:focus-visible {
   max-width: 70ch;
   margin: 0;
   color: var(--color-muted);
-  font-size: 1.0625rem;
+  font-size: 1rem;
   text-wrap: pretty;
 }
 
@@ -266,7 +283,15 @@ dialog > :last-child {
   padding: 0.75rem;
   color: var(--color-primary-strong);
   font-weight: 700;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 0 0 1.5rem;
+  background: var(--color-surface);
 }
+
+.notice p { margin: 0; }
 
 .capture-form h2,
 .capture-form > p {
@@ -326,7 +351,7 @@ dialog > :last-child {
 }
 
 .form-error {
-  margin: 0;
+  margin: 0 0 1rem;
   border: 1px solid var(--color-danger);
   border-radius: 8px;
   padding: 0.75rem;
@@ -334,7 +359,7 @@ dialog > :last-child {
 
 .primary-action,
 .secondary-action {
-  min-height: 40px;
+  min-height: 44px;
   width: fit-content;
   border-radius: 8px;
   padding: 0.5rem 0.875rem;
@@ -378,14 +403,14 @@ textarea::placeholder {
 
 .next-steps {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 2rem;
-  margin: 2rem 0;
+  gap: 1.75rem;
+  max-width: 40rem;
+  margin: 1.75rem 0;
 }
 
 .next-steps > div {
-  border-top: 2px solid var(--color-surface-strong);
-  padding-top: 1rem;
+  border-top: 1px solid var(--color-surface-strong);
+  padding-top: 1.25rem;
 }
 
 .next-steps h3 {
@@ -400,10 +425,35 @@ textarea::placeholder {
 }
 
 .workspace-status {
-  margin-top: 2.5rem;
+  margin-top: 2rem;
   color: var(--color-primary-strong);
   font-weight: 650;
 }
+
+.how-it-works { display: grid; gap: 1.25rem; max-width: 40rem; margin: 1.75rem 0; padding-left: 1.5rem; }
+.how-it-works li { padding-left: 0.5rem; }
+.how-it-works li::marker { color: var(--color-primary-strong); font-weight: 700; }
+.how-it-works h3 { margin: 0 0 0.25rem; font-size: 1rem; }
+.how-it-works p { margin: 0; color: var(--color-muted); }
+.home-guide > p { max-width: 58ch; }
+.home-guide .help-text { margin-top: 0.25rem; font-size: 0.875rem; }
+.home-guide .workspace-status { margin-bottom: 0.25rem; }
+.harness-connection { display: grid; gap: 1.5rem; overflow-wrap: anywhere; min-width: 0; }
+.harness-connection > .form-error { margin-bottom: 0; }
+.connection-result { display: grid; gap: 0.875rem; max-width: 40rem; padding: 1.25rem; border: 1px solid var(--color-surface-strong); border-radius: 10px; background: var(--color-surface); }
+.connection-result h2, .connection-result p { margin: 0; }
+.technical-details { border-top: 1px solid var(--color-surface-strong); padding-top: 0.875rem; overflow-wrap: anywhere; }
+.technical-details summary { width: fit-content; cursor: pointer; color: var(--color-muted); font-size: 0.875rem; font-weight: 600; }
+.technical-details[open] summary { margin-bottom: 1rem; }
+.technical-details pre { font-size: 0.8125rem; }
+.technical-details p { margin: 0.5rem 0; }
+.connection-plan { display: grid; gap: 1rem; margin: 0.5rem 0; }
+.connection-plan h3 { font-size: 1rem; margin-bottom: 0.375rem; }
+.connection-plan ul, .connection-plan ol { margin: 0.375rem 0 0; padding-left: 1.5rem; }
+.connection-plan li + li { margin-top: 0.5rem; }
+.connection-history-details > summary { font-weight: 600; }
+.connection-history-details[open] > summary { margin-bottom: 1rem; }
+.empty-state { max-width: 36rem; padding-top: 0.5rem; }
 
 .project-switcher {
   margin-top: 1.25rem;
@@ -671,9 +721,12 @@ dialog p {
 
   .sidebar nav {
     flex-direction: row;
-    overflow-x: auto;
+    flex-wrap: wrap;
     padding: 0.5rem;
   }
+
+  .nav-group { display: contents; }
+  .nav-group-label { display: none; }
 
   .sidebar nav button {
     flex: 0 0 auto;

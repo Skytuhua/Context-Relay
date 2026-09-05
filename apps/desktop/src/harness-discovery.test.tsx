@@ -55,7 +55,7 @@ it('requests a fresh exact plan only after Full discovery and still requires app
   open(); preview();
   expect(await screen.findByRole('heading', { name: 'Review connection changes' })).toBeVisible();
   expect(requests).toEqual([{ method: 'harness_probe', params }, { method: 'harness_preview', params }]);
-  expect(screen.getByRole('button', { name: 'Apply reviewed plan' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Connect harness' })).toBeDisabled();
 });
 
 it('discards discovery after selection changes without requesting the obsolete plan', async () => {
@@ -140,7 +140,7 @@ it.each([
 ])('rejects invalid discovery %# without exposing raw payloads or requesting a plan', async value => {
   invoke.mockImplementation(async (_command, { request }: { request: LocalRequest }) => { requests.push(request); return response(value); });
   open(); preview();
-  expect(await screen.findByRole('alert')).toHaveTextContent(/preview could not be loaded/i);
+  expect(await screen.findByRole('alert')).toHaveTextContent(/Could not check this connection/i);
   expect(requests).toEqual([{ method: 'harness_probe', params }]);
   expect(screen.queryByText(/PRIVATE-/)).not.toBeInTheDocument();
   expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();

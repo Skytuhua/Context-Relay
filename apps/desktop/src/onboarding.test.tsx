@@ -38,7 +38,7 @@ it('guides a first project from folder selection to the next useful actions with
   expect(form).toBeVisible();
   await act(async () => { finish(project); });
   expect(screen.getByRole('button', { name: 'Connect a harness' })).toBeVisible();
-  expect(screen.getByRole('button', { name: 'Save your first context' })).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Save context' })).toBeVisible();
 });
 
 it('connects the newly added project even when another project already exists', async () => {
@@ -94,7 +94,7 @@ it('keeps an acknowledged new context visible when an older list arrives', async
   fireEvent.click(screen.getByRole('button', { name: 'Saved context' }));
   const form = screen.getByRole('form', { name: 'New context' });
   fireEvent.change(within(form).getByLabelText('Title'), { target: { value: saved.title } });
-  fireEvent.change(within(form).getByLabelText('What should your AI remember?'), { target: { value: saved.bodyMarkdown } });
+  fireEvent.change(within(form).getByLabelText('What should your harness remember?'), { target: { value: saved.bodyMarkdown } });
   fireEvent.submit(form);
   await screen.findByText('Context saved');
   await act(async () => { finishList([]); });
@@ -151,7 +151,7 @@ it('keeps an unsaved context draft and explains a failed save without exposing n
   await act(async () => {});
   const form = screen.getByRole('form', { name: 'New context' });
   fireEvent.change(within(form).getByLabelText('Title'), { target: { value: 'Preference' } });
-  fireEvent.change(within(form).getByLabelText('What should your AI remember?'), { target: { value: 'Use plain language.' } });
+  fireEvent.change(within(form).getByLabelText('What should your harness remember?'), { target: { value: 'Use plain language.' } });
   fireEvent.submit(form);
   fireEvent.submit(form);
   expect(createMemory).toHaveBeenCalledTimes(1);
@@ -159,5 +159,5 @@ it('keeps an unsaved context draft and explains a failed save without exposing n
   await act(async () => { reject({ code: 'internal', message: 'private native details' }); });
   expect(screen.getByRole('alert')).toHaveTextContent('Your draft is still here');
   expect(screen.getByRole('alert')).not.toHaveTextContent('private native details');
-  expect(within(form).getByLabelText('What should your AI remember?')).toHaveValue('Use plain language.');
+  expect(within(form).getByLabelText('What should your harness remember?')).toHaveValue('Use plain language.');
 });

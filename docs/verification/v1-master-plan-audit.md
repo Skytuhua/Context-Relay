@@ -80,3 +80,12 @@ bound into execution, approval and recovery. This does not complete T10/T14/T20:
 effective memory settings/root selection, Stop delivery, full native setup and
 installed recovery remain open. The [Claude evidence](claude-native-mcp-2026-09-06.md)
 records the scoped tests and the macOS recovery-fixture CI correction.
+
+2026-09-06 first-use update: the desktop now orders project creation, context
+capture and harness connection, uses grouped navigation and preserves distinct
+Undo targets for repeated connections. All 140 frontend tests, type checking,
+lint and the production build pass. Isolated headless Edge checks cover desktop
+and narrow layouts; [the evidence](first-use-ui-2026-09-06.md) distinguishes this
+from installed acceptance. T08/T20 and the broader product goal are not closed
+by these frontend checks. The macOS recovery fixture correction passed hosted
+Rust tests in CI run 33989730248.
