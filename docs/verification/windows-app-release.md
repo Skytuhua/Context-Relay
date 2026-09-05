@@ -178,3 +178,10 @@ corrected scoped patch received independent review. These tests use the real
 React UI with a controlled workspace gateway; installed Windows acceptance is
 still pending while desktop control remains paused. They do not qualify durable
 retries, every record-mutation race, or the full usability/release objective.
+
+2026-09-06, 01:11:00 candidate: locked Windows packaging of `beb7727` production
+source succeeded. `Context Relay_0.1.0_x64-setup.exe` is 10,866,780 bytes, SHA-256
+`4abffa1b49921817eef405c2a8d86611dc4ef4810f5d885487b6d1ca228fb9fb`,
+Authenticode NotSigned. This replaces the previous local candidate and includes
+the staged host merger and record-editing fixes, but no working staged generator.
+It remains uninstalled; the normal installation is still the earlier b45 build.
