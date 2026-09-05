@@ -453,6 +453,11 @@ impl BridgePreviewHarness for CodexAdapter {
         desired: &DesiredState,
     ) -> Result<PrimaryMemoryMutationPlan, ClientError> {
         let capabilities = full_setup_memory_capabilities(self.native_memory_capabilities()?)?;
+        if !matches!(capabilities.disable, NativeMemoryDisable::Supported(_)) {
+            return Err(unsupported(
+                "Codex memory settings cannot be safely changed; check its global and project configuration before connecting",
+            ));
+        }
         let mut plan = primary_memory_registration_plan(&capabilities.sources);
         if let Some(instruction) = desired
             .components
@@ -627,12 +632,23 @@ fn push_memory_mutation(
     if mutation.expected == mutation.intended {
         return;
     }
-    plan.native.push(mutation);
+    let path = mutation
+        .target
+        .display
+        .clone()
+        .unwrap_or_else(|| digest_text(digest(&mutation.target.bytes)));
+    let summary = match target {
+        "primary-memory-instruction" => "Add instructions for using saved context",
+        "primary-memory-hooks" => "Add session hooks for saved context",
+        "native-memory-disable" => "Turn off the AI app's built-in memory",
+        _ => target,
+    };
     plan.semantic_changes.push(ClassifiedChange {
         class: ChangeClass::Update,
-        target: target.to_owned(),
-        summary: target.to_owned(),
+        target: path,
+        summary: summary.to_owned(),
     });
+    plan.native.push(mutation);
 }
 
 pub struct BridgeInstallService<'a, H, L> {

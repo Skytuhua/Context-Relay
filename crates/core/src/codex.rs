@@ -1837,63 +1837,64 @@ impl NativeMemoryAdapter for CodexAdapter {
             CapabilityLevel::Full => {}
         }
 
-        let path = self.layout.codex_home.join("config.toml");
-        let snapshot = match OsNativeFileSystem::new().snapshot(&path) {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                return Ok(NativeMemoryCapabilities {
-                    disable: NativeMemoryDisable::WatchOnly,
-                    sources,
-                });
+        let watch_only = || NativeMemoryCapabilities {
+            disable: NativeMemoryDisable::WatchOnly,
+            sources: sources.clone(),
+        };
+        let mut mutations = Vec::new();
+        let mut seen = HashSet::new();
+        // Project layers override the global settings. Include their explicit
+        // memory values in the same reviewed, reversible setup transaction.
+        for (path, project_layer) in self.effective_config_paths()? {
+            // CODEX_HOME may itself be the project's .codex directory. The
+            // first occurrence is global and must set both inherited defaults.
+            if !seen.insert(path.clone()) {
+                continue;
             }
-        };
-        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
-            return Ok(NativeMemoryCapabilities {
-                disable: NativeMemoryDisable::WatchOnly,
-                sources,
-            });
-        };
-        let mut document = match bytes_to_document(bytes) {
-            Ok(document) => document,
-            Err(_) => {
-                return Ok(NativeMemoryCapabilities {
-                    disable: NativeMemoryDisable::WatchOnly,
-                    sources,
-                });
+            if project_layer {
+                self.validate_project_path(&path)?;
+                match fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                    Err(_) => return Ok(watch_only()),
+                    Ok(_) => {}
+                }
             }
-        };
-        let supported_shape = document.get("memories").is_none_or(|item| {
-            item.as_table_like().is_some_and(|table| {
-                ["generate_memories", "use_memories"].iter().all(|key| {
-                    table
-                        .get(key)
-                        .is_none_or(|value| value.as_value().and_then(TomlValue::as_bool).is_some())
-                })
-            })
-        });
-        if !supported_shape {
-            let capabilities = NativeMemoryCapabilities {
-                disable: NativeMemoryDisable::WatchOnly,
-                sources,
+            let snapshot = match OsNativeFileSystem::new().snapshot(&path) {
+                Ok(snapshot) => snapshot,
+                Err(_) => return Ok(watch_only()),
             };
-            capabilities.validate()?;
-            return Ok(capabilities);
-        }
-        let already_disabled = document.get("memories").is_some_and(|item| {
-            item.as_table_like().is_some_and(|table| {
-                ["generate_memories", "use_memories"].iter().all(|key| {
-                    table
-                        .get(key)
-                        .and_then(Item::as_value)
-                        .and_then(TomlValue::as_bool)
-                        == Some(false)
+            if project_layer && matches!(snapshot.state(), NativeState::Absent { .. }) {
+                continue;
+            }
+            let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
+                return Ok(watch_only());
+            };
+            let mut document = match bytes_to_document(bytes) {
+                Ok(document) => document,
+                Err(_) => return Ok(watch_only()),
+            };
+            let supported_shape = document.get("memories").is_none_or(|item| {
+                item.as_table_like().is_some_and(|table| {
+                    ["generate_memories", "use_memories"].iter().all(|key| {
+                        table.get(key).is_none_or(|value| {
+                            value.as_value().and_then(TomlValue::as_bool).is_some()
+                        })
+                    })
                 })
-            })
-        });
-        let mutations = if already_disabled {
-            vec![]
-        } else {
+            });
+            if !supported_shape {
+                return Ok(watch_only());
+            }
+            let mut changed = false;
             for key in ["generate_memories", "use_memories"] {
+                let current = document
+                    .get("memories")
+                    .and_then(Item::as_table_like)
+                    .and_then(|table| table.get(key))
+                    .and_then(Item::as_bool);
+                if current == Some(false) || (project_layer && current.is_none()) {
+                    continue;
+                }
                 let item = &mut document["memories"][key];
                 if let Some(TomlValue::Boolean(current)) = item.as_value_mut() {
                     let decor = current.decor().clone();
@@ -1903,11 +1904,14 @@ impl NativeMemoryAdapter for CodexAdapter {
                 } else {
                     *item = toml_edit::value(false);
                 }
+                changed = true;
             }
-            let intended =
-                NativeState::regular_file(document.to_string().into_bytes(), metadata.clone());
-            vec![self.approved_file(&path, snapshot.fingerprint(), intended)?]
-        };
+            if changed {
+                let intended =
+                    NativeState::regular_file(document.to_string().into_bytes(), metadata.clone());
+                mutations.push(self.approved_file(&path, snapshot.fingerprint(), intended)?);
+            }
+        }
         let capabilities = NativeMemoryCapabilities {
             disable: NativeMemoryDisable::Supported(mutations),
             sources,
@@ -2352,6 +2356,40 @@ impl CodexAdapter {
         }
         Ok(paths)
     }
+
+    fn verify_native_memory_plan_state(
+        &self,
+        plan: &NativeTransactionPlan,
+        final_state: bool,
+    ) -> Result<(), BoundaryError> {
+        if plan.native_memory_registrations.is_empty() {
+            return Ok(());
+        }
+        let capabilities = self
+            .native_memory_capabilities()
+            .map_err(|_| BoundaryError::new("Codex memory settings cannot be inspected"))?;
+        let NativeMemoryDisable::Supported(required) = capabilities.disable else {
+            return Err(BoundaryError::new("Codex memory settings changed"));
+        };
+        for needed in required {
+            // Reservation checks run between writes, including inverse writes.
+            // Permit only the two exact reviewed states, in either direction.
+            // Final validation permits enabled values only as an inverse result.
+            let approved = plan.mutations.iter().any(|mutation| {
+                mutation.target == needed.target
+                    && mutation.kind == MutationKind::Payload
+                    && ((!final_state
+                        && mutation.expected == needed.expected
+                        && mutation.intended == needed.intended)
+                        || (mutation.expected == needed.intended
+                            && mutation.intended == needed.expected))
+            });
+            if !approved {
+                return Err(BoundaryError::new("Codex memory settings changed"));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl NativeAdapter for CodexAdapter {
@@ -2367,7 +2405,7 @@ impl NativeAdapter for CodexAdapter {
         {
             return Err(BoundaryError::new("Codex installation changed"));
         }
-        Ok(())
+        self.verify_native_memory_plan_state(plan, false)
     }
     fn compare_approved_digests(
         &mut self,
@@ -2425,7 +2463,7 @@ impl NativeAdapter for CodexAdapter {
                 "Codex effective state differs from the plan",
             ));
         }
-        Ok(())
+        self.verify_native_memory_plan_state(plan, true)
     }
 }
 

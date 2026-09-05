@@ -1301,6 +1301,18 @@ fn intended_bytes(mutation: &ApprovedMutation) -> Vec<u8> {
 fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy() {
     for harness_id in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Hermes] {
         let mut fixture = matrix_fixture(harness_id);
+        if harness_id == HarnessId::Codex {
+            fs::write(
+                fixture.project_root.join(".codex/config.toml"),
+                "# project memory override\n[memories]\nuse_memories = true\n",
+            )
+            .unwrap();
+            fs::write(
+                fixture.project_root.join("service/.codex/config.toml"),
+                "# nested memory override\n[memories]\ngenerate_memories = true\n",
+            )
+            .unwrap();
+        }
         let vault_path = TempVault::new(&format!("primary-memory-matrix-{harness_id:?}"));
         let keys = MemoryKeyStore::default();
         let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
@@ -1403,7 +1415,10 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
                 }));
             }
             HarnessId::Codex => {
-                assert_eq!(intended.len(), 3);
+                assert_eq!(intended.len(), 5);
+                assert!(intended.iter().any(|(path, bytes)| path
+                    == &fixture.project_root.join(".codex/config.toml")
+                    && String::from_utf8_lossy(bytes).contains("use_memories = false")));
                 assert!(intended.iter().any(|(_, bytes)| {
                     let text = String::from_utf8_lossy(bytes);
                     text.contains("generate_memories = false")
@@ -1938,6 +1953,154 @@ fn import_only_exact_memory_bindings_apply_and_rollback_as_registration_only_pla
         BridgeInstallService::persisted(&mut vault)
             .rollback(&recovery_setup.plan_id, NOW_MS + 12, &mut MustNotExecute)
             .unwrap();
+        assert_raw_unchanged(&fixture);
+    }
+}
+
+#[test]
+fn codex_full_preview_rejects_uninspectable_memory_settings_without_writing() {
+    for relative in [".codex/config.toml", "service/.codex/config.toml"] {
+        let fixture = codex_matrix_fixture();
+        let path = fixture.project_root.join(relative);
+        fs::write(&path, "[memories]\nuse_memories = 'unsupported'\n").unwrap();
+        let global = fixture
+            .project_root
+            .parent()
+            .unwrap()
+            .join("codex/config.toml");
+        let before = fs::read(&global).unwrap();
+        let vault_path = TempVault::new("codex-memory-invalid-preview");
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+        let error = BridgeInstallService::new(
+            &mut vault,
+            fixture.harness.clone(),
+            Locator {
+                bridge: fixture.bridge.clone(),
+                calls: Rc::new(Cell::new(0)),
+            },
+            DeviceId::from_str(ID_1).unwrap(),
+            clock(NOW_MS),
+        )
+        .preview(
+            Some(&RegisteredProject {
+                project_id: fixture.project_id,
+                root: wire_path(&fixture.project_root),
+            }),
+            NOW_MS,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code,
+            context_relay_protocol::ErrorCode::HarnessUnsupported
+        );
+        assert!(error.message.contains("Codex memory settings"));
+        assert_eq!(fs::read(&global).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[memories]\nuse_memories = 'unsupported'\n"
+        );
+        assert_raw_unchanged(&fixture);
+    }
+}
+
+#[test]
+fn codex_setup_rejects_new_memory_overrides_after_preview_without_writing() {
+    for (global, prior, changed_value) in [
+        (false, None, "true"),
+        (false, Some("# inherits global memory settings\n"), "true"),
+        (false, Some("[memories]\nuse_memories = false\n"), "true"),
+        (false, None, "'invalid boolean'"),
+        (true, None, "true"),
+        (true, None, "'invalid boolean'"),
+    ] {
+        let mut fixture = codex_matrix_fixture();
+        let config_path = if global {
+            fixture
+                .project_root
+                .parent()
+                .unwrap()
+                .join("codex/config.toml")
+        } else {
+            fixture.project_root.join(".codex/config.toml")
+        };
+        let changed = if global {
+            let disabled = fs::read_to_string(&config_path)
+                .unwrap()
+                .replace("generate_memories = true", "generate_memories = false")
+                .replace("use_memories = true", "use_memories = false");
+            fs::write(&config_path, &disabled).unwrap();
+            disabled.replace(
+                "use_memories = false",
+                &format!("use_memories = {changed_value}"),
+            )
+        } else {
+            match prior {
+                None => fs::remove_file(&config_path).unwrap(),
+                Some(value) => fs::write(&config_path, value).unwrap(),
+            }
+            format!("[memories]\nuse_memories = {changed_value}\n")
+        };
+        let vault_path = TempVault::new("codex-memory-override-after-preview");
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+        let setup = BridgeInstallService::new(
+            &mut vault,
+            fixture.harness.clone(),
+            Locator {
+                bridge: fixture.bridge.clone(),
+                calls: Rc::new(Cell::new(0)),
+            },
+            DeviceId::from_str(ID_1).unwrap(),
+            clock(NOW_MS),
+        )
+        .preview(
+            Some(&RegisteredProject {
+                project_id: fixture.project_id,
+                root: wire_path(&fixture.project_root),
+            }),
+            NOW_MS,
+        )
+        .unwrap();
+        let opened =
+            open_plan(&vault.setup_plan(&setup.plan_id).unwrap().unwrap().payload).unwrap();
+        let original = opened
+            .plan
+            .mutations
+            .iter()
+            .map(|mutation| {
+                let path = mutation_path(&mutation.target);
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect::<Vec<_>>();
+        fs::write(&config_path, &changed).unwrap();
+        let mut executor = MatrixExecutor {
+            live: fixture.harness.cli_state(),
+            harness: &mut fixture.harness,
+            lock_root: fixture.lock_root.clone(),
+        };
+        let result = BridgeInstallService::persisted(&mut vault).apply(
+            &setup.plan_id,
+            NOW_MS + 1,
+            &mut executor,
+        );
+        assert!(
+            result.is_err(),
+            "new memory setting was not in the reviewed plan: global={global}, prior={prior:?}, value={changed_value}"
+        );
+        for (path, bytes) in original {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        assert_eq!(fs::read_to_string(config_path).unwrap(), changed);
+        for registration in &opened.plan.native_memory_registrations {
+            assert!(
+                vault
+                    .native_memory_ledger(&registration.source.id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
         assert_raw_unchanged(&fixture);
     }
 }

@@ -12,7 +12,8 @@ use context_relay_core::{
     mcp::install::bridge_component,
     native_memory::{
         NativeMemoryAdapter, NativeMemoryDisable, NativeMemoryDocumentKind,
-        PRIMARY_MEMORY_INSTRUCTIONS, managed_memory_hooks, primary_memory_instruction_component,
+        NativeMemoryRegistration, PRIMARY_MEMORY_INSTRUCTIONS, managed_memory_hooks,
+        primary_memory_instruction_component,
     },
     native_transaction::{
         approval_hash_v1,
@@ -927,6 +928,173 @@ fn unknown_and_wrapper_codex_installations_are_watch_only_without_guessed_settin
 }
 
 #[test]
+fn native_memory_disable_includes_active_project_overrides_and_restores_them_exactly() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let root_config = fixture.layout.project_root.join(".codex/config.toml");
+    let nested_config = fixture.layout.working_directory.join(".codex/config.toml");
+    fs::write(&root_config, "# project rationale\nunknown_key = 42\n[memories]\ngenerate_memories = true # preserve comment\n").unwrap();
+    fs::write(
+        &nested_config,
+        "# nested rationale\n[memories]\nuse_memories = true # preserve usage\n",
+    )
+    .unwrap();
+    let paths = [
+        fixture.codex_home.join("config.toml"),
+        root_config.clone(),
+        nested_config.clone(),
+    ];
+    let before = paths
+        .iter()
+        .map(|path| fs::read(path).unwrap())
+        .collect::<Vec<_>>();
+    let NativeMemoryDisable::Supported(mutations) = fixture
+        .adapter
+        .native_memory_capabilities()
+        .unwrap()
+        .disable
+    else {
+        panic!("expected supported disable")
+    };
+    assert_eq!(
+        mutations.len(),
+        3,
+        "active project layers can override the global disable"
+    );
+    for path in &paths {
+        assert!(
+            mutations
+                .iter()
+                .any(|mutation| mutation.target == test_wire_path(path))
+        );
+    }
+    let nonce = [75; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native.create_before_images(&mutations).unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native.compare_and_swap_targets(&mutations).unwrap();
+    for mutation in &mutations {
+        native.apply_mutation(&nonce, mutation).unwrap();
+    }
+    let root_after = fs::read_to_string(&root_config).unwrap();
+    assert!(root_after.contains("unknown_key = 42"));
+    assert!(root_after.contains("generate_memories = false # preserve comment"));
+    assert!(
+        !root_after.contains("use_memories"),
+        "absent project keys should inherit the global value"
+    );
+    assert!(
+        fs::read_to_string(&nested_config)
+            .unwrap()
+            .contains("use_memories = false # preserve usage")
+    );
+    let NativeMemoryDisable::Supported(repeated) = fixture
+        .adapter
+        .native_memory_capabilities()
+        .unwrap()
+        .disable
+    else {
+        panic!("expected supported replay")
+    };
+    assert!(repeated.is_empty());
+    native.restore_matching_applied_targets(&nonce).unwrap();
+    for (path, expected) in paths.iter().zip(before) {
+        assert_eq!(fs::read(path).unwrap(), expected);
+    }
+}
+
+#[test]
+fn native_memory_disable_deduplicates_overlapping_global_and_project_config() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let mut layout = fixture.layout.clone();
+    layout.codex_home = layout.project_root.join(".codex");
+    let config = layout.codex_home.join("config.toml");
+    let trusted_root = toml_edit::Value::from(layout.project_root.display().to_string());
+    fs::write(&config, format!("[memories]\ngenerate_memories = true\n[projects.{trusted_root}]\ntrust_level = \"trusted\"\n")).unwrap();
+    let device = DeviceId::from_str(DEVICE_ID).unwrap();
+    let adapter = CodexAdapter::from_layout(
+        layout,
+        fixture.project_id,
+        device,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device),
+    )
+    .unwrap();
+    let NativeMemoryDisable::Supported(mutations) =
+        adapter.native_memory_capabilities().unwrap().disable
+    else {
+        panic!("expected supported disable")
+    };
+    assert_eq!(
+        mutations.len(),
+        1,
+        "one native target may appear only once in an approved plan"
+    );
+    let NativeState::RegularFile { bytes, .. } =
+        NativeState::decode_v1(&mutations[0].content).unwrap()
+    else {
+        panic!("expected config file")
+    };
+    let rendered = String::from_utf8(bytes).unwrap();
+    assert!(rendered.contains("generate_memories = false"));
+    assert!(
+        rendered.contains("use_memories = false"),
+        "global semantics must retain the default for missing keys"
+    );
+}
+
+#[test]
+fn native_memory_disable_does_not_require_project_config_directories() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let mut layout = fixture.layout.clone();
+    layout.working_directory = layout.project_root.join("without-codex-directory");
+    fs::create_dir(&layout.working_directory).unwrap();
+    fs::remove_file(layout.project_root.join(".codex/config.toml")).unwrap();
+    let device = DeviceId::from_str(DEVICE_ID).unwrap();
+    let adapter = CodexAdapter::from_layout(
+        layout.clone(),
+        fixture.project_id,
+        device,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device),
+    )
+    .unwrap();
+    let NativeMemoryDisable::Supported(mutations) =
+        adapter.native_memory_capabilities().unwrap().disable
+    else {
+        panic!("absent project settings must inherit the global disable")
+    };
+    assert_eq!(mutations.len(), 1);
+    assert!(!layout.working_directory.join(".codex").exists());
+}
+
+#[test]
+fn native_memory_disable_rejects_uninspectable_active_project_settings_without_partial_plan() {
+    for invalid in [
+        "memories = true",
+        "[memories]\nuse_memories = 'yes'",
+        "[memories]\ngenerate_memories = []",
+        "invalid [toml",
+    ] {
+        let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+        let path = fixture.layout.working_directory.join(".codex/config.toml");
+        fs::write(&path, invalid).unwrap();
+        let global_before = fs::read(fixture.codex_home.join("config.toml")).unwrap();
+        assert_eq!(
+            fixture
+                .adapter
+                .native_memory_capabilities()
+                .unwrap()
+                .disable,
+            NativeMemoryDisable::WatchOnly,
+            "invalid: {invalid}"
+        );
+        assert_eq!(
+            fs::read(fixture.codex_home.join("config.toml")).unwrap(),
+            global_before
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), invalid);
+    }
+}
+
+#[test]
 fn native_memory_disable_rolls_back_true_false_and_absent_codex_values_exactly() {
     for (index, prior) in [Some(true), Some(false), None].into_iter().enumerate() {
         let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
@@ -1730,6 +1898,64 @@ fn native_staged_output_validation_rejects_either_changed_hash() {
             "Codex staged output changed"
         );
     }
+}
+
+#[test]
+fn native_memory_final_validation_rejects_reverted_forward_values_but_accepts_rollback() {
+    let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+        panic!("supported disable")
+    };
+    let mut plan = codex_native_plan(&fixture, vec![]);
+    plan.mutations = mutations;
+    plan.native_memory_registrations = capabilities
+        .sources
+        .into_iter()
+        .map(|source| NativeMemoryRegistration {
+            source,
+            last_applied_digest: None,
+        })
+        .collect();
+    let receipt = ApplyReceipt {
+        plan_id: plan.setup.plan_id,
+        applied_hlc: HybridLogicalClock::new(
+            1_900_000_000_001,
+            0,
+            DeviceId::from_str(DEVICE_ID).unwrap(),
+        ),
+        resulting_digests: plan
+            .mutations
+            .iter()
+            .map(|mutation| mutation.intended.0)
+            .collect(),
+    };
+    let nonce = [89; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native.create_before_images(&plan.mutations).unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native.compare_and_swap_targets(&plan.mutations).unwrap();
+    for mutation in &plan.mutations {
+        native.apply_mutation(&nonce, mutation).unwrap();
+    }
+    NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &receipt).unwrap();
+    native.restore_matching_applied_targets(&nonce).unwrap();
+    assert!(
+        NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &receipt).is_err(),
+        "a forward receipt must not certify reverted memory settings"
+    );
+    for mutation in &mut plan.mutations {
+        std::mem::swap(&mut mutation.expected, &mut mutation.intended);
+    }
+    let inverse_receipt = ApplyReceipt {
+        resulting_digests: plan
+            .mutations
+            .iter()
+            .map(|mutation| mutation.intended.0)
+            .collect(),
+        ..receipt
+    };
+    NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &inverse_receipt).unwrap();
 }
 
 #[test]
