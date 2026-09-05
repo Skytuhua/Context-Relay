@@ -159,20 +159,9 @@ impl ClaudeCodeAdapter {
             )
         })?;
         let executable_hash = digest_file(&executable)?;
-        let output = run_bounded_command(&executable, &["--version"], executable_hash)?;
-        let version =
-            parse_version(std::str::from_utf8(&output).unwrap_or_default()).ok_or_else(|| {
-                client_error(
-                    ErrorCode::HarnessUnsupported,
-                    "Claude Code returned an invalid version",
-                    false,
-                )
-            })?;
-        parse_doctor_output(&run_bounded_command(
-            &executable,
-            &["doctor"],
-            executable_hash,
-        )?)?;
+        let version = discover_version_with(|arguments| {
+            run_bounded_command(&executable, arguments, executable_hash)
+        })?;
         let home = home_dir().ok_or_else(|| {
             client_error(
                 ErrorCode::NotFound,
@@ -3161,11 +3150,99 @@ fn parse_version(output: &str) -> Option<String> {
 }
 
 fn find_executable() -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
     let names = executable_names(cfg!(windows));
-    env::split_paths(&path)
-        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
-        .find(|candidate| digest_regular_non_link_file(candidate).is_ok())
+    let from_path = env::var_os("PATH").and_then(|path| {
+        env::split_paths(&path)
+            .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
+            .find(|candidate| digest_regular_non_link_file(candidate).is_ok())
+    });
+    if from_path.is_some() {
+        return from_path;
+    }
+    #[cfg(windows)]
+    {
+        if let Some(home) = env::var_os("USERPROFILE") {
+            let native = PathBuf::from(home).join(".local/bin/claude.exe");
+            if digest_regular_non_link_file(&native).is_ok() {
+                return Some(native);
+            }
+        }
+        let mut roots = Vec::new();
+        if let Some(roaming) = env::var_os("APPDATA") {
+            roots.push(PathBuf::from(roaming).join("Claude/claude-code"));
+        }
+        if let Some(local) = env::var_os("LOCALAPPDATA") {
+            roots.push(
+                PathBuf::from(local)
+                    .join("Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/claude-code"),
+            );
+        }
+        find_windows_bundled_claude(&roots)
+    }
+    #[cfg(not(windows))]
+    None
+}
+
+#[cfg(windows)]
+fn find_windows_bundled_claude(roots: &[PathBuf]) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for root in roots {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(version) = name
+                .split('.')
+                .map(str::parse::<u32>)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+                .filter(|parts| {
+                    parts.len() == 3
+                        && parts
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(".")
+                            == name
+                })
+            else {
+                continue;
+            };
+            let executable = entry.path().join("claude.exe");
+            if validate_executable_path_components(&executable).is_ok() {
+                candidates.push((version, executable));
+            }
+        }
+    }
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    candidates.into_iter().map(|(_, path)| path).find(|path| {
+        digest_regular_non_link_file(path).is_ok()
+            && open_executable_without_substitution(path)
+                .and_then(windows_reader_is_native_pe)
+                .unwrap_or(false)
+    })
+}
+
+fn discover_version_with(
+    mut execute: impl FnMut(&[&str]) -> Result<Vec<u8>, ClientError>,
+) -> Result<String, ClientError> {
+    let output = execute(&["--version"])?;
+    let version =
+        parse_version(std::str::from_utf8(&output).unwrap_or_default()).ok_or_else(|| {
+            client_error(
+                ErrorCode::HarnessUnsupported,
+                "Claude Code returned an invalid version",
+                false,
+            )
+        })?;
+    // An unqualified version can be reported as ImportOnly without running its
+    // potentially interactive diagnostics. Full setup retains its existing gate.
+    if SUPPORTED_VERSIONS.contains(&version.as_str()) {
+        parse_doctor_output(&execute(&["doctor"])?)?;
+    }
+    Ok(version)
 }
 
 fn executable_names(windows: bool) -> &'static [&'static str] {
@@ -3414,6 +3491,80 @@ mod tests {
     };
     use serde_json::Value;
     use std::{fs, str::FromStr as _};
+
+    #[cfg(windows)]
+    #[test]
+    fn bundled_claude_discovery_uses_numeric_release_directories_and_native_files() {
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!(
+            "relay-claude-discovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        for version in ["2.1.9", "2.1.202", "2.1.999-malicious", "02.1.999"] {
+            let directory = root.join(version);
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("claude.exe"), fixture_executable_bytes()).unwrap();
+        }
+        // A greater version with a script or directory is not an executable candidate.
+        fs::create_dir(root.join("3.0.0")).unwrap();
+        fs::write(root.join("3.0.0/claude.cmd"), b"@echo unsafe").unwrap();
+        fs::create_dir(root.join("4.0.0")).unwrap();
+        fs::write(root.join("4.0.0/claude.exe"), b"not a native executable").unwrap();
+        let result = super::find_windows_bundled_claude(std::slice::from_ref(&root));
+        assert!(
+            fs::canonicalize(&root)
+                .unwrap()
+                .starts_with(fs::canonicalize(&temp).unwrap())
+        );
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Some(root.join("2.1.202/claude.exe")));
+    }
+
+    #[test]
+    fn discovery_of_unqualified_claude_does_not_require_interactive_doctor() {
+        let mut commands = Vec::new();
+        let version = super::discover_version_with(|arguments| {
+            commands.push(
+                arguments
+                    .iter()
+                    .map(|item| item.to_string())
+                    .collect::<Vec<_>>(),
+            );
+            if arguments == ["--version"] {
+                Ok(b"2.1.202 (Claude Code)\n".to_vec())
+            } else {
+                Err(super::invalid_request("Doctor must not be executed"))
+            }
+        })
+        .unwrap();
+        assert_eq!(version, "2.1.202");
+        assert_eq!(commands, vec![vec!["--version"]]);
+    }
+
+    #[test]
+    fn discovery_of_supported_claude_still_requires_its_qualified_doctor_output() {
+        let mut commands = Vec::new();
+        let result = super::discover_version_with(|arguments| {
+            commands.push(
+                arguments
+                    .iter()
+                    .map(|item| item.to_string())
+                    .collect::<Vec<_>>(),
+            );
+            Ok(if arguments == ["--version"] {
+                b"2.1.214 (Claude Code)\n".to_vec()
+            } else {
+                b"unexpected output".to_vec()
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(commands, vec![vec!["--version"], vec!["doctor"]]);
+    }
 
     #[test]
     fn windows_discovery_and_mutation_accept_only_native_claude_exe() {

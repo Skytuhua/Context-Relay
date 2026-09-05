@@ -20,6 +20,85 @@ use support::{
 
 const CREDENTIAL: &str = "task-6-tests";
 
+fn registration_project() -> context_relay_protocol::ProjectIdentity {
+    context_relay_protocol::ProjectIdentity {
+        project_id: ID_7.parse().unwrap(),
+        github_repository_id: None,
+        git_remote_fingerprint: None,
+        monorepo_subdirectory: None,
+        name: "Research".into(),
+    }
+}
+
+#[test]
+fn project_registration_rolls_back_when_the_path_write_fails() {
+    let path = TempVault::new("project-atomic");
+    let keys = MemoryKeyStore::default();
+    drop(Vault::open(path.path(), CREDENTIAL, &keys).unwrap());
+    let connection = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    connection.execute_batch("CREATE TRIGGER reject_project_path BEFORE INSERT ON paths BEGIN SELECT RAISE(ABORT, 'injected path failure'); END;").unwrap();
+    drop(connection);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let project = registration_project();
+    assert!(matches!(
+        vault.register_project(&project, &native_path()),
+        Err(VaultError::Database(_))
+    ));
+    assert!(vault.projects().unwrap().is_empty());
+    assert!(
+        vault
+            .path(&project.project_id.to_string())
+            .unwrap()
+            .is_none()
+    );
+    drop(vault);
+    let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert!(vault.projects().unwrap().is_empty());
+}
+
+#[test]
+fn project_registration_replays_exactly_and_preserves_both_records_across_restart() {
+    let path = TempVault::new("project-replay");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let project = registration_project();
+    let folder = native_path();
+    vault.register_project(&project, &folder).unwrap();
+    vault.register_project(&project, &folder).unwrap();
+    let mut renamed = project.clone();
+    renamed.name = "Unrelated rename".into();
+    assert!(vault.register_project(&renamed, &folder).is_err());
+    let mut redirected = folder.clone();
+    redirected.bytes = r"D:\other"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    redirected.display = Some(r"D:\other".into());
+    assert!(vault.register_project(&project, &redirected).is_err());
+    drop(vault);
+    let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(vault.projects().unwrap(), vec![project.clone()]);
+    assert_eq!(
+        vault.path(&project.project_id.to_string()).unwrap(),
+        Some(folder)
+    );
+}
+
+#[test]
+fn project_registration_repairs_only_a_matching_legacy_partial_project() {
+    let path = TempVault::new("project-partial");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let project = registration_project();
+    vault.put_project(&project).unwrap();
+    vault.register_project(&project, &native_path()).unwrap();
+    assert_eq!(vault.projects().unwrap(), vec![project.clone()]);
+    assert_eq!(
+        vault.path(&project.project_id.to_string()).unwrap(),
+        Some(native_path())
+    );
+}
+
 fn open_keyed(path: &std::path::Path, key: &[u8; 32]) -> Connection {
     let connection = Connection::open(path).unwrap();
     // SAFETY: the connection owns the handle, the 32-byte key remains valid for the call,

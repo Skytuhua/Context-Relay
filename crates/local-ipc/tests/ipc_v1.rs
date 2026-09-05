@@ -255,7 +255,7 @@ fn challenged_hmac_matches_frozen_vector() {
 
     assert_eq!(
         serde_json::to_string(&proof).unwrap(),
-        r#""vIjLF221NRLHOpwHDx9ZmjSsNW7Xx7keDPG46cCNS7M""#
+        r#""sW9Gfmk1amxAaP2siOxnnBk5bFCfwuMk9Qw6uXiVM8E""#
     );
     assert!(
         verify_proof(
@@ -460,7 +460,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
 
     assert_eq!(
         serde_json::to_string(&server_proof).unwrap(),
-        r#""5waUUOCuxRderadzSuNDDkVDFB1kLnOdSZahgcMbtxA""#
+        r#""dOSqnI07KKmf6N5OGzB3o-Lb5MFfK6imiH2UxpdE9RE""#
     );
     assert!(
         verify_server_proof(
@@ -732,6 +732,13 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
             request_fixture(
                 "project_upsert",
                 serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}}),
+            ),
+        ),
+        (
+            "ProjectRegister",
+            request_fixture(
+                "project_register",
+                serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}, "path": {"platform": "windows", "bytes": "", "display": null}}),
             ),
         ),
         (
@@ -1038,9 +1045,9 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
 }
 
 #[test]
-fn role_allowlist_covers_all_53_requests() {
+fn role_allowlist_covers_all_54_requests() {
     let fixtures = all_request_fixtures();
-    assert_eq!(fixtures.len(), 53);
+    assert_eq!(fixtures.len(), 54);
 
     for (name, request) in &fixtures {
         let common = matches!(*name, "Cancel" | "Health");
@@ -1094,7 +1101,7 @@ fn role_allowlist_covers_all_53_requests() {
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::Desktop, request))
             .count(),
-        50
+        51
     );
     assert_eq!(
         fixtures

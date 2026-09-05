@@ -26,6 +26,7 @@
     "hydrate:sidecars": "node scripts/hydrate-sidecars.mjs",
     "tauri:dev": "pnpm --filter @context-relay/desktop tauri dev",
     "tauri:build": "pnpm --filter @context-relay/desktop tauri build",
+    "package:windows": "node scripts/package-windows.mjs",
     "license:check": "node scripts/check-license-metadata.mjs"
   },
   "devDependencies": {

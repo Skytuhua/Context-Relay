@@ -329,14 +329,11 @@ pub fn bind_cli_recovery_plan(
 ) -> Result<BoundCliRecoveryPlan, BoundaryError> {
     let opened = open_plan(sealed_plan_payload)
         .map_err(|_| BoundaryError::new("native CLI recovery plan is invalid"))?;
-    // Bridge previews with CLI mutations are deliberately CLI-only. Enforcing
-    // that invariant here means adapter attestation cannot strand recovery in
-    // the middle of a partially applied native-file phase.
-    if opened.plan.approval_version != 2
-        || wal.is_empty()
-        || opened.plan.cli_mutations.is_empty()
-        || !opened.plan.mutations.is_empty()
-    {
+    // Full setup plans include native files as well as CLI declarations.
+    // Bind the CLI WAL to its sealed subset; native recovery separately checks
+    // the file WAL, exact before-images and object provenance. This does not
+    // authorize adopting a file replaced by an overlapping CLI write.
+    if opened.plan.approval_version != 2 || wal.is_empty() || opened.plan.cli_mutations.is_empty() {
         return Err(BoundaryError::new(
             "native CLI recovery plan is not approval-bound",
         ));

@@ -27,8 +27,9 @@ use context_relay_native_runner::{
     RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand, SidecarId,
 };
 use context_relay_protocol::{
-    ClientError, DeviceId, ErrorCode, HarnessId, HarnessParams, HybridLogicalClock, NativePlatform,
-    NativeScope, PlanId, PlanParams, ProjectId, SetupPlan, Sha256Digest, WireNativeValue,
+    ClientError, DeviceId, ErrorCode, HarnessAdapter as _, HarnessId, HarnessParams,
+    HybridLogicalClock, NativePlatform, NativeScope, PlanId, PlanParams, ProbeContext, ProbeReport,
+    ProjectId, SetupPlan, Sha256Digest, WireNativeValue,
 };
 
 #[cfg(not(windows))]
@@ -43,6 +44,15 @@ pub(crate) const NON_LAUNCHING_WINDOWS_SID: &str = "S-1-15-2-1-2-3-4-5-6-7";
 /// protocol DTOs; callers cannot inject paths, digests, commands, or plan
 /// bodies into apply and rollback.
 pub trait BridgeInstallEngine: Send + Sync {
+    fn probe(
+        &self,
+        _vault: &Vault,
+        _device_id: DeviceId,
+        _params: HarnessParams,
+    ) -> Result<ProbeReport, ClientError> {
+        Err(unsupported("Harness discovery is unavailable"))
+    }
+
     fn reconcile_after_native_recovery(
         &self,
         vault: &mut Vault,
@@ -132,6 +142,49 @@ impl ProductionBridgeInstallEngine {
 }
 
 impl BridgeInstallEngine for ProductionBridgeInstallEngine {
+    fn probe(
+        &self,
+        vault: &Vault,
+        device_id: DeviceId,
+        params: HarnessParams,
+    ) -> Result<ProbeReport, ClientError> {
+        let binding = project_binding(vault, params.project_id)?;
+        let observed_hlc = HybridLogicalClock::new(now_ms()?, 0, device_id);
+        let context = ProbeContext {
+            harness: params.harness,
+            requested_profile: params.hermes_profile.clone(),
+        };
+        match params.harness {
+            HarnessId::ClaudeCode => ClaudeCodeAdapter::discover(
+                &binding.root,
+                binding.project_id,
+                device_id,
+                observed_hlc,
+            )
+            .and_then(|adapter| adapter.probe(&context)),
+            HarnessId::Codex => CodexAdapter::discover(
+                &binding.root,
+                &binding.root,
+                binding.project_id,
+                device_id,
+                observed_hlc,
+            )
+            .and_then(|adapter| adapter.probe(&context)),
+            HarnessId::Hermes => HermesAdapter::discover(
+                &binding.root,
+                &binding.root,
+                params
+                    .hermes_profile
+                    .as_deref()
+                    .ok_or_else(|| invalid("Hermes discovery requires an explicit profile"))?,
+                binding.project_id,
+                device_id,
+                observed_hlc,
+            )
+            .and_then(|adapter| adapter.probe(&context)),
+        }
+    }
+
     fn reconcile_after_native_recovery(
         &self,
         vault: &mut Vault,
@@ -374,7 +427,7 @@ impl ProductionBridgePlanExecutor<'_> {
     }
 }
 
-fn sealed_project_binding(
+pub(crate) fn sealed_project_binding(
     plan: &context_relay_core::native_transaction::NativeTransactionPlan,
 ) -> Result<(PathBuf, ProjectId), ClientError> {
     let mut projects = plan.setup.target_scopes.iter().filter_map(|scope| {
@@ -664,6 +717,50 @@ pub(crate) mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+
+    #[test]
+    fn cli_recovery_uses_the_sealed_project_instead_of_the_vault_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let vault_root = root.join("vault");
+        let project_root = root.join("project with spaces");
+        fs::create_dir(&vault_root).unwrap();
+        fs::create_dir(&project_root).unwrap();
+        let project_id = ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073981").unwrap();
+        let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073990").unwrap();
+        let recovery = crate::ProductionBridgeCliRecoveryIo {
+            root: vault_root.clone(),
+            project_id: global_project_id().unwrap(),
+            device_id,
+            observed_hlc: HybridLogicalClock::new(1, 0, device_id),
+        };
+        let mut plan = base_plan();
+        plan.setup.target_scopes.push(NativeScope::Project {
+            project_id,
+            root: crate::unit_test_support::wire_native_path(&project_root),
+        });
+        let mut bound = context_relay_core::native_transaction::recovery::BoundCliRecoveryPlan {
+            plan,
+            mutations: vec![],
+        };
+        assert_eq!(
+            recovery.project_binding(&bound).unwrap(),
+            (project_root.clone(), project_id)
+        );
+        bound.plan.setup.target_scopes.push(NativeScope::Project {
+            project_id: global_project_id().unwrap(),
+            root: crate::unit_test_support::wire_native_path(&vault_root),
+        });
+        assert!(
+            recovery.project_binding(&bound).is_err(),
+            "ambiguous project scopes cannot select a recovery root"
+        );
+        bound.plan.setup.target_scopes = vec![NativeScope::Global];
+        assert_eq!(
+            recovery.project_binding(&bound).unwrap(),
+            (vault_root, global_project_id().unwrap())
+        );
+    }
 
     #[test]
     fn terminal_apply_and_rollback_replay_before_any_production_composition() {

@@ -24,10 +24,10 @@ use context_relay_local_ipc::{
     ServerHelloV1, connect, create_proof, read_json, write_json,
 };
 use context_relay_protocol::{
-    ApprovalClass, CancelParams, ClientError, ClientRole, DaemonInstanceNonce, DeviceId, ErrorCode,
-    HarnessId, HarnessParams, HelloParams, JsonRpcErrorV1, JsonRpcRequestV1, JsonRpcSuccessV1,
-    JsonRpcVersion, LocalRequest, LocalResult, NativePlatform, PlanId, PlanParams, RecordId,
-    SetupPlan, Sha256Digest, WireNativeValue,
+    ApprovalClass, CancelParams, CapabilityLevel, ClientError, ClientRole, DaemonInstanceNonce,
+    DeviceId, ErrorCode, HarnessId, HarnessParams, HelloParams, InstallationMethod, JsonRpcErrorV1,
+    JsonRpcRequestV1, JsonRpcSuccessV1, JsonRpcVersion, LocalRequest, LocalResult, NativePlatform,
+    PlanId, PlanParams, ProbeReport, RecordId, SetupPlan, Sha256Digest, WireNativeValue,
 };
 use uuid::Uuid;
 
@@ -35,9 +35,93 @@ const TOKEN: [u8; 32] = [0x5a; 32];
 const PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
 const ROLLBACK_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073990";
 
+#[cfg(any(windows, target_os = "macos"))]
+#[tokio::test]
+async fn project_registration_is_desktop_only_and_keeps_identity_and_path_after_restart() {
+    let engine = Arc::new(RecordingEngine::default());
+    let fixture = Fixture::start("project-register", engine.clone(), None).await;
+    let root = unique_temp_path("project-folder-專案");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = native_folder(&root);
+    let project = context_relay_protocol::ProjectIdentity {
+        project_id: PLAN.parse().unwrap(),
+        github_repository_id: None,
+        git_remote_fingerprint: None,
+        monorepo_subdirectory: None,
+        name: "Research".into(),
+    };
+    let request = LocalRequest::ProjectRegister(context_relay_protocol::ProjectRegisterParams {
+        project: project.clone(),
+        path: path.clone(),
+    });
+    let mut installer = RawClient::connect(&fixture.runtime, ClientRole::Installer).await;
+    assert_eq!(
+        installer.call(request.clone()).await.unwrap_err().code,
+        ErrorCode::ScopeDenied
+    );
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    let missing = LocalRequest::ProjectRegister(context_relay_protocol::ProjectRegisterParams {
+        project: project.clone(),
+        path: native_folder(&root.join("does-not-exist")),
+    });
+    assert_eq!(
+        client.call(missing).await.unwrap_err().code,
+        ErrorCode::InvalidRequest
+    );
+    assert!(
+        matches!(client.call(LocalRequest::ProjectsList(context_relay_protocol::EmptyParams {})).await.unwrap(), LocalResult::Projects { projects } if projects.is_empty())
+    );
+    assert_eq!(
+        client.call(request.clone()).await.unwrap(),
+        LocalResult::Empty
+    );
+    assert_eq!(client.call(request).await.unwrap(), LocalResult::Empty);
+    let config = fixture.stop().await;
+    config
+        .with_vault(|vault| {
+            assert_eq!(vault.projects()?, vec![project.clone()]);
+            assert_eq!(
+                vault.path(&project.project_id.to_string())?,
+                Some(path.clone())
+            );
+            Ok(())
+        })
+        .unwrap();
+    let fixture = Fixture::from_config(config, engine).await;
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    assert!(
+        matches!(client.call(LocalRequest::ProjectsList(context_relay_protocol::EmptyParams {})).await.unwrap(), LocalResult::Projects { projects } if projects == vec![project])
+    );
+    fixture.stop().await;
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn native_folder(path: &Path) -> WireNativeValue {
+    #[cfg(target_os = "macos")]
+    use std::os::unix::ffi::OsStrExt as _;
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStrExt as _;
+    WireNativeValue {
+        #[cfg(windows)]
+        platform: NativePlatform::Windows,
+        #[cfg(target_os = "macos")]
+        platform: NativePlatform::Macos,
+        #[cfg(windows)]
+        bytes: path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect(),
+        #[cfg(target_os = "macos")]
+        bytes: path.as_os_str().as_bytes().to_vec(),
+        display: Some(path.display().to_string()),
+    }
+}
+
 #[derive(Default)]
 struct RecordingEngine {
     reconciles: AtomicUsize,
+    probes: Mutex<Vec<HarnessParams>>,
     previews: Mutex<Vec<(HarnessId, Option<String>)>>,
     applied: Mutex<BTreeSet<PlanId>>,
     rolled_back: Mutex<BTreeSet<PlanId>>,
@@ -164,6 +248,26 @@ impl RecordingEngine {
 }
 
 impl BridgeInstallEngine for RecordingEngine {
+    fn probe(
+        &self,
+        _vault: &Vault,
+        _device_id: DeviceId,
+        params: HarnessParams,
+    ) -> Result<ProbeReport, ClientError> {
+        self.probes.lock().unwrap().push(params.clone());
+        let plan = plan(params.harness);
+        Ok(ProbeReport {
+            executable: Some(plan.executable_path),
+            executable_sha256: Some(plan.executable_hash),
+            harness_version: Some("0.144.6".to_owned()),
+            installation_method: InstallationMethod::Manual,
+            config_roots: vec![],
+            active_profile: params.hermes_profile,
+            policy_conflicts: vec![],
+            capability: CapabilityLevel::ImportOnly,
+        })
+    }
+
     fn reconcile_after_native_recovery(
         &self,
         _vault: &mut Vault,
@@ -228,6 +332,32 @@ impl BridgeInstallEngine for RecordingEngine {
         }
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn discovery_returns_capability_through_authenticated_ipc_without_creating_a_plan() {
+    let fixture = Fixture::start("probe", Arc::new(RecordingEngine::default()), None).await;
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    for harness in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Hermes] {
+        let params = HarnessParams {
+            harness,
+            project_id: None,
+            hermes_profile: (harness == HarnessId::Hermes).then(|| "coder".to_owned()),
+        };
+        let result = client
+            .call(LocalRequest::HarnessProbe(params.clone()))
+            .await
+            .unwrap();
+        assert!(matches!(result, LocalResult::Probe { report }
+            if report.capability == CapabilityLevel::ImportOnly
+                && report.harness_version.as_deref() == Some("0.144.6")
+                && report.active_profile == params.hermes_profile));
+        assert_eq!(fixture.engine.probes.lock().unwrap().last(), Some(&params));
+    }
+    assert!(fixture.engine.previews.lock().unwrap().is_empty());
+    assert_eq!(fixture.engine.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.engine.bridge_launches.load(Ordering::SeqCst), 0);
+    fixture.stop().await;
 }
 
 #[tokio::test]

@@ -974,6 +974,22 @@ impl<'a> OfflineWorkspace<'a> {
         vault(self.vault.put_project(&project))
     }
 
+    pub fn register_project(
+        &mut self,
+        project: ProjectIdentity,
+        path: WireNativeValue,
+    ) -> Result<(), ClientError> {
+        // Registration stores only a binding. Native setup still revalidates
+        // its reviewed filesystem targets before granting an AI app access.
+        crate::mcp::binding::canonical_directory(&path).map_err(|()| ClientError {
+            code: ErrorCode::InvalidRequest,
+            message: "Choose an existing, accessible project folder".into(),
+            field_path: Some("path".into()),
+            retryable: false,
+        })?;
+        vault(self.vault.register_project(&project, &path))
+    }
+
     pub fn projects(&self) -> Result<Vec<ProjectIdentity>, ClientError> {
         vault(self.vault.projects())
     }

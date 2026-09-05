@@ -3,6 +3,8 @@ mod connection;
 mod frame;
 #[cfg(any(windows, test))]
 mod pipe_connect;
+#[cfg(windows)]
+mod shutdown;
 mod transport;
 
 #[cfg(test)]
@@ -19,6 +21,8 @@ pub use connection::{
 };
 pub use context_relay_protocol::MAX_IPC_FRAME_BYTES;
 pub use frame::{read_frame, read_json, write_frame, write_json};
+#[cfg(windows)]
+pub use shutdown::shutdown_running_daemon;
 pub use transport::{ConnectedStream, InstanceGuard, Listener, RuntimeConfig, connect};
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +57,8 @@ pub enum IpcError {
     ProtocolVersionUnsupported,
     #[error("IPC request is invalid")]
     InvalidRequest,
+    #[error("Context Relay shutdown timed out")]
+    ShutdownTimeout,
 }
 
 // One connection per maximum MCP call and cancellation, plus a narrow control reserve.

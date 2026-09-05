@@ -9,6 +9,10 @@ import type {
 } from './bindings';
 
 export class LocalClient {
+  chooseProjectFolder(): Promise<string | null> {
+    return invoke<string | null>('choose_project_folder');
+  }
+
   async call(request: LocalRequest): Promise<LocalResult> {
     if (
       request.method === 'recovery_enrollment_begin' ||

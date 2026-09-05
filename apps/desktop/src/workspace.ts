@@ -1,6 +1,7 @@
 import type {
   Base64Url,
   CandidateId,
+  HarnessParams,
   LocalRequest,
   LocalResult,
   MemoryCandidate,
@@ -10,6 +11,7 @@ import type {
   PairingCode,
   PairingId,
   PairingSafetyNumber,
+  PlanId,
   ProjectId,
   ProjectIdentity,
   RecoveryEnrollmentConfirmParams,
@@ -25,6 +27,7 @@ import type {
   UuidV7,
 } from './bindings';
 import { LocalClient } from './local-client';
+import { type HarnessGateway, requireHarnessAcknowledgment, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
 
 export type PairingInviteResult = Extract<LocalResult, { kind: 'pairing_invite' }>;
 export type PairingRequestResult = Extract<LocalResult, { kind: 'pairing_request' }>;
@@ -63,7 +66,8 @@ export interface DeviceGateway {
   recoveryEnrollmentCancel(enrollmentId: RecoveryEnrollmentId): Promise<void>;
 }
 
-export interface WorkspaceGateway extends DeviceGateway {
+export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
+  chooseProjectFolder(): Promise<string | null>;
   status(): Promise<StatusOutput>;
   projects(): Promise<ProjectIdentity[]>;
   createProject(name: string, path: string): Promise<ProjectIdentity>;
@@ -90,7 +94,38 @@ export interface WorkspaceGateway extends DeviceGateway {
 }
 
 export class LocalWorkspaceGateway implements WorkspaceGateway {
+  private pendingProject: { name: string; pathKey: string; project: ProjectIdentity } | null = null;
   constructor(private readonly client = new LocalClient()) {}
+
+  chooseProjectFolder() {
+    return this.client.chooseProjectFolder();
+  }
+
+  async harnessProbe(params: HarnessParams) {
+    const result = await this.call({ method: 'harness_probe', params });
+    if (!result || result.kind !== 'probe' || Object.keys(result).length !== 2 ||
+      !result.data || Object.keys(result.data).length !== 1) {
+      throw new Error('Harness discovery was not returned.');
+    }
+    return validateHarnessProbe(result.data.report, params);
+  }
+
+  async harnessPreview(params: HarnessParams) {
+    const result = await this.call({ method: 'harness_preview', params });
+    if (!result || result.kind !== 'plan' || Object.keys(result).length !== 2 ||
+      !result.data || Object.keys(result.data).length !== 1) {
+      throw new Error('Setup preview was not returned.');
+    }
+    return validateHarnessPlan(result.data.plan, params);
+  }
+
+  async harnessApply(planId: PlanId) {
+    requireHarnessAcknowledgment(await this.call({ method: 'harness_apply', params: { planId } }));
+  }
+
+  async harnessRollback(planId: PlanId) {
+    requireHarnessAcknowledgment(await this.call({ method: 'harness_rollback', params: { planId } }));
+  }
 
   async status() {
     return statusResult(await this.call({ method: 'sync_status', params: {} }));
@@ -209,18 +244,19 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
   }
 
   async createProject(name: string, path: string) {
-    const project: ProjectIdentity = {
+    const folder = nativePath(path);
+    const pathKey = `${folder.platform}:${folder.bytes}`;
+    const project: ProjectIdentity = this.pendingProject?.name === name && this.pendingProject.pathKey === pathKey ? this.pendingProject.project : {
       projectId: uuidV7() as ProjectId,
       githubRepositoryId: null,
       gitRemoteFingerprint: null,
       monorepoSubdirectory: null,
       name,
     };
-    await this.call({ method: 'project_upsert', params: { project } });
-    await this.call({
-      method: 'project_path_set',
-      params: { projectId: project.projectId, path: nativePath(path) },
-    });
+    this.pendingProject = { name, pathKey, project };
+    const result = await this.call({ method: 'project_register', params: { project, path: folder } });
+    if (result.kind !== 'empty') unexpected(result);
+    this.pendingProject = null;
     return project;
   }
 
@@ -428,14 +464,20 @@ function uuidV7(): UuidV7 {
 
 function nativePath(path: string) {
   const macos = navigator.userAgent.includes('Mac');
+  // Explorer's Copy as path wraps Windows paths in quotes. These cannot be
+  // filename characters on Windows, but they are valid on macOS.
+  if (!macos && path.startsWith('"') && path.endsWith('"')) path = path.slice(1, -1);
   const bytes = macos
     ? new TextEncoder().encode(path)
-    : Uint8Array.from(
-        [...path].flatMap((character) => {
-          const code = character.charCodeAt(0);
-          return [code & 0xff, code >> 8];
-        }),
-      );
+    : new Uint8Array(path.length * 2);
+  if (!macos) {
+    const view = new DataView(bytes.buffer);
+    // Windows paths carry UTF-16 code units, including surrogate pairs and
+    // unpaired surrogates. Iterating code points would drop the second unit.
+    for (let index = 0; index < path.length; index += 1) {
+      view.setUint16(index * 2, path.charCodeAt(index), true);
+    }
+  }
   const binary = [...bytes].map((byte) => String.fromCharCode(byte)).join('');
   return {
     platform: macos ? ('macos' as const) : ('windows' as const),

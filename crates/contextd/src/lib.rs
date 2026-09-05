@@ -368,6 +368,23 @@ struct ProductionBridgeCliRecoveryIo {
 }
 
 impl ProductionBridgeCliRecoveryIo {
+    fn project_binding(
+        &self,
+        bound: &BoundCliRecoveryPlan,
+    ) -> Result<(PathBuf, context_relay_protocol::ProjectId), BoundaryError> {
+        if bound
+            .plan
+            .setup
+            .target_scopes
+            .iter()
+            .any(|scope| matches!(scope, context_relay_protocol::NativeScope::Project { .. }))
+        {
+            return bridge_install::sealed_project_binding(&bound.plan)
+                .map_err(|error| BoundaryError::new(error.message));
+        }
+        Ok((self.root.clone(), self.project_id))
+    }
+
     fn with_executor<R>(
         &self,
         bound: &BoundCliRecoveryPlan,
@@ -376,11 +393,12 @@ impl ProductionBridgeCliRecoveryIo {
             &[context_relay_core::native_transaction::ApprovedCliMutation],
         ) -> Result<R, BoundaryError>,
     ) -> Result<R, BoundaryError> {
+        let (root, project_id) = self.project_binding(bound)?;
         match bound.plan.setup.harness {
             HarnessId::ClaudeCode => {
                 let mut adapter = context_relay_core::claude_code::ClaudeCodeAdapter::discover(
-                    &self.root,
-                    self.project_id,
+                    &root,
+                    project_id,
                     self.device_id,
                     self.observed_hlc,
                 )
@@ -391,9 +409,9 @@ impl ProductionBridgeCliRecoveryIo {
             }
             HarnessId::Codex => {
                 let mut adapter = context_relay_core::codex::CodexAdapter::discover(
-                    &self.root,
-                    &self.root,
-                    self.project_id,
+                    &root,
+                    &root,
+                    project_id,
                     self.device_id,
                     self.observed_hlc,
                 )
@@ -957,6 +975,7 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         | LocalRequest::NativeHookEvent(_)
         | LocalRequest::ProjectsList(_)
         | LocalRequest::ProjectUpsert(_)
+        | LocalRequest::ProjectRegister(_)
         | LocalRequest::MemoryList(_)
         | LocalRequest::MemorySearch(_)
         | LocalRequest::MemoryCreate(_)
@@ -980,13 +999,13 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         | LocalRequest::AccountDeletionCancel(_)) => {
             RoutedRequest::Work(VaultCommand::Workspace(request))
         }
-        request @ (LocalRequest::HarnessPreview(_)
+        request @ (LocalRequest::HarnessProbe(_)
+        | LocalRequest::HarnessPreview(_)
         | LocalRequest::HarnessApply(_)
         | LocalRequest::HarnessRollback(_)) => {
             RoutedRequest::Work(VaultCommand::HarnessSetup(request))
         }
-        LocalRequest::HarnessProbe(_)
-        | LocalRequest::HarnessRepair(_)
+        LocalRequest::HarnessRepair(_)
         | LocalRequest::PackageImport(_)
         | LocalRequest::PackageExport(_) => RoutedRequest::Immediate(Err(unsupported_error(
             "The requested local adapter operation is not supported",
@@ -1540,6 +1559,10 @@ fn execute_harness_setup(
     request: LocalRequest,
 ) -> Result<LocalResult, ClientError> {
     match request {
+        LocalRequest::HarnessProbe(params) => state
+            .bridge_install
+            .probe(&state.vault, state.device_id, params)
+            .map(|report| LocalResult::Probe { report }),
         LocalRequest::HarnessPreview(params) => state
             .bridge_install
             .preview(&mut state.vault, &state.vault_path, state.device_id, params)
@@ -1623,6 +1646,11 @@ fn execute_workspace_request(
         LocalRequest::ProjectUpsert(params) => {
             OfflineWorkspace::new(&mut state.vault, state.device_id)
                 .upsert_project(params.project)
+                .map(|()| LocalResult::Empty)
+        }
+        LocalRequest::ProjectRegister(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .register_project(params.project, params.path)
                 .map(|()| LocalResult::Empty)
         }
         LocalRequest::MemorySearch(params) => {
@@ -3689,7 +3717,7 @@ mod tests {
     #[test]
     fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 53);
+        assert_eq!(fixtures.len(), 54);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -6048,6 +6076,13 @@ mod tests {
                 request_fixture(
                     "project_upsert",
                     serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}}),
+                ),
+            ),
+            (
+                "ProjectRegister",
+                request_fixture(
+                    "project_register",
+                    serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}, "path": {"platform": "windows", "bytes": "", "display": null}}),
                 ),
             ),
             (
