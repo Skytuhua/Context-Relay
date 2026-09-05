@@ -306,3 +306,11 @@ artifact's pure string helpers. All 94 core library, 47 Claude adapter and 11
 memory setup tests pass, as does core/daemon all-target Clippy. Independent review
 approved the scoped correction. Repository/worktree selection, relative explicit
 directories, settings precedence and full connection qualification remain open.
+
+The locked installer was rebuilt from production source `47266f7` at
+2026-09-06 03:41:06: `Context Relay_0.1.0_x64-setup.exe`, 10,890,944 bytes,
+SHA-256 `e952fbfa197c89f6c72c613015dcb47ef7926d314484cbdacdf1e7e29f4f1af1`,
+Authenticode NotSigned. Packaging completed successfully. This candidate includes
+the noninteractive validation and memory-key corrections, plus prior harness
+wording, discovery, record-action and command-context fixes. It was not installed
+or visually verified and does not enable Full support for the installed runtimes.
