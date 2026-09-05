@@ -54,6 +54,7 @@ pub struct BridgeMutationPlan {
 
 pub struct PrimaryMemoryMutationPlan {
     pub native: Vec<ApprovedMutation>,
+    pub expected_native_digests: Vec<ExpectedNativeDigest>,
     pub registrations: Vec<NativeMemoryRegistration>,
     pub semantic_changes: Vec<ClassifiedChange>,
 }
@@ -62,6 +63,7 @@ impl PrimaryMemoryMutationPlan {
     fn empty() -> Self {
         Self {
             native: vec![],
+            expected_native_digests: vec![],
             registrations: vec![],
             semantic_changes: vec![],
         }
@@ -448,6 +450,9 @@ impl BridgePreviewHarness for ClaudeCodeAdapter {
 }
 
 impl BridgePreviewHarness for CodexAdapter {
+    fn bridge_adapter_version(&self) -> u32 {
+        2
+    }
     fn bridge_harness(&self) -> HarnessId {
         HarnessId::Codex
     }
@@ -467,10 +472,10 @@ impl BridgePreviewHarness for CodexAdapter {
     fn bridge_mutations(
         &self,
         _: &DesiredState,
-        intended: &ComponentRecord,
+        _: &ComponentRecord,
     ) -> Result<BridgeMutationPlan, ClientError> {
         Ok(BridgeMutationPlan {
-            cli: Some(self.plan_bridge_cli_mutation(intended)?),
+            cli: None,
             native: vec![],
         })
     }
@@ -486,6 +491,7 @@ impl BridgePreviewHarness for CodexAdapter {
             ));
         }
         let mut plan = primary_memory_registration_plan(&capabilities.sources);
+        plan.expected_native_digests = self.native_bridge_dependencies()?;
         if let Some(instruction) = desired
             .components
             .iter()
@@ -509,8 +515,38 @@ impl BridgePreviewHarness for CodexAdapter {
             );
         }
         if let NativeMemoryDisable::Supported(mutations) = capabilities.disable {
-            for mutation in mutations {
-                push_memory_mutation(&mut plan, mutation, "native-memory-disable");
+            if let Some(bridge) = desired
+                .components
+                .iter()
+                .find(|component| component.kind == ComponentKind::McpServer)
+            {
+                let combined = self.plan_native_bridge_with_memory_disable(bridge, &mutations)?;
+                let global = combined.target.clone();
+                if combined.expected == combined.intended {
+                    let NativeState::RegularFile { bytes, .. } =
+                        NativeState::decode_v1(&combined.content)
+                            .map_err(|_| invalid("Codex config snapshot is invalid"))?
+                    else {
+                        return Err(invalid("Codex config snapshot is invalid"));
+                    };
+                    plan.expected_native_digests
+                        .retain(|dependency| dependency.target != global);
+                    plan.expected_native_digests.push(ExpectedNativeDigest {
+                        target: global.clone(),
+                        expected_digest: Some(digest(&bytes)),
+                    });
+                }
+                push_memory_mutation(&mut plan, combined, "primary-memory-bridge-and-disable");
+                for mutation in mutations
+                    .into_iter()
+                    .filter(|mutation| mutation.target != global)
+                {
+                    push_memory_mutation(&mut plan, mutation, "native-memory-disable");
+                }
+            } else {
+                for mutation in mutations {
+                    push_memory_mutation(&mut plan, mutation, "native-memory-disable");
+                }
             }
         }
         Ok(plan)
@@ -669,7 +705,10 @@ fn push_memory_mutation(
     let summary = match target {
         "primary-memory-instruction" => "Add instructions for using saved context",
         "primary-memory-hooks" => "Add session hooks for saved context",
-        "native-memory-disable" => "Turn off the AI app's built-in memory",
+        "primary-memory-bridge-and-disable" => {
+            "Connect the harness and turn off its built-in memory"
+        }
+        "native-memory-disable" => "Turn off the harness's built-in memory",
         _ => target,
     };
     plan.semantic_changes.push(ClassifiedChange {
@@ -1909,13 +1948,14 @@ where
             components: desired_components,
             scopes: desired_scopes,
         };
-        // CLI harnesses capture their authoritative prior declaration here.
-        // Hermes instead classifies its imported native projection first.
+        // Claude captures its live CLI declaration. Native configuration
+        // writers classify their imported projection and seal complete files.
         let captured_mutations = match harness {
-            HarnessId::ClaudeCode | HarnessId::Codex => {
+            HarnessId::ClaudeCode => Some(self.harness.bridge_mutations(&desired, &intended)?),
+            HarnessId::Codex if self.harness.bridge_adapter_version() < 2 => {
                 Some(self.harness.bridge_mutations(&desired, &intended)?)
             }
-            HarnessId::Hermes => None,
+            HarnessId::Codex | HarnessId::Hermes => None,
         };
         let change = bridge_change(
             harness,
@@ -1931,11 +1971,30 @@ where
             conflicts: vec![],
         };
 
-        // These calls are intentionally kept in preview even though the exact
-        // CLI mutation below is the authority for rollback argv.
-        let _rendered = self.harness.render(&desired)?;
+        // The generic Codex adapter retains CLI operations for arbitrary MCP
+        // edits. This fixed setup declaration is rendered by its native plan.
+        let native_codex =
+            harness == HarnessId::Codex && self.harness.bridge_adapter_version() == 2;
+        let render_desired = if native_codex {
+            DesiredState {
+                components: desired
+                    .components
+                    .iter()
+                    .filter(|component| component.kind != ComponentKind::McpServer)
+                    .cloned()
+                    .collect(),
+                scopes: desired.scopes.clone(),
+            }
+        } else {
+            desired.clone()
+        };
+        let _rendered = self.harness.render(&render_desired)?;
         let mut classified = self.harness.classify(&semantic_diff)?;
-        let adapter_operations = self.harness.plan_cli_ops(&classified)?.0;
+        let adapter_operations = if native_codex {
+            vec![]
+        } else {
+            self.harness.plan_cli_ops(&classified)?.0
+        };
         let mut mutations = if classified.0.is_empty() {
             BridgeMutationPlan {
                 cli: None,
@@ -1976,6 +2035,17 @@ where
             expected_digest: Some(bridge.digest),
         }];
         expected_native_digests.extend(self.harness.bridge_operational_digests()?);
+        expected_native_digests.extend(memory.expected_native_digests);
+        if harness == HarnessId::Codex {
+            // Native mutations already bind both whole-file states. Read-only
+            // dependencies retain their original hashes across apply and Undo.
+            expected_native_digests.retain(|dependency| {
+                !mutations
+                    .native
+                    .iter()
+                    .any(|mutation| mutation.target == dependency.target)
+            });
+        }
         let mut setup = SetupPlan {
             plan_id,
             harness,
@@ -2239,7 +2309,21 @@ fn bridge_change(
     cli_mutation: Option<&ApprovedCliMutation>,
 ) -> Result<Option<ClassifiedChange>, ClientError> {
     let class = match harness {
-        HarnessId::ClaudeCode | HarnessId::Codex => bridge_cli_change(cli_mutation, intended)?,
+        HarnessId::ClaudeCode => bridge_cli_change(cli_mutation, intended)?,
+        HarnessId::Codex if cli_mutation.is_some() => bridge_cli_change(cli_mutation, intended)?,
+        HarnessId::Codex => match imported.iter().find(|component| {
+            component.kind == ComponentKind::McpServer
+                && component.scope == ScopeRef::Global
+                && component.name == BRIDGE_SERVER_NAME
+        }) {
+            None => Some(ChangeClass::Create),
+            Some(component)
+                if !component.archived && codex_native_bridge_matches(component, intended) =>
+            {
+                None
+            }
+            Some(_) => Some(ChangeClass::Update),
+        },
         HarnessId::Hermes => bridge_hermes_change(profile, imported, intended)?,
     };
     let target = match harness {
@@ -2268,6 +2352,20 @@ fn bridge_cli_change(
         Some(previous) if previous.canonical_body == intended.body_markdown => None,
         Some(_) => Some(ChangeClass::Update),
     })
+}
+
+fn codex_native_bridge_matches(imported: &ComponentRecord, intended: &ComponentRecord) -> bool {
+    let Ok(mut body) = serde_json::from_str::<serde_json::Value>(&imported.body_markdown) else {
+        return false;
+    };
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    object
+        .entry("type")
+        .or_insert(serde_json::Value::String("stdio".to_owned()));
+    serde_json::from_str::<serde_json::Value>(&intended.body_markdown)
+        .is_ok_and(|expected| body == expected)
 }
 
 fn bridge_hermes_change(

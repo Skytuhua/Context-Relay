@@ -408,3 +408,12 @@ Undo. Local checks pass 104 core library, 63 adapter and 16 setup tests; the
 [Claude evidence](claude-native-mcp-2026-09-06.md) records native cases, limits and
 the contained test runner. Full connection and installed acceptance remain open.
 The existing local 11d6740 installer is unchanged.
+
+Codex managed setup now has one native writer for its bridge and global memory
+settings. The pinned 0.144.6 CLI reads this output identically to its own MCP
+command, including unusual Windows paths. Local checks pass 104 core library,
+67 Codex adapter, 7 merge, 12 preview and 17 memory setup tests, including combined
+crash recovery/Undo and passive configuration drift. Core/daemon and isolated
+launcher Clippy pass. The [Codex evidence](codex-staged-generation-2026-09-06.md)
+records the design amendment and distinguishes this from full connection.
+No capability version or installer changed; native installed acceptance is open.

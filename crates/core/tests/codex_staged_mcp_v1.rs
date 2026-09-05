@@ -1,7 +1,7 @@
 use std::fs;
 
 use context_relay_core::{
-    codex::staged_mcp::CodexMcpGenerationInput, native_transaction::model::CanonicalCliDeclaration,
+    codex::managed_mcp::CodexManagedMcpInput, native_transaction::model::CanonicalCliDeclaration,
 };
 #[cfg(any(windows, target_os = "macos"))]
 use context_relay_native_runner::{NativeState, OsNativeFileSystem};
@@ -63,8 +63,8 @@ impl Fixture {
         }
     }
 
-    fn input(&self) -> CodexMcpGenerationInput {
-        CodexMcpGenerationInput::new(&self.declaration).unwrap()
+    fn input(&self) -> CodexManagedMcpInput {
+        CodexManagedMcpInput::new(&self.declaration).unwrap()
     }
 
     #[cfg(any(windows, target_os = "macos"))]
@@ -134,7 +134,7 @@ fn generation_rejects_noncanonical_or_tampered_inputs() {
         cases.push(wrong);
     }
     for wrong in cases {
-        assert!(CodexMcpGenerationInput::new(&wrong).is_err());
+        assert!(CodexManagedMcpInput::new(&wrong).is_err());
     }
 }
 

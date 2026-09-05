@@ -2240,6 +2240,169 @@ fn codex_mcp_list(body: &str) -> Vec<u8> {
 }
 
 #[test]
+fn managed_bridge_setup_composes_mcp_and_memory_without_a_live_cli_writer() {
+    use context_relay_core::setup::BridgePreviewHarness;
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let bridge = executable_bridge(&fixture, "bridge 測試 ' $HOME with spaces");
+    let desired = DesiredState {
+        components: vec![bridge.clone()],
+        scopes: vec![NativeScope::Global],
+    };
+    let global = fixture.codex_home.join("config.toml");
+    let original = fs::read(&global).unwrap();
+    let bridge_plan = fixture.adapter.bridge_mutations(&desired, &bridge).unwrap();
+    assert!(
+        bridge_plan.cli.is_none(),
+        "setup must not run a live MCP writer"
+    );
+    let plan = fixture.adapter.primary_memory_mutations(&desired).unwrap();
+    let configs = plan
+        .native
+        .iter()
+        .filter(|mutation| mutation.target == test_wire_path(&global))
+        .collect::<Vec<_>>();
+    assert_eq!(configs.len(), 1);
+    let NativeState::RegularFile { bytes, metadata } =
+        NativeState::decode_v1(&configs[0].content).unwrap()
+    else {
+        panic!("expected global config")
+    };
+    let before = context_relay_native_runner::OsNativeFileSystem::new()
+        .snapshot(&global)
+        .unwrap();
+    // Reads can advance Windows access time; compare the restorable metadata
+    // contract used by the actual native transaction, retaining original bytes.
+    assert_eq!(
+        NativeState::regular_file(original.clone(), metadata).fingerprint(),
+        *before.fingerprint()
+    );
+    let text = String::from_utf8(bytes).unwrap();
+    let document = text.parse::<toml_edit::DocumentMut>().unwrap();
+    let body: Value = serde_json::from_str(&bridge.body_markdown).unwrap();
+    assert_eq!(
+        document["mcp_servers"]["context-relay"]["command"].as_str(),
+        body["command"].as_str()
+    );
+    assert_eq!(
+        document["memories"]["generate_memories"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(document["memories"]["use_memories"].as_bool(), Some(false));
+    assert_eq!(
+        fs::read(&global).unwrap(),
+        original,
+        "preview must not write"
+    );
+}
+
+#[test]
+fn native_bridge_setup_rejects_foreign_options_and_project_overrides_without_writing() {
+    use context_relay_core::setup::BridgePreviewHarness;
+    for extra in [
+        "enabled = false",
+        "enabled = true",
+        "env = { TOKEN = 'synthetic' }",
+        "cwd = 'other'",
+        "future_option = true",
+        "project override",
+        "project scalar",
+        "project array",
+    ] {
+        let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+        let bridge = executable_bridge(&fixture, "bridge with spaces");
+        let desired = DesiredState {
+            components: vec![bridge],
+            scopes: vec![NativeScope::Global],
+        };
+        let plan = fixture.adapter.primary_memory_mutations(&desired).unwrap();
+        let global = fixture.codex_home.join("config.toml");
+        let mutation = plan
+            .native
+            .iter()
+            .find(|mutation| mutation.target == test_wire_path(&global))
+            .unwrap();
+        let NativeState::RegularFile { bytes, .. } =
+            NativeState::decode_v1(&mutation.content).unwrap()
+        else {
+            panic!("file")
+        };
+        let mut document = String::from_utf8(bytes)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let target = if extra.starts_with("project ") {
+            fixture.layout.project_root.join(".codex/config.toml")
+        } else {
+            global.clone()
+        };
+        if extra == "project override" {
+            fs::write(&target, "[mcp_servers.context-relay]\nenabled = false\n").unwrap();
+        } else if extra == "project scalar" {
+            fs::write(&target, "mcp_servers = 'invalid'\n").unwrap();
+        } else if extra == "project array" {
+            fs::write(&target, "mcp_servers = []\n").unwrap();
+        } else {
+            let parsed = extra.parse::<toml_edit::DocumentMut>().unwrap();
+            for (key, value) in parsed.iter() {
+                document["mcp_servers"]["context-relay"][key] = value.clone();
+            }
+            fs::write(&target, document.to_string()).unwrap();
+        }
+        let before = fs::read(&target).unwrap();
+        assert!(
+            fixture.adapter.primary_memory_mutations(&desired).is_err(),
+            "{extra}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), before);
+    }
+}
+
+#[test]
+fn legacy_cli_bridge_plan_keeps_its_memory_only_fingerprint_contract() {
+    let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let prior = executable_bridge(&fixture, "old bridge");
+    let next = executable_bridge(&fixture, "new bridge");
+    let old: Value = serde_json::from_str(&prior.body_markdown).unwrap();
+    let path = fixture.codex_home.join("config.toml");
+    let mut document = fs::read_to_string(&path)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    let table = format!(
+        "[mcp_servers.context-relay]\ncommand = {}\nargs = [\"--harness\", \"codex\"]\n",
+        old["command"]
+    )
+    .parse::<toml_edit::DocumentMut>()
+    .unwrap();
+    document["mcp_servers"]["context-relay"] = table["mcp_servers"]["context-relay"].clone();
+    fs::write(&path, document.to_string()).unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+        panic!("supported memory")
+    };
+    let mut plan = codex_native_plan(&fixture, vec![]);
+    plan.setup.adapter_version = 1;
+    plan.setup.rulesync_version = "bridge-preview-v1".into();
+    plan.setup
+        .semantic_changes
+        .push(context_relay_protocol::ClassifiedChange {
+            class: context_relay_protocol::ChangeClass::Update,
+            target: "codex-mcp|global|context-relay".into(),
+            summary: next.body_markdown,
+        });
+    plan.mutations = mutations;
+    plan.native_memory_registrations = capabilities
+        .sources
+        .into_iter()
+        .map(|source| NativeMemoryRegistration {
+            source,
+            last_applied_digest: None,
+        })
+        .collect();
+    NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).unwrap();
+}
+
+#[test]
 fn bridge_cli_plan_binds_exact_declarations_and_preserves_argv_boundaries() {
     let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
     let bridge = executable_bridge(&fixture, "bridge executable with spaces");

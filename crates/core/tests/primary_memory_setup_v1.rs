@@ -250,6 +250,7 @@ impl BridgePreviewHarness for Harness {
         .unwrap();
         Ok(PrimaryMemoryMutationPlan {
             native,
+            expected_native_digests: vec![],
             registrations: vec![NativeMemoryRegistration {
                 source,
                 last_applied_digest: None,
@@ -438,6 +439,12 @@ impl HarnessAdapter for FrozenHarness {
 }
 
 impl BridgePreviewHarness for FrozenHarness {
+    fn bridge_adapter_version(&self) -> u32 {
+        match self {
+            Self::Codex { adapter, .. } => BridgePreviewHarness::bridge_adapter_version(adapter),
+            _ => 1,
+        }
+    }
     fn watch_only_memory_digests(&self) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
         match self {
             Self::Claude { adapter, .. } => {
@@ -500,13 +507,7 @@ impl BridgePreviewHarness for FrozenHarness {
     ) -> Result<BridgeMutationPlan, ClientError> {
         let cli = match self {
             Self::Claude { adapter, .. } => Some(adapter.plan_bridge_cli_mutation(intended)?),
-            Self::Codex { adapter, cli } => {
-                let cli = cli.clone();
-                Some(adapter.plan_bridge_cli_mutation_with_runner(
-                    intended,
-                    move |arguments: &[String]| codex_cli_output(arguments, cli.borrow().as_ref()),
-                )?)
-            }
+            Self::Codex { .. } => None,
             Self::Hermes(_) => None,
         };
         Ok(BridgeMutationPlan {
@@ -554,6 +555,9 @@ impl NativeAdapter for FrozenHarness {
     ) -> Result<(), BoundaryError> {
         match self {
             Self::Claude { adapter, .. } => {
+                NativeAdapter::verify_live_state_reservation(adapter, plan)
+            }
+            Self::Codex { adapter, .. } => {
                 NativeAdapter::verify_live_state_reservation(adapter, plan)
             }
             _ => Ok(()),
@@ -635,82 +639,6 @@ impl NativeAdapter for FrozenHarness {
             Self::Hermes(adapter) => NativeAdapter::release_live_state_reservation(adapter),
         }
     }
-}
-
-fn codex_cli_output(
-    arguments: &[String],
-    live: Option<&CanonicalCliDeclaration>,
-) -> Result<Vec<u8>, BoundaryError> {
-    match arguments {
-        [plugin, list, format]
-            if (plugin.as_str(), list.as_str(), format.as_str())
-                == ("plugin", "list", "--json") =>
-        {
-            Ok(br#"{"installed":[],"available":[]}"#.to_vec())
-        }
-        [mcp, list, format]
-            if (mcp.as_str(), list.as_str(), format.as_str()) == ("mcp", "list", "--json") =>
-        {
-            Ok(match live {
-                Some(declaration) => codex_mcp_list(&declaration.canonical_body),
-                None => b"[]".to_vec(),
-            })
-        }
-        [mcp, get, name, format]
-            if (mcp.as_str(), get.as_str(), name.as_str(), format.as_str())
-                == ("mcp", "get", BRIDGE_SERVER_NAME, "--json") =>
-        {
-            Ok(codex_mcp_get(
-                &live
-                    .ok_or_else(|| BoundaryError::new("missing declaration"))?
-                    .canonical_body,
-            ))
-        }
-        _ => Err(BoundaryError::new("unexpected Codex CLI inspection")),
-    }
-}
-
-fn codex_mcp_list(body: &str) -> Vec<u8> {
-    let body: Value = serde_json::from_str(body).unwrap();
-    serde_json::to_vec(&json!([{
-        "name": BRIDGE_SERVER_NAME,
-        "enabled": true,
-        "disabled_reason": null,
-        "transport": {
-            "type": "stdio",
-            "command": body["command"],
-            "args": body["args"],
-            "env": {},
-            "env_vars": [],
-            "cwd": null
-        },
-        "startup_timeout_sec": null,
-        "tool_timeout_sec": null,
-        "auth_status": "unsupported"
-    }]))
-    .unwrap()
-}
-
-fn codex_mcp_get(body: &str) -> Vec<u8> {
-    let body: Value = serde_json::from_str(body).unwrap();
-    serde_json::to_vec(&json!({
-        "name": BRIDGE_SERVER_NAME,
-        "enabled": true,
-        "disabled_reason": null,
-        "transport": {
-            "type": "stdio",
-            "command": body["command"],
-            "args": body["args"],
-            "env": {},
-            "env_vars": [],
-            "cwd": null
-        },
-        "enabled_tools": null,
-        "disabled_tools": null,
-        "startup_timeout_sec": null,
-        "tool_timeout_sec": null
-    }))
-    .unwrap()
 }
 
 struct MatrixCli {
@@ -1481,7 +1409,7 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
         assert_eq!(opened.plan.native_memory_registrations.len(), 2);
         assert_eq!(
             opened.plan.cli_mutations.is_empty(),
-            harness_id == HarnessId::Hermes
+            harness_id != HarnessId::ClaudeCode
         );
         assert!(opened.plan.mutations.len() >= 2);
         let original = opened
@@ -2509,7 +2437,9 @@ fn codex_setup_rejects_new_memory_overrides_after_preview_without_writing() {
             "new memory setting was not in the reviewed plan: global={global}, prior={prior:?}, value={changed_value}"
         );
         for (path, bytes) in original {
-            assert_eq!(fs::read(path).unwrap(), bytes);
+            if path != config_path {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
         }
         assert_eq!(fs::read_to_string(config_path).unwrap(), changed);
         for registration in &opened.plan.native_memory_registrations {
@@ -2522,6 +2452,122 @@ fn codex_setup_rejects_new_memory_overrides_after_preview_without_writing() {
         }
         assert_raw_unchanged(&fixture);
     }
+}
+
+#[test]
+fn codex_native_bridge_repeat_preview_binds_noop_and_absent_project_configuration() {
+    let mut fixture = codex_matrix_fixture();
+    let global = fixture
+        .project_root
+        .parent()
+        .unwrap()
+        .join("codex/config.toml");
+    let project = fixture.project_root.join(".codex/config.toml");
+    fs::remove_file(&project).unwrap();
+    let vault_path = TempVault::new("codex-native-repeat");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+    let preview = |vault: &mut Vault, fixture: &MatrixFixture, now| {
+        BridgeInstallService::new(
+            vault,
+            fixture.harness.clone(),
+            Locator {
+                bridge: fixture.bridge.clone(),
+                calls: Rc::new(Cell::new(0)),
+            },
+            DeviceId::from_str(ID_1).unwrap(),
+            clock(now),
+        )
+        .preview(
+            Some(&RegisteredProject {
+                project_id: fixture.project_id,
+                root: wire_path(&fixture.project_root),
+            }),
+            now,
+        )
+        .unwrap()
+    };
+    let setup = preview(&mut vault, &fixture, NOW_MS);
+    let mut executor = MatrixExecutor {
+        live: fixture.harness.cli_state(),
+        harness: &mut fixture.harness,
+        lock_root: fixture.lock_root.clone(),
+    };
+    BridgeInstallService::persisted(&mut vault)
+        .apply(&setup.plan_id, NOW_MS + 1, &mut executor)
+        .unwrap();
+    let connected = fs::read(&global).unwrap();
+    let repeat = preview(&mut vault, &fixture, NOW_MS + 2);
+    let opened = open_plan(&vault.setup_plan(&repeat.plan_id).unwrap().unwrap().payload).unwrap();
+    assert!(opened.plan.mutations.is_empty());
+    assert!(opened.plan.cli_mutations.is_empty());
+    assert!(
+        !repeat
+            .semantic_changes
+            .iter()
+            .any(|change| change.target == "codex-mcp|global|context-relay")
+    );
+    assert!(
+        repeat
+            .expected_native_digests
+            .contains(&ExpectedNativeDigest {
+                target: wire_path(&global),
+                expected_digest: Some(Sha256Digest(Sha256::digest(&connected).into()))
+            })
+    );
+    assert!(
+        repeat
+            .expected_native_digests
+            .contains(&ExpectedNativeDigest {
+                target: wire_path(&project),
+                expected_digest: None
+            })
+    );
+    for path in [&global, &project] {
+        let prior = fs::read(path).ok();
+        let changed = if path == &global {
+            [connected.as_slice(), b"\n# concurrent edit\n"].concat()
+        } else {
+            b"[mcp_servers.context-relay]\nenabled = false\n".to_vec()
+        };
+        fs::write(path, &changed).unwrap();
+        assert!(
+            NativeAdapter::verify_live_state_reservation(&mut fixture.harness, &opened.plan)
+                .is_err()
+        );
+        assert_eq!(fs::read(path).unwrap(), changed);
+        match prior {
+            Some(bytes) => fs::write(path, bytes).unwrap(),
+            None => fs::remove_file(path).unwrap(),
+        }
+    }
+    NativeAdapter::verify_live_state_reservation(&mut fixture.harness, &opened.plan).unwrap();
+    let mut executor = MatrixExecutor {
+        live: fixture.harness.cli_state(),
+        harness: &mut fixture.harness,
+        lock_root: fixture.lock_root.clone(),
+    };
+    BridgeInstallService::persisted(&mut vault)
+        .apply(&repeat.plan_id, NOW_MS + 3, &mut executor)
+        .unwrap();
+    assert_eq!(fs::read(&global).unwrap(), connected);
+    let drift = preview(&mut vault, &fixture, NOW_MS + 4);
+    fs::write(&project, "[mcp_servers.context-relay]\nenabled = false\n").unwrap();
+    let mut executor = MatrixExecutor {
+        live: fixture.harness.cli_state(),
+        harness: &mut fixture.harness,
+        lock_root: fixture.lock_root.clone(),
+    };
+    assert!(
+        BridgeInstallService::persisted(&mut vault)
+            .apply(&drift.plan_id, NOW_MS + 5, &mut executor)
+            .is_err()
+    );
+    assert_eq!(fs::read(&global).unwrap(), connected);
+    assert_eq!(
+        fs::read_to_string(&project).unwrap(),
+        "[mcp_servers.context-relay]\nenabled = false\n"
+    );
 }
 
 #[test]

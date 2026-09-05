@@ -4,7 +4,7 @@
 //! particular it deliberately never walks `$CODEX_HOME`: auth, sessions,
 //! history, sqlite state, logs, and approval records are not adapter input.
 
-pub mod staged_mcp;
+pub mod managed_mcp;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -21,10 +21,10 @@ use context_relay_native_runner::{NativeState, OsNativeFileSystem};
 use context_relay_protocol::{
     ApplyReceipt, CapabilityLevel, ChangeClass, ClassifiedChanges, CliOperation, CliOperations,
     ClientError, ComponentKind, ComponentRecord, DesiredState, DeviceId, DiscoveredScopes,
-    ErrorCode, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest, ImportedState,
-    InstallationMethod, NativePlatform, NativeScope, ProbeContext, ProbeReport, ProjectId,
-    Provenance, RecordId, RenderedFile, RenderedState, ScopeRef, SemanticDiff, Sha256Digest,
-    ValidationReport, WireNativeValue,
+    ErrorCode, ExpectedNativeDigest, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest,
+    ImportedState, InstallationMethod, NativePlatform, NativeScope, ProbeContext, ProbeReport,
+    ProjectId, Provenance, RecordId, RenderedFile, RenderedState, ScopeRef, SemanticDiff,
+    Sha256Digest, ValidationReport, WireNativeValue,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -564,6 +564,99 @@ impl CodexAdapter {
 
     pub fn project_root_wire(&self) -> WireNativeValue {
         wire_path(&self.layout.project_root)
+    }
+
+    pub(crate) fn native_bridge_dependencies(
+        &self,
+    ) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
+        self.reject_native_bridge_overrides()?;
+        self.effective_config_paths()?
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|path| {
+                let bytes = read_optional_file(&path)?;
+                Ok(ExpectedNativeDigest {
+                    target: wire_path(&path),
+                    expected_digest: bytes.as_deref().map(digest),
+                })
+            })
+            .collect()
+    }
+
+    fn reject_native_bridge_overrides(&self) -> Result<(), ClientError> {
+        let global = self.layout.codex_home.join("config.toml");
+        for (path, project_layer) in self.effective_config_paths()? {
+            if !project_layer || path == global {
+                continue;
+            }
+            self.validate_project_path(&path)?;
+            if let Some(bytes) = read_optional_file(&path)? {
+                let document = bytes_to_document(&bytes)?;
+                let servers = document
+                    .get("mcp_servers")
+                    .map(|item| {
+                        item.as_table()
+                            .ok_or_else(|| invalid("Codex project MCP configuration is invalid"))
+                    })
+                    .transpose()?;
+                if servers.is_some_and(|servers| servers.contains_key(BRIDGE_SERVER_NAME)) {
+                    return Err(client_error(
+                        ErrorCode::Conflict,
+                        "Project configuration overrides the Context Relay bridge; remove that override before connecting",
+                        false,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Composes the managed MCP declaration and memory disable from one exact
+    /// before-image. Arbitrary MCP and plugin edits still use their CLI path.
+    pub(crate) fn plan_native_bridge_with_memory_disable(
+        &self,
+        intended: &ComponentRecord,
+        disable_mutations: &[ApprovedMutation],
+    ) -> Result<ApprovedMutation, ClientError> {
+        self.require_apply_supported()?;
+        self.recheck_executable_client()?;
+        self.reject_native_bridge_overrides()?;
+        if intended.archived || !is_managed_bridge_component(HarnessId::Codex, intended) {
+            return Err(invalid("Codex native setup requires the managed bridge"));
+        }
+        let path = self.layout.codex_home.join("config.toml");
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid("Codex config cannot be safely inspected"))?;
+        let matching = disable_mutations
+            .iter()
+            .filter(|mutation| mutation.target == wire_path(&path))
+            .collect::<Vec<_>>();
+        let base = match matching.as_slice() {
+            [] => snapshot.state().clone(),
+            [mutation] if mutation.expected.0.0 == *snapshot.fingerprint() => {
+                let state = NativeState::decode_v1(&mutation.content)
+                    .map_err(|_| invalid("Codex memory projection is invalid"))?;
+                if state.fingerprint() != mutation.intended.0.0 {
+                    return Err(invalid("Codex memory projection is invalid"));
+                }
+                state
+            }
+            _ => {
+                return Err(client_error(
+                    ErrorCode::Conflict,
+                    "Codex memory configuration changed during preview",
+                    false,
+                ));
+            }
+        };
+        let item = managed_mcp::CodexManagedMcpInput::new(&canonical_cli_declaration(
+            &intended.body_markdown,
+        )?)?
+        .native_item();
+        self.approved_file(&path, snapshot.fingerprint(), item.merge_into(&base)?)
     }
 
     pub fn plan_bridge_cli_mutation(
@@ -1931,7 +2024,7 @@ impl NativeMemoryAdapter for CodexAdapter {
                 Ok(document) => document,
                 Err(_) => return Ok(watch_only()),
             };
-            let changed = match staged_mcp::disable_memory_settings(&mut document, project_layer) {
+            let changed = match managed_mcp::disable_memory_settings(&mut document, project_layer) {
                 Ok(changed) => changed,
                 Err(_) => return Ok(watch_only()),
             };
@@ -2409,6 +2502,28 @@ impl CodexAdapter {
             return Err(BoundaryError::new("Codex memory settings changed"));
         };
         for needed in required {
+            let composed = if plan.setup.rulesync_version == "bridge-preview-v1"
+                && plan.setup.adapter_version == 2
+                && needed.target == wire_path(&self.layout.codex_home.join("config.toml"))
+            {
+                plan.setup
+                    .semantic_changes
+                    .iter()
+                    .find(|change| change.target == "codex-mcp|global|context-relay")
+                    .map(|change| {
+                        let declaration = canonical_cli_declaration(&change.summary)?;
+                        let input = managed_mcp::CodexManagedMcpInput::new(&declaration)?;
+                        let state = NativeState::decode_v1(&needed.content)
+                            .map_err(|_| invalid("Codex memory state is invalid"))?;
+                        input.native_item().merge_into(&state).map(|state| {
+                            RestorableStateFingerprint(Sha256Digest(state.fingerprint()))
+                        })
+                    })
+                    .transpose()
+                    .map_err(|_| BoundaryError::new("Codex combined memory state is invalid"))?
+            } else {
+                None
+            };
             // Reservation checks run between writes, including inverse writes.
             // Permit only the two exact reviewed states, in either direction.
             // Final validation permits enabled values only as an inverse result.
@@ -2419,10 +2534,56 @@ impl CodexAdapter {
                         && mutation.expected == needed.expected
                         && mutation.intended == needed.intended)
                         || (mutation.expected == needed.intended
-                            && mutation.intended == needed.expected))
+                            && mutation.intended == needed.expected)
+                        || composed.as_ref().is_some_and(|combined| {
+                            (!final_state
+                                && mutation.expected == needed.expected
+                                && &mutation.intended == combined)
+                                || (&mutation.expected == combined
+                                    && mutation.intended == needed.expected)
+                        }))
             });
             if !approved {
                 return Err(BoundaryError::new("Codex memory settings changed"));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_native_bridge_plan_state(
+        &self,
+        plan: &NativeTransactionPlan,
+        final_state: bool,
+    ) -> Result<(), BoundaryError> {
+        if plan.setup.rulesync_version != "bridge-preview-v1" || plan.setup.adapter_version != 2 {
+            return Ok(());
+        }
+        if !plan.cli_mutations.is_empty() || !plan.setup.cli_operations.is_empty() {
+            return Err(BoundaryError::new(
+                "Codex native setup cannot contain CLI mutations",
+            ));
+        }
+        let dependencies = self
+            .native_bridge_dependencies()
+            .map_err(|_| BoundaryError::new("Codex bridge configuration changed"))?;
+        for dependency in dependencies {
+            if let Some(mutation) = plan
+                .mutations
+                .iter()
+                .find(|mutation| mutation.target == dependency.target)
+            {
+                let path = decode_wire_path(&dependency.target)?;
+                let snapshot = OsNativeFileSystem::new()
+                    .snapshot(&path)
+                    .map_err(|_| BoundaryError::new("Codex config cannot be inspected"))?;
+                let fingerprint = RestorableStateFingerprint(Sha256Digest(*snapshot.fingerprint()));
+                if fingerprint != mutation.intended
+                    && (final_state || fingerprint != mutation.expected)
+                {
+                    return Err(BoundaryError::new("Codex native configuration changed"));
+                }
+            } else if !plan.setup.expected_native_digests.contains(&dependency) {
+                return Err(BoundaryError::new("Codex bridge dependency changed"));
             }
         }
         Ok(())
@@ -2442,6 +2603,7 @@ impl NativeAdapter for CodexAdapter {
         {
             return Err(BoundaryError::new("Codex installation changed"));
         }
+        self.verify_native_bridge_plan_state(plan, false)?;
         self.verify_native_memory_plan_state(plan, false)
     }
     fn compare_approved_digests(
@@ -2500,6 +2662,7 @@ impl NativeAdapter for CodexAdapter {
                 "Codex effective state differs from the plan",
             ));
         }
+        self.verify_native_bridge_plan_state(plan, true)?;
         self.verify_native_memory_plan_state(plan, true)
     }
 }

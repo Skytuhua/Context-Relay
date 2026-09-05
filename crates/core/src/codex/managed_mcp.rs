@@ -1,8 +1,7 @@
-//! Host-side validation and merge boundary for isolated Codex MCP generation.
-//!
-//! Parsing output does not attest how it was generated. The restricted runner
-//! and approval-bound generation evidence must be verified by the caller before
-//! any resulting native state can be applied. This module performs no writes.
+//! Canonical managed Codex MCP serialization, compatibility checks and native merge.
+//! Native setup serializes the documented fields directly. The output validator
+//! also supports checking captured CLI fixtures; it does not attest execution.
+//! This module performs no writes. Apply requires an approved native transaction.
 
 use context_relay_native_runner::NativeState;
 use context_relay_protocol::ClientError;
@@ -19,11 +18,26 @@ const SERVER: &str = "context-relay";
 
 /// Closed input: one already-canonical local bridge, with no configurable flags,
 /// environment, server name, or working directory. It contains no live config.
-pub struct CodexMcpGenerationInput {
+pub struct CodexManagedMcpInput {
     command: String,
 }
 
-impl CodexMcpGenerationInput {
+impl CodexManagedMcpInput {
+    /// Serializes the documented native configuration directly. This does not
+    /// claim CLI authorship and does not execute the configured command.
+    pub(super) fn native_item(&self) -> CodexManagedMcpItem {
+        let mut item = Table::new();
+        item["command"] = toml_edit::value(&self.command);
+        let mut args = toml_edit::Array::new();
+        args.push("--harness");
+        args.push("codex");
+        item["args"] = toml_edit::value(args);
+        CodexManagedMcpItem {
+            item,
+            command: self.command.clone(),
+        }
+    }
+
     pub fn new(declaration: &CanonicalCliDeclaration) -> Result<Self, ClientError> {
         if declaration.canonical_body.len() > MAX_OUTPUT_BYTES {
             return Err(invalid("Codex staged input is too large"));
@@ -60,7 +74,7 @@ impl CodexMcpGenerationInput {
         &self,
         config: &[u8],
         readback: &[u8],
-    ) -> Result<ValidatedCodexMcpItem, ClientError> {
+    ) -> Result<CodexManagedMcpItem, ClientError> {
         if config.len() > MAX_OUTPUT_BYTES || readback.len() > MAX_OUTPUT_BYTES {
             return Err(invalid("Codex staged output is too large"));
         }
@@ -87,20 +101,20 @@ impl CodexMcpGenerationInput {
         }
         let mut item = item.clone();
         item.set_position(None);
-        Ok(ValidatedCodexMcpItem {
+        Ok(CodexManagedMcpItem {
             item,
             command: self.command.clone(),
         })
     }
 }
 
-/// A structurally checked CLI output item, not a sandbox or approval attestation.
-pub struct ValidatedCodexMcpItem {
+/// A structurally checked managed item, not a sandbox or approval attestation.
+pub struct CodexManagedMcpItem {
     item: Table,
     command: String,
 }
 
-impl ValidatedCodexMcpItem {
+impl CodexManagedMcpItem {
     /// Produces one intended global file state from a captured live snapshot.
     /// The caller must seal/apply it through the native transaction machinery.
     /// Absent files need an approved creation-metadata policy and are rejected.
@@ -248,4 +262,104 @@ struct StdioReadback {
     env: Value,
     env_vars: Vec<String>,
     cwd: Value,
+}
+
+#[cfg(all(test, windows))]
+mod native_tests {
+    use super::*;
+    use context_relay_native_runner::OsNativeFileSystem;
+    use context_relay_protocol::{HarnessId, Sha256Digest};
+    use serde_json::json;
+    use sha2::{Digest as _, Sha256};
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
+        time::Duration,
+    };
+
+    #[test]
+    #[ignore = "requires explicitly selected Codex 0.144.6 and Node; synthetic profiles only"]
+    fn pinned_codex_reads_native_bridge_exactly_like_its_official_cli() {
+        const SHA256: &str = "4b76ded066d0239115ca97473d010c92072bc5c5550a45dd7cbebe1e9eb956a7";
+        let executable = PathBuf::from(
+            env::var_os("CONTEXT_RELAY_TEST_CODEX_EXE").expect("explicit Codex executable"),
+        );
+        let node = PathBuf::from(
+            env::var_os("CONTEXT_RELAY_TEST_NODE_EXE").expect("explicit Node executable"),
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(fs::read(&executable).unwrap())),
+            SHA256
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let physical = fs::canonicalize(temp.path()).unwrap();
+        assert!(
+            matches!(physical.components().next(), Some(std::path::Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_)))
+        );
+        let root = PathBuf::from(physical.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
+        assert!(root.is_absolute());
+        assert_eq!(fs::canonicalize(&root).unwrap(), physical);
+        let mut cases = vec![];
+        for name in ["plain", "space 測試 O'Brien $HOME"] {
+            let home = root.join(name);
+            fs::create_dir(&home).unwrap();
+            let command = home.join("inert bridge.exe");
+            fs::write(&command, b"synthetic bridge; must never execute").unwrap();
+            let command = fs::canonicalize(command).unwrap();
+            let body =
+                json!({"args":["--harness","codex"],"command":command,"type":"stdio"}).to_string();
+            let declaration = CanonicalCliDeclaration {
+                harness: HarnessId::Codex,
+                server_name: SERVER.into(),
+                fingerprint: Sha256Digest(Sha256::digest(body.as_bytes()).into()),
+                canonical_body: body,
+            };
+            let input = CodexManagedMcpInput::new(&declaration).unwrap();
+            let config = home.join("config.toml");
+            fs::write(&config, "# retain synthetic mixed configuration\nmodel = 'synthetic-unused'\n[memories]\ngenerate_memories = true # retain comment\nuse_memories = true\n[mcp_servers.unrelated]\nurl = 'https://example.invalid/synthetic'\n").unwrap();
+            let before = OsNativeFileSystem::new().snapshot(&config).unwrap();
+            let intended = input.native_item().merge_into(before.state()).unwrap();
+            let NativeState::RegularFile { bytes, .. } = intended else {
+                panic!("native file")
+            };
+            assert!(
+                String::from_utf8_lossy(&bytes)
+                    .contains("generate_memories = false # retain comment")
+            );
+            fs::write(&config, bytes).unwrap();
+            cases.push(json!({"name":name,"home":home,"command":command}));
+        }
+        let manifest = root.join("manifest.json");
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&json!({"executable":executable,"sha256":SHA256,"cases":cases}))
+                .unwrap(),
+        )
+        .unwrap();
+        let stdout = root.join("stdout");
+        let stderr = root.join("stderr");
+        let mut command = Command::new(node);
+        command.env_clear();
+        for name in ["SystemRoot", "WINDIR"] {
+            if let Some(value) = env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/codex-native-mcp-readback.mjs"),
+            )
+            .arg(manifest)
+            .current_dir(&root)
+            .stdin(Stdio::piped())
+            .stdout(fs::File::create(&stdout).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap());
+        let result =
+            crate::test_windows_process::run_in_owned_job(&mut command, Duration::from_secs(90))
+                .unwrap();
+        assert!(result.success(), "{}", fs::read_to_string(stderr).unwrap());
+        println!("{}", fs::read_to_string(stdout).unwrap());
+    }
 }

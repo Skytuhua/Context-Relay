@@ -132,3 +132,12 @@ and exact Undo. Local checks pass 104 core library, 63 adapter and 16 setup test
 The [Claude evidence](claude-native-mcp-2026-09-06.md) retains interactive/runtime
 settings, production bridge delivery, full setup/recovery and installed acceptance
 as open. T10/T14/T20 and the full product goal remain incomplete.
+
+2026-09-06 Codex writer update: fixed managed bridge setup composes MCP and
+global memory settings into one native write, preserving exact approvals and
+Undo. Real 0.144.6 configuration readback matches the official CLI in synthetic
+profiles. The [Codex evidence](codex-staged-generation-2026-09-06.md) records the
+Windows path-resolution diagnosis, native transaction coverage and remaining
+hook/bridge/installed qualification. The obsolete generator requirement is
+superseded, without weakening native CAS or sandbox boundaries. No additional
+Full version is enabled; T10/T14/T20 remain incomplete.

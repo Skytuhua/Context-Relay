@@ -2,6 +2,11 @@
 
 ## Status
 
+The generation mechanism below is superseded by the
+[single native writer amendment](2026-09-06-codex-native-bridge-design.md).
+The reproduced failure and isolation results remain evidence; they are not
+requirements to ship the unsuccessful generator.
+
 Implementation direction for the remaining Windows connection and rollback
 failure. This is not release qualification. Codex 0.144.6 remains ImportOnly
 until this path and native hook trust/execution pass real-install acceptance.
