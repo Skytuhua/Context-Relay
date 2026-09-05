@@ -701,6 +701,7 @@ mod tests {
             IpcError::HandshakeTimeout,
             IpcError::ProtocolVersionUnsupported,
             IpcError::InvalidRequest,
+            IpcError::ShutdownTimeout,
         ] {
             assert_eq!(safe_ipc_error(error), expected);
         }
