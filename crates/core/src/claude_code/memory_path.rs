@@ -43,7 +43,7 @@ pub(super) fn configured_directory(value: &str, home: &Path) -> Option<PathBuf> 
     Some(PathBuf::from(text.nfc().collect::<String>()))
 }
 
-fn normalize(path: &Path) -> PathBuf {
+pub(super) fn normalize(path: &Path) -> PathBuf {
     let mut components = Vec::new();
     for component in path.components() {
         match component {

@@ -441,9 +441,18 @@ impl BridgeLocator for NeverBridgeLocator {
     }
 }
 
-struct NeverBridgeExecutor;
+struct WatchOnlyCodexVerifier<'a>(&'a CodexAdapter);
 
-impl BridgePlanExecutor for NeverBridgeExecutor {
+impl BridgePlanExecutor for WatchOnlyCodexVerifier<'_> {
+    fn verify_watch_only_registration(
+        &mut self,
+        plan: &NativeTransactionPlan,
+        now_ms: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        context_relay_core::setup::verify_watch_only_registration(self.0, plan, now_ms)
+            .map_err(|error| BridgeExecutionError::restored(error.message))
+    }
+
     fn execute(
         &mut self,
         _: &mut Vault,
@@ -509,7 +518,7 @@ impl BridgeInstallEngine for WatchOnlyCodexSetupEngine {
         BridgeInstallService::persisted(vault).apply(
             &params.plan_id,
             1_900_000_000_001,
-            &mut NeverBridgeExecutor,
+            &mut WatchOnlyCodexVerifier(&self.adapter.lock().unwrap()),
         )
     }
 
@@ -523,7 +532,7 @@ impl BridgeInstallEngine for WatchOnlyCodexSetupEngine {
         BridgeInstallService::persisted(vault).rollback(
             &params.plan_id,
             1_900_000_000_002,
-            &mut NeverBridgeExecutor,
+            &mut WatchOnlyCodexVerifier(&self.adapter.lock().unwrap()),
         )
     }
 }

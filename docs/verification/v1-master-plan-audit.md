@@ -114,3 +114,12 @@ The production verifier launches no harness, proven by a twelve-case isolated
 canary. All 322 selected core tests and 59 daemon tests pass. The
 [registration evidence](read-only-memory-registration-2026-09-06.md) retains Full
 connection and installed acceptance as open; T10/T14/T20 are not completed.
+
+2026-09-06 default-root update: Claude memory lookup now follows the pinned
+repository/worktree helper, with 16 native vectors per platform and live source
+revalidation. Local checks pass 104 core library, 60 Claude adapter and 16 memory
+setup tests. The macOS registration canary passed; a stale watcher integration
+fixture was corrected and its four tests pass locally. The [Claude evidence](claude-native-mcp-2026-09-06.md)
+and [registration evidence](read-only-memory-registration-2026-09-06.md) retain
+session settings, full native setup/recovery and installed acceptance as open.
+T10/T14/T20 remain incomplete; no additional harness version is enabled.

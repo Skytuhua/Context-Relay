@@ -72,3 +72,17 @@ complete native setup/recovery, Codex isolation, Hermes launcher qualification
 and installed acceptance remain open. The unsigned installer from source
 `11d6740` is unchanged and does not include this or the two preceding memory
 settings/path corrections. Native desktop control remains paused.
+
+## Hosted watcher integration follow-up
+
+CI33994948098 passed the production registration canary and all 60 macOS daemon
+library tests, then failed the `authoritative_memory_v1` integration fixture.
+That fixture still used a `NeverBridgeExecutor` with no live verifier. It now
+calls the actual read-only Codex verifier while retaining a panic if any native
+transaction is invoked. All four integration tests pass locally on Windows,
+including registration, delivery of an edited source to the real daemon watcher
+and Undo without configuration changes. The correction still needs the next
+hosted run; the earlier overall CI result is not green.
+
+Evidence: `ci-679-macos-rust-failure.log` and
+`watch-registration-authoritative-memory.log` in the local closeout directory.

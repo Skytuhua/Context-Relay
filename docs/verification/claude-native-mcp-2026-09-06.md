@@ -427,3 +427,62 @@ unverified registration. The [cross-harness evidence](read-only-memory-registrat
 records the production canary, recovery/Undo matrix and Windows path correction.
 This closes the registration revalidation gap above, not full runtime connection
 qualification. No additional version is enabled and the installer is unchanged.
+
+## Default repository and worktree memory roots
+
+The default memory key previously used the selected project folder directly.
+Pinned 2.1.202 `vQd`/`rf` instead select the nearest repository ancestor and, for
+a verified linked worktree, its common repository root. The adapter now walks
+ancestor `.git` markers without starting Git or Claude. It checks the worktree
+metadata layout, `commondir` and reverse `gitdir` before sharing a main repository's
+memory folder. Bare common repositories retain their own directory as the key;
+submodules and malformed or incomplete worktree declarations retain the native
+fallback repository root. Non-repository projects retain the selected folder.
+Explicit memory settings continue to take precedence.
+
+The two relevant functions were extracted from the same SHA-256-pinned executable
+and run against virtual filesystems with Windows and POSIX path modules. The
+committed `claude-code-2.1.202-memory-repositories.json` contains 16 cases per
+platform: plain/nested repositories, linked and bare worktrees, submodules,
+absolute/relative pointers, BOM whitespace, malformed prefixes and broken
+backlinks. The generator executes only those bounded helpers and a synthetic
+read-only filesystem; no native initialization, project contents or model calls.
+The [current memory documentation](https://code.claude.com/docs/en/memory#storage-location)
+also describes repository-level memory shared across worktrees. Pinned helper
+evidence remains authoritative for this implementation's version-specific rules.
+
+Metadata reads use the existing bounded reader and reject symlinks, reparse
+points, unsafe ancestors and unqualified network/device pointers. Uninspectable
+bindings remain unavailable rather than silently selecting another folder.
+Windows comparisons preserve case and use the ordinary spelling expected by the
+native helper. Converting a canonical path must resolve back to that same path,
+preventing trailing-dot/space aliases or generic volume prefixes from redirecting
+the walk. Known versions use the corrected default; unknown versions still need
+an explicit qualified memory directory.
+
+Two adapter regressions failed before the fix: selecting a repository ancestor
+and sharing linked-worktree memory. They also verify that a newly added nested
+repository or changed backlink invalidates existing setup and reservation checks.
+Review identified a mixed relative/absolute Windows prefix mismatch, reproduced
+with a failing native vector and corrected. Additional Windows tests cover
+generic device/volume prefixes and real trailing-dot/space sibling directories.
+The Unix link tests are committed and await hosted execution.
+
+Final local checks pass 104 ordinary core library tests (two opt-in real-runtime
+tests not run), 60 Claude adapter tests and 16 primary-memory setup tests.
+All 16 Windows native-helper vectors pass. Independent review approved the
+lookup and final Windows conversion corrections. Evidence logs in the local
+closeout directory are `claude-repository-memory-red.log`,
+`claude-repository-memory-common-path-red.log`,
+`claude-repository-memory-vectors.log` and
+`claude-repository-memory-final-suites.log`.
+
+Core/daemon all-target test-support Clippy passes with warnings denied
+(`claude-repository-memory-clippy-final.log`). The final `graphify update .`
+completed with 15,112 nodes and 43,523 edges
+(`claude-repository-memory-graphify-final.log`).
+
+This closes the default repository/worktree helper mismatch. Native session
+project-root selection, trust/flags/environment, other managed settings sources,
+Stop events and full real setup/recovery still need qualification. No additional
+version is enabled, and the existing 11d6740 unsigned installer is unchanged.

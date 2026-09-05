@@ -387,3 +387,14 @@ All 322 selected core tests and 59 daemon tests pass; the
 [registration evidence](read-only-memory-registration-2026-09-06.md) describes
 scope and recovery/Undo coverage. This source change neither enables Full
 connection nor updates the 11d6740 installer. Installed acceptance remains open.
+
+Claude default memory lookup now uses the repository ancestor and verified common
+worktree root. Local tests pass 104 core library, 60 Claude adapter and 16
+primary-memory setup cases, including source revalidation and Windows pointer
+alias checks. The [Claude evidence](claude-native-mcp-2026-09-06.md) distinguishes
+native-helper conformance from full session qualification. The prior registration
+change passed its macOS production canary but exposed an outdated watcher test
+executor; the corrected four-test daemon integration suite passes locally.
+The [registration evidence](read-only-memory-registration-2026-09-06.md) records
+that hosted failure and its correction. Full connection, installed acceptance
+and the 11d6740 installer status are unchanged.

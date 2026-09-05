@@ -1125,6 +1125,86 @@ fn native_memory_disable_rolls_back_true_false_and_absent_claude_values_exactly(
     }
 }
 
+fn use_default_memory(fixture: &Fixture) {
+    let path = fixture.adapter.project_settings_path();
+    let mut settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    settings
+        .as_object_mut()
+        .unwrap()
+        .remove("autoMemoryDirectory");
+    fs::write(path, serde_json::to_vec(&settings).unwrap()).unwrap();
+}
+
+fn expected_default_memory(fixture: &Fixture, repository: &Path) -> WireNativeValue {
+    let key = repository
+        .to_str()
+        .unwrap()
+        .trim_start_matches(r"\\?\")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    test_wire_path(
+        &fixture
+            .root
+            .join("custom claude config/projects")
+            .join(key)
+            .join("memory/MEMORY.md"),
+    )
+}
+
+#[test]
+fn native_memory_claude_default_uses_repository_ancestor_and_rechecks_new_nested_repository() {
+    let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    use_default_memory(&fixture);
+    fs::create_dir(fixture.root.join(".git")).unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert_eq!(
+        capabilities.sources[0].path,
+        expected_default_memory(&fixture, &fixture.root)
+    );
+    let plan = claude_memory_plan(&fixture);
+    NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).unwrap();
+    fs::create_dir(fixture.root.join("project with spaces/.git")).unwrap();
+    assert!(NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).is_err());
+    assert!(NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, &plan).is_err());
+}
+
+#[test]
+fn native_memory_claude_default_shares_linked_worktree_memory_and_rechecks_backlink() {
+    let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    use_default_memory(&fixture);
+    let main = fixture.root.join("main");
+    let gitdir = main.join(".git/worktrees/topic");
+    fs::create_dir_all(&gitdir).unwrap();
+    fs::write(
+        fixture.root.join("project with spaces/.git"),
+        b"gitdir: ../main/.git/worktrees/topic\n",
+    )
+    .unwrap();
+    fs::write(gitdir.join("commondir"), b"../..\n").unwrap();
+    fs::write(
+        gitdir.join("gitdir"),
+        b"../../../../project with spaces/.git\n",
+    )
+    .unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert_eq!(
+        capabilities.sources[0].path,
+        expected_default_memory(&fixture, &main)
+    );
+    let plan = claude_memory_plan(&fixture);
+    NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).unwrap();
+    fs::write(gitdir.join("gitdir"), b"../../../../missing/.git\n").unwrap();
+    assert!(NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).is_err());
+    assert!(NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, &plan).is_err());
+}
+
 #[test]
 fn native_memory_claude_reads_user_project_and_local_directory_precedence() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
