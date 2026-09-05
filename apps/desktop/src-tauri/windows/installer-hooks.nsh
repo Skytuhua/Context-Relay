@@ -19,7 +19,8 @@
 
 !macro NSIS_HOOK_PREINSTALL
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
-  ; Use the new helper so older installed daemons need no --shutdown support.
+  ; Always use the new helper: older daemon binaries ignore --shutdown and start.
+  ; The embedded helper authenticates shutdown only for current and legacy 1.4 IPC.
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
   File /oname=context-relay-service-control.exe "${CONTEXT_RELAY_HOOK_DIR}\..\binaries\context-relay-contextd-x86_64-pc-windows-msvc.exe"

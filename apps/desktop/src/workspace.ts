@@ -94,6 +94,7 @@ export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
 }
 
 export class LocalWorkspaceGateway implements WorkspaceGateway {
+  private pendingProject: { name: string; pathKey: string; project: ProjectIdentity } | null = null;
   constructor(private readonly client = new LocalClient()) {}
 
   chooseProjectFolder() {
@@ -243,18 +244,19 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
   }
 
   async createProject(name: string, path: string) {
-    const project: ProjectIdentity = {
+    const folder = nativePath(path);
+    const pathKey = `${folder.platform}:${folder.bytes}`;
+    const project: ProjectIdentity = this.pendingProject?.name === name && this.pendingProject.pathKey === pathKey ? this.pendingProject.project : {
       projectId: uuidV7() as ProjectId,
       githubRepositoryId: null,
       gitRemoteFingerprint: null,
       monorepoSubdirectory: null,
       name,
     };
-    await this.call({ method: 'project_upsert', params: { project } });
-    await this.call({
-      method: 'project_path_set',
-      params: { projectId: project.projectId, path: nativePath(path) },
-    });
+    this.pendingProject = { name, pathKey, project };
+    const result = await this.call({ method: 'project_register', params: { project, path: folder } });
+    if (result.kind !== 'empty') unexpected(result);
+    this.pendingProject = null;
     return project;
   }
 

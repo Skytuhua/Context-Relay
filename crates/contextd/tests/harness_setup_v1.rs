@@ -35,6 +35,89 @@ const TOKEN: [u8; 32] = [0x5a; 32];
 const PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
 const ROLLBACK_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073990";
 
+#[cfg(any(windows, target_os = "macos"))]
+#[tokio::test]
+async fn project_registration_is_desktop_only_and_keeps_identity_and_path_after_restart() {
+    let engine = Arc::new(RecordingEngine::default());
+    let fixture = Fixture::start("project-register", engine.clone(), None).await;
+    let root = unique_temp_path("project-folder-專案");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = native_folder(&root);
+    let project = context_relay_protocol::ProjectIdentity {
+        project_id: PLAN.parse().unwrap(),
+        github_repository_id: None,
+        git_remote_fingerprint: None,
+        monorepo_subdirectory: None,
+        name: "Research".into(),
+    };
+    let request = LocalRequest::ProjectRegister(context_relay_protocol::ProjectRegisterParams {
+        project: project.clone(),
+        path: path.clone(),
+    });
+    let mut installer = RawClient::connect(&fixture.runtime, ClientRole::Installer).await;
+    assert_eq!(
+        installer.call(request.clone()).await.unwrap_err().code,
+        ErrorCode::ScopeDenied
+    );
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    let missing = LocalRequest::ProjectRegister(context_relay_protocol::ProjectRegisterParams {
+        project: project.clone(),
+        path: native_folder(&root.join("does-not-exist")),
+    });
+    assert_eq!(
+        client.call(missing).await.unwrap_err().code,
+        ErrorCode::InvalidRequest
+    );
+    assert!(
+        matches!(client.call(LocalRequest::ProjectsList(context_relay_protocol::EmptyParams {})).await.unwrap(), LocalResult::Projects { projects } if projects.is_empty())
+    );
+    assert_eq!(
+        client.call(request.clone()).await.unwrap(),
+        LocalResult::Empty
+    );
+    assert_eq!(client.call(request).await.unwrap(), LocalResult::Empty);
+    let config = fixture.stop().await;
+    config
+        .with_vault(|vault| {
+            assert_eq!(vault.projects()?, vec![project.clone()]);
+            assert_eq!(
+                vault.path(&project.project_id.to_string())?,
+                Some(path.clone())
+            );
+            Ok(())
+        })
+        .unwrap();
+    let fixture = Fixture::from_config(config, engine).await;
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    assert!(
+        matches!(client.call(LocalRequest::ProjectsList(context_relay_protocol::EmptyParams {})).await.unwrap(), LocalResult::Projects { projects } if projects == vec![project])
+    );
+    fixture.stop().await;
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn native_folder(path: &Path) -> WireNativeValue {
+    #[cfg(target_os = "macos")]
+    use std::os::unix::ffi::OsStrExt as _;
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStrExt as _;
+    WireNativeValue {
+        #[cfg(windows)]
+        platform: NativePlatform::Windows,
+        #[cfg(target_os = "macos")]
+        platform: NativePlatform::Macos,
+        #[cfg(windows)]
+        bytes: path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect(),
+        #[cfg(target_os = "macos")]
+        bytes: path.as_os_str().as_bytes().to_vec(),
+        display: Some(path.display().to_string()),
+    }
+}
+
 #[derive(Default)]
 struct RecordingEngine {
     reconciles: AtomicUsize,

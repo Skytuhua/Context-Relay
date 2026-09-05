@@ -29,7 +29,7 @@ beforeEach(() => {
     ? { kind: 'plan', data: { plan: preview } } : { kind: 'empty' };
   invoke.mockReset().mockImplementation(async (_command, { request }: { request: LocalRequest }) => {
     if (request.method === 'sync_status') return { kind: 'status', data: { status: {
-      protocol: { min: { major: 1, minor: 4 }, max: { major: 1, minor: 4 } }, vault: 'unlocked',
+      protocol: { min: { major: 1, minor: 5 }, max: { major: 1, minor: 5 } }, vault: 'unlocked',
       resolvedProject: null, sync: 'offline', access: { mode: 'default' },
     } } };
     if (request.method === 'projects_list') return { kind: 'projects', data: { projects } };

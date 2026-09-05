@@ -957,6 +957,7 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         | LocalRequest::NativeHookEvent(_)
         | LocalRequest::ProjectsList(_)
         | LocalRequest::ProjectUpsert(_)
+        | LocalRequest::ProjectRegister(_)
         | LocalRequest::MemoryList(_)
         | LocalRequest::MemorySearch(_)
         | LocalRequest::MemoryCreate(_)
@@ -1627,6 +1628,11 @@ fn execute_workspace_request(
         LocalRequest::ProjectUpsert(params) => {
             OfflineWorkspace::new(&mut state.vault, state.device_id)
                 .upsert_project(params.project)
+                .map(|()| LocalResult::Empty)
+        }
+        LocalRequest::ProjectRegister(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .register_project(params.project, params.path)
                 .map(|()| LocalResult::Empty)
         }
         LocalRequest::MemorySearch(params) => {
@@ -3693,7 +3699,7 @@ mod tests {
     #[test]
     fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 53);
+        assert_eq!(fixtures.len(), 54);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -6052,6 +6058,13 @@ mod tests {
                 request_fixture(
                     "project_upsert",
                     serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}}),
+                ),
+            ),
+            (
+                "ProjectRegister",
+                request_fixture(
+                    "project_register",
+                    serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}, "path": {"platform": "windows", "bytes": "", "display": null}}),
                 ),
             ),
             (

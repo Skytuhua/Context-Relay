@@ -64,6 +64,10 @@ params!(ProjectParams {
 params!(ProjectUpsertParams {
     project: ProjectIdentity
 });
+params!(ProjectRegisterParams {
+    project: ProjectIdentity,
+    path: WireNativeValue
+});
 params!(ProjectPathParams {
     project_id: ProjectId,
     path: WireNativeValue
@@ -540,6 +544,7 @@ pub enum LocalRequest {
     Unlock(EmptyParams),
     ProjectsList(EmptyParams),
     ProjectUpsert(ProjectUpsertParams),
+    ProjectRegister(ProjectRegisterParams),
     ProjectPathSet(ProjectPathParams),
     MemoryGet(MemoryParams),
     MemoryList(MemoryListParams),
@@ -606,6 +611,10 @@ impl LocalRequest {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
             Self::ProjectUpsert(p) => p.project.validate(),
+            Self::ProjectRegister(p) => {
+                p.project.validate()?;
+                p.path.validate()
+            }
             Self::ProjectPathSet(p) => p.path.validate(),
             Self::McpCall(p) => {
                 p.binding.working_directory.validate()?;

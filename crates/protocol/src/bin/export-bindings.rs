@@ -120,6 +120,7 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         CandidateListParams,
         SearchParams,
         ProjectUpsertParams,
+        ProjectRegisterParams,
         MemoryListParams,
         CandidateReviewParams,
         TaskParams,

@@ -1291,6 +1291,50 @@ impl Vault {
         Ok(())
     }
 
+    pub fn register_project(
+        &mut self,
+        project: &ProjectIdentity,
+        path: &WireNativeValue,
+    ) -> Result<(), VaultError> {
+        project
+            .validate()
+            .and_then(|()| path.validate())
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        let id = project.project_id.to_string();
+        let transaction = self.connection.transaction()?;
+        let existing_project: Option<ProjectIdentity> = load_json(
+            &transaction,
+            "SELECT payload_json FROM projects WHERE id = ?1",
+            &id,
+        )?;
+        let existing_path: Option<WireNativeValue> = load_json(
+            &transaction,
+            "SELECT payload_json FROM paths WHERE id = ?1",
+            &id,
+        )?;
+        // Repeating an uncertain registration may complete an older partial
+        // entry, but must never rename or redirect an already bound project.
+        if existing_project
+            .as_ref()
+            .is_some_and(|value| value != project)
+            || existing_path.as_ref().is_some_and(|value| value != path)
+        {
+            return Err(VaultError::Validation(
+                "project registration conflicts with an existing record".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO projects(id, payload_json) VALUES (?1, ?2) ON CONFLICT(id) DO NOTHING",
+            params![id, to_json(project)?],
+        )?;
+        transaction.execute(
+            "INSERT INTO paths(id, payload_json) VALUES (?1, ?2) ON CONFLICT(id) DO NOTHING",
+            params![id, to_json(path)?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn projects(&self) -> Result<Vec<ProjectIdentity>, VaultError> {
         let mut projects: Vec<ProjectIdentity> = load_json_list(
             &self.connection,

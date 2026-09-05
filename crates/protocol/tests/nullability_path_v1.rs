@@ -84,7 +84,7 @@ fn required_nullable_shared_and_output_fields_distinguish_omission_from_null() {
     );
     assert_required_nullable::<StatusOutput>(
         json!({
-            "protocol":{"min":{"major":1,"minor":4},"max":{"major":1,"minor":4}},
+            "protocol":{"min":{"major":1,"minor":5},"max":{"major":1,"minor":5}},
             "vault":"unlocked",
             "resolvedProject":null,
             "sync":"idle",
