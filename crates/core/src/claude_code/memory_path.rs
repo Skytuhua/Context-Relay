@@ -1,4 +1,102 @@
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+
+use unicode_normalization::UnicodeNormalization as _;
+
+/// Match the pinned harness's configured-directory string rules before binding
+/// the result to the filesystem. An ignored value falls back to its default.
+pub(super) fn configured_directory(value: &str, home: &Path) -> Option<PathBuf> {
+    if value.is_empty() {
+        return None;
+    }
+    let expanded;
+    let value = if let Some(suffix) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        let normalized = normalize(Path::new(suffix));
+        let child = normalized.to_str()?;
+        if matches!(child, "." | "..") || child.starts_with("../") || child.starts_with("..\\") {
+            return None;
+        }
+        let home = home.to_str()?;
+        // Node's path.join concatenates a rooted suffix; Path::join replaces
+        // the home in that case, which would select a different directory.
+        expanded = format!("{home}{}{suffix}", std::path::MAIN_SEPARATOR);
+        &expanded
+    } else {
+        value
+    };
+    let normalized = normalize(Path::new(value));
+    let text = normalized.to_str()?.trim_end_matches(['/', '\\']);
+    let path = Path::new(text);
+    if !path.has_root()
+        || text.encode_utf16().count() < 3
+        || text.starts_with(r"\\")
+        || text.starts_with("//")
+        || text.contains('\0')
+        || (text.len() == 2 && text.as_bytes()[1] == b':')
+    {
+        return None;
+    }
+    // Native strings end in a separator, but a filesystem binding must not:
+    // lstat/symlink_metadata can follow a directory symlink with a trailing '/'.
+    Some(PathBuf::from(text.nfc().collect::<String>()))
+}
+
+fn normalize(path: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(components.last(), Some(Component::Normal(_))) {
+                    components.pop();
+                } else if !path.has_root() {
+                    components.push(component);
+                }
+            }
+            _ => components.push(component),
+        }
+    }
+    // Append component bytes rather than PathBuf::push: an interior "D:"
+    // segment must not be reinterpreted as a replacement drive prefix.
+    let mut result = std::ffi::OsString::new();
+    let mut separator = false;
+    for component in components {
+        if separator {
+            result.push(std::path::MAIN_SEPARATOR_STR);
+        }
+        result.push(component.as_os_str());
+        separator = matches!(component, Component::Normal(_) | Component::ParentDir);
+    }
+    if result.is_empty() {
+        PathBuf::from(".")
+    } else {
+        PathBuf::from(result)
+    }
+}
+
+pub(super) fn bind_current_drive(path: PathBuf, project: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return Some(path);
+    }
+    #[cfg(windows)]
+    if path.has_root() {
+        use std::path::Prefix;
+        if let Some(Component::Prefix(prefix)) = project.components().next()
+            && let Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) = prefix.kind()
+        {
+            return Some(PathBuf::from(format!(
+                "{}:{}",
+                char::from(drive),
+                path.to_str()?
+            )));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = project;
+    None
+}
 
 pub(super) fn directory_key(path: &Path) -> Option<String> {
     let input = path.to_str()?;
@@ -80,6 +178,66 @@ mod tests {
     struct KeyCase {
         input: String,
         key: String,
+    }
+
+    #[derive(Deserialize)]
+    struct DirectoryFixture {
+        cases: Vec<PlatformCases>,
+    }
+
+    #[derive(Deserialize)]
+    struct PlatformCases {
+        platform: String,
+        home: String,
+        cases: Vec<DirectoryCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct DirectoryCase {
+        input: String,
+        directory: Option<String>,
+    }
+
+    #[test]
+    fn configured_directories_match_the_pinned_cli_string_helper() {
+        let fixture: DirectoryFixture = serde_json::from_str(include_str!(
+            "../../tests/fixtures/claude-code-2.1.202-memory-directories.json"
+        ))
+        .unwrap();
+        let platform = if cfg!(windows) { "windows" } else { "macos" };
+        let vectors = fixture
+            .cases
+            .into_iter()
+            .filter(|case| case.platform == platform)
+            .collect::<Vec<_>>();
+        assert!(!vectors.is_empty());
+        for vectors in vectors {
+            for case in vectors.cases {
+                assert_eq!(
+                    configured_directory(&case.input, Path::new(&vectors.home)),
+                    case.directory.map(PathBuf::from),
+                    "{} under {}",
+                    case.input,
+                    vectors.home
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rooted_configured_directories_use_the_selected_projects_drive() {
+        assert_eq!(
+            bind_current_drive(PathBuf::from(r"\memory"), Path::new(r"\\?\D:\project")),
+            Some(PathBuf::from(r"D:\memory"))
+        );
+        assert_eq!(
+            bind_current_drive(
+                PathBuf::from(r"\memory"),
+                Path::new(r"\\server\share\project")
+            ),
+            None
+        );
     }
 
     #[test]

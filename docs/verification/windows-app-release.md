@@ -358,3 +358,11 @@ Authenticode NotSigned. Packaging completed successfully. It includes the
 revised first-use frontend and the prior Claude home/hook corrections. It was
 not installed or tested through native desktop control. Full harness connection
 and release acceptance remain unfinished.
+
+The following source correction now resolves Claude's configured memory paths
+using pinned native behavior: home expansion, lexical normalization, ignored
+relative values and an unavailable result for unsupported explicit bindings.
+Ancestor validation also protects memory directory inspection. Local core,
+adapter and setup regressions pass; the [Claude evidence](claude-native-mcp-2026-09-06.md)
+records exact scope and pending POSIX/runtime checks. The 11d6740 installer above
+does not include this subsequent source change. Full connection remains open.

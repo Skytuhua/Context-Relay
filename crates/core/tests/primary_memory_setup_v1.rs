@@ -996,7 +996,7 @@ fn claude_matrix_fixture_with_version(version: &str) -> MatrixFixture {
     let config_dir = root.join("claude");
     let lock_root = root.join("locks");
     fs::create_dir(&lock_root).unwrap();
-    let project_root = root.join("project");
+    let project_root = root.join("project with spaces");
     materialize_json(&config_dir, source["config"].as_object().unwrap());
     materialize_json(&project_root, source["project"].as_object().unwrap());
     let state_path = config_dir.join(".claude.json");
@@ -1042,7 +1042,7 @@ fn claude_matrix_fixture_with_version(version: &str) -> MatrixFixture {
     let device_id = DeviceId::from_str(ID_1).unwrap();
     let adapter = ClaudeCodeAdapter::from_layout(
         ClaudeCodeLayout {
-            user_home: root.to_path_buf(),
+            user_home: PathBuf::from(root.to_str().unwrap().trim_start_matches(r"\\?\")),
             executable,
             version: version.to_owned(),
             installation_method: InstallationMethod::PackageManager,
@@ -1475,7 +1475,7 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
                 assert!(intended.iter().any(|(_, bytes)| {
                     let text = String::from_utf8_lossy(bytes);
                     text.contains("\"autoMemoryEnabled\":false")
-                        && text.contains("\"autoMemoryDirectory\":\".claude/native-memory\"")
+                        && text.contains("\"autoMemoryDirectory\":\"~/project with spaces/.claude/native-memory\"")
                 }));
                 assert!(intended.iter().any(|(_, bytes)| {
                     let text = String::from_utf8_lossy(bytes);
@@ -1854,8 +1854,8 @@ fn full_claude_setup_rejects_unavailable_native_memory_before_persisting_any_pla
             context_relay_protocol::ErrorCode::InvalidRequest,
         ),
         (
-            "unsafe-binding",
-            br#"{"autoMemoryDirectory":"../outside-project/memory"}"#.as_slice(),
+            "invalid-directory-type",
+            br#"{"autoMemoryDirectory":123}"#.as_slice(),
             context_relay_protocol::ErrorCode::HarnessUnsupported,
         ),
     ] {

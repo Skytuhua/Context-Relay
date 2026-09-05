@@ -89,3 +89,11 @@ and narrow layouts; [the evidence](first-use-ui-2026-09-06.md) distinguishes thi
 from installed acceptance. T08/T20 and the broader product goal are not closed
 by these frontend checks. The macOS recovery fixture correction passed hosted
 Rust tests in CI run 33989730248.
+
+2026-09-06 configured-directory update: Claude's explicit memory path rules now
+match pinned string-helper evidence, including home expansion, relative fallback
+and normalization before applying adapter limits. Ancestor checks cover memory
+bindings; POSIX symlink execution still needs CI. Local checks pass 100 core,
+51 Claude adapter and 11 primary-memory tests. The [Claude evidence](claude-native-mcp-2026-09-06.md)
+keeps effective settings precedence, default repository/worktree selection and
+full native/installed connection acceptance open; T10/T14/T20 are not completed.

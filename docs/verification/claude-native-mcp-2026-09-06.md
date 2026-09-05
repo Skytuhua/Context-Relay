@@ -314,3 +314,53 @@ This qualifies startup command rendering and event delivery, not Stop events,
 full memory setup, real transaction/crash recovery or installed acceptance.
 Memory settings precedence, directory selection and repository/worktree binding
 remain open. No Full support was enabled for the installed 2.1.202 runtime.
+
+## Configured memory directory correction
+
+The adapter previously joined ordinary relative `autoMemoryDirectory` values
+to the selected project. The pinned 2.1.202 string helper instead ignores them
+and falls back to its default. The adapter now expands `~/` and `~\` from the
+selected home, normalizes dot segments and Unicode, and distinguishes ignored
+values from valid but unsupported bindings. A valid explicit directory whose
+normalized representation is too long remains unavailable; it cannot silently
+become the default directory. Long input or a NUL-containing component that is
+removed by normalization follows the native helper's order of operations.
+Windows drive-rooted paths bind to the selected project's drive. Unknown
+versions still require an explicit supported binding and cannot guess defaults.
+
+The pure helper was extracted from the same digest-pinned native artifact and
+run with isolated path modules and synthetic homes. The committed fixture has
+44 Windows and 44 POSIX input cases plus three Windows verbatim-home cases.
+It includes Unicode, tilde expansion, ordinary relative paths, drive prefixes,
+long input, removable NUL components and verbatim/UNC rejection. No third-party
+helper source is shipped in the fixture. Windows tests pass all 47 applicable
+vectors; POSIX execution remains a hosted gate. This tests path-string behavior,
+not the native runtime's effective settings or its home lookup.
+
+Filesystem binding now checks every ancestor and removes terminal separators
+before inspection. Review caught the Unix trailing-slash behavior that can
+follow a directory symlink despite `symlink_metadata`; the new Unix regression
+covers existing and dangling linked directories and missing children beneath a
+linked ancestor. That Unix regression requires hosted execution. The fixture
+homes preserve canonical POSIX paths while removing Windows verbatim prefixes.
+Synthetic release fixtures now configure an actual home-relative directory
+instead of relying on the incorrect project-relative behavior.
+
+Local checks pass 100 ordinary core tests, 51 Claude adapter tests and 11 primary
+memory setup tests, plus core/daemon all-target test-support Clippy with warnings
+denied. The existing rollback/privacy matrix still passes. Red regressions were
+observed for home expansion, relative fallback and long-input normalization.
+Evidence is in `claude-memory-directory-*.log`, the isolated generator
+`qualify-claude-memory-directory.mjs`, and the committed
+`claude-code-2.1.202-memory-directories.json` fixture.
+
+The [current storage documentation](https://code.claude.com/docs/en/memory#storage-location)
+also describes absolute and home-relative settings. It includes features newer
+than the pinned artifact, so this correction follows the pinned helper rather
+than assuming every documented feature exists in 2.1.202.
+
+This does not close user/local/managed/environment precedence, effective disable
+settings, repository/worktree default selection, source revalidation, full native
+setup or installed acceptance. No Full support was enabled. The existing
+11d6740 installer predates this source correction. The earlier macOS recovery
+fixture (5d92f4f) has since passed hosted CI33989730248.

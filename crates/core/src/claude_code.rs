@@ -1121,29 +1121,21 @@ impl ClaudeCodeAdapter {
             let Some(value) = value.as_str() else {
                 return Ok(None);
             };
-            let configured = Path::new(value);
-            if value.is_empty()
-                || value.len() > 4_096
-                || configured
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            if let Some(configured) =
+                memory_path::configured_directory(value, &self.layout.user_home)
             {
-                return Ok(None);
-            }
-            let root = if configured.is_absolute() {
-                configured.to_path_buf()
-            } else {
-                if configured.components().any(|component| {
-                    matches!(
-                        component,
-                        std::path::Component::RootDir | std::path::Component::Prefix(_)
-                    )
-                }) {
+                // A valid but unrepresentable explicit directory must remain
+                // unavailable, not silently become a different default root.
+                if configured.as_os_str().len() > 4096 {
                     return Ok(None);
                 }
-                self.layout.project_root.join(configured)
-            };
-            return safe_memory_directory_binding(&root);
+                let Some(root) =
+                    memory_path::bind_current_drive(configured, &self.layout.project_root)
+                else {
+                    return Ok(None);
+                };
+                return safe_memory_directory_binding(&root);
+            }
         }
         if !supported {
             return Ok(None);
@@ -1340,6 +1332,9 @@ fn missing_project_settings_metadata(
 }
 
 fn safe_memory_directory_binding(path: &Path) -> Result<Option<PathBuf>, ClientError> {
+    if mcp_state::validate_config_path(path, true).is_err() {
+        return Ok(None);
+    }
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Ok(None),
         Ok(_) => fs::canonicalize(path)
