@@ -56,6 +56,18 @@ class FakeWorkspaceGateway implements WorkspaceGateway {
     return [];
   }
 
+  async harnessPreview(): Promise<never> {
+    throw new Error('not used in this workflow');
+  }
+
+  async harnessApply(): Promise<never> {
+    throw new Error('not used in this workflow');
+  }
+
+  async harnessRollback(): Promise<never> {
+    throw new Error('not used in this workflow');
+  }
+
   async createPairingInvite(): Promise<never> {
     throw new Error('not used in this workflow');
   }

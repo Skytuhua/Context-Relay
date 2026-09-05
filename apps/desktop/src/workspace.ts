@@ -1,6 +1,7 @@
 import type {
   Base64Url,
   CandidateId,
+  HarnessParams,
   LocalRequest,
   LocalResult,
   MemoryCandidate,
@@ -10,6 +11,7 @@ import type {
   PairingCode,
   PairingId,
   PairingSafetyNumber,
+  PlanId,
   ProjectId,
   ProjectIdentity,
   RecoveryEnrollmentConfirmParams,
@@ -25,6 +27,7 @@ import type {
   UuidV7,
 } from './bindings';
 import { LocalClient } from './local-client';
+import { type HarnessGateway, requireHarnessAcknowledgment, validateHarnessPlan } from './harness-gateway';
 
 export type PairingInviteResult = Extract<LocalResult, { kind: 'pairing_invite' }>;
 export type PairingRequestResult = Extract<LocalResult, { kind: 'pairing_request' }>;
@@ -63,7 +66,7 @@ export interface DeviceGateway {
   recoveryEnrollmentCancel(enrollmentId: RecoveryEnrollmentId): Promise<void>;
 }
 
-export interface WorkspaceGateway extends DeviceGateway {
+export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
   status(): Promise<StatusOutput>;
   projects(): Promise<ProjectIdentity[]>;
   createProject(name: string, path: string): Promise<ProjectIdentity>;
@@ -91,6 +94,23 @@ export interface WorkspaceGateway extends DeviceGateway {
 
 export class LocalWorkspaceGateway implements WorkspaceGateway {
   constructor(private readonly client = new LocalClient()) {}
+
+  async harnessPreview(params: HarnessParams) {
+    const result = await this.call({ method: 'harness_preview', params });
+    if (!result || result.kind !== 'plan' || Object.keys(result).length !== 2 ||
+      !result.data || Object.keys(result.data).length !== 1) {
+      throw new Error('Setup preview was not returned.');
+    }
+    return validateHarnessPlan(result.data.plan, params);
+  }
+
+  async harnessApply(planId: PlanId) {
+    requireHarnessAcknowledgment(await this.call({ method: 'harness_apply', params: { planId } }));
+  }
+
+  async harnessRollback(planId: PlanId) {
+    requireHarnessAcknowledgment(await this.call({ method: 'harness_rollback', params: { planId } }));
+  }
 
   async status() {
     return statusResult(await this.call({ method: 'sync_status', params: {} }));

@@ -9,6 +9,7 @@ import type {
   TaskStatus,
 } from './bindings';
 import { DevicesScreen } from './devices';
+import { HarnessesScreen } from './harnesses';
 import { LocalWorkspaceGateway, type WorkspaceGateway } from './workspace';
 
 type ScreenId =
@@ -404,7 +405,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           </section>
         );
       case 'harnesses':
-        return <Deferred title="Local harness support" text="Adapter discovery is available after a supported harness is installed." />;
+        return null;
       case 'packages':
         return <Deferred title="Portable context packages" text="Package inspection remains disabled until a local adapter supports it." />;
       case 'activity':
@@ -467,6 +468,9 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           {error && <p className="form-error" id="workspace-error" role="alert">{error}</p>}
           {notice && <p className="notice" role="status">{notice}</p>}
           {renderScreen(activeScreen)}
+          <div hidden={activeScreen !== 'harnesses'}>
+            <HarnessesScreen gateway={gateway} projects={projects} active={activeScreen === 'harnesses'} />
+          </div>
         </main>
       </div>
     </>
