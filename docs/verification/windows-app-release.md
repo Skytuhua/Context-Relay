@@ -123,3 +123,29 @@ An isolated real Codex 0.144.6 add/get/remove run (local runner qualify-codex-sh
 2026-09-05, recovery candidate built at 23:24:55: locked Windows packaging succeeded and produced `Context Relay_0.1.0_x64-setup.exe`, 10,867,388 bytes, SHA-256 `234235eaefd1f1521249c86b1d0470f64227f4537a5de27dade52f6bd8ee7a0f`; Authenticode reports NotSigned. Graphify AST updated to 14,508 nodes and 41,725 edges. The candidate has not been installed. A second isolated Codex 0.144.6 CLI run generated and read back the managed entry from an empty synthetic home and removed it back to empty bytes (context-relay-codex-shared-config-zWIBhS). This proves empty-input CLI behavior only, not sandbox isolation. Hosted 74a4301 installer, Supabase and secret workflows passed; its full CI was still in progress at the last check.
 
 The complete daemon library suite also passed all 58 tests, including startup recovery before listener binding and authenticated two-daemon pairing fixtures. These are automated fixture results, not installed-app acceptance or production hosted-sync qualification.
+
+2026-09-05, staged Codex merge boundary: added host-side closed generation input and
+strict TOML/JSON output validation in `codex::staged_mcp`. Only the canonical local
+Context Relay command and fixed Codex arguments are accepted. Extra settings,
+servers, environment, duplicate/unknown readback keys, mismatched declarations
+and excessive output reject. The validated item merges with global memory
+booleans into one intended native file state; unrelated settings/comments and
+the original live metadata are preserved, and the function performs no writes.
+The existing memory adapter shares the same boolean-edit implementation.
+
+The initial unavailable implementation failed four new tests. Independent review
+then found that a first connection without any MCP section created an inline
+parent table, which the adapter would reject. A focused regression reproduced
+that defect; the merge now creates an ordinary table explicitly. Tests include
+first connection, repeated merge, existing bridge comments, inline memory,
+foreign declarations, malformed data and host-only secret canaries. This is a
+host-side component only: it does not prove official CLI authorship, sandbox
+isolation, approval binding, or a working installed connection. The restricted
+generator, generation evidence, setup integration and full rollback acceptance
+remain pending. Codex 0.144.6 remains ImportOnly. The latest installer is still
+the earlier 2042a1f recovery candidate; this component has not been packaged or
+installed, and desktop control remains paused.
+
+Focused verification passes 7 staged-input/output/merge tests, 64 Codex adapter
+tests and 11 primary-memory setup tests. The corrected merge received independent
+approval. These results do not qualify the staged runner or installed workflow.

@@ -4,6 +4,8 @@
 //! particular it deliberately never walks `$CODEX_HOME`: auth, sessions,
 //! history, sqlite state, logs, and approval records are not adapter input.
 
+pub mod staged_mcp;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     env, fs,
@@ -1873,39 +1875,10 @@ impl NativeMemoryAdapter for CodexAdapter {
                 Ok(document) => document,
                 Err(_) => return Ok(watch_only()),
             };
-            let supported_shape = document.get("memories").is_none_or(|item| {
-                item.as_table_like().is_some_and(|table| {
-                    ["generate_memories", "use_memories"].iter().all(|key| {
-                        table.get(key).is_none_or(|value| {
-                            value.as_value().and_then(TomlValue::as_bool).is_some()
-                        })
-                    })
-                })
-            });
-            if !supported_shape {
-                return Ok(watch_only());
-            }
-            let mut changed = false;
-            for key in ["generate_memories", "use_memories"] {
-                let current = document
-                    .get("memories")
-                    .and_then(Item::as_table_like)
-                    .and_then(|table| table.get(key))
-                    .and_then(Item::as_bool);
-                if current == Some(false) || (project_layer && current.is_none()) {
-                    continue;
-                }
-                let item = &mut document["memories"][key];
-                if let Some(TomlValue::Boolean(current)) = item.as_value_mut() {
-                    let decor = current.decor().clone();
-                    let mut intended = toml_edit::Formatted::new(false);
-                    *intended.decor_mut() = decor;
-                    *item = Item::Value(TomlValue::Boolean(intended));
-                } else {
-                    *item = toml_edit::value(false);
-                }
-                changed = true;
-            }
+            let changed = match staged_mcp::disable_memory_settings(&mut document, project_layer) {
+                Ok(changed) => changed,
+                Err(_) => return Ok(watch_only()),
+            };
             if changed {
                 let intended =
                     NativeState::regular_file(document.to_string().into_bytes(), metadata.clone());
