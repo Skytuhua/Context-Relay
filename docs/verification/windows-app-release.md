@@ -149,3 +149,14 @@ installed, and desktop control remains paused.
 Focused verification passes 7 staged-input/output/merge tests, 64 Codex adapter
 tests and 11 primary-memory setup tests. The corrected merge received independent
 approval. These results do not qualify the staged runner or installed workflow.
+
+2026-09-06, real generator incompatibility: the pinned Codex 0.144.6 executable
+was tested in the production AppContainer launcher with an empty private stage.
+Version reporting succeeds, but MCP add exits 1 because configuration loading
+cannot canonicalize the private CODEX_HOME (Windows error 5). Private directory
+enumeration succeeds. The tested prototype was removed from release source;
+the host-side merger remains. Codex's alternate restricted-token CLI reports
+that restricted reads require its elevated Windows backend, which was not set
+up for the isolated test. The [qualification record](codex-staged-generation-2026-09-06.md)
+contains exact scope, runtime identity, cleanup disposition and reproduction
+evidence. No Full capability, installed-app or release-readiness claim follows.

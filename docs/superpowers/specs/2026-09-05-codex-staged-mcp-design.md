@@ -6,6 +6,15 @@ Implementation direction for the remaining Windows connection and rollback
 failure. This is not release qualification. Codex 0.144.6 remains ImportOnly
 until this path and native hook trust/execution pass real-install acceptance.
 
+2026-09-06 qualification update: the pinned Windows 0.144.6 CLI fails to load
+configuration inside the tested zero-capability AppContainer because it cannot
+canonicalize the private CODEX_HOME. Directory access itself succeeds. The
+unsuccessful prototype was removed from release source; see the
+[observed compatibility result](../../verification/codex-staged-generation-2026-09-06.md).
+A compatible pinned runtime or qualified equivalent restriction mechanism is
+still required. The host-side validated merge exists; this does not make the
+full staged setup available.
+
 ## Reproduced failure
 
 The existing full setup writes native memory settings into global config.toml,
