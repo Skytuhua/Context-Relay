@@ -130,3 +130,13 @@ security purpose; it is not a general allowlist.
 - Classification: `synthetic-negative-test`
 - Non-credential basis: The historical current-head fixture retains deliberately fabricated bearer-header-shaped text that has no provider, subject, scope, issuance record, or authorization value.
 - Security purpose: The expanded Hermes adapter suite continues to prove the importer removes embedded header secrets from MCP and hook components after later adapter changes.
+
+### `b357b29ad4379fae191a288fb653dd55e69f340c:crates/core/src/hermes/yaml.rs:private-key:464`
+
+- Historical commit: `b357b29ad4379fae191a288fb653dd55e69f340c`
+- Historical path: `crates/core/src/hermes/yaml.rs`
+- Rule: `private-key`
+- Line: `464`
+- Classification: `detector-literal`
+- Non-credential basis: The exact squash-merge object was inspected at lines 464–466. These are static string comparisons in `scan_text_secret`, with no key body, issuer, account, or private-key capability. They match the detector logic independently inspected in the earlier historical object at `3c2a371aef74f4962af64d0fe71545557244f21a`.
+- Security purpose: The comparisons reject private-key-shaped content before Hermes YAML enters normalized context. Squashing PR #12 gave the same detector a new immutable commit and line fingerprint; this entry admits only that inspected object and leaves every detector and full-history scanning enabled.

@@ -30,9 +30,10 @@ const reviewedExceptionFingerprints = [
   '6b144104d8a315038785dfdeaccdb13cdbca730d:crates/core/tests/hermes_adapter_v1.rs:curl-auth-header:399',
   'f98444a51754f5deaba2da9aa86f4463129a3380:crates/core/src/hermes/yaml.rs:private-key:94',
   '3c2a371aef74f4962af64d0fe71545557244f21a:crates/core/tests/hermes_adapter_v1.rs:curl-auth-header:2480',
+  'b357b29ad4379fae191a288fb653dd55e69f340c:crates/core/src/hermes/yaml.rs:private-key:464',
 ].join('\n') + '\n';
-const reviewedIgnoreByteLength = 1103;
-const reviewedIgnoreSha256 = '651da29e101f61580d789284520431ca8aaf944f933394b86130149b865d6032';
+const reviewedIgnoreByteLength = 1191;
+const reviewedIgnoreSha256 = 'b2d113e0427ff7a58cb8ba4bd1810257bd15badffe0c411d8602401d8de199e2';
 const allowedExceptionClassifications = new Set([
   'detector-literal',
   'synthetic-negative-test',
@@ -82,7 +83,7 @@ test('repository secret scan verifies pinned Gitleaks and scans every Git ref', 
   assert.match(source, /17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c/);
   assert.match(source, /\.github\/repository\.gitleaksignore/);
   assert.doesNotMatch(source, /third_party\/sidecars\/policies\/repository\.gitleaksignore/);
-  assert.match(source, /\(Get-Item -LiteralPath \$ignore\)\.Length -ne 1103/);
+  assert.match(source, /\(Get-Item -LiteralPath \$ignore\)\.Length -ne 1191/);
   assert.match(source, new RegExp(reviewedIgnoreSha256));
   assert.match(source, /--gitleaks-ignore-path/);
   assert.match(source, /--ignore-gitleaks-allow/);
