@@ -23,6 +23,8 @@ use sha2::{Digest, Sha256};
 
 mod mcp_state;
 use mcp_state::McpConfiguration;
+mod command_context;
+use command_context::ClaudeCommandContext;
 
 use crate::mcp::install::{
     BRIDGE_SERVER_NAME, is_canonical_bridge_body, is_managed_bridge_component,
@@ -155,10 +157,13 @@ impl ClaudeCodeAdapter {
                 false,
             )
         })?;
-        let executable_hash = digest_file(&executable)?;
-        let version = discover_version_with(|arguments| {
-            run_bounded_command(&executable, arguments, executable_hash)
-        })?;
+        if env::var_os("CLAUDE_CODE_CUSTOM_OAUTH_URL").is_some_and(|value| !value.is_empty()) {
+            return Err(client_error(
+                ErrorCode::HarnessUnsupported,
+                "Claude Code custom OAuth state is not supported",
+                false,
+            ));
+        }
         let home = home_dir().ok_or_else(|| {
             client_error(
                 ErrorCode::NotFound,
@@ -174,6 +179,11 @@ impl ClaudeCodeAdapter {
         } else {
             home.join(".claude.json")
         };
+        let command_context = ClaudeCommandContext::new(&config_dir, &state_path, &project_root)?;
+        let executable_hash = digest_file(&executable)?;
+        let version = discover_version_with(|arguments| {
+            run_bounded_command(&executable, arguments, executable_hash, &command_context)
+        })?;
         Self::from_layout(
             ClaudeCodeLayout {
                 installation_method: installation_method(&executable),
@@ -215,6 +225,14 @@ impl ClaudeCodeAdapter {
 
     pub fn project_root_wire(&self) -> WireNativeValue {
         wire_path(&self.layout.project_root)
+    }
+
+    fn command_context(&self) -> Result<ClaudeCommandContext, ClientError> {
+        ClaudeCommandContext::new(
+            &self.layout.config_dir,
+            &self.layout.state_path,
+            &self.layout.project_root,
+        )
     }
 
     pub fn project_settings_path(&self) -> PathBuf {
@@ -381,6 +399,7 @@ impl ClaudeCodeAdapter {
                 "Claude Code CLI mutation requires the managed bridge",
             ));
         }
+        self.command_context()?.validate()?;
         self.recheck_executable_client()?;
         let expected = self
             .probe_managed_declaration()
@@ -441,6 +460,12 @@ impl ClaudeCodeAdapter {
         runner: &mut impl ClaudeCodeCommandRunner,
         arguments: &[String],
     ) -> Result<Vec<u8>, BoundaryError> {
+        let context = self
+            .command_context()
+            .map_err(|_| BoundaryError::new("Claude Code configuration binding is invalid"))?;
+        context
+            .validate()
+            .map_err(|_| BoundaryError::new("Claude Code configuration binding changed"))?;
         let executable =
             open_verified_claude_executable(&self.layout.executable, self.executable_hash)?;
         runner.before_launch(arguments)?;
@@ -452,6 +477,7 @@ impl ClaudeCodeAdapter {
             executable: &executable,
             launch,
             arguments,
+            context,
         })
     }
 
@@ -486,6 +512,9 @@ impl ClaudeCodeAdapter {
     fn probe_managed_declaration(
         &self,
     ) -> Result<Option<CanonicalCliDeclaration>, BridgeDeclarationProbeError> {
+        self.command_context()
+            .and_then(|context| context.validate())
+            .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
         McpConfiguration::read(&self.layout)
             .map_err(|_| BridgeDeclarationProbeError::Inspection)?
             .managed_declaration()
@@ -762,17 +791,9 @@ impl ClaudeCodeAdapter {
         components: &mut Vec<ComponentRecord>,
         digests: &mut BTreeSet<Sha256Digest>,
     ) -> Result<(), ClientError> {
-        let Some(bytes) = read_optional_file(&self.layout.state_path)? else {
-            return Ok(());
-        };
-        let value = parse_object(&bytes, "Claude Code state is invalid")?;
+        let value = mcp_state::read_object(&self.layout.state_path)?;
         let servers = if let Some(project) = project {
-            value
-                .get("projects")
-                .and_then(Value::as_object)
-                .and_then(|projects| projects.get(project.to_string_lossy().as_ref()))
-                .and_then(Value::as_object)
-                .and_then(|project| project.get("mcpServers"))
+            mcp_state::project_entry(&value, project)?.and_then(|project| project.get("mcpServers"))
         } else {
             value.get("mcpServers")
         };
@@ -1510,10 +1531,16 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     }
 
     fn validate_effective(&self, receipt: &ApplyReceipt) -> Result<ValidationReport, ClientError> {
+        let context = self.command_context()?;
         self.validate_effective_with(receipt, |command| {
             let argv = command.argv();
             let arguments = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            run_bounded_command(&self.layout.executable, &arguments, self.executable_hash)
+            run_bounded_command(
+                &self.layout.executable,
+                &arguments,
+                self.executable_hash,
+                &context,
+            )
         })
     }
 }
@@ -1545,6 +1572,9 @@ impl ClaudeCodeAdapter {
 
 impl NativeAdapter for ClaudeCodeAdapter {
     fn reprobe_live_state(&mut self, plan: &NativeTransactionPlan) -> Result<(), BoundaryError> {
+        self.command_context()
+            .and_then(|context| context.validate())
+            .map_err(|_| BoundaryError::new("Claude Code configuration binding changed"))?;
         if self.capability() != CapabilityLevel::Full
             || plan.setup.harness != HarnessId::ClaudeCode
             || plan.setup.harness_version != self.layout.version
@@ -1854,14 +1884,16 @@ fn run_bounded_command(
     executable: &Path,
     arguments: &[&str],
     expected_hash: Sha256Digest,
+    context: &ClaudeCommandContext,
 ) -> Result<Vec<u8>, ClientError> {
-    run_bounded_command_with_hook(executable, arguments, expected_hash, || {})
+    run_bounded_command_with_hook(executable, arguments, expected_hash, context, || {})
 }
 
 fn run_bounded_command_with_hook(
     executable: &Path,
     arguments: &[&str],
     expected_hash: Sha256Digest,
+    context: &ClaudeCommandContext,
     before_spawn: impl FnOnce(),
 ) -> Result<Vec<u8>, ClientError> {
     let executable = open_verified_claude_executable(executable, expected_hash)
@@ -1870,24 +1902,26 @@ fn run_bounded_command_with_hook(
     executable
         .revalidate_before_launch()
         .map_err(|_| client_error(ErrorCode::Conflict, "Claude Code executable changed", false))?;
-    run_bounded_verified_command(&executable, arguments)
+    run_bounded_verified_command(&executable, arguments, context)
 }
 
 fn run_bounded_verified_command(
     executable: &VerifiedClaudeExecutable,
     arguments: &[&str],
+    context: &ClaudeCommandContext,
 ) -> Result<Vec<u8>, ClientError> {
     executable
         .revalidate_before_launch()
         .map_err(|_| client_error(ErrorCode::Conflict, "Claude Code executable changed", false))?;
     let launch = executable.prepare_launch()?;
-    run_prepared_claude_command(launch, &executable.source_path, arguments)
+    run_prepared_claude_command(launch, &executable.source_path, arguments, context)
 }
 
 fn run_prepared_claude_command(
     launch: PreparedClaudeLaunch,
     original_path: &Path,
     arguments: &[&str],
+    context: &ClaudeCommandContext,
 ) -> Result<Vec<u8>, ClientError> {
     #[cfg(windows)]
     if launch.source_path.as_path() != original_path {
@@ -1905,6 +1939,7 @@ fn run_prepared_claude_command(
         )
     })?;
     let mut command = Command::new(launch.program());
+    context.configure(&mut command, arguments)?;
     command
         .args(arguments)
         .stdin(Stdio::null())
@@ -2202,6 +2237,7 @@ pub struct VerifiedClaudeCommand<'a> {
     executable: &'a VerifiedClaudeExecutable,
     launch: PreparedClaudeLaunch,
     arguments: &'a [String],
+    context: ClaudeCommandContext,
 }
 
 impl VerifiedClaudeCommand<'_> {
@@ -2215,9 +2251,15 @@ impl VerifiedClaudeCommand<'_> {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        run_prepared_claude_command(self.launch, &self.executable.source_path, &arguments).map_err(
-            |_| BoundaryError::new("Claude Code command failed at the native transaction boundary"),
+        run_prepared_claude_command(
+            self.launch,
+            &self.executable.source_path,
+            &arguments,
+            &self.context,
         )
+        .map_err(|_| {
+            BoundaryError::new("Claude Code command failed at the native transaction boundary")
+        })
     }
 }
 
@@ -2688,31 +2730,17 @@ fn contains_redaction(value: &Value) -> bool {
 }
 
 fn project_is_approved(state_path: &Path, project_root: &Path) -> bool {
-    read_optional_file(state_path)
-        .ok()
-        .flatten()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|state| {
-            state
-                .get("projects")?
-                .get(project_root.to_string_lossy().as_ref())?
-                .get("hasTrustDialogAccepted")?
-                .as_bool()
-        })
-        == Some(true)
+    mcp_state::read_object(state_path).ok().and_then(|state| {
+        mcp_state::project_entry(&state, project_root)
+            .ok()??
+            .get("hasTrustDialogAccepted")?
+            .as_bool()
+    }) == Some(true)
 }
 
 fn project_mcp_approval_status(state_path: &Path, project_root: &Path) -> Result<(bool, bool), ()> {
-    let Some(bytes) = read_optional_file(state_path).map_err(|_| ())? else {
-        return Ok((false, false));
-    };
-    let state = serde_json::from_slice::<Value>(&bytes).map_err(|_| ())?;
-    let Some(project) = state
-        .get("projects")
-        .and_then(Value::as_object)
-        .and_then(|projects| projects.get(project_root.to_string_lossy().as_ref()))
-        .and_then(Value::as_object)
-    else {
+    let state = mcp_state::read_object(state_path).map_err(|_| ())?;
+    let Some(project) = mcp_state::project_entry(&state, project_root).map_err(|_| ())? else {
         return Ok((false, false));
     };
     let configured = [
@@ -3440,7 +3468,15 @@ mod tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let expected_hash = digest_file(&executable).unwrap();
 
-        let output = run_bounded_command(&executable, &["attested"], expected_hash).unwrap();
+        let physical = fs::canonicalize(root.path()).unwrap();
+        let context = super::ClaudeCommandContext::new(
+            &physical.join(".claude"),
+            &physical.join(".claude.json"),
+            &physical,
+        )
+        .unwrap();
+        let output =
+            run_bounded_command(&executable, &["attested"], expected_hash, &context).unwrap();
 
         assert_eq!(output, b"attested\n");
     }
@@ -3460,11 +3496,23 @@ mod tests {
         fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
         let expected_hash = digest_file(&executable).unwrap();
 
-        let result =
-            run_bounded_command_with_hook(&executable, &["attested"], expected_hash, || {
+        let physical = fs::canonicalize(root.path()).unwrap();
+        let context = super::ClaudeCommandContext::new(
+            &physical.join(".claude"),
+            &physical.join(".claude.json"),
+            &physical,
+        )
+        .unwrap();
+        let result = run_bounded_command_with_hook(
+            &executable,
+            &["attested"],
+            expected_hash,
+            &context,
+            || {
                 fs::rename(&executable, &attested_backup).unwrap();
                 fs::rename(&replacement, &executable).unwrap();
-            });
+            },
+        );
 
         assert!(result.is_err());
     }
@@ -3525,7 +3573,7 @@ mod tests {
         fs::create_dir_all(&project_root).unwrap();
         let sentinel = physical_root.join("configured-bridge-ran");
         let command = serde_json::to_string(&sentinel.to_string_lossy()).unwrap();
-        let state_path = physical_root.join(".claude.json");
+        let state_path = config_dir.join(".claude.json");
         fs::write(
             &state_path,
             format!(
@@ -3616,7 +3664,7 @@ mod tests {
         let project_root = physical_root.join("project");
         fs::create_dir_all(&config_dir).unwrap();
         fs::create_dir_all(&project_root).unwrap();
-        let state_path = physical_root.join(".claude.json");
+        let state_path = config_dir.join(".claude.json");
         let project_key = project_root.to_string_lossy().into_owned();
         fs::write(
             &state_path,

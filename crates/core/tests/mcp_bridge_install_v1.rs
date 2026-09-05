@@ -79,7 +79,7 @@ fn adapter_fixture() -> AdapterFixture {
 
     let claude_config = root.path().join("claude");
     fs::create_dir_all(&claude_config).unwrap();
-    let claude_state = root.path().join(".claude.json");
+    let claude_state = claude_config.join(".claude.json");
     fs::write(&claude_state, b"{}").unwrap();
     let claude_executable = root
         .path()

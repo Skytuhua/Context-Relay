@@ -62,7 +62,7 @@ fn fixture(source: &str) -> Fixture {
     materialize(&config_dir, fixture["config"].as_object().unwrap());
     materialize(&project_root, fixture["project"].as_object().unwrap());
 
-    let state_path = root.join(".claude.json");
+    let state_path = config_dir.join(".claude.json");
     let mut state = fixture["state"].clone();
     let project = state["projects"]
         .as_object_mut()
@@ -1955,6 +1955,84 @@ fn bridge_preview_detects_the_local_scope_key_written_by_windows_claude() {
             .unwrap_err()
             .code,
         ErrorCode::Conflict
+    );
+}
+
+#[cfg(windows)]
+fn use_claude_project_key(fixture: &Fixture, conflict: bool) {
+    let mut state: Value = serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+    let projects = state["projects"].as_object_mut().unwrap();
+    let key = projects.keys().next().unwrap().clone();
+    let mut project = projects.remove(&key).unwrap();
+    if conflict {
+        project["enabledMcpjsonServers"] = json!(["docs"]);
+        project["disabledMcpjsonServers"] = json!(["docs"]);
+    }
+    let cli_key = key.strip_prefix(r"\\?\").unwrap_or(&key).replace('\\', "/");
+    projects.insert(cli_key, project);
+    fs::write(&fixture.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_probe_recognizes_existing_claude_project_trust() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    use_claude_project_key(&fixture, false);
+    let report = fixture
+        .adapter
+        .probe(&ProbeContext {
+            harness: HarnessId::ClaudeCode,
+            requested_profile: None,
+        })
+        .unwrap();
+    assert!(
+        !report
+            .policy_conflicts
+            .iter()
+            .any(|value| value == "project_unapproved")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_probe_does_not_skip_claude_project_approval_conflicts() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    use_claude_project_key(&fixture, true);
+    let report = fixture
+        .adapter
+        .probe(&ProbeContext {
+            harness: HarnessId::ClaudeCode,
+            requested_profile: None,
+        })
+        .unwrap();
+    assert!(
+        report
+            .policy_conflicts
+            .iter()
+            .any(|value| value == "project_mcp_approval_conflict")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_import_includes_claude_local_project_servers() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    use_claude_project_key(&fixture, false);
+    let imported = fixture
+        .adapter
+        .import(&ImportRequest {
+            scopes: vec![NativeScope::Project {
+                project_id: fixture.project_id,
+                root: fixture.adapter.project_root_wire(),
+            }],
+            include_disabled: true,
+        })
+        .unwrap();
+    assert!(
+        imported
+            .components
+            .iter()
+            .any(|component| component.name == "local-only")
     );
 }
 

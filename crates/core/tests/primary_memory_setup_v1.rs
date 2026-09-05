@@ -998,7 +998,7 @@ fn claude_matrix_fixture_with_version(version: &str) -> MatrixFixture {
     let project_root = root.join("project");
     materialize_json(&config_dir, source["config"].as_object().unwrap());
     materialize_json(&project_root, source["project"].as_object().unwrap());
-    let state_path = root.join(".claude.json");
+    let state_path = config_dir.join(".claude.json");
     let mut state = source["state"].clone();
     let project = state["projects"]
         .as_object_mut()

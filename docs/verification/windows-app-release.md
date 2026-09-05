@@ -258,3 +258,16 @@ Windows local-project key spelling, project shadowing and exclusive managed MCP
 policy are checked. See the [qualification evidence](claude-native-mcp-2026-09-06.md)
 for exact scope and remaining gates. This is source progress; 2.1.202 remains
 ImportOnly, and the previously recorded installer does not include this patch.
+
+## 2026-09-06: Claude command target and project lookup
+
+Claude commands now use the selected project and explicit default/overridden
+configuration context. The real digest-pinned 2.1.202 executable successfully
+added and removed inert local MCP declarations in both temporary configurations
+through the core launcher. Trust, approval and local import also recognize the
+Windows project keys written by that CLI. The follow-up qualification document
+records exact scope, tests and remaining gates. All 45 Claude adapter, 11
+primary-memory setup, 5 bridge-install and 17 ordinary Claude unit tests pass,
+as does core all-target test-support Clippy with warnings denied. This still
+does not enable Full support, qualify persisted command-context recovery, or
+change the installed app. The latest local installer remains the 3cbe619 build.

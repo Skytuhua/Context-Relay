@@ -46,23 +46,10 @@ impl McpConfiguration {
         }
         let state = read_object(&layout.state_path)?;
         let project = read_object(&layout.project_root.join(".mcp.json"))?;
-        let projects = optional_object(state.get("projects"))?;
-        let key = layout
-            .project_root
-            .to_str()
-            .ok_or_else(|| invalid_request("Claude Code project path is not text"))?;
-        let mut matches = projects
-            .iter()
-            .filter(|(candidate, _)| project_keys_match(candidate, key));
-        let local = optional_object(matches.next().map(|(_, value)| value))?;
-        if matches.next().is_some() {
-            return Err(invalid_request(
-                "Claude Code project configuration is ambiguous",
-            ));
-        }
+        let local = project_entry(&state, &layout.project_root)?;
         Ok(Self {
             user: optional_object(state.get("mcpServers"))?,
-            local: optional_object(local.get("mcpServers"))?,
+            local: optional_object(local.and_then(|value| value.get("mcpServers")))?,
             project: optional_object(project.get("mcpServers"))?,
         })
     }
@@ -99,6 +86,38 @@ impl McpConfiguration {
     }
 }
 
+pub(super) fn project_entry<'a>(
+    state: &'a Map<String, Value>,
+    project: &Path,
+) -> Result<Option<&'a Map<String, Value>>, ClientError> {
+    let Some(projects) = state.get("projects") else {
+        return Ok(None);
+    };
+    let projects = projects
+        .as_object()
+        .ok_or_else(|| invalid_request("Claude Code projects are invalid"))?;
+    let key = project
+        .to_str()
+        .ok_or_else(|| invalid_request("Claude Code project path is not text"))?;
+    let mut matches = projects
+        .iter()
+        .filter(|(candidate, _)| project_keys_match(candidate, key));
+    let first = matches
+        .next()
+        .map(|(_, value)| {
+            value
+                .as_object()
+                .ok_or_else(|| invalid_request("Claude Code project configuration is invalid"))
+        })
+        .transpose()?;
+    if matches.next().is_some() {
+        return Err(invalid_request(
+            "Claude Code project configuration is ambiguous",
+        ));
+    }
+    Ok(first)
+}
+
 fn project_keys_match(left: &str, right: &str) -> bool {
     #[cfg(windows)]
     {
@@ -126,7 +145,7 @@ fn optional_object(value: Option<&Value>) -> Result<Map<String, Value>, ClientEr
     }
 }
 
-fn validate_config_path(path: &Path, allow_missing: bool) -> std::io::Result<()> {
+pub(super) fn validate_config_path(path: &Path, allow_missing: bool) -> std::io::Result<()> {
     if !path.is_absolute()
         || path
             .components()
@@ -150,7 +169,7 @@ fn validate_config_path(path: &Path, allow_missing: bool) -> std::io::Result<()>
     Ok(())
 }
 
-fn read_object(path: &Path) -> Result<Map<String, Value>, ClientError> {
+pub(super) fn read_object(path: &Path) -> Result<Map<String, Value>, ClientError> {
     let error = || invalid_request("Claude Code MCP configuration cannot be safely inspected");
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
