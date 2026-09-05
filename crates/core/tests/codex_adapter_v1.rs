@@ -2044,6 +2044,60 @@ fn bridge_cli_plan_binds_exact_declarations_and_preserves_argv_boundaries() {
 }
 
 #[test]
+fn bridge_cli_readback_accepts_null_env_but_rejects_overrides_and_invalid_shapes() {
+    // Captured from isolated 0.144.6 MCP management. Use an already-qualified
+    // adapter version: this output compatibility test does not grant Full support.
+    for (environment, expected_error) in [
+        (Value::Null, None),
+        (json!({}), None),
+        (
+            json!({"QUALIFICATION_OVERRIDE": "value"}),
+            Some(ErrorCode::Conflict),
+        ),
+        (json!(false), Some(ErrorCode::InvalidRequest)),
+    ] {
+        let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+        let bridge = executable_bridge(&fixture, "bridge with spaces");
+        let bridge_body: Value = serde_json::from_str(&bridge.body_markdown).unwrap();
+        let mut observed: Value =
+            serde_json::from_str(include_str!("fixtures/codex-0.144.6-mcp.json")).unwrap();
+        for key in ["mcpListJson", "mcpGetJson"] {
+            let server = if key == "mcpListJson" {
+                &mut observed[key][0]
+            } else {
+                &mut observed[key]
+            };
+            server["transport"]["command"] = bridge_body["command"].clone();
+            server["transport"]["env"] = environment.clone();
+        }
+        let mut validation = |argv: &[String]| {
+            let key = match argv
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                ["plugin", "list", "--json"] => "pluginListJson",
+                ["mcp", "list", "--json"] => "mcpListJson",
+                ["mcp", "get", "context-relay", "--json"] => "mcpGetJson",
+                _ => panic!("unexpected qualification command"),
+            };
+            Ok(serde_json::to_vec(&observed[key]).unwrap())
+        };
+        let result = fixture
+            .adapter
+            .plan_bridge_cli_mutation_with_runner(&bridge, &mut validation);
+        if let Some(code) = expected_error {
+            assert_eq!(result.unwrap_err().code, code);
+        } else {
+            let mutation = result.unwrap();
+            assert_eq!(mutation.expected, Some(declaration(&bridge.body_markdown)));
+            assert_eq!(mutation.intended, mutation.expected);
+        }
+    }
+}
+
+#[test]
 fn bridge_cli_plan_restores_the_exact_managed_prior_declaration() {
     let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
     let prior = executable_bridge(&fixture, "prior bridge executable");

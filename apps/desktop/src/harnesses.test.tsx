@@ -33,6 +33,13 @@ beforeEach(() => {
       resolvedProject: null, sync: 'offline', access: { mode: 'default' },
     } } };
     if (request.method === 'projects_list') return { kind: 'projects', data: { projects } };
+    // Discovery ordering and capabilities are exercised by harness-discovery.test.tsx.
+    // This suite records the subsequent preview/apply/rollback lifecycle.
+    if (request.method === 'harness_probe') return { kind: 'probe', data: { report: {
+      executable: fixture.executablePath, executableSha256: fixture.executableHash,
+      harnessVersion: fixture.harnessVersion, installationMethod: 'manual', configRoots: [],
+      activeProfile: request.params.hermesProfile, policyConflicts: [], capability: 'full',
+    } } };
     requests.push(request);
     return operation(request);
   });
@@ -41,13 +48,13 @@ afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
 async function open() {
   const result = render(<App gateway={new LocalWorkspaceGateway()} />);
-  await screen.findByText('Offline');
-  fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
+  await screen.findByText('Ready on this computer');
+  fireEvent.click(screen.getByRole('button', { name: 'AI apps' }));
   return result;
 }
 async function review() {
-  fireEvent.click(screen.getByRole('button', { name: 'Preview setup' }));
-  await screen.findByRole('heading', { name: 'Review setup plan' });
+  fireEvent.click(screen.getByRole('button', { name: 'Check connection' }));
+  await screen.findByRole('heading', { name: 'Review connection changes' });
 }
 function approve() {
   fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed/ }));
@@ -72,7 +79,7 @@ it('requires explicit review, applies only the exact stored ID, and awaits ackno
   expect(requests).toHaveLength(2);
   expect(requests[1]).toEqual({ method: 'harness_apply', params: { planId: '018f22e2-79b0-7cc8-98c4-dc0c0c07398f' } });
   expect(screen.queryByText(/Setup applied/)).not.toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'Preview setup' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Check connection' })).toBeDisabled();
   await act(async () => pending.resolve({ kind: 'empty' }));
   expect(await screen.findByText(/Setup applied/)).toBeVisible();
 });
@@ -91,7 +98,7 @@ it('shows safe apply failure, clears approval and never creates a rollback succe
   expect(requests.filter((r) => r.method === 'harness_apply')).toHaveLength(1);
 });
 
-it.each(['Project', 'Harness'])('clears approval when %s selection changes', async (label) => {
+it.each(['Project', 'AI app'])('clears approval when %s selection changes', async (label) => {
   await open(); await review();
   fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed/ }));
   fireEvent.change(screen.getByRole('combobox', { name: label }), { target: { value: label === 'Project' ? secondProject : 'claude_code' } });
@@ -102,29 +109,31 @@ it.each(['Project', 'Harness'])('clears approval when %s selection changes', asy
 it('ignores a late preview after selection changes and prevents overlapping previews', async () => {
   const pending = deferred<unknown>(); operation = async () => pending.promise;
   await open();
-  fireEvent.click(screen.getByRole('button', { name: 'Preview setup' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Check connection' }));
+  await waitFor(() => expect(requests).toHaveLength(1));
   fireEvent.change(screen.getByRole('combobox', { name: 'Project' }), { target: { value: secondProject } });
-  fireEvent.click(screen.getByRole('button', { name: /Previewing/ }));
+  fireEvent.click(screen.getByRole('button', { name: /Checking app/ }));
   expect(requests).toHaveLength(1);
   await act(async () => pending.resolve({ kind: 'plan', data: { plan: preview } }));
-  expect(screen.queryByRole('heading', { name: 'Review setup plan' })).not.toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'Preview setup' })).toBeEnabled();
+  expect(screen.queryByRole('heading', { name: 'Review connection changes' })).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Check connection' })).toBeEnabled();
 });
 
 it('ignores preview responses after leaving the screen', async () => {
   const pending = deferred<unknown>(); operation = async () => pending.promise;
   await open();
-  fireEvent.click(screen.getByRole('button', { name: 'Preview setup' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Check connection' }));
+  await waitFor(() => expect(requests).toHaveLength(1));
   fireEvent.click(screen.getByRole('button', { name: 'Home' }));
   await act(async () => pending.resolve({ kind: 'plan', data: { plan: preview } }));
-  fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
-  expect(screen.queryByRole('heading', { name: 'Review setup plan' })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'AI apps' }));
+  expect(screen.queryByRole('heading', { name: 'Review connection changes' })).not.toBeInTheDocument();
 });
 
 it('requires an explicit Hermes profile and clears reviewed approval when it changes', async () => {
   await open();
-  fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'hermes' } });
-  expect(screen.getByRole('button', { name: 'Preview setup' })).toBeDisabled();
+  fireEvent.change(screen.getByRole('combobox', { name: 'AI app' }), { target: { value: 'hermes' } });
+  expect(screen.getByRole('button', { name: 'Check connection' })).toBeDisabled();
   fireEvent.change(screen.getByRole('textbox', { name: 'Hermes profile' }), { target: { value: 'coder' } });
   preview.harness = 'hermes'; preview.harnessProfile = 'coder';
   await review();
@@ -163,7 +172,7 @@ it('retains rollback for the acknowledged plan after selection changes and requi
   await open(); await review(); approve();
   await screen.findByText(/Setup applied/);
   fireEvent.change(screen.getByRole('combobox', { name: 'Project' }), { target: { value: secondProject } });
-  fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'claude_code' } });
+  fireEvent.change(screen.getByRole('combobox', { name: 'AI app' }), { target: { value: 'claude_code' } });
   fireEvent.click(screen.getByRole('button', { name: 'Roll back Codex for Research' }));
   expect(requests).toHaveLength(2);
   fireEvent.click(screen.getByRole('button', { name: 'Confirm rollback' }));
@@ -177,8 +186,8 @@ it('keeps a pending apply exclusive across navigation and retains its acknowledg
     ? { kind: 'plan', data: { plan: preview } } : pending.promise;
   await open(); await review(); approve();
   fireEvent.click(screen.getByRole('button', { name: 'Home' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
-  expect(screen.getByRole('button', { name: 'Preview setup' })).toBeDisabled();
+  fireEvent.click(screen.getByRole('button', { name: 'AI apps' }));
+  expect(screen.getByRole('button', { name: 'Check connection' })).toBeDisabled();
   await act(async () => pending.resolve({ kind: 'empty' }));
   expect(await screen.findByRole('button', { name: 'Roll back Codex for Research' })).toBeEnabled();
 });
@@ -187,7 +196,7 @@ it('requires fresh approval after navigating away from a reviewed preview', asyn
   await open(); await review();
   fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed/ }));
   fireEvent.click(screen.getByRole('button', { name: 'Home' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
+  fireEvent.click(screen.getByRole('button', { name: 'AI apps' }));
   expect(screen.queryByRole('button', { name: 'Apply reviewed plan' })).not.toBeInTheDocument();
 });
 
@@ -212,7 +221,7 @@ it('can cancel rollback and awaits acknowledgment without duplicate or overlappi
   fireEvent.click(screen.getByRole('button', { name: 'Confirm rollback' }));
   fireEvent.click(screen.getByRole('button', { name: 'Roll back Codex for Research' }));
   expect(requests).toHaveLength(3);
-  expect(screen.getByRole('button', { name: 'Preview setup' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Check connection' })).toBeDisabled();
   expect(screen.queryByText(/Rollback completed/)).not.toBeInTheDocument();
   await act(async () => pending.resolve({ kind: 'empty' }));
   expect(await screen.findByText(/Rollback completed/)).toBeVisible();
@@ -226,7 +235,7 @@ it('shows bytes when the native display string is empty', async () => {
 
 it('rejects malformed previews without rendering plaintext errors or unsafe HTML', async () => {
   operation = async () => ({ kind: 'plan', data: { plan: { ...preview, batchHash: 'PRIVATE-MALFORMED' } } });
-  await open(); fireEvent.click(screen.getByRole('button', { name: 'Preview setup' }));
+  await open(); fireEvent.click(screen.getByRole('button', { name: 'Check connection' }));
   expect(await screen.findByRole('alert')).toHaveTextContent(/preview could not be loaded/i);
   expect(screen.queryByText(/PRIVATE-MALFORMED/)).not.toBeInTheDocument();
   expect(screen.queryByRole('checkbox', { name: /I reviewed/ })).not.toBeInTheDocument();
@@ -250,5 +259,5 @@ it('shows review changes, permissions, network, CLI, artifacts and honest native
   expect(screen.getByText('https://example.com:443')).toBeVisible();
   expect(screen.getByText('--register')).toBeVisible();
   expect(screen.getByText('bridge.zip')).toBeVisible();
-  expect(screen.getByText('Identity and digest details')).toBeVisible();
+  expect(screen.getByText('Technical verification details')).toBeVisible();
 });

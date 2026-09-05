@@ -24,10 +24,10 @@ use context_relay_local_ipc::{
     ServerHelloV1, connect, create_proof, read_json, write_json,
 };
 use context_relay_protocol::{
-    ApprovalClass, CancelParams, ClientError, ClientRole, DaemonInstanceNonce, DeviceId, ErrorCode,
-    HarnessId, HarnessParams, HelloParams, JsonRpcErrorV1, JsonRpcRequestV1, JsonRpcSuccessV1,
-    JsonRpcVersion, LocalRequest, LocalResult, NativePlatform, PlanId, PlanParams, RecordId,
-    SetupPlan, Sha256Digest, WireNativeValue,
+    ApprovalClass, CancelParams, CapabilityLevel, ClientError, ClientRole, DaemonInstanceNonce,
+    DeviceId, ErrorCode, HarnessId, HarnessParams, HelloParams, InstallationMethod, JsonRpcErrorV1,
+    JsonRpcRequestV1, JsonRpcSuccessV1, JsonRpcVersion, LocalRequest, LocalResult, NativePlatform,
+    PlanId, PlanParams, ProbeReport, RecordId, SetupPlan, Sha256Digest, WireNativeValue,
 };
 use uuid::Uuid;
 
@@ -38,6 +38,7 @@ const ROLLBACK_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073990";
 #[derive(Default)]
 struct RecordingEngine {
     reconciles: AtomicUsize,
+    probes: Mutex<Vec<HarnessParams>>,
     previews: Mutex<Vec<(HarnessId, Option<String>)>>,
     applied: Mutex<BTreeSet<PlanId>>,
     rolled_back: Mutex<BTreeSet<PlanId>>,
@@ -164,6 +165,26 @@ impl RecordingEngine {
 }
 
 impl BridgeInstallEngine for RecordingEngine {
+    fn probe(
+        &self,
+        _vault: &Vault,
+        _device_id: DeviceId,
+        params: HarnessParams,
+    ) -> Result<ProbeReport, ClientError> {
+        self.probes.lock().unwrap().push(params.clone());
+        let plan = plan(params.harness);
+        Ok(ProbeReport {
+            executable: Some(plan.executable_path),
+            executable_sha256: Some(plan.executable_hash),
+            harness_version: Some("0.144.6".to_owned()),
+            installation_method: InstallationMethod::Manual,
+            config_roots: vec![],
+            active_profile: params.hermes_profile,
+            policy_conflicts: vec![],
+            capability: CapabilityLevel::ImportOnly,
+        })
+    }
+
     fn reconcile_after_native_recovery(
         &self,
         _vault: &mut Vault,
@@ -228,6 +249,32 @@ impl BridgeInstallEngine for RecordingEngine {
         }
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn discovery_returns_capability_through_authenticated_ipc_without_creating_a_plan() {
+    let fixture = Fixture::start("probe", Arc::new(RecordingEngine::default()), None).await;
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    for harness in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Hermes] {
+        let params = HarnessParams {
+            harness,
+            project_id: None,
+            hermes_profile: (harness == HarnessId::Hermes).then(|| "coder".to_owned()),
+        };
+        let result = client
+            .call(LocalRequest::HarnessProbe(params.clone()))
+            .await
+            .unwrap();
+        assert!(matches!(result, LocalResult::Probe { report }
+            if report.capability == CapabilityLevel::ImportOnly
+                && report.harness_version.as_deref() == Some("0.144.6")
+                && report.active_profile == params.hermes_profile));
+        assert_eq!(fixture.engine.probes.lock().unwrap().last(), Some(&params));
+    }
+    assert!(fixture.engine.previews.lock().unwrap().is_empty());
+    assert_eq!(fixture.engine.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.engine.bridge_launches.load(Ordering::SeqCst), 0);
+    fixture.stop().await;
 }
 
 #[tokio::test]

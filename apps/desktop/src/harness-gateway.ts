@@ -1,12 +1,23 @@
-import type { HarnessParams, PlanId, SetupPlan } from './bindings';
+import type { HarnessParams, PlanId, ProbeReport, SetupPlan } from './bindings';
 import * as protocolValidation from './protocol-validation';
 
 const assertSetupPlan: (value: unknown) => asserts value is SetupPlan = protocolValidation.assertSetupPlan;
+const assertProbeReport: (value: unknown) => asserts value is ProbeReport = protocolValidation.assertProbeReport;
 
 export interface HarnessGateway {
+  harnessProbe(params: HarnessParams): Promise<ProbeReport>;
   harnessPreview(params: HarnessParams): Promise<SetupPlan>;
   harnessApply(planId: PlanId): Promise<void>;
   harnessRollback(planId: PlanId): Promise<void>;
+}
+
+export function validateHarnessProbe(value: unknown, params: HarnessParams): ProbeReport {
+  assertProbeReport(value);
+  if (value.activeProfile !== params.hermesProfile ||
+    (value.capability === 'full' && (!value.executable || !value.executableSha256 || !value.harnessVersion))) {
+    throw new Error('Harness discovery does not match the selection.');
+  }
+  return value;
 }
 
 export function validateHarnessPlan(value: unknown, params: HarnessParams): SetupPlan {

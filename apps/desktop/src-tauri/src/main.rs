@@ -30,6 +30,25 @@ fn application_info() -> ApplicationInfo {
     }
 }
 
+#[tauri::command]
+async fn choose_project_folder(app: AppHandle) -> Result<Option<String>, &'static str> {
+    // The native picker runs off the UI thread. Selecting a folder does not
+    // register it, read its contents, or grant an AI app access to it.
+    app.dialog()
+        .file()
+        .set_title("Choose your project folder")
+        .blocking_pick_folder()
+        .map(|selected| {
+            selected
+                .into_path()
+                .map_err(|_| "The selected folder could not be opened")?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| "The selected folder name cannot be displayed")
+        })
+        .transpose()
+}
+
 #[derive(Default)]
 struct LocalClientState {
     client: Mutex<Option<Client>>,
@@ -333,6 +352,7 @@ fn main() {
         .manage(DesktopRecoveryHostState::default())
         .invoke_handler(tauri::generate_handler![
             application_info,
+            choose_project_folder,
             local_request,
             recovery_enrollment_begin,
             recovery_enrollment_confirm

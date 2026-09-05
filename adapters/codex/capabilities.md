@@ -9,6 +9,19 @@ when an administrator requirements file is active or the selected project is
 not explicitly trusted. Missing installations are represented by discovery
 failure rather than by constructing an adapter for an unbound executable.
 
+Windows standalone discovery recognizes the standard Programs/OpenAI/Codex
+alias and `.codex/packages/standalone/current` junction only after verifying
+their exact targets. It binds the physical native release executable beneath
+the expected releases directory and verifies that the release directory and
+held executable report the same version. Arbitrary PATH junctions and nested
+reparse points remain rejected. Later launches retain executable identity,
+digest and topology checks. Finding standalone `0.144.6` does not qualify it
+for full setup; its lifecycle hooks and native memory behavior remain unverified.
+
+The MCP parser accepts `transport.env: null` as no environment overrides,
+matching the standalone `0.144.6` CLI output. Nonempty environment overrides
+still prevent treating an existing MCP declaration as Context Relay managed.
+
 Full setup is transactional. Every file/CLI mutation planner and native/CLI
 apply recheck requires the effective setup capability to remain `Full`, in
 addition to rechecking the executable path, native identity, digest, version,

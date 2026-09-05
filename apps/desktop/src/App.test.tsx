@@ -10,12 +10,10 @@ import type { WorkspaceGateway } from './workspace';
 const destinations = [
   'Home',
   'Projects',
-  'Memory',
-  'Review queue',
+  'Saved context',
+  'Suggestions',
   'Tasks',
-  'Harnesses',
-  'Packages',
-  'Activity',
+  'AI apps',
   'Devices',
   'Settings',
 ] as const;
@@ -78,8 +76,8 @@ describe('App', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.getByLabelText('Project name')).toHaveValue('Unsaved project');
     fireEvent.click(screen.getByRole('button', { name: 'Home' }));
-    expect(screen.getByText('Offline')).toBeVisible();
-    expect(screen.getByText('Vault: unlocked')).toBeVisible();
+    expect(screen.getByText('Ready on this computer')).toBeVisible();
+    expect(screen.getByText('Ready on this computer')).toBeVisible();
   });
 
   it('bounds a stalled startup and ignores its late response after a successful retry', async () => {
@@ -94,14 +92,14 @@ describe('App', () => {
     };
     render(<App gateway={reconnectingGateway} />);
     await act(async () => { await vi.advanceTimersByTimeAsync(45_000); });
-    expect(screen.queryByText('Connecting')).not.toBeInTheDocument();
+    expect(screen.queryByText('Opening your workspace…')).not.toBeInTheDocument();
     expect(screen.getByRole('alert')).toBeVisible();
     stalled = false;
     fireEvent.click(screen.getByRole('button', { name: 'Retry connection' }));
     await act(async () => {});
-    expect(screen.getByText('Vault: unlocked')).toBeVisible();
+    expect(screen.getByText('Ready on this computer')).toBeVisible();
     await act(async () => { finishOldStatus({ ...await gateway.status(), vault: 'locked' }); });
-    expect(screen.getByText('Vault: unlocked')).toBeVisible();
+    expect(screen.getByText('Ready on this computer')).toBeVisible();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
@@ -112,7 +110,7 @@ describe('App', () => {
 
   it('exposes every keyboard-reachable workspace destination and focuses selected headings', async () => {
     render(<App gateway={gateway} />);
-    expect(await screen.findByText('Offline')).toBeVisible();
+    expect(await screen.findByText('Ready on this computer')).toBeVisible();
     const navigation = screen.getByRole('navigation', { name: 'Workspace' });
     expect(within(navigation).getAllByRole('button').map((button) => button.textContent)).toEqual(
       destinations,
@@ -135,13 +133,13 @@ describe('App', () => {
 
   it('reports associated validation errors without echoing submitted plaintext', async () => {
     render(<App gateway={gateway} />);
-    await screen.findByText('Offline');
-    fireEvent.click(screen.getByRole('button', { name: 'Memory' }));
-    const form = await screen.findByRole('form', { name: 'New memory' });
+    await screen.findByText('Ready on this computer');
+    fireEvent.click(screen.getByRole('button', { name: 'Saved context' }));
+    const form = await screen.findByRole('form', { name: 'New context' });
     fireEvent.submit(form);
     expect(form).toHaveAttribute('aria-describedby', 'workspace-error');
     expect(screen.getByRole('alert')).toHaveTextContent('Enter a title.');
-    expect(screen.getByRole('alert')).not.toHaveTextContent('Memory');
+    expect(screen.getByRole('alert')).not.toHaveTextContent('Saved context');
   });
 
   it('keeps all workspace persistence behind the typed client', () => {
@@ -155,7 +153,7 @@ describe('App', () => {
 
   it('restores the security dialog trigger focus after close', async () => {
     render(<App gateway={gateway} />);
-    await screen.findByText('Offline');
+    await screen.findByText('Ready on this computer');
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
     const trigger = screen.getByRole('button', { name: 'Security details' });
     fireEvent.click(trigger);

@@ -1,6 +1,6 @@
 import Ajv2020 from 'ajv/dist/2020.js';
 
-import type { MemoryRecord, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
+import type { MemoryRecord, ProbeReport, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
 
 const utf8 = new TextEncoder();
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -137,6 +137,19 @@ const nativeScope = (value: unknown, field: string) => {
   choice(item.scope, ['global', 'project'], `${field}.scope`);
   if (project) { id(item.projectId, `${field}.projectId`); native(item.root, `${field}.root`); }
 };
+
+export const assertProbeReport = (value: unknown): asserts value is ProbeReport => {
+  const item = object(value, ['executable', 'executableSha256', 'harnessVersion', 'installationMethod', 'configRoots', 'activeProfile', 'policyConflicts', 'capability'], 'probeReport');
+  if (item.executable !== null) native(item.executable, 'probeReport.executable');
+  if (item.executableSha256 !== null) sha(item.executableSha256, 'probeReport.executableSha256');
+  if (item.harnessVersion !== null) text(item.harnessVersion, adapterTextLimit, 'probeReport.harnessVersion');
+  if (item.activeProfile !== null) text(item.activeProfile, adapterTextLimit, 'probeReport.activeProfile');
+  choice(item.installationMethod, ['bundled', 'package_manager', 'manual', 'unknown'], 'probeReport.installationMethod');
+  choice(item.capability, ['full', 'import_only', 'blocked', 'missing'], 'probeReport.capability');
+  for (const value of list(item.configRoots, adapterCollectionLimit, 'probeReport.configRoots')) native(value, 'probeReport.configRoots');
+  for (const value of list(item.policyConflicts, adapterCollectionLimit, 'probeReport.policyConflicts')) text(value, adapterTextLimit, 'probeReport.policyConflicts');
+};
+
 const dependency = (value: unknown, field: string) => {
   const item = object(value, ['name', 'version', 'digest', 'immutableSourceRef'], field);
   text(item.name, 512, `${field}.name`); text(item.version, 512, `${field}.version`); sha(item.digest, `${field}.digest`); text(item.immutableSourceRef, 1024 * 1024, `${field}.immutableSourceRef`);

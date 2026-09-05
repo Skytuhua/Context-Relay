@@ -27,8 +27,9 @@ use context_relay_native_runner::{
     RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand, SidecarId,
 };
 use context_relay_protocol::{
-    ClientError, DeviceId, ErrorCode, HarnessId, HarnessParams, HybridLogicalClock, NativePlatform,
-    NativeScope, PlanId, PlanParams, ProjectId, SetupPlan, Sha256Digest, WireNativeValue,
+    ClientError, DeviceId, ErrorCode, HarnessAdapter as _, HarnessId, HarnessParams,
+    HybridLogicalClock, NativePlatform, NativeScope, PlanId, PlanParams, ProbeContext, ProbeReport,
+    ProjectId, SetupPlan, Sha256Digest, WireNativeValue,
 };
 
 #[cfg(not(windows))]
@@ -43,6 +44,15 @@ pub(crate) const NON_LAUNCHING_WINDOWS_SID: &str = "S-1-15-2-1-2-3-4-5-6-7";
 /// protocol DTOs; callers cannot inject paths, digests, commands, or plan
 /// bodies into apply and rollback.
 pub trait BridgeInstallEngine: Send + Sync {
+    fn probe(
+        &self,
+        _vault: &Vault,
+        _device_id: DeviceId,
+        _params: HarnessParams,
+    ) -> Result<ProbeReport, ClientError> {
+        Err(unsupported("Harness discovery is unavailable"))
+    }
+
     fn reconcile_after_native_recovery(
         &self,
         vault: &mut Vault,
@@ -132,6 +142,49 @@ impl ProductionBridgeInstallEngine {
 }
 
 impl BridgeInstallEngine for ProductionBridgeInstallEngine {
+    fn probe(
+        &self,
+        vault: &Vault,
+        device_id: DeviceId,
+        params: HarnessParams,
+    ) -> Result<ProbeReport, ClientError> {
+        let binding = project_binding(vault, params.project_id)?;
+        let observed_hlc = HybridLogicalClock::new(now_ms()?, 0, device_id);
+        let context = ProbeContext {
+            harness: params.harness,
+            requested_profile: params.hermes_profile.clone(),
+        };
+        match params.harness {
+            HarnessId::ClaudeCode => ClaudeCodeAdapter::discover(
+                &binding.root,
+                binding.project_id,
+                device_id,
+                observed_hlc,
+            )
+            .and_then(|adapter| adapter.probe(&context)),
+            HarnessId::Codex => CodexAdapter::discover(
+                &binding.root,
+                &binding.root,
+                binding.project_id,
+                device_id,
+                observed_hlc,
+            )
+            .and_then(|adapter| adapter.probe(&context)),
+            HarnessId::Hermes => HermesAdapter::discover(
+                &binding.root,
+                &binding.root,
+                params
+                    .hermes_profile
+                    .as_deref()
+                    .ok_or_else(|| invalid("Hermes discovery requires an explicit profile"))?,
+                binding.project_id,
+                device_id,
+                observed_hlc,
+            )
+            .and_then(|adapter| adapter.probe(&context)),
+        }
+    }
+
     fn reconcile_after_native_recovery(
         &self,
         vault: &mut Vault,

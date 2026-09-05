@@ -980,13 +980,13 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         | LocalRequest::AccountDeletionCancel(_)) => {
             RoutedRequest::Work(VaultCommand::Workspace(request))
         }
-        request @ (LocalRequest::HarnessPreview(_)
+        request @ (LocalRequest::HarnessProbe(_)
+        | LocalRequest::HarnessPreview(_)
         | LocalRequest::HarnessApply(_)
         | LocalRequest::HarnessRollback(_)) => {
             RoutedRequest::Work(VaultCommand::HarnessSetup(request))
         }
-        LocalRequest::HarnessProbe(_)
-        | LocalRequest::HarnessRepair(_)
+        LocalRequest::HarnessRepair(_)
         | LocalRequest::PackageImport(_)
         | LocalRequest::PackageExport(_) => RoutedRequest::Immediate(Err(unsupported_error(
             "The requested local adapter operation is not supported",
@@ -1540,6 +1540,10 @@ fn execute_harness_setup(
     request: LocalRequest,
 ) -> Result<LocalResult, ClientError> {
     match request {
+        LocalRequest::HarnessProbe(params) => state
+            .bridge_install
+            .probe(&state.vault, state.device_id, params)
+            .map(|report| LocalResult::Probe { report }),
         LocalRequest::HarnessPreview(params) => state
             .bridge_install
             .preview(&mut state.vault, &state.vault_path, state.device_id, params)

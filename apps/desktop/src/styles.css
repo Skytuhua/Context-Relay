@@ -132,8 +132,8 @@ button {
   font-weight: 700;
 }
 
-:where(a, button, input, select, textarea):focus-visible,
-h1:focus {
+:where(a, button, input, select, textarea, summary):focus-visible,
+h1:focus-visible {
   outline: 3px solid var(--color-primary-strong);
   outline-offset: 3px;
 }
@@ -169,9 +169,7 @@ h1:focus {
 .screen-content,
 .deferred-state {
   max-width: 52rem;
-  border: 1px solid var(--color-surface-strong);
-  border-radius: 12px;
-  padding: 1.5rem;
+  padding: 0;
 }
 
 .screen-content h2,
@@ -290,6 +288,7 @@ dialog > :last-child {
 }
 
 .field input,
+.field select,
 .field textarea {
   width: 100%;
   min-height: 44px;
@@ -301,11 +300,12 @@ dialog > :last-child {
 }
 
 .field textarea {
-  min-height: 10rem;
+  min-height: 7rem;
   resize: vertical;
 }
 
 .field input:hover,
+.field select:hover,
 .field textarea:hover {
   border-color: var(--color-muted);
 }
@@ -363,6 +363,60 @@ dialog > :last-child {
 
 .secondary-action:hover {
   background: var(--color-surface);
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--color-muted);
+  opacity: 1;
+}
+
+.next-steps {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2rem;
+  margin: 2rem 0;
+}
+
+.next-steps > div {
+  border-top: 2px solid var(--color-surface-strong);
+  padding-top: 1rem;
+}
+
+.next-steps h3 {
+  margin: 0;
+  font-size: 1.125rem;
+}
+
+.next-steps p,
+.help-text,
+.empty-message {
+  color: var(--color-muted);
+}
+
+.workspace-status {
+  margin-top: 2.5rem;
+  color: var(--color-primary-strong);
+  font-weight: 650;
+}
+
+.project-switcher {
+  margin-top: 1.25rem;
+  max-width: 24rem;
+}
+
+.inline-form {
+  flex-wrap: wrap;
+}
+
+.inline-form input {
+  min-width: 0;
+  flex: 1 1 12rem;
 }
 
 .security-facts {
@@ -635,8 +689,10 @@ dialog p {
 
   .screen-content,
   .deferred-state {
-    padding: 1.25rem;
+    padding: 0;
   }
+
+  .next-steps { grid-template-columns: minmax(0, 1fr); }
 
   .security-facts > div {
     grid-template-columns: minmax(0, 1fr);

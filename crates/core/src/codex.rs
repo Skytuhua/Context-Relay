@@ -372,11 +372,23 @@ impl CodexAdapter {
         };
         let executable =
             find_executable(&home).ok_or_else(|| not_found("Codex executable was not found"))?;
-        let (executable_snapshot, version) =
-            discover_executable_version(&executable, &working_directory)?;
+        let installation_method = installation_method(&executable);
+        #[cfg(windows)]
+        let (executable, expected_standalone_version) = resolve_windows_standalone_candidate(
+            &executable,
+            &home,
+            env::var_os("LOCALAPPDATA").as_deref().map(Path::new),
+        )?;
+        #[cfg(not(windows))]
+        let expected_standalone_version: Option<String> = None;
+        let (executable_snapshot, version) = discover_executable_version(
+            &executable,
+            &working_directory,
+            expected_standalone_version.as_deref(),
+        )?;
         Self::from_discovered_layout_after_version(
             CodexLayout {
-                installation_method: installation_method(&executable),
+                installation_method,
                 executable,
                 executable_kind: CodexExecutableKind::Unknown,
                 version: String::new(),
@@ -2868,8 +2880,7 @@ fn parse_managed_mcp_get_json(
     if transport.get("type").and_then(Value::as_str) != Some("stdio")
         || !transport
             .get("env")
-            .and_then(Value::as_object)
-            .is_some_and(Map::is_empty)
+            .is_some_and(|env| env.is_null() || env.as_object().is_some_and(Map::is_empty))
         || !transport
             .get("env_vars")
             .and_then(Value::as_array)
@@ -3014,6 +3025,16 @@ fn normalize_live_mcp(object: &Map<String, Value>) -> Result<Value, ClientError>
         if let Some(value) = object.get(key) {
             declaration.insert(key.into(), value.clone());
         }
+    }
+    if let Some(transport) = declaration
+        .get_mut("transport")
+        .and_then(Value::as_object_mut)
+        && transport.get("type").and_then(Value::as_str) == Some("stdio")
+        && transport.get("env").is_some_and(Value::is_null)
+    {
+        // Codex CLI emits null for an omitted stdio env table. Its effective
+        // declaration is the same empty map produced by config normalization.
+        transport.insert("env".into(), Value::Object(Map::new()));
     }
     Ok(redact_sensitive(Value::Object(declaration)))
 }
@@ -3202,11 +3223,12 @@ fn parse_mcp_transport(transport: &Map<String, Value>) -> Result<(), ClientError
                     .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
                 false,
             )?;
-            parse_string_map(
-                transport
-                    .get("env")
-                    .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
-            )?;
+            let environment = transport
+                .get("env")
+                .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+            if !environment.is_null() {
+                parse_string_map(environment)?;
+            }
             parse_string_array(
                 transport
                     .get("env_vars")
@@ -4251,13 +4273,20 @@ fn hash_file(path: &Path) -> std::io::Result<Sha256Digest> {
 fn discover_executable_version(
     executable: &Path,
     working_directory: &Path,
+    expected_standalone_version: Option<&str>,
 ) -> Result<(CodexExecutableSnapshot, String), ClientError> {
-    discover_executable_version_after_snapshot(executable, working_directory, || {})
+    discover_executable_version_after_snapshot(
+        executable,
+        working_directory,
+        expected_standalone_version,
+        || {},
+    )
 }
 
 fn discover_executable_version_after_snapshot(
     executable: &Path,
     working_directory: &Path,
+    expected_standalone_version: Option<&str>,
     after_snapshot: impl FnOnce(),
 ) -> Result<(CodexExecutableSnapshot, String), ClientError> {
     let snapshot = snapshot_executable(executable)?;
@@ -4276,6 +4305,11 @@ fn discover_executable_version_after_snapshot(
         // unclassified candidate merely to obtain its version.
         "0.0.0".to_owned()
     };
+    if expected_standalone_version.is_some_and(|expected| expected != version) {
+        return Err(unsupported(
+            "Codex standalone release version does not match",
+        ));
+    }
     if snapshot_executable(executable)? != snapshot {
         return Err(client_error(
             ErrorCode::Conflict,
@@ -4475,6 +4509,114 @@ fn find_executable(home: &Path) -> Option<PathBuf> {
         cfg!(windows),
     ));
     candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+#[cfg(windows)]
+fn resolve_windows_standalone_candidate(
+    candidate: &Path,
+    home: &Path,
+    local_app_data: Option<&Path>,
+) -> Result<(PathBuf, Option<String>), ClientError> {
+    let unchanged = || Ok((candidate.to_path_buf(), None));
+    let Some(candidate_path) = lexical_windows_disk_path(candidate) else {
+        return unchanged();
+    };
+    let Some(home) = lexical_windows_disk_path(home) else {
+        return unchanged();
+    };
+    let standalone = home.join(".codex/packages/standalone");
+    let current = standalone.join("current");
+    let current_bin = current.join("bin");
+    let programs_bin = local_app_data
+        .and_then(lexical_windows_disk_path)
+        .map(|local| local.join("Programs/OpenAI/Codex/bin"));
+    let is_programs_alias = programs_bin
+        .as_ref()
+        .is_some_and(|bin| candidate_path == bin.join("codex.exe"));
+    if !is_programs_alias && candidate_path != current_bin.join("codex.exe") {
+        return unchanged();
+    }
+    let alias = if is_programs_alias {
+        programs_bin.as_ref().expect("recognized Programs alias")
+    } else {
+        &current
+    };
+    let metadata = fs::symlink_metadata(alias)
+        .map_err(|_| invalid("Codex standalone alias is unavailable"))?;
+    if !is_link_or_reparse_point(&metadata) {
+        return unchanged();
+    }
+
+    // Resolve only the installer's two documented aliases. Never canonicalize
+    // an arbitrary PATH entry or the expected releases root: that would hide
+    // unapproved reparse points from the physical executable topology checks.
+    let _alias_topology = open_codex_path_topology(alias)
+        .map_err(|_| invalid("Codex standalone alias topology is unsafe"))?;
+    let releases = standalone.join("releases");
+    // The synthetic final component makes the topology include releases itself.
+    let _release_topology = open_codex_path_topology(&releases.join("codex.exe"))
+        .map_err(|_| invalid("Codex standalone release topology is unsafe"))?;
+    let read_target = |path: &Path| {
+        fs::read_link(path)
+            .ok()
+            .and_then(|target| lexical_windows_disk_path(&target))
+            .ok_or_else(|| invalid("Codex standalone alias target is unsafe"))
+    };
+    if is_programs_alias && read_target(alias)? != current_bin {
+        return Err(invalid("Codex standalone alias target is unexpected"));
+    }
+    let release = read_target(&current)?;
+    let tail = release
+        .strip_prefix(&releases)
+        .map_err(|_| invalid("Codex standalone release is outside its root"))?;
+    let mut components = tail.components();
+    let Some(std::path::Component::Normal(directory)) = components.next() else {
+        return Err(invalid("Codex standalone release path is invalid"));
+    };
+    if components.next().is_some() {
+        return Err(invalid("Codex standalone release path is invalid"));
+    }
+    let target = match std::env::consts::ARCH {
+        "x86_64" => "-x86_64-pc-windows-msvc",
+        "aarch64" => "-aarch64-pc-windows-msvc",
+        _ => return Err(unsupported("Codex standalone architecture is unsupported")),
+    };
+    let version = directory
+        .to_str()
+        .and_then(|directory| directory.strip_suffix(target))
+        .filter(|version| valid_version(version))
+        .ok_or_else(|| invalid("Codex standalone release directory is invalid"))?;
+    let executable = release.join("bin/codex.exe");
+    let _physical_topology = open_codex_path_topology(&executable)
+        .map_err(|_| invalid("Codex standalone executable topology is unsafe"))?;
+    // Persist this physical path. Retargeting either alias after this point
+    // cannot change which release is snapshotted, probed, or later launched.
+    Ok((executable, Some(version.to_owned())))
+}
+
+#[cfg(windows)]
+fn lexical_windows_disk_path(path: &Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Component::Prefix(prefix) = components.next()? else {
+        return None;
+    };
+    let drive = match prefix.kind() {
+        Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+        _ => return None,
+    };
+    if components.next()? != Component::RootDir {
+        return None;
+    }
+    let mut normalized = PathBuf::from(format!("{}:\\", char::from(drive.to_ascii_uppercase())));
+    for component in components {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        normalized.push(name);
+    }
+    Some(normalized)
 }
 fn platform_candidates(home: &Path, local_app_data: Option<&Path>, windows: bool) -> Vec<PathBuf> {
     if windows {
@@ -5161,7 +5303,7 @@ mod tests {
         let sentinel = root.join("wrapper-ran");
         fs::write(&executable, b"\x7fELFnative executable").unwrap();
 
-        let result = discover_executable_version_after_snapshot(&executable, &root, || {
+        let result = discover_executable_version_after_snapshot(&executable, &root, None, || {
             fs::write(
                 &executable,
                 format!(
@@ -5247,6 +5389,18 @@ mod tests {
         ));
         assert!(!sentinel_exists);
     }
+    #[test]
+    fn observed_stdio_null_environment_normalizes_to_no_overrides() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/codex-0.144.6-mcp.json")).unwrap();
+        let declaration = parse_mcp_get_json(
+            &serde_json::to_vec(&fixture["mcpGetJson"]).unwrap(),
+            "context-relay",
+        )
+        .unwrap();
+        assert_eq!(declaration["transport"]["env"], serde_json::json!({}));
+    }
+
     #[test]
     fn frozen_release_outputs_match_reviewed_json_contracts() {
         for source in [
@@ -5521,5 +5675,311 @@ mod tests {
                 PathBuf::from("C:/Users/test/AppData/Local/Programs/ChatGPT/resources/codex.exe")
             ]
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod standalone_discovery_tests {
+    use super::*;
+    use std::{os::windows::process::CommandExt, sync::OnceLock};
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    const TARGET: &str = if cfg!(target_arch = "aarch64") {
+        "aarch64-pc-windows-msvc"
+    } else {
+        "x86_64-pc-windows-msvc"
+    };
+
+    struct Standalone {
+        _root: tempfile::TempDir,
+        home: PathBuf,
+        local: PathBuf,
+        releases: PathBuf,
+        current: PathBuf,
+        alias: PathBuf,
+        original: PathBuf,
+        replacement: PathBuf,
+    }
+
+    fn native_probe() -> &'static [u8] {
+        static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+        BYTES.get_or_init(|| {
+            let build = tempfile::tempdir().unwrap();
+            let binary = build.path().join("probe.exe");
+            let output = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+                .arg("--edition=2024")
+                .arg(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/codex-native-discovery-probe.rs"),
+                )
+                .arg("-o")
+                .arg(&binary)
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "native fixture failed to build: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fs::read(binary).unwrap()
+        })
+    }
+
+    fn junction(link: &Path, target: &Path) {
+        let output = Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link.to_str().unwrap().replace('/', "\\"))
+            .arg(target.to_str().unwrap().replace('/', "\\"))
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "mandatory junction fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    impl Standalone {
+        fn new() -> Self {
+            let root = tempfile::Builder::new()
+                .prefix("context-relay-standalone-")
+                .tempdir()
+                .unwrap();
+            let home = root.path().join("home");
+            let local = home.join("AppData/Local");
+            let base = home.join(".codex/packages/standalone");
+            let releases = base.join("releases");
+            let release = |version: &str| {
+                let bin = releases.join(format!("{version}-{TARGET}")).join("bin");
+                fs::create_dir_all(&bin).unwrap();
+                fs::write(bin.join("codex.exe"), native_probe()).unwrap();
+                fs::write(bin.join("version.txt"), version).unwrap();
+                bin.join("codex.exe")
+            };
+            let original = release("0.144.1");
+            let replacement = release("0.144.0");
+            let current = base.join("current");
+            junction(&current, original.parent().unwrap().parent().unwrap());
+            let alias_bin = local.join("Programs/OpenAI/Codex/bin");
+            fs::create_dir_all(alias_bin.parent().unwrap()).unwrap();
+            junction(&alias_bin, &current.join("bin"));
+            Self {
+                _root: root,
+                home,
+                local,
+                releases,
+                current,
+                alias: alias_bin.join("codex.exe"),
+                original,
+                replacement,
+            }
+        }
+
+        fn resolve(&self) -> Result<(PathBuf, Option<String>), ClientError> {
+            resolve_windows_standalone_candidate(&self.alias, &self.home, Some(&self.local))
+        }
+
+        fn retarget(&self, release: &Path) {
+            fs::remove_dir(&self.current).unwrap();
+            junction(&self.current, release);
+        }
+
+        fn adapter(
+            &self,
+            physical: PathBuf,
+            snapshot: CodexExecutableSnapshot,
+            version: String,
+        ) -> CodexAdapter {
+            let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
+            CodexAdapter::from_discovered_layout_after_version(
+                CodexLayout {
+                    executable: physical,
+                    executable_kind: CodexExecutableKind::Unknown,
+                    version: String::new(),
+                    installation_method: InstallationMethod::Manual,
+                    codex_home: self.home.join(".codex"),
+                    user_skills_dir: self.home.join(".agents/skills"),
+                    project_root: self.home.clone(),
+                    working_directory: self.home.clone(),
+                    requirements_paths: vec![],
+                },
+                ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073981").unwrap(),
+                device_id,
+                HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+                snapshot,
+                version,
+                || {},
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn standalone_alias_is_resolved_before_version_and_later_retargets_cannot_redirect_probe() {
+        for retarget_after_snapshot in [false, true] {
+            let fixture = Standalone::new();
+            let (physical, expected_version) = fixture.resolve().unwrap();
+            assert_eq!(physical, fixture.original);
+            assert_eq!(expected_version.as_deref(), Some("0.144.1"));
+            let replacement_release = fixture.replacement.parent().unwrap().parent().unwrap();
+            if !retarget_after_snapshot {
+                fixture.retarget(replacement_release);
+            }
+            let (snapshot, version) = discover_executable_version_after_snapshot(
+                &physical,
+                &fixture.home,
+                expected_version.as_deref(),
+                || {
+                    if retarget_after_snapshot {
+                        fixture.retarget(replacement_release);
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(version, "0.144.1");
+            assert!(physical.with_file_name("invoked").exists());
+            assert!(!fixture.replacement.with_file_name("invoked").exists());
+            let output =
+                run_bounded_command(&physical, &["--version"], snapshot.digest, &fixture.home)
+                    .unwrap();
+            assert_eq!(output, b"codex-cli 0.144.1\n");
+            assert!(!fixture.replacement.with_file_name("invoked").exists());
+        }
+    }
+
+    #[test]
+    fn standalone_resolution_rejects_outside_root_wrong_shape_target_and_nested_junctions() {
+        for mode in [
+            "outside",
+            "shape",
+            "target",
+            "nested",
+            "root-link",
+            "programs-target",
+        ] {
+            let fixture = Standalone::new();
+            match mode {
+                "outside" => fixture.retarget(fixture._root.path()),
+                "shape" => fixture.retarget(fixture.original.parent().unwrap()),
+                "target" => {
+                    let wrong = fixture.releases.join("0.144.1-wrong-target");
+                    fs::create_dir(&wrong).unwrap();
+                    fixture.retarget(&wrong);
+                }
+                "nested" => {
+                    let bin = fixture.original.parent().unwrap();
+                    let moved = bin.with_file_name("moved-bin");
+                    fs::rename(bin, &moved).unwrap();
+                    junction(bin, &moved);
+                }
+                "root-link" => {
+                    let moved = fixture.releases.with_file_name("moved-releases");
+                    fs::rename(&fixture.releases, &moved).unwrap();
+                    junction(&fixture.releases, &moved);
+                }
+                "programs-target" => {
+                    let alias_bin = fixture.alias.parent().unwrap();
+                    fs::remove_dir(alias_bin).unwrap();
+                    junction(alias_bin, fixture.replacement.parent().unwrap());
+                }
+                _ => unreachable!(),
+            }
+            assert!(fixture.resolve().is_err(), "accepted {mode}");
+            assert!(!fixture.replacement.with_file_name("invoked").exists());
+        }
+    }
+
+    #[test]
+    fn standalone_resolution_never_canonicalizes_an_arbitrary_path_alias() {
+        let fixture = Standalone::new();
+        let arbitrary = fixture._root.path().join("custom-bin");
+        junction(&arbitrary, fixture.original.parent().unwrap());
+        let candidate = arbitrary.join("codex.exe");
+        let (path, expected_version) =
+            resolve_windows_standalone_candidate(&candidate, &fixture.home, Some(&fixture.local))
+                .unwrap();
+        assert_eq!(path, candidate);
+        assert!(expected_version.is_none());
+        assert!(snapshot_executable(&path).is_err());
+    }
+
+    #[test]
+    fn standalone_current_alias_is_bound_to_the_expected_physical_release() {
+        let fixture = Standalone::new();
+        let (physical, expected_version) = resolve_windows_standalone_candidate(
+            &fixture.current.join("bin/codex.exe"),
+            &fixture.home,
+            None,
+        )
+        .unwrap();
+        assert_eq!(physical, fixture.original);
+        assert_eq!(expected_version.as_deref(), Some("0.144.1"));
+        let (_, version) =
+            discover_executable_version(&physical, &fixture.home, expected_version.as_deref())
+                .unwrap();
+        assert_eq!(version, "0.144.1");
+        assert!(!fixture.replacement.with_file_name("invoked").exists());
+    }
+
+    #[test]
+    fn constructed_standalone_adapter_stays_bound_after_alias_retargets() {
+        let fixture = Standalone::new();
+        let (physical, expected_version) = fixture.resolve().unwrap();
+        let (snapshot, version) =
+            discover_executable_version(&physical, &fixture.home, expected_version.as_deref())
+                .unwrap();
+        let adapter = fixture.adapter(physical, snapshot, version);
+        fixture.retarget(fixture.replacement.parent().unwrap().parent().unwrap());
+        let output = run_bounded_command(
+            &adapter.layout.executable,
+            &["--version"],
+            adapter.executable_hash,
+            &fixture.home,
+        )
+        .unwrap();
+        assert_eq!(output, b"codex-cli 0.144.1\n");
+        assert!(!fixture.replacement.with_file_name("invoked").exists());
+    }
+
+    #[test]
+    fn constructed_standalone_adapter_rejects_changed_binary_and_reparse_ancestor() {
+        for replace_ancestor in [false, true] {
+            let fixture = Standalone::new();
+            let (physical, expected_version) = fixture.resolve().unwrap();
+            let (snapshot, version) =
+                discover_executable_version(&physical, &fixture.home, expected_version.as_deref())
+                    .unwrap();
+            let adapter = fixture.adapter(physical, snapshot, version);
+            if replace_ancestor {
+                let bin = fixture.original.parent().unwrap();
+                fs::rename(bin, bin.with_file_name("retired-bin")).unwrap();
+                junction(bin, fixture.replacement.parent().unwrap());
+            } else {
+                let mut replacement = native_probe().to_vec();
+                replacement.extend_from_slice(b"changed executable digest");
+                fs::write(&fixture.original, replacement).unwrap();
+            }
+            assert!(
+                run_bounded_command(
+                    &adapter.layout.executable,
+                    &["--version"],
+                    adapter.executable_hash,
+                    &fixture.home
+                )
+                .is_err()
+            );
+            assert!(!fixture.replacement.with_file_name("invoked").exists());
+        }
+    }
+
+    #[test]
+    fn standalone_release_directory_must_match_the_native_version() {
+        let fixture = Standalone::new();
+        fs::write(fixture.original.with_file_name("version.txt"), "0.144.0").unwrap();
+        let result = discover_executable_version(&fixture.original, &fixture.home, Some("0.144.1"));
+        assert!(result.is_err());
     }
 }
