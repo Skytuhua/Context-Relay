@@ -20,6 +20,7 @@ use context_relay_core::{
         engine::{BoundaryError, NativeAdapter, NativeFileSystem},
         filesystem::OsNativeTransactionFileSystem,
     },
+    setup::BridgePreviewHarness,
 };
 use context_relay_native_runner::NativeState;
 use context_relay_protocol::{
@@ -1122,6 +1123,293 @@ fn native_memory_disable_rolls_back_true_false_and_absent_claude_values_exactly(
         native.restore_matching_applied_targets(&nonce).unwrap();
         assert_eq!(fs::read(&settings_path).unwrap(), before);
     }
+}
+
+#[test]
+fn native_memory_claude_reads_user_project_and_local_directory_precedence() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let user = fixture.root.join("custom claude config/settings.json");
+    let project = fixture.adapter.project_settings_path();
+    let local = project.with_file_name("settings.local.json");
+    fs::write(&user, br#"{"autoMemoryDirectory":"~/user memory"}"#).unwrap();
+    fs::write(&project, b"{}").unwrap();
+    for (path, body, expected) in [
+        (&project, "{}", "user memory"),
+        (
+            &project,
+            r#"{"autoMemoryDirectory":"~/project memory"}"#,
+            "project memory",
+        ),
+        (
+            &local,
+            r#"{"autoMemoryDirectory":"~/local memory"}"#,
+            "local memory",
+        ),
+    ] {
+        fs::write(path, body).unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        let expected = fixture.root.join(expected).join("MEMORY.md");
+        assert_eq!(capabilities.sources[0].path, test_wire_path(&expected));
+    }
+}
+
+#[test]
+fn native_memory_claude_disables_the_local_override_and_rolls_it_back_exactly() {
+    for enabled in [true, false] {
+        let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        let project = fixture.adapter.project_settings_path();
+        let project_before = fs::read(&project).unwrap();
+        let local = project.with_file_name("settings.local.json");
+        let before = format!("{{\n  \"autoMemoryEnabled\": {enabled}, \"unmanaged\": [1, 2]\n}}\n");
+        fs::write(&local, &before).unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+            panic!("local override must be supported");
+        };
+        assert_eq!(mutations.len(), usize::from(enabled));
+        if enabled {
+            assert_eq!(mutations[0].target, test_wire_path(&local));
+            let nonce = [86; 16];
+            let mut native = OsNativeTransactionFileSystem::new(nonce);
+            let images = native.create_before_images(&mutations).unwrap();
+            native.record_native_metadata(&images).unwrap();
+            native.compare_and_swap_targets(&mutations).unwrap();
+            native.apply_mutation(&nonce, &mutations[0]).unwrap();
+            let after: Value = serde_json::from_slice(&fs::read(&local).unwrap()).unwrap();
+            assert_eq!(
+                after,
+                json!({"autoMemoryEnabled": false, "unmanaged": [1, 2]})
+            );
+            native.restore_matching_applied_targets(&nonce).unwrap();
+        }
+        assert_eq!(fs::read(&local).unwrap(), before.as_bytes());
+        assert_eq!(fs::read(&project).unwrap(), project_before);
+    }
+}
+
+#[test]
+fn native_memory_claude_rejects_ambiguous_or_non_file_settings_layers() {
+    for layer in [
+        "custom claude config/settings.json",
+        "project with spaces/.claude/settings.local.json",
+        "managed-settings.json",
+    ] {
+        for body in [
+            r#"{"autoMemoryEnabled":true,"autoMemoryEnabled":false}"#,
+            "[]",
+        ] {
+            let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+            let path = fixture.root.join(layer);
+            fs::write(&path, body).unwrap();
+            let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+            assert!(
+                matches!(capabilities.disable, NativeMemoryDisable::Unavailable),
+                "{layer}: {body}"
+            );
+            assert!(capabilities.sources.is_empty());
+        }
+        let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        let path = fixture.root.join(layer);
+        if path.is_file() {
+            fs::remove_file(&path).unwrap();
+        }
+        fs::create_dir(&path).unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        assert!(
+            matches!(capabilities.disable, NativeMemoryDisable::Unavailable),
+            "{layer}"
+        );
+    }
+}
+
+fn claude_memory_plan(fixture: &Fixture) -> NativeTransactionPlan {
+    let executable = fixture.root.join(if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    });
+    let mut plan = native_digest_plan(
+        &executable,
+        Sha256Digest(Sha256::digest(fs::read(&executable).unwrap()).into()),
+    );
+    plan.setup
+        .expected_native_digests
+        .extend(fixture.adapter.bridge_operational_digests().unwrap());
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    plan.native_memory_registrations = capabilities
+        .sources
+        .into_iter()
+        .map(
+            |source| context_relay_core::native_memory::NativeMemoryRegistration {
+                source,
+                last_applied_digest: None,
+            },
+        )
+        .collect();
+    if let NativeMemoryDisable::Supported(mutations) = capabilities.disable {
+        plan.mutations = mutations;
+    }
+    plan
+}
+
+#[test]
+fn native_memory_claude_rechecks_new_local_overrides_and_managed_changes() {
+    for (layer, body) in [
+        (
+            "project with spaces/.claude/settings.local.json",
+            r#"{"autoMemoryEnabled":true}"#,
+        ),
+        (
+            "custom claude config/settings.json",
+            r#"{"autoMemoryDirectory":"~/changed memory"}"#,
+        ),
+        ("managed-settings.json", r#"{"autoMemoryEnabled":true}"#),
+    ] {
+        let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        let plan = claude_memory_plan(&fixture);
+        NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).unwrap();
+        let before = fs::read(fixture.adapter.project_settings_path()).unwrap();
+        fs::write(fixture.root.join(layer), body).unwrap();
+        assert!(
+            NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).is_err(),
+            "{layer}"
+        );
+        assert!(
+            NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, &plan).is_err(),
+            "{layer}"
+        );
+        assert_eq!(
+            fs::read(fixture.adapter.project_settings_path()).unwrap(),
+            before
+        );
+    }
+}
+
+fn memory_receipt(plan: &NativeTransactionPlan) -> context_relay_protocol::ApplyReceipt {
+    context_relay_protocol::ApplyReceipt {
+        plan_id: plan.setup.plan_id,
+        applied_hlc: HybridLogicalClock::new(
+            1_900_000_000_001,
+            0,
+            DeviceId::from_str(DEVICE_ID).unwrap(),
+        ),
+        resulting_digests: plan
+            .mutations
+            .iter()
+            .map(|mutation| mutation.intended.0)
+            .collect(),
+    }
+}
+
+#[test]
+fn native_memory_claude_verifies_intermediate_forward_and_inverse_settings() {
+    for local_override in [false, true] {
+        let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        if local_override {
+            fs::write(
+                fixture
+                    .adapter
+                    .project_settings_path()
+                    .with_file_name("settings.local.json"),
+                br#"{"autoMemoryEnabled":true}"#,
+            )
+            .unwrap();
+        }
+        let mut plan = claude_memory_plan(&fixture);
+        let bridge = executable_bridge(&fixture, "memory bridge", b"fixture bridge");
+        let hooks = fixture
+            .adapter
+            .plan_native_global_settings(&DesiredState {
+                components: managed_memory_hooks(HarnessId::ClaudeCode, &test_wire_path(&bridge))
+                    .unwrap(),
+                scopes: vec![NativeScope::Global],
+            })
+            .unwrap();
+        plan.mutations.insert(0, hooks);
+        let before: Vec<_> = plan
+            .mutations
+            .iter()
+            .map(|mutation| {
+                // Fixture paths all have display strings; production uses wire bytes.
+                let path = Path::new(mutation.target.display.as_ref().unwrap());
+                context_relay_native_runner::OsNativeFileSystem::new()
+                    .snapshot(path)
+                    .unwrap()
+                    .state()
+                    .encode_v1()
+                    .unwrap()
+            })
+            .collect();
+        let receipt = memory_receipt(&plan);
+        NativeAdapter::compare_approved_digests(&mut fixture.adapter, &plan).unwrap();
+        assert!(NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &receipt).is_err());
+        let nonce = [88; 16];
+        let mut native = OsNativeTransactionFileSystem::new(nonce);
+        let images = native.create_before_images(&plan.mutations).unwrap();
+        native.record_native_metadata(&images).unwrap();
+        native.compare_and_swap_targets(&plan.mutations).unwrap();
+        for mutation in &plan.mutations {
+            NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, &plan).unwrap();
+            native.apply_mutation(&nonce, mutation).unwrap();
+        }
+        NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &receipt).unwrap();
+        let mut inverse = plan.clone();
+        for (mutation, prior) in inverse.mutations.iter_mut().zip(&before) {
+            std::mem::swap(&mut mutation.expected, &mut mutation.intended);
+            mutation.content.clone_from(prior);
+        }
+        NativeAdapter::reprobe_live_state(&mut fixture.adapter, &inverse).unwrap();
+        NativeAdapter::compare_approved_digests(&mut fixture.adapter, &inverse).unwrap();
+        native.restore_matching_applied_targets(&nonce).unwrap();
+        assert!(NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &receipt).is_err());
+        NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, &inverse).unwrap();
+        NativeAdapter::validate_effective(
+            &mut fixture.adapter,
+            &inverse,
+            &memory_receipt(&inverse),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn native_memory_claude_preserves_watch_only_and_rejects_unbound_legacy_plans() {
+    let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    fs::write(
+        fixture.root.join("managed-settings.json"),
+        br#"{"autoMemoryEnabled":true}"#,
+    )
+    .unwrap();
+    let plan = claude_memory_plan(&fixture);
+    assert!(plan.mutations.is_empty());
+    NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).unwrap();
+    NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &memory_receipt(&plan)).unwrap();
+    let mut unbound = plan.clone();
+    unbound.setup.expected_native_digests.truncate(1);
+    assert!(NativeAdapter::reprobe_live_state(&mut fixture.adapter, &unbound).is_err());
+    fs::write(fixture.root.join("managed-settings.json"), b"{}").unwrap();
+    assert!(
+        NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &memory_receipt(&plan))
+            .is_err()
+    );
+}
+
+#[test]
+fn native_memory_claude_keeps_the_same_binding_when_the_directory_is_created() {
+    let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    fs::write(
+        fixture.adapter.project_settings_path(),
+        br#"{"autoMemoryDirectory":"~/new memory/topics"}"#,
+    )
+    .unwrap();
+    let plan = claude_memory_plan(&fixture);
+    fs::create_dir_all(fixture.root.join("new memory/topics")).unwrap();
+    NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).unwrap();
+    let current = fixture.adapter.native_memory_capabilities().unwrap();
+    assert_eq!(
+        current.sources[0],
+        plan.native_memory_registrations[0].source
+    );
 }
 
 #[test]

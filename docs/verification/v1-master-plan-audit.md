@@ -97,3 +97,12 @@ bindings; POSIX symlink execution still needs CI. Local checks pass 100 core,
 51 Claude adapter and 11 primary-memory tests. The [Claude evidence](claude-native-mcp-2026-09-06.md)
 keeps effective settings precedence, default repository/worktree selection and
 full native/installed connection acceptance open; T10/T14/T20 are not completed.
+
+2026-09-06 file-settings update: Claude now reads user/project/local memory
+settings, targets effective local overrides and seals/rechecks file dependencies
+through Full setup and undo. Windows missing-root identity and recovery metadata
+template regressions are corrected. Local checks pass 100 core, 58 Claude adapter
+and 11 primary-memory tests. The [Claude evidence](claude-native-mcp-2026-09-06.md)
+retains ImportOnly registration revalidation, runtime trust/flags/environment,
+other managed sources, repository/worktree defaults and full installed
+qualification as open. T10/T14/T20 remain incomplete and the installer is unchanged.

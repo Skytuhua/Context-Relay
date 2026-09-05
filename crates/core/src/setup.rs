@@ -350,6 +350,10 @@ pub trait BridgePreviewHarness: HarnessAdapter {
 }
 
 impl BridgePreviewHarness for ClaudeCodeAdapter {
+    fn bridge_operational_digests(&self) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
+        self.memory_settings_digests()
+    }
+
     fn bridge_harness(&self) -> HarnessId {
         HarnessId::ClaudeCode
     }

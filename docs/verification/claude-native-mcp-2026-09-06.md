@@ -364,3 +364,56 @@ settings, repository/worktree default selection, source revalidation, full nativ
 setup or installed acceptance. No Full support was enabled. The existing
 11d6740 installer predates this source correction. The earlier macOS recovery
 fixture (5d92f4f) has since passed hosted CI33989730248.
+
+## File settings precedence and transaction revalidation
+
+Claude memory inspection now includes the selected configuration's user
+settings, project settings and `settings.local.json`, in that priority order.
+The pinned artifact's settings loader (`aUn`/`pOt`) and memory selector (`EQd`)
+were inspected without starting the harness. A local `autoMemoryEnabled` value
+selects the local file as the disable target; changing only the project file
+would otherwise leave the local override active. Unrelated values and exact
+original bytes are preserved through rollback. Existing managed-file memory
+settings still produce watch-only capability and are never written.
+
+Every inspected layer uses the bounded, unique-key JSON reader and ancestor
+checks also used for native MCP configuration. Full setup seals user, project,
+local and configured managed-file dependencies, including absent files. It
+rechecks these dependencies and the exact memory sources before writing,
+between writes and during final validation. A newly added local override or
+changed managed setting invalidates the reviewed plan. Files modified by the
+plan use exact restorable fingerprints so global hook updates and inverse
+transactions can pass through their two reviewed states. Legacy Full plans
+without these dependencies require a new preview. ImportOnly registration-only
+plans still use the pre-existing registration path; their preview-to-apply
+settings revalidation remains open.
+
+Review also reproduced an absent-to-present Windows directory spelling change.
+Missing roots now bind through their nearest canonical existing ancestor, so
+creating the same memory folder retains its descriptor and source ID. The
+expanded recovery matrix found that undo-to-absence could select an adjacent
+transaction backup as a metadata template. Reserved `.context-relay-*` files
+are now excluded from template selection.
+
+Four settings regressions and the Windows directory-creation regression were
+observed failing before their fixes. Local validation passes 100 ordinary core
+tests (two real-runtime tests remain opt-in), 58 Claude adapter tests and 11
+primary-memory setup tests. Coverage includes local true/false overrides,
+directory precedence, ambiguous/non-file layers, drift, global hook writes,
+intermediate checks, watch-only Full transactions, legacy plans, exact undo and
+recovery after commit. Logs are `claude-memory-settings-*.log` in the local
+evidence directory.
+
+Core/daemon all-target test-support Clippy passes with warnings denied;
+independent review approved the settings patch and its two follow-up fixes.
+`graphify update .` completed (15,031 nodes, 43,263 edges). Hosted CI33992307102
+has now passed the preceding configured-directory source's macOS Rust tests,
+including its POSIX path regressions; the current settings patch has only been
+run locally on Windows so far.
+
+This is a file-layer correction, not complete effective-runtime qualification.
+Interactive trust, launch flags and environment, managed drop-ins/registry,
+repository/worktree defaults, native Stop events and full real setup/recovery
+remain open. No additional version was enabled. The existing unsigned installer
+from source 11d6740 does not include this change or the preceding configured-path
+correction; it has not been installed or tested through native desktop control.

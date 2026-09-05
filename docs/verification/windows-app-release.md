@@ -366,3 +366,13 @@ Ancestor validation also protects memory directory inspection. Local core,
 adapter and setup regressions pass; the [Claude evidence](claude-native-mcp-2026-09-06.md)
 records exact scope and pending POSIX/runtime checks. The 11d6740 installer above
 does not include this subsequent source change. Full connection remains open.
+
+Claude file-layer inspection now respects user, project and local memory
+settings. Local overrides are disabled in the file that actually controls them.
+Full setup binds settings dependencies and revalidates them during apply and
+undo; missing memory folders retain stable Windows source IDs when created.
+Local checks pass 100 core, 58 Claude adapter and 11 primary-memory setup tests,
+including the recovery/undo-to-absence case. The [Claude evidence](claude-native-mcp-2026-09-06.md)
+records the boundaries: ImportOnly registration revalidation, runtime
+flags/environment/trust, other managed sources and full installed acceptance
+remain open. The 11d6740 installer also predates this source-only correction.

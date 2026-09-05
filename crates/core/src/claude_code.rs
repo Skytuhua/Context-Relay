@@ -13,10 +13,10 @@ use context_relay_native_runner::{NativeState, OsNativeFileSystem};
 use context_relay_protocol::{
     ApplyReceipt, CapabilityLevel, ChangeClass, ClassifiedChanges, CliOperation, CliOperations,
     ClientError, ComponentKind, ComponentRecord, DesiredState, DeviceId, DiscoveredScopes,
-    ErrorCode, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest, ImportedState,
-    InstallationMethod, NativePlatform, NativeScope, ProbeContext, ProbeReport, ProjectId,
-    Provenance, RecordId, RenderedFile, RenderedState, ScopeRef, SemanticDiff, Sha256Digest,
-    ValidationReport, WireNativeValue,
+    ErrorCode, ExpectedNativeDigest, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest,
+    ImportedState, InstallationMethod, NativePlatform, NativeScope, ProbeContext, ProbeReport,
+    ProjectId, Provenance, RecordId, RenderedFile, RenderedState, ScopeRef, SemanticDiff,
+    Sha256Digest, ValidationReport, WireNativeValue,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -1001,7 +1001,16 @@ impl ClaudeCodeAdapter {
 
 impl NativeMemoryAdapter for ClaudeCodeAdapter {
     fn native_memory_capabilities(&self) -> Result<NativeMemoryCapabilities, ClientError> {
-        let path = self.project_settings_path();
+        let configuration = match self.effective_native_memory_settings() {
+            Ok(configuration) => configuration,
+            Err(_) => {
+                return Ok(NativeMemoryCapabilities {
+                    disable: NativeMemoryDisable::Unavailable,
+                    sources: vec![],
+                });
+            }
+        };
+        let path = configuration.disable_path;
         let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str());
         let snapshot = match OsNativeFileSystem::new().snapshot(&path) {
             Ok(snapshot) => Some(snapshot),
@@ -1019,9 +1028,12 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
         let (project_settings, metadata) = match snapshot.as_ref().map(|snapshot| snapshot.state())
         {
             Some(NativeState::RegularFile { bytes, metadata }) => {
-                let settings = match parse_object(bytes, "Claude Code settings are invalid") {
-                    Ok(settings) => settings,
-                    Err(_) => {
+                let settings = match mcp_state::parse_unique_json(bytes)
+                    .ok()
+                    .and_then(|value| value.as_object().cloned())
+                {
+                    Some(settings) if settings == configuration.disable_settings => settings,
+                    _ => {
                         return Ok(NativeMemoryCapabilities {
                             disable: NativeMemoryDisable::Unavailable,
                             sources: vec![],
@@ -1032,17 +1044,13 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
             }
             Some(NativeState::Absent { .. }) | None => (None, None),
         };
-        let (effective_settings, managed) =
-            match self.effective_native_memory_settings(project_settings.as_ref()) {
-                Ok(effective) => effective,
-                Err(_) => {
-                    return Ok(NativeMemoryCapabilities {
-                        disable: NativeMemoryDisable::Unavailable,
-                        sources: vec![],
-                    });
-                }
-            };
-        let Some(memory_root) = self.bound_native_memory_root(&effective_settings, supported)?
+        if project_settings.is_none() && !configuration.disable_settings.is_empty() {
+            return Err(invalid_request(
+                "Claude Code memory settings changed during inspection",
+            ));
+        }
+        let Some(memory_root) =
+            self.bound_native_memory_root(&configuration.effective, supported)?
         else {
             return Ok(NativeMemoryCapabilities {
                 disable: NativeMemoryDisable::Unavailable,
@@ -1050,7 +1058,7 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
             });
         };
         let sources = self.native_memory_sources(&memory_root)?;
-        if !supported || managed {
+        if !supported || configuration.managed {
             let capabilities = NativeMemoryCapabilities {
                 disable: NativeMemoryDisable::WatchOnly,
                 sources,
@@ -1219,23 +1227,28 @@ impl ClaudeCodeAdapter {
         Ok(sources)
     }
 
-    fn effective_native_memory_settings(
-        &self,
-        project_settings: Option<&Map<String, Value>>,
-    ) -> Result<(Map<String, Value>, bool), ()> {
-        let mut effective = project_settings.cloned().unwrap_or_default();
+    fn effective_native_memory_settings(&self) -> Result<EffectiveMemorySettings, ()> {
+        let project_path = self.project_settings_path();
+        let local_path = project_path.with_file_name("settings.local.json");
+        let user = mcp_state::read_object(&self.layout.config_dir.join("settings.json"))
+            .map_err(|_| ())?;
+        let project = mcp_state::read_object(&project_path).map_err(|_| ())?;
+        let local = mcp_state::read_object(&local_path).map_err(|_| ())?;
+        let mut effective = Map::new();
+        // File settings for the selected project: user < project < local.
+        // Launch flags, environment and interactive trust need separate runtime
+        // qualification; this does not enable additional supported versions.
+        for settings in [&user, &project, &local] {
+            for key in ["autoMemoryDirectory", "autoMemoryEnabled"] {
+                if let Some(value) = settings.get(key) {
+                    effective.insert(key.to_owned(), value.clone());
+                }
+            }
+        }
         let mut managed = false;
         let mut managed_directory = None::<Value>;
         for path in &self.layout.managed_settings_paths {
-            if !path.is_file() {
-                continue;
-            }
-            let settings = read_optional_file(path)
-                .ok()
-                .flatten()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                .and_then(|value| value.as_object().cloned())
-                .ok_or(())?;
+            let settings = mcp_state::read_object(path).map_err(|_| ())?;
             managed |= settings.contains_key("autoMemoryEnabled")
                 || settings.contains_key("autoMemoryDirectory");
             if let Some(directory) = settings.get("autoMemoryDirectory") {
@@ -1251,8 +1264,132 @@ impl ClaudeCodeAdapter {
         if let Some(directory) = managed_directory {
             effective.insert("autoMemoryDirectory".to_owned(), directory);
         }
-        Ok((effective, managed))
+        let (disable_path, disable_settings) = if local.contains_key("autoMemoryEnabled") {
+            (local_path, local)
+        } else {
+            (project_path, project)
+        };
+        Ok(EffectiveMemorySettings {
+            effective,
+            managed,
+            disable_path,
+            disable_settings,
+        })
     }
+
+    fn memory_settings_paths(&self) -> BTreeSet<PathBuf> {
+        let project = self.project_settings_path();
+        [
+            self.layout.config_dir.join("settings.json"),
+            project.with_file_name("settings.local.json"),
+            project,
+        ]
+        .into_iter()
+        .chain(self.layout.managed_settings_paths.iter().cloned())
+        .collect()
+    }
+
+    pub(crate) fn memory_settings_digests(&self) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
+        self.memory_settings_paths()
+            .into_iter()
+            .map(|path| {
+                Ok(ExpectedNativeDigest {
+                    target: wire_path(&path),
+                    expected_digest: mcp_state::read_bytes(&path)?
+                        .map(|bytes| Sha256Digest(Sha256::digest(bytes).into())),
+                })
+            })
+            .collect()
+    }
+
+    fn verify_native_memory_plan_state(
+        &self,
+        plan: &NativeTransactionPlan,
+        final_state: bool,
+    ) -> Result<(), BoundaryError> {
+        if plan.native_memory_registrations.is_empty() {
+            return Ok(());
+        }
+        for current in self
+            .memory_settings_digests()
+            .map_err(|_| BoundaryError::new("Claude Code memory settings cannot be inspected"))?
+        {
+            let expected = plan
+                .setup
+                .expected_native_digests
+                .iter()
+                .find(|expected| expected.target == current.target)
+                .ok_or_else(|| {
+                    BoundaryError::new(
+                        "Claude Code memory settings were not bound; request a new preview",
+                    )
+                })?;
+            if let Some(mutation) = plan
+                .mutations
+                .iter()
+                .find(|mutation| mutation.target == current.target)
+            {
+                let path = decode_wire_path(&current.target)?;
+                let snapshot = OsNativeFileSystem::new().snapshot(&path).map_err(|_| {
+                    BoundaryError::new("Claude Code memory settings cannot be inspected")
+                })?;
+                let fingerprint = RestorableStateFingerprint(Sha256Digest(*snapshot.fingerprint()));
+                if fingerprint != mutation.intended
+                    && (final_state || fingerprint != mutation.expected)
+                {
+                    return Err(BoundaryError::new("Claude Code memory settings changed"));
+                }
+            } else if current.expected_digest != expected.expected_digest {
+                return Err(BoundaryError::new("Claude Code memory settings changed"));
+            }
+        }
+        let capabilities = self
+            .native_memory_capabilities()
+            .map_err(|error| BoundaryError::new(error.message))?;
+        if plan.native_memory_registrations.len() != capabilities.sources.len()
+            || plan
+                .native_memory_registrations
+                .iter()
+                .any(|registration| !capabilities.sources.contains(&registration.source))
+        {
+            return Err(BoundaryError::new(
+                "Claude Code native memory location changed",
+            ));
+        }
+        match capabilities.disable {
+            NativeMemoryDisable::Unavailable => {
+                return Err(BoundaryError::new(
+                    "Claude Code native memory is unavailable",
+                ));
+            }
+            NativeMemoryDisable::WatchOnly => {}
+            NativeMemoryDisable::Supported(required) => {
+                for needed in required {
+                    // Intermediate checks allow the exact approved states in either
+                    // direction. An enabled final state is valid only for undo.
+                    if !plan.mutations.iter().any(|mutation| {
+                        mutation.target == needed.target
+                            && mutation.kind == MutationKind::Payload
+                            && ((!final_state
+                                && mutation.expected == needed.expected
+                                && mutation.intended == needed.intended)
+                                || (mutation.expected == needed.intended
+                                    && mutation.intended == needed.expected))
+                    }) {
+                        return Err(BoundaryError::new("Claude Code memory settings changed"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct EffectiveMemorySettings {
+    effective: Map<String, Value>,
+    managed: bool,
+    disable_path: PathBuf,
+    disable_settings: Map<String, Value>,
 }
 
 fn safely_missing_project_settings(project_root: &Path, settings_path: &Path) -> bool {
@@ -1307,7 +1444,15 @@ fn missing_project_settings_metadata(
         .collect::<Result<Vec<_>, _>>()?;
     siblings.sort();
     for sibling in siblings {
-        if sibling == settings_path {
+        // Recovery keeps adjacent backup/candidate files while undo runs.
+        // They are never user metadata templates (and the native filesystem
+        // deliberately refuses to open its reserved recovery names).
+        if sibling == settings_path
+            || sibling
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.to_ascii_lowercase().starts_with(".context-relay-"))
+        {
             continue;
         }
         let metadata = fs::symlink_metadata(&sibling).map_err(|_| {
@@ -1340,7 +1485,30 @@ fn safe_memory_directory_binding(path: &Path) -> Result<Option<PathBuf>, ClientE
         Ok(_) => fs::canonicalize(path)
             .map(Some)
             .map_err(|_| invalid_request("Claude Code memory directory cannot be resolved")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(path.to_path_buf())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Bind missing suffixes through their existing canonical ancestor.
+            // Windows canonicalization adds a verbatim prefix: use the same
+            // spelling before and after the harness creates this directory.
+            for ancestor in path.ancestors().skip(1) {
+                match fs::symlink_metadata(ancestor) {
+                    Ok(metadata) if metadata.is_dir() => {
+                        let canonical = fs::canonicalize(ancestor).map_err(|_| {
+                            invalid_request("Claude Code memory directory cannot be resolved")
+                        })?;
+                        mcp_state::validate_config_path(path, true).map_err(|_| {
+                            invalid_request("Claude Code memory directory topology changed")
+                        })?;
+                        let suffix = path.strip_prefix(ancestor).map_err(|_| {
+                            invalid_request("Claude Code memory directory cannot be resolved")
+                        })?;
+                        return Ok(Some(canonical.join(suffix)));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    _ => return Ok(None),
+                }
+            }
+            Ok(None)
+        }
         Err(_) => Ok(None),
     }
 }
@@ -1598,7 +1766,7 @@ impl NativeAdapter for ClaudeCodeAdapter {
         for mutation in &plan.cli_mutations {
             self.validate_cli_context(mutation)?;
         }
-        Ok(())
+        self.verify_native_memory_plan_state(plan, false)
     }
 
     fn compare_approved_digests(
@@ -1607,6 +1775,24 @@ impl NativeAdapter for ClaudeCodeAdapter {
     ) -> Result<(), BoundaryError> {
         for expected in &plan.setup.expected_native_digests {
             let path = decode_wire_path(&expected.target)?;
+            // On undo these dependency digests still describe the original
+            // preview. Mutated files instead carry exact restorable pre/post
+            // fingerprints, reversed by the sealed inverse plan.
+            if !plan.native_memory_registrations.is_empty()
+                && self.memory_settings_paths().contains(&path)
+                && let Some(mutation) = plan
+                    .mutations
+                    .iter()
+                    .find(|mutation| mutation.target == expected.target)
+            {
+                let snapshot = OsNativeFileSystem::new().snapshot(&path).map_err(|_| {
+                    BoundaryError::new("Claude Code native state cannot be inspected")
+                })?;
+                if *snapshot.fingerprint() != mutation.expected.0.0 {
+                    return Err(BoundaryError::new("Claude Code native state changed"));
+                }
+                continue;
+            }
             let actual = if path.is_file() {
                 Some(digest_file_boundary(&path)?)
             } else {
@@ -1617,6 +1803,13 @@ impl NativeAdapter for ClaudeCodeAdapter {
             }
         }
         Ok(())
+    }
+
+    fn verify_live_state_reservation(
+        &mut self,
+        plan: &NativeTransactionPlan,
+    ) -> Result<(), BoundaryError> {
+        self.reprobe_live_state(plan)
     }
 
     fn validate_staged_output(
@@ -1650,7 +1843,7 @@ impl NativeAdapter for ClaudeCodeAdapter {
                 "Claude Code effective state differs from the plan",
             ));
         }
-        Ok(())
+        self.verify_native_memory_plan_state(plan, true)
     }
 }
 

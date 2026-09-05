@@ -170,13 +170,25 @@ pub(super) fn validate_config_path(path: &Path, allow_missing: bool) -> std::io:
 }
 
 pub(super) fn read_object(path: &Path) -> Result<Map<String, Value>, ClientError> {
+    let Some(bytes) = read_bytes(path)? else {
+        return Ok(Map::new());
+    };
+    let error = || invalid_request("Claude Code MCP configuration cannot be safely inspected");
+    let value = parse_unique_json(&bytes).map_err(|_| error())?;
+    match value {
+        Value::Object(object) => Ok(object),
+        _ => Err(error()),
+    }
+}
+
+pub(super) fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
     let error = || invalid_request("Claude Code MCP configuration cannot be safely inspected");
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {
             // Missing configuration is allowed; a dangling link is not absence.
             validate_config_path(path, true).map_err(|_| error())?;
-            return Ok(Map::new());
+            return Ok(None);
         }
         Err(_) => return Err(error()),
     };
@@ -210,11 +222,7 @@ pub(super) fn read_object(path: &Path) -> Result<Map<String, Value>, ClientError
     {
         return Err(error());
     }
-    let value = parse_unique_json(&bytes).map_err(|_| error())?;
-    match value {
-        Value::Object(object) => Ok(object),
-        _ => Err(error()),
-    }
+    Ok(Some(bytes))
 }
 
 pub(super) fn parse_unique_json(bytes: &[u8]) -> Result<Value, serde_json::Error> {

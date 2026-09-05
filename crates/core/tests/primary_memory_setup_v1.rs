@@ -475,6 +475,9 @@ impl BridgePreviewHarness for FrozenHarness {
 
     fn bridge_operational_digests(&self) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
         match self {
+            Self::Claude { adapter, .. } => {
+                BridgePreviewHarness::bridge_operational_digests(adapter)
+            }
             Self::Hermes(adapter) => BridgePreviewHarness::bridge_operational_digests(adapter),
             _ => Ok(vec![]),
         }
@@ -535,6 +538,18 @@ impl BridgePreviewHarness for FrozenHarness {
 }
 
 impl NativeAdapter for FrozenHarness {
+    fn verify_live_state_reservation(
+        &mut self,
+        plan: &NativeTransactionPlan,
+    ) -> Result<(), BoundaryError> {
+        match self {
+            Self::Claude { adapter, .. } => {
+                NativeAdapter::verify_live_state_reservation(adapter, plan)
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn reprobe_live_state(&mut self, plan: &NativeTransactionPlan) -> Result<(), BoundaryError> {
         match self {
             Self::Claude { adapter, .. } => NativeAdapter::reprobe_live_state(adapter, plan),
