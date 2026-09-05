@@ -326,3 +326,10 @@ recognizable for replacement. See the Claude qualification document for the
 exact runtime scope, regression checks and macOS recovery-fixture follow-up.
 The 47266f7 installer above predates these changes; full connection and installed
 acceptance remain open.
+
+The locked installer rebuilt from production source `5d92f4f` at
+2026-09-06 04:21:36: `Context Relay_0.1.0_x64-setup.exe`, 10,907,394 bytes,
+SHA-256 `57199e121b7319d0d62398b36b3a02849bc197e14dd57d6e17f1b4266a84b197`,
+Authenticode NotSigned. Packaging completed successfully. It includes the
+explicit-home and Windows startup-hook corrections. This candidate was not
+installed or visually verified; Full support and release acceptance remain open.
