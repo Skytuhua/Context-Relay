@@ -184,3 +184,48 @@ Evidence is in `qualify-claude-plugin.mjs`, `claude-plugin-help.log` and
 installation is contained under the temporary root ending `4jft8y` and is
 retained as evidence. This experiment is not a confinement or general plugin
 execution-safety proof.
+
+## Follow-up: noninteractive version and installed-plugin validation
+
+Discovery and effective validation now use the bounded `--version` contract,
+requiring the live version to match the selected layout. They no longer invoke
+the interactive doctor command or expect its fictional fixed diagnostic line.
+Plugin validation accepts the observed installed metadata and optional bounded
+fields while preserving the previous four-field fixture contract. Nonempty or
+malformed errors, unknown fields and recursive duplicate JSON keys are rejected.
+Optional MCP configuration is inspected for shape only and never placed in
+returned errors. This does not expand the Full version allowlist.
+
+The renamed opt-in test
+`pinned_claude_cli_uses_selected_configuration_and_validates_installed_plugin`
+passed with the real digest-pinned 2.1.202 executable through the core launcher.
+It adds/removes a local MCP declaration, checks the actual version, installs an
+inert local plugin and validates its nonempty JSON output in both fresh default
+and overridden configurations. It passed in 63.11 seconds. Its initial marketplace
+setup failed because Claude rejects a Windows verbatim prefix as a marketplace
+source; a separate real CLI experiment reproduced the exact source-format error.
+The fixture now supplies the ordinary drive path for that source argument.
+
+A separate temporary plugin experiment supplied synthetic MCP and SessionStart/
+Stop hook marker commands. Validate, marketplace add, plugin install and JSON
+listing succeeded without creating either marker. Listing did include synthetic
+MCP environment configuration. This result covers that fixture and these commands,
+not universal plugin helper or network isolation. No normal configuration or
+model session was used.
+
+Regressions failed before correction. Final checks pass 92 core library tests
+(one opt-in test ignored in the ordinary suite), 47 Claude adapter tests and
+11 primary-memory setup tests. Core and daemon all-target test-support Clippy
+passes with warnings denied. Independent review approved the scoped correction.
+Evidence: `claude-cli-validation-red.log`, `claude-cli-validation-suites.log`,
+`claude-cli-validation-real-final.log`, `claude-cli-validation-clippy.log`,
+`claude-plugin-canary.log` and `claude-plugin-verbatim.log` in the local evidence
+directory. The latest 24038b9 installer predates this correction.
+
+Native memory remains a separate qualification gap. The installed 2.1.202 source
+and current [memory documentation](https://code.claude.com/docs/en/memory#storage-location)
+reject ordinary relative autoMemoryDirectory values, whereas current adapter
+fixtures resolve them against the project. The source also resolves settings
+precedence/trust, repository/worktree roots, Windows path spelling and long
+project keys differently from the adapter's simple canonical-path substitution.
+These findings are not yet corrected here and do not establish a full connection.

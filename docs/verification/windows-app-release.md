@@ -288,3 +288,14 @@ Packaging completed successfully; the candidate was not installed or visually
 verified. The nonempty plugin experiment found another existing validation
 schema mismatch, recorded in the Claude evidence document. Full harness support
 and release acceptance remain unfinished.
+
+The subsequent Claude validation correction replaces interactive doctor with
+exact live-version checking and accepts actual installed-plugin metadata while
+rejecting reported errors and duplicate JSON keys. The pinned 2.1.202 test now
+passes plugin installation/list validation and local MCP add/remove through the
+core launcher in default and overridden temporary configurations. All 92 ordinary
+core library, 47 Claude adapter and 11 primary-memory setup tests pass, as does
+core/daemon all-target test-support Clippy. The 24038b9 installer above predates
+this patch. Native memory location/settings, hooks and real transaction recovery
+remain open; no Full support or installed acceptance is claimed. See the Claude
+qualification document for evidence and the newly identified memory mismatch.

@@ -123,14 +123,14 @@ pub struct ClaudeCodeCliExecutor<'a, O> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ClaudeCommand {
-    Doctor,
+    Version,
     PluginList,
 }
 
 impl ClaudeCommand {
     fn argv(&self) -> Vec<String> {
         match self {
-            Self::Doctor => vec!["doctor".to_owned()],
+            Self::Version => vec!["--version".to_owned()],
             Self::PluginList => {
                 vec!["plugin".to_owned(), "list".to_owned(), "--json".to_owned()]
             }
@@ -1574,7 +1574,15 @@ impl ClaudeCodeAdapter {
         for command in commands {
             let output = execute(&command)?;
             match command {
-                ClaudeCommand::Doctor => parse_doctor_output(&output)?,
+                ClaudeCommand::Version => {
+                    if parse_version_output(&output)? != self.layout.version {
+                        return Err(client_error(
+                            ErrorCode::Conflict,
+                            "Claude Code version changed",
+                            false,
+                        ));
+                    }
+                }
                 ClaudeCommand::PluginList => parse_plugin_list_output(&output)?,
             }
         }
@@ -1875,7 +1883,7 @@ fn settings_path(adapter: &ClaudeCodeAdapter, scope: &ScopeRef) -> Result<PathBu
 }
 
 fn validation_commands() -> Vec<ClaudeCommand> {
-    vec![ClaudeCommand::Doctor, ClaudeCommand::PluginList]
+    vec![ClaudeCommand::Version, ClaudeCommand::PluginList]
 }
 
 fn collect_mcp_names(
@@ -2482,15 +2490,17 @@ fn bounded_utf8(bytes: &[u8]) -> Result<&str, ClientError> {
         .map_err(|_| invalid_request("Claude Code command output is not UTF-8"))
 }
 
-fn parse_doctor_output(bytes: &[u8]) -> Result<(), ClientError> {
-    (bounded_utf8(bytes)?.trim() == "Claude Code diagnostics: OK")
-        .then_some(())
-        .ok_or_else(|| invalid_request("Claude Code doctor output is invalid"))
+fn parse_version_output(bytes: &[u8]) -> Result<String, ClientError> {
+    let output = bounded_utf8(bytes)?.trim();
+    let version = parse_version(output)
+        .filter(|version| output == format!("{version} (Claude Code)"))
+        .ok_or_else(|| invalid_request("Claude Code version output is invalid"))?;
+    Ok(version)
 }
 
 fn parse_plugin_list_output(bytes: &[u8]) -> Result<(), ClientError> {
     bounded_utf8(bytes)?;
-    let plugins = serde_json::from_slice::<Value>(bytes)
+    let plugins = mcp_state::parse_unique_json(bytes)
         .ok()
         .and_then(|value| value.as_array().cloned())
         .filter(|plugins| plugins.len() <= 256)
@@ -2499,11 +2509,65 @@ fn parse_plugin_list_output(bytes: &[u8]) -> Result<(), ClientError> {
         let plugin = plugin
             .as_object()
             .ok_or_else(|| invalid_request("Claude Code plugin output is invalid"))?;
-        let allowed = ["id", "version", "enabled", "errors"];
-        if plugin.keys().any(|key| !allowed.contains(&key.as_str()))
-            || plugin.len() != allowed.len()
-        {
+        let allowed = [
+            "id",
+            "version",
+            "enabled",
+            "errors",
+            "scope",
+            "installPath",
+            "installedAt",
+            "lastUpdated",
+            "projectPath",
+            "mcpServers",
+            "notes",
+        ];
+        if plugin.keys().any(|key| !allowed.contains(&key.as_str())) {
             return Err(invalid_request("Claude Code plugin output is invalid"));
+        }
+        if let Some(scope) = plugin.get("scope") {
+            if !matches!(
+                scope.as_str(),
+                Some("user" | "project" | "local" | "session")
+            ) || !bounded_plugin_text(plugin.get("installPath"), 4096)
+            {
+                return Err(invalid_request("Claude Code plugin output is invalid"));
+            }
+        } else if plugin.len() != 4 || !plugin.contains_key("errors") {
+            // Keep the previous four-field contract readable while accepting
+            // the actual installed-plugin metadata emitted by current Claude.
+            return Err(invalid_request("Claude Code plugin output is invalid"));
+        }
+        for field in ["projectPath", "installedAt", "lastUpdated"] {
+            if plugin.contains_key(field) && !bounded_plugin_text(plugin.get(field), 4096) {
+                return Err(invalid_request("Claude Code plugin output is invalid"));
+            }
+        }
+        if let Some(notes) = plugin.get("notes") {
+            let notes = notes
+                .as_array()
+                .filter(|notes| notes.len() <= 64)
+                .ok_or_else(|| invalid_request("Claude Code plugin output is invalid"))?;
+            if notes
+                .iter()
+                .any(|note| !bounded_plugin_text(Some(note), 4096))
+            {
+                return Err(invalid_request("Claude Code plugin output is invalid"));
+            }
+        }
+        if let Some(servers) = plugin.get("mcpServers") {
+            let servers = servers
+                .as_object()
+                .filter(|servers| servers.len() <= MAX_MCP_VALIDATION_NAMES)
+                .ok_or_else(|| invalid_request("Claude Code plugin output is invalid"))?;
+            for (name, body) in servers {
+                safe_name(name)?;
+                if !body.is_object() {
+                    return Err(invalid_request("Claude Code plugin output is invalid"));
+                }
+            }
+            // This output can include credentials. Validate shape only: never
+            // return the configuration or incorporate it into error messages.
         }
         safe_name(
             plugin
@@ -2523,13 +2587,18 @@ fn parse_plugin_list_output(bytes: &[u8]) -> Result<(), ClientError> {
             || plugin.get("enabled").and_then(Value::as_bool).is_none()
             || plugin
                 .get("errors")
-                .and_then(Value::as_array)
-                .is_none_or(|errors| !errors.is_empty())
+                .is_some_and(|errors| errors.as_array().is_none_or(|errors| !errors.is_empty()))
         {
             return Err(invalid_request("Claude Code plugin output is invalid"));
         }
     }
     Ok(())
+}
+
+fn bounded_plugin_text(value: Option<&Value>, max_bytes: usize) -> bool {
+    value.and_then(Value::as_str).is_some_and(|text| {
+        !text.is_empty() && text.len() <= max_bytes && !text.chars().any(char::is_control)
+    })
 }
 
 fn canonical_cli_declaration(body: &str) -> Result<CanonicalCliDeclaration, ClientError> {
@@ -3090,19 +3159,15 @@ fn discover_version_with(
     mut execute: impl FnMut(&[&str]) -> Result<Vec<u8>, ClientError>,
 ) -> Result<String, ClientError> {
     let output = execute(&["--version"])?;
-    let version =
-        parse_version(std::str::from_utf8(&output).unwrap_or_default()).ok_or_else(|| {
-            client_error(
-                ErrorCode::HarnessUnsupported,
-                "Claude Code returned an invalid version",
-                false,
-            )
-        })?;
-    // An unqualified version can be reported as ImportOnly without running its
-    // potentially interactive diagnostics. Full setup retains its existing gate.
-    if SUPPORTED_VERSIONS.contains(&version.as_str()) {
-        parse_doctor_output(&execute(&["doctor"])?)?;
-    }
+    let version = parse_version_output(&output).map_err(|_| {
+        client_error(
+            ErrorCode::HarnessUnsupported,
+            "Claude Code returned an invalid version",
+            false,
+        )
+    })?;
+    // Doctor is an interactive diagnostic UI, not a machine-readable health
+    // contract. Native state and the attested version are checked separately.
     Ok(version)
 }
 
@@ -3339,8 +3404,8 @@ mod tests {
 
     use super::{
         ClaudeCodeAdapter, ClaudeCodeLayout, ClaudeCommand, MAX_MCP_VALIDATION_NAMES, digest_file,
-        executable_names, is_native_claude_executable_path, parse_doctor_output,
-        parse_plugin_list_output, validation_commands, windows_attributes_are_reparse,
+        executable_names, is_native_claude_executable_path, parse_plugin_list_output,
+        parse_version_output, validation_commands, windows_attributes_are_reparse,
         windows_path_component_attributes_are_safe, windows_reader_is_native_pe,
     };
     #[cfg(unix)]
@@ -3407,7 +3472,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_of_supported_claude_still_requires_its_qualified_doctor_output() {
+    fn discovery_of_supported_claude_uses_noninteractive_version_output() {
         let mut commands = Vec::new();
         let result = super::discover_version_with(|arguments| {
             commands.push(
@@ -3422,8 +3487,8 @@ mod tests {
                 b"unexpected output".to_vec()
             })
         });
-        assert!(result.is_err());
-        assert_eq!(commands, vec![vec!["--version"], vec!["doctor"]]);
+        assert_eq!(result.unwrap(), "2.1.214");
+        assert_eq!(commands, vec![vec!["--version"]]);
     }
 
     #[test]
@@ -3563,11 +3628,11 @@ mod tests {
                 .map(|command| command.argv())
                 .collect::<Vec<_>>(),
             vec![
-                vec!["doctor".to_owned()],
+                vec!["--version".to_owned()],
                 vec!["plugin".to_owned(), "list".to_owned(), "--json".to_owned()],
             ]
         );
-        parse_doctor_output(fixture["doctorOutput"].as_str().unwrap().as_bytes()).unwrap();
+        parse_version_output(b"2.1.214 (Claude Code)\n").unwrap();
         parse_plugin_list_output(
             serde_json::to_vec(&fixture["pluginListJson"])
                 .unwrap()
@@ -3578,8 +3643,43 @@ mod tests {
 
     #[test]
     fn validation_rejects_unbounded_malformed_or_secret_output() {
-        assert!(parse_doctor_output(&vec![b'x'; 65 * 1024]).is_err());
+        assert!(parse_version_output(&vec![b'x'; 65 * 1024]).is_err());
         assert!(parse_plugin_list_output(br#"[{"id":"ok","token":"secret"}]"#).is_err());
+    }
+
+    #[test]
+    fn validation_accepts_installed_plugin_metadata_from_the_real_cli() {
+        let bytes = include_bytes!("../tests/fixtures/claude-code-2.1.202-plugin-list.json");
+        parse_plugin_list_output(bytes).unwrap();
+        let mut plugins: Value = serde_json::from_slice(bytes).unwrap();
+        plugins[0]["mcpServers"] = serde_json::json!({"probe": {"command":"C:\\Fixture\\node.exe", "args":["canary.mjs"], "env":{"TOKEN":"SYNTHETIC-CANARY"}}});
+        parse_plugin_list_output(&serde_json::to_vec(&plugins).unwrap()).unwrap();
+        plugins[0]["errors"] = serde_json::json!(["SYNTHETIC-CANARY"]);
+        let error = parse_plugin_list_output(&serde_json::to_vec(&plugins).unwrap()).unwrap_err();
+        assert!(!format!("{error:?}").contains("SYNTHETIC-CANARY"));
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_plugin_errors_instead_of_hiding_them() {
+        assert!(parse_plugin_list_output(br#"[{"id":"probe@fixture","version":"1.0.0","enabled":true,"errors":["SYNTHETIC-CANARY"],"errors":[]}]"#).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_malformed_installed_plugin_metadata_without_echoing_it() {
+        let bytes = include_bytes!("../tests/fixtures/claude-code-2.1.202-plugin-list.json");
+        for (field, value) in [
+            ("scope", serde_json::json!("SYNTHETIC-CANARY")),
+            ("installPath", Value::Null),
+            ("enabled", serde_json::json!("SYNTHETIC-CANARY")),
+            ("mcpServers", serde_json::json!("SYNTHETIC-CANARY")),
+            ("token", serde_json::json!("SYNTHETIC-CANARY")),
+        ] {
+            let mut plugins: Value = serde_json::from_slice(bytes).unwrap();
+            plugins[0][field] = value;
+            let error = parse_plugin_list_output(&serde_json::to_vec(&plugins).unwrap())
+                .expect_err("Malformed plugin metadata must not pass validation");
+            assert!(!format!("{error:?}").contains("SYNTHETIC-CANARY"));
+        }
     }
 
     #[test]
@@ -3635,7 +3735,7 @@ mod tests {
             .validate_effective_with(&receipt, |command| {
                 commands.push(command.argv());
                 Ok(match command {
-                    ClaudeCommand::Doctor => b"Claude Code diagnostics: OK\n".to_vec(),
+                    ClaudeCommand::Version => b"2.1.214 (Claude Code)\n".to_vec(),
                     ClaudeCommand::PluginList => b"[]".to_vec(),
                 })
             })
@@ -3643,7 +3743,7 @@ mod tests {
         assert!(report.valid);
         assert_eq!(
             commands,
-            vec![vec!["doctor"], vec!["plugin", "list", "--json"],]
+            vec![vec!["--version"], vec!["plugin", "list", "--json"],]
         );
         assert!(!sentinel.exists());
     }
@@ -3736,6 +3836,21 @@ mod tests {
     }
 
     #[test]
+    fn effective_validation_stops_when_the_live_version_differs_from_the_selected_layout() {
+        let fixture = mcp_source_fixture([], [], []);
+        let mut commands = Vec::new();
+        let error = fixture
+            .adapter
+            .validate_effective_with(&fixture.receipt, |command| {
+                commands.push(command.argv());
+                Ok(b"2.1.213 (Claude Code)\n".to_vec())
+            })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(commands, vec![vec!["--version".to_owned()]]);
+    }
+
+    #[test]
     fn effective_validation_accepts_exactly_the_deduplicated_mcp_name_limit() {
         let half = MAX_MCP_VALIDATION_NAMES / 2;
         let quarter = MAX_MCP_VALIDATION_NAMES / 4;
@@ -3753,7 +3868,7 @@ mod tests {
             .validate_effective_with(&fixture.receipt, |command| {
                 commands.push(command.argv());
                 Ok(match command {
-                    ClaudeCommand::Doctor => b"Claude Code diagnostics: OK\n".to_vec(),
+                    ClaudeCommand::Version => b"2.1.214 (Claude Code)\n".to_vec(),
                     ClaudeCommand::PluginList => b"[]".to_vec(),
                 })
             })

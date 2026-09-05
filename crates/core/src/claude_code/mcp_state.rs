@@ -210,11 +210,15 @@ pub(super) fn read_object(path: &Path) -> Result<Map<String, Value>, ClientError
     {
         return Err(error());
     }
-    let StrictValue(value) = serde_json::from_slice(&bytes).map_err(|_| error())?;
+    let value = parse_unique_json(&bytes).map_err(|_| error())?;
     match value {
         Value::Object(object) => Ok(object),
         _ => Err(error()),
     }
+}
+
+pub(super) fn parse_unique_json(bytes: &[u8]) -> Result<Value, serde_json::Error> {
+    serde_json::from_slice::<StrictValue>(bytes).map(|value| value.0)
 }
 
 // Value normally keeps the last duplicate key. Reject duplicates at every

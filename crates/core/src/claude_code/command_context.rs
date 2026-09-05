@@ -215,7 +215,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     #[ignore = "requires an explicitly selected, digest-pinned installed Claude CLI"]
-    fn pinned_claude_cli_writes_only_the_selected_default_and_override_configuration() {
+    fn pinned_claude_cli_uses_selected_configuration_and_validates_installed_plugin() {
         use sha2::{Digest as _, Sha256};
         let executable = PathBuf::from(
             env::var_os("CONTEXT_RELAY_TEST_CLAUDE_EXE").expect("explicit Claude executable"),
@@ -273,8 +273,63 @@ mod tests {
             .unwrap();
             let saved: Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
             assert!(saved["projects"][&key]["mcpServers"].get(&server).is_none());
+            let marketplace = home.join("local-fixture-marketplace");
+            let plugin = marketplace.join("plugins/relay-probe");
+            fs::create_dir_all(marketplace.join(".claude-plugin")).unwrap();
+            fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+            fs::create_dir_all(plugin.join("skills/probe")).unwrap();
+            fs::write(marketplace.join(".claude-plugin/marketplace.json"), serde_json::to_vec(&json!({
+                "name":"relay-qualification", "owner":{"name":"Local test fixture"},
+                "plugins":[{"name":"relay-probe", "source":"./plugins/relay-probe", "description":"Static qualification fixture"}]
+            })).unwrap()).unwrap();
+            fs::write(plugin.join(".claude-plugin/plugin.json"), br#"{"name":"relay-probe","version":"1.0.0","description":"Static qualification fixture"}"#).unwrap();
+            fs::write(
+                plugin.join("skills/probe/SKILL.md"),
+                "---\ndescription: Static qualification fixture\n---\nThis is a test note.\n",
+            )
+            .unwrap();
+            let version_output =
+                super::super::run_bounded_command(&executable, &["--version"], hash, &context)
+                    .unwrap();
+            assert_eq!(
+                super::super::parse_version_output(&version_output).unwrap(),
+                "2.1.202"
+            );
+            // Claude's marketplace parser rejects a Windows verbatim prefix
+            // even though it names the same physical local directory.
+            let marketplace_argument = marketplace.to_str().unwrap().strip_prefix(r"\\?\").unwrap();
+            for arguments in [
+                vec![
+                    "plugin",
+                    "marketplace",
+                    "add",
+                    marketplace_argument,
+                    "--scope",
+                    "user",
+                ],
+                vec![
+                    "plugin",
+                    "install",
+                    "relay-probe@relay-qualification",
+                    "--scope",
+                    "user",
+                ],
+            ] {
+                super::super::run_bounded_command(&executable, &arguments, hash, &context).unwrap();
+            }
+            let output = super::super::run_bounded_command(
+                &executable,
+                &["plugin", "list", "--json"],
+                hash,
+                &context,
+            )
+            .unwrap();
+            super::super::parse_plugin_list_output(&output).unwrap();
+            let plugins: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(plugins.as_array().unwrap().len(), 1);
+            assert_eq!(plugins[0]["id"], "relay-probe@relay-qualification");
             println!(
-                "Qualified {} configuration with the real pinned CLI",
+                "Qualified {} configuration and installed-plugin validation with the real pinned CLI",
                 if overridden { "override" } else { "default" }
             );
         }
