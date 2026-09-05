@@ -1,15 +1,20 @@
-// Inert executable for the opt-in, pinned Claude CLI startup test. It does not
+// Inert executable for the opt-in, pinned Claude CLI lifecycle tests. It does not
 // connect to Context Relay or read any configuration, credentials, or transcript.
 use std::io::Read as _;
 
 fn main() {
-    assert_eq!(
-        std::env::args().skip(1).collect::<Vec<_>>(),
-        ["--hook-event", "session-start", "--harness", "claude-code"]
-    );
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    assert_eq!(arguments.len(), 4);
+    assert_eq!(arguments[0], "--hook-event");
+    assert_eq!(arguments[2..], ["--harness", "claude-code"]);
+    let output = match arguments[1].as_str() {
+        "session-start" => "hook-input.json",
+        "session-stop" => "hook-stop-input.json",
+        _ => panic!("unexpected hook event"),
+    };
     let mut input = Vec::new();
     std::io::stdin().take(65_537).read_to_end(&mut input).unwrap();
     assert!(input.len() <= 65_536);
     let executable = std::env::current_exe().unwrap();
-    std::fs::write(executable.with_file_name("hook-input.json"), input).unwrap();
+    std::fs::write(executable.with_file_name(output), input).unwrap();
 }

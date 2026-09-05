@@ -486,3 +486,87 @@ This closes the default repository/worktree helper mismatch. Native session
 project-root selection, trust/flags/environment, other managed settings sources,
 Stop events and full real setup/recovery still need qualification. No additional
 version is enabled, and the existing 11d6740 unsigned installer is unchanged.
+
+## Native sessions and settings-provided environment controls
+
+A repeatable opt-in Windows test runs actual noninteractive Claude 2.1.202
+sessions against a loopback model stub. It verifies the executable SHA-256
+(7ff0787ebdc19fc509ccea8886ebf6a53ad8213407fa3a2b7c6d1446efc419f6) and reported
+version, uses fresh synthetic homes/projects and a dummy API key, and retains
+marker matches rather than complete model prompts. Production-generated
+SessionStart and Stop commands call an inert capture executable whose path
+contains spaces, an apostrophe, a literal `$HOME` and Unicode. Both events must
+carry the successful session ID and selected working directory.
+
+All 20 native cases pass: ordinary user/project/local settings, ambient memory
+enable/disable values, `--settings`, `--setting-sources user`, default/custom
+configuration homes, repository subfolders, linked worktrees, file-provided
+environment controls, Windows lowercase/mixed-case names, conflicting aliases
+and a project override of a lowercase user value. Each session made exactly one
+model request to the local stub with the expected memory marker and no wrong-root
+marker. This directly qualifies noninteractive session root selection and native
+delivery of both lifecycle events; it does not exercise the production daemon
+bridge or a real model.
+
+The sessions exposed a production mismatch:
+`env.CLAUDE_CODE_DISABLE_AUTO_MEMORY=false` in Claude settings forces memory on
+even when `autoMemoryEnabled` is false. The adapter now recognizes this control
+in user, project and local files. Its existing approved project/local transaction
+sets that environment value to `"true"` when present, alongside the ordinary
+memory switch. Local environment overrides select the local file even without
+an `autoMemoryEnabled` entry. Other environment keys are retained, repeated
+inspection produces no extra mutation, and Undo restores exact original bytes.
+Managed controls remain read-only.
+
+On Windows, environment names are compared without regard to ASCII case, and an
+existing spelling is updated in place. Multiple spellings in one settings layer
+are rejected as ambiguous rather than relying on native assignment order.
+Malformed environment objects or non-string memory-control values are unavailable.
+The file-dependency checks also invalidate plans when these controls change
+after preview.
+
+The fixture waits for a stdin gate until Rust places Node in a non-inheritable
+Windows job with kill-on-close. An outer deadline and per-session limits bound
+failures. Synthetic descendant canaries verify termination after normal exit and
+timeout, preventing failed qualification sessions from leaving descendants running.
+
+Local evidence:
+
+- `claude-settings-env-red.log` reproduces the missing environment mutation;
+  `claude-settings-env-casing-red.log` reproduces missed Windows key casing.
+- `claude-settings-env-final-suites.log`: 104 ordinary core library tests pass
+  (three real-CLI tests are opt-in), 63 Claude adapter tests pass and 16 primary
+  memory setup tests pass.
+- `claude-local-session-final-contained-runtime.log`: both descendant-cleanup
+  canaries and all 20 real session cases pass after the final path guard, with
+  the test-support feature enabled.
+- `claude-settings-env-transaction-recovery.log`: the frozen transaction matrix
+  passes with a user environment override and a previously disabled project
+  setting, including simulated crash recovery and exact Undo.
+- `claude-settings-env-clippy-final.log`: core and daemon all-target test-support Clippy
+  passes with warnings denied.
+- The existing real startup test passed for default/custom configurations.
+  An unrelated real plugin check exhausted disk space while staging its binary;
+  generated core debug artifacts were cleaned before retrying it. Both real
+  MCP/plugin configuration cases then passed in
+  `claude-local-session-plugin-optimized-retry.log` (61.20 seconds), using
+  `--config 'profile.dev.package.sha2.opt-level=3'` to optimize hashing without
+  changing the verification checks. The slower ordinary-debug retry was stopped.
+  Final independent review found no remaining issues. `graphify update .` passed
+  with 15,172 nodes and 43,594 edges; optional SQL/OCaml parsers remain unavailable.
+
+To repeat the native matrix, explicitly set `CONTEXT_RELAY_TEST_CLAUDE_EXE`,
+`CONTEXT_RELAY_TEST_CLAUDE_SHA256` and `CONTEXT_RELAY_TEST_NODE_EXE` to the pinned
+Windows CLI, its digest above and a local Node executable; `rustc` must be on PATH.
+Run:
+
+```text
+cargo test -p context-relay-core --lib pinned_claude_sessions_use_effective_memory_and_deliver_generated_lifecycle_hooks -- --ignored --nocapture
+```
+
+This correction covers settings-provided memory enable/disable environment
+controls. Interactive trust, other launch contexts, environment-selected memory
+directories, managed drop-ins/registry/remote settings and full native
+setup/crash recovery remain open. No additional Full version is enabled. The
+installed application and local unsigned installer from source 11d6740 remain
+unchanged; this is not installed release acceptance.

@@ -1423,6 +1423,20 @@ fn intended_bytes(mutation: &ApprovedMutation) -> Vec<u8> {
 fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy() {
     for harness_id in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Hermes] {
         let mut fixture = matrix_fixture(harness_id);
+        if harness_id == HarnessId::ClaudeCode {
+            let user = fixture
+                .project_root
+                .parent()
+                .unwrap()
+                .join("claude/settings.json");
+            let mut settings: Value = serde_json::from_slice(&fs::read(&user).unwrap()).unwrap();
+            settings["env"] = serde_json::json!({"CLAUDE_CODE_DISABLE_AUTO_MEMORY":"false"});
+            fs::write(user, serde_json::to_vec(&settings).unwrap()).unwrap();
+            let project = fixture.project_root.join(".claude/settings.json");
+            let mut settings: Value = serde_json::from_slice(&fs::read(&project).unwrap()).unwrap();
+            settings["autoMemoryEnabled"] = Value::Bool(false);
+            fs::write(project, serde_json::to_vec(&settings).unwrap()).unwrap();
+        }
         if harness_id == HarnessId::Codex {
             fs::write(
                 fixture.project_root.join(".codex/config.toml"),
@@ -1528,6 +1542,7 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
                 assert!(intended.iter().any(|(_, bytes)| {
                     let text = String::from_utf8_lossy(bytes);
                     text.contains("\"autoMemoryEnabled\":false")
+                        && text.contains("\"CLAUDE_CODE_DISABLE_AUTO_MEMORY\":\"true\"")
                         && text.contains("\"autoMemoryDirectory\":\"~/project with spaces/.claude/native-memory\"")
                 }));
                 assert!(intended.iter().any(|(_, bytes)| {

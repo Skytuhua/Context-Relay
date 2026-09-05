@@ -1268,6 +1268,88 @@ fn native_memory_claude_disables_the_local_override_and_rolls_it_back_exactly() 
 }
 
 #[test]
+fn native_memory_claude_disables_settings_environment_overrides_and_restores_them() {
+    for (layer, local_enabled) in [
+        ("user", false),
+        ("project", false),
+        ("local", false),
+        ("user", true),
+    ] {
+        let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        let user = fixture.root.join("custom claude config/settings.json");
+        let project = fixture.adapter.project_settings_path();
+        let local = project.with_file_name("settings.local.json");
+        let selected = match layer {
+            "user" => &user,
+            "project" => &project,
+            _ => &local,
+        };
+        let mut settings: Value = if selected.is_file() {
+            serde_json::from_slice(&fs::read(selected).unwrap()).unwrap()
+        } else {
+            json!({})
+        };
+        settings["autoMemoryEnabled"] = json!(false);
+        if layer == "local" {
+            settings
+                .as_object_mut()
+                .unwrap()
+                .remove("autoMemoryEnabled");
+        }
+        settings["env"] =
+            json!({"CLAUDE_CODE_DISABLE_AUTO_MEMORY":"false", "KEEP_THIS":"unchanged"});
+        fs::write(selected, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+        if local_enabled {
+            fs::write(&local, br#"{"autoMemoryEnabled":true,"unrelated":123}"#).unwrap();
+        }
+        let target = if layer == "local" || local_enabled {
+            &local
+        } else {
+            &project
+        };
+        let before = fs::read(target).unwrap();
+        let user_before = fs::read(&user).unwrap();
+        let NativeMemoryDisable::Supported(mutations) = fixture
+            .adapter
+            .native_memory_capabilities()
+            .unwrap()
+            .disable
+        else {
+            panic!("file environment must be controllable");
+        };
+        assert_eq!(mutations.len(), 1, "{layer}");
+        assert_eq!(mutations[0].target, test_wire_path(target));
+        let nonce = [87; 16];
+        let mut native = OsNativeTransactionFileSystem::new(nonce);
+        let images = native.create_before_images(&mutations).unwrap();
+        native.record_native_metadata(&images).unwrap();
+        native.compare_and_swap_targets(&mutations).unwrap();
+        native.apply_mutation(&nonce, &mutations[0]).unwrap();
+        let after: Value = serde_json::from_slice(&fs::read(target).unwrap()).unwrap();
+        assert_eq!(after["autoMemoryEnabled"], false);
+        assert_eq!(
+            after["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"], "true",
+            "{layer}"
+        );
+        if target == selected {
+            assert_eq!(after["env"]["KEEP_THIS"], "unchanged");
+        }
+        let NativeMemoryDisable::Supported(repeated) = fixture
+            .adapter
+            .native_memory_capabilities()
+            .unwrap()
+            .disable
+        else {
+            panic!("applied disable must remain supported");
+        };
+        assert!(repeated.is_empty());
+        native.restore_matching_applied_targets(&nonce).unwrap();
+        assert_eq!(fs::read(target).unwrap(), before);
+        assert_eq!(fs::read(&user).unwrap(), user_before);
+    }
+}
+
+#[test]
 fn native_memory_claude_rejects_ambiguous_or_non_file_settings_layers() {
     for layer in [
         "custom claude config/settings.json",
@@ -1277,6 +1359,8 @@ fn native_memory_claude_rejects_ambiguous_or_non_file_settings_layers() {
         for body in [
             r#"{"autoMemoryEnabled":true,"autoMemoryEnabled":false}"#,
             "[]",
+            r#"{"env":[]}"#,
+            r#"{"env":{"CLAUDE_CODE_DISABLE_AUTO_MEMORY":false}}"#,
         ] {
             let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
             let path = fixture.root.join(layer);
@@ -1300,6 +1384,81 @@ fn native_memory_claude_rejects_ambiguous_or_non_file_settings_layers() {
             "{layer}"
         );
     }
+}
+
+#[test]
+fn native_memory_claude_does_not_override_managed_memory_environment() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    fs::write(
+        fixture.root.join("managed-settings.json"),
+        br#"{"env":{"CLAUDE_CODE_DISABLE_AUTO_MEMORY":"false"}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        fixture
+            .adapter
+            .native_memory_capabilities()
+            .unwrap()
+            .disable,
+        NativeMemoryDisable::WatchOnly
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn native_memory_claude_handles_windows_environment_names_without_ambiguous_aliases() {
+    for key in [
+        "claude_code_disable_auto_memory",
+        "Claude_Code_Disable_Auto_Memory",
+    ] {
+        let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        let local = fixture
+            .adapter
+            .project_settings_path()
+            .with_file_name("settings.local.json");
+        fs::write(
+            &local,
+            serde_json::to_vec(&json!({"autoMemoryEnabled":false,"env":{key:"false"}})).unwrap(),
+        )
+        .unwrap();
+        let NativeMemoryDisable::Supported(mutations) = fixture
+            .adapter
+            .native_memory_capabilities()
+            .unwrap()
+            .disable
+        else {
+            panic!("case-insensitive override must be controllable");
+        };
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].target, test_wire_path(&local));
+        let intended = NativeState::decode_v1(&mutations[0].content).unwrap();
+        let NativeState::RegularFile { bytes, .. } = intended else {
+            panic!("file mutation");
+        };
+        let after: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(after["env"], json!({key:"true"}));
+        fs::write(
+            fixture.root.join("managed-settings.json"),
+            serde_json::to_vec(&json!({"env":{key:"false"}})).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            fixture
+                .adapter
+                .native_memory_capabilities()
+                .unwrap()
+                .disable,
+            NativeMemoryDisable::WatchOnly
+        ));
+    }
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    fs::write(fixture.adapter.project_settings_path(), br#"{"env":{"CLAUDE_CODE_DISABLE_AUTO_MEMORY":"true","claude_code_disable_auto_memory":"false"}}"#).unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert!(matches!(
+        capabilities.disable,
+        NativeMemoryDisable::Unavailable
+    ));
+    assert!(capabilities.sources.is_empty());
 }
 
 fn claude_memory_plan(fixture: &Fixture) -> NativeTransactionPlan {
@@ -1344,6 +1503,10 @@ fn native_memory_claude_rechecks_new_local_overrides_and_managed_changes() {
             r#"{"autoMemoryDirectory":"~/changed memory"}"#,
         ),
         ("managed-settings.json", r#"{"autoMemoryEnabled":true}"#),
+        (
+            "project with spaces/.claude/settings.local.json",
+            r#"{"env":{"CLAUDE_CODE_DISABLE_AUTO_MEMORY":"false"}}"#,
+        ),
     ] {
         let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
         let plan = claude_memory_plan(&fixture);

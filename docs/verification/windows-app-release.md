@@ -398,3 +398,13 @@ executor; the corrected four-test daemon integration suite passes locally.
 The [registration evidence](read-only-memory-registration-2026-09-06.md) records
 that hosted failure and its correction. Full connection, installed acceptance
 and the 11d6740 installer status are unchanged.
+
+Twenty real noninteractive Claude sessions now pass against a local model stub,
+including production-generated startup/Stop commands and selected memory roots.
+They exposed a file-environment control that could defeat native-memory disable.
+The adapter now handles that control in the effective project/local file,
+including Windows casing, preserves other keys and restores original bytes on
+Undo. Local checks pass 104 core library, 63 adapter and 16 setup tests; the
+[Claude evidence](claude-native-mcp-2026-09-06.md) records native cases, limits and
+the contained test runner. Full connection and installed acceptance remain open.
+The existing local 11d6740 installer is unchanged.

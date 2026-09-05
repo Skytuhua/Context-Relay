@@ -123,3 +123,12 @@ fixture was corrected and its four tests pass locally. The [Claude evidence](cla
 and [registration evidence](read-only-memory-registration-2026-09-06.md) retain
 session settings, full native setup/recovery and installed acceptance as open.
 T10/T14/T20 remain incomplete; no additional harness version is enabled.
+
+2026-09-06 native-session update: twenty actual noninteractive Claude sessions
+pass against a loopback model stub, verifying selected memory roots and generated
+startup/Stop hook delivery. A settings-provided environment override that defeated
+native-memory disable is now handled transactionally, including Windows casing
+and exact Undo. Local checks pass 104 core library, 63 adapter and 16 setup tests.
+The [Claude evidence](claude-native-mcp-2026-09-06.md) retains interactive/runtime
+settings, production bridge delivery, full setup/recovery and installed acceptance
+as open. T10/T14/T20 and the full product goal remain incomplete.

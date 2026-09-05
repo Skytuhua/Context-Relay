@@ -27,6 +27,8 @@ mod command_context;
 use command_context::ClaudeCommandContext;
 mod memory_path;
 mod memory_repository;
+#[cfg(all(test, windows))]
+mod session_tests;
 
 use crate::mcp::install::{
     BRIDGE_SERVER_NAME, is_canonical_bridge_body, is_managed_bridge_component,
@@ -1140,10 +1142,36 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
                 });
             }
         };
+        let environment_key = memory_environment_key(&settings)
+            .map_err(|_| invalid_request("Claude Code memory environment is ambiguous"))?
+            .map(str::to_owned);
+        let environment_disabled = !configuration.environment_override
+            || environment_key.as_ref().is_some_and(|key| {
+                settings
+                    .get("env")
+                    .and_then(|env| env.get(key))
+                    .and_then(Value::as_str)
+                    == Some("true")
+            });
         let mutations = match settings.get("autoMemoryEnabled") {
-            Some(Value::Bool(false)) => vec![],
-            Some(Value::Bool(true)) | None => {
+            Some(Value::Bool(false)) if environment_disabled => vec![],
+            Some(Value::Bool(_)) | None => {
                 settings.insert("autoMemoryEnabled".to_owned(), Value::Bool(false));
+                if configuration.environment_override {
+                    // A file-provided false environment value forces native memory
+                    // on even when autoMemoryEnabled is false. Override it in the
+                    // same project/local transaction while preserving other keys.
+                    settings
+                        .entry("env")
+                        .or_insert_with(|| Value::Object(Map::new()))
+                        .as_object_mut()
+                        .expect("validated settings environment")
+                        .insert(
+                            environment_key
+                                .unwrap_or_else(|| "CLAUDE_CODE_DISABLE_AUTO_MEMORY".to_owned()),
+                            Value::String("true".to_owned()),
+                        );
+                }
                 let rendered = serde_json::to_vec(&Value::Object(settings)).map_err(|_| {
                     invalid_request("Claude Code memory settings cannot be rendered")
                 })?;
@@ -1290,9 +1318,13 @@ impl ClaudeCodeAdapter {
             .map_err(|_| ())?;
         let project = mcp_state::read_object(&project_path).map_err(|_| ())?;
         let local = mcp_state::read_object(&local_path).map_err(|_| ())?;
+        let local_environment = memory_environment_key(&local)?.is_some();
+        let environment_override = memory_environment_key(&user)?.is_some()
+            | memory_environment_key(&project)?.is_some()
+            | local_environment;
         let mut effective = Map::new();
         // File settings for the selected project: user < project < local.
-        // Launch flags, environment and interactive trust need separate runtime
+        // Launch flags, ambient environment and interactive trust need separate runtime
         // qualification; this does not enable additional supported versions.
         for settings in [&user, &project, &local] {
             for key in ["autoMemoryDirectory", "autoMemoryEnabled"] {
@@ -1305,8 +1337,10 @@ impl ClaudeCodeAdapter {
         let mut managed_directory = None::<Value>;
         for path in &self.layout.managed_settings_paths {
             let settings = mcp_state::read_object(path).map_err(|_| ())?;
+            let managed_environment = memory_environment_key(&settings)?.is_some();
             managed |= settings.contains_key("autoMemoryEnabled")
-                || settings.contains_key("autoMemoryDirectory");
+                || settings.contains_key("autoMemoryDirectory")
+                || managed_environment;
             if let Some(directory) = settings.get("autoMemoryDirectory") {
                 if managed_directory
                     .as_ref()
@@ -1320,14 +1354,16 @@ impl ClaudeCodeAdapter {
         if let Some(directory) = managed_directory {
             effective.insert("autoMemoryDirectory".to_owned(), directory);
         }
-        let (disable_path, disable_settings) = if local.contains_key("autoMemoryEnabled") {
-            (local_path, local)
-        } else {
-            (project_path, project)
-        };
+        let (disable_path, disable_settings) =
+            if local.contains_key("autoMemoryEnabled") || local_environment {
+                (local_path, local)
+            } else {
+                (project_path, project)
+            };
         Ok(EffectiveMemorySettings {
             effective,
             managed,
+            environment_override,
             disable_path,
             disable_settings,
         })
@@ -1444,8 +1480,33 @@ impl ClaudeCodeAdapter {
 struct EffectiveMemorySettings {
     effective: Map<String, Value>,
     managed: bool,
+    environment_override: bool,
     disable_path: PathBuf,
     disable_settings: Map<String, Value>,
+}
+
+fn memory_environment_key(settings: &Map<String, Value>) -> Result<Option<&str>, ()> {
+    let Some(environment) = settings.get("env") else {
+        return Ok(None);
+    };
+    let environment = environment.as_object().ok_or(())?;
+    let mut selected = None;
+    for (key, value) in environment {
+        let matches = if cfg!(windows) {
+            key.eq_ignore_ascii_case("CLAUDE_CODE_DISABLE_AUTO_MEMORY")
+        } else {
+            key == "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+        };
+        if matches {
+            // Windows aliases share one process variable. Reject conflicting
+            // spellings rather than depending on JSON iteration/assignment order.
+            if selected.is_some() || !value.is_string() {
+                return Err(());
+            }
+            selected = Some(key.as_str());
+        }
+    }
+    Ok(selected)
 }
 
 fn safely_missing_project_settings(project_root: &Path, settings_path: &Path) -> bool {
