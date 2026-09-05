@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::{fmt::Write as _, future::Future};
 
 use context_relay_local_ipc::{Client, IpcError};

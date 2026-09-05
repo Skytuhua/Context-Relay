@@ -87,6 +87,24 @@ pnpm typecheck && pnpm test
 pnpm license:check
 ```
 
+To build an unsigned Windows x64 installer candidate on Windows:
+
+```sh
+pnpm package:windows
+```
+
+The command builds the desktop and its four companion executables, then writes
+an NSIS setup `.exe` under
+`target/x86_64-pc-windows-msvc/release/bundle/nsis/` (or your configured Cargo
+target directory). It installs for the current user and includes the WebView2
+bootstrapper; installing WebView2 requires internet if it is absent. Packaging
+uses static CRT linkage and locked Cargo dependencies. Relevant pull requests
+also build a candidate with checksums in GitHub Actions.
+
+These are internal candidates. Signing, installed-product testing, hosted
+functionality and the remaining [release acceptance requirements](docs/verification/windows-app-release.md)
+must pass before claiming a complete product release.
+
 ## Security
 
 Please report security issues through [GitHub private vulnerability reporting](https://github.com/Skytuhua/Context-Relay/security/advisories/new). Do not open a public issue for a suspected vulnerability.

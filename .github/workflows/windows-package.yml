@@ -1,0 +1,67 @@
+name: Windows installer candidate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-package.yml'
+      - 'apps/desktop/**'
+      - 'crates/**'
+      - 'scripts/package-windows*'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - '.node-version'
+      - 'LICENSE'
+      - 'THIRD_PARTY_NOTICES.md'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Windows installer candidate
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - run: npm install --global pnpm@11.9.0
+      - run: pnpm install --frozen-lockfile
+      - run: rustup show
+      - run: node --test scripts/package-windows.test.mjs
+      - run: pnpm package:windows
+      - name: Record candidate checksums
+        shell: pwsh
+        run: |
+          $releaseDirectory = Join-Path $env:GITHUB_WORKSPACE 'target/x86_64-pc-windows-msvc/release'
+          $bundleDirectory = Join-Path $releaseDirectory 'bundle/nsis'
+          $installers = @(Get-ChildItem -LiteralPath $bundleDirectory -Filter '*-setup.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one Windows installer' }
+          $candidateFiles = @($installers[0])
+          foreach ($name in @('context-relay-desktop', 'context-relay-contextd', 'context-relay-context-mcp', 'context-relay-native-helper', 'context-relay-sidecar-installer')) {
+            $candidateFiles += Get-Item -LiteralPath (Join-Path $releaseDirectory "$name.exe") -ErrorAction Stop
+          }
+          $evidence = [ordered]@{
+            source_commit = $env:GITHUB_SHA
+            target = 'x86_64-pc-windows-msvc'
+            status = 'unsigned internal candidate; installed-product acceptance remains required'
+            files = @($candidateFiles | ForEach-Object {
+              [ordered]@{ name = $_.Name; bytes = $_.Length; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+            })
+          }
+          $evidence | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $bundleDirectory 'checksums.json') -Encoding utf8
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: context-relay-windows-x64-${{ github.sha }}
+          path: |
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/checksums.json
+          if-no-files-found: error
+          retention-days: 7

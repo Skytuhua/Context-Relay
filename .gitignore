@@ -8,6 +8,7 @@
 /apps/desktop/dist/
 /src-tauri/target/
 /apps/desktop/src-tauri/gen/schemas/
+/apps/desktop/src-tauri/binaries/
 /.pnpm-store/
 
 # Supabase local state
