@@ -53,7 +53,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const [evidence, setEvidence] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [saving, setSaving] = useState<'memory' | 'task' | null>(null);
+  const [saving, setSaving] = useState<'memory' | 'task' | 'memory-edit' | 'task-edit' | null>(null);
   const savingRef = useRef(false);
   const [projectBusy, setProjectBusy] = useState(false);
   const projectBusyRef = useRef(false);
@@ -185,23 +185,33 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
 
   async function submitMemoryEdit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!editingMemory) return;
+    if (!editingMemory || savingRef.current || connectionState !== 'ready') return;
     const data = new FormData(event.currentTarget);
     const title = String(data.get('title') ?? '').trim();
     const body = String(data.get('body') ?? '').trim();
     if (!title || !body) return setError('Enter a title and memory text.');
+    savingRef.current = true;
+    readGeneration.current += 1;
+    setRecordsLoading(false);
+    setSaving('memory-edit');
+    setError(null);
+    setNotice(null);
     try {
       const memory = await gateway.updateMemory(editingMemory, title, body);
       setMemories((current) => replaceRecord(current, memory));
       setEditingMemory(null);
       setNotice('Memory updated');
       setError(null);
+      refreshSavedRecords('memory', activeProject?.projectId ?? null);
     } catch {
-      setError('The memory changed before it could be updated.');
-    }
+      setError('We could not confirm the update. Your draft is still here. Check Saved context before trying again.');
+    } finally { savingRef.current = false; setSaving(null); }
   }
 
   async function archiveMemory(memory: MemoryRecord) {
+    if (savingRef.current) return;
+    readGeneration.current += 1;
+    setRecordsLoading(false);
     try {
       await gateway.archiveMemory(memory);
       setMemories((current) => current.filter((item) => item.id !== memory.id));
@@ -212,6 +222,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   }
 
   function openArchive(memory: MemoryRecord, trigger: HTMLButtonElement) {
+    if (savingRef.current) return;
     setArchiveTarget(memory);
     archiveTriggerRef.current = trigger;
     queueMicrotask(() => archiveDialogRef.current?.showModal());
@@ -273,22 +284,32 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
 
   async function submitTaskEdit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!editingTask) return;
+    if (!editingTask || !activeProject || savingRef.current || connectionState !== 'ready') return;
     const data = new FormData(event.currentTarget);
     const title = String(data.get('title') ?? '').trim();
     const body = String(data.get('body') ?? '').trim();
     if (!title || !body) return setError('Enter a title and task details.');
+    savingRef.current = true;
+    readGeneration.current += 1;
+    setRecordsLoading(false);
+    setSaving('task-edit');
+    setError(null);
+    setNotice(null);
     try {
       const task = await gateway.updateTask(editingTask, title, body);
       setTasks((current) => replaceRecord(current, task));
       setEditingTask(null);
       setNotice('Task updated');
+      refreshSavedRecords('task', activeProject.projectId);
     } catch {
-      setError('The task changed before it could be updated.');
-    }
+      setError('We could not confirm the update. Your draft is still here. Check the task list before trying again.');
+    } finally { savingRef.current = false; setSaving(null); }
   }
 
   async function transitionTask(task: TaskRecord, next: TaskStatus) {
+    if (savingRef.current) return;
+    readGeneration.current += 1;
+    setRecordsLoading(false);
     try {
       const updated = await gateway.transitionTask(task, next);
       setTasks((current) => replaceRecord(current, updated));
@@ -298,8 +319,11 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   }
 
   async function completeTask(task: TaskRecord) {
+    if (savingRef.current) return;
     const summary = evidence[task.id]?.trim();
     if (!summary) return setError(`Enter completion evidence for ${task.title}.`);
+    readGeneration.current += 1;
+    setRecordsLoading(false);
     try {
       const updated = await gateway.completeTask(task, summary);
       setTasks((current) => replaceRecord(current, updated));
@@ -352,8 +376,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           <section className="screen-content">
             <form aria-label="Context search" role="search" className="inline-form" onSubmit={searchMemory}>
               <label htmlFor="memory-query">Search saved context</label>
-              <input id="memory-query" name="query" type="search" />
-              <button className="secondary-action" type="submit">Search</button>
+              <input id="memory-query" name="query" type="search" disabled={!!saving} />
+              <button className="secondary-action" type="submit" disabled={!!saving}>Search</button>
             </form>
             <form aria-describedby={error ? 'workspace-error' : undefined} aria-label="New context" className="capture-form" onSubmit={submitMemory}>
               <h2>Save something worth remembering</h2>
@@ -363,12 +387,12 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
               <button className="primary-action" type="submit" disabled={!!saving || connectionState !== 'ready'}>{saving === 'memory' ? 'Saving…' : 'Save context'}</button>
             </form>
             {editingMemory && (
-              <form aria-describedby={error ? 'workspace-error' : undefined} aria-label="Edit memory" className="capture-form edit-form" onSubmit={submitMemoryEdit}>
+              <form key={editingMemory.id} aria-describedby={error ? 'workspace-error' : undefined} aria-label="Edit memory" className="capture-form edit-form" onSubmit={submitMemoryEdit}>
                 <h2>Edit memory</h2>
-                <Field label="Edit title" name="title" defaultValue={editingMemory.title} />
-                <Field label="Edit memory" name="body" defaultValue={editingMemory.bodyMarkdown} multiline />
-                <button className="primary-action" type="submit">Update memory</button>
-                <button className="secondary-action" onClick={() => setEditingMemory(null)} type="button">Cancel edit</button>
+                <Field label="Edit title" name="title" defaultValue={editingMemory.title} disabled={!!saving} />
+                <Field label="Edit memory" name="body" defaultValue={editingMemory.bodyMarkdown} multiline disabled={!!saving} />
+                <button className="primary-action" type="submit" disabled={!!saving || connectionState !== 'ready'}>{saving === 'memory-edit' ? 'Saving changes…' : 'Update memory'}</button>
+                <button className="secondary-action" disabled={!!saving} onClick={() => setEditingMemory(null)} type="button">Cancel edit</button>
               </form>
             )}
             <RecordList title="Saved context">
@@ -377,8 +401,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
                 <li className="record-card" key={memory.id}>
                   <h3>{memory.title}</h3>
                   <p>{memory.bodyMarkdown}</p>
-                  <button aria-label={`Edit ${memory.title}`} onClick={() => setEditingMemory(memory)} type="button">Edit</button>
-                  <button aria-label={`Archive ${memory.title}`} onClick={(event) => openArchive(memory, event.currentTarget)} type="button">Archive</button>
+                  <button aria-label={`Edit ${memory.title}`} disabled={!!saving} onClick={() => setEditingMemory(memory)} type="button">Edit</button>
+                  <button aria-label={`Archive ${memory.title}`} disabled={!!saving} onClick={(event) => openArchive(memory, event.currentTarget)} type="button">Archive</button>
                 </li>
               ))}
             </RecordList>
@@ -439,11 +463,11 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
               <button className="primary-action" type="submit" disabled={!!saving || connectionState !== 'ready'}>{saving === 'task' ? 'Saving…' : 'Save task'}</button>
             </form>
             {editingTask && (
-              <form aria-describedby={error ? 'workspace-error' : undefined} aria-label="Edit task" className="capture-form edit-form" onSubmit={submitTaskEdit}>
+              <form key={editingTask.id} aria-describedby={error ? 'workspace-error' : undefined} aria-label="Edit task" className="capture-form edit-form" onSubmit={submitTaskEdit}>
                 <h2>Edit task</h2>
-                <Field label="Edit task title" name="title" defaultValue={editingTask.title} />
-                <Field label="Edit task details" name="body" defaultValue={editingTask.bodyMarkdown} multiline />
-                <button className="primary-action" type="submit">Update task</button>
+                <Field label="Edit task title" name="title" defaultValue={editingTask.title} disabled={!!saving} />
+                <Field label="Edit task details" name="body" defaultValue={editingTask.bodyMarkdown} multiline disabled={!!saving} />
+                <button className="primary-action" type="submit" disabled={!!saving || connectionState !== 'ready'}>{saving === 'task-edit' ? 'Saving changes…' : 'Update task'}</button>
               </form>
             )}
             <RecordList title="Tasks">
@@ -453,18 +477,19 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
                   <h3>{task.title}</h3>
                   <p>{task.bodyMarkdown}</p>
                   <p className="state-label">{task.status === 'done' ? 'Done' : task.status.replace('_', ' ')}</p>
-                  <button aria-label={`Edit ${task.title}`} onClick={() => setEditingTask(task)} type="button">Edit</button>
+                  <button aria-label={`Edit ${task.title}`} disabled={!!saving} onClick={() => setEditingTask(task)} type="button">Edit</button>
                   {task.status !== 'done' && (
                     <>
-                      <button aria-label={`Start ${task.title}`} onClick={() => void transitionTask(task, 'in_progress')} type="button">Start</button>
+                      <button aria-label={`Start ${task.title}`} disabled={!!saving} onClick={() => void transitionTask(task, 'in_progress')} type="button">Start</button>
                       <label htmlFor={`evidence-${task.id}`}>Evidence for {task.title}</label>
                       <input
                         id={`evidence-${task.id}`}
+                        disabled={!!saving}
                         onChange={(event) => setEvidence((current) => ({ ...current, [task.id]: event.target.value }))}
                         type="text"
                         value={evidence[task.id] ?? ''}
                       />
-                      <button aria-label={`Complete ${task.title}`} onClick={() => void completeTask(task)} type="button">Complete</button>
+                      <button aria-label={`Complete ${task.title}`} disabled={!!saving} onClick={() => void completeTask(task)} type="button">Complete</button>
                     </>
                   )}
                   {task.evidence.map((item) => <p key={`${task.id}-${item.summary}`}>{item.summary}</p>)}

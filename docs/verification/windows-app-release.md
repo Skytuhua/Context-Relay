@@ -160,3 +160,21 @@ that restricted reads require its elevated Windows backend, which was not set
 up for the isolated test. The [qualification record](codex-staged-generation-2026-09-06.md)
 contains exact scope, runtime identity, cleanup disposition and reproduction
 evidence. No Full capability, installed-app or release-readiness claim follows.
+
+2026-09-06, record editing fixes: switching between two existing notes or tasks
+reused uncontrolled form fields from the previous record. The edit form now
+belongs to the selected record ID. Edits use the same pending-save guard as
+creation: duplicate submits, navigation, project changes and competing controls
+are disabled until acknowledgment. Unconfirmed edits retain their draft and
+show an uncertainty message instead of claiming a version conflict. Older reads
+cannot overwrite a successful edit; subsequent archive/start/complete actions
+also invalidate a pending post-edit refresh.
+
+Four target-switch/duplicate-submit cases failed before correction. Independent
+review identified the subsequent-mutation refresh race, and three additional
+regressions reproduced it before correction. All 124 frontend tests pass,
+including eight edit/ordering regressions; type checking and lint pass. The
+corrected scoped patch received independent review. These tests use the real
+React UI with a controlled workspace gateway; installed Windows acceptance is
+still pending while desktop control remains paused. They do not qualify durable
+retries, every record-mutation race, or the full usability/release objective.
