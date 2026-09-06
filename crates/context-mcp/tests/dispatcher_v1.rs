@@ -661,8 +661,8 @@ fn remember_call(id: Value) -> Value {
 fn status_output() -> Value {
     json!({
         "protocol": {
-            "min": {"major": 1, "minor": 9},
-            "max": {"major": 1, "minor": 9}
+            "min": context_relay_protocol::PROTOCOL_VERSION,
+            "max": context_relay_protocol::PROTOCOL_VERSION
         },
         "vault": "unlocked",
         "resolvedProject": null,

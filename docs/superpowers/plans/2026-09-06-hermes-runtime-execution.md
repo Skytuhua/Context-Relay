@@ -84,3 +84,17 @@ Windows process-lifetime references:
 and [job accounting](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information).
 Termination requests apply to the job hierarchy; inspect the active-process count
 and finish outstanding I/O before releasing the owned runtime.
+
+## Production setup qualification — 2026-09-07
+
+The authenticated daemon composition now passes explicit preparation, prepared
+review, tracked Save, readback through the saved bridge command and arguments,
+daemon/vault restart, idempotent reapply and exact Undo. The fixture uses the
+actual copied 0.17.0 runtime, production setup engine and real stdio dispatcher
+with an explicit test-only IPC namespace and synthetic credentials. It passed in
+1575.45 seconds. The test-only capability override has been removed; the exact
+retained version gate is enabled in source. Ordinary launchers remain import-only.
+
+See [the qualification report](../../verification/hermes-production-setup-2026-09-07.md)
+for test boundaries and evidence. Actual Hermes client/model behavior, installed
+credentials and replacement-installer acceptance remain separate requirements.

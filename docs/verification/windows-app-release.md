@@ -495,3 +495,27 @@ executing Python. It resolves the editable checkout and managed CPython junction
 labels the metadata version, and preserves ImportOnly until complete runtime
 capture and connection qualification are implemented. No replacement local EXE
 or installed acceptance is claimed by this discovery work.
+
+## Current source qualification — 2026-09-07
+
+The [first-use UI evidence](first-use-ui-2026-09-06.md) now includes guided
+preparation, tracked Save/Undo, durable history and focused availability/review
+results at desktop and narrow widths. Source 2819112 brings new results into
+view without allowing an inactive screen's delayed reply to steal focus. The
+desktop uses Harnesses consistently and distinguishes settings saved from a
+verified live connection.
+
+The [Hermes production setup report](hermes-production-setup-2026-09-07.md)
+supersedes the passive-discovery-only status for runtime preparation and daemon
+composition. Complete capture, reviewed retention, staged management execution
+and authenticated tracked setup are implemented. The configured bridge cycle
+passed Save, context readback, daemon/vault restart, reapply and exact Undo in
+1575.45 seconds. The source gate now permits a verified retained 0.17.0 adapter;
+ordinary Python launchers remain import-only. Installed release acceptance and
+an actual Hermes client/model session remain unverified.
+
+The local unsigned x64 installer remains the 11d6740 candidate, SHA-256
+`a18e2051f1fc30a9d7cf66dec71ac747f6f54facf03485fa826447d233d326bf`.
+It predates these source changes. Codex 0.144.6 and Claude Code 2.1.202 still
+require their remaining qualification gates. Signing, installed workflow and
+clean-machine acceptance remain open; native desktop control is paused.

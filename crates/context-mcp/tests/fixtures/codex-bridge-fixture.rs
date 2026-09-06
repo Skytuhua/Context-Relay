@@ -24,21 +24,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let executable = std::env::current_exe()?;
     let root = executable.parent().ok_or("missing fixture parent")?;
     let suffix = std::fs::read_to_string(root.join("bridge-runtime.txt"))?;
-    // The production suffix is 'main'; this fixture cannot select it.
-    if !suffix.starts_with("codex-native-") || suffix.len() != 45 {
-        return Err("invalid fixture runtime".into());
-    }
+    let harness = match &invocation {
+        Invocation::Mcp { harness } | Invocation::Hook { harness, .. } => *harness,
+    };
+    let token = fixture_token(&suffix, harness).ok_or("invalid fixture runtime")?;
     let runtime = RuntimeConfig::for_test(suffix, Some(root.join("runtime")))?;
-    let daemon = LocalDaemon::for_test(runtime, InstallationToken::from_bytes([0x71; 32]));
+    let daemon = LocalDaemon::for_test(runtime, InstallationToken::from_bytes(token));
     let cwd = std::env::current_dir()?;
     match invocation {
-        Invocation::Mcp {
-            harness: HarnessId::Codex,
-        } => {
+        Invocation::Mcp { harness } => {
             Server::new(
                 daemon,
                 McpBinding {
-                    harness: HarnessId::Codex,
+                    harness,
                     working_directory: wire_path(&cwd),
                 },
             )
@@ -60,6 +58,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("fixture requires Codex".into()),
     }
     Ok(())
+}
+
+// Closed test namespaces and fixed synthetic tokens cannot select production 'main'.
+fn fixture_token(suffix: &str, harness: HarnessId) -> Option<[u8; 32]> {
+    match harness {
+        HarnessId::Codex if suffix.starts_with("codex-native-") && suffix.len() == 45 => {
+            Some([0x71; 32])
+        }
+        HarnessId::Hermes if suffix.starts_with("hermes-native-") && suffix.len() == 46 => {
+            Some([0x5a; 32])
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_runtime_binding_cannot_select_production_or_another_harness() {
+        let codex = format!("codex-native-{}", "a".repeat(32));
+        let hermes = format!("hermes-native-{}", "b".repeat(32));
+        assert_eq!(fixture_token(&codex, HarnessId::Codex), Some([0x71; 32]));
+        assert_eq!(fixture_token(&hermes, HarnessId::Hermes), Some([0x5a; 32]));
+        for (suffix, harness) in [
+            ("main", HarnessId::Hermes),
+            ("main", HarnessId::Codex),
+            (&codex, HarnessId::Hermes),
+            (&hermes, HarnessId::Codex),
+            (&hermes, HarnessId::ClaudeCode),
+            ("hermes-native-short", HarnessId::Hermes),
+        ] {
+            assert_eq!(fixture_token(suffix, harness), None);
+        }
+    }
 }
 
 fn wire_path(path: &Path) -> WireNativeValue {

@@ -136,8 +136,6 @@ pub struct HermesAdapter {
     retained_runtime: Option<retained_adapter::AdapterRuntime>,
     #[cfg(windows)]
     preview_runtime: Option<Box<crate::native_transaction::InstalledRuntimeBinding>>,
-    #[cfg(all(test, windows))]
-    qualify_retained_setup: bool,
 }
 
 enum DiscoveryVersion<'a> {
@@ -164,8 +162,6 @@ impl Clone for HermesAdapter {
             retained_runtime: self.retained_runtime.clone(),
             #[cfg(windows)]
             preview_runtime: self.preview_runtime.clone(),
-            #[cfg(all(test, windows))]
-            qualify_retained_setup: self.qualify_retained_setup,
         }
     }
 }
@@ -476,8 +472,6 @@ impl HermesAdapter {
             retained_runtime: None,
             #[cfg(windows)]
             preview_runtime: None,
-            #[cfg(all(test, windows))]
-            qualify_retained_setup: false,
         })
     }
 
@@ -566,16 +560,13 @@ impl HermesAdapter {
         }
         #[cfg(windows)]
         if self.retained_runtime.is_some() {
-            #[cfg(test)]
-            if self.qualify_retained_setup
-                && self.layout.version == "0.17.0"
-                && self.yaml_topology_supported()
-            {
-                return CapabilityLevel::Full;
-            }
-            // Connection, restart and Undo qualification must precede enabling
-            // Python-backed writes, even for a version supported natively.
-            return CapabilityLevel::ImportOnly;
+            // A retained adapter owns a verified copy bound to the sealed plan.
+            // Ordinary Python launchers still require explicit preparation.
+            return if self.layout.version == "0.17.0" && self.yaml_topology_supported() {
+                CapabilityLevel::Full
+            } else {
+                CapabilityLevel::ImportOnly
+            };
         }
         if SUPPORTED_VERSIONS.contains(&self.layout.version.as_str())
             && self.executable_snapshot.runnable()
@@ -854,7 +845,17 @@ impl HarnessAdapter for HermesAdapter {
                 .flatten()
                 .is_some_and(|installation| installation.version == self.layout.version)
         {
-            policy_conflicts.push("python_runtime_not_qualified".into());
+            #[cfg(windows)]
+            let needs_preparation = self.retained_runtime.is_none()
+                && self.layout.version == "0.17.0"
+                && self.yaml_topology_supported();
+            #[cfg(not(windows))]
+            let needs_preparation = false;
+            if needs_preparation {
+                policy_conflicts.push("python_runtime_preparation_required".into());
+            } else if self.capability() != CapabilityLevel::Full {
+                policy_conflicts.push("python_runtime_not_qualified".into());
+            }
         }
         match gateway::inspect_gateway(&self.layout.profile)? {
             gateway::GatewayStatus::Idle => {}
@@ -1916,7 +1917,7 @@ mod tests {
             runtime: reference.clone(),
         };
         assert_eq!(NativeAdapter::installed_runtime(&adapter), Some(&expected));
-        assert_eq!(adapter.capability(), CapabilityLevel::ImportOnly);
+        assert_eq!(adapter.capability(), CapabilityLevel::Full);
         let clone = adapter.clone();
         assert_eq!(NativeAdapter::installed_runtime(&clone), Some(&expected));
         let mut ordinary_launcher = |_: &HermesValidationRequest| -> Result<Vec<u8>, ClientError> {
@@ -1967,6 +1968,32 @@ mod tests {
                 .reopen_approved_runtime(store.path(), &approved, Arc::new(AtomicBool::new(false)))
                 .is_err()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_capability_requires_exact_version_and_supported_yaml() {
+        let _guard = python_runtime::management_test_guard();
+        use std::sync::{Arc, atomic::AtomicBool};
+        let fixture = validation_fixture("0.17.0");
+        assert_eq!(fixture.adapter.capability(), CapabilityLevel::ImportOnly);
+        let launcher = fs::read(&fixture.layout.executable).unwrap();
+        let (_store, runtime) = python_runtime::runtime_fixture(&launcher);
+        let adapter = fixture
+            .adapter
+            .clone()
+            .bind_retained_runtime(runtime, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        assert_eq!(adapter.capability(), CapabilityLevel::Full);
+        let mut wrong_version = adapter.clone();
+        wrong_version.layout.version = "0.18.0".into();
+        assert_eq!(wrong_version.capability(), CapabilityLevel::ImportOnly);
+        fs::write(
+            fixture.layout.profile.hermes_home.join("config.yaml"),
+            b"memory: [unterminated\n",
+        )
+        .unwrap();
+        assert_eq!(adapter.capability(), CapabilityLevel::ImportOnly);
     }
 
     #[cfg(windows)]

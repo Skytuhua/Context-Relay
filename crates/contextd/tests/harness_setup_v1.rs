@@ -35,6 +35,10 @@ const TOKEN: [u8; 32] = [0x5a; 32];
 const PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
 const ROLLBACK_PLAN: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073990";
 
+#[cfg(all(windows, feature = "test-support"))]
+#[path = "harness_setup_v1/production_hermes.rs"]
+mod production_hermes;
+
 #[cfg(any(windows, target_os = "macos"))]
 #[tokio::test]
 async fn project_registration_is_desktop_only_and_keeps_identity_and_path_after_restart() {

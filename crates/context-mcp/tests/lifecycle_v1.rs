@@ -34,8 +34,8 @@ impl Daemon for FakeDaemon {
         ready(Ok(match call.name.as_str() {
             "context_relay_status" => json!({
                 "protocol": {
-                    "min": {"major": 1, "minor": 9},
-                    "max": {"major": 1, "minor": 9}
+                    "min": context_relay_protocol::PROTOCOL_VERSION,
+                    "max": context_relay_protocol::PROTOCOL_VERSION
                 },
                 "vault": "unlocked",
                 "resolvedProject": null,

@@ -147,7 +147,6 @@ impl BridgePlanExecutor for Executor<'_> {
         .unwrap()
         .reopen_approved_runtime(self.store, plan, Arc::new(AtomicBool::new(false)))
         .unwrap();
-        adapter.qualify_retained_setup = true;
         println!("Runtime reopened; starting native transaction");
         let mut restricted = InProcess(plan);
         let mut filesystem = OsNativeTransactionFileSystem::new(*plan.setup.plan_id.as_bytes());

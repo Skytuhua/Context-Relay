@@ -25,9 +25,11 @@ zeroize.workspace = true
 [dev-dependencies]
 context-relay-local-ipc = { version = "0.1.0", path = "../local-ipc", features = ["test-support"] }
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "process"] }
 uuid.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
 dunce = "1.0.5"
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_JobObjects"] }

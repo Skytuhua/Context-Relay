@@ -42,8 +42,8 @@ input/output, and unknown fields are never forwarded or persisted.
 ## Supported installations and profile binding
 
 Hermes `0.18.2` and `0.18.1` native executable images are supported for import
-and apply. Every script or wrapper is import-only, including the upstream Unix
-four-line Bash shim and its `venv/bin/hermes` Python console script. Matching a
+and apply. Ordinary scripts and wrappers are import-only, including the upstream
+Unix four-line Bash shim and its `venv/bin/hermes` Python console script. Matching a
 launcher body, `pyvenv.cfg`, sibling interpreter path, native interpreter bytes,
 or a claimed version does not authenticate the installed `hermes_cli` package,
 package metadata, dependencies, or transitive Python import closure. Context
@@ -53,12 +53,12 @@ launchers and never grants them Full capability.
 Upstream tags `v2026.7.7.2` (`0.18.2`, commit
 `9de9c25f620ff7f1ce0fd5457d596052d5159596`) and `v2026.7.7` (`0.18.1`,
 commit `f9eca7e15f1c2bfe5194aae5aa489af53c0a1a23`) establish source history, not
-the identity of a mutable local venv. Python launcher apply support remains
-disabled until a complete immutable runtime/package closure is captured, separately
-bound into reviewed setup and recovery, and reattested before every execution.
+the identity of a mutable local venv. The separate Windows retained-runtime path
+captures the bounded runtime/package inventory, binds it into reviewed setup and
+recovery, and reattests the retained bytes before management execution.
 The [Python installation design](../../docs/superpowers/specs/2026-09-06-hermes-python-installation.md)
 permits a local installation snapshot as identity; it does not call that snapshot
-publisher authentication or extend the qualified version matrix.
+publisher authentication.
 
 Windows discovery can now read an installed version from bounded, consistent
 CPython venv and Hermes distribution metadata without launching Python. Both wheel
@@ -67,16 +67,26 @@ The inspector resolves the venv, interpreter, base Python directory, site-packag
 and editable source, and records the metadata paths/digests. It supports uv's
 same-parent minor-version Python junction while rejecting other aliases and
 remote/device paths. The observations are not a complete import inventory and
-never authorize launch. The UI labels the reported version as package metadata
-and keeps the Python runtime ImportOnly. Complete capture, sealed runtime binding,
-staged execution, and actual connection/recovery qualification remain unimplemented.
+never authorize launch. The UI labels the reported version as package metadata.
+An eligible Windows 0.17.0 installation offers explicit preparation, followed by
+a separate settings review. Preparation leaves ordinary harness settings unchanged.
+Tracked Save and Undo consume the exact approved runtime binding; the management
+runner uses a private profile and owns its copied runtime until child processes
+and pending I/O settle. It cannot fall back to the ordinary Python launcher.
+
+The source gate grants Full to a verified retained 0.17.0 adapter with
+supported YAML. The ordinary launcher, other retained versions and ambiguous
+configurations remain ImportOnly. Production-composition qualification is recorded
+in [the current verification report](../../docs/verification/hermes-production-setup-2026-09-07.md).
+Its configured bridge, restart and exact Undo cycle passed. This is not a release
+qualification or an installed Hermes client/model connection claim.
 
 Windows PE/MZ candidates are also import-only, including a `hermes.exe` renamed
 to omit its suffix. A setuptools/distlib Python console launcher is itself a PE
 executable, so neither an `MZ` header nor the path can prove that the file is a
-standalone Hermes implementation. Until an immutable reviewed Windows artifact
-or complete package/import-closure manifest exists, every PE/MZ candidate is
-classified as a wrapper and never executed.
+standalone Hermes implementation. PE/MZ launcher candidates remain classified as
+wrappers and are never executed directly. Retained Python management execution
+uses the separate reviewed runtime binding described above.
 
 The adapter binds one explicitly named profile to its canonical profile root;
 it never falls back to another profile or creates a missing profile. The
@@ -138,7 +148,7 @@ as exact.
 
 ## Import-only rules
 
-All wrappers, unknown Hermes versions, and configurations whose reviewed YAML
+Ordinary wrappers, unknown Hermes versions, and configurations whose reviewed YAML
 paths cannot be patched without ambiguity remain import-only. Import-only
 installations are never allowed to start the version or validation command or
 enter native apply. Unsupported YAML includes unsafe or non-block topology,
