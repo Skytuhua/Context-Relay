@@ -51,7 +51,7 @@ pub fn seal_plan(
         return Err(PlanSealError::ApprovalHash);
     }
 
-    let native_plan = json!({
+    let mut native_plan = json!({
         "setup": plan.setup,
         "approvalVersion": plan.approval_version,
         "helperPolicyVersion": plan.helper_policy_version,
@@ -107,6 +107,9 @@ pub fn seal_plan(
             "nativeDigest": digest(change.native_digest),
         })).collect::<Vec<_>>(),
     });
+    if let Some(runtime) = &plan.installed_runtime {
+        native_plan["installedRuntime"] = json!(runtime);
+    }
     serde_json::to_vec(&json!({
         "schemaVersion": SEALED_PLAN_SCHEMA_VERSION,
         "approvalVersion": 2,
@@ -417,6 +420,8 @@ struct SealedNativePlan {
     cli_mutations: Vec<SealedCliMutation>,
     #[serde(default)]
     native_memory_registrations: Vec<crate::native_memory::NativeMemoryRegistration>,
+    #[serde(default)]
+    installed_runtime: Option<super::InstalledRuntimeBinding>,
     ownership_changes: Vec<SealedOwnershipChange>,
 }
 
@@ -453,6 +458,7 @@ impl SealedNativePlan {
                 .map(SealedCliMutation::open)
                 .collect::<Result<_, _>>()?,
             native_memory_registrations: self.native_memory_registrations,
+            installed_runtime: self.installed_runtime,
             ownership_changes: self
                 .ownership_changes
                 .into_iter()

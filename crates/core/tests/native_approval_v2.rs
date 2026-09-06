@@ -192,6 +192,7 @@ fn plan() -> NativeTransactionPlan {
         scanner_result_hash: Sha256Digest([12; 32]),
         mutations: vec![],
         cli_mutations: vec![cli_mutation],
+        installed_runtime: None,
         native_memory_registrations: vec![memory_registration()],
         ownership_changes: vec![],
     }
@@ -208,6 +209,146 @@ fn assert_rejects(plan: &NativeTransactionPlan, expected: &str) {
 #[test]
 fn freezes_the_v2_domain_separator() {
     assert_eq!(APPROVAL_DOMAIN_V2, b"context-relay/native-plan/v2\0");
+}
+
+fn retained_hermes_plan() -> NativeTransactionPlan {
+    use context_relay_core::native_transaction::InstalledRuntimeBinding;
+    let mut candidate = plan();
+    candidate.setup.harness = HarnessId::Hermes;
+    candidate.setup.harness_profile = Some("default".into());
+    candidate.setup.executable_path = WireNativeValue {
+        platform: NativePlatform::Windows,
+        bytes: "C:\\fixture\\hermes.exe"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect(),
+        display: Some("C:\\fixture\\hermes.exe".into()),
+    };
+    candidate.cli_mutations.clear();
+    candidate.setup.cli_operations.clear();
+    candidate.native_memory_registrations.clear();
+    candidate.sidecars[0].target = RuntimeTarget::WindowsX86_64;
+    candidate.installed_runtime = Some(InstalledRuntimeBinding::HermesPythonV1 {
+        runtime: serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1,
+            "storageKey": "context-relay-hermes-runtime-Abc123",
+            "manifestIdentity": Sha256Digest([71; 32]),
+        }))
+        .unwrap(),
+    });
+    candidate
+}
+
+#[test]
+fn retained_runtime_is_bound_in_sealed_and_reversible_plans() {
+    use context_relay_core::native_transaction::seal_reversible_plan;
+    let mut candidate = retained_hermes_plan();
+    let approved = approval_hash_v2(&candidate).unwrap();
+    candidate.setup.batch_hash = approved;
+    for sealed in [
+        seal_plan(&candidate, approved).unwrap(),
+        seal_reversible_plan(&candidate, approved, &[], None).unwrap(),
+    ] {
+        assert_eq!(
+            open_plan(&sealed).unwrap().plan.installed_runtime,
+            candidate.installed_runtime
+        );
+        for replacement in [
+            None,
+            Some(serde_json::json!({
+                "kind": "hermesPythonV1", "runtime": {
+                    "schemaVersion": 1, "storageKey": "context-relay-hermes-runtime-Abc124",
+                    "manifestIdentity": Sha256Digest([71; 32]),
+                }
+            })),
+        ] {
+            let mut altered: serde_json::Value = serde_json::from_slice(&sealed).unwrap();
+            let native = altered["nativePlan"].as_object_mut().unwrap();
+            if let Some(value) = replacement {
+                native.insert("installedRuntime".into(), value);
+            } else {
+                native.remove("installedRuntime");
+            }
+            assert!(open_plan(&serde_json::to_vec(&altered).unwrap()).is_err());
+        }
+    }
+}
+
+#[test]
+fn retained_runtime_rejects_wrong_harness_platform_and_legacy_approval() {
+    use context_relay_core::native_transaction::approval_hash_v1;
+    let candidate = retained_hermes_plan();
+    assert!(approval_hash_v1(&candidate).is_err());
+    let mut wrong_harness = candidate.clone();
+    wrong_harness.setup.harness = HarnessId::Codex;
+    wrong_harness.setup.harness_profile = None;
+    assert_rejects(&wrong_harness, "installed runtime requires Windows Hermes");
+    let mut wrong_platform = candidate;
+    wrong_platform.setup.executable_path = native_text("/fixture/hermes");
+    assert_rejects(&wrong_platform, "installed runtime requires Windows Hermes");
+}
+
+#[test]
+fn retained_runtime_identity_schema_and_discriminator_are_checked() {
+    let candidate = retained_hermes_plan();
+    let baseline = approval_hash_v2(&candidate).unwrap();
+    for (field, value, valid) in [
+        (
+            "manifestIdentity",
+            serde_json::json!(Sha256Digest([72; 32])),
+            true,
+        ),
+        ("schemaVersion", serde_json::json!(2), false),
+        ("storageKey", serde_json::json!("../outside"), false),
+    ] {
+        let mut binding =
+            serde_json::to_value(candidate.installed_runtime.as_ref().unwrap()).unwrap();
+        binding["runtime"][field] = value;
+        let mut changed = candidate.clone();
+        changed.installed_runtime = Some(serde_json::from_value(binding).unwrap());
+        if valid {
+            assert_ne!(approval_hash_v2(&changed).unwrap(), baseline);
+        } else {
+            assert!(approval_hash_v2(&changed).is_err());
+        }
+    }
+    for (field, value) in [
+        ("kind", serde_json::json!("hermesPythonV2")),
+        ("unknown", serde_json::json!(true)),
+    ] {
+        let mut binding =
+            serde_json::to_value(candidate.installed_runtime.as_ref().unwrap()).unwrap();
+        binding[field] = value;
+        assert!(serde_json::from_value::<context_relay_core::native_transaction::InstalledRuntimeBinding>(binding).is_err());
+    }
+}
+
+#[test]
+fn legacy_plans_omit_runtime_binding_and_preserve_approval_through_reopen() {
+    for with_memory in [false, true] {
+        let mut candidate = plan();
+        if !with_memory {
+            candidate.native_memory_registrations.clear();
+        }
+        let approved = approval_hash_v2(&candidate).unwrap();
+        // Frozen from approval.rs at c48965d, before retained-runtime support.
+        let expected = if with_memory {
+            "3853c0212eb0b45483bef49cb80fe65ce73b216177fef9b8a7ee3004e8b1f732"
+        } else {
+            "609fbaf30125e8fac8d907010a4c6fe20902f2ec387679f978f464001d29c8ae"
+        };
+        assert_eq!(
+            serde_json::to_value(approved).unwrap(),
+            serde_json::json!(expected)
+        );
+        candidate.setup.batch_hash = approved;
+        let sealed = seal_plan(&candidate, approved).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&sealed).unwrap();
+        assert!(value["nativePlan"].get("installedRuntime").is_none());
+        let reopened = open_plan(&sealed).unwrap().plan;
+        assert!(reopened.installed_runtime.is_none());
+        assert_eq!(approval_hash_v2(&reopened).unwrap(), approved);
+    }
 }
 
 fn claude_context_plan() -> NativeTransactionPlan {

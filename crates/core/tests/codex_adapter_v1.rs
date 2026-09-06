@@ -365,6 +365,7 @@ fn codex_native_plan(
         scanner_result_hash: Sha256Digest([31; 32]),
         mutations: vec![mutation],
         cli_mutations: vec![],
+        installed_runtime: None,
         native_memory_registrations: vec![],
         ownership_changes: vec![],
     };

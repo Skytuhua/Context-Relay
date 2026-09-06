@@ -210,10 +210,21 @@ pub struct NativeTransactionPlan {
     pub scanner_result_hash: Sha256Digest,
     pub mutations: Vec<ApprovedMutation>,
     pub cli_mutations: Vec<ApprovedCliMutation>,
+    pub installed_runtime: Option<InstalledRuntimeBinding>,
     /// Exact native fallback source descriptors activated only after this
     /// sealed setup plan commits successfully.
     pub native_memory_registrations: Vec<NativeMemoryRegistration>,
     pub ownership_changes: Vec<OwnershipChange>,
+}
+
+/// Closed runtime/command-policy identity, distinct from shipped sidecar provenance.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum InstalledRuntimeBinding {
+    #[serde(rename = "hermesPythonV1")]
+    HermesPythonV1 {
+        runtime: crate::hermes::python_runtime::RetainedRuntimeReference,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

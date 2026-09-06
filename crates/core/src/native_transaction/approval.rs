@@ -33,6 +33,11 @@ pub enum ApprovalError {
 }
 
 pub fn approval_hash_v1(plan: &NativeTransactionPlan) -> Result<Sha256Digest, ApprovalError> {
+    if plan.installed_runtime.is_some() {
+        return Err(ApprovalError::Invalid(
+            "approval v1 cannot bind installed runtimes".into(),
+        ));
+    }
     if !plan.cli_mutations.is_empty() {
         return Err(ApprovalError::Invalid(
             "approval v1 cannot bind cli mutations".into(),
@@ -59,6 +64,20 @@ pub fn approval_hash_v2(plan: &NativeTransactionPlan) -> Result<Sha256Digest, Ap
     validate(plan)?;
     validate_cli_mutations(plan)?;
     validate_native_memory_registrations(plan)?;
+    if let Some(super::InstalledRuntimeBinding::HermesPythonV1 { runtime }) =
+        &plan.installed_runtime
+    {
+        if plan.setup.harness != HarnessId::Hermes
+            || plan.setup.executable_path.platform != NativePlatform::Windows
+        {
+            return Err(ApprovalError::Invalid(
+                "installed runtime requires Windows Hermes".into(),
+            ));
+        }
+        runtime
+            .validate()
+            .map_err(|_| ApprovalError::Invalid("installed runtime reference is invalid".into()))?;
+    }
 
     let mut value = vec![
         Value::from(2),
@@ -68,8 +87,14 @@ pub fn approval_hash_v2(plan: &NativeTransactionPlan) -> Result<Sha256Digest, Ap
     // Preserve the already-shipped v2 preimage for legacy plans whose exact
     // registration set was empty. Any Task 10 descriptor set adds this fully
     // validated fourth member and is therefore approval-bound.
-    if !plan.native_memory_registrations.is_empty() {
+    if !plan.native_memory_registrations.is_empty() || plan.installed_runtime.is_some() {
         value.push(native_memory_approval_value(plan)?);
+    }
+    if let Some(runtime) = &plan.installed_runtime {
+        value.push(
+            serde_json::to_value(runtime)
+                .map_err(|error| ApprovalError::Serialization(error.to_string()))?,
+        );
     }
     hash_approval(APPROVAL_DOMAIN_V2, &Value::Array(value))
 }

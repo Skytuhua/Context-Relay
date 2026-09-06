@@ -921,6 +921,7 @@ impl<'a> HermesMemoryExportService<'a> {
             scanner_result_hash: digest(b"hermes-memory-export-scanner-v1"),
             mutations: mutation.into_iter().collect(),
             cli_mutations: vec![],
+            installed_runtime: None,
             native_memory_registrations: vec![NativeMemoryRegistration {
                 source,
                 last_applied_digest: Some(intended_digest),
@@ -1578,6 +1579,11 @@ pub fn verify_watch_only_registration(
     plan: &NativeTransactionPlan,
     now_ms: u64,
 ) -> Result<(), ClientError> {
+    if plan.installed_runtime.is_some() {
+        return Err(conflict(
+            "Read-only registration cannot consume a retained runtime",
+        ));
+    }
     if !is_watch_only_registration_plan(plan)
         || plan
             .setup
@@ -2108,6 +2114,7 @@ where
             scanner_result_hash: digest(b"bridge-preview-scanner-v1"),
             mutations: mutations.native,
             cli_mutations: cli_mutation.into_iter().collect(),
+            installed_runtime: None,
             native_memory_registrations: memory.registrations,
             ownership_changes: vec![],
         };
@@ -2277,6 +2284,7 @@ where
             scanner_result_hash: digest(b"native-memory-watch-only-scanner-v1"),
             mutations: vec![],
             cli_mutations: vec![],
+            installed_runtime: None,
             native_memory_registrations: registrations,
             ownership_changes: vec![],
         };

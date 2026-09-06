@@ -364,6 +364,11 @@ impl ProductionBridgePlanExecutor<'_> {
         &self,
         plan: &context_relay_core::native_transaction::NativeTransactionPlan,
     ) -> Result<(), ClientError> {
+        if plan.installed_runtime.is_some() {
+            return Err(invalid(
+                "Retained Hermes runtime registration is not connected yet",
+            ));
+        }
         let (root, project_id) = sealed_project_binding(plan)?;
         if plan.setup.target_scopes.iter().any(|scope| match scope {
             NativeScope::Global => false,
@@ -426,6 +431,9 @@ impl ProductionBridgePlanExecutor<'_> {
         created_ms: u64,
         now_ms: u64,
     ) -> Result<(), ProductionExecutionError> {
+        if plan.installed_runtime.is_some() {
+            return Err(invalid("Retained Hermes runtime execution is not connected yet").into());
+        }
         let (root, project_id) = sealed_project_binding(plan)?;
         let observed_hlc = HybridLogicalClock::new(now_ms, 0, self.device_id);
         let lock_root = canonical_lock_root(self.vault_path)?;
@@ -824,6 +832,41 @@ pub(crate) mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+
+    #[test]
+    fn retained_runtime_is_rejected_before_production_discovery() {
+        let path = TempVault::new("retained-runtime-production-guard");
+        let keys = MemoryKeyStore::default();
+        let mut vault =
+            Vault::open(path.path(), "retained-runtime-production-guard", &keys).unwrap();
+        let mut plan = base_plan();
+        plan.installed_runtime = Some(
+            serde_json::from_value(serde_json::json!({
+                "kind": "hermesPythonV1", "runtime": {
+                    "schemaVersion": 1, "storageKey": "context-relay-hermes-runtime-Abc123",
+                    "manifestIdentity": Sha256Digest([71; 32]),
+                }
+            }))
+            .unwrap(),
+        );
+        let mut executor = ProductionBridgePlanExecutor {
+            vault_path: path.path(),
+            device_id: "018f22e2-79b0-7cc8-98c4-dc0c0c073990".parse().unwrap(),
+        };
+        assert!(
+            executor
+                .verify_registration_inner(&plan)
+                .unwrap_err()
+                .message
+                .contains("Retained Hermes runtime registration")
+        );
+        match executor.execute_inner(&mut vault, &plan, &[], 1, 1) {
+            Err(ProductionExecutionError::Compose(error)) => {
+                assert!(error.message.contains("Retained Hermes runtime execution"))
+            }
+            _ => panic!("runtime must be rejected before ordinary production composition"),
+        }
+    }
 
     #[test]
     fn codex_probe_reports_saved_approvals_without_starting_another_process() {
@@ -1497,6 +1540,7 @@ pub(crate) mod tests {
             scanner_result_hash: Sha256Digest([8; 32]),
             mutations: vec![],
             cli_mutations: vec![],
+            installed_runtime: None,
             native_memory_registrations: vec![],
             ownership_changes: vec![],
         }

@@ -465,6 +465,7 @@ fn hermes_native_plan(
         scanner_result_hash: Sha256Digest([28; 32]),
         mutations: vec![mutation],
         cli_mutations: vec![],
+        installed_runtime: None,
         native_memory_registrations: vec![],
         ownership_changes: vec![],
     }

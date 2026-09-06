@@ -24,6 +24,32 @@ const MAX_DEPTH: usize = 32;
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Persisted identity, not permission to execute. Reopening also verifies bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedRuntimeReference {
+    schema_version: u32,
+    storage_key: String,
+    manifest_identity: Sha256Digest,
+}
+
+impl RetainedRuntimeReference {
+    pub(crate) fn validate(&self) -> Result<(), ClientError> {
+        let suffix = self
+            .storage_key
+            .strip_prefix("context-relay-hermes-runtime-")
+            .ok_or_else(invalid)?;
+        if self.schema_version != 1
+            || !(6..=64).contains(&suffix.len())
+            || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(invalid());
+        }
+        stage_path(&self.storage_key)?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeFile {

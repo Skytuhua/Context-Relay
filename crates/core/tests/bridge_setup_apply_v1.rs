@@ -194,6 +194,7 @@ fn plan() -> NativeTransactionPlan {
         scanner_result_hash: Sha256Digest([12; 32]),
         mutations: vec![],
         cli_mutations: vec![cli],
+        installed_runtime: None,
         native_memory_registrations: vec![],
         ownership_changes: vec![],
     }

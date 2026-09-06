@@ -1,5 +1,6 @@
 //! Persisted runtime identity for future sealed setup and recovery.
 
+pub use super::RetainedRuntimeReference;
 use super::{
     CapturedRuntime, Inventory, MAX_DEPTH, MAX_ENTRIES, MAX_FILE_BYTES, RuntimeFile,
     RuntimeManifest, children, invalid, inventory_stage_with, manifest_bytes_identity, read_file,
@@ -9,7 +10,6 @@ use context_relay_native_runner::{
     OsNativeFileSystem, PinnedNativeDirectory, RuntimeTarget, validate_path_set,
 };
 use context_relay_protocol::{ClientError, Sha256Digest};
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -19,18 +19,7 @@ use std::{
 };
 
 const MAX_MANIFEST_BYTES: usize = 48 * 1024 * 1024;
-const KEY_PREFIX: &str = "context-relay-hermes-runtime-";
 const MANIFEST_NAME: &str = "manifest.json";
-
-/// This identity must be bound by the caller's trusted approval. It is not an
-/// approval token and reopening it does not authorize executing any code.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RetainedRuntimeReference {
-    schema_version: u32,
-    storage_key: String,
-    manifest_identity: Sha256Digest,
-}
 
 #[derive(Debug)]
 pub struct RetainedRuntime {
@@ -181,18 +170,7 @@ impl RetainedRuntime {
 }
 
 fn validate_reference(reference: &RetainedRuntimeReference) -> Result<(), ClientError> {
-    let suffix = reference
-        .storage_key
-        .strip_prefix(KEY_PREFIX)
-        .ok_or_else(invalid)?;
-    if reference.schema_version != 1
-        || !(6..=64).contains(&suffix.len())
-        || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
-    {
-        return Err(invalid());
-    }
-    stage_path(&reference.storage_key)?;
-    Ok(())
+    reference.validate()
 }
 
 fn require_entries(path: &Path, expected: &[&str]) -> Result<(), ClientError> {

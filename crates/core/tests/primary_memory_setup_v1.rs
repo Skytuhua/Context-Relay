@@ -2289,9 +2289,20 @@ fn import_only_verifier_rejects_legacy_dependencies_expiry_and_wrong_bindings() 
     };
     check(&opened.plan, NOW_MS + 1).unwrap();
     assert!(check(&opened.plan, setup.expires_at).is_err());
-    for change in ["legacy", "version", "profile", "project"] {
+    for change in ["runtime", "legacy", "version", "profile", "project"] {
         let mut plan = opened.plan.clone();
         match change {
+            "runtime" => {
+                plan.installed_runtime = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "kind": "hermesPythonV1", "runtime": {
+                            "schemaVersion": 1, "storageKey": "context-relay-hermes-runtime-Abc123",
+                            "manifestIdentity": Sha256Digest([71; 32]),
+                        }
+                    }))
+                    .unwrap(),
+                )
+            }
             "legacy" => plan.setup.expected_native_digests.truncate(1),
             "version" => plan.setup.harness_version = "2.1.216".to_owned(),
             "profile" => plan.setup.harness_profile = Some("other".to_owned()),

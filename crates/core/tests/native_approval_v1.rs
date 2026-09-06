@@ -137,6 +137,7 @@ fn plan() -> NativeTransactionPlan {
             },
         ],
         cli_mutations: vec![],
+        installed_runtime: None,
         native_memory_registrations: vec![],
         ownership_changes: vec![],
     }
