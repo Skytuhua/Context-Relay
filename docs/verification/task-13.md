@@ -11,6 +11,15 @@ as [A-005](../protocols/contract-amendments.md).
 
 ## Finding disposition
 
+2026-09-06 native discovery amendment: the fixed eight-tool first page below
+hid completion, handoff and status from actual Codex 0.144.6 sessions. The bridge
+now returns all eleven tools in one bounded first response, retains the old
+opaque cursor and rejects invalid cursors. The [native evidence](codex-mcp-roundtrip-2026-09-06.md)
+records real CLI/app-server memory and task round trips and restart persistence.
+This supersedes the fixed two-page implementation choice in T13-01; official
+revision negotiation, metadata, argument defaults and cursor validation remain.
+The updated test is `tools_list_keeps_the_legacy_cursor_and_call_arguments_default_to_empty_object`.
+
 | ID | Severity | RED evidence | Implemented boundary | GREEN evidence | Status |
 |---|---|---|---|---|---|
 | T13-01 | Important | Official 2025-06-18/2025-11-25 initialize metadata was rejected, omitted `tools/call.arguments` failed, and `tools/list` returned one unpageable collection. | The bridge accepts the two frozen official revisions, defined `_meta`/progress metadata, `clientInfo.title` and standard optional client fields, defaults absent arguments to `{}`, and exposes an opaque two-page cursor contract. Unknown lifecycle methods, invalid metadata, and invalid cursors still fail closed. | `official_initialize_envelopes_accept_client_title_and_request_metadata`; `tools_list_uses_an_opaque_cursor_and_call_arguments_default_to_empty_object`; complete lifecycle suite 17/17. | verified locally |

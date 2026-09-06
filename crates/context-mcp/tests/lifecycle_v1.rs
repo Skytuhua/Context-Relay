@@ -169,21 +169,21 @@ async fn initializes_then_lists_exact_frozen_tools() {
         messages[0]["result"]["capabilities"]["tools"]["listChanged"],
         false
     );
-    assert_eq!(
-        messages[1]["result"]["nextCursor"],
-        "context-relay-tools-v1:8"
-    );
+    assert!(messages[1]["result"].get("nextCursor").is_none());
     let tools = messages[1]["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .chain(messages[2]["result"]["tools"].as_array().unwrap())
         .collect::<Vec<_>>();
     let names = tools
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(names, MCP_TOOL_NAMES);
+    assert!(
+        serde_json::to_vec(&messages[1]).unwrap().len()
+            < context_relay_protocol::MAX_IPC_FRAME_BYTES
+    );
     assert!(
         tools
             .iter()
@@ -250,7 +250,7 @@ async fn official_initialize_envelopes_accept_client_title_and_request_metadata(
 }
 
 #[tokio::test]
-async fn tools_list_uses_an_opaque_cursor_and_call_arguments_default_to_empty_object() {
+async fn tools_list_keeps_the_legacy_cursor_and_call_arguments_default_to_empty_object() {
     let daemon = FakeDaemon::default();
     let run = run_server(
         daemon.clone(),
@@ -285,8 +285,11 @@ async fn tools_list_uses_an_opaque_cursor_and_call_arguments_default_to_empty_ob
     assert_eq!(run.result, Ok(()));
     let messages = parse_stdout_lines(&run.output);
     let first = &messages[1]["result"];
-    assert_eq!(first["tools"].as_array().unwrap().len(), 8);
-    assert_eq!(first["nextCursor"], "context-relay-tools-v1:8");
+    assert_eq!(
+        first["tools"].as_array().unwrap().len(),
+        MCP_TOOL_NAMES.len()
+    );
+    assert!(first.get("nextCursor").is_none());
     let second = &messages[2]["result"];
     assert_eq!(second["tools"].as_array().unwrap().len(), 3);
     assert!(second.get("nextCursor").is_none());

@@ -435,3 +435,12 @@ hooks work with Codex's default feature settings, while an explicit disable
 suppresses even trusted commands. See [setup status evidence](harness-setup-status-2026-09-06.md).
 Effective native trust readback, production bridge round trips and installed
 acceptance remain open. No Full gate or installer changed.
+
+Actual Codex client qualification found that the old first page omitted three
+MCP tools. The bridge now advertises all eleven immediately, retaining the legacy
+cursor. Real CLI and app-server sessions pass memory save/get/search, status,
+task creation/completion/listing and persistence after daemon restart, using
+production dispatch with isolated IPC credentials. All 66 MCP suite tests and
+all-target Clippy pass. See [native round-trip evidence](codex-mcp-roundtrip-2026-09-06.md)
+for the exact boundary; installed entry points, native trust readback, full setup
+and the unchanged installer still require acceptance.

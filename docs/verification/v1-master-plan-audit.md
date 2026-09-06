@@ -157,3 +157,10 @@ connection. The [evidence](harness-setup-status-2026-09-06.md) covers 143 fronte
 tests, desktop/narrow browser checks and an expanded 32-session native matrix
 with default-enabled and explicitly disabled hooks. Native trust readback,
 production bridge delivery and installed acceptance remain required.
+
+2026-09-06 MCP discovery update: actual Codex sessions missed three tools after
+the old first page. The bridge now advertises all eleven; [native qualification](codex-mcp-roundtrip-2026-09-06.md)
+passes memory and task exchanges on CLI/app-server with production dispatch,
+isolated authenticated IPC and daemon-restart persistence. The 66-test MCP suite
+and all-target Clippy pass. Installed process/credential binding, full native
+setup and effective trust readback remain open; this does not enable a Full version.

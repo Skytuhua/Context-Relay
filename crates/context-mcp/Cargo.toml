@@ -24,6 +24,15 @@ tokio = { workspace = true, features = ["io-std"] }
 uuid.workspace = true
 
 [dev-dependencies]
+context-relay-core = { version = "0.1.0", path = "../core" }
 sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+
+[[example]]
+name = "codex-bridge-fixture"
+path = "tests/fixtures/codex-bridge-fixture.rs"
+required-features = ["test-support"]
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_JobObjects"] }
