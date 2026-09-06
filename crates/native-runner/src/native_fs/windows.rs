@@ -556,6 +556,228 @@ pub(super) fn create_private_directory(path: &Path) -> Result<(File, Vec<File>),
     Ok((directory, held.handles))
 }
 
+pub(super) fn open_private_directory(path: &Path) -> Result<(File, Vec<File>), RunnerError> {
+    let held = HeldPath::new(path)?;
+    let directory = nt_open_relative(
+        held.parent()?,
+        &held.name,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+    )
+    .map_err(open_runner_error)?;
+    let node = raw_node(&directory)?;
+    verify_private_directory(&directory)?;
+    if node.identity.VolumeSerialNumber != held.volume {
+        return Err(RunnerError::UnsafeTopology);
+    }
+    Ok((directory, held.handles))
+}
+
+pub(super) fn verify_private_directory(directory: &File) -> Result<(), RunnerError> {
+    use windows_sys::Win32::Security::{CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE};
+    let expected =
+        current_user_private_security_descriptor(CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE)?;
+    let node = raw_node(directory)?;
+    if !node.directory
+        || node.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !super::equivalent_security_descriptors(&security_descriptor(directory)?, &expected)
+    {
+        return Err(RunnerError::UnsafeTopology);
+    }
+    Ok(())
+}
+
+// The root has already crossed the absolute-path boundary. Walk descendants by
+// handle so long captured paths do not require relaxing the global Win32 limit.
+fn held_relative(
+    directory: &File,
+    root: &Path,
+    path: &crate::StagePath,
+) -> Result<HeldPath, RunnerError> {
+    let mut components = path.as_str().split('/').collect::<Vec<_>>();
+    let name = OsString::from(components.pop().ok_or(RunnerError::InvalidPath)?);
+    validate_name(&name, false)?;
+    let volume = raw_node(directory)?.identity.VolumeSerialNumber;
+    let mut handles = vec![directory.try_clone().map_err(|_| RunnerError::Io)?];
+    let mut parent_path = root.to_owned();
+    for component in components {
+        let name = OsStr::new(component);
+        validate_name(name, false)?;
+        let child = nt_open_relative(
+            handles.last().ok_or(RunnerError::Io)?,
+            name,
+            FILE_TRAVERSE
+                | FILE_READ_ATTRIBUTES
+                | windows_sys::Win32::Storage::FileSystem::READ_CONTROL,
+            STABLE_DIRECTORY_SHARE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        )
+        .map_err(open_runner_error)?;
+        let node = raw_node(&child)?;
+        verify_private_descendant(&child)?;
+        if !node.directory
+            || node.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || node.identity.VolumeSerialNumber != volume
+        {
+            return Err(RunnerError::UnsafeTopology);
+        }
+        handles.push(child);
+        parent_path.push(name);
+    }
+    Ok(HeldPath {
+        handles,
+        parent_path,
+        name,
+        volume,
+    })
+}
+
+pub(super) fn hash_relative_file(
+    directory: &File,
+    root: &Path,
+    path: &crate::StagePath,
+    max_bytes: u64,
+    synchronize: bool,
+) -> Result<(u64, [u8; 32]), RunnerError> {
+    let held = held_relative(directory, root, path)?;
+    let access = GENERIC_READ | if synchronize { GENERIC_WRITE } else { 0 };
+    let mut file = held
+        .open_target(access, FILE_SHARE_READ)
+        .map_err(open_runner_error)?;
+    let before = raw_node(&file)?;
+    verify_private_descendant(&file)?;
+    if before.directory
+        || before.links != 1
+        || before.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || before.identity.VolumeSerialNumber != held.volume
+    {
+        return Err(RunnerError::UnsafeTopology);
+    }
+    if before.size > max_bytes {
+        return Err(RunnerError::LimitExceeded);
+    }
+    if !alternate_streams(&held, &held.name, &file, false)?.is_empty() {
+        return Err(RunnerError::UnsafeTopology);
+    }
+    let mut hash = Sha256::new();
+    let mut length = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|_| RunnerError::Io)?;
+        if count == 0 {
+            break;
+        }
+        length = length
+            .checked_add(count as u64)
+            .ok_or(RunnerError::LimitExceeded)?;
+        if length > max_bytes {
+            return Err(RunnerError::LimitExceeded);
+        }
+        hash.update(&buffer[..count]);
+    }
+    if synchronize {
+        flush_handle(&file)?;
+    }
+    if length != before.size || !raw_node_unchanged(&before, &raw_node(&file)?) {
+        return Err(RunnerError::ConcurrentChange);
+    }
+    Ok((length, hash.finalize().into()))
+}
+
+pub(super) fn flush_relative_directory(
+    directory: &File,
+    root: &Path,
+    path: &crate::StagePath,
+) -> Result<(), RunnerError> {
+    verify_relative_directory(directory, root, path, true)
+}
+
+pub(super) fn verify_relative_directory(
+    directory: &File,
+    root: &Path,
+    path: &crate::StagePath,
+    synchronize: bool,
+) -> Result<(), RunnerError> {
+    let held = held_relative(directory, root, path)?;
+    let child = nt_open_relative(
+        held.parent()?,
+        &held.name,
+        GENERIC_READ | if synchronize { GENERIC_WRITE } else { 0 },
+        FILE_SHARE_READ,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+    )
+    .map_err(open_runner_error)?;
+    let node = raw_node(&child)?;
+    verify_private_descendant(&child)?;
+    if !node.directory
+        || node.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || node.identity.VolumeSerialNumber != held.volume
+    {
+        return Err(RunnerError::UnsafeTopology);
+    }
+    if synchronize {
+        flush_handle(&child)?;
+    }
+    Ok(())
+}
+
+// Descendants inherit their sole user ACE. Elevated Windows may assign the
+// Administrators owner to new files; allow that fixed privileged group across
+// elevation changes, while requiring the sole data-access ACE to name this user.
+fn verify_private_descendant(file: &File) -> Result<(), RunnerError> {
+    use windows_sys::Win32::Security::{
+        CONTAINER_INHERIT_ACE, EqualSid, GetAce, INHERITED_ACE, IsWellKnownSid, OBJECT_INHERIT_ACE,
+        WinBuiltinAdministratorsSid,
+    };
+    let descriptor = security_descriptor(file)?;
+    let expected = current_user_private_file_security_descriptor()?;
+    let actual = restorable_security_descriptor(&descriptor)?;
+    let expected = restorable_security_descriptor(&expected)?;
+    if (unsafe { EqualSid(actual.owner, expected.owner) } == 0
+        && unsafe { IsWellKnownSid(actual.owner, WinBuiltinAdministratorsSid) } == 0)
+        || actual.dacl.is_null()
+        || unsafe { (*actual.dacl).AceCount } != 1
+    {
+        return Err(RunnerError::UnsafeTopology);
+    }
+    let mut ace = null_mut();
+    if unsafe { GetAce(actual.dacl, 0, &mut ace) } == 0 || ace.is_null() {
+        return Err(RunnerError::UnsafeTopology);
+    }
+    let header = unsafe { &*ace.cast::<windows_sys::Win32::Security::ACE_HEADER>() };
+    // The expected SID length bounds the access ACE before its typed fields or
+    // SID are inspected; other ACE formats are not accepted.
+    let expected_size = size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>()
+        + unsafe { GetLengthSid(expected.owner) } as usize;
+    if header.AceType != 0 || usize::from(header.AceSize) != expected_size {
+        return Err(RunnerError::UnsafeTopology);
+    }
+    let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+    let allowed_flags = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE | INHERITED_ACE;
+    let sid = (&raw const ace.SidStart).cast_mut().cast();
+    if u32::from(ace.Header.AceFlags) & !allowed_flags != 0
+        || ace.Mask != FILE_ALL_ACCESS
+        || unsafe { IsValidSid(sid) } == 0
+        || unsafe { EqualSid(sid, expected.owner) } == 0
+    {
+        return Err(RunnerError::UnsafeTopology);
+    }
+    Ok(())
+}
+
+pub(super) fn synchronize_directory(path: &Path) -> Result<(), RunnerError> {
+    let held = HeldPath::for_inspection(&path.join(".context-relay-directory-sync"))?;
+    flush_handle(&held.open_flushable_parent()?)
+}
+
+pub(super) fn synchronize_pinned_directory(directory: &File) -> Result<(), RunnerError> {
+    flush_handle(directory)
+}
+
 fn nt_open(
     root_directory: HANDLE,
     name: &OsStr,
@@ -2592,6 +2814,81 @@ mod pre_rename_tests {
         assert_eq!(ace.Mask, FILE_ALL_ACCESS);
         let sid = (&raw const ace.SidStart).cast_mut().cast();
         assert_ne!(unsafe { EqualSid(owner, sid) }, 0);
+    }
+
+    #[test]
+    fn retained_runtime_hash_rejects_links_and_streams_and_accepts_long_descendants() {
+        let root = test_root("retained-runtime-relative-files");
+        let path = root.join("runtime");
+        let (directory, ancestors) = create_private_directory(&path).unwrap();
+        let relative = crate::StagePath::try_from("module.py").unwrap();
+        fs::write(path.join("module.py"), b"VALUE = 1").unwrap();
+        fs::hard_link(path.join("module.py"), root.join("alias.py")).unwrap();
+        assert!(hash_relative_file(&directory, &path, &relative, 100, false).is_err());
+        fs::remove_file(root.join("alias.py")).unwrap();
+        fs::write(path.join("module.py:unexpected"), b"extra").unwrap();
+        assert!(hash_relative_file(&directory, &path, &relative, 100, false).is_err());
+        fs::remove_file(path.join("module.py:unexpected")).unwrap();
+        hash_relative_file(&directory, &path, &relative, 100, true).unwrap();
+        let nested = ["a".repeat(100), "b".repeat(100), "c".repeat(100)].join("/");
+        let nested_path = path.join(&nested);
+        assert!(nested_path.as_os_str().len() > 259);
+        fs::create_dir_all(&nested_path).unwrap();
+        fs::write(nested_path.join("deep.py"), b"deep").unwrap();
+        let relative = crate::StagePath::try_from(format!("{nested}/deep.py")).unwrap();
+        assert_eq!(
+            hash_relative_file(&directory, &path, &relative, 100, true)
+                .unwrap()
+                .0,
+            4
+        );
+        flush_relative_directory(
+            &directory,
+            &path,
+            &crate::StagePath::try_from(nested).unwrap(),
+        )
+        .unwrap();
+        drop(directory);
+        drop(ancestors);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_runtime_reopen_hash_and_flush_preserve_the_boundary() {
+        use std::os::windows::process::CommandExt as _;
+        let root = test_root("retained-runtime-boundary");
+        let path = root.join("runtime");
+        let (directory, ancestors) = create_private_directory(&path).unwrap();
+        fs::create_dir(path.join("nested")).unwrap();
+        fs::write(path.join("nested/module.py"), b"VALUE = 1").unwrap();
+        drop(directory);
+        drop(ancestors);
+        let (directory, ancestors) = open_private_directory(&path).unwrap();
+        let relative = crate::StagePath::try_from("nested/module.py").unwrap();
+        let (length, digest) = hash_relative_file(&directory, &path, &relative, 100, true).unwrap();
+        assert_eq!(length, 9);
+        assert_eq!(digest, <[u8; 32]>::from(Sha256::digest(b"VALUE = 1")));
+        assert!(hash_relative_file(&directory, &path, &relative, 1, true).is_err());
+        flush_relative_directory(
+            &directory,
+            &path,
+            &crate::StagePath::try_from("nested").unwrap(),
+        )
+        .unwrap();
+        flush_handle(&directory).unwrap();
+        assert!(open_absolute_directory_with_access(&path, GENERIC_WRITE).is_err());
+        drop(directory);
+        drop(ancestors);
+        synchronize_directory(&root).unwrap();
+        let output = Command::new("icacls")
+            .arg(&path)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(open_private_directory(&path).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

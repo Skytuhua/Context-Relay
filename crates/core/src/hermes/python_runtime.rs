@@ -2,6 +2,8 @@
 
 mod literals;
 mod projection;
+#[cfg(windows)]
+pub mod retained;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -52,6 +54,8 @@ pub struct CapturedRuntime {
     // Drop the handles before TempDir removes its owned tree.
     #[cfg(windows)]
     pin: context_relay_native_runner::PinnedNativeDirectory,
+    #[cfg(windows)]
+    container_pin: context_relay_native_runner::PinnedNativeDirectory,
     _directory: tempfile::TempDir,
     root: PathBuf,
     manifest: RuntimeManifest,
@@ -212,13 +216,27 @@ fn capture_inputs(
         builder.permissions(fs::Permissions::from_mode(0o700));
     }
     let directory = builder.tempdir_in(&parent).map_err(|_| invalid())?;
-    let root_path = directory.path().join("runtime");
+    let container = directory.path().join("runtime");
+    let root_path = container.join("payload");
+    #[cfg(windows)]
+    let container_pin = context_relay_native_runner::OsNativeFileSystem::new()
+        .create_private_directory(&container)
+        .map_err(|_| invalid())?;
     #[cfg(windows)]
     let pin = context_relay_native_runner::OsNativeFileSystem::new()
         .create_private_directory(&root_path)
         .map_err(|_| invalid())?;
     #[cfg(not(windows))]
-    fs::create_dir(&root_path).map_err(|_| invalid())?;
+    {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        builder.create(&container).map_err(|_| invalid())?;
+        builder.create(&root_path).map_err(|_| invalid())?;
+    }
     #[cfg(test)]
     let started = std::time::Instant::now();
     let mut inventory = Inventory::default();
@@ -259,6 +277,8 @@ fn capture_inputs(
     let captured = CapturedRuntime {
         #[cfg(windows)]
         pin,
+        #[cfg(windows)]
+        container_pin,
         _directory: directory,
         root: root_path,
         manifest,
@@ -328,10 +348,14 @@ fn stage_path(path: &str) -> Result<StagePath, ClientError> {
 
 fn manifest_identity(manifest: &RuntimeManifest) -> Result<Sha256Digest, ClientError> {
     let bytes = serde_json::to_vec(manifest).map_err(|_| invalid())?;
+    Ok(manifest_bytes_identity(&bytes))
+}
+
+fn manifest_bytes_identity(bytes: &[u8]) -> Sha256Digest {
     let mut hash = Sha256::new();
     hash.update(b"context-relay/hermes-python-runtime/v1\0");
     hash.update(bytes);
-    Ok(Sha256Digest(hash.finalize().into()))
+    Sha256Digest(hash.finalize().into())
 }
 
 fn omitted_source(path: &Path) -> Result<bool, ClientError> {
@@ -477,6 +501,24 @@ fn inspect_node(
     depth: usize,
     source_policy: bool,
 ) -> Result<(), ClientError> {
+    inspect_node_with(
+        source,
+        relative,
+        inventory,
+        depth,
+        source_policy,
+        &mut |source, relative| read_file(source, relative, |_| Ok(())),
+    )
+}
+
+fn inspect_node_with(
+    source: &Path,
+    relative: &str,
+    inventory: &mut Inventory,
+    depth: usize,
+    source_policy: bool,
+    reader: &mut impl FnMut(&Path, &str) -> Result<RuntimeFile, ClientError>,
+) -> Result<(), ClientError> {
     if depth > MAX_DEPTH {
         return Err(invalid());
     }
@@ -491,24 +533,34 @@ fn inspect_node(
         inventory.parents(relative)?;
         inventory.directory(relative)?;
         for (name, path) in children(source)? {
-            inspect_node(
+            inspect_node_with(
                 &path,
                 &format!("{relative}/{name}"),
                 inventory,
                 depth + 1,
                 source_policy,
+                reader,
             )?;
         }
     } else {
-        inventory.file(read_file(source, relative, |_| Ok(()))?)?;
+        inventory.file(reader(source, relative)?)?;
     }
     Ok(())
 }
 
 fn inventory_stage(stage: &Path) -> Result<RuntimeManifest, ClientError> {
+    inventory_stage_with(stage, &mut |source, relative| {
+        read_file(source, relative, |_| Ok(()))
+    })
+}
+
+fn inventory_stage_with(
+    stage: &Path,
+    reader: &mut impl FnMut(&Path, &str) -> Result<RuntimeFile, ClientError>,
+) -> Result<RuntimeManifest, ClientError> {
     let mut inventory = Inventory::default();
     for (name, path) in children(stage)? {
-        inspect_node(&path, &name, &mut inventory, 0, false)?;
+        inspect_node_with(&path, &name, &mut inventory, 0, false, reader)?;
     }
     Ok(RuntimeManifest {
         schema_version: 1,
@@ -820,6 +872,19 @@ mod tests {
                 .iter()
                 .map(|file| file.size)
                 .sum::<u64>(),
+            started.elapsed()
+        );
+        let retained = captured.retain().unwrap();
+        let reference =
+            serde_json::from_slice(&serde_json::to_vec(retained.reference()).unwrap()).unwrap();
+        drop(retained);
+        println!(
+            "Retained runtime flushed; reopening from serialized identity at {:?}",
+            started.elapsed()
+        );
+        let captured = retained::RetainedRuntime::open(&parent, &reference).unwrap();
+        println!(
+            "Fresh retained-runtime verification passed at {:?}",
             started.elapsed()
         );
         let home = parent.join("probe-home");
