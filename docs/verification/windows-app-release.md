@@ -479,3 +479,10 @@ now feeds the existing compatibility check and desktop with explicitly labelled
 user-settings evidence, without launching app-server. It distinguishes saved
 approval from effective hooks or a verified connection. Protocol 1.6 retains
 shutdown-only upgrade compatibility with both previous Windows previews.
+
+[Desktop retry correction](desktop-save-retry-2026-09-06.md) preserves exact
+operation IDs after lost save acknowledgments, binds creation retries to the
+visible draft and prevents older replay results from duplicating cards or
+overwriting newer visible revisions. Headless browser checks exercise real
+frontend/gateway retry behavior at desktop and narrow widths. Durable draft
+recovery across an app restart and installed acceptance remain open.

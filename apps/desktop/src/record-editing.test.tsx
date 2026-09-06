@@ -89,6 +89,28 @@ it('keeps an acknowledged edit visible when an older search finishes later', asy
   expect(screen.queryByText('Loading your saved records…')).not.toBeInTheDocument();
 });
 
+it('keeps a newer visible revision when an older uncertain edit is replayed and refresh fails', async () => {
+  const original = { ...first, revision: 'original' as MemoryRecord['revision'] };
+  const oldSave = { ...original, revision: 'old-save' as MemoryRecord['revision'], bodyMarkdown: 'Earlier saved edit' };
+  const current = { ...original, revision: 'latest' as MemoryRecord['revision'], bodyMarkdown: 'Newer saved text' };
+  const updateMemory = vi.fn().mockRejectedValueOnce(new Error('reply lost')).mockResolvedValue(oldSave);
+  const memories = vi.fn().mockResolvedValueOnce([original]).mockRejectedValue(new Error('refresh failed'));
+  render(<App gateway={{ ...gateway, memories, updateMemory, searchMemories: async () => [current] }} />);
+  await screen.findByText('Ready on this computer');
+  fireEvent.click(screen.getByRole('button', { name: 'Saved context' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Edit First record' }));
+  fireEvent.change(screen.getByRole('textbox', { name: 'Edit context' }), { target: { value: oldSave.bodyMarkdown } });
+  fireEvent.submit(screen.getByRole('form', { name: 'Edit context' }));
+  await screen.findByRole('alert');
+  fireEvent.change(screen.getByLabelText('Search saved context'), { target: { value: 'First' } });
+  fireEvent.submit(screen.getByRole('search', { name: 'Context search' }));
+  await screen.findByText(current.bodyMarkdown);
+  fireEvent.submit(screen.getByRole('form', { name: 'Edit context' }));
+  await screen.findByText('Memory updated');
+  expect(screen.getByText(current.bodyMarkdown)).toBeVisible();
+  expect(screen.queryByText(oldSave.bodyMarkdown)).not.toBeInTheDocument();
+});
+
 it.each(['start', 'complete', 'archive'] as const)('does not let an edit refresh undo a later %s acknowledgment', async (action) => {
   let finishRefresh!: (records: (TaskRecord & MemoryRecord)[]) => void;
   const edited = { ...first, title: 'Edited record' };

@@ -76,6 +76,7 @@ export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
     projectId: string | null,
     title: string,
     bodyMarkdown: string,
+    attempt?: object,
   ): Promise<MemoryRecord>;
   updateMemory(
     memory: MemoryRecord,
@@ -87,7 +88,7 @@ export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
   candidates(projectId: string | null): Promise<MemoryCandidate[]>;
   reviewCandidate(candidate: MemoryCandidate, accepted: boolean): Promise<MemoryCandidate>;
   tasks(projectId: string): Promise<TaskRecord[]>;
-  createTask(projectId: string, title: string, bodyMarkdown: string): Promise<TaskRecord>;
+  createTask(projectId: string, title: string, bodyMarkdown: string, attempt?: object): Promise<TaskRecord>;
   updateTask(task: TaskRecord, title: string, bodyMarkdown: string): Promise<TaskRecord>;
   transitionTask(task: TaskRecord, status: TaskStatus): Promise<TaskRecord>;
   completeTask(task: TaskRecord, summary: string): Promise<TaskRecord>;
@@ -95,6 +96,9 @@ export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
 
 export class LocalWorkspaceGateway implements WorkspaceGateway {
   private pendingProject: { name: string; pathKey: string; project: ProjectIdentity } | null = null;
+  private readonly pendingOperations = new Map<string, { operationId: OperationId; createsRecord: boolean }>();
+  private readonly draftAttempts = new WeakMap<object, number>();
+  private nextDraftAttempt = 1;
   constructor(private readonly client = new LocalClient()) {}
 
   chooseProjectFolder() {
@@ -271,7 +275,7 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
     return result.kind === 'memories' ? result.data.memories : unexpected(result);
   }
 
-  async createMemory(projectId: string | null, title: string, bodyMarkdown: string) {
+  async createMemory(projectId: string | null, title: string, bodyMarkdown: string, attempt?: object) {
     return memoryResult(
       await this.call({
         method: 'memory_create',
@@ -285,7 +289,7 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
           bodyMarkdown,
           tags: [],
         },
-      }),
+      }, attempt),
     );
   }
 
@@ -356,7 +360,7 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
     return result.kind === 'tasks' ? result.data.tasks : unexpected(result);
   }
 
-  async createTask(projectId: string, title: string, bodyMarkdown: string) {
+  async createTask(projectId: string, title: string, bodyMarkdown: string, attempt?: object) {
     return taskResult(
       await this.call({
         method: 'task_upsert',
@@ -369,7 +373,7 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
           status: 'open',
           expectedRevision: null,
         },
-      }),
+      }, attempt),
     );
   }
 
@@ -418,8 +422,48 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
     );
   }
 
-  private call(request: LocalRequest) {
-    return this.client.call(request);
+  private call(request: LocalRequest, attempt?: object) {
+    switch (request.method) {
+      case 'memory_create':
+      case 'memory_update':
+      case 'memory_archive':
+        return this.mutation(request, memoryResult, attempt);
+      case 'task_upsert':
+      case 'task_transition':
+      case 'task_complete':
+        return this.mutation(request, taskResult, attempt);
+      case 'candidate_review':
+        return this.mutation(request, candidateResult);
+      default:
+        return this.client.call(request);
+    }
+  }
+
+  private async mutation(
+    request: Extract<LocalRequest, { params: { operationId: OperationId } }>,
+    validate: (result: LocalResult) => { id: string },
+    attempt?: object,
+  ): Promise<LocalResult> {
+    // Retain the identity until a usable acknowledgment arrives. Only an
+    // explicit identical request replays it; changed input gets a new identity.
+    let draft = 0;
+    if (attempt) {
+      draft = this.draftAttempts.get(attempt) ?? this.nextDraftAttempt++;
+      this.draftAttempts.set(attempt, draft);
+    }
+    const key = JSON.stringify({ draft, method: request.method, params: { ...request.params, operationId: undefined } });
+    const operationId = this.pendingOperations.get(key)?.operationId ?? request.params.operationId;
+    this.pendingOperations.set(key, { operationId, createsRecord: request.method === 'memory_create' ||
+      (request.method === 'task_upsert' && request.params.taskId === null) });
+    const result = await this.client.call({ ...request, params: { ...request.params, operationId } } as LocalRequest);
+    const record = validate(result);
+    // A later acknowledged edit/archive/completion proves this creation was
+    // observed. A future identical creation must be a new record.
+    for (const [pendingKey, pending] of this.pendingOperations) {
+      if (pending.createsRecord && pending.operationId === record.id) this.pendingOperations.delete(pendingKey);
+    }
+    if (this.pendingOperations.get(key)?.operationId === operationId) this.pendingOperations.delete(key);
+    return result;
   }
 }
 
@@ -439,6 +483,11 @@ function memoryResult(result: LocalResult) {
 
 function taskResult(result: LocalResult) {
   return result.kind === 'tasks' && result.data.tasks[0] ? result.data.tasks[0] : unexpected(result);
+}
+
+function candidateResult(result: LocalResult) {
+  return result.kind === 'candidates' && result.data.candidates[0]
+    ? result.data.candidates[0] : unexpected(result);
 }
 
 function unexpected(result: LocalResult): never {

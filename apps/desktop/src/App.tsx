@@ -68,6 +68,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const [notice, setNotice] = useState<string | null>(null);
   const [saving, setSaving] = useState<SaveAction | null>(null);
   const savingRef = useRef(false);
+  const memoryDraft = useRef({});
+  const taskDraft = useRef({});
   const [projectBusy, setProjectBusy] = useState(false);
   const projectBusyRef = useRef(false);
   const readGeneration = useRef(0);
@@ -117,6 +119,10 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
 
   async function selectScreen(screen: ScreenId, scope = activeProject) {
     if (savingRef.current || projectBusyRef.current) return;
+    if (screen !== activeScreen || scope?.projectId !== activeProject?.projectId) {
+      memoryDraft.current = {};
+      taskDraft.current = {};
+    }
     const generation = ++readGeneration.current;
     hasNavigatedRef.current = true;
     setActiveScreen(screen);
@@ -197,14 +203,15 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     if (!body) return setError('Enter memory text.');
     if (!beginSave('memory')) return;
     try {
-      const memory = await gateway.createMemory(activeProject?.projectId ?? null, title, body);
-      setMemories((current) => [memory, ...current]);
+      const memory = await gateway.createMemory(activeProject?.projectId ?? null, title, body, memoryDraft.current);
+      setMemories((current) => current.some((item) => item.id === memory.id) ? current : [memory, ...current]);
       setNotice('Context saved');
       setError(null);
       form.reset();
+      memoryDraft.current = {};
       refreshSavedRecords('memory', activeProject?.projectId ?? null);
     } catch {
-      setError('We could not confirm the save. Your draft is still here. Check Saved context before trying again.');
+      setError('We could not confirm the save. Your draft is still here. Choose Save context again to retry this draft.');
     } finally { finishSave(); }
   }
 
@@ -218,13 +225,13 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     if (!beginSave('memory-edit')) return;
     try {
       const memory = await gateway.updateMemory(editingMemory, title, body);
-      setMemories((current) => replaceRecord(current, memory));
+      setMemories((current) => replaceRecord(current, memory, editingMemory.revision));
       setEditingMemory(null);
       setNotice('Memory updated');
       setError(null);
       refreshSavedRecords('memory', activeProject?.projectId ?? null);
     } catch {
-      setError('We could not confirm the update. Your draft is still here. Check Saved context before trying again.');
+      setError('We could not confirm the update. Your draft is still here. Choose Update context again to retry these changes.');
     } finally { finishSave(); }
   }
 
@@ -286,14 +293,15 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     if (!body) return setError('Enter task details.');
     if (!beginSave('task')) return;
     try {
-      const task = await gateway.createTask(activeProject.projectId, title, body);
-      setTasks((current) => [task, ...current]);
+      const task = await gateway.createTask(activeProject.projectId, title, body, taskDraft.current);
+      setTasks((current) => current.some((item) => item.id === task.id) ? current : [task, ...current]);
       setNotice('Task saved');
       setError(null);
       form.reset();
+      taskDraft.current = {};
       refreshSavedRecords('task', activeProject.projectId);
     } catch {
-      setError('We could not confirm the save. Your draft is still here. Check the task list before trying again.');
+      setError('We could not confirm the save. Your draft is still here. Choose Save task again to retry this draft.');
     } finally { finishSave(); }
   }
 
@@ -307,12 +315,12 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     if (!beginSave('task-edit')) return;
     try {
       const task = await gateway.updateTask(editingTask, title, body);
-      setTasks((current) => replaceRecord(current, task));
+      setTasks((current) => replaceRecord(current, task, editingTask.revision));
       setEditingTask(null);
       setNotice('Task updated');
       refreshSavedRecords('task', activeProject.projectId);
     } catch {
-      setError('We could not confirm the update. Your draft is still here. Check the task list before trying again.');
+      setError('We could not confirm the update. Your draft is still here. Choose Update task again to retry these changes.');
     } finally { finishSave(); }
   }
 
@@ -320,7 +328,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     if (!beginSave('task-status')) return;
     try {
       const updated = await gateway.transitionTask(task, next);
-      setTasks((current) => replaceRecord(current, updated));
+      setTasks((current) => replaceRecord(current, updated, task.revision));
       setNotice(next === 'in_progress' ? 'Task started' : 'Task updated');
     } catch {
       setError('We could not confirm the task status. Reload Tasks to check before trying again.');
@@ -334,7 +342,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     if (!beginSave('task-complete')) return;
     try {
       const updated = await gateway.completeTask(task, summary);
-      setTasks((current) => replaceRecord(current, updated));
+      setTasks((current) => replaceRecord(current, updated, task.revision));
       setNotice('Task completed');
       setError(null);
     } catch {
@@ -385,7 +393,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       case 'memory':
         return (
           <section className="screen-content">
-            <form aria-describedby={error ? 'workspace-error' : undefined} aria-label="New context" className="capture-form" onSubmit={submitMemory}>
+            <form key={'context-' + (activeProject?.projectId ?? 'global')} aria-describedby={error ? 'workspace-error' : undefined} aria-label="New context" className="capture-form" onSubmit={submitMemory}>
               <h2>Save something worth remembering</h2>
               <p>For example: “Use TypeScript for this project” or a decision you do not want to explain again.</p>
               <Field label="Title" name="title" disabled={!!saving} placeholder="For example, Writing preferences" />
@@ -466,7 +474,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
         </section>;
         return (
           <section className="screen-content">
-            <form aria-describedby={error ? 'workspace-error' : undefined} aria-label="New task" className="capture-form" onSubmit={submitTask}>
+            <form key={'task-' + activeProject.projectId} aria-describedby={error ? 'workspace-error' : undefined} aria-label="New task" className="capture-form" onSubmit={submitTask}>
               <h2>New task</h2>
               <p>Write down the next piece of work so you or your harness can pick it up later.</p>
               <Field label="Task title" name="title" disabled={!!saving} placeholder="For example, Fix the sign-in page" />
@@ -648,6 +656,9 @@ function NextSteps({ onConnect, onContext }: { onConnect: () => void; onContext:
   </div>;
 }
 
-function replaceRecord<T extends { id: string }>(records: T[], replacement: T) {
-  return records.map((record) => (record.id === replacement.id ? replacement : record));
+function replaceRecord<T extends { id: string; revision: string }>(records: T[], replacement: T, expectedRevision: string) {
+  // Replayed operations return their original snapshot. Preserve any version
+  // that a newer read already placed on screen until the fresh list arrives.
+  return records.map((record) => record.id === replacement.id &&
+    (record.revision === expectedRevision || record.revision === replacement.revision) ? replacement : record);
 }

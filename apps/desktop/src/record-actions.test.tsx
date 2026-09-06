@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 
 import App from './App';
@@ -26,6 +26,41 @@ const actions = [
 ] as const;
 
 afterEach(cleanup);
+
+it.each(['context', 'task'] as const)('keeps the %s draft on reload and clears it when opening the other form', async (kind) => {
+  render(<App gateway={gateway} />);
+  await screen.findByText('Ready on this computer');
+  const page = kind === 'context' ? 'Saved context' : 'Tasks';
+  const formName = kind === 'context' ? 'New context' : 'New task';
+  fireEvent.click(screen.getByRole('button', { name: page }));
+  const form = await screen.findByRole('form', { name: formName });
+  fireEvent.change(within(form).getAllByRole('textbox')[0], { target: { value: 'Unsubmitted draft' } });
+  fireEvent.click(screen.getByRole('button', { name: page }));
+  expect(within(screen.getByRole('form', { name: formName })).getAllByRole('textbox')[0]).toHaveValue('Unsubmitted draft');
+  fireEvent.click(screen.getByRole('button', { name: kind === 'context' ? 'Tasks' : 'Saved context' }));
+  const next = await screen.findByRole('form', { name: kind === 'context' ? 'New task' : 'New context' });
+  expect(within(next).getAllByRole('textbox')[0]).toHaveValue('');
+});
+
+it.each(['context', 'task'] as const)('does not duplicate or replace a visible %s with its older creation acknowledgment', async (kind) => {
+  const current = kind === 'context' ? memory : task;
+  const old = { ...current, bodyMarkdown: 'Earlier creation text' };
+  const read = vi.fn().mockResolvedValueOnce([current]).mockRejectedValue(new Error('refresh unavailable'));
+  render(<App gateway={{ ...gateway, memories: read, tasks: read,
+    createMemory: async () => old as MemoryRecord, createTask: async () => old as TaskRecord }} />);
+  await screen.findByText('Ready on this computer');
+  fireEvent.click(screen.getByRole('button', { name: kind === 'context' ? 'Saved context' : 'Tasks' }));
+  await screen.findByText(current.bodyMarkdown);
+  const form = screen.getByRole('form', { name: kind === 'context' ? 'New context' : 'New task' });
+  const fields = within(form).getAllByRole('textbox');
+  fireEvent.change(fields[0], { target: { value: current.title } });
+  fireEvent.change(fields[1], { target: { value: old.bodyMarkdown } });
+  fireEvent.submit(form);
+  await screen.findByText(kind === 'context' ? 'Context saved' : 'Task saved');
+  expect(screen.getAllByRole('heading', { name: current.title })).toHaveLength(1);
+  expect(screen.getByText(current.bodyMarkdown)).toBeVisible();
+  expect(screen.queryByText(old.bodyMarkdown)).not.toBeInTheDocument();
+});
 
 async function clickAction(action: typeof actions[number]) {
   fireEvent.click(screen.getByRole('button', { name: action.button }));
