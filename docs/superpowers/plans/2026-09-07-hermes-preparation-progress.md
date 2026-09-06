@@ -96,6 +96,20 @@ to the two affected project crates reclaimed 30.1 GiB before the successful runs
 
 ## Remaining desktop and setup work
 
+Setup preview now carries the adapter-selected installed runtime into the v2
+approval hash and sealed plan. The same identity survives vault reopening and
+the linked Undo plan. Preview rejects identity changes during rendering; the
+watch-only path rejects a binding acquired during probe, source registration or
+digest callbacks before saving an unbound plan. A valid watch-only baseline still
+succeeds. These checks do not enable Python execution or consume daemon results.
+
+The three runtime-plan tests and all 17 primary-memory setup tests pass. The
+watch-only regression first reproduced a saved plan that discarded the newly
+acquired binding. Core/contextd all-target Clippy with test support and warnings
+denied passes. Independent review approved the final watch-only check. The plan
+apply/Undo fixture uses a recording executor, so it verifies sealed identity and
+idempotency rather than an actual harness connection.
+
 - Preserve the completed reference for sealing into the reviewed setup plan;
   unfinished or orphaned copies must never become implicit launch authority.
 - Show plain-language stages and a Cancel action. Selection changes and late

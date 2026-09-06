@@ -312,6 +312,14 @@ pub struct PersistedBridgeInstallService<'a> {
 pub trait BridgePreviewHarness: HarnessAdapter {
     fn bridge_harness(&self) -> HarnessId;
 
+    /// Identity selected by the adapter, never a path supplied by the IPC caller.
+    /// A bound runtime must survive unchanged through preview and sealed approval.
+    fn bridge_installed_runtime(
+        &self,
+    ) -> Option<crate::native_transaction::InstalledRuntimeBinding> {
+        None
+    }
+
     /// Declares whether preview must attest the bridge before invoking any
     /// adapter probe. Import-only adapters override this so registration-only
     /// setup never resolves a bridge executable.
@@ -565,6 +573,12 @@ impl BridgePreviewHarness for HermesAdapter {
         HarnessId::Hermes
     }
 
+    fn bridge_installed_runtime(
+        &self,
+    ) -> Option<crate::native_transaction::InstalledRuntimeBinding> {
+        crate::native_transaction::engine::NativeAdapter::installed_runtime(self).cloned()
+    }
+
     fn bridge_setup_capability(&self) -> CapabilityLevel {
         self.capability()
     }
@@ -765,6 +779,7 @@ impl<'a> HermesMemoryExportService<'a> {
         let runtime_target = self.runtime_target.ok_or_else(|| {
             unsupported("Hermes managed memory export is unavailable on this host")
         })?;
+        let installed_runtime = adapter.bridge_installed_runtime();
         let report = adapter.probe(&ProbeContext {
             harness: HarnessId::Hermes,
             requested_profile: Some(adapter.profile_name().to_owned()),
@@ -921,13 +936,18 @@ impl<'a> HermesMemoryExportService<'a> {
             scanner_result_hash: digest(b"hermes-memory-export-scanner-v1"),
             mutations: mutation.into_iter().collect(),
             cli_mutations: vec![],
-            installed_runtime: None,
+            installed_runtime: installed_runtime.clone(),
             native_memory_registrations: vec![NativeMemoryRegistration {
                 source,
                 last_applied_digest: Some(intended_digest),
             }],
             ownership_changes: vec![],
         };
+        if adapter.bridge_installed_runtime() != installed_runtime {
+            return Err(conflict(
+                "Hermes runtime changed during memory export preview",
+            ));
+        }
         let approval_hash =
             approval_hash_v2(&plan).map_err(|_| invalid("Hermes export plan is invalid"))?;
         setup.batch_hash = approval_hash;
@@ -1842,6 +1862,12 @@ where
             .ok_or_else(|| unsupported("Harness setup is unavailable on this host"))?;
         let harness = self.harness.bridge_harness();
         let setup_capability = self.harness.bridge_setup_capability();
+        let installed_runtime = self.harness.bridge_installed_runtime();
+        if installed_runtime.is_some() && setup_capability != CapabilityLevel::Full {
+            return Err(unsupported(
+                "The prepared runtime is not qualified for setup yet",
+            ));
+        }
         let located_bridge = if setup_capability == CapabilityLevel::Full {
             let located = self.bridge_locator.locate()?;
             let attested = attest_bridge_executable(&located.path)?;
@@ -2114,10 +2140,13 @@ where
             scanner_result_hash: digest(b"bridge-preview-scanner-v1"),
             mutations: mutations.native,
             cli_mutations: cli_mutation.into_iter().collect(),
-            installed_runtime: None,
+            installed_runtime: installed_runtime.clone(),
             native_memory_registrations: memory.registrations,
             ownership_changes: vec![],
         };
+        if self.harness.bridge_installed_runtime() != installed_runtime {
+            return Err(conflict("Harness runtime changed during setup preview"));
+        }
         let approval_hash =
             approval_hash_v2(&plan).map_err(|_| invalid("Bridge preview plan is invalid"))?;
         setup.batch_hash = approval_hash;
@@ -2288,6 +2317,13 @@ where
             native_memory_registrations: registrations,
             ownership_changes: vec![],
         };
+        // Watch-only plans cannot authorize runtime execution. Check after all
+        // adapter callbacks so a newly selected runtime is never silently lost.
+        if self.harness.bridge_installed_runtime().is_some() {
+            return Err(conflict(
+                "Harness runtime changed during watch-only setup preview",
+            ));
+        }
         let approval_hash =
             approval_hash_v2(&plan).map_err(|_| invalid("Watch-only setup plan is invalid"))?;
         setup.batch_hash = approval_hash;
