@@ -19,3 +19,7 @@ tauri-plugin-dialog = "2"
 tokio.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+context-relay-local-ipc = { version = "0.1.0", path = "../../../crates/local-ipc", features = ["test-support"] }
+tempfile.workspace = true

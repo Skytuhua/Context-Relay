@@ -62,7 +62,7 @@ pub enum IpcError {
 }
 
 // One connection per maximum MCP call and cancellation, plus a narrow control reserve.
-pub const CONNECTION_LIMIT: usize = 130;
+pub const CONNECTION_LIMIT: usize = 131;
 pub const REQUEST_QUEUE_CAPACITY: usize = 64;
 pub const RESPONSE_QUEUE_CAPACITY: usize = 64;
 pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -71,7 +71,8 @@ pub const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 const MCP_DISPATCHER_CONNECTION_BUDGET: usize = 64;
 const MCP_CANCELLATION_CONNECTION_BUDGET: usize = 64;
-const CONTROL_CONNECTION_RESERVE: usize = 2;
+// Desktop's ordinary and immediate-control channels, plus its recovery host.
+const CONTROL_CONNECTION_RESERVE: usize = 3;
 const _: () = assert!(
     CONNECTION_LIMIT
         >= MCP_DISPATCHER_CONNECTION_BUDGET

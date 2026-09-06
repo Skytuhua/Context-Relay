@@ -52,6 +52,41 @@ async fn choose_project_folder(app: AppHandle) -> Result<Option<String>, &'stati
 #[derive(Default)]
 struct LocalClientState {
     client: Mutex<Option<Client>>,
+    control: Mutex<Option<Client>>,
+}
+
+impl LocalClientState {
+    async fn call_with<F, Fut>(
+        &self,
+        role: ClientRole,
+        id: RecordId,
+        request: LocalRequest,
+        connect: F,
+    ) -> Result<LocalResult, ClientError>
+    where
+        F: FnOnce(ClientRole) -> Fut,
+        Fut: Future<Output = Result<Client, IpcError>>,
+    {
+        // These daemon routes bypass the vault queue. Keep them reachable even
+        // while a record/history request owns the ordinary connection.
+        let channel = match &request {
+            LocalRequest::HarnessPreparationStatus(_)
+            | LocalRequest::HarnessPreparationCancel(_)
+            | LocalRequest::Health(_) => &self.control,
+            _ => &self.client,
+        };
+        let mut client = channel.lock().await;
+        if client.is_none() {
+            *client = Some(connect(role).await.map_err(safe_ipc_error)?);
+        }
+        let result = client
+            .as_mut()
+            .expect("client was initialized")
+            .call(id, request)
+            .await;
+        evict_on_call_error(&mut client, &result);
+        result
+    }
 }
 
 #[derive(Default)]
@@ -164,17 +199,7 @@ async fn local_request(
     state: State<'_, LocalClientState>,
 ) -> Result<LocalResult, ClientError> {
     local_request_with(request, |role, id, request| async move {
-        let mut client = state.client.lock().await;
-        if client.is_none() {
-            *client = Some(Client::connect(role).await.map_err(safe_ipc_error)?);
-        }
-        let result = client
-            .as_mut()
-            .expect("client was initialized")
-            .call(id, request)
-            .await;
-        evict_on_call_error(&mut client, &result);
-        result
+        state.call_with(role, id, request, Client::connect).await
     })
     .await
 }
@@ -360,6 +385,9 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("Context Relay desktop shell should run");
 }
+
+#[cfg(all(test, any(windows, target_os = "macos")))]
+mod desktop_transport_tests;
 
 #[cfg(test)]
 mod tests {
