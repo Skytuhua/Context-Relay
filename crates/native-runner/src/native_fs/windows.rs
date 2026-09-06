@@ -536,6 +536,26 @@ fn nt_open_relative(
     )
 }
 
+pub(super) fn create_private_directory(path: &Path) -> Result<(File, Vec<File>), RunnerError> {
+    use windows_sys::Win32::Security::{CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE};
+    let held = HeldPath::new(path)?;
+    let mut descriptor =
+        current_user_private_security_descriptor(CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE)?;
+    let directory = nt_open_with_security(
+        held.parent()?.as_raw_handle() as HANDLE,
+        &held.name,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        Some(&mut descriptor),
+    )
+    .map_err(open_runner_error)?;
+    // Retain all ancestor handles: another process cannot move the newly private
+    // tree through an otherwise permissive temporary parent while it is in use.
+    Ok((directory, held.handles))
+}
+
 fn nt_open(
     root_directory: HANDLE,
     name: &OsStr,
@@ -543,6 +563,26 @@ fn nt_open(
     share_access: u32,
     create_disposition: u32,
     create_options: u32,
+) -> Result<File, NtOpenError> {
+    nt_open_with_security(
+        root_directory,
+        name,
+        desired_access,
+        share_access,
+        create_disposition,
+        create_options,
+        None,
+    )
+}
+
+fn nt_open_with_security(
+    root_directory: HANDLE,
+    name: &OsStr,
+    desired_access: u32,
+    share_access: u32,
+    create_disposition: u32,
+    create_options: u32,
+    mut descriptor: Option<&mut [u8]>,
 ) -> Result<File, NtOpenError> {
     let mut name = name.encode_wide().collect::<Vec<_>>();
     let bytes = name
@@ -563,7 +603,9 @@ fn nt_open(
         root_directory,
         object_name: &mut unicode,
         attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
-        security_descriptor: null_mut(),
+        security_descriptor: descriptor
+            .as_mut()
+            .map_or(null_mut(), |bytes| bytes.as_mut_ptr().cast()),
         security_quality_of_service: null_mut(),
     };
     let mut status_block = IoStatusBlock {
@@ -2324,6 +2366,10 @@ impl Drop for LocalSecurityDescriptor {
 }
 
 fn current_user_private_file_security_descriptor() -> Result<Vec<u8>, RunnerError> {
+    current_user_private_security_descriptor(0)
+}
+
+fn current_user_private_security_descriptor(inheritance: u32) -> Result<Vec<u8>, RunnerError> {
     let mut token: HANDLE = null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(RunnerError::Io);
@@ -2354,7 +2400,9 @@ fn current_user_private_file_security_descriptor() -> Result<Vec<u8>, RunnerErro
         let acl_capacity = u32::try_from(acl_storage.len() * size_of::<u32>())
             .map_err(|_| RunnerError::LimitExceeded)?;
         if unsafe { InitializeAcl(acl, acl_capacity, ACL_REVISION) } == 0
-            || unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, 0, FILE_ALL_ACCESS, owner) } == 0
+            || unsafe {
+                AddAccessAllowedAceEx(acl, ACL_REVISION, inheritance, FILE_ALL_ACCESS, owner)
+            } == 0
         {
             return Err(RunnerError::Io);
         }
@@ -2544,6 +2592,55 @@ mod pre_rename_tests {
         assert_eq!(ace.Mask, FILE_ALL_ACCESS);
         let sid = (&raw const ace.SidStart).cast_mut().cast();
         assert_ne!(unsafe { EqualSid(owner, sid) }, 0);
+    }
+
+    #[test]
+    fn private_directory_creation_does_not_inherit_public_parent_access() {
+        use std::os::windows::process::CommandExt as _;
+        let root = test_root("private-runtime-directory");
+        let status = Command::new("icacls")
+            .arg(&root)
+            .args(["/inheritance:e", "/grant", "*S-1-1-0:(OI)(CI)F"])
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let path = root.join("runtime");
+        let (directory, ancestors) = create_private_directory(&path).unwrap();
+        assert!(
+            open_absolute_directory_with_access(&path, GENERIC_WRITE).is_err(),
+            "private root must exclude a second write-capable handle"
+        );
+        let descriptor = security_descriptor(&directory).unwrap();
+        assert_owner_only_file_descriptor(&descriptor);
+        assert!(!descriptor_has_inheritable_world_access(&descriptor));
+        assert!(create_private_directory(&path).is_err());
+        fs::create_dir(path.join("nested")).unwrap();
+        let child_path = path.join("nested/module.py");
+        fs::write(&child_path, b"VALUE = 1").unwrap();
+        let child = File::open(&child_path).unwrap();
+        let child_descriptor = security_descriptor(&child).unwrap();
+        assert!(!descriptor_has_inheritable_world_access(&child_descriptor));
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = null_mut();
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    child_descriptor.as_ptr().cast_mut().cast(),
+                    &mut present,
+                    &mut dacl,
+                    &mut defaulted,
+                )
+            },
+            0
+        );
+        assert_eq!(unsafe { (*dacl).AceCount }, 1);
+        assert!(fs::rename(&root, root.with_extension("moved")).is_err());
+        drop(child);
+        drop(directory);
+        drop(ancestors);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

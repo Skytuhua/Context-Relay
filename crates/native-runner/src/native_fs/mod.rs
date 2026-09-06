@@ -559,6 +559,8 @@ pub struct PinnedNativeDirectory {
     path: PathBuf,
     #[cfg(any(windows, target_os = "macos"))]
     directory: File,
+    #[cfg(windows)]
+    _creation_ancestors: Vec<File>,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -572,6 +574,8 @@ impl PinnedNativeDirectory {
         Ok(Self {
             path: path.to_path_buf(),
             directory,
+            #[cfg(windows)]
+            _creation_ancestors: Vec::new(),
         })
     }
 
@@ -648,6 +652,21 @@ fn validate_pinned_child_name(name: &str) -> Result<(), RunnerError> {
 impl OsNativeFileSystem {
     pub const fn new() -> Self {
         Self
+    }
+
+    /// Atomically creates an absent Windows directory with a protected,
+    /// inheritable current-user-only DACL and pins its ancestor topology.
+    #[cfg(windows)]
+    pub fn create_private_directory(
+        &self,
+        path: &Path,
+    ) -> Result<PinnedNativeDirectory, RunnerError> {
+        let (directory, ancestors) = windows::create_private_directory(path)?;
+        Ok(PinnedNativeDirectory {
+            path: path.to_owned(),
+            directory,
+            _creation_ancestors: ancestors,
+        })
     }
 
     pub fn snapshot(&self, path: &Path) -> Result<NativeSnapshot, RunnerError> {

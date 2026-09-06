@@ -222,7 +222,7 @@ fn resolve_python_home(path: &Path, minor: u8) -> Result<PathBuf, ClientError> {
     real_path(&resolved, true)
 }
 
-fn real_path(path: &Path, directory: bool) -> Result<PathBuf, ClientError> {
+pub(super) fn real_path(path: &Path, directory: bool) -> Result<PathBuf, ClientError> {
     validate_local_path(path)?;
     // Walk from the root so a linked ancestor is rejected before any lookup
     // through it (including a lookup that might reach a remote share).
@@ -264,7 +264,7 @@ fn validate_local_path(path: &Path) -> Result<(), ClientError> {
     Ok(())
 }
 
-fn is_link(metadata: &fs::Metadata) -> bool {
+pub(super) fn is_link(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
     }
@@ -332,7 +332,7 @@ fn observe_after_resolve(
     Ok(text.to_owned())
 }
 
-fn open_without_substitution(path: &Path) -> std::io::Result<File> {
+pub(super) fn open_without_substitution(path: &Path) -> std::io::Result<File> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -354,14 +354,14 @@ fn open_without_substitution(path: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(unix)]
-fn file_identity(file: &File) -> std::io::Result<(u64, u64)> {
+pub(super) fn file_identity(file: &File) -> std::io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
     let metadata = file.metadata()?;
     Ok((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(windows)]
-fn file_identity(file: &File) -> std::io::Result<(u64, u64)> {
+pub(super) fn file_identity(file: &File) -> std::io::Result<(u64, u64)> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::{
         Foundation::HANDLE,
