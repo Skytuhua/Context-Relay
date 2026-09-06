@@ -1100,6 +1100,7 @@ fn codex_matrix_fixture_with_version(version: &str) -> MatrixFixture {
             version: version.to_owned(),
             installation_method: InstallationMethod::PackageManager,
             codex_home,
+            user_home: home.clone(),
             user_skills_dir: home.join(".agents/skills"),
             project_root: project_root.clone(),
             working_directory,

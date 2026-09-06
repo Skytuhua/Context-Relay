@@ -177,3 +177,11 @@ daemon-boundary job, is removed. Its replacement is a feature-gated daemon test
 helper with a standalone negative/positive compilation contract. The unchanged
 checker, all seven boundary tests and the rebuilt native round trips pass.
 This repairs the test architecture without relaxing the production boundary.
+
+2026-09-06 command-context update: Codex subprocesses now use selected profile
+and project paths carried by verified commands and sealed CLI approvals. The
+[native evidence](codex-command-context-2026-09-06.md) covers ten actual commands
+in two disposable profiles, context-tamper rejection, 274 affected Rust tests
+and seven boundary tests. CI fixture corrections handle colored diagnostics
+and the remaining Windows trust-key materializer. Live connection readback,
+full native setup and installed acceptance remain incomplete.

@@ -793,6 +793,7 @@ impl MaterializedCodex {
                 version: version.into(),
                 installation_method: InstallationMethod::PackageManager,
                 codex_home: codex_home.clone(),
+                user_home: home.clone(),
                 user_skills_dir: home.join(".agents/skills"),
                 project_root: project_root.clone(),
                 working_directory,

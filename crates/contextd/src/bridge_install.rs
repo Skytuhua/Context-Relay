@@ -1001,6 +1001,7 @@ pub(crate) mod tests {
                         version: "9.9.9".into(),
                         installation_method,
                         codex_home: home.join("codex"),
+                        user_home: home.clone(),
                         user_skills_dir: home.join(".agents/skills"),
                         project_root: project.clone(),
                         working_directory: project.clone(),

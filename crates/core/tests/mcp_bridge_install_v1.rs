@@ -136,6 +136,7 @@ fn adapter_fixture() -> AdapterFixture {
             version: "0.144.1".to_owned(),
             installation_method: InstallationMethod::Manual,
             codex_home,
+            user_home: root.path().join("home"),
             user_skills_dir,
             project_root: project_root.clone(),
             working_directory: working_directory.clone(),

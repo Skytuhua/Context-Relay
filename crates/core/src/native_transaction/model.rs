@@ -165,6 +165,12 @@ pub struct ApprovedCliMutation {
     deny_unknown_fields
 )]
 pub enum CliExecutionContext {
+    CodexV1 {
+        codex_home: WireNativeValue,
+        user_home: WireNativeValue,
+        project_root: WireNativeValue,
+        working_directory: WireNativeValue,
+    },
     /// Legacy binding retained for reading sealed plans. Its inferred home is
     /// insufficient for custom configurations; new execution requires V2.
     ClaudeCodeV1 {

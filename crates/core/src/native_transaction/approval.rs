@@ -261,28 +261,39 @@ fn validate_cli_context(
     mutation: &ApprovedCliMutation,
 ) -> Result<(), ApprovalError> {
     let Some(context) = &mutation.execution_context else {
-        // Preserve the hash of existing plans. The Claude executor separately
-        // refuses legacy unbound operations and requires a fresh preview.
+        // Preserve the hash of existing plans. Qualified executors separately
+        // refuse legacy unbound operations and require a fresh preview.
         return Ok(());
     };
-    let paths = match context {
+    let (harness, paths) = match context {
+        CliExecutionContext::CodexV1 {
+            codex_home,
+            user_home,
+            project_root,
+            working_directory,
+        } => (
+            HarnessId::Codex,
+            vec![codex_home, user_home, project_root, working_directory],
+        ),
         CliExecutionContext::ClaudeCodeV1 {
             config_dir,
             state_path,
             project_root,
-        } => {
-            vec![config_dir, state_path, project_root]
-        }
+        } => (
+            HarnessId::ClaudeCode,
+            vec![config_dir, state_path, project_root],
+        ),
         CliExecutionContext::ClaudeCodeV2 {
             config_dir,
             state_path,
             project_root,
             user_home,
-        } => {
-            vec![config_dir, state_path, project_root, user_home]
-        }
+        } => (
+            HarnessId::ClaudeCode,
+            vec![config_dir, state_path, project_root, user_home],
+        ),
     };
-    if plan.setup.harness != HarnessId::ClaudeCode {
+    if plan.setup.harness != harness {
         return Err(ApprovalError::Invalid(
             "CLI context harness differs from setup plan".into(),
         ));

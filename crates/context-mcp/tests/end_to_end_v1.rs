@@ -1370,10 +1370,17 @@ impl MaterializedCodexE2e {
         let codex_home = root.join("codex-home");
         let home = root.join("home");
         let working_directory = project_root.join("service");
+        // Keep the native Windows spelling used to create this temporary
+        // project as its Codex trust key, while retaining physical bindings.
+        #[cfg(windows)]
+        let project_key = fixture.project_root.as_path();
+        #[cfg(not(windows))]
+        let project_key = project_root.as_path();
+        assert_eq!(std::fs::canonicalize(project_key).unwrap(), project_root);
         materialize_json_substituting(
             &codex_home,
             frozen["codexHome"].as_object().unwrap(),
-            &project_root,
+            project_key,
         );
         materialize_json(
             &home.join(".agents/skills"),
@@ -1404,6 +1411,7 @@ impl MaterializedCodexE2e {
             version: "0.144.1".into(),
             installation_method: InstallationMethod::PackageManager,
             codex_home: codex_home.clone(),
+            user_home: home.clone(),
             user_skills_dir: home.join(".agents/skills"),
             project_root,
             working_directory,

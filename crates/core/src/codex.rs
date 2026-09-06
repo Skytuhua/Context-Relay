@@ -4,7 +4,9 @@
 //! particular it deliberately never walks `$CODEX_HOME`: auth, sessions,
 //! history, sqlite state, logs, and approval records are not adapter input.
 
+mod command_context;
 pub mod managed_mcp;
+use command_context::CodexCommandContext;
 #[cfg(all(test, windows))]
 mod session_tests;
 
@@ -95,6 +97,7 @@ pub struct CodexLayout {
     pub version: String,
     pub installation_method: InstallationMethod,
     pub codex_home: PathBuf,
+    pub user_home: PathBuf,
     pub user_skills_dir: PathBuf,
     pub project_root: PathBuf,
     pub working_directory: PathBuf,
@@ -269,6 +272,7 @@ pub struct VerifiedCodexCommand<'a> {
     executable: &'a VerifiedCodexExecutable,
     launch: PreparedCodexLaunch,
     arguments: &'a [String],
+    context: CodexCommandContext,
 }
 
 impl VerifiedCodexCommand<'_> {
@@ -276,7 +280,7 @@ impl VerifiedCodexCommand<'_> {
         self.arguments
     }
 
-    pub fn execute(self, working_directory: &Path) -> Result<Vec<u8>, BoundaryError> {
+    pub fn execute(self) -> Result<Vec<u8>, BoundaryError> {
         let arguments = self
             .arguments
             .iter()
@@ -286,7 +290,8 @@ impl VerifiedCodexCommand<'_> {
             self.launch,
             &self.executable.path,
             &arguments,
-            working_directory,
+            &self.context.working_directory,
+            Some(&self.context),
         )
         .map_err(|_| BoundaryError::new("Codex command failed at the native transaction boundary"))
     }
@@ -310,13 +315,11 @@ where
 }
 
 #[derive(Clone, Debug)]
-pub struct CodexProcessRunner {
-    working_directory: PathBuf,
-}
+pub struct CodexProcessRunner;
 
 impl CodexCommandRunner for CodexProcessRunner {
     fn run(&mut self, command: VerifiedCodexCommand<'_>) -> Result<Vec<u8>, BoundaryError> {
-        command.execute(&self.working_directory)
+        command.execute()
     }
 }
 
@@ -452,6 +455,7 @@ impl CodexAdapter {
                 executable_kind: CodexExecutableKind::Unknown,
                 version: String::new(),
                 codex_home,
+                user_home: home.clone(),
                 user_skills_dir: home.join(".agents/skills"),
                 project_root,
                 working_directory,
@@ -517,6 +521,7 @@ impl CodexAdapter {
         for path in [
             &layout.executable,
             &layout.codex_home,
+            &layout.user_home,
             &layout.project_root,
             &layout.working_directory,
         ] {
@@ -526,6 +531,7 @@ impl CodexAdapter {
         }
         if !layout.executable.is_file()
             || !layout.codex_home.is_dir()
+            || !layout.user_home.is_dir()
             || !layout.project_root.is_dir()
             || !layout.working_directory.is_dir()
         {
@@ -533,6 +539,7 @@ impl CodexAdapter {
         }
         layout.executable = canonical_existing_path(&layout.executable)?;
         layout.codex_home = canonical_existing_directory(&layout.codex_home)?;
+        layout.user_home = canonical_existing_directory(&layout.user_home)?;
         layout.user_skills_dir = canonical_directory_or_absent_path(&layout.user_skills_dir)?;
         layout.project_root = canonical_existing_directory(&layout.project_root)?;
         layout.working_directory = canonical_existing_directory(&layout.working_directory)?;
@@ -692,7 +699,7 @@ impl CodexAdapter {
             })?;
         let intended_declaration = canonical_cli_declaration(&intended.body_markdown)?;
         Ok(ApprovedCliMutation {
-            execution_context: None,
+            execution_context: Some(CodexCommandContext::new(&self.layout)?.approval_binding()),
             stable_id: intended.id.to_string(),
             forward: vec![self.declaration_operation(Some(&intended_declaration))?],
             rollback: vec![self.declaration_operation(expected.as_ref())?],
@@ -722,9 +729,7 @@ impl CodexAdapter {
     }
 
     fn process_runner(&self) -> CodexProcessRunner {
-        CodexProcessRunner {
-            working_directory: self.layout.working_directory.clone(),
-        }
+        CodexProcessRunner
     }
 
     pub(crate) fn recheck_executable_client(&self) -> Result<(), ClientError> {
@@ -777,6 +782,8 @@ impl CodexAdapter {
             executable: &executable,
             launch,
             arguments,
+            context: CodexCommandContext::new(&self.layout)
+                .map_err(|_| BoundaryError::new("Codex configuration binding changed"))?,
         })
     }
 
@@ -2300,12 +2307,8 @@ impl HarnessAdapter for CodexAdapter {
     fn validate_effective(&self, receipt: &ApplyReceipt) -> Result<ValidationReport, ClientError> {
         self.validate_effective_with(receipt, |command| {
             let argv = command.argv();
-            run_bounded_command(
-                &self.layout.executable,
-                &argv.iter().map(String::as_str).collect::<Vec<_>>(),
-                self.executable_hash,
-                &self.layout.working_directory,
-            )
+            self.run_verified(&mut self.process_runner(), &argv)
+                .map_err(|_| unsupported("Codex effective configuration could not be checked"))
         })
     }
 }
@@ -2806,6 +2809,13 @@ where
     V: CodexCommandRunner,
 {
     fn validate_mutation(&self, mutation: &ApprovedCliMutation) -> Result<(), BoundaryError> {
+        let context = CodexCommandContext::new(&self.adapter.layout)
+            .map_err(|_| BoundaryError::new("Codex configuration binding changed"))?;
+        if mutation.execution_context.as_ref() != Some(&context.approval_binding()) {
+            return Err(BoundaryError::new(
+                "Codex command context differs from the approved setup; request a new preview",
+            ));
+        }
         if mutation.stable_id.is_empty()
             || (mutation.expected.is_none() && mutation.intended.is_none())
         {
@@ -4656,7 +4666,7 @@ fn run_bounded_verified_command_with_hook(
         .revalidate_before_launch()
         .map_err(|_| client_error(ErrorCode::Conflict, "Codex executable changed", false))?;
     let launch = executable.prepare_launch()?;
-    run_prepared_codex_command(launch, &executable.path, arguments, working_directory)
+    run_prepared_codex_command(launch, &executable.path, arguments, working_directory, None)
 }
 
 fn run_prepared_codex_command(
@@ -4664,6 +4674,7 @@ fn run_prepared_codex_command(
     original_path: &Path,
     arguments: &[&str],
     working_directory: &Path,
+    context: Option<&CodexCommandContext>,
 ) -> Result<Vec<u8>, ClientError> {
     #[cfg(windows)]
     if launch.program.as_path() != original_path {
@@ -4674,6 +4685,18 @@ fn run_prepared_codex_command(
         ));
     }
     let mut command = Command::new(&launch.program);
+    if let Some(context) = context {
+        context.configure(&mut command)?;
+    } else if arguments != ["--version"] {
+        return Err(invalid(
+            "Codex configuration commands require a bound context",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000);
+    }
     command
         .args(arguments)
         .current_dir(working_directory)
@@ -5087,10 +5110,11 @@ mod tests {
         let expected_hash = hash_file(&executable).unwrap();
         let verified = open_verified_codex_executable(&executable, expected_hash).unwrap();
 
-        let result = run_bounded_verified_command_with_hook(&verified, &[], &root, || {
-            fs::rename(&executable, &original).unwrap();
-            fs::rename(&replacement, &executable).unwrap();
-        });
+        let result =
+            run_bounded_verified_command_with_hook(&verified, &["--version"], &root, || {
+                fs::rename(&executable, &original).unwrap();
+                fs::rename(&replacement, &executable).unwrap();
+            });
 
         let _ = fs::remove_dir_all(&root);
         result.unwrap();
@@ -5120,9 +5144,10 @@ mod tests {
         let expected_hash = hash_file(&executable).unwrap();
         let verified = open_verified_codex_executable(&executable, expected_hash).unwrap();
 
-        let result = run_bounded_verified_command_with_hook(&verified, &[], &root, || {
-            fs::copy(false_source, &executable).unwrap();
-        });
+        let result =
+            run_bounded_verified_command_with_hook(&verified, &["--version"], &root, || {
+                fs::copy(false_source, &executable).unwrap();
+            });
 
         let _ = fs::remove_dir_all(&root);
         assert!(result.is_err());
@@ -5235,6 +5260,7 @@ mod tests {
                 codex_home,
                 user_skills_dir,
                 project_root,
+                user_home: root.join("home"),
                 working_directory,
                 requirements_paths: vec![],
             },
@@ -5827,6 +5853,7 @@ mod tests {
                 codex_home,
                 user_skills_dir,
                 project_root: project_root.clone(),
+                user_home: root.clone(),
                 working_directory: project_root,
                 requirements_paths: vec![],
             },
@@ -6266,6 +6293,7 @@ mod standalone_discovery_tests {
                     version: String::new(),
                     installation_method: InstallationMethod::Manual,
                     codex_home: self.home.join(".codex"),
+                    user_home: self.home.clone(),
                     user_skills_dir: self.home.join(".agents/skills"),
                     project_root: self.home.clone(),
                     working_directory: self.home.clone(),
@@ -6437,6 +6465,36 @@ mod standalone_discovery_tests {
                 .is_err()
             );
             assert!(!fixture.replacement.with_file_name("invoked").exists());
+        }
+    }
+
+    #[test]
+    fn adapter_commands_use_the_selected_codex_home_and_working_directory() {
+        let fixture = Standalone::new();
+        let (physical, expected_version) = fixture.resolve().unwrap();
+        let (snapshot, version) =
+            discover_executable_version(&physical, &fixture.home, expected_version.as_deref())
+                .unwrap();
+        let adapter = fixture.adapter(physical, snapshot, version);
+        let output = adapter
+            .run_verified(&mut adapter.process_runner(), &["--context".to_owned()])
+            .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        for (name, expected) in [
+            ("CODEX_HOME", adapter.layout.codex_home.as_path()),
+            ("HOME", fixture.home.as_path()),
+            ("USERPROFILE", fixture.home.as_path()),
+            ("cwd", adapter.layout.working_directory.as_path()),
+        ] {
+            let actual = text
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .unwrap();
+            assert_eq!(
+                fs::canonicalize(actual).unwrap(),
+                fs::canonicalize(expected).unwrap(),
+                "{name}"
+            );
         }
     }
 

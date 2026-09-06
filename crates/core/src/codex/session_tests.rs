@@ -276,6 +276,7 @@ fn pinned_codex_project_trust_matches_adapter_lookup() {
                 version: "0.144.6".into(),
                 installation_method: InstallationMethod::Manual,
                 codex_home: home.clone(),
+                user_home: home.clone(),
                 user_skills_dir: home.join("skills"),
                 project_root: project.clone(),
                 working_directory: cwd.clone(),

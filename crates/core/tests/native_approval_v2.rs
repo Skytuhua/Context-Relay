@@ -249,6 +249,48 @@ fn claude_context_plan() -> NativeTransactionPlan {
 }
 
 #[test]
+fn codex_execution_context_is_approval_bound_and_survives_sealing() {
+    let mut candidate = plan();
+    candidate.cli_mutations[0].execution_context = Some(CliExecutionContext::CodexV1 {
+        codex_home: native_text("/fixture/custom-config"),
+        user_home: native_text("/fixture/home"),
+        project_root: native_text("/fixture/project"),
+        working_directory: native_text("/fixture/project/service"),
+    });
+    let approved = approval_hash_v2(&candidate).unwrap();
+    candidate.setup.batch_hash = approved;
+    let sealed = seal_plan(&candidate, approved).unwrap();
+    assert_eq!(
+        open_plan(&sealed).unwrap().plan.cli_mutations,
+        candidate.cli_mutations
+    );
+    for field in ["codexHome", "userHome", "projectRoot", "workingDirectory"] {
+        let mut tampered: serde_json::Value = serde_json::from_slice(&sealed).unwrap();
+        tampered["nativePlan"]["cliMutations"][0]["executionContext"][field] =
+            serde_json::to_value(native_text("/fixture/changed")).unwrap();
+        assert!(
+            open_plan(&serde_json::to_vec(&tampered).unwrap()).is_err(),
+            "{field}"
+        );
+    }
+    let mut unbound = candidate.clone();
+    unbound.cli_mutations[0].execution_context = None;
+    assert_ne!(approval_hash_v2(&unbound).unwrap(), approved);
+    let mut wrong_harness = claude_context_plan();
+    wrong_harness.cli_mutations[0].execution_context =
+        candidate.cli_mutations[0].execution_context.clone();
+    assert!(approval_hash_v2(&wrong_harness).is_err());
+    let Some(CliExecutionContext::CodexV1 {
+        working_directory, ..
+    }) = &mut candidate.cli_mutations[0].execution_context
+    else {
+        unreachable!()
+    };
+    *working_directory = native_text("../other");
+    assert!(approval_hash_v2(&candidate).is_err());
+}
+
+#[test]
 fn claude_execution_context_is_approval_bound_and_survives_sealing() {
     let mut candidate = claude_context_plan();
     let approved = approval_hash_v2(&candidate).unwrap();

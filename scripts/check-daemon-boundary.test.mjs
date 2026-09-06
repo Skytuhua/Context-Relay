@@ -93,7 +93,7 @@ fn main() {
     const cargo = (features = []) =>
       spawnSync(
         'cargo',
-        ['check', '--locked', '--quiet', ...features],
+        ['check', '--locked', '--quiet', '--color', 'never', ...features],
         cargoOptions,
       );
 

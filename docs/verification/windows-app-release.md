@@ -457,3 +457,11 @@ hosted CI. Its hook factory now uses the daemon's feature-gated test interface.
 The unchanged boundary checker, seven tests including an isolated compilation
 probe, and rebuilt real Codex round trips pass locally. The [MCP evidence](codex-mcp-roundtrip-2026-09-06.md)
 records the hosted failure and correction; installed acceptance remains open.
+
+Codex command execution now binds the selected profile, user home, project and
+working directory into native launches and sealed CLI approvals. Real 0.144.6
+commands pass in default/custom disposable profiles with competing profiles
+unchanged. All 274 affected Rust tests and seven boundary tests pass. The
+[command-context evidence](codex-command-context-2026-09-06.md) records this fix,
+two CI fixture corrections and the remaining live-readback/installed gates.
+The local installer and Full runtime versions remain unchanged.

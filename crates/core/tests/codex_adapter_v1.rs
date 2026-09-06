@@ -108,6 +108,7 @@ fn fixture_with_requirements(source: &str, bind_requirements: bool) -> Fixture {
         version: fixture["version"].as_str().unwrap().to_owned(),
         installation_method: InstallationMethod::PackageManager,
         codex_home: codex_home.clone(),
+        user_home: home.clone(),
         user_skills_dir: home.join(".agents/skills"),
         project_root: project_root.clone(),
         working_directory,
@@ -1823,7 +1824,6 @@ fn verified_runner_executes_prepared_identity_after_late_path_substitution() {
         executable: PathBuf,
         original: PathBuf,
         replacement: PathBuf,
-        working_directory: PathBuf,
         successful_launches: Arc<AtomicU64>,
         substituted: bool,
     }
@@ -1838,7 +1838,7 @@ fn verified_runner_executes_prepared_identity_after_late_path_substitution() {
                     .map_err(|_| BoundaryError::new("fixture substitution failed"))?;
                 self.substituted = true;
             }
-            command.execute(&self.working_directory)?;
+            command.execute()?;
             self.successful_launches.fetch_add(1, Ordering::Relaxed);
             Ok(match arguments.as_slice() {
                 [plugin, list, json]
@@ -1884,7 +1884,6 @@ fn verified_runner_executes_prepared_identity_after_late_path_substitution() {
         executable: fixture.layout.executable.clone(),
         original: fixture.root.join("original-codex"),
         replacement,
-        working_directory: fixture.layout.working_directory.clone(),
         successful_launches: Arc::clone(&successful_launches),
         substituted: false,
     };
@@ -2850,6 +2849,65 @@ fn bridge_cli_plan_rejects_malformed_redacted_secret_bearing_and_unmanaged_prior
         .plan_bridge_cli_mutation_with_runner(&intended, &mut validation)
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Conflict);
+}
+
+#[test]
+fn cli_execution_rejects_missing_or_changed_profile_bindings_before_launch() {
+    use context_relay_core::native_transaction::{CliExecutionContext, engine::BoundaryError};
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let bridge = executable_bridge(&fixture, "bridge executable");
+    let approved = fixture
+        .adapter
+        .plan_bridge_cli_mutation_with_runner(&bridge, |argv: &[String]| {
+            Ok(if argv[0] == "plugin" {
+                br#"{"installed":[],"available":[]}"#.to_vec()
+            } else {
+                b"[]".to_vec()
+            })
+        })
+        .unwrap();
+    for change in 0..5 {
+        let mut mutation = approved.clone();
+        if change == 0 {
+            mutation.execution_context = None;
+        } else {
+            let Some(CliExecutionContext::CodexV1 {
+                codex_home,
+                user_home,
+                project_root,
+                working_directory,
+            }) = &mut mutation.execution_context
+            else {
+                panic!("missing context")
+            };
+            let target = match change {
+                1 => codex_home,
+                2 => user_home,
+                3 => project_root,
+                _ => working_directory,
+            };
+            *target = test_wire_path(&fixture.root.join("other-profile"));
+        }
+        let never_run = |_: &[String]| -> Result<Vec<u8>, BoundaryError> {
+            panic!("unapproved context reached a runner")
+        };
+        let mut executor = fixture
+            .adapter
+            .cli_executor_with_runners(never_run, never_run);
+        assert!(executor.probe_cli_mutation(&mutation).is_err());
+        assert!(
+            executor
+                .compare_cli_targets(std::slice::from_ref(&mutation))
+                .is_err()
+        );
+        assert!(executor.apply_cli_mutation(&mutation).is_err());
+        assert!(executor.restore_cli_mutation_if_matches(&mutation).is_err());
+        assert!(
+            executor
+                .finish_committed_cli_mutations(std::slice::from_ref(&mutation))
+                .is_err()
+        );
+    }
 }
 
 #[test]
