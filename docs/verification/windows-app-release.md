@@ -473,3 +473,9 @@ status request. The probe is therefore compiled only for tests, with no normal
 profile or production entry point. Startup-effect containment must precede
 managed-hook assessment and desktop/daemon wiring. The local installer is still
 the earlier candidate and Codex 0.144.6 remains ImportOnly.
+
+A separate [saved-hook approval reader](codex-saved-hook-approval-2026-09-06.md)
+now feeds the existing compatibility check and desktop with explicitly labelled
+user-settings evidence, without launching app-server. It distinguishes saved
+approval from effective hooks or a verified connection. Protocol 1.6 retains
+shutdown-only upgrade compatibility with both previous Windows previews.

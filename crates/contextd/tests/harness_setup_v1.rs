@@ -257,6 +257,7 @@ impl BridgeInstallEngine for RecordingEngine {
         self.probes.lock().unwrap().push(params.clone());
         let plan = plan(params.harness);
         Ok(ProbeReport {
+            codex_saved_hook_approval: None,
             executable: Some(plan.executable_path),
             executable_sha256: Some(plan.executable_hash),
             harness_version: Some("0.144.6".to_owned()),

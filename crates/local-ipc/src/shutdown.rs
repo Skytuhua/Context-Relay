@@ -76,7 +76,7 @@ async fn shutdown_with(
     .map_err(|_| IpcError::ShutdownTimeout)?
 }
 
-// Upgrade-only compatibility with the last Windows preview's frozen shutdown wire.
+// Upgrade-only compatibility with the Windows previews' frozen shutdown wire.
 // This function can send only hello and shutdown, and never returns a client/session.
 // Ordinary Client connections continue to require the exact current protocol.
 async fn request_shutdown(
@@ -87,6 +87,7 @@ async fn request_shutdown(
         let server_hello: ServerHelloV1 = read_json(&mut stream).await?;
         if server_hello.protocol != PROTOCOL_VERSION
             && server_hello.protocol != (ProtocolVersion { major: 1, minor: 4 })
+            && server_hello.protocol != (ProtocolVersion { major: 1, minor: 5 })
         {
             return Err(IpcError::ProtocolVersionUnsupported);
         }
@@ -239,6 +240,11 @@ mod tests {
         for mode in ["ack", "legacy-ack"] {
             assert_shutdown_waits_for_exit(mode).await;
         }
+    }
+
+    #[tokio::test]
+    async fn authenticated_shutdown_accepts_the_previous_1_5_preview() {
+        assert_shutdown_waits_for_exit("legacy-ack-1-5").await;
     }
 
     async fn assert_shutdown_waits_for_exit(mode: &str) {
@@ -500,7 +506,11 @@ mod tests {
     async fn legacy_server(mut stream: ConnectedStream, root: &Path, mode: &str) {
         let protocol = ProtocolVersion {
             major: 1,
-            minor: if mode == "legacy-unsupported" { 3 } else { 4 },
+            minor: match mode {
+                "legacy-unsupported" => 3,
+                "legacy-ack-1-5" => 5,
+                _ => 4,
+            },
         };
         let mut hello = ServerHelloV1::generate(generate_instance_nonce().unwrap()).unwrap();
         hello.protocol = protocol;
@@ -564,11 +574,11 @@ mod tests {
             }
             "legacy-extra-field" => response["unexpected"] = serde_json::json!(true),
             "legacy-jsonrpc" => response["jsonrpc"] = serde_json::json!("1.0"),
-            "legacy-ack" => {}
+            "legacy-ack" | "legacy-ack-1-5" => {}
             _ => panic!("unexpected legacy fixture mode"),
         }
         write_json(&mut stream, &response).await.unwrap();
-        if mode == "legacy-ack" {
+        if matches!(mode, "legacy-ack" | "legacy-ack-1-5") {
             fs::write(root.join("ack"), b"").unwrap();
             wait_for(&root.join("exit")).await;
         }

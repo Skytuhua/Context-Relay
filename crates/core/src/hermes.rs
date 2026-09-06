@@ -684,6 +684,7 @@ impl HarnessAdapter for HermesAdapter {
         policy_conflicts.sort();
         policy_conflicts.dedup();
         Ok(ProbeReport {
+            codex_saved_hook_approval: None,
             executable: Some(wire_path(&self.layout.executable)),
             executable_sha256: Some(self.executable_hash),
             harness_version: Some(self.layout.version.clone()),

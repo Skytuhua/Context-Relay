@@ -192,3 +192,10 @@ native startup effects that prevent treating a new app-server launch as a passiv
 normal-profile check. The probe and its process dependency are test-only.
 Startup containment, exact managed-hook assessment, daemon IPC and desktop status
 remain unfinished; no Full version or installed acceptance is added by this change.
+
+2026-09-06 saved-hook update: the [file-only approval reader](codex-saved-hook-approval-2026-09-06.md)
+now supplies typed daemon/desktop saved-settings evidence for Codex 0.144.6.
+Exact native approval matching is qualified in disposable profiles. Effective
+runtime enablement, connection verification and the remaining release gates
+remain open. Protocol 1.6 preserves authenticated shutdown-only compatibility
+with 1.4 and 1.5 installed previews.

@@ -89,6 +89,8 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         InstallationMethod,
         ProbeContext,
         ProbeReport,
+        SavedHookApproval,
+        SavedMemoryHookApproval,
         NativeScope,
         ImportRequest,
         ImportedState,

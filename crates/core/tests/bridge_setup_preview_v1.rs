@@ -129,6 +129,7 @@ impl HarnessAdapter for Harness {
         assert_eq!(context.harness, HarnessId::Codex);
         self.calls.borrow_mut().probe += 1;
         Ok(ProbeReport {
+            codex_saved_hook_approval: None,
             executable: Some(self.executable.clone()),
             executable_sha256: Some(Sha256Digest([3; 32])),
             harness_version: Some("0.144.1".to_owned()),

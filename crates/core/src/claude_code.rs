@@ -23,7 +23,6 @@ use sha2::{Digest, Sha256};
 
 mod mcp_state;
 use mcp_state::McpConfiguration;
-#[cfg(test)]
 pub(crate) use mcp_state::parse_unique_json;
 mod command_context;
 use command_context::ClaudeCommandContext;
@@ -1643,6 +1642,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             ));
         }
         Ok(ProbeReport {
+            codex_saved_hook_approval: None,
             executable: Some(wire_path(&self.layout.executable)),
             executable_sha256: Some(self.executable_hash),
             harness_version: Some(self.layout.version.clone()),

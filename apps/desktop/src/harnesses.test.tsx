@@ -29,7 +29,7 @@ beforeEach(() => {
     ? { kind: 'plan', data: { plan: preview } } : { kind: 'empty' };
   invoke.mockReset().mockImplementation(async (_command, { request }: { request: LocalRequest }) => {
     if (request.method === 'sync_status') return { kind: 'status', data: { status: {
-      protocol: { min: { major: 1, minor: 5 }, max: { major: 1, minor: 5 } }, vault: 'unlocked',
+      protocol: { min: { major: 1, minor: 6 }, max: { major: 1, minor: 6 } }, vault: 'unlocked',
       resolvedProject: null, sync: 'offline', access: { mode: 'default' },
     } } };
     if (request.method === 'projects_list') return { kind: 'projects', data: { projects } };
@@ -38,7 +38,7 @@ beforeEach(() => {
     if (request.method === 'harness_probe') return { kind: 'probe', data: { report: {
       executable: fixture.executablePath, executableSha256: fixture.executableHash,
       harnessVersion: fixture.harnessVersion, installationMethod: 'manual', configRoots: [],
-      activeProfile: request.params.hermesProfile, policyConflicts: [], capability: 'full',
+      activeProfile: request.params.hermesProfile, codexSavedHookApproval: null, policyConflicts: [], capability: 'full',
     } } };
     requests.push(request);
     return operation(request);

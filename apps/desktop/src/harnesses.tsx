@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { HarnessId, HarnessParams, PlanId, ProbeReport, ProjectIdentity, SetupPlan, WireNativeValue } from './bindings';
+import type { HarnessId, HarnessParams, PlanId, ProbeReport, ProjectIdentity, SavedHookApproval, SavedMemoryHookApproval, SetupPlan, WireNativeValue } from './bindings';
 import { type HarnessGateway, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
 
 const harnessNames: Record<HarnessId, string> = { claude_code: 'Claude Code', codex: 'Codex', hermes: 'Hermes' };
@@ -94,8 +94,8 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
     try {
       const report = validateHarnessProbe(await gateway.harnessProbe(params), params);
       if (!mounted.current || revision !== generation.current) return;
+      setDiscovery({ harness: params.harness, report: structuredClone(report) });
       if (report.capability !== 'full') {
-        setDiscovery({ harness: params.harness, report: structuredClone(report) });
         return;
       }
       const result = validateHarnessPlan(await gateway.harnessPreview(params), params);
@@ -113,6 +113,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   async function applySetup() {
     if (!canApply || !review || BigInt(review.plan.expiresAt) <= BigInt(Date.now()) || !start('apply')) return;
     const approvedReview = review;
+    setDiscovery(null);
     setApproved(false);
     setRollbackTarget(null);
     try {
@@ -133,6 +134,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
 
   async function rollbackSetup(item: ReviewedPlan) {
     if (rollbackTarget !== item.plan.planId || !start('rollback')) return;
+    setDiscovery(null);
     setRollbackTarget(null);
     setApproved(false);
     try {
@@ -180,7 +182,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
       </form>
       {error && <p className="form-error" role="alert">{error}</p>}
       {notice && <p className="notice" role="status">{notice}</p>}
-      {discovery && <section className="connection-result" aria-label="Harness availability">
+      {discovery && discovery.report.capability !== 'full' && <section className="connection-result" aria-label="Harness availability">
         <h2>{harnessNames[discovery.harness]}{discovery.report.harnessVersion && discovery.report.harnessVersion !== 'unknown' ? ` ${discovery.report.harnessVersion}` : ''}</h2>
         <p role="status">{discovery.report.capability === 'missing'
           ? `${harnessNames[discovery.harness]} was not found. Install it, restart Context Relay and select Review setup again.`
@@ -193,6 +195,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
         {onSaveContext && <button className="secondary-action" type="button" disabled={!!busy} onClick={onSaveContext}>Save context</button>}
         {discovery.report.executable && <details className="technical-details"><summary>Technical details</summary><p>Executable: {nativeText(discovery.report.executable)}</p></details>}
       </section>}
+      {discovery?.report.codexSavedHookApproval && <SavedHookApprovals approval={discovery.report.codexSavedHookApproval} />}
       {busy && <p role="status">{busy === 'preview' ? 'Checking the installed harness…' : busy === 'apply' ? 'Saving harness settings…' : 'Undoing setup changes…'}</p>}
       {review && <section className="record-card" aria-labelledby="harness-review-title">
         <h2 id="harness-review-title">Review setup changes</h2>
@@ -225,6 +228,22 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
       </section>}
     </section>
   );
+}
+
+function SavedHookApprovals({ approval }: { approval: SavedMemoryHookApproval }) {
+  const labels: Record<SavedHookApproval, string> = {
+    missing: 'Not saved', needs_approval: 'Needs your approval', approved: 'Approval saved',
+    changed: 'Changed — review again', disabled: 'Disabled in saved settings',
+  };
+  return <section className="record-card connection-result" aria-label="Saved Codex hook approvals">
+    <h3>Saved Codex hook approvals</h3>
+    <dl>
+      <dt>Load context when a session starts</dt><dd>{labels[approval.sessionStart]}</dd>
+      <dt>Collect context when a response finishes</dt><dd>{labels[approval.stop]}</dd>
+    </dl>
+    <p>These saved approvals do not confirm that hooks are enabled or that context is being shared.</p>
+    <p className="help-text">This checks the user settings for the selected Codex installation. Select Review setup to refresh.</p>
+  </section>;
 }
 
 function SetupNextSteps({ item }: { item: ReviewedPlan }) {

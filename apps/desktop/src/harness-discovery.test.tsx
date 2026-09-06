@@ -14,7 +14,7 @@ const params: HarnessParams = { harness: 'codex', projectId, hermesProfile: null
 const fixture = JSON.parse(readFileSync('../../crates/protocol/tests/fixtures/runtime-contracts-v1.json', 'utf8')).setupPlan as SetupPlan;
 const report: ProbeReport = { executable: fixture.executablePath, executableSha256: fixture.executableHash,
   harnessVersion: '0.144.6', installationMethod: 'manual', configRoots: [], activeProfile: null,
-  policyConflicts: [], capability: 'import_only' };
+  codexSavedHookApproval: null, policyConflicts: [], capability: 'import_only' };
 const response = (value: unknown) => ({ kind: 'probe', data: { report: value } });
 let requests: LocalRequest[];
 

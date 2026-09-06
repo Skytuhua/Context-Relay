@@ -13,7 +13,8 @@ export interface HarnessGateway {
 
 export function validateHarnessProbe(value: unknown, params: HarnessParams): ProbeReport {
   assertProbeReport(value);
-  if (value.activeProfile !== params.hermesProfile ||
+  if ((value.codexSavedHookApproval !== null && (params.harness !== 'codex' || value.harnessVersion !== '0.144.6')) ||
+    value.activeProfile !== params.hermesProfile ||
     (value.capability === 'full' && (!value.executable || !value.executableSha256 || !value.harnessVersion))) {
     throw new Error('Harness discovery does not match the selection.');
   }

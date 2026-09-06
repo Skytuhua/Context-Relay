@@ -97,8 +97,10 @@ cargo test --locked --config 'profile.dev.package.sha2.opt-level=3' -p context-r
 ## Remaining acceptance
 
 This retains a qualification mechanism, not a product connection check.
-Startup-effect containment must precede normal-profile use. Typed managed-hook assessment, daemon
-IPC, desktop status/action wiring and remaining platform qualification are still
-required. It does not enable a Full runtime version, establish bridge credential
+Startup-effect containment must precede normal-profile use of this process probe.
+A separate [file-only reader](codex-saved-hook-approval-2026-09-06.md) now supplies
+typed saved-approval evidence to daemon and desktop. Effective runtime readback,
+connection verification and remaining platform qualification are still required.
+Neither check enables a Full runtime version, establishes bridge credential
 binding, prove full native setup/recovery, rebuild or install the local candidate,
 or complete the wider first-use/release goal. Codex 0.144.6 remains ImportOnly.

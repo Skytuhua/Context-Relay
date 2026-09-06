@@ -2,9 +2,11 @@
 //!
 //! This module only reads configuration which is useful to relay.  In
 //! particular it deliberately never walks `$CODEX_HOME`: auth, sessions,
-//! history, sqlite state, logs, and approval records are not adapter input.
+//! history, sqlite state, and logs are not adapter input. The explicit saved-hook
+//! check reads approval entries in the selected user config only.
 
 mod command_context;
+pub mod hook_approval;
 // Starting app-server can migrate profiles and refresh plugins. Keep this
 // qualification probe out of production until startup side effects are contained.
 #[cfg(test)]
@@ -2076,6 +2078,7 @@ impl HarnessAdapter for CodexAdapter {
             return Err(invalid("Codex adapter received another harness"));
         }
         Ok(ProbeReport {
+            codex_saved_hook_approval: None,
             executable: Some(wire_path(&self.layout.executable)),
             executable_sha256: Some(self.executable_hash),
             harness_version: Some(self.layout.version.clone()),

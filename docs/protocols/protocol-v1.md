@@ -1,6 +1,8 @@
 # Context Relay protocol version 1
 
-Context Relay protocol version 1.5 is identified by `PROTOCOL_MAJOR = 1` and `PROTOCOL_MINOR = 5`. Sync operations use schema version 1; scope-bound signed checkpoints use the independent checkpoint schema version 2. Local IPC frames are limited to 8 MiB.
+Context Relay protocol version 1.6 is identified by `PROTOCOL_MAJOR = 1` and `PROTOCOL_MINOR = 6`. Sync operations use schema version 1; scope-bound signed checkpoints use the independent checkpoint schema version 2. Local IPC frames are limited to 8 MiB.
+
+Harness discovery includes nullable `codexSavedHookApproval` with `sessionStart` and `stop` states. These describe saved user hook definitions and approvals, not effective runtime enablement or a verified connection. `null` means the check is unavailable, including unsupported versions or unreadable settings.
 
 Version negotiation requires matching major versions and selects the greatest minor version present in both advertised ranges. A major mismatch or disjoint minor range returns `protocol_version_unsupported`. No caller may fall back to an unknown major.
 
@@ -101,11 +103,11 @@ automatically or falls back to the legacy two-request creation sequence.
 `project_upsert` and `project_path_set` remain available for their existing
 independent operations. Their presence is not an atomic creation contract.
 
-Ordinary local clients require exactly 1.5 and reject 1.4 before application
+Ordinary local clients require exactly 1.6 and reject 1.5 before application
 dispatch. The Windows updater always extracts its new authenticated shutdown
 helper before replacing companions; it never runs an old daemon executable
 that might ignore `--shutdown` and start a service. The helper has one private
-compatibility path for protocol 1.4: verify both installation-token proofs,
+compatibility path for protocols 1.4 and 1.5: verify both installation-token proofs,
 send only the fixed shutdown request, require its matching empty acknowledgment,
 and wait for the exact connected process to exit. It cannot return a reusable
 client or dispatch other legacy requests. Other legacy versions are rejected.

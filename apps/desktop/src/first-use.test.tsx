@@ -54,7 +54,7 @@ it('keeps an unavailable harness actionable without exposing technical paths by 
   render(<App gateway={{ ...gateway, projects: async () => [project], memories, harnessPreview,
     harnessProbe: async () => ({ executable: fixture.executablePath, executableSha256: fixture.executableHash,
       harnessVersion: '0.144.6', installationMethod: 'manual', configRoots: [], activeProfile: null,
-      policyConflicts: [], capability: 'import_only' }),
+      codexSavedHookApproval: null, policyConflicts: [], capability: 'import_only' }),
   }} />);
   await screen.findByText('Ready on this computer');
   fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));

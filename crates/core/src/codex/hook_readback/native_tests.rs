@@ -115,6 +115,16 @@ fn pinned_codex_reads_native_hook_trust_without_executing_hooks() {
     let mut wrapper = adapter.clone();
     wrapper.layout.executable_kind = CodexExecutableKind::Wrapper;
     assert!(wrapper.read_native_hooks().is_err());
+    use super::super::hook_approval::SavedHookApproval;
+    let saved = adapter
+        .saved_memory_hook_approval(&wire_path(&bridge))
+        .unwrap();
+    assert_eq!(saved.session_start, SavedHookApproval::NeedsApproval);
+    assert_eq!(saved.stop, SavedHookApproval::NeedsApproval);
+    assert!(
+        !config.join(".personality_migration").exists(),
+        "settings reader started Codex"
+    );
     let initial = adapter.read_native_hooks().unwrap();
     // Even this empty profile is changed by app-server startup. This probe
     // must remain test-only until those non-RPC effects can be contained.
@@ -160,6 +170,18 @@ fn pinned_codex_reads_native_hook_trust_without_executing_hooks() {
             .unwrap();
         }
         let before_hooks = fs::read(&hook_path).unwrap();
+        let saved = adapter
+            .saved_memory_hook_approval(&wire_path(&bridge))
+            .unwrap();
+        let expected_saved = if phase == "modified" {
+            SavedHookApproval::Changed
+        } else {
+            SavedHookApproval::Approved
+        };
+        // A global feature disable does not revoke the persisted approval.
+        // Keep that distinction from native runtime availability explicit.
+        assert_eq!(saved.session_start, expected_saved, "{phase}");
+        assert_eq!(saved.stop, expected_saved, "{phase}");
         let result = adapter.read_native_hooks().unwrap();
         assert_eq!(result.len(), if phase == "disabled" { 0 } else { 2 });
         assert!(result.iter().all(|hook| hook.trust_status == phase));

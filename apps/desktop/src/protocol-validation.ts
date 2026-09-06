@@ -139,7 +139,11 @@ const nativeScope = (value: unknown, field: string) => {
 };
 
 export const assertProbeReport = (value: unknown): asserts value is ProbeReport => {
-  const item = object(value, ['executable', 'executableSha256', 'harnessVersion', 'installationMethod', 'configRoots', 'activeProfile', 'policyConflicts', 'capability'], 'probeReport');
+  const item = object(value, ['executable', 'executableSha256', 'harnessVersion', 'installationMethod', 'configRoots', 'activeProfile', 'policyConflicts', 'capability', 'codexSavedHookApproval'], 'probeReport');
+  if (item.codexSavedHookApproval !== null) {
+    const approval = object(item.codexSavedHookApproval, ['sessionStart', 'stop'], 'probeReport.codexSavedHookApproval');
+    for (const key of ['sessionStart', 'stop']) choice(approval[key], ['missing', 'needs_approval', 'approved', 'changed', 'disabled'], 'probeReport.codexSavedHookApproval');
+  }
   if (item.executable !== null) native(item.executable, 'probeReport.executable');
   if (item.executableSha256 !== null) sha(item.executableSha256, 'probeReport.executableSha256');
   if (item.harnessVersion !== null) text(item.harnessVersion, adapterTextLimit, 'probeReport.harnessVersion');

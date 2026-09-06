@@ -139,6 +139,22 @@ impl ProductionBridgeInstallEngine {
             bridge: AdjacentBridgeLocator::beside(daemon_executable),
         }
     }
+
+    fn probe_codex(
+        &self,
+        adapter: &CodexAdapter,
+        context: &ProbeContext,
+    ) -> Result<ProbeReport, ClientError> {
+        let mut report = adapter.probe(context)?;
+        // Reuse this discovery's attested adapter. This reads saved user
+        // settings only; never start app-server to inspect a live profile.
+        report.codex_saved_hook_approval = self.bridge.locate().ok().and_then(|bridge| {
+            adapter
+                .saved_memory_hook_approval(&wire_native_path(&bridge.path))
+                .ok()
+        });
+        Ok(report)
+    }
 }
 
 impl BridgeInstallEngine for ProductionBridgeInstallEngine {
@@ -169,7 +185,7 @@ impl BridgeInstallEngine for ProductionBridgeInstallEngine {
                 device_id,
                 observed_hlc,
             )
-            .and_then(|adapter| adapter.probe(&context)),
+            .and_then(|adapter| self.probe_codex(&adapter, &context)),
             HarnessId::Hermes => HermesAdapter::discover(
                 &binding.root,
                 &binding.root,
@@ -701,6 +717,30 @@ impl RestrictedExecutor for BridgeRestrictedExecutor {
     }
 }
 
+fn wire_native_path(path: &Path) -> WireNativeValue {
+    #[cfg(windows)]
+    let (platform, bytes) = {
+        use std::os::windows::ffi::OsStrExt as _;
+        (
+            NativePlatform::Windows,
+            path.as_os_str()
+                .encode_wide()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+        )
+    };
+    #[cfg(not(windows))]
+    let (platform, bytes) = {
+        use std::os::unix::ffi::OsStrExt as _;
+        (NativePlatform::Macos, path.as_os_str().as_bytes().to_vec())
+    };
+    WireNativeValue {
+        platform,
+        bytes,
+        display: None,
+    }
+}
+
 #[cfg(windows)]
 fn decode_wire_path(value: &WireNativeValue) -> Result<PathBuf, ClientError> {
     use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
@@ -784,6 +824,102 @@ pub(crate) mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+
+    #[test]
+    fn codex_probe_reports_saved_approvals_without_starting_another_process() {
+        use context_relay_core::codex::{CodexExecutableKind, CodexLayout};
+        use context_relay_protocol::{
+            InstallationMethod, SavedHookApproval, SavedMemoryHookApproval,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let home = root.join("home");
+        let config = home.join(".codex");
+        let project = root.join("project");
+        fs::create_dir_all(&config).unwrap();
+        fs::create_dir(&project).unwrap();
+        let device: DeviceId = "018f22e2-79b0-7cc8-98c4-dc0c0c073982".parse().unwrap();
+        let adapter = CodexAdapter::from_layout(
+            CodexLayout {
+                executable: std::env::current_exe().unwrap(),
+                executable_kind: CodexExecutableKind::Native,
+                version: "0.144.6".into(),
+                installation_method: InstallationMethod::Manual,
+                codex_home: config.clone(),
+                user_home: home.clone(),
+                user_skills_dir: home.join(".agents/skills"),
+                project_root: project.clone(),
+                working_directory: project,
+                requirements_paths: vec![],
+            },
+            "018f22e2-79b0-7cc8-98c4-dc0c0c073981".parse().unwrap(),
+            device,
+            HybridLogicalClock::new(1, 0, device),
+        )
+        .unwrap();
+        let engine = ProductionBridgeInstallEngine::with_daemon_executable(root.join("contextd"));
+        let context = ProbeContext {
+            harness: HarnessId::Codex,
+            requested_profile: None,
+        };
+        // Without the installed adjacent bridge, approval evidence is unavailable.
+        assert_eq!(
+            engine
+                .probe_codex(&adapter, &context)
+                .unwrap()
+                .codex_saved_hook_approval,
+            None
+        );
+        let bridge = engine.bridge.bridge_path().unwrap();
+        fs::write(&bridge, b"fixture only; never executed").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&bridge, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let missing = engine.probe_codex(&adapter, &context).unwrap();
+        assert_eq!(
+            missing.codex_saved_hook_approval,
+            Some(SavedMemoryHookApproval {
+                session_start: SavedHookApproval::Missing,
+                stop: SavedHookApproval::Missing,
+            })
+        );
+        assert_eq!(
+            missing.capability,
+            context_relay_protocol::CapabilityLevel::ImportOnly
+        );
+        let component = context_relay_core::native_memory::managed_memory_hooks(
+            HarnessId::Codex,
+            &wire_native_path(&engine.bridge.locate().unwrap().path),
+        )
+        .unwrap()
+        .remove(0);
+        let hooks = format!("{{\"hooks\":{}}}", component.body_markdown);
+        fs::write(config.join("hooks.json"), &hooks).unwrap();
+        let pending = engine.probe_codex(&adapter, &context).unwrap();
+        assert_eq!(
+            pending.codex_saved_hook_approval,
+            Some(SavedMemoryHookApproval {
+                session_start: SavedHookApproval::NeedsApproval,
+                stop: SavedHookApproval::NeedsApproval,
+            })
+        );
+        assert_eq!(
+            fs::read_to_string(config.join("hooks.json")).unwrap(),
+            hooks
+        );
+        assert!(!config.join(".personality_migration").exists());
+        fs::write(config.join("hooks.json"), b"{malformed").unwrap();
+        assert_eq!(
+            engine
+                .probe_codex(&adapter, &context)
+                .unwrap()
+                .codex_saved_hook_approval,
+            None
+        );
+    }
 
     fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
         let command = std::process::Command::new(program);
