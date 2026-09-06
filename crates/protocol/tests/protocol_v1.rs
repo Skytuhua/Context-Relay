@@ -75,7 +75,7 @@ fn exact_local_wire_versions_do_not_negotiate_across_saved_hook_approval() {
         max: PROTOCOL_VERSION,
     };
 
-    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 8 });
+    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 9 });
     assert!(negotiate_version(legacy, current).is_err());
     assert_eq!(negotiate_version(current, current), Ok(PROTOCOL_VERSION));
 }

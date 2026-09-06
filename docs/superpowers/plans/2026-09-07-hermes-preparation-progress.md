@@ -70,7 +70,7 @@ accepted or returned. Older ordinary clients still require an exact version;
 authenticated installer shutdown also accepts the previous 1.7 candidate.
 
 PreparedRuntime owns the unused holder and releases its pins before cleanup.
-The worker owns a successful result until later setup consumption is implemented.
+The worker owns a successful result until explicit setup consumption.
 Replacing an unused result cleans it on the worker, outside the status lock.
 Ready is published only after the owned result returns; a late cancel cannot turn
 a successful result into Canceled. The durable core API still transfers cleanup
@@ -110,9 +110,8 @@ denied passes. Independent review approved the final watch-only check. The plan
 apply/Undo fixture uses a recording executor, so it verifies sealed identity and
 idempotency rather than an actual harness connection.
 
-- Connect the daemon's completed operation to the owned preview API below;
-  bind the operation ID and selection explicitly, including replay after a lost
-  response. Unfinished or orphaned copies never become implicit launch authority.
+- Connect the desktop to the prepared-operation request described below.
+  Unfinished or orphaned copies never become implicit launch authority.
 - Show plain-language stages and a Cancel action. Selection changes and late
   replies must not replace the current selection's review. Existing setup review
   supplies the user's approval; do not add confirmation steps for implementation
@@ -142,8 +141,7 @@ The new fixture uses non-executable Python and launcher bytes. Real preview and
 vault reopening preserve the exact runtime identity and approval hash, with
 planned native mutations but unchanged Hermes configuration. A mismatched project
 fails and removes the unused holder. This qualifies passive planning, not command
-execution, native setup acceptance, or a replacement installer. The daemon's
-preparation result is not yet consumed through this API.
+execution, native setup acceptance, or a replacement installer.
 
 Validation passes 80 Hermes unit tests with three opt-in checks ignored, and all
 54 selected bridge preview/apply/rollback, runtime-plan and primary-memory tests.
@@ -151,3 +149,44 @@ Core/contextd all-target Clippy passes with test support and warnings denied.
 Clippy initially caught an adapter-size increase; the optional preview identity
 now uses a box, and the focused inert preview test passes after that correction.
 Independent review approved ownership transfer and the passive execution boundary.
+
+## Exact daemon consumption and protocol 1.9
+
+`harness_prepared_preview` takes the same operation ID and selection used for
+preparation. It is Desktop-only and runs on the owned vault worker. Admission
+takes the artifact once under a short lock; plan construction and cleanup run
+outside that lock. Status and Cancel remain responsive. Another preparation or
+consumer cannot replace the operation during preview. Successful plans and
+failed results are cached for the same operation/selection, including a client
+reconnect after a lost response. Changed selection conflicts. Daemon restart
+expires the in-memory operation; it does not rediscover an arbitrary copy.
+
+Production preparation now retains the captured adapter inside PreparedHermesSetup
+along with the canonical vault path and device identity. Consumption validates
+the current workspace and registered project before invoking the passive core
+preview. Production consumers explicitly reject the test-only fixture artifact.
+Preview panic payloads are redacted, and failures cannot consume the copy again.
+
+Protocol 1.9 makes the new method explicit and updates generated bindings,
+schemas, fixtures and independently computed .NET authentication vectors.
+Authenticated installer shutdown accepts the preceding 1.8 candidate alongside
+1.4–1.7. Ordinary clients still require the exact protocol version.
+
+Six coordinator tests cover lifecycle, nonblocking status, single consumption,
+selection conflict and success/failure replay. The authenticated IPC fixture
+checks the new route, client reconnect, changed selection, one factory/preview
+call, restart expiration and denials for Installer/MCP/RecoveryHost roles. It
+uses a recording engine and a test-only artifact; production runtime execution
+is not qualified by that fixture. Live retained-runtime apply/recovery and the
+desktop progress/cancel flow remain unfinished.
+
+Validation passes all 14 authenticated harness IPC tests, 68 daemon unit tests
+(one opt-in ignored), full protocol/local-IPC suites, 193 frontend tests and 37
+affected MCP lifecycle/dispatcher tests. Frontend type checking passes. Clippy
+with test support and warnings denied passes core, daemon, protocol and local-IPC
+targets. Initial runs caught missing test imports, stale protocol fixtures, a
+Windows metadata-file lock, and the cached plan enlarging the worker message.
+Fixtures/imports were corrected, builds completed before the lock retry, and the
+cached result now uses a box. Independent review approved the consumer, workspace
+binding, role checks and shutdown ordering. No native UI or ordinary harness
+configuration was used for these checks.

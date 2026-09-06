@@ -21,7 +21,7 @@ const destinations = [
 const gateway = {
   pendingWrites: async () => ({ writes: [], nextCursor: null }),
   status: async () => ({
-    protocol: { min: { major: 1, minor: 8 }, max: { major: 1, minor: 8 } },
+    protocol: { min: { major: 1, minor: 9 }, max: { major: 1, minor: 9 } },
     vault: 'unlocked',
     resolvedProject: null,
     sync: 'offline',

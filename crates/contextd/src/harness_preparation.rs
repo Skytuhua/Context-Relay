@@ -2,7 +2,7 @@
 use context_relay_core::hermes::python_runtime::{PreparationPhase, PreparationProgress};
 use context_relay_protocol::{
     ClientError, ErrorCode, HarnessPreparationPhase as Phase, HarnessPreparationStatus,
-    HarnessPrepareParams, LocalRequest, OperationId,
+    HarnessPrepareParams, LocalRequest, OperationId, SetupPlan,
 };
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -15,7 +15,7 @@ use std::{
 };
 
 #[cfg(windows)]
-pub type PreparedArtifact = context_relay_core::hermes::python_runtime::retained::PreparedRuntime;
+pub type PreparedArtifact = crate::bridge_install::PreparedArtifact;
 #[cfg(not(windows))]
 pub type PreparedArtifact = ();
 
@@ -32,7 +32,9 @@ struct Operation<T> {
     status: HarnessPreparationStatus,
     cancel: Arc<AtomicBool>,
     active: bool,
-    _artifact: Option<T>,
+    artifact: Option<T>,
+    previewing: bool,
+    preview: Option<Box<Result<SetupPlan, ClientError>>>,
 }
 
 struct State<T> {
@@ -102,7 +104,7 @@ impl<T: Send + 'static> PreparationSupervisor<T> {
                     operation.active = false;
                     match outcome {
                         Ok(artifact) => {
-                            operation._artifact = Some(artifact);
+                            operation.artifact = Some(artifact);
                             operation.status.phase = Phase::Ready;
                         }
                         Err(error) if error.code == ErrorCode::Canceled => {
@@ -181,7 +183,7 @@ impl<T> PreparationClient<T> {
                     Err(conflict())
                 };
             }
-            if current.active {
+            if current.active || current.previewing {
                 return Err(super::busy_error());
             }
         }
@@ -208,7 +210,7 @@ impl<T> PreparationClient<T> {
                     Err(conflict())
                 };
             }
-            if current.active {
+            if current.active || current.previewing {
                 return Err(super::busy_error());
             }
         }
@@ -224,7 +226,9 @@ impl<T> PreparationClient<T> {
             status: status.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
             active: true,
-            _artifact: None,
+            artifact: None,
+            previewing: false,
+            preview: None,
         });
         if let Err(error) = self.sender.try_send(Work::Prepare(task, previous)) {
             let work = match error {
@@ -246,6 +250,57 @@ impl<T> PreparationClient<T> {
             .filter(|op| op.status.operation_id == id)
             .ok_or_else(missing)?;
         Ok(operation.status.clone())
+    }
+
+    /// Called on the owned vault worker. Only admission/result publication hold
+    /// the status lock; preview I/O and unused-artifact cleanup run outside it.
+    pub(crate) fn preview(
+        &self,
+        params: &HarnessPrepareParams,
+        build: impl FnOnce(T) -> Result<SetupPlan, ClientError>,
+    ) -> Result<SetupPlan, ClientError> {
+        LocalRequest::HarnessPreparedPreview(params.clone())
+            .validate()
+            .map_err(|_| super::invalid_request_error())?;
+        let artifact = {
+            let mut state = self.state.lock().map_err(|_| failed())?;
+            if !state.accepting {
+                return Err(super::busy_error());
+            }
+            let operation = state
+                .operation
+                .as_mut()
+                .filter(|op| op.status.operation_id == params.operation_id)
+                .ok_or_else(missing)?;
+            if operation.status.selection != params.selection {
+                return Err(conflict());
+            }
+            if let Some(result) = &operation.preview {
+                return result.as_ref().clone();
+            }
+            if operation.active || operation.previewing {
+                return Err(super::busy_error());
+            }
+            let artifact = operation.artifact.take().ok_or_else(missing)?;
+            operation.previewing = true;
+            artifact
+        };
+        let result =
+            catch_unwind(AssertUnwindSafe(|| build(artifact))).unwrap_or_else(|_| Err(failed()));
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(operation) = state
+            .operation
+            .as_mut()
+            .filter(|op| op.status.operation_id == params.operation_id)
+        {
+            operation.previewing = false;
+            if result.is_err() {
+                operation.status.phase = Phase::Failed;
+                operation.status.error = Some(failed());
+            }
+            operation.preview = Some(Box::new(result.clone()));
+        }
+        result
     }
 
     pub(crate) fn cancel(&self, id: OperationId) -> Result<HarnessPreparationStatus, ClientError> {
@@ -342,6 +397,106 @@ mod tests {
                 harness: HarnessId::Hermes,
                 hermes_profile: Some("default".into()),
             },
+        }
+    }
+
+    #[test]
+    fn prepared_preview_consumes_once_and_keeps_status_responsive() {
+        let supervisor = PreparationSupervisor::<()>::spawn().unwrap();
+        let client = supervisor.client();
+        let request = params();
+        client
+            .start(request.clone(), Box::new(|_, _| Ok(())))
+            .unwrap();
+        terminal(&client, request.operation_id);
+        let (entered, entering) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let preview_client = client.clone();
+        let preview_request = request.clone();
+        let plan: context_relay_protocol::SetupPlan = serde_json::from_value(
+            serde_json::from_str::<serde_json::Value>(include_str!(
+                "../../protocol/tests/fixtures/runtime-contracts-v1.json"
+            ))
+            .unwrap()["setupPlan"]
+                .clone(),
+        )
+        .unwrap();
+        let expected = plan.clone();
+        let thread = std::thread::spawn(move || {
+            preview_client.preview(&preview_request, |_| {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                Ok(plan)
+            })
+        });
+        entering.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            client.status(request.operation_id).unwrap().phase,
+            Phase::Ready
+        );
+        assert_eq!(
+            client.cancel(request.operation_id).unwrap().phase,
+            Phase::Ready
+        );
+        assert_eq!(
+            client
+                .start(params(), Box::new(|_, _| Ok(())))
+                .unwrap_err()
+                .code,
+            ErrorCode::Busy
+        );
+        assert_eq!(
+            client
+                .preview(&request, |_| unreachable!())
+                .unwrap_err()
+                .code,
+            ErrorCode::Busy
+        );
+        let mut changed = request.clone();
+        changed.selection.hermes_profile = Some("another".into());
+        assert_eq!(
+            client
+                .preview(&changed, |_| unreachable!())
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        release.send(()).unwrap();
+        assert_eq!(thread.join().unwrap().unwrap(), expected);
+        assert_eq!(
+            client
+                .preview(&request, |_| panic!("must replay saved review"))
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn failed_preview_replays_error_without_reusing_the_copy() {
+        let supervisor = PreparationSupervisor::<()>::spawn().unwrap();
+        let client = supervisor.client();
+        for panic in [false, true] {
+            let request = params();
+            client
+                .start(request.clone(), Box::new(|_, _| Ok(())))
+                .unwrap();
+            terminal(&client, request.operation_id);
+            let result = client.preview(&request, |_| {
+                assert!(!panic, "private panic payload");
+                Err(conflict())
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                client.status(request.operation_id).unwrap().phase,
+                Phase::Failed
+            );
+            let again = client.preview(&request, |_| panic!("must not consume again"));
+            assert_eq!(again, result);
+            assert!(
+                !serde_json::to_string(&client.status(request.operation_id).unwrap())
+                    .unwrap()
+                    .contains("payload")
+            );
         }
     }
 

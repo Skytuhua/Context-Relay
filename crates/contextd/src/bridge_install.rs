@@ -44,6 +44,18 @@ pub(crate) const NON_LAUNCHING_WINDOWS_SID: &str = "S-1-15-2-1-2-3-4-5-6-7";
 /// protocol DTOs; callers cannot inject paths, digests, commands, or plan
 /// bodies into apply and rollback.
 pub trait BridgeInstallEngine: Send + Sync {
+    fn preview_prepared(
+        &self,
+        _vault: &mut Vault,
+        _vault_path: &Path,
+        _device_id: DeviceId,
+        _params: HarnessParams,
+        _artifact: crate::harness_preparation::PreparedArtifact,
+    ) -> Result<SetupPlan, ClientError> {
+        Err(unsupported(
+            "Prepared setup is unavailable for this harness",
+        ))
+    }
     fn prepare(
         &self,
         _vault: &Vault,
@@ -138,6 +150,28 @@ pub struct ProductionBridgeInstallEngine {
     bridge: AdjacentBridgeLocator,
 }
 
+#[cfg(windows)]
+pub struct PreparedArtifact(PreparedArtifactKind);
+
+#[cfg(windows)]
+enum PreparedArtifactKind {
+    Hermes {
+        setup: Box<context_relay_core::hermes::PreparedHermesSetup>,
+        vault_path: PathBuf,
+        device_id: DeviceId,
+    },
+    #[cfg(feature = "test-support")]
+    Fixture,
+}
+
+#[cfg(all(windows, feature = "test-support"))]
+impl PreparedArtifact {
+    #[doc(hidden)]
+    pub fn fixture() -> Self {
+        Self(PreparedArtifactKind::Fixture)
+    }
+}
+
 impl ProductionBridgeInstallEngine {
     pub fn production() -> Result<Self, ClientError> {
         Ok(Self {
@@ -169,6 +203,49 @@ impl ProductionBridgeInstallEngine {
 }
 
 impl BridgeInstallEngine for ProductionBridgeInstallEngine {
+    fn preview_prepared(
+        &self,
+        vault: &mut Vault,
+        vault_path: &Path,
+        device_id: DeviceId,
+        params: HarnessParams,
+        artifact: crate::harness_preparation::PreparedArtifact,
+    ) -> Result<SetupPlan, ClientError> {
+        #[cfg(not(windows))]
+        {
+            let _ = (vault, vault_path, device_id, params, artifact);
+            Err(unsupported(
+                "Prepared setup is unavailable on this platform",
+            ))
+        }
+        #[cfg(windows)]
+        {
+            let (setup, prepared_path, prepared_device) = match artifact.0 {
+                PreparedArtifactKind::Hermes {
+                    setup,
+                    vault_path,
+                    device_id,
+                } => (setup, vault_path, device_id),
+                #[cfg(feature = "test-support")]
+                PreparedArtifactKind::Fixture => {
+                    return Err(unsupported("Test artifacts cannot use production setup"));
+                }
+            };
+            if params.harness != HarnessId::Hermes
+                || prepared_device != device_id
+                || fs::canonicalize(vault_path)
+                    .map_err(|_| internal("The vault location is unavailable"))?
+                    != prepared_path
+            {
+                return Err(invalid("Prepared setup belongs to another workspace"));
+            }
+            let binding = project_binding(vault, params.project_id)?;
+            let project = binding
+                .registered
+                .ok_or_else(|| invalid("Choose a registered project"))?;
+            setup.preview(vault, self.bridge.clone(), &project, now_ms()?)
+        }
+    }
     fn prepare(
         &self,
         vault: &Vault,
@@ -191,7 +268,12 @@ impl BridgeInstallEngine for ProductionBridgeInstallEngine {
                 ));
             }
             let binding = project_binding(vault, params.project_id)?;
+            if binding.registered.is_none() {
+                return Err(invalid("Choose a registered project"));
+            }
             let store = canonical_lock_root(vault_path)?;
+            let vault_path = fs::canonicalize(vault_path)
+                .map_err(|_| internal("The vault location is unavailable"))?;
             let profile = params
                 .hermes_profile
                 .ok_or_else(|| invalid("Choose a Hermes profile"))?;
@@ -208,7 +290,12 @@ impl BridgeInstallEngine for ProductionBridgeInstallEngine {
                     device_id,
                     observed_hlc,
                 )?;
-                adapter.prepare_owned_runtime(&store, cancelled, report)
+                let runtime = adapter.prepare_owned_runtime(&store, cancelled, report)?;
+                Ok(PreparedArtifact(PreparedArtifactKind::Hermes {
+                    setup: Box::new(adapter.into_setup_preview(runtime)?),
+                    vault_path,
+                    device_id,
+                }))
             }))
         }
     }

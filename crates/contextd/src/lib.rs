@@ -983,6 +983,7 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
     if matches!(
         &request,
         LocalRequest::HarnessPrepare(_)
+            | LocalRequest::HarnessPreparedPreview(_)
             | LocalRequest::HarnessPreparationStatus(_)
             | LocalRequest::HarnessPreparationCancel(_)
     ) && !role_allows(role, &request)
@@ -1046,6 +1047,7 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         }
         request @ (LocalRequest::HarnessProbe(_)
         | LocalRequest::HarnessPrepare(_)
+        | LocalRequest::HarnessPreparedPreview(_)
         | LocalRequest::HarnessPreview(_)
         | LocalRequest::HarnessApply(_)
         | LocalRequest::HarnessRollback(_)) => {
@@ -1624,6 +1626,25 @@ fn execute_harness_setup(
             client
                 .start(params, task)
                 .map(|status| LocalResult::HarnessPreparation { status })
+        }
+        LocalRequest::HarnessPreparedPreview(params) => {
+            let client = state
+                .preparation
+                .as_ref()
+                .ok_or_else(service_internal_error)?;
+            client
+                .preview(&params, |artifact| {
+                    state.bridge_install.preview_prepared(
+                        &mut state.vault,
+                        &state.vault_path,
+                        state.device_id,
+                        params.selection.clone(),
+                        artifact,
+                    )
+                })
+                .map(|plan| LocalResult::Plan {
+                    plan: Box::new(plan),
+                })
         }
         LocalRequest::HarnessProbe(params) => state
             .bridge_install
@@ -3671,7 +3692,7 @@ mod tests {
     #[test]
     fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 58);
+        assert_eq!(fixtures.len(), 59);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -6324,6 +6345,16 @@ mod tests {
                 ),
             ),
             ("HarnessProbe", request_fixture("harness_probe", harness())),
+            (
+                "HarnessPreparedPreview",
+                request_fixture(
+                    "harness_prepared_preview",
+                    serde_json::json!({
+                        "operationId": ID,
+                        "selection": {"harness": "hermes", "projectId": null, "hermesProfile": "default"}
+                    }),
+                ),
+            ),
             (
                 "HarnessPreview",
                 request_fixture("harness_preview", harness()),

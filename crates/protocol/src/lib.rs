@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 8;
+pub const PROTOCOL_MINOR: u16 = 9;
 pub const SYNC_SCHEMA_VERSION: u16 = 1;
 pub const CHECKPOINT_SCHEMA_VERSION: u16 = 2;
 pub const MAX_IPC_FRAME_BYTES: usize = 8 * 1024 * 1024;

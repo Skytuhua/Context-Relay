@@ -120,6 +120,8 @@ fn native_folder(path: &Path) -> WireNativeValue {
 
 #[derive(Default)]
 struct RecordingEngine {
+    #[cfg(all(windows, feature = "test-support"))]
+    ready_preparation: bool,
     preparation_starts: Arc<AtomicUsize>,
     preparation_factories: AtomicUsize,
     fail_repeated_preparation_factory: bool,
@@ -251,6 +253,17 @@ impl RecordingEngine {
 }
 
 impl BridgeInstallEngine for RecordingEngine {
+    #[cfg(all(windows, feature = "test-support"))]
+    fn preview_prepared(
+        &self,
+        vault: &mut Vault,
+        vault_path: &Path,
+        device_id: DeviceId,
+        params: HarnessParams,
+        _: context_relay_contextd::harness_preparation::PreparedArtifact,
+    ) -> Result<SetupPlan, ClientError> {
+        self.preview(vault, vault_path, device_id, params)
+    }
     fn prepare(
         &self,
         _vault: &Vault,
@@ -264,8 +277,16 @@ impl BridgeInstallEngine for RecordingEngine {
             return Err(conflict("Project path changed after preparation started"));
         }
         let starts = self.preparation_starts.clone();
+        #[cfg(all(windows, feature = "test-support"))]
+        let ready = self.ready_preparation;
         Ok(Box::new(move |cancel, mut report| {
             starts.fetch_add(1, Ordering::SeqCst);
+            #[cfg(all(windows, feature = "test-support"))]
+            if ready {
+                return Ok(
+                    context_relay_contextd::harness_preparation::PreparedArtifact::fixture(),
+                );
+            }
             report(
                 context_relay_core::hermes::python_runtime::PreparationProgress {
                     phase: context_relay_core::hermes::python_runtime::PreparationPhase::Copying,
@@ -370,6 +391,89 @@ impl BridgeInstallEngine for RecordingEngine {
         }
         Ok(())
     }
+}
+
+#[cfg(all(windows, feature = "test-support"))]
+#[tokio::test]
+async fn prepared_preview_replays_exact_result_through_authenticated_ipc() {
+    use context_relay_protocol::{
+        HarnessPreparationIdParams, HarnessPreparationPhase, HarnessPrepareParams, OperationId,
+    };
+    use std::time::Duration;
+    use tokio::time::timeout;
+    let engine = Arc::new(RecordingEngine {
+        ready_preparation: true,
+        ..Default::default()
+    });
+    let fixture = Fixture::start("prepared-preview", engine.clone(), None).await;
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    let params = HarnessPrepareParams {
+        operation_id: OperationId::new(Uuid::now_v7()).unwrap(),
+        selection: HarnessParams {
+            harness: HarnessId::Hermes,
+            project_id: None,
+            hermes_profile: Some("coder".into()),
+        },
+    };
+    assert_eq!(
+        client
+            .call(LocalRequest::HarnessPreparedPreview(params.clone()))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound
+    );
+    client
+        .call(LocalRequest::HarnessPrepare(params.clone()))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let status = client.call(LocalRequest::HarnessPreparationStatus(HarnessPreparationIdParams { operation_id: params.operation_id })).await.unwrap();
+            if matches!(status, LocalResult::HarnessPreparation { status } if status.phase == HarnessPreparationPhase::Ready) { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.unwrap();
+    let first = client
+        .call(LocalRequest::HarnessPreparedPreview(params.clone()))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&first, LocalResult::Plan { plan } if plan.harness_profile.as_deref() == Some("coder"))
+    );
+    drop(client);
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    assert_eq!(
+        client
+            .call(LocalRequest::HarnessPreparedPreview(params.clone()))
+            .await
+            .unwrap(),
+        first
+    );
+    let mut changed = params.clone();
+    changed.selection.hermes_profile = Some("default".into());
+    assert_eq!(
+        client
+            .call(LocalRequest::HarnessPreparedPreview(changed))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(engine.preparation_starts.load(Ordering::SeqCst), 1);
+    assert_eq!(engine.previews.lock().unwrap().len(), 1);
+    let config = fixture.stop().await;
+    let fixture = Fixture::from_config(config, engine).await;
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    assert_eq!(
+        client
+            .call(LocalRequest::HarnessPreparedPreview(params))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound
+    );
+    fixture.stop().await;
 }
 
 #[tokio::test]
@@ -852,6 +956,7 @@ async fn preparation_ipc_stays_responsive_and_is_desktop_only() {
         let mut client = RawClient::connect(&fixture.runtime, role).await;
         for request in [
             LocalRequest::HarnessPrepare(params.clone()),
+            LocalRequest::HarnessPreparedPreview(params.clone()),
             LocalRequest::HarnessPreparationStatus(id.clone()),
             LocalRequest::HarnessPreparationCancel(id.clone()),
         ] {

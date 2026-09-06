@@ -615,6 +615,7 @@ pub enum LocalRequest {
     AccessSet(AccessSetParams),
     HarnessProbe(HarnessParams),
     HarnessPrepare(HarnessPrepareParams),
+    HarnessPreparedPreview(HarnessPrepareParams),
     HarnessPreparationStatus(HarnessPreparationIdParams),
     HarnessPreparationCancel(HarnessPreparationIdParams),
     HarnessPreview(HarnessParams),
@@ -732,7 +733,7 @@ impl LocalRequest {
             Self::HarnessProbe(p) | Self::HarnessPreview(p) | Self::HarnessRepair(p) => {
                 validate_harness_profile(p)
             }
-            Self::HarnessPrepare(p) => {
+            Self::HarnessPrepare(p) | Self::HarnessPreparedPreview(p) => {
                 validate_harness_profile(&p.selection)?;
                 if p.selection.harness != HarnessId::Hermes {
                     return Err(ValidationError::Invalid("harnessPrepare.selection"));

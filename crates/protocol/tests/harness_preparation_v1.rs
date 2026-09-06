@@ -18,11 +18,12 @@ fn status() -> Value {
 fn preparation_requests_are_closed_and_bind_selection_without_paths() {
     for method in [
         "harness_prepare",
+        "harness_prepared_preview",
         "harness_preparation_status",
         "harness_preparation_cancel",
     ] {
         let mut request = json!({"method": method, "params": {"operationId": id()}});
-        if method == "harness_prepare" {
+        if matches!(method, "harness_prepare" | "harness_prepared_preview") {
             request["params"]["selection"] = selection();
         }
         let parsed: LocalRequest = serde_json::from_value(request.clone()).unwrap();
@@ -31,14 +32,16 @@ fn preparation_requests_are_closed_and_bind_selection_without_paths() {
         request["params"]["executable"] = json!("untrusted.exe");
         assert!(serde_json::from_value::<LocalRequest>(request).is_err());
     }
-    let request = json!({"method": "harness_prepare", "params": {"operationId": id(),
-        "selection": {"projectId": null, "harness": "codex", "hermesProfile": null}}});
-    assert!(
-        serde_json::from_value::<LocalRequest>(request)
-            .unwrap()
-            .validate()
-            .is_err()
-    );
+    for method in ["harness_prepare", "harness_prepared_preview"] {
+        let request = json!({"method": method, "params": {"operationId": id(),
+            "selection": {"projectId": null, "harness": "codex", "hermesProfile": null}}});
+        assert!(
+            serde_json::from_value::<LocalRequest>(request)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
 }
 
 #[test]
