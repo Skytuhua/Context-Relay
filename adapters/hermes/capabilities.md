@@ -54,9 +54,22 @@ Upstream tags `v2026.7.7.2` (`0.18.2`, commit
 `9de9c25f620ff7f1ce0fd5457d596052d5159596`) and `v2026.7.7` (`0.18.1`,
 commit `f9eca7e15f1c2bfe5194aae5aa489af53c0a1a23`) establish source history, not
 the identity of a mutable local venv. Python launcher apply support remains
-disabled until the repository contains an immutable reviewed manifest for the
-complete installed package and import closure and the adapter binds and
-reattests every manifest entry.
+disabled until a complete immutable runtime/package closure is captured, separately
+bound into reviewed setup and recovery, and reattested before every execution.
+The [Python installation design](../../docs/superpowers/specs/2026-09-06-hermes-python-installation.md)
+permits a local installation snapshot as identity; it does not call that snapshot
+publisher authentication or extend the qualified version matrix.
+
+Windows discovery can now read an installed version from bounded, consistent
+CPython venv and Hermes distribution metadata without launching Python. Both wheel
+installs without direct-URL metadata and editable local installs are described.
+The inspector resolves the venv, interpreter, base Python directory, site-packages
+and editable source, and records the metadata paths/digests. It supports uv's
+same-parent minor-version Python junction while rejecting other aliases and
+remote/device paths. The observations are not a complete import inventory and
+never authorize launch. The UI labels the reported version as package metadata
+and keeps the Python runtime ImportOnly. Complete capture, sealed runtime binding,
+staged execution, and actual connection/recovery qualification remain unimplemented.
 
 Windows PE/MZ candidates are also import-only, including a `hermes.exe` renamed
 to omit its suffix. A setuptools/distlib Python console launcher is itself a PE

@@ -131,6 +131,21 @@ it('explains an unavailable Hermes home separately from a missing executable', a
   expect(screen.getByRole('alert')).not.toHaveTextContent('executable was not found');
 });
 
+it('identifies a Python installation without presenting its metadata version as qualified', async () => {
+  invoke.mockImplementation(async (_command, { request }: { request: LocalRequest }) => {
+    requests.push(request);
+    return response({ ...report, activeProfile: 'default', harnessVersion: '0.17.0', policyConflicts: ['python_runtime_not_qualified'] });
+  });
+  open();
+  fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'hermes' } });
+  preview();
+  expect(await screen.findByRole('heading', { name: 'Hermes 0.17.0' })).toBeVisible();
+  expect(screen.getByText(/Hermes uses a Python runtime that Context Relay does not support for automatic connection yet/)).toBeVisible();
+  expect(screen.getByText(/Version read from installed package metadata/)).toBeInTheDocument();
+  expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+  expect(requests.map(request => request.method)).toEqual(['harness_probe']);
+});
+
 it.each([
   { ...report, capability: 'PRIVATE-INVALID' },
   { ...report, activeProfile: 'another-profile' },

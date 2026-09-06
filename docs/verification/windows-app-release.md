@@ -488,3 +488,10 @@ visible draft and prevents older replay results from duplicating cards or
 overwriting newer visible revisions. Headless browser checks exercise real
 frontend/gateway retry behavior at desktop and narrow widths. Durable draft
 recovery across an app restart and installed acceptance remain open.
+
+[Passive Hermes Python discovery](hermes-python-discovery-2026-09-06.md) now
+identifies the actual Windows uv installation from bounded metadata without
+executing Python. It resolves the editable checkout and managed CPython junction,
+labels the metadata version, and preserves ImportOnly until complete runtime
+capture and connection qualification are implemented. No replacement local EXE
+or installed acceptance is claimed by this discovery work.

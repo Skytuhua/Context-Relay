@@ -6,6 +6,7 @@
 mod gateway;
 mod import;
 mod profile;
+pub mod python_installation;
 mod render;
 mod yaml;
 
@@ -669,6 +670,14 @@ impl HarnessAdapter for HermesAdapter {
             return Err(invalid("Hermes probe profile does not match the adapter"));
         }
         let mut policy_conflicts = self.import_policy_conflicts();
+        if !self.executable_snapshot.runnable()
+            && python_installation::inspect(&self.layout.executable)
+                .ok()
+                .flatten()
+                .is_some_and(|installation| installation.version == self.layout.version)
+        {
+            policy_conflicts.push("python_runtime_not_qualified".into());
+        }
         match gateway::inspect_gateway(&self.layout.profile)? {
             gateway::GatewayStatus::Idle => {}
             gateway::GatewayStatus::Stale => policy_conflicts.push("gateway_state_stale".into()),
@@ -1395,7 +1404,13 @@ fn discover_executable_version_with_boundaries(
         }
         parse_version(&output).ok_or_else(|| invalid("Hermes returned an invalid version"))?
     } else {
-        "unknown".to_owned()
+        // Metadata discovery never changes executable classification or launch
+        // authority. A Python installation still needs complete runtime capture
+        // and qualification before either version or validation can be executed.
+        python_installation::inspect(executable)
+            .ok()
+            .flatten()
+            .map_or_else(|| "unknown".to_owned(), |installation| installation.version)
     };
     Ok((attested.snapshot, version))
 }

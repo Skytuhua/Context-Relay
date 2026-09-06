@@ -188,12 +188,14 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
           ? `${harnessNames[discovery.harness]} was not found. Install it, restart Context Relay and select Review setup again.`
           : discovery.report.capability === 'blocked'
             ? 'Local policy prevents automatic setup. Check the restrictions configured for this harness before trying again.'
+            : discovery.harness === 'hermes' && discovery.report.policyConflicts.includes('python_runtime_not_qualified')
+              ? 'Hermes uses a Python runtime that Context Relay does not support for automatic connection yet. Your Hermes installation does not need to be reinstalled.'
             : discovery.harness === 'hermes' && discovery.report.harnessVersion === 'unknown'
               ? 'Hermes was found, but this launcher cannot connect automatically yet. Context Relay cannot verify its version and runtime. You can still save context and tasks while launcher support is completed.'
               : 'This version cannot connect automatically yet. You can still save context and tasks in Context Relay while support for this version is completed.'}</p>
         <p>The harness is not connected. No setup changes were made.</p>
         {onSaveContext && <button className="secondary-action" type="button" disabled={!!busy} onClick={onSaveContext}>Save context</button>}
-        {discovery.report.executable && <details className="technical-details"><summary>Technical details</summary><p>Executable: {nativeText(discovery.report.executable)}</p></details>}
+        {discovery.report.executable && <details className="technical-details"><summary>Technical details</summary><p>Executable: {nativeText(discovery.report.executable)}</p>{discovery.harness === 'hermes' && discovery.report.policyConflicts.includes('python_runtime_not_qualified') && <p>Version read from installed package metadata. The Python runtime has not been executed or verified for connection.</p>}</details>}
       </section>}
       {discovery?.report.codexSavedHookApproval && <SavedHookApprovals approval={discovery.report.codexSavedHookApproval} />}
       {busy && <p role="status">{busy === 'preview' ? 'Checking the installed harness…' : busy === 'apply' ? 'Saving harness settings…' : 'Undoing setup changes…'}</p>}
