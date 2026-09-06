@@ -29,7 +29,9 @@ from privileged actors changing access controls.
 
 The Windows process runner is implemented and independently reviewed; synthetic
 verification is recorded in 2026-09-06-hermes-management-runner-verification.md.
-Actual retained installation qualification and production integration remain open.
+Actual retained Version/ConfigCheck commands passed with an isolated profile and
+unchanged runtime inventory. Production integration and connection qualification
+remain open.
 
 - Own an unnamed kill-on-close Windows job; create the child suspended, assign and
   verify membership before resuming. Disable breakaway and bound process count.
@@ -54,6 +56,13 @@ Actual retained installation qualification and production integration remain ope
   setup, restart and Undo before enabling Full and producing another installer.
 
 ## Verification
+
+The owned core management facade is implemented and independently reviewed. It
+derives the executable root from LockedRuntime, validates bounded YAML before
+creating a private profile, and transfers both owners to the process runner.
+Runtime inventory is verified before and after execution; nonzero exits and
+stderr fail. Hermes's version banner is parsed separately from Python/SDK versions.
+Evidence: 2026-09-07-hermes-management-facade-verification.md.
 
 Run focused Windows filesystem/runtime regressions and affected Rust Clippy/fmt
 checks. Refresh graphify after code changes. Request review of ownership and

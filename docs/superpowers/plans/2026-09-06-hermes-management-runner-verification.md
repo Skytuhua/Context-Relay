@@ -32,12 +32,20 @@ Final synthetic verification:
   actionable findings.
 
 Logs are under .codex/context-relay-closeout-2026-09-05/hermes-management-*.log.
-The opt-in actual installed-runtime capture/check is running and is not yet a
-passing qualification claim. Its exact test is
+The opt-in actual installed-runtime capture/check PASSED on 2026-09-07. Its exact test is
 installed_retained_management_checks_use_owned_runtime_and_isolated_home.
 It holds the copied runtime, private home pin and containing temporary directory
 together through Version/ConfigCheck and verifies inventory after each command.
-No normal harness configuration, credentials, service or native UI are modified.
+It copied 14,629 files, completed source rechecking at 300.52 seconds, and reopened
+and locked the retained runtime at 626.17 seconds. Version returned Hermes 0.17.0,
+Python 3.11.15 and OpenAI SDK 2.24.0 with exit 0 and empty stderr. ConfigCheck also
+returned exit 0, Configuration Status and empty stderr using the empty synthetic
+configuration. Final inventory verification completed at 764.12 seconds; the test
+exited successfully in 768.08 seconds. Missing optional credentials are expected
+in this isolated profile; this is not a connected provider or setup acceptance.
+The source recheck passed and the installed checkout retained its same seven
+pre-existing modified files. No normal harness configuration, credentials, service
+or native UI were modified. This debug run does not establish release performance.
 
 Production runtime-aware discovery, adapter validation, daemon execution,
 registration/recovery, actual setup/restart/Undo and Full support remain open.

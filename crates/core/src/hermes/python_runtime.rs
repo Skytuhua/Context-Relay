@@ -1,6 +1,8 @@
 //! Retained local runtime bytes. A capture is identity, not launch permission.
 
 mod literals;
+#[cfg(windows)]
+mod management;
 mod projection;
 #[cfg(windows)]
 pub mod retained;
