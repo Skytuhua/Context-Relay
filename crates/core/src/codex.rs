@@ -2,7 +2,21 @@
 //!
 //! This module only reads configuration which is useful to relay.  In
 //! particular it deliberately never walks `$CODEX_HOME`: auth, sessions,
-//! history, sqlite state, logs, and approval records are not adapter input.
+//! history, sqlite state, and logs are not adapter input. The explicit saved-hook
+//! check reads approval entries in the selected user config only.
+
+mod command_context;
+pub mod hook_approval;
+// Starting app-server can migrate profiles and refresh plugins. Keep this
+// qualification probe out of production until startup side effects are contained.
+#[cfg(test)]
+mod hook_readback;
+pub mod managed_mcp;
+use command_context::CodexCommandContext;
+#[cfg(all(test, windows))]
+mod native_setup_tests;
+#[cfg(all(test, windows))]
+mod session_tests;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -19,10 +33,10 @@ use context_relay_native_runner::{NativeState, OsNativeFileSystem};
 use context_relay_protocol::{
     ApplyReceipt, CapabilityLevel, ChangeClass, ClassifiedChanges, CliOperation, CliOperations,
     ClientError, ComponentKind, ComponentRecord, DesiredState, DeviceId, DiscoveredScopes,
-    ErrorCode, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest, ImportedState,
-    InstallationMethod, NativePlatform, NativeScope, ProbeContext, ProbeReport, ProjectId,
-    Provenance, RecordId, RenderedFile, RenderedState, ScopeRef, SemanticDiff, Sha256Digest,
-    ValidationReport, WireNativeValue,
+    ErrorCode, ExpectedNativeDigest, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest,
+    ImportedState, InstallationMethod, NativePlatform, NativeScope, ProbeContext, ProbeReport,
+    ProjectId, Provenance, RecordId, RenderedFile, RenderedState, ScopeRef, SemanticDiff,
+    Sha256Digest, ValidationReport, WireNativeValue,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -91,6 +105,7 @@ pub struct CodexLayout {
     pub version: String,
     pub installation_method: InstallationMethod,
     pub codex_home: PathBuf,
+    pub user_home: PathBuf,
     pub user_skills_dir: PathBuf,
     pub project_root: PathBuf,
     pub working_directory: PathBuf,
@@ -104,6 +119,9 @@ pub struct CodexAdapter {
     origin_device: DeviceId,
     observed_hlc: HybridLogicalClock,
     executable_hash: Sha256Digest,
+    // Candidate setup qualification in isolated unit-test profiles only.
+    #[cfg(all(test, windows))]
+    qualify_01446: bool,
 }
 
 /// An opened, digest-bound Codex executable identity.
@@ -265,6 +283,7 @@ pub struct VerifiedCodexCommand<'a> {
     executable: &'a VerifiedCodexExecutable,
     launch: PreparedCodexLaunch,
     arguments: &'a [String],
+    context: CodexCommandContext,
 }
 
 impl VerifiedCodexCommand<'_> {
@@ -272,7 +291,7 @@ impl VerifiedCodexCommand<'_> {
         self.arguments
     }
 
-    pub fn execute(self, working_directory: &Path) -> Result<Vec<u8>, BoundaryError> {
+    pub fn execute(self) -> Result<Vec<u8>, BoundaryError> {
         let arguments = self
             .arguments
             .iter()
@@ -282,7 +301,8 @@ impl VerifiedCodexCommand<'_> {
             self.launch,
             &self.executable.path,
             &arguments,
-            working_directory,
+            &self.context.working_directory,
+            Some(&self.context),
         )
         .map_err(|_| BoundaryError::new("Codex command failed at the native transaction boundary"))
     }
@@ -306,13 +326,11 @@ where
 }
 
 #[derive(Clone, Debug)]
-pub struct CodexProcessRunner {
-    working_directory: PathBuf,
-}
+pub struct CodexProcessRunner;
 
 impl CodexCommandRunner for CodexProcessRunner {
     fn run(&mut self, command: VerifiedCodexCommand<'_>) -> Result<Vec<u8>, BoundaryError> {
-        command.execute(&self.working_directory)
+        command.execute()
     }
 }
 
@@ -357,8 +375,44 @@ impl CodexAdapter {
         origin_device: DeviceId,
         observed_hlc: HybridLogicalClock,
     ) -> Result<Self, ClientError> {
-        let project_root = project_root.into();
-        let working_directory = working_directory.into();
+        Self::discover_inner(
+            project_root.into(),
+            working_directory.into(),
+            project_id,
+            origin_device,
+            observed_hlc,
+            None,
+        )
+    }
+
+    /// Resolves the installed candidate and configuration without a version
+    /// subprocess; only the exact executable approved in preview can bind.
+    pub fn discover_for_registration(
+        project_root: impl Into<PathBuf>,
+        working_directory: impl Into<PathBuf>,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        approved: &context_relay_protocol::SetupPlan,
+    ) -> Result<Self, ClientError> {
+        Self::discover_inner(
+            project_root.into(),
+            working_directory.into(),
+            project_id,
+            origin_device,
+            observed_hlc,
+            Some(approved),
+        )
+    }
+
+    fn discover_inner(
+        project_root: PathBuf,
+        working_directory: PathBuf,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        approved: Option<&context_relay_protocol::SetupPlan>,
+    ) -> Result<Self, ClientError> {
         let home = home_dir().ok_or_else(|| not_found("Codex home was not found"))?;
         let codex_home = match env::var_os("CODEX_HOME") {
             Some(value) => {
@@ -372,15 +426,47 @@ impl CodexAdapter {
         };
         let executable =
             find_executable(&home).ok_or_else(|| not_found("Codex executable was not found"))?;
-        let (executable_snapshot, version) =
-            discover_executable_version(&executable, &working_directory)?;
+        let installation_method = installation_method(&executable);
+        #[cfg(windows)]
+        let (executable, expected_standalone_version) = resolve_windows_standalone_candidate(
+            &executable,
+            &home,
+            env::var_os("LOCALAPPDATA").as_deref().map(Path::new),
+        )?;
+        #[cfg(not(windows))]
+        let expected_standalone_version: Option<String> = None;
+        let (executable_snapshot, version) = match approved {
+            Some(approved) => {
+                let snapshot = snapshot_executable(&executable)?;
+                let approved_path = canonical_existing_path(&executable)?;
+                let version = crate::setup::approved_registration_version(
+                    approved,
+                    HarnessId::Codex,
+                    &wire_path(&approved_path),
+                    snapshot.digest,
+                )?;
+                if expected_standalone_version
+                    .as_ref()
+                    .is_some_and(|expected| *expected != version)
+                {
+                    return Err(invalid("Codex standalone version binding changed"));
+                }
+                (snapshot, version)
+            }
+            None => discover_executable_version(
+                &executable,
+                &working_directory,
+                expected_standalone_version.as_deref(),
+            )?,
+        };
         Self::from_discovered_layout_after_version(
             CodexLayout {
-                installation_method: installation_method(&executable),
+                installation_method,
                 executable,
                 executable_kind: CodexExecutableKind::Unknown,
                 version: String::new(),
                 codex_home,
+                user_home: home.clone(),
                 user_skills_dir: home.join(".agents/skills"),
                 project_root,
                 working_directory,
@@ -446,6 +532,7 @@ impl CodexAdapter {
         for path in [
             &layout.executable,
             &layout.codex_home,
+            &layout.user_home,
             &layout.project_root,
             &layout.working_directory,
         ] {
@@ -455,6 +542,7 @@ impl CodexAdapter {
         }
         if !layout.executable.is_file()
             || !layout.codex_home.is_dir()
+            || !layout.user_home.is_dir()
             || !layout.project_root.is_dir()
             || !layout.working_directory.is_dir()
         {
@@ -462,6 +550,7 @@ impl CodexAdapter {
         }
         layout.executable = canonical_existing_path(&layout.executable)?;
         layout.codex_home = canonical_existing_directory(&layout.codex_home)?;
+        layout.user_home = canonical_existing_directory(&layout.user_home)?;
         layout.user_skills_dir = canonical_directory_or_absent_path(&layout.user_skills_dir)?;
         layout.project_root = canonical_existing_directory(&layout.project_root)?;
         layout.working_directory = canonical_existing_directory(&layout.working_directory)?;
@@ -490,11 +579,106 @@ impl CodexAdapter {
             origin_device,
             observed_hlc,
             executable_hash,
+            #[cfg(all(test, windows))]
+            qualify_01446: false,
         })
     }
 
     pub fn project_root_wire(&self) -> WireNativeValue {
         wire_path(&self.layout.project_root)
+    }
+
+    pub(crate) fn native_bridge_dependencies(
+        &self,
+    ) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
+        self.reject_native_bridge_overrides()?;
+        self.effective_config_paths()?
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|path| {
+                let bytes = read_optional_file(&path)?;
+                Ok(ExpectedNativeDigest {
+                    target: wire_path(&path),
+                    expected_digest: bytes.as_deref().map(digest),
+                })
+            })
+            .collect()
+    }
+
+    fn reject_native_bridge_overrides(&self) -> Result<(), ClientError> {
+        let global = self.layout.codex_home.join("config.toml");
+        for (path, project_layer) in self.effective_config_paths()? {
+            if !project_layer || path == global {
+                continue;
+            }
+            self.validate_project_path(&path)?;
+            if let Some(bytes) = read_optional_file(&path)? {
+                let document = bytes_to_document(&bytes)?;
+                let servers = document
+                    .get("mcp_servers")
+                    .map(|item| {
+                        item.as_table()
+                            .ok_or_else(|| invalid("Codex project MCP configuration is invalid"))
+                    })
+                    .transpose()?;
+                if servers.is_some_and(|servers| servers.contains_key(BRIDGE_SERVER_NAME)) {
+                    return Err(client_error(
+                        ErrorCode::Conflict,
+                        "Project configuration overrides the Context Relay bridge; remove that override before connecting",
+                        false,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Composes the managed MCP declaration and memory disable from one exact
+    /// before-image. Arbitrary MCP and plugin edits still use their CLI path.
+    pub(crate) fn plan_native_bridge_with_memory_disable(
+        &self,
+        intended: &ComponentRecord,
+        disable_mutations: &[ApprovedMutation],
+    ) -> Result<ApprovedMutation, ClientError> {
+        self.require_apply_supported()?;
+        self.recheck_executable_client()?;
+        self.reject_native_bridge_overrides()?;
+        if intended.archived || !is_managed_bridge_component(HarnessId::Codex, intended) {
+            return Err(invalid("Codex native setup requires the managed bridge"));
+        }
+        let path = self.layout.codex_home.join("config.toml");
+        let snapshot = OsNativeFileSystem::new()
+            .snapshot(&path)
+            .map_err(|_| invalid("Codex config cannot be safely inspected"))?;
+        let matching = disable_mutations
+            .iter()
+            .filter(|mutation| mutation.target == wire_path(&path))
+            .collect::<Vec<_>>();
+        let base = match matching.as_slice() {
+            [] => snapshot.state().clone(),
+            [mutation] if mutation.expected.0.0 == *snapshot.fingerprint() => {
+                let state = NativeState::decode_v1(&mutation.content)
+                    .map_err(|_| invalid("Codex memory projection is invalid"))?;
+                if state.fingerprint() != mutation.intended.0.0 {
+                    return Err(invalid("Codex memory projection is invalid"));
+                }
+                state
+            }
+            _ => {
+                return Err(client_error(
+                    ErrorCode::Conflict,
+                    "Codex memory configuration changed during preview",
+                    false,
+                ));
+            }
+        };
+        let item = managed_mcp::CodexManagedMcpInput::new(&canonical_cli_declaration(
+            &intended.body_markdown,
+        )?)?
+        .native_item();
+        self.approved_file(&path, snapshot.fingerprint(), item.merge_into(&base)?)
     }
 
     pub fn plan_bridge_cli_mutation(
@@ -528,6 +712,7 @@ impl CodexAdapter {
             })?;
         let intended_declaration = canonical_cli_declaration(&intended.body_markdown)?;
         Ok(ApprovedCliMutation {
+            execution_context: Some(CodexCommandContext::new(&self.layout)?.approval_binding()),
             stable_id: intended.id.to_string(),
             forward: vec![self.declaration_operation(Some(&intended_declaration))?],
             rollback: vec![self.declaration_operation(expected.as_ref())?],
@@ -557,12 +742,10 @@ impl CodexAdapter {
     }
 
     fn process_runner(&self) -> CodexProcessRunner {
-        CodexProcessRunner {
-            working_directory: self.layout.working_directory.clone(),
-        }
+        CodexProcessRunner
     }
 
-    fn recheck_executable_client(&self) -> Result<(), ClientError> {
+    pub(crate) fn recheck_executable_client(&self) -> Result<(), ClientError> {
         open_verified_codex_executable(&self.layout.executable, self.executable_hash)
             .map_err(|_| client_error(ErrorCode::Conflict, "Codex executable changed", false))?;
         Ok(())
@@ -612,6 +795,8 @@ impl CodexAdapter {
             executable: &executable,
             launch,
             arguments,
+            context: CodexCommandContext::new(&self.layout)
+                .map_err(|_| BoundaryError::new("Codex configuration binding changed"))?,
         })
     }
 
@@ -896,9 +1081,10 @@ impl CodexAdapter {
     }
 
     pub(crate) fn capability(&self) -> CapabilityLevel {
-        if SUPPORTED_VERSIONS.contains(&self.layout.version.as_str())
-            && self.layout.executable_kind == CodexExecutableKind::Native
-        {
+        let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str());
+        #[cfg(all(test, windows))]
+        let supported = supported || (self.qualify_01446 && self.layout.version == "0.144.6");
+        if supported && self.layout.executable_kind == CodexExecutableKind::Native {
             CapabilityLevel::Full
         } else {
             CapabilityLevel::ImportOnly
@@ -971,19 +1157,28 @@ impl CodexAdapter {
     }
 
     fn project_is_trusted(&self) -> Result<bool, ClientError> {
+        Ok(self
+            .project_trust_layers()?
+            .iter()
+            .all(|(_, trusted)| *trusted))
+    }
+
+    fn project_trust_layers(&self) -> Result<Vec<(PathBuf, bool)>, ClientError> {
+        let layers = self.project_layers()?;
         let Some(bytes) = read_optional_file(&self.layout.codex_home.join("config.toml"))? else {
-            return Ok(false);
+            return Ok(layers.into_iter().map(|path| (path, false)).collect());
         };
         let document = bytes_to_document(&bytes)?;
-        let root = self.layout.project_root.to_string_lossy();
-        Ok(document
-            .get("projects")
-            .and_then(Item::as_table)
-            .and_then(|projects| projects.get(root.as_ref()))
-            .and_then(Item::as_table)
-            .and_then(|project| project.get("trust_level"))
-            .and_then(Item::as_str)
-            == Some("trusted"))
+        let root_level = project_trust_for_path(&document, &self.layout.project_root)?;
+        layers
+            .into_iter()
+            .map(|path| {
+                // A directory's explicit decision wins over the project default,
+                // including an explicit denial within a trusted repository.
+                let level = project_trust_for_path(&document, &path)?.or(root_level);
+                Ok((path, level == Some(true)))
+            })
+            .collect()
     }
 
     fn config_path(&self, scope: &ScopeRef) -> Result<PathBuf, ClientError> {
@@ -1352,7 +1547,9 @@ impl CodexAdapter {
                 )?;
             }
             ScopeRef::Project { project_id } => {
-                for (index, directory) in self.project_layers()?.into_iter().enumerate() {
+                for (index, (directory, trusted)) in
+                    self.project_trust_layers()?.into_iter().enumerate()
+                {
                     self.import_instruction(
                         &directory,
                         ScopeRef::Project { project_id },
@@ -1371,7 +1568,7 @@ impl CodexAdapter {
                         components,
                         digests,
                     )?;
-                    if self.project_is_trusted()? {
+                    if trusted {
                         self.import_config(
                             &directory.join(".codex/config.toml"),
                             ScopeRef::Project { project_id },
@@ -1825,77 +2022,52 @@ impl NativeMemoryAdapter for CodexAdapter {
             CapabilityLevel::Full => {}
         }
 
-        let path = self.layout.codex_home.join("config.toml");
-        let snapshot = match OsNativeFileSystem::new().snapshot(&path) {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                return Ok(NativeMemoryCapabilities {
-                    disable: NativeMemoryDisable::WatchOnly,
-                    sources,
-                });
+        let watch_only = || NativeMemoryCapabilities {
+            disable: NativeMemoryDisable::WatchOnly,
+            sources: sources.clone(),
+        };
+        let mut mutations = Vec::new();
+        let mut seen = HashSet::new();
+        // Project layers override the global settings. Include their explicit
+        // memory values in the same reviewed, reversible setup transaction.
+        for (path, project_layer) in self.effective_config_paths()? {
+            // CODEX_HOME may itself be the project's .codex directory. The
+            // first occurrence is global and must set both inherited defaults.
+            if !seen.insert(path.clone()) {
+                continue;
             }
-        };
-        let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
-            return Ok(NativeMemoryCapabilities {
-                disable: NativeMemoryDisable::WatchOnly,
-                sources,
-            });
-        };
-        let mut document = match bytes_to_document(bytes) {
-            Ok(document) => document,
-            Err(_) => {
-                return Ok(NativeMemoryCapabilities {
-                    disable: NativeMemoryDisable::WatchOnly,
-                    sources,
-                });
-            }
-        };
-        let supported_shape = document.get("memories").is_none_or(|item| {
-            item.as_table_like().is_some_and(|table| {
-                ["generate_memories", "use_memories"].iter().all(|key| {
-                    table
-                        .get(key)
-                        .is_none_or(|value| value.as_value().and_then(TomlValue::as_bool).is_some())
-                })
-            })
-        });
-        if !supported_shape {
-            let capabilities = NativeMemoryCapabilities {
-                disable: NativeMemoryDisable::WatchOnly,
-                sources,
-            };
-            capabilities.validate()?;
-            return Ok(capabilities);
-        }
-        let already_disabled = document.get("memories").is_some_and(|item| {
-            item.as_table_like().is_some_and(|table| {
-                ["generate_memories", "use_memories"].iter().all(|key| {
-                    table
-                        .get(key)
-                        .and_then(Item::as_value)
-                        .and_then(TomlValue::as_bool)
-                        == Some(false)
-                })
-            })
-        });
-        let mutations = if already_disabled {
-            vec![]
-        } else {
-            for key in ["generate_memories", "use_memories"] {
-                let item = &mut document["memories"][key];
-                if let Some(TomlValue::Boolean(current)) = item.as_value_mut() {
-                    let decor = current.decor().clone();
-                    let mut intended = toml_edit::Formatted::new(false);
-                    *intended.decor_mut() = decor;
-                    *item = Item::Value(TomlValue::Boolean(intended));
-                } else {
-                    *item = toml_edit::value(false);
+            if project_layer {
+                self.validate_project_path(&path)?;
+                match fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                    Err(_) => return Ok(watch_only()),
+                    Ok(_) => {}
                 }
             }
-            let intended =
-                NativeState::regular_file(document.to_string().into_bytes(), metadata.clone());
-            vec![self.approved_file(&path, snapshot.fingerprint(), intended)?]
-        };
+            let snapshot = match OsNativeFileSystem::new().snapshot(&path) {
+                Ok(snapshot) => snapshot,
+                Err(_) => return Ok(watch_only()),
+            };
+            if project_layer && matches!(snapshot.state(), NativeState::Absent { .. }) {
+                continue;
+            }
+            let NativeState::RegularFile { bytes, metadata } = snapshot.state() else {
+                return Ok(watch_only());
+            };
+            let mut document = match bytes_to_document(bytes) {
+                Ok(document) => document,
+                Err(_) => return Ok(watch_only()),
+            };
+            let changed = match managed_mcp::disable_memory_settings(&mut document, project_layer) {
+                Ok(changed) => changed,
+                Err(_) => return Ok(watch_only()),
+            };
+            if changed {
+                let intended =
+                    NativeState::regular_file(document.to_string().into_bytes(), metadata.clone());
+                mutations.push(self.approved_file(&path, snapshot.fingerprint(), intended)?);
+            }
+        }
         let capabilities = NativeMemoryCapabilities {
             disable: NativeMemoryDisable::Supported(mutations),
             sources,
@@ -1914,6 +2086,7 @@ impl HarnessAdapter for CodexAdapter {
             return Err(invalid("Codex adapter received another harness"));
         }
         Ok(ProbeReport {
+            codex_saved_hook_approval: None,
             executable: Some(wire_path(&self.layout.executable)),
             executable_sha256: Some(self.executable_hash),
             harness_version: Some(self.layout.version.clone()),
@@ -2149,12 +2322,8 @@ impl HarnessAdapter for CodexAdapter {
     fn validate_effective(&self, receipt: &ApplyReceipt) -> Result<ValidationReport, ClientError> {
         self.validate_effective_with(receipt, |command| {
             let argv = command.argv();
-            run_bounded_command(
-                &self.layout.executable,
-                &argv.iter().map(String::as_str).collect::<Vec<_>>(),
-                self.executable_hash,
-                &self.layout.working_directory,
-            )
+            self.run_verified(&mut self.process_runner(), &argv)
+                .map_err(|_| unsupported("Codex effective configuration could not be checked"))
         })
     }
 }
@@ -2331,14 +2500,123 @@ impl CodexAdapter {
 
     fn effective_config_paths(&self) -> Result<Vec<(PathBuf, bool)>, ClientError> {
         let mut paths = vec![(self.layout.codex_home.join("config.toml"), false)];
-        if self.project_is_trusted()? {
-            paths.extend(
-                self.project_layers()?
-                    .into_iter()
-                    .map(|layer| (layer.join(".codex/config.toml"), true)),
-            );
-        }
+        paths.extend(
+            self.project_trust_layers()?
+                .into_iter()
+                .filter(|(_, trusted)| *trusted)
+                .map(|(layer, _)| (layer.join(".codex/config.toml"), true)),
+        );
         Ok(paths)
+    }
+
+    fn verify_native_memory_plan_state(
+        &self,
+        plan: &NativeTransactionPlan,
+        final_state: bool,
+    ) -> Result<(), BoundaryError> {
+        if plan.native_memory_registrations.is_empty() {
+            return Ok(());
+        }
+        let capabilities = self
+            .native_memory_capabilities()
+            .map_err(|_| BoundaryError::new("Codex memory settings cannot be inspected"))?;
+        if plan.native_memory_registrations.len() != capabilities.sources.len()
+            || plan
+                .native_memory_registrations
+                .iter()
+                .any(|registration| !capabilities.sources.contains(&registration.source))
+        {
+            return Err(BoundaryError::new("Codex native memory location changed"));
+        }
+        let NativeMemoryDisable::Supported(required) = capabilities.disable else {
+            return Err(BoundaryError::new("Codex memory settings changed"));
+        };
+        for needed in required {
+            let composed = if plan.setup.rulesync_version == "bridge-preview-v1"
+                && plan.setup.adapter_version == 2
+                && needed.target == wire_path(&self.layout.codex_home.join("config.toml"))
+            {
+                plan.setup
+                    .semantic_changes
+                    .iter()
+                    .find(|change| change.target == "codex-mcp|global|context-relay")
+                    .map(|change| {
+                        let declaration = canonical_cli_declaration(&change.summary)?;
+                        let input = managed_mcp::CodexManagedMcpInput::new(&declaration)?;
+                        let state = NativeState::decode_v1(&needed.content)
+                            .map_err(|_| invalid("Codex memory state is invalid"))?;
+                        input.native_item().merge_into(&state).map(|state| {
+                            RestorableStateFingerprint(Sha256Digest(state.fingerprint()))
+                        })
+                    })
+                    .transpose()
+                    .map_err(|_| BoundaryError::new("Codex combined memory state is invalid"))?
+            } else {
+                None
+            };
+            // Reservation checks run between writes, including inverse writes.
+            // Permit only the two exact reviewed states, in either direction.
+            // Final validation permits enabled values only as an inverse result.
+            let approved = plan.mutations.iter().any(|mutation| {
+                mutation.target == needed.target
+                    && mutation.kind == MutationKind::Payload
+                    && ((!final_state
+                        && mutation.expected == needed.expected
+                        && mutation.intended == needed.intended)
+                        || (mutation.expected == needed.intended
+                            && mutation.intended == needed.expected)
+                        || composed.as_ref().is_some_and(|combined| {
+                            (!final_state
+                                && mutation.expected == needed.expected
+                                && &mutation.intended == combined)
+                                || (&mutation.expected == combined
+                                    && mutation.intended == needed.expected)
+                        }))
+            });
+            if !approved {
+                return Err(BoundaryError::new("Codex memory settings changed"));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_native_bridge_plan_state(
+        &self,
+        plan: &NativeTransactionPlan,
+        final_state: bool,
+    ) -> Result<(), BoundaryError> {
+        if plan.setup.rulesync_version != "bridge-preview-v1" || plan.setup.adapter_version != 2 {
+            return Ok(());
+        }
+        if !plan.cli_mutations.is_empty() || !plan.setup.cli_operations.is_empty() {
+            return Err(BoundaryError::new(
+                "Codex native setup cannot contain CLI mutations",
+            ));
+        }
+        let dependencies = self
+            .native_bridge_dependencies()
+            .map_err(|_| BoundaryError::new("Codex bridge configuration changed"))?;
+        for dependency in dependencies {
+            if let Some(mutation) = plan
+                .mutations
+                .iter()
+                .find(|mutation| mutation.target == dependency.target)
+            {
+                let path = decode_wire_path(&dependency.target)?;
+                let snapshot = OsNativeFileSystem::new()
+                    .snapshot(&path)
+                    .map_err(|_| BoundaryError::new("Codex config cannot be inspected"))?;
+                let fingerprint = RestorableStateFingerprint(Sha256Digest(*snapshot.fingerprint()));
+                if fingerprint != mutation.intended
+                    && (final_state || fingerprint != mutation.expected)
+                {
+                    return Err(BoundaryError::new("Codex native configuration changed"));
+                }
+            } else if !plan.setup.expected_native_digests.contains(&dependency) {
+                return Err(BoundaryError::new("Codex bridge dependency changed"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2355,7 +2633,8 @@ impl NativeAdapter for CodexAdapter {
         {
             return Err(BoundaryError::new("Codex installation changed"));
         }
-        Ok(())
+        self.verify_native_bridge_plan_state(plan, false)?;
+        self.verify_native_memory_plan_state(plan, false)
     }
     fn compare_approved_digests(
         &mut self,
@@ -2413,7 +2692,8 @@ impl NativeAdapter for CodexAdapter {
                 "Codex effective state differs from the plan",
             ));
         }
-        Ok(())
+        self.verify_native_bridge_plan_state(plan, true)?;
+        self.verify_native_memory_plan_state(plan, true)
     }
 }
 
@@ -2544,6 +2824,13 @@ where
     V: CodexCommandRunner,
 {
     fn validate_mutation(&self, mutation: &ApprovedCliMutation) -> Result<(), BoundaryError> {
+        let context = CodexCommandContext::new(&self.adapter.layout)
+            .map_err(|_| BoundaryError::new("Codex configuration binding changed"))?;
+        if mutation.execution_context.as_ref() != Some(&context.approval_binding()) {
+            return Err(BoundaryError::new(
+                "Codex command context differs from the approved setup; request a new preview",
+            ));
+        }
         if mutation.stable_id.is_empty()
             || (mutation.expected.is_none() && mutation.intended.is_none())
         {
@@ -2709,7 +2996,7 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<BTreeMap<String, bool>, Client
     if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
         return Err(invalid("Codex plugin output is invalid"));
     }
-    let object = serde_json::from_slice::<Value>(bytes)
+    let object = crate::claude_code::parse_unique_json(bytes)
         .ok()
         .and_then(|value| value.as_object().cloned())
         .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
@@ -2748,8 +3035,10 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<BTreeMap<String, bool>, Client
             "installPolicy",
             "authPolicy",
         ];
-        if plugin.len() != allowed.len()
-            || plugin.keys().any(|key| !allowed.contains(&key.as_str()))
+        if allowed.iter().any(|key| !plugin.contains_key(*key))
+            || plugin
+                .keys()
+                .any(|key| !allowed.contains(&key.as_str()) && key != "marketplaceSource")
         {
             return Err(invalid("Codex plugin output is invalid"));
         }
@@ -2767,7 +3056,12 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<BTreeMap<String, bool>, Client
         };
         safe_name(string_field("name")?)?;
         safe_name(string_field("marketplaceName")?)?;
-        string_field("version")?;
+        if !plugin.get("version").is_some_and(Value::is_null) {
+            string_field("version")?;
+        }
+        if let Some(source) = plugin.get("marketplaceSource") {
+            parse_plugin_string_object(source, &["sourceType", "source"], &[])?;
+        }
         let install_policy = string_field("installPolicy")?;
         let auth_policy = string_field("authPolicy")?;
         let enabled = plugin
@@ -2776,7 +3070,7 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<BTreeMap<String, bool>, Client
             .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
         if !ids.insert(id)
             || plugin.get("installed").and_then(Value::as_bool) != Some(expected_installed)
-            || install_policy != "AVAILABLE"
+            || !["AVAILABLE", "NOT_AVAILABLE", "INSTALLED_BY_DEFAULT"].contains(&install_policy)
             || !["ON_USE", "ON_INSTALL"].contains(&auth_policy)
         {
             return Err(invalid("Codex plugin output is invalid"));
@@ -2868,8 +3162,7 @@ fn parse_managed_mcp_get_json(
     if transport.get("type").and_then(Value::as_str) != Some("stdio")
         || !transport
             .get("env")
-            .and_then(Value::as_object)
-            .is_some_and(Map::is_empty)
+            .is_some_and(|env| env.is_null() || env.as_object().is_some_and(Map::is_empty))
         || !transport
             .get("env_vars")
             .and_then(Value::as_array)
@@ -3015,6 +3308,16 @@ fn normalize_live_mcp(object: &Map<String, Value>) -> Result<Value, ClientError>
             declaration.insert(key.into(), value.clone());
         }
     }
+    if let Some(transport) = declaration
+        .get_mut("transport")
+        .and_then(Value::as_object_mut)
+        && transport.get("type").and_then(Value::as_str) == Some("stdio")
+        && transport.get("env").is_some_and(Value::is_null)
+    {
+        // Codex CLI emits null for an omitted stdio env table. Its effective
+        // declaration is the same empty map produced by config normalization.
+        transport.insert("env".into(), Value::Object(Map::new()));
+    }
     Ok(redact_sensitive(Value::Object(declaration)))
 }
 
@@ -3120,19 +3423,36 @@ fn parse_plugin_source(value: &Value) -> Result<(), ClientError> {
         .get("source")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
-    let expected = match source {
-        "git" => ["source", "url", "ref"].as_slice(),
-        "local" => ["source", "path"].as_slice(),
+    // JsonPluginSource from the pinned native CLI. Optional fields are omitted,
+    // not null; accepting their shape grants no new CLI mutation authority.
+    let (required, optional): (&[&str], &[&str]) = match source {
+        "git" => (&["source", "url"], &["ref", "sha"]),
+        "git-subdir" => (&["source", "url", "path"], &["ref", "sha"]),
+        "local" => (&["source", "path"], &[]),
+        "npm" => (&["source", "package"], &["version", "registry"]),
         _ => return Err(invalid("Codex plugin output is invalid")),
     };
-    if object.len() != expected.len() || object.keys().any(|key| !expected.contains(&key.as_str()))
+    parse_plugin_string_object(value, required, optional)
+}
+
+fn parse_plugin_string_object(
+    value: &Value,
+    required: &[&str],
+    optional: &[&str],
+) -> Result<(), ClientError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
+    if required.iter().any(|key| !object.contains_key(*key))
+        || object
+            .keys()
+            .any(|key| !required.contains(&key.as_str()) && !optional.contains(&key.as_str()))
     {
         return Err(invalid("Codex plugin output is invalid"));
     }
-    for key in expected.iter().filter(|key| **key != "source") {
-        let value = object
-            .get(*key)
-            .and_then(Value::as_str)
+    for value in object.values() {
+        let value = value
+            .as_str()
             .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
             .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
         if value == "<redacted>" {
@@ -3202,11 +3522,12 @@ fn parse_mcp_transport(transport: &Map<String, Value>) -> Result<(), ClientError
                     .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
                 false,
             )?;
-            parse_string_map(
-                transport
-                    .get("env")
-                    .ok_or_else(|| invalid("Codex MCP output is invalid"))?,
-            )?;
+            let environment = transport
+                .get("env")
+                .ok_or_else(|| invalid("Codex MCP output is invalid"))?;
+            if !environment.is_null() {
+                parse_string_map(environment)?;
+            }
             parse_string_array(
                 transport
                     .get("env_vars")
@@ -3472,6 +3793,58 @@ fn reviewed_skill_files(root: &Path) -> Result<Vec<PathBuf>, ClientError> {
 
 fn canonical_existing_path(path: &Path) -> Result<PathBuf, ClientError> {
     fs::canonicalize(path).map_err(|_| invalid("Codex path cannot be safely resolved"))
+}
+
+/// Match Codex's project-trust keys without changing the physical paths used
+/// for reads, approval fingerprints or writes. A normalized exact entry wins
+/// over older mixed-case entries; the remaining aliases use lexical order.
+fn project_trust_for_path(
+    document: &DocumentMut,
+    canonical_path: &Path,
+) -> Result<Option<bool>, ClientError> {
+    let Some(projects) = document.get("projects") else {
+        return Ok(None);
+    };
+    let projects = projects
+        .as_table_like()
+        .ok_or_else(|| invalid("Codex project trust configuration is invalid"))?;
+    let mut levels = BTreeMap::new();
+    for (key, project) in projects.iter() {
+        let project = project
+            .as_table_like()
+            .ok_or_else(|| invalid("Codex project trust configuration is invalid"))?;
+        if let Some(level) = project.get("trust_level") {
+            let trusted = match level.as_str() {
+                Some("trusted") => true,
+                Some("untrusted") => false,
+                _ => return Err(invalid("Codex project trust configuration is invalid")),
+            };
+            levels.insert(key, trusted);
+        }
+    }
+    #[cfg(windows)]
+    let native_path = dunce::simplified(canonical_path);
+    #[cfg(not(windows))]
+    let native_path = canonical_path;
+    let native_key = native_path
+        .to_str()
+        .ok_or_else(|| invalid("Codex project trust path is not UTF-8"))?;
+    let key = if cfg!(windows) {
+        native_key.to_ascii_lowercase()
+    } else {
+        native_key.to_owned()
+    };
+    if let Some(level) = levels.get(key.as_str()) {
+        return Ok(Some(*level));
+    }
+    if cfg!(windows)
+        && let Some((_, level)) = levels
+            .iter()
+            .find(|(candidate, _)| candidate.to_ascii_lowercase() == key)
+    {
+        return Ok(Some(*level));
+    }
+    Ok(None)
 }
 
 fn canonical_existing_directory(path: &Path) -> Result<PathBuf, ClientError> {
@@ -4251,13 +4624,20 @@ fn hash_file(path: &Path) -> std::io::Result<Sha256Digest> {
 fn discover_executable_version(
     executable: &Path,
     working_directory: &Path,
+    expected_standalone_version: Option<&str>,
 ) -> Result<(CodexExecutableSnapshot, String), ClientError> {
-    discover_executable_version_after_snapshot(executable, working_directory, || {})
+    discover_executable_version_after_snapshot(
+        executable,
+        working_directory,
+        expected_standalone_version,
+        || {},
+    )
 }
 
 fn discover_executable_version_after_snapshot(
     executable: &Path,
     working_directory: &Path,
+    expected_standalone_version: Option<&str>,
     after_snapshot: impl FnOnce(),
 ) -> Result<(CodexExecutableSnapshot, String), ClientError> {
     let snapshot = snapshot_executable(executable)?;
@@ -4276,6 +4656,11 @@ fn discover_executable_version_after_snapshot(
         // unclassified candidate merely to obtain its version.
         "0.0.0".to_owned()
     };
+    if expected_standalone_version.is_some_and(|expected| expected != version) {
+        return Err(unsupported(
+            "Codex standalone release version does not match",
+        ));
+    }
     if snapshot_executable(executable)? != snapshot {
         return Err(client_error(
             ErrorCode::Conflict,
@@ -4320,7 +4705,7 @@ fn run_bounded_verified_command_with_hook(
         .revalidate_before_launch()
         .map_err(|_| client_error(ErrorCode::Conflict, "Codex executable changed", false))?;
     let launch = executable.prepare_launch()?;
-    run_prepared_codex_command(launch, &executable.path, arguments, working_directory)
+    run_prepared_codex_command(launch, &executable.path, arguments, working_directory, None)
 }
 
 fn run_prepared_codex_command(
@@ -4328,6 +4713,7 @@ fn run_prepared_codex_command(
     original_path: &Path,
     arguments: &[&str],
     working_directory: &Path,
+    context: Option<&CodexCommandContext>,
 ) -> Result<Vec<u8>, ClientError> {
     #[cfg(windows)]
     if launch.program.as_path() != original_path {
@@ -4338,6 +4724,18 @@ fn run_prepared_codex_command(
         ));
     }
     let mut command = Command::new(&launch.program);
+    if let Some(context) = context {
+        context.configure(&mut command)?;
+    } else if arguments != ["--version"] {
+        return Err(invalid(
+            "Codex configuration commands require a bound context",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000);
+    }
     command
         .args(arguments)
         .current_dir(working_directory)
@@ -4475,6 +4873,114 @@ fn find_executable(home: &Path) -> Option<PathBuf> {
         cfg!(windows),
     ));
     candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+#[cfg(windows)]
+fn resolve_windows_standalone_candidate(
+    candidate: &Path,
+    home: &Path,
+    local_app_data: Option<&Path>,
+) -> Result<(PathBuf, Option<String>), ClientError> {
+    let unchanged = || Ok((candidate.to_path_buf(), None));
+    let Some(candidate_path) = lexical_windows_disk_path(candidate) else {
+        return unchanged();
+    };
+    let Some(home) = lexical_windows_disk_path(home) else {
+        return unchanged();
+    };
+    let standalone = home.join(".codex/packages/standalone");
+    let current = standalone.join("current");
+    let current_bin = current.join("bin");
+    let programs_bin = local_app_data
+        .and_then(lexical_windows_disk_path)
+        .map(|local| local.join("Programs/OpenAI/Codex/bin"));
+    let is_programs_alias = programs_bin
+        .as_ref()
+        .is_some_and(|bin| candidate_path == bin.join("codex.exe"));
+    if !is_programs_alias && candidate_path != current_bin.join("codex.exe") {
+        return unchanged();
+    }
+    let alias = if is_programs_alias {
+        programs_bin.as_ref().expect("recognized Programs alias")
+    } else {
+        &current
+    };
+    let metadata = fs::symlink_metadata(alias)
+        .map_err(|_| invalid("Codex standalone alias is unavailable"))?;
+    if !is_link_or_reparse_point(&metadata) {
+        return unchanged();
+    }
+
+    // Resolve only the installer's two documented aliases. Never canonicalize
+    // an arbitrary PATH entry or the expected releases root: that would hide
+    // unapproved reparse points from the physical executable topology checks.
+    let _alias_topology = open_codex_path_topology(alias)
+        .map_err(|_| invalid("Codex standalone alias topology is unsafe"))?;
+    let releases = standalone.join("releases");
+    // The synthetic final component makes the topology include releases itself.
+    let _release_topology = open_codex_path_topology(&releases.join("codex.exe"))
+        .map_err(|_| invalid("Codex standalone release topology is unsafe"))?;
+    let read_target = |path: &Path| {
+        fs::read_link(path)
+            .ok()
+            .and_then(|target| lexical_windows_disk_path(&target))
+            .ok_or_else(|| invalid("Codex standalone alias target is unsafe"))
+    };
+    if is_programs_alias && read_target(alias)? != current_bin {
+        return Err(invalid("Codex standalone alias target is unexpected"));
+    }
+    let release = read_target(&current)?;
+    let tail = release
+        .strip_prefix(&releases)
+        .map_err(|_| invalid("Codex standalone release is outside its root"))?;
+    let mut components = tail.components();
+    let Some(std::path::Component::Normal(directory)) = components.next() else {
+        return Err(invalid("Codex standalone release path is invalid"));
+    };
+    if components.next().is_some() {
+        return Err(invalid("Codex standalone release path is invalid"));
+    }
+    let target = match std::env::consts::ARCH {
+        "x86_64" => "-x86_64-pc-windows-msvc",
+        "aarch64" => "-aarch64-pc-windows-msvc",
+        _ => return Err(unsupported("Codex standalone architecture is unsupported")),
+    };
+    let version = directory
+        .to_str()
+        .and_then(|directory| directory.strip_suffix(target))
+        .filter(|version| valid_version(version))
+        .ok_or_else(|| invalid("Codex standalone release directory is invalid"))?;
+    let executable = release.join("bin/codex.exe");
+    let _physical_topology = open_codex_path_topology(&executable)
+        .map_err(|_| invalid("Codex standalone executable topology is unsafe"))?;
+    // Persist this physical path. Retargeting either alias after this point
+    // cannot change which release is snapshotted, probed, or later launched.
+    Ok((executable, Some(version.to_owned())))
+}
+
+#[cfg(windows)]
+fn lexical_windows_disk_path(path: &Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Component::Prefix(prefix) = components.next()? else {
+        return None;
+    };
+    let drive = match prefix.kind() {
+        Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+        _ => return None,
+    };
+    if components.next()? != Component::RootDir {
+        return None;
+    }
+    let mut normalized = PathBuf::from(format!("{}:\\", char::from(drive.to_ascii_uppercase())));
+    for component in components {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        normalized.push(name);
+    }
+    Some(normalized)
 }
 fn platform_candidates(home: &Path, local_app_data: Option<&Path>, windows: bool) -> Vec<PathBuf> {
     if windows {
@@ -4643,10 +5149,11 @@ mod tests {
         let expected_hash = hash_file(&executable).unwrap();
         let verified = open_verified_codex_executable(&executable, expected_hash).unwrap();
 
-        let result = run_bounded_verified_command_with_hook(&verified, &[], &root, || {
-            fs::rename(&executable, &original).unwrap();
-            fs::rename(&replacement, &executable).unwrap();
-        });
+        let result =
+            run_bounded_verified_command_with_hook(&verified, &["--version"], &root, || {
+                fs::rename(&executable, &original).unwrap();
+                fs::rename(&replacement, &executable).unwrap();
+            });
 
         let _ = fs::remove_dir_all(&root);
         result.unwrap();
@@ -4676,9 +5183,10 @@ mod tests {
         let expected_hash = hash_file(&executable).unwrap();
         let verified = open_verified_codex_executable(&executable, expected_hash).unwrap();
 
-        let result = run_bounded_verified_command_with_hook(&verified, &[], &root, || {
-            fs::copy(false_source, &executable).unwrap();
-        });
+        let result =
+            run_bounded_verified_command_with_hook(&verified, &["--version"], &root, || {
+                fs::copy(false_source, &executable).unwrap();
+            });
 
         let _ = fs::remove_dir_all(&root);
         assert!(result.is_err());
@@ -4749,7 +5257,10 @@ mod tests {
         let executable = root.join("codex");
         fs::write(&executable, b"\x7fELFtest executable").unwrap();
         let sentinel = root.join("configured-stdio-ran");
-        let quoted_project = serde_json::to_string(&project_root.to_string_lossy()).unwrap();
+        let project_key = project_root.as_path();
+        #[cfg(windows)]
+        let project_key = dunce::simplified(project_key);
+        let quoted_project = serde_json::to_string(&project_key.to_string_lossy()).unwrap();
         let quoted_sentinel = serde_json::to_string(&sentinel.to_string_lossy()).unwrap();
         let global_config = codex_home.join("config.toml");
         fs::write(
@@ -4788,6 +5299,7 @@ mod tests {
                 codex_home,
                 user_skills_dir,
                 project_root,
+                user_home: root.join("home"),
                 working_directory,
                 requirements_paths: vec![],
             },
@@ -4819,6 +5331,164 @@ mod tests {
             ),
             resulting_digests: vec![],
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_project_trust_recognizes_codex_keys_and_preserves_explicit_distrust() {
+        let fixture = effective_validation_fixture();
+        let physical = fixture.adapter.layout.project_root.to_str().unwrap();
+        let native = physical.strip_prefix(r"\\?\").unwrap();
+        let lower = native.to_ascii_lowercase();
+        let upper = native.to_ascii_uppercase();
+        for (entries, expected) in [
+            (vec![(lower.clone(), "trusted")], true),
+            (vec![(upper.clone(), "trusted")], true),
+            (vec![(physical.to_owned(), "trusted")], false),
+            (
+                vec![(upper.clone(), "trusted"), (lower.clone(), "untrusted")],
+                false,
+            ),
+            (
+                vec![
+                    (physical.to_owned(), "trusted"),
+                    (lower.clone(), "untrusted"),
+                ],
+                false,
+            ),
+            (vec![(upper, "untrusted"), (lower, "trusted")], true),
+        ] {
+            let config = entries
+                .iter()
+                .map(|(key, trust)| {
+                    format!(
+                        "[projects.{}]\ntrust_level = {trust:?}\n",
+                        serde_json::to_string(key).unwrap()
+                    )
+                })
+                .collect::<String>();
+            fs::write(&fixture.global_config, config).unwrap();
+            assert_eq!(
+                fixture.adapter.project_is_trusted().unwrap(),
+                expected,
+                "{entries:?}"
+            );
+            assert_eq!(
+                fixture.adapter.effective_config_paths().unwrap().len(),
+                if expected { 3 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn project_trust_requires_a_valid_explicit_level_and_accepts_inline_tables() {
+        let project = Path::new(if cfg!(windows) {
+            r"C:\Project Ä"
+        } else {
+            "/tmp/Project Ä"
+        });
+        let key = serde_json::to_string(project.to_str().unwrap()).unwrap();
+        for (body, expected) in [
+            (String::new(), None),
+            (format!("[projects.{key}]\n"), None),
+            (
+                format!("projects = {{ {key} = {{ trust_level = 'trusted' }} }}\n"),
+                Some(true),
+            ),
+            (
+                format!("[projects.{key}]\ntrust_level = 'untrusted'\n"),
+                Some(false),
+            ),
+        ] {
+            assert_eq!(
+                project_trust_for_path(&body.parse().unwrap(), project).unwrap(),
+                expected
+            );
+        }
+        for body in [
+            "projects = false".to_owned(),
+            format!("[projects]\n{key} = 'trusted'"),
+            format!("[projects.{key}]\ntrust_level = true"),
+            format!("[projects.{key}]\ntrust_level = 'unknown'"),
+        ] {
+            assert!(project_trust_for_path(&body.parse().unwrap(), project).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_nested_distrust_excludes_its_effective_configuration() {
+        let fixture = effective_validation_fixture();
+        let child = fixture.adapter.layout.working_directory.as_path();
+        #[cfg(windows)]
+        let child = dunce::simplified(child);
+        let mut config = fs::read_to_string(&fixture.global_config).unwrap();
+        config.push_str(&format!(
+            "\n[projects.{}]\ntrust_level = 'untrusted'\n",
+            serde_json::to_string(child.to_str().unwrap()).unwrap()
+        ));
+        fs::write(&fixture.global_config, config).unwrap();
+        assert_eq!(
+            fixture.adapter.effective_config_paths().unwrap(),
+            vec![
+                (fixture.global_config.clone(), false),
+                (fixture.root_config.clone(), true)
+            ]
+        );
+        assert!(!fixture.adapter.project_is_trusted().unwrap());
+        assert!(
+            fixture
+                .adapter
+                .policy_conflicts()
+                .unwrap()
+                .contains(&"project_untrusted".to_owned())
+        );
+        assert!(
+            !fixture
+                .adapter
+                .imported_mcp_declarations()
+                .unwrap()
+                .contains_key("nested")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_project_trust_keeps_verbatim_only_names_and_does_not_fold_unicode() {
+        for path in [
+            r"\\?\C:\temp\NUL",
+            r"\\?\C:\temp\trailing.",
+            r"\\?\C:\temp\trailing ",
+        ] {
+            let body = format!(
+                "[projects.{}]\ntrust_level = 'trusted'",
+                serde_json::to_string(path).unwrap()
+            );
+            assert_eq!(
+                project_trust_for_path(&body.parse().unwrap(), Path::new(path)).unwrap(),
+                Some(true)
+            );
+        }
+        let body: DocumentMut = "[projects.'c:\\project ä']\ntrust_level = 'trusted'"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            project_trust_for_path(&body, Path::new(r"\\?\C:\Project Ä")).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_project_trust_preserves_case() {
+        let body: DocumentMut = "[projects.'/tmp/Project']\ntrust_level = 'trusted'\n[projects.'/tmp/project']\ntrust_level = 'untrusted'".parse().unwrap();
+        assert_eq!(
+            project_trust_for_path(&body, Path::new("/tmp/Project")).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            project_trust_for_path(&body, Path::new("/tmp/project")).unwrap(),
+            Some(false)
+        );
     }
 
     fn effective_validation_output(
@@ -4956,8 +5626,10 @@ mod tests {
         );
         assert!(!fixture.sentinel.exists());
 
-        let quoted_project =
-            serde_json::to_string(&fixture.adapter.layout.project_root.to_string_lossy()).unwrap();
+        let project_key = fixture.adapter.layout.project_root.as_path();
+        #[cfg(windows)]
+        let project_key = dunce::simplified(project_key);
+        let quoted_project = serde_json::to_string(&project_key.to_string_lossy()).unwrap();
         fs::write(
             &fixture.global_config,
             format!(
@@ -5161,7 +5833,7 @@ mod tests {
         let sentinel = root.join("wrapper-ran");
         fs::write(&executable, b"\x7fELFnative executable").unwrap();
 
-        let result = discover_executable_version_after_snapshot(&executable, &root, || {
+        let result = discover_executable_version_after_snapshot(&executable, &root, None, || {
             fs::write(
                 &executable,
                 format!(
@@ -5220,6 +5892,7 @@ mod tests {
                 codex_home,
                 user_skills_dir,
                 project_root: project_root.clone(),
+                user_home: root.clone(),
                 working_directory: project_root,
                 requirements_paths: vec![],
             },
@@ -5248,6 +5921,18 @@ mod tests {
         assert!(!sentinel_exists);
     }
     #[test]
+    fn observed_stdio_null_environment_normalizes_to_no_overrides() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/codex-0.144.6-mcp.json")).unwrap();
+        let declaration = parse_mcp_get_json(
+            &serde_json::to_vec(&fixture["mcpGetJson"]).unwrap(),
+            "context-relay",
+        )
+        .unwrap();
+        assert_eq!(declaration["transport"]["env"], serde_json::json!({}));
+    }
+
+    #[test]
     fn frozen_release_outputs_match_reviewed_json_contracts() {
         for source in [
             include_str!("../tests/fixtures/codex-0.144.0.json"),
@@ -5264,6 +5949,104 @@ mod tests {
                 .unwrap();
         }
     }
+    #[test]
+    fn plugin_json_accepts_native_optional_metadata_and_source_variants() {
+        // Pinned Codex 0.144.6 JsonPluginListEntry / JsonPluginSource.
+        let sources = [
+            serde_json::json!({"source":"local","path":"C:/fixture/plugin"}),
+            serde_json::json!({"source":"git","url":"https://example.com/plugins.git"}),
+            serde_json::json!({"source":"git","url":"https://example.com/plugins.git","ref":"main","sha":"abc"}),
+            serde_json::json!({"source":"git-subdir","url":"https://example.com/plugins.git","path":"plugins/tool"}),
+            serde_json::json!({"source":"npm","package":"@fixture/tool"}),
+            serde_json::json!({"source":"npm","package":"@fixture/tool","version":"1.0","registry":"https://example.com"}),
+        ];
+        for source in sources {
+            for policy in ["AVAILABLE", "NOT_AVAILABLE", "INSTALLED_BY_DEFAULT"] {
+                for version in [Value::Null, Value::String("1.0.0".into())] {
+                    let mut plugin = serde_json::json!({
+                        "pluginId":"tool@team", "name":"tool", "marketplaceName":"team",
+                        "version":version, "installed":true, "enabled":false,
+                        "source":source, "installPolicy":policy, "authPolicy":"ON_USE"
+                    });
+                    for metadata in [false, true] {
+                        if metadata {
+                            plugin["marketplaceSource"] = serde_json::json!({
+                                "sourceType":"local", "source":"C:/fixture/marketplace"
+                            });
+                        }
+                        let bytes = serde_json::to_vec(&serde_json::json!({
+                            "installed":[plugin], "available":[]
+                        }))
+                        .unwrap();
+                        assert_eq!(
+                            parse_plugin_list_json(&bytes).unwrap(),
+                            BTreeMap::from([("tool@team".into(), false)])
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plugin_json_rejects_malformed_optional_metadata_and_duplicate_keys() {
+        let plugin = serde_json::json!({
+            "pluginId":"tool@team", "name":"tool", "marketplaceName":"team",
+            "version":"1.0", "installed":true, "enabled":true,
+            "source":{"source":"git","url":"https://example.com/plugins.git","ref":"main"},
+            "installPolicy":"AVAILABLE", "authPolicy":"ON_USE"
+        });
+        for (key, value) in [
+            ("version", serde_json::json!(false)),
+            ("version", serde_json::json!("")),
+            ("marketplaceSource", Value::Null),
+            (
+                "marketplaceSource",
+                serde_json::json!({"sourceType":"local"}),
+            ),
+            (
+                "marketplaceSource",
+                serde_json::json!({"sourceType":"local","source":"x","extra":true}),
+            ),
+            (
+                "marketplaceSource",
+                serde_json::json!({"sourceType":false,"source":"x"}),
+            ),
+            (
+                "source",
+                serde_json::json!({"source":"git","url":"x","ref":null}),
+            ),
+            (
+                "source",
+                serde_json::json!({"source":"npm","package":"x","version":3}),
+            ),
+            (
+                "source",
+                serde_json::json!({"source":"git-subdir","url":"x"}),
+            ),
+        ] {
+            let mut changed = plugin.clone();
+            changed[key] = value;
+            let bytes =
+                serde_json::to_vec(&serde_json::json!({"installed":[changed],"available":[]}))
+                    .unwrap();
+            assert!(parse_plugin_list_json(&bytes).is_err(), "{key}");
+        }
+        let bytes =
+            serde_json::to_string(&serde_json::json!({"installed":[plugin],"available":[]}))
+                .unwrap();
+        for duplicate in [
+            bytes.replace("\"enabled\":true", "\"enabled\":false,\"enabled\":true"),
+            bytes.replace(
+                "\"source\":\"git\"",
+                "\"source\":\"local\",\"source\":\"git\"",
+            ),
+            bytes.replace("\"available\":[]", "\"available\":[{}],\"available\":[]"),
+        ] {
+            assert!(parse_plugin_list_json(duplicate.as_bytes()).is_err());
+        }
+    }
+
     #[test]
     fn plugin_json_schema_rejects_wrong_types_membership_sources_and_unknown_fields() {
         let plugin = serde_json::json!({
@@ -5521,5 +6304,342 @@ mod tests {
                 PathBuf::from("C:/Users/test/AppData/Local/Programs/ChatGPT/resources/codex.exe")
             ]
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod standalone_discovery_tests {
+    use super::*;
+    use std::{os::windows::process::CommandExt, sync::OnceLock};
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    const TARGET: &str = if cfg!(target_arch = "aarch64") {
+        "aarch64-pc-windows-msvc"
+    } else {
+        "x86_64-pc-windows-msvc"
+    };
+
+    struct Standalone {
+        _root: tempfile::TempDir,
+        home: PathBuf,
+        local: PathBuf,
+        releases: PathBuf,
+        current: PathBuf,
+        alias: PathBuf,
+        original: PathBuf,
+        replacement: PathBuf,
+    }
+
+    fn native_probe() -> &'static [u8] {
+        static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+        BYTES.get_or_init(|| {
+            let build = tempfile::tempdir().unwrap();
+            let binary = build.path().join("probe.exe");
+            let output = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+                .arg("--edition=2024")
+                .arg(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/codex-native-discovery-probe.rs"),
+                )
+                .arg("-o")
+                .arg(&binary)
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "native fixture failed to build: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fs::read(binary).unwrap()
+        })
+    }
+
+    fn junction(link: &Path, target: &Path) {
+        let output = Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link.to_str().unwrap().replace('/', "\\"))
+            .arg(target.to_str().unwrap().replace('/', "\\"))
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "mandatory junction fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    impl Standalone {
+        fn new() -> Self {
+            let root = tempfile::Builder::new()
+                .prefix("context-relay-standalone-")
+                .tempdir()
+                .unwrap();
+            let home = root.path().join("home");
+            let local = home.join("AppData/Local");
+            let base = home.join(".codex/packages/standalone");
+            let releases = base.join("releases");
+            let release = |version: &str| {
+                let bin = releases.join(format!("{version}-{TARGET}")).join("bin");
+                fs::create_dir_all(&bin).unwrap();
+                fs::write(bin.join("codex.exe"), native_probe()).unwrap();
+                fs::write(bin.join("version.txt"), version).unwrap();
+                bin.join("codex.exe")
+            };
+            let original = release("0.144.1");
+            let replacement = release("0.144.0");
+            let current = base.join("current");
+            junction(&current, original.parent().unwrap().parent().unwrap());
+            let alias_bin = local.join("Programs/OpenAI/Codex/bin");
+            fs::create_dir_all(alias_bin.parent().unwrap()).unwrap();
+            junction(&alias_bin, &current.join("bin"));
+            Self {
+                _root: root,
+                home,
+                local,
+                releases,
+                current,
+                alias: alias_bin.join("codex.exe"),
+                original,
+                replacement,
+            }
+        }
+
+        fn resolve(&self) -> Result<(PathBuf, Option<String>), ClientError> {
+            resolve_windows_standalone_candidate(&self.alias, &self.home, Some(&self.local))
+        }
+
+        fn retarget(&self, release: &Path) {
+            fs::remove_dir(&self.current).unwrap();
+            junction(&self.current, release);
+        }
+
+        fn adapter(
+            &self,
+            physical: PathBuf,
+            snapshot: CodexExecutableSnapshot,
+            version: String,
+        ) -> CodexAdapter {
+            let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
+            CodexAdapter::from_discovered_layout_after_version(
+                CodexLayout {
+                    executable: physical,
+                    executable_kind: CodexExecutableKind::Unknown,
+                    version: String::new(),
+                    installation_method: InstallationMethod::Manual,
+                    codex_home: self.home.join(".codex"),
+                    user_home: self.home.clone(),
+                    user_skills_dir: self.home.join(".agents/skills"),
+                    project_root: self.home.clone(),
+                    working_directory: self.home.clone(),
+                    requirements_paths: vec![],
+                },
+                ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073981").unwrap(),
+                device_id,
+                HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+                snapshot,
+                version,
+                || {},
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn standalone_alias_is_resolved_before_version_and_later_retargets_cannot_redirect_probe() {
+        for retarget_after_snapshot in [false, true] {
+            let fixture = Standalone::new();
+            let (physical, expected_version) = fixture.resolve().unwrap();
+            assert_eq!(physical, fixture.original);
+            assert_eq!(expected_version.as_deref(), Some("0.144.1"));
+            let replacement_release = fixture.replacement.parent().unwrap().parent().unwrap();
+            if !retarget_after_snapshot {
+                fixture.retarget(replacement_release);
+            }
+            let (snapshot, version) = discover_executable_version_after_snapshot(
+                &physical,
+                &fixture.home,
+                expected_version.as_deref(),
+                || {
+                    if retarget_after_snapshot {
+                        fixture.retarget(replacement_release);
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(version, "0.144.1");
+            assert!(physical.with_file_name("invoked").exists());
+            assert!(!fixture.replacement.with_file_name("invoked").exists());
+            let output =
+                run_bounded_command(&physical, &["--version"], snapshot.digest, &fixture.home)
+                    .unwrap();
+            assert_eq!(output, b"codex-cli 0.144.1\n");
+            assert!(!fixture.replacement.with_file_name("invoked").exists());
+        }
+    }
+
+    #[test]
+    fn standalone_resolution_rejects_outside_root_wrong_shape_target_and_nested_junctions() {
+        for mode in [
+            "outside",
+            "shape",
+            "target",
+            "nested",
+            "root-link",
+            "programs-target",
+        ] {
+            let fixture = Standalone::new();
+            match mode {
+                "outside" => fixture.retarget(fixture._root.path()),
+                "shape" => fixture.retarget(fixture.original.parent().unwrap()),
+                "target" => {
+                    let wrong = fixture.releases.join("0.144.1-wrong-target");
+                    fs::create_dir(&wrong).unwrap();
+                    fixture.retarget(&wrong);
+                }
+                "nested" => {
+                    let bin = fixture.original.parent().unwrap();
+                    let moved = bin.with_file_name("moved-bin");
+                    fs::rename(bin, &moved).unwrap();
+                    junction(bin, &moved);
+                }
+                "root-link" => {
+                    let moved = fixture.releases.with_file_name("moved-releases");
+                    fs::rename(&fixture.releases, &moved).unwrap();
+                    junction(&fixture.releases, &moved);
+                }
+                "programs-target" => {
+                    let alias_bin = fixture.alias.parent().unwrap();
+                    fs::remove_dir(alias_bin).unwrap();
+                    junction(alias_bin, fixture.replacement.parent().unwrap());
+                }
+                _ => unreachable!(),
+            }
+            assert!(fixture.resolve().is_err(), "accepted {mode}");
+            assert!(!fixture.replacement.with_file_name("invoked").exists());
+        }
+    }
+
+    #[test]
+    fn standalone_resolution_never_canonicalizes_an_arbitrary_path_alias() {
+        let fixture = Standalone::new();
+        let arbitrary = fixture._root.path().join("custom-bin");
+        junction(&arbitrary, fixture.original.parent().unwrap());
+        let candidate = arbitrary.join("codex.exe");
+        let (path, expected_version) =
+            resolve_windows_standalone_candidate(&candidate, &fixture.home, Some(&fixture.local))
+                .unwrap();
+        assert_eq!(path, candidate);
+        assert!(expected_version.is_none());
+        assert!(snapshot_executable(&path).is_err());
+    }
+
+    #[test]
+    fn standalone_current_alias_is_bound_to_the_expected_physical_release() {
+        let fixture = Standalone::new();
+        let (physical, expected_version) = resolve_windows_standalone_candidate(
+            &fixture.current.join("bin/codex.exe"),
+            &fixture.home,
+            None,
+        )
+        .unwrap();
+        assert_eq!(physical, fixture.original);
+        assert_eq!(expected_version.as_deref(), Some("0.144.1"));
+        let (_, version) =
+            discover_executable_version(&physical, &fixture.home, expected_version.as_deref())
+                .unwrap();
+        assert_eq!(version, "0.144.1");
+        assert!(!fixture.replacement.with_file_name("invoked").exists());
+    }
+
+    #[test]
+    fn constructed_standalone_adapter_stays_bound_after_alias_retargets() {
+        let fixture = Standalone::new();
+        let (physical, expected_version) = fixture.resolve().unwrap();
+        let (snapshot, version) =
+            discover_executable_version(&physical, &fixture.home, expected_version.as_deref())
+                .unwrap();
+        let adapter = fixture.adapter(physical, snapshot, version);
+        fixture.retarget(fixture.replacement.parent().unwrap().parent().unwrap());
+        let output = run_bounded_command(
+            &adapter.layout.executable,
+            &["--version"],
+            adapter.executable_hash,
+            &fixture.home,
+        )
+        .unwrap();
+        assert_eq!(output, b"codex-cli 0.144.1\n");
+        assert!(!fixture.replacement.with_file_name("invoked").exists());
+    }
+
+    #[test]
+    fn constructed_standalone_adapter_rejects_changed_binary_and_reparse_ancestor() {
+        for replace_ancestor in [false, true] {
+            let fixture = Standalone::new();
+            let (physical, expected_version) = fixture.resolve().unwrap();
+            let (snapshot, version) =
+                discover_executable_version(&physical, &fixture.home, expected_version.as_deref())
+                    .unwrap();
+            let adapter = fixture.adapter(physical, snapshot, version);
+            if replace_ancestor {
+                let bin = fixture.original.parent().unwrap();
+                fs::rename(bin, bin.with_file_name("retired-bin")).unwrap();
+                junction(bin, fixture.replacement.parent().unwrap());
+            } else {
+                let mut replacement = native_probe().to_vec();
+                replacement.extend_from_slice(b"changed executable digest");
+                fs::write(&fixture.original, replacement).unwrap();
+            }
+            assert!(
+                run_bounded_command(
+                    &adapter.layout.executable,
+                    &["--version"],
+                    adapter.executable_hash,
+                    &fixture.home
+                )
+                .is_err()
+            );
+            assert!(!fixture.replacement.with_file_name("invoked").exists());
+        }
+    }
+
+    #[test]
+    fn adapter_commands_use_the_selected_codex_home_and_working_directory() {
+        let fixture = Standalone::new();
+        let (physical, expected_version) = fixture.resolve().unwrap();
+        let (snapshot, version) =
+            discover_executable_version(&physical, &fixture.home, expected_version.as_deref())
+                .unwrap();
+        let adapter = fixture.adapter(physical, snapshot, version);
+        let output = adapter
+            .run_verified(&mut adapter.process_runner(), &["--context".to_owned()])
+            .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        for (name, expected) in [
+            ("CODEX_HOME", adapter.layout.codex_home.as_path()),
+            ("HOME", fixture.home.as_path()),
+            ("USERPROFILE", fixture.home.as_path()),
+            ("cwd", adapter.layout.working_directory.as_path()),
+        ] {
+            let actual = text
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .unwrap();
+            assert_eq!(
+                fs::canonicalize(actual).unwrap(),
+                fs::canonicalize(expected).unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_release_directory_must_match_the_native_version() {
+        let fixture = Standalone::new();
+        fs::write(fixture.original.with_file_name("version.txt"), "0.144.0").unwrap();
+        let result = discover_executable_version(&fixture.original, &fixture.home, Some("0.144.1"));
+        assert!(result.is_err());
     }
 }

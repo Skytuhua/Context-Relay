@@ -17,6 +17,14 @@ beforeEach(() => {
   invoke.mockReset();
 });
 
+it('opens the native folder picker without sending workspace mutations, including cancellation', async () => {
+  invoke.mockResolvedValueOnce('C:\\Work\\專案 🚀').mockResolvedValueOnce(null);
+  const gateway = new LocalWorkspaceGateway();
+  await expect(gateway.chooseProjectFolder()).resolves.toBe('C:\\Work\\專案 🚀');
+  await expect(gateway.chooseProjectFolder()).resolves.toBeNull();
+  expect(invoke.mock.calls).toEqual([['choose_project_folder'], ['choose_project_folder']]);
+});
+
 it('forwards only the typed request through the local_request command', async () => {
   const response = { kind: 'projects', data: { projects: [] } } as const;
   invoke.mockResolvedValue(response);

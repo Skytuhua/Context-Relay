@@ -5,8 +5,18 @@
 
 mod gateway;
 mod import;
+#[cfg(windows)]
+mod prepared_setup;
 mod profile;
+pub mod python_installation;
+pub mod python_runtime;
 mod render;
+#[cfg(windows)]
+mod retained_adapter;
+#[cfg(windows)]
+pub use prepared_setup::PreparedHermesSetup;
+#[cfg(all(test, windows))]
+mod native_setup_tests;
 mod yaml;
 
 use std::{
@@ -122,6 +132,21 @@ pub struct HermesAdapter {
     executable_snapshot: Box<ExecutableSnapshot>,
     gateway_profile: Option<gateway::GatewayProfileReservation>,
     gateway_lease: Option<gateway::GatewayLease>,
+    #[cfg(windows)]
+    retained_runtime: Option<retained_adapter::AdapterRuntime>,
+    #[cfg(windows)]
+    preview_runtime: Option<Box<crate::native_transaction::InstalledRuntimeBinding>>,
+    #[cfg(all(test, windows))]
+    qualify_retained_setup: bool,
+}
+
+enum DiscoveryVersion<'a> {
+    Probe,
+    Approved(&'a context_relay_protocol::SetupPlan),
+    #[cfg(windows)]
+    Retained(&'a NativeTransactionPlan),
+    #[cfg(windows)]
+    Preparation,
 }
 
 impl Clone for HermesAdapter {
@@ -135,6 +160,12 @@ impl Clone for HermesAdapter {
             executable_snapshot: self.executable_snapshot.clone(),
             gateway_profile: None,
             gateway_lease: None,
+            #[cfg(windows)]
+            retained_runtime: self.retained_runtime.clone(),
+            #[cfg(windows)]
+            preview_runtime: self.preview_runtime.clone(),
+            #[cfg(all(test, windows))]
+            qualify_retained_setup: self.qualify_retained_setup,
         }
     }
 }
@@ -200,11 +231,146 @@ impl HermesAdapter {
         origin_device: DeviceId,
         observed_hlc: HybridLogicalClock,
     ) -> Result<Self, ClientError> {
+        Self::discover_inner(
+            project_root.into(),
+            working_directory.into(),
+            requested_profile,
+            project_id,
+            origin_device,
+            observed_hlc,
+            DiscoveryVersion::Probe,
+        )
+    }
+
+    /// Rechecks the selected profile and executable without launching Hermes.
+    pub fn discover_for_registration(
+        project_root: impl Into<PathBuf>,
+        working_directory: impl Into<PathBuf>,
+        requested_profile: &str,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        approved: &context_relay_protocol::SetupPlan,
+    ) -> Result<Self, ClientError> {
+        Self::discover_inner(
+            project_root.into(),
+            working_directory.into(),
+            requested_profile,
+            project_id,
+            origin_device,
+            observed_hlc,
+            DiscoveryVersion::Approved(approved),
+        )
+    }
+
+    /// Resolves only Python installation metadata. Preparation must never run
+    /// the installed command, including when discovery finds a native binary.
+    #[cfg(windows)]
+    pub fn discover_for_preparation(
+        project_root: impl Into<PathBuf>,
+        working_directory: impl Into<PathBuf>,
+        requested_profile: &str,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+    ) -> Result<Self, ClientError> {
+        Self::discover_inner(
+            project_root.into(),
+            working_directory.into(),
+            requested_profile,
+            project_id,
+            origin_device,
+            observed_hlc,
+            DiscoveryVersion::Preparation,
+        )
+    }
+
+    /// Passively rediscovers an authenticated retained setup plan. Unlike
+    /// registration, this accepts native writes; execution still requires
+    /// reopen_approved_runtime to acquire the exact approved runtime owner.
+    #[cfg(windows)]
+    pub fn discover_for_retained_setup(
+        project_root: impl Into<PathBuf>,
+        working_directory: impl Into<PathBuf>,
+        requested_profile: &str,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        approved: &NativeTransactionPlan,
+    ) -> Result<Self, ClientError> {
+        approved
+            .setup
+            .validate()
+            .map_err(|_| conflict("Hermes retained setup plan is invalid"))?;
+        if approved.approval_version != 2
+            || approved.setup.harness != HarnessId::Hermes
+            || approved.installed_runtime.is_none()
+        {
+            return Err(conflict("Hermes retained setup plan is invalid"));
+        }
+        Self::discover_inner(
+            project_root.into(),
+            working_directory.into(),
+            requested_profile,
+            project_id,
+            origin_device,
+            observed_hlc,
+            DiscoveryVersion::Retained(approved),
+        )
+    }
+
+    fn discover_inner(
+        project_root: PathBuf,
+        working_directory: PathBuf,
+        requested_profile: &str,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        discovery: DiscoveryVersion<'_>,
+    ) -> Result<Self, ClientError> {
         let default_hermes_home = default_hermes_home()?;
         let profile = profile::select_profile(&default_hermes_home, requested_profile)?;
         let executable =
             find_executable().ok_or_else(|| not_found("Hermes executable was not found"))?;
-        let (snapshot, version) = discover_executable_version(&executable)?;
+        let (snapshot, version) = match discovery {
+            #[cfg(windows)]
+            DiscoveryVersion::Retained(approved) => {
+                retained_adapter::verify_approved_profile_home(&profile, approved)?;
+                let snapshot = snapshot_executable(&executable)?;
+                let path = fs::canonicalize(&executable)
+                    .map_err(|_| invalid("Hermes executable cannot be safely resolved"))?;
+                if approved.setup.executable_path != wire_path(&path)
+                    || approved.setup.executable_hash != snapshot.digest
+                    || approved.setup.harness_profile.as_deref() != Some(profile.name.as_str())
+                {
+                    return Err(conflict(
+                        "The approved Hermes installation changed; request a new preview",
+                    ));
+                }
+                (snapshot, approved.setup.harness_version.clone())
+            }
+            DiscoveryVersion::Approved(approved) => {
+                let snapshot = snapshot_executable(&executable)?;
+                let approved_path = fs::canonicalize(&executable)
+                    .map_err(|_| invalid("Hermes executable cannot be safely resolved"))?;
+                let version = crate::setup::approved_registration_version(
+                    approved,
+                    HarnessId::Hermes,
+                    &wire_path(&approved_path),
+                    snapshot.digest,
+                )?;
+                (snapshot, version)
+            }
+            #[cfg(windows)]
+            DiscoveryVersion::Preparation => {
+                let snapshot = snapshot_executable(&executable)?;
+                let installation = python_installation::inspect(&executable)?.ok_or_else(|| {
+                    invalid("This Hermes installation does not need Python runtime preparation")
+                })?;
+                (snapshot, installation.version)
+            }
+            DiscoveryVersion::Probe => discover_executable_version(&executable)?,
+        };
         let installation_method = installation_method(&executable);
         Self::from_attested_layout(
             HermesLayout {
@@ -214,8 +380,8 @@ impl HermesAdapter {
                 installation_method,
                 default_hermes_home,
                 profile,
-                project_root: project_root.into(),
-                working_directory: working_directory.into(),
+                project_root,
+                working_directory,
             },
             project_id,
             origin_device,
@@ -306,6 +472,12 @@ impl HermesAdapter {
             executable_snapshot: Box::new(executable),
             gateway_profile: None,
             gateway_lease: None,
+            #[cfg(windows)]
+            retained_runtime: None,
+            #[cfg(windows)]
+            preview_runtime: None,
+            #[cfg(all(test, windows))]
+            qualify_retained_setup: false,
         })
     }
 
@@ -347,12 +519,29 @@ impl HermesAdapter {
         if !yaml::topology_supported(&parsed_staged) {
             return Err(invalid("Hermes staged config topology is unsupported"));
         }
+        self.check_config_projection(&staged_config, &mut execute)
+    }
+
+    fn check_config_projection(
+        &self,
+        staged_config: &[u8],
+        execute: &mut impl FnMut(&HermesValidationRequest) -> Result<Vec<u8>, ClientError>,
+    ) -> Result<ValidationReport, ClientError> {
+        #[cfg(windows)]
+        if self.preview_runtime.is_some() {
+            return Err(conflict("Hermes preview cannot execute a runtime"));
+        }
+        #[cfg(windows)]
+        if let Some(runtime) = &self.retained_runtime {
+            let output = runtime.check_config(staged_config)?;
+            return parse_config_check_output(&output, &self.layout.version);
+        }
         let attested = attest_executable(&self.layout.executable)?;
         if attested.snapshot != *self.executable_snapshot {
             return Err(conflict("Hermes executable changed"));
         }
         let executable_stage = stage_executable(&attested)?;
-        let stage = create_validation_stage(&staged_config)?;
+        let stage = create_validation_stage(staged_config)?;
         let request = HermesValidationRequest {
             executable: executable_stage.path.clone(),
             argv: vec!["config".into(), "check".into()],
@@ -365,6 +554,29 @@ impl HermesAdapter {
     }
 
     pub(crate) fn capability(&self) -> CapabilityLevel {
+        #[cfg(windows)]
+        if self.preview_runtime.is_some() {
+            // Only the opaque PreparedHermesSetup owns this adapter. Allow its
+            // pure planner; execution entry points independently reject it.
+            return if self.layout.version == "0.17.0" && self.yaml_topology_supported() {
+                CapabilityLevel::Full
+            } else {
+                CapabilityLevel::ImportOnly
+            };
+        }
+        #[cfg(windows)]
+        if self.retained_runtime.is_some() {
+            #[cfg(test)]
+            if self.qualify_retained_setup
+                && self.layout.version == "0.17.0"
+                && self.yaml_topology_supported()
+            {
+                return CapabilityLevel::Full;
+            }
+            // Connection, restart and Undo qualification must precede enabling
+            // Python-backed writes, even for a version supported natively.
+            return CapabilityLevel::ImportOnly;
+        }
         if SUPPORTED_VERSIONS.contains(&self.layout.version.as_str())
             && self.executable_snapshot.runnable()
             && self.yaml_topology_supported()
@@ -383,7 +595,7 @@ impl HermesAdapter {
             .is_some_and(|parsed| yaml::topology_supported(&parsed))
     }
 
-    fn revalidate_bound_installation(&self) -> Result<(), ClientError> {
+    pub(crate) fn revalidate_bound_installation(&self) -> Result<(), ClientError> {
         profile::validate_profile_binding(&self.layout.default_hermes_home, &self.layout.profile)?;
         let selected =
             profile::select_profile(&self.layout.default_hermes_home, &self.layout.profile.name)?;
@@ -403,6 +615,10 @@ impl HermesAdapter {
             || !working_directory.starts_with(&project_root)
         {
             return Err(conflict("Hermes project binding changed"));
+        }
+        #[cfg(windows)]
+        if let Some(runtime) = &self.retained_runtime {
+            runtime.verify()?;
         }
         Ok(())
     }
@@ -444,7 +660,25 @@ impl HermesAdapter {
 }
 
 impl NativeAdapter for HermesAdapter {
+    fn installed_runtime(&self) -> Option<&crate::native_transaction::InstalledRuntimeBinding> {
+        #[cfg(windows)]
+        if let Some(runtime) = &self.preview_runtime {
+            return Some(runtime);
+        }
+        #[cfg(windows)]
+        if let Some(runtime) = &self.retained_runtime {
+            return Some(runtime.binding());
+        }
+        None
+    }
+
     fn reprobe_live_state(&mut self, plan: &NativeTransactionPlan) -> Result<(), BoundaryError> {
+        #[cfg(windows)]
+        if self.preview_runtime.is_some() {
+            return Err(BoundaryError::new(
+                "Hermes preview cannot apply a setup plan",
+            ));
+        }
         self.gateway_profile.take();
         self.gateway_lease.take();
         if !plan.cli_mutations.is_empty() || !plan.setup.cli_operations.is_empty() {
@@ -614,6 +848,14 @@ impl HarnessAdapter for HermesAdapter {
             return Err(invalid("Hermes probe profile does not match the adapter"));
         }
         let mut policy_conflicts = self.import_policy_conflicts();
+        if !self.executable_snapshot.runnable()
+            && python_installation::inspect(&self.layout.executable)
+                .ok()
+                .flatten()
+                .is_some_and(|installation| installation.version == self.layout.version)
+        {
+            policy_conflicts.push("python_runtime_not_qualified".into());
+        }
         match gateway::inspect_gateway(&self.layout.profile)? {
             gateway::GatewayStatus::Idle => {}
             gateway::GatewayStatus::Stale => policy_conflicts.push("gateway_state_stale".into()),
@@ -629,6 +871,7 @@ impl HarnessAdapter for HermesAdapter {
         policy_conflicts.sort();
         policy_conflicts.dedup();
         Ok(ProbeReport {
+            codex_saved_hook_approval: None,
             executable: Some(wire_path(&self.layout.executable)),
             executable_sha256: Some(self.executable_hash),
             harness_version: Some(self.layout.version.clone()),
@@ -1339,7 +1582,13 @@ fn discover_executable_version_with_boundaries(
         }
         parse_version(&output).ok_or_else(|| invalid("Hermes returned an invalid version"))?
     } else {
-        "unknown".to_owned()
+        // Metadata discovery never changes executable classification or launch
+        // authority. A Python installation still needs complete runtime capture
+        // and qualification before either version or validation can be executed.
+        python_installation::inspect(executable)
+            .ok()
+            .flatten()
+            .map_or_else(|| "unknown".to_owned(), |installation| installation.version)
     };
     Ok((attested.snapshot, version))
 }
@@ -1555,6 +1804,321 @@ pub(super) fn conflict(message: &'static str) -> ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn prepared_hermes_preview_is_passive_and_persists_only_a_valid_plan() {
+        use crate::{
+            mcp::install::{BridgeExecutable, attest_bridge_executable},
+            native_transaction::{InstalledRuntimeBinding, approval_hash_v2, open_plan},
+            setup::{BridgeLocator, RegisteredProject},
+            vault::{DatabaseKeyStore, Vault, VaultError},
+        };
+        use std::sync::Mutex;
+        use zeroize::Zeroizing;
+        #[derive(Default)]
+        struct Keys(Mutex<Option<Vec<u8>>>);
+        impl DatabaseKeyStore for Keys {
+            fn load_key(&self, _: &str) -> Result<Option<Zeroizing<Vec<u8>>>, VaultError> {
+                Ok(self.0.lock().unwrap().clone().map(Zeroizing::new))
+            }
+            fn store_key(&self, _: &str, key: &[u8]) -> Result<(), VaultError> {
+                *self.0.lock().unwrap() = Some(key.to_vec());
+                Ok(())
+            }
+        }
+        struct Locator(PathBuf);
+        impl BridgeLocator for Locator {
+            fn locate(&self) -> Result<BridgeExecutable, ClientError> {
+                attest_bridge_executable(&self.0)
+            }
+        }
+        for valid_project in [true, false] {
+            let fixture = validation_fixture("0.17.0");
+            fs::write(
+                fixture.layout.profile.hermes_home.join("config.yaml"),
+                b"model: adapter\nmemory:\n  memory_enabled: true\n  user_profile_enabled: true\n",
+            )
+            .unwrap();
+            let original =
+                fs::read(fixture.layout.profile.hermes_home.join("config.yaml")).unwrap();
+            let launcher = fs::read(&fixture.layout.executable).unwrap();
+            let (store, runtime) = python_runtime::inert_prepared_fixture(&launcher);
+            let reference = runtime.reference().clone();
+            let holder = fs::read_dir(store.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("context-relay-hermes-runtime-")
+                })
+                .unwrap();
+            let prepared = fixture.adapter.clone().into_setup_preview(runtime).unwrap();
+            let bridge = fixture.root.join("context-mcp.exe");
+            fs::write(&bridge, b"inert bridge; never execute").unwrap();
+            let vault_path = store.path().join("vault.db");
+            let keys = Keys::default();
+            let mut vault = Vault::open(&vault_path, "prepared-preview", &keys).unwrap();
+            let registered = RegisteredProject {
+                project_id: if valid_project {
+                    fixture.project_id
+                } else {
+                    ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073999").unwrap()
+                },
+                root: fixture.adapter.project_root_wire(),
+            };
+            let result =
+                prepared.preview(&mut vault, Locator(bridge), &registered, 1_900_000_000_000);
+            assert_eq!(
+                fs::read(fixture.layout.profile.hermes_home.join("config.yaml")).unwrap(),
+                original
+            );
+            assert_eq!(fixture.adapter.capability(), CapabilityLevel::ImportOnly);
+            if valid_project {
+                let setup = result.unwrap();
+                assert!(holder.exists());
+                drop(vault);
+                let vault = Vault::open(&vault_path, "prepared-preview", &keys).unwrap();
+                let stored = vault.setup_plan(&setup.plan_id).unwrap().unwrap();
+                let plan = open_plan(&stored.payload).unwrap().plan;
+                assert_eq!(
+                    plan.installed_runtime,
+                    Some(InstalledRuntimeBinding::HermesPythonV1 { runtime: reference })
+                );
+                assert_eq!(approval_hash_v2(&plan).unwrap(), setup.batch_hash);
+                assert!(!plan.mutations.is_empty());
+            } else {
+                assert!(result.is_err());
+                assert!(
+                    !holder.exists(),
+                    "failed preview must clean the unused copy"
+                );
+            }
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn retained_adapter_reopens_exact_reference_and_never_falls_back_after_failure() {
+        let _guard = python_runtime::management_test_guard();
+        use std::sync::{Arc, atomic::AtomicBool};
+        let fixture = validation_fixture("0.17.0");
+        let launcher = fs::read(&fixture.layout.executable).unwrap();
+        let (store, runtime) = python_runtime::runtime_fixture(&launcher);
+        let reference = runtime.reference().clone();
+        let mut approved = runtime_plan(&fixture.adapter, reference.clone());
+        let adapter = fixture
+            .adapter
+            .clone()
+            .bind_retained_runtime(runtime, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        let expected = crate::native_transaction::InstalledRuntimeBinding::HermesPythonV1 {
+            runtime: reference.clone(),
+        };
+        assert_eq!(NativeAdapter::installed_runtime(&adapter), Some(&expected));
+        assert_eq!(adapter.capability(), CapabilityLevel::ImportOnly);
+        let clone = adapter.clone();
+        assert_eq!(NativeAdapter::installed_runtime(&clone), Some(&expected));
+        let mut ordinary_launcher = |_: &HermesValidationRequest| -> Result<Vec<u8>, ClientError> {
+            panic!("retained checks must never execute the ordinary launcher")
+        };
+        assert!(
+            adapter
+                .check_config_projection(b"model: adapter\n", &mut ordinary_launcher)
+                .unwrap()
+                .valid
+        );
+        let error = adapter
+            .check_config_projection(b"model: stderr\n", &mut ordinary_launcher)
+            .unwrap_err();
+        assert!(!error.message.contains("fixture failure"));
+        assert_eq!(
+            clone
+                .check_config_projection(b"model: adapter\n", &mut ordinary_launcher)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        drop(clone);
+        drop(adapter);
+        let reopened = fixture
+            .adapter
+            .clone()
+            .reopen_approved_runtime(store.path(), &approved, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        assert_eq!(NativeAdapter::installed_runtime(&reopened), Some(&expected));
+        assert!(
+            reopened
+                .check_config_projection(b"model: adapter\n", &mut ordinary_launcher)
+                .unwrap()
+                .valid
+        );
+        drop(reopened);
+        let mut changed = serde_json::to_value(&reference).unwrap();
+        changed["storageKey"] = serde_json::json!("context-relay-hermes-runtime-missing");
+        let changed = serde_json::from_value(changed).unwrap();
+        approved.installed_runtime = Some(
+            crate::native_transaction::InstalledRuntimeBinding::HermesPythonV1 { runtime: changed },
+        );
+        assert!(
+            fixture
+                .adapter
+                .clone()
+                .reopen_approved_runtime(store.path(), &approved, Arc::new(AtomicBool::new(false)))
+                .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_adapter_rejects_launcher_and_version_mismatches_and_cancellation() {
+        let _guard = python_runtime::management_test_guard();
+        use std::sync::{Arc, atomic::AtomicBool};
+        let fixture = validation_fixture("0.18.2");
+        let launcher = fs::read(&fixture.layout.executable).unwrap();
+        let (_store, runtime) = python_runtime::runtime_fixture(&launcher);
+        assert_eq!(
+            fixture
+                .adapter
+                .clone()
+                .bind_retained_runtime(runtime, Arc::new(AtomicBool::new(false)))
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        let (_other_store, runtime) = python_runtime::runtime_fixture(b"another launcher");
+        assert_eq!(
+            fixture
+                .adapter
+                .clone()
+                .bind_retained_runtime(runtime, Arc::new(AtomicBool::new(false)))
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        let (store, runtime) = python_runtime::runtime_fixture(&launcher);
+        let reference = runtime.reference().clone();
+        let approved = runtime_plan(&fixture.adapter, reference);
+        drop(runtime);
+        assert_eq!(
+            fixture
+                .adapter
+                .clone()
+                .reopen_approved_runtime(store.path(), &approved, Arc::new(AtomicBool::new(true)))
+                .unwrap_err()
+                .code,
+            ErrorCode::Canceled
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_adapter_rejects_changed_approval_bindings_before_opening_runtime() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let fixture = validation_fixture("0.17.0");
+        let reference = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 1, "storageKey": "context-relay-hermes-runtime-missing",
+            "manifestIdentity": Sha256Digest([1; 32])
+        }))
+        .unwrap();
+        let approved = runtime_plan(&fixture.adapter, reference);
+        let changes: &[fn(&mut NativeTransactionPlan)] = &[
+            |p| p.approval_version = 1,
+            |p| p.setup.harness = HarnessId::Codex,
+            |p| p.setup.adapter_version += 1,
+            |p| p.setup.harness_profile = Some("another".into()),
+            |p| p.setup.executable_hash = Sha256Digest([9; 32]),
+            |p| p.setup.executable_path = wire_path(Path::new("C:/different/hermes.exe")),
+            |p| p.setup.harness_version = "0.18.2".into(),
+            |p| p.setup.target_scopes = vec![NativeScope::Global],
+            |p| {
+                if let NativeScope::Project { root, .. } = &mut p.setup.target_scopes[1] {
+                    *root = wire_path(Path::new("C:/different-project"));
+                }
+            },
+            |p| p.installed_runtime = None,
+        ];
+        for change in changes {
+            let mut changed = approved.clone();
+            change(&mut changed);
+            let error = fixture
+                .adapter
+                .clone()
+                .reopen_approved_runtime(
+                    &fixture.root.join("missing-store"),
+                    &changed,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::Conflict);
+            assert!(error.message.contains("approved runtime"));
+        }
+    }
+
+    #[cfg(windows)]
+    fn runtime_plan(
+        adapter: &HermesAdapter,
+        reference: python_runtime::RetainedRuntimeReference,
+    ) -> NativeTransactionPlan {
+        use context_relay_protocol::{NetworkDelta, PermissionDelta, SetupPlan};
+        let zero = Sha256Digest([0; 32]);
+        NativeTransactionPlan {
+            setup: SetupPlan {
+                plan_id: validation_receipt().plan_id,
+                harness: HarnessId::Hermes,
+                harness_profile: Some(adapter.profile_name().into()),
+                adapter_version: HERMES_ADAPTER_VERSION,
+                executable_path: wire_path(&adapter.layout.executable),
+                executable_hash: adapter.executable_hash,
+                harness_version: adapter.layout.version.clone(),
+                target_scopes: vec![
+                    NativeScope::Global,
+                    NativeScope::Project {
+                        project_id: adapter.project_id,
+                        root: adapter.project_root_wire(),
+                    },
+                ],
+                expected_native_digests: vec![adapter.gateway_lock_expected_digest().unwrap()],
+                semantic_changes: vec![],
+                cli_operations: vec![],
+                package_artifacts: vec![],
+                permission_delta: PermissionDelta {
+                    added: vec![],
+                    removed: vec![],
+                },
+                network_delta: NetworkDelta {
+                    added: vec![],
+                    removed: vec![],
+                },
+                scanner_report_hash: zero,
+                rulesync_version: "fixture".into(),
+                rulesync_hash: zero,
+                approval_class: ApprovalClass::Passive,
+                expires_at: 2_000_000_000_000,
+                batch_hash: zero,
+            },
+            approval_version: 2,
+            helper_policy_version: 1,
+            manifest_schema_version: 1,
+            manifest_digest: zero,
+            helper_hash: zero,
+            sidecars: vec![],
+            structural_allowlist_hash: zero,
+            staged_inputs: vec![],
+            expected_semantic_output_hash: zero,
+            scanner_result_hash: zero,
+            mutations: vec![],
+            cli_mutations: vec![],
+            installed_runtime: Some(
+                crate::native_transaction::InstalledRuntimeBinding::HermesPythonV1 {
+                    runtime: reference,
+                },
+            ),
+            native_memory_registrations: vec![],
+            ownership_changes: vec![],
+        }
+    }
+
     use std::{
         cell::{Cell, RefCell},
         str::FromStr,

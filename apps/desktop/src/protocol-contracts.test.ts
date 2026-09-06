@@ -188,8 +188,8 @@ const nullAtPath = (value: unknown, path: readonly PropertyKey[]) => {
 };
 
 describe('generated protocol version', () => {
-  it('advertises the profile-bound local contract as v1.4', () => {
-    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 4 });
+  it('advertises the background harness preparation contract as v1.8', () => {
+    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 10 });
   });
 });
 
@@ -306,7 +306,7 @@ describe('protocol schemas', () => {
     }
   });
 
-  it('accepts only the exact status protocol range for v1.4', () => {
+  it('accepts only the exact status protocol range for v1.10', () => {
     const ajv = createProtocolSchemaValidator();
     const validate = ajv.compile(load('schemas/context_relay_status-output-v1.json'));
     const fixture = load('crates/protocol/tests/fixtures/mcp-output-valid.json').context_relay_status;
@@ -314,7 +314,7 @@ describe('protocol schemas', () => {
     for (const protocol of [
       { min: { major: 2, minor: 0 }, max: { major: 2, minor: 0 } },
       { min: { major: 1, minor: 0 }, max: { major: 1, minor: 0 } },
-      { min: { major: 1, minor: 4 }, max: { major: 1, minor: 5 } },
+      { min: { major: 1, minor: 6 }, max: { major: 1, minor: 10 } },
       { min: { major: 1, minor: 1 }, max: { major: 1, minor: 0 } },
     ]) {
       expect(validate({ ...fixture, protocol }), JSON.stringify(protocol)).toBe(false);

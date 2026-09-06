@@ -47,6 +47,7 @@ use tokio::{
 };
 
 pub mod bridge_install;
+pub mod harness_preparation;
 mod native_memory;
 mod pairing;
 mod recovery_enrollment;
@@ -106,6 +107,8 @@ pub(crate) mod unit_test_support {
 }
 
 use bridge_install::{BridgeInstallEngine, ProductionBridgeInstallEngine};
+use harness_preparation::{PreparationClient, PreparationSupervisor};
+mod harness_execution;
 use native_memory::{
     NativeMemorySupervisor, NativeMemoryUpdateSender, NoopLifecycleProbe,
     native_memory_update_channel,
@@ -204,6 +207,7 @@ impl InstallationTokenProvider for PlatformInstallationTokenProvider {
 }
 
 struct VaultConfig {
+    preparation: Option<PreparationClient>,
     path: PathBuf,
     credential_id: String,
     key_store: Arc<dyn DatabaseKeyStore>,
@@ -230,6 +234,7 @@ impl VaultConfig {
         key_store: Arc<dyn DatabaseKeyStore>,
     ) -> Self {
         Self {
+            preparation: None,
             path,
             credential_id: credential_id.into(),
             key_store,
@@ -368,6 +373,23 @@ struct ProductionBridgeCliRecoveryIo {
 }
 
 impl ProductionBridgeCliRecoveryIo {
+    fn project_binding(
+        &self,
+        bound: &BoundCliRecoveryPlan,
+    ) -> Result<(PathBuf, context_relay_protocol::ProjectId), BoundaryError> {
+        if bound
+            .plan
+            .setup
+            .target_scopes
+            .iter()
+            .any(|scope| matches!(scope, context_relay_protocol::NativeScope::Project { .. }))
+        {
+            return bridge_install::sealed_project_binding(&bound.plan)
+                .map_err(|error| BoundaryError::new(error.message));
+        }
+        Ok((self.root.clone(), self.project_id))
+    }
+
     fn with_executor<R>(
         &self,
         bound: &BoundCliRecoveryPlan,
@@ -376,11 +398,12 @@ impl ProductionBridgeCliRecoveryIo {
             &[context_relay_core::native_transaction::ApprovedCliMutation],
         ) -> Result<R, BoundaryError>,
     ) -> Result<R, BoundaryError> {
+        let (root, project_id) = self.project_binding(bound)?;
         match bound.plan.setup.harness {
             HarnessId::ClaudeCode => {
                 let mut adapter = context_relay_core::claude_code::ClaudeCodeAdapter::discover(
-                    &self.root,
-                    self.project_id,
+                    &root,
+                    project_id,
                     self.device_id,
                     self.observed_hlc,
                 )
@@ -391,9 +414,9 @@ impl ProductionBridgeCliRecoveryIo {
             }
             HarnessId::Codex => {
                 let mut adapter = context_relay_core::codex::CodexAdapter::discover(
-                    &self.root,
-                    &self.root,
-                    self.project_id,
+                    &root,
+                    &root,
+                    project_id,
                     self.device_id,
                     self.observed_hlc,
                 )
@@ -653,6 +676,7 @@ impl DaemonConfig {
 }
 
 pub struct Daemon {
+    preparation: PreparationSupervisor,
     instance: Option<InstanceGuard>,
     listener: Option<Listener>,
     worker: VaultWorker,
@@ -668,7 +692,9 @@ pub struct Daemon {
 impl Daemon {
     pub async fn start(config: DaemonConfig) -> Result<Self, DaemonError> {
         let mut instance = InstanceGuard::acquire(&config.runtime).map_err(map_guard_error)?;
-        let vault_config = config.vault.load_device_identity()?;
+        let mut vault_config = config.vault.load_device_identity()?;
+        let preparation = PreparationSupervisor::spawn().map_err(|_| DaemonError::Startup)?;
+        vault_config.preparation = Some(preparation.client());
         let native_memory_probe = vault_config.native_memory_probe.clone();
         let token = Arc::new(config.token_provider.load_or_create()?);
         let instance_nonce = generate_instance_nonce().map_err(|_| DaemonError::Startup)?;
@@ -693,6 +719,7 @@ impl Daemon {
         let (state_sender, state_receiver) = watch::channel(DaemonState::Running);
         Ok(Self {
             instance: Some(instance),
+            preparation,
             listener: Some(listener),
             worker,
             native_memory,
@@ -720,6 +747,8 @@ impl Daemon {
             .ok_or(DaemonError::Transport)?;
         let mut worker_exit = self.worker.take_exit();
         let service = ConnectionService {
+            execution: harness_execution::ExecutionClient::default(),
+            preparation: self.preparation.client(),
             token: self.token.clone(),
             instance_nonce: self.instance_nonce,
             registry: RequestRegistry::default(),
@@ -758,11 +787,13 @@ impl Daemon {
         }
 
         self.worker.close_admission();
+        self.preparation.client().close();
         self.state_sender.send_replace(DaemonState::Draining);
         self.shutdown_sender.send_replace(true);
         while connections.join_next().await.is_some() {}
         self.native_memory.shutdown_and_join_async().await;
         self.worker.shutdown_and_join_async().await;
+        self.preparation.shutdown_and_join_async().await;
         drop(listener);
         self.instance.take();
         self.state_sender.send_replace(DaemonState::Stopped);
@@ -776,6 +807,8 @@ impl Daemon {
 
 #[derive(Clone)]
 struct ConnectionService {
+    execution: harness_execution::ExecutionClient,
+    preparation: PreparationClient,
     token: Arc<InstallationToken>,
     instance_nonce: DaemonInstanceNonce,
     registry: RequestRegistry,
@@ -842,6 +875,42 @@ async fn serve_request(
     }
 
     match route_request(role, request) {
+        RoutedRequest::ExecutionCurrent => {
+            let result =
+                begin_immediate(&registration).map(|()| LocalResult::HarnessExecutionCurrent {
+                    status: service.execution.current(),
+                });
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
+        RoutedRequest::ExecutionStart(params) => {
+            let result = begin_immediate(&registration)
+                .and_then(|()| service.execution.start(&service.worker, params))
+                .map(|status| LocalResult::HarnessExecution { status });
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
+        RoutedRequest::ExecutionStatus(params) => {
+            let result = begin_immediate(&registration).map(|()| LocalResult::HarnessExecution {
+                status: service.execution.status(&params),
+            });
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
+        RoutedRequest::PreparationStatus(params) => {
+            let result = begin_immediate(&registration)
+                .and_then(|()| service.preparation.status(params.operation_id))
+                .map(|status| LocalResult::HarnessPreparation { status });
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
+        RoutedRequest::PreparationCancel(params) => {
+            let result = begin_immediate(&registration)
+                .and_then(|()| service.preparation.cancel(params.operation_id))
+                .map(|status| LocalResult::HarnessPreparation { status });
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
         RoutedRequest::Immediate(result) => {
             let result = begin_immediate(&registration).and(result);
             connection.respond(id, result).await?;
@@ -899,8 +968,10 @@ fn begin_immediate(registration: &RequestRegistration) -> Result<(), ClientError
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.listener.take();
+        self.preparation.client().close();
         self.native_memory.shutdown_and_join();
         self.worker.shutdown_and_join();
+        self.preparation.shutdown_and_join();
         self.instance.take();
         self.state_sender.send_replace(DaemonState::Stopped);
     }
@@ -908,6 +979,11 @@ impl Drop for Daemon {
 
 #[derive(Debug)]
 enum RoutedRequest {
+    ExecutionCurrent,
+    ExecutionStart(context_relay_protocol::HarnessExecutionParams),
+    ExecutionStatus(context_relay_protocol::HarnessExecutionParams),
+    PreparationStatus(context_relay_protocol::HarnessPreparationIdParams),
+    PreparationCancel(context_relay_protocol::HarnessPreparationIdParams),
     Immediate(Result<LocalResult, ClientError>),
     Health,
     Shutdown,
@@ -934,6 +1010,21 @@ enum VaultCommand {
 fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
     if matches!(
         &request,
+        LocalRequest::HarnessPrepare(_)
+            | LocalRequest::HarnessExecutionStart(_)
+            | LocalRequest::HarnessExecutionStatus(_)
+            | LocalRequest::HarnessExecutionCurrent(_)
+            | LocalRequest::HarnessSetupGet(_)
+            | LocalRequest::HarnessSetupsList(_)
+            | LocalRequest::HarnessPreparedPreview(_)
+            | LocalRequest::HarnessPreparationStatus(_)
+            | LocalRequest::HarnessPreparationCancel(_)
+    ) && !role_allows(role, &request)
+    {
+        return RoutedRequest::Immediate(Err(scope_denied_error()));
+    }
+    if matches!(
+        &request,
         LocalRequest::RecoveryEnrollmentBegin(_)
             | LocalRequest::RecoveryEnrollmentOverview(_)
             | LocalRequest::RecoveryEnrollmentConfirm(_)
@@ -944,6 +1035,11 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         return RoutedRequest::Immediate(Err(scope_denied_error()));
     }
     match request {
+        LocalRequest::HarnessExecutionCurrent(_) => RoutedRequest::ExecutionCurrent,
+        LocalRequest::HarnessExecutionStart(params) => RoutedRequest::ExecutionStart(params),
+        LocalRequest::HarnessExecutionStatus(params) => RoutedRequest::ExecutionStatus(params),
+        LocalRequest::HarnessPreparationStatus(params) => RoutedRequest::PreparationStatus(params),
+        LocalRequest::HarnessPreparationCancel(params) => RoutedRequest::PreparationCancel(params),
         LocalRequest::Hello(_) => RoutedRequest::Immediate(Err(invalid_request_error())),
         LocalRequest::Cancel(_) => RoutedRequest::Immediate(Err(invalid_request_error())),
         LocalRequest::Shutdown(_) => RoutedRequest::Shutdown,
@@ -955,8 +1051,13 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         LocalRequest::MemoryGet(params) => RoutedRequest::Work(VaultCommand::MemoryGet(params)),
         request @ (LocalRequest::McpCall(_)
         | LocalRequest::NativeHookEvent(_)
+        | LocalRequest::DesktopWritePrepare(_)
+        | LocalRequest::DesktopWritesList(_)
+        | LocalRequest::DesktopWriteGet(_)
+        | LocalRequest::DesktopWriteForget(_)
         | LocalRequest::ProjectsList(_)
         | LocalRequest::ProjectUpsert(_)
+        | LocalRequest::ProjectRegister(_)
         | LocalRequest::MemoryList(_)
         | LocalRequest::MemorySearch(_)
         | LocalRequest::MemoryCreate(_)
@@ -980,13 +1081,17 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         | LocalRequest::AccountDeletionCancel(_)) => {
             RoutedRequest::Work(VaultCommand::Workspace(request))
         }
-        request @ (LocalRequest::HarnessPreview(_)
+        request @ (LocalRequest::HarnessProbe(_)
+        | LocalRequest::HarnessSetupGet(_)
+        | LocalRequest::HarnessSetupsList(_)
+        | LocalRequest::HarnessPrepare(_)
+        | LocalRequest::HarnessPreparedPreview(_)
+        | LocalRequest::HarnessPreview(_)
         | LocalRequest::HarnessApply(_)
         | LocalRequest::HarnessRollback(_)) => {
             RoutedRequest::Work(VaultCommand::HarnessSetup(request))
         }
-        LocalRequest::HarnessProbe(_)
-        | LocalRequest::HarnessRepair(_)
+        LocalRequest::HarnessRepair(_)
         | LocalRequest::PackageImport(_)
         | LocalRequest::PackageExport(_) => RoutedRequest::Immediate(Err(unsupported_error(
             "The requested local adapter operation is not supported",
@@ -1087,6 +1192,7 @@ fn work_timeout_error() -> ClientError {
 
 trait WorkAdmission: Send {
     fn begin(&self) -> bool;
+    fn finished(&self, _result: &Result<LocalResult, ClientError>) {}
 }
 
 impl WorkAdmission for RequestRegistration {
@@ -1201,6 +1307,7 @@ struct StoredExport {
 }
 
 struct WorkspaceState {
+    preparation: Option<PreparationClient>,
     vault: Vault,
     vault_path: PathBuf,
     device_id: DeviceId,
@@ -1296,6 +1403,7 @@ fn open_workspace(
         };
     Ok((
         WorkspaceState {
+            preparation: config.preparation.clone(),
             vault,
             vault_path: config.path.clone(),
             device_id: config.device_id,
@@ -1444,6 +1552,7 @@ fn run_vault_worker(
         } else {
             Err(canceled_error())
         };
+        admission.finished(&result);
         let _ = response.send(result);
         drop(admission);
     }
@@ -1540,6 +1649,65 @@ fn execute_harness_setup(
     request: LocalRequest,
 ) -> Result<LocalResult, ClientError> {
     match request {
+        LocalRequest::HarnessSetupGet(params) => {
+            context_relay_core::setup::harness_setup(&state.vault, &params.plan_id).map(|setup| {
+                LocalResult::HarnessSetup {
+                    setup: Box::new(setup),
+                }
+            })
+        }
+        LocalRequest::HarnessSetupsList(params) => {
+            context_relay_core::setup::harness_setups(&state.vault, params.after.as_ref())
+                .map(|page| LocalResult::HarnessSetups { page })
+        }
+        LocalRequest::HarnessPrepare(params) => {
+            let client = state
+                .preparation
+                .as_ref()
+                .ok_or_else(service_internal_error)?;
+            if let Some(status) = client.replay(&params)? {
+                return Ok(LocalResult::HarnessPreparation { status });
+            }
+            // A rejected factory is still a resolved attempt. Publish its exact
+            // identity through the owned worker so reconnecting clients can
+            // distinguish terminal failure from a start awaiting admission.
+            // The preparation worker redacts the error and replay retains it.
+            let task = state
+                .bridge_install
+                .prepare(
+                    &state.vault,
+                    &state.vault_path,
+                    state.device_id,
+                    params.selection.clone(),
+                )
+                .unwrap_or_else(|error| Box::new(move |_, _| Err(error)));
+            client
+                .start(params, task)
+                .map(|status| LocalResult::HarnessPreparation { status })
+        }
+        LocalRequest::HarnessPreparedPreview(params) => {
+            let client = state
+                .preparation
+                .as_ref()
+                .ok_or_else(service_internal_error)?;
+            client
+                .preview(&params, |artifact| {
+                    state.bridge_install.preview_prepared(
+                        &mut state.vault,
+                        &state.vault_path,
+                        state.device_id,
+                        params.selection.clone(),
+                        artifact,
+                    )
+                })
+                .map(|plan| LocalResult::Plan {
+                    plan: Box::new(plan),
+                })
+        }
+        LocalRequest::HarnessProbe(params) => state
+            .bridge_install
+            .probe(&state.vault, state.device_id, params)
+            .map(|report| LocalResult::Probe { report }),
         LocalRequest::HarnessPreview(params) => state
             .bridge_install
             .preview(&mut state.vault, &state.vault_path, state.device_id, params)
@@ -1617,12 +1785,37 @@ fn execute_workspace_request(
                 .handle_native_hook_event(project_id, params)
                 .map(|()| LocalResult::Empty)
         }
+        LocalRequest::DesktopWritePrepare(params) => state
+            .vault
+            .prepare_desktop_write(&params.write)
+            .map(|()| LocalResult::Empty)
+            .map_err(client_error_from_vault),
+        LocalRequest::DesktopWritesList(params) => state
+            .vault
+            .desktop_writes(params.after)
+            .map(|page| LocalResult::DesktopWrites { page })
+            .map_err(client_error_from_vault),
+        LocalRequest::DesktopWriteGet(params) => state
+            .vault
+            .desktop_write(params.operation_id)
+            .map(|write| LocalResult::DesktopWrite { write })
+            .map_err(client_error_from_vault),
+        LocalRequest::DesktopWriteForget(params) => state
+            .vault
+            .forget_desktop_write(params.operation_id)
+            .map(|()| LocalResult::Empty)
+            .map_err(client_error_from_vault),
         LocalRequest::ProjectsList(_) => OfflineWorkspace::new(&mut state.vault, state.device_id)
             .projects()
             .map(|projects| LocalResult::Projects { projects }),
         LocalRequest::ProjectUpsert(params) => {
             OfflineWorkspace::new(&mut state.vault, state.device_id)
                 .upsert_project(params.project)
+                .map(|()| LocalResult::Empty)
+        }
+        LocalRequest::ProjectRegister(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .register_project(params.project, params.path)
                 .map(|()| LocalResult::Empty)
         }
         LocalRequest::MemorySearch(params) => {
@@ -2024,12 +2217,10 @@ pub mod test_support {
     use context_relay_core::vault::TestVaultCell;
     use context_relay_core::{
         codex::CodexAdapter,
-        mcp::install::{BRIDGE_SERVER_NAME, BridgeExecutable},
+        mcp::install::BridgeExecutable,
         native_memory::{NativeMemoryLedger, NativeMemorySource, NativeMemorySourceId},
         native_transaction::{
-            ApprovedCliMutation, ApprovedInput, CanonicalCliDeclaration, NativeTransactionPlan,
-            SidecarBinding,
-            cli::{CliMutationOutcome, CliRestoreOutcome, NativeCliExecutor},
+            ApprovedInput, NativeTransactionPlan, SidecarBinding,
             engine::{
                 BoundaryError, FrozenOutput, NativeAdapter, NoFault, RestrictedExecutor,
                 RestrictedRun,
@@ -2039,7 +2230,8 @@ pub mod test_support {
         },
         setup::{
             BridgeInstallService, BridgeLocator, BridgeMutationPlan, BridgePreviewHarness,
-            NativeEngineBridgePlanExecutor, PrimaryMemoryMutationPlan, RegisteredProject,
+            NativeEngineBridgePlanExecutor, NoBridgeCliExecutor, PrimaryMemoryMutationPlan,
+            RegisteredProject,
         },
         vault::{BeforeImagePolicy, DatabaseKeyStore, NativeSandboxIdentity, Vault, VaultError},
     };
@@ -2094,6 +2286,14 @@ pub mod test_support {
         created_hlc: HybridLogicalClock,
     ) -> Result<ComponentRecord, ClientError> {
         primary_memory_instruction_component(harness, project_id, origin_device, created_hlc)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn test_managed_memory_hooks(
+        harness: HarnessId,
+        bridge_executable: &WireNativeValue,
+    ) -> Result<Vec<ComponentRecord>, ClientError> {
+        context_relay_core::native_memory::managed_memory_hooks(harness, bridge_executable)
     }
 
     #[derive(Clone)]
@@ -2513,6 +2713,7 @@ pub mod test_support {
         pub version: String,
         pub installation_method: InstallationMethod,
         pub codex_home: PathBuf,
+        pub user_home: PathBuf,
         pub user_skills_dir: PathBuf,
         pub project_root: PathBuf,
         pub working_directory: PathBuf,
@@ -2556,6 +2757,7 @@ pub mod test_support {
                     version: request.version,
                     installation_method: request.installation_method,
                     codex_home: request.codex_home,
+                    user_home: request.user_home,
                     user_skills_dir: request.user_skills_dir,
                     project_root: request.project_root.clone(),
                     working_directory: request.working_directory,
@@ -2595,10 +2797,7 @@ pub mod test_support {
             lock_root: PathBuf,
         ) -> Self {
             Self {
-                harness: Mutex::new(TestCodexHarness {
-                    adapter,
-                    live_cli: Arc::new(Mutex::new(None)),
-                }),
+                harness: Mutex::new(TestCodexHarness { adapter }),
                 bridge,
                 project_id,
                 project_root: std::fs::canonicalize(project_root)
@@ -2631,9 +2830,7 @@ pub mod test_support {
             };
             let mut filesystem = OsNativeTransactionFileSystem::new(*plan_id.as_bytes());
             let mut hook = NoFault;
-            let mut cli = TestCodexCli {
-                live: harness.live_cli.clone(),
-            };
+            let mut cli = NoBridgeCliExecutor;
             let mut executor = NativeEngineBridgePlanExecutor::new(
                 &mut *harness,
                 &mut restricted,
@@ -2725,7 +2922,6 @@ pub mod test_support {
     #[derive(Clone)]
     struct TestCodexHarness {
         adapter: CodexAdapter,
-        live_cli: Arc<Mutex<Option<CanonicalCliDeclaration>>>,
     }
 
     impl HarnessAdapter for TestCodexHarness {
@@ -2762,6 +2958,10 @@ pub mod test_support {
     }
 
     impl BridgePreviewHarness for TestCodexHarness {
+        fn bridge_adapter_version(&self) -> u32 {
+            self.adapter.bridge_adapter_version()
+        }
+
         fn bridge_harness(&self) -> HarnessId {
             HarnessId::Codex
         }
@@ -2780,19 +2980,10 @@ pub mod test_support {
 
         fn bridge_mutations(
             &self,
-            _: &DesiredState,
+            desired: &DesiredState,
             intended: &ComponentRecord,
         ) -> Result<BridgeMutationPlan, ClientError> {
-            let live = self.live_cli.clone();
-            Ok(BridgeMutationPlan {
-                cli: Some(self.adapter.plan_bridge_cli_mutation_with_runner(
-                    intended,
-                    move |arguments: &[String]| {
-                        test_codex_cli_output(arguments, live.lock().unwrap().as_ref())
-                    },
-                )?),
-                native: vec![],
-            })
+            self.adapter.bridge_mutations(desired, intended)
         }
 
         fn primary_memory_mutations(
@@ -2825,6 +3016,13 @@ pub mod test_support {
             plan: &NativeTransactionPlan,
         ) -> Result<(), BoundaryError> {
             NativeAdapter::compare_approved_digests(&mut self.adapter, plan)
+        }
+
+        fn verify_live_state_reservation(
+            &mut self,
+            plan: &NativeTransactionPlan,
+        ) -> Result<(), BoundaryError> {
+            NativeAdapter::verify_live_state_reservation(&mut self.adapter, plan)
         }
 
         fn validate_staged_output(
@@ -2889,163 +3087,6 @@ pub mod test_support {
         fn reject_unsafe_topology(&mut self) -> Result<(), BoundaryError> {
             Ok(())
         }
-    }
-
-    struct TestCodexCli {
-        live: Arc<Mutex<Option<CanonicalCliDeclaration>>>,
-    }
-
-    impl NativeCliExecutor for TestCodexCli {
-        fn probe_cli_mutation(
-            &mut self,
-            _: &ApprovedCliMutation,
-        ) -> Result<Option<Sha256Digest>, BoundaryError> {
-            Ok(self
-                .live
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|value| value.fingerprint))
-        }
-
-        fn compare_cli_targets(
-            &mut self,
-            mutations: &[ApprovedCliMutation],
-        ) -> Result<(), BoundaryError> {
-            for mutation in mutations {
-                if self
-                    .live
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|value| value.fingerprint)
-                    != mutation.expected.as_ref().map(|value| value.fingerprint)
-                {
-                    return Err(BoundaryError::new("Test Codex CLI state changed"));
-                }
-            }
-            Ok(())
-        }
-
-        fn apply_cli_mutation(
-            &mut self,
-            mutation: &ApprovedCliMutation,
-        ) -> Result<CliMutationOutcome, BoundaryError> {
-            let current = self
-                .live
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|value| value.fingerprint);
-            if current == mutation.expected.as_ref().map(|value| value.fingerprint) {
-                self.live.lock().unwrap().clone_from(&mutation.intended);
-            }
-            Ok(CliMutationOutcome {
-                resulting_fingerprint: self
-                    .live
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|value| value.fingerprint),
-                command_error: None,
-            })
-        }
-
-        fn restore_cli_mutation_if_matches(
-            &mut self,
-            mutation: &ApprovedCliMutation,
-        ) -> Result<CliRestoreOutcome, BoundaryError> {
-            let intended = mutation.intended.as_ref().map(|value| value.fingerprint);
-            let mut live = self.live.lock().unwrap();
-            if live.as_ref().map(|value| value.fingerprint) != intended {
-                return Ok(CliRestoreOutcome {
-                    restored: false,
-                    resulting_fingerprint: live.as_ref().map(|value| value.fingerprint),
-                });
-            }
-            live.clone_from(&mutation.expected);
-            Ok(CliRestoreOutcome {
-                restored: true,
-                resulting_fingerprint: live.as_ref().map(|value| value.fingerprint),
-            })
-        }
-
-        fn finish_committed_cli_mutations(
-            &mut self,
-            mutations: &[ApprovedCliMutation],
-        ) -> Result<(), BoundaryError> {
-            for mutation in mutations {
-                if self
-                    .live
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|value| value.fingerprint)
-                    != mutation.intended.as_ref().map(|value| value.fingerprint)
-                {
-                    return Err(BoundaryError::new("Test Codex committed CLI state changed"));
-                }
-            }
-            Ok(())
-        }
-    }
-
-    fn test_codex_cli_output(
-        arguments: &[String],
-        live: Option<&CanonicalCliDeclaration>,
-    ) -> Result<Vec<u8>, BoundaryError> {
-        match arguments {
-            [plugin, list, format]
-                if (plugin.as_str(), list.as_str(), format.as_str())
-                    == ("plugin", "list", "--json") =>
-            {
-                Ok(br#"{"installed":[],"available":[]}"#.to_vec())
-            }
-            [mcp, list, format]
-                if (mcp.as_str(), list.as_str(), format.as_str()) == ("mcp", "list", "--json") =>
-            {
-                Ok(match live {
-                    Some(declaration) => test_codex_mcp_list(&declaration.canonical_body)?,
-                    None => b"[]".to_vec(),
-                })
-            }
-            [mcp, get, name, format]
-                if (mcp.as_str(), get.as_str(), name.as_str(), format.as_str())
-                    == ("mcp", "get", BRIDGE_SERVER_NAME, "--json") =>
-            {
-                test_codex_mcp_get(
-                    &live
-                        .ok_or_else(|| BoundaryError::new("missing test Codex declaration"))?
-                        .canonical_body,
-                )
-            }
-            _ => Err(BoundaryError::new("unexpected test Codex CLI inspection")),
-        }
-    }
-
-    fn test_codex_transport(body: &str) -> Result<String, BoundaryError> {
-        let prefix = body
-            .strip_suffix('}')
-            .ok_or_else(|| BoundaryError::new("test Codex declaration is invalid"))?;
-        Ok(format!(
-            "{prefix},\"env\":{{}},\"env_vars\":[],\"cwd\":null}}"
-        ))
-    }
-
-    fn test_codex_mcp_list(body: &str) -> Result<Vec<u8>, BoundaryError> {
-        Ok(format!(
-            "[{{\"name\":\"{BRIDGE_SERVER_NAME}\",\"enabled\":true,\"disabled_reason\":null,\"transport\":{},\"startup_timeout_sec\":null,\"tool_timeout_sec\":null,\"auth_status\":\"unsupported\"}}]",
-            test_codex_transport(body)?
-        )
-        .into_bytes())
-    }
-
-    fn test_codex_mcp_get(body: &str) -> Result<Vec<u8>, BoundaryError> {
-        Ok(format!(
-            "{{\"name\":\"{BRIDGE_SERVER_NAME}\",\"enabled\":true,\"disabled_reason\":null,\"transport\":{},\"enabled_tools\":null,\"disabled_tools\":null,\"startup_timeout_sec\":null,\"tool_timeout_sec\":null}}",
-            test_codex_transport(body)?
-        )
-        .into_bytes())
     }
 
     fn test_native_identity() -> NativeSandboxIdentity {
@@ -3423,19 +3464,20 @@ mod tests {
             let bin = root.join("bin");
             let home = root.join("home");
             let config_root = root.join("claude-config");
-            let state_path = root.join("live-state");
-            let get_path = root.join("mcp-get.json");
+            let project = root.join("project");
+            let state_path = config_root.join(".claude.json");
             std::fs::create_dir_all(&bin).unwrap();
             std::fs::create_dir_all(&home).unwrap();
             std::fs::create_dir_all(&config_root).unwrap();
-            std::fs::write(&state_path, initial).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            let home = std::fs::canonicalize(home).unwrap();
+            let config_root = std::fs::canonicalize(config_root).unwrap();
+            let project = std::fs::canonicalize(project).unwrap();
             let executable = bin.join("claude");
             std::fs::write(
                 &executable,
                 format!(
-                    "#!/bin/sh\ncase \"$*\" in\n  --version) printf '2.1.214\\n' ;;\n  doctor) printf 'Claude Code diagnostics: OK\\n' ;;\n  'mcp list') if [ \"$(/bin/cat '{}')\" = present ]; then printf 'context-relay: local (stdio)\\n'; fi ;;\n  'mcp get context-relay') /bin/cat '{}' ;;\n  'mcp remove context-relay --scope user') printf absent > '{}' ;;\n  *) exit 9 ;;\nesac\n",
-                    state_path.display(),
-                    get_path.display(),
+                    "#!/bin/sh\ncase \"$*\" in\n  --version) printf '2.1.214 (Claude Code)\\n' ;;\n  'mcp remove context-relay --scope user') printf '{{}}' > '{}' ;;\n  *) exit 9 ;;\nesac\n",
                     state_path.display(),
                 ),
             )
@@ -3456,15 +3498,21 @@ mod tests {
             std::fs::set_permissions(&bridge_executable, std::fs::Permissions::from_mode(0o700))
                 .unwrap();
             let bridge_executable = std::fs::canonicalize(bridge_executable).unwrap();
-            std::fs::write(
-                &get_path,
-                serde_json::to_vec(&serde_json::json!({
-                    "name": "context-relay",
-                    "scope": "user",
+            let present_state = serde_json::json!({
+                "mcpServers": { "context-relay": {
                     "type": "stdio",
                     "command": bridge_executable.to_str().unwrap(),
                     "args": ["--harness", "claude-code"],
-                }))
+                }}
+            });
+            let absent_state = serde_json::json!({});
+            std::fs::write(
+                &state_path,
+                serde_json::to_vec(if initial == "present" {
+                    &present_state
+                } else {
+                    &absent_state
+                })
                 .unwrap(),
             )
             .unwrap();
@@ -3481,6 +3529,14 @@ mod tests {
                 keys.as_ref(),
                 &executable,
                 &bridge_executable,
+                context_relay_core::native_transaction::CliExecutionContext::ClaudeCodeV2 {
+                    config_dir: unit_test_support::wire_native_path(&config_root),
+                    state_path: unit_test_support::wire_native_path(
+                        &config_root.join(".claude.json"),
+                    ),
+                    project_root: unit_test_support::wire_native_path(&project),
+                    user_home: unit_test_support::wire_native_path(&home),
+                },
                 committed,
             );
 
@@ -3509,8 +3565,13 @@ mod tests {
                 "{label}",
             );
             assert_eq!(
-                std::fs::read_to_string(&state_path).unwrap(),
-                final_state,
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&state_path).unwrap())
+                    .unwrap(),
+                if final_state == "present" {
+                    present_state
+                } else {
+                    serde_json::json!({})
+                },
                 "{label}",
             );
             assert!(!bridge_canary.exists(), "{label}");
@@ -3689,7 +3750,7 @@ mod tests {
     #[test]
     fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 53);
+        assert_eq!(fixtures.len(), 59);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -5170,6 +5231,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vault_worker_recovers_prepared_writes_after_restart_without_applying_them() {
+        let path = unique_temp_path("worker-desktop-recovery").join("vault.db");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let id = "018f22e2-79b0-7cc8-98c4-dc0c0c073981";
+        let write = serde_json::json!({"method":"memory_create","params":{
+            "operationId":id,"scope":{"scope":"global"},"kind":"note",
+            "title":"Retained decision","bodyMarkdown":"Original content","tags":[]
+        }});
+        let mut worker = VaultWorker::spawn(VaultConfig::new(
+            path.clone(),
+            "worker-desktop-recovery",
+            keys.clone(),
+        ))
+        .await
+        .unwrap();
+        let prepared = worker
+            .client()
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "desktop_write_prepare",
+                    serde_json::json!({"write":write}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared, LocalResult::Empty);
+        let exported = worker
+            .client()
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "export_records",
+                    serde_json::json!({"projectId":null,"includeArchived":true}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let LocalResult::Export { payload } = exported else {
+            panic!("expected full encrypted backup")
+        };
+        assert_eq!(payload.record_count, 0);
+        assert_eq!(payload.chunk_count, 1);
+        assert!(
+            !payload
+                .chunk
+                .as_slice()
+                .windows(b"Original content".len())
+                .any(|bytes| bytes == b"Original content")
+        );
+        let restored_path = path.parent().unwrap().join("restored-backup.db");
+        std::fs::write(&restored_path, payload.chunk.as_slice()).unwrap();
+        let restored_vault =
+            Vault::open(&restored_path, "worker-desktop-recovery", keys.as_ref()).unwrap();
+        assert!(restored_vault.memories(None, true).unwrap().is_empty());
+        let pending = restored_vault
+            .desktop_write(id.parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(pending).unwrap(), write);
+        drop(restored_vault);
+        worker.shutdown_and_join();
+        let mut worker = VaultWorker::spawn(VaultConfig::new(
+            path.clone(),
+            "worker-desktop-recovery",
+            keys.clone(),
+        ))
+        .await
+        .unwrap();
+        let client = worker.client();
+        let list = client
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "desktop_writes_list",
+                    serde_json::json!({"after":null}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let LocalResult::DesktopWrites { page } = list else {
+            panic!("expected pending writes")
+        };
+        assert_eq!(page.writes.len(), 1);
+        let restored = client
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "desktop_write_get",
+                    serde_json::json!({"operationId":id}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let LocalResult::DesktopWrite {
+            write: Some(restored),
+        } = restored
+        else {
+            panic!("expected recovery copy")
+        };
+        assert_eq!(serde_json::to_value(&restored).unwrap(), write);
+        // Startup/list/get did not apply the prepared write.
+        let memories = client
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "memory_list",
+                    serde_json::json!({"projectId":null,"includeArchived":true}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(memories, LocalResult::Memories { memories } if memories.is_empty()));
+        let first = client
+            .try_submit(
+                VaultCommand::Workspace(restored.clone().into_request()),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        worker.shutdown_and_join();
+        let mut worker =
+            VaultWorker::spawn(VaultConfig::new(path, "worker-desktop-recovery", keys))
+                .await
+                .unwrap();
+        let client = worker.client();
+        let replay = client
+            .try_submit(
+                VaultCommand::Workspace(restored.into_request()),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, replay);
+        let forgotten = client
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "desktop_write_forget",
+                    serde_json::json!({"operationId":id}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forgotten, LocalResult::Empty);
+        worker.shutdown_and_join();
+    }
+
+    #[tokio::test]
     async fn vault_worker_runs_the_offline_workspace_and_encrypted_export() {
         let path = unique_temp_path("worker-offline-workspace").join("vault.db");
         let keys = Arc::new(MemoryKeyStore::default());
@@ -5993,6 +6219,28 @@ mod tests {
 
         vec![
             (
+                "DesktopWritesList",
+                request_fixture("desktop_writes_list", serde_json::json!({"after": null})),
+            ),
+            (
+                "DesktopWriteGet",
+                request_fixture("desktop_write_get", serde_json::json!({"operationId": ID})),
+            ),
+            (
+                "DesktopWriteForget",
+                request_fixture(
+                    "desktop_write_forget",
+                    serde_json::json!({"operationId": ID}),
+                ),
+            ),
+            (
+                "DesktopWritePrepare",
+                request_fixture(
+                    "desktop_write_prepare",
+                    serde_json::json!({"write": {"method":"memory_archive","params":{"operationId": ID,"memoryId": ID,"expectedRevision": ID}}}),
+                ),
+            ),
+            (
                 "Hello",
                 request_fixture(
                     "hello",
@@ -6048,6 +6296,13 @@ mod tests {
                 request_fixture(
                     "project_upsert",
                     serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}}),
+                ),
+            ),
+            (
+                "ProjectRegister",
+                request_fixture(
+                    "project_register",
+                    serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}, "path": {"platform": "windows", "bytes": "", "display": null}}),
                 ),
             ),
             (
@@ -6148,6 +6403,16 @@ mod tests {
                 ),
             ),
             ("HarnessProbe", request_fixture("harness_probe", harness())),
+            (
+                "HarnessPreparedPreview",
+                request_fixture(
+                    "harness_prepared_preview",
+                    serde_json::json!({
+                        "operationId": ID,
+                        "selection": {"harness": "hermes", "projectId": null, "hermesProfile": "default"}
+                    }),
+                ),
+            ),
             (
                 "HarnessPreview",
                 request_fixture("harness_preview", harness()),
@@ -6410,6 +6675,7 @@ mod tests {
         keys: &dyn DatabaseKeyStore,
         executable: &Path,
         bridge_executable: &Path,
+        execution_context: context_relay_core::native_transaction::CliExecutionContext,
         committed: bool,
     ) -> (PlanId, String) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -6418,6 +6684,7 @@ mod tests {
             &mut vault,
             executable,
             bridge_executable,
+            execution_context,
         );
         let plan_id = plan.setup.plan_id;
         vault

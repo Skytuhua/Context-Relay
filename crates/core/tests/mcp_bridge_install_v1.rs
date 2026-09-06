@@ -79,7 +79,7 @@ fn adapter_fixture() -> AdapterFixture {
 
     let claude_config = root.path().join("claude");
     fs::create_dir_all(&claude_config).unwrap();
-    let claude_state = root.path().join(".claude.json");
+    let claude_state = claude_config.join(".claude.json");
     fs::write(&claude_state, b"{}").unwrap();
     let claude_executable = root
         .path()
@@ -98,6 +98,7 @@ fn adapter_fixture() -> AdapterFixture {
     fs::write(&claude_executable, &claude_bytes).unwrap();
     let claude = ClaudeCodeAdapter::from_layout(
         ClaudeCodeLayout {
+            user_home: root.path().to_path_buf(),
             executable: claude_executable,
             version: "2.1.214".to_owned(),
             installation_method: InstallationMethod::Manual,
@@ -116,8 +117,11 @@ fn adapter_fixture() -> AdapterFixture {
     let user_skills_dir = root.path().join("home/.agents/skills");
     fs::create_dir_all(&codex_home).unwrap();
     fs::create_dir_all(&user_skills_dir).unwrap();
-    let quoted_project =
-        serde_json::to_string(fs::canonicalize(&project_root).unwrap().to_str().unwrap()).unwrap();
+    let physical_project = fs::canonicalize(&project_root).unwrap();
+    let project_key = physical_project.as_path();
+    #[cfg(windows)]
+    let project_key = dunce::simplified(project_key);
+    let quoted_project = serde_json::to_string(project_key.to_str().unwrap()).unwrap();
     fs::write(
         codex_home.join("config.toml"),
         format!("[projects.{quoted_project}]\ntrust_level = \"trusted\"\n"),
@@ -132,6 +136,7 @@ fn adapter_fixture() -> AdapterFixture {
             version: "0.144.1".to_owned(),
             installation_method: InstallationMethod::Manual,
             codex_home,
+            user_home: root.path().join("home"),
             user_skills_dir,
             project_root: project_root.clone(),
             working_directory: working_directory.clone(),

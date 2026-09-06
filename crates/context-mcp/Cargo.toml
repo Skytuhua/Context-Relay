@@ -27,3 +27,12 @@ uuid.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+
+[[example]]
+name = "codex-bridge-fixture"
+path = "tests/fixtures/codex-bridge-fixture.rs"
+required-features = ["test-support"]
+
+[target.'cfg(windows)'.dev-dependencies]
+dunce = "1.0.5"
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_JobObjects"] }

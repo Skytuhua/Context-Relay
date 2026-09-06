@@ -87,6 +87,7 @@ mod tests {
 
     fn mutation(stable_id: &str) -> ApprovedCliMutation {
         ApprovedCliMutation {
+            execution_context: None,
             stable_id: stable_id.to_owned(),
             expected: None,
             intended: None,

@@ -58,11 +58,63 @@ macro_rules! params { ($name:ident { $($(#[$field_attr:meta])* $field:ident : $t
     pub struct $name { $($(#[$field_attr])* pub $field:$ty),* }
 }; }
 params!(EmptyParams {});
+params!(HarnessPrepareParams {
+    operation_id: OperationId,
+    selection: HarnessParams
+});
+params!(HarnessPreparationIdParams {
+    operation_id: OperationId
+});
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessPreparationPhase {
+    Inspecting,
+    Copying,
+    CheckingSource,
+    CheckingCopy,
+    Retaining,
+    Cancelling,
+    Ready,
+    Canceled,
+    Failed,
+}
+
+params!(HarnessPreparationStatus {
+    operation_id: OperationId,
+    selection: HarnessParams,
+    phase: HarnessPreparationPhase,
+    completed_files: u32,
+    completed_bytes: u32,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    error: Option<ClientError>
+});
+
+impl HarnessPreparationStatus {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_harness_profile(&self.selection)?;
+        if self.selection.harness != HarnessId::Hermes
+            || self.completed_files > 32768
+            || self.completed_bytes > 1_073_741_824
+            || (self.phase == HarnessPreparationPhase::Failed) != self.error.is_some()
+        {
+            return Err(ValidationError::Invalid("harnessPreparation"));
+        }
+        if let Some(error) = &self.error {
+            required_text(&error.message, "harnessPreparation.error", MAX_TITLE_BYTES)?;
+        }
+        Ok(())
+    }
+}
 params!(ProjectParams {
     project_id: ProjectId
 });
 params!(ProjectUpsertParams {
     project: ProjectIdentity
+});
+params!(ProjectRegisterParams {
+    project: ProjectIdentity,
+    path: WireNativeValue
 });
 params!(ProjectPathParams {
     project_id: ProjectId,
@@ -531,6 +583,10 @@ pub enum ClientRole {
 )]
 #[ts(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum LocalRequest {
+    DesktopWritePrepare(DesktopWritePrepareParams),
+    DesktopWritesList(DesktopWritesListParams),
+    DesktopWriteGet(DesktopWriteIdParams),
+    DesktopWriteForget(DesktopWriteIdParams),
     Hello(HelloParams),
     Cancel(CancelParams),
     Shutdown(EmptyParams),
@@ -540,6 +596,7 @@ pub enum LocalRequest {
     Unlock(EmptyParams),
     ProjectsList(EmptyParams),
     ProjectUpsert(ProjectUpsertParams),
+    ProjectRegister(ProjectRegisterParams),
     ProjectPathSet(ProjectPathParams),
     MemoryGet(MemoryParams),
     MemoryList(MemoryListParams),
@@ -557,6 +614,15 @@ pub enum LocalRequest {
     AccessGet(HarnessParams),
     AccessSet(AccessSetParams),
     HarnessProbe(HarnessParams),
+    HarnessPrepare(HarnessPrepareParams),
+    HarnessPreparedPreview(HarnessPrepareParams),
+    HarnessPreparationStatus(HarnessPreparationIdParams),
+    HarnessPreparationCancel(HarnessPreparationIdParams),
+    HarnessExecutionStart(crate::HarnessExecutionParams),
+    HarnessExecutionStatus(crate::HarnessExecutionParams),
+    HarnessExecutionCurrent(EmptyParams),
+    HarnessSetupsList(crate::HarnessSetupsParams),
+    HarnessSetupGet(PlanParams),
     HarnessPreview(HarnessParams),
     HarnessApply(PlanParams),
     HarnessRepair(HarnessParams),
@@ -605,7 +671,12 @@ fn validate_tags(tags: &[String]) -> Result<(), ValidationError> {
 impl LocalRequest {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::DesktopWritePrepare(p) => p.write.validate(),
             Self::ProjectUpsert(p) => p.project.validate(),
+            Self::ProjectRegister(p) => {
+                p.project.validate()?;
+                p.path.validate()
+            }
             Self::ProjectPathSet(p) => p.path.validate(),
             Self::McpCall(p) => {
                 p.binding.working_directory.validate()?;
@@ -666,6 +737,13 @@ impl LocalRequest {
             .validate(),
             Self::HarnessProbe(p) | Self::HarnessPreview(p) | Self::HarnessRepair(p) => {
                 validate_harness_profile(p)
+            }
+            Self::HarnessPrepare(p) | Self::HarnessPreparedPreview(p) => {
+                validate_harness_profile(&p.selection)?;
+                if p.selection.harness != HarnessId::Hermes {
+                    return Err(ValidationError::Invalid("harnessPrepare.selection"));
+                }
+                Ok(())
             }
             Self::AccessGet(p) if p.hermes_profile.is_some() => {
                 Err(ValidationError::Invalid("accessGet.hermesProfile"))
@@ -996,6 +1074,27 @@ pub enum AccountDeletionState {
     rename_all_fields = "camelCase"
 )]
 pub enum LocalResult {
+    HarnessExecutionCurrent {
+        status: Option<crate::HarnessExecutionStatus>,
+    },
+    HarnessExecution {
+        status: crate::HarnessExecutionStatus,
+    },
+    HarnessSetup {
+        setup: Box<crate::HarnessSetupRecord>,
+    },
+    HarnessSetups {
+        page: crate::HarnessSetupsPage,
+    },
+    HarnessPreparation {
+        status: HarnessPreparationStatus,
+    },
+    DesktopWrite {
+        write: Option<crate::DesktopWrite>,
+    },
+    DesktopWrites {
+        page: crate::DesktopWritesPage,
+    },
     Empty,
     Health {
         protocol: ProtocolVersion,
@@ -1087,6 +1186,29 @@ pub enum LocalResult {
     deny_unknown_fields
 )]
 enum LocalResultSerde {
+    HarnessExecutionCurrent {
+        #[serde(deserialize_with = "crate::required_nullable")]
+        status: Option<crate::HarnessExecutionStatus>,
+    },
+    HarnessExecution {
+        status: crate::HarnessExecutionStatus,
+    },
+    HarnessSetup {
+        setup: Box<crate::HarnessSetupRecord>,
+    },
+    HarnessSetups {
+        page: crate::HarnessSetupsPage,
+    },
+    HarnessPreparation {
+        status: HarnessPreparationStatus,
+    },
+    DesktopWrite {
+        #[serde(deserialize_with = "crate::required_nullable")]
+        write: Option<crate::DesktopWrite>,
+    },
+    DesktopWrites {
+        page: crate::DesktopWritesPage,
+    },
     Empty,
     Health {
         protocol: ProtocolVersion,
@@ -1172,6 +1294,17 @@ enum LocalResultSerde {
 impl LocalResult {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::HarnessExecutionCurrent { status } => status
+                .as_ref()
+                .map_or(Ok(()), crate::HarnessExecutionStatus::validate),
+            Self::HarnessExecution { status } => status.validate(),
+            Self::HarnessSetup { setup } => setup.validate(),
+            Self::HarnessSetups { page } => page.validate(),
+            Self::HarnessPreparation { status } => status.validate(),
+            Self::DesktopWrite { write } => {
+                write.as_ref().map_or(Ok(()), crate::DesktopWrite::validate)
+            }
+            Self::DesktopWrites { page } => page.validate(),
             Self::Empty | Self::AccountDeletion { .. } | Self::Access { .. } => Ok(()),
             Self::Health { protocol, .. } => {
                 if protocol.major != crate::PROTOCOL_MAJOR {
@@ -1269,6 +1402,16 @@ params!(JsonRpcErrorV1 {
     #[serde(deserialize_with = "crate::required_nullable")]
     id: Option<RecordId>,
     error: JsonRpcErrorObject
+});
+params!(DesktopWritePrepareParams {
+    write: crate::DesktopWrite
+});
+params!(DesktopWriteIdParams {
+    operation_id: OperationId
+});
+params!(DesktopWritesListParams {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    after: Option<OperationId>
 });
 pub const JSON_RPC_PARSE_ERROR: i32 = -32700;
 pub const JSON_RPC_INVALID_REQUEST: i32 = -32600;

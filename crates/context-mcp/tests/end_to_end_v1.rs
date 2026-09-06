@@ -659,6 +659,12 @@ async fn three_harness_daemon_flow_is_scoped_idempotent_and_never_installs_a_bri
 #[tokio::test]
 async fn production_setup_watcher_review_and_actual_mcp_form_one_chain() {
     let fixture = Fixture::new();
+    // Exercise the verbatim spelling even when the caller's TEMP is ordinary.
+    #[cfg(windows)]
+    let fixture = Fixture {
+        project_root: std::fs::canonicalize(&fixture.project_root).unwrap(),
+        ..fixture
+    };
     let project = project_identity("authoritative native memory");
     let materialized = MaterializedCodexE2e::new(&fixture, project.project_id);
     let config = fixture
@@ -689,6 +695,8 @@ async fn production_setup_watcher_review_and_actual_mcp_form_one_chain() {
     let stored = config.setup_plan_summary(&plan.plan_id).unwrap().unwrap();
     assert!(stored.previewed);
     assert_eq!(&stored.setup, plan.as_ref());
+    assert_eq!(plan.adapter_version, 2);
+    assert!(plan.cli_operations.is_empty());
     assert_eq!(stored.mutation_count, 3);
     assert_eq!(stored.native_memory_registrations.len(), 2);
     assert!(
@@ -717,6 +725,11 @@ async fn production_setup_watcher_review_and_actual_mcp_form_one_chain() {
         std::fs::read_to_string(&materialized.config_path)
             .unwrap()
             .contains("generate_memories = false")
+    );
+    assert!(
+        std::fs::read_to_string(&materialized.config_path)
+            .unwrap()
+            .contains("[mcp_servers.context-relay]")
     );
     assert!(
         std::fs::read_to_string(&materialized.instruction_path)
@@ -1363,10 +1376,17 @@ impl MaterializedCodexE2e {
         let codex_home = root.join("codex-home");
         let home = root.join("home");
         let working_directory = project_root.join("service");
+        // TEMP itself can use a verbatim path on Windows. Match Codex's
+        // trust-key spelling independently of how the fixture was created.
+        #[cfg(windows)]
+        let project_key = dunce::simplified(&project_root);
+        #[cfg(not(windows))]
+        let project_key = project_root.as_path();
+        assert_eq!(std::fs::canonicalize(project_key).unwrap(), project_root);
         materialize_json_substituting(
             &codex_home,
             frozen["codexHome"].as_object().unwrap(),
-            &project_root,
+            project_key,
         );
         materialize_json(
             &home.join(".agents/skills"),
@@ -1397,6 +1417,7 @@ impl MaterializedCodexE2e {
             version: "0.144.1".into(),
             installation_method: InstallationMethod::PackageManager,
             codex_home: codex_home.clone(),
+            user_home: home.clone(),
             user_skills_dir: home.join(".agents/skills"),
             project_root,
             working_directory,

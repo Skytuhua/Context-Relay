@@ -104,6 +104,7 @@ fn operation(action: &str) -> CliOperation {
 
 fn cli_mutation(index: u8) -> ApprovedCliMutation {
     ApprovedCliMutation {
+        execution_context: None,
         stable_id: "b5be495e-d4ee-7a2e-a29e-b589ebc5d7fd".to_owned(),
         expected: None,
         intended: Some(declaration(
@@ -193,6 +194,7 @@ fn plan_with_approval(
         scanner_result_hash: Sha256Digest([8; 32]),
         mutations: with_native.then(native_mutation).into_iter().collect(),
         cli_mutations,
+        installed_runtime: None,
         native_memory_registrations: vec![],
         ownership_changes: vec![],
     };

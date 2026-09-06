@@ -22,19 +22,28 @@ use context_relay_core::{
     native_transaction::{
         ApprovedCliMutation, ApprovedInput, ApprovedMutation, CanonicalCliDeclaration,
         MutationKind, NativeTransactionPlan, RestorableStateFingerprint, SidecarBinding,
+        TransactionStep,
         cli::{CliMutationOutcome, CliRestoreOutcome, NativeCliExecutor},
         engine::{
-            BoundaryError, FrozenOutput, NativeAdapter, NoFault, RestrictedExecutor, RestrictedRun,
+            BoundaryError, FaultHook, FrozenOutput, NativeAdapter, NoFault, RestrictedExecutor,
+            RestrictedRun,
         },
         filesystem::OsNativeTransactionFileSystem,
         open_plan,
+        recovery::{
+            CliRecoveryRestore, NativeCliRecoveryIo, OsNativeRecoveryIo, bind_cli_recovery_plan,
+            recover_native_transactions_with_cli,
+        },
     },
     setup::{
         BridgeExecutionError, BridgeInstallService, BridgeLocator, BridgeMutationPlan,
         BridgePlanExecutor, BridgePreviewHarness, HermesMemoryExportService,
         NativeEngineBridgePlanExecutor, PrimaryMemoryMutationPlan, RegisteredProject,
     },
-    vault::{BeforeImagePolicy, NativeSandboxIdentity, SetupPlanAction, SetupPlanLifecycle, Vault},
+    vault::{
+        BeforeImagePolicy, NativeCliWalRecord, NativeSandboxIdentity, SetupPlanAction,
+        SetupPlanLifecycle, Vault,
+    },
 };
 use context_relay_native_runner::{NativeState, OsNativeFileSystem, RuntimeTarget};
 use context_relay_protocol::{
@@ -42,8 +51,8 @@ use context_relay_protocol::{
     CliOperations, ClientError, ComponentKind, ComponentRecord, DesiredState, DeviceId,
     DiscoveredScopes, ExpectedNativeDigest, HarnessAdapter, HarnessId, HybridLogicalClock,
     ImportRequest, ImportedState, InstallationMethod, NativePlatform, NativeScope, ProbeContext,
-    ProbeReport, ProjectId, RenderedState, ScopeRef, SemanticDiff, Sha256Digest, ValidationReport,
-    WireNativeValue,
+    ProbeReport, ProjectId, RenderedState, ScopeRef, SemanticDiff, SetupPlan, Sha256Digest,
+    ValidationReport, WireNativeValue,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
@@ -98,6 +107,7 @@ impl Harness {
             timeout_ms: 30_000,
         };
         ApprovedCliMutation {
+            execution_context: None,
             stable_id: intended.id.to_string(),
             expected: None,
             intended: Some(declaration),
@@ -111,6 +121,7 @@ impl HarnessAdapter for Harness {
     fn probe(&self, context: &ProbeContext) -> Result<ProbeReport, ClientError> {
         assert_eq!(context.harness, HarnessId::Codex);
         Ok(ProbeReport {
+            codex_saved_hook_approval: None,
             executable: Some(self.executable.clone()),
             executable_sha256: Some(Sha256Digest([3; 32])),
             harness_version: Some("0.144.1".to_owned()),
@@ -240,6 +251,7 @@ impl BridgePreviewHarness for Harness {
         .unwrap();
         Ok(PrimaryMemoryMutationPlan {
             native,
+            expected_native_digests: vec![],
             registrations: vec![NativeMemoryRegistration {
                 source,
                 last_applied_digest: None,
@@ -428,6 +440,22 @@ impl HarnessAdapter for FrozenHarness {
 }
 
 impl BridgePreviewHarness for FrozenHarness {
+    fn bridge_adapter_version(&self) -> u32 {
+        match self {
+            Self::Codex { adapter, .. } => BridgePreviewHarness::bridge_adapter_version(adapter),
+            _ => 1,
+        }
+    }
+    fn watch_only_memory_digests(&self) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
+        match self {
+            Self::Claude { adapter, .. } => {
+                BridgePreviewHarness::watch_only_memory_digests(adapter)
+            }
+            Self::Codex { adapter, .. } => BridgePreviewHarness::watch_only_memory_digests(adapter),
+            Self::Hermes(adapter) => BridgePreviewHarness::watch_only_memory_digests(adapter),
+        }
+    }
+
     fn bridge_harness(&self) -> HarnessId {
         self.id()
     }
@@ -465,6 +493,9 @@ impl BridgePreviewHarness for FrozenHarness {
 
     fn bridge_operational_digests(&self) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
         match self {
+            Self::Claude { adapter, .. } => {
+                BridgePreviewHarness::bridge_operational_digests(adapter)
+            }
             Self::Hermes(adapter) => BridgePreviewHarness::bridge_operational_digests(adapter),
             _ => Ok(vec![]),
         }
@@ -476,20 +507,8 @@ impl BridgePreviewHarness for FrozenHarness {
         intended: &ComponentRecord,
     ) -> Result<BridgeMutationPlan, ClientError> {
         let cli = match self {
-            Self::Claude { adapter, cli } => {
-                let cli = cli.clone();
-                Some(adapter.plan_bridge_cli_mutation_with_runner(
-                    intended,
-                    move |arguments: &[String]| claude_cli_output(arguments, cli.borrow().as_ref()),
-                )?)
-            }
-            Self::Codex { adapter, cli } => {
-                let cli = cli.clone();
-                Some(adapter.plan_bridge_cli_mutation_with_runner(
-                    intended,
-                    move |arguments: &[String]| codex_cli_output(arguments, cli.borrow().as_ref()),
-                )?)
-            }
+            Self::Claude { adapter, .. } => Some(adapter.plan_bridge_cli_mutation(intended)?),
+            Self::Codex { .. } => None,
             Self::Hermes(_) => None,
         };
         Ok(BridgeMutationPlan {
@@ -531,6 +550,21 @@ impl BridgePreviewHarness for FrozenHarness {
 }
 
 impl NativeAdapter for FrozenHarness {
+    fn verify_live_state_reservation(
+        &mut self,
+        plan: &NativeTransactionPlan,
+    ) -> Result<(), BoundaryError> {
+        match self {
+            Self::Claude { adapter, .. } => {
+                NativeAdapter::verify_live_state_reservation(adapter, plan)
+            }
+            Self::Codex { adapter, .. } => {
+                NativeAdapter::verify_live_state_reservation(adapter, plan)
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn reprobe_live_state(&mut self, plan: &NativeTransactionPlan) -> Result<(), BoundaryError> {
         match self {
             Self::Claude { adapter, .. } => NativeAdapter::reprobe_live_state(adapter, plan),
@@ -606,109 +640,6 @@ impl NativeAdapter for FrozenHarness {
             Self::Hermes(adapter) => NativeAdapter::release_live_state_reservation(adapter),
         }
     }
-}
-
-fn claude_cli_output(
-    arguments: &[String],
-    live: Option<&CanonicalCliDeclaration>,
-) -> Result<Vec<u8>, BoundaryError> {
-    match arguments {
-        [mcp, list] if (mcp.as_str(), list.as_str()) == ("mcp", "list") => Ok(live
-            .map(|_| b"context-relay: local (stdio)\n".to_vec())
-            .unwrap_or_default()),
-        [mcp, get, name]
-            if (mcp.as_str(), get.as_str(), name.as_str())
-                == ("mcp", "get", BRIDGE_SERVER_NAME) =>
-        {
-            let declaration = live.ok_or_else(|| BoundaryError::new("missing declaration"))?;
-            let body: Value = serde_json::from_str(&declaration.canonical_body).unwrap();
-            Ok(serde_json::to_vec(&json!({
-                "name": BRIDGE_SERVER_NAME,
-                "scope": "user",
-                "type": body["type"],
-                "command": body["command"],
-                "args": body["args"],
-            }))
-            .unwrap())
-        }
-        _ => Err(BoundaryError::new("unexpected Claude CLI inspection")),
-    }
-}
-
-fn codex_cli_output(
-    arguments: &[String],
-    live: Option<&CanonicalCliDeclaration>,
-) -> Result<Vec<u8>, BoundaryError> {
-    match arguments {
-        [plugin, list, format]
-            if (plugin.as_str(), list.as_str(), format.as_str())
-                == ("plugin", "list", "--json") =>
-        {
-            Ok(br#"{"installed":[],"available":[]}"#.to_vec())
-        }
-        [mcp, list, format]
-            if (mcp.as_str(), list.as_str(), format.as_str()) == ("mcp", "list", "--json") =>
-        {
-            Ok(match live {
-                Some(declaration) => codex_mcp_list(&declaration.canonical_body),
-                None => b"[]".to_vec(),
-            })
-        }
-        [mcp, get, name, format]
-            if (mcp.as_str(), get.as_str(), name.as_str(), format.as_str())
-                == ("mcp", "get", BRIDGE_SERVER_NAME, "--json") =>
-        {
-            Ok(codex_mcp_get(
-                &live
-                    .ok_or_else(|| BoundaryError::new("missing declaration"))?
-                    .canonical_body,
-            ))
-        }
-        _ => Err(BoundaryError::new("unexpected Codex CLI inspection")),
-    }
-}
-
-fn codex_mcp_list(body: &str) -> Vec<u8> {
-    let body: Value = serde_json::from_str(body).unwrap();
-    serde_json::to_vec(&json!([{
-        "name": BRIDGE_SERVER_NAME,
-        "enabled": true,
-        "disabled_reason": null,
-        "transport": {
-            "type": "stdio",
-            "command": body["command"],
-            "args": body["args"],
-            "env": {},
-            "env_vars": [],
-            "cwd": null
-        },
-        "startup_timeout_sec": null,
-        "tool_timeout_sec": null,
-        "auth_status": "unsupported"
-    }]))
-    .unwrap()
-}
-
-fn codex_mcp_get(body: &str) -> Vec<u8> {
-    let body: Value = serde_json::from_str(body).unwrap();
-    serde_json::to_vec(&json!({
-        "name": BRIDGE_SERVER_NAME,
-        "enabled": true,
-        "disabled_reason": null,
-        "transport": {
-            "type": "stdio",
-            "command": body["command"],
-            "args": body["args"],
-            "env": {},
-            "env_vars": [],
-            "cwd": null
-        },
-        "enabled_tools": null,
-        "disabled_tools": null,
-        "startup_timeout_sec": null,
-        "tool_timeout_sec": null
-    }))
-    .unwrap()
 }
 
 struct MatrixCli {
@@ -834,6 +765,20 @@ impl BridgePlanExecutor for MatrixExecutor<'_> {
         created_ms: u64,
         now_ms: u64,
     ) -> Result<(), BridgeExecutionError> {
+        self.execute_with_hook(vault, plan, sealed_plan, created_ms, now_ms, &mut NoFault)
+    }
+}
+
+impl MatrixExecutor<'_> {
+    fn execute_with_hook(
+        &mut self,
+        vault: &mut Vault,
+        plan: &NativeTransactionPlan,
+        sealed_plan: &[u8],
+        created_ms: u64,
+        now_ms: u64,
+        hook: &mut impl FaultHook,
+    ) -> Result<(), BridgeExecutionError> {
         let mut restricted = MatrixRestricted {
             inputs: plan.staged_inputs.clone(),
             sidecars: plan.sidecars.clone(),
@@ -843,7 +788,6 @@ impl BridgePlanExecutor for MatrixExecutor<'_> {
             },
         };
         let mut filesystem = OsNativeTransactionFileSystem::new(*plan.setup.plan_id.as_bytes());
-        let mut hook = NoFault;
         let mut cli = MatrixCli {
             live: self.live.clone(),
         };
@@ -851,7 +795,7 @@ impl BridgePlanExecutor for MatrixExecutor<'_> {
             &mut *self.harness,
             &mut restricted,
             &mut filesystem,
-            &mut hook,
+            hook,
             &mut cli,
             &self.lock_root,
             NativeSandboxIdentity::Windows {
@@ -862,6 +806,84 @@ impl BridgePlanExecutor for MatrixExecutor<'_> {
             HybridLogicalClock::new(now_ms, 0, DeviceId::from_str(ID_1).unwrap()),
         )
         .execute(vault, plan, sealed_plan, created_ms, now_ms)
+    }
+}
+
+struct CrashBeforeNativeCleanup<'a>(MatrixExecutor<'a>);
+
+struct CommitCrash;
+
+impl FaultHook for CommitCrash {
+    fn after_step(&mut self, step: TransactionStep) -> Result<(), BoundaryError> {
+        if step == TransactionStep::CommitOwnershipAndReceipt {
+            panic!("simulated exit with committed native and CLI WAL still present");
+        }
+        Ok(())
+    }
+}
+
+impl BridgePlanExecutor for CrashBeforeNativeCleanup<'_> {
+    fn execute(
+        &mut self,
+        vault: &mut Vault,
+        plan: &NativeTransactionPlan,
+        sealed_plan: &[u8],
+        created_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        self.0.execute_with_hook(
+            vault,
+            plan,
+            sealed_plan,
+            created_ms,
+            now_ms,
+            &mut CommitCrash,
+        )
+    }
+}
+
+struct BoundMatrixCliRecovery<'a> {
+    harness: &'a mut FrozenHarness,
+    cli: MatrixCli,
+}
+
+impl NativeCliRecoveryIo for BoundMatrixCliRecovery<'_> {
+    fn probe_cli_declaration(
+        &mut self,
+        sealed: &[u8],
+        row: &NativeCliWalRecord,
+    ) -> Result<Option<Sha256Digest>, BoundaryError> {
+        let bound = bind_cli_recovery_plan(sealed, std::slice::from_ref(row))?;
+        NativeAdapter::reprobe_live_state(self.harness, &bound.plan)?;
+        self.cli.probe_cli_mutation(&bound.mutations[0])
+    }
+
+    fn restore_cli_mutation_if_matches(
+        &mut self,
+        sealed: &[u8],
+        row: &NativeCliWalRecord,
+    ) -> Result<CliRecoveryRestore, BoundaryError> {
+        let bound = bind_cli_recovery_plan(sealed, std::slice::from_ref(row))?;
+        NativeAdapter::reprobe_live_state(self.harness, &bound.plan)?;
+        self.cli
+            .restore_cli_mutation_if_matches(&bound.mutations[0])
+            .map(|outcome| {
+                if outcome.restored {
+                    CliRecoveryRestore::Restored
+                } else {
+                    CliRecoveryRestore::Conflict
+                }
+            })
+    }
+
+    fn finish_committed_cli_mutations(
+        &mut self,
+        sealed: &[u8],
+        rows: &[NativeCliWalRecord],
+    ) -> Result<(), BoundaryError> {
+        let bound = bind_cli_recovery_plan(sealed, rows)?;
+        NativeAdapter::reprobe_live_state(self.harness, &bound.plan)?;
+        self.cli.finish_committed_cli_mutations(&bound.mutations)
     }
 }
 
@@ -884,6 +906,34 @@ impl BridgePlanExecutor for CrashAfterCommit<'_> {
 }
 
 struct MustNotExecute;
+
+struct RegistrationVerifier<'a> {
+    harness: &'a FrozenHarness,
+    calls: usize,
+}
+
+impl BridgePlanExecutor for RegistrationVerifier<'_> {
+    fn verify_watch_only_registration(
+        &mut self,
+        plan: &NativeTransactionPlan,
+        now_ms: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        self.calls += 1;
+        context_relay_core::setup::verify_watch_only_registration(self.harness, plan, now_ms)
+            .map_err(|error| BridgeExecutionError::restored(error.message))
+    }
+
+    fn execute(
+        &mut self,
+        _: &mut Vault,
+        _: &NativeTransactionPlan,
+        _: &[u8],
+        _: u64,
+        _: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        panic!("registration must never execute a native transaction");
+    }
+}
 
 impl BridgePlanExecutor for MustNotExecute {
     fn execute(
@@ -928,10 +978,10 @@ fn claude_matrix_fixture_with_version(version: &str) -> MatrixFixture {
     let config_dir = root.join("claude");
     let lock_root = root.join("locks");
     fs::create_dir(&lock_root).unwrap();
-    let project_root = root.join("project");
+    let project_root = root.join("project with spaces");
     materialize_json(&config_dir, source["config"].as_object().unwrap());
     materialize_json(&project_root, source["project"].as_object().unwrap());
-    let state_path = root.join(".claude.json");
+    let state_path = config_dir.join(".claude.json");
     let mut state = source["state"].clone();
     let project = state["projects"]
         .as_object_mut()
@@ -974,6 +1024,7 @@ fn claude_matrix_fixture_with_version(version: &str) -> MatrixFixture {
     let device_id = DeviceId::from_str(ID_1).unwrap();
     let adapter = ClaudeCodeAdapter::from_layout(
         ClaudeCodeLayout {
+            user_home: PathBuf::from(root.to_str().unwrap().trim_start_matches(r"\\?\")),
             executable,
             version: version.to_owned(),
             installation_method: InstallationMethod::PackageManager,
@@ -1015,10 +1066,13 @@ fn codex_matrix_fixture_with_version(version: &str) -> MatrixFixture {
     let home = root.join("home");
     let project_root = root.join("project");
     let working_directory = project_root.join("service");
+    let project_key = project_root.as_path();
+    #[cfg(windows)]
+    let project_key = dunce::simplified(project_key);
     materialize_json_substituting(
         &codex_home,
         source["codexHome"].as_object().unwrap(),
-        &project_root,
+        project_key,
     );
     materialize_json(
         &home.join(".agents/skills"),
@@ -1047,6 +1101,7 @@ fn codex_matrix_fixture_with_version(version: &str) -> MatrixFixture {
             version: version.to_owned(),
             installation_method: InstallationMethod::PackageManager,
             codex_home,
+            user_home: home.clone(),
             user_skills_dir: home.join(".agents/skills"),
             project_root: project_root.clone(),
             working_directory,
@@ -1301,6 +1356,32 @@ fn intended_bytes(mutation: &ApprovedMutation) -> Vec<u8> {
 fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy() {
     for harness_id in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Hermes] {
         let mut fixture = matrix_fixture(harness_id);
+        if harness_id == HarnessId::ClaudeCode {
+            let user = fixture
+                .project_root
+                .parent()
+                .unwrap()
+                .join("claude/settings.json");
+            let mut settings: Value = serde_json::from_slice(&fs::read(&user).unwrap()).unwrap();
+            settings["env"] = serde_json::json!({"CLAUDE_CODE_DISABLE_AUTO_MEMORY":"false"});
+            fs::write(user, serde_json::to_vec(&settings).unwrap()).unwrap();
+            let project = fixture.project_root.join(".claude/settings.json");
+            let mut settings: Value = serde_json::from_slice(&fs::read(&project).unwrap()).unwrap();
+            settings["autoMemoryEnabled"] = Value::Bool(false);
+            fs::write(project, serde_json::to_vec(&settings).unwrap()).unwrap();
+        }
+        if harness_id == HarnessId::Codex {
+            fs::write(
+                fixture.project_root.join(".codex/config.toml"),
+                "# project memory override\n[memories]\nuse_memories = true\n",
+            )
+            .unwrap();
+            fs::write(
+                fixture.project_root.join("service/.codex/config.toml"),
+                "# nested memory override\n[memories]\ngenerate_memories = true\n",
+            )
+            .unwrap();
+        }
         let vault_path = TempVault::new(&format!("primary-memory-matrix-{harness_id:?}"));
         let keys = MemoryKeyStore::default();
         let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
@@ -1333,7 +1414,7 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
         assert_eq!(opened.plan.native_memory_registrations.len(), 2);
         assert_eq!(
             opened.plan.cli_mutations.is_empty(),
-            harness_id == HarnessId::Hermes
+            harness_id != HarnessId::ClaudeCode
         );
         assert!(opened.plan.mutations.len() >= 2);
         let original = opened
@@ -1394,7 +1475,8 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
                 assert!(intended.iter().any(|(_, bytes)| {
                     let text = String::from_utf8_lossy(bytes);
                     text.contains("\"autoMemoryEnabled\":false")
-                        && text.contains("\"autoMemoryDirectory\":\".claude/native-memory\"")
+                        && text.contains("\"CLAUDE_CODE_DISABLE_AUTO_MEMORY\":\"true\"")
+                        && text.contains("\"autoMemoryDirectory\":\"~/project with spaces/.claude/native-memory\"")
                 }));
                 assert!(intended.iter().any(|(_, bytes)| {
                     let text = String::from_utf8_lossy(bytes);
@@ -1403,7 +1485,10 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
                 }));
             }
             HarnessId::Codex => {
-                assert_eq!(intended.len(), 3);
+                assert_eq!(intended.len(), 5);
+                assert!(intended.iter().any(|(path, bytes)| path
+                    == &fixture.project_root.join(".codex/config.toml")
+                    && String::from_utf8_lossy(bytes).contains("use_memories = false")));
                 assert!(intended.iter().any(|(_, bytes)| {
                     let text = String::from_utf8_lossy(bytes);
                     text.contains("generate_memories = false")
@@ -1442,7 +1527,7 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
 
         let live = fixture.harness.cli_state();
         let crashed = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let mut executor = CrashAfterCommit(MatrixExecutor {
+            let mut executor = CrashBeforeNativeCleanup(MatrixExecutor {
                 harness: &mut fixture.harness,
                 live: live.clone(),
                 lock_root: fixture.lock_root.clone(),
@@ -1458,6 +1543,19 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
             vault.setup_plan(&setup.plan_id).unwrap().unwrap().lifecycle,
             SetupPlanLifecycle::Applying
         );
+        if !opened.plan.cli_mutations.is_empty() {
+            let wal = vault
+                .native_cli_wal(&format!("bridge-setup-{}", setup.plan_id))
+                .unwrap();
+            assert!(!wal.is_empty());
+            let bound = context_relay_core::native_transaction::recovery::bind_cli_recovery_plan(
+                &stored.payload,
+                &wal,
+            )
+            .unwrap();
+            assert_eq!(bound.plan, opened.plan);
+            assert_eq!(bound.mutations, opened.plan.cli_mutations);
+        }
         for (path, bytes) in &intended {
             assert_eq!(fs::read(path).unwrap(), *bytes, "{}", path.display());
         }
@@ -1472,6 +1570,19 @@ fn frozen_harnesses_transact_authoritative_memory_with_recovery_and_raw_privacy(
         }
         assert_raw_unchanged(&fixture);
 
+        let mut recovery_io = OsNativeRecoveryIo::new(|_, _| Ok(()));
+        let mut cli_recovery = BoundMatrixCliRecovery {
+            harness: &mut fixture.harness,
+            cli: MatrixCli { live: live.clone() },
+        };
+        recover_native_transactions_with_cli(&mut vault, &mut recovery_io, &mut cli_recovery)
+            .unwrap();
+        assert!(
+            vault
+                .native_cli_wal(&format!("bridge-setup-{}", setup.plan_id))
+                .unwrap()
+                .is_empty()
+        );
         BridgeInstallService::persisted(&mut vault)
             .reconcile_after_native_recovery()
             .unwrap();
@@ -1744,8 +1855,8 @@ fn full_claude_setup_rejects_unavailable_native_memory_before_persisting_any_pla
             context_relay_protocol::ErrorCode::InvalidRequest,
         ),
         (
-            "unsafe-binding",
-            br#"{"autoMemoryDirectory":"../outside-project/memory"}"#.as_slice(),
+            "invalid-directory-type",
+            br#"{"autoMemoryDirectory":123}"#.as_slice(),
             context_relay_protocol::ErrorCode::HarnessUnsupported,
         ),
     ] {
@@ -1859,9 +1970,20 @@ fn import_only_exact_memory_bindings_apply_and_rollback_as_registration_only_pla
             );
         }
 
+        let before_tree = snapshot_tree(fixture._temp.path());
+        let mut verifier = RegistrationVerifier {
+            harness: &fixture.harness,
+            calls: 0,
+        };
         BridgeInstallService::persisted(&mut vault)
-            .apply(&setup.plan_id, NOW_MS + 1, &mut MustNotExecute)
+            .apply(&setup.plan_id, NOW_MS + 1, &mut verifier)
             .unwrap();
+        assert_eq!(verifier.calls, 1);
+        // A committed replay neither discovers nor re-registers the sources.
+        BridgeInstallService::persisted(&mut vault)
+            .apply(&setup.plan_id, NOW_MS + 2, &mut verifier)
+            .unwrap();
+        assert_eq!(verifier.calls, 1);
         for registration in &opened.plan.native_memory_registrations {
             assert_eq!(
                 vault
@@ -1884,6 +2006,7 @@ fn import_only_exact_memory_bindings_apply_and_rollback_as_registration_only_pla
             );
         }
         assert_raw_unchanged(&fixture);
+        assert_eq!(snapshot_tree(fixture._temp.path()), before_tree);
 
         let recovery_setup = BridgeInstallService::new(
             &mut vault,
@@ -1923,23 +2046,544 @@ fn import_only_exact_memory_bindings_apply_and_rollback_as_registration_only_pla
                 .unwrap()
                 .unwrap()
                 .lifecycle,
-            SetupPlanLifecycle::Applied
+            SetupPlanLifecycle::ApplyRestored
         );
         for registration in &recovery_opened.plan.native_memory_registrations {
-            assert_eq!(
+            assert!(
                 vault
                     .native_memory_ledger(&registration.source.id)
                     .unwrap()
-                    .unwrap()
-                    .source,
-                Some(registration.source.clone())
+                    .is_none()
             );
         }
-        BridgeInstallService::persisted(&mut vault)
-            .rollback(&recovery_setup.plan_id, NOW_MS + 12, &mut MustNotExecute)
-            .unwrap();
+        assert!(
+            BridgeInstallService::persisted(&mut vault)
+                .apply(&recovery_setup.plan_id, NOW_MS + 12, &mut MustNotExecute)
+                .is_err()
+        );
         assert_raw_unchanged(&fixture);
     }
+}
+
+#[test]
+fn import_only_registration_requires_live_validation_before_publishing_sources() {
+    let fixture = claude_matrix_fixture_with_version("2.1.215");
+    let vault_path = TempVault::new("watch-only-no-verifier");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+    let setup = BridgeInstallService::new(
+        &mut vault,
+        fixture.harness.clone(),
+        Locator {
+            bridge: fixture.bridge.clone(),
+            calls: Rc::new(Cell::new(0)),
+        },
+        DeviceId::from_str(ID_1).unwrap(),
+        clock(NOW_MS),
+    )
+    .preview(
+        Some(&RegisteredProject {
+            project_id: fixture.project_id,
+            root: wire_path(&fixture.project_root),
+        }),
+        NOW_MS,
+    )
+    .unwrap();
+    let before = snapshot_tree(fixture._temp.path());
+    assert!(
+        BridgeInstallService::persisted(&mut vault)
+            .apply(&setup.plan_id, NOW_MS + 1, &mut MustNotExecute)
+            .is_err()
+    );
+    assert!(vault.native_memory_ledgers().unwrap().is_empty());
+    assert_eq!(snapshot_tree(fixture._temp.path()), before);
+}
+
+#[test]
+fn import_only_recovery_does_not_publish_an_unverified_registration() {
+    let fixture = claude_matrix_fixture_with_version("2.1.215");
+    let vault_path = TempVault::new("watch-only-unverified-recovery");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+    let setup = BridgeInstallService::new(
+        &mut vault,
+        fixture.harness.clone(),
+        Locator {
+            bridge: fixture.bridge.clone(),
+            calls: Rc::new(Cell::new(0)),
+        },
+        DeviceId::from_str(ID_1).unwrap(),
+        clock(NOW_MS),
+    )
+    .preview(
+        Some(&RegisteredProject {
+            project_id: fixture.project_id,
+            root: wire_path(&fixture.project_root),
+        }),
+        NOW_MS,
+    )
+    .unwrap();
+    vault
+        .claim_setup_plan(&setup.plan_id, SetupPlanAction::Apply, NOW_MS + 1)
+        .unwrap();
+    fs::write(
+        fixture.project_root.join(".claude/settings.local.json"),
+        br#"{"autoMemoryDirectory":"~/changed memory"}"#,
+    )
+    .unwrap();
+    let before = snapshot_tree(fixture._temp.path());
+    BridgeInstallService::persisted(&mut vault)
+        .reconcile_after_native_recovery()
+        .unwrap();
+    assert!(vault.native_memory_ledgers().unwrap().is_empty());
+    assert_eq!(
+        vault.setup_plan(&setup.plan_id).unwrap().unwrap().lifecycle,
+        SetupPlanLifecycle::ApplyRestored
+    );
+    assert_eq!(snapshot_tree(fixture._temp.path()), before);
+}
+
+fn watch_preview(vault: &mut Vault, fixture: &MatrixFixture) -> SetupPlan {
+    BridgeInstallService::new(
+        vault,
+        fixture.harness.clone(),
+        Locator {
+            bridge: fixture.bridge.clone(),
+            calls: Rc::new(Cell::new(0)),
+        },
+        DeviceId::from_str(ID_1).unwrap(),
+        clock(NOW_MS),
+    )
+    .preview(
+        Some(&RegisteredProject {
+            project_id: fixture.project_id,
+            root: wire_path(&fixture.project_root),
+        }),
+        NOW_MS,
+    )
+    .unwrap()
+}
+
+#[test]
+fn import_only_apply_and_resume_reject_changed_sources_settings_and_executables() {
+    for resumed in [false, true] {
+        for change in [
+            "directory",
+            "enabled",
+            "user",
+            "managed",
+            "topic",
+            "executable",
+        ] {
+            let fixture = claude_matrix_fixture_with_version("2.1.215");
+            let vault_path = TempVault::new(&format!("watch-drift-{resumed}-{change}"));
+            let keys = MemoryKeyStore::default();
+            let mut vault =
+                Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+            let setup = watch_preview(&mut vault, &fixture);
+            if resumed {
+                vault
+                    .claim_setup_plan(&setup.plan_id, SetupPlanAction::Apply, NOW_MS + 1)
+                    .unwrap();
+            }
+            let root = fixture.project_root.parent().unwrap();
+            let (path, bytes): (PathBuf, &[u8]) = match change {
+                "directory" => (
+                    fixture.project_root.join(".claude/settings.local.json"),
+                    br#"{"autoMemoryDirectory":"~/changed memory"}"#,
+                ),
+                "enabled" => (
+                    fixture.project_root.join(".claude/settings.local.json"),
+                    br#"{"autoMemoryEnabled":true}"#,
+                ),
+                "user" => (root.join("claude/settings.json"), b"{}"),
+                "managed" => (
+                    root.join("managed-settings.json"),
+                    br#"{"autoMemoryEnabled":true}"#,
+                ),
+                "topic" => (
+                    fixture
+                        .project_root
+                        .join(".claude/native-memory/new-topic.md"),
+                    b"new topic\n",
+                ),
+                "executable" => (
+                    mutation_path(&setup.executable_path),
+                    b"replaced executable",
+                ),
+                _ => unreachable!(),
+            };
+            fs::write(path, bytes).unwrap();
+            let before = snapshot_tree(fixture._temp.path());
+            let mut verifier = RegistrationVerifier {
+                harness: &fixture.harness,
+                calls: 0,
+            };
+            assert!(
+                BridgeInstallService::persisted(&mut vault)
+                    .apply(&setup.plan_id, NOW_MS + 2, &mut verifier)
+                    .is_err(),
+                "{resumed}/{change}"
+            );
+            assert_eq!(verifier.calls, 1);
+            assert!(vault.native_memory_ledgers().unwrap().is_empty());
+            assert_eq!(
+                vault.setup_plan(&setup.plan_id).unwrap().unwrap().lifecycle,
+                SetupPlanLifecycle::ApplyRestored
+            );
+            assert_eq!(
+                snapshot_tree(fixture._temp.path()),
+                before,
+                "{resumed}/{change}"
+            );
+        }
+    }
+}
+
+#[test]
+fn import_only_resume_verifies_current_sources_and_expiry_before_commit() {
+    for expired in [false, true] {
+        let fixture = claude_matrix_fixture_with_version("2.1.215");
+        let vault_path = TempVault::new(&format!("watch-resume-expiry-{expired}"));
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+        let setup = watch_preview(&mut vault, &fixture);
+        vault
+            .claim_setup_plan(&setup.plan_id, SetupPlanAction::Apply, NOW_MS + 1)
+            .unwrap();
+        let mut verifier = RegistrationVerifier {
+            harness: &fixture.harness,
+            calls: 0,
+        };
+        let result = BridgeInstallService::persisted(&mut vault).apply(
+            &setup.plan_id,
+            if expired {
+                setup.expires_at
+            } else {
+                NOW_MS + 2
+            },
+            &mut verifier,
+        );
+        if expired {
+            assert!(result.is_err());
+            assert_eq!(verifier.calls, 0);
+            assert!(vault.native_memory_ledgers().unwrap().is_empty());
+        } else {
+            result.unwrap();
+            assert_eq!(verifier.calls, 1);
+            assert_eq!(vault.native_memory_ledgers().unwrap().len(), 2);
+        }
+    }
+}
+
+#[test]
+fn import_only_verifier_rejects_legacy_dependencies_expiry_and_wrong_bindings() {
+    let fixture = claude_matrix_fixture_with_version("2.1.215");
+    let vault_path = TempVault::new("watch-sealed-binding");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+    let setup = watch_preview(&mut vault, &fixture);
+    let opened = open_plan(&vault.setup_plan(&setup.plan_id).unwrap().unwrap().payload).unwrap();
+    let check = |plan: &NativeTransactionPlan, now| {
+        context_relay_core::setup::verify_watch_only_registration(&fixture.harness, plan, now)
+    };
+    check(&opened.plan, NOW_MS + 1).unwrap();
+    assert!(check(&opened.plan, setup.expires_at).is_err());
+    for change in ["runtime", "legacy", "version", "profile", "project"] {
+        let mut plan = opened.plan.clone();
+        match change {
+            "runtime" => {
+                plan.installed_runtime = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "kind": "hermesPythonV1", "runtime": {
+                            "schemaVersion": 1, "storageKey": "context-relay-hermes-runtime-Abc123",
+                            "manifestIdentity": Sha256Digest([71; 32]),
+                        }
+                    }))
+                    .unwrap(),
+                )
+            }
+            "legacy" => plan.setup.expected_native_digests.truncate(1),
+            "version" => plan.setup.harness_version = "2.1.216".to_owned(),
+            "profile" => plan.setup.harness_profile = Some("other".to_owned()),
+            "project" => {
+                for scope in &mut plan.setup.target_scopes {
+                    if let NativeScope::Project { root, .. } = scope {
+                        *root = wire_path(fixture._temp.path());
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        assert!(check(&plan, NOW_MS + 1).is_err(), "{change}");
+    }
+    assert!(vault.native_memory_ledgers().unwrap().is_empty());
+}
+
+#[test]
+fn codex_full_preview_rejects_uninspectable_memory_settings_without_writing() {
+    for relative in [".codex/config.toml", "service/.codex/config.toml"] {
+        let fixture = codex_matrix_fixture();
+        let path = fixture.project_root.join(relative);
+        fs::write(&path, "[memories]\nuse_memories = 'unsupported'\n").unwrap();
+        let global = fixture
+            .project_root
+            .parent()
+            .unwrap()
+            .join("codex/config.toml");
+        let before = fs::read(&global).unwrap();
+        let vault_path = TempVault::new("codex-memory-invalid-preview");
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+        let error = BridgeInstallService::new(
+            &mut vault,
+            fixture.harness.clone(),
+            Locator {
+                bridge: fixture.bridge.clone(),
+                calls: Rc::new(Cell::new(0)),
+            },
+            DeviceId::from_str(ID_1).unwrap(),
+            clock(NOW_MS),
+        )
+        .preview(
+            Some(&RegisteredProject {
+                project_id: fixture.project_id,
+                root: wire_path(&fixture.project_root),
+            }),
+            NOW_MS,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code,
+            context_relay_protocol::ErrorCode::HarnessUnsupported
+        );
+        assert!(error.message.contains("Codex memory settings"));
+        assert_eq!(fs::read(&global).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[memories]\nuse_memories = 'unsupported'\n"
+        );
+        assert_raw_unchanged(&fixture);
+    }
+}
+
+#[test]
+fn codex_setup_rejects_new_memory_overrides_after_preview_without_writing() {
+    for (global, prior, changed_value) in [
+        (false, None, "true"),
+        (false, Some("# inherits global memory settings\n"), "true"),
+        (false, Some("[memories]\nuse_memories = false\n"), "true"),
+        (false, None, "'invalid boolean'"),
+        (true, None, "true"),
+        (true, None, "'invalid boolean'"),
+    ] {
+        let mut fixture = codex_matrix_fixture();
+        let config_path = if global {
+            fixture
+                .project_root
+                .parent()
+                .unwrap()
+                .join("codex/config.toml")
+        } else {
+            fixture.project_root.join(".codex/config.toml")
+        };
+        let changed = if global {
+            let disabled = fs::read_to_string(&config_path)
+                .unwrap()
+                .replace("generate_memories = true", "generate_memories = false")
+                .replace("use_memories = true", "use_memories = false");
+            fs::write(&config_path, &disabled).unwrap();
+            disabled.replace(
+                "use_memories = false",
+                &format!("use_memories = {changed_value}"),
+            )
+        } else {
+            match prior {
+                None => fs::remove_file(&config_path).unwrap(),
+                Some(value) => fs::write(&config_path, value).unwrap(),
+            }
+            format!("[memories]\nuse_memories = {changed_value}\n")
+        };
+        let vault_path = TempVault::new("codex-memory-override-after-preview");
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+        let setup = BridgeInstallService::new(
+            &mut vault,
+            fixture.harness.clone(),
+            Locator {
+                bridge: fixture.bridge.clone(),
+                calls: Rc::new(Cell::new(0)),
+            },
+            DeviceId::from_str(ID_1).unwrap(),
+            clock(NOW_MS),
+        )
+        .preview(
+            Some(&RegisteredProject {
+                project_id: fixture.project_id,
+                root: wire_path(&fixture.project_root),
+            }),
+            NOW_MS,
+        )
+        .unwrap();
+        let opened =
+            open_plan(&vault.setup_plan(&setup.plan_id).unwrap().unwrap().payload).unwrap();
+        let original = opened
+            .plan
+            .mutations
+            .iter()
+            .map(|mutation| {
+                let path = mutation_path(&mutation.target);
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect::<Vec<_>>();
+        fs::write(&config_path, &changed).unwrap();
+        let mut executor = MatrixExecutor {
+            live: fixture.harness.cli_state(),
+            harness: &mut fixture.harness,
+            lock_root: fixture.lock_root.clone(),
+        };
+        let result = BridgeInstallService::persisted(&mut vault).apply(
+            &setup.plan_id,
+            NOW_MS + 1,
+            &mut executor,
+        );
+        assert!(
+            result.is_err(),
+            "new memory setting was not in the reviewed plan: global={global}, prior={prior:?}, value={changed_value}"
+        );
+        for (path, bytes) in original {
+            if path != config_path {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+        }
+        assert_eq!(fs::read_to_string(config_path).unwrap(), changed);
+        for registration in &opened.plan.native_memory_registrations {
+            assert!(
+                vault
+                    .native_memory_ledger(&registration.source.id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_raw_unchanged(&fixture);
+    }
+}
+
+#[test]
+fn codex_native_bridge_repeat_preview_binds_noop_and_absent_project_configuration() {
+    let mut fixture = codex_matrix_fixture();
+    let global = fixture
+        .project_root
+        .parent()
+        .unwrap()
+        .join("codex/config.toml");
+    let project = fixture.project_root.join(".codex/config.toml");
+    fs::remove_file(&project).unwrap();
+    let vault_path = TempVault::new("codex-native-repeat");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(vault_path.path(), "primary-memory-setup-v1", &keys).unwrap();
+    let preview = |vault: &mut Vault, fixture: &MatrixFixture, now| {
+        BridgeInstallService::new(
+            vault,
+            fixture.harness.clone(),
+            Locator {
+                bridge: fixture.bridge.clone(),
+                calls: Rc::new(Cell::new(0)),
+            },
+            DeviceId::from_str(ID_1).unwrap(),
+            clock(now),
+        )
+        .preview(
+            Some(&RegisteredProject {
+                project_id: fixture.project_id,
+                root: wire_path(&fixture.project_root),
+            }),
+            now,
+        )
+        .unwrap()
+    };
+    let setup = preview(&mut vault, &fixture, NOW_MS);
+    let mut executor = MatrixExecutor {
+        live: fixture.harness.cli_state(),
+        harness: &mut fixture.harness,
+        lock_root: fixture.lock_root.clone(),
+    };
+    BridgeInstallService::persisted(&mut vault)
+        .apply(&setup.plan_id, NOW_MS + 1, &mut executor)
+        .unwrap();
+    let connected = fs::read(&global).unwrap();
+    let repeat = preview(&mut vault, &fixture, NOW_MS + 2);
+    let opened = open_plan(&vault.setup_plan(&repeat.plan_id).unwrap().unwrap().payload).unwrap();
+    assert!(opened.plan.mutations.is_empty());
+    assert!(opened.plan.cli_mutations.is_empty());
+    assert!(
+        !repeat
+            .semantic_changes
+            .iter()
+            .any(|change| change.target == "codex-mcp|global|context-relay")
+    );
+    assert!(
+        repeat
+            .expected_native_digests
+            .contains(&ExpectedNativeDigest {
+                target: wire_path(&global),
+                expected_digest: Some(Sha256Digest(Sha256::digest(&connected).into()))
+            })
+    );
+    assert!(
+        repeat
+            .expected_native_digests
+            .contains(&ExpectedNativeDigest {
+                target: wire_path(&project),
+                expected_digest: None
+            })
+    );
+    for path in [&global, &project] {
+        let prior = fs::read(path).ok();
+        let changed = if path == &global {
+            [connected.as_slice(), b"\n# concurrent edit\n"].concat()
+        } else {
+            b"[mcp_servers.context-relay]\nenabled = false\n".to_vec()
+        };
+        fs::write(path, &changed).unwrap();
+        assert!(
+            NativeAdapter::verify_live_state_reservation(&mut fixture.harness, &opened.plan)
+                .is_err()
+        );
+        assert_eq!(fs::read(path).unwrap(), changed);
+        match prior {
+            Some(bytes) => fs::write(path, bytes).unwrap(),
+            None => fs::remove_file(path).unwrap(),
+        }
+    }
+    NativeAdapter::verify_live_state_reservation(&mut fixture.harness, &opened.plan).unwrap();
+    let mut executor = MatrixExecutor {
+        live: fixture.harness.cli_state(),
+        harness: &mut fixture.harness,
+        lock_root: fixture.lock_root.clone(),
+    };
+    BridgeInstallService::persisted(&mut vault)
+        .apply(&repeat.plan_id, NOW_MS + 3, &mut executor)
+        .unwrap();
+    assert_eq!(fs::read(&global).unwrap(), connected);
+    let drift = preview(&mut vault, &fixture, NOW_MS + 4);
+    fs::write(&project, "[mcp_servers.context-relay]\nenabled = false\n").unwrap();
+    let mut executor = MatrixExecutor {
+        live: fixture.harness.cli_state(),
+        harness: &mut fixture.harness,
+        lock_root: fixture.lock_root.clone(),
+    };
+    assert!(
+        BridgeInstallService::persisted(&mut vault)
+            .apply(&drift.plan_id, NOW_MS + 5, &mut executor)
+            .is_err()
+    );
+    assert_eq!(fs::read(&global).unwrap(), connected);
+    assert_eq!(
+        fs::read_to_string(&project).unwrap(),
+        "[mcp_servers.context-relay]\nenabled = false\n"
+    );
 }
 
 #[test]

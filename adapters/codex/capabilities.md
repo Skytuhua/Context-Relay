@@ -9,6 +9,21 @@ when an administrator requirements file is active or the selected project is
 not explicitly trusted. Missing installations are represented by discovery
 failure rather than by constructing an adapter for an unbound executable.
 
+Windows standalone discovery recognizes the standard Programs/OpenAI/Codex
+alias and `.codex/packages/standalone/current` junction only after verifying
+their exact targets. It binds the physical native release executable beneath
+the expected releases directory and verifies that the release directory and
+held executable report the same version. Arbitrary PATH junctions and nested
+reparse points remain rejected. Later launches retain executable identity,
+digest and topology checks. Finding standalone `0.144.6` does not qualify it
+for full setup. Isolated lifecycle, memory, MCP and native-transaction evidence
+is recorded in the verification documents; installed acceptance and remaining
+profile/platform qualification still gate production enablement.
+
+The MCP parser accepts `transport.env: null` as no environment overrides,
+matching the standalone `0.144.6` CLI output. Nonempty environment overrides
+still prevent treating an existing MCP declaration as Context Relay managed.
+
 Full setup is transactional. Every file/CLI mutation planner and native/CLI
 apply recheck requires the effective setup capability to remain `Full`, in
 addition to rechecking the executable path, native identity, digest, version,
@@ -75,12 +90,22 @@ rejected on render. Environment and header maps are never exported literally.
 
 ## Plugins, MCP, and hooks
 
-Global plugin and MCP changes use only bounded Codex JSON CLI operations.
+Generic global plugin and MCP changes use bounded Codex JSON CLI operations.
+Managed bridge setup instead serializes its MCP declaration together with the
+memory settings into one native transaction; it does not run a second CLI
+writer against the same config file.
 Project-scoped plugin and MCP writes remain import-only. Effective validation
 compares the complete enabled plugin set, the complete enabled MCP name set,
 and normalized MCP transport declarations; an extra, missing, disabled, or
 drifted declaration fails validation. Validation never starts configured MCP
 servers.
+
+Plugin-list readback accepts the pinned native schema's nullable version,
+optional marketplace source, local/Git/Git-subdirectory/npm sources, and three
+installation-policy labels. Fields remain bounded and strictly typed; duplicate
+JSON keys and unknown fields are rejected. Readback reduces these records to
+installed IDs and enabled states; source metadata never supplies executable,
+path or installation authority.
 
 Supported frozen versions use managed `SessionStart` and `Stop` commands.
 Explicit task completion uses the typed `context_relay_complete_task` MCP tool
@@ -100,6 +125,22 @@ manual. Arbitrary PATH results are unknown rather than inferred from a
 substring.
 
 ## Remaining qualification
+
+Full memory setup includes explicit memory overrides in active trusted project
+layers, and rechecks them before writes and at final validation. It preserves
+inherited project settings, comments and exact rollback images. Recovery of a
+project-bound plan reconstructs its sealed project scope; native memory source
+descriptors must still match the resolved Codex home.
+
+Mixed native/CLI plans can bind their exact sealed CLI WAL for recovery, but
+this does not authorize rebasing file fingerprints or adopting replacement
+objects. The [native bridge amendment](../../docs/superpowers/specs/2026-09-06-codex-native-bridge-design.md)
+supersedes the staged CLI generator for managed setup. The opt-in pinned Windows
+fixture exercises ordinary save, injected-panic recovery before and after commit,
+vault reopen, fresh executable/profile discovery, idempotent reapply and Undo.
+It uses an inert bridge marker and cannot establish installed process/credential
+binding or actual daemon crash recovery. See the
+[qualification record](../../docs/verification/codex-native-setup-2026-09-06.md).
 
 The frozen/synthetic adapter and macOS native boundary are covered in CI. A
 release still requires the master plan's credentialed real-install matrix on

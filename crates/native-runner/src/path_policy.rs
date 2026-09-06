@@ -56,15 +56,33 @@ impl TryFrom<String> for StagePath {
 }
 
 pub fn validate_path_set(target: RuntimeTarget, paths: &[StagePath]) -> Result<(), RunnerError> {
+    validate_path_set_cancellable(target, paths, || false)
+}
+
+/// Preserves target collision rules while allowing long sets to be interrupted.
+pub fn validate_path_set_cancellable(
+    target: RuntimeTarget,
+    paths: &[StagePath],
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<(), RunnerError> {
+    if cancelled() {
+        return Err(RunnerError::Canceled);
+    }
     match target {
         RuntimeTarget::WindowsX86_64 => {
             let mut aliases: Vec<String> = Vec::new();
             for path in paths {
+                if cancelled() {
+                    return Err(RunnerError::Canceled);
+                }
                 let alias = path.as_str().nfkc().collect::<String>();
-                if aliases.iter().any(|existing| {
-                    windows_ordinal_ignore_case_eq(existing, &alias).unwrap_or(true)
-                }) {
-                    return Err(RunnerError::PathCollision);
+                for existing in &aliases {
+                    if cancelled() {
+                        return Err(RunnerError::Canceled);
+                    }
+                    if windows_ordinal_ignore_case_eq(existing, &alias).unwrap_or(true) {
+                        return Err(RunnerError::PathCollision);
+                    }
                 }
                 aliases.push(alias);
             }
@@ -72,6 +90,9 @@ pub fn validate_path_set(target: RuntimeTarget, paths: &[StagePath]) -> Result<(
         RuntimeTarget::MacosArm64 => {
             let mut aliases = BTreeSet::new();
             for path in paths {
+                if cancelled() {
+                    return Err(RunnerError::Canceled);
+                }
                 let alias = path
                     .as_str()
                     .nfd()
@@ -144,4 +165,39 @@ fn windows_reserved_name(component: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_validation_cancels_inside_windows_alias_comparisons() {
+        let paths = ["alpha", "beta", "專案"].map(|p| StagePath::try_from(p).unwrap());
+        let mut checkpoints = 0;
+        assert_eq!(
+            validate_path_set_cancellable(RuntimeTarget::WindowsX86_64, &paths, || {
+                checkpoints += 1;
+                checkpoints == 6 // First comparison for the third path, before the rest of its scan.
+            }),
+            Err(RunnerError::Canceled)
+        );
+        assert_eq!(checkpoints, 6);
+        validate_path_set(RuntimeTarget::WindowsX86_64, &paths).unwrap();
+        let aliases = ["Ａ.txt", "A.txt"].map(|p| StagePath::try_from(p).unwrap());
+        assert_eq!(
+            validate_path_set_cancellable(RuntimeTarget::WindowsX86_64, &aliases, || false),
+            Err(RunnerError::PathCollision)
+        );
+    }
+
+    #[test]
+    fn path_validation_observes_cancel_before_both_platform_policies() {
+        for target in [RuntimeTarget::WindowsX86_64, RuntimeTarget::MacosArm64] {
+            assert_eq!(
+                validate_path_set_cancellable(target, &[], || true),
+                Err(RunnerError::Canceled)
+            );
+        }
+    }
 }

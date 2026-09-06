@@ -1,6 +1,6 @@
 import Ajv2020 from 'ajv/dist/2020.js';
 
-import type { MemoryRecord, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
+import type { HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
 
 const utf8 = new TextEncoder();
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -137,6 +137,23 @@ const nativeScope = (value: unknown, field: string) => {
   choice(item.scope, ['global', 'project'], `${field}.scope`);
   if (project) { id(item.projectId, `${field}.projectId`); native(item.root, `${field}.root`); }
 };
+
+export const assertProbeReport = (value: unknown): asserts value is ProbeReport => {
+  const item = object(value, ['executable', 'executableSha256', 'harnessVersion', 'installationMethod', 'configRoots', 'activeProfile', 'policyConflicts', 'capability', 'codexSavedHookApproval'], 'probeReport');
+  if (item.codexSavedHookApproval !== null) {
+    const approval = object(item.codexSavedHookApproval, ['sessionStart', 'stop'], 'probeReport.codexSavedHookApproval');
+    for (const key of ['sessionStart', 'stop']) choice(approval[key], ['missing', 'needs_approval', 'approved', 'changed', 'disabled'], 'probeReport.codexSavedHookApproval');
+  }
+  if (item.executable !== null) native(item.executable, 'probeReport.executable');
+  if (item.executableSha256 !== null) sha(item.executableSha256, 'probeReport.executableSha256');
+  if (item.harnessVersion !== null) text(item.harnessVersion, adapterTextLimit, 'probeReport.harnessVersion');
+  if (item.activeProfile !== null) text(item.activeProfile, adapterTextLimit, 'probeReport.activeProfile');
+  choice(item.installationMethod, ['bundled', 'package_manager', 'manual', 'unknown'], 'probeReport.installationMethod');
+  choice(item.capability, ['full', 'import_only', 'blocked', 'missing'], 'probeReport.capability');
+  for (const value of list(item.configRoots, adapterCollectionLimit, 'probeReport.configRoots')) native(value, 'probeReport.configRoots');
+  for (const value of list(item.policyConflicts, adapterCollectionLimit, 'probeReport.policyConflicts')) text(value, adapterTextLimit, 'probeReport.policyConflicts');
+};
+
 const dependency = (value: unknown, field: string) => {
   const item = object(value, ['name', 'version', 'digest', 'immutableSourceRef'], field);
   text(item.name, 512, `${field}.name`); text(item.version, 512, `${field}.version`); sha(item.digest, `${field}.digest`); text(item.immutableSourceRef, 1024 * 1024, `${field}.immutableSourceRef`);
@@ -200,3 +217,74 @@ export const createProtocolSchemaValidator = () => {
 };
 export const assertSha256Hex = (value: string) => sha(value, 'SHA-256 hex');
 export const assertBase64UrlBytes = (value: string, size: number) => fixed(value, size, 'fixed-size base64url');
+
+const setupStates = ['previewed', 'applying', 'applied', 'apply_restored', 'rolling_back', 'rolled_back', 'rollback_restored', 'conflict', 'expired'];
+function clientError(value: unknown, field: string) {
+  const error = object(value, ['code', 'message', 'fieldPath', 'retryable'], field);
+  choice(error.code, ['protocol_version_unsupported', 'invalid_request', 'frame_too_large', 'vault_locked', 'not_found', 'revision_conflict', 'scope_denied', 'approval_required', 'plan_changed', 'plan_expired', 'harness_unsupported', 'conflict', 'quota_exceeded', 'canceled', 'timeout', 'busy', 'internal'], `${field}.code`);
+  text(error.message, 512, `${field}.message`);
+  if (error.fieldPath !== null) string(error.fieldPath, `${field}.fieldPath`);
+  choice(error.retryable, [true, false], `${field}.retryable`);
+}
+
+export function validateHarnessPreparation(value: unknown): HarnessPreparationStatus {
+  const item = object(value, ['operationId', 'selection', 'phase', 'completedFiles', 'completedBytes', 'error'], 'harnessPreparation');
+  id(item.operationId, 'harnessPreparation.operationId');
+  const selection = object(item.selection, ['harness', 'projectId', 'hermesProfile'], 'harnessPreparation.selection');
+  if (selection.harness !== 'hermes') fail('harnessPreparation.harness');
+  if (selection.projectId !== null) id(selection.projectId, 'harnessPreparation.projectId');
+  const profile = text(selection.hermesProfile, 64, 'harnessPreparation.profile');
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(profile)) fail('harnessPreparation.profile');
+  choice(item.phase, ['inspecting', 'copying', 'checking_source', 'checking_copy', 'retaining', 'cancelling', 'ready', 'canceled', 'failed'], 'harnessPreparation.phase');
+  uint(item.completedFiles, 32768, 'harnessPreparation.completedFiles');
+  uint(item.completedBytes, 1_073_741_824, 'harnessPreparation.completedBytes');
+  if ((item.phase === 'failed') !== (item.error !== null)) fail('harnessPreparation.error');
+  if (item.error !== null) clientError(item.error, 'harnessPreparation.error');
+  return value as HarnessPreparationStatus;
+}
+
+export function validateHarnessExecution(value: unknown): HarnessExecutionStatus {
+  const item = object(value, ['planId', 'action', 'phase', 'error'], 'harnessExecution');
+  id(item.planId, 'harnessExecution.planId');
+  choice(item.action, ['apply', 'rollback'], 'harnessExecution.action');
+  choice(item.phase, ['queued', 'running', 'finished', 'unknown'], 'harnessExecution.phase');
+  if (item.error !== null) {
+    if (item.phase !== 'finished') fail('harnessExecution.error');
+    clientError(item.error, 'harnessExecution.error');
+  }
+  return value as HarnessExecutionStatus;
+}
+
+export function validateHarnessSetupRecord(value: unknown): HarnessSetupRecord {
+  const item = object(value, ['plan', 'state', 'createdAt'], 'harnessSetup');
+  const assertPlan: (value: unknown) => asserts value is SetupPlan = assertSetupPlan;
+  assertPlan(item.plan);
+  if (item.plan.rulesyncVersion !== 'bridge-preview-v1') fail('harnessSetup.plan');
+  choice(item.state, setupStates, 'harnessSetup.state');
+  u64(item.createdAt, 'harnessSetup.createdAt');
+  return value as HarnessSetupRecord;
+}
+
+export function validateHarnessSetupsPage(value: unknown): HarnessSetupsPage {
+  const page = object(value, ['setups', 'nextAfter'], 'harnessSetups');
+  let previous: string | null = null;
+  for (const value of list(page.setups, 50, 'harnessSetups.setups')) {
+    const item = object(value, ['planId', 'harness', 'harnessProfile', 'targetScopes', 'state', 'createdAt', 'expiresAt'], 'harnessSetups.setup');
+    id(item.planId, 'harnessSetups.planId');
+    if (previous !== null && (item.planId as string) >= previous) fail('harnessSetups.order');
+    previous = item.planId as string;
+    choice(item.harness, ['codex', 'claude_code', 'hermes'], 'harnessSetups.harness');
+    if (item.harness === 'hermes') text(item.harnessProfile, 512, 'harnessSetups.profile');
+    else if (item.harnessProfile !== null) fail('harnessSetups.profile');
+    const scopes = list(item.targetScopes, adapterCollectionLimit, 'harnessSetups.scopes');
+    if (!scopes.length) fail('harnessSetups.scopes');
+    scopes.forEach(value => scope(value, 'harnessSetups.scope'));
+    choice(item.state, setupStates, 'harnessSetups.state');
+    u64(item.createdAt, 'harnessSetups.createdAt'); u64(item.expiresAt, 'harnessSetups.expiresAt');
+  }
+  if (page.nextAfter !== null) {
+    id(page.nextAfter, 'harnessSetups.nextAfter');
+    if (previous !== null && (page.nextAfter as string) > previous) fail('harnessSetups.nextAfter');
+  }
+  return value as HarnessSetupsPage;
+}

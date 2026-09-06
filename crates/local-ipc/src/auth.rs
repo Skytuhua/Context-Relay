@@ -188,6 +188,10 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
     use ClientRole::{Desktop, DesktopRecoveryHost, Installer, McpBridge};
 
     match request {
+        LocalRequest::DesktopWritePrepare(_)
+        | LocalRequest::DesktopWritesList(_)
+        | LocalRequest::DesktopWriteGet(_)
+        | LocalRequest::DesktopWriteForget(_) => matches!(role, Desktop),
         LocalRequest::Hello(_) => false,
         LocalRequest::Cancel(_) => true,
         LocalRequest::Shutdown(_) => matches!(role, Desktop),
@@ -197,6 +201,7 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::Unlock(_) => matches!(role, Desktop),
         LocalRequest::ProjectsList(_) => matches!(role, Desktop),
         LocalRequest::ProjectUpsert(_) => matches!(role, Desktop),
+        LocalRequest::ProjectRegister(_) => matches!(role, Desktop),
         LocalRequest::ProjectPathSet(_) => matches!(role, Desktop),
         LocalRequest::MemoryGet(_) => matches!(role, Desktop),
         LocalRequest::MemoryList(_) => matches!(role, Desktop),
@@ -214,6 +219,15 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::AccessGet(_) => matches!(role, Desktop | Installer),
         LocalRequest::AccessSet(_) => matches!(role, Desktop | Installer),
         LocalRequest::HarnessProbe(_) => matches!(role, Desktop | Installer),
+        LocalRequest::HarnessPrepare(_)
+        | LocalRequest::HarnessPreparedPreview(_)
+        | LocalRequest::HarnessPreparationStatus(_)
+        | LocalRequest::HarnessPreparationCancel(_)
+        | LocalRequest::HarnessExecutionStart(_)
+        | LocalRequest::HarnessExecutionStatus(_)
+        | LocalRequest::HarnessExecutionCurrent(_)
+        | LocalRequest::HarnessSetupsList(_)
+        | LocalRequest::HarnessSetupGet(_) => matches!(role, Desktop),
         LocalRequest::HarnessPreview(_) => matches!(role, Desktop | Installer),
         LocalRequest::HarnessApply(_) => matches!(role, Desktop | Installer),
         LocalRequest::HarnessRepair(_) => matches!(role, Desktop | Installer),

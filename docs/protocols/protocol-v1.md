@@ -1,6 +1,8 @@
 # Context Relay protocol version 1
 
-Context Relay protocol version 1.4 is identified by `PROTOCOL_MAJOR = 1` and `PROTOCOL_MINOR = 4`. Sync operations use schema version 1; scope-bound signed checkpoints use the independent checkpoint schema version 2. Local IPC frames are limited to 8 MiB.
+Context Relay protocol version 1.6 is identified by `PROTOCOL_MAJOR = 1` and `PROTOCOL_MINOR = 6`. Sync operations use schema version 1; scope-bound signed checkpoints use the independent checkpoint schema version 2. Local IPC frames are limited to 8 MiB.
+
+Harness discovery includes nullable `codexSavedHookApproval` with `sessionStart` and `stop` states. These describe saved user hook definitions and approvals, not effective runtime enablement or a verified connection. `null` means the check is unavailable, including unsupported versions or unreadable settings.
 
 Version negotiation requires matching major versions and selects the greatest minor version present in both advertised ranges. A major mismatch or disjoint minor range returns `protocol_version_unsupported`. No caller may fall back to an unknown major.
 
@@ -83,3 +85,32 @@ Protocol 1.4 adds required-nullable `hermesProfile` to `HarnessParams` and `harn
 reject 1.3 peers before request decoding, and 1.4 decoders reject omitted profile fields. No
 downgrade fallback is allowed. The change prevents previewing one Hermes profile and later applying
 or recovering the transaction against `default` or another ambient profile.
+
+
+## Atomic project registration
+
+Protocol 1.5 adds the Desktop-only `project_register` request with required
+`project` and `path` fields. The ordered daemon worker checks that the native
+path names an existing accessible directory, then commits the project identity
+and its local folder binding in one vault transaction. A failure during either
+write commits neither new record. Exact same-ID/content replay succeeds;
+conflicting content for an existing ID is rejected. A matching legacy identity
+without a folder can be completed without replacing that identity.
+
+The desktop retains the most recent uncertain registration identity for an
+explicit retry of the same name and native path. It never retries the write
+automatically or falls back to the legacy two-request creation sequence.
+`project_upsert` and `project_path_set` remain available for their existing
+independent operations. Their presence is not an atomic creation contract.
+
+Ordinary local clients require exactly 1.6 and reject 1.5 before application
+dispatch. The Windows updater always extracts its new authenticated shutdown
+helper before replacing companions; it never runs an old daemon executable
+that might ignore `--shutdown` and start a service. The helper has one private
+compatibility path for protocols 1.4 and 1.5: verify both installation-token proofs,
+send only the fixed shutdown request, require its matching empty acknowledgment,
+and wait for the exact connected process to exit. It cannot return a reusable
+client or dispatch other legacy requests. Other legacy versions are rejected.
+An absent service succeeds without starting a daemon or reading credentials.
+No vault schema migration is needed for project registration, and sync/checkpoint
+schema versions are unchanged.

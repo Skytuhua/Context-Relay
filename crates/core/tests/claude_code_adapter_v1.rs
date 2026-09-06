@@ -1,8 +1,6 @@
 use std::{
-    cell::Cell,
     fs,
     path::{Path, PathBuf},
-    rc::Rc,
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -22,6 +20,7 @@ use context_relay_core::{
         engine::{BoundaryError, NativeAdapter, NativeFileSystem},
         filesystem::OsNativeTransactionFileSystem,
     },
+    setup::BridgePreviewHarness,
 };
 use context_relay_native_runner::NativeState;
 use context_relay_protocol::{
@@ -64,7 +63,7 @@ fn fixture(source: &str) -> Fixture {
     materialize(&config_dir, fixture["config"].as_object().unwrap());
     materialize(&project_root, fixture["project"].as_object().unwrap());
 
-    let state_path = root.join(".claude.json");
+    let state_path = config_dir.join(".claude.json");
     let mut state = fixture["state"].clone();
     let project = state["projects"]
         .as_object_mut()
@@ -117,6 +116,7 @@ fn fixture(source: &str) -> Fixture {
             executable,
             version: fixture["version"].as_str().unwrap().to_owned(),
             installation_method: InstallationMethod::PackageManager,
+            user_home: PathBuf::from(root.to_str().unwrap().trim_start_matches(r"\\?\")),
             config_dir,
             state_path: state_path.clone(),
             project_root,
@@ -241,7 +241,16 @@ fn memory_hooks_render_only_frozen_context_relay_compatible_events_with_literal_
             let command = hooks[native_event][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap();
-            assert!(command.contains(bridge.to_string_lossy().as_ref()));
+            let bridge_path = bridge.to_str().unwrap();
+            #[cfg(windows)]
+            let bridge_path = bridge_path
+                .strip_prefix(r"\\?\")
+                .unwrap_or(bridge_path)
+                .replace('\\', "/");
+            #[cfg(windows)]
+            assert!(command.contains(&bridge_path));
+            #[cfg(not(windows))]
+            assert!(command.contains(bridge_path));
             assert!(command.ends_with(&format!(" --hook-event {event} --harness claude-code")));
             assert_eq!(hooks[native_event][0]["hooks"][0]["type"], "command");
             assert_eq!(
@@ -950,7 +959,10 @@ fn native_memory_capability_matrix_is_exact_for_frozen_claude_releases() {
         };
         let rendered: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(rendered["autoMemoryEnabled"], false);
-        assert_eq!(rendered["autoMemoryDirectory"], ".claude/native-memory");
+        assert_eq!(
+            rendered["autoMemoryDirectory"],
+            "~/project with spaces/.claude/native-memory"
+        );
         assert_eq!(rendered["unmanaged"]["keep"], true);
         assert_eq!(rendered.as_object().unwrap().len(), 6);
 
@@ -1010,13 +1022,22 @@ fn unknown_claude_versions_never_guess_a_default_native_memory_binding() {
     let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
     assert!(matches!(
         capabilities.disable,
+        NativeMemoryDisable::Unavailable
+    ));
+    assert!(capabilities.sources.is_empty());
+
+    settings["autoMemoryDirectory"] = json!("~/project with spaces/.claude/native-memory");
+    fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert!(matches!(
+        capabilities.disable,
         NativeMemoryDisable::WatchOnly
     ));
     assert!(!capabilities.sources.is_empty());
 }
 
 #[test]
-fn frozen_claude_default_binding_is_exact_and_invalid_explicit_paths_are_unavailable() {
+fn frozen_claude_default_binding_is_exact_when_an_explicit_path_is_ignored() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let settings_path = fixture.adapter.project_settings_path();
     let mut settings: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
@@ -1029,6 +1050,7 @@ fn frozen_claude_default_binding_is_exact_and_invalid_explicit_paths_are_unavail
     let project_root = fixture.root.join("project with spaces");
     let project_key = project_root
         .to_string_lossy()
+        .trim_start_matches(r"\\?\")
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '-' {
@@ -1052,11 +1074,7 @@ fn frozen_claude_default_binding_is_exact_and_invalid_explicit_paths_are_unavail
     settings["autoMemoryDirectory"] = json!("../sibling-project/memory");
     fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
     let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
-    assert!(matches!(
-        capabilities.disable,
-        NativeMemoryDisable::Unavailable
-    ));
-    assert!(capabilities.sources.is_empty());
+    assert_eq!(capabilities.sources[0].path, test_wire_path(&expected));
 }
 
 #[test]
@@ -1105,6 +1123,536 @@ fn native_memory_disable_rolls_back_true_false_and_absent_claude_values_exactly(
         native.restore_matching_applied_targets(&nonce).unwrap();
         assert_eq!(fs::read(&settings_path).unwrap(), before);
     }
+}
+
+fn use_default_memory(fixture: &Fixture) {
+    let path = fixture.adapter.project_settings_path();
+    let mut settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    settings
+        .as_object_mut()
+        .unwrap()
+        .remove("autoMemoryDirectory");
+    fs::write(path, serde_json::to_vec(&settings).unwrap()).unwrap();
+}
+
+fn expected_default_memory(fixture: &Fixture, repository: &Path) -> WireNativeValue {
+    let key = repository
+        .to_str()
+        .unwrap()
+        .trim_start_matches(r"\\?\")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    test_wire_path(
+        &fixture
+            .root
+            .join("custom claude config/projects")
+            .join(key)
+            .join("memory/MEMORY.md"),
+    )
+}
+
+#[test]
+fn native_memory_claude_default_uses_repository_ancestor_and_rechecks_new_nested_repository() {
+    let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    use_default_memory(&fixture);
+    fs::create_dir(fixture.root.join(".git")).unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert_eq!(
+        capabilities.sources[0].path,
+        expected_default_memory(&fixture, &fixture.root)
+    );
+    let plan = claude_memory_plan(&fixture);
+    NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).unwrap();
+    fs::create_dir(fixture.root.join("project with spaces/.git")).unwrap();
+    assert!(NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).is_err());
+    assert!(NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, &plan).is_err());
+}
+
+#[test]
+fn native_memory_claude_default_shares_linked_worktree_memory_and_rechecks_backlink() {
+    let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    use_default_memory(&fixture);
+    let main = fixture.root.join("main");
+    let gitdir = main.join(".git/worktrees/topic");
+    fs::create_dir_all(&gitdir).unwrap();
+    fs::write(
+        fixture.root.join("project with spaces/.git"),
+        b"gitdir: ../main/.git/worktrees/topic\n",
+    )
+    .unwrap();
+    fs::write(gitdir.join("commondir"), b"../..\n").unwrap();
+    fs::write(
+        gitdir.join("gitdir"),
+        b"../../../../project with spaces/.git\n",
+    )
+    .unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert_eq!(
+        capabilities.sources[0].path,
+        expected_default_memory(&fixture, &main)
+    );
+    let plan = claude_memory_plan(&fixture);
+    NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).unwrap();
+    fs::write(gitdir.join("gitdir"), b"../../../../missing/.git\n").unwrap();
+    assert!(NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).is_err());
+    assert!(NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, &plan).is_err());
+}
+
+#[test]
+fn native_memory_claude_reads_user_project_and_local_directory_precedence() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let user = fixture.root.join("custom claude config/settings.json");
+    let project = fixture.adapter.project_settings_path();
+    let local = project.with_file_name("settings.local.json");
+    fs::write(&user, br#"{"autoMemoryDirectory":"~/user memory"}"#).unwrap();
+    fs::write(&project, b"{}").unwrap();
+    for (path, body, expected) in [
+        (&project, "{}", "user memory"),
+        (
+            &project,
+            r#"{"autoMemoryDirectory":"~/project memory"}"#,
+            "project memory",
+        ),
+        (
+            &local,
+            r#"{"autoMemoryDirectory":"~/local memory"}"#,
+            "local memory",
+        ),
+    ] {
+        fs::write(path, body).unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        let expected = fixture.root.join(expected).join("MEMORY.md");
+        assert_eq!(capabilities.sources[0].path, test_wire_path(&expected));
+    }
+}
+
+#[test]
+fn native_memory_claude_disables_the_local_override_and_rolls_it_back_exactly() {
+    for enabled in [true, false] {
+        let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        let project = fixture.adapter.project_settings_path();
+        let project_before = fs::read(&project).unwrap();
+        let local = project.with_file_name("settings.local.json");
+        let before = format!("{{\n  \"autoMemoryEnabled\": {enabled}, \"unmanaged\": [1, 2]\n}}\n");
+        fs::write(&local, &before).unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+            panic!("local override must be supported");
+        };
+        assert_eq!(mutations.len(), usize::from(enabled));
+        if enabled {
+            assert_eq!(mutations[0].target, test_wire_path(&local));
+            let nonce = [86; 16];
+            let mut native = OsNativeTransactionFileSystem::new(nonce);
+            let images = native.create_before_images(&mutations).unwrap();
+            native.record_native_metadata(&images).unwrap();
+            native.compare_and_swap_targets(&mutations).unwrap();
+            native.apply_mutation(&nonce, &mutations[0]).unwrap();
+            let after: Value = serde_json::from_slice(&fs::read(&local).unwrap()).unwrap();
+            assert_eq!(
+                after,
+                json!({"autoMemoryEnabled": false, "unmanaged": [1, 2]})
+            );
+            native.restore_matching_applied_targets(&nonce).unwrap();
+        }
+        assert_eq!(fs::read(&local).unwrap(), before.as_bytes());
+        assert_eq!(fs::read(&project).unwrap(), project_before);
+    }
+}
+
+#[test]
+fn native_memory_claude_disables_settings_environment_overrides_and_restores_them() {
+    for (layer, local_enabled) in [
+        ("user", false),
+        ("project", false),
+        ("local", false),
+        ("user", true),
+    ] {
+        let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        let user = fixture.root.join("custom claude config/settings.json");
+        let project = fixture.adapter.project_settings_path();
+        let local = project.with_file_name("settings.local.json");
+        let selected = match layer {
+            "user" => &user,
+            "project" => &project,
+            _ => &local,
+        };
+        let mut settings: Value = if selected.is_file() {
+            serde_json::from_slice(&fs::read(selected).unwrap()).unwrap()
+        } else {
+            json!({})
+        };
+        settings["autoMemoryEnabled"] = json!(false);
+        if layer == "local" {
+            settings
+                .as_object_mut()
+                .unwrap()
+                .remove("autoMemoryEnabled");
+        }
+        settings["env"] =
+            json!({"CLAUDE_CODE_DISABLE_AUTO_MEMORY":"false", "KEEP_THIS":"unchanged"});
+        fs::write(selected, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+        if local_enabled {
+            fs::write(&local, br#"{"autoMemoryEnabled":true,"unrelated":123}"#).unwrap();
+        }
+        let target = if layer == "local" || local_enabled {
+            &local
+        } else {
+            &project
+        };
+        let before = fs::read(target).unwrap();
+        let user_before = fs::read(&user).unwrap();
+        let NativeMemoryDisable::Supported(mutations) = fixture
+            .adapter
+            .native_memory_capabilities()
+            .unwrap()
+            .disable
+        else {
+            panic!("file environment must be controllable");
+        };
+        assert_eq!(mutations.len(), 1, "{layer}");
+        assert_eq!(mutations[0].target, test_wire_path(target));
+        let nonce = [87; 16];
+        let mut native = OsNativeTransactionFileSystem::new(nonce);
+        let images = native.create_before_images(&mutations).unwrap();
+        native.record_native_metadata(&images).unwrap();
+        native.compare_and_swap_targets(&mutations).unwrap();
+        native.apply_mutation(&nonce, &mutations[0]).unwrap();
+        let after: Value = serde_json::from_slice(&fs::read(target).unwrap()).unwrap();
+        assert_eq!(after["autoMemoryEnabled"], false);
+        assert_eq!(
+            after["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"], "true",
+            "{layer}"
+        );
+        if target == selected {
+            assert_eq!(after["env"]["KEEP_THIS"], "unchanged");
+        }
+        let NativeMemoryDisable::Supported(repeated) = fixture
+            .adapter
+            .native_memory_capabilities()
+            .unwrap()
+            .disable
+        else {
+            panic!("applied disable must remain supported");
+        };
+        assert!(repeated.is_empty());
+        native.restore_matching_applied_targets(&nonce).unwrap();
+        assert_eq!(fs::read(target).unwrap(), before);
+        assert_eq!(fs::read(&user).unwrap(), user_before);
+    }
+}
+
+#[test]
+fn native_memory_claude_rejects_ambiguous_or_non_file_settings_layers() {
+    for layer in [
+        "custom claude config/settings.json",
+        "project with spaces/.claude/settings.local.json",
+        "managed-settings.json",
+    ] {
+        for body in [
+            r#"{"autoMemoryEnabled":true,"autoMemoryEnabled":false}"#,
+            "[]",
+            r#"{"env":[]}"#,
+            r#"{"env":{"CLAUDE_CODE_DISABLE_AUTO_MEMORY":false}}"#,
+        ] {
+            let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+            let path = fixture.root.join(layer);
+            fs::write(&path, body).unwrap();
+            let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+            assert!(
+                matches!(capabilities.disable, NativeMemoryDisable::Unavailable),
+                "{layer}: {body}"
+            );
+            assert!(capabilities.sources.is_empty());
+        }
+        let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        let path = fixture.root.join(layer);
+        if path.is_file() {
+            fs::remove_file(&path).unwrap();
+        }
+        fs::create_dir(&path).unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        assert!(
+            matches!(capabilities.disable, NativeMemoryDisable::Unavailable),
+            "{layer}"
+        );
+    }
+}
+
+#[test]
+fn native_memory_claude_does_not_override_managed_memory_environment() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    fs::write(
+        fixture.root.join("managed-settings.json"),
+        br#"{"env":{"CLAUDE_CODE_DISABLE_AUTO_MEMORY":"false"}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        fixture
+            .adapter
+            .native_memory_capabilities()
+            .unwrap()
+            .disable,
+        NativeMemoryDisable::WatchOnly
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn native_memory_claude_handles_windows_environment_names_without_ambiguous_aliases() {
+    for key in [
+        "claude_code_disable_auto_memory",
+        "Claude_Code_Disable_Auto_Memory",
+    ] {
+        let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        let local = fixture
+            .adapter
+            .project_settings_path()
+            .with_file_name("settings.local.json");
+        fs::write(
+            &local,
+            serde_json::to_vec(&json!({"autoMemoryEnabled":false,"env":{key:"false"}})).unwrap(),
+        )
+        .unwrap();
+        let NativeMemoryDisable::Supported(mutations) = fixture
+            .adapter
+            .native_memory_capabilities()
+            .unwrap()
+            .disable
+        else {
+            panic!("case-insensitive override must be controllable");
+        };
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].target, test_wire_path(&local));
+        let intended = NativeState::decode_v1(&mutations[0].content).unwrap();
+        let NativeState::RegularFile { bytes, .. } = intended else {
+            panic!("file mutation");
+        };
+        let after: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(after["env"], json!({key:"true"}));
+        fs::write(
+            fixture.root.join("managed-settings.json"),
+            serde_json::to_vec(&json!({"env":{key:"false"}})).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            fixture
+                .adapter
+                .native_memory_capabilities()
+                .unwrap()
+                .disable,
+            NativeMemoryDisable::WatchOnly
+        ));
+    }
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    fs::write(fixture.adapter.project_settings_path(), br#"{"env":{"CLAUDE_CODE_DISABLE_AUTO_MEMORY":"true","claude_code_disable_auto_memory":"false"}}"#).unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert!(matches!(
+        capabilities.disable,
+        NativeMemoryDisable::Unavailable
+    ));
+    assert!(capabilities.sources.is_empty());
+}
+
+fn claude_memory_plan(fixture: &Fixture) -> NativeTransactionPlan {
+    let executable = fixture.root.join(if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    });
+    let mut plan = native_digest_plan(
+        &executable,
+        Sha256Digest(Sha256::digest(fs::read(&executable).unwrap()).into()),
+    );
+    plan.setup
+        .expected_native_digests
+        .extend(fixture.adapter.bridge_operational_digests().unwrap());
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    plan.native_memory_registrations = capabilities
+        .sources
+        .into_iter()
+        .map(
+            |source| context_relay_core::native_memory::NativeMemoryRegistration {
+                source,
+                last_applied_digest: None,
+            },
+        )
+        .collect();
+    if let NativeMemoryDisable::Supported(mutations) = capabilities.disable {
+        plan.mutations = mutations;
+    }
+    plan
+}
+
+#[test]
+fn native_memory_claude_rechecks_new_local_overrides_and_managed_changes() {
+    for (layer, body) in [
+        (
+            "project with spaces/.claude/settings.local.json",
+            r#"{"autoMemoryEnabled":true}"#,
+        ),
+        (
+            "custom claude config/settings.json",
+            r#"{"autoMemoryDirectory":"~/changed memory"}"#,
+        ),
+        ("managed-settings.json", r#"{"autoMemoryEnabled":true}"#),
+        (
+            "project with spaces/.claude/settings.local.json",
+            r#"{"env":{"CLAUDE_CODE_DISABLE_AUTO_MEMORY":"false"}}"#,
+        ),
+    ] {
+        let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        let plan = claude_memory_plan(&fixture);
+        NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).unwrap();
+        let before = fs::read(fixture.adapter.project_settings_path()).unwrap();
+        fs::write(fixture.root.join(layer), body).unwrap();
+        assert!(
+            NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).is_err(),
+            "{layer}"
+        );
+        assert!(
+            NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, &plan).is_err(),
+            "{layer}"
+        );
+        assert_eq!(
+            fs::read(fixture.adapter.project_settings_path()).unwrap(),
+            before
+        );
+    }
+}
+
+fn memory_receipt(plan: &NativeTransactionPlan) -> context_relay_protocol::ApplyReceipt {
+    context_relay_protocol::ApplyReceipt {
+        plan_id: plan.setup.plan_id,
+        applied_hlc: HybridLogicalClock::new(
+            1_900_000_000_001,
+            0,
+            DeviceId::from_str(DEVICE_ID).unwrap(),
+        ),
+        resulting_digests: plan
+            .mutations
+            .iter()
+            .map(|mutation| mutation.intended.0)
+            .collect(),
+    }
+}
+
+#[test]
+fn native_memory_claude_verifies_intermediate_forward_and_inverse_settings() {
+    for local_override in [false, true] {
+        let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        if local_override {
+            fs::write(
+                fixture
+                    .adapter
+                    .project_settings_path()
+                    .with_file_name("settings.local.json"),
+                br#"{"autoMemoryEnabled":true}"#,
+            )
+            .unwrap();
+        }
+        let mut plan = claude_memory_plan(&fixture);
+        let bridge = executable_bridge(&fixture, "memory bridge", b"fixture bridge");
+        let hooks = fixture
+            .adapter
+            .plan_native_global_settings(&DesiredState {
+                components: managed_memory_hooks(HarnessId::ClaudeCode, &test_wire_path(&bridge))
+                    .unwrap(),
+                scopes: vec![NativeScope::Global],
+            })
+            .unwrap();
+        plan.mutations.insert(0, hooks);
+        let before: Vec<_> = plan
+            .mutations
+            .iter()
+            .map(|mutation| {
+                // Fixture paths all have display strings; production uses wire bytes.
+                let path = Path::new(mutation.target.display.as_ref().unwrap());
+                context_relay_native_runner::OsNativeFileSystem::new()
+                    .snapshot(path)
+                    .unwrap()
+                    .state()
+                    .encode_v1()
+                    .unwrap()
+            })
+            .collect();
+        let receipt = memory_receipt(&plan);
+        NativeAdapter::compare_approved_digests(&mut fixture.adapter, &plan).unwrap();
+        assert!(NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &receipt).is_err());
+        let nonce = [88; 16];
+        let mut native = OsNativeTransactionFileSystem::new(nonce);
+        let images = native.create_before_images(&plan.mutations).unwrap();
+        native.record_native_metadata(&images).unwrap();
+        native.compare_and_swap_targets(&plan.mutations).unwrap();
+        for mutation in &plan.mutations {
+            NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, &plan).unwrap();
+            native.apply_mutation(&nonce, mutation).unwrap();
+        }
+        NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &receipt).unwrap();
+        let mut inverse = plan.clone();
+        for (mutation, prior) in inverse.mutations.iter_mut().zip(&before) {
+            std::mem::swap(&mut mutation.expected, &mut mutation.intended);
+            mutation.content.clone_from(prior);
+        }
+        NativeAdapter::reprobe_live_state(&mut fixture.adapter, &inverse).unwrap();
+        NativeAdapter::compare_approved_digests(&mut fixture.adapter, &inverse).unwrap();
+        native.restore_matching_applied_targets(&nonce).unwrap();
+        assert!(NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &receipt).is_err());
+        NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, &inverse).unwrap();
+        NativeAdapter::validate_effective(
+            &mut fixture.adapter,
+            &inverse,
+            &memory_receipt(&inverse),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn native_memory_claude_preserves_watch_only_and_rejects_unbound_legacy_plans() {
+    let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    fs::write(
+        fixture.root.join("managed-settings.json"),
+        br#"{"autoMemoryEnabled":true}"#,
+    )
+    .unwrap();
+    let plan = claude_memory_plan(&fixture);
+    assert!(plan.mutations.is_empty());
+    NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).unwrap();
+    NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &memory_receipt(&plan)).unwrap();
+    let mut unbound = plan.clone();
+    unbound.setup.expected_native_digests.truncate(1);
+    assert!(NativeAdapter::reprobe_live_state(&mut fixture.adapter, &unbound).is_err());
+    fs::write(fixture.root.join("managed-settings.json"), b"{}").unwrap();
+    assert!(
+        NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &memory_receipt(&plan))
+            .is_err()
+    );
+}
+
+#[test]
+fn native_memory_claude_keeps_the_same_binding_when_the_directory_is_created() {
+    let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    fs::write(
+        fixture.adapter.project_settings_path(),
+        br#"{"autoMemoryDirectory":"~/new memory/topics"}"#,
+    )
+    .unwrap();
+    let plan = claude_memory_plan(&fixture);
+    fs::create_dir_all(fixture.root.join("new memory/topics")).unwrap();
+    NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).unwrap();
+    let current = fixture.adapter.native_memory_capabilities().unwrap();
+    assert_eq!(
+        current.sources[0],
+        plan.native_memory_registrations[0].source
+    );
 }
 
 #[test]
@@ -1166,7 +1714,8 @@ fn native_memory_claude_accepts_an_exact_absolute_explicit_directory() {
     fs::create_dir_all(&memory_root).unwrap();
     let settings_path = fixture.adapter.project_settings_path();
     let mut settings: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
-    settings["autoMemoryDirectory"] = json!(memory_root.to_string_lossy());
+    settings["autoMemoryDirectory"] =
+        json!(memory_root.to_string_lossy().trim_start_matches(r"\\?\"));
     fs::write(settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
 
     let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
@@ -1181,12 +1730,167 @@ fn native_memory_claude_accepts_an_exact_absolute_explicit_directory() {
 }
 
 #[test]
+fn native_memory_claude_expands_home_and_normalizes_the_configured_directory() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let memory_root = fixture.root.join("explicit memory directory");
+    fs::create_dir_all(&memory_root).unwrap();
+    fs::write(memory_root.join("topic.md"), "# Selected home\n").unwrap();
+    let settings_path = fixture.adapter.project_settings_path();
+    let mut settings: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    for configured in [
+        "~/unused/../explicit memory directory",
+        "~\\explicit memory directory",
+    ] {
+        settings["autoMemoryDirectory"] = json!(configured);
+        fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        assert_eq!(capabilities.sources.len(), 2, "{configured}");
+        assert_eq!(
+            capabilities.sources[0].path,
+            test_wire_path(&memory_root.join("MEMORY.md"))
+        );
+        assert_eq!(
+            capabilities.sources[1].path,
+            test_wire_path(&memory_root.join("topic.md"))
+        );
+    }
+}
+
+#[test]
+fn native_memory_claude_ignores_relative_directory_like_the_native_runtime() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let settings_path = fixture.adapter.project_settings_path();
+    let mut settings: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    settings
+        .as_object_mut()
+        .unwrap()
+        .remove("autoMemoryDirectory");
+    fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+    let default = fixture
+        .adapter
+        .native_memory_capabilities()
+        .unwrap()
+        .sources;
+    for configured in [
+        ".claude/native-memory",
+        "../other-project/memory",
+        "~/../memory",
+    ] {
+        settings["autoMemoryDirectory"] = json!(configured);
+        fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(
+            fixture
+                .adapter
+                .native_memory_capabilities()
+                .unwrap()
+                .sources,
+            default,
+            "{configured}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_memory_claude_rejects_linked_directories_even_with_a_trailing_separator() {
+    use std::os::unix::fs::symlink;
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let target = fixture.root.join("real memory");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("MEMORY.md"), "# Not selected\n").unwrap();
+    let linked = fixture.root.join("linked memory");
+    symlink(&target, &linked).unwrap();
+    let settings_path = fixture.adapter.project_settings_path();
+    for configured in ["~/linked memory/", "~/linked memory/missing/"] {
+        fs::write(
+            &settings_path,
+            serde_json::to_vec(&json!({"autoMemoryDirectory": configured})).unwrap(),
+        )
+        .unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        assert!(matches!(
+            capabilities.disable,
+            NativeMemoryDisable::Unavailable
+        ));
+        assert!(capabilities.sources.is_empty());
+    }
+    fs::remove_file(target.join("MEMORY.md")).unwrap();
+    fs::remove_dir(&target).unwrap();
+    fs::write(
+        &settings_path,
+        br#"{"autoMemoryDirectory":"~/linked memory/"}"#,
+    )
+    .unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert!(matches!(
+        capabilities.disable,
+        NativeMemoryDisable::Unavailable
+    ));
+    assert!(capabilities.sources.is_empty());
+}
+
+#[test]
+fn native_memory_claude_normalizes_long_input_before_bounding_the_binding() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let memory_root = fixture.root.join("short memory");
+    fs::create_dir(&memory_root).unwrap();
+    let configured = format!(
+        "{}/{}/short memory",
+        fixture.root.to_str().unwrap().trim_start_matches(r"\\?\"),
+        "segment/../".repeat(500)
+    );
+    assert!(configured.len() > 4096);
+    fs::write(
+        fixture.adapter.project_settings_path(),
+        serde_json::to_vec(&json!({"autoMemoryDirectory": configured})).unwrap(),
+    )
+    .unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert_eq!(
+        capabilities.sources[0].path,
+        test_wire_path(&memory_root.join("MEMORY.md"))
+    );
+    let configured = format!(
+        "{}/discard\0/../short memory",
+        fixture.root.to_str().unwrap().trim_start_matches(r"\\?\")
+    );
+    fs::write(
+        fixture.adapter.project_settings_path(),
+        serde_json::to_vec(&json!({"autoMemoryDirectory": configured})).unwrap(),
+    )
+    .unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert_eq!(
+        capabilities.sources[0].path,
+        test_wire_path(&memory_root.join("MEMORY.md"))
+    );
+
+    let configured = format!(
+        "{}{}",
+        fixture.root.to_str().unwrap().trim_start_matches(r"\\?\"),
+        "/leaf".repeat(1000)
+    );
+    fs::write(
+        fixture.adapter.project_settings_path(),
+        serde_json::to_vec(&json!({"autoMemoryDirectory": configured})).unwrap(),
+    )
+    .unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert!(matches!(
+        capabilities.disable,
+        NativeMemoryDisable::Unavailable
+    ));
+    assert!(capabilities.sources.is_empty());
+}
+
+#[test]
 fn native_memory_claude_supported_absent_project_settings_plans_exact_creation_and_rollback() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     fs::remove_file(fixture.adapter.project_settings_path()).unwrap();
     let project_root = fixture.root.join("project with spaces");
     let project_key = project_root
         .to_string_lossy()
+        .trim_start_matches(r"\\?\")
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '-' {
@@ -1265,6 +1969,7 @@ fn native_memory_claude_absent_project_settings_parent_watches_without_creating_
     let project_root = fixture.root.join("project with spaces");
     let project_key = project_root
         .to_string_lossy()
+        .trim_start_matches(r"\\?\")
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '-' {
@@ -1312,7 +2017,7 @@ fn native_memory_claude_managed_directory_is_the_only_effective_watch_binding() 
         fixture.root.join("managed-settings.json"),
         serde_json::to_vec(&json!({
             "autoMemoryEnabled": true,
-            "autoMemoryDirectory": managed_root.to_string_lossy(),
+            "autoMemoryDirectory": managed_root.to_string_lossy().trim_start_matches(r"\\?\"),
         }))
         .unwrap(),
     )
@@ -1336,6 +2041,19 @@ fn native_memory_claude_managed_directory_is_the_only_effective_watch_binding() 
             .contains(".claude/native-memory")
     }));
 
+    let settings_path = fixture.adapter.project_settings_path();
+    let mut settings: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    settings
+        .as_object_mut()
+        .unwrap()
+        .remove("autoMemoryDirectory");
+    fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+    fs::write(fixture.root.join("managed-settings.json"), b"{}").unwrap();
+    let default = fixture
+        .adapter
+        .native_memory_capabilities()
+        .unwrap()
+        .sources;
     fs::write(
         fixture.root.join("managed-settings.json"),
         br#"{"autoMemoryEnabled":true,"autoMemoryDirectory":"../sibling-project/memory"}"#,
@@ -1344,9 +2062,9 @@ fn native_memory_claude_managed_directory_is_the_only_effective_watch_binding() 
     let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
     assert!(matches!(
         capabilities.disable,
-        NativeMemoryDisable::Unavailable
+        NativeMemoryDisable::WatchOnly
     ));
-    assert!(capabilities.sources.is_empty());
+    assert_eq!(capabilities.sources, default);
 }
 
 #[test]
@@ -1595,29 +2313,6 @@ fn bridge(_fixture: &Fixture, path: &Path) -> ComponentRecord {
     .unwrap()
 }
 
-fn validation_output(argv: &[String], declaration: Option<&str>) -> Result<Vec<u8>, BoundaryError> {
-    match argv {
-        [mcp, list] if mcp == "mcp" && list == "list" => Ok(declaration
-            .map(|_| b"context-relay: local (stdio)\n".to_vec())
-            .unwrap_or_default()),
-        [mcp, get, name] if mcp == "mcp" && get == "get" && name == "context-relay" => {
-            let body: Value = serde_json::from_str(
-                declaration.ok_or_else(|| BoundaryError::new("missing declaration"))?,
-            )
-            .unwrap();
-            Ok(serde_json::to_vec(&json!({
-                "name": "context-relay",
-                "scope": "user",
-                "type": body["type"],
-                "command": body["command"],
-                "args": body["args"],
-            }))
-            .unwrap())
-        }
-        _ => Err(BoundaryError::new("unexpected validation argv")),
-    }
-}
-
 fn displays(operation: &context_relay_protocol::CliOperation) -> Vec<String> {
     operation
         .arguments
@@ -1698,9 +2393,71 @@ fn native_digest_plan(target: &Path, digest: Sha256Digest) -> NativeTransactionP
         scanner_result_hash: Sha256Digest([8; 32]),
         mutations: vec![],
         cli_mutations: vec![],
+        installed_runtime: None,
         native_memory_registrations: vec![],
         ownership_changes: vec![],
     }
+}
+
+#[test]
+fn bridge_preview_reads_saved_configuration_without_launching_a_harness() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "context relay bridge", b"bridge v1");
+    let intended = bridge(&fixture, &bridge_path);
+    let before = fs::read(&fixture.state_path).unwrap();
+
+    // The fixture executable is intentionally not runnable. Preview needs no
+    // subprocess: Claude's real mcp list/get commands start configured servers.
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+
+    assert_eq!(mutation.expected, None);
+    assert_eq!(fs::read(&fixture.state_path).unwrap(), before);
+}
+
+#[test]
+fn bridge_preview_preserves_exact_saved_argument_boundaries() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let old_path = executable_bridge(&fixture, "old bridge 專案", b"old bridge");
+    let new_path = executable_bridge(&fixture, "new bridge", b"new bridge");
+    let prior = bridge(&fixture, &old_path).body_markdown;
+    let intended = bridge(&fixture, &new_path);
+    let mut state: Value = serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+    state["mcpServers"] = json!({"context-relay": serde_json::from_str::<Value>(&prior).unwrap()});
+    fs::write(&fixture.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+    assert_eq!(mutation.expected.unwrap().canonical_body, prior);
+
+    state["mcpServers"]["context-relay"]["args"] = json!(["--harness claude-code"]);
+    fs::write(&fixture.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let error = fixture
+        .adapter
+        .plan_bridge_cli_mutation(&intended)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+}
+
+fn set_saved_bridge(fixture: &Fixture, body: Option<&str>) {
+    let mut state: Value = serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+    let servers = state
+        .as_object_mut()
+        .unwrap()
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .unwrap();
+    match body {
+        Some(body) => {
+            servers.insert(
+                "context-relay".to_owned(),
+                serde_json::from_str(body).unwrap(),
+            );
+        }
+        None => {
+            servers.remove("context-relay");
+        }
+    }
+    fs::write(&fixture.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
 }
 
 #[test]
@@ -1708,16 +2465,7 @@ fn bridge_cli_plan_binds_exact_declarations_fingerprints_and_user_scope_argv() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let bridge_path = executable_bridge(&fixture, "context relay bridge", b"bridge v1");
     let intended = bridge(&fixture, &bridge_path);
-    let mut validation_argv = Vec::new();
-
-    let mutation = fixture
-        .adapter
-        .plan_bridge_cli_mutation_with_runner(&intended, |argv: &[String]| {
-            validation_argv.push(argv.to_vec());
-            validation_output(argv, None)
-        })
-        .unwrap();
-
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
     assert_eq!(mutation.stable_id, intended.id.to_string());
     assert_eq!(mutation.expected, None);
     let declaration = mutation.intended.unwrap();
@@ -1728,7 +2476,6 @@ fn bridge_cli_plan_binds_exact_declarations_fingerprints_and_user_scope_argv() {
         declaration.fingerprint,
         Sha256Digest(Sha256::digest(declaration.canonical_body.as_bytes()).into())
     );
-    assert_eq!(validation_argv, vec![vec!["mcp", "list"]]);
     assert_eq!(
         displays(&mutation.forward[0]),
         vec![
@@ -1753,25 +2500,13 @@ fn bridge_cli_plan_restores_the_exact_secret_free_managed_prior_declaration() {
     let new_path = executable_bridge(&fixture, "new bridge", b"new bridge");
     let prior = bridge(&fixture, &old_path).body_markdown;
     let intended = bridge(&fixture, &new_path);
-    let mut validation_argv = Vec::new();
-
-    let mutation = fixture
-        .adapter
-        .plan_bridge_cli_mutation_with_runner(&intended, |argv: &[String]| {
-            validation_argv.push(argv.to_vec());
-            validation_output(argv, Some(&prior))
-        })
-        .unwrap();
-
+    set_saved_bridge(&fixture, Some(&prior));
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
     let expected = mutation.expected.unwrap();
     assert_eq!(expected.canonical_body, prior);
     assert_eq!(
         expected.fingerprint,
-        Sha256Digest(Sha256::digest(expected.canonical_body.as_bytes()).into())
-    );
-    assert_eq!(
-        validation_argv,
-        vec![vec!["mcp", "list"], vec!["mcp", "get", "context-relay"]]
+        Sha256Digest(Sha256::digest(prior.as_bytes()).into())
     );
     assert_eq!(
         displays(&mutation.rollback[0]),
@@ -1779,7 +2514,7 @@ fn bridge_cli_plan_restores_the_exact_secret_free_managed_prior_declaration() {
             "mcp",
             "add-json",
             "context-relay",
-            expected.canonical_body.as_str(),
+            prior.as_str(),
             "--scope",
             "user",
         ]
@@ -1787,151 +2522,260 @@ fn bridge_cli_plan_restores_the_exact_secret_free_managed_prior_declaration() {
 }
 
 #[test]
-fn bridge_cli_plan_reports_disabled_and_unmanaged_prior_declarations_as_conflicts() {
+fn bridge_cli_plan_rejects_disabled_secret_bearing_and_unmanaged_saved_declarations() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
-    let old_path = executable_bridge(&fixture, "old bridge", b"old bridge");
-    let intended_path = executable_bridge(&fixture, "intended bridge", b"intended bridge");
-    let old: Value = serde_json::from_str(&bridge(&fixture, &old_path).body_markdown).unwrap();
-    let intended = bridge(&fixture, &intended_path);
-    let rejected = [
-        json!({
-            "name": "context-relay",
-            "scope": "user",
-            "type": "stdio",
-            "command": old["command"],
-            "args": ["--harness", "codex"],
-        }),
-        json!({
-            "name": "context-relay",
-            "scope": "user",
-            "type": "stdio",
-            "command": old["command"],
-            "args": ["--harness", "claude-code"],
-            "enabled": false,
-        }),
-    ];
-
-    for prior in rejected {
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    for (key, value) in [
+        ("args", json!(["--harness", "codex"])),
+        ("args", json!(["--harness claude-code"])),
+        ("enabled", json!(false)),
+        ("env", json!({"TOKEN": "synthetic-secret"})),
+        ("env", json!({})),
+        ("type", json!("http")),
+        ("command", json!("<redacted>")),
+        ("command", json!("relative-bridge")),
+        ("cwd", json!("elsewhere")),
+    ] {
+        let mut prior: Value = serde_json::from_str(&intended.body_markdown).unwrap();
+        prior[key] = value;
+        set_saved_bridge(&fixture, Some(&serde_json::to_string(&prior).unwrap()));
+        let before = fs::read(&fixture.state_path).unwrap();
         let error = fixture
             .adapter
-            .plan_bridge_cli_mutation_with_runner(&intended, |argv: &[String]| match argv {
-                [mcp, list] if (mcp.as_str(), list.as_str()) == ("mcp", "list") => {
-                    Ok(b"context-relay: local (stdio)\n".to_vec())
-                }
-                [mcp, get, name]
-                    if (mcp.as_str(), get.as_str(), name.as_str())
-                        == ("mcp", "get", "context-relay") =>
-                {
-                    Ok(serde_json::to_vec(&prior).unwrap())
-                }
-                _ => panic!("unexpected validation argv: {argv:?}"),
-            })
+            .plan_bridge_cli_mutation(&intended)
             .unwrap_err();
-
-        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(error.code, ErrorCode::Conflict, "{key}");
+        assert_eq!(fs::read(&fixture.state_path).unwrap(), before);
     }
 }
 
 #[test]
-fn bridge_cli_plan_rejects_malformed_redacted_secret_bearing_and_unmanaged_prior_state() {
+fn bridge_cli_plan_rejects_malformed_or_duplicate_native_json() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
-    let bridge_path = executable_bridge(&fixture, "intended bridge", b"bridge");
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
     let intended = bridge(&fixture, &bridge_path);
-    let invalid_get_outputs = [
-        (b"not-json".to_vec(), ErrorCode::InvalidRequest),
-        (
-            serde_json::to_vec(&json!({
-                "name": "context-relay",
-                "scope": "user",
-                "type": "stdio",
-                "command": "<redacted>",
-                "args": ["--harness", "claude-code"],
-            }))
-            .unwrap(),
-            ErrorCode::InvalidRequest,
-        ),
-        (
-            serde_json::to_vec(&json!({
-                "name": "context-relay",
-                "scope": "user",
-                "type": "stdio",
-                "command": "/old/bridge",
-                "args": ["--harness", "claude-code"],
-                "env": {"TOKEN": "secret"},
-            }))
-            .unwrap(),
-            ErrorCode::Conflict,
-        ),
-        (
-            serde_json::to_vec(&json!({
-                "name": "context-relay",
-                "scope": "user",
-                "type": "http",
-                "command": "/old/bridge",
-                "args": ["--harness", "claude-code"],
-            }))
-            .unwrap(),
-            ErrorCode::Conflict,
-        ),
-    ];
-
-    for (get_output, expected_code) in invalid_get_outputs {
-        let mut calls = 0;
+    for state in [
+        "not-json",
+        "[]",
+        r#"{"mcpServers":null}"#,
+        r#"{"projects":[]}"#,
+        r#"{"mcpServers":{},"mcpServers":{}}"#,
+        r#"{"mcpServers":{"context-relay":{},"context-relay":{}}}"#,
+        r#"{"mcpServers":{"context-relay":{"command":"first","command":"second"}}}"#,
+    ] {
+        fs::write(&fixture.state_path, state).unwrap();
         let error = fixture
             .adapter
-            .plan_bridge_cli_mutation_with_runner(&intended, |argv: &[String]| {
-                calls += 1;
-                match argv {
-                    [mcp, list] if mcp == "mcp" && list == "list" => {
-                        Ok(b"context-relay: local (stdio)\n".to_vec())
-                    }
-                    [mcp, get, name] if mcp == "mcp" && get == "get" && name == "context-relay" => {
-                        Ok(get_output.clone())
-                    }
-                    _ => Err(BoundaryError::new("unexpected validation argv")),
-                }
-            })
+            .plan_bridge_cli_mutation(&intended)
             .unwrap_err();
-
-        assert_eq!(calls, 2);
-        assert_eq!(error.code, expected_code);
+        assert_eq!(error.code, ErrorCode::InvalidRequest, "{state}");
         assert!(!error.retryable);
     }
 }
 
 #[test]
-fn cli_executor_runs_only_exact_approved_argv_and_read_only_validation() {
+fn bridge_cli_plan_rejects_project_and_local_shadowing_without_modifying_them() {
+    for project_file in [false, true] {
+        let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+        let intended = bridge(&fixture, &bridge_path);
+        set_saved_bridge(&fixture, Some(&intended.body_markdown));
+        let declaration: Value = serde_json::from_str(&intended.body_markdown).unwrap();
+        let path = if project_file {
+            let path = fixture.root.join("project with spaces/.mcp.json");
+            fs::write(
+                &path,
+                serde_json::to_vec(&json!({"mcpServers":{"context-relay":declaration}})).unwrap(),
+            )
+            .unwrap();
+            path
+        } else {
+            let mut state: Value =
+                serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+            let project = state["projects"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .next()
+                .unwrap();
+            project["mcpServers"]["context-relay"] = declaration;
+            fs::write(&fixture.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+            fixture.state_path.clone()
+        };
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            fixture
+                .adapter
+                .plan_bridge_cli_mutation(&intended)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn bridge_cli_plan_bounds_native_configuration_and_rejects_non_files() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    fs::write(&fixture.state_path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+    assert!(fixture.adapter.plan_bridge_cli_mutation(&intended).is_err());
+    fs::remove_file(&fixture.state_path).unwrap();
+    // Absent state is a valid first connection, not an inspection error.
+    assert_eq!(
+        fixture
+            .adapter
+            .plan_bridge_cli_mutation(&intended)
+            .unwrap()
+            .expected,
+        None
+    );
+    fs::create_dir(&fixture.state_path).unwrap();
+    assert!(fixture.adapter.plan_bridge_cli_mutation(&intended).is_err());
+}
+
+#[test]
+fn bridge_preview_does_not_mistake_ignored_user_settings_for_managed_mcp_state() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    set_saved_bridge(&fixture, Some(&intended.body_markdown));
+    let policy = fixture.root.join("managed-mcp.json");
+    fs::write(&policy, br#"{"mcpServers":{}}"#).unwrap();
+    assert!(fixture.adapter.plan_bridge_cli_mutation(&intended).is_err());
+    fs::remove_file(&policy).unwrap();
+    fs::create_dir(&policy).unwrap();
+    assert!(fixture.adapter.plan_bridge_cli_mutation(&intended).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn bridge_preview_detects_the_local_scope_key_written_by_windows_claude() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    let mut state: Value = serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+    let projects = state["projects"].as_object_mut().unwrap();
+    let native_key = projects.keys().next().unwrap().clone();
+    let mut project = projects.remove(&native_key).unwrap();
+    project["mcpServers"]["context-relay"] = serde_json::from_str(&intended.body_markdown).unwrap();
+    // Captured from actual Claude 2.1.202 local-scope add-json on Windows.
+    let cli_key = native_key
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&native_key)
+        .replace('\\', "/");
+    projects.insert(cli_key, project);
+    fs::write(&fixture.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    assert_eq!(
+        fixture
+            .adapter
+            .plan_bridge_cli_mutation(&intended)
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+}
+
+#[cfg(windows)]
+fn use_claude_project_key(fixture: &Fixture, conflict: bool) {
+    let mut state: Value = serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+    let projects = state["projects"].as_object_mut().unwrap();
+    let key = projects.keys().next().unwrap().clone();
+    let mut project = projects.remove(&key).unwrap();
+    if conflict {
+        project["enabledMcpjsonServers"] = json!(["docs"]);
+        project["disabledMcpjsonServers"] = json!(["docs"]);
+    }
+    let cli_key = key.strip_prefix(r"\\?\").unwrap_or(&key).replace('\\', "/");
+    projects.insert(cli_key, project);
+    fs::write(&fixture.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_probe_recognizes_existing_claude_project_trust() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    use_claude_project_key(&fixture, false);
+    let report = fixture
+        .adapter
+        .probe(&ProbeContext {
+            harness: HarnessId::ClaudeCode,
+            requested_profile: None,
+        })
+        .unwrap();
+    assert!(
+        !report
+            .policy_conflicts
+            .iter()
+            .any(|value| value == "project_unapproved")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_probe_does_not_skip_claude_project_approval_conflicts() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    use_claude_project_key(&fixture, true);
+    let report = fixture
+        .adapter
+        .probe(&ProbeContext {
+            harness: HarnessId::ClaudeCode,
+            requested_profile: None,
+        })
+        .unwrap();
+    assert!(
+        report
+            .policy_conflicts
+            .iter()
+            .any(|value| value == "project_mcp_approval_conflict")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_import_includes_claude_local_project_servers() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    use_claude_project_key(&fixture, false);
+    let imported = fixture
+        .adapter
+        .import(&ImportRequest {
+            scopes: vec![NativeScope::Project {
+                project_id: fixture.project_id,
+                root: fixture.adapter.project_root_wire(),
+            }],
+            include_disabled: true,
+        })
+        .unwrap();
+    assert!(
+        imported
+            .components
+            .iter()
+            .any(|component| component.name == "local-only")
+    );
+}
+
+#[test]
+fn cli_executor_runs_only_approved_mutations_and_reads_back_the_saved_declaration() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");
     let intended = bridge(&fixture, &bridge_path);
-    let mut planning_runner = |argv: &[String]| validation_output(argv, None);
-    let mutation = fixture
-        .adapter
-        .plan_bridge_cli_mutation_with_runner(&intended, &mut planning_runner)
-        .unwrap();
-    let mut operation_argv = Vec::new();
-    let mut validation_argv = Vec::new();
-    let body = intended.body_markdown.clone();
-    let applied = Rc::new(Cell::new(false));
-    let operation_applied = Rc::clone(&applied);
-    let validation_applied = Rc::clone(&applied);
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+    let before: Value = serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+    let mut operations = Vec::new();
     let (probed, outcome) = {
-        let mut executor = fixture.adapter.cli_executor_with_runners(
-            |argv: &[String]| {
-                operation_argv.push(argv.to_vec());
-                operation_applied.set(true);
-                Ok::<Vec<u8>, BoundaryError>(Vec::new())
-            },
-            |argv: &[String]| {
-                validation_argv.push(argv.to_vec());
-                validation_output(argv, validation_applied.get().then_some(body.as_str()))
-            },
-        );
-        let probed = executor.probe_cli_mutation(&mutation).unwrap();
-        let outcome = executor.apply_cli_mutation(&mutation).unwrap();
-        (probed, outcome)
+        let mut executor = fixture.adapter.cli_executor_with_runner(|argv: &[String]| {
+            operations.push(argv.to_vec());
+            set_saved_bridge(&fixture, Some(&argv[3]));
+            Ok::<Vec<u8>, BoundaryError>(Vec::new())
+        });
+        (
+            executor.probe_cli_mutation(&mutation).unwrap(),
+            executor.apply_cli_mutation(&mutation).unwrap(),
+        )
     };
-
     assert_eq!(probed, None);
     assert_eq!(outcome.command_error, None);
     assert_eq!(
@@ -1939,25 +2783,161 @@ fn cli_executor_runs_only_exact_approved_argv_and_read_only_validation() {
         mutation.intended.as_ref().map(|value| value.fingerprint)
     );
     assert_eq!(
-        operation_argv,
+        operations,
         vec![vec![
             "mcp",
             "add-json",
             "context-relay",
             intended.body_markdown.as_str(),
             "--scope",
-            "user",
+            "user"
         ]]
     );
-    assert!(
-        validation_argv
-            .iter()
-            .all(|argv| { argv == &["mcp", "list"] || argv == &["mcp", "get", "context-relay"] })
+    let saved: Value = serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+    assert_eq!(saved["oauthAccount"], before["oauthAccount"]);
+    assert_eq!(saved["projects"], before["projects"]);
+}
+
+#[test]
+fn cli_executor_detects_a_command_that_did_not_write_the_intended_declaration() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+    let mut executor = fixture.adapter.cli_executor_with_runner(|_: &[String]| {
+        Ok::<_, BoundaryError>(b"Added stdio MCP server context-relay to user config\n".to_vec())
+    });
+    let outcome = executor.apply_cli_mutation(&mutation).unwrap();
+    assert_eq!(outcome.resulting_fingerprint, None);
+}
+
+#[test]
+fn cli_executor_rejects_a_different_configuration_project_or_home_after_preview() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+    for change in 0..3 {
+        let config = fixture.root.join(if change == 0 {
+            "other config"
+        } else {
+            "custom claude config"
+        });
+        let project = fixture.root.join(if change == 1 {
+            "other project"
+        } else {
+            "project with spaces"
+        });
+        let home = if change == 2 {
+            fixture.root.join("other home")
+        } else {
+            fixture.root.clone()
+        };
+        fs::create_dir_all(&config).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let device = DeviceId::from_str(DEVICE_ID).unwrap();
+        let adapter = ClaudeCodeAdapter::from_layout(
+            ClaudeCodeLayout {
+                executable: fixture.root.join(if cfg!(windows) {
+                    "claude.exe"
+                } else {
+                    "claude"
+                }),
+                version: "2.1.214".into(),
+                installation_method: InstallationMethod::PackageManager,
+                user_home: home,
+                state_path: config.join(".claude.json"),
+                config_dir: config,
+                project_root: project,
+                managed_settings_paths: vec![fixture.root.join("managed-settings.json")],
+            },
+            fixture.project_id,
+            device,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device),
+        )
+        .unwrap();
+        let mut executor =
+            adapter.cli_executor_with_runner(|_: &[String]| -> Result<Vec<u8>, BoundaryError> {
+                panic!("a different command context must not launch the CLI")
+            });
+        assert!(
+            executor
+                .compare_cli_targets(std::slice::from_ref(&mutation))
+                .is_err()
+        );
+        assert!(executor.apply_cli_mutation(&mutation).is_err());
+        assert!(executor.restore_cli_mutation_if_matches(&mutation).is_err());
+    }
+}
+
+#[test]
+fn claude_reprobe_and_executor_reject_legacy_unbound_cli_mutations() {
+    let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    let mut mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+    let executable = fixture.root.join(if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    });
+    let hash = Sha256Digest(Sha256::digest(fs::read(&executable).unwrap()).into());
+    let mut plan = native_digest_plan(&executable, hash);
+    plan.cli_mutations = vec![mutation.clone()];
+    fixture.adapter.reprobe_live_state(&plan).unwrap();
+    mutation.execution_context = None;
+    plan.cli_mutations = vec![mutation.clone()];
+    assert!(fixture.adapter.reprobe_live_state(&plan).is_err());
+    let mut executor = fixture.adapter.cli_executor_with_runner(
+        |_: &[String]| -> Result<Vec<u8>, BoundaryError> {
+            panic!("legacy unbound mutation must not launch the CLI")
+        },
     );
-    assert!(operation_argv.iter().chain(&validation_argv).all(|argv| {
-        argv.first()
-            .is_some_and(|program| program != bridge_path.to_str().unwrap())
-    }));
+    assert!(executor.probe_cli_mutation(&mutation).is_err());
+    assert!(
+        executor
+            .compare_cli_targets(std::slice::from_ref(&mutation))
+            .is_err()
+    );
+    assert!(executor.apply_cli_mutation(&mutation).is_err());
+    assert!(executor.restore_cli_mutation_if_matches(&mutation).is_err());
+    assert!(
+        executor
+            .finish_committed_cli_mutations(&[mutation])
+            .is_err()
+    );
+}
+
+#[test]
+fn claude_executor_rejects_legacy_inferred_home_context_before_launch() {
+    use context_relay_core::native_transaction::CliExecutionContext;
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    let mut mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+    let Some(CliExecutionContext::ClaudeCodeV2 {
+        config_dir,
+        state_path,
+        project_root,
+        ..
+    }) = mutation.execution_context.take()
+    else {
+        panic!("new preview must bind home")
+    };
+    mutation.execution_context = Some(CliExecutionContext::ClaudeCodeV1 {
+        config_dir,
+        state_path,
+        project_root,
+    });
+    let mut executor = fixture.adapter.cli_executor_with_runner(
+        |_: &[String]| -> Result<Vec<u8>, BoundaryError> {
+            panic!("legacy inferred home must not launch")
+        },
+    );
+    assert!(executor.probe_cli_mutation(&mutation).is_err());
+    assert!(executor.apply_cli_mutation(&mutation).is_err());
+    assert!(executor.restore_cli_mutation_if_matches(&mutation).is_err());
 }
 
 #[test]
@@ -1966,26 +2946,16 @@ fn cli_executor_restores_only_while_live_declaration_equals_intended() {
     let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");
     let divergent_path = executable_bridge(&fixture, "divergent bridge", b"divergent");
     let intended = bridge(&fixture, &bridge_path);
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
     let divergent = bridge(&fixture, &divergent_path).body_markdown;
-    let mut planning_runner = |argv: &[String]| validation_output(argv, None);
-    let mutation = fixture
-        .adapter
-        .plan_bridge_cli_mutation_with_runner(&intended, &mut planning_runner)
-        .unwrap();
-    let mut operation_calls = 0;
-    let outcome = {
-        let mut executor = fixture.adapter.cli_executor_with_runners(
-            |_: &[String]| {
-                operation_calls += 1;
-                Ok::<Vec<u8>, BoundaryError>(Vec::new())
-            },
-            |argv: &[String]| validation_output(argv, Some(&divergent)),
-        );
-        executor.restore_cli_mutation_if_matches(&mutation).unwrap()
-    };
-
+    set_saved_bridge(&fixture, Some(&divergent));
+    let mut executor = fixture.adapter.cli_executor_with_runner(
+        |_: &[String]| -> Result<Vec<u8>, BoundaryError> {
+            panic!("divergent state must not execute a command")
+        },
+    );
+    let outcome = executor.restore_cli_mutation_if_matches(&mutation).unwrap();
     assert!(!outcome.restored);
-    assert_eq!(operation_calls, 0);
     assert_eq!(
         outcome.resulting_fingerprint,
         Some(Sha256Digest(Sha256::digest(divergent.as_bytes()).into()))
@@ -1997,102 +2967,31 @@ fn cli_executor_runs_the_exact_rollback_after_intended_state_matches() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");
     let intended = bridge(&fixture, &bridge_path);
-    let mut planning_runner = |argv: &[String]| validation_output(argv, None);
-    let mutation = fixture
-        .adapter
-        .plan_bridge_cli_mutation_with_runner(&intended, &mut planning_runner)
-        .unwrap();
-    let present = Rc::new(Cell::new(true));
-    let operation_present = Rc::clone(&present);
-    let validation_present = Rc::clone(&present);
-    let rollback_argv = Rc::new(std::cell::RefCell::new(Vec::new()));
-    let recorded_argv = Rc::clone(&rollback_argv);
-    let body = intended.body_markdown.clone();
-    let mut executor = fixture.adapter.cli_executor_with_runners(
-        |argv: &[String]| {
-            recorded_argv.borrow_mut().push(argv.to_vec());
-            operation_present.set(false);
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
+    set_saved_bridge(&fixture, Some(&intended.body_markdown));
+    let mut operations = Vec::new();
+    let outcome = {
+        let mut executor = fixture.adapter.cli_executor_with_runner(|argv: &[String]| {
+            operations.push(argv.to_vec());
+            set_saved_bridge(&fixture, None);
             Ok::<Vec<u8>, BoundaryError>(Vec::new())
-        },
-        |argv: &[String]| {
-            validation_output(argv, validation_present.get().then_some(body.as_str()))
-        },
-    );
-
-    let outcome = executor.restore_cli_mutation_if_matches(&mutation).unwrap();
-
+        });
+        executor.restore_cli_mutation_if_matches(&mutation).unwrap()
+    };
     assert!(outcome.restored);
     assert_eq!(outcome.resulting_fingerprint, None);
     assert_eq!(
-        rollback_argv.borrow().as_slice(),
-        &[vec!["mcp", "remove", "context-relay", "--scope", "user"]]
+        operations,
+        vec![vec!["mcp", "remove", "context-relay", "--scope", "user"]]
     );
 }
 
 #[test]
-fn cli_executor_rechecks_non_link_harness_executable_before_any_runner() {
+fn cli_executor_rechecks_harness_executable_before_any_mutation() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");
     let intended = bridge(&fixture, &bridge_path);
-    let mut planning_runner = |argv: &[String]| validation_output(argv, None);
-    let mutation = fixture
-        .adapter
-        .plan_bridge_cli_mutation_with_runner(&intended, &mut planning_runner)
-        .unwrap();
-    fs::write(
-        fixture.root.join("replacement claude"),
-        b"replacement executable",
-    )
-    .unwrap();
-    let harness_name = if cfg!(windows) {
-        "claude.exe"
-    } else {
-        "claude"
-    };
-    #[cfg(unix)]
-    {
-        let _ = harness_name;
-        fs::remove_file(fixture.root.join("claude")).unwrap();
-        std::os::unix::fs::symlink(
-            fixture.root.join("replacement claude"),
-            fixture.root.join("claude"),
-        )
-        .unwrap();
-    }
-    #[cfg(windows)]
-    // Symlink creation is privileged on Windows; tamper the attested
-    // executable's content instead, which the digest recheck must catch.
-    fs::write(fixture.root.join(harness_name), b"changed executable").unwrap();
-    let runner_calls = Rc::new(Cell::new(0));
-    let operation_calls = Rc::clone(&runner_calls);
-    let validation_calls = Rc::clone(&runner_calls);
-    let comparison = {
-        let mut executor = fixture.adapter.cli_executor_with_runners(
-            |_: &[String]| {
-                operation_calls.set(operation_calls.get() + 1);
-                Ok::<Vec<u8>, BoundaryError>(Vec::new())
-            },
-            |_: &[String]| {
-                validation_calls.set(validation_calls.get() + 1);
-                Ok::<Vec<u8>, BoundaryError>(Vec::new())
-            },
-        );
-        executor.compare_cli_targets(std::slice::from_ref(&mutation))
-    };
-    assert!(comparison.is_err());
-    assert_eq!(runner_calls.get(), 0);
-}
-
-#[test]
-fn cli_executor_rechecks_harness_executable_digest_before_any_runner() {
-    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
-    let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");
-    let intended = bridge(&fixture, &bridge_path);
-    let mut planning_runner = |argv: &[String]| validation_output(argv, None);
-    let mutation = fixture
-        .adapter
-        .plan_bridge_cli_mutation_with_runner(&intended, &mut planning_runner)
-        .unwrap();
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
     fs::write(
         fixture.root.join(if cfg!(windows) {
             "claude.exe"
@@ -2102,80 +3001,67 @@ fn cli_executor_rechecks_harness_executable_digest_before_any_runner() {
         b"changed executable",
     )
     .unwrap();
-    let runner_calls = Rc::new(Cell::new(0));
-    let operation_calls = Rc::clone(&runner_calls);
-    let validation_calls = Rc::clone(&runner_calls);
-    let comparison = {
-        let mut executor = fixture.adapter.cli_executor_with_runners(
-            |_: &[String]| {
-                operation_calls.set(operation_calls.get() + 1);
-                Ok::<Vec<u8>, BoundaryError>(Vec::new())
-            },
-            |_: &[String]| {
-                validation_calls.set(validation_calls.get() + 1);
-                Ok::<Vec<u8>, BoundaryError>(Vec::new())
-            },
-        );
-        executor.compare_cli_targets(std::slice::from_ref(&mutation))
-    };
-    assert!(comparison.is_err());
-    assert_eq!(runner_calls.get(), 0);
+    let mut executor = fixture.adapter.cli_executor_with_runner(
+        |_: &[String]| -> Result<Vec<u8>, BoundaryError> {
+            panic!("changed executable reached mutation")
+        },
+    );
+    assert!(
+        executor
+            .compare_cli_targets(std::slice::from_ref(&mutation))
+            .is_err()
+    );
+    assert!(executor.apply_cli_mutation(&mutation).is_err());
 }
 
 #[cfg(unix)]
 #[test]
 fn verified_runner_rejects_path_substitution_before_execution() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    };
-
     struct SubstitutingRunner {
         executable: PathBuf,
         original: PathBuf,
         replacement: PathBuf,
-        executions: Arc<AtomicU64>,
     }
-
     impl ClaudeCodeCommandRunner for SubstitutingRunner {
         fn before_launch(&mut self, _: &[String]) -> Result<(), BoundaryError> {
-            fs::rename(&self.executable, &self.original)
-                .map_err(|_| BoundaryError::new("fixture rename failed"))?;
-            fs::rename(&self.replacement, &self.executable)
-                .map_err(|_| BoundaryError::new("fixture substitution failed"))
+            fs::rename(&self.executable, &self.original).unwrap();
+            fs::rename(&self.replacement, &self.executable).unwrap();
+            Ok(())
         }
-
         fn run(&mut self, _: VerifiedClaudeCommand<'_>) -> Result<Vec<u8>, BoundaryError> {
-            self.executions.fetch_add(1, Ordering::Relaxed);
-            Ok(Vec::new())
+            panic!("substituted executable reached launch")
         }
     }
-
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let bridge_path = executable_bridge(&fixture, "configured bridge", b"bridge");
     let intended = bridge(&fixture, &bridge_path);
+    let mutation = fixture.adapter.plan_bridge_cli_mutation(&intended).unwrap();
     let executable = fixture.root.join("claude");
     let replacement = fixture.root.join("replacement claude");
     fs::write(&replacement, fs::read(&executable).unwrap()).unwrap();
-    let executions = Arc::new(AtomicU64::new(0));
     let runner = SubstitutingRunner {
-        executable: executable.clone(),
+        executable,
         original: fixture.root.join("original claude"),
         replacement,
-        executions: Arc::clone(&executions),
     };
+    let outcome = fixture
+        .adapter
+        .cli_executor_with_runner(runner)
+        .apply_cli_mutation(&mutation)
+        .unwrap();
+    assert!(outcome.command_error.is_some());
+    assert_eq!(outcome.resulting_fingerprint, None);
+}
 
-    assert!(
-        fixture
-            .adapter
-            .plan_bridge_cli_mutation_with_runner(&intended, runner)
-            .is_err()
-    );
-    assert_eq!(
-        executions.load(Ordering::Relaxed),
-        0,
-        "substituted executable reached the runner launch boundary"
-    );
+#[cfg(unix)]
+#[test]
+fn passive_preview_rejects_a_link_instead_of_treating_it_as_absence() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let bridge_path = executable_bridge(&fixture, "bridge", b"bridge");
+    let intended = bridge(&fixture, &bridge_path);
+    fs::remove_file(&fixture.state_path).unwrap();
+    std::os::unix::fs::symlink(fixture.root.join("missing"), &fixture.state_path).unwrap();
+    assert!(fixture.adapter.plan_bridge_cli_mutation(&intended).is_err());
 }
 
 #[test]

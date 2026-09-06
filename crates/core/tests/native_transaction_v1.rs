@@ -201,6 +201,7 @@ fn plan() -> NativeTransactionPlan {
             ),
         ],
         cli_mutations: vec![],
+        installed_runtime: None,
         native_memory_registrations: vec![],
         ownership_changes: vec![],
     };
@@ -887,6 +888,30 @@ fn run_with_faults(
     );
     let result = engine.apply(plan, now_ms, clock());
     (state, result)
+}
+
+#[test]
+fn retained_runtime_requires_an_adapter_binding_before_any_transaction_work() {
+    let mut candidate = plan();
+    candidate.installed_runtime = Some(
+        serde_json::from_value(serde_json::json!({
+            "kind": "hermesPythonV1", "runtime": {
+                "schemaVersion": 1, "storageKey": "context-relay-hermes-runtime-Abc123",
+                "manifestIdentity": Sha256Digest([71; 32]),
+            }
+        }))
+        .unwrap(),
+    );
+    let (state, result) = run(&candidate, false, None, 1_800_000_000_000);
+    assert!(!state.borrow().journal_lock_acquired);
+    assert!(state.borrow().completed.is_empty());
+    assert_eq!(state.borrow().live_writes, 0);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("adapter does not own")
+    );
 }
 
 #[test]

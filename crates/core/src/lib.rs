@@ -12,6 +12,9 @@ pub mod setup;
 pub mod sync;
 pub mod vault;
 
+#[cfg(all(test, windows))]
+mod test_windows_process;
+
 use context_relay_protocol::{PROTOCOL_VERSION, ProtocolVersion};
 
 #[derive(Debug, PartialEq, Eq)]

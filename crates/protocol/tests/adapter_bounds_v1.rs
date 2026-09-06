@@ -38,6 +38,7 @@ fn component() -> ComponentRecord {
 
 fn probe_report() -> ProbeReport {
     ProbeReport {
+        codex_saved_hook_approval: None,
         executable: Some(native_value()),
         executable_sha256: Some(Sha256Digest([0; 32])),
         harness_version: Some("1.0".into()),
@@ -47,6 +48,37 @@ fn probe_report() -> ProbeReport {
         policy_conflicts: vec!["conflict".into()],
         capability: CapabilityLevel::Full,
     }
+}
+
+#[test]
+fn saved_hook_approval_is_a_strict_nullable_settings_report() {
+    let mut value = serde_json::to_value(probe_report()).unwrap();
+    for state in [
+        "missing",
+        "needs_approval",
+        "approved",
+        "changed",
+        "disabled",
+    ] {
+        value["codexSavedHookApproval"] = serde_json::json!({"sessionStart": state, "stop": state});
+        let report: ProbeReport = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(report).unwrap(), value);
+    }
+    for invalid in [
+        serde_json::json!({"sessionStart": "connected", "stop": "approved"}),
+        serde_json::json!({"sessionStart": "approved"}),
+        serde_json::json!({"sessionStart": "approved", "stop": "approved", "connected": true}),
+    ] {
+        value["codexSavedHookApproval"] = invalid;
+        assert!(serde_json::from_value::<ProbeReport>(value.clone()).is_err());
+    }
+    value["codexSavedHookApproval"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<ProbeReport>(value.clone()).is_ok());
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("codexSavedHookApproval");
+    assert!(serde_json::from_value::<ProbeReport>(value).is_err());
 }
 
 fn rendered_file() -> RenderedFile {

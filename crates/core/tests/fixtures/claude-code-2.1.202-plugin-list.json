@@ -1,0 +1,11 @@
+[
+  {
+    "id": "relay-probe@relay-qualification",
+    "version": "1.0.0",
+    "scope": "user",
+    "enabled": true,
+    "installPath": "C:\\Fixture\\claude\\plugins\\cache\\relay-qualification\\relay-probe\\1.0.0",
+    "installedAt": "2026-09-05T19:04:53.101Z",
+    "lastUpdated": "2026-09-05T19:04:53.101Z"
+  }
+]

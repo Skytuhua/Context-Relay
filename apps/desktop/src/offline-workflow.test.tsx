@@ -15,6 +15,20 @@ import type { WorkspaceGateway } from './workspace';
 const id = (suffix: string) => `018f22e2-79b0-7cc8-98c4-dc0c0c0739${suffix}`;
 
 class FakeWorkspaceGateway implements WorkspaceGateway {
+  async harnessPrepare(): Promise<never> { throw new Error('Not used'); }
+  async harnessPreparationStatus(): Promise<never> { throw new Error('Not used'); }
+  async harnessPreparationCancel(): Promise<never> { throw new Error('Not used'); }
+  async harnessPreparedPreview(): Promise<never> { throw new Error('Not used'); }
+  async harnessExecutionCurrent() { return null; }
+  async harnessSetupsList() { return { setups: [], nextAfter: null }; }
+  async harnessSetupGet(): Promise<never> { throw new Error('Not used'); }
+  async harnessExecutionStart(): Promise<never> { throw new Error('Not used'); }
+  async harnessExecutionStatus(): Promise<never> { throw new Error('Not used'); }
+  async pendingWrites() { return { writes: [], nextCursor: null }; }
+  async pendingWrite() { return null; }
+  async retryWrite() { return { cleanupPending: false }; }
+  async forgetWrite() {}
+  async chooseProjectFolder() { return null; }
   networkCalls = 0;
   private projectsValue: ProjectIdentity[] = [];
   private memoriesValue: MemoryRecord[] = [];
@@ -44,7 +58,7 @@ class FakeWorkspaceGateway implements WorkspaceGateway {
 
   async status(): Promise<StatusOutput> {
     return {
-      protocol: { min: { major: 1, minor: 4 }, max: { major: 1, minor: 4 } },
+      protocol: { min: { major: 1, minor: 10 }, max: { major: 1, minor: 10 } },
       vault: 'unlocked',
       resolvedProject: null,
       sync: 'offline',
@@ -54,6 +68,19 @@ class FakeWorkspaceGateway implements WorkspaceGateway {
 
   async devices() {
     return [];
+  }
+
+  async harnessProbe(): Promise<never> { throw new Error('Harness discovery unavailable in offline fixture'); }
+  async harnessPreview(): Promise<never> {
+    throw new Error('not used in this workflow');
+  }
+
+  async harnessApply(): Promise<never> {
+    throw new Error('not used in this workflow');
+  }
+
+  async harnessRollback(): Promise<never> {
+    throw new Error('not used in this workflow');
   }
 
   async createPairingInvite(): Promise<never> {
@@ -242,45 +269,45 @@ it('keeps daemon-owned project, review, and task state after the offline desktop
   };
   const gateway = new FakeWorkspaceGateway();
   render(<App gateway={gateway} />);
-  expect(await screen.findByText('Offline')).toBeVisible();
+  expect(await screen.findByText('Ready on this computer')).toBeVisible();
 
   fireEvent.click(screen.getByRole('button', { name: 'Projects' }));
   fireEvent.change(screen.getByRole('textbox', { name: 'Project name' }), {
     target: { value: 'Context Relay' },
   });
-  fireEvent.change(screen.getByRole('textbox', { name: 'Local path' }), {
+  fireEvent.change(screen.getByRole('textbox', { name: 'Project folder' }), {
     target: { value: 'C:\\work\\context-relay' },
   });
   fireEvent.submit(screen.getByRole('form', { name: 'Add project' }));
   expect(await screen.findByText('Context Relay')).toBeVisible();
 
-  fireEvent.click(screen.getByRole('button', { name: 'Memory' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Saved context' }));
   fireEvent.change(screen.getByRole('textbox', { name: 'Title' }), {
     target: { value: 'Portable validator' },
   });
-  fireEvent.change(screen.getByRole('textbox', { name: 'Memory' }), {
+  fireEvent.change(screen.getByRole('textbox', { name: 'What should your harness remember?' }), {
     target: { value: 'Keep platform output strict' },
   });
-  fireEvent.submit(screen.getByRole('form', { name: 'New memory' }));
+  fireEvent.submit(screen.getByRole('form', { name: 'New context' }));
   expect(await screen.findByText('Portable validator')).toBeVisible();
 
   fireEvent.click(screen.getByRole('button', { name: 'Edit Portable validator' }));
   fireEvent.change(screen.getByRole('textbox', { name: 'Edit title' }), {
     target: { value: 'Portable report validator' },
   });
-  fireEvent.submit(screen.getByRole('form', { name: 'Edit memory' }));
+  fireEvent.submit(screen.getByRole('form', { name: 'Edit context' }));
   expect(await screen.findByText('Portable report validator')).toBeVisible();
 
-  fireEvent.change(screen.getByRole('searchbox', { name: 'Search memory' }), {
+  fireEvent.change(screen.getByRole('searchbox', { name: 'Search saved context' }), {
     target: { value: 'strict' },
   });
-  fireEvent.submit(screen.getByRole('search', { name: 'Memory search' }));
+  fireEvent.submit(screen.getByRole('search', { name: 'Context search' }));
   expect(await screen.findByText('Portable report validator')).toBeVisible();
   fireEvent.click(screen.getByRole('button', { name: 'Archive Portable report validator' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Confirm archive' }));
   expect(await screen.findByText('Memory archived')).toBeVisible();
 
-  fireEvent.click(screen.getByRole('button', { name: 'Review queue' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Suggestions' }));
   expect(await screen.findByText('Candidate memory')).toBeVisible();
   fireEvent.click(screen.getByRole('button', { name: 'Accept Candidate memory' }));
   expect(await screen.findByText('Candidate accepted')).toBeVisible();

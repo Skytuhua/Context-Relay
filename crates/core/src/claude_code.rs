@@ -13,13 +13,23 @@ use context_relay_native_runner::{NativeState, OsNativeFileSystem};
 use context_relay_protocol::{
     ApplyReceipt, CapabilityLevel, ChangeClass, ClassifiedChanges, CliOperation, CliOperations,
     ClientError, ComponentKind, ComponentRecord, DesiredState, DeviceId, DiscoveredScopes,
-    ErrorCode, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest, ImportedState,
-    InstallationMethod, NativePlatform, NativeScope, ProbeContext, ProbeReport, ProjectId,
-    Provenance, RecordId, RenderedFile, RenderedState, ScopeRef, SemanticDiff, Sha256Digest,
-    ValidationReport, WireNativeValue,
+    ErrorCode, ExpectedNativeDigest, HarnessAdapter, HarnessId, HybridLogicalClock, ImportRequest,
+    ImportedState, InstallationMethod, NativePlatform, NativeScope, ProbeContext, ProbeReport,
+    ProjectId, Provenance, RecordId, RenderedFile, RenderedState, ScopeRef, SemanticDiff,
+    Sha256Digest, ValidationReport, WireNativeValue,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+
+mod mcp_state;
+use mcp_state::McpConfiguration;
+pub(crate) use mcp_state::parse_unique_json;
+mod command_context;
+use command_context::ClaudeCommandContext;
+mod memory_path;
+mod memory_repository;
+#[cfg(all(test, windows))]
+mod session_tests;
 
 use crate::mcp::install::{
     BRIDGE_SERVER_NAME, is_canonical_bridge_body, is_managed_bridge_component,
@@ -41,8 +51,7 @@ use crate::native_transaction::{
 const SUPPORTED_VERSIONS: [&str; 2] = ["2.1.214", "2.1.213"];
 const CLI_TIMEOUT_MS: u32 = 30_000;
 const CLI_OUTPUT_LIMIT: u64 = 64 * 1024;
-// Each configured name adds one sequential `mcp get` subprocess, so keep
-// effective validation bounded independently of the generic adapter DTO limit.
+// Bound the combined native MCP inventory independently of the adapter DTO limit.
 const MAX_MCP_VALIDATION_NAMES: usize = 64;
 const MANAGED_START: &str = "<!-- context-relay:start -->";
 const MANAGED_END: &str = "<!-- context-relay:end -->";
@@ -71,6 +80,7 @@ pub struct ClaudeCodeLayout {
     pub executable: PathBuf,
     pub version: String,
     pub installation_method: InstallationMethod,
+    pub user_home: PathBuf,
     pub config_dir: PathBuf,
     pub state_path: PathBuf,
     pub project_root: PathBuf,
@@ -112,29 +122,24 @@ impl ClaudeCodeCommandRunner for ClaudeCodeProcessRunner {
     }
 }
 
-pub struct ClaudeCodeCliExecutor<'a, O, V> {
+pub struct ClaudeCodeCliExecutor<'a, O> {
     adapter: &'a ClaudeCodeAdapter,
     operation_runner: O,
-    validation_runner: V,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ClaudeCommand {
-    Doctor,
+    Version,
     PluginList,
-    McpList,
-    McpGet(String),
 }
 
 impl ClaudeCommand {
     fn argv(&self) -> Vec<String> {
         match self {
-            Self::Doctor => vec!["doctor".to_owned()],
+            Self::Version => vec!["--version".to_owned()],
             Self::PluginList => {
                 vec!["plugin".to_owned(), "list".to_owned(), "--json".to_owned()]
             }
-            Self::McpList => vec!["mcp".to_owned(), "list".to_owned()],
-            Self::McpGet(name) => vec!["mcp".to_owned(), "get".to_owned(), name.clone()],
         }
     }
 }
@@ -150,7 +155,40 @@ impl ClaudeCodeAdapter {
         origin_device: DeviceId,
         observed_hlc: HybridLogicalClock,
     ) -> Result<Self, ClientError> {
-        let project_root = project_root.into();
+        Self::discover_inner(
+            project_root.into(),
+            project_id,
+            origin_device,
+            observed_hlc,
+            None,
+        )
+    }
+
+    /// Rechecks discovery without launching the harness. The saved version is
+    /// valid only for the exact executable path and bytes approved in preview.
+    pub fn discover_for_registration(
+        project_root: impl Into<PathBuf>,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        approved: &context_relay_protocol::SetupPlan,
+    ) -> Result<Self, ClientError> {
+        Self::discover_inner(
+            project_root.into(),
+            project_id,
+            origin_device,
+            observed_hlc,
+            Some(approved),
+        )
+    }
+
+    fn discover_inner(
+        project_root: PathBuf,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        approved: Option<&context_relay_protocol::SetupPlan>,
+    ) -> Result<Self, ClientError> {
         let executable = find_executable().ok_or_else(|| {
             client_error(
                 ErrorCode::NotFound,
@@ -158,21 +196,13 @@ impl ClaudeCodeAdapter {
                 false,
             )
         })?;
-        let executable_hash = digest_file(&executable)?;
-        let output = run_bounded_command(&executable, &["--version"], executable_hash)?;
-        let version =
-            parse_version(std::str::from_utf8(&output).unwrap_or_default()).ok_or_else(|| {
-                client_error(
-                    ErrorCode::HarnessUnsupported,
-                    "Claude Code returned an invalid version",
-                    false,
-                )
-            })?;
-        parse_doctor_output(&run_bounded_command(
-            &executable,
-            &["doctor"],
-            executable_hash,
-        )?)?;
+        if env::var_os("CLAUDE_CODE_CUSTOM_OAUTH_URL").is_some_and(|value| !value.is_empty()) {
+            return Err(client_error(
+                ErrorCode::HarnessUnsupported,
+                "Claude Code custom OAuth state is not supported",
+                false,
+            ));
+        }
         let home = home_dir().ok_or_else(|| {
             client_error(
                 ErrorCode::NotFound,
@@ -188,9 +218,24 @@ impl ClaudeCodeAdapter {
         } else {
             home.join(".claude.json")
         };
-        Self::from_layout(
+        let command_context =
+            ClaudeCommandContext::new(&config_dir, &state_path, &project_root, &home)?;
+        let executable_hash = digest_file(&executable)?;
+        let version = match approved {
+            Some(approved) => crate::setup::approved_registration_version(
+                approved,
+                HarnessId::ClaudeCode,
+                &wire_path(&executable),
+                executable_hash,
+            )?,
+            None => discover_version_with(|arguments| {
+                run_bounded_command(&executable, arguments, executable_hash, &command_context)
+            })?,
+        };
+        let adapter = Self::from_layout(
             ClaudeCodeLayout {
                 installation_method: installation_method(&executable),
+                user_home: home,
                 executable,
                 version,
                 config_dir,
@@ -201,7 +246,17 @@ impl ClaudeCodeAdapter {
             project_id,
             origin_device,
             observed_hlc,
-        )
+        )?;
+        if let Some(approved) = approved {
+            crate::setup::approved_registration_version(
+                approved,
+                HarnessId::ClaudeCode,
+                &wire_path(&adapter.layout.executable),
+                adapter.executable_hash,
+            )?;
+            adapter.revalidate_memory_binding()?;
+        }
+        Ok(adapter)
     }
 
     pub fn from_layout(
@@ -229,6 +284,29 @@ impl ClaudeCodeAdapter {
 
     pub fn project_root_wire(&self) -> WireNativeValue {
         wire_path(&self.layout.project_root)
+    }
+
+    fn command_context(&self) -> Result<ClaudeCommandContext, ClientError> {
+        ClaudeCommandContext::new(
+            &self.layout.config_dir,
+            &self.layout.state_path,
+            &self.layout.project_root,
+            &self.layout.user_home,
+        )
+    }
+
+    fn validate_cli_context(&self, mutation: &ApprovedCliMutation) -> Result<(), BoundaryError> {
+        let context = self
+            .command_context()
+            .map_err(|_| BoundaryError::new("Claude Code configuration binding is invalid"))?;
+        if mutation.execution_context.as_ref() != Some(&context.approval_binding()) {
+            return Err(BoundaryError::new(
+                "Claude Code command context differs from the approved setup; request a new preview",
+            ));
+        }
+        context
+            .validate()
+            .map_err(|_| BoundaryError::new("Claude Code configuration binding changed"))
     }
 
     pub fn project_settings_path(&self) -> PathBuf {
@@ -389,23 +467,16 @@ impl ClaudeCodeAdapter {
         &self,
         intended: &ComponentRecord,
     ) -> Result<ApprovedCliMutation, ClientError> {
-        self.plan_bridge_cli_mutation_with_runner(intended, ClaudeCodeProcessRunner)
-    }
-
-    pub fn plan_bridge_cli_mutation_with_runner(
-        &self,
-        intended: &ComponentRecord,
-        mut validation_runner: impl ClaudeCodeCommandRunner,
-    ) -> Result<ApprovedCliMutation, ClientError> {
         self.require_apply_supported()?;
         if !is_managed_bridge_component(HarnessId::ClaudeCode, intended) {
             return Err(invalid_request(
                 "Claude Code CLI mutation requires the managed bridge",
             ));
         }
+        self.command_context()?.validate()?;
         self.recheck_executable_client()?;
         let expected = self
-            .probe_managed_declaration(&mut validation_runner)
+            .probe_managed_declaration()
             .map_err(|error| match error {
                 BridgeDeclarationProbeError::Conflict => client_error(
                     ErrorCode::Conflict,
@@ -418,6 +489,7 @@ impl ClaudeCodeAdapter {
             })?;
         let intended_declaration = canonical_cli_declaration(&intended.body_markdown)?;
         Ok(ApprovedCliMutation {
+            execution_context: Some(self.command_context()?.approval_binding()),
             stable_id: intended.id.to_string(),
             forward: vec![self.declaration_operation(Some(&intended_declaration))],
             rollback: vec![self.declaration_operation(expected.as_ref())],
@@ -426,25 +498,17 @@ impl ClaudeCodeAdapter {
         })
     }
 
-    pub fn cli_executor(
-        &self,
-    ) -> ClaudeCodeCliExecutor<'_, ClaudeCodeProcessRunner, ClaudeCodeProcessRunner> {
-        self.cli_executor_with_runners(ClaudeCodeProcessRunner, ClaudeCodeProcessRunner)
+    pub fn cli_executor(&self) -> ClaudeCodeCliExecutor<'_, ClaudeCodeProcessRunner> {
+        self.cli_executor_with_runner(ClaudeCodeProcessRunner)
     }
 
-    pub fn cli_executor_with_runners<O, V>(
-        &self,
-        operation_runner: O,
-        validation_runner: V,
-    ) -> ClaudeCodeCliExecutor<'_, O, V>
+    pub fn cli_executor_with_runner<O>(&self, operation_runner: O) -> ClaudeCodeCliExecutor<'_, O>
     where
         O: ClaudeCodeCommandRunner,
-        V: ClaudeCodeCommandRunner,
     {
         ClaudeCodeCliExecutor {
             adapter: self,
             operation_runner,
-            validation_runner,
         }
     }
 
@@ -459,6 +523,11 @@ impl ClaudeCodeAdapter {
         Ok(())
     }
 
+    pub(crate) fn revalidate_memory_binding(&self) -> Result<(), ClientError> {
+        self.command_context()?.validate()?;
+        self.recheck_executable_client()
+    }
+
     fn recheck_executable_boundary(&self) -> Result<(), BoundaryError> {
         if digest_regular_non_link_file_boundary(&self.layout.executable)? != self.executable_hash {
             return Err(BoundaryError::new("Claude Code executable changed"));
@@ -471,6 +540,12 @@ impl ClaudeCodeAdapter {
         runner: &mut impl ClaudeCodeCommandRunner,
         arguments: &[String],
     ) -> Result<Vec<u8>, BoundaryError> {
+        let context = self
+            .command_context()
+            .map_err(|_| BoundaryError::new("Claude Code configuration binding is invalid"))?;
+        context
+            .validate()
+            .map_err(|_| BoundaryError::new("Claude Code configuration binding changed"))?;
         let executable =
             open_verified_claude_executable(&self.layout.executable, self.executable_hash)?;
         runner.before_launch(arguments)?;
@@ -482,6 +557,7 @@ impl ClaudeCodeAdapter {
             executable: &executable,
             launch,
             arguments,
+            context,
         })
     }
 
@@ -515,26 +591,13 @@ impl ClaudeCodeAdapter {
 
     fn probe_managed_declaration(
         &self,
-        validation_runner: &mut impl ClaudeCodeCommandRunner,
     ) -> Result<Option<CanonicalCliDeclaration>, BridgeDeclarationProbeError> {
-        let list_argv = vec!["mcp".to_owned(), "list".to_owned()];
-        let listed = self
-            .run_verified(validation_runner, &list_argv)
+        self.command_context()
+            .and_then(|context| context.validate())
             .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
-        let names =
-            parse_mcp_list_output(&listed).map_err(|_| BridgeDeclarationProbeError::Inspection)?;
-        if !names.contains(BRIDGE_SERVER_NAME) {
-            return Ok(None);
-        }
-        let get_argv = vec![
-            "mcp".to_owned(),
-            "get".to_owned(),
-            BRIDGE_SERVER_NAME.to_owned(),
-        ];
-        let output = self
-            .run_verified(validation_runner, &get_argv)
-            .map_err(|_| BridgeDeclarationProbeError::Inspection)?;
-        parse_managed_mcp_get_output(&output)
+        McpConfiguration::read(&self.layout)
+            .map_err(|_| BridgeDeclarationProbeError::Inspection)?
+            .managed_declaration()
     }
 
     pub(crate) fn capability(&self) -> CapabilityLevel {
@@ -583,32 +646,12 @@ impl ClaudeCodeAdapter {
     }
 
     fn validation_commands(&self) -> Result<Vec<ClaudeCommand>, ClientError> {
-        Ok(validation_commands(self.imported_mcp_names()?))
+        self.imported_mcp_names()?;
+        Ok(validation_commands())
     }
 
     fn imported_mcp_names(&self) -> Result<Vec<String>, ClientError> {
-        let mut names = BTreeSet::new();
-        if let Some(bytes) = read_optional_file(&self.layout.state_path)? {
-            let state = parse_object(&bytes, "Claude Code MCP configuration is invalid")?;
-            collect_mcp_names(state.get("mcpServers"), &mut names)?;
-            collect_mcp_names(
-                state
-                    .get("projects")
-                    .and_then(Value::as_object)
-                    .and_then(|projects| {
-                        projects.get(self.layout.project_root.to_string_lossy().as_ref())
-                    })
-                    .and_then(Value::as_object)
-                    .and_then(|project| project.get("mcpServers")),
-                &mut names,
-            )?;
-        }
-        let path = self.layout.project_root.join(".mcp.json");
-        if let Some(bytes) = read_optional_file(&path)? {
-            let value = parse_object(&bytes, "Claude Code MCP configuration is invalid")?;
-            collect_mcp_names(value.get("mcpServers"), &mut names)?;
-        }
-        Ok(names.into_iter().collect())
+        McpConfiguration::read(&self.layout)?.names()
     }
 
     fn import_scope(
@@ -828,17 +871,9 @@ impl ClaudeCodeAdapter {
         components: &mut Vec<ComponentRecord>,
         digests: &mut BTreeSet<Sha256Digest>,
     ) -> Result<(), ClientError> {
-        let Some(bytes) = read_optional_file(&self.layout.state_path)? else {
-            return Ok(());
-        };
-        let value = parse_object(&bytes, "Claude Code state is invalid")?;
+        let value = mcp_state::read_object(&self.layout.state_path)?;
         let servers = if let Some(project) = project {
-            value
-                .get("projects")
-                .and_then(Value::as_object)
-                .and_then(|projects| projects.get(project.to_string_lossy().as_ref()))
-                .and_then(Value::as_object)
-                .and_then(|project| project.get("mcpServers"))
+            mcp_state::project_entry(&value, project)?.and_then(|project| project.get("mcpServers"))
         } else {
             value.get("mcpServers")
         };
@@ -1026,7 +1061,16 @@ impl ClaudeCodeAdapter {
 
 impl NativeMemoryAdapter for ClaudeCodeAdapter {
     fn native_memory_capabilities(&self) -> Result<NativeMemoryCapabilities, ClientError> {
-        let path = self.project_settings_path();
+        let configuration = match self.effective_native_memory_settings() {
+            Ok(configuration) => configuration,
+            Err(_) => {
+                return Ok(NativeMemoryCapabilities {
+                    disable: NativeMemoryDisable::Unavailable,
+                    sources: vec![],
+                });
+            }
+        };
+        let path = configuration.disable_path;
         let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str());
         let snapshot = match OsNativeFileSystem::new().snapshot(&path) {
             Ok(snapshot) => Some(snapshot),
@@ -1044,9 +1088,12 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
         let (project_settings, metadata) = match snapshot.as_ref().map(|snapshot| snapshot.state())
         {
             Some(NativeState::RegularFile { bytes, metadata }) => {
-                let settings = match parse_object(bytes, "Claude Code settings are invalid") {
-                    Ok(settings) => settings,
-                    Err(_) => {
+                let settings = match mcp_state::parse_unique_json(bytes)
+                    .ok()
+                    .and_then(|value| value.as_object().cloned())
+                {
+                    Some(settings) if settings == configuration.disable_settings => settings,
+                    _ => {
                         return Ok(NativeMemoryCapabilities {
                             disable: NativeMemoryDisable::Unavailable,
                             sources: vec![],
@@ -1057,17 +1104,13 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
             }
             Some(NativeState::Absent { .. }) | None => (None, None),
         };
-        let (effective_settings, managed) =
-            match self.effective_native_memory_settings(project_settings.as_ref()) {
-                Ok(effective) => effective,
-                Err(_) => {
-                    return Ok(NativeMemoryCapabilities {
-                        disable: NativeMemoryDisable::Unavailable,
-                        sources: vec![],
-                    });
-                }
-            };
-        let Some(memory_root) = self.bound_native_memory_root(&effective_settings, supported)?
+        if project_settings.is_none() && !configuration.disable_settings.is_empty() {
+            return Err(invalid_request(
+                "Claude Code memory settings changed during inspection",
+            ));
+        }
+        let Some(memory_root) =
+            self.bound_native_memory_root(&configuration.effective, supported)?
         else {
             return Ok(NativeMemoryCapabilities {
                 disable: NativeMemoryDisable::Unavailable,
@@ -1075,7 +1118,7 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
             });
         };
         let sources = self.native_memory_sources(&memory_root)?;
-        if !supported || managed {
+        if !supported || configuration.managed {
             let capabilities = NativeMemoryCapabilities {
                 disable: NativeMemoryDisable::WatchOnly,
                 sources,
@@ -1100,10 +1143,36 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
                 });
             }
         };
+        let environment_key = memory_environment_key(&settings)
+            .map_err(|_| invalid_request("Claude Code memory environment is ambiguous"))?
+            .map(str::to_owned);
+        let environment_disabled = !configuration.environment_override
+            || environment_key.as_ref().is_some_and(|key| {
+                settings
+                    .get("env")
+                    .and_then(|env| env.get(key))
+                    .and_then(Value::as_str)
+                    == Some("true")
+            });
         let mutations = match settings.get("autoMemoryEnabled") {
-            Some(Value::Bool(false)) => vec![],
-            Some(Value::Bool(true)) | None => {
+            Some(Value::Bool(false)) if environment_disabled => vec![],
+            Some(Value::Bool(_)) | None => {
                 settings.insert("autoMemoryEnabled".to_owned(), Value::Bool(false));
+                if configuration.environment_override {
+                    // A file-provided false environment value forces native memory
+                    // on even when autoMemoryEnabled is false. Override it in the
+                    // same project/local transaction while preserving other keys.
+                    settings
+                        .entry("env")
+                        .or_insert_with(|| Value::Object(Map::new()))
+                        .as_object_mut()
+                        .expect("validated settings environment")
+                        .insert(
+                            environment_key
+                                .unwrap_or_else(|| "CLAUDE_CODE_DISABLE_AUTO_MEMORY".to_owned()),
+                            Value::String("true".to_owned()),
+                        );
+                }
                 let rendered = serde_json::to_vec(&Value::Object(settings)).map_err(|_| {
                     invalid_request("Claude Code memory settings cannot be rendered")
                 })?;
@@ -1146,51 +1215,31 @@ impl ClaudeCodeAdapter {
             let Some(value) = value.as_str() else {
                 return Ok(None);
             };
-            let configured = Path::new(value);
-            if value.is_empty()
-                || value.len() > 4_096
-                || configured
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            if let Some(configured) =
+                memory_path::configured_directory(value, &self.layout.user_home)
             {
-                return Ok(None);
-            }
-            let root = if configured.is_absolute() {
-                configured.to_path_buf()
-            } else {
-                if configured.components().any(|component| {
-                    matches!(
-                        component,
-                        std::path::Component::RootDir | std::path::Component::Prefix(_)
-                    )
-                }) {
+                // A valid but unrepresentable explicit directory must remain
+                // unavailable, not silently become a different default root.
+                if configured.as_os_str().len() > 4096 {
                     return Ok(None);
                 }
-                self.layout.project_root.join(configured)
-            };
-            return safe_memory_directory_binding(&root);
+                let Some(root) =
+                    memory_path::bind_current_drive(configured, &self.layout.project_root)
+                else {
+                    return Ok(None);
+                };
+                return safe_memory_directory_binding(&root);
+            }
         }
         if !supported {
             return Ok(None);
         }
-        let canonical_project = match fs::canonicalize(&self.layout.project_root) {
-            Ok(path) => path,
-            Err(_) => return Ok(None),
-        };
-        let key = canonical_project
-            .to_string_lossy()
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || character == '-' {
-                    character
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>();
-        if key.is_empty() || key.len() > 4_096 {
+        let Some(repository) = memory_repository::default_root(&self.layout.project_root) else {
             return Ok(None);
-        }
+        };
+        let Some(key) = memory_path::directory_key(&repository) else {
+            return Ok(None);
+        };
         safe_memory_directory_binding(
             &self
                 .layout
@@ -1263,25 +1312,36 @@ impl ClaudeCodeAdapter {
         Ok(sources)
     }
 
-    fn effective_native_memory_settings(
-        &self,
-        project_settings: Option<&Map<String, Value>>,
-    ) -> Result<(Map<String, Value>, bool), ()> {
-        let mut effective = project_settings.cloned().unwrap_or_default();
+    fn effective_native_memory_settings(&self) -> Result<EffectiveMemorySettings, ()> {
+        let project_path = self.project_settings_path();
+        let local_path = project_path.with_file_name("settings.local.json");
+        let user = mcp_state::read_object(&self.layout.config_dir.join("settings.json"))
+            .map_err(|_| ())?;
+        let project = mcp_state::read_object(&project_path).map_err(|_| ())?;
+        let local = mcp_state::read_object(&local_path).map_err(|_| ())?;
+        let local_environment = memory_environment_key(&local)?.is_some();
+        let environment_override = memory_environment_key(&user)?.is_some()
+            | memory_environment_key(&project)?.is_some()
+            | local_environment;
+        let mut effective = Map::new();
+        // File settings for the selected project: user < project < local.
+        // Launch flags, ambient environment and interactive trust need separate runtime
+        // qualification; this does not enable additional supported versions.
+        for settings in [&user, &project, &local] {
+            for key in ["autoMemoryDirectory", "autoMemoryEnabled"] {
+                if let Some(value) = settings.get(key) {
+                    effective.insert(key.to_owned(), value.clone());
+                }
+            }
+        }
         let mut managed = false;
         let mut managed_directory = None::<Value>;
         for path in &self.layout.managed_settings_paths {
-            if !path.is_file() {
-                continue;
-            }
-            let settings = read_optional_file(path)
-                .ok()
-                .flatten()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                .and_then(|value| value.as_object().cloned())
-                .ok_or(())?;
+            let settings = mcp_state::read_object(path).map_err(|_| ())?;
+            let managed_environment = memory_environment_key(&settings)?.is_some();
             managed |= settings.contains_key("autoMemoryEnabled")
-                || settings.contains_key("autoMemoryDirectory");
+                || settings.contains_key("autoMemoryDirectory")
+                || managed_environment;
             if let Some(directory) = settings.get("autoMemoryDirectory") {
                 if managed_directory
                     .as_ref()
@@ -1295,8 +1355,159 @@ impl ClaudeCodeAdapter {
         if let Some(directory) = managed_directory {
             effective.insert("autoMemoryDirectory".to_owned(), directory);
         }
-        Ok((effective, managed))
+        let (disable_path, disable_settings) =
+            if local.contains_key("autoMemoryEnabled") || local_environment {
+                (local_path, local)
+            } else {
+                (project_path, project)
+            };
+        Ok(EffectiveMemorySettings {
+            effective,
+            managed,
+            environment_override,
+            disable_path,
+            disable_settings,
+        })
     }
+
+    fn memory_settings_paths(&self) -> BTreeSet<PathBuf> {
+        let project = self.project_settings_path();
+        [
+            self.layout.config_dir.join("settings.json"),
+            project.with_file_name("settings.local.json"),
+            project,
+        ]
+        .into_iter()
+        .chain(self.layout.managed_settings_paths.iter().cloned())
+        .collect()
+    }
+
+    pub(crate) fn memory_settings_digests(&self) -> Result<Vec<ExpectedNativeDigest>, ClientError> {
+        self.memory_settings_paths()
+            .into_iter()
+            .map(|path| {
+                Ok(ExpectedNativeDigest {
+                    target: wire_path(&path),
+                    expected_digest: mcp_state::read_bytes(&path)?
+                        .map(|bytes| Sha256Digest(Sha256::digest(bytes).into())),
+                })
+            })
+            .collect()
+    }
+
+    fn verify_native_memory_plan_state(
+        &self,
+        plan: &NativeTransactionPlan,
+        final_state: bool,
+    ) -> Result<(), BoundaryError> {
+        if plan.native_memory_registrations.is_empty() {
+            return Ok(());
+        }
+        for current in self
+            .memory_settings_digests()
+            .map_err(|_| BoundaryError::new("Claude Code memory settings cannot be inspected"))?
+        {
+            let expected = plan
+                .setup
+                .expected_native_digests
+                .iter()
+                .find(|expected| expected.target == current.target)
+                .ok_or_else(|| {
+                    BoundaryError::new(
+                        "Claude Code memory settings were not bound; request a new preview",
+                    )
+                })?;
+            if let Some(mutation) = plan
+                .mutations
+                .iter()
+                .find(|mutation| mutation.target == current.target)
+            {
+                let path = decode_wire_path(&current.target)?;
+                let snapshot = OsNativeFileSystem::new().snapshot(&path).map_err(|_| {
+                    BoundaryError::new("Claude Code memory settings cannot be inspected")
+                })?;
+                let fingerprint = RestorableStateFingerprint(Sha256Digest(*snapshot.fingerprint()));
+                if fingerprint != mutation.intended
+                    && (final_state || fingerprint != mutation.expected)
+                {
+                    return Err(BoundaryError::new("Claude Code memory settings changed"));
+                }
+            } else if current.expected_digest != expected.expected_digest {
+                return Err(BoundaryError::new("Claude Code memory settings changed"));
+            }
+        }
+        let capabilities = self
+            .native_memory_capabilities()
+            .map_err(|error| BoundaryError::new(error.message))?;
+        if plan.native_memory_registrations.len() != capabilities.sources.len()
+            || plan
+                .native_memory_registrations
+                .iter()
+                .any(|registration| !capabilities.sources.contains(&registration.source))
+        {
+            return Err(BoundaryError::new(
+                "Claude Code native memory location changed",
+            ));
+        }
+        match capabilities.disable {
+            NativeMemoryDisable::Unavailable => {
+                return Err(BoundaryError::new(
+                    "Claude Code native memory is unavailable",
+                ));
+            }
+            NativeMemoryDisable::WatchOnly => {}
+            NativeMemoryDisable::Supported(required) => {
+                for needed in required {
+                    // Intermediate checks allow the exact approved states in either
+                    // direction. An enabled final state is valid only for undo.
+                    if !plan.mutations.iter().any(|mutation| {
+                        mutation.target == needed.target
+                            && mutation.kind == MutationKind::Payload
+                            && ((!final_state
+                                && mutation.expected == needed.expected
+                                && mutation.intended == needed.intended)
+                                || (mutation.expected == needed.intended
+                                    && mutation.intended == needed.expected))
+                    }) {
+                        return Err(BoundaryError::new("Claude Code memory settings changed"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct EffectiveMemorySettings {
+    effective: Map<String, Value>,
+    managed: bool,
+    environment_override: bool,
+    disable_path: PathBuf,
+    disable_settings: Map<String, Value>,
+}
+
+fn memory_environment_key(settings: &Map<String, Value>) -> Result<Option<&str>, ()> {
+    let Some(environment) = settings.get("env") else {
+        return Ok(None);
+    };
+    let environment = environment.as_object().ok_or(())?;
+    let mut selected = None;
+    for (key, value) in environment {
+        let matches = if cfg!(windows) {
+            key.eq_ignore_ascii_case("CLAUDE_CODE_DISABLE_AUTO_MEMORY")
+        } else {
+            key == "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+        };
+        if matches {
+            // Windows aliases share one process variable. Reject conflicting
+            // spellings rather than depending on JSON iteration/assignment order.
+            if selected.is_some() || !value.is_string() {
+                return Err(());
+            }
+            selected = Some(key.as_str());
+        }
+    }
+    Ok(selected)
 }
 
 fn safely_missing_project_settings(project_root: &Path, settings_path: &Path) -> bool {
@@ -1351,7 +1562,15 @@ fn missing_project_settings_metadata(
         .collect::<Result<Vec<_>, _>>()?;
     siblings.sort();
     for sibling in siblings {
-        if sibling == settings_path {
+        // Recovery keeps adjacent backup/candidate files while undo runs.
+        // They are never user metadata templates (and the native filesystem
+        // deliberately refuses to open its reserved recovery names).
+        if sibling == settings_path
+            || sibling
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.to_ascii_lowercase().starts_with(".context-relay-"))
+        {
             continue;
         }
         let metadata = fs::symlink_metadata(&sibling).map_err(|_| {
@@ -1376,12 +1595,38 @@ fn missing_project_settings_metadata(
 }
 
 fn safe_memory_directory_binding(path: &Path) -> Result<Option<PathBuf>, ClientError> {
+    if mcp_state::validate_config_path(path, true).is_err() {
+        return Ok(None);
+    }
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Ok(None),
         Ok(_) => fs::canonicalize(path)
             .map(Some)
             .map_err(|_| invalid_request("Claude Code memory directory cannot be resolved")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(path.to_path_buf())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Bind missing suffixes through their existing canonical ancestor.
+            // Windows canonicalization adds a verbatim prefix: use the same
+            // spelling before and after the harness creates this directory.
+            for ancestor in path.ancestors().skip(1) {
+                match fs::symlink_metadata(ancestor) {
+                    Ok(metadata) if metadata.is_dir() => {
+                        let canonical = fs::canonicalize(ancestor).map_err(|_| {
+                            invalid_request("Claude Code memory directory cannot be resolved")
+                        })?;
+                        mcp_state::validate_config_path(path, true).map_err(|_| {
+                            invalid_request("Claude Code memory directory topology changed")
+                        })?;
+                        let suffix = path.strip_prefix(ancestor).map_err(|_| {
+                            invalid_request("Claude Code memory directory cannot be resolved")
+                        })?;
+                        return Ok(Some(canonical.join(suffix)));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    _ => return Ok(None),
+                }
+            }
+            Ok(None)
+        }
         Err(_) => Ok(None),
     }
 }
@@ -1397,6 +1642,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             ));
         }
         Ok(ProbeReport {
+            codex_saved_hook_approval: None,
             executable: Some(wire_path(&self.layout.executable)),
             executable_sha256: Some(self.executable_hash),
             harness_version: Some(self.layout.version.clone()),
@@ -1576,10 +1822,16 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     }
 
     fn validate_effective(&self, receipt: &ApplyReceipt) -> Result<ValidationReport, ClientError> {
+        let context = self.command_context()?;
         self.validate_effective_with(receipt, |command| {
             let argv = command.argv();
             let arguments = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            run_bounded_command(&self.layout.executable, &arguments, self.executable_hash)
+            run_bounded_command(
+                &self.layout.executable,
+                &arguments,
+                self.executable_hash,
+                &context,
+            )
         })
     }
 }
@@ -1595,22 +1847,19 @@ impl ClaudeCodeAdapter {
             .map_err(|_| invalid_request("Claude Code receipt is invalid"))?;
         self.require_apply_supported()?;
         let commands = self.validation_commands()?;
-        let mut listed_mcp = BTreeSet::new();
         for command in commands {
             let output = execute(&command)?;
             match command {
-                ClaudeCommand::Doctor => parse_doctor_output(&output)?,
-                ClaudeCommand::PluginList => parse_plugin_list_output(&output)?,
-                ClaudeCommand::McpList => listed_mcp = parse_mcp_list_output(&output)?,
-                ClaudeCommand::McpGet(name) => {
-                    if !listed_mcp.contains(&name) {
-                        return Ok(ValidationReport {
-                            valid: false,
-                            findings: vec!["configured_mcp_server_missing".to_owned()],
-                        });
+                ClaudeCommand::Version => {
+                    if parse_version_output(&output)? != self.layout.version {
+                        return Err(client_error(
+                            ErrorCode::Conflict,
+                            "Claude Code version changed",
+                            false,
+                        ));
                     }
-                    parse_mcp_get_output(&output, &name)?;
                 }
+                ClaudeCommand::PluginList => parse_plugin_list_output(&output)?,
             }
         }
         Ok(ValidationReport {
@@ -1622,6 +1871,9 @@ impl ClaudeCodeAdapter {
 
 impl NativeAdapter for ClaudeCodeAdapter {
     fn reprobe_live_state(&mut self, plan: &NativeTransactionPlan) -> Result<(), BoundaryError> {
+        self.command_context()
+            .and_then(|context| context.validate())
+            .map_err(|_| BoundaryError::new("Claude Code configuration binding changed"))?;
         if self.capability() != CapabilityLevel::Full
             || plan.setup.harness != HarnessId::ClaudeCode
             || plan.setup.harness_version != self.layout.version
@@ -1630,7 +1882,10 @@ impl NativeAdapter for ClaudeCodeAdapter {
         {
             return Err(BoundaryError::new("Claude Code installation changed"));
         }
-        Ok(())
+        for mutation in &plan.cli_mutations {
+            self.validate_cli_context(mutation)?;
+        }
+        self.verify_native_memory_plan_state(plan, false)
     }
 
     fn compare_approved_digests(
@@ -1639,6 +1894,24 @@ impl NativeAdapter for ClaudeCodeAdapter {
     ) -> Result<(), BoundaryError> {
         for expected in &plan.setup.expected_native_digests {
             let path = decode_wire_path(&expected.target)?;
+            // On undo these dependency digests still describe the original
+            // preview. Mutated files instead carry exact restorable pre/post
+            // fingerprints, reversed by the sealed inverse plan.
+            if !plan.native_memory_registrations.is_empty()
+                && self.memory_settings_paths().contains(&path)
+                && let Some(mutation) = plan
+                    .mutations
+                    .iter()
+                    .find(|mutation| mutation.target == expected.target)
+            {
+                let snapshot = OsNativeFileSystem::new().snapshot(&path).map_err(|_| {
+                    BoundaryError::new("Claude Code native state cannot be inspected")
+                })?;
+                if *snapshot.fingerprint() != mutation.expected.0.0 {
+                    return Err(BoundaryError::new("Claude Code native state changed"));
+                }
+                continue;
+            }
             let actual = if path.is_file() {
                 Some(digest_file_boundary(&path)?)
             } else {
@@ -1649,6 +1922,13 @@ impl NativeAdapter for ClaudeCodeAdapter {
             }
         }
         Ok(())
+    }
+
+    fn verify_live_state_reservation(
+        &mut self,
+        plan: &NativeTransactionPlan,
+    ) -> Result<(), BoundaryError> {
+        self.reprobe_live_state(plan)
     }
 
     fn validate_staged_output(
@@ -1682,14 +1962,13 @@ impl NativeAdapter for ClaudeCodeAdapter {
                 "Claude Code effective state differs from the plan",
             ));
         }
-        Ok(())
+        self.verify_native_memory_plan_state(plan, true)
     }
 }
 
-impl<O, V> NativeCliExecutor for ClaudeCodeCliExecutor<'_, O, V>
+impl<O> NativeCliExecutor for ClaudeCodeCliExecutor<'_, O>
 where
     O: ClaudeCodeCommandRunner,
-    V: ClaudeCodeCommandRunner,
 {
     fn probe_cli_mutation(
         &mut self,
@@ -1697,9 +1976,7 @@ where
     ) -> Result<Option<Sha256Digest>, BoundaryError> {
         self.adapter.recheck_executable_boundary()?;
         self.validate_mutation(mutation)?;
-        let live = self
-            .adapter
-            .probe_managed_declaration(&mut self.validation_runner)?;
+        let live = self.adapter.probe_managed_declaration()?;
         Ok(declaration_fingerprint(live.as_ref()))
     }
 
@@ -1710,9 +1987,7 @@ where
         self.adapter.recheck_executable_boundary()?;
         for mutation in mutations {
             self.validate_mutation(mutation)?;
-            let live = self
-                .adapter
-                .probe_managed_declaration(&mut self.validation_runner)?;
+            let live = self.adapter.probe_managed_declaration()?;
             if declaration_fingerprint(live.as_ref())
                 != declaration_fingerprint(mutation.expected.as_ref())
             {
@@ -1730,9 +2005,7 @@ where
     ) -> Result<CliMutationOutcome, BoundaryError> {
         self.adapter.recheck_executable_boundary()?;
         self.validate_mutation(mutation)?;
-        let live = self
-            .adapter
-            .probe_managed_declaration(&mut self.validation_runner)?;
+        let live = self.adapter.probe_managed_declaration()?;
         if declaration_fingerprint(live.as_ref())
             != declaration_fingerprint(mutation.expected.as_ref())
         {
@@ -1742,9 +2015,7 @@ where
             });
         }
         let command_error = self.run_operations(&mutation.forward).err();
-        let resulting = self
-            .adapter
-            .probe_managed_declaration(&mut self.validation_runner)?;
+        let resulting = self.adapter.probe_managed_declaration()?;
         Ok(CliMutationOutcome {
             resulting_fingerprint: declaration_fingerprint(resulting.as_ref()),
             command_error,
@@ -1757,9 +2028,7 @@ where
     ) -> Result<CliRestoreOutcome, BoundaryError> {
         self.adapter.recheck_executable_boundary()?;
         self.validate_mutation(mutation)?;
-        let live = self
-            .adapter
-            .probe_managed_declaration(&mut self.validation_runner)?;
+        let live = self.adapter.probe_managed_declaration()?;
         if declaration_fingerprint(live.as_ref())
             != declaration_fingerprint(mutation.intended.as_ref())
         {
@@ -1769,9 +2038,7 @@ where
             });
         }
         self.run_operations(&mutation.rollback)?;
-        let resulting = self
-            .adapter
-            .probe_managed_declaration(&mut self.validation_runner)?;
+        let resulting = self.adapter.probe_managed_declaration()?;
         Ok(CliRestoreOutcome {
             restored: declaration_fingerprint(resulting.as_ref())
                 == declaration_fingerprint(mutation.expected.as_ref()),
@@ -1786,9 +2053,7 @@ where
         self.adapter.recheck_executable_boundary()?;
         for mutation in mutations {
             self.validate_mutation(mutation)?;
-            let live = self
-                .adapter
-                .probe_managed_declaration(&mut self.validation_runner)?;
+            let live = self.adapter.probe_managed_declaration()?;
             if declaration_fingerprint(live.as_ref())
                 != declaration_fingerprint(mutation.intended.as_ref())
             {
@@ -1801,12 +2066,12 @@ where
     }
 }
 
-impl<O, V> ClaudeCodeCliExecutor<'_, O, V>
+impl<O> ClaudeCodeCliExecutor<'_, O>
 where
     O: ClaudeCodeCommandRunner,
-    V: ClaudeCodeCommandRunner,
 {
     fn validate_mutation(&self, mutation: &ApprovedCliMutation) -> Result<(), BoundaryError> {
+        self.adapter.validate_cli_context(mutation)?;
         if mutation.expected.is_none() && mutation.intended.is_none() {
             return Err(BoundaryError::new(
                 "Claude Code CLI mutation has no declaration",
@@ -1918,14 +2183,8 @@ fn settings_path(adapter: &ClaudeCodeAdapter, scope: &ScopeRef) -> Result<PathBu
     }
 }
 
-fn validation_commands(mcp_names: Vec<String>) -> Vec<ClaudeCommand> {
-    let mut commands = vec![
-        ClaudeCommand::Doctor,
-        ClaudeCommand::PluginList,
-        ClaudeCommand::McpList,
-    ];
-    commands.extend(mcp_names.into_iter().map(ClaudeCommand::McpGet));
-    commands
+fn validation_commands() -> Vec<ClaudeCommand> {
+    vec![ClaudeCommand::Version, ClaudeCommand::PluginList]
 }
 
 fn collect_mcp_names(
@@ -1953,14 +2212,16 @@ fn run_bounded_command(
     executable: &Path,
     arguments: &[&str],
     expected_hash: Sha256Digest,
+    context: &ClaudeCommandContext,
 ) -> Result<Vec<u8>, ClientError> {
-    run_bounded_command_with_hook(executable, arguments, expected_hash, || {})
+    run_bounded_command_with_hook(executable, arguments, expected_hash, context, || {})
 }
 
 fn run_bounded_command_with_hook(
     executable: &Path,
     arguments: &[&str],
     expected_hash: Sha256Digest,
+    context: &ClaudeCommandContext,
     before_spawn: impl FnOnce(),
 ) -> Result<Vec<u8>, ClientError> {
     let executable = open_verified_claude_executable(executable, expected_hash)
@@ -1969,24 +2230,26 @@ fn run_bounded_command_with_hook(
     executable
         .revalidate_before_launch()
         .map_err(|_| client_error(ErrorCode::Conflict, "Claude Code executable changed", false))?;
-    run_bounded_verified_command(&executable, arguments)
+    run_bounded_verified_command(&executable, arguments, context)
 }
 
 fn run_bounded_verified_command(
     executable: &VerifiedClaudeExecutable,
     arguments: &[&str],
+    context: &ClaudeCommandContext,
 ) -> Result<Vec<u8>, ClientError> {
     executable
         .revalidate_before_launch()
         .map_err(|_| client_error(ErrorCode::Conflict, "Claude Code executable changed", false))?;
     let launch = executable.prepare_launch()?;
-    run_prepared_claude_command(launch, &executable.source_path, arguments)
+    run_prepared_claude_command(launch, &executable.source_path, arguments, context)
 }
 
 fn run_prepared_claude_command(
     launch: PreparedClaudeLaunch,
     original_path: &Path,
     arguments: &[&str],
+    context: &ClaudeCommandContext,
 ) -> Result<Vec<u8>, ClientError> {
     #[cfg(windows)]
     if launch.source_path.as_path() != original_path {
@@ -2004,6 +2267,7 @@ fn run_prepared_claude_command(
         )
     })?;
     let mut command = Command::new(launch.program());
+    context.configure(&mut command, arguments)?;
     command
         .args(arguments)
         .stdin(Stdio::null())
@@ -2301,6 +2565,7 @@ pub struct VerifiedClaudeCommand<'a> {
     executable: &'a VerifiedClaudeExecutable,
     launch: PreparedClaudeLaunch,
     arguments: &'a [String],
+    context: ClaudeCommandContext,
 }
 
 impl VerifiedClaudeCommand<'_> {
@@ -2314,9 +2579,15 @@ impl VerifiedClaudeCommand<'_> {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        run_prepared_claude_command(self.launch, &self.executable.source_path, &arguments).map_err(
-            |_| BoundaryError::new("Claude Code command failed at the native transaction boundary"),
+        run_prepared_claude_command(
+            self.launch,
+            &self.executable.source_path,
+            &arguments,
+            &self.context,
         )
+        .map_err(|_| {
+            BoundaryError::new("Claude Code command failed at the native transaction boundary")
+        })
     }
 }
 
@@ -2520,15 +2791,17 @@ fn bounded_utf8(bytes: &[u8]) -> Result<&str, ClientError> {
         .map_err(|_| invalid_request("Claude Code command output is not UTF-8"))
 }
 
-fn parse_doctor_output(bytes: &[u8]) -> Result<(), ClientError> {
-    (bounded_utf8(bytes)?.trim() == "Claude Code diagnostics: OK")
-        .then_some(())
-        .ok_or_else(|| invalid_request("Claude Code doctor output is invalid"))
+fn parse_version_output(bytes: &[u8]) -> Result<String, ClientError> {
+    let output = bounded_utf8(bytes)?.trim();
+    let version = parse_version(output)
+        .filter(|version| output == format!("{version} (Claude Code)"))
+        .ok_or_else(|| invalid_request("Claude Code version output is invalid"))?;
+    Ok(version)
 }
 
 fn parse_plugin_list_output(bytes: &[u8]) -> Result<(), ClientError> {
     bounded_utf8(bytes)?;
-    let plugins = serde_json::from_slice::<Value>(bytes)
+    let plugins = mcp_state::parse_unique_json(bytes)
         .ok()
         .and_then(|value| value.as_array().cloned())
         .filter(|plugins| plugins.len() <= 256)
@@ -2537,11 +2810,65 @@ fn parse_plugin_list_output(bytes: &[u8]) -> Result<(), ClientError> {
         let plugin = plugin
             .as_object()
             .ok_or_else(|| invalid_request("Claude Code plugin output is invalid"))?;
-        let allowed = ["id", "version", "enabled", "errors"];
-        if plugin.keys().any(|key| !allowed.contains(&key.as_str()))
-            || plugin.len() != allowed.len()
-        {
+        let allowed = [
+            "id",
+            "version",
+            "enabled",
+            "errors",
+            "scope",
+            "installPath",
+            "installedAt",
+            "lastUpdated",
+            "projectPath",
+            "mcpServers",
+            "notes",
+        ];
+        if plugin.keys().any(|key| !allowed.contains(&key.as_str())) {
             return Err(invalid_request("Claude Code plugin output is invalid"));
+        }
+        if let Some(scope) = plugin.get("scope") {
+            if !matches!(
+                scope.as_str(),
+                Some("user" | "project" | "local" | "session")
+            ) || !bounded_plugin_text(plugin.get("installPath"), 4096)
+            {
+                return Err(invalid_request("Claude Code plugin output is invalid"));
+            }
+        } else if plugin.len() != 4 || !plugin.contains_key("errors") {
+            // Keep the previous four-field contract readable while accepting
+            // the actual installed-plugin metadata emitted by current Claude.
+            return Err(invalid_request("Claude Code plugin output is invalid"));
+        }
+        for field in ["projectPath", "installedAt", "lastUpdated"] {
+            if plugin.contains_key(field) && !bounded_plugin_text(plugin.get(field), 4096) {
+                return Err(invalid_request("Claude Code plugin output is invalid"));
+            }
+        }
+        if let Some(notes) = plugin.get("notes") {
+            let notes = notes
+                .as_array()
+                .filter(|notes| notes.len() <= 64)
+                .ok_or_else(|| invalid_request("Claude Code plugin output is invalid"))?;
+            if notes
+                .iter()
+                .any(|note| !bounded_plugin_text(Some(note), 4096))
+            {
+                return Err(invalid_request("Claude Code plugin output is invalid"));
+            }
+        }
+        if let Some(servers) = plugin.get("mcpServers") {
+            let servers = servers
+                .as_object()
+                .filter(|servers| servers.len() <= MAX_MCP_VALIDATION_NAMES)
+                .ok_or_else(|| invalid_request("Claude Code plugin output is invalid"))?;
+            for (name, body) in servers {
+                safe_name(name)?;
+                if !body.is_object() {
+                    return Err(invalid_request("Claude Code plugin output is invalid"));
+                }
+            }
+            // This output can include credentials. Validate shape only: never
+            // return the configuration or incorporate it into error messages.
         }
         safe_name(
             plugin
@@ -2561,8 +2888,7 @@ fn parse_plugin_list_output(bytes: &[u8]) -> Result<(), ClientError> {
             || plugin.get("enabled").and_then(Value::as_bool).is_none()
             || plugin
                 .get("errors")
-                .and_then(Value::as_array)
-                .is_none_or(|errors| !errors.is_empty())
+                .is_some_and(|errors| errors.as_array().is_none_or(|errors| !errors.is_empty()))
         {
             return Err(invalid_request("Claude Code plugin output is invalid"));
         }
@@ -2570,102 +2896,10 @@ fn parse_plugin_list_output(bytes: &[u8]) -> Result<(), ClientError> {
     Ok(())
 }
 
-fn parse_mcp_list_output(bytes: &[u8]) -> Result<BTreeSet<String>, ClientError> {
-    let output = bounded_utf8(bytes)?;
-    let mut names = BTreeSet::new();
-    for line in output.lines() {
-        let (name, detail) = line
-            .split_once(": ")
-            .ok_or_else(|| invalid_request("Claude Code MCP list output is invalid"))?;
-        safe_name(name)?;
-        let (endpoint, kind) = detail
-            .rsplit_once(" (")
-            .filter(|(_, kind)| kind.ends_with(')'))
-            .ok_or_else(|| invalid_request("Claude Code MCP list output is invalid"))?;
-        if endpoint.is_empty()
-            || endpoint.len() > 2_048
-            || endpoint.chars().any(char::is_control)
-            || kind.len() < 2
-            || kind.len() > 33
-            || !kind[..kind.len() - 1]
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            || !names.insert(name.to_owned())
-        {
-            return Err(invalid_request("Claude Code MCP list output is invalid"));
-        }
-    }
-    Ok(names)
-}
-
-fn parse_mcp_get_output(bytes: &[u8], expected_name: &str) -> Result<(), ClientError> {
-    bounded_utf8(bytes)?;
-    let server = serde_json::from_slice::<Value>(bytes)
-        .ok()
-        .and_then(|value| value.as_object().cloned())
-        .ok_or_else(|| invalid_request("Claude Code MCP get output is invalid"))?;
-    if server
-        .keys()
-        .any(|key| !["name", "type", "url"].contains(&key.as_str()))
-        || server.len() != 3
-        || server.get("name").and_then(Value::as_str) != Some(expected_name)
-    {
-        return Err(invalid_request("Claude Code MCP get output is invalid"));
-    }
-    safe_name(expected_name)?;
-    for key in ["type", "url"] {
-        let value = server
-            .get(key)
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_request("Claude Code MCP get output is invalid"))?;
-        if value.is_empty() || value.len() > 2_048 || value.chars().any(char::is_control) {
-            return Err(invalid_request("Claude Code MCP get output is invalid"));
-        }
-    }
-    Ok(())
-}
-
-fn parse_managed_mcp_get_output(
-    bytes: &[u8],
-) -> Result<Option<CanonicalCliDeclaration>, BridgeDeclarationProbeError> {
-    bounded_utf8(bytes).map_err(|_| BridgeDeclarationProbeError::Inspection)?;
-    let server = serde_json::from_slice::<Value>(bytes)
-        .ok()
-        .and_then(|value| value.as_object().cloned())
-        .ok_or(BridgeDeclarationProbeError::Inspection)?;
-    if server.get("enabled") == Some(&Value::Bool(false)) {
-        return Err(BridgeDeclarationProbeError::Conflict);
-    }
-    if server.len() != 5
-        || server
-            .keys()
-            .any(|key| !["name", "scope", "type", "command", "args"].contains(&key.as_str()))
-    {
-        return Err(if server.contains_key("env") {
-            BridgeDeclarationProbeError::Conflict
-        } else {
-            BridgeDeclarationProbeError::Inspection
-        });
-    }
-    if server.get("name").and_then(Value::as_str) != Some(BRIDGE_SERVER_NAME) {
-        return Err(BridgeDeclarationProbeError::Inspection);
-    }
-    if server.get("scope").and_then(Value::as_str) != Some("user") {
-        return Err(BridgeDeclarationProbeError::Conflict);
-    }
-    if server.get("command").and_then(Value::as_str) == Some("<redacted>") {
-        return Err(BridgeDeclarationProbeError::Inspection);
-    }
-    let body = serde_json::json!({
-        "args": server.get("args").cloned().unwrap_or(Value::Null),
-        "command": server.get("command").cloned().unwrap_or(Value::Null),
-        "type": server.get("type").cloned().unwrap_or(Value::Null),
-    });
-    let canonical_body =
-        canonical_json(&body).map_err(|_| BridgeDeclarationProbeError::Inspection)?;
-    canonical_cli_declaration(&canonical_body)
-        .map(Some)
-        .map_err(|_| BridgeDeclarationProbeError::Conflict)
+fn bounded_plugin_text(value: Option<&Value>, max_bytes: usize) -> bool {
+    value.and_then(Value::as_str).is_some_and(|text| {
+        !text.is_empty() && text.len() <= max_bytes && !text.chars().any(char::is_control)
+    })
 }
 
 fn canonical_cli_declaration(body: &str) -> Result<CanonicalCliDeclaration, ClientError> {
@@ -2885,31 +3119,17 @@ fn contains_redaction(value: &Value) -> bool {
 }
 
 fn project_is_approved(state_path: &Path, project_root: &Path) -> bool {
-    read_optional_file(state_path)
-        .ok()
-        .flatten()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|state| {
-            state
-                .get("projects")?
-                .get(project_root.to_string_lossy().as_ref())?
-                .get("hasTrustDialogAccepted")?
-                .as_bool()
-        })
-        == Some(true)
+    mcp_state::read_object(state_path).ok().and_then(|state| {
+        mcp_state::project_entry(&state, project_root)
+            .ok()??
+            .get("hasTrustDialogAccepted")?
+            .as_bool()
+    }) == Some(true)
 }
 
 fn project_mcp_approval_status(state_path: &Path, project_root: &Path) -> Result<(bool, bool), ()> {
-    let Some(bytes) = read_optional_file(state_path).map_err(|_| ())? else {
-        return Ok((false, false));
-    };
-    let state = serde_json::from_slice::<Value>(&bytes).map_err(|_| ())?;
-    let Some(project) = state
-        .get("projects")
-        .and_then(Value::as_object)
-        .and_then(|projects| projects.get(project_root.to_string_lossy().as_ref()))
-        .and_then(Value::as_object)
-    else {
+    let state = mcp_state::read_object(state_path).map_err(|_| ())?;
+    let Some(project) = mcp_state::project_entry(&state, project_root).map_err(|_| ())? else {
         return Ok((false, false));
     };
     let configured = [
@@ -3161,11 +3381,95 @@ fn parse_version(output: &str) -> Option<String> {
 }
 
 fn find_executable() -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
     let names = executable_names(cfg!(windows));
-    env::split_paths(&path)
-        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
-        .find(|candidate| digest_regular_non_link_file(candidate).is_ok())
+    let from_path = env::var_os("PATH").and_then(|path| {
+        env::split_paths(&path)
+            .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
+            .find(|candidate| digest_regular_non_link_file(candidate).is_ok())
+    });
+    if from_path.is_some() {
+        return from_path;
+    }
+    #[cfg(windows)]
+    {
+        if let Some(home) = env::var_os("USERPROFILE") {
+            let native = PathBuf::from(home).join(".local/bin/claude.exe");
+            if digest_regular_non_link_file(&native).is_ok() {
+                return Some(native);
+            }
+        }
+        let mut roots = Vec::new();
+        if let Some(roaming) = env::var_os("APPDATA") {
+            roots.push(PathBuf::from(roaming).join("Claude/claude-code"));
+        }
+        if let Some(local) = env::var_os("LOCALAPPDATA") {
+            roots.push(
+                PathBuf::from(local)
+                    .join("Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/claude-code"),
+            );
+        }
+        find_windows_bundled_claude(&roots)
+    }
+    #[cfg(not(windows))]
+    None
+}
+
+#[cfg(windows)]
+fn find_windows_bundled_claude(roots: &[PathBuf]) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for root in roots {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(version) = name
+                .split('.')
+                .map(str::parse::<u32>)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+                .filter(|parts| {
+                    parts.len() == 3
+                        && parts
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(".")
+                            == name
+                })
+            else {
+                continue;
+            };
+            let executable = entry.path().join("claude.exe");
+            if validate_executable_path_components(&executable).is_ok() {
+                candidates.push((version, executable));
+            }
+        }
+    }
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    candidates.into_iter().map(|(_, path)| path).find(|path| {
+        digest_regular_non_link_file(path).is_ok()
+            && open_executable_without_substitution(path)
+                .and_then(windows_reader_is_native_pe)
+                .unwrap_or(false)
+    })
+}
+
+fn discover_version_with(
+    mut execute: impl FnMut(&[&str]) -> Result<Vec<u8>, ClientError>,
+) -> Result<String, ClientError> {
+    let output = execute(&["--version"])?;
+    let version = parse_version_output(&output).map_err(|_| {
+        client_error(
+            ErrorCode::HarnessUnsupported,
+            "Claude Code returned an invalid version",
+            false,
+        )
+    })?;
+    // Doctor is an interactive diagnostic UI, not a machine-readable health
+    // contract. Native state and the attested version are checked separately.
+    Ok(version)
 }
 
 fn executable_names(windows: bool) -> &'static [&'static str] {
@@ -3401,10 +3705,9 @@ mod tests {
 
     use super::{
         ClaudeCodeAdapter, ClaudeCodeLayout, ClaudeCommand, MAX_MCP_VALIDATION_NAMES, digest_file,
-        executable_names, is_native_claude_executable_path, parse_doctor_output,
-        parse_mcp_get_output, parse_mcp_list_output, parse_plugin_list_output, validation_commands,
-        windows_attributes_are_reparse, windows_path_component_attributes_are_safe,
-        windows_reader_is_native_pe,
+        executable_names, is_native_claude_executable_path, parse_plugin_list_output,
+        parse_version_output, validation_commands, windows_attributes_are_reparse,
+        windows_path_component_attributes_are_safe, windows_reader_is_native_pe,
     };
     #[cfg(unix)]
     use super::{run_bounded_command, run_bounded_command_with_hook};
@@ -3414,6 +3717,80 @@ mod tests {
     };
     use serde_json::Value;
     use std::{fs, str::FromStr as _};
+
+    #[cfg(windows)]
+    #[test]
+    fn bundled_claude_discovery_uses_numeric_release_directories_and_native_files() {
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!(
+            "relay-claude-discovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        for version in ["2.1.9", "2.1.202", "2.1.999-malicious", "02.1.999"] {
+            let directory = root.join(version);
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("claude.exe"), fixture_executable_bytes()).unwrap();
+        }
+        // A greater version with a script or directory is not an executable candidate.
+        fs::create_dir(root.join("3.0.0")).unwrap();
+        fs::write(root.join("3.0.0/claude.cmd"), b"@echo unsafe").unwrap();
+        fs::create_dir(root.join("4.0.0")).unwrap();
+        fs::write(root.join("4.0.0/claude.exe"), b"not a native executable").unwrap();
+        let result = super::find_windows_bundled_claude(std::slice::from_ref(&root));
+        assert!(
+            fs::canonicalize(&root)
+                .unwrap()
+                .starts_with(fs::canonicalize(&temp).unwrap())
+        );
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result, Some(root.join("2.1.202/claude.exe")));
+    }
+
+    #[test]
+    fn discovery_of_unqualified_claude_does_not_require_interactive_doctor() {
+        let mut commands = Vec::new();
+        let version = super::discover_version_with(|arguments| {
+            commands.push(
+                arguments
+                    .iter()
+                    .map(|item| item.to_string())
+                    .collect::<Vec<_>>(),
+            );
+            if arguments == ["--version"] {
+                Ok(b"2.1.202 (Claude Code)\n".to_vec())
+            } else {
+                Err(super::invalid_request("Doctor must not be executed"))
+            }
+        })
+        .unwrap();
+        assert_eq!(version, "2.1.202");
+        assert_eq!(commands, vec![vec!["--version"]]);
+    }
+
+    #[test]
+    fn discovery_of_supported_claude_uses_noninteractive_version_output() {
+        let mut commands = Vec::new();
+        let result = super::discover_version_with(|arguments| {
+            commands.push(
+                arguments
+                    .iter()
+                    .map(|item| item.to_string())
+                    .collect::<Vec<_>>(),
+            );
+            Ok(if arguments == ["--version"] {
+                b"2.1.214 (Claude Code)\n".to_vec()
+            } else {
+                b"unexpected output".to_vec()
+            })
+        });
+        assert_eq!(result.unwrap(), "2.1.214");
+        assert_eq!(commands, vec![vec!["--version"]]);
+    }
 
     #[test]
     fn windows_discovery_and_mutation_accept_only_native_claude_exe() {
@@ -3476,7 +3853,16 @@ mod tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let expected_hash = digest_file(&executable).unwrap();
 
-        let output = run_bounded_command(&executable, &["attested"], expected_hash).unwrap();
+        let physical = fs::canonicalize(root.path()).unwrap();
+        let context = super::ClaudeCommandContext::new(
+            &physical.join(".claude"),
+            &physical.join(".claude.json"),
+            &physical,
+            &physical,
+        )
+        .unwrap();
+        let output =
+            run_bounded_command(&executable, &["attested"], expected_hash, &context).unwrap();
 
         assert_eq!(output, b"attested\n");
     }
@@ -3496,11 +3882,24 @@ mod tests {
         fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
         let expected_hash = digest_file(&executable).unwrap();
 
-        let result =
-            run_bounded_command_with_hook(&executable, &["attested"], expected_hash, || {
+        let physical = fs::canonicalize(root.path()).unwrap();
+        let context = super::ClaudeCommandContext::new(
+            &physical.join(".claude"),
+            &physical.join(".claude.json"),
+            &physical,
+            &physical,
+        )
+        .unwrap();
+        let result = run_bounded_command_with_hook(
+            &executable,
+            &["attested"],
+            expected_hash,
+            &context,
+            || {
                 fs::rename(&executable, &attested_backup).unwrap();
                 fs::rename(&replacement, &executable).unwrap();
-            });
+            },
+        );
 
         assert!(result.is_err());
     }
@@ -3525,60 +3924,78 @@ mod tests {
         let fixture: Value =
             serde_json::from_str(include_str!("../tests/fixtures/claude-code-2.1.214.json"))
                 .unwrap();
-        let commands = validation_commands(vec!["docs".to_owned()]);
+        let commands = validation_commands();
         assert_eq!(
             commands
                 .into_iter()
                 .map(|command| command.argv())
                 .collect::<Vec<_>>(),
             vec![
-                vec!["doctor".to_owned()],
+                vec!["--version".to_owned()],
                 vec!["plugin".to_owned(), "list".to_owned(), "--json".to_owned()],
-                vec!["mcp".to_owned(), "list".to_owned()],
-                vec!["mcp".to_owned(), "get".to_owned(), "docs".to_owned()],
             ]
         );
-        parse_doctor_output(fixture["doctorOutput"].as_str().unwrap().as_bytes()).unwrap();
+        parse_version_output(b"2.1.214 (Claude Code)\n").unwrap();
         parse_plugin_list_output(
             serde_json::to_vec(&fixture["pluginListJson"])
                 .unwrap()
                 .as_slice(),
         )
         .unwrap();
-        parse_mcp_list_output(fixture["mcpListOutput"].as_str().unwrap().as_bytes()).unwrap();
-        parse_mcp_get_output(
-            serde_json::to_vec(&fixture["mcpGetOutput"])
-                .unwrap()
-                .as_slice(),
-            "docs",
-        )
-        .unwrap();
     }
 
     #[test]
     fn validation_rejects_unbounded_malformed_or_secret_output() {
-        assert!(parse_doctor_output(&vec![b'x'; 65 * 1024]).is_err());
+        assert!(parse_version_output(&vec![b'x'; 65 * 1024]).is_err());
         assert!(parse_plugin_list_output(br#"[{"id":"ok","token":"secret"}]"#).is_err());
-        assert!(parse_mcp_list_output(b"not a reviewed line").is_err());
-        assert!(
-            parse_mcp_get_output(
-                br#"{"name":"docs","type":"http","url":"https://example.com","headers":{"Authorization":"secret"}}"#,
-                "docs",
-            )
-            .is_err()
-        );
+    }
+
+    #[test]
+    fn validation_accepts_installed_plugin_metadata_from_the_real_cli() {
+        let bytes = include_bytes!("../tests/fixtures/claude-code-2.1.202-plugin-list.json");
+        parse_plugin_list_output(bytes).unwrap();
+        let mut plugins: Value = serde_json::from_slice(bytes).unwrap();
+        plugins[0]["mcpServers"] = serde_json::json!({"probe": {"command":"C:\\Fixture\\node.exe", "args":["canary.mjs"], "env":{"TOKEN":"SYNTHETIC-CANARY"}}});
+        parse_plugin_list_output(&serde_json::to_vec(&plugins).unwrap()).unwrap();
+        plugins[0]["errors"] = serde_json::json!(["SYNTHETIC-CANARY"]);
+        let error = parse_plugin_list_output(&serde_json::to_vec(&plugins).unwrap()).unwrap_err();
+        assert!(!format!("{error:?}").contains("SYNTHETIC-CANARY"));
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_plugin_errors_instead_of_hiding_them() {
+        assert!(parse_plugin_list_output(br#"[{"id":"probe@fixture","version":"1.0.0","enabled":true,"errors":["SYNTHETIC-CANARY"],"errors":[]}]"#).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_malformed_installed_plugin_metadata_without_echoing_it() {
+        let bytes = include_bytes!("../tests/fixtures/claude-code-2.1.202-plugin-list.json");
+        for (field, value) in [
+            ("scope", serde_json::json!("SYNTHETIC-CANARY")),
+            ("installPath", Value::Null),
+            ("enabled", serde_json::json!("SYNTHETIC-CANARY")),
+            ("mcpServers", serde_json::json!("SYNTHETIC-CANARY")),
+            ("token", serde_json::json!("SYNTHETIC-CANARY")),
+        ] {
+            let mut plugins: Value = serde_json::from_slice(bytes).unwrap();
+            plugins[0][field] = value;
+            let error = parse_plugin_list_output(&serde_json::to_vec(&plugins).unwrap())
+                .expect_err("Malformed plugin metadata must not pass validation");
+            assert!(!format!("{error:?}").contains("SYNTHETIC-CANARY"));
+        }
     }
 
     #[test]
     fn effective_validation_includes_global_mcp_without_executing_configured_servers() {
         let root = tempfile::tempdir().unwrap();
-        let config_dir = root.path().join("claude");
-        let project_root = root.path().join("project");
+        let physical_root = fs::canonicalize(root.path()).unwrap();
+        let config_dir = physical_root.join("claude");
+        let project_root = physical_root.join("project");
         fs::create_dir_all(&config_dir).unwrap();
         fs::create_dir_all(&project_root).unwrap();
-        let sentinel = root.path().join("configured-bridge-ran");
+        let sentinel = physical_root.join("configured-bridge-ran");
         let command = serde_json::to_string(&sentinel.to_string_lossy()).unwrap();
-        let state_path = root.path().join(".claude.json");
+        let state_path = config_dir.join(".claude.json");
         fs::write(
             &state_path,
             format!(
@@ -3593,9 +4010,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let executable = root
-            .path()
-            .join(format!("claude-bin{}", std::env::consts::EXE_SUFFIX));
+        let executable = physical_root.join(format!("claude-bin{}", std::env::consts::EXE_SUFFIX));
         fs::write(&executable, fixture_executable_bytes()).unwrap();
         let device = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
         let adapter = ClaudeCodeAdapter::from_layout(
@@ -3603,6 +4018,7 @@ mod tests {
                 executable,
                 version: "2.1.214".to_owned(),
                 installation_method: InstallationMethod::Manual,
+                user_home: physical_root.clone(),
                 config_dir,
                 state_path,
                 project_root,
@@ -3623,30 +4039,15 @@ mod tests {
             .validate_effective_with(&receipt, |command| {
                 commands.push(command.argv());
                 Ok(match command {
-                    ClaudeCommand::Doctor => b"Claude Code diagnostics: OK\n".to_vec(),
+                    ClaudeCommand::Version => b"2.1.214 (Claude Code)\n".to_vec(),
                     ClaudeCommand::PluginList => b"[]".to_vec(),
-                    ClaudeCommand::McpList => {
-                        b"context-relay: local (stdio)\nproject-tools: local (stdio)\n".to_vec()
-                    }
-                    ClaudeCommand::McpGet(name) => serde_json::to_vec(&serde_json::json!({
-                        "name": name,
-                        "type": "stdio",
-                        "url": "stdio://local"
-                    }))
-                    .unwrap(),
                 })
             })
             .unwrap();
         assert!(report.valid);
         assert_eq!(
             commands,
-            vec![
-                vec!["doctor"],
-                vec!["plugin", "list", "--json"],
-                vec!["mcp", "list"],
-                vec!["mcp", "get", "context-relay"],
-                vec!["mcp", "get", "project-tools"],
-            ]
+            vec![vec!["--version"], vec!["plugin", "list", "--json"],]
         );
         assert!(!sentinel.exists());
     }
@@ -3681,11 +4082,12 @@ mod tests {
         project_file: impl IntoIterator<Item = usize>,
     ) -> McpSourceFixture {
         let root = tempfile::tempdir().unwrap();
-        let config_dir = root.path().join("claude");
-        let project_root = root.path().join("project");
+        let physical_root = fs::canonicalize(root.path()).unwrap();
+        let config_dir = physical_root.join("claude");
+        let project_root = physical_root.join("project");
         fs::create_dir_all(&config_dir).unwrap();
         fs::create_dir_all(&project_root).unwrap();
-        let state_path = root.path().join(".claude.json");
+        let state_path = config_dir.join(".claude.json");
         let project_key = project_root.to_string_lossy().into_owned();
         fs::write(
             &state_path,
@@ -3708,9 +4110,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let executable = root
-            .path()
-            .join(format!("claude-bin{}", std::env::consts::EXE_SUFFIX));
+        let executable = physical_root.join(format!("claude-bin{}", std::env::consts::EXE_SUFFIX));
         fs::write(&executable, fixture_executable_bytes()).unwrap();
         let device = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073982").unwrap();
         let adapter = ClaudeCodeAdapter::from_layout(
@@ -3718,6 +4118,7 @@ mod tests {
                 executable,
                 version: "2.1.214".to_owned(),
                 installation_method: InstallationMethod::Manual,
+                user_home: physical_root.clone(),
                 config_dir,
                 state_path,
                 project_root,
@@ -3739,22 +4140,19 @@ mod tests {
         }
     }
 
-    fn bounded_validation_output(command: &ClaudeCommand, names: &[String]) -> Vec<u8> {
-        match command {
-            ClaudeCommand::Doctor => b"Claude Code diagnostics: OK\n".to_vec(),
-            ClaudeCommand::PluginList => b"[]".to_vec(),
-            ClaudeCommand::McpList => names
-                .iter()
-                .map(|name| format!("{name}: local (stdio)\n"))
-                .collect::<String>()
-                .into_bytes(),
-            ClaudeCommand::McpGet(name) => serde_json::to_vec(&serde_json::json!({
-                "name": name,
-                "type": "stdio",
-                "url": "stdio://local"
-            }))
-            .unwrap(),
-        }
+    #[test]
+    fn effective_validation_stops_when_the_live_version_differs_from_the_selected_layout() {
+        let fixture = mcp_source_fixture([], [], []);
+        let mut commands = Vec::new();
+        let error = fixture
+            .adapter
+            .validate_effective_with(&fixture.receipt, |command| {
+                commands.push(command.argv());
+                Ok(b"2.1.213 (Claude Code)\n".to_vec())
+            })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(commands, vec![vec!["--version".to_owned()]]);
     }
 
     #[test]
@@ -3774,19 +4172,16 @@ mod tests {
             .adapter
             .validate_effective_with(&fixture.receipt, |command| {
                 commands.push(command.argv());
-                Ok(bounded_validation_output(command, &names))
+                Ok(match command {
+                    ClaudeCommand::Version => b"2.1.214 (Claude Code)\n".to_vec(),
+                    ClaudeCommand::PluginList => b"[]".to_vec(),
+                })
             })
             .unwrap();
 
         assert!(report.valid);
-        assert_eq!(commands.len(), MAX_MCP_VALIDATION_NAMES + 3);
-        assert_eq!(
-            commands[3..]
-                .iter()
-                .map(|command| command[2].clone())
-                .collect::<Vec<_>>(),
-            names
-        );
+        assert_eq!(commands.len(), 2);
+        assert_eq!(fixture.adapter.imported_mcp_names().unwrap(), names);
     }
 
     #[test]

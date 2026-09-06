@@ -38,13 +38,21 @@ unicode-casefold.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+context-relay-native-runner = { version = "0.1.0", path = "../native-runner", features = ["test-support"] }
+process-wrap = { version = "10.0.0", default-features = false, features = ["std", "creation-flags", "job-object", "process-group"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.186"
 
 [target.'cfg(windows)'.dependencies]
+dunce = "1.0.5"
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Storage_FileSystem",
   "Win32_System_Threading",
   "Win32_System_IO",
 ] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_JobObjects"] }

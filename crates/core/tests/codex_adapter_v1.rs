@@ -12,7 +12,8 @@ use context_relay_core::{
     mcp::install::bridge_component,
     native_memory::{
         NativeMemoryAdapter, NativeMemoryDisable, NativeMemoryDocumentKind,
-        PRIMARY_MEMORY_INSTRUCTIONS, managed_memory_hooks, primary_memory_instruction_component,
+        NativeMemoryRegistration, PRIMARY_MEMORY_INSTRUCTIONS, managed_memory_hooks,
+        primary_memory_instruction_component,
     },
     native_transaction::{
         approval_hash_v1,
@@ -72,10 +73,13 @@ fn fixture_with_requirements(source: &str, bind_requirements: bool) -> Fixture {
     let home = root.join("home");
     let project_root = root.join("project with spaces");
     let working_directory = project_root.join("service");
+    let project_key = project_root.as_path();
+    #[cfg(windows)]
+    let project_key = dunce::simplified(project_key);
     materialize_substituting(
         &codex_home,
         fixture["codexHome"].as_object().unwrap(),
-        &project_root,
+        project_key,
     );
     if let Some(extra) = fixture["nativeMemoryConfigToml"].as_str() {
         let config_path = codex_home.join("config.toml");
@@ -104,6 +108,7 @@ fn fixture_with_requirements(source: &str, bind_requirements: bool) -> Fixture {
         version: fixture["version"].as_str().unwrap().to_owned(),
         installation_method: InstallationMethod::PackageManager,
         codex_home: codex_home.clone(),
+        user_home: home.clone(),
         user_skills_dir: home.join(".agents/skills"),
         project_root: project_root.clone(),
         working_directory,
@@ -360,6 +365,7 @@ fn codex_native_plan(
         scanner_result_hash: Sha256Digest([31; 32]),
         mutations: vec![mutation],
         cli_mutations: vec![],
+        installed_runtime: None,
         native_memory_registrations: vec![],
         ownership_changes: vec![],
     };
@@ -457,8 +463,20 @@ fn memory_hooks_render_only_the_frozen_lifecycle_events_with_literal_arguments()
             let command = hooks[native_event][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap();
-            assert!(command.contains(bridge.to_string_lossy().as_ref()));
-            assert!(command.ends_with(&format!(" --hook-event {event} --harness codex")));
+            let path = bridge.to_string_lossy();
+            #[cfg(windows)]
+            let executable = format!(
+                "& '{}'",
+                path.strip_prefix(r"\\?\")
+                    .unwrap_or(&path)
+                    .replace('\'', "''")
+            );
+            #[cfg(not(windows))]
+            let executable = format!("'{}'", path.replace('\'', "'\\''"));
+            assert_eq!(
+                command,
+                format!("{executable} --hook-event {event} --harness codex")
+            );
             assert_eq!(hooks[native_event][0]["hooks"][0]["type"], "command");
             assert_eq!(
                 hooks[native_event][0]["hooks"][0]["statusMessage"],
@@ -927,6 +945,176 @@ fn unknown_and_wrapper_codex_installations_are_watch_only_without_guessed_settin
 }
 
 #[test]
+fn native_memory_disable_includes_active_project_overrides_and_restores_them_exactly() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let root_config = fixture.layout.project_root.join(".codex/config.toml");
+    let nested_config = fixture.layout.working_directory.join(".codex/config.toml");
+    fs::write(&root_config, "# project rationale\nunknown_key = 42\n[memories]\ngenerate_memories = true # preserve comment\n").unwrap();
+    fs::write(
+        &nested_config,
+        "# nested rationale\n[memories]\nuse_memories = true # preserve usage\n",
+    )
+    .unwrap();
+    let paths = [
+        fixture.codex_home.join("config.toml"),
+        root_config.clone(),
+        nested_config.clone(),
+    ];
+    let before = paths
+        .iter()
+        .map(|path| fs::read(path).unwrap())
+        .collect::<Vec<_>>();
+    let NativeMemoryDisable::Supported(mutations) = fixture
+        .adapter
+        .native_memory_capabilities()
+        .unwrap()
+        .disable
+    else {
+        panic!("expected supported disable")
+    };
+    assert_eq!(
+        mutations.len(),
+        3,
+        "active project layers can override the global disable"
+    );
+    for path in &paths {
+        assert!(
+            mutations
+                .iter()
+                .any(|mutation| mutation.target == test_wire_path(path))
+        );
+    }
+    let nonce = [75; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native.create_before_images(&mutations).unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native.compare_and_swap_targets(&mutations).unwrap();
+    for mutation in &mutations {
+        native.apply_mutation(&nonce, mutation).unwrap();
+    }
+    let root_after = fs::read_to_string(&root_config).unwrap();
+    assert!(root_after.contains("unknown_key = 42"));
+    assert!(root_after.contains("generate_memories = false # preserve comment"));
+    assert!(
+        !root_after.contains("use_memories"),
+        "absent project keys should inherit the global value"
+    );
+    assert!(
+        fs::read_to_string(&nested_config)
+            .unwrap()
+            .contains("use_memories = false # preserve usage")
+    );
+    let NativeMemoryDisable::Supported(repeated) = fixture
+        .adapter
+        .native_memory_capabilities()
+        .unwrap()
+        .disable
+    else {
+        panic!("expected supported replay")
+    };
+    assert!(repeated.is_empty());
+    native.restore_matching_applied_targets(&nonce).unwrap();
+    for (path, expected) in paths.iter().zip(before) {
+        assert_eq!(fs::read(path).unwrap(), expected);
+    }
+}
+
+#[test]
+fn native_memory_disable_deduplicates_overlapping_global_and_project_config() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let mut layout = fixture.layout.clone();
+    layout.codex_home = layout.project_root.join(".codex");
+    let config = layout.codex_home.join("config.toml");
+    let project_key = layout.project_root.as_path();
+    #[cfg(windows)]
+    let project_key = dunce::simplified(project_key);
+    let trusted_root = toml_edit::Value::from(project_key.display().to_string());
+    fs::write(&config, format!("[memories]\ngenerate_memories = true\n[projects.{trusted_root}]\ntrust_level = \"trusted\"\n")).unwrap();
+    let device = DeviceId::from_str(DEVICE_ID).unwrap();
+    let adapter = CodexAdapter::from_layout(
+        layout,
+        fixture.project_id,
+        device,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device),
+    )
+    .unwrap();
+    let NativeMemoryDisable::Supported(mutations) =
+        adapter.native_memory_capabilities().unwrap().disable
+    else {
+        panic!("expected supported disable")
+    };
+    assert_eq!(
+        mutations.len(),
+        1,
+        "one native target may appear only once in an approved plan"
+    );
+    let NativeState::RegularFile { bytes, .. } =
+        NativeState::decode_v1(&mutations[0].content).unwrap()
+    else {
+        panic!("expected config file")
+    };
+    let rendered = String::from_utf8(bytes).unwrap();
+    assert!(rendered.contains("generate_memories = false"));
+    assert!(
+        rendered.contains("use_memories = false"),
+        "global semantics must retain the default for missing keys"
+    );
+}
+
+#[test]
+fn native_memory_disable_does_not_require_project_config_directories() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let mut layout = fixture.layout.clone();
+    layout.working_directory = layout.project_root.join("without-codex-directory");
+    fs::create_dir(&layout.working_directory).unwrap();
+    fs::remove_file(layout.project_root.join(".codex/config.toml")).unwrap();
+    let device = DeviceId::from_str(DEVICE_ID).unwrap();
+    let adapter = CodexAdapter::from_layout(
+        layout.clone(),
+        fixture.project_id,
+        device,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device),
+    )
+    .unwrap();
+    let NativeMemoryDisable::Supported(mutations) =
+        adapter.native_memory_capabilities().unwrap().disable
+    else {
+        panic!("absent project settings must inherit the global disable")
+    };
+    assert_eq!(mutations.len(), 1);
+    assert!(!layout.working_directory.join(".codex").exists());
+}
+
+#[test]
+fn native_memory_disable_rejects_uninspectable_active_project_settings_without_partial_plan() {
+    for invalid in [
+        "memories = true",
+        "[memories]\nuse_memories = 'yes'",
+        "[memories]\ngenerate_memories = []",
+        "invalid [toml",
+    ] {
+        let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+        let path = fixture.layout.working_directory.join(".codex/config.toml");
+        fs::write(&path, invalid).unwrap();
+        let global_before = fs::read(fixture.codex_home.join("config.toml")).unwrap();
+        assert_eq!(
+            fixture
+                .adapter
+                .native_memory_capabilities()
+                .unwrap()
+                .disable,
+            NativeMemoryDisable::WatchOnly,
+            "invalid: {invalid}"
+        );
+        assert_eq!(
+            fs::read(fixture.codex_home.join("config.toml")).unwrap(),
+            global_before
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), invalid);
+    }
+}
+
+#[test]
 fn native_memory_disable_rolls_back_true_false_and_absent_codex_values_exactly() {
     for (index, prior) in [Some(true), Some(false), None].into_iter().enumerate() {
         let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
@@ -1300,6 +1488,59 @@ fn untrusted_projects_skip_project_config_hooks_and_rules() {
 }
 
 #[test]
+fn explicit_nested_distrust_blocks_setup_and_skips_only_that_native_layer() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let config = fixture.codex_home.join("config.toml");
+    let child = fixture.layout.working_directory.as_path();
+    #[cfg(windows)]
+    let child = dunce::simplified(child);
+    let mut contents = fs::read_to_string(&config).unwrap();
+    contents.push_str(&format!(
+        "\n[projects.{}]\ntrust_level = 'untrusted'\n",
+        serde_json::to_string(child.to_str().unwrap()).unwrap()
+    ));
+    fs::write(&config, &contents).unwrap();
+    let report = fixture
+        .adapter
+        .probe(&ProbeContext {
+            harness: HarnessId::Codex,
+            requested_profile: None,
+        })
+        .unwrap();
+    assert_eq!(report.capability, CapabilityLevel::Blocked);
+    let imported = import_everything(&fixture);
+    let locations = imported
+        .components
+        .iter()
+        .flat_map(|component| component.metadata.iter())
+        .filter(|(key, _)| key == "structuralLocation")
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        locations
+            .iter()
+            .any(|value| value.starts_with("project/.codex/config.toml#")),
+        "{locations:?}"
+    );
+    assert!(
+        !locations
+            .iter()
+            .any(|value| value.starts_with("project/service/.codex/")),
+        "{locations:?}"
+    );
+    assert!(
+        fixture
+            .adapter
+            .render(&DesiredState {
+                components: vec![],
+                scopes: vec![]
+            })
+            .is_err()
+    );
+    assert_eq!(fs::read_to_string(config).unwrap(), contents);
+}
+
+#[test]
 fn unknown_versions_are_import_only() {
     let mut source: Value =
         serde_json::from_str(include_str!("fixtures/codex-0.144.1.json")).unwrap();
@@ -1584,7 +1825,6 @@ fn verified_runner_executes_prepared_identity_after_late_path_substitution() {
         executable: PathBuf,
         original: PathBuf,
         replacement: PathBuf,
-        working_directory: PathBuf,
         successful_launches: Arc<AtomicU64>,
         substituted: bool,
     }
@@ -1599,7 +1839,7 @@ fn verified_runner_executes_prepared_identity_after_late_path_substitution() {
                     .map_err(|_| BoundaryError::new("fixture substitution failed"))?;
                 self.substituted = true;
             }
-            command.execute(&self.working_directory)?;
+            command.execute()?;
             self.successful_launches.fetch_add(1, Ordering::Relaxed);
             Ok(match arguments.as_slice() {
                 [plugin, list, json]
@@ -1645,7 +1885,6 @@ fn verified_runner_executes_prepared_identity_after_late_path_substitution() {
         executable: fixture.layout.executable.clone(),
         original: fixture.root.join("original-codex"),
         replacement,
-        working_directory: fixture.layout.working_directory.clone(),
         successful_launches: Arc::clone(&successful_launches),
         substituted: false,
     };
@@ -1730,6 +1969,106 @@ fn native_staged_output_validation_rejects_either_changed_hash() {
             "Codex staged output changed"
         );
     }
+}
+
+#[test]
+fn native_memory_reprobe_rejects_a_different_codex_home_even_when_memory_is_disabled() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    let mut plan = codex_native_plan(&fixture, vec![]);
+    let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+        panic!("supported disable")
+    };
+    plan.mutations = mutations;
+    plan.approval_version = 2;
+    plan.native_memory_registrations = capabilities
+        .sources
+        .into_iter()
+        .map(|source| NativeMemoryRegistration {
+            source,
+            last_applied_digest: None,
+        })
+        .collect();
+    plan.setup.batch_hash =
+        context_relay_core::native_transaction::approval_hash_v2(&plan).unwrap();
+    let mut layout = fixture.layout.clone();
+    layout.codex_home = fixture.root.join("different-codex-home");
+    fs::create_dir(&layout.codex_home).unwrap();
+    let config = fs::read_to_string(fixture.codex_home.join("config.toml"))
+        .unwrap()
+        .replace("generate_memories = true", "generate_memories = false")
+        .replace("use_memories = true", "use_memories = false");
+    fs::write(layout.codex_home.join("config.toml"), config).unwrap();
+    let device_id = DeviceId::from_str(DEVICE_ID).unwrap();
+    let mut changed = CodexAdapter::from_layout(
+        layout,
+        fixture.project_id,
+        device_id,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device_id),
+    )
+    .unwrap();
+    assert!(
+        NativeAdapter::reprobe_live_state(&mut changed, &plan).is_err(),
+        "recovery must remain bound to the approved native memory home"
+    );
+}
+
+#[test]
+fn native_memory_final_validation_rejects_reverted_forward_values_but_accepts_rollback() {
+    let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+        panic!("supported disable")
+    };
+    let mut plan = codex_native_plan(&fixture, vec![]);
+    plan.mutations = mutations;
+    plan.native_memory_registrations = capabilities
+        .sources
+        .into_iter()
+        .map(|source| NativeMemoryRegistration {
+            source,
+            last_applied_digest: None,
+        })
+        .collect();
+    let receipt = ApplyReceipt {
+        plan_id: plan.setup.plan_id,
+        applied_hlc: HybridLogicalClock::new(
+            1_900_000_000_001,
+            0,
+            DeviceId::from_str(DEVICE_ID).unwrap(),
+        ),
+        resulting_digests: plan
+            .mutations
+            .iter()
+            .map(|mutation| mutation.intended.0)
+            .collect(),
+    };
+    let nonce = [89; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native.create_before_images(&plan.mutations).unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native.compare_and_swap_targets(&plan.mutations).unwrap();
+    for mutation in &plan.mutations {
+        native.apply_mutation(&nonce, mutation).unwrap();
+    }
+    NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &receipt).unwrap();
+    native.restore_matching_applied_targets(&nonce).unwrap();
+    assert!(
+        NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &receipt).is_err(),
+        "a forward receipt must not certify reverted memory settings"
+    );
+    for mutation in &mut plan.mutations {
+        std::mem::swap(&mut mutation.expected, &mut mutation.intended);
+    }
+    let inverse_receipt = ApplyReceipt {
+        resulting_digests: plan
+            .mutations
+            .iter()
+            .map(|mutation| mutation.intended.0)
+            .collect(),
+        ..receipt
+    };
+    NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &inverse_receipt).unwrap();
 }
 
 #[test]
@@ -1972,6 +2311,169 @@ fn codex_mcp_list(body: &str) -> Vec<u8> {
 }
 
 #[test]
+fn managed_bridge_setup_composes_mcp_and_memory_without_a_live_cli_writer() {
+    use context_relay_core::setup::BridgePreviewHarness;
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let bridge = executable_bridge(&fixture, "bridge 測試 ' $HOME with spaces");
+    let desired = DesiredState {
+        components: vec![bridge.clone()],
+        scopes: vec![NativeScope::Global],
+    };
+    let global = fixture.codex_home.join("config.toml");
+    let original = fs::read(&global).unwrap();
+    let bridge_plan = fixture.adapter.bridge_mutations(&desired, &bridge).unwrap();
+    assert!(
+        bridge_plan.cli.is_none(),
+        "setup must not run a live MCP writer"
+    );
+    let plan = fixture.adapter.primary_memory_mutations(&desired).unwrap();
+    let configs = plan
+        .native
+        .iter()
+        .filter(|mutation| mutation.target == test_wire_path(&global))
+        .collect::<Vec<_>>();
+    assert_eq!(configs.len(), 1);
+    let NativeState::RegularFile { bytes, metadata } =
+        NativeState::decode_v1(&configs[0].content).unwrap()
+    else {
+        panic!("expected global config")
+    };
+    let before = context_relay_native_runner::OsNativeFileSystem::new()
+        .snapshot(&global)
+        .unwrap();
+    // Reads can advance Windows access time; compare the restorable metadata
+    // contract used by the actual native transaction, retaining original bytes.
+    assert_eq!(
+        NativeState::regular_file(original.clone(), metadata).fingerprint(),
+        *before.fingerprint()
+    );
+    let text = String::from_utf8(bytes).unwrap();
+    let document = text.parse::<toml_edit::DocumentMut>().unwrap();
+    let body: Value = serde_json::from_str(&bridge.body_markdown).unwrap();
+    assert_eq!(
+        document["mcp_servers"]["context-relay"]["command"].as_str(),
+        body["command"].as_str()
+    );
+    assert_eq!(
+        document["memories"]["generate_memories"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(document["memories"]["use_memories"].as_bool(), Some(false));
+    assert_eq!(
+        fs::read(&global).unwrap(),
+        original,
+        "preview must not write"
+    );
+}
+
+#[test]
+fn native_bridge_setup_rejects_foreign_options_and_project_overrides_without_writing() {
+    use context_relay_core::setup::BridgePreviewHarness;
+    for extra in [
+        "enabled = false",
+        "enabled = true",
+        "env = { TOKEN = 'synthetic' }",
+        "cwd = 'other'",
+        "future_option = true",
+        "project override",
+        "project scalar",
+        "project array",
+    ] {
+        let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+        let bridge = executable_bridge(&fixture, "bridge with spaces");
+        let desired = DesiredState {
+            components: vec![bridge],
+            scopes: vec![NativeScope::Global],
+        };
+        let plan = fixture.adapter.primary_memory_mutations(&desired).unwrap();
+        let global = fixture.codex_home.join("config.toml");
+        let mutation = plan
+            .native
+            .iter()
+            .find(|mutation| mutation.target == test_wire_path(&global))
+            .unwrap();
+        let NativeState::RegularFile { bytes, .. } =
+            NativeState::decode_v1(&mutation.content).unwrap()
+        else {
+            panic!("file")
+        };
+        let mut document = String::from_utf8(bytes)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let target = if extra.starts_with("project ") {
+            fixture.layout.project_root.join(".codex/config.toml")
+        } else {
+            global.clone()
+        };
+        if extra == "project override" {
+            fs::write(&target, "[mcp_servers.context-relay]\nenabled = false\n").unwrap();
+        } else if extra == "project scalar" {
+            fs::write(&target, "mcp_servers = 'invalid'\n").unwrap();
+        } else if extra == "project array" {
+            fs::write(&target, "mcp_servers = []\n").unwrap();
+        } else {
+            let parsed = extra.parse::<toml_edit::DocumentMut>().unwrap();
+            for (key, value) in parsed.iter() {
+                document["mcp_servers"]["context-relay"][key] = value.clone();
+            }
+            fs::write(&target, document.to_string()).unwrap();
+        }
+        let before = fs::read(&target).unwrap();
+        assert!(
+            fixture.adapter.primary_memory_mutations(&desired).is_err(),
+            "{extra}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), before);
+    }
+}
+
+#[test]
+fn legacy_cli_bridge_plan_keeps_its_memory_only_fingerprint_contract() {
+    let mut fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let prior = executable_bridge(&fixture, "old bridge");
+    let next = executable_bridge(&fixture, "new bridge");
+    let old: Value = serde_json::from_str(&prior.body_markdown).unwrap();
+    let path = fixture.codex_home.join("config.toml");
+    let mut document = fs::read_to_string(&path)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    let table = format!(
+        "[mcp_servers.context-relay]\ncommand = {}\nargs = [\"--harness\", \"codex\"]\n",
+        old["command"]
+    )
+    .parse::<toml_edit::DocumentMut>()
+    .unwrap();
+    document["mcp_servers"]["context-relay"] = table["mcp_servers"]["context-relay"].clone();
+    fs::write(&path, document.to_string()).unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+        panic!("supported memory")
+    };
+    let mut plan = codex_native_plan(&fixture, vec![]);
+    plan.setup.adapter_version = 1;
+    plan.setup.rulesync_version = "bridge-preview-v1".into();
+    plan.setup
+        .semantic_changes
+        .push(context_relay_protocol::ClassifiedChange {
+            class: context_relay_protocol::ChangeClass::Update,
+            target: "codex-mcp|global|context-relay".into(),
+            summary: next.body_markdown,
+        });
+    plan.mutations = mutations;
+    plan.native_memory_registrations = capabilities
+        .sources
+        .into_iter()
+        .map(|source| NativeMemoryRegistration {
+            source,
+            last_applied_digest: None,
+        })
+        .collect();
+    NativeAdapter::reprobe_live_state(&mut fixture.adapter, &plan).unwrap();
+}
+
+#[test]
 fn bridge_cli_plan_binds_exact_declarations_and_preserves_argv_boundaries() {
     let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
     let bridge = executable_bridge(&fixture, "bridge executable with spaces");
@@ -2041,6 +2543,60 @@ fn bridge_cli_plan_binds_exact_declarations_and_preserves_argv_boundaries() {
             vec!["mcp", "list", "--json"],
         ]
     );
+}
+
+#[test]
+fn bridge_cli_readback_accepts_null_env_but_rejects_overrides_and_invalid_shapes() {
+    // Captured from isolated 0.144.6 MCP management. Use an already-qualified
+    // adapter version: this output compatibility test does not grant Full support.
+    for (environment, expected_error) in [
+        (Value::Null, None),
+        (json!({}), None),
+        (
+            json!({"QUALIFICATION_OVERRIDE": "value"}),
+            Some(ErrorCode::Conflict),
+        ),
+        (json!(false), Some(ErrorCode::InvalidRequest)),
+    ] {
+        let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+        let bridge = executable_bridge(&fixture, "bridge with spaces");
+        let bridge_body: Value = serde_json::from_str(&bridge.body_markdown).unwrap();
+        let mut observed: Value =
+            serde_json::from_str(include_str!("fixtures/codex-0.144.6-mcp.json")).unwrap();
+        for key in ["mcpListJson", "mcpGetJson"] {
+            let server = if key == "mcpListJson" {
+                &mut observed[key][0]
+            } else {
+                &mut observed[key]
+            };
+            server["transport"]["command"] = bridge_body["command"].clone();
+            server["transport"]["env"] = environment.clone();
+        }
+        let mut validation = |argv: &[String]| {
+            let key = match argv
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                ["plugin", "list", "--json"] => "pluginListJson",
+                ["mcp", "list", "--json"] => "mcpListJson",
+                ["mcp", "get", "context-relay", "--json"] => "mcpGetJson",
+                _ => panic!("unexpected qualification command"),
+            };
+            Ok(serde_json::to_vec(&observed[key]).unwrap())
+        };
+        let result = fixture
+            .adapter
+            .plan_bridge_cli_mutation_with_runner(&bridge, &mut validation);
+        if let Some(code) = expected_error {
+            assert_eq!(result.unwrap_err().code, code);
+        } else {
+            let mutation = result.unwrap();
+            assert_eq!(mutation.expected, Some(declaration(&bridge.body_markdown)));
+            assert_eq!(mutation.intended, mutation.expected);
+        }
+    }
 }
 
 #[test]
@@ -2294,6 +2850,65 @@ fn bridge_cli_plan_rejects_malformed_redacted_secret_bearing_and_unmanaged_prior
         .plan_bridge_cli_mutation_with_runner(&intended, &mut validation)
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Conflict);
+}
+
+#[test]
+fn cli_execution_rejects_missing_or_changed_profile_bindings_before_launch() {
+    use context_relay_core::native_transaction::{CliExecutionContext, engine::BoundaryError};
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let bridge = executable_bridge(&fixture, "bridge executable");
+    let approved = fixture
+        .adapter
+        .plan_bridge_cli_mutation_with_runner(&bridge, |argv: &[String]| {
+            Ok(if argv[0] == "plugin" {
+                br#"{"installed":[],"available":[]}"#.to_vec()
+            } else {
+                b"[]".to_vec()
+            })
+        })
+        .unwrap();
+    for change in 0..5 {
+        let mut mutation = approved.clone();
+        if change == 0 {
+            mutation.execution_context = None;
+        } else {
+            let Some(CliExecutionContext::CodexV1 {
+                codex_home,
+                user_home,
+                project_root,
+                working_directory,
+            }) = &mut mutation.execution_context
+            else {
+                panic!("missing context")
+            };
+            let target = match change {
+                1 => codex_home,
+                2 => user_home,
+                3 => project_root,
+                _ => working_directory,
+            };
+            *target = test_wire_path(&fixture.root.join("other-profile"));
+        }
+        let never_run = |_: &[String]| -> Result<Vec<u8>, BoundaryError> {
+            panic!("unapproved context reached a runner")
+        };
+        let mut executor = fixture
+            .adapter
+            .cli_executor_with_runners(never_run, never_run);
+        assert!(executor.probe_cli_mutation(&mutation).is_err());
+        assert!(
+            executor
+                .compare_cli_targets(std::slice::from_ref(&mutation))
+                .is_err()
+        );
+        assert!(executor.apply_cli_mutation(&mutation).is_err());
+        assert!(executor.restore_cli_mutation_if_matches(&mutation).is_err());
+        assert!(
+            executor
+                .finish_committed_cli_mutations(std::slice::from_ref(&mutation))
+                .is_err()
+        );
+    }
 }
 
 #[test]

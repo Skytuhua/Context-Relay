@@ -23,6 +23,7 @@ use crate::search::{
     AllowedSearchScope, Embedding384, SearchHit, quote_fts_query, reciprocal_rank_fusion,
 };
 
+mod desktop_writes;
 mod native_transactions;
 pub use native_transactions::*;
 mod devices;
@@ -34,7 +35,7 @@ pub use recovery_restore::*;
 mod sync;
 pub use sync::*;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 25;
+pub const LATEST_SCHEMA_VERSION: u32 = 26;
 pub const MAX_NATIVE_HOOK_SESSIONS: usize = 256;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
@@ -52,7 +53,7 @@ pub enum VaultError {
     FutureSchema { found: u32 },
     #[error("vault migration failed: {0}")]
     Migration(String),
-    #[error("the before-image budget is exhausted")]
+    #[error("the local storage quota is exhausted")]
     BudgetExceeded,
     #[error("credential store failure: {0}")]
     Credential(String),
@@ -1291,6 +1292,50 @@ impl Vault {
         Ok(())
     }
 
+    pub fn register_project(
+        &mut self,
+        project: &ProjectIdentity,
+        path: &WireNativeValue,
+    ) -> Result<(), VaultError> {
+        project
+            .validate()
+            .and_then(|()| path.validate())
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        let id = project.project_id.to_string();
+        let transaction = self.connection.transaction()?;
+        let existing_project: Option<ProjectIdentity> = load_json(
+            &transaction,
+            "SELECT payload_json FROM projects WHERE id = ?1",
+            &id,
+        )?;
+        let existing_path: Option<WireNativeValue> = load_json(
+            &transaction,
+            "SELECT payload_json FROM paths WHERE id = ?1",
+            &id,
+        )?;
+        // Repeating an uncertain registration may complete an older partial
+        // entry, but must never rename or redirect an already bound project.
+        if existing_project
+            .as_ref()
+            .is_some_and(|value| value != project)
+            || existing_path.as_ref().is_some_and(|value| value != path)
+        {
+            return Err(VaultError::Validation(
+                "project registration conflicts with an existing record".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO projects(id, payload_json) VALUES (?1, ?2) ON CONFLICT(id) DO NOTHING",
+            params![id, to_json(project)?],
+        )?;
+        transaction.execute(
+            "INSERT INTO paths(id, payload_json) VALUES (?1, ?2) ON CONFLICT(id) DO NOTHING",
+            params![id, to_json(path)?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn projects(&self) -> Result<Vec<ProjectIdentity>, VaultError> {
         let mut projects: Vec<ProjectIdentity> = load_json_list(
             &self.connection,
@@ -2061,6 +2106,16 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
                 "../migrations/0025_native_memory_managed_digest.sql"
             ))
             .and_then(|_| transaction.pragma_update(None, "user_version", 25))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 26 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0026_desktop_writes.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 26))
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }

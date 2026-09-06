@@ -3032,6 +3032,26 @@ impl Vault {
         load_setup_plan(&self.connection, plan_id)
     }
 
+    /// Newest IDs first, including one lookahead ID. Load sealed bodies individually.
+    pub fn setup_plan_ids_after(&self, after: Option<&PlanId>) -> Result<Vec<PlanId>, VaultError> {
+        let mut statement = self.connection.prepare(
+            "SELECT plan_id FROM setup_plan_lifecycle
+             WHERE (?1 IS NULL OR plan_id < ?1) ORDER BY plan_id DESC LIMIT 51",
+        )?;
+        let ids = statement
+            .query_map([after.map(ToString::to_string)], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                id.parse().map_err(|_| {
+                    VaultError::Validation("setup plan identifier is invalid".to_owned())
+                })
+            })
+            .collect()
+    }
+
     pub fn incomplete_setup_plans(&self) -> Result<Vec<SetupPlanRecord>, VaultError> {
         let plan_ids = {
             let mut statement = self.connection.prepare(

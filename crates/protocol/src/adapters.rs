@@ -251,6 +251,25 @@ validated_adapter_dto!(
     }
 );
 
+/// Approval recorded in Codex user settings, not effective runtime policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum SavedHookApproval {
+    Missing,
+    NeedsApproval,
+    Approved,
+    Changed,
+    Disabled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct SavedMemoryHookApproval {
+    pub session_start: SavedHookApproval,
+    pub stop: SavedHookApproval,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(rename_all = "camelCase")]
 pub struct ProbeReport {
@@ -262,6 +281,7 @@ pub struct ProbeReport {
     pub active_profile: Option<String>,
     pub policy_conflicts: Vec<String>,
     pub capability: CapabilityLevel,
+    pub codex_saved_hook_approval: Option<SavedMemoryHookApproval>,
 }
 
 impl ProbeReport {
@@ -303,6 +323,8 @@ validated_adapter_dto!(
         active_profile: Option<String>,
         policy_conflicts: Vec<String>,
         capability: CapabilityLevel,
+        #[serde(deserialize_with = "crate::required_nullable")]
+        codex_saved_hook_approval: Option<SavedMemoryHookApproval>,
     }
 );
 

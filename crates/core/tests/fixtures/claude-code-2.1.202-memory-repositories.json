@@ -1,0 +1,451 @@
+{
+  "version": "2.1.202",
+  "executableSha256": "7ff0787ebdc19fc509ccea8886ebf6a53ad8213407fa3a2b7c6d1446efc419f6",
+  "evidence": "Repository/worktree helpers executed with a virtual filesystem; no live session qualification.",
+  "cases": [
+    {
+      "platform": "windows",
+      "name": "non-repository",
+      "project": "plain/nested",
+      "dirs": [
+        "plain/nested"
+      ],
+      "files": {},
+      "expectedRoot": "plain/nested"
+    },
+    {
+      "platform": "windows",
+      "name": "repository-subfolder",
+      "project": "main/src/pkg",
+      "dirs": [
+        "main/.git",
+        "main/src/pkg"
+      ],
+      "files": {},
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "windows",
+      "name": "nested-repository",
+      "project": "main/child/src",
+      "dirs": [
+        "main/.git",
+        "main/child/.git",
+        "main/child/src"
+      ],
+      "files": {},
+      "expectedRoot": "main/child"
+    },
+    {
+      "platform": "windows",
+      "name": "invalid-git-file",
+      "project": "main/src",
+      "dirs": [
+        "main/src"
+      ],
+      "files": {
+        "main/.git": "not a gitdir\n"
+      },
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "windows",
+      "name": "git-file-without-common-dir",
+      "project": "main/src",
+      "dirs": [
+        "main/src",
+        "storage"
+      ],
+      "files": {
+        "main/.git": "gitdir: ../storage\n"
+      },
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "windows",
+      "name": "linked-worktree-relative",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: ../main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "../..\n",
+        "main/.git/worktrees/topic/gitdir": "../../../../topic/.git\n"
+      },
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "windows",
+      "name": "linked-worktree-absolute",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: $ROOT/main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "../..\n",
+        "main/.git/worktrees/topic/gitdir": "$ROOT/topic/.git\n"
+      },
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "windows",
+      "name": "linked-worktree-absolute-common",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: ../main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "$ROOT/main/.git\n",
+        "main/.git/worktrees/topic/gitdir": "../../../../topic/.git\n"
+      },
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "windows",
+      "name": "linked-worktree-absolute-backlink",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: ../main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "../..\n",
+        "main/.git/worktrees/topic/gitdir": "$ROOT/topic/.git\n"
+      },
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "windows",
+      "name": "linked-worktree-bom-and-whitespace",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "﻿ \tgitdir: ../main/.git/worktrees/topic \r\n",
+        "main/.git/worktrees/topic/commondir": "../..\n",
+        "main/.git/worktrees/topic/gitdir": "../../../../topic/.git\n"
+      },
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "windows",
+      "name": "invalid-prefix",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "GITDIR: ../main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "../..\n",
+        "main/.git/worktrees/topic/gitdir": "../../../../topic/.git\n"
+      },
+      "expectedRoot": "topic"
+    },
+    {
+      "platform": "windows",
+      "name": "invalid-backlink",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: ../main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "../..\n",
+        "main/.git/worktrees/topic/gitdir": "../../../../missing/.git\n"
+      },
+      "expectedRoot": "topic"
+    },
+    {
+      "platform": "windows",
+      "name": "missing-backlink",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: ../main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "../..\n"
+      },
+      "expectedRoot": "topic"
+    },
+    {
+      "platform": "windows",
+      "name": "wrong-common-topology",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: ../main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "../../..\n",
+        "main/.git/worktrees/topic/gitdir": "../../../../topic/.git\n"
+      },
+      "expectedRoot": "topic"
+    },
+    {
+      "platform": "windows",
+      "name": "bare-repository-worktree",
+      "project": "topic/src",
+      "dirs": [
+        "storage.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: ../storage.git/worktrees/topic\n",
+        "storage.git/worktrees/topic/commondir": "../..\n",
+        "storage.git/worktrees/topic/gitdir": "../../../topic/.git\n"
+      },
+      "expectedRoot": "storage.git"
+    },
+    {
+      "platform": "windows",
+      "name": "submodule-keeps-its-root",
+      "project": "main/sub/src",
+      "dirs": [
+        "main/.git/modules/sub",
+        "main/sub/src"
+      ],
+      "files": {
+        "main/sub/.git": "gitdir: ../.git/modules/sub\n",
+        "main/.git/modules/sub/commondir": "../..\n",
+        "main/.git/modules/sub/gitdir": "../../../sub/.git\n"
+      },
+      "expectedRoot": "main/sub"
+    },
+    {
+      "platform": "macos",
+      "name": "non-repository",
+      "project": "plain/nested",
+      "dirs": [
+        "plain/nested"
+      ],
+      "files": {},
+      "expectedRoot": "plain/nested"
+    },
+    {
+      "platform": "macos",
+      "name": "repository-subfolder",
+      "project": "main/src/pkg",
+      "dirs": [
+        "main/.git",
+        "main/src/pkg"
+      ],
+      "files": {},
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "macos",
+      "name": "nested-repository",
+      "project": "main/child/src",
+      "dirs": [
+        "main/.git",
+        "main/child/.git",
+        "main/child/src"
+      ],
+      "files": {},
+      "expectedRoot": "main/child"
+    },
+    {
+      "platform": "macos",
+      "name": "invalid-git-file",
+      "project": "main/src",
+      "dirs": [
+        "main/src"
+      ],
+      "files": {
+        "main/.git": "not a gitdir\n"
+      },
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "macos",
+      "name": "git-file-without-common-dir",
+      "project": "main/src",
+      "dirs": [
+        "main/src",
+        "storage"
+      ],
+      "files": {
+        "main/.git": "gitdir: ../storage\n"
+      },
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "macos",
+      "name": "linked-worktree-relative",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: ../main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "../..\n",
+        "main/.git/worktrees/topic/gitdir": "../../../../topic/.git\n"
+      },
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "macos",
+      "name": "linked-worktree-absolute",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: $ROOT/main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "../..\n",
+        "main/.git/worktrees/topic/gitdir": "$ROOT/topic/.git\n"
+      },
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "macos",
+      "name": "linked-worktree-absolute-common",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: ../main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "$ROOT/main/.git\n",
+        "main/.git/worktrees/topic/gitdir": "../../../../topic/.git\n"
+      },
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "macos",
+      "name": "linked-worktree-absolute-backlink",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: ../main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "../..\n",
+        "main/.git/worktrees/topic/gitdir": "$ROOT/topic/.git\n"
+      },
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "macos",
+      "name": "linked-worktree-bom-and-whitespace",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "﻿ \tgitdir: ../main/.git/worktrees/topic \r\n",
+        "main/.git/worktrees/topic/commondir": "../..\n",
+        "main/.git/worktrees/topic/gitdir": "../../../../topic/.git\n"
+      },
+      "expectedRoot": "main"
+    },
+    {
+      "platform": "macos",
+      "name": "invalid-prefix",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "GITDIR: ../main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "../..\n",
+        "main/.git/worktrees/topic/gitdir": "../../../../topic/.git\n"
+      },
+      "expectedRoot": "topic"
+    },
+    {
+      "platform": "macos",
+      "name": "invalid-backlink",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: ../main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "../..\n",
+        "main/.git/worktrees/topic/gitdir": "../../../../missing/.git\n"
+      },
+      "expectedRoot": "topic"
+    },
+    {
+      "platform": "macos",
+      "name": "missing-backlink",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: ../main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "../..\n"
+      },
+      "expectedRoot": "topic"
+    },
+    {
+      "platform": "macos",
+      "name": "wrong-common-topology",
+      "project": "topic/src",
+      "dirs": [
+        "main/.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: ../main/.git/worktrees/topic\n",
+        "main/.git/worktrees/topic/commondir": "../../..\n",
+        "main/.git/worktrees/topic/gitdir": "../../../../topic/.git\n"
+      },
+      "expectedRoot": "topic"
+    },
+    {
+      "platform": "macos",
+      "name": "bare-repository-worktree",
+      "project": "topic/src",
+      "dirs": [
+        "storage.git/worktrees/topic",
+        "topic/src"
+      ],
+      "files": {
+        "topic/.git": "gitdir: ../storage.git/worktrees/topic\n",
+        "storage.git/worktrees/topic/commondir": "../..\n",
+        "storage.git/worktrees/topic/gitdir": "../../../topic/.git\n"
+      },
+      "expectedRoot": "storage.git"
+    },
+    {
+      "platform": "macos",
+      "name": "submodule-keeps-its-root",
+      "project": "main/sub/src",
+      "dirs": [
+        "main/.git/modules/sub",
+        "main/sub/src"
+      ],
+      "files": {
+        "main/sub/.git": "gitdir: ../.git/modules/sub\n",
+        "main/.git/modules/sub/commondir": "../..\n",
+        "main/.git/modules/sub/gitdir": "../../../sub/.git\n"
+      },
+      "expectedRoot": "main/sub"
+    }
+  ]
+}

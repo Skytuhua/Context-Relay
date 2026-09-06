@@ -27,8 +27,9 @@ use context_relay_native_runner::{
     RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, RuntimeTarget, SidecarCommand, SidecarId,
 };
 use context_relay_protocol::{
-    ClientError, DeviceId, ErrorCode, HarnessId, HarnessParams, HybridLogicalClock, NativePlatform,
-    NativeScope, PlanId, PlanParams, ProjectId, SetupPlan, Sha256Digest, WireNativeValue,
+    ClientError, DeviceId, ErrorCode, HarnessAdapter as _, HarnessId, HarnessParams,
+    HybridLogicalClock, NativePlatform, NativeScope, PlanId, PlanParams, ProbeContext, ProbeReport,
+    ProjectId, SetupPlan, Sha256Digest, WireNativeValue,
 };
 
 #[cfg(not(windows))]
@@ -43,6 +44,38 @@ pub(crate) const NON_LAUNCHING_WINDOWS_SID: &str = "S-1-15-2-1-2-3-4-5-6-7";
 /// protocol DTOs; callers cannot inject paths, digests, commands, or plan
 /// bodies into apply and rollback.
 pub trait BridgeInstallEngine: Send + Sync {
+    fn preview_prepared(
+        &self,
+        _vault: &mut Vault,
+        _vault_path: &Path,
+        _device_id: DeviceId,
+        _params: HarnessParams,
+        _artifact: crate::harness_preparation::PreparedArtifact,
+    ) -> Result<SetupPlan, ClientError> {
+        Err(unsupported(
+            "Prepared setup is unavailable for this harness",
+        ))
+    }
+    fn prepare(
+        &self,
+        _vault: &Vault,
+        _vault_path: &Path,
+        _device_id: DeviceId,
+        _params: HarnessParams,
+    ) -> Result<crate::harness_preparation::PreparationTask, ClientError> {
+        Err(unsupported(
+            "Background preparation is unavailable for this harness",
+        ))
+    }
+    fn probe(
+        &self,
+        _vault: &Vault,
+        _device_id: DeviceId,
+        _params: HarnessParams,
+    ) -> Result<ProbeReport, ClientError> {
+        Err(unsupported("Harness discovery is unavailable"))
+    }
+
     fn reconcile_after_native_recovery(
         &self,
         vault: &mut Vault,
@@ -117,6 +150,28 @@ pub struct ProductionBridgeInstallEngine {
     bridge: AdjacentBridgeLocator,
 }
 
+#[cfg(windows)]
+pub struct PreparedArtifact(PreparedArtifactKind);
+
+#[cfg(windows)]
+enum PreparedArtifactKind {
+    Hermes {
+        setup: Box<context_relay_core::hermes::PreparedHermesSetup>,
+        vault_path: PathBuf,
+        device_id: DeviceId,
+    },
+    #[cfg(feature = "test-support")]
+    Fixture,
+}
+
+#[cfg(all(windows, feature = "test-support"))]
+impl PreparedArtifact {
+    #[doc(hidden)]
+    pub fn fixture() -> Self {
+        Self(PreparedArtifactKind::Fixture)
+    }
+}
+
 impl ProductionBridgeInstallEngine {
     pub fn production() -> Result<Self, ClientError> {
         Ok(Self {
@@ -129,9 +184,164 @@ impl ProductionBridgeInstallEngine {
             bridge: AdjacentBridgeLocator::beside(daemon_executable),
         }
     }
+
+    fn probe_codex(
+        &self,
+        adapter: &CodexAdapter,
+        context: &ProbeContext,
+    ) -> Result<ProbeReport, ClientError> {
+        let mut report = adapter.probe(context)?;
+        // Reuse this discovery's attested adapter. This reads saved user
+        // settings only; never start app-server to inspect a live profile.
+        report.codex_saved_hook_approval = self.bridge.locate().ok().and_then(|bridge| {
+            adapter
+                .saved_memory_hook_approval(&wire_native_path(&bridge.path))
+                .ok()
+        });
+        Ok(report)
+    }
 }
 
 impl BridgeInstallEngine for ProductionBridgeInstallEngine {
+    fn preview_prepared(
+        &self,
+        vault: &mut Vault,
+        vault_path: &Path,
+        device_id: DeviceId,
+        params: HarnessParams,
+        artifact: crate::harness_preparation::PreparedArtifact,
+    ) -> Result<SetupPlan, ClientError> {
+        #[cfg(not(windows))]
+        {
+            let _ = (vault, vault_path, device_id, params, artifact);
+            Err(unsupported(
+                "Prepared setup is unavailable on this platform",
+            ))
+        }
+        #[cfg(windows)]
+        {
+            let (setup, prepared_path, prepared_device) = match artifact.0 {
+                PreparedArtifactKind::Hermes {
+                    setup,
+                    vault_path,
+                    device_id,
+                } => (setup, vault_path, device_id),
+                #[cfg(feature = "test-support")]
+                PreparedArtifactKind::Fixture => {
+                    return Err(unsupported("Test artifacts cannot use production setup"));
+                }
+            };
+            if params.harness != HarnessId::Hermes
+                || prepared_device != device_id
+                || fs::canonicalize(vault_path)
+                    .map_err(|_| internal("The vault location is unavailable"))?
+                    != prepared_path
+            {
+                return Err(invalid("Prepared setup belongs to another workspace"));
+            }
+            let binding = project_binding(vault, params.project_id)?;
+            let project = binding
+                .registered
+                .ok_or_else(|| invalid("Choose a registered project"))?;
+            setup.preview(vault, self.bridge.clone(), &project, now_ms()?)
+        }
+    }
+    fn prepare(
+        &self,
+        vault: &Vault,
+        vault_path: &Path,
+        device_id: DeviceId,
+        params: HarnessParams,
+    ) -> Result<crate::harness_preparation::PreparationTask, ClientError> {
+        #[cfg(not(windows))]
+        {
+            let _ = (vault, vault_path, device_id, params);
+            Err(unsupported(
+                "Background preparation is unavailable on this platform",
+            ))
+        }
+        #[cfg(windows)]
+        {
+            if params.harness != HarnessId::Hermes {
+                return Err(unsupported(
+                    "This harness does not need runtime preparation",
+                ));
+            }
+            let binding = project_binding(vault, params.project_id)?;
+            if binding.registered.is_none() {
+                return Err(invalid("Choose a registered project"));
+            }
+            let store = canonical_lock_root(vault_path)?;
+            let vault_path = fs::canonicalize(vault_path)
+                .map_err(|_| internal("The vault location is unavailable"))?;
+            let profile = params
+                .hermes_profile
+                .ok_or_else(|| invalid("Choose a Hermes profile"))?;
+            let observed_hlc = HybridLogicalClock::new(now_ms()?, 0, device_id);
+            Ok(Box::new(move |cancelled, report| {
+                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(crate::canceled_error());
+                }
+                let adapter = HermesAdapter::discover_for_preparation(
+                    &binding.root,
+                    &binding.root,
+                    &profile,
+                    binding.project_id,
+                    device_id,
+                    observed_hlc,
+                )?;
+                let runtime = adapter.prepare_owned_runtime(&store, cancelled, report)?;
+                Ok(PreparedArtifact(PreparedArtifactKind::Hermes {
+                    setup: Box::new(adapter.into_setup_preview(runtime)?),
+                    vault_path,
+                    device_id,
+                }))
+            }))
+        }
+    }
+    fn probe(
+        &self,
+        vault: &Vault,
+        device_id: DeviceId,
+        params: HarnessParams,
+    ) -> Result<ProbeReport, ClientError> {
+        let binding = project_binding(vault, params.project_id)?;
+        let observed_hlc = HybridLogicalClock::new(now_ms()?, 0, device_id);
+        let context = ProbeContext {
+            harness: params.harness,
+            requested_profile: params.hermes_profile.clone(),
+        };
+        match params.harness {
+            HarnessId::ClaudeCode => ClaudeCodeAdapter::discover(
+                &binding.root,
+                binding.project_id,
+                device_id,
+                observed_hlc,
+            )
+            .and_then(|adapter| adapter.probe(&context)),
+            HarnessId::Codex => CodexAdapter::discover(
+                &binding.root,
+                &binding.root,
+                binding.project_id,
+                device_id,
+                observed_hlc,
+            )
+            .and_then(|adapter| self.probe_codex(&adapter, &context)),
+            HarnessId::Hermes => HermesAdapter::discover(
+                &binding.root,
+                &binding.root,
+                params
+                    .hermes_profile
+                    .as_deref()
+                    .ok_or_else(|| invalid("Hermes discovery requires an explicit profile"))?,
+                binding.project_id,
+                device_id,
+                observed_hlc,
+            )
+            .and_then(|adapter| adapter.probe(&context)),
+        }
+    }
+
     fn reconcile_after_native_recovery(
         &self,
         vault: &mut Vault,
@@ -252,6 +462,15 @@ struct ProductionBridgePlanExecutor<'a> {
 }
 
 impl BridgePlanExecutor for ProductionBridgePlanExecutor<'_> {
+    fn verify_watch_only_registration(
+        &mut self,
+        plan: &context_relay_core::native_transaction::NativeTransactionPlan,
+        _now_ms: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        self.verify_registration_inner(plan)
+            .map_err(|error| BridgeExecutionError::restored(error.message))
+    }
+
     fn execute(
         &mut self,
         vault: &mut Vault,
@@ -282,6 +501,69 @@ impl From<ClientError> for ProductionExecutionError {
 }
 
 impl ProductionBridgePlanExecutor<'_> {
+    fn verify_registration_inner(
+        &self,
+        plan: &context_relay_core::native_transaction::NativeTransactionPlan,
+    ) -> Result<(), ClientError> {
+        if plan.installed_runtime.is_some() {
+            return Err(invalid(
+                "Retained Hermes runtime registration is not connected yet",
+            ));
+        }
+        let (root, project_id) = sealed_project_binding(plan)?;
+        if plan.setup.target_scopes.iter().any(|scope| match scope {
+            NativeScope::Global => false,
+            NativeScope::Project { root: approved, .. } => {
+                !decode_wire_path(approved).is_ok_and(|approved| approved == root)
+            }
+        }) {
+            return Err(invalid("The approved registration project root changed"));
+        }
+        let observed_hlc = HybridLogicalClock::new(now_ms()?, 0, self.device_id);
+        // This branch never constructs a restricted executor, native filesystem,
+        // journal, CLI writer, gateway lease, or bridge executable.
+        match plan.setup.harness {
+            HarnessId::ClaudeCode => {
+                let adapter = ClaudeCodeAdapter::discover_for_registration(
+                    &root,
+                    project_id,
+                    self.device_id,
+                    observed_hlc,
+                    &plan.setup,
+                )?;
+                context_relay_core::setup::verify_watch_only_registration(&adapter, plan, now_ms()?)
+            }
+            HarnessId::Codex => {
+                let adapter = CodexAdapter::discover_for_registration(
+                    &root,
+                    &root,
+                    project_id,
+                    self.device_id,
+                    observed_hlc,
+                    &plan.setup,
+                )?;
+                context_relay_core::setup::verify_watch_only_registration(&adapter, plan, now_ms()?)
+            }
+            HarnessId::Hermes => {
+                let profile = plan
+                    .setup
+                    .harness_profile
+                    .as_deref()
+                    .ok_or_else(|| invalid("Persisted Hermes setup profile is unavailable"))?;
+                let adapter = HermesAdapter::discover_for_registration(
+                    &root,
+                    &root,
+                    profile,
+                    project_id,
+                    self.device_id,
+                    observed_hlc,
+                    &plan.setup,
+                )?;
+                context_relay_core::setup::verify_watch_only_registration(&adapter, plan, now_ms()?)
+            }
+        }
+    }
+
     fn execute_inner(
         &mut self,
         vault: &mut Vault,
@@ -290,6 +572,21 @@ impl ProductionBridgePlanExecutor<'_> {
         created_ms: u64,
         now_ms: u64,
     ) -> Result<(), ProductionExecutionError> {
+        if plan.installed_runtime.is_some() {
+            // The persisted service has already authenticated the vault record.
+            // Check its sealed approval again before any runtime version command.
+            let opened =
+                context_relay_core::native_transaction::open_plan(sealed_plan).map_err(|_| {
+                    invalid("Retained Hermes runtime execution needs a valid sealed plan")
+                })?;
+            if opened.plan != *plan || plan.setup.harness != HarnessId::Hermes {
+                return Err(
+                    invalid("Retained Hermes runtime execution plan does not match").into(),
+                );
+            }
+            #[cfg(not(windows))]
+            return Err(invalid("Retained Hermes runtime execution requires Windows").into());
+        }
         let (root, project_id) = sealed_project_binding(plan)?;
         let observed_hlc = HybridLogicalClock::new(now_ms, 0, self.device_id);
         let lock_root = canonical_lock_root(self.vault_path)?;
@@ -347,14 +644,38 @@ impl ProductionBridgePlanExecutor<'_> {
                     .harness_profile
                     .as_deref()
                     .ok_or_else(|| invalid("Persisted Hermes setup profile is unavailable"))?;
-                let mut adapter = HermesAdapter::discover(
-                    &root,
-                    &root,
-                    profile,
-                    project_id,
-                    self.device_id,
-                    observed_hlc,
-                )?;
+                let mut adapter = if plan.installed_runtime.is_some() {
+                    #[cfg(windows)]
+                    {
+                        HermesAdapter::discover_for_retained_setup(
+                            &root,
+                            &root,
+                            profile,
+                            project_id,
+                            self.device_id,
+                            observed_hlc,
+                            plan,
+                        )?
+                        .reopen_approved_runtime(
+                            &lock_root,
+                            plan,
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        )?
+                    }
+                    #[cfg(not(windows))]
+                    return Err(
+                        invalid("Retained Hermes runtime execution requires Windows").into(),
+                    );
+                } else {
+                    HermesAdapter::discover(
+                        &root,
+                        &root,
+                        profile,
+                        project_id,
+                        self.device_id,
+                        observed_hlc,
+                    )?
+                };
                 let mut cli = NoBridgeCliExecutor;
                 let mut executor = NativeEngineBridgePlanExecutor::new(
                     &mut adapter,
@@ -374,7 +695,7 @@ impl ProductionBridgePlanExecutor<'_> {
     }
 }
 
-fn sealed_project_binding(
+pub(crate) fn sealed_project_binding(
     plan: &context_relay_core::native_transaction::NativeTransactionPlan,
 ) -> Result<(PathBuf, ProjectId), ClientError> {
     let mut projects = plan.setup.target_scopes.iter().filter_map(|scope| {
@@ -581,6 +902,30 @@ impl RestrictedExecutor for BridgeRestrictedExecutor {
     }
 }
 
+fn wire_native_path(path: &Path) -> WireNativeValue {
+    #[cfg(windows)]
+    let (platform, bytes) = {
+        use std::os::windows::ffi::OsStrExt as _;
+        (
+            NativePlatform::Windows,
+            path.as_os_str()
+                .encode_wide()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+        )
+    };
+    #[cfg(not(windows))]
+    let (platform, bytes) = {
+        use std::os::unix::ffi::OsStrExt as _;
+        (NativePlatform::Macos, path.as_os_str().as_bytes().to_vec())
+    };
+    WireNativeValue {
+        platform,
+        bytes,
+        display: None,
+    }
+}
+
 #[cfg(windows)]
 fn decode_wire_path(value: &WireNativeValue) -> Result<PathBuf, ClientError> {
     use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
@@ -646,7 +991,7 @@ pub(crate) mod tests {
     #[cfg(target_os = "macos")]
     use context_relay_core::native_transaction::{ApprovedCliMutation, CanonicalCliDeclaration};
     use context_relay_core::{
-        native_transaction::{NativeTransactionPlan, approval_hash_v2, seal_plan},
+        native_transaction::{NativeTransactionPlan, approval_hash_v2, open_plan, seal_plan},
         setup::{BridgeExecutionError, BridgePlanExecutor},
         vault::{DatabaseKeyStore, SetupPlanWrite, VaultError},
     };
@@ -664,6 +1009,587 @@ pub(crate) mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+
+    #[test]
+    fn retained_runtime_requires_matching_sealed_plan_before_production_discovery() {
+        let path = TempVault::new("retained-runtime-production-guard");
+        let keys = MemoryKeyStore::default();
+        let mut vault =
+            Vault::open(path.path(), "retained-runtime-production-guard", &keys).unwrap();
+        let mut plan = base_plan();
+        plan.setup.batch_hash = approval_hash_v2(&plan).unwrap();
+        let ordinary_sealed = seal_plan(&plan, plan.setup.batch_hash).unwrap();
+        assert_eq!(open_plan(&ordinary_sealed).unwrap().plan, plan);
+        plan.installed_runtime = Some(
+            serde_json::from_value(serde_json::json!({
+                "kind": "hermesPythonV1", "runtime": {
+                    "schemaVersion": 1, "storageKey": "context-relay-hermes-runtime-Abc123",
+                    "manifestIdentity": Sha256Digest([71; 32]),
+                }
+            }))
+            .unwrap(),
+        );
+        let mut executor = ProductionBridgePlanExecutor {
+            vault_path: path.path(),
+            device_id: "018f22e2-79b0-7cc8-98c4-dc0c0c073990".parse().unwrap(),
+        };
+        assert!(
+            executor
+                .verify_registration_inner(&plan)
+                .unwrap_err()
+                .message
+                .contains("Retained Hermes runtime registration")
+        );
+        for (sealed, message) in [
+            (&[][..], "needs a valid sealed plan"),
+            (ordinary_sealed.as_slice(), "plan does not match"),
+        ] {
+            match executor.execute_inner(&mut vault, &plan, sealed, 1, 1) {
+                Err(ProductionExecutionError::Compose(error)) => {
+                    assert!(error.message.contains(message), "{}", error.message)
+                }
+                _ => panic!("runtime must be rejected before ordinary production composition"),
+            }
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn interrupted_pre_journal_setup_allows_restart_and_reads_without_execution() {
+        use context_relay_core::vault::SetupPlanAction;
+        use context_relay_local_ipc::{Client, InstallationToken, RuntimeConfig};
+        use context_relay_protocol::{
+            ClientRole, EmptyParams, LocalRequest, LocalResult, RecordId,
+        };
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::Arc;
+
+        struct CrashBeforeJournal;
+        impl BridgePlanExecutor for CrashBeforeJournal {
+            fn execute(
+                &mut self,
+                _vault: &mut Vault,
+                _plan: &NativeTransactionPlan,
+                _sealed: &[u8],
+                _created_ms: u64,
+                _now_ms: u64,
+            ) -> Result<(), BridgeExecutionError> {
+                panic!("interrupted before opening the native journal");
+            }
+        }
+
+        for undo in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let runtime = RuntimeConfig::for_test(
+                format!("pre-journal-{}", uuid::Uuid::now_v7()),
+                Some(temp.path().to_owned()),
+            )
+            .unwrap();
+            let config = crate::test_support::TestDaemonConfig::new(
+                runtime.clone(),
+                temp.path().join("vault.db"),
+                InstallationToken::from_bytes([0x68; 32]),
+            )
+            .with_bridge_install_engine(Arc::new(
+                ProductionBridgeInstallEngine::with_daemon_executable(
+                    "/definitely/missing/contextd",
+                ),
+            ));
+            let before = config
+                .with_vault(|vault| {
+                    let plan = persist_native_plan(vault, base_plan());
+                    if undo {
+                        BridgeInstallService::persisted(vault)
+                            .apply(&plan.setup.plan_id, 2, &mut RecordingExecutor)
+                            .unwrap();
+                        assert!(
+                            catch_unwind(AssertUnwindSafe(|| {
+                                BridgeInstallService::persisted(vault).rollback(
+                                    &plan.setup.plan_id,
+                                    3,
+                                    &mut CrashBeforeJournal,
+                                )
+                            }))
+                            .is_err()
+                        );
+                    } else {
+                        vault.claim_setup_plan(&plan.setup.plan_id, SetupPlanAction::Apply, 2)?;
+                    }
+                    vault.incomplete_setup_plans()
+                })
+                .unwrap();
+            assert_eq!(before.len(), if undo { 2 } else { 1 });
+
+            let daemon = config
+                .start()
+                .await
+                .expect("unstarted setup must not prevent reopening");
+            let handle = daemon.handle();
+            let running = tokio::spawn(daemon.run());
+            let mut client = Client::connect_for_test(
+                &runtime,
+                ClientRole::Desktop,
+                &config.installation_token(),
+            )
+            .await
+            .unwrap();
+            let result = client
+                .call(
+                    RecordId::new(uuid::Uuid::now_v7()).unwrap(),
+                    LocalRequest::ProjectsList(EmptyParams {}),
+                )
+                .await;
+            handle.shutdown().await;
+            running.await.unwrap().unwrap();
+            assert_eq!(result.unwrap(), LocalResult::Projects { projects: vec![] });
+            config
+                .with_vault(|vault| {
+                    assert_eq!(vault.incomplete_setup_plans()?, before);
+                    for plan in &before {
+                        assert!(
+                            vault
+                                .native_transaction(&format!("bridge-setup-{}", plan.plan_id))?
+                                .is_none()
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn codex_probe_reports_saved_approvals_without_starting_another_process() {
+        use context_relay_core::codex::{CodexExecutableKind, CodexLayout};
+        use context_relay_protocol::{
+            InstallationMethod, SavedHookApproval, SavedMemoryHookApproval,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let home = root.join("home");
+        let config = home.join(".codex");
+        let project = root.join("project");
+        fs::create_dir_all(&config).unwrap();
+        fs::create_dir(&project).unwrap();
+        let device: DeviceId = "018f22e2-79b0-7cc8-98c4-dc0c0c073982".parse().unwrap();
+        let adapter = CodexAdapter::from_layout(
+            CodexLayout {
+                executable: std::env::current_exe().unwrap(),
+                executable_kind: CodexExecutableKind::Native,
+                version: "0.144.6".into(),
+                installation_method: InstallationMethod::Manual,
+                codex_home: config.clone(),
+                user_home: home.clone(),
+                user_skills_dir: home.join(".agents/skills"),
+                project_root: project.clone(),
+                working_directory: project,
+                requirements_paths: vec![],
+            },
+            "018f22e2-79b0-7cc8-98c4-dc0c0c073981".parse().unwrap(),
+            device,
+            HybridLogicalClock::new(1, 0, device),
+        )
+        .unwrap();
+        let engine = ProductionBridgeInstallEngine::with_daemon_executable(root.join("contextd"));
+        let context = ProbeContext {
+            harness: HarnessId::Codex,
+            requested_profile: None,
+        };
+        // Without the installed adjacent bridge, approval evidence is unavailable.
+        assert_eq!(
+            engine
+                .probe_codex(&adapter, &context)
+                .unwrap()
+                .codex_saved_hook_approval,
+            None
+        );
+        let bridge = engine.bridge.bridge_path().unwrap();
+        fs::write(&bridge, b"fixture only; never executed").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&bridge, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let missing = engine.probe_codex(&adapter, &context).unwrap();
+        assert_eq!(
+            missing.codex_saved_hook_approval,
+            Some(SavedMemoryHookApproval {
+                session_start: SavedHookApproval::Missing,
+                stop: SavedHookApproval::Missing,
+            })
+        );
+        assert_eq!(
+            missing.capability,
+            context_relay_protocol::CapabilityLevel::ImportOnly
+        );
+        let component = context_relay_core::native_memory::managed_memory_hooks(
+            HarnessId::Codex,
+            &wire_native_path(&engine.bridge.locate().unwrap().path),
+        )
+        .unwrap()
+        .remove(0);
+        let hooks = format!("{{\"hooks\":{}}}", component.body_markdown);
+        fs::write(config.join("hooks.json"), &hooks).unwrap();
+        let pending = engine.probe_codex(&adapter, &context).unwrap();
+        assert_eq!(
+            pending.codex_saved_hook_approval,
+            Some(SavedMemoryHookApproval {
+                session_start: SavedHookApproval::NeedsApproval,
+                stop: SavedHookApproval::NeedsApproval,
+            })
+        );
+        assert_eq!(
+            fs::read_to_string(config.join("hooks.json")).unwrap(),
+            hooks
+        );
+        assert!(!config.join(".personality_migration").exists());
+        fs::write(config.join("hooks.json"), b"{malformed").unwrap();
+        assert_eq!(
+            engine
+                .probe_codex(&adapter, &context)
+                .unwrap()
+                .codex_saved_hook_approval,
+            None
+        );
+    }
+
+    fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+        let command = std::process::Command::new(program);
+        #[cfg(windows)]
+        let command = {
+            use std::os::windows::process::CommandExt as _;
+            let mut command = command;
+            command.creation_flags(0x0800_0000);
+            command
+        };
+        command
+    }
+
+    #[test]
+    fn production_registration_discovery_never_launches_approved_or_changed_harnesses() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let canary = root.join(format!("watch-canary{}", std::env::consts::EXE_SUFFIX));
+        let fallback_marker = root.join("unexpected-launch-with-cleared-environment");
+        let output = hidden_command(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/watch-registration-canary.rs"),
+            )
+            .env("CONTEXT_RELAY_TEST_WATCH_FALLBACK", &fallback_marker)
+            .arg("-o")
+            .arg(&canary)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let marker = root.join("positive-control");
+        let output = hidden_command(&canary)
+            .env("CONTEXT_RELAY_TEST_WATCH_MARKER", &marker)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(marker.is_file(), "the canary must detect an actual launch");
+        for harness in ["claude", "codex", "hermes"] {
+            for change in ["unchanged", "bytes", "path", "project"] {
+                let case = root.join(format!("{harness}-{change}"));
+                let bin = case.join("bin");
+                let other_bin = case.join("other-bin");
+                let home = case.join("home");
+                let user_home = PathBuf::from(home.to_str().unwrap().trim_start_matches(r"\\?\"));
+                for directory in [&bin, &other_bin, &home] {
+                    fs::create_dir_all(directory).unwrap();
+                }
+                let name = format!("{harness}{}", std::env::consts::EXE_SUFFIX);
+                fs::copy(&canary, bin.join(&name)).unwrap();
+                fs::copy(&canary, other_bin.join(&name)).unwrap();
+                let child_marker = case.join("unexpected-launch");
+                let search_path = if change == "path" { &other_bin } else { &bin };
+                let search_path =
+                    PathBuf::from(search_path.to_str().unwrap().trim_start_matches(r"\\?\"));
+                let mut child = hidden_command(std::env::current_exe().unwrap());
+                child
+                    .env_clear()
+                    .args([
+                        "--exact",
+                        "bridge_install::tests::registration_discovery_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("CONTEXT_RELAY_TEST_WATCH_ROOT", &case)
+                    .env("CONTEXT_RELAY_TEST_WATCH_HARNESS", harness)
+                    .env("CONTEXT_RELAY_TEST_WATCH_CHANGE", change)
+                    .env("CONTEXT_RELAY_TEST_WATCH_MARKER", &child_marker)
+                    .env("PATH", &search_path)
+                    .env("HOME", &user_home)
+                    .env("USERPROFILE", &user_home)
+                    .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+                    .env("CODEX_HOME", home.join("codex"))
+                    .env("HERMES_HOME", home.join("hermes"))
+                    .current_dir(&case);
+                for key in ["SystemRoot", "WINDIR", "TEMP", "TMP"] {
+                    if let Some(value) = std::env::var_os(key) {
+                        child.env(key, value);
+                    }
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    !child_marker.exists() && !fallback_marker.exists(),
+                    "{harness}/{change} launched a harness"
+                );
+                assert!(
+                    output.status.success(),
+                    "{harness}/{change}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "only invoked in an isolated child environment by the production registration canary"]
+    fn registration_discovery_child() {
+        use context_relay_core::{
+            claude_code::ClaudeCodeLayout,
+            codex::{CodexExecutableKind, CodexLayout},
+            hermes::{HermesExecutableKind, HermesLayout, HermesProfile},
+        };
+        let root = PathBuf::from(std::env::var_os("CONTEXT_RELAY_TEST_WATCH_ROOT").unwrap());
+        let harness = std::env::var("CONTEXT_RELAY_TEST_WATCH_HARNESS").unwrap();
+        let change = std::env::var("CONTEXT_RELAY_TEST_WATCH_CHANGE").unwrap();
+        let home = root.join("home");
+        // Use the ordinary Windows home spelling used by the native runtime.
+        let user_home = PathBuf::from(home.to_str().unwrap().trim_start_matches(r"\\?\"));
+        let project = root.join("project");
+        for path in [
+            project.join(".claude"),
+            home.join("claude"),
+            home.join("codex"),
+            home.join("hermes"),
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(
+            project.join(".claude/settings.json"),
+            br#"{"autoMemoryDirectory":"~/memory"}"#,
+        )
+        .unwrap();
+        fs::write(home.join("claude/settings.json"), b"{}").unwrap();
+        fs::write(home.join("claude/.claude.json"), b"{}").unwrap();
+        fs::write(home.join("codex/config.toml"), b"").unwrap();
+        fs::write(home.join("hermes/config.yaml"), b"{}\n").unwrap();
+        let project = fs::canonicalize(project).unwrap();
+        let executable = root
+            .join("bin")
+            .join(format!("{harness}{}", std::env::consts::EXE_SUFFIX));
+        let executable = PathBuf::from(executable.to_str().unwrap().trim_start_matches(r"\\?\"));
+        let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073990").unwrap();
+        let project_id = global_project_id().unwrap();
+        let now = now_ms().unwrap();
+        let clock = HybridLogicalClock::new(now, 0, device_id);
+        let vault_path = root.join("vault.db");
+        let mut vault = Vault::open(
+            &vault_path,
+            "watch-production-canary",
+            &MemoryKeyStore::default(),
+        )
+        .unwrap();
+        fn preview(
+            vault: &mut Vault,
+            adapter: impl context_relay_core::setup::BridgePreviewHarness,
+            project: &Path,
+            device: DeviceId,
+            clock: HybridLogicalClock,
+            now: u64,
+        ) -> NativeTransactionPlan {
+            let setup = BridgeInstallService::new(
+                vault,
+                adapter,
+                ProductionBridgeInstallEngine::with_daemon_executable("unused").bridge,
+                device,
+                clock,
+            )
+            .preview(
+                Some(&RegisteredProject {
+                    project_id: global_project_id().unwrap(),
+                    root: crate::unit_test_support::wire_native_path(project),
+                }),
+                now,
+            )
+            .unwrap();
+            context_relay_core::native_transaction::open_plan(
+                &vault.setup_plan(&setup.plan_id).unwrap().unwrap().payload,
+            )
+            .unwrap()
+            .plan
+        }
+        let installation_method = context_relay_protocol::InstallationMethod::PackageManager;
+        let mut plan = match harness.as_str() {
+            "claude" => preview(
+                &mut vault,
+                ClaudeCodeAdapter::from_layout(
+                    ClaudeCodeLayout {
+                        executable: executable.clone(),
+                        version: "9.9.9".into(),
+                        installation_method,
+                        user_home,
+                        config_dir: home.join("claude"),
+                        state_path: home.join("claude/.claude.json"),
+                        project_root: project.clone(),
+                        managed_settings_paths: if cfg!(windows) {
+                            vec![]
+                        } else if cfg!(target_os = "macos") {
+                            vec![PathBuf::from(
+                                "/Library/Application Support/ClaudeCode/managed-settings.json",
+                            )]
+                        } else {
+                            vec![PathBuf::from("/etc/claude-code/managed-settings.json")]
+                        },
+                    },
+                    project_id,
+                    device_id,
+                    clock,
+                )
+                .unwrap(),
+                &project,
+                device_id,
+                clock,
+                now,
+            ),
+            "codex" => preview(
+                &mut vault,
+                CodexAdapter::from_layout(
+                    CodexLayout {
+                        executable: executable.clone(),
+                        executable_kind: CodexExecutableKind::Native,
+                        version: "9.9.9".into(),
+                        installation_method,
+                        codex_home: home.join("codex"),
+                        user_home: home.clone(),
+                        user_skills_dir: home.join(".agents/skills"),
+                        project_root: project.clone(),
+                        working_directory: project.clone(),
+                        requirements_paths: vec![],
+                    },
+                    project_id,
+                    device_id,
+                    clock,
+                )
+                .unwrap(),
+                &project,
+                device_id,
+                clock,
+                now,
+            ),
+            "hermes" => preview(
+                &mut vault,
+                HermesAdapter::from_layout(
+                    HermesLayout {
+                        executable: executable.clone(),
+                        executable_kind: HermesExecutableKind::Native,
+                        version: "9.9.9".into(),
+                        installation_method,
+                        default_hermes_home: home.join("hermes"),
+                        profile: HermesProfile {
+                            name: "default".into(),
+                            hermes_home: fs::canonicalize(home.join("hermes")).unwrap(),
+                        },
+                        project_root: project.clone(),
+                        working_directory: project.clone(),
+                    },
+                    project_id,
+                    device_id,
+                    clock,
+                )
+                .unwrap(),
+                &project,
+                device_id,
+                clock,
+                now,
+            ),
+            _ => unreachable!(),
+        };
+        if change == "bytes" {
+            use std::io::Write as _;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&executable)
+                .unwrap()
+                .write_all(b"changed")
+                .unwrap();
+        }
+        if change == "project" {
+            // A noncanonical project claim must be rejected before discovery.
+            let separator = std::path::MAIN_SEPARATOR;
+            let noncanonical = PathBuf::from(format!(
+                "{}{separator}..{separator}project",
+                project.display()
+            ));
+            plan.setup.target_scopes = vec![NativeScope::Project {
+                project_id,
+                root: crate::unit_test_support::wire_native_path(&noncanonical),
+            }];
+        }
+        let mut executor = ProductionBridgePlanExecutor {
+            vault_path: &vault_path,
+            device_id,
+        };
+        let result = executor.verify_watch_only_registration(&plan, now);
+        if change == "unchanged" {
+            result.unwrap();
+        } else {
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn cli_recovery_uses_the_sealed_project_instead_of_the_vault_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let vault_root = root.join("vault");
+        let project_root = root.join("project with spaces");
+        fs::create_dir(&vault_root).unwrap();
+        fs::create_dir(&project_root).unwrap();
+        let project_id = ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073981").unwrap();
+        let device_id = DeviceId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073990").unwrap();
+        let recovery = crate::ProductionBridgeCliRecoveryIo {
+            root: vault_root.clone(),
+            project_id: global_project_id().unwrap(),
+            device_id,
+            observed_hlc: HybridLogicalClock::new(1, 0, device_id),
+        };
+        let mut plan = base_plan();
+        plan.setup.target_scopes.push(NativeScope::Project {
+            project_id,
+            root: crate::unit_test_support::wire_native_path(&project_root),
+        });
+        let mut bound = context_relay_core::native_transaction::recovery::BoundCliRecoveryPlan {
+            plan,
+            mutations: vec![],
+        };
+        assert_eq!(
+            recovery.project_binding(&bound).unwrap(),
+            (project_root.clone(), project_id)
+        );
+        bound.plan.setup.target_scopes.push(NativeScope::Project {
+            project_id: global_project_id().unwrap(),
+            root: crate::unit_test_support::wire_native_path(&vault_root),
+        });
+        assert!(
+            recovery.project_binding(&bound).is_err(),
+            "ambiguous project scopes cannot select a recovery root"
+        );
+        bound.plan.setup.target_scopes = vec![NativeScope::Global];
+        assert_eq!(
+            recovery.project_binding(&bound).unwrap(),
+            (vault_root, global_project_id().unwrap())
+        );
+    }
 
     #[test]
     fn terminal_apply_and_rollback_replay_before_any_production_composition() {
@@ -776,6 +1702,7 @@ pub(crate) mod tests {
         vault: &mut Vault,
         executable: &Path,
         bridge_executable: &Path,
+        execution_context: context_relay_core::native_transaction::CliExecutionContext,
     ) -> NativeTransactionPlan {
         let mut plan = base_plan();
         plan.setup.harness = HarnessId::ClaudeCode;
@@ -783,6 +1710,17 @@ pub(crate) mod tests {
         plan.setup.executable_hash =
             Sha256Digest(Sha256::digest(fs::read(executable).unwrap()).into());
         plan.setup.harness_version = "2.1.214".into();
+        let context_relay_core::native_transaction::CliExecutionContext::ClaudeCodeV2 {
+            project_root,
+            ..
+        } = &execution_context
+        else {
+            panic!("fixture needs an explicit Claude context");
+        };
+        plan.setup.target_scopes.push(NativeScope::Project {
+            project_id: global_project_id().unwrap(),
+            root: project_root.clone(),
+        });
         plan.sidecars[0].command = SidecarCommand::RuleSyncGenerate {
             target: RuleSyncTarget::ClaudeCode,
             features: RuleSyncFeatures::new(&[RuleSyncFeature::Mcp]).unwrap(),
@@ -824,6 +1762,7 @@ pub(crate) mod tests {
         };
         plan.setup.cli_operations = vec![forward.clone()];
         plan.cli_mutations = vec![ApprovedCliMutation {
+            execution_context: Some(execution_context),
             stable_id: "f4a4f9a2-0e8d-720e-8df4-a5a68da3e9c7".into(),
             expected: None,
             intended: Some(intended),
@@ -891,6 +1830,7 @@ pub(crate) mod tests {
             scanner_result_hash: Sha256Digest([8; 32]),
             mutations: vec![],
             cli_mutations: vec![],
+            installed_runtime: None,
             native_memory_registrations: vec![],
             ownership_changes: vec![],
         }
