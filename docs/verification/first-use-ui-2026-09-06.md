@@ -54,3 +54,20 @@ replace native installer, physical keyboard/screen-reader or clean-machine
 acceptance. The installed runtime compatibility gates remain unchanged. The
 synthetic project named `Installer verification 專案 🚀` is preserved and is not
 an application feature. The candidate is unsigned; no signing service exists.
+
+## Result visibility follow-up — 2026-09-07
+
+At 1166 × 800, the Hermes availability result and its Prepare action could appear
+below the initial viewport after Review setup. Availability and settings-review
+headings now receive keyboard focus and scroll into view when their result arrives
+on the active Harnesses screen. Keyboard focus uses the existing visible outline.
+Late results after leaving the screen do not move focus back to Harnesses.
+
+Four result-focus assertions failed before the change. The 218-test frontend suite
+then passed; an additional regression passed against the same mounted component
+becoming inactive before a delayed response. Type checking, lint and production
+build passed. Headless Edge verified the focused heading inside the viewport for
+Hermes availability, direct review and prepared review at desktop/narrow widths.
+The existing 13 preparation/Save/history/Undo flow views also passed with no browser
+errors or horizontal overflow. This is controlled frontend evidence, not installed
+harness connection acceptance. Local evidence uses `.codex/harness-result-focus-`.

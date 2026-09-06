@@ -150,7 +150,7 @@ button:hover { background: var(--color-surface); }
 }
 
 :where(a, button, input, select, textarea, summary):focus-visible,
-h1:focus-visible {
+:is(h1, h2):focus-visible {
   outline: 3px solid var(--color-primary-strong);
   outline-offset: 3px;
 }

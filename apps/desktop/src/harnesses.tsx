@@ -34,12 +34,20 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   const busyRef = useRef<BusyAction>(null);
   const generation = useRef(0);
   const mounted = useRef(false);
+  const resultHeadingRef = useRef<HTMLHeadingElement>(null);
   const project = projects.find((item) => item.projectId === projectId);
   const expired = review !== null && BigInt(review.plan.expiresAt) <= BigInt(now);
   const conflicts = review?.plan.semanticChanges.some((change) => change.class === 'conflict') ?? false;
   const matching = review !== null && (review.params.projectId === null || review.params.projectId === project?.projectId) &&
     review.params.harness === harness && review.params.hermesProfile === (harness === 'hermes' ? canonicalProfile : null);
   const canApply = approved && matching && !expired && !conflicts && !busy;
+
+  useEffect(() => {
+    if (!active) return;
+    const heading = resultHeadingRef.current;
+    heading?.focus({ preventScroll: true });
+    heading?.scrollIntoView?.({ block: 'start' });
+  }, [active, discovery, review]);
 
   useEffect(() => {
     if (!active || execution.busy) return;
@@ -261,7 +269,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
         {outcomeText(execution.outcome.status.action, execution.outcome.setup.state, execution.outcome.status.error !== null)} {label(reviewed(execution.outcome.setup, projects))}.
       </p>{execution.outcome.setup.state === 'applied' && <SetupNextSteps item={reviewed(execution.outcome.setup, projects)} />}</section>}
       {discovery && discovery.report.capability !== 'full' && <section className="connection-result" aria-label="Harness availability">
-        <h2>{harnessNames[discovery.harness]}{discovery.report.harnessVersion && discovery.report.harnessVersion !== 'unknown' ? ` ${discovery.report.harnessVersion}` : ''}</h2>
+        <h2 ref={resultHeadingRef} tabIndex={-1}>{harnessNames[discovery.harness]}{discovery.report.harnessVersion && discovery.report.harnessVersion !== 'unknown' ? ` ${discovery.report.harnessVersion}` : ''}</h2>
         <p role="status">{discovery.report.capability === 'missing'
           ? `${harnessNames[discovery.harness]} was not found. Install it, restart Context Relay and select Review setup again.`
           : discovery.report.capability === 'blocked'
@@ -286,7 +294,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
       {busy && busy !== 'preparing' && <p role="status">{busy === 'preview' ? 'Checking the installed harness…' : busy === 'loading' ? 'Loading saved setup…' : busy === 'checking' ? 'Checking for unfinished setup…' : busy === 'apply' ? 'Saving harness settings…' : 'Undoing setup changes…'}</p>}
       {execution.pending && <p className="help-text">This can take a few minutes. You can use another screen; return here to check the result.</p>}
       {review && <section className="record-card" aria-labelledby="harness-review-title">
-        <h2 id="harness-review-title">Review setup changes</h2>
+        <h2 id="harness-review-title" ref={resultHeadingRef} tabIndex={-1}>Review setup changes</h2>
         <p>{label(review)}</p>
         <PlanDetails plan={review.plan} projectName={review.projectName} />
         {review.params.harness === 'codex' && <p>After saving, review the Context Relay session hooks in the Codex CLI. Codex requires approval before new or changed hooks can run.</p>}

@@ -46,6 +46,7 @@ it.each([
   });
   await open(); preview();
   expect(await screen.findByText(message)).toBeVisible();
+  expect(screen.getByRole('heading', { name: capability === 'missing' ? 'Codex' : 'Codex 0.144.6' })).toHaveFocus();
   if (capability !== 'missing') expect(screen.getByText(/0\.144\.6/)).toBeVisible();
   expect(requests).toEqual([{ method: 'harness_probe', params }]);
   expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
@@ -60,6 +61,7 @@ it('requests a fresh exact plan only after Full discovery and still requires app
   });
   await open(); preview();
   expect(await screen.findByRole('heading', { name: 'Review setup changes' })).toBeVisible();
+  expect(screen.getByRole('heading', { name: 'Review setup changes' })).toHaveFocus();
   expect(requests).toEqual([{ method: 'harness_probe', params }, { method: 'harness_preview', params }]);
   expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled();
 });
@@ -135,6 +137,21 @@ it('explains an unavailable Hermes home separately from a missing executable', a
   preview();
   expect(await screen.findByRole('alert')).toHaveTextContent('Hermes home folder is unavailable');
   expect(screen.getByRole('alert')).not.toHaveTextContent('executable was not found');
+});
+
+it('does not move focus back to a hidden harness screen when a late result arrives', async () => {
+  let resolve!: (value: unknown) => void;
+  invoke.mockImplementation(() => new Promise(done => { resolve = done; }));
+  const gateway = new LocalWorkspaceGateway();
+  const view = render(<><button type="button">Another screen</button><HarnessesScreen gateway={gateway} projects={[project]} /></>);
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Review setup' })).toBeEnabled());
+  preview();
+  view.rerender(<><button type="button">Another screen</button><HarnessesScreen gateway={gateway} projects={[project]} active={false} /></>);
+  const otherScreen = screen.getByRole('button', { name: 'Another screen' });
+  otherScreen.focus();
+  await act(async () => resolve(response(report)));
+  expect(otherScreen).toHaveFocus();
+  expect(screen.queryByRole('heading', { name: 'Codex 0.144.6' })).not.toBeInTheDocument();
 });
 
 it('identifies a Python installation without presenting its metadata version as qualified', async () => {
