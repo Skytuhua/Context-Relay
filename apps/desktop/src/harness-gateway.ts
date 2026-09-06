@@ -1,10 +1,14 @@
-import type { HarnessExecutionParams, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, HarnessParams, PlanId, ProbeReport, SetupPlan } from './bindings';
+import type { HarnessPrepareParams, HarnessPreparationStatus, HarnessExecutionParams, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, HarnessParams, PlanId, ProbeReport, SetupPlan } from './bindings';
 import * as protocolValidation from './protocol-validation';
 
 const assertSetupPlan: (value: unknown) => asserts value is SetupPlan = protocolValidation.assertSetupPlan;
 const assertProbeReport: (value: unknown) => asserts value is ProbeReport = protocolValidation.assertProbeReport;
 
 export interface HarnessGateway {
+  harnessPrepare(params: HarnessPrepareParams): Promise<HarnessPreparationStatus>;
+  harnessPreparationStatus(params: HarnessPrepareParams): Promise<HarnessPreparationStatus>;
+  harnessPreparationCancel(params: HarnessPrepareParams): Promise<HarnessPreparationStatus>;
+  harnessPreparedPreview(params: HarnessPrepareParams): Promise<SetupPlan>;
   harnessExecutionStart(params: HarnessExecutionParams): Promise<HarnessExecutionStatus>;
   harnessExecutionStatus(params: HarnessExecutionParams): Promise<HarnessExecutionStatus>;
   harnessExecutionCurrent(): Promise<HarnessExecutionStatus | null>;

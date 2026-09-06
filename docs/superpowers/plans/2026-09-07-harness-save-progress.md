@@ -92,6 +92,30 @@ saved guidance, restart history, confirmed Undo, and no horizontal overflow.
 
 ## Remaining integration
 
-The visible preparation progress/cancel flow, production Full gates, live harness
-connection validation, rebuilt installer and installed acceptance remain unfinished.
-Native Computer Use remains paused. No new EXE is claimed by this backend change.
+The frontend now implements Prepare, Status, Cancel and PreparedPreview. It stores
+only the operation identity and selection before starting, observes progress even
+while the start response is delayed, and requires a separate action to review a
+Ready copy. Cancellation is confirmed through status; a completion race remains
+Ready. A lost response or missing operation retains the original identity for
+observation or explicit same-ID retry. Missing status never proves that a queued
+native invocation cannot start later, so it cannot authorize a replacement ID.
+Failed prepared reviews refresh status rather than retaining a stale Ready label.
+If the service rejects the preparation factory before copying, it records that
+exact attempt through the owned worker and publishes a redacted terminal failure.
+Same-ID requests replay that failure, so the screen can safely dismiss it without
+confusing a definite rejection with admission that is still pending.
+
+The preparation UI is currently behind the proposed
+`python_runtime_preparation_required` discovery flag for Windows Hermes 0.17.0.
+Production still emits `python_runtime_not_qualified`; the new action is therefore
+not exposed yet. Before changing that flag and the retained Full gate, qualify an
+isolated cycle through ProductionBridgeInstallEngine/ProductionBridgePlanExecutor:
+authenticated Prepare, PreparedPreview, tracked Save, history after daemon restart,
+and Undo, without the test-only qualification switch. Existing core qualification
+uses a custom executor and inert bridge, so it does not prove this composition.
+Preserve rejection of missing runtime binding, wrong version, unsupported YAML and
+profile drift. A live MCP session remains separate evidence for a connection claim.
+
+Production Full gates, live harness connection validation, rebuilt installer and
+installed acceptance remain unfinished. Native Computer Use remains paused. No
+new EXE is claimed by these changes.

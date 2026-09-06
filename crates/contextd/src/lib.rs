@@ -1668,12 +1668,19 @@ fn execute_harness_setup(
             if let Some(status) = client.replay(&params)? {
                 return Ok(LocalResult::HarnessPreparation { status });
             }
-            let task = state.bridge_install.prepare(
-                &state.vault,
-                &state.vault_path,
-                state.device_id,
-                params.selection.clone(),
-            )?;
+            // A rejected factory is still a resolved attempt. Publish its exact
+            // identity through the owned worker so reconnecting clients can
+            // distinguish terminal failure from a start awaiting admission.
+            // The preparation worker redacts the error and replay retains it.
+            let task = state
+                .bridge_install
+                .prepare(
+                    &state.vault,
+                    &state.vault_path,
+                    state.device_id,
+                    params.selection.clone(),
+                )
+                .unwrap_or_else(|error| Box::new(move |_, _| Err(error)));
             client
                 .start(params, task)
                 .map(|status| LocalResult::HarnessPreparation { status })

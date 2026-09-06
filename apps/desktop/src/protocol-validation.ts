@@ -1,6 +1,6 @@
 import Ajv2020 from 'ajv/dist/2020.js';
 
-import type { HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
+import type { HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
 
 const utf8 = new TextEncoder();
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -219,6 +219,30 @@ export const assertSha256Hex = (value: string) => sha(value, 'SHA-256 hex');
 export const assertBase64UrlBytes = (value: string, size: number) => fixed(value, size, 'fixed-size base64url');
 
 const setupStates = ['previewed', 'applying', 'applied', 'apply_restored', 'rolling_back', 'rolled_back', 'rollback_restored', 'conflict', 'expired'];
+function clientError(value: unknown, field: string) {
+  const error = object(value, ['code', 'message', 'fieldPath', 'retryable'], field);
+  choice(error.code, ['protocol_version_unsupported', 'invalid_request', 'frame_too_large', 'vault_locked', 'not_found', 'revision_conflict', 'scope_denied', 'approval_required', 'plan_changed', 'plan_expired', 'harness_unsupported', 'conflict', 'quota_exceeded', 'canceled', 'timeout', 'busy', 'internal'], `${field}.code`);
+  text(error.message, 512, `${field}.message`);
+  if (error.fieldPath !== null) string(error.fieldPath, `${field}.fieldPath`);
+  choice(error.retryable, [true, false], `${field}.retryable`);
+}
+
+export function validateHarnessPreparation(value: unknown): HarnessPreparationStatus {
+  const item = object(value, ['operationId', 'selection', 'phase', 'completedFiles', 'completedBytes', 'error'], 'harnessPreparation');
+  id(item.operationId, 'harnessPreparation.operationId');
+  const selection = object(item.selection, ['harness', 'projectId', 'hermesProfile'], 'harnessPreparation.selection');
+  if (selection.harness !== 'hermes') fail('harnessPreparation.harness');
+  if (selection.projectId !== null) id(selection.projectId, 'harnessPreparation.projectId');
+  const profile = text(selection.hermesProfile, 64, 'harnessPreparation.profile');
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(profile)) fail('harnessPreparation.profile');
+  choice(item.phase, ['inspecting', 'copying', 'checking_source', 'checking_copy', 'retaining', 'cancelling', 'ready', 'canceled', 'failed'], 'harnessPreparation.phase');
+  uint(item.completedFiles, 32768, 'harnessPreparation.completedFiles');
+  uint(item.completedBytes, 1_073_741_824, 'harnessPreparation.completedBytes');
+  if ((item.phase === 'failed') !== (item.error !== null)) fail('harnessPreparation.error');
+  if (item.error !== null) clientError(item.error, 'harnessPreparation.error');
+  return value as HarnessPreparationStatus;
+}
+
 export function validateHarnessExecution(value: unknown): HarnessExecutionStatus {
   const item = object(value, ['planId', 'action', 'phase', 'error'], 'harnessExecution');
   id(item.planId, 'harnessExecution.planId');
@@ -226,11 +250,7 @@ export function validateHarnessExecution(value: unknown): HarnessExecutionStatus
   choice(item.phase, ['queued', 'running', 'finished', 'unknown'], 'harnessExecution.phase');
   if (item.error !== null) {
     if (item.phase !== 'finished') fail('harnessExecution.error');
-    const error = object(item.error, ['code', 'message', 'fieldPath', 'retryable'], 'harnessExecution.error');
-    choice(error.code, ['protocol_version_unsupported', 'invalid_request', 'frame_too_large', 'vault_locked', 'not_found', 'revision_conflict', 'scope_denied', 'approval_required', 'plan_changed', 'plan_expired', 'harness_unsupported', 'conflict', 'quota_exceeded', 'canceled', 'timeout', 'busy', 'internal'], 'harnessExecution.error.code');
-    text(error.message, 512, 'harnessExecution.error.message');
-    if (error.fieldPath !== null) string(error.fieldPath, 'harnessExecution.error.fieldPath');
-    choice(error.retryable, [true, false], 'harnessExecution.error.retryable');
+    clientError(item.error, 'harnessExecution.error');
   }
   return value as HarnessExecutionStatus;
 }

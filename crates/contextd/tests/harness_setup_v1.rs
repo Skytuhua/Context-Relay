@@ -125,6 +125,7 @@ struct RecordingEngine {
     preparation_starts: Arc<AtomicUsize>,
     preparation_factories: AtomicUsize,
     fail_repeated_preparation_factory: bool,
+    reject_preparation_factory: bool,
     reconciles: AtomicUsize,
     probes: Mutex<Vec<HarnessParams>>,
     previews: Mutex<Vec<(HarnessId, Option<String>)>>,
@@ -271,8 +272,9 @@ impl BridgeInstallEngine for RecordingEngine {
         _device_id: DeviceId,
         _params: HarnessParams,
     ) -> Result<context_relay_contextd::harness_preparation::PreparationTask, ClientError> {
-        if self.preparation_factories.fetch_add(1, Ordering::SeqCst) > 0
-            && self.fail_repeated_preparation_factory
+        let previous = self.preparation_factories.fetch_add(1, Ordering::SeqCst);
+        if self.reject_preparation_factory
+            || (previous > 0 && self.fail_repeated_preparation_factory)
         {
             return Err(conflict("Project path changed after preparation started"));
         }
@@ -473,6 +475,74 @@ async fn prepared_preview_replays_exact_result_through_authenticated_ipc() {
             .code,
         ErrorCode::NotFound
     );
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn rejected_preparation_factory_retains_terminal_identity_and_replays_without_restarting() {
+    use context_relay_protocol::{
+        HarnessPreparationIdParams, HarnessPreparationPhase, HarnessPrepareParams, OperationId,
+    };
+    let engine = Arc::new(RecordingEngine {
+        reject_preparation_factory: true,
+        ..Default::default()
+    });
+    let fixture = Fixture::start("prepare-factory-rejected", engine.clone(), None).await;
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    let params = HarnessPrepareParams {
+        operation_id: OperationId::new(Uuid::now_v7()).unwrap(),
+        selection: HarnessParams {
+            harness: HarnessId::Hermes,
+            project_id: None,
+            hermes_profile: Some("coder".into()),
+        },
+    };
+    client
+        .call(LocalRequest::HarnessPrepare(params.clone()))
+        .await
+        .unwrap();
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let result = client.call(LocalRequest::HarnessPreparationStatus(HarnessPreparationIdParams { operation_id: params.operation_id })).await.unwrap();
+            if matches!(&result, LocalResult::HarnessPreparation { status } if status.phase == HarnessPreparationPhase::Failed) { break result; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }).await.unwrap();
+    let LocalResult::HarnessPreparation { status } = &failed else {
+        panic!("expected failed status")
+    };
+    assert_eq!(status.operation_id, params.operation_id);
+    assert_eq!(status.selection, params.selection);
+    assert!(
+        !status
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("Project path")
+    );
+    drop(client);
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    assert_eq!(
+        client
+            .call(LocalRequest::HarnessPrepare(params.clone()))
+            .await
+            .unwrap(),
+        failed
+    );
+    let mut changed = params;
+    changed.selection.hermes_profile = Some("other".into());
+    assert_eq!(
+        client
+            .call(LocalRequest::HarnessPrepare(changed))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(engine.preparation_factories.load(Ordering::SeqCst), 1);
+    assert_eq!(engine.preparation_starts.load(Ordering::SeqCst), 0);
+    assert_eq!(engine.writes.load(Ordering::SeqCst), 0);
     fixture.stop().await;
 }
 

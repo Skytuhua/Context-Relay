@@ -2,10 +2,11 @@ import { useEffect, useRef, useState } from 'react';
 import type { HarnessId, HarnessParams, HarnessSetupRecord, HarnessSetupState, HarnessSetupSummary, PlanId, ProbeReport, ProjectIdentity, SavedHookApproval, SavedMemoryHookApproval, SetupPlan, WireNativeValue } from './bindings';
 import { type HarnessGateway, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
 import { useHarnessExecution } from './use-harness-execution';
+import { useHarnessPreparation } from './use-harness-preparation';
 
 const harnessNames: Record<HarnessId, string> = { claude_code: 'Claude Code', codex: 'Codex', hermes: 'Hermes' };
 type ReviewedPlan = { plan: SetupPlan; params: HarnessParams; projectName: string; state?: HarnessSetupState };
-type BusyAction = 'preview' | 'loading' | 'checking' | 'apply' | 'rollback' | null;
+type BusyAction = 'preview' | 'loading' | 'checking' | 'preparing' | 'apply' | 'rollback' | null;
 
 export function HarnessesScreen({ gateway, projects, preferredProjectId, onProjectChange, onAddProject, onSaveContext, active = true }: { gateway: HarnessGateway; projects: ProjectIdentity[]; preferredProjectId?: string; onProjectChange?: (id: string) => void; onAddProject?: () => void; onSaveContext?: () => void; active?: boolean }) {
   const [selectedProjectId, setProjectId] = useState<string | null>(null);
@@ -18,6 +19,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   const [discovery, setDiscovery] = useState<{ harness: HarnessId; report: ProbeReport } | null>(null);
   const [approved, setApproved] = useState(false);
   const execution = useHarnessExecution(gateway, active);
+  const preparation = useHarnessPreparation(gateway, active);
   const [history, setHistory] = useState<HarnessSetupSummary[]>([]);
   const [nextAfter, setNextAfter] = useState<PlanId | null>(null);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -26,7 +28,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   const [details, setDetails] = useState<Map<PlanId, HarnessSetupRecord>>(new Map());
   const [rollbackTarget, setRollbackTarget] = useState<PlanId | null>(null);
   const [localBusy, setBusy] = useState<BusyAction>(null);
-  const busy: BusyAction = localBusy ?? (execution.busy ? execution.pending?.action ?? 'checking' : null);
+  const busy: BusyAction = localBusy ?? (execution.busy ? execution.pending?.action ?? 'checking' : preparation.busy ? 'preparing' : null);
   const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now);
   const busyRef = useRef<BusyAction>(null);
@@ -96,7 +98,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   }
 
   function start(action: Exclude<BusyAction, null>) {
-    if (!active || busyRef.current || execution.busy) return false;
+    if (!active || busyRef.current || execution.busy || preparation.busy) return false;
     busyRef.current = action;
     setBusy(action);
     setError(null);
@@ -110,7 +112,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   }
 
   async function previewSetup() {
-    if (!project || (harness === 'hermes' && !validProfile) || !start('preview')) return;
+    if (preparation.target || !project || (harness === 'hermes' && !validProfile) || !start('preview')) return;
     clearReview();
     const revision = generation.current;
     const params: HarnessParams = { harness, projectId: project.projectId, hermesProfile: harness === 'hermes' ? canonicalProfile : null };
@@ -152,6 +154,27 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
     setApproved(false);
     setReview(null); setError(null);
     await execution.execute({ planId: item.plan.planId, action: 'rollback' });
+  }
+
+  async function reviewPreparedSetup() {
+    const target = preparation.target;
+    if (!target || preparation.status?.phase !== 'ready' || !start('preview')) return;
+    const revision = generation.current;
+    try {
+      const plan = validateHarnessPlan(await gateway.harnessPreparedPreview(target), target.selection);
+      if (!mounted.current || revision !== generation.current) return;
+      const restored = reviewed({ plan, state: 'previewed', createdAt: '0' }, projects);
+      setHarness(target.selection.harness); setProfile(target.selection.hermesProfile ?? 'default');
+      if (target.selection.projectId !== null) {
+        if (onProjectChange) onProjectChange(target.selection.projectId); else setProjectId(target.selection.projectId);
+      }
+      setNow(Date.now()); setReview(restored); setApproved(false); setDiscovery(null);
+      preparation.dismiss(); refreshHistory(value => value + 1);
+    } catch {
+      preparation.checkAgain();
+      if (mounted.current && revision === generation.current) setError('Could not confirm the prepared review. Checking preparation before offering the next action.');
+    }
+    finally { finish(); }
   }
 
   async function loadSetup(id: PlanId, intent: 'details' | 'review' | 'undo') {
@@ -201,25 +224,38 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
         <p>Choose your project and harness to check compatibility and review the settings.</p>
         <div className="field">
           <label htmlFor="harness-project">Project</label>
-          <select id="harness-project" value={projectId} disabled={busy === 'apply' || busy === 'rollback'} onChange={(event) => { clearReview(); if (onProjectChange) onProjectChange(event.target.value); else setProjectId(event.target.value); }}>
+          <select id="harness-project" value={projectId} disabled={busy === 'apply' || busy === 'rollback' || preparation.busy} onChange={(event) => { clearReview(); if (onProjectChange) onProjectChange(event.target.value); else setProjectId(event.target.value); }}>
             <option value="">Choose your project</option>
             {projects.map((item) => <option key={item.projectId} value={item.projectId}>{item.name}</option>)}
           </select>
         </div>
         <div className="field">
           <label htmlFor="harness-kind">Harness</label>
-          <select id="harness-kind" value={harness} disabled={busy === 'apply' || busy === 'rollback'} onChange={(event) => { clearReview(); setHarness(event.target.value as HarnessId); }}>
+          <select id="harness-kind" value={harness} disabled={busy === 'apply' || busy === 'rollback' || preparation.busy} onChange={(event) => { clearReview(); setHarness(event.target.value as HarnessId); }}>
             {Object.entries(harnessNames).map(([id, name]) => <option key={id} value={id}>{name}</option>)}
           </select>
         </div>
         {harness === 'hermes' && <div className="field">
           <label htmlFor="hermes-profile">Hermes profile</label>
-          <input id="hermes-profile" value={profile} maxLength={64} required aria-invalid={!validProfile} aria-describedby="hermes-profile-help" disabled={busy === 'apply' || busy === 'rollback'} onChange={(event) => { clearReview(); setProfile(event.target.value); }} />
+          <input id="hermes-profile" value={profile} maxLength={64} required aria-invalid={!validProfile} aria-describedby="hermes-profile-help" disabled={busy === 'apply' || busy === 'rollback' || preparation.busy} onChange={(event) => { clearReview(); setProfile(event.target.value); }} />
           <p id="hermes-profile-help">Use a profile name, such as default or coder. Leave default selected unless you created another profile. Folder paths are not profile names.</p>
         </div>}
-        <button className="primary-action" type="submit" disabled={!!busy || !project || (harness === 'hermes' && !validProfile)}>{busy === 'preview' ? 'Checking harness…' : 'Review setup'}</button>
+        <button className="primary-action" type="submit" disabled={!!busy || preparation.target !== null || !project || (harness === 'hermes' && !validProfile)}>{busy === 'preview' ? 'Checking harness…' : 'Review setup'}</button>
       </form>
       {error && <p className="form-error" role="alert">{error}</p>}
+      {preparation.error && <p className="form-error" role="alert">{preparation.error}{preparation.target && <button type="button" onClick={preparation.checkAgain}>Check preparation</button>}</p>}
+      {preparation.target && <section className="record-card" aria-label="Harness preparation">
+        <h2>Prepare Hermes setup</h2>
+        <p>Hermes ({preparation.target.selection.hermesProfile}) for {projects.find(item => item.projectId === preparation.target?.selection.projectId)?.name ?? 'saved project'}</p>
+        {!preparation.missing && <p role="status">{preparation.status ? preparationText(preparation.status.phase) : 'Checking preparation…'}</p>}
+        {preparation.status && preparation.status.completedFiles > 0 && <p className="help-text">{preparation.status.completedFiles.toLocaleString()} files · {(preparation.status.completedBytes / 1024 / 1024).toLocaleString(undefined, { maximumFractionDigits: 1 })} MB processed</p>}
+        <p>Preparation makes a private copy for Context Relay. Harness settings change only after you review and save them.</p>
+        {preparation.busy && <p>This can take a few minutes. You can use another screen and return to check progress.</p>}
+        {preparation.busy && <button type="button" className="secondary-action" disabled={preparation.canceling || preparation.status?.phase === 'cancelling'} onClick={() => void preparation.cancel()}>Cancel preparation</button>}
+        {!preparation.busy && !preparation.missing && preparation.status?.phase === 'ready' && <button type="button" className="primary-action" disabled={!!busy} onClick={() => void reviewPreparedSetup()}>Review prepared setup</button>}
+        {preparation.missing && <button type="button" className="primary-action" disabled={!!busy} onClick={() => void preparation.retry()}>Retry same preparation</button>}
+        {!preparation.busy && !preparation.missing && <button type="button" className="secondary-action" disabled={!!busy} onClick={preparation.dismiss}>Dismiss preparation</button>}
+      </section>}
       {execution.error && <p className="form-error" role="alert">{execution.error} <button type="button" onClick={execution.checkAgain}>Check again</button></p>}
       {execution.outcome && <section aria-label="Setup result"><p className={execution.outcome.status.error ? 'form-error' : 'notice'} role={execution.outcome.status.error ? 'alert' : 'status'}>
         {outcomeText(execution.outcome.status.action, execution.outcome.setup.state, execution.outcome.status.error !== null)} {label(reviewed(execution.outcome.setup, projects))}.
@@ -230,17 +266,24 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
           ? `${harnessNames[discovery.harness]} was not found. Install it, restart Context Relay and select Review setup again.`
           : discovery.report.capability === 'blocked'
             ? 'Local policy prevents automatic setup. Check the restrictions configured for this harness before trying again.'
+            : preparationAvailable(discovery.harness, discovery.report)
+              ? 'Hermes needs a private runtime copy before you can review its setup. Preparation can take a few minutes and can be canceled.'
             : discovery.harness === 'hermes' && discovery.report.policyConflicts.includes('python_runtime_not_qualified')
               ? 'Hermes uses a Python runtime that Context Relay does not support for automatic connection yet. Your Hermes installation does not need to be reinstalled.'
             : discovery.harness === 'hermes' && discovery.report.harnessVersion === 'unknown'
               ? 'Hermes was found, but this launcher cannot connect automatically yet. Context Relay cannot verify its version and runtime. You can still save context and tasks while launcher support is completed.'
               : 'This version cannot connect automatically yet. You can still save context and tasks in Context Relay while support for this version is completed.'}</p>
         <p>The harness is not connected. No setup changes were made.</p>
+        {preparationAvailable(discovery.harness, discovery.report) && !preparation.target && <button type="button" className="primary-action" disabled={!!busy} onClick={() => {
+          if (busy || !project) return;
+          const selection: HarnessParams = { harness: 'hermes', projectId: project.projectId, hermesProfile: canonicalProfile };
+          clearReview(); void preparation.begin(selection);
+        }}>Prepare setup</button>}
         {onSaveContext && <button className="secondary-action" type="button" disabled={!!busy} onClick={onSaveContext}>Save context</button>}
         {discovery.report.executable && <details className="technical-details"><summary>Technical details</summary><p>Executable: {nativeText(discovery.report.executable)}</p>{discovery.harness === 'hermes' && discovery.report.policyConflicts.includes('python_runtime_not_qualified') && <p>Version read from installed package metadata. The Python runtime has not been executed or verified for connection.</p>}</details>}
       </section>}
       {discovery?.report.codexSavedHookApproval && <SavedHookApprovals approval={discovery.report.codexSavedHookApproval} />}
-      {busy && <p role="status">{busy === 'preview' ? 'Checking the installed harness…' : busy === 'loading' ? 'Loading saved setup…' : busy === 'checking' ? 'Checking for unfinished setup…' : busy === 'apply' ? 'Saving harness settings…' : 'Undoing setup changes…'}</p>}
+      {busy && busy !== 'preparing' && <p role="status">{busy === 'preview' ? 'Checking the installed harness…' : busy === 'loading' ? 'Loading saved setup…' : busy === 'checking' ? 'Checking for unfinished setup…' : busy === 'apply' ? 'Saving harness settings…' : 'Undoing setup changes…'}</p>}
       {execution.pending && <p className="help-text">This can take a few minutes. You can use another screen; return here to check the result.</p>}
       {review && <section className="record-card" aria-labelledby="harness-review-title">
         <h2 id="harness-review-title">Review setup changes</h2>
@@ -286,6 +329,22 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
       </section>}
     </section>
   );
+}
+
+function preparationAvailable(harness: HarnessId, report: ProbeReport) {
+  return harness === 'hermes' && report.capability === 'import_only' && report.harnessVersion === '0.17.0' &&
+    report.executable?.platform === 'windows' && report.policyConflicts.includes('python_runtime_preparation_required');
+}
+
+function preparationText(phase: import('./bindings').HarnessPreparationPhase) {
+  const names: Record<typeof phase, string> = {
+    inspecting: 'Checking the Hermes installation…', copying: 'Copying the Hermes runtime…',
+    checking_source: 'Checking the source files…', checking_copy: 'Checking the prepared copy…',
+    retaining: 'Finishing preparation…', cancelling: 'Canceling preparation…',
+    ready: 'Preparation is ready. Review the changes before saving.', canceled: 'Preparation canceled.',
+    failed: 'Preparation could not finish. Dismiss this attempt and review the harness to try again.',
+  };
+  return names[phase];
 }
 
 function reviewed(setup: HarnessSetupRecord, projects: ProjectIdentity[]): ReviewedPlan {

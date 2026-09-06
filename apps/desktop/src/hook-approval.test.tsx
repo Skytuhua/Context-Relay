@@ -18,6 +18,7 @@ it.each([
     installationMethod: 'manual', configRoots: [], activeProfile: null, policyConflicts: [], capability: 'import_only',
     codexSavedHookApproval: { sessionStart: state, stop: state } } as ProbeReport;
   const gateway: HarnessGateway = { harnessProbe: vi.fn().mockResolvedValue(report),
+    harnessPrepare: vi.fn(), harnessPreparationStatus: vi.fn(), harnessPreparationCancel: vi.fn(), harnessPreparedPreview: vi.fn(),
     harnessExecutionStart: vi.fn(), harnessExecutionStatus: vi.fn(), harnessExecutionCurrent: vi.fn().mockResolvedValue(null),
     harnessSetupGet: vi.fn(), harnessSetupsList: vi.fn().mockResolvedValue({ setups: [], nextAfter: null }),
     harnessPreview: vi.fn(), harnessApply: vi.fn(), harnessRollback: vi.fn() };

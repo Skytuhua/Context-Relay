@@ -4,6 +4,7 @@ import type {
   DesktopWrite,
   DesktopWritesPage,
   HarnessParams,
+  HarnessPrepareParams,
   HarnessExecutionParams,
   LocalRequest,
   LocalResult,
@@ -27,11 +28,11 @@ import type {
   TaskId,
   TaskRecord,
   TaskStatus,
-  UuidV7,
 } from './bindings';
 import { LocalClient } from './local-client';
+import { uuidV7 } from './uuid';
 import { type HarnessGateway, requireHarnessAcknowledgment, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
-import { validateHarnessExecution, validateHarnessSetupRecord, validateHarnessSetupsPage } from './protocol-validation';
+import { validateHarnessPreparation, validateHarnessExecution, validateHarnessSetupRecord, validateHarnessSetupsPage } from './protocol-validation';
 
 export type PairingInviteResult = Extract<LocalResult, { kind: 'pairing_invite' }>;
 export type PairingRequestResult = Extract<LocalResult, { kind: 'pairing_request' }>;
@@ -236,6 +237,34 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
       throw new Error('Setup history did not advance.');
     }
     return page;
+  }
+
+  async harnessPrepare(params: HarnessPrepareParams) {
+    return this.harnessPreparation('harness_prepare', params);
+  }
+
+  async harnessPreparationStatus(params: HarnessPrepareParams) {
+    return this.harnessPreparation('harness_preparation_status', params);
+  }
+
+  async harnessPreparationCancel(params: HarnessPrepareParams) {
+    return this.harnessPreparation('harness_preparation_cancel', params);
+  }
+
+  private async harnessPreparation(method: 'harness_prepare' | 'harness_preparation_status' | 'harness_preparation_cancel', params: HarnessPrepareParams) {
+    const request: LocalRequest = method === 'harness_prepare' ? { method, params } : { method, params: { operationId: params.operationId } };
+    const result = await this.call(request);
+    const status = validateHarnessPreparation(harnessResult(result, 'harness_preparation', 'status'));
+    if (status.operationId !== params.operationId || status.selection.harness !== params.selection.harness ||
+      status.selection.projectId !== params.selection.projectId || status.selection.hermesProfile !== params.selection.hermesProfile) {
+      throw new Error('Preparation does not match the selected operation.');
+    }
+    return status;
+  }
+
+  async harnessPreparedPreview(params: HarnessPrepareParams) {
+    const result = await this.call({ method: 'harness_prepared_preview', params });
+    return validateHarnessPlan(harnessResult(result, 'plan', 'plan'), params.selection);
   }
 
   async harnessPreview(params: HarnessParams) {
@@ -650,18 +679,7 @@ function unexpectedNativeResult(result: never): never {
   throw new Error(`Unexpected native recovery result: ${String(result)}`);
 }
 
-function uuidV7(): UuidV7 {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  let timestamp = BigInt(Date.now());
-  for (let index = 5; index >= 0; index -= 1) {
-    bytes[index] = Number(timestamp & 0xffn);
-    timestamp >>= 8n;
-  }
-  bytes[6] = (bytes[6] & 0x0f) | 0x70;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}` as UuidV7;
-}
+
 
 function nativePath(path: string) {
   const macos = navigator.userAgent.includes('Mac');

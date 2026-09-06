@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { beforeEach, expect, it, vi } from 'vitest';
-import type { DecimalU64, HarnessParams, ProjectId, SetupPlan } from './bindings';
+import type { DecimalU64, HarnessParams, HarnessPrepareParams, ProjectId, SetupPlan, OperationId } from './bindings';
 
 const invoke = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
@@ -13,6 +13,40 @@ function plan(): SetupPlan {
   return { ...value, expiresAt: '2000000000000' as DecimalU64, targetScopes: [{ scope: 'project', projectId, root: value.executablePath }] };
 }
 beforeEach(() => invoke.mockReset());
+
+it('prepares, observes, cancels and reviews the exact Hermes operation and selection', async () => {
+  const gateway = new LocalWorkspaceGateway();
+  const key: HarnessPrepareParams = { operationId: plan().planId as unknown as OperationId, selection: { ...params, harness: 'hermes', hermesProfile: 'default' } };
+  const status = { ...key, phase: 'copying', completedFiles: 42, completedBytes: 4096, error: null };
+  invoke.mockResolvedValue({ kind: 'harness_preparation', data: { status } });
+  expect(await gateway.harnessPrepare(key)).toEqual(status);
+  expect(await gateway.harnessPreparationStatus(key)).toEqual(status);
+  expect(await gateway.harnessPreparationCancel(key)).toEqual(status);
+  invoke.mockResolvedValue({ kind: 'plan', data: { plan: { ...plan(), harness: 'hermes', harnessProfile: 'default' } } });
+  expect((await gateway.harnessPreparedPreview(key)).harness).toBe('hermes');
+  expect(invoke.mock.calls.map(call => call[1].request)).toEqual([
+    { method: 'harness_prepare', params: key },
+    { method: 'harness_preparation_status', params: { operationId: key.operationId } },
+    { method: 'harness_preparation_cancel', params: { operationId: key.operationId } },
+    { method: 'harness_prepared_preview', params: key },
+  ]);
+});
+
+it('rejects preparation responses with wrong selection, identity, counters or failure state', async () => {
+  const gateway = new LocalWorkspaceGateway();
+  const key: HarnessPrepareParams = { operationId: plan().planId as unknown as OperationId, selection: { ...params, harness: 'hermes', hermesProfile: 'default' } };
+  const status = { ...key, phase: 'copying', completedFiles: 42, completedBytes: 4096, error: null };
+  for (const patch of [
+    { operationId: projectId }, { selection: { ...key.selection, hermesProfile: 'other' } },
+    { selection: { ...key.selection, extra: true } }, { completedFiles: 32769 },
+    { completedBytes: 1_073_741_825 }, { completedFiles: -1 }, { completedBytes: 0.5 },
+    { phase: 'failed' }, { phase: 'ready', error: { code: 'internal', message: 'failure', fieldPath: null, retryable: false } },
+    { extra: true }, { error: undefined },
+  ]) {
+    invoke.mockResolvedValue({ kind: 'harness_preparation', data: { status: { ...status, ...patch } } });
+    await expect(gateway.harnessPreparationStatus(key)).rejects.toThrow();
+  }
+});
 
 it('tracks the exact plan and action and reads its authoritative saved record', async () => {
   const gateway = new LocalWorkspaceGateway();
