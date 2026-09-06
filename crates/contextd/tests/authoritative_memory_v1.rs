@@ -767,10 +767,14 @@ impl MaterializedCodex {
         let home = root.join("home");
         let project_root = root.join("project");
         let working_directory = project_root.join("service");
+        #[cfg(windows)]
+        let project_key = dunce::simplified(&project_root);
+        #[cfg(not(windows))]
+        let project_key = project_root.as_path();
         materialize_substituting(
             &codex_home,
             fixture["codexHome"].as_object().unwrap(),
-            &project_root,
+            project_key,
         );
         materialize(
             &home.join(".agents/skills"),

@@ -27,3 +27,6 @@ serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 uuid.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+dunce = "1.0.5"

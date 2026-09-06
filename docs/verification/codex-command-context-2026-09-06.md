@@ -83,6 +83,25 @@ CI run `34005214789` exposed two test issues on the previous commit:
   spelling and asserts that it resolves to the bound physical path. The actual
   setup/watcher/review/MCP chain and all ten end-to-end tests pass locally.
 
+The original temporary-path correction above was insufficient: CI run
+`34021397684` still failed when Windows TEMP itself used a verbatim path. Both
+the MCP and authoritative-daemon materializers now use `dunce::simplified`
+solely for their synthetic Codex trust keys, retaining physical path bindings.
+The MCP chain test always supplies a canonical Windows project path so ordinary
+local runs also exercise this regression. `dunce` is a Windows-only test
+dependency in these two crates and was already present in the lockfile.
+
+Forced-verbatim TEMP/TMP reproduced the original failures in both suites before
+the correction. Afterwards all ten MCP end-to-end tests and all four
+authoritative-daemon tests passed (18.15 and 7.31 seconds). The permanent MCP
+regression also passed with ordinary TEMP (5.49 seconds). Formatting, diff checks
+and daemon/MCP all-target Clippy with test support and warnings denied pass.
+Independent review found no actionable issues. Evidence is retained in
+`mcp-verbatim-temp-{red,green,regression}.log`,
+`daemon-verbatim-temp-{red,green}.log` and `verbatim-fixtures-clippy.log`.
+The installer, Secret Scan and Supabase workflows for `2e24749` passed; its
+general CI run still contains the Windows fixture failure and is not green.
+
 The source dependency checker and product trust policy are unchanged. Exact
 hosted failures are retained in `ci-baefedc-boundary.log` and
 `ci-baefedc-windows-tests.log`; `codex-command-context-boundary.log` records the

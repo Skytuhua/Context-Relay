@@ -659,6 +659,12 @@ async fn three_harness_daemon_flow_is_scoped_idempotent_and_never_installs_a_bri
 #[tokio::test]
 async fn production_setup_watcher_review_and_actual_mcp_form_one_chain() {
     let fixture = Fixture::new();
+    // Exercise the verbatim spelling even when the caller's TEMP is ordinary.
+    #[cfg(windows)]
+    let fixture = Fixture {
+        project_root: std::fs::canonicalize(&fixture.project_root).unwrap(),
+        ..fixture
+    };
     let project = project_identity("authoritative native memory");
     let materialized = MaterializedCodexE2e::new(&fixture, project.project_id);
     let config = fixture
@@ -1370,10 +1376,10 @@ impl MaterializedCodexE2e {
         let codex_home = root.join("codex-home");
         let home = root.join("home");
         let working_directory = project_root.join("service");
-        // Keep the native Windows spelling used to create this temporary
-        // project as its Codex trust key, while retaining physical bindings.
+        // TEMP itself can use a verbatim path on Windows. Match Codex's
+        // trust-key spelling independently of how the fixture was created.
         #[cfg(windows)]
-        let project_key = fixture.project_root.as_path();
+        let project_key = dunce::simplified(&project_root);
         #[cfg(not(windows))]
         let project_key = project_root.as_path();
         assert_eq!(std::fs::canonicalize(project_key).unwrap(), project_root);
