@@ -39,6 +39,9 @@ pub struct PreparedRuntime {
 }
 
 impl PreparedRuntime {
+    pub(crate) fn manifest(&self) -> &RuntimeManifest {
+        self.runtime.manifest()
+    }
     pub fn reference(&self) -> &RetainedRuntimeReference {
         self.runtime.reference()
     }

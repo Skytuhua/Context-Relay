@@ -1857,6 +1857,17 @@ where
         registered_project: Option<&RegisteredProject>,
         now_ms: u64,
     ) -> Result<SetupPlan, ClientError> {
+        self.preview_before_persist(registered_project, now_ms, || {})
+    }
+
+    /// Transfer an owned runtime only after the complete plan has been sealed,
+    /// but before the vault may commit a reference to it.
+    pub(crate) fn preview_before_persist(
+        &mut self,
+        registered_project: Option<&RegisteredProject>,
+        now_ms: u64,
+        before_persist: impl FnOnce(),
+    ) -> Result<SetupPlan, ClientError> {
         let runtime_target = self
             .runtime_target
             .ok_or_else(|| unsupported("Harness setup is unavailable on this host"))?;
@@ -2166,6 +2177,7 @@ where
             )
         };
         let sealed = sealed.map_err(|_| invalid("Bridge preview plan cannot be sealed"))?;
+        before_persist();
         self.vault
             .put_setup_plan(SetupPlanWrite {
                 plan_id: &setup.plan_id,

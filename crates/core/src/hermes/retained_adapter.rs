@@ -114,6 +114,9 @@ impl HermesAdapter {
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self, ClientError> {
         check_cancelled(&cancelled)?;
+        if self.preview_runtime.is_some() {
+            return Err(conflict("Hermes preview cannot execute a runtime"));
+        }
         let reference = self.approved_runtime_reference(approved)?;
         let runtime = RetainedRuntime::open(store, reference)?.lock()?;
         self.bind_retained_runtime(runtime, cancelled)

@@ -110,8 +110,9 @@ denied passes. Independent review approved the final watch-only check. The plan
 apply/Undo fixture uses a recording executor, so it verifies sealed identity and
 idempotency rather than an actual harness connection.
 
-- Preserve the completed reference for sealing into the reviewed setup plan;
-  unfinished or orphaned copies must never become implicit launch authority.
+- Connect the daemon's completed operation to the owned preview API below;
+  bind the operation ID and selection explicitly, including replay after a lost
+  response. Unfinished or orphaned copies never become implicit launch authority.
 - Show plain-language stages and a Cancel action. Selection changes and late
   replies must not replace the current selection's review. Existing setup review
   supplies the user's approval; do not add confirmation steps for implementation
@@ -121,3 +122,32 @@ idempotency rather than an actual harness connection.
 - Qualify actual connection, restart and Undo before enabling Full and issuing a
   replacement installer. No installed service, normal harness state or native UI
   was changed by preparation-control tests.
+
+## Owned passive Hermes preview
+
+`HermesAdapter::into_setup_preview` now consumes a prepared runtime and returns
+an opaque `PreparedHermesSetup`. It checks the selected launcher digest, version
+0.17.0 and supported configuration shape. The private adapter can render a
+preview but explicitly rejects native reprobe, configuration execution and
+approved-runtime reopening. Normal adapter discovery remains ImportOnly.
+
+The preview uses the existing bridge/memory planner and captures its rollback
+states. Only after the complete plan is sealed does it transfer the runtime to
+durable ownership, immediately before writing the plan into the encrypted vault.
+Earlier errors clean up the unused copy. A failed vault acknowledgement preserves
+the durable copy because the plan might actually have committed. Unreferenced
+durable-copy collection remains future work.
+
+The new fixture uses non-executable Python and launcher bytes. Real preview and
+vault reopening preserve the exact runtime identity and approval hash, with
+planned native mutations but unchanged Hermes configuration. A mismatched project
+fails and removes the unused holder. This qualifies passive planning, not command
+execution, native setup acceptance, or a replacement installer. The daemon's
+preparation result is not yet consumed through this API.
+
+Validation passes 80 Hermes unit tests with three opt-in checks ignored, and all
+54 selected bridge preview/apply/rollback, runtime-plan and primary-memory tests.
+Core/contextd all-target Clippy passes with test support and warnings denied.
+Clippy initially caught an adapter-size increase; the optional preview identity
+now uses a box, and the focused inert preview test passes after that correction.
+Independent review approved ownership transfer and the passive execution boundary.

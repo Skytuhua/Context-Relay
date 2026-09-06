@@ -5,12 +5,16 @@
 
 mod gateway;
 mod import;
+#[cfg(windows)]
+mod prepared_setup;
 mod profile;
 pub mod python_installation;
 pub mod python_runtime;
 mod render;
 #[cfg(windows)]
 mod retained_adapter;
+#[cfg(windows)]
+pub use prepared_setup::PreparedHermesSetup;
 mod yaml;
 
 use std::{
@@ -128,6 +132,8 @@ pub struct HermesAdapter {
     gateway_lease: Option<gateway::GatewayLease>,
     #[cfg(windows)]
     retained_runtime: Option<retained_adapter::AdapterRuntime>,
+    #[cfg(windows)]
+    preview_runtime: Option<Box<crate::native_transaction::InstalledRuntimeBinding>>,
 }
 
 enum DiscoveryVersion<'a> {
@@ -150,6 +156,8 @@ impl Clone for HermesAdapter {
             gateway_lease: None,
             #[cfg(windows)]
             retained_runtime: self.retained_runtime.clone(),
+            #[cfg(windows)]
+            preview_runtime: self.preview_runtime.clone(),
         }
     }
 }
@@ -408,6 +416,8 @@ impl HermesAdapter {
             gateway_lease: None,
             #[cfg(windows)]
             retained_runtime: None,
+            #[cfg(windows)]
+            preview_runtime: None,
         })
     }
 
@@ -458,6 +468,10 @@ impl HermesAdapter {
         execute: &mut impl FnMut(&HermesValidationRequest) -> Result<Vec<u8>, ClientError>,
     ) -> Result<ValidationReport, ClientError> {
         #[cfg(windows)]
+        if self.preview_runtime.is_some() {
+            return Err(conflict("Hermes preview cannot execute a runtime"));
+        }
+        #[cfg(windows)]
         if let Some(runtime) = &self.retained_runtime {
             let output = runtime.check_config(staged_config)?;
             return parse_config_check_output(&output, &self.layout.version);
@@ -480,6 +494,16 @@ impl HermesAdapter {
     }
 
     pub(crate) fn capability(&self) -> CapabilityLevel {
+        #[cfg(windows)]
+        if self.preview_runtime.is_some() {
+            // Only the opaque PreparedHermesSetup owns this adapter. Allow its
+            // pure planner; execution entry points independently reject it.
+            return if self.layout.version == "0.17.0" && self.yaml_topology_supported() {
+                CapabilityLevel::Full
+            } else {
+                CapabilityLevel::ImportOnly
+            };
+        }
         #[cfg(windows)]
         if self.retained_runtime.is_some() {
             // Connection, restart and Undo qualification must precede enabling
@@ -571,6 +595,10 @@ impl HermesAdapter {
 impl NativeAdapter for HermesAdapter {
     fn installed_runtime(&self) -> Option<&crate::native_transaction::InstalledRuntimeBinding> {
         #[cfg(windows)]
+        if let Some(runtime) = &self.preview_runtime {
+            return Some(runtime);
+        }
+        #[cfg(windows)]
         if let Some(runtime) = &self.retained_runtime {
             return Some(runtime.binding());
         }
@@ -578,6 +606,12 @@ impl NativeAdapter for HermesAdapter {
     }
 
     fn reprobe_live_state(&mut self, plan: &NativeTransactionPlan) -> Result<(), BoundaryError> {
+        #[cfg(windows)]
+        if self.preview_runtime.is_some() {
+            return Err(BoundaryError::new(
+                "Hermes preview cannot apply a setup plan",
+            ));
+        }
         self.gateway_profile.take();
         self.gateway_lease.take();
         if !plan.cli_mutations.is_empty() || !plan.setup.cli_operations.is_empty() {
@@ -1703,6 +1737,99 @@ pub(super) fn conflict(message: &'static str) -> ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn prepared_hermes_preview_is_passive_and_persists_only_a_valid_plan() {
+        use crate::{
+            mcp::install::{BridgeExecutable, attest_bridge_executable},
+            native_transaction::{InstalledRuntimeBinding, approval_hash_v2, open_plan},
+            setup::{BridgeLocator, RegisteredProject},
+            vault::{DatabaseKeyStore, Vault, VaultError},
+        };
+        use std::sync::Mutex;
+        use zeroize::Zeroizing;
+        #[derive(Default)]
+        struct Keys(Mutex<Option<Vec<u8>>>);
+        impl DatabaseKeyStore for Keys {
+            fn load_key(&self, _: &str) -> Result<Option<Zeroizing<Vec<u8>>>, VaultError> {
+                Ok(self.0.lock().unwrap().clone().map(Zeroizing::new))
+            }
+            fn store_key(&self, _: &str, key: &[u8]) -> Result<(), VaultError> {
+                *self.0.lock().unwrap() = Some(key.to_vec());
+                Ok(())
+            }
+        }
+        struct Locator(PathBuf);
+        impl BridgeLocator for Locator {
+            fn locate(&self) -> Result<BridgeExecutable, ClientError> {
+                attest_bridge_executable(&self.0)
+            }
+        }
+        for valid_project in [true, false] {
+            let fixture = validation_fixture("0.17.0");
+            fs::write(
+                fixture.layout.profile.hermes_home.join("config.yaml"),
+                b"model: adapter\nmemory:\n  memory_enabled: true\n  user_profile_enabled: true\n",
+            )
+            .unwrap();
+            let original =
+                fs::read(fixture.layout.profile.hermes_home.join("config.yaml")).unwrap();
+            let launcher = fs::read(&fixture.layout.executable).unwrap();
+            let (store, runtime) = python_runtime::inert_prepared_fixture(&launcher);
+            let reference = runtime.reference().clone();
+            let holder = fs::read_dir(store.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("context-relay-hermes-runtime-")
+                })
+                .unwrap();
+            let prepared = fixture.adapter.clone().into_setup_preview(runtime).unwrap();
+            let bridge = fixture.root.join("context-mcp.exe");
+            fs::write(&bridge, b"inert bridge; never execute").unwrap();
+            let vault_path = store.path().join("vault.db");
+            let keys = Keys::default();
+            let mut vault = Vault::open(&vault_path, "prepared-preview", &keys).unwrap();
+            let registered = RegisteredProject {
+                project_id: if valid_project {
+                    fixture.project_id
+                } else {
+                    ProjectId::from_str("018f22e2-79b0-7cc8-98c4-dc0c0c073999").unwrap()
+                },
+                root: fixture.adapter.project_root_wire(),
+            };
+            let result =
+                prepared.preview(&mut vault, Locator(bridge), &registered, 1_900_000_000_000);
+            assert_eq!(
+                fs::read(fixture.layout.profile.hermes_home.join("config.yaml")).unwrap(),
+                original
+            );
+            assert_eq!(fixture.adapter.capability(), CapabilityLevel::ImportOnly);
+            if valid_project {
+                let setup = result.unwrap();
+                assert!(holder.exists());
+                drop(vault);
+                let vault = Vault::open(&vault_path, "prepared-preview", &keys).unwrap();
+                let stored = vault.setup_plan(&setup.plan_id).unwrap().unwrap();
+                let plan = open_plan(&stored.payload).unwrap().plan;
+                assert_eq!(
+                    plan.installed_runtime,
+                    Some(InstalledRuntimeBinding::HermesPythonV1 { runtime: reference })
+                );
+                assert_eq!(approval_hash_v2(&plan).unwrap(), setup.batch_hash);
+                assert!(!plan.mutations.is_empty());
+            } else {
+                assert!(result.is_err());
+                assert!(
+                    !holder.exists(),
+                    "failed preview must clean the unused copy"
+                );
+            }
+        }
+    }
     #[cfg(windows)]
     #[test]
     fn retained_adapter_reopens_exact_reference_and_never_falls_back_after_failure() {

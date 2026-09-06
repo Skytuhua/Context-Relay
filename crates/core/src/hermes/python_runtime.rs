@@ -257,6 +257,42 @@ fn capture_inputs(parent: &Path, roots: Vec<SourceRoot>) -> Result<CapturedRunti
     )
 }
 
+#[cfg(all(test, windows))]
+pub(super) fn inert_prepared_fixture(
+    launcher: &[u8],
+) -> (tempfile::TempDir, retained::PreparedRuntime) {
+    let store = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(store.path()).unwrap();
+    let source = root.join("source");
+    fs::create_dir(&source).unwrap();
+    let mut roots = vec![];
+    for (name, destination, bytes) in [
+        (
+            "python",
+            "python/python.exe",
+            b"inert: must never execute".as_slice(),
+        ),
+        (
+            "bootstrap",
+            "bootstrap.py",
+            b"raise RuntimeError('must never execute')".as_slice(),
+        ),
+        ("launcher", "metadata/hermes-launcher.exe", launcher),
+    ] {
+        let path = source.join(name);
+        fs::write(&path, bytes).unwrap();
+        roots.push(RuntimeSource {
+            source: path,
+            destination: destination.into(),
+        });
+    }
+    let prepared = capture_inputs(&root, roots)
+        .unwrap()
+        .prepare_owned_with_progress(&AtomicBool::new(false), |_| {})
+        .unwrap();
+    (store, prepared)
+}
+
 fn capture_inputs_controlled(
     parent: &Path,
     mut roots: Vec<SourceRoot>,
