@@ -417,3 +417,12 @@ crash recovery/Undo and passive configuration drift. Core/daemon and isolated
 launcher Clippy pass. The [Codex evidence](codex-staged-generation-2026-09-06.md)
 records the design amendment and distinguishes this from full connection.
 No capability version or installer changed; native installed acceptance is open.
+
+
+Codex Windows hooks now use PowerShell invocation with literal native paths,
+including ASCII and smart apostrophes. Twenty-four real CLI/app-server sessions
+pass with exact trust/modified-state behavior and synthetic startup/Stop delivery.
+The [hook evidence](codex-native-hooks-2026-09-06.md) records the runtime matrix,
+review finding, source checks and the obsolete end-to-end test wrapper correction.
+Product trust review, full bridge connection and installed acceptance remain open;
+the local 11d6740 installer is unchanged.

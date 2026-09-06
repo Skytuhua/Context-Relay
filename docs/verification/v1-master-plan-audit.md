@@ -141,3 +141,12 @@ Windows path-resolution diagnosis, native transaction coverage and remaining
 hook/bridge/installed qualification. The obsolete generator requirement is
 superseded, without weakening native CAS or sandbox boundaries. No additional
 Full version is enabled; T10/T14/T20 remain incomplete.
+
+
+2026-09-06 Codex lifecycle update: Windows hook commands now use PowerShell
+invocation and escape all single-quote delimiters. The [native evidence](codex-native-hooks-2026-09-06.md)
+records 24 actual CLI/app-server sessions with synthetic hooks, exact trust and
+modified-definition rejection. The obsolete daemon test wrapper now exercises
+the current native writer. Product trust review, production bridge delivery,
+custom runtime settings and installed acceptance remain open. No Full version
+is enabled; T10/T14/T20 and the full product goal remain incomplete.

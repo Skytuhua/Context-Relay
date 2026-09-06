@@ -689,6 +689,8 @@ async fn production_setup_watcher_review_and_actual_mcp_form_one_chain() {
     let stored = config.setup_plan_summary(&plan.plan_id).unwrap().unwrap();
     assert!(stored.previewed);
     assert_eq!(&stored.setup, plan.as_ref());
+    assert_eq!(plan.adapter_version, 2);
+    assert!(plan.cli_operations.is_empty());
     assert_eq!(stored.mutation_count, 3);
     assert_eq!(stored.native_memory_registrations.len(), 2);
     assert!(
@@ -717,6 +719,11 @@ async fn production_setup_watcher_review_and_actual_mcp_form_one_chain() {
         std::fs::read_to_string(&materialized.config_path)
             .unwrap()
             .contains("generate_memories = false")
+    );
+    assert!(
+        std::fs::read_to_string(&materialized.config_path)
+            .unwrap()
+            .contains("[mcp_servers.context-relay]")
     );
     assert!(
         std::fs::read_to_string(&materialized.instruction_path)

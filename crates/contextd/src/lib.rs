@@ -2052,12 +2052,10 @@ pub mod test_support {
     use context_relay_core::vault::TestVaultCell;
     use context_relay_core::{
         codex::CodexAdapter,
-        mcp::install::{BRIDGE_SERVER_NAME, BridgeExecutable},
+        mcp::install::BridgeExecutable,
         native_memory::{NativeMemoryLedger, NativeMemorySource, NativeMemorySourceId},
         native_transaction::{
-            ApprovedCliMutation, ApprovedInput, CanonicalCliDeclaration, NativeTransactionPlan,
-            SidecarBinding,
-            cli::{CliMutationOutcome, CliRestoreOutcome, NativeCliExecutor},
+            ApprovedInput, NativeTransactionPlan, SidecarBinding,
             engine::{
                 BoundaryError, FrozenOutput, NativeAdapter, NoFault, RestrictedExecutor,
                 RestrictedRun,
@@ -2067,7 +2065,8 @@ pub mod test_support {
         },
         setup::{
             BridgeInstallService, BridgeLocator, BridgeMutationPlan, BridgePreviewHarness,
-            NativeEngineBridgePlanExecutor, PrimaryMemoryMutationPlan, RegisteredProject,
+            NativeEngineBridgePlanExecutor, NoBridgeCliExecutor, PrimaryMemoryMutationPlan,
+            RegisteredProject,
         },
         vault::{BeforeImagePolicy, DatabaseKeyStore, NativeSandboxIdentity, Vault, VaultError},
     };
@@ -2623,10 +2622,7 @@ pub mod test_support {
             lock_root: PathBuf,
         ) -> Self {
             Self {
-                harness: Mutex::new(TestCodexHarness {
-                    adapter,
-                    live_cli: Arc::new(Mutex::new(None)),
-                }),
+                harness: Mutex::new(TestCodexHarness { adapter }),
                 bridge,
                 project_id,
                 project_root: std::fs::canonicalize(project_root)
@@ -2659,9 +2655,7 @@ pub mod test_support {
             };
             let mut filesystem = OsNativeTransactionFileSystem::new(*plan_id.as_bytes());
             let mut hook = NoFault;
-            let mut cli = TestCodexCli {
-                live: harness.live_cli.clone(),
-            };
+            let mut cli = NoBridgeCliExecutor;
             let mut executor = NativeEngineBridgePlanExecutor::new(
                 &mut *harness,
                 &mut restricted,
@@ -2753,7 +2747,6 @@ pub mod test_support {
     #[derive(Clone)]
     struct TestCodexHarness {
         adapter: CodexAdapter,
-        live_cli: Arc<Mutex<Option<CanonicalCliDeclaration>>>,
     }
 
     impl HarnessAdapter for TestCodexHarness {
@@ -2790,6 +2783,10 @@ pub mod test_support {
     }
 
     impl BridgePreviewHarness for TestCodexHarness {
+        fn bridge_adapter_version(&self) -> u32 {
+            self.adapter.bridge_adapter_version()
+        }
+
         fn bridge_harness(&self) -> HarnessId {
             HarnessId::Codex
         }
@@ -2808,19 +2805,10 @@ pub mod test_support {
 
         fn bridge_mutations(
             &self,
-            _: &DesiredState,
+            desired: &DesiredState,
             intended: &ComponentRecord,
         ) -> Result<BridgeMutationPlan, ClientError> {
-            let live = self.live_cli.clone();
-            Ok(BridgeMutationPlan {
-                cli: Some(self.adapter.plan_bridge_cli_mutation_with_runner(
-                    intended,
-                    move |arguments: &[String]| {
-                        test_codex_cli_output(arguments, live.lock().unwrap().as_ref())
-                    },
-                )?),
-                native: vec![],
-            })
+            self.adapter.bridge_mutations(desired, intended)
         }
 
         fn primary_memory_mutations(
@@ -2853,6 +2841,13 @@ pub mod test_support {
             plan: &NativeTransactionPlan,
         ) -> Result<(), BoundaryError> {
             NativeAdapter::compare_approved_digests(&mut self.adapter, plan)
+        }
+
+        fn verify_live_state_reservation(
+            &mut self,
+            plan: &NativeTransactionPlan,
+        ) -> Result<(), BoundaryError> {
+            NativeAdapter::verify_live_state_reservation(&mut self.adapter, plan)
         }
 
         fn validate_staged_output(
@@ -2917,163 +2912,6 @@ pub mod test_support {
         fn reject_unsafe_topology(&mut self) -> Result<(), BoundaryError> {
             Ok(())
         }
-    }
-
-    struct TestCodexCli {
-        live: Arc<Mutex<Option<CanonicalCliDeclaration>>>,
-    }
-
-    impl NativeCliExecutor for TestCodexCli {
-        fn probe_cli_mutation(
-            &mut self,
-            _: &ApprovedCliMutation,
-        ) -> Result<Option<Sha256Digest>, BoundaryError> {
-            Ok(self
-                .live
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|value| value.fingerprint))
-        }
-
-        fn compare_cli_targets(
-            &mut self,
-            mutations: &[ApprovedCliMutation],
-        ) -> Result<(), BoundaryError> {
-            for mutation in mutations {
-                if self
-                    .live
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|value| value.fingerprint)
-                    != mutation.expected.as_ref().map(|value| value.fingerprint)
-                {
-                    return Err(BoundaryError::new("Test Codex CLI state changed"));
-                }
-            }
-            Ok(())
-        }
-
-        fn apply_cli_mutation(
-            &mut self,
-            mutation: &ApprovedCliMutation,
-        ) -> Result<CliMutationOutcome, BoundaryError> {
-            let current = self
-                .live
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|value| value.fingerprint);
-            if current == mutation.expected.as_ref().map(|value| value.fingerprint) {
-                self.live.lock().unwrap().clone_from(&mutation.intended);
-            }
-            Ok(CliMutationOutcome {
-                resulting_fingerprint: self
-                    .live
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|value| value.fingerprint),
-                command_error: None,
-            })
-        }
-
-        fn restore_cli_mutation_if_matches(
-            &mut self,
-            mutation: &ApprovedCliMutation,
-        ) -> Result<CliRestoreOutcome, BoundaryError> {
-            let intended = mutation.intended.as_ref().map(|value| value.fingerprint);
-            let mut live = self.live.lock().unwrap();
-            if live.as_ref().map(|value| value.fingerprint) != intended {
-                return Ok(CliRestoreOutcome {
-                    restored: false,
-                    resulting_fingerprint: live.as_ref().map(|value| value.fingerprint),
-                });
-            }
-            live.clone_from(&mutation.expected);
-            Ok(CliRestoreOutcome {
-                restored: true,
-                resulting_fingerprint: live.as_ref().map(|value| value.fingerprint),
-            })
-        }
-
-        fn finish_committed_cli_mutations(
-            &mut self,
-            mutations: &[ApprovedCliMutation],
-        ) -> Result<(), BoundaryError> {
-            for mutation in mutations {
-                if self
-                    .live
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|value| value.fingerprint)
-                    != mutation.intended.as_ref().map(|value| value.fingerprint)
-                {
-                    return Err(BoundaryError::new("Test Codex committed CLI state changed"));
-                }
-            }
-            Ok(())
-        }
-    }
-
-    fn test_codex_cli_output(
-        arguments: &[String],
-        live: Option<&CanonicalCliDeclaration>,
-    ) -> Result<Vec<u8>, BoundaryError> {
-        match arguments {
-            [plugin, list, format]
-                if (plugin.as_str(), list.as_str(), format.as_str())
-                    == ("plugin", "list", "--json") =>
-            {
-                Ok(br#"{"installed":[],"available":[]}"#.to_vec())
-            }
-            [mcp, list, format]
-                if (mcp.as_str(), list.as_str(), format.as_str()) == ("mcp", "list", "--json") =>
-            {
-                Ok(match live {
-                    Some(declaration) => test_codex_mcp_list(&declaration.canonical_body)?,
-                    None => b"[]".to_vec(),
-                })
-            }
-            [mcp, get, name, format]
-                if (mcp.as_str(), get.as_str(), name.as_str(), format.as_str())
-                    == ("mcp", "get", BRIDGE_SERVER_NAME, "--json") =>
-            {
-                test_codex_mcp_get(
-                    &live
-                        .ok_or_else(|| BoundaryError::new("missing test Codex declaration"))?
-                        .canonical_body,
-                )
-            }
-            _ => Err(BoundaryError::new("unexpected test Codex CLI inspection")),
-        }
-    }
-
-    fn test_codex_transport(body: &str) -> Result<String, BoundaryError> {
-        let prefix = body
-            .strip_suffix('}')
-            .ok_or_else(|| BoundaryError::new("test Codex declaration is invalid"))?;
-        Ok(format!(
-            "{prefix},\"env\":{{}},\"env_vars\":[],\"cwd\":null}}"
-        ))
-    }
-
-    fn test_codex_mcp_list(body: &str) -> Result<Vec<u8>, BoundaryError> {
-        Ok(format!(
-            "[{{\"name\":\"{BRIDGE_SERVER_NAME}\",\"enabled\":true,\"disabled_reason\":null,\"transport\":{},\"startup_timeout_sec\":null,\"tool_timeout_sec\":null,\"auth_status\":\"unsupported\"}}]",
-            test_codex_transport(body)?
-        )
-        .into_bytes())
-    }
-
-    fn test_codex_mcp_get(body: &str) -> Result<Vec<u8>, BoundaryError> {
-        Ok(format!(
-            "{{\"name\":\"{BRIDGE_SERVER_NAME}\",\"enabled\":true,\"disabled_reason\":null,\"transport\":{},\"enabled_tools\":null,\"disabled_tools\":null,\"startup_timeout_sec\":null,\"tool_timeout_sec\":null}}",
-            test_codex_transport(body)?
-        )
-        .into_bytes())
     }
 
     fn test_native_identity() -> NativeSandboxIdentity {

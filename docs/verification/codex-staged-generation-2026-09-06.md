@@ -140,3 +140,9 @@ Concurrent configuration changes remain conflicts. Legacy adapter-v1 memory
 fingerprint behavior is covered independently. No version was enabled; hook
 trust/execution, production bridge round trips, supported platform qualification
 and installed acceptance remain open. The unsigned installer is unchanged.
+
+
+The subsequent [Windows lifecycle qualification](codex-native-hooks-2026-09-06.md)
+fixes PowerShell command invocation and smart-quote escaping. Twenty-four actual
+CLI/app-server sessions verify exact trust state and synthetic lifecycle delivery.
+Product trust review, production bridge delivery and installed acceptance remain open.

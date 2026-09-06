@@ -5,6 +5,8 @@
 //! history, sqlite state, logs, and approval records are not adapter input.
 
 pub mod managed_mcp;
+#[cfg(all(test, windows))]
+mod session_tests;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},

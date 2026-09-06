@@ -458,8 +458,20 @@ fn memory_hooks_render_only_the_frozen_lifecycle_events_with_literal_arguments()
             let command = hooks[native_event][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap();
-            assert!(command.contains(bridge.to_string_lossy().as_ref()));
-            assert!(command.ends_with(&format!(" --hook-event {event} --harness codex")));
+            let path = bridge.to_string_lossy();
+            #[cfg(windows)]
+            let executable = format!(
+                "& '{}'",
+                path.strip_prefix(r"\\?\")
+                    .unwrap_or(&path)
+                    .replace('\'', "''")
+            );
+            #[cfg(not(windows))]
+            let executable = format!("'{}'", path.replace('\'', "'\\''"));
+            assert_eq!(
+                command,
+                format!("{executable} --hook-event {event} --harness codex")
+            );
             assert_eq!(hooks[native_event][0]["hooks"][0]["type"], "command");
             assert_eq!(
                 hooks[native_event][0]["hooks"][0]["statusMessage"],

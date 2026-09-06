@@ -193,6 +193,39 @@ fn bash_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
 }
 
+#[cfg(windows)]
+fn powershell_quote(path: &str) -> String {
+    let mut literal = String::from("& '");
+    for character in path.chars() {
+        literal.push(character);
+        if powershell_single_quote(character) {
+            literal.push(character);
+        }
+    }
+    literal.push('\'');
+    literal
+}
+
+#[cfg(windows)]
+fn powershell_single_quote(character: char) -> bool {
+    // PowerShell's IsSingleQuote also recognizes the four smart single quotes.
+    matches!(character, '\'' | '\u{2018}'..='\u{201b}')
+}
+
+#[cfg(windows)]
+fn powershell_literal_path(literal: &str) -> Option<String> {
+    let inner = literal.strip_prefix("& '")?.strip_suffix('\'')?;
+    let mut characters = inner.chars();
+    let mut path = String::new();
+    while let Some(character) = characters.next() {
+        if powershell_single_quote(character) && characters.next() != Some(character) {
+            return None;
+        }
+        path.push(character);
+    }
+    Some(path)
+}
+
 #[cfg(not(windows))]
 fn canonical_literal_executable(_: HarnessId, literal: &str, _: bool) -> bool {
     bash_literal_path(literal)
@@ -201,21 +234,29 @@ fn canonical_literal_executable(_: HarnessId, literal: &str, _: bool) -> bool {
 
 #[cfg(windows)]
 fn canonical_literal_executable(harness: HarnessId, literal: &str, allow_legacy: bool) -> bool {
-    if harness == HarnessId::ClaudeCode {
-        if let Some(path) = bash_literal_path(literal) {
-            let bytes = path
-                .replace('/', "\\")
-                .encode_utf16()
-                .flat_map(u16::to_le_bytes)
-                .collect::<Vec<_>>();
-            return crate::native_transaction::approval::windows_target_key(&bytes)
-                .is_ok_and(|path| bash_quote(&path.replace('\\', "/")) == literal);
-        }
-        // Old Context Relay entries must remain recognizable for replacement
-        // and archival, but cannot be approved as newly generated commands.
-        if !allow_legacy {
-            return false;
-        }
+    let path = match harness {
+        HarnessId::ClaudeCode => bash_literal_path(literal),
+        HarnessId::Codex => powershell_literal_path(literal),
+        HarnessId::Hermes => None,
+    };
+    if let Some(path) = path {
+        let bytes = path
+            .replace('/', "\\")
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        return crate::native_transaction::approval::windows_target_key(&bytes).is_ok_and(|path| {
+            match harness {
+                HarnessId::ClaudeCode => bash_quote(&path.replace('\\', "/")) == literal,
+                HarnessId::Codex => powershell_quote(&path) == literal,
+                HarnessId::Hermes => false,
+            }
+        });
+    }
+    // Old Context Relay entries remain recognizable for replacement and
+    // archival, but cannot be approved as newly generated commands.
+    if !allow_legacy {
+        return false;
     }
     let Some(path) = literal
         .strip_prefix('"')
@@ -324,36 +365,18 @@ fn literal_executable(_: HarnessId, value: &WireNativeValue) -> Result<String, C
 
 #[cfg(windows)]
 fn literal_executable(harness: HarnessId, value: &WireNativeValue) -> Result<String, ClientError> {
-    use std::{ffi::OsString, os::windows::ffi::OsStringExt as _};
-
     if value.platform != NativePlatform::Windows || !value.bytes.len().is_multiple_of(2) {
         return Err(invalid("Product memory hook executable is invalid"));
     }
-    if harness == HarnessId::ClaudeCode {
-        // Claude executes Windows hooks through Bash. Validate the native path
-        // before removing its verbatim prefix so Win32 aliases cannot change it.
-        let path = crate::native_transaction::approval::windows_target_key(&value.bytes)
-            .map_err(|_| invalid("Product memory hook executable is unsafe"))?;
-        return Ok(bash_quote(&path.replace('\\', "/")));
+    // Validate before removing a verbatim prefix so Win32 aliases cannot
+    // change the executable. Each harness uses a different Windows shell.
+    let path = crate::native_transaction::approval::windows_target_key(&value.bytes)
+        .map_err(|_| invalid("Product memory hook executable is unsafe"))?;
+    match harness {
+        HarnessId::ClaudeCode => Ok(bash_quote(&path.replace('\\', "/"))),
+        HarnessId::Codex => Ok(powershell_quote(&path)),
+        HarnessId::Hermes => Err(invalid("Hermes has no lifecycle hook command")),
     }
-    let path = OsString::from_wide(
-        &value
-            .bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect::<Vec<_>>(),
-    );
-    let path = path
-        .to_str()
-        .ok_or_else(|| invalid("Product memory hook executable is not UTF-8"))?;
-    if !Path::new(path).is_absolute()
-        || path
-            .chars()
-            .any(|character| matches!(character, '"' | '%' | '!' | '^' | '&' | '|' | '<' | '>'))
-    {
-        return Err(invalid("Product memory hook executable is unsafe"));
-    }
-    Ok(format!("\"{path}\""))
 }
 
 fn invalid(message: &'static str) -> ClientError {
@@ -397,6 +420,77 @@ mod windows_tests {
     }
 
     #[test]
+    fn codex_hooks_use_powershell_literals_for_canonical_windows_paths() {
+        let component = managed_memory_hooks(
+            HarnessId::Codex,
+            &wire(r"\\?\C:\Users\A $HOME\O'Brien\bridge.exe"),
+        )
+        .unwrap()
+        .remove(0);
+        let body: Value = serde_json::from_str(&component.body_markdown).unwrap();
+        assert_eq!(
+            body["SessionStart"][0]["hooks"][0]["command"],
+            "& 'C:\\Users\\A $HOME\\O''Brien\\bridge.exe' --hook-event session-start --harness codex"
+        );
+        assert!(is_managed_memory_hook_component(
+            HarnessId::Codex,
+            &component
+        ));
+    }
+
+    #[test]
+    fn legacy_codex_windows_quotes_are_only_accepted_for_cleanup() {
+        let component = managed_memory_hooks(HarnessId::Codex, &wire(r"\\?\C:\Fixture\bridge.exe"))
+            .unwrap()
+            .remove(0);
+        let mut old_body: Value = serde_json::from_str(&component.body_markdown).unwrap();
+        for (event, kind) in CODEX_EVENTS {
+            old_body[event][0]["hooks"][0]["command"] = json!(format!(
+                r#""\\?\C:\Fixture\old.exe" --hook-event {kind} --harness codex"#
+            ));
+        }
+        let mut old_component = component.clone();
+        old_component.body_markdown = serde_json::to_string(&old_body).unwrap();
+        assert!(!is_managed_memory_hook_component(
+            HarnessId::Codex,
+            &old_component
+        ));
+        assert_eq!(
+            merge_managed_memory_hooks(HarnessId::Codex, Some(&old_body), &component).unwrap(),
+            serde_json::from_str::<Value>(&component.body_markdown).unwrap()
+        );
+        let injected = "& 'C:\\Fixture\\bridge.exe'; Write-Output 'extra'";
+        assert!(!canonical_literal_executable(
+            HarnessId::Codex,
+            injected,
+            true
+        ));
+    }
+
+    #[test]
+    fn powershell_smart_quote_delimiters_are_escaped_and_only_exact_pairs_are_recognized() {
+        let path = r"C:\O‘Brien O’Brien O‚Brien O‛Brien O'Brien “double”\bridge.exe";
+        let literal = r"& 'C:\O‘‘Brien O’’Brien O‚‚Brien O‛‛Brien O''Brien “double”\bridge.exe'";
+        assert_eq!(powershell_quote(path), literal);
+        assert_eq!(powershell_literal_path(literal).as_deref(), Some(path));
+        assert!(canonical_literal_executable(
+            HarnessId::Codex,
+            literal,
+            false
+        ));
+        for character in ['\'', '\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}'] {
+            let unescaped =
+                format!("& 'C:\\Fixture\\A{character} ; Write-Output synthetic ; #.exe'");
+            assert!(powershell_literal_path(&unescaped).is_none());
+            assert!(!canonical_literal_executable(
+                HarnessId::Codex,
+                &unescaped,
+                true
+            ));
+        }
+    }
+
+    #[test]
     fn legacy_claude_windows_quotes_are_only_accepted_for_cleanup() {
         let component =
             managed_memory_hooks(HarnessId::ClaudeCode, &wire(r"\\?\C:\Fixture\bridge.exe"))
@@ -418,7 +512,7 @@ mod windows_tests {
     }
 
     #[test]
-    fn claude_hook_paths_reject_windows_aliases_before_removing_verbatim_prefix() {
+    fn hook_paths_reject_windows_aliases_before_removing_verbatim_prefix() {
         for path in [
             r"\\?\C:\Fixture\bridge.exe.",
             r"\\?\C:\Fixture\bridge.exe ",
@@ -426,10 +520,12 @@ mod windows_tests {
             r"\\?\C:\Fixture\..\bridge.exe",
             r"\\?\UNC\server\share\bridge.exe",
         ] {
-            assert!(
-                managed_memory_hooks(HarnessId::ClaudeCode, &wire(path)).is_err(),
-                "{path}"
-            );
+            for harness in [HarnessId::ClaudeCode, HarnessId::Codex] {
+                assert!(
+                    managed_memory_hooks(harness, &wire(path)).is_err(),
+                    "{path}"
+                );
+            }
         }
     }
 }
