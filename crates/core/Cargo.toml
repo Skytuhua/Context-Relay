@@ -38,6 +38,9 @@ unicode-casefold.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+process-wrap = { version = "10.0.0", default-features = false, features = ["std", "creation-flags", "job-object", "process-group"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.186"
 

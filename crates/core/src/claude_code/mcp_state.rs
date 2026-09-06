@@ -225,7 +225,7 @@ pub(super) fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, ClientError> {
     Ok(Some(bytes))
 }
 
-pub(super) fn parse_unique_json(bytes: &[u8]) -> Result<Value, serde_json::Error> {
+pub(crate) fn parse_unique_json(bytes: &[u8]) -> Result<Value, serde_json::Error> {
     serde_json::from_slice::<StrictValue>(bytes).map(|value| value.0)
 }
 

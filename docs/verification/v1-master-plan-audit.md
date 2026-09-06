@@ -185,3 +185,10 @@ in two disposable profiles, context-tamper rejection, 274 affected Rust tests
 and seven boundary tests. CI fixture corrections handle colored diagnostics
 and the remaining Windows trust-key materializer. Live connection readback,
 full native setup and installed acceptance remain incomplete.
+
+2026-09-06 hook-readback update: [isolated qualification](codex-hook-readback-2026-09-06.md)
+exercises actual Codex untrusted/trusted/disabled/modified states. Review found
+native startup effects that prevent treating a new app-server launch as a passive
+normal-profile check. The probe and its process dependency are test-only.
+Startup containment, exact managed-hook assessment, daemon IPC and desktop status
+remain unfinished; no Full version or installed acceptance is added by this change.

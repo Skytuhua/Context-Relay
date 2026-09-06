@@ -23,6 +23,8 @@ use sha2::{Digest, Sha256};
 
 mod mcp_state;
 use mcp_state::McpConfiguration;
+#[cfg(test)]
+pub(crate) use mcp_state::parse_unique_json;
 mod command_context;
 use command_context::ClaudeCommandContext;
 mod memory_path;

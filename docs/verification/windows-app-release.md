@@ -465,3 +465,11 @@ unchanged. All 274 affected Rust tests and seven boundary tests pass. The
 [command-context evidence](codex-command-context-2026-09-06.md) records this fix,
 two CI fixture corrections and the remaining live-readback/installed gates.
 The local installer and Full runtime versions remain unchanged.
+
+The [isolated hook-readback experiment](codex-hook-readback-2026-09-06.md) exercises
+four actual Codex 0.144.6 states in a disposable profile. Review established that
+app-server startup can migrate settings and update plugins before processing a
+status request. The probe is therefore compiled only for tests, with no normal
+profile or production entry point. Startup-effect containment must precede
+managed-hook assessment and desktop/daemon wiring. The local installer is still
+the earlier candidate and Codex 0.144.6 remains ImportOnly.

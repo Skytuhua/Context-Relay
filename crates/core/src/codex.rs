@@ -5,6 +5,10 @@
 //! history, sqlite state, logs, and approval records are not adapter input.
 
 mod command_context;
+// Starting app-server can migrate profiles and refresh plugins. Keep this
+// qualification probe out of production until startup side effects are contained.
+#[cfg(test)]
+mod hook_readback;
 pub mod managed_mcp;
 use command_context::CodexCommandContext;
 #[cfg(all(test, windows))]
