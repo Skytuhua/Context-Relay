@@ -474,3 +474,73 @@ fn management_zero_byte_completion_keeps_pipe_open_and_cap_active() {
         Err(ManagementError::OutputLimit)
     );
 }
+
+#[test]
+#[ignore = "requires an explicit CPython 3.11 home; runs only a disposable copy"]
+fn settings_readback_accepts_windows_path_aliases_and_rejects_external_paths() {
+    let _serial = SERIAL.lock().unwrap();
+    let source = PathBuf::from(std::env::var_os("CONTEXT_RELAY_TEST_PYTHON_HOME").unwrap());
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("runtime");
+    let python = root.join("python");
+    let packages = root.join("packages/hermes_cli");
+    let home = temp.path().join("profile");
+    for path in [&python, &packages, &home] {
+        fs::create_dir_all(path).unwrap();
+    }
+    for name in [
+        "python.exe",
+        "python311.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+    ] {
+        fs::copy(source.join(name), python.join(name)).unwrap();
+    }
+    fn copy_library(source: &Path, target: &Path) {
+        fs::create_dir(target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            assert!(!kind.is_symlink());
+            let target = target.join(entry.file_name());
+            if kind.is_dir() {
+                copy_library(&entry.path(), &target);
+            } else {
+                assert!(kind.is_file());
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    copy_library(&source.join("Lib"), &python.join("Lib"));
+    fs::write(packages.join("__init__.py"), b"").unwrap();
+    fs::write(packages.join("config.py"),
+        b"def load_config_readonly():\n    return {'memory': {'memory_enabled': True, 'user_profile_enabled': True}}\n"
+    ).unwrap();
+    let pth = python.join("python311._pth");
+    fs::write(&pth, b"Lib\n../packages\n").unwrap();
+    for alias in [root.clone(), fs::canonicalize(&root).unwrap()] {
+        let (output, ()) =
+            read_hermes_settings_for_qualification(&alias, &home, (), &AtomicBool::new(false))
+                .unwrap();
+        assert_eq!(
+            output.exit_code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let settings: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            settings,
+            serde_json::json!({"server": null, "agentMemory": true, "userMemory": true})
+        );
+    }
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(&pth, format!("Lib\n../packages\n{}\n", outside.display())).unwrap();
+    let (output, ()) =
+        read_hermes_settings_for_qualification(&root, &home, (), &AtomicBool::new(false)).unwrap();
+    assert_ne!(
+        output.exit_code, 0,
+        "an external import path must remain rejected"
+    );
+}

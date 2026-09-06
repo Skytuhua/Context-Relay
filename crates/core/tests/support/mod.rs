@@ -237,7 +237,10 @@ pub fn persist_native_terminal(
                 )
                 .unwrap();
         }
-        NativeTransactionStatus::Restoring => unreachable!(),
+        NativeTransactionStatus::Restoring => {
+            vault.begin_native_recovery(&transaction_id).unwrap();
+            return;
+        }
     }
     vault.finish_native_cleanup(&transaction_id).unwrap();
 }

@@ -1063,8 +1063,9 @@ impl PersistedBridgeInstallService<'_> {
     }
 
     /// Reconciles setup lifecycles after native startup recovery has made each
-    /// begun transaction terminal. A missing native row is reported without
-    /// executing; a subsequent explicit apply/rollback may safely resume it.
+    /// begun transaction terminal. A claim without a native row remains
+    /// unresolved without preventing startup or executing anything; a subsequent
+    /// explicit apply/rollback may safely resume it.
     pub fn reconcile_after_native_recovery(&mut self) -> Result<(), ClientError> {
         let incomplete = self
             .vault
@@ -1109,11 +1110,7 @@ impl PersistedBridgeInstallService<'_> {
                             })?;
                         continue;
                     }
-                    if self.reconcile_apply_terminal(&stored)?.is_none() {
-                        return Err(conflict(
-                            "Bridge apply has not begun its native transaction",
-                        ));
-                    }
+                    self.reconcile_apply_terminal(&stored)?;
                 }
                 SetupPlanLifecycle::RollingBack => {
                     let (inverse, inverse_opened) = self.validated_inverse_plan(&opened)?;
@@ -1132,14 +1129,7 @@ impl PersistedBridgeInstallService<'_> {
                             })?;
                         continue;
                     }
-                    if self
-                        .reconcile_rollback_terminal(&stored, &inverse)?
-                        .is_none()
-                    {
-                        return Err(conflict(
-                            "Bridge rollback has not begun its native transaction",
-                        ));
-                    }
+                    self.reconcile_rollback_terminal(&stored, &inverse)?;
                 }
                 _ => return Err(invalid("Incomplete bridge plan lifecycle is invalid")),
             }

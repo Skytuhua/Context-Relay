@@ -470,6 +470,21 @@ fn apply_resumes_an_already_claimed_plan_when_the_native_transaction_is_missing(
         .unwrap();
     let mut executor = RecordingExecutor::default();
 
+    drop(vault);
+    let mut vault = Vault::open(path.path(), "bridge-setup-apply-v1", &keys).unwrap();
+    BridgeInstallService::persisted(&mut vault)
+        .reconcile_after_native_recovery()
+        .expect("a claim interrupted before native execution must allow startup");
+    assert_eq!(
+        vault
+            .setup_plan(&candidate.setup.plan_id)
+            .unwrap()
+            .unwrap()
+            .lifecycle,
+        SetupPlanLifecycle::Applying,
+    );
+    assert_eq!(executor.calls, 0);
+
     BridgeInstallService::persisted(&mut vault)
         .apply(&candidate.setup.plan_id, NOW_MS + 2, &mut executor)
         .unwrap();
@@ -773,6 +788,10 @@ fn startup_reconciliation_leaves_pending_or_missing_native_outcomes_unexecuted()
             "bridge-setup-reconcile-pending",
             Some(NativeTransactionStatus::Pending),
         ),
+        (
+            "bridge-setup-reconcile-restoring",
+            Some(NativeTransactionStatus::Restoring),
+        ),
         ("bridge-setup-reconcile-missing", None),
     ] {
         let path = TempVault::new(name);
@@ -785,12 +804,8 @@ fn startup_reconciliation_leaves_pending_or_missing_native_outcomes_unexecuted()
             persist_native_terminal(&mut vault, &candidate, &sealed, NOW_MS, NOW_MS + 1, status);
         }
 
-        assert!(
-            BridgeInstallService::persisted(&mut vault)
-                .reconcile_after_native_recovery()
-                .is_err(),
-            "{name}"
-        );
+        let outcome = BridgeInstallService::persisted(&mut vault).reconcile_after_native_recovery();
+        assert_eq!(outcome.is_err(), native_status.is_some(), "{name}");
         assert_eq!(
             vault
                 .setup_plan(&candidate.setup.plan_id)

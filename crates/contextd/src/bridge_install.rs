@@ -1053,6 +1053,111 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn interrupted_pre_journal_setup_allows_restart_and_reads_without_execution() {
+        use context_relay_core::vault::SetupPlanAction;
+        use context_relay_local_ipc::{Client, InstallationToken, RuntimeConfig};
+        use context_relay_protocol::{
+            ClientRole, EmptyParams, LocalRequest, LocalResult, RecordId,
+        };
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::Arc;
+
+        struct CrashBeforeJournal;
+        impl BridgePlanExecutor for CrashBeforeJournal {
+            fn execute(
+                &mut self,
+                _vault: &mut Vault,
+                _plan: &NativeTransactionPlan,
+                _sealed: &[u8],
+                _created_ms: u64,
+                _now_ms: u64,
+            ) -> Result<(), BridgeExecutionError> {
+                panic!("interrupted before opening the native journal");
+            }
+        }
+
+        for undo in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let runtime = RuntimeConfig::for_test(
+                format!("pre-journal-{}", uuid::Uuid::now_v7()),
+                Some(temp.path().to_owned()),
+            )
+            .unwrap();
+            let config = crate::test_support::TestDaemonConfig::new(
+                runtime.clone(),
+                temp.path().join("vault.db"),
+                InstallationToken::from_bytes([0x68; 32]),
+            )
+            .with_bridge_install_engine(Arc::new(
+                ProductionBridgeInstallEngine::with_daemon_executable(
+                    "/definitely/missing/contextd",
+                ),
+            ));
+            let before = config
+                .with_vault(|vault| {
+                    let plan = persist_native_plan(vault, base_plan());
+                    if undo {
+                        BridgeInstallService::persisted(vault)
+                            .apply(&plan.setup.plan_id, 2, &mut RecordingExecutor)
+                            .unwrap();
+                        assert!(
+                            catch_unwind(AssertUnwindSafe(|| {
+                                BridgeInstallService::persisted(vault).rollback(
+                                    &plan.setup.plan_id,
+                                    3,
+                                    &mut CrashBeforeJournal,
+                                )
+                            }))
+                            .is_err()
+                        );
+                    } else {
+                        vault.claim_setup_plan(&plan.setup.plan_id, SetupPlanAction::Apply, 2)?;
+                    }
+                    vault.incomplete_setup_plans()
+                })
+                .unwrap();
+            assert_eq!(before.len(), if undo { 2 } else { 1 });
+
+            let daemon = config
+                .start()
+                .await
+                .expect("unstarted setup must not prevent reopening");
+            let handle = daemon.handle();
+            let running = tokio::spawn(daemon.run());
+            let mut client = Client::connect_for_test(
+                &runtime,
+                ClientRole::Desktop,
+                &config.installation_token(),
+            )
+            .await
+            .unwrap();
+            let result = client
+                .call(
+                    RecordId::new(uuid::Uuid::now_v7()).unwrap(),
+                    LocalRequest::ProjectsList(EmptyParams {}),
+                )
+                .await;
+            handle.shutdown().await;
+            running.await.unwrap().unwrap();
+            assert_eq!(result.unwrap(), LocalResult::Projects { projects: vec![] });
+            config
+                .with_vault(|vault| {
+                    assert_eq!(vault.incomplete_setup_plans()?, before);
+                    for plan in &before {
+                        assert!(
+                            vault
+                                .native_transaction(&format!("bridge-setup-{}", plan.plan_id))?
+                                .is_none()
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
     #[test]
     fn codex_probe_reports_saved_approvals_without_starting_another_process() {
         use context_relay_core::codex::{CodexExecutableKind, CodexLayout};

@@ -65,7 +65,11 @@ import sys, os, json
 from pathlib import Path
 root = Path(sys.argv[1]).resolve()
 assert sys.flags.isolated and sys.flags.no_site
-assert all(Path(p).resolve().is_relative_to(root) for p in sys.path)
+# CPython can mix ordinary and extended-length spellings of the same Windows
+# directory. Check ancestry by file identity, while still rejecting outside paths.
+paths = [Path(p).resolve(strict=True) for p in sys.path]
+assert all(root.samefile(p) or any(root.samefile(parent) for parent in p.parents)
+           for p in paths)
 sys.prefix = str(root / 'environment')
 sys.exec_prefix = sys.prefix
 dll = root / 'packages' / 'pywin32_system32'
