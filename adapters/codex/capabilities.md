@@ -16,7 +16,9 @@ the expected releases directory and verifies that the release directory and
 held executable report the same version. Arbitrary PATH junctions and nested
 reparse points remain rejected. Later launches retain executable identity,
 digest and topology checks. Finding standalone `0.144.6` does not qualify it
-for full setup; its lifecycle hooks and native memory behavior remain unverified.
+for full setup. Isolated lifecycle, memory, MCP and native-transaction evidence
+is recorded in the verification documents; installed acceptance and remaining
+profile/platform qualification still gate production enablement.
 
 The MCP parser accepts `transport.env: null` as no environment overrides,
 matching the standalone `0.144.6` CLI output. Nonempty environment overrides
@@ -88,12 +90,22 @@ rejected on render. Environment and header maps are never exported literally.
 
 ## Plugins, MCP, and hooks
 
-Global plugin and MCP changes use only bounded Codex JSON CLI operations.
+Generic global plugin and MCP changes use bounded Codex JSON CLI operations.
+Managed bridge setup instead serializes its MCP declaration together with the
+memory settings into one native transaction; it does not run a second CLI
+writer against the same config file.
 Project-scoped plugin and MCP writes remain import-only. Effective validation
 compares the complete enabled plugin set, the complete enabled MCP name set,
 and normalized MCP transport declarations; an extra, missing, disabled, or
 drifted declaration fails validation. Validation never starts configured MCP
 servers.
+
+Plugin-list readback accepts the pinned native schema's nullable version,
+optional marketplace source, local/Git/Git-subdirectory/npm sources, and three
+installation-policy labels. Fields remain bounded and strictly typed; duplicate
+JSON keys and unknown fields are rejected. Readback reduces these records to
+installed IDs and enabled states; source metadata never supplies executable,
+path or installation authority.
 
 Supported frozen versions use managed `SessionStart` and `Stop` commands.
 Explicit task completion uses the typed `context_relay_complete_task` MCP tool
@@ -122,10 +134,13 @@ descriptors must still match the resolved Codex home.
 
 Mixed native/CLI plans can bind their exact sealed CLI WAL for recovery, but
 this does not authorize rebasing file fingerprints or adopting replacement
-objects. Real Codex MCP commands rewrite the same global configuration file
-as native memory setup. Full shared-file apply/rollback remains unqualified;
-the [staged MCP design](../../docs/superpowers/specs/2026-09-05-codex-staged-mcp-design.md)
-describes the required follow-up implementation and sandbox evidence.
+objects. The [native bridge amendment](../../docs/superpowers/specs/2026-09-06-codex-native-bridge-design.md)
+supersedes the staged CLI generator for managed setup. The opt-in pinned Windows
+fixture exercises ordinary save, injected-panic recovery before and after commit,
+vault reopen, fresh executable/profile discovery, idempotent reapply and Undo.
+It uses an inert bridge marker and cannot establish installed process/credential
+binding or actual daemon crash recovery. See the
+[qualification record](../../docs/verification/codex-native-setup-2026-09-06.md).
 
 The frozen/synthetic adapter and macOS native boundary are covered in CI. A
 release still requires the master plan's credentialed real-install matrix on

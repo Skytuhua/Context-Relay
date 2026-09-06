@@ -14,6 +14,8 @@ mod hook_readback;
 pub mod managed_mcp;
 use command_context::CodexCommandContext;
 #[cfg(all(test, windows))]
+mod native_setup_tests;
+#[cfg(all(test, windows))]
 mod session_tests;
 
 use std::{
@@ -117,6 +119,9 @@ pub struct CodexAdapter {
     origin_device: DeviceId,
     observed_hlc: HybridLogicalClock,
     executable_hash: Sha256Digest,
+    // Candidate setup qualification in isolated unit-test profiles only.
+    #[cfg(all(test, windows))]
+    qualify_01446: bool,
 }
 
 /// An opened, digest-bound Codex executable identity.
@@ -574,6 +579,8 @@ impl CodexAdapter {
             origin_device,
             observed_hlc,
             executable_hash,
+            #[cfg(all(test, windows))]
+            qualify_01446: false,
         })
     }
 
@@ -1074,9 +1081,10 @@ impl CodexAdapter {
     }
 
     pub(crate) fn capability(&self) -> CapabilityLevel {
-        if SUPPORTED_VERSIONS.contains(&self.layout.version.as_str())
-            && self.layout.executable_kind == CodexExecutableKind::Native
-        {
+        let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str());
+        #[cfg(all(test, windows))]
+        let supported = supported || (self.qualify_01446 && self.layout.version == "0.144.6");
+        if supported && self.layout.executable_kind == CodexExecutableKind::Native {
             CapabilityLevel::Full
         } else {
             CapabilityLevel::ImportOnly
@@ -2988,7 +2996,7 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<BTreeMap<String, bool>, Client
     if bytes.len() as u64 > CLI_OUTPUT_LIMIT {
         return Err(invalid("Codex plugin output is invalid"));
     }
-    let object = serde_json::from_slice::<Value>(bytes)
+    let object = crate::claude_code::parse_unique_json(bytes)
         .ok()
         .and_then(|value| value.as_object().cloned())
         .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
@@ -3027,8 +3035,10 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<BTreeMap<String, bool>, Client
             "installPolicy",
             "authPolicy",
         ];
-        if plugin.len() != allowed.len()
-            || plugin.keys().any(|key| !allowed.contains(&key.as_str()))
+        if allowed.iter().any(|key| !plugin.contains_key(*key))
+            || plugin
+                .keys()
+                .any(|key| !allowed.contains(&key.as_str()) && key != "marketplaceSource")
         {
             return Err(invalid("Codex plugin output is invalid"));
         }
@@ -3046,7 +3056,12 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<BTreeMap<String, bool>, Client
         };
         safe_name(string_field("name")?)?;
         safe_name(string_field("marketplaceName")?)?;
-        string_field("version")?;
+        if !plugin.get("version").is_some_and(Value::is_null) {
+            string_field("version")?;
+        }
+        if let Some(source) = plugin.get("marketplaceSource") {
+            parse_plugin_string_object(source, &["sourceType", "source"], &[])?;
+        }
         let install_policy = string_field("installPolicy")?;
         let auth_policy = string_field("authPolicy")?;
         let enabled = plugin
@@ -3055,7 +3070,7 @@ fn parse_plugin_list_json(bytes: &[u8]) -> Result<BTreeMap<String, bool>, Client
             .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
         if !ids.insert(id)
             || plugin.get("installed").and_then(Value::as_bool) != Some(expected_installed)
-            || install_policy != "AVAILABLE"
+            || !["AVAILABLE", "NOT_AVAILABLE", "INSTALLED_BY_DEFAULT"].contains(&install_policy)
             || !["ON_USE", "ON_INSTALL"].contains(&auth_policy)
         {
             return Err(invalid("Codex plugin output is invalid"));
@@ -3408,19 +3423,36 @@ fn parse_plugin_source(value: &Value) -> Result<(), ClientError> {
         .get("source")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
-    let expected = match source {
-        "git" => ["source", "url", "ref"].as_slice(),
-        "local" => ["source", "path"].as_slice(),
+    // JsonPluginSource from the pinned native CLI. Optional fields are omitted,
+    // not null; accepting their shape grants no new CLI mutation authority.
+    let (required, optional): (&[&str], &[&str]) = match source {
+        "git" => (&["source", "url"], &["ref", "sha"]),
+        "git-subdir" => (&["source", "url", "path"], &["ref", "sha"]),
+        "local" => (&["source", "path"], &[]),
+        "npm" => (&["source", "package"], &["version", "registry"]),
         _ => return Err(invalid("Codex plugin output is invalid")),
     };
-    if object.len() != expected.len() || object.keys().any(|key| !expected.contains(&key.as_str()))
+    parse_plugin_string_object(value, required, optional)
+}
+
+fn parse_plugin_string_object(
+    value: &Value,
+    required: &[&str],
+    optional: &[&str],
+) -> Result<(), ClientError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
+    if required.iter().any(|key| !object.contains_key(*key))
+        || object
+            .keys()
+            .any(|key| !required.contains(&key.as_str()) && !optional.contains(&key.as_str()))
     {
         return Err(invalid("Codex plugin output is invalid"));
     }
-    for key in expected.iter().filter(|key| **key != "source") {
-        let value = object
-            .get(*key)
-            .and_then(Value::as_str)
+    for value in object.values() {
+        let value = value
+            .as_str()
             .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
             .ok_or_else(|| invalid("Codex plugin output is invalid"))?;
         if value == "<redacted>" {
@@ -5917,6 +5949,104 @@ mod tests {
                 .unwrap();
         }
     }
+    #[test]
+    fn plugin_json_accepts_native_optional_metadata_and_source_variants() {
+        // Pinned Codex 0.144.6 JsonPluginListEntry / JsonPluginSource.
+        let sources = [
+            serde_json::json!({"source":"local","path":"C:/fixture/plugin"}),
+            serde_json::json!({"source":"git","url":"https://example.com/plugins.git"}),
+            serde_json::json!({"source":"git","url":"https://example.com/plugins.git","ref":"main","sha":"abc"}),
+            serde_json::json!({"source":"git-subdir","url":"https://example.com/plugins.git","path":"plugins/tool"}),
+            serde_json::json!({"source":"npm","package":"@fixture/tool"}),
+            serde_json::json!({"source":"npm","package":"@fixture/tool","version":"1.0","registry":"https://example.com"}),
+        ];
+        for source in sources {
+            for policy in ["AVAILABLE", "NOT_AVAILABLE", "INSTALLED_BY_DEFAULT"] {
+                for version in [Value::Null, Value::String("1.0.0".into())] {
+                    let mut plugin = serde_json::json!({
+                        "pluginId":"tool@team", "name":"tool", "marketplaceName":"team",
+                        "version":version, "installed":true, "enabled":false,
+                        "source":source, "installPolicy":policy, "authPolicy":"ON_USE"
+                    });
+                    for metadata in [false, true] {
+                        if metadata {
+                            plugin["marketplaceSource"] = serde_json::json!({
+                                "sourceType":"local", "source":"C:/fixture/marketplace"
+                            });
+                        }
+                        let bytes = serde_json::to_vec(&serde_json::json!({
+                            "installed":[plugin], "available":[]
+                        }))
+                        .unwrap();
+                        assert_eq!(
+                            parse_plugin_list_json(&bytes).unwrap(),
+                            BTreeMap::from([("tool@team".into(), false)])
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plugin_json_rejects_malformed_optional_metadata_and_duplicate_keys() {
+        let plugin = serde_json::json!({
+            "pluginId":"tool@team", "name":"tool", "marketplaceName":"team",
+            "version":"1.0", "installed":true, "enabled":true,
+            "source":{"source":"git","url":"https://example.com/plugins.git","ref":"main"},
+            "installPolicy":"AVAILABLE", "authPolicy":"ON_USE"
+        });
+        for (key, value) in [
+            ("version", serde_json::json!(false)),
+            ("version", serde_json::json!("")),
+            ("marketplaceSource", Value::Null),
+            (
+                "marketplaceSource",
+                serde_json::json!({"sourceType":"local"}),
+            ),
+            (
+                "marketplaceSource",
+                serde_json::json!({"sourceType":"local","source":"x","extra":true}),
+            ),
+            (
+                "marketplaceSource",
+                serde_json::json!({"sourceType":false,"source":"x"}),
+            ),
+            (
+                "source",
+                serde_json::json!({"source":"git","url":"x","ref":null}),
+            ),
+            (
+                "source",
+                serde_json::json!({"source":"npm","package":"x","version":3}),
+            ),
+            (
+                "source",
+                serde_json::json!({"source":"git-subdir","url":"x"}),
+            ),
+        ] {
+            let mut changed = plugin.clone();
+            changed[key] = value;
+            let bytes =
+                serde_json::to_vec(&serde_json::json!({"installed":[changed],"available":[]}))
+                    .unwrap();
+            assert!(parse_plugin_list_json(&bytes).is_err(), "{key}");
+        }
+        let bytes =
+            serde_json::to_string(&serde_json::json!({"installed":[plugin],"available":[]}))
+                .unwrap();
+        for duplicate in [
+            bytes.replace("\"enabled\":true", "\"enabled\":false,\"enabled\":true"),
+            bytes.replace(
+                "\"source\":\"git\"",
+                "\"source\":\"local\",\"source\":\"git\"",
+            ),
+            bytes.replace("\"available\":[]", "\"available\":[{}],\"available\":[]"),
+        ] {
+            assert!(parse_plugin_list_json(duplicate.as_bytes()).is_err());
+        }
+    }
+
     #[test]
     fn plugin_json_schema_rejects_wrong_types_membership_sources_and_unknown_fields() {
         let plugin = serde_json::json!({
