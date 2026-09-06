@@ -70,6 +70,11 @@ reference; reopening checks the authenticated plan's adapter/profile/project and
 installation bindings before any command. Evidence and remaining daemon/UI work:
 2026-09-07-hermes-adapter-runtime-verification.md.
 
+Passive preparation now has phase/count progress and cooperative cancellation
+through copy, verification, directory alias validation and retention publication.
+Daemon/desktop integration remains separate from the existing vault worker;
+implementation details and next steps: 2026-09-07-hermes-preparation-progress.md.
+
 Run focused Windows filesystem/runtime regressions and affected Rust Clippy/fmt
 checks. Refresh graphify after code changes. Request review of ownership and
 failure paths before recording the slice as verified.

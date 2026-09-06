@@ -1,5 +1,7 @@
 use super::super::python_installation::{PythonInstallation, real_path};
-use super::{RuntimeFile, SourceRoot, invalid, literals, read_file, stage_path};
+use super::{
+    RuntimeFile, SourceRoot, invalid, literals, preparation::Control, read_file, stage_path,
+};
 use context_relay_protocol::ClientError;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -13,7 +15,19 @@ pub(super) struct Projection {
     pub controls: Vec<RuntimeFile>,
 }
 
+#[cfg(test)]
 pub(super) fn build(installation: &PythonInstallation) -> Result<Projection, ClientError> {
+    build_controlled(
+        installation,
+        &Control::new(&std::sync::atomic::AtomicBool::new(false), &mut |_| {}),
+    )
+}
+
+pub(super) fn build_controlled(
+    installation: &PythonInstallation,
+    preparation: &Control<'_>,
+) -> Result<Projection, ClientError> {
+    preparation.check()?;
     let mut plan = Projection {
         roots: vec![
             SourceRoot {
@@ -34,6 +48,7 @@ pub(super) fn build(installation: &PythonInstallation) -> Result<Projection, Cli
             &source.join("pyproject.toml"),
             "source/pyproject.toml",
             &mut plan,
+            preparation,
         )?;
         plan.roots.push(SourceRoot {
             source: source.join("pyproject.toml"),
@@ -45,6 +60,7 @@ pub(super) fn build(installation: &PythonInstallation) -> Result<Projection, Cli
             .and_then(|tool| tool.get("setuptools"))
             .ok_or_else(invalid)?;
         for name in strings(setuptools.get("py-modules").ok_or_else(invalid)?)? {
+            preparation.check()?;
             identifier(&name)?;
             safe_pattern(&name)?;
             let path = real_path(&source.join(format!("{name}.py")), false)?;
@@ -60,6 +76,7 @@ pub(super) fn build(installation: &PythonInstallation) -> Result<Projection, Cli
             .and_then(|value| value.get("include"))
             .ok_or_else(invalid)?;
         for pattern in strings(include)? {
+            preparation.check()?;
             let name = pattern.strip_suffix(".*").unwrap_or(&pattern);
             identifier(name)?;
             safe_pattern(name)?;
@@ -81,20 +98,24 @@ pub(super) fn build(installation: &PythonInstallation) -> Result<Projection, Cli
         }
         if let Some(data) = setuptools.get("package-data") {
             for (package, patterns) in data.as_table_like().ok_or_else(invalid)?.iter() {
+                preparation.check()?;
                 if package != "*"
                     && !modules.contains_key(package.split('.').next().ok_or_else(invalid)?)
                 {
                     return Err(invalid());
                 }
                 for pattern in strings(patterns)? {
+                    preparation.check()?;
                     safe_pattern(&pattern)?;
                 }
             }
         }
         if let Some(data) = setuptools.get("data-files") {
             for (target, patterns) in data.as_table_like().ok_or_else(invalid)?.iter() {
+                preparation.check()?;
                 stage_path(target)?;
                 for pattern in strings(patterns)? {
+                    preparation.check()?;
                     safe_pattern(&pattern)?;
                     if !pattern.starts_with(&(target.to_owned() + "/")) {
                         return Err(invalid());
@@ -103,7 +124,12 @@ pub(super) fn build(installation: &PythonInstallation) -> Result<Projection, Cli
                 add_source_directory(source, target, &mut plan)?;
             }
         }
-        let manifest = control(&source.join("MANIFEST.in"), "source/MANIFEST.in", &mut plan)?;
+        let manifest = control(
+            &source.join("MANIFEST.in"),
+            "source/MANIFEST.in",
+            &mut plan,
+            preparation,
+        )?;
         plan.roots.push(SourceRoot {
             source: source.join("MANIFEST.in"),
             destination: "source/MANIFEST.in".into(),
@@ -113,6 +139,7 @@ pub(super) fn build(installation: &PythonInstallation) -> Result<Projection, Cli
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
         {
+            preparation.check()?;
             let parts: Vec<_> = line.split_ascii_whitespace().collect();
             match parts.as_slice() {
                 [
@@ -126,6 +153,7 @@ pub(super) fn build(installation: &PythonInstallation) -> Result<Projection, Cli
                         && !patterns.is_empty() =>
                 {
                     for pattern in patterns {
+                        preparation.check()?;
                         safe_pattern(pattern)?;
                     }
                 }
@@ -137,6 +165,7 @@ pub(super) fn build(installation: &PythonInstallation) -> Result<Projection, Cli
         // Wheel data-files are installed under the environment prefix rather
         // than site-packages. These are Hermes's declared sibling-data roots.
         for name in ["skills", "optional-skills", "optional-mcps", "locales"] {
+            preparation.check()?;
             let path = installation.venv.join(name);
             match fs::symlink_metadata(&path) {
                 Ok(_) => plan.roots.push(SourceRoot {
@@ -148,7 +177,7 @@ pub(super) fn build(installation: &PythonInstallation) -> Result<Projection, Cli
             }
         }
     }
-    let (extra_paths, pywin32) = startup_paths(installation, &modules, &mut plan)?;
+    let (extra_paths, pywin32) = startup_paths(installation, &modules, &mut plan, preparation)?;
     let mut paths = vec![
         "Lib".to_owned(),
         "DLLs".to_owned(),
@@ -188,12 +217,20 @@ pub(super) fn build(installation: &PythonInstallation) -> Result<Projection, Cli
         .sort_by(|left, right| left.destination.cmp(&right.destination));
     let mut roots: Vec<SourceRoot> = Vec::new();
     for root in plan.roots {
-        if let Some(parent) = roots.iter().find(|parent| {
-            root.destination == parent.destination
+        preparation.check()?;
+        let mut matching = None;
+        for parent in &roots {
+            preparation.check()?;
+            if root.destination == parent.destination
                 || root
                     .destination
                     .starts_with(&(parent.destination.clone() + "/"))
-        }) {
+            {
+                matching = Some(parent);
+                break;
+            }
+        }
+        if let Some(parent) = matching {
             let suffix = root
                 .destination
                 .strip_prefix(&parent.destination)
@@ -263,9 +300,16 @@ fn add_source_directory(
     Ok(())
 }
 
-fn control(path: &Path, relative: &str, plan: &mut Projection) -> Result<String, ClientError> {
+fn control(
+    path: &Path,
+    relative: &str,
+    plan: &mut Projection,
+    preparation: &Control<'_>,
+) -> Result<String, ClientError> {
+    preparation.check()?;
     let mut bytes = Vec::new();
     let file = read_file(path, relative, |chunk| {
+        preparation.check()?;
         if bytes.len() + chunk.len() > 256 * 1024 {
             return Err(invalid());
         }
@@ -280,6 +324,7 @@ fn startup_paths(
     installation: &PythonInstallation,
     modules: &BTreeMap<String, (PathBuf, bool)>,
     plan: &mut Projection,
+    preparation: &Control<'_>,
 ) -> Result<(Vec<String>, bool), ClientError> {
     let mut paths = BTreeSet::new();
     let mut pywin32 = false;
@@ -289,16 +334,18 @@ fn startup_paths(
         installation.version.replace('.', "_")
     );
     let editable_line = format!("import {finder_module}; {finder_module}.install()");
-    for (name, path) in super::children(&installation.site_packages)? {
+    for (name, path) in super::children_controlled(&installation.site_packages, preparation)? {
+        preparation.check()?;
         if !name.ends_with(".pth") {
             continue;
         }
-        let text = control(&path, &format!("packages/{name}"), plan)?;
+        let text = control(&path, &format!("packages/{name}"), plan, preparation)?;
         for line in text
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
         {
+            preparation.check()?;
             if line == "import _virtualenv" {
                 continue;
             }
@@ -319,6 +366,7 @@ fn startup_paths(
                         .join(format!("{finder_module}.py")),
                     &format!("packages/{finder_module}.py"),
                     plan,
+                    preparation,
                 )?;
                 validate_finder(&finder, installation, modules)?;
                 continue;

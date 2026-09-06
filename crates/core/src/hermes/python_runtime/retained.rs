@@ -2,13 +2,12 @@
 
 pub use super::RetainedRuntimeReference;
 use super::{
-    CapturedRuntime, Inventory, MAX_DEPTH, MAX_ENTRIES, MAX_FILE_BYTES, RuntimeFile,
-    RuntimeManifest, children, invalid, inventory_stage_with, manifest_bytes_identity, read_file,
+    CapturedRuntime, Inventory, MAX_DEPTH, MAX_ENTRIES, MAX_FILE_BYTES, PreparationPhase,
+    PreparationProgress, RuntimeFile, RuntimeManifest, children_controlled, invalid,
+    inventory_stage_controlled, manifest_bytes_identity, preparation::Control, read_file,
     real_path, stage_path,
 };
-use context_relay_native_runner::{
-    NativeReadLease, OsNativeFileSystem, PinnedNativeDirectory, RuntimeTarget, validate_path_set,
-};
+use context_relay_native_runner::{NativeReadLease, OsNativeFileSystem, PinnedNativeDirectory};
 use context_relay_protocol::{ClientError, Sha256Digest};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -16,6 +15,7 @@ use std::{
     io::Write,
     os::windows::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
 };
 
 const MAX_MANIFEST_BYTES: usize = 48 * 1024 * 1024;
@@ -63,36 +63,69 @@ impl CapturedRuntime {
     /// Publishes a durable copy identified by its manifest hash. Files are not permanently
     /// locked: execution must reverify and hold its own locks later.
     pub fn retain(self) -> Result<RetainedRuntime, ClientError> {
-        self.retain_with_directory_sync(|path| {
+        self.retain_controlled(&Control::new(&AtomicBool::new(false), &mut |_| {}))
+    }
+
+    /// A cancel observed before publication removes the unpublished holder.
+    /// Ready means publication committed; a later cancel does not undo it.
+    pub fn retain_with_progress(
+        self,
+        cancelled: &AtomicBool,
+        mut report: impl FnMut(PreparationProgress),
+    ) -> Result<RetainedRuntime, ClientError> {
+        self.retain_controlled(&Control::new(cancelled, &mut report))
+    }
+
+    pub(super) fn retain_controlled(
+        self,
+        control: &Control<'_>,
+    ) -> Result<RetainedRuntime, ClientError> {
+        self.retain_with_controlled_sync(control, |path| {
             OsNativeFileSystem::new()
                 .synchronize_directory(path)
                 .map_err(|_| invalid())
         })
     }
 
+    #[cfg(test)]
     fn retain_with_directory_sync(
         self,
+        synchronize: impl FnMut(&Path) -> Result<(), ClientError>,
+    ) -> Result<RetainedRuntime, ClientError> {
+        self.retain_with_controlled_sync(
+            &Control::new(&AtomicBool::new(false), &mut |_| {}),
+            synchronize,
+        )
+    }
+
+    fn retain_with_controlled_sync(
+        self,
+        control: &Control<'_>,
         mut synchronize: impl FnMut(&Path) -> Result<(), ClientError>,
     ) -> Result<RetainedRuntime, ClientError> {
+        control.phase(PreparationPhase::Retaining)?;
         self.pin.verify_private().map_err(|_| invalid())?;
         self.container_pin.verify_private().map_err(|_| invalid())?;
-        validate_manifest(&self.manifest)?;
+        validate_manifest_controlled(&self.manifest, control)?;
         let container = self.root.parent().ok_or_else(invalid)?;
-        require_entries(container, &["payload"])?;
-        require_entries(self._directory.path(), &["runtime"])?;
-        verify_payload(&self.pin, &self.root, &self.manifest, true)?;
+        require_entries_controlled(container, &["payload"], control)?;
+        require_entries_controlled(self._directory.path(), &["runtime"], control)?;
+        verify_payload_controlled(&self.pin, &self.root, &self.manifest, true, control)?;
         // Children before parents so every new directory entry reaches its
         // durability barrier before the manifest is published.
         for directory in self.manifest.directories.iter().rev() {
+            control.check()?;
             self.pin
                 .synchronize_relative_directory(&stage_path(directory)?)
                 .map_err(|_| invalid())?;
         }
+        control.check()?;
         self.pin.synchronize().map_err(|_| invalid())?;
         let bytes = serde_json::to_vec(&self.manifest).map_err(|_| invalid())?;
         if bytes.len() > MAX_MANIFEST_BYTES {
             return Err(invalid());
         }
+        control.check()?;
         let mut output = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -102,11 +135,15 @@ impl CapturedRuntime {
             .open(container.join(MANIFEST_NAME))
             .map_err(|_| invalid())?;
         output.write_all(&bytes).map_err(|_| invalid())?;
+        control.check()?;
         output.sync_all().map_err(|_| invalid())?;
         drop(output);
         self.container_pin.synchronize().map_err(|_| invalid())?;
+        control.check()?;
         synchronize(self._directory.path())?;
+        control.check()?;
         synchronize(self._directory.path().parent().ok_or_else(invalid)?)?;
+        control.check()?;
         let reference = RetainedRuntimeReference {
             schema_version: 1,
             storage_key: self
@@ -119,10 +156,12 @@ impl CapturedRuntime {
             manifest_identity: self.identity,
         };
         validate_reference(&reference)?;
-        let retained_manifest = read_manifest(container, &self.container_pin, &reference)?;
+        let retained_manifest =
+            read_manifest_controlled(container, &self.container_pin, &reference, control)?;
         if retained_manifest != self.manifest {
             return Err(invalid());
         }
+        control.check()?;
         let CapturedRuntime {
             pin,
             container_pin,
@@ -132,6 +171,7 @@ impl CapturedRuntime {
             ..
         } = self;
         let _ = _directory.keep();
+        control.ready();
         Ok(RetainedRuntime {
             pin,
             container_pin,
@@ -247,7 +287,19 @@ fn validate_reference(reference: &RetainedRuntimeReference) -> Result<(), Client
 }
 
 fn require_entries(path: &Path, expected: &[&str]) -> Result<(), ClientError> {
-    let observed = children(path)?
+    require_entries_controlled(
+        path,
+        expected,
+        &Control::new(&AtomicBool::new(false), &mut |_| {}),
+    )
+}
+
+fn require_entries_controlled(
+    path: &Path,
+    expected: &[&str],
+    control: &Control<'_>,
+) -> Result<(), ClientError> {
+    let observed = children_controlled(path, control)?
         .into_iter()
         .map(|(name, _)| name)
         .collect::<Vec<_>>();
@@ -266,9 +318,24 @@ fn read_manifest(
     pin: &PinnedNativeDirectory,
     reference: &RetainedRuntimeReference,
 ) -> Result<RuntimeManifest, ClientError> {
-    require_entries(container, &[MANIFEST_NAME, "payload"])?;
+    read_manifest_controlled(
+        container,
+        pin,
+        reference,
+        &Control::new(&AtomicBool::new(false), &mut |_| {}),
+    )
+}
+
+fn read_manifest_controlled(
+    container: &Path,
+    pin: &PinnedNativeDirectory,
+    reference: &RetainedRuntimeReference,
+    control: &Control<'_>,
+) -> Result<RuntimeManifest, ClientError> {
+    require_entries_controlled(container, &[MANIFEST_NAME, "payload"], control)?;
     let mut bytes = Vec::new();
     let observed = read_file(&container.join(MANIFEST_NAME), MANIFEST_NAME, |chunk| {
+        control.check()?;
         if bytes.len().saturating_add(chunk.len()) > MAX_MANIFEST_BYTES {
             return Err(invalid());
         }
@@ -289,7 +356,7 @@ fn read_manifest(
         return Err(invalid());
     }
     let manifest: RuntimeManifest = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-    validate_manifest(&manifest)?;
+    validate_manifest_controlled(&manifest, control)?;
     if serde_json::to_vec(&manifest).map_err(|_| invalid())? != bytes {
         return Err(invalid());
     }
@@ -297,6 +364,17 @@ fn read_manifest(
 }
 
 fn validate_manifest(manifest: &RuntimeManifest) -> Result<(), ClientError> {
+    validate_manifest_controlled(
+        manifest,
+        &Control::new(&AtomicBool::new(false), &mut |_| {}),
+    )
+}
+
+fn validate_manifest_controlled(
+    manifest: &RuntimeManifest,
+    control: &Control<'_>,
+) -> Result<(), ClientError> {
+    control.check()?;
     if manifest.schema_version != 1
         || manifest.projection != "hermes-python-source-first-v1"
         || manifest.source_roots.is_empty()
@@ -325,6 +403,7 @@ fn validate_manifest(manifest: &RuntimeManifest) -> Result<(), ClientError> {
         .map(String::as_str)
         .chain(manifest.files.iter().map(|file| file.path.as_str()))
     {
+        control.check()?;
         stage_path(path)?;
         if path.split('/').count() > MAX_DEPTH + 1 {
             return Err(invalid());
@@ -333,29 +412,30 @@ fn validate_manifest(manifest: &RuntimeManifest) -> Result<(), ClientError> {
         siblings.entry(parent).or_default().push(name.to_owned());
     }
     for names in siblings.values() {
+        control.check()?;
         if names.iter().all(|name| name.is_ascii()) {
             let mut aliases = BTreeSet::new();
-            if names
-                .iter()
-                .any(|name| !aliases.insert(name.to_ascii_uppercase()))
-            {
-                return Err(invalid());
+            for name in names {
+                control.check()?;
+                if !aliases.insert(name.to_ascii_uppercase()) {
+                    return Err(invalid());
+                }
             }
         } else {
-            validate_path_set(
-                RuntimeTarget::WindowsX86_64,
+            control.check_paths(
                 &names
                     .iter()
                     .map(|name| stage_path(name))
                     .collect::<Result<Vec<_>, _>>()?,
-            )
-            .map_err(|_| invalid())?;
+            )?;
         }
     }
     for path in &manifest.directories {
+        control.check()?;
         inventory.directory(path)?;
     }
     for file in &manifest.files {
+        control.check()?;
         inventory.file(file.clone())?;
     }
     if inventory
@@ -374,20 +454,44 @@ fn verify_payload(
     manifest: &RuntimeManifest,
     synchronize: bool,
 ) -> Result<(), ClientError> {
+    verify_payload_controlled(
+        pin,
+        root,
+        manifest,
+        synchronize,
+        &Control::new(&AtomicBool::new(false), &mut |_| {}),
+    )
+}
+
+fn verify_payload_controlled(
+    pin: &PinnedNativeDirectory,
+    root: &Path,
+    manifest: &RuntimeManifest,
+    synchronize: bool,
+    control: &Control<'_>,
+) -> Result<(), ClientError> {
     for directory in &manifest.directories {
+        control.check()?;
         pin.verify_relative_directory(&stage_path(directory)?)
             .map_err(|_| invalid())?;
     }
-    let observed = inventory_stage_with(root, &mut |_, relative| {
-        let (size, hash) = pin
-            .hash_regular_file(&stage_path(relative)?, MAX_FILE_BYTES, synchronize)
-            .map_err(|_| invalid())?;
-        Ok(RuntimeFile {
-            path: relative.into(),
-            size,
-            sha256: Sha256Digest(hash),
-        })
-    })?;
+    let observed = inventory_stage_controlled(
+        root,
+        &mut |_, relative| {
+            control.check()?;
+            let (size, hash) = pin
+                .hash_regular_file(&stage_path(relative)?, MAX_FILE_BYTES, synchronize)
+                .map_err(|_| invalid())?;
+            control.bytes(size)?;
+            control.file()?;
+            Ok(RuntimeFile {
+                path: relative.into(),
+                size,
+                sha256: Sha256Digest(hash),
+            })
+        },
+        control,
+    )?;
     if observed.directories != manifest.directories || observed.files != manifest.files {
         return Err(invalid());
     }
@@ -627,6 +731,40 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(calls, fail_at);
             assert!(!holder.exists());
+            assert_eq!(
+                fs::read(source.join("module.py")).unwrap(),
+                b"VALUE = 'approved'\n"
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_cancel_after_final_flush_still_cleans_unpublished_holder() {
+        for cancel_after in [1, 2] {
+            let (_temp, _store, source, captured) = fixture();
+            let holder = captured._directory.path().to_owned();
+            let cancelled = AtomicBool::new(false);
+            let mut events = Vec::new();
+            let mut report = |event| events.push(event);
+            let control = Control::new(&cancelled, &mut report);
+            let mut calls = 0;
+            let result = captured.retain_with_controlled_sync(&control, |path| {
+                OsNativeFileSystem::new()
+                    .synchronize_directory(path)
+                    .map_err(|_| invalid())?;
+                calls += 1;
+                if calls == cancel_after {
+                    cancelled.store(true, std::sync::atomic::Ordering::Release);
+                }
+                Ok(())
+            });
+            assert_eq!(
+                result.unwrap_err().code,
+                context_relay_protocol::ErrorCode::Canceled
+            );
+            assert_eq!(calls, cancel_after);
+            assert!(!holder.exists());
+            assert!(!events.iter().any(|p| p.phase == PreparationPhase::Ready));
             assert_eq!(
                 fs::read(source.join("module.py")).unwrap(),
                 b"VALUE = 'approved'\n"

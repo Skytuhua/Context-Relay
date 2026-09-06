@@ -56,12 +56,27 @@ impl HermesAdapter {
         store: &Path,
         cancelled: Arc<AtomicBool>,
     ) -> Result<RetainedRuntimeReference, ClientError> {
+        self.prepare_retained_runtime_with_progress(store, cancelled, |_| {})
+    }
+
+    /// Progress contains phase-local work counts and no private paths or values.
+    pub fn prepare_retained_runtime_with_progress(
+        &self,
+        store: &Path,
+        cancelled: Arc<AtomicBool>,
+        mut report: impl FnMut(python_runtime::PreparationProgress),
+    ) -> Result<RetainedRuntimeReference, ClientError> {
         check_cancelled(&cancelled)?;
         self.revalidate_bound_installation()?;
-        let captured = python_runtime::capture(&self.layout.executable, store)?;
+        let captured = python_runtime::capture_with_progress(
+            &self.layout.executable,
+            store,
+            &cancelled,
+            &mut report,
+        )?;
         check_cancelled(&cancelled)?;
         self.revalidate_bound_installation()?;
-        let runtime = captured.retain()?;
+        let runtime = captured.retain_with_progress(&cancelled, report)?;
         Ok(runtime.reference().clone())
     }
 

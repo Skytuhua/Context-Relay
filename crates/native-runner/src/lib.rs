@@ -50,7 +50,9 @@ pub use native_fs::{
     OsNativeFileSystem, PinnedNativeDirectory, PrivateStage, equivalent_security_descriptors,
     inspect_native_tree,
 };
-pub use path_policy::{StagePath, validate_path_set, windows_ordinal_ignore_case_eq};
+pub use path_policy::{
+    StagePath, validate_path_set, validate_path_set_cancellable, windows_ordinal_ignore_case_eq,
+};
 pub use report_validation::{
     validate_gitleaks_report, validate_rulesync_outputs, validate_semgrep_report,
 };
@@ -58,6 +60,8 @@ pub use stage::{StageDirectory, StageLayout};
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum RunnerError {
+    #[error("native validation was canceled")]
+    Canceled,
     #[error("stage path is invalid")]
     InvalidPath,
     #[error("stage paths alias on the target filesystem")]

@@ -5,7 +5,10 @@ mod literals;
 mod management;
 #[cfg(all(test, windows))]
 pub(super) use management::tests::{management_test_guard, runtime_fixture};
+mod preparation;
 mod projection;
+use preparation::Control;
+pub use preparation::{PreparationPhase, PreparationProgress};
 #[cfg(windows)]
 pub mod retained;
 
@@ -14,9 +17,10 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
 };
 
-use context_relay_native_runner::{RuntimeTarget, StagePath, validate_path_set};
+use context_relay_native_runner::StagePath;
 use context_relay_protocol::{ClientError, Sha256Digest};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -103,9 +107,21 @@ impl CapturedRuntime {
         self.identity
     }
     pub fn verify(&self) -> Result<(), ClientError> {
+        self.verify_controlled(&Control::new(&AtomicBool::new(false), &mut |_| {}))
+    }
+    fn verify_controlled(&self, control: &Control<'_>) -> Result<(), ClientError> {
+        control.phase(PreparationPhase::CheckingCopy)?;
         #[cfg(windows)]
         self.pin.verify_path().map_err(|_| invalid())?;
-        let observed = inventory_stage(self.root())?;
+        let observed = inventory_stage_controlled(
+            self.root(),
+            &mut |source, relative| {
+                let file = read_file(source, relative, |bytes| control.bytes(bytes.len() as u64))?;
+                control.file()?;
+                Ok(file)
+            },
+            control,
+        )?;
         if observed.directories != self.manifest.directories
             || observed.files != self.manifest.files
             || manifest_identity(&self.manifest)? != self.identity
@@ -119,13 +135,29 @@ impl CapturedRuntime {
 /// Capture the selected installed runtime without running its launcher or Python.
 /// The returned bytes still need sealed approval and contained command qualification.
 pub fn capture(executable: &Path, parent: &Path) -> Result<CapturedRuntime, ClientError> {
+    capture_with_progress(executable, parent, &AtomicBool::new(false), |_| {})
+}
+
+/// Passive preparation with cooperative cancellation and phase-local counts.
+/// The callback runs synchronously and should only record/coalesce progress.
+pub fn capture_with_progress(
+    executable: &Path,
+    parent: &Path,
+    cancelled: &AtomicBool,
+    mut report: impl FnMut(PreparationProgress),
+) -> Result<CapturedRuntime, ClientError> {
+    let control = Control::new(cancelled, &mut report);
+    control.phase(PreparationPhase::Inspecting)?;
     let installation = super::python_installation::inspect(executable)?.ok_or_else(invalid)?;
-    let mut projection = projection::build(&installation)?;
+    control.check()?;
+    let mut projection = projection::build_controlled(&installation, &control)?;
+    control.check()?;
     projection.roots.push(SourceRoot {
         source: real_path(executable, false)?,
         destination: "metadata/hermes-launcher.exe".into(),
     });
     for (index, observation) in installation.metadata.iter().enumerate() {
+        control.check()?;
         if !projection
             .roots
             .iter()
@@ -137,24 +169,28 @@ pub fn capture(executable: &Path, parent: &Path) -> Result<CapturedRuntime, Clie
             });
         }
     }
-    let mut captured = capture_inputs(parent, projection.roots)?;
+    let mut captured = capture_inputs_controlled(parent, projection.roots, &control)?;
     verify_metadata_observations(&captured.manifest, &installation.metadata)?;
     for control in projection.controls {
         if !captured.manifest.files.contains(&control) {
             return Err(invalid());
         }
     }
+    control.check()?;
     if super::python_installation::inspect(executable)?.as_ref() != Some(&installation) {
         return Err(invalid());
     }
     let mut expected = Inventory::default();
     for directory in &captured.manifest.directories {
+        control.check()?;
         expected.directory(directory)?;
     }
     for file in &captured.manifest.files {
+        control.check()?;
         expected.file(file.clone())?;
     }
     for (path, bytes) in projection.generated {
+        control.check()?;
         stage_path(&path)?;
         if bytes.len() as u64 > MAX_FILE_BYTES {
             return Err(invalid());
@@ -172,7 +208,7 @@ pub fn capture(executable: &Path, parent: &Path) -> Result<CapturedRuntime, Clie
     captured.manifest.directories = expected.directories.into_iter().collect();
     captured.manifest.files = expected.files.into_values().collect();
     captured.identity = manifest_identity(&captured.manifest)?;
-    captured.verify()?;
+    captured.verify_controlled(&control)?;
     Ok(captured)
 }
 
@@ -212,10 +248,21 @@ fn verify_metadata_observations(
     Ok(())
 }
 
-fn capture_inputs(
+#[cfg(test)]
+fn capture_inputs(parent: &Path, roots: Vec<SourceRoot>) -> Result<CapturedRuntime, ClientError> {
+    capture_inputs_controlled(
+        parent,
+        roots,
+        &Control::new(&AtomicBool::new(false), &mut |_| {}),
+    )
+}
+
+fn capture_inputs_controlled(
     parent: &Path,
     mut roots: Vec<SourceRoot>,
+    control: &Control<'_>,
 ) -> Result<CapturedRuntime, ClientError> {
+    control.phase(PreparationPhase::Copying)?;
     let parent = real_path(parent, true)?;
     if roots.is_empty() || roots.len() > 128 {
         return Err(invalid());
@@ -231,6 +278,7 @@ fn capture_inputs(
         }
     }
     for root in &mut roots {
+        control.check()?;
         stage_path(&root.destination)?;
         let metadata = fs::symlink_metadata(&root.source).map_err(|_| invalid())?;
         root.source = real_path(&root.source, metadata.is_dir())?;
@@ -277,6 +325,7 @@ fn capture_inputs(
             &root_path,
             &mut inventory,
             0,
+            control,
         )?;
     }
     #[cfg(test)]
@@ -286,8 +335,16 @@ fn capture_inputs(
     // A fresh complete source inventory catches additions/deletions during copy,
     // including files that did not exist when their parent was first visited.
     let mut current = Inventory::default();
+    control.phase(PreparationPhase::CheckingSource)?;
     for root in &roots {
-        inspect_node(&root.source, &root.destination, &mut current, 0, true)?;
+        inspect_node(
+            &root.source,
+            &root.destination,
+            &mut current,
+            0,
+            true,
+            control,
+        )?;
     }
     if current != inventory {
         return Err(invalid());
@@ -431,10 +488,15 @@ fn reject_private_name(path: &Path) -> Result<(), ClientError> {
     Ok(())
 }
 
-fn children(path: &Path) -> Result<Vec<(String, PathBuf)>, ClientError> {
+fn children_controlled(
+    path: &Path,
+    control: &Control<'_>,
+) -> Result<Vec<(String, PathBuf)>, ClientError> {
+    control.check()?;
     real_path(path, true)?;
     let mut entries = Vec::new();
     for entry in fs::read_dir(path).map_err(|_| invalid())? {
+        control.check()?;
         if entries.len() >= MAX_ENTRIES {
             return Err(invalid());
         }
@@ -444,26 +506,25 @@ fn children(path: &Path) -> Result<Vec<(String, PathBuf)>, ClientError> {
         entries.push((name, entry.path()));
     }
     entries.sort_by(|left, right| left.0.cmp(&right.0));
+    control.check()?;
     // ASCII NFKC is unchanged and ordinal case equivalence is exactly ASCII
     // uppercase. Avoid quadratic comparisons in large package directories.
     if entries.iter().all(|(name, _)| name.is_ascii()) {
         let mut aliases = BTreeSet::new();
-        if entries
-            .iter()
-            .any(|(name, _)| !aliases.insert(name.to_ascii_uppercase()))
-        {
-            return Err(invalid());
+        for (name, _) in &entries {
+            control.check()?;
+            if !aliases.insert(name.to_ascii_uppercase()) {
+                return Err(invalid());
+            }
         }
         return Ok(entries);
     }
-    validate_path_set(
-        RuntimeTarget::WindowsX86_64,
+    control.check_paths(
         &entries
             .iter()
             .map(|(name, _)| stage_path(name))
             .collect::<Result<Vec<_>, _>>()?,
-    )
-    .map_err(|_| invalid())?;
+    )?;
     Ok(entries)
 }
 
@@ -473,7 +534,9 @@ fn capture_node(
     stage: &Path,
     inventory: &mut Inventory,
     depth: usize,
+    control: &Control<'_>,
 ) -> Result<(), ClientError> {
+    control.check()?;
     if depth > MAX_DEPTH {
         return Err(invalid());
     }
@@ -488,13 +551,14 @@ fn capture_node(
         inventory.parents(relative)?;
         inventory.directory(relative)?;
         fs::create_dir_all(stage.join(relative)).map_err(|_| invalid())?;
-        for (name, path) in children(source)? {
+        for (name, path) in children_controlled(source, control)? {
             capture_node(
                 &path,
                 &format!("{relative}/{name}"),
                 stage,
                 inventory,
                 depth + 1,
+                control,
             )?;
         }
     } else {
@@ -511,15 +575,18 @@ fn capture_node(
             .ok_or_else(invalid)?;
         let mut copied = 0u64;
         let file = read_file(source, relative, |bytes| {
+            control.check()?;
             copied += bytes.len() as u64;
             if copied > remaining {
                 return Err(invalid());
             }
-            output.write_all(bytes).map_err(|_| invalid())
+            output.write_all(bytes).map_err(|_| invalid())?;
+            control.bytes(bytes.len() as u64)
         })?;
         // This temporary capture has no durable approval. Verify readable bytes
         // after copying; a future durable promotion must flush before sealing.
         inventory.file(file)?;
+        control.file()?;
     }
     Ok(())
 }
@@ -530,6 +597,7 @@ fn inspect_node(
     inventory: &mut Inventory,
     depth: usize,
     source_policy: bool,
+    control: &Control<'_>,
 ) -> Result<(), ClientError> {
     inspect_node_with(
         source,
@@ -537,7 +605,12 @@ fn inspect_node(
         inventory,
         depth,
         source_policy,
-        &mut |source, relative| read_file(source, relative, |_| Ok(())),
+        &mut |source, relative| {
+            let file = read_file(source, relative, |bytes| control.bytes(bytes.len() as u64))?;
+            control.file()?;
+            Ok(file)
+        },
+        control,
     )
 }
 
@@ -548,7 +621,9 @@ fn inspect_node_with(
     depth: usize,
     source_policy: bool,
     reader: &mut impl FnMut(&Path, &str) -> Result<RuntimeFile, ClientError>,
+    control: &Control<'_>,
 ) -> Result<(), ClientError> {
+    control.check()?;
     if depth > MAX_DEPTH {
         return Err(invalid());
     }
@@ -562,7 +637,7 @@ fn inspect_node_with(
     if metadata.is_dir() {
         inventory.parents(relative)?;
         inventory.directory(relative)?;
-        for (name, path) in children(source)? {
+        for (name, path) in children_controlled(source, control)? {
             inspect_node_with(
                 &path,
                 &format!("{relative}/{name}"),
@@ -570,6 +645,7 @@ fn inspect_node_with(
                 depth + 1,
                 source_policy,
                 reader,
+                control,
             )?;
         }
     } else {
@@ -578,19 +654,15 @@ fn inspect_node_with(
     Ok(())
 }
 
-fn inventory_stage(stage: &Path) -> Result<RuntimeManifest, ClientError> {
-    inventory_stage_with(stage, &mut |source, relative| {
-        read_file(source, relative, |_| Ok(()))
-    })
-}
-
-fn inventory_stage_with(
+fn inventory_stage_controlled(
     stage: &Path,
     reader: &mut impl FnMut(&Path, &str) -> Result<RuntimeFile, ClientError>,
+    control: &Control<'_>,
 ) -> Result<RuntimeManifest, ClientError> {
+    control.check()?;
     let mut inventory = Inventory::default();
-    for (name, path) in children(stage)? {
-        inspect_node_with(&path, &name, &mut inventory, 0, false, reader)?;
+    for (name, path) in children_controlled(stage, control)? {
+        inspect_node_with(&path, &name, &mut inventory, 0, false, reader, control)?;
     }
     Ok(RuntimeManifest {
         schema_version: 1,
