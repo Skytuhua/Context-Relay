@@ -7,7 +7,7 @@ use super::{
     real_path, stage_path,
 };
 use context_relay_native_runner::{
-    OsNativeFileSystem, PinnedNativeDirectory, RuntimeTarget, validate_path_set,
+    NativeReadLease, OsNativeFileSystem, PinnedNativeDirectory, RuntimeTarget, validate_path_set,
 };
 use context_relay_protocol::{ClientError, Sha256Digest};
 use std::{
@@ -28,6 +28,35 @@ pub struct RetainedRuntime {
     root: PathBuf,
     manifest: RuntimeManifest,
     reference: RetainedRuntimeReference,
+}
+
+/// Owns verified runtime file handles until the management process tree stops.
+/// The caller must transfer this entire value to the process guard; dropping it
+/// releases the locks. This is a byte lease, not an OS sandbox or launch approval.
+#[derive(Debug)]
+pub struct LockedRuntime {
+    _leases: Vec<NativeReadLease>,
+    runtime: RetainedRuntime,
+}
+
+impl LockedRuntime {
+    pub fn root(&self) -> &Path {
+        self.runtime.root()
+    }
+    pub fn manifest(&self) -> &RuntimeManifest {
+        self.runtime.manifest()
+    }
+    pub fn reference(&self) -> &RetainedRuntimeReference {
+        self.runtime.reference()
+    }
+    pub fn identity(&self) -> Sha256Digest {
+        self.runtime.identity()
+    }
+    /// Rechecks privacy and exact inventory while the original byte leases live.
+    /// New names can still be created; this detects them, not their possible use.
+    pub fn verify(&self) -> Result<(), ClientError> {
+        self.runtime.verify()
+    }
 }
 
 impl CapturedRuntime {
@@ -114,6 +143,50 @@ impl CapturedRuntime {
 }
 
 impl RetainedRuntime {
+    pub fn lock(self) -> Result<LockedRuntime, ClientError> {
+        self.pin.verify_private().map_err(|_| invalid())?;
+        self.container_pin.verify_private().map_err(|_| invalid())?;
+        validate_manifest(&self.manifest)?;
+        let bytes = serde_json::to_vec(&self.manifest).map_err(|_| invalid())?;
+        let (manifest_lease, size, hash) = self
+            .container_pin
+            .lock_regular_file(&stage_path(MANIFEST_NAME)?, MAX_MANIFEST_BYTES as u64)
+            .map_err(|_| invalid())?;
+        use sha2::{Digest as _, Sha256};
+        if size != bytes.len() as u64
+            || hash != <[u8; 32]>::from(Sha256::digest(&bytes))
+            || manifest_bytes_identity(&bytes) != self.reference.manifest_identity
+        {
+            return Err(invalid());
+        }
+        let mut leases =
+            Vec::with_capacity(1 + self.manifest.directories.len() + self.manifest.files.len());
+        leases.push(manifest_lease);
+        for directory in &self.manifest.directories {
+            leases.push(
+                self.pin
+                    .lock_relative_directory(&stage_path(directory)?)
+                    .map_err(|_| invalid())?,
+            );
+        }
+        for expected in &self.manifest.files {
+            let (lease, size, hash) = self
+                .pin
+                .lock_regular_file(&stage_path(&expected.path)?, MAX_FILE_BYTES)
+                .map_err(|_| invalid())?;
+            if size != expected.size || Sha256Digest(hash) != expected.sha256 {
+                return Err(invalid());
+            }
+            leases.push(lease);
+        }
+        let locked = LockedRuntime {
+            _leases: leases,
+            runtime: self,
+        };
+        locked.verify()?;
+        Ok(locked)
+    }
+
     pub fn open(store: &Path, reference: &RetainedRuntimeReference) -> Result<Self, ClientError> {
         validate_reference(reference)?;
         let store = real_path(store, true)?;
@@ -364,6 +437,65 @@ mod tests {
             b"VALUE = 'approved'\n"
         );
         reopened.verify().unwrap();
+    }
+
+    #[test]
+    fn runtime_lease_holds_files_manifest_and_empty_directories_until_drop() {
+        let (_temp, _store, _source, captured) = fixture();
+        let retained = captured.retain().unwrap();
+        let root = retained.root().to_owned();
+        let file = root.join("source/module.py");
+        let empty = root.join("source/empty");
+        let manifest = root.parent().unwrap().join(MANIFEST_NAME);
+        let locked = retained.lock().unwrap();
+        assert_eq!(locked.root(), root);
+        assert_eq!(locked.reference().manifest_identity, locked.identity());
+        assert!(!locked.manifest().files.is_empty());
+        for path in [&file, &manifest] {
+            assert!(fs::write(path, b"changed").is_err());
+            assert!(fs::remove_file(path).is_err());
+            assert!(fs::rename(path, path.with_extension("moved")).is_err());
+            assert!(fs::read(path).is_ok());
+        }
+        assert!(fs::remove_dir(&empty).is_err());
+        assert!(fs::rename(root.join("source"), root.join("moved")).is_err());
+        locked.verify().unwrap();
+        drop(locked);
+        fs::write(&file, b"released").unwrap();
+        fs::rename(&empty, root.join("source/moved")).unwrap();
+        fs::write(&manifest, b"released").unwrap();
+    }
+
+    #[test]
+    fn runtime_lease_rejects_existing_writer_and_releases_partial_acquisition() {
+        let (_temp, _store, _source, captured) = fixture();
+        let retained = captured.retain().unwrap();
+        let root = retained.root().to_owned();
+        let file = root.join("source/module.py");
+        let writer = fs::OpenOptions::new().write(true).open(&file).unwrap();
+        assert!(retained.lock().is_err());
+        drop(writer);
+        fs::write(&file, b"released").unwrap();
+        fs::remove_dir(root.join("source/empty")).unwrap();
+        fs::write(root.parent().unwrap().join(MANIFEST_NAME), b"released").unwrap();
+    }
+
+    #[test]
+    fn runtime_lease_rechecks_changes_since_reopen_and_detects_new_names() {
+        let (_temp, _store, _source, captured) = fixture();
+        let retained = captured.retain().unwrap();
+        let root = retained.root().to_owned();
+        fs::write(root.join("source/module.py"), b"changed").unwrap();
+        assert!(retained.lock().is_err());
+        let (_temp, _store, _source, captured) = fixture();
+        let locked = captured.retain().unwrap().lock().unwrap();
+        let extra = locked.root().join("source/extra.py");
+        // Directory handles do not freeze the namespace. The post-check must
+        // reject a new file; this API does not claim to prevent its import.
+        fs::write(&extra, b"unexpected").unwrap();
+        assert!(locked.verify().is_err());
+        fs::remove_file(extra).unwrap();
+        locked.verify().unwrap();
     }
 
     #[test]

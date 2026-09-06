@@ -563,6 +563,16 @@ pub struct PinnedNativeDirectory {
     _creation_ancestors: Vec<File>,
 }
 
+/// Owns a private descendant read handle and its no-delete ancestor handles.
+/// Existing file writes/replacement are excluded until drop. This does not
+/// freeze directory namespaces or confer process execution authority.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct NativeReadLease {
+    _file: File,
+    _ancestors: Vec<File>,
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 impl PinnedNativeDirectory {
     #[cfg(windows)]
@@ -583,6 +593,28 @@ impl PinnedNativeDirectory {
     ) -> Result<(u64, [u8; 32]), RunnerError> {
         self.verify_path()?;
         windows::hash_relative_file(&self.directory, &self.path, path, max_bytes, synchronize)
+    }
+
+    /// Hashes and retains the same writer-excluding file handle. No write or
+    /// delete sharing is granted, and all traversed ancestors stay held.
+    #[cfg(windows)]
+    pub fn lock_regular_file(
+        &self,
+        path: &StagePath,
+        max_bytes: u64,
+    ) -> Result<(NativeReadLease, u64, [u8; 32]), RunnerError> {
+        self.verify_path()?;
+        windows::lock_relative_file(&self.directory, &self.path, path, max_bytes, false)
+    }
+
+    /// Holds a verified private directory, including empty directories.
+    #[cfg(windows)]
+    pub fn lock_relative_directory(
+        &self,
+        path: &StagePath,
+    ) -> Result<NativeReadLease, RunnerError> {
+        self.verify_path()?;
+        windows::lock_relative_directory(&self.directory, &self.path, path, false)
     }
 
     /// Checks a private descendant directory, including empty directories.

@@ -40,6 +40,8 @@ pub use manifest::{
     RuntimeTarget, SidecarId, SidecarManifest, VerifiedClosure, VerifiedMaterial,
     parse_sidecar_manifest, verify_closure,
 };
+#[cfg(windows)]
+pub use native_fs::NativeReadLease;
 pub use native_fs::{
     AlternateStream, NativeMetadata, NativeMutationFailure, NativeMutationOutcome,
     NativeObjectToken, NativeRecoveryDisposition, NativeSnapshot, NativeState, NativeTreeInventory,

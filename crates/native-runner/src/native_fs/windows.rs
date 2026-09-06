@@ -642,6 +642,17 @@ pub(super) fn hash_relative_file(
     max_bytes: u64,
     synchronize: bool,
 ) -> Result<(u64, [u8; 32]), RunnerError> {
+    let (_lease, length, hash) = lock_relative_file(directory, root, path, max_bytes, synchronize)?;
+    Ok((length, hash))
+}
+
+pub(super) fn lock_relative_file(
+    directory: &File,
+    root: &Path,
+    path: &crate::StagePath,
+    max_bytes: u64,
+    synchronize: bool,
+) -> Result<(super::NativeReadLease, u64, [u8; 32]), RunnerError> {
     let held = held_relative(directory, root, path)?;
     let access = GENERIC_READ | if synchronize { GENERIC_WRITE } else { 0 };
     let mut file = held
@@ -684,7 +695,14 @@ pub(super) fn hash_relative_file(
     if length != before.size || !raw_node_unchanged(&before, &raw_node(&file)?) {
         return Err(RunnerError::ConcurrentChange);
     }
-    Ok((length, hash.finalize().into()))
+    Ok((
+        super::NativeReadLease {
+            _file: file,
+            _ancestors: held.handles,
+        },
+        length,
+        hash.finalize().into(),
+    ))
 }
 
 pub(super) fn flush_relative_directory(
@@ -701,6 +719,16 @@ pub(super) fn verify_relative_directory(
     path: &crate::StagePath,
     synchronize: bool,
 ) -> Result<(), RunnerError> {
+    lock_relative_directory(directory, root, path, synchronize)?;
+    Ok(())
+}
+
+pub(super) fn lock_relative_directory(
+    directory: &File,
+    root: &Path,
+    path: &crate::StagePath,
+    synchronize: bool,
+) -> Result<super::NativeReadLease, RunnerError> {
     let held = held_relative(directory, root, path)?;
     let child = nt_open_relative(
         held.parent()?,
@@ -722,7 +750,10 @@ pub(super) fn verify_relative_directory(
     if synchronize {
         flush_handle(&child)?;
     }
-    Ok(())
+    Ok(super::NativeReadLease {
+        _file: child,
+        _ancestors: held.handles,
+    })
 }
 
 // Descendants inherit their sole user ACE. Elevated Windows may assign the
@@ -2814,6 +2845,32 @@ mod pre_rename_tests {
         assert_eq!(ace.Mask, FILE_ALL_ACCESS);
         let sid = (&raw const ace.SidStart).cast_mut().cast();
         assert_ne!(unsafe { EqualSid(owner, sid) }, 0);
+    }
+
+    #[test]
+    fn native_read_lease_retains_hashed_file_and_relative_ancestors() {
+        let root = test_root("runtime-read-lease");
+        let path = root.join("runtime");
+        let (directory, ancestors) = create_private_directory(&path).unwrap();
+        fs::create_dir(path.join("nested")).unwrap();
+        let file = path.join("nested/module.py");
+        fs::write(&file, b"VALUE = 1").unwrap();
+        let relative = crate::StagePath::try_from("nested/module.py").unwrap();
+        let (lease, length, hash) =
+            lock_relative_file(&directory, &path, &relative, 100, false).unwrap();
+        assert_eq!(length, 9);
+        assert_eq!(hash, <[u8; 32]>::from(Sha256::digest(b"VALUE = 1")));
+        drop(directory);
+        drop(ancestors);
+        assert!(fs::write(&file, b"changed").is_err());
+        assert!(fs::remove_file(&file).is_err());
+        assert!(fs::rename(path.join("nested"), path.join("renamed")).is_err());
+        assert!(fs::rename(&path, root.join("renamed")).is_err());
+        assert_eq!(fs::read(&file).unwrap(), b"VALUE = 1");
+        drop(lease);
+        fs::write(&file, b"released").unwrap();
+        fs::rename(path.join("nested"), path.join("renamed")).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
