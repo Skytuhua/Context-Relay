@@ -15,6 +15,10 @@ import type { WorkspaceGateway } from './workspace';
 const id = (suffix: string) => `018f22e2-79b0-7cc8-98c4-dc0c0c0739${suffix}`;
 
 class FakeWorkspaceGateway implements WorkspaceGateway {
+  async pendingWrites() { return { writes: [], nextCursor: null }; }
+  async pendingWrite() { return null; }
+  async retryWrite() { return { cleanupPending: false }; }
+  async forgetWrite() {}
   async chooseProjectFolder() { return null; }
   networkCalls = 0;
   private projectsValue: ProjectIdentity[] = [];
@@ -45,7 +49,7 @@ class FakeWorkspaceGateway implements WorkspaceGateway {
 
   async status(): Promise<StatusOutput> {
     return {
-      protocol: { min: { major: 1, minor: 6 }, max: { major: 1, minor: 6 } },
+      protocol: { min: { major: 1, minor: 7 }, max: { major: 1, minor: 7 } },
       vault: 'unlocked',
       resolvedProject: null,
       sync: 'offline',

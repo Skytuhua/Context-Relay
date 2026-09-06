@@ -188,6 +188,10 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
     use ClientRole::{Desktop, DesktopRecoveryHost, Installer, McpBridge};
 
     match request {
+        LocalRequest::DesktopWritePrepare(_)
+        | LocalRequest::DesktopWritesList(_)
+        | LocalRequest::DesktopWriteGet(_)
+        | LocalRequest::DesktopWriteForget(_) => matches!(role, Desktop),
         LocalRequest::Hello(_) => false,
         LocalRequest::Cancel(_) => true,
         LocalRequest::Shutdown(_) => matches!(role, Desktop),

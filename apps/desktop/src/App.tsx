@@ -1,4 +1,4 @@
-import { type FormEvent, useEffect, useRef, useState } from 'react';
+import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 
 import type {
   MemoryCandidate,
@@ -11,7 +11,8 @@ import type {
 import { DevicesScreen } from './devices';
 import { HarnessesScreen } from './harnesses';
 import { ProjectForm } from './project-form';
-import { LocalWorkspaceGateway, type WorkspaceGateway } from './workspace';
+import { WriteRecovery } from './write-recovery';
+import { LocalWorkspaceGateway, RecoveryStorageFullError, type WorkspaceGateway } from './workspace';
 
 type ScreenId =
   | 'home'
@@ -65,6 +66,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const [archiveTarget, setArchiveTarget] = useState<MemoryRecord | null>(null);
   const [evidence, setEvidence] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
+  const [recoveryStorageFull, setRecoveryStorageFull] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [saving, setSaving] = useState<SaveAction | null>(null);
   const savingRef = useRef(false);
@@ -72,6 +74,10 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const taskDraft = useRef({});
   const [projectBusy, setProjectBusy] = useState(false);
   const projectBusyRef = useRef(false);
+  const recoveryBusy = useCallback((value: boolean) => {
+    projectBusyRef.current = value;
+    setProjectBusy(value);
+  }, []);
   const readGeneration = useRef(0);
   const [recordsLoading, setRecordsLoading] = useState(false);
   const hasNavigatedRef = useRef(false);
@@ -119,6 +125,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
 
   async function selectScreen(screen: ScreenId, scope = activeProject) {
     if (savingRef.current || projectBusyRef.current) return;
+    setRecoveryStorageFull(false);
     if (screen !== activeScreen || scope?.projectId !== activeProject?.projectId) {
       memoryDraft.current = {};
       taskDraft.current = {};
@@ -165,11 +172,12 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     setError(null);
   }
 
-  function refreshSavedRecords(kind: 'memory' | 'task', projectId: string | null) {
+  function refreshSavedRecords(kind: 'memory' | 'task' | 'review', projectId: string | null) {
     const generation = ++readGeneration.current;
     setRecordsLoading(true);
     const load = kind === 'memory'
       ? gateway.memories(projectId).then((records) => { if (generation === readGeneration.current) setMemories(records); })
+      : kind === 'review' ? gateway.candidates(projectId).then((records) => { if (generation === readGeneration.current) setCandidates(records); })
       : gateway.tasks(projectId!).then((records) => { if (generation === readGeneration.current) setTasks(records); });
     void load.catch(() => {
       if (generation === readGeneration.current) setError('Your change was saved, but the list could not refresh. Select this page again to reload it.');
@@ -182,6 +190,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     readGeneration.current += 1;
     setRecordsLoading(false);
     setSaving(action);
+    setRecoveryStorageFull(false);
     setError(null);
     setNotice(null);
     return true;
@@ -190,6 +199,12 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   function finishSave() {
     savingRef.current = false;
     setSaving(null);
+  }
+
+  function reportSaveError(failure: unknown, fallback: string) {
+    const full = failure instanceof RecoveryStorageFullError;
+    setRecoveryStorageFull(full);
+    setError(full ? failure.message : fallback);
   }
 
   async function submitMemory(event: FormEvent<HTMLFormElement>) {
@@ -210,8 +225,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       form.reset();
       memoryDraft.current = {};
       refreshSavedRecords('memory', activeProject?.projectId ?? null);
-    } catch {
-      setError('We could not confirm the save. Your draft is still here. Choose Save context again to retry this draft.');
+    } catch (failure) {
+      reportSaveError(failure, 'We could not confirm the save. Your draft is still here. Choose Save context again to retry this draft.');
     } finally { finishSave(); }
   }
 
@@ -230,8 +245,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       setNotice('Memory updated');
       setError(null);
       refreshSavedRecords('memory', activeProject?.projectId ?? null);
-    } catch {
-      setError('We could not confirm the update. Your draft is still here. Choose Update context again to retry these changes.');
+    } catch (failure) {
+      reportSaveError(failure, 'We could not confirm the update. Your draft is still here. Choose Update context again to retry these changes.');
     } finally { finishSave(); }
   }
 
@@ -242,8 +257,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       setMemories((current) => current.filter((item) => item.id !== memory.id));
       setEditingMemory((current) => current?.id === memory.id ? null : current);
       setNotice('Memory archived');
-    } catch {
-      setError('We could not confirm the archive. Reload Saved context to check before trying again.');
+    } catch (failure) {
+      reportSaveError(failure, 'We could not confirm the archive. Reload Saved context to check before trying again.');
     } finally { finishSave(); }
   }
 
@@ -276,8 +291,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       await gateway.reviewCandidate(candidate, accepted);
       setCandidates((current) => current.filter((item) => item.id !== candidate.id));
       setNotice(accepted ? 'Candidate accepted' : 'Candidate rejected');
-    } catch {
-      setError('We could not confirm your review. Reload Suggestions to check before trying again.');
+    } catch (failure) {
+      reportSaveError(failure, 'We could not confirm your review. Reload Suggestions to check before trying again.');
     } finally { finishSave(); }
   }
 
@@ -300,8 +315,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       form.reset();
       taskDraft.current = {};
       refreshSavedRecords('task', activeProject.projectId);
-    } catch {
-      setError('We could not confirm the save. Your draft is still here. Choose Save task again to retry this draft.');
+    } catch (failure) {
+      reportSaveError(failure, 'We could not confirm the save. Your draft is still here. Choose Save task again to retry this draft.');
     } finally { finishSave(); }
   }
 
@@ -319,8 +334,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       setEditingTask(null);
       setNotice('Task updated');
       refreshSavedRecords('task', activeProject.projectId);
-    } catch {
-      setError('We could not confirm the update. Your draft is still here. Choose Update task again to retry these changes.');
+    } catch (failure) {
+      reportSaveError(failure, 'We could not confirm the update. Your draft is still here. Choose Update task again to retry these changes.');
     } finally { finishSave(); }
   }
 
@@ -330,8 +345,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       const updated = await gateway.transitionTask(task, next);
       setTasks((current) => replaceRecord(current, updated, task.revision));
       setNotice(next === 'in_progress' ? 'Task started' : 'Task updated');
-    } catch {
-      setError('We could not confirm the task status. Reload Tasks to check before trying again.');
+    } catch (failure) {
+      reportSaveError(failure, 'We could not confirm the task status. Reload Tasks to check before trying again.');
     } finally { finishSave(); }
   }
 
@@ -345,8 +360,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       setTasks((current) => replaceRecord(current, updated, task.revision));
       setNotice('Task completed');
       setError(null);
-    } catch {
-      setError('We could not confirm completion. Your evidence is still here. Reload Tasks to check before trying again.');
+    } catch (failure) {
+      reportSaveError(failure, 'We could not confirm completion. Your evidence is still here. Reload Tasks to check before trying again.');
     } finally { finishSave(); }
   }
 
@@ -355,6 +370,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       case 'home':
         return (
           <section className="screen-content home-guide" aria-labelledby="home-start-title">
+            {connectionState === 'ready' && <WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} />}
             <h2 id="home-start-title">{activeProject ? 'What would you like to remember?' : 'Stop explaining the same things again'}</h2>
             <p>Save a decision, preference or project note once. A connected harness can find it when you start your next session.</p>
             {!activeProject ? <>
@@ -398,14 +414,14 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
               <p>For example: “Use TypeScript for this project” or a decision you do not want to explain again.</p>
               <Field label="Title" name="title" disabled={!!saving} placeholder="For example, Writing preferences" />
               <Field label="What should your harness remember?" name="body" multiline disabled={!!saving} placeholder="A decision, preference or detail to use next time…" />
-              <button className="primary-action" type="submit" disabled={!!saving || connectionState !== 'ready'}>{saving === 'memory' ? 'Saving…' : 'Save context'}</button>
+              <button className="primary-action" type="submit" disabled={!!saving || projectBusy || connectionState !== 'ready'}>{saving === 'memory' ? 'Saving…' : 'Save context'}</button>
             </form>
             {editingMemory && (
               <form key={editingMemory.id} aria-describedby={error ? 'workspace-error' : undefined} aria-label="Edit context" className="capture-form edit-form" onSubmit={submitMemoryEdit}>
                 <h2>Edit context</h2>
                 <Field label="Edit title" name="title" defaultValue={editingMemory.title} disabled={!!saving} />
                 <Field label="Edit context" name="body" defaultValue={editingMemory.bodyMarkdown} multiline disabled={!!saving} />
-                <button className="primary-action" type="submit" disabled={!!saving || connectionState !== 'ready'}>{saving === 'memory-edit' ? 'Saving changes…' : 'Update context'}</button>
+                <button className="primary-action" type="submit" disabled={!!saving || projectBusy || connectionState !== 'ready'}>{saving === 'memory-edit' ? 'Saving changes…' : 'Update context'}</button>
                 <button className="secondary-action" disabled={!!saving} onClick={() => setEditingMemory(null)} type="button">Cancel edit</button>
               </form>
             )}
@@ -420,7 +436,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
                   <h3>{memory.title}</h3>
                   <p>{memory.bodyMarkdown}</p>
                   <button aria-label={`Edit ${memory.title}`} disabled={!!saving} onClick={() => setEditingMemory(memory)} type="button">Edit</button>
-                  <button aria-label={`Archive ${memory.title}`} disabled={!!saving || connectionState !== 'ready'} onClick={(event) => openArchive(memory, event.currentTarget)} type="button">Archive</button>
+                  <button aria-label={`Archive ${memory.title}`} disabled={!!saving || projectBusy || connectionState !== 'ready'} onClick={(event) => openArchive(memory, event.currentTarget)} type="button">Archive</button>
                 </li>
               ))}
             </RecordList>
@@ -433,7 +449,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
               <p>{archiveTarget?.title}</p>
               <button
                 className="primary-action"
-                disabled={!!saving || connectionState !== 'ready'}
+                disabled={!!saving || projectBusy || connectionState !== 'ready'}
                 onClick={() => {
                   if (archiveTarget) void archiveMemory(archiveTarget);
                   archiveDialogRef.current?.close();
@@ -459,8 +475,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
                   <h3>{candidate.proposedMemory.title}</h3>
                   <p>{candidate.proposedMemory.bodyMarkdown}</p>
                   <p>{candidate.evidenceSummary}</p>
-                  <button aria-label={`Accept ${candidate.proposedMemory.title}`} disabled={!!saving || connectionState !== 'ready'} onClick={() => void review(candidate, true)} type="button">Accept</button>
-                  <button aria-label={`Reject ${candidate.proposedMemory.title}`} disabled={!!saving || connectionState !== 'ready'} onClick={() => void review(candidate, false)} type="button">Reject</button>
+                  <button aria-label={`Accept ${candidate.proposedMemory.title}`} disabled={!!saving || projectBusy || connectionState !== 'ready'} onClick={() => void review(candidate, true)} type="button">Accept</button>
+                  <button aria-label={`Reject ${candidate.proposedMemory.title}`} disabled={!!saving || projectBusy || connectionState !== 'ready'} onClick={() => void review(candidate, false)} type="button">Reject</button>
                 </li>
               ))}
             </ul>
@@ -479,14 +495,14 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
               <p>Write down the next piece of work so you or your harness can pick it up later.</p>
               <Field label="Task title" name="title" disabled={!!saving} placeholder="For example, Fix the sign-in page" />
               <Field label="Task details" name="body" multiline disabled={!!saving} />
-              <button className="primary-action" type="submit" disabled={!!saving || connectionState !== 'ready'}>{saving === 'task' ? 'Saving…' : 'Save task'}</button>
+              <button className="primary-action" type="submit" disabled={!!saving || projectBusy || connectionState !== 'ready'}>{saving === 'task' ? 'Saving…' : 'Save task'}</button>
             </form>
             {editingTask && (
               <form key={editingTask.id} aria-describedby={error ? 'workspace-error' : undefined} aria-label="Edit task" className="capture-form edit-form" onSubmit={submitTaskEdit}>
                 <h2>Edit task</h2>
                 <Field label="Edit task title" name="title" defaultValue={editingTask.title} disabled={!!saving} />
                 <Field label="Edit task details" name="body" defaultValue={editingTask.bodyMarkdown} multiline disabled={!!saving} />
-                <button className="primary-action" type="submit" disabled={!!saving || connectionState !== 'ready'}>{saving === 'task-edit' ? 'Saving changes…' : 'Update task'}</button>
+                <button className="primary-action" type="submit" disabled={!!saving || projectBusy || connectionState !== 'ready'}>{saving === 'task-edit' ? 'Saving changes…' : 'Update task'}</button>
               </form>
             )}
             <RecordList title="Tasks">
@@ -499,7 +515,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
                   <button aria-label={`Edit ${task.title}`} disabled={!!saving} onClick={() => setEditingTask(task)} type="button">Edit</button>
                   {task.status !== 'done' && (
                     <>
-                      <button aria-label={`Start ${task.title}`} disabled={!!saving || connectionState !== 'ready'} onClick={() => void transitionTask(task, 'in_progress')} type="button">Start</button>
+                      <button aria-label={`Start ${task.title}`} disabled={!!saving || projectBusy || connectionState !== 'ready'} onClick={() => void transitionTask(task, 'in_progress')} type="button">Start</button>
                       <label htmlFor={`evidence-${task.id}`}>Evidence for {task.title}</label>
                       <input
                         id={`evidence-${task.id}`}
@@ -508,7 +524,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
                         type="text"
                         value={evidence[task.id] ?? ''}
                       />
-                      <button aria-label={`Complete ${task.title}`} disabled={!!saving || connectionState !== 'ready'} onClick={() => void completeTask(task)} type="button">Complete</button>
+                      <button aria-label={`Complete ${task.title}`} disabled={!!saving || projectBusy || connectionState !== 'ready'} onClick={() => void completeTask(task)} type="button">Complete</button>
                     </>
                   )}
                   {task.evidence.map((item) => <p key={`${task.id}-${item.summary}`}>{item.summary}</p>)}
@@ -599,6 +615,10 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           {saving && SAVE_MESSAGES[saving] && <p role="status">{SAVE_MESSAGES[saving]}</p>}
           {recordsLoading && <p role="status">Loading your saved records…</p>}
           {renderScreen(activeScreen)}
+          {recoveryStorageFull && activeScreen !== 'home' && <WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} onConfirmed={() => {
+            if (activeScreen === 'memory' || activeScreen === 'tasks') refreshSavedRecords(activeScreen === 'memory' ? 'memory' : 'task', activeProject?.projectId ?? null);
+            else if (activeScreen === 'review') refreshSavedRecords('review', activeProject?.projectId ?? null);
+          }} />}
           <div hidden={activeScreen !== 'harnesses'}>
             <HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
               const project = projects.find((item) => item.projectId === id);

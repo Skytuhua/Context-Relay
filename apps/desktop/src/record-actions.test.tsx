@@ -10,6 +10,7 @@ const memory = { id: 'note', title: 'Project decision', bodyMarkdown: 'Use TypeS
 const task = { id: 'task', projectId: project.projectId, title: 'Verify changes', bodyMarkdown: 'Run checks', status: 'open', evidence: [] } as unknown as TaskRecord;
 const candidate = { id: 'suggestion', proposedMemory: memory, evidenceSummary: 'A useful decision', state: 'pending' } as MemoryCandidate;
 const gateway = {
+  pendingWrites: async () => ({ writes: [], nextCursor: null }),
   status: async () => ({ vault: 'unlocked', sync: 'offline' }),
   projects: async () => [project],
   memories: async () => [memory],

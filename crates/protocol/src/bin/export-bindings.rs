@@ -42,6 +42,12 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
     );
     macro_rules! push { ($($ty:ty),+ $(,)?) => { $(bindings.push_str(&declaration::<$ty>());)+ }; }
     push!(
+        DesktopWrite,
+        DesktopWriteSummary,
+        DesktopWritesPage,
+        DesktopWritePrepareParams,
+        DesktopWriteIdParams,
+        DesktopWritesListParams,
         ProtocolVersion,
         ProtocolVersionRange,
         ProtocolInfo,

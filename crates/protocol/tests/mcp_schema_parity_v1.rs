@@ -6,8 +6,8 @@ use context_relay_protocol::{
 fn status_output_requires_the_exact_supported_local_version() {
     let mut output = serde_json::json!({
         "protocol": {
-            "min": { "major": 1, "minor": 6 },
-            "max": { "major": 1, "minor": 6 }
+            "min": { "major": 1, "minor": 7 },
+            "max": { "major": 1, "minor": 7 }
         },
         "vault": "unlocked",
         "resolvedProject": null,
@@ -26,8 +26,8 @@ fn status_output_requires_the_exact_supported_local_version() {
             "max": { "major": 1, "minor": 0 }
         }),
         serde_json::json!({
-            "min": { "major": 1, "minor": 6 },
-            "max": { "major": 1, "minor": 7 }
+            "min": { "major": 1, "minor": 7 },
+            "max": { "major": 1, "minor": 8 }
         }),
         serde_json::json!({
             "min": { "major": 1, "minor": 1 },

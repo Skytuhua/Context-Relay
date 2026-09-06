@@ -2,7 +2,23 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import type { MemoryCandidate, MemoryRecord, TaskRecord } from './bindings';
 
 const invoke = vi.hoisted(() => vi.fn());
-vi.mock('@tauri-apps/api/core', () => ({ invoke }));
+vi.mock('@tauri-apps/api/core', () => ({ invoke: async (command: string, args: { request: { method: string; params: { operationId: string; taskId?: string | null; accepted?: boolean } } }) => {
+  const request = args.request;
+  if (request.method === 'desktop_write_prepare' || request.method === 'desktop_write_forget') return { kind: 'empty' };
+  const result = await invoke(command, args);
+  if (result?.kind === 'memory' && result.data.memory) {
+    return { ...result, data: { memory: { ...result.data.memory, revision: request.params.operationId,
+      ...(request.method === 'memory_create' ? { id: request.params.operationId } : {}) } } };
+  }
+  if (result?.kind === 'tasks' && result.data.tasks[0]) {
+    return { ...result, data: { tasks: [{ ...result.data.tasks[0], revision: request.params.operationId,
+      ...(request.method === 'task_upsert' && request.params.taskId === null ? { id: request.params.operationId } : {}) }] } };
+  }
+  if (result?.kind === 'candidates' && result.data.candidates[0]) {
+    return { ...result, data: { candidates: [{ ...result.data.candidates[0], state: request.params.accepted ? 'accepted' : 'rejected' }] } };
+  }
+  return result;
+} }));
 import { LocalWorkspaceGateway } from './workspace';
 
 const memory = { id: 'memory', revision: 'revision' } as MemoryRecord;

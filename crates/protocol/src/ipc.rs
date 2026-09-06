@@ -535,6 +535,10 @@ pub enum ClientRole {
 )]
 #[ts(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum LocalRequest {
+    DesktopWritePrepare(DesktopWritePrepareParams),
+    DesktopWritesList(DesktopWritesListParams),
+    DesktopWriteGet(DesktopWriteIdParams),
+    DesktopWriteForget(DesktopWriteIdParams),
     Hello(HelloParams),
     Cancel(CancelParams),
     Shutdown(EmptyParams),
@@ -610,6 +614,7 @@ fn validate_tags(tags: &[String]) -> Result<(), ValidationError> {
 impl LocalRequest {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::DesktopWritePrepare(p) => p.write.validate(),
             Self::ProjectUpsert(p) => p.project.validate(),
             Self::ProjectRegister(p) => {
                 p.project.validate()?;
@@ -1005,6 +1010,12 @@ pub enum AccountDeletionState {
     rename_all_fields = "camelCase"
 )]
 pub enum LocalResult {
+    DesktopWrite {
+        write: Option<crate::DesktopWrite>,
+    },
+    DesktopWrites {
+        page: crate::DesktopWritesPage,
+    },
     Empty,
     Health {
         protocol: ProtocolVersion,
@@ -1096,6 +1107,13 @@ pub enum LocalResult {
     deny_unknown_fields
 )]
 enum LocalResultSerde {
+    DesktopWrite {
+        #[serde(deserialize_with = "crate::required_nullable")]
+        write: Option<crate::DesktopWrite>,
+    },
+    DesktopWrites {
+        page: crate::DesktopWritesPage,
+    },
     Empty,
     Health {
         protocol: ProtocolVersion,
@@ -1181,6 +1199,10 @@ enum LocalResultSerde {
 impl LocalResult {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::DesktopWrite { write } => {
+                write.as_ref().map_or(Ok(()), crate::DesktopWrite::validate)
+            }
+            Self::DesktopWrites { page } => page.validate(),
             Self::Empty | Self::AccountDeletion { .. } | Self::Access { .. } => Ok(()),
             Self::Health { protocol, .. } => {
                 if protocol.major != crate::PROTOCOL_MAJOR {
@@ -1278,6 +1300,16 @@ params!(JsonRpcErrorV1 {
     #[serde(deserialize_with = "crate::required_nullable")]
     id: Option<RecordId>,
     error: JsonRpcErrorObject
+});
+params!(DesktopWritePrepareParams {
+    write: crate::DesktopWrite
+});
+params!(DesktopWriteIdParams {
+    operation_id: OperationId
+});
+params!(DesktopWritesListParams {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    after: Option<OperationId>
 });
 pub const JSON_RPC_PARSE_ERROR: i32 = -32700;
 pub const JSON_RPC_INVALID_REQUEST: i32 = -32600;

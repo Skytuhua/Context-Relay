@@ -188,8 +188,8 @@ const nullAtPath = (value: unknown, path: readonly PropertyKey[]) => {
 };
 
 describe('generated protocol version', () => {
-  it('advertises the saved hook approval contract as v1.6', () => {
-    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 6 });
+  it('advertises the durable write recovery contract as v1.7', () => {
+    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 7 });
   });
 });
 
@@ -306,7 +306,7 @@ describe('protocol schemas', () => {
     }
   });
 
-  it('accepts only the exact status protocol range for v1.6', () => {
+  it('accepts only the exact status protocol range for v1.7', () => {
     const ajv = createProtocolSchemaValidator();
     const validate = ajv.compile(load('schemas/context_relay_status-output-v1.json'));
     const fixture = load('crates/protocol/tests/fixtures/mcp-output-valid.json').context_relay_status;

@@ -158,8 +158,8 @@ fn status_reports_the_resolved_project_and_actual_policy() {
 
     let output = fixture.call("context_relay_status", json!({})).unwrap();
 
-    assert_eq!(output["protocol"]["min"], json!({"major": 1, "minor": 6}));
-    assert_eq!(output["protocol"]["max"], json!({"major": 1, "minor": 6}));
+    assert_eq!(output["protocol"]["min"], json!({"major": 1, "minor": 7}));
+    assert_eq!(output["protocol"]["max"], json!({"major": 1, "minor": 7}));
     assert_eq!(output["vault"], "unlocked");
     assert_eq!(output["resolvedProject"], fixture.project_id.to_string());
     assert_eq!(output["sync"], "offline");

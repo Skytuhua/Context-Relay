@@ -973,6 +973,10 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         LocalRequest::MemoryGet(params) => RoutedRequest::Work(VaultCommand::MemoryGet(params)),
         request @ (LocalRequest::McpCall(_)
         | LocalRequest::NativeHookEvent(_)
+        | LocalRequest::DesktopWritePrepare(_)
+        | LocalRequest::DesktopWritesList(_)
+        | LocalRequest::DesktopWriteGet(_)
+        | LocalRequest::DesktopWriteForget(_)
         | LocalRequest::ProjectsList(_)
         | LocalRequest::ProjectUpsert(_)
         | LocalRequest::ProjectRegister(_)
@@ -1640,6 +1644,26 @@ fn execute_workspace_request(
                 .handle_native_hook_event(project_id, params)
                 .map(|()| LocalResult::Empty)
         }
+        LocalRequest::DesktopWritePrepare(params) => state
+            .vault
+            .prepare_desktop_write(&params.write)
+            .map(|()| LocalResult::Empty)
+            .map_err(client_error_from_vault),
+        LocalRequest::DesktopWritesList(params) => state
+            .vault
+            .desktop_writes(params.after)
+            .map(|page| LocalResult::DesktopWrites { page })
+            .map_err(client_error_from_vault),
+        LocalRequest::DesktopWriteGet(params) => state
+            .vault
+            .desktop_write(params.operation_id)
+            .map(|write| LocalResult::DesktopWrite { write })
+            .map_err(client_error_from_vault),
+        LocalRequest::DesktopWriteForget(params) => state
+            .vault
+            .forget_desktop_write(params.operation_id)
+            .map(|()| LocalResult::Empty)
+            .map_err(client_error_from_vault),
         LocalRequest::ProjectsList(_) => OfflineWorkspace::new(&mut state.vault, state.device_id)
             .projects()
             .map(|projects| LocalResult::Projects { projects }),
@@ -3585,7 +3609,7 @@ mod tests {
     #[test]
     fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 54);
+        assert_eq!(fixtures.len(), 58);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -5066,6 +5090,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vault_worker_recovers_prepared_writes_after_restart_without_applying_them() {
+        let path = unique_temp_path("worker-desktop-recovery").join("vault.db");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let id = "018f22e2-79b0-7cc8-98c4-dc0c0c073981";
+        let write = serde_json::json!({"method":"memory_create","params":{
+            "operationId":id,"scope":{"scope":"global"},"kind":"note",
+            "title":"Retained decision","bodyMarkdown":"Original content","tags":[]
+        }});
+        let mut worker = VaultWorker::spawn(VaultConfig::new(
+            path.clone(),
+            "worker-desktop-recovery",
+            keys.clone(),
+        ))
+        .await
+        .unwrap();
+        let prepared = worker
+            .client()
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "desktop_write_prepare",
+                    serde_json::json!({"write":write}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared, LocalResult::Empty);
+        let exported = worker
+            .client()
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "export_records",
+                    serde_json::json!({"projectId":null,"includeArchived":true}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let LocalResult::Export { payload } = exported else {
+            panic!("expected full encrypted backup")
+        };
+        assert_eq!(payload.record_count, 0);
+        assert_eq!(payload.chunk_count, 1);
+        assert!(
+            !payload
+                .chunk
+                .as_slice()
+                .windows(b"Original content".len())
+                .any(|bytes| bytes == b"Original content")
+        );
+        let restored_path = path.parent().unwrap().join("restored-backup.db");
+        std::fs::write(&restored_path, payload.chunk.as_slice()).unwrap();
+        let restored_vault =
+            Vault::open(&restored_path, "worker-desktop-recovery", keys.as_ref()).unwrap();
+        assert!(restored_vault.memories(None, true).unwrap().is_empty());
+        let pending = restored_vault
+            .desktop_write(id.parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(pending).unwrap(), write);
+        drop(restored_vault);
+        worker.shutdown_and_join();
+        let mut worker = VaultWorker::spawn(VaultConfig::new(
+            path.clone(),
+            "worker-desktop-recovery",
+            keys.clone(),
+        ))
+        .await
+        .unwrap();
+        let client = worker.client();
+        let list = client
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "desktop_writes_list",
+                    serde_json::json!({"after":null}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let LocalResult::DesktopWrites { page } = list else {
+            panic!("expected pending writes")
+        };
+        assert_eq!(page.writes.len(), 1);
+        let restored = client
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "desktop_write_get",
+                    serde_json::json!({"operationId":id}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let LocalResult::DesktopWrite {
+            write: Some(restored),
+        } = restored
+        else {
+            panic!("expected recovery copy")
+        };
+        assert_eq!(serde_json::to_value(&restored).unwrap(), write);
+        // Startup/list/get did not apply the prepared write.
+        let memories = client
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "memory_list",
+                    serde_json::json!({"projectId":null,"includeArchived":true}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(memories, LocalResult::Memories { memories } if memories.is_empty()));
+        let first = client
+            .try_submit(
+                VaultCommand::Workspace(restored.clone().into_request()),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        worker.shutdown_and_join();
+        let mut worker =
+            VaultWorker::spawn(VaultConfig::new(path, "worker-desktop-recovery", keys))
+                .await
+                .unwrap();
+        let client = worker.client();
+        let replay = client
+            .try_submit(
+                VaultCommand::Workspace(restored.into_request()),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, replay);
+        let forgotten = client
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "desktop_write_forget",
+                    serde_json::json!({"operationId":id}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forgotten, LocalResult::Empty);
+        worker.shutdown_and_join();
+    }
+
+    #[tokio::test]
     async fn vault_worker_runs_the_offline_workspace_and_encrypted_export() {
         let path = unique_temp_path("worker-offline-workspace").join("vault.db");
         let keys = Arc::new(MemoryKeyStore::default());
@@ -5888,6 +6077,28 @@ mod tests {
             || serde_json::json!({"harness": "codex", "projectId": null, "hermesProfile": null});
 
         vec![
+            (
+                "DesktopWritesList",
+                request_fixture("desktop_writes_list", serde_json::json!({"after": null})),
+            ),
+            (
+                "DesktopWriteGet",
+                request_fixture("desktop_write_get", serde_json::json!({"operationId": ID})),
+            ),
+            (
+                "DesktopWriteForget",
+                request_fixture(
+                    "desktop_write_forget",
+                    serde_json::json!({"operationId": ID}),
+                ),
+            ),
+            (
+                "DesktopWritePrepare",
+                request_fixture(
+                    "desktop_write_prepare",
+                    serde_json::json!({"write": {"method":"memory_archive","params":{"operationId": ID,"memoryId": ID,"expectedRevision": ID}}}),
+                ),
+            ),
             (
                 "Hello",
                 request_fixture(

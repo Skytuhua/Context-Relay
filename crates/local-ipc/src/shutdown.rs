@@ -88,6 +88,7 @@ async fn request_shutdown(
         if server_hello.protocol != PROTOCOL_VERSION
             && server_hello.protocol != (ProtocolVersion { major: 1, minor: 4 })
             && server_hello.protocol != (ProtocolVersion { major: 1, minor: 5 })
+            && server_hello.protocol != (ProtocolVersion { major: 1, minor: 6 })
         {
             return Err(IpcError::ProtocolVersionUnsupported);
         }
@@ -245,6 +246,7 @@ mod tests {
     #[tokio::test]
     async fn authenticated_shutdown_accepts_the_previous_1_5_preview() {
         assert_shutdown_waits_for_exit("legacy-ack-1-5").await;
+        assert_shutdown_waits_for_exit("legacy-ack-1-6").await;
     }
 
     async fn assert_shutdown_waits_for_exit(mode: &str) {
@@ -509,6 +511,7 @@ mod tests {
             minor: match mode {
                 "legacy-unsupported" => 3,
                 "legacy-ack-1-5" => 5,
+                "legacy-ack-1-6" => 6,
                 _ => 4,
             },
         };
@@ -574,11 +577,11 @@ mod tests {
             }
             "legacy-extra-field" => response["unexpected"] = serde_json::json!(true),
             "legacy-jsonrpc" => response["jsonrpc"] = serde_json::json!("1.0"),
-            "legacy-ack" | "legacy-ack-1-5" => {}
+            "legacy-ack" | "legacy-ack-1-5" | "legacy-ack-1-6" => {}
             _ => panic!("unexpected legacy fixture mode"),
         }
         write_json(&mut stream, &response).await.unwrap();
-        if matches!(mode, "legacy-ack" | "legacy-ack-1-5") {
+        if matches!(mode, "legacy-ack" | "legacy-ack-1-5" | "legacy-ack-1-6") {
             fs::write(root.join("ack"), b"").unwrap();
             wait_for(&root.join("exit")).await;
         }

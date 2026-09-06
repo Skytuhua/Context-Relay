@@ -766,6 +766,15 @@ dialog p {
   }
 }
 
+.write-recovery { margin-bottom: 2rem; padding: 1.25rem; border: 1px solid var(--color-ink); border-radius: 0.75rem; }
+.recovery-list { list-style: none; padding: 0; }
+.recovery-list li { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.75rem; padding: 0.75rem 0; }
+.recovery-list li div { min-width: 0; overflow-wrap: anywhere; }
+.recovery-list span { display: block; }
+.recovery-body { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; max-height: 18rem; overflow: auto; }
+.recovery-review { margin-top: 1rem; border-top: 1px solid var(--color-ink); padding-top: 1rem; overflow-wrap: anywhere; }
+.recovery-review .form-actions { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 1rem; }
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

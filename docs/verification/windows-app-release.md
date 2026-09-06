@@ -11,6 +11,8 @@ This ledger supplements the [v1 master-plan audit](v1-master-plan-audit.md); it 
 
 ## Acceptance map
 
+Submitted-save restart recovery is tracked in [Desktop save recovery](desktop-save-recovery-2026-09-06.md). Its isolated verification does not replace installed release acceptance.
+
 | Requirement | Current evidence | Remaining acceptance |
 | --- | --- | --- |
 | Downloadable Windows x64 installer | Locked NSIS candidates built locally and in CI; normal Explorer installation tested. Existing source-only alpha still has no assets. | Full release qualification, signatures/provenance/checksums, attached to a release. |

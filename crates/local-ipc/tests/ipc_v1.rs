@@ -243,9 +243,9 @@ fn verify_server_proof(
 
 #[test]
 fn challenged_hmac_matches_frozen_vector() {
-    // The protocol bytes are part of the authenticated transcript. This 1.6
+    // The protocol bytes are part of the authenticated transcript. This 1.7
     // vector was independently checked with .NET HMACSHA256.
-    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 6 });
+    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 7 });
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
     let proof = create_proof(
         &token,
@@ -258,7 +258,7 @@ fn challenged_hmac_matches_frozen_vector() {
 
     assert_eq!(
         serde_json::to_string(&proof).unwrap(),
-        r#""WK4ULa-gCav2jfTatnTVKHzFG08OBJxdpU5dsVGpWv0""#
+        r#""itoDDW-_-x-X6lYNkdv4ZhaVwevYYKAbfrUG43kgbQE""#
     );
     assert!(
         verify_proof(
@@ -442,7 +442,7 @@ fn auth_server_hello_is_strict_and_requires_a_32_byte_challenge() {
 
 #[test]
 fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
-    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 6 });
+    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 7 });
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
     let client_proof = create_proof(
         &token,
@@ -464,7 +464,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
 
     assert_eq!(
         serde_json::to_string(&server_proof).unwrap(),
-        r#""iEhIeKpbNhvM4lp0v8rZCgmjp0zD7lN9jMbGZfhpGxM""#
+        r#""Gd5796ZMlG2VxuEzUskbxg6mFoLgvzfDE2g6LZ6xvdo""#
     );
     assert!(
         verify_server_proof(
@@ -676,6 +676,28 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         || serde_json::json!({"harness": "codex", "projectId": null, "hermesProfile": null});
 
     vec![
+        (
+            "DesktopWritesList",
+            request_fixture("desktop_writes_list", serde_json::json!({"after": null})),
+        ),
+        (
+            "DesktopWriteGet",
+            request_fixture("desktop_write_get", serde_json::json!({"operationId": ID})),
+        ),
+        (
+            "DesktopWriteForget",
+            request_fixture(
+                "desktop_write_forget",
+                serde_json::json!({"operationId": ID}),
+            ),
+        ),
+        (
+            "DesktopWritePrepare",
+            request_fixture(
+                "desktop_write_prepare",
+                serde_json::json!({"write": {"method":"memory_archive","params":{"operationId": ID,"memoryId": ID,"expectedRevision": ID}}}),
+            ),
+        ),
         (
             "Hello",
             request_fixture(
@@ -1049,9 +1071,9 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
 }
 
 #[test]
-fn role_allowlist_covers_all_54_requests() {
+fn role_allowlist_covers_all_58_requests() {
     let fixtures = all_request_fixtures();
-    assert_eq!(fixtures.len(), 54);
+    assert_eq!(fixtures.len(), 58);
 
     for (name, request) in &fixtures {
         let common = matches!(*name, "Cancel" | "Health");
@@ -1105,7 +1127,7 @@ fn role_allowlist_covers_all_54_requests() {
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::Desktop, request))
             .count(),
-        51
+        55
     );
     assert_eq!(
         fixtures

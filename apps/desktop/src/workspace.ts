@@ -1,6 +1,8 @@
 import type {
   Base64Url,
   CandidateId,
+  DesktopWrite,
+  DesktopWritesPage,
   HarnessParams,
   LocalRequest,
   LocalResult,
@@ -42,6 +44,12 @@ export type PairingStatusResult = Extract<
 >;
 export type PairingDecisionResult = PairingRequestResult | PairingApprovalResult;
 
+export class RecoveryStorageFullError extends Error {
+  constructor() {
+    super('Recovery storage is full. Your draft is still here. Review or dismiss older recovery copies below, then try saving again.');
+  }
+}
+
 export interface DeviceGateway {
   devices(): Promise<Extract<LocalResult, { kind: 'devices' }>['data']['devices']>;
   createPairingInvite(): Promise<PairingInviteResult>;
@@ -67,6 +75,10 @@ export interface DeviceGateway {
 }
 
 export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
+  pendingWrites(after: OperationId | null): Promise<DesktopWritesPage>;
+  pendingWrite(operationId: OperationId): Promise<DesktopWrite | null>;
+  retryWrite(write: DesktopWrite): Promise<{ cleanupPending: boolean }>;
+  forgetWrite(operationId: OperationId): Promise<void>;
   chooseProjectFolder(): Promise<string | null>;
   status(): Promise<StatusOutput>;
   projects(): Promise<ProjectIdentity[]>;
@@ -100,6 +112,69 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
   private readonly draftAttempts = new WeakMap<object, number>();
   private nextDraftAttempt = 1;
   constructor(private readonly client = new LocalClient()) {}
+
+  async pendingWrites(after: OperationId | null): Promise<DesktopWritesPage> {
+    const result = await this.client.call({ method: 'desktop_writes_list', params: { after } });
+    if (result.kind !== 'desktop_writes') return unexpected(result);
+    const page = result.data.page;
+    if (!page || !Array.isArray(page.writes) || page.writes.length > 50 ||
+      !(page.nextCursor === null || typeof page.nextCursor === 'string') ||
+      page.writes.some((write, index) => !write || typeof write.operationId !== 'string' ||
+        typeof write.action !== 'string' || typeof write.title !== 'string' ||
+        write.operationId <= (index ? page.writes[index - 1].operationId : after ?? '')) ||
+      (page.nextCursor !== null && page.nextCursor !== page.writes.at(-1)?.operationId)) {
+      throw new Error('Unconfirmed changes could not be read.');
+    }
+    return page;
+  }
+
+  async pendingWrite(operationId: OperationId): Promise<DesktopWrite | null> {
+    const result = await this.client.call({ method: 'desktop_write_get', params: { operationId } });
+    if (result.kind !== 'desktop_write') return unexpected(result);
+    const write = result.data.write;
+    if (write === null) return null;
+    if (!write || !['memory_create', 'memory_update', 'memory_archive', 'task_upsert',
+      'task_complete', 'task_transition', 'candidate_review'].includes(write.method) ||
+      write.params?.operationId !== operationId) throw new Error('The recovery copy could not be read.');
+    return write;
+  }
+
+  async retryWrite(write: DesktopWrite): Promise<{ cleanupPending: boolean }> {
+    // Re-read the immutable copy so a stale review cannot become a different write.
+    const stored = await this.pendingWrite(write.params.operationId);
+    if (!stored || JSON.stringify(stored) !== JSON.stringify(write)) {
+      throw new Error('This recovery copy changed. Reload the list before retrying.');
+    }
+    const result = await this.client.call(stored);
+    const record = writeRecord(stored, result);
+    this.retirePending(stored.params.operationId, record.id);
+    return { cleanupPending: !(await this.cleanupWrite(stored.params.operationId)) };
+  }
+
+  async forgetWrite(operationId: OperationId): Promise<void> {
+    const result = await this.client.call({ method: 'desktop_write_forget', params: { operationId } });
+    if (result.kind !== 'empty') unexpected(result);
+    this.retirePending(operationId);
+  }
+
+  private retirePending(operationId: OperationId, recordId?: string) {
+    for (const [key, pending] of this.pendingOperations) {
+      if (pending.operationId === operationId || (pending.createsRecord && pending.operationId === recordId)) {
+        this.pendingOperations.delete(key);
+      }
+    }
+  }
+
+  private async cleanupWrite(operationId: OperationId): Promise<boolean> {
+    try {
+      await this.forgetWrite(operationId);
+      return true;
+    } catch {
+      // The record acknowledgment is already known. A cleanup failure cannot
+      // turn it into a failed save; Home still exposes the retained recovery copy.
+      return false;
+    }
+  }
 
   chooseProjectFolder() {
     return this.client.chooseProjectFolder();
@@ -427,21 +502,18 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
       case 'memory_create':
       case 'memory_update':
       case 'memory_archive':
-        return this.mutation(request, memoryResult, attempt);
       case 'task_upsert':
       case 'task_transition':
       case 'task_complete':
-        return this.mutation(request, taskResult, attempt);
       case 'candidate_review':
-        return this.mutation(request, candidateResult);
+        return this.mutation(request, attempt);
       default:
         return this.client.call(request);
     }
   }
 
   private async mutation(
-    request: Extract<LocalRequest, { params: { operationId: OperationId } }>,
-    validate: (result: LocalResult) => { id: string },
+    request: DesktopWrite,
     attempt?: object,
   ): Promise<LocalResult> {
     // Retain the identity until a usable acknowledgment arrives. Only an
@@ -455,16 +527,47 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
     const operationId = this.pendingOperations.get(key)?.operationId ?? request.params.operationId;
     this.pendingOperations.set(key, { operationId, createsRecord: request.method === 'memory_create' ||
       (request.method === 'task_upsert' && request.params.taskId === null) });
-    const result = await this.client.call({ ...request, params: { ...request.params, operationId } } as LocalRequest);
-    const record = validate(result);
+    const write = { ...request, params: { ...request.params, operationId } } as DesktopWrite;
+    let prepared: LocalResult;
+    try {
+      prepared = await this.client.call({ method: 'desktop_write_prepare', params: { write } });
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'quota_exceeded') {
+        throw new RecoveryStorageFullError();
+      }
+      throw error;
+    }
+    if (prepared.kind !== 'empty') unexpected(prepared);
+    const result = await this.client.call(write);
+    const record = writeRecord(write, result);
     // A later acknowledged edit/archive/completion proves this creation was
     // observed. A future identical creation must be a new record.
-    for (const [pendingKey, pending] of this.pendingOperations) {
-      if (pending.createsRecord && pending.operationId === record.id) this.pendingOperations.delete(pendingKey);
-    }
-    if (this.pendingOperations.get(key)?.operationId === operationId) this.pendingOperations.delete(key);
+    this.retirePending(operationId, record.id);
+    await this.cleanupWrite(operationId);
     return result;
   }
+}
+
+function writeRecord(write: DesktopWrite, result: LocalResult) {
+  if ((result.kind === 'tasks' && result.data.tasks.length !== 1) ||
+    (result.kind === 'candidates' && result.data.candidates.length !== 1)) {
+    throw new Error('The change acknowledgment contained unrelated records.');
+  }
+  const record = write.method.startsWith('memory_') ? memoryResult(result)
+    : write.method === 'candidate_review' ? candidateResult(result) : taskResult(result);
+  const expectedId = write.method === 'memory_create' ? write.params.operationId
+    : write.method === 'memory_update' || write.method === 'memory_archive' ? write.params.memoryId
+      : write.method === 'candidate_review' ? write.params.candidateId
+        : write.method === 'task_upsert' ? write.params.taskId ?? write.params.operationId : write.params.taskId;
+  if (record.id !== expectedId) throw new Error('The change acknowledgment did not match the recovery copy.');
+  if (write.method === 'candidate_review') {
+    if (!('state' in record) || record.state !== (write.params.accepted ? 'accepted' : 'rejected')) {
+      throw new Error('The suggestion decision was not acknowledged.');
+    }
+  } else if (!('revision' in record) || record.revision !== write.params.operationId) {
+    throw new Error('The change revision was not acknowledged.');
+  }
+  return record;
 }
 
 function statusResult(result: LocalResult) {

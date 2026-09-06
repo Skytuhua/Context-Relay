@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod canonical_cbor;
 pub mod clock;
+pub mod desktop_writes;
 pub mod digests;
 pub mod domain;
 pub mod error;
@@ -16,6 +17,7 @@ pub mod validation;
 pub use adapters::*;
 pub use canonical_cbor::*;
 pub use clock::*;
+pub use desktop_writes::*;
 pub use digests::*;
 pub use domain::*;
 pub use error::*;
@@ -32,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 6;
+pub const PROTOCOL_MINOR: u16 = 7;
 pub const SYNC_SCHEMA_VERSION: u16 = 1;
 pub const CHECKPOINT_SCHEMA_VERSION: u16 = 2;
 pub const MAX_IPC_FRAME_BYTES: usize = 8 * 1024 * 1024;

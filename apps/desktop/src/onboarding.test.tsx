@@ -7,6 +7,7 @@ import type { WorkspaceGateway } from './workspace';
 
 const project = { projectId: '018f22e2-79b0-7cc8-98c4-dc0c0c073980', name: 'Research' } as ProjectIdentity;
 const gateway = {
+  pendingWrites: async () => ({ writes: [], nextCursor: null }),
   status: async () => ({ vault: 'unlocked', sync: 'offline' }),
   projects: async () => [],
   memories: async () => [],
