@@ -108,6 +108,7 @@ pub(crate) mod unit_test_support {
 
 use bridge_install::{BridgeInstallEngine, ProductionBridgeInstallEngine};
 use harness_preparation::{PreparationClient, PreparationSupervisor};
+mod harness_execution;
 use native_memory::{
     NativeMemorySupervisor, NativeMemoryUpdateSender, NoopLifecycleProbe,
     native_memory_update_channel,
@@ -746,6 +747,7 @@ impl Daemon {
             .ok_or(DaemonError::Transport)?;
         let mut worker_exit = self.worker.take_exit();
         let service = ConnectionService {
+            execution: harness_execution::ExecutionClient::default(),
             preparation: self.preparation.client(),
             token: self.token.clone(),
             instance_nonce: self.instance_nonce,
@@ -805,6 +807,7 @@ impl Daemon {
 
 #[derive(Clone)]
 struct ConnectionService {
+    execution: harness_execution::ExecutionClient,
     preparation: PreparationClient,
     token: Arc<InstallationToken>,
     instance_nonce: DaemonInstanceNonce,
@@ -872,6 +875,28 @@ async fn serve_request(
     }
 
     match route_request(role, request) {
+        RoutedRequest::ExecutionCurrent => {
+            let result =
+                begin_immediate(&registration).map(|()| LocalResult::HarnessExecutionCurrent {
+                    status: service.execution.current(),
+                });
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
+        RoutedRequest::ExecutionStart(params) => {
+            let result = begin_immediate(&registration)
+                .and_then(|()| service.execution.start(&service.worker, params))
+                .map(|status| LocalResult::HarnessExecution { status });
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
+        RoutedRequest::ExecutionStatus(params) => {
+            let result = begin_immediate(&registration).map(|()| LocalResult::HarnessExecution {
+                status: service.execution.status(&params),
+            });
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
         RoutedRequest::PreparationStatus(params) => {
             let result = begin_immediate(&registration)
                 .and_then(|()| service.preparation.status(params.operation_id))
@@ -954,6 +979,9 @@ impl Drop for Daemon {
 
 #[derive(Debug)]
 enum RoutedRequest {
+    ExecutionCurrent,
+    ExecutionStart(context_relay_protocol::HarnessExecutionParams),
+    ExecutionStatus(context_relay_protocol::HarnessExecutionParams),
     PreparationStatus(context_relay_protocol::HarnessPreparationIdParams),
     PreparationCancel(context_relay_protocol::HarnessPreparationIdParams),
     Immediate(Result<LocalResult, ClientError>),
@@ -983,6 +1011,11 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
     if matches!(
         &request,
         LocalRequest::HarnessPrepare(_)
+            | LocalRequest::HarnessExecutionStart(_)
+            | LocalRequest::HarnessExecutionStatus(_)
+            | LocalRequest::HarnessExecutionCurrent(_)
+            | LocalRequest::HarnessSetupGet(_)
+            | LocalRequest::HarnessSetupsList(_)
             | LocalRequest::HarnessPreparedPreview(_)
             | LocalRequest::HarnessPreparationStatus(_)
             | LocalRequest::HarnessPreparationCancel(_)
@@ -1002,6 +1035,9 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         return RoutedRequest::Immediate(Err(scope_denied_error()));
     }
     match request {
+        LocalRequest::HarnessExecutionCurrent(_) => RoutedRequest::ExecutionCurrent,
+        LocalRequest::HarnessExecutionStart(params) => RoutedRequest::ExecutionStart(params),
+        LocalRequest::HarnessExecutionStatus(params) => RoutedRequest::ExecutionStatus(params),
         LocalRequest::HarnessPreparationStatus(params) => RoutedRequest::PreparationStatus(params),
         LocalRequest::HarnessPreparationCancel(params) => RoutedRequest::PreparationCancel(params),
         LocalRequest::Hello(_) => RoutedRequest::Immediate(Err(invalid_request_error())),
@@ -1046,6 +1082,8 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
             RoutedRequest::Work(VaultCommand::Workspace(request))
         }
         request @ (LocalRequest::HarnessProbe(_)
+        | LocalRequest::HarnessSetupGet(_)
+        | LocalRequest::HarnessSetupsList(_)
         | LocalRequest::HarnessPrepare(_)
         | LocalRequest::HarnessPreparedPreview(_)
         | LocalRequest::HarnessPreview(_)
@@ -1154,6 +1192,7 @@ fn work_timeout_error() -> ClientError {
 
 trait WorkAdmission: Send {
     fn begin(&self) -> bool;
+    fn finished(&self, _result: &Result<LocalResult, ClientError>) {}
 }
 
 impl WorkAdmission for RequestRegistration {
@@ -1513,6 +1552,7 @@ fn run_vault_worker(
         } else {
             Err(canceled_error())
         };
+        admission.finished(&result);
         let _ = response.send(result);
         drop(admission);
     }
@@ -1609,6 +1649,17 @@ fn execute_harness_setup(
     request: LocalRequest,
 ) -> Result<LocalResult, ClientError> {
     match request {
+        LocalRequest::HarnessSetupGet(params) => {
+            context_relay_core::setup::harness_setup(&state.vault, &params.plan_id).map(|setup| {
+                LocalResult::HarnessSetup {
+                    setup: Box::new(setup),
+                }
+            })
+        }
+        LocalRequest::HarnessSetupsList(params) => {
+            context_relay_core::setup::harness_setups(&state.vault, params.after.as_ref())
+                .map(|page| LocalResult::HarnessSetups { page })
+        }
         LocalRequest::HarnessPrepare(params) => {
             let client = state
                 .preparation

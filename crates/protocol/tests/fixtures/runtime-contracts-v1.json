@@ -98,7 +98,7 @@
   "memoryCreateRequest": {
     "jsonrpc": "2.0",
     "id": "018f22e2-79b0-7cc8-98c4-dc0c0c07398f",
-    "protocol": {"major": 1, "minor": 9},
+    "protocol": {"major": 1, "minor": 10},
     "daemonInstanceNonce": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
     "method": "memory_create",
     "params": {

@@ -222,7 +222,12 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::HarnessPrepare(_)
         | LocalRequest::HarnessPreparedPreview(_)
         | LocalRequest::HarnessPreparationStatus(_)
-        | LocalRequest::HarnessPreparationCancel(_) => matches!(role, Desktop),
+        | LocalRequest::HarnessPreparationCancel(_)
+        | LocalRequest::HarnessExecutionStart(_)
+        | LocalRequest::HarnessExecutionStatus(_)
+        | LocalRequest::HarnessExecutionCurrent(_)
+        | LocalRequest::HarnessSetupsList(_)
+        | LocalRequest::HarnessSetupGet(_) => matches!(role, Desktop),
         LocalRequest::HarnessPreview(_) => matches!(role, Desktop | Installer),
         LocalRequest::HarnessApply(_) => matches!(role, Desktop | Installer),
         LocalRequest::HarnessRepair(_) => matches!(role, Desktop | Installer),

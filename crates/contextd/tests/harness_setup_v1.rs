@@ -1052,6 +1052,110 @@ async fn preparation_ipc_stays_responsive_and_is_desktop_only() {
     fixture.stop().await;
 }
 
+#[tokio::test]
+async fn tracked_save_survives_timeout_reconnect_and_shutdown_without_duplicate_execution() {
+    use context_relay_protocol::{
+        HarnessExecutionAction, HarnessExecutionParams, HarnessExecutionPhase as Phase,
+        HarnessSetupsParams,
+    };
+    use tokio::time::{Duration, timeout};
+    struct Release(Arc<TestWorkerGate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    let gate = Arc::new(TestWorkerGate::new());
+    let release = Release(gate.clone());
+    let engine = Arc::new(RecordingEngine::default());
+    let fixture = Fixture::start("tracked-save", engine.clone(), Some(gate.clone())).await;
+    let params = HarnessExecutionParams {
+        plan_id: PLAN.parse().unwrap(),
+        action: HarnessExecutionAction::Apply,
+    };
+    for role in [
+        ClientRole::Installer,
+        ClientRole::McpBridge,
+        ClientRole::DesktopRecoveryHost,
+    ] {
+        let mut client = RawClient::connect(&fixture.runtime, role).await;
+        for request in [
+            LocalRequest::HarnessExecutionStart(params.clone()),
+            LocalRequest::HarnessExecutionCurrent(context_relay_protocol::EmptyParams {}),
+            LocalRequest::HarnessExecutionStatus(params.clone()),
+            LocalRequest::HarnessSetupGet(PlanParams {
+                plan_id: params.plan_id,
+            }),
+            LocalRequest::HarnessSetupsList(HarnessSetupsParams { after: None }),
+        ] {
+            assert_eq!(
+                client.call(request).await.unwrap_err().code,
+                ErrorCode::ScopeDenied
+            );
+        }
+    }
+    assert_eq!(gate.enqueued(), 0);
+    let mut first = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    let result = timeout(
+        Duration::from_secs(2),
+        first.call(LocalRequest::HarnessExecutionStart(params.clone())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(result, LocalResult::HarnessExecution { status } if matches!(status.phase, Phase::Queued | Phase::Running))
+    );
+    drop(first);
+    timeout(Duration::from_secs(3), gate.wait_until_entered())
+        .await
+        .unwrap();
+    // Exceed both the old daemon response timeout and the IPC timeout.
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    let mut reconnected = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    let current = timeout(
+        Duration::from_secs(2),
+        reconnected.call(LocalRequest::HarnessExecutionCurrent(
+            context_relay_protocol::EmptyParams {},
+        )),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(current, LocalResult::HarnessExecutionCurrent { status: Some(status) } if status.plan_id == params.plan_id && status.action == params.action && status.phase == Phase::Running)
+    );
+    for request in [
+        LocalRequest::HarnessExecutionStatus(params.clone()),
+        LocalRequest::HarnessExecutionStart(params.clone()),
+    ] {
+        let result = timeout(Duration::from_secs(2), reconnected.call(request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, LocalResult::HarnessExecution { status } if status.phase == Phase::Running && status.error.is_none())
+        );
+    }
+    assert_eq!(gate.enqueued(), 1);
+    assert_eq!(engine.writes.load(Ordering::SeqCst), 0);
+    let shutdown = tokio::spawn(fixture.stop());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!shutdown.is_finished(), "shutdown must join accepted work");
+    drop(release);
+    let config = timeout(Duration::from_secs(5), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(engine.writes.load(Ordering::SeqCst), 1);
+    let fixture = Fixture::from_config(config, engine).await;
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    assert!(
+        matches!(client.call(LocalRequest::HarnessExecutionStatus(params)).await.unwrap(), LocalResult::HarnessExecution { status } if status.phase == Phase::Unknown)
+    );
+    fixture.stop().await;
+}
+
 struct Fixture {
     handle: context_relay_contextd::DaemonHandle,
     run: tokio::task::JoinHandle<Result<(), context_relay_contextd::DaemonError>>,

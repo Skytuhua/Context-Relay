@@ -71,6 +71,9 @@ impl LocalClientState {
         // while a record/history request owns the ordinary connection.
         let channel = match &request {
             LocalRequest::HarnessPreparationStatus(_)
+            | LocalRequest::HarnessExecutionStart(_)
+            | LocalRequest::HarnessExecutionStatus(_)
+            | LocalRequest::HarnessExecutionCurrent(_)
             | LocalRequest::HarnessPreparationCancel(_)
             | LocalRequest::Health(_) => &self.control,
             _ => &self.client,

@@ -39,6 +39,9 @@ use crate::{
 
 pub const PREVIEW_TTL_MS: u64 = 15 * 60 * 1_000;
 
+mod history;
+pub use history::{harness_setup, harness_setups};
+
 /// A registered project is imported for conflict detection and binds the
 /// managed primary-memory instruction. The bridge itself remains global.
 #[derive(Clone, Debug, Eq, PartialEq)]

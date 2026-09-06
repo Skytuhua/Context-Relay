@@ -67,10 +67,31 @@ async fn status_cancel_and_health_cross_desktop_transport_while_a_vault_call_is_
         .unwrap();
         assert_eq!(control.role(), ClientRole::Desktop);
         // All three calls must reuse this control connection while ordinary is blocked.
-        for expected in ["status", "cancel", "health"] {
+        for expected in [
+            "status",
+            "cancel",
+            "start",
+            "execution",
+            "current",
+            "health",
+        ] {
             let request = control.next_request().await.unwrap();
             assert!(request.registration.begin());
             let result = match (&request.request, expected) {
+                (LocalRequest::HarnessExecutionCurrent(_), "current") => {
+                    LocalResult::HarnessExecutionCurrent { status: None }
+                }
+                (LocalRequest::HarnessExecutionStart(params), "start")
+                | (LocalRequest::HarnessExecutionStatus(params), "execution") => {
+                    LocalResult::HarnessExecution {
+                        status: context_relay_protocol::HarnessExecutionStatus {
+                            plan_id: params.plan_id,
+                            action: params.action,
+                            phase: context_relay_protocol::HarnessExecutionPhase::Running,
+                            error: None,
+                        },
+                    }
+                }
                 (LocalRequest::HarnessPreparationStatus(params), "status")
                 | (LocalRequest::HarnessPreparationCancel(params), "cancel") => {
                     LocalResult::HarnessPreparation {
@@ -129,6 +150,15 @@ async fn status_cancel_and_health_cross_desktop_transport_while_a_vault_call_is_
     for request in [
         LocalRequest::HarnessPreparationStatus(id.clone()),
         LocalRequest::HarnessPreparationCancel(id),
+        LocalRequest::HarnessExecutionStart(context_relay_protocol::HarnessExecutionParams {
+            plan_id: "018f22e2-79b0-7cc8-98c4-dc0c0c075701".parse().unwrap(),
+            action: context_relay_protocol::HarnessExecutionAction::Apply,
+        }),
+        LocalRequest::HarnessExecutionStatus(context_relay_protocol::HarnessExecutionParams {
+            plan_id: "018f22e2-79b0-7cc8-98c4-dc0c0c075701".parse().unwrap(),
+            action: context_relay_protocol::HarnessExecutionAction::Apply,
+        }),
+        LocalRequest::HarnessExecutionCurrent(EmptyParams {}),
         LocalRequest::Health(EmptyParams {}),
     ] {
         let result = timeout(
@@ -148,7 +178,10 @@ async fn status_cancel_and_health_cross_desktop_transport_while_a_vault_call_is_
         );
         assert!(matches!(
             result,
-            LocalResult::HarnessPreparation { .. } | LocalResult::Health { .. }
+            LocalResult::HarnessPreparation { .. }
+                | LocalResult::HarnessExecution { .. }
+                | LocalResult::HarnessExecutionCurrent { .. }
+                | LocalResult::Health { .. }
         ));
     }
     release.send(()).unwrap();

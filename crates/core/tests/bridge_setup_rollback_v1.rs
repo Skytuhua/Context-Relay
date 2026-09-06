@@ -332,6 +332,29 @@ fn rollback_persists_and_applies_a_linked_exact_inverse_then_replays() {
         1,
         "rollback replay must not execute the inverse twice"
     );
+    drop(vault);
+    let vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
+    let history = context_relay_core::setup::harness_setups(&vault, None).unwrap();
+    assert_eq!(
+        history.setups.len(),
+        1,
+        "the inverse must not appear as another saved setup"
+    );
+    assert_eq!(history.setups[0].plan_id, original.setup.plan_id);
+    assert_eq!(
+        history.setups[0].state,
+        context_relay_protocol::HarnessSetupState::RolledBack
+    );
+    let saved = context_relay_core::setup::harness_setup(&vault, &original.setup.plan_id).unwrap();
+    assert_eq!(saved.plan, original.setup);
+    assert_eq!(
+        saved.state,
+        context_relay_protocol::HarnessSetupState::RolledBack
+    );
+    assert!(
+        context_relay_core::setup::harness_setup(&vault, &rollback_executor.calls[0].setup.plan_id)
+            .is_err()
+    );
 }
 
 #[test]

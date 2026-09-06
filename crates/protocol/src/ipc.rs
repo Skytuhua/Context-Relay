@@ -618,6 +618,11 @@ pub enum LocalRequest {
     HarnessPreparedPreview(HarnessPrepareParams),
     HarnessPreparationStatus(HarnessPreparationIdParams),
     HarnessPreparationCancel(HarnessPreparationIdParams),
+    HarnessExecutionStart(crate::HarnessExecutionParams),
+    HarnessExecutionStatus(crate::HarnessExecutionParams),
+    HarnessExecutionCurrent(EmptyParams),
+    HarnessSetupsList(crate::HarnessSetupsParams),
+    HarnessSetupGet(PlanParams),
     HarnessPreview(HarnessParams),
     HarnessApply(PlanParams),
     HarnessRepair(HarnessParams),
@@ -1069,6 +1074,18 @@ pub enum AccountDeletionState {
     rename_all_fields = "camelCase"
 )]
 pub enum LocalResult {
+    HarnessExecutionCurrent {
+        status: Option<crate::HarnessExecutionStatus>,
+    },
+    HarnessExecution {
+        status: crate::HarnessExecutionStatus,
+    },
+    HarnessSetup {
+        setup: Box<crate::HarnessSetupRecord>,
+    },
+    HarnessSetups {
+        page: crate::HarnessSetupsPage,
+    },
     HarnessPreparation {
         status: HarnessPreparationStatus,
     },
@@ -1169,6 +1186,19 @@ pub enum LocalResult {
     deny_unknown_fields
 )]
 enum LocalResultSerde {
+    HarnessExecutionCurrent {
+        #[serde(deserialize_with = "crate::required_nullable")]
+        status: Option<crate::HarnessExecutionStatus>,
+    },
+    HarnessExecution {
+        status: crate::HarnessExecutionStatus,
+    },
+    HarnessSetup {
+        setup: Box<crate::HarnessSetupRecord>,
+    },
+    HarnessSetups {
+        page: crate::HarnessSetupsPage,
+    },
     HarnessPreparation {
         status: HarnessPreparationStatus,
     },
@@ -1264,6 +1294,12 @@ enum LocalResultSerde {
 impl LocalResult {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::HarnessExecutionCurrent { status } => status
+                .as_ref()
+                .map_or(Ok(()), crate::HarnessExecutionStatus::validate),
+            Self::HarnessExecution { status } => status.validate(),
+            Self::HarnessSetup { setup } => setup.validate(),
+            Self::HarnessSetups { page } => page.validate(),
             Self::HarnessPreparation { status } => status.validate(),
             Self::DesktopWrite { write } => {
                 write.as_ref().map_or(Ok(()), crate::DesktopWrite::validate)

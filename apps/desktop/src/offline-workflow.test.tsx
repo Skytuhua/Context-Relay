@@ -49,7 +49,7 @@ class FakeWorkspaceGateway implements WorkspaceGateway {
 
   async status(): Promise<StatusOutput> {
     return {
-      protocol: { min: { major: 1, minor: 9 }, max: { major: 1, minor: 9 } },
+      protocol: { min: { major: 1, minor: 10 }, max: { major: 1, minor: 10 } },
       vault: 'unlocked',
       resolvedProject: null,
       sync: 'offline',

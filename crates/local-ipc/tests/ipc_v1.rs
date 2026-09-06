@@ -243,9 +243,15 @@ fn verify_server_proof(
 
 #[test]
 fn challenged_hmac_matches_frozen_vector() {
-    // The protocol bytes are part of the authenticated transcript. This 1.9
+    // The protocol bytes are part of the authenticated transcript. This 1.10
     // vector was independently checked with .NET HMACSHA256.
-    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 9 });
+    assert_eq!(
+        PROTOCOL_VERSION,
+        ProtocolVersion {
+            major: 1,
+            minor: 10
+        }
+    );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
     let proof = create_proof(
         &token,
@@ -258,7 +264,7 @@ fn challenged_hmac_matches_frozen_vector() {
 
     assert_eq!(
         serde_json::to_string(&proof).unwrap(),
-        r#""dY7NfD4Xu8AtVYjPCNfd5qXsl9yNlPE5WeWWololmKo""#
+        r#""WwqpIxOyYSKYq3XRHkjiy_sSEBovb_7DpccPq6jMads""#
     );
     assert!(
         verify_proof(
@@ -442,7 +448,13 @@ fn auth_server_hello_is_strict_and_requires_a_32_byte_challenge() {
 
 #[test]
 fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
-    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 9 });
+    assert_eq!(
+        PROTOCOL_VERSION,
+        ProtocolVersion {
+            major: 1,
+            minor: 10
+        }
+    );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
     let client_proof = create_proof(
         &token,
@@ -464,7 +476,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
 
     assert_eq!(
         serde_json::to_string(&server_proof).unwrap(),
-        r#""AFB89LjvmF1k99-7xL3fgS-o6INoHP0SQQtY-YsIUCo""#
+        r#""IvMtAg4wO0Ev48Fs3yzhpEVsaGOJ6fX_kIG4moG_DW0""#
     );
     assert!(
         verify_server_proof(
@@ -915,6 +927,32 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         ),
         ("HarnessProbe", request_fixture("harness_probe", harness())),
         (
+            "HarnessExecutionStart",
+            request_fixture(
+                "harness_execution_start",
+                serde_json::json!({"planId": ID, "action": "apply"}),
+            ),
+        ),
+        (
+            "HarnessExecutionStatus",
+            request_fixture(
+                "harness_execution_status",
+                serde_json::json!({"planId": ID, "action": "rollback"}),
+            ),
+        ),
+        (
+            "HarnessExecutionCurrent",
+            request_fixture("harness_execution_current", empty()),
+        ),
+        (
+            "HarnessSetupsList",
+            request_fixture("harness_setups_list", serde_json::json!({"after": null})),
+        ),
+        (
+            "HarnessSetupGet",
+            request_fixture("harness_setup_get", serde_json::json!({"planId": ID})),
+        ),
+        (
             "HarnessPreview",
             request_fixture("harness_preview", harness()),
         ),
@@ -1071,9 +1109,9 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
 }
 
 #[test]
-fn role_allowlist_covers_all_58_requests() {
+fn role_allowlist_covers_core_and_tracked_setup_requests() {
     let fixtures = all_request_fixtures();
-    assert_eq!(fixtures.len(), 58);
+    assert_eq!(fixtures.len(), 63);
 
     for (name, request) in &fixtures {
         let common = matches!(*name, "Cancel" | "Health");
@@ -1127,7 +1165,7 @@ fn role_allowlist_covers_all_58_requests() {
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::Desktop, request))
             .count(),
-        55
+        60
     );
     assert_eq!(
         fixtures

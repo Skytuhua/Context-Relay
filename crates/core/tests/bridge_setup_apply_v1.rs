@@ -356,6 +356,45 @@ fn apply_reloads_and_revalidates_the_persisted_plan_then_replays_idempotently() 
 }
 
 #[test]
+fn saved_setup_history_survives_restart_and_filters_other_purposes_with_bounded_pages() {
+    use context_relay_core::setup::{harness_setup, harness_setups};
+    use context_relay_protocol::HarnessSetupState;
+    let path = TempVault::new("setup-history");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), "history", &keys).unwrap();
+    for i in 0..51 {
+        let mut other = plan();
+        other.setup.plan_id = format!("ffffffff-ffff-7cc8-98c4-{i:012x}").parse().unwrap();
+        other.setup.rulesync_version = "hermes-memory-export-v1".into();
+        persist(&mut vault, other);
+    }
+    let (expected, _) = persist(&mut vault, plan());
+    let id = expected.setup.plan_id;
+    assert_eq!(
+        harness_setup(&vault, &id).unwrap().state,
+        HarnessSetupState::Previewed
+    );
+    BridgeInstallService::persisted(&mut vault)
+        .apply(&id, NOW_MS + 1, &mut RecordingExecutor::default())
+        .unwrap();
+    drop(vault);
+    let vault = Vault::open(path.path(), "history", &keys).unwrap();
+    let first = harness_setups(&vault, None).unwrap();
+    assert!(first.setups.is_empty());
+    assert!(first.next_after.is_some());
+    let last = harness_setups(&vault, first.next_after.as_ref()).unwrap();
+    assert_eq!(last.next_after, None);
+    assert_eq!(last.setups.len(), 1);
+    assert_eq!(last.setups[0].plan_id, id);
+    assert_eq!(last.setups[0].state, HarnessSetupState::Applied);
+    let saved = harness_setup(&vault, &id).unwrap();
+    assert_eq!(saved.plan, expected.setup);
+    assert_eq!(saved.created_at, NOW_MS);
+    let excluded = "ffffffff-ffff-7cc8-98c4-000000000000".parse().unwrap();
+    assert!(harness_setup(&vault, &excluded).is_err());
+}
+
+#[test]
 fn expired_or_tampered_persisted_plans_never_reach_the_executor() {
     let path = TempVault::new("bridge-setup-apply-expired");
     let keys = MemoryKeyStore::default();
