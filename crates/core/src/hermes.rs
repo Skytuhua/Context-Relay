@@ -15,6 +15,8 @@ mod render;
 mod retained_adapter;
 #[cfg(windows)]
 pub use prepared_setup::PreparedHermesSetup;
+#[cfg(all(test, windows))]
+mod native_setup_tests;
 mod yaml;
 
 use std::{
@@ -134,11 +136,15 @@ pub struct HermesAdapter {
     retained_runtime: Option<retained_adapter::AdapterRuntime>,
     #[cfg(windows)]
     preview_runtime: Option<Box<crate::native_transaction::InstalledRuntimeBinding>>,
+    #[cfg(all(test, windows))]
+    qualify_retained_setup: bool,
 }
 
 enum DiscoveryVersion<'a> {
     Probe,
     Approved(&'a context_relay_protocol::SetupPlan),
+    #[cfg(windows)]
+    Retained(&'a NativeTransactionPlan),
     #[cfg(windows)]
     Preparation,
 }
@@ -158,6 +164,8 @@ impl Clone for HermesAdapter {
             retained_runtime: self.retained_runtime.clone(),
             #[cfg(windows)]
             preview_runtime: self.preview_runtime.clone(),
+            #[cfg(all(test, windows))]
+            qualify_retained_setup: self.qualify_retained_setup,
         }
     }
 }
@@ -277,6 +285,40 @@ impl HermesAdapter {
         )
     }
 
+    /// Passively rediscovers an authenticated retained setup plan. Unlike
+    /// registration, this accepts native writes; execution still requires
+    /// reopen_approved_runtime to acquire the exact approved runtime owner.
+    #[cfg(windows)]
+    pub fn discover_for_retained_setup(
+        project_root: impl Into<PathBuf>,
+        working_directory: impl Into<PathBuf>,
+        requested_profile: &str,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+        approved: &NativeTransactionPlan,
+    ) -> Result<Self, ClientError> {
+        approved
+            .setup
+            .validate()
+            .map_err(|_| conflict("Hermes retained setup plan is invalid"))?;
+        if approved.approval_version != 2
+            || approved.setup.harness != HarnessId::Hermes
+            || approved.installed_runtime.is_none()
+        {
+            return Err(conflict("Hermes retained setup plan is invalid"));
+        }
+        Self::discover_inner(
+            project_root.into(),
+            working_directory.into(),
+            requested_profile,
+            project_id,
+            origin_device,
+            observed_hlc,
+            DiscoveryVersion::Retained(approved),
+        )
+    }
+
     fn discover_inner(
         project_root: PathBuf,
         working_directory: PathBuf,
@@ -291,6 +333,22 @@ impl HermesAdapter {
         let executable =
             find_executable().ok_or_else(|| not_found("Hermes executable was not found"))?;
         let (snapshot, version) = match discovery {
+            #[cfg(windows)]
+            DiscoveryVersion::Retained(approved) => {
+                retained_adapter::verify_approved_profile_home(&profile, approved)?;
+                let snapshot = snapshot_executable(&executable)?;
+                let path = fs::canonicalize(&executable)
+                    .map_err(|_| invalid("Hermes executable cannot be safely resolved"))?;
+                if approved.setup.executable_path != wire_path(&path)
+                    || approved.setup.executable_hash != snapshot.digest
+                    || approved.setup.harness_profile.as_deref() != Some(profile.name.as_str())
+                {
+                    return Err(conflict(
+                        "The approved Hermes installation changed; request a new preview",
+                    ));
+                }
+                (snapshot, approved.setup.harness_version.clone())
+            }
             DiscoveryVersion::Approved(approved) => {
                 let snapshot = snapshot_executable(&executable)?;
                 let approved_path = fs::canonicalize(&executable)
@@ -418,6 +476,8 @@ impl HermesAdapter {
             retained_runtime: None,
             #[cfg(windows)]
             preview_runtime: None,
+            #[cfg(all(test, windows))]
+            qualify_retained_setup: false,
         })
     }
 
@@ -506,6 +566,13 @@ impl HermesAdapter {
         }
         #[cfg(windows)]
         if self.retained_runtime.is_some() {
+            #[cfg(test)]
+            if self.qualify_retained_setup
+                && self.layout.version == "0.17.0"
+                && self.yaml_topology_supported()
+            {
+                return CapabilityLevel::Full;
+            }
             // Connection, restart and Undo qualification must precede enabling
             // Python-backed writes, even for a version supported natively.
             return CapabilityLevel::ImportOnly;
@@ -2011,7 +2078,7 @@ mod tests {
                         root: adapter.project_root_wire(),
                     },
                 ],
-                expected_native_digests: vec![],
+                expected_native_digests: vec![adapter.gateway_lock_expected_digest().unwrap()],
                 semantic_changes: vec![],
                 cli_operations: vec![],
                 package_artifacts: vec![],

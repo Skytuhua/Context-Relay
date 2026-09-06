@@ -251,6 +251,77 @@ fn management_launch_failures_and_uncertain_cleanup_preserve_ownership() {
 }
 
 #[test]
+fn settings_readback_returns_owner_only_after_descendants_stop() {
+    use std::os::windows::process::CommandExt as _;
+    let _serial = SERIAL.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    fs::create_dir(root.join("python")).unwrap();
+    let source = root.join("readback_fixture.rs");
+    fs::write(
+        &source,
+        r#"
+use std::{env, process::{Command, Stdio}, thread, time::Duration};
+fn main() {
+    let args = env::args().collect::<Vec<_>>();
+    if args.get(1).is_some_and(|v| v == "--child") {
+        loop { thread::sleep(Duration::from_secs(1)); }
+    }
+    assert_eq!(&args[1..5], ["-I", "-S", "-B", "-c"]);
+    assert!(args[5].contains("load_config_readonly"));
+    let child = Command::new(env::current_exe().unwrap()).arg("--child")
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    println!("{}", child.id());
+}
+"#,
+    )
+    .unwrap();
+    let compilation = std::process::Command::new("rustc")
+        .args(["--edition=2024", "--crate-name", "readback_fixture"])
+        .arg(source)
+        .arg("-o")
+        .arg(root.join("python/python.exe"))
+        .creation_flags(0x0800_0000)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    let released = Arc::new(AtomicBool::new(false));
+    let (output, owner) = read_hermes_settings_for_qualification(
+        &root,
+        &root,
+        Owner(released.clone()),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(output.exit_code, 0);
+    assert!(!released.load(Ordering::SeqCst));
+    let pid = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let process = unsafe {
+        windows_sys::Win32::System::Threading::OpenProcess(
+            windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    if let Ok(process) = owned(process) {
+        assert_eq!(
+            unsafe { WaitForSingleObject(raw(&process), 0) },
+            WAIT_OBJECT_0
+        );
+    }
+    drop(owner);
+    assert!(released.load(Ordering::SeqCst));
+}
+
+#[test]
 fn management_retains_real_file_locks_until_cleanup_can_be_proved() {
     let _serial = SERIAL.lock().unwrap();
     let mut random = [0u8; 16];

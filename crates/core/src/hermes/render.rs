@@ -155,18 +155,14 @@ impl HermesAdapter {
                         .map_err(|_| {
                             invalid("Hermes primary instruction metadata template is unsafe")
                         })?;
-                let NativeState::RegularFile { metadata, .. } = template.state() else {
-                    return Err(invalid(
-                        "Hermes primary instruction needs an existing project-root metadata template",
-                    ));
+                let metadata = match template.state() {
+                    NativeState::RegularFile { metadata, .. } => metadata
+                        .for_absent_sibling_creation(&current)
+                        .map_err(|_| invalid("Hermes primary instruction metadata template is not bound to the target parent"))?,
+                    NativeState::Absent { .. } => OsNativeFileSystem::new()
+                        .metadata_for_new_private_file(&path)
+                        .map_err(|_| invalid("Hermes project instruction cannot be created safely"))?,
                 };
-                let metadata = metadata
-                    .for_absent_sibling_creation(&current)
-                    .map_err(|_| {
-                        invalid(
-                            "Hermes primary instruction metadata template is not bound to the target parent",
-                        )
-                    })?;
                 NativeState::regular_file(
                     render_managed_markdown(&[], &component.body_markdown, false)?,
                     metadata,

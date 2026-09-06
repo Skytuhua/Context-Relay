@@ -4,7 +4,9 @@ mod literals;
 #[cfg(windows)]
 mod management;
 #[cfg(all(test, windows))]
-pub(super) use management::tests::{management_test_guard, runtime_fixture};
+pub(super) use management::tests::{
+    management_test_guard, prepared_runtime_fixture, runtime_fixture,
+};
 mod preparation;
 mod projection;
 use preparation::Control;

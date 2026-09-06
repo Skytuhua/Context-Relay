@@ -225,6 +225,14 @@ pub(super) mod tests {
     pub(in crate::hermes) fn runtime_fixture(
         launcher: &[u8],
     ) -> (tempfile::TempDir, LockedRuntime) {
+        let (temp, runtime) = prepared_runtime_fixture(launcher, false);
+        (temp, runtime.persist().lock().unwrap())
+    }
+
+    pub(in crate::hermes) fn prepared_runtime_fixture(
+        launcher: &[u8],
+        native_setup: bool,
+    ) -> (tempfile::TempDir, super::super::retained::PreparedRuntime) {
         use crate::hermes::python_runtime::{RuntimeSource, capture_inputs};
         use std::{os::windows::process::CommandExt as _, process::Command};
         let temp = tempfile::tempdir().unwrap();
@@ -232,7 +240,7 @@ pub(super) mod tests {
         let source = root.join("fixture.rs");
         let python = root.join("python");
         fs::create_dir(&python).unwrap();
-        fs::write(&source, r#"
+        let program = r#"
 use std::{env, fs, path::PathBuf};
 fn main() {
     let args = env::args().collect::<Vec<_>>();
@@ -250,7 +258,11 @@ fn main() {
             println!("Hermes Agent v0.17.0 (2026.6.19)\nPython: 3.11.15\nOpenAI SDK: 2.24.0");
         }
         ["config", "check"] => {
-            if config == "model: adapter\n" {
+            if NATIVE_SETUP {
+                assert!(config == "{}\n" || config.starts_with("mcp_servers:\n"), "unexpected projection: {config}");
+                assert!(!config.contains("must-not-stage"));
+                println!("📋 Configuration Status\n\n  Config version: 32 ✓\n\n  Required:\n\n  Optional:");
+            } else if config == "model: adapter\n" {
                 println!("📋 Configuration Status\n\n  Config version: 32 ✓\n\n  Required:\n\n  Optional:");
             } else if config == "model: stderr\n" {
                 eprintln!("fixture failure that must not be exposed");
@@ -262,7 +274,12 @@ fn main() {
         _ => panic!("unexpected command"),
     }
 }
-"#).unwrap();
+"#;
+        fs::write(
+            &source,
+            format!("const NATIVE_SETUP: bool = {native_setup};\n{program}"),
+        )
+        .unwrap();
         let compilation = Command::new("rustc")
             .args([
                 "--edition=2024",
@@ -302,9 +319,7 @@ fn main() {
             ],
         )
         .unwrap()
-        .retain()
-        .unwrap()
-        .lock()
+        .prepare_owned_with_progress(&AtomicBool::new(false), |_| {})
         .unwrap();
         (temp, runtime)
     }

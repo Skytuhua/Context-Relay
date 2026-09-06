@@ -276,6 +276,25 @@ impl RetainedRuntime {
     }
 
     pub fn open(store: &Path, reference: &RetainedRuntimeReference) -> Result<Self, ClientError> {
+        let runtime = Self::open_manifest(store, reference)?;
+        verify_payload(&runtime.pin, &runtime.root, &runtime.manifest, false)?;
+        Ok(runtime)
+    }
+
+    /// Opens directly into byte ownership. Lock acquisition still hashes every
+    /// file and verifies the final complete inventory; it does not need open's
+    /// preliminary payload scan as well. No unchecked runtime escapes this API.
+    pub fn open_locked(
+        store: &Path,
+        reference: &RetainedRuntimeReference,
+    ) -> Result<LockedRuntime, ClientError> {
+        Self::open_manifest(store, reference)?.lock()
+    }
+
+    fn open_manifest(
+        store: &Path,
+        reference: &RetainedRuntimeReference,
+    ) -> Result<Self, ClientError> {
         validate_reference(reference)?;
         let store = real_path(store, true)?;
         let holder = store.join(&reference.storage_key);
@@ -290,7 +309,6 @@ impl RetainedRuntime {
             .map_err(|_| invalid())?;
         require_entries(&holder, &["runtime"])?;
         let manifest = read_manifest(&container, &container_pin, reference)?;
-        verify_payload(&pin, &root, &manifest, false)?;
         Ok(Self {
             pin,
             container_pin,
@@ -584,6 +602,37 @@ mod tests {
             fs::read(source.join("module.py")).unwrap(),
             b"VALUE = 'approved'\n"
         );
+    }
+
+    #[test]
+    fn combined_reopen_verifies_inventory_and_holds_byte_leases() {
+        for change in ["none", "bytes", "extra", "missing", "directory"] {
+            let (_temp, store, _source, captured) = fixture();
+            let retained = captured.retain().unwrap();
+            let reference = retained.reference().clone();
+            let root = retained.root().to_owned();
+            let module = root.join("source/module.py");
+            drop(retained);
+            match change {
+                "bytes" => fs::write(&module, b"changed").unwrap(),
+                "extra" => fs::write(root.join("source/extra.py"), b"added").unwrap(),
+                "missing" => fs::remove_file(&module).unwrap(),
+                "directory" => fs::remove_dir(root.join("source/empty")).unwrap(),
+                "none" => (),
+                _ => unreachable!(),
+            }
+            let opened = RetainedRuntime::open_locked(&store, &reference);
+            if change == "none" {
+                let locked = opened.unwrap();
+                assert!(fs::write(&module, b"must remain locked").is_err());
+                assert_eq!(locked.reference(), &reference);
+                locked.verify().unwrap();
+                drop(locked);
+                fs::write(&module, b"released").unwrap();
+            } else {
+                assert!(opened.is_err(), "{change}");
+            }
+        }
     }
 
     #[test]

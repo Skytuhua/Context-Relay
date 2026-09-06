@@ -39,6 +39,7 @@ x25519-dalek.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+context-relay-native-runner = { version = "0.1.0", path = "../native-runner", features = ["test-support"] }
 process-wrap = { version = "10.0.0", default-features = false, features = ["std", "creation-flags", "job-object", "process-group"] }
 
 [target.'cfg(unix)'.dependencies]

@@ -831,6 +831,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "unicode-normalization",
  "windows-sys 0.61.2",

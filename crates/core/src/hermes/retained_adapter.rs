@@ -118,7 +118,7 @@ impl HermesAdapter {
             return Err(conflict("Hermes preview cannot execute a runtime"));
         }
         let reference = self.approved_runtime_reference(approved)?;
-        let runtime = RetainedRuntime::open(store, reference)?.lock()?;
+        let runtime = RetainedRuntime::open_locked(store, reference)?;
         self.bind_retained_runtime(runtime, cancelled)
     }
 
@@ -130,6 +130,7 @@ impl HermesAdapter {
         setup
             .validate()
             .map_err(|_| conflict("Hermes approved runtime plan is invalid"))?;
+        verify_approved_profile_home(&self.layout.profile, approved)?;
         let projects = setup
             .target_scopes
             .iter()
@@ -190,6 +191,29 @@ impl HermesAdapter {
         });
         Ok(self)
     }
+}
+
+/// Bridge previews always seal the selected profile's gateway lock dependency,
+/// including no-op plans. Undo preserves its path while adjusting its digest.
+/// Use that sealed canonical path rather than trusting a reusable profile name.
+pub(super) fn verify_approved_profile_home(
+    profile: &super::HermesProfile,
+    approved: &NativeTransactionPlan,
+) -> Result<(), ClientError> {
+    let target = super::wire_path(&profile.hermes_home.join("gateway.lock"));
+    let mut locks = approved
+        .setup
+        .expected_native_digests
+        .iter()
+        .filter(|dependency| {
+            super::decode_wire_path(&dependency.target)
+                .is_ok_and(|path| path.file_name() == Some(std::ffi::OsStr::new("gateway.lock")))
+        });
+    if locks.next().map(|dependency| &dependency.target) != Some(&target) || locks.next().is_some()
+    {
+        return Err(conflict("Hermes approved profile location changed"));
+    }
+    Ok(())
 }
 
 fn busy() -> ClientError {

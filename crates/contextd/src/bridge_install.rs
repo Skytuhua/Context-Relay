@@ -573,7 +573,19 @@ impl ProductionBridgePlanExecutor<'_> {
         now_ms: u64,
     ) -> Result<(), ProductionExecutionError> {
         if plan.installed_runtime.is_some() {
-            return Err(invalid("Retained Hermes runtime execution is not connected yet").into());
+            // The persisted service has already authenticated the vault record.
+            // Check its sealed approval again before any runtime version command.
+            let opened =
+                context_relay_core::native_transaction::open_plan(sealed_plan).map_err(|_| {
+                    invalid("Retained Hermes runtime execution needs a valid sealed plan")
+                })?;
+            if opened.plan != *plan || plan.setup.harness != HarnessId::Hermes {
+                return Err(
+                    invalid("Retained Hermes runtime execution plan does not match").into(),
+                );
+            }
+            #[cfg(not(windows))]
+            return Err(invalid("Retained Hermes runtime execution requires Windows").into());
         }
         let (root, project_id) = sealed_project_binding(plan)?;
         let observed_hlc = HybridLogicalClock::new(now_ms, 0, self.device_id);
@@ -632,14 +644,38 @@ impl ProductionBridgePlanExecutor<'_> {
                     .harness_profile
                     .as_deref()
                     .ok_or_else(|| invalid("Persisted Hermes setup profile is unavailable"))?;
-                let mut adapter = HermesAdapter::discover(
-                    &root,
-                    &root,
-                    profile,
-                    project_id,
-                    self.device_id,
-                    observed_hlc,
-                )?;
+                let mut adapter = if plan.installed_runtime.is_some() {
+                    #[cfg(windows)]
+                    {
+                        HermesAdapter::discover_for_retained_setup(
+                            &root,
+                            &root,
+                            profile,
+                            project_id,
+                            self.device_id,
+                            observed_hlc,
+                            plan,
+                        )?
+                        .reopen_approved_runtime(
+                            &lock_root,
+                            plan,
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        )?
+                    }
+                    #[cfg(not(windows))]
+                    return Err(
+                        invalid("Retained Hermes runtime execution requires Windows").into(),
+                    );
+                } else {
+                    HermesAdapter::discover(
+                        &root,
+                        &root,
+                        profile,
+                        project_id,
+                        self.device_id,
+                        observed_hlc,
+                    )?
+                };
                 let mut cli = NoBridgeCliExecutor;
                 let mut executor = NativeEngineBridgePlanExecutor::new(
                     &mut adapter,
@@ -955,7 +991,7 @@ pub(crate) mod tests {
     #[cfg(target_os = "macos")]
     use context_relay_core::native_transaction::{ApprovedCliMutation, CanonicalCliDeclaration};
     use context_relay_core::{
-        native_transaction::{NativeTransactionPlan, approval_hash_v2, seal_plan},
+        native_transaction::{NativeTransactionPlan, approval_hash_v2, open_plan, seal_plan},
         setup::{BridgeExecutionError, BridgePlanExecutor},
         vault::{DatabaseKeyStore, SetupPlanWrite, VaultError},
     };
@@ -975,12 +1011,15 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
-    fn retained_runtime_is_rejected_before_production_discovery() {
+    fn retained_runtime_requires_matching_sealed_plan_before_production_discovery() {
         let path = TempVault::new("retained-runtime-production-guard");
         let keys = MemoryKeyStore::default();
         let mut vault =
             Vault::open(path.path(), "retained-runtime-production-guard", &keys).unwrap();
         let mut plan = base_plan();
+        plan.setup.batch_hash = approval_hash_v2(&plan).unwrap();
+        let ordinary_sealed = seal_plan(&plan, plan.setup.batch_hash).unwrap();
+        assert_eq!(open_plan(&ordinary_sealed).unwrap().plan, plan);
         plan.installed_runtime = Some(
             serde_json::from_value(serde_json::json!({
                 "kind": "hermesPythonV1", "runtime": {
@@ -1001,11 +1040,16 @@ pub(crate) mod tests {
                 .message
                 .contains("Retained Hermes runtime registration")
         );
-        match executor.execute_inner(&mut vault, &plan, &[], 1, 1) {
-            Err(ProductionExecutionError::Compose(error)) => {
-                assert!(error.message.contains("Retained Hermes runtime execution"))
+        for (sealed, message) in [
+            (&[][..], "needs a valid sealed plan"),
+            (ordinary_sealed.as_slice(), "plan does not match"),
+        ] {
+            match executor.execute_inner(&mut vault, &plan, sealed, 1, 1) {
+                Err(ProductionExecutionError::Compose(error)) => {
+                    assert!(error.message.contains(message), "{}", error.message)
+                }
+                _ => panic!("runtime must be rejected before ordinary production composition"),
             }
-            _ => panic!("runtime must be rejected before ordinary production composition"),
         }
     }
 

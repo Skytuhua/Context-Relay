@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [features]
 default = []
+test-support = []
 ci-candidate-sidecar-smoke = []
 
 [[bin]]
@@ -26,6 +27,9 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 unicode-normalization.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10.1"

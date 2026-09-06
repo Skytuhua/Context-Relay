@@ -1,6 +1,11 @@
 //! Closed Hermes Python management commands with owned Windows process cleanup.
 //! This provides process-tree lifetime control, not an OS sandbox or approval.
 
+#[cfg(any(test, feature = "test-support"))]
+mod readback;
+#[cfg(any(test, feature = "test-support"))]
+pub use readback::read_hermes_settings_for_qualification;
+
 use crate::windows::{ProcThreadAttributes, create_verified_kill_job};
 use rand_core::{OsRng, RngCore as _};
 use std::{
