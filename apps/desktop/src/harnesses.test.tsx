@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import type { DecimalU64, LocalRequest, ProjectId, ProjectIdentity, SetupPlan } from './bindings';
+import type { DecimalU64, HarnessExecutionParams, HarnessExecutionStatus, HarnessSetupRecord, LocalRequest, ProjectId, ProjectIdentity, SetupPlan } from './bindings';
 
 const invoke = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
@@ -17,16 +17,22 @@ const projects: ProjectIdentity[] = [projectId, secondProject].map((id, index) =
 let preview: SetupPlan;
 let operation: (request: LocalRequest) => Promise<unknown>;
 let requests: LocalRequest[];
+let saved: Map<string, HarnessSetupRecord>;
+let current: HarnessExecutionStatus | null;
+function finished(params: HarnessExecutionParams = { planId: preview.planId, action: 'apply' }) {
+  return { kind: 'harness_execution', data: { status: { ...params, phase: 'finished', error: null } } };
+}
 
 beforeEach(() => {
   requests = [];
+  saved = new Map(); current = null;
   const fixture = JSON.parse(readFileSync('../../crates/protocol/tests/fixtures/runtime-contracts-v1.json', 'utf8')).setupPlan as SetupPlan;
-  preview = { ...fixture, expiresAt: String(Date.now() + 60_000) as DecimalU64,
+  preview = { ...fixture, rulesyncVersion: 'bridge-preview-v1', expiresAt: String(Date.now() + 60_000) as DecimalU64,
     targetScopes: [{ scope: 'project', projectId, root: fixture.executablePath }],
     semanticChanges: [{ class: 'create', target: '.codex/config.toml', summary: 'Register Context Relay' }],
   };
   operation = async (request) => request.method === 'harness_preview'
-    ? { kind: 'plan', data: { plan: preview } } : { kind: 'empty' };
+    ? { kind: 'plan', data: { plan: preview } } : request.method === 'harness_execution_start' ? finished(request.params) : { kind: 'empty' };
   invoke.mockReset().mockImplementation(async (_command, { request }: { request: LocalRequest }) => {
     if (request.method === 'sync_status') return { kind: 'status', data: { status: {
       protocol: { min: { major: 1, minor: 10 }, max: { major: 1, minor: 10 } }, vault: 'unlocked',
@@ -41,16 +47,42 @@ beforeEach(() => {
       activeProfile: request.params.hermesProfile, codexSavedHookApproval: null, policyConflicts: [], capability: 'full',
     } } };
     if (request.method === 'desktop_writes_list') return { kind: 'desktop_writes', data: { page: { writes: [], nextCursor: null } } };
+    if (request.method === 'harness_execution_current') return { kind: 'harness_execution_current', data: { status: current } };
+    if (request.method === 'harness_execution_status') return { kind: 'harness_execution', data: { status: current ?? { ...request.params, phase: 'unknown', error: null } } };
+    if (request.method === 'harness_setup_get') return { kind: 'harness_setup', data: { setup: saved.get(request.params.planId) } };
+    if (request.method === 'harness_setups_list') return { kind: 'harness_setups', data: { page: { nextAfter: null, setups: [...saved.values()].sort((a, b) => b.plan.planId.localeCompare(a.plan.planId)).map(({ plan, state, createdAt }) => ({ planId: plan.planId, harness: plan.harness, harnessProfile: plan.harnessProfile,
+      targetScopes: plan.targetScopes.map(scope => scope.scope === 'project' ? { scope: 'project', projectId: scope.projectId } : scope), state, createdAt, expiresAt: plan.expiresAt })) } } };
     requests.push(request);
-    return operation(request);
+    if (request.method === 'harness_execution_start') {
+      current = { ...request.params, phase: 'queued', error: null };
+      try {
+        const result = await operation(request) as ReturnType<typeof finished>;
+        if (result.kind === 'harness_execution') {
+          current = result.data.status as HarnessExecutionStatus;
+          const record = saved.get(request.params.planId);
+          if (record && current.phase === 'finished' && current.error === null) record.state = request.params.action === 'apply' ? 'applied' : 'rolled_back';
+        }
+        return result;
+      } catch (error) {
+        current = { ...request.params, phase: 'finished', error: { code: 'internal', message: 'PRIVATE NATIVE ERROR', fieldPath: null, retryable: false } };
+        throw error;
+      }
+    }
+    const result = await operation(request);
+    if (request.method === 'harness_preview' && result && typeof result === 'object' && 'data' in result) {
+      const plan = (result.data as { plan: SetupPlan }).plan;
+      if (plan) saved.set(plan.planId, { plan: structuredClone(plan), state: 'previewed', createdAt: '1900000000000' });
+    }
+    return result;
   });
 });
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
-async function open() {
+async function open(waitUntilReady = true) {
   const result = render(<App gateway={new LocalWorkspaceGateway()} />);
   await screen.findByText('Ready on this computer');
   fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
+  if (waitUntilReady) await waitFor(() => expect(screen.getByRole('button', { name: 'Review setup' })).toBeEnabled());
   return result;
 }
 async function review() {
@@ -67,6 +99,137 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+it('keeps an accepted save pending beyond 30 seconds without resending or claiming success', async () => {
+  operation = async request => request.method === 'harness_preview' ? { kind: 'plan', data: { plan: preview } }
+    : request.method === 'harness_execution_start' ? { kind: 'harness_execution', data: { status: { ...request.params, phase: 'running', error: null } } } : { kind: 'empty' };
+  await open(); await review();
+  vi.useFakeTimers();
+  await act(async () => approve());
+  await act(async () => { await vi.advanceTimersByTimeAsync(31_000); });
+  expect(screen.getByText('Saving harness settings…')).toBeVisible();
+  expect(screen.queryByText(/Settings saved:/)).not.toBeInTheDocument();
+  expect(requests.filter(request => request.method === 'harness_execution_start')).toHaveLength(1);
+  expect(invoke.mock.calls.filter(call => call[1]?.request?.method === 'harness_execution_status').length).toBeGreaterThan(20);
+  current = { planId: preview.planId, action: 'apply', phase: 'finished', error: null };
+  saved.get(preview.planId)!.state = 'applied';
+  await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+  vi.useRealTimers();
+  expect(await screen.findByText(/Settings saved:/)).toBeVisible();
+});
+
+it('recovers a lost save acknowledgement by reading the original result without resending', async () => {
+  const originalStart = LocalWorkspaceGateway.prototype.harnessExecutionStart;
+  vi.spyOn(LocalWorkspaceGateway.prototype, 'harnessExecutionStart').mockImplementation(async function(this: LocalWorkspaceGateway, params) {
+    await originalStart.call(this, params);
+    throw new Error('Lost acknowledgement');
+  });
+  await open(); await review(); approve();
+  expect(await screen.findByText(/Settings saved:/)).toBeVisible();
+  expect(requests.filter(request => request.method === 'harness_execution_start')).toEqual([
+    { method: 'harness_execution_start', params: { planId: preview.planId, action: 'apply' } },
+  ]);
+});
+
+it('keeps the same pending save across a failed progress read', async () => {
+  saved.set(preview.planId, { plan: preview, state: 'applying', createdAt: '1900000000000' });
+  current = { planId: preview.planId, action: 'apply', phase: 'running', error: null };
+  vi.spyOn(LocalWorkspaceGateway.prototype, 'harnessExecutionStatus').mockRejectedValueOnce(new Error('PRIVATE STATUS ERROR'));
+  await open(false);
+  await screen.findByText('Saving harness settings…');
+  vi.useFakeTimers();
+  // Restart the observer so its retry timer is owned by this test clock.
+  fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+  await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Harnesses' })));
+  await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+  expect(screen.getByRole('alert')).toHaveTextContent('Reconnecting to check the same setup');
+  expect(screen.getByRole('button', { name: 'Review setup' })).toBeDisabled();
+  expect(screen.queryByText(/PRIVATE STATUS ERROR|Settings saved:/)).not.toBeInTheDocument();
+  saved.get(preview.planId)!.state = 'applied';
+  current = { ...current!, phase: 'finished' };
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+  vi.useRealTimers();
+  expect(await screen.findByText(/Settings saved:/)).toBeVisible();
+  expect(requests).toEqual([]);
+});
+
+it('discovers a running save after remount and postpones ordinary history reads', async () => {
+  saved.set(preview.planId, { plan: preview, state: 'applying', createdAt: '1900000000000' });
+  current = { planId: preview.planId, action: 'apply', phase: 'running', error: null };
+  const view = await open(false);
+  await screen.findByText('Saving harness settings…');
+  view.unmount();
+  invoke.mockClear();
+  await open(false);
+  await screen.findByText('Saving harness settings…');
+  const observed = invoke.mock.calls.map(call => call[1]?.request?.method);
+  expect(observed).toContain('harness_execution_current');
+  expect(observed).not.toContain('harness_setups_list');
+  expect(observed).not.toContain('harness_execution_start');
+  expect(screen.queryByText(/Settings saved:/)).not.toBeInTheDocument();
+});
+
+it('reloads saved setup history after a complete desktop and daemon restart and undoes the original', async () => {
+  const original = structuredClone(preview);
+  saved.set(original.planId, { plan: original, state: 'applied', createdAt: '1900000000000' });
+  current = null; // No in-memory attempt exists after daemon restart.
+  await open();
+  fireEvent.change(screen.getByRole('combobox', { name: 'Project' }), { target: { value: secondProject } });
+  fireEvent.click(await screen.findByRole('button', { name: 'Undo setup 0C07398F for Codex for Research' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Undo setup changes' }));
+  expect(await screen.findByText(/Setup changes undone:/)).toBeVisible();
+  expect(requests).toEqual([{ method: 'harness_execution_start', params: { planId: original.planId, action: 'rollback' } }]);
+});
+
+it('shows an ownerless claim as interrupted and resumes only after reviewing the exact original', async () => {
+  saved.set(preview.planId, { plan: preview, state: 'applying', createdAt: '1900000000000' });
+  await open();
+  expect(await screen.findByText('Save interrupted — review before resuming.')).toBeVisible();
+  expect(screen.queryByText('Saving harness settings…')).not.toBeInTheDocument();
+  expect(requests).toEqual([]);
+  fireEvent.click(screen.getByRole('button', { name: 'Review saved setup for Codex for Research' }));
+  await screen.findByRole('heading', { name: 'Review setup changes' });
+  expect(screen.getByRole('button', { name: 'Resume save' })).toBeDisabled();
+  fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed/ }));
+  fireEvent.click(screen.getByRole('button', { name: 'Resume save' }));
+  expect(await screen.findByText(/Settings saved:/)).toBeVisible();
+  expect(requests).toEqual([{ method: 'harness_execution_start', params: { planId: preview.planId, action: 'apply' } }]);
+});
+
+it('requires a fresh review when an interrupted save has expired', async () => {
+  preview.expiresAt = '1' as DecimalU64;
+  saved.set(preview.planId, { plan: preview, state: 'applying', createdAt: '1900000000000' });
+  await open();
+  fireEvent.click(await screen.findByRole('button', { name: 'Review saved setup for Codex for Research' }));
+  await screen.findByRole('heading', { name: 'Review setup changes' });
+  expect(screen.getByText('This setup review has expired. Select Review setup again.')).toBeVisible();
+  expect(screen.getByRole('checkbox', { name: /I reviewed/ })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Resume save' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Review setup' })).toBeEnabled();
+  expect(screen.queryByText(/Settings saved:/)).not.toBeInTheDocument();
+  expect(requests).toEqual([]);
+});
+
+it('does not treat a failed Undo on an Applied plan as a successful Undo', async () => {
+  saved.set(preview.planId, { plan: preview, state: 'applied', createdAt: '1900000000000' });
+  current = { planId: preview.planId, action: 'rollback', phase: 'finished', error: { code: 'conflict', message: 'PRIVATE-PATH', fieldPath: null, retryable: false } };
+  await open();
+  expect(screen.getByRole('alert')).toHaveTextContent('Undo reported a problem. Settings saved');
+  expect(screen.queryByText(/PRIVATE-PATH|Setup changes undone/)).not.toBeInTheDocument();
+  expect(requests).toEqual([]);
+});
+
+it('keeps pagination available when the first history page contains only excluded plans', async () => {
+  const cursor = 'ffffffff-ffff-7cc8-98c4-dc0c0c073990' as SetupPlan['planId'];
+  saved.set(preview.planId, { plan: preview, state: 'applied', createdAt: '1900000000000' });
+  const originalList = LocalWorkspaceGateway.prototype.harnessSetupsList;
+  const list = vi.spyOn(LocalWorkspaceGateway.prototype, 'harnessSetupsList').mockImplementationOnce(async () => ({ setups: [], nextAfter: cursor }))
+    .mockImplementation(function(this: LocalWorkspaceGateway, after) { return originalList.call(this, after); });
+  await open();
+  fireEvent.click(await screen.findByRole('button', { name: 'Load more setups' }));
+  expect(await screen.findByRole('button', { name: 'Undo setup 0C07398F for Codex for Research' })).toBeVisible();
+  expect(list).toHaveBeenLastCalledWith(cursor);
+});
+
 it('requires explicit review, applies only the exact stored ID, and awaits acknowledgment', async () => {
   const pending = deferred<unknown>();
   operation = async (request) => request.method === 'harness_preview'
@@ -76,13 +239,13 @@ it('requires explicit review, applies only the exact stored ID, and awaits ackno
   expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled();
   expect(requests).toEqual([{ method: 'harness_preview', params: { harness: 'codex', projectId, hermesProfile: null } }]);
   approve();
-  fireEvent.click(screen.getByRole('button', { name: /Saving settings/ }));
+  fireEvent.submit(screen.getByRole('form', { name: 'Review harness setup' }));
   expect(requests).toHaveLength(2);
-  expect(requests[1]).toEqual({ method: 'harness_apply', params: { planId: '018f22e2-79b0-7cc8-98c4-dc0c0c07398f' } });
+  expect(requests[1]).toEqual({ method: 'harness_execution_start', params: { action: 'apply', planId: '018f22e2-79b0-7cc8-98c4-dc0c0c07398f' } });
   expect(screen.queryByText(/Connected:/)).not.toBeInTheDocument();
   expect(screen.queryByRole('region', { name: /Finish setup/ })).not.toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Review setup' })).toBeDisabled();
-  await act(async () => pending.resolve({ kind: 'empty' }));
+  await act(async () => pending.resolve(finished()));
   expect(await screen.findByText(/Settings saved:/)).toBeVisible();
   expect(screen.queryByText(/Connected:/)).not.toBeInTheDocument();
   const next = screen.getByRole('region', { name: 'Finish setup for Codex for Research' });
@@ -100,7 +263,7 @@ it('keeps Codex approval guidance with its saved project when the selection chan
   const next = screen.getByRole('region', { name: 'Finish setup for Codex for Research' });
   expect(within(next).getByText(/Open the Codex CLI/)).toHaveTextContent('Research');
   expect(within(next).queryByText(/Second project/)).not.toBeInTheDocument();
-  expect(requests.map(request => request.method)).toEqual(['harness_preview', 'harness_apply']);
+  expect(requests.map(request => request.method)).toEqual(['harness_preview', 'harness_execution_start']);
 });
 
 it.each(['claude_code', 'hermes'] as const)('does not claim a verified connection or give Codex approval steps for %s', async (harness) => {
@@ -123,12 +286,12 @@ it('shows safe apply failure, clears approval and never creates a rollback succe
     throw new Error('PRIVATE-SECRET-PATH');
   };
   await open(); await review(); approve();
-  expect(await screen.findByRole('alert')).toHaveTextContent(/could not be confirmed/i);
+  await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/Save reported a problem/i));
   expect(screen.queryByText(/PRIVATE-SECRET/)).not.toBeInTheDocument();
   expect(screen.queryByText(/Connected:/)).not.toBeInTheDocument();
   expect(screen.queryByRole('button', { name: /Undo setup/ })).not.toBeInTheDocument();
   expect(screen.queryByRole('checkbox', { name: /I reviewed/ })).not.toBeInTheDocument();
-  expect(requests.filter((r) => r.method === 'harness_apply')).toHaveLength(1);
+  expect(requests.filter((r) => r.method === 'harness_execution_start')).toHaveLength(1);
 });
 
 it.each(['Project', 'Harness'])('clears approval when %s selection changes', async (label) => {
@@ -208,12 +371,12 @@ it('retains rollback for the acknowledged plan after selection changes and requi
   await screen.findByText(/Settings saved:/);
   fireEvent.change(screen.getByRole('combobox', { name: 'Project' }), { target: { value: secondProject } });
   fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'claude_code' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Undo setup 1 for Codex for Research' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Undo setup 0C07398F for Codex for Research' }));
   expect(requests).toHaveLength(2);
-  fireEvent.click(screen.getByRole('button', { name: 'Undo setup changes' }));
-  await screen.findByText(/Setup changes undone/);
+  fireEvent.click(await screen.findByRole('button', { name: 'Undo setup changes' }));
+  await screen.findByText(/Setup changes undone:/);
   expect(screen.queryByRole('region', { name: /Finish setup/ })).not.toBeInTheDocument();
-  expect(requests[2]).toEqual({ method: 'harness_rollback', params: { planId: '018f22e2-79b0-7cc8-98c4-dc0c0c07398f' } });
+  expect(requests[2]).toEqual({ method: 'harness_execution_start', params: { action: 'rollback', planId: '018f22e2-79b0-7cc8-98c4-dc0c0c07398f' } });
 });
 
 it('keeps a pending apply exclusive across navigation and retains its acknowledged rollback', async () => {
@@ -224,8 +387,8 @@ it('keeps a pending apply exclusive across navigation and retains its acknowledg
   fireEvent.click(screen.getByRole('button', { name: 'Home' }));
   fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
   expect(screen.getByRole('button', { name: 'Review setup' })).toBeDisabled();
-  await act(async () => pending.resolve({ kind: 'empty' }));
-  expect(await screen.findByRole('button', { name: 'Undo setup 1 for Codex for Research' })).toBeEnabled();
+  await act(async () => pending.resolve(finished()));
+  expect(await screen.findByRole('button', { name: 'Undo setup 0C07398F for Codex for Research' })).toBeEnabled();
 });
 
 it('distinguishes repeated connections and retains each original change review for undo', async () => {
@@ -235,19 +398,20 @@ it('distinguishes repeated connections and retains each original change review f
     semanticChanges: [{ class: 'update', target: '.codex/config.toml', summary: 'Change the context permissions' }] };
   await review(); approve(); await screen.findByText(/Settings saved:/);
   const history = screen.getByRole('region', { name: 'Recent setup changes' });
-  const entries = within(history).getAllByRole('heading', { level: 3, name: 'Codex for Research' }).map((heading) => heading.closest('li')!);
+  const entries = within(history).getAllByRole('heading', { level: 3, name: /Codex for Research · setup/ }).map((heading) => heading.closest('li')!);
   expect(entries).toHaveLength(2);
-  expect(within(entries[0]).getByText(/Setup 1 ·/)).toBeVisible();
-  expect(within(entries[1]).getByText(/Setup 2 ·/)).toBeVisible();
-  fireEvent.click(within(entries[0]).getByText('View saved changes'));
-  expect(within(entries[0]).getByText('Register Context Relay')).toBeVisible();
+  expect(within(entries[0]).getByRole('button', { name: 'Undo setup 0C073990 for Codex for Research' })).toBeVisible();
+  expect(within(entries[1]).getByRole('button', { name: 'Undo setup 0C07398F for Codex for Research' })).toBeVisible();
   fireEvent.click(within(entries[1]).getByText('View saved changes'));
-  expect(within(entries[1]).getByText('Change the context permissions')).toBeVisible();
-  fireEvent.click(within(entries[0]).getByRole('button', { name: /Undo setup 1/ }));
-  fireEvent.click(screen.getByRole('button', { name: 'Undo setup changes' }));
-  await screen.findByText(/Setup changes undone/);
-  expect(requests.at(-1)).toEqual({ method: 'harness_rollback', params: { planId: firstId } });
-  expect(within(history).getByText(/Setup 2 ·/)).toBeVisible();
+  expect(within(entries[1]).getByText('Register Context Relay')).toBeVisible();
+  fireEvent.click(within(entries[0]).getByText('View saved changes'));
+  expect(within(entries[0]).getByText('Change the context permissions')).toBeVisible();
+  fireEvent.click(within(entries[1]).getByRole('button', { name: /Undo setup .* for/ }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Undo setup changes' }));
+  await screen.findByText(/Setup changes undone:/);
+  expect(requests.at(-1)).toEqual({ method: 'harness_execution_start', params: { action: 'rollback', planId: firstId } });
+  expect(within(entries[0]).getByRole('button', { name: /Undo setup .* for/ })).toBeEnabled();
+  expect(within(entries[1]).queryByRole('button', { name: /Undo setup .* for/ })).not.toBeInTheDocument();
 });
 
 it('requires fresh approval after navigating away from a reviewed preview', async () => {
@@ -261,28 +425,28 @@ it('requires fresh approval after navigating away from a reviewed preview', asyn
 it('keeps rollback available after failure and requires new confirmation for retry', async () => {
   await open(); await review(); approve(); await screen.findByText(/Settings saved:/);
   operation = async () => { throw new Error('PRIVATE-ROLLBACK'); };
-  fireEvent.click(screen.getByRole('button', { name: 'Undo setup 1 for Codex for Research' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Undo setup changes' }));
-  expect(await screen.findByRole('alert')).toHaveTextContent(/Undo could not be confirmed/);
+  fireEvent.click(screen.getByRole('button', { name: 'Undo setup 0C07398F for Codex for Research' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Undo setup changes' }));
+  await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/Undo reported a problem/));
   expect(screen.queryByText(/PRIVATE-ROLLBACK|Setup changes undone/)).not.toBeInTheDocument();
   expect(screen.queryByRole('button', { name: 'Undo setup changes' })).not.toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'Undo setup 1 for Codex for Research' })).toBeEnabled();
+  expect(screen.getByRole('button', { name: 'Undo setup 0C07398F for Codex for Research' })).toBeEnabled();
 });
 
 it('can cancel rollback and awaits acknowledgment without duplicate or overlapping actions', async () => {
   await open(); await review(); approve(); await screen.findByText(/Settings saved:/);
-  fireEvent.click(screen.getByRole('button', { name: 'Undo setup 1 for Codex for Research' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Keep settings' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Undo setup 0C07398F for Codex for Research' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Keep settings' }));
   expect(requests).toHaveLength(2);
   const pending = deferred<unknown>(); operation = async () => pending.promise;
-  fireEvent.click(screen.getByRole('button', { name: 'Undo setup 1 for Codex for Research' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Undo setup changes' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Undo setup 1 for Codex for Research' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Undo setup 0C07398F for Codex for Research' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Undo setup changes' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Undo setup 0C07398F for Codex for Research' }));
   expect(requests).toHaveLength(3);
   expect(screen.getByRole('button', { name: 'Review setup' })).toBeDisabled();
   expect(screen.queryByText(/Setup changes undone/)).not.toBeInTheDocument();
-  await act(async () => pending.resolve({ kind: 'empty' }));
-  expect(await screen.findByText(/Setup changes undone/)).toBeVisible();
+  await act(async () => pending.resolve(finished({ planId: preview.planId, action: 'rollback' })));
+  expect(await screen.findByText(/Setup changes undone:/)).toBeVisible();
 });
 
 it('shows bytes when the native display string is empty', async () => {

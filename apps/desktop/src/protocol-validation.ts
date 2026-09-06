@@ -1,6 +1,6 @@
 import Ajv2020 from 'ajv/dist/2020.js';
 
-import type { MemoryRecord, ProbeReport, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
+import type { HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
 
 const utf8 = new TextEncoder();
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -217,3 +217,54 @@ export const createProtocolSchemaValidator = () => {
 };
 export const assertSha256Hex = (value: string) => sha(value, 'SHA-256 hex');
 export const assertBase64UrlBytes = (value: string, size: number) => fixed(value, size, 'fixed-size base64url');
+
+const setupStates = ['previewed', 'applying', 'applied', 'apply_restored', 'rolling_back', 'rolled_back', 'rollback_restored', 'conflict', 'expired'];
+export function validateHarnessExecution(value: unknown): HarnessExecutionStatus {
+  const item = object(value, ['planId', 'action', 'phase', 'error'], 'harnessExecution');
+  id(item.planId, 'harnessExecution.planId');
+  choice(item.action, ['apply', 'rollback'], 'harnessExecution.action');
+  choice(item.phase, ['queued', 'running', 'finished', 'unknown'], 'harnessExecution.phase');
+  if (item.error !== null) {
+    if (item.phase !== 'finished') fail('harnessExecution.error');
+    const error = object(item.error, ['code', 'message', 'fieldPath', 'retryable'], 'harnessExecution.error');
+    choice(error.code, ['protocol_version_unsupported', 'invalid_request', 'frame_too_large', 'vault_locked', 'not_found', 'revision_conflict', 'scope_denied', 'approval_required', 'plan_changed', 'plan_expired', 'harness_unsupported', 'conflict', 'quota_exceeded', 'canceled', 'timeout', 'busy', 'internal'], 'harnessExecution.error.code');
+    text(error.message, 512, 'harnessExecution.error.message');
+    if (error.fieldPath !== null) string(error.fieldPath, 'harnessExecution.error.fieldPath');
+    choice(error.retryable, [true, false], 'harnessExecution.error.retryable');
+  }
+  return value as HarnessExecutionStatus;
+}
+
+export function validateHarnessSetupRecord(value: unknown): HarnessSetupRecord {
+  const item = object(value, ['plan', 'state', 'createdAt'], 'harnessSetup');
+  const assertPlan: (value: unknown) => asserts value is SetupPlan = assertSetupPlan;
+  assertPlan(item.plan);
+  if (item.plan.rulesyncVersion !== 'bridge-preview-v1') fail('harnessSetup.plan');
+  choice(item.state, setupStates, 'harnessSetup.state');
+  u64(item.createdAt, 'harnessSetup.createdAt');
+  return value as HarnessSetupRecord;
+}
+
+export function validateHarnessSetupsPage(value: unknown): HarnessSetupsPage {
+  const page = object(value, ['setups', 'nextAfter'], 'harnessSetups');
+  let previous: string | null = null;
+  for (const value of list(page.setups, 50, 'harnessSetups.setups')) {
+    const item = object(value, ['planId', 'harness', 'harnessProfile', 'targetScopes', 'state', 'createdAt', 'expiresAt'], 'harnessSetups.setup');
+    id(item.planId, 'harnessSetups.planId');
+    if (previous !== null && (item.planId as string) >= previous) fail('harnessSetups.order');
+    previous = item.planId as string;
+    choice(item.harness, ['codex', 'claude_code', 'hermes'], 'harnessSetups.harness');
+    if (item.harness === 'hermes') text(item.harnessProfile, 512, 'harnessSetups.profile');
+    else if (item.harnessProfile !== null) fail('harnessSetups.profile');
+    const scopes = list(item.targetScopes, adapterCollectionLimit, 'harnessSetups.scopes');
+    if (!scopes.length) fail('harnessSetups.scopes');
+    scopes.forEach(value => scope(value, 'harnessSetups.scope'));
+    choice(item.state, setupStates, 'harnessSetups.state');
+    u64(item.createdAt, 'harnessSetups.createdAt'); u64(item.expiresAt, 'harnessSetups.expiresAt');
+  }
+  if (page.nextAfter !== null) {
+    id(page.nextAfter, 'harnessSetups.nextAfter');
+    if (previous !== null && (page.nextAfter as string) > previous) fail('harnessSetups.nextAfter');
+  }
+  return value as HarnessSetupsPage;
+}

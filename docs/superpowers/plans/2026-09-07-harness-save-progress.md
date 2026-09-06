@@ -67,13 +67,30 @@ using code from 0d0cc00. It exercises native Save, fresh-process discovery, vaul
 reopen, reapply, Undo and readback through Hermes's own settings loader. It used
 disposable profiles and a copied runtime, not the user's ordinary harness state.
 
-## Remaining integration
+## Visible Save, Undo and history
 
-The screen still uses the older synchronous Save/Undo methods. Wire the tracked
-requests into visible polling, recovery after screen changes/restart, exact-plan
-review and Undo, and purpose-filtered history. Queue acceptance must never display
-Settings saved. Applying/RollingBack with no live owner must display interrupted
-or unconfirmed, with explicit recovery rather than an endless spinner.
+The desktop now uses tracked Start/Status/Current requests and resolves terminal
+attempts against the exact persisted plan. A lost acknowledgement or failed status
+read reconnects without resending a mutation. Pending work stays visible after
+navigation or remount, and loading history waits until active execution finishes.
+Saved history is loaded from the vault after restart, including bounded pagination
+through empty filtered pages. Original plans remain available for review and Undo.
+
+Ownerless Applying/RollingBack records show interrupted recovery actions rather
+than an endless spinner. Resuming Save requires explicit review and approval, and
+an expired original requires a fresh review. Undo reloads the exact original plan
+before confirmation. Stable short plan references distinguish repeated setups.
+Settings saved includes instructions for completing harness setup and explicitly
+states that the connection has not been verified.
+
+Frontend coverage includes saves lasting more than 30 seconds, response loss,
+intermittent observation failure, navigation/remount, full restart with persisted
+history, interrupted and expired claims, repeated setups, filtered pagination and
+failed Undo against an Applied plan. The actual React screen also passed isolated
+headless Edge checks at 1166 and 390 pixels, including review, pending navigation,
+saved guidance, restart history, confirmed Undo, and no horizontal overflow.
+
+## Remaining integration
 
 The visible preparation progress/cancel flow, production Full gates, live harness
 connection validation, rebuilt installer and installed acceptance remain unfinished.

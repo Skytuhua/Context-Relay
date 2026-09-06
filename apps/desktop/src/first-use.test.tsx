@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import App from './App';
 import type { ProjectIdentity, SetupPlan } from './bindings';
@@ -7,6 +7,8 @@ import type { WorkspaceGateway } from './workspace';
 
 const project = { projectId: '018f22e2-79b0-7cc8-98c4-dc0c0c075001', name: 'My website' } as ProjectIdentity;
 const gateway = {
+  harnessExecutionCurrent: async () => null,
+  harnessSetupsList: async () => ({ setups: [], nextAfter: null }),
   pendingWrites: async () => ({ writes: [], nextCursor: null }),
   status: async () => ({ vault: 'unlocked', sync: 'offline' }), projects: async () => [],
   memories: async () => [], tasks: async () => [], candidates: async () => [],
@@ -59,6 +61,7 @@ it('keeps an unavailable harness actionable without exposing technical paths by 
   }} />);
   await screen.findByText('Ready on this computer');
   fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Review setup' })).toBeEnabled());
   fireEvent.click(screen.getByRole('button', { name: 'Review setup' }));
   const availability = await screen.findByRole('region', { name: 'Harness availability' });
   expect(within(availability).getByText(/Executable:/)).not.toBeVisible();

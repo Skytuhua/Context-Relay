@@ -15,6 +15,11 @@ import type { WorkspaceGateway } from './workspace';
 const id = (suffix: string) => `018f22e2-79b0-7cc8-98c4-dc0c0c0739${suffix}`;
 
 class FakeWorkspaceGateway implements WorkspaceGateway {
+  async harnessExecutionCurrent() { return null; }
+  async harnessSetupsList() { return { setups: [], nextAfter: null }; }
+  async harnessSetupGet(): Promise<never> { throw new Error('Not used'); }
+  async harnessExecutionStart(): Promise<never> { throw new Error('Not used'); }
+  async harnessExecutionStatus(): Promise<never> { throw new Error('Not used'); }
   async pendingWrites() { return { writes: [], nextCursor: null }; }
   async pendingWrite() { return null; }
   async retryWrite() { return { cleanupPending: false }; }

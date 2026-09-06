@@ -19,6 +19,8 @@ const destinations = [
 ] as const;
 
 const gateway = {
+  harnessExecutionCurrent: async () => null,
+  harnessSetupsList: async () => ({ setups: [], nextAfter: null }),
   pendingWrites: async () => ({ writes: [], nextCursor: null }),
   status: async () => ({
     protocol: { min: { major: 1, minor: 10 }, max: { major: 1, minor: 10 } },

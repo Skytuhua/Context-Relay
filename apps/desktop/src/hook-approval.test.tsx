@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import { HarnessesScreen } from './harnesses';
 import type { HarnessGateway } from './harness-gateway';
@@ -18,8 +18,11 @@ it.each([
     installationMethod: 'manual', configRoots: [], activeProfile: null, policyConflicts: [], capability: 'import_only',
     codexSavedHookApproval: { sessionStart: state, stop: state } } as ProbeReport;
   const gateway: HarnessGateway = { harnessProbe: vi.fn().mockResolvedValue(report),
+    harnessExecutionStart: vi.fn(), harnessExecutionStatus: vi.fn(), harnessExecutionCurrent: vi.fn().mockResolvedValue(null),
+    harnessSetupGet: vi.fn(), harnessSetupsList: vi.fn().mockResolvedValue({ setups: [], nextAfter: null }),
     harnessPreview: vi.fn(), harnessApply: vi.fn(), harnessRollback: vi.fn() };
   render(<HarnessesScreen gateway={gateway} projects={[project]} />);
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Review setup' })).toBeEnabled());
   fireEvent.click(screen.getByRole('button', { name: 'Review setup' }));
   const status = await screen.findByRole('region', { name: 'Saved Codex hook approvals' });
   expect(within(status).getAllByText(label)).toHaveLength(2);

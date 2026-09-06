@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import type { HarnessId, HarnessParams, PlanId, ProbeReport, ProjectIdentity, SavedHookApproval, SavedMemoryHookApproval, SetupPlan, WireNativeValue } from './bindings';
+import type { HarnessId, HarnessParams, HarnessSetupRecord, HarnessSetupState, HarnessSetupSummary, PlanId, ProbeReport, ProjectIdentity, SavedHookApproval, SavedMemoryHookApproval, SetupPlan, WireNativeValue } from './bindings';
 import { type HarnessGateway, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
+import { useHarnessExecution } from './use-harness-execution';
 
 const harnessNames: Record<HarnessId, string> = { claude_code: 'Claude Code', codex: 'Codex', hermes: 'Hermes' };
-type ReviewedPlan = { plan: SetupPlan; params: HarnessParams; projectName: string };
-type AppliedPlan = ReviewedPlan & { setupNumber: number; savedAt: number };
-type BusyAction = 'preview' | 'apply' | 'rollback' | null;
+type ReviewedPlan = { plan: SetupPlan; params: HarnessParams; projectName: string; state?: HarnessSetupState };
+type BusyAction = 'preview' | 'loading' | 'checking' | 'apply' | 'rollback' | null;
 
 export function HarnessesScreen({ gateway, projects, preferredProjectId, onProjectChange, onAddProject, onSaveContext, active = true }: { gateway: HarnessGateway; projects: ProjectIdentity[]; preferredProjectId?: string; onProjectChange?: (id: string) => void; onAddProject?: () => void; onSaveContext?: () => void; active?: boolean }) {
   const [selectedProjectId, setProjectId] = useState<string | null>(null);
@@ -17,12 +17,17 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   const [review, setReview] = useState<ReviewedPlan | null>(null);
   const [discovery, setDiscovery] = useState<{ harness: HarnessId; report: ProbeReport } | null>(null);
   const [approved, setApproved] = useState(false);
-  const [applied, setApplied] = useState<AppliedPlan[]>([]);
-  const nextSetupNumber = useRef(1);
+  const execution = useHarnessExecution(gateway, active);
+  const [history, setHistory] = useState<HarnessSetupSummary[]>([]);
+  const [nextAfter, setNextAfter] = useState<PlanId | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyRevision, refreshHistory] = useState(0);
+  const [details, setDetails] = useState<Map<PlanId, HarnessSetupRecord>>(new Map());
   const [rollbackTarget, setRollbackTarget] = useState<PlanId | null>(null);
-  const [busy, setBusy] = useState<BusyAction>(null);
+  const [localBusy, setBusy] = useState<BusyAction>(null);
+  const busy: BusyAction = localBusy ?? (execution.busy ? execution.pending?.action ?? 'checking' : null);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now);
   const busyRef = useRef<BusyAction>(null);
   const generation = useRef(0);
@@ -30,9 +35,27 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   const project = projects.find((item) => item.projectId === projectId);
   const expired = review !== null && BigInt(review.plan.expiresAt) <= BigInt(now);
   const conflicts = review?.plan.semanticChanges.some((change) => change.class === 'conflict') ?? false;
-  const matching = review !== null && review.params.projectId === project?.projectId &&
+  const matching = review !== null && (review.params.projectId === null || review.params.projectId === project?.projectId) &&
     review.params.harness === harness && review.params.hermesProfile === (harness === 'hermes' ? canonicalProfile : null);
   const canApply = approved && matching && !expired && !conflicts && !busy;
+
+  useEffect(() => {
+    if (!active || execution.busy) return;
+    let canceled = false;
+    setHistoryLoading(true);
+    gateway.harnessSetupsList().then(page => {
+      if (canceled) return;
+      setHistory(page.setups); setNextAfter(page.nextAfter); setHistoryError(null);
+    }).catch(() => { if (!canceled) setHistoryError('Saved setup history could not be loaded.'); })
+      .finally(() => { if (!canceled) setHistoryLoading(false); });
+    return () => { canceled = true; };
+  }, [gateway, active, execution.busy, execution.outcome, historyRevision]);
+
+  useEffect(() => {
+    if (!execution.outcome) return;
+    const setup = execution.outcome.setup;
+    setDetails(current => new Map(current).set(setup.plan.planId, setup));
+  }, [execution.outcome]);
 
   useEffect(() => {
     mounted.current = true;
@@ -50,7 +73,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
 
   useEffect(() => {
     generation.current += 1;
-    setReview(null);
+    setReview(current => current?.params.projectId === projectId || current?.params.projectId === null ? current : null);
     setDiscovery(null);
     setApproved(false);
     setRollbackTarget(null);
@@ -68,16 +91,16 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
     setDiscovery(null);
     setApproved(false);
     setError(null);
-    setNotice(null);
+    execution.clearOutcome();
     setRollbackTarget(null);
   }
 
   function start(action: Exclude<BusyAction, null>) {
-    if (!active || busyRef.current) return false;
+    if (!active || busyRef.current || execution.busy) return false;
     busyRef.current = action;
     setBusy(action);
     setError(null);
-    setNotice(null);
+    execution.clearOutcome();
     return true;
   }
 
@@ -103,6 +126,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
       setNow(Date.now());
       // Keep the reviewed contents and their selection together for apply and rollback.
       setReview({ plan: structuredClone(result), params, projectName: project.name });
+      refreshHistory(value => value + 1);
     } catch (error) {
       if (mounted.current && revision === generation.current) {
         setError(setupError(error, params.harness));
@@ -111,41 +135,56 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   }
 
   async function applySetup() {
-    if (!canApply || !review || BigInt(review.plan.expiresAt) <= BigInt(Date.now()) || !start('apply')) return;
+    if (!canApply || !review || BigInt(review.plan.expiresAt) <= BigInt(Date.now())) return;
     const approvedReview = review;
     setDiscovery(null);
     setApproved(false);
     setRollbackTarget(null);
-    try {
-      await gateway.harnessApply(approvedReview.plan.planId);
-      if (!mounted.current) return;
-      const saved = { ...approvedReview, setupNumber: nextSetupNumber.current++, savedAt: Date.now() };
-      setApplied((items) => [...items.filter((item) => item.plan.planId !== approvedReview.plan.planId), saved]);
-      setReview(null);
-      // Apply acknowledges the configuration transaction, not a live harness session.
-      setNotice(`Settings saved: ${label(approvedReview)}.`);
-    } catch {
-      if (mounted.current) {
-        setReview(null);
-        setError('Saving these settings could not be confirmed. Select Review setup to see the latest changes before retrying.');
-      }
-    } finally { finish(); }
+    setReview(null);
+    setError(null);
+    await execution.execute({ planId: approvedReview.plan.planId, action: 'apply' });
   }
 
   async function rollbackSetup(item: ReviewedPlan) {
-    if (rollbackTarget !== item.plan.planId || !start('rollback')) return;
+    if (rollbackTarget !== item.plan.planId || busy) return;
     setDiscovery(null);
     setRollbackTarget(null);
     setApproved(false);
+    setReview(null); setError(null);
+    await execution.execute({ planId: item.plan.planId, action: 'rollback' });
+  }
+
+  async function loadSetup(id: PlanId, intent: 'details' | 'review' | 'undo') {
+    if (!start('loading')) return;
+    const revision = generation.current;
     try {
-      await gateway.harnessRollback(item.plan.planId);
+      const setup = await gateway.harnessSetupGet(id);
+      if (!mounted.current || revision !== generation.current) return;
+      setDetails(current => new Map(current).set(id, setup));
+      setHistory(current => current.map(item => item.planId === id ? { ...item, state: setup.state } : item));
+      if (intent === 'undo' && ['applied', 'rolling_back'].includes(setup.state)) setRollbackTarget(id);
+      if (intent === 'review' && ['previewed', 'applying'].includes(setup.state)) {
+        const restored = reviewed(setup, projects);
+        setHarness(restored.params.harness); setProfile(restored.params.hermesProfile ?? 'default');
+        if (restored.params.projectId !== null) {
+          if (onProjectChange) onProjectChange(restored.params.projectId); else setProjectId(restored.params.projectId);
+        }
+        setApproved(false); setNow(Date.now()); setReview(restored);
+      }
+    } catch { if (mounted.current) setError('Could not load this saved setup. Its changes have not been retried.'); }
+    finally { finish(); }
+  }
+
+  async function loadMoreHistory() {
+    if (!nextAfter || historyLoading || busy) return;
+    setHistoryLoading(true);
+    try {
+      const page = await gateway.harnessSetupsList(nextAfter);
       if (!mounted.current) return;
-      setApplied((items) => items.filter((current) => current.plan.planId !== item.plan.planId));
-      setReview(null);
-      setNotice(`Setup changes undone: ${label(item)}.`);
-    } catch {
-      if (mounted.current) setError('Undo could not be confirmed. Check the harness configuration before trying to undo these changes again.');
-    } finally { finish(); }
+      setHistory(current => [...current, ...page.setups.filter(item => !current.some(existing => existing.planId === item.planId))]);
+      setNextAfter(page.nextAfter); setHistoryError(null);
+    } catch { if (mounted.current) setHistoryError('More saved setups could not be loaded. Try again.'); }
+    finally { if (mounted.current) setHistoryLoading(false); }
   }
 
   if (projects.length === 0) return <section className="screen-content empty-state" aria-label="Harness connection">
@@ -181,7 +220,10 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
         <button className="primary-action" type="submit" disabled={!!busy || !project || (harness === 'hermes' && !validProfile)}>{busy === 'preview' ? 'Checking harness…' : 'Review setup'}</button>
       </form>
       {error && <p className="form-error" role="alert">{error}</p>}
-      {notice && <p className="notice" role="status">{notice}</p>}
+      {execution.error && <p className="form-error" role="alert">{execution.error} <button type="button" onClick={execution.checkAgain}>Check again</button></p>}
+      {execution.outcome && <section aria-label="Setup result"><p className={execution.outcome.status.error ? 'form-error' : 'notice'} role={execution.outcome.status.error ? 'alert' : 'status'}>
+        {outcomeText(execution.outcome.status.action, execution.outcome.setup.state, execution.outcome.status.error !== null)} {label(reviewed(execution.outcome.setup, projects))}.
+      </p>{execution.outcome.setup.state === 'applied' && <SetupNextSteps item={reviewed(execution.outcome.setup, projects)} />}</section>}
       {discovery && discovery.report.capability !== 'full' && <section className="connection-result" aria-label="Harness availability">
         <h2>{harnessNames[discovery.harness]}{discovery.report.harnessVersion && discovery.report.harnessVersion !== 'unknown' ? ` ${discovery.report.harnessVersion}` : ''}</h2>
         <p role="status">{discovery.report.capability === 'missing'
@@ -198,7 +240,8 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
         {discovery.report.executable && <details className="technical-details"><summary>Technical details</summary><p>Executable: {nativeText(discovery.report.executable)}</p>{discovery.harness === 'hermes' && discovery.report.policyConflicts.includes('python_runtime_not_qualified') && <p>Version read from installed package metadata. The Python runtime has not been executed or verified for connection.</p>}</details>}
       </section>}
       {discovery?.report.codexSavedHookApproval && <SavedHookApprovals approval={discovery.report.codexSavedHookApproval} />}
-      {busy && <p role="status">{busy === 'preview' ? 'Checking the installed harness…' : busy === 'apply' ? 'Saving harness settings…' : 'Undoing setup changes…'}</p>}
+      {busy && <p role="status">{busy === 'preview' ? 'Checking the installed harness…' : busy === 'loading' ? 'Loading saved setup…' : busy === 'checking' ? 'Checking for unfinished setup…' : busy === 'apply' ? 'Saving harness settings…' : 'Undoing setup changes…'}</p>}
+      {execution.pending && <p className="help-text">This can take a few minutes. You can use another screen; return here to check the result.</p>}
       {review && <section className="record-card" aria-labelledby="harness-review-title">
         <h2 id="harness-review-title">Review setup changes</h2>
         <p>{label(review)}</p>
@@ -207,29 +250,75 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
         {expired && <p className="form-error">This setup review has expired. Select Review setup again.</p>}
         {conflicts && <p className="form-error">Resolve the conflicting settings shown above, then select Review setup again.</p>}
         {!matching && <p className="form-error">The project or harness changed. Select Review setup again.</p>}
+        {review.state === 'applying' && !expired && <p>The previous save was interrupted. Review these settings before resuming the same setup.</p>}
         <label>
           <input type="checkbox" checked={approved} disabled={!!busy || expired || conflicts || !matching} onChange={(event) => setApproved(event.target.checked)} />
           I reviewed and approve these settings.
         </label>
-        <button className="primary-action" type="button" disabled={!canApply} onClick={() => void applySetup()}>{busy === 'apply' ? 'Saving settings…' : 'Save settings'}</button>
+        <button className="primary-action" type="button" disabled={!canApply} onClick={() => void applySetup()}>{review.state === 'applying' ? 'Resume save' : 'Save settings'}</button>
       </section>}
-      {applied.length > 0 && <section aria-label="Recent setup changes">
+      {(history.length > 0 || nextAfter !== null || historyError || historyLoading) && <section aria-label="Recent setup changes">
         <h2>Recent setup changes</h2>
-        <ul className="record-list">{applied.map((item) => <li className="record-card" key={item.plan.planId}>
-          <h3>{label(item)}</h3>
-          <p className="help-text">Setup {item.setupNumber} · {new Date(item.savedAt).toLocaleString()} · Version {item.plan.harnessVersion}</p>
-          <SetupNextSteps item={item} />
-          <details className="connection-history-details"><summary>View saved changes</summary><PlanDetails plan={item.plan} projectName={item.projectName} /></details>
-          <button className="secondary-action" type="button" disabled={!!busy} onClick={() => setRollbackTarget(item.plan.planId)}>Undo setup {item.setupNumber} for {label(item)}</button>
-          {rollbackTarget === item.plan.planId && <div role="group" aria-label={`Confirm rollback of ${label(item)}`}>
+        {historyError && <p className="form-error" role="alert">{historyError} <button type="button" disabled={!!busy} onClick={() => refreshHistory(value => value + 1)}>Reload history</button></p>}
+        {historyLoading && <p role="status">Loading saved setups…</p>}
+        <ul className="record-list">{history.filter(summary => summary.planId !== review?.plan.planId).map(summary => {
+          const saved = execution.outcome?.setup.plan.planId === summary.planId ? execution.outcome.setup : details.get(summary.planId);
+          const state = execution.outcome?.setup.plan.planId === summary.planId ? execution.outcome.setup.state : summary.state;
+          const item = saved ? reviewed(saved, projects) : null;
+          const name = summaryLabel(summary, projects);
+          const reference = summary.planId.slice(-8).toUpperCase();
+          return <li className="record-card" key={summary.planId}>
+          <h3>{name} · setup {reference}</h3>
+          <p>{execution.pending?.planId === summary.planId ? (execution.pending.action === 'apply' ? 'Saving settings…' : 'Undoing setup changes…') : setupStateText(state)}</p>
+          <p className="help-text">{expiryText(summary.createdAt)}</p>
+          {item && state === 'applied' && saved?.state === 'applied' && execution.outcome?.setup.plan.planId !== summary.planId && <SetupNextSteps item={item} />}
+          {item ? <details className="connection-history-details"><summary>View saved changes</summary><PlanDetails plan={item.plan} projectName={item.projectName} /></details>
+            : <button type="button" className="secondary-action" disabled={!!busy} onClick={() => void loadSetup(summary.planId, 'details')}>View saved changes for {name}</button>}
+          {(state === 'previewed' || state === 'applying') && <button type="button" className="secondary-action" disabled={!!busy} onClick={() => void loadSetup(summary.planId, 'review')}>Review saved setup for {name}</button>}
+          {(state === 'applied' || state === 'rolling_back') && <button className="secondary-action" type="button" disabled={!!busy} onClick={() => void loadSetup(summary.planId, 'undo')}>{state === 'rolling_back' ? 'Resume Undo' : 'Undo setup'} {reference} for {name}</button>}
+          {item && rollbackTarget === summary.planId && <div role="group" aria-label={`Confirm rollback of ${label(item)}`}>
             <p>Restore the configuration from before this setup? Context Relay will check for changes made since then.</p>
             <button type="button" className="primary-action" disabled={!!busy} onClick={() => void rollbackSetup(item)}>Undo setup changes</button>
             <button type="button" className="secondary-action" disabled={!!busy} onClick={() => setRollbackTarget(null)}>Keep settings</button>
           </div>}
-        </li>)}</ul>
+        </li>; })}</ul>
+        {nextAfter !== null && <button type="button" className="secondary-action" disabled={historyLoading || !!busy} onClick={() => void loadMoreHistory()}>Load more setups</button>}
       </section>}
     </section>
   );
+}
+
+function reviewed(setup: HarnessSetupRecord, projects: ProjectIdentity[]): ReviewedPlan {
+  const project = setup.plan.targetScopes.find(scope => scope.scope === 'project');
+  const projectId = project?.scope === 'project' ? project.projectId : null;
+  return { plan: setup.plan, state: setup.state,
+    params: { harness: setup.plan.harness, hermesProfile: setup.plan.harnessProfile, projectId },
+    projectName: projectId === null ? 'all projects' : projects.find(item => item.projectId === projectId)?.name ?? 'saved project',
+  };
+}
+
+function summaryLabel(summary: HarnessSetupSummary, projects: ProjectIdentity[]) {
+  const project = summary.targetScopes.find(scope => scope.scope === 'project');
+  const projectName = project?.scope === 'project' ? projects.find(item => item.projectId === project.projectId)?.name ?? 'saved project' : 'all projects';
+  return `${harnessNames[summary.harness]}${summary.harnessProfile ? ` (${summary.harnessProfile})` : ''} for ${projectName}`;
+}
+
+function setupStateText(state: HarnessSetupState) {
+  const names: Record<HarnessSetupState, string> = {
+    previewed: 'Saved review — settings have not been saved.', applying: 'Save interrupted — review before resuming.',
+    applied: 'Settings saved', apply_restored: 'Save failed; previous settings were restored.',
+    rolling_back: 'Undo interrupted — review before resuming.', rolled_back: 'Setup changes undone',
+    rollback_restored: 'Undo failed; the attempted Undo was restored.', conflict: 'Settings changed — this setup needs review.',
+    expired: 'This review expired. Select Review setup to create a new review.',
+  };
+  return names[state];
+}
+
+function outcomeText(action: 'apply' | 'rollback', state: HarnessSetupState, failed: boolean) {
+  if (failed) return `${action === 'apply' ? 'Save' : 'Undo'} reported a problem. ${setupStateText(state)} `;
+  if (action === 'apply' && state === 'applied') return 'Settings saved:';
+  if (action === 'rollback' && state === 'rolled_back') return 'Setup changes undone:';
+  return `${action === 'apply' ? 'Save' : 'Undo'} was not confirmed. ${setupStateText(state)} `;
 }
 
 function SavedHookApprovals({ approval }: { approval: SavedMemoryHookApproval }) {

@@ -14,6 +14,42 @@ function plan(): SetupPlan {
 }
 beforeEach(() => invoke.mockReset());
 
+it('tracks the exact plan and action and reads its authoritative saved record', async () => {
+  const gateway = new LocalWorkspaceGateway();
+  const savedPlan = { ...plan(), rulesyncVersion: 'bridge-preview-v1' };
+  const key = { planId: savedPlan.planId, action: 'apply' as const };
+  const status = { ...key, phase: 'queued', error: null };
+  invoke.mockResolvedValueOnce({ kind: 'harness_execution', data: { status } })
+    .mockResolvedValueOnce({ kind: 'harness_execution_current', data: { status } })
+    .mockResolvedValueOnce({ kind: 'harness_execution', data: { status: { ...status, phase: 'finished' } } })
+    .mockResolvedValueOnce({ kind: 'harness_setup', data: { setup: { plan: savedPlan, state: 'applied', createdAt: '1900000000000' } } });
+  expect((await gateway.harnessExecutionStart(key)).phase).toBe('queued');
+  expect(await gateway.harnessExecutionCurrent()).toEqual(status);
+  expect((await gateway.harnessExecutionStatus(key)).phase).toBe('finished');
+  expect((await gateway.harnessSetupGet(savedPlan.planId)).state).toBe('applied');
+  expect(invoke.mock.calls.map(call => call[1].request)).toEqual([
+    { method: 'harness_execution_start', params: key }, { method: 'harness_execution_current', params: {} },
+    { method: 'harness_execution_status', params: key }, { method: 'harness_setup_get', params: { planId: savedPlan.planId } },
+  ]);
+});
+
+it('rejects mismatched identities, ambiguous attempts and malformed history', async () => {
+  const gateway = new LocalWorkspaceGateway();
+  const key = { planId: plan().planId, action: 'apply' as const };
+  for (const status of [
+    { ...key, action: 'rollback', phase: 'finished', error: null },
+    { ...key, phase: 'running', error: { code: 'internal', message: 'Failure', fieldPath: null, retryable: false } },
+    { ...key, phase: 'finished' },
+  ]) {
+    invoke.mockResolvedValue({ kind: 'harness_execution', data: { status } });
+    await expect(gateway.harnessExecutionStatus(key)).rejects.toThrow();
+  }
+  invoke.mockResolvedValue({ kind: 'harness_setups', data: { page: { setups: [], nextAfter: key.planId } } });
+  await expect(gateway.harnessSetupsList(key.planId)).rejects.toThrow();
+  invoke.mockResolvedValue({ kind: 'harness_execution_current', data: {} });
+  await expect(gateway.harnessExecutionCurrent()).rejects.toThrow();
+});
+
 it('previews native setup and sends only the stored ID for apply and rollback', async () => {
   invoke.mockResolvedValueOnce({ kind: 'plan', data: { plan: plan() } }).mockResolvedValue({ kind: 'empty' });
   const gateway = new LocalWorkspaceGateway();

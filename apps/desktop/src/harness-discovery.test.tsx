@@ -19,14 +19,20 @@ const response = (value: unknown) => ({ kind: 'probe', data: { report: value } }
 let requests: LocalRequest[];
 
 beforeEach(() => {
+  vi.spyOn(LocalWorkspaceGateway.prototype, 'harnessExecutionCurrent').mockResolvedValue(null);
+  vi.spyOn(LocalWorkspaceGateway.prototype, 'harnessSetupsList').mockResolvedValue({ setups: [], nextAfter: null });
   requests = [];
   invoke.mockReset().mockImplementation(async (_command, { request }: { request: LocalRequest }) => {
     requests.push(request);
     return response(report);
   });
 });
-afterEach(cleanup);
-function open() { return render(<HarnessesScreen gateway={new LocalWorkspaceGateway()} projects={[project]} />); }
+afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+async function open() {
+  const view = render(<HarnessesScreen gateway={new LocalWorkspaceGateway()} projects={[project]} />);
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Review setup' })).toBeEnabled());
+  return view;
+}
 function preview() { fireEvent.click(screen.getByRole('button', { name: 'Review setup' })); }
 
 it.each([
@@ -38,7 +44,7 @@ it.each([
     requests.push(request);
     return response({ ...report, capability, ...(capability === 'missing' ? { executable: null, executableSha256: null, harnessVersion: null } : {}) });
   });
-  open(); preview();
+  await open(); preview();
   expect(await screen.findByText(message)).toBeVisible();
   if (capability !== 'missing') expect(screen.getByText(/0\.144\.6/)).toBeVisible();
   expect(requests).toEqual([{ method: 'harness_probe', params }]);
@@ -52,7 +58,7 @@ it('requests a fresh exact plan only after Full discovery and still requires app
     if (request.method === 'harness_probe') return response({ ...report, capability: 'full' });
     return { kind: 'plan', data: { plan: { ...fixture, expiresAt: String(Date.now() + 60_000), targetScopes: [{ scope: 'project', projectId, root: fixture.executablePath }] } } };
   });
-  open(); preview();
+  await open(); preview();
   expect(await screen.findByRole('heading', { name: 'Review setup changes' })).toBeVisible();
   expect(requests).toEqual([{ method: 'harness_probe', params }, { method: 'harness_preview', params }]);
   expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled();
@@ -64,7 +70,7 @@ it('discards discovery after selection changes without requesting the obsolete p
     requests.push(request);
     return new Promise(done => { resolve = done; });
   });
-  open(); preview();
+  await open(); preview();
   await waitFor(() => expect(requests).toHaveLength(1));
   fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'claude_code' } });
   await act(async () => resolve(response({ ...report, capability: 'full' })));
@@ -79,7 +85,7 @@ it('binds Hermes discovery and approval to its canonical profile name', async ()
     if (request.method === 'harness_probe') return response({ ...report, capability: 'full', activeProfile: 'coder' });
     return { kind: 'plan', data: { plan: { ...fixture, harness: 'hermes', harnessProfile: 'coder', expiresAt: String(Date.now() + 60_000), targetScopes: [{ scope: 'project', projectId, root: fixture.executablePath }] } } };
   });
-  open();
+  await open();
   fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'hermes' } });
   fireEvent.change(screen.getByRole('textbox', { name: 'Hermes profile' }), { target: { value: ' Coder ' } });
   preview();
@@ -89,7 +95,7 @@ it('binds Hermes discovery and approval to its canonical profile name', async ()
 });
 
 it('offers the default Hermes profile and explains that a folder path is invalid', async () => {
-  open();
+  await open();
   fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'hermes' } });
   expect(screen.getByRole('textbox', { name: 'Hermes profile' })).toHaveValue('default');
   expect(screen.getByText(/Use a profile name, such as default or coder/)).toBeVisible();
@@ -102,7 +108,7 @@ it('offers the default Hermes profile and explains that a folder path is invalid
 
 it('explains a confirmed missing Claude Code executable instead of blaming setup preview', async () => {
   invoke.mockRejectedValue({ code: 'not_found', message: 'Claude Code executable was not found', fieldPath: null, retryable: false });
-  open();
+  await open();
   fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'claude_code' } });
   preview();
   expect(await screen.findByRole('alert')).toHaveTextContent('Claude Code command-line executable was not found');
@@ -112,7 +118,7 @@ it('explains a confirmed missing Claude Code executable instead of blaming setup
 
 it('explains an unqualified Hermes launcher without calling it a supported version', async () => {
   invoke.mockResolvedValue(response({ ...report, activeProfile: 'default', harnessVersion: 'unknown' }));
-  open();
+  await open();
   fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'hermes' } });
   fireEvent.change(screen.getByRole('textbox', { name: 'Hermes profile' }), { target: { value: 'default' } });
   preview();
@@ -123,7 +129,7 @@ it('explains an unqualified Hermes launcher without calling it a supported versi
 
 it('explains an unavailable Hermes home separately from a missing executable', async () => {
   invoke.mockRejectedValue({ code: 'not_found', message: 'Hermes default profile was not found', fieldPath: null, retryable: false });
-  open();
+  await open();
   fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'hermes' } });
   fireEvent.change(screen.getByRole('textbox', { name: 'Hermes profile' }), { target: { value: 'default' } });
   preview();
@@ -136,7 +142,7 @@ it('identifies a Python installation without presenting its metadata version as 
     requests.push(request);
     return response({ ...report, activeProfile: 'default', harnessVersion: '0.17.0', policyConflicts: ['python_runtime_not_qualified'] });
   });
-  open();
+  await open();
   fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'hermes' } });
   preview();
   expect(await screen.findByRole('heading', { name: 'Hermes 0.17.0' })).toBeVisible();
@@ -154,7 +160,7 @@ it.each([
   { ...report, capability: 'full', executable: null },
 ])('rejects invalid discovery %# without exposing raw payloads or requesting a plan', async value => {
   invoke.mockImplementation(async (_command, { request }: { request: LocalRequest }) => { requests.push(request); return response(value); });
-  open(); preview();
+  await open(); preview();
   expect(await screen.findByRole('alert')).toHaveTextContent(/Could not review this setup/i);
   expect(requests).toEqual([{ method: 'harness_probe', params }]);
   expect(screen.queryByText(/PRIVATE-/)).not.toBeInTheDocument();

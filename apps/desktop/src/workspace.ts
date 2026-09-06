@@ -4,6 +4,7 @@ import type {
   DesktopWrite,
   DesktopWritesPage,
   HarnessParams,
+  HarnessExecutionParams,
   LocalRequest,
   LocalResult,
   MemoryCandidate,
@@ -30,6 +31,7 @@ import type {
 } from './bindings';
 import { LocalClient } from './local-client';
 import { type HarnessGateway, requireHarnessAcknowledgment, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
+import { validateHarnessExecution, validateHarnessSetupRecord, validateHarnessSetupsPage } from './protocol-validation';
 
 export type PairingInviteResult = Extract<LocalResult, { kind: 'pairing_invite' }>;
 export type PairingRequestResult = Extract<LocalResult, { kind: 'pairing_request' }>;
@@ -43,6 +45,16 @@ export type PairingStatusResult = Extract<
   | { kind: 'pairing_completion' }
 >;
 export type PairingDecisionResult = PairingRequestResult | PairingApprovalResult;
+
+function harnessResult(result: unknown, kind: string, field: string): unknown {
+  if (!result || typeof result !== 'object' || Object.keys(result).length !== 2 ||
+    !('kind' in result) || result.kind !== kind || !('data' in result) ||
+    !result.data || typeof result.data !== 'object' || Array.isArray(result.data) ||
+    Object.keys(result.data).length !== 1 || !(field in result.data)) {
+    throw new Error('The harness response was not confirmed.');
+  }
+  return (result.data as Record<string, unknown>)[field];
+}
 
 export class RecoveryStorageFullError extends Error {
   constructor() {
@@ -187,6 +199,43 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
       throw new Error('Harness discovery was not returned.');
     }
     return validateHarnessProbe(result.data.report, params);
+  }
+
+  async harnessExecutionStart(params: HarnessExecutionParams) {
+    return this.harnessExecution('harness_execution_start', params);
+  }
+
+  async harnessExecutionStatus(params: HarnessExecutionParams) {
+    return this.harnessExecution('harness_execution_status', params);
+  }
+
+  private async harnessExecution(method: 'harness_execution_start' | 'harness_execution_status', params: HarnessExecutionParams) {
+    const result = await this.call({ method, params });
+    const status = validateHarnessExecution(harnessResult(result, 'harness_execution', 'status'));
+    if (status.planId !== params.planId || status.action !== params.action) throw new Error('Setup operation identity changed.');
+    return status;
+  }
+
+  async harnessExecutionCurrent() {
+    const result = await this.call({ method: 'harness_execution_current', params: {} });
+    const value = harnessResult(result, 'harness_execution_current', 'status');
+    return value === null ? null : validateHarnessExecution(value);
+  }
+
+  async harnessSetupGet(planId: PlanId) {
+    const result = await this.call({ method: 'harness_setup_get', params: { planId } });
+    const setup = validateHarnessSetupRecord(harnessResult(result, 'harness_setup', 'setup'));
+    if (setup.plan.planId !== planId) throw new Error('Saved setup identity changed.');
+    return setup;
+  }
+
+  async harnessSetupsList(after: PlanId | null = null) {
+    const result = await this.call({ method: 'harness_setups_list', params: { after } });
+    const page = validateHarnessSetupsPage(harnessResult(result, 'harness_setups', 'page'));
+    if (after !== null && (page.setups.some(item => item.planId >= after) || (page.nextAfter !== null && page.nextAfter >= after))) {
+      throw new Error('Setup history did not advance.');
+    }
+    return page;
   }
 
   async harnessPreview(params: HarnessParams) {
