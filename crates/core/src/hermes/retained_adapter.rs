@@ -66,6 +66,31 @@ impl HermesAdapter {
         cancelled: Arc<AtomicBool>,
         mut report: impl FnMut(python_runtime::PreparationProgress),
     ) -> Result<RetainedRuntimeReference, ClientError> {
+        let mut ready = None;
+        let runtime = self
+            .prepare_owned_runtime(store, cancelled, |progress| {
+                if progress.phase == python_runtime::PreparationPhase::Ready {
+                    ready = Some(progress);
+                } else {
+                    report(progress);
+                }
+            })?
+            .persist();
+        // The durable API reports Ready after cleanup ownership is transferred.
+        // The owned API below instead leaves cleanup with its caller.
+        if let Some(progress) = ready {
+            report(progress);
+        }
+        Ok(runtime.reference().clone())
+    }
+
+    /// The background operation owns this copy until setup commits its reference.
+    pub fn prepare_owned_runtime(
+        &self,
+        store: &Path,
+        cancelled: Arc<AtomicBool>,
+        mut report: impl FnMut(python_runtime::PreparationProgress),
+    ) -> Result<python_runtime::retained::PreparedRuntime, ClientError> {
         check_cancelled(&cancelled)?;
         self.revalidate_bound_installation()?;
         let captured = python_runtime::capture_with_progress(
@@ -76,8 +101,7 @@ impl HermesAdapter {
         )?;
         check_cancelled(&cancelled)?;
         self.revalidate_bound_installation()?;
-        let runtime = captured.retain_with_progress(&cancelled, report)?;
-        Ok(runtime.reference().clone())
+        captured.prepare_owned_with_progress(&cancelled, report)
     }
 
     /// Reopens the exact runtime bound by a verified persisted plan. The caller

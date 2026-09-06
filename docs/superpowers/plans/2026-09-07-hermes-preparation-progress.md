@@ -50,16 +50,54 @@ checks excluded. Core/contextd/native-runner all-target Clippy passes with test
 support and warnings denied. Formatting and whitespace checks pass. Independent
 review approved both corrections with no further actionable findings.
 
-## Remaining daemon and desktop work
+## Implemented daemon ownership and IPC
 
-- Prepare the selected adapter and project binding briefly on the vault worker,
-  then run passive preparation on a separately owned, bounded worker.
-- Keep one operation's selection, progress, cancellation and resulting reference
-  together. Polling status/cancel must not queue behind the long preparation.
+The daemon now owns one background preparation worker. Start briefly resolves
+the registered project on the vault worker, then snapshots Python installation
+metadata and captures the runtime on the separate worker. This discovery path
+cannot enter the native version-command branch. A bounded channel admits one
+preparation at a time; progress coalesces into one in-memory status. Status and
+Cancel requests bypass the vault queue. Repeating the current operation ID and
+selection returns its status before resolving mutable project inputs again.
+Other active starts return Busy; reusing the current ID with different inputs
+returns Conflict. Replacing a terminal operation expires its old status.
+
+Protocol 1.8 adds Desktop-only harness_prepare, harness_preparation_status and
+harness_preparation_cancel. Start binds an operation ID and harness selection;
+status/cancel take only that ID. Replies contain a closed phase, bounded counts,
+selection and a fixed error. No runtime path, manifest reference or command is
+accepted or returned. Older ordinary clients still require an exact version;
+authenticated installer shutdown also accepts the previous 1.7 candidate.
+
+PreparedRuntime owns the unused holder and releases its pins before cleanup.
+The worker owns a successful result until later setup consumption is implemented.
+Replacing an unused result cleans it on the worker, outside the status lock.
+Ready is published only after the owned result returns; a late cancel cannot turn
+a successful result into Canceled. The durable core API still transfers cleanup
+ownership before reporting Ready. Daemon shutdown closes admission, cancels and
+joins the worker before releasing instance ownership. Async shutdown retains its
+join handle across awaits, so dropping the future does not detach the writer.
+
+Four coordinator tests cover nonblocking status/cancel, idempotency, result
+ownership, panic redaction and joined shutdown. Two core tests verify cleanup of
+an unused copy and persistence of an explicitly transferred copy. Authenticated
+IPC tests exercise background progress, unrelated project reads, cancellation,
+role denials, retry without a second factory call, and status loss after restart.
+The factory deliberately fails if called again, reproducing the review finding
+that a renamed project could otherwise break a lost-response retry.
+
+Current validation passes 79 Hermes library tests (three opt-in checks ignored),
+66 daemon library tests (one ignored), all 13 harness setup IPC tests, the full
+protocol/local-IPC suites, frontend type checking and 193 frontend tests.
+Core/contextd/protocol/local-IPC all-target Clippy passes with test support and
+warnings denied. Independent review approved the replay and passive-discovery
+corrections. The test build initially exhausted disk space; Cargo cleanup scoped
+to the two affected project crates reclaimed 30.1 GiB before the successful runs.
+
+## Remaining desktop and setup work
+
 - Preserve the completed reference for sealing into the reviewed setup plan;
   unfinished or orphaned copies must never become implicit launch authority.
-- Stop admitting preparation at shutdown, request cancellation and settle the
-  owned worker. Cancellation/completion races must produce one terminal result.
 - Show plain-language stages and a Cancel action. Selection changes and late
   replies must not replace the current selection's review. Existing setup review
   supplies the user's approval; do not add confirmation steps for implementation

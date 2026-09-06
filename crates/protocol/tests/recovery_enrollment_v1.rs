@@ -19,7 +19,7 @@ fn request(method: &str, params: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": support::ID,
-        "protocol": {"major": 1, "minor": 7},
+        "protocol": {"major": 1, "minor": 8},
         "daemonInstanceNonce": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
         "method": method,
         "params": params,

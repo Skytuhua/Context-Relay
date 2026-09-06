@@ -44,6 +44,17 @@ pub(crate) const NON_LAUNCHING_WINDOWS_SID: &str = "S-1-15-2-1-2-3-4-5-6-7";
 /// protocol DTOs; callers cannot inject paths, digests, commands, or plan
 /// bodies into apply and rollback.
 pub trait BridgeInstallEngine: Send + Sync {
+    fn prepare(
+        &self,
+        _vault: &Vault,
+        _vault_path: &Path,
+        _device_id: DeviceId,
+        _params: HarnessParams,
+    ) -> Result<crate::harness_preparation::PreparationTask, ClientError> {
+        Err(unsupported(
+            "Background preparation is unavailable for this harness",
+        ))
+    }
     fn probe(
         &self,
         _vault: &Vault,
@@ -158,6 +169,49 @@ impl ProductionBridgeInstallEngine {
 }
 
 impl BridgeInstallEngine for ProductionBridgeInstallEngine {
+    fn prepare(
+        &self,
+        vault: &Vault,
+        vault_path: &Path,
+        device_id: DeviceId,
+        params: HarnessParams,
+    ) -> Result<crate::harness_preparation::PreparationTask, ClientError> {
+        #[cfg(not(windows))]
+        {
+            let _ = (vault, vault_path, device_id, params);
+            Err(unsupported(
+                "Background preparation is unavailable on this platform",
+            ))
+        }
+        #[cfg(windows)]
+        {
+            if params.harness != HarnessId::Hermes {
+                return Err(unsupported(
+                    "This harness does not need runtime preparation",
+                ));
+            }
+            let binding = project_binding(vault, params.project_id)?;
+            let store = canonical_lock_root(vault_path)?;
+            let profile = params
+                .hermes_profile
+                .ok_or_else(|| invalid("Choose a Hermes profile"))?;
+            let observed_hlc = HybridLogicalClock::new(now_ms()?, 0, device_id);
+            Ok(Box::new(move |cancelled, report| {
+                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(crate::canceled_error());
+                }
+                let adapter = HermesAdapter::discover_for_preparation(
+                    &binding.root,
+                    &binding.root,
+                    &profile,
+                    binding.project_id,
+                    device_id,
+                    observed_hlc,
+                )?;
+                adapter.prepare_owned_runtime(&store, cancelled, report)
+            }))
+        }
+    }
     fn probe(
         &self,
         vault: &Vault,

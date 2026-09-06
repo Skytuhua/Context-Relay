@@ -66,8 +66,8 @@ fn project_upsert_validates_the_project_identity() {
 fn offline_is_an_additive_sync_state() {
     let status: StatusOutput = serde_json::from_value(serde_json::json!({
         "protocol": {
-            "min": {"major": 1, "minor": 7},
-            "max": {"major": 1, "minor": 7}
+            "min": {"major": 1, "minor": 8},
+            "max": {"major": 1, "minor": 8}
         },
         "vault": "unlocked",
         "resolvedProject": null,

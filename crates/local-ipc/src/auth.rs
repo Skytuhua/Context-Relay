@@ -219,6 +219,9 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::AccessGet(_) => matches!(role, Desktop | Installer),
         LocalRequest::AccessSet(_) => matches!(role, Desktop | Installer),
         LocalRequest::HarnessProbe(_) => matches!(role, Desktop | Installer),
+        LocalRequest::HarnessPrepare(_)
+        | LocalRequest::HarnessPreparationStatus(_)
+        | LocalRequest::HarnessPreparationCancel(_) => matches!(role, Desktop),
         LocalRequest::HarnessPreview(_) => matches!(role, Desktop | Installer),
         LocalRequest::HarnessApply(_) => matches!(role, Desktop | Installer),
         LocalRequest::HarnessRepair(_) => matches!(role, Desktop | Installer),

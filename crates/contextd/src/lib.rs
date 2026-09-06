@@ -47,6 +47,7 @@ use tokio::{
 };
 
 pub mod bridge_install;
+pub mod harness_preparation;
 mod native_memory;
 mod pairing;
 mod recovery_enrollment;
@@ -106,6 +107,7 @@ pub(crate) mod unit_test_support {
 }
 
 use bridge_install::{BridgeInstallEngine, ProductionBridgeInstallEngine};
+use harness_preparation::{PreparationClient, PreparationSupervisor};
 use native_memory::{
     NativeMemorySupervisor, NativeMemoryUpdateSender, NoopLifecycleProbe,
     native_memory_update_channel,
@@ -204,6 +206,7 @@ impl InstallationTokenProvider for PlatformInstallationTokenProvider {
 }
 
 struct VaultConfig {
+    preparation: Option<PreparationClient>,
     path: PathBuf,
     credential_id: String,
     key_store: Arc<dyn DatabaseKeyStore>,
@@ -230,6 +233,7 @@ impl VaultConfig {
         key_store: Arc<dyn DatabaseKeyStore>,
     ) -> Self {
         Self {
+            preparation: None,
             path,
             credential_id: credential_id.into(),
             key_store,
@@ -671,6 +675,7 @@ impl DaemonConfig {
 }
 
 pub struct Daemon {
+    preparation: PreparationSupervisor,
     instance: Option<InstanceGuard>,
     listener: Option<Listener>,
     worker: VaultWorker,
@@ -686,7 +691,9 @@ pub struct Daemon {
 impl Daemon {
     pub async fn start(config: DaemonConfig) -> Result<Self, DaemonError> {
         let mut instance = InstanceGuard::acquire(&config.runtime).map_err(map_guard_error)?;
-        let vault_config = config.vault.load_device_identity()?;
+        let mut vault_config = config.vault.load_device_identity()?;
+        let preparation = PreparationSupervisor::spawn().map_err(|_| DaemonError::Startup)?;
+        vault_config.preparation = Some(preparation.client());
         let native_memory_probe = vault_config.native_memory_probe.clone();
         let token = Arc::new(config.token_provider.load_or_create()?);
         let instance_nonce = generate_instance_nonce().map_err(|_| DaemonError::Startup)?;
@@ -711,6 +718,7 @@ impl Daemon {
         let (state_sender, state_receiver) = watch::channel(DaemonState::Running);
         Ok(Self {
             instance: Some(instance),
+            preparation,
             listener: Some(listener),
             worker,
             native_memory,
@@ -738,6 +746,7 @@ impl Daemon {
             .ok_or(DaemonError::Transport)?;
         let mut worker_exit = self.worker.take_exit();
         let service = ConnectionService {
+            preparation: self.preparation.client(),
             token: self.token.clone(),
             instance_nonce: self.instance_nonce,
             registry: RequestRegistry::default(),
@@ -776,11 +785,13 @@ impl Daemon {
         }
 
         self.worker.close_admission();
+        self.preparation.client().close();
         self.state_sender.send_replace(DaemonState::Draining);
         self.shutdown_sender.send_replace(true);
         while connections.join_next().await.is_some() {}
         self.native_memory.shutdown_and_join_async().await;
         self.worker.shutdown_and_join_async().await;
+        self.preparation.shutdown_and_join_async().await;
         drop(listener);
         self.instance.take();
         self.state_sender.send_replace(DaemonState::Stopped);
@@ -794,6 +805,7 @@ impl Daemon {
 
 #[derive(Clone)]
 struct ConnectionService {
+    preparation: PreparationClient,
     token: Arc<InstallationToken>,
     instance_nonce: DaemonInstanceNonce,
     registry: RequestRegistry,
@@ -860,6 +872,20 @@ async fn serve_request(
     }
 
     match route_request(role, request) {
+        RoutedRequest::PreparationStatus(params) => {
+            let result = begin_immediate(&registration)
+                .and_then(|()| service.preparation.status(params.operation_id))
+                .map(|status| LocalResult::HarnessPreparation { status });
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
+        RoutedRequest::PreparationCancel(params) => {
+            let result = begin_immediate(&registration)
+                .and_then(|()| service.preparation.cancel(params.operation_id))
+                .map(|status| LocalResult::HarnessPreparation { status });
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
         RoutedRequest::Immediate(result) => {
             let result = begin_immediate(&registration).and(result);
             connection.respond(id, result).await?;
@@ -917,8 +943,10 @@ fn begin_immediate(registration: &RequestRegistration) -> Result<(), ClientError
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.listener.take();
+        self.preparation.client().close();
         self.native_memory.shutdown_and_join();
         self.worker.shutdown_and_join();
+        self.preparation.shutdown_and_join();
         self.instance.take();
         self.state_sender.send_replace(DaemonState::Stopped);
     }
@@ -926,6 +954,8 @@ impl Drop for Daemon {
 
 #[derive(Debug)]
 enum RoutedRequest {
+    PreparationStatus(context_relay_protocol::HarnessPreparationIdParams),
+    PreparationCancel(context_relay_protocol::HarnessPreparationIdParams),
     Immediate(Result<LocalResult, ClientError>),
     Health,
     Shutdown,
@@ -952,6 +982,15 @@ enum VaultCommand {
 fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
     if matches!(
         &request,
+        LocalRequest::HarnessPrepare(_)
+            | LocalRequest::HarnessPreparationStatus(_)
+            | LocalRequest::HarnessPreparationCancel(_)
+    ) && !role_allows(role, &request)
+    {
+        return RoutedRequest::Immediate(Err(scope_denied_error()));
+    }
+    if matches!(
+        &request,
         LocalRequest::RecoveryEnrollmentBegin(_)
             | LocalRequest::RecoveryEnrollmentOverview(_)
             | LocalRequest::RecoveryEnrollmentConfirm(_)
@@ -962,6 +1001,8 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         return RoutedRequest::Immediate(Err(scope_denied_error()));
     }
     match request {
+        LocalRequest::HarnessPreparationStatus(params) => RoutedRequest::PreparationStatus(params),
+        LocalRequest::HarnessPreparationCancel(params) => RoutedRequest::PreparationCancel(params),
         LocalRequest::Hello(_) => RoutedRequest::Immediate(Err(invalid_request_error())),
         LocalRequest::Cancel(_) => RoutedRequest::Immediate(Err(invalid_request_error())),
         LocalRequest::Shutdown(_) => RoutedRequest::Shutdown,
@@ -1004,6 +1045,7 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
             RoutedRequest::Work(VaultCommand::Workspace(request))
         }
         request @ (LocalRequest::HarnessProbe(_)
+        | LocalRequest::HarnessPrepare(_)
         | LocalRequest::HarnessPreview(_)
         | LocalRequest::HarnessApply(_)
         | LocalRequest::HarnessRollback(_)) => {
@@ -1224,6 +1266,7 @@ struct StoredExport {
 }
 
 struct WorkspaceState {
+    preparation: Option<PreparationClient>,
     vault: Vault,
     vault_path: PathBuf,
     device_id: DeviceId,
@@ -1319,6 +1362,7 @@ fn open_workspace(
         };
     Ok((
         WorkspaceState {
+            preparation: config.preparation.clone(),
             vault,
             vault_path: config.path.clone(),
             device_id: config.device_id,
@@ -1563,6 +1607,24 @@ fn execute_harness_setup(
     request: LocalRequest,
 ) -> Result<LocalResult, ClientError> {
     match request {
+        LocalRequest::HarnessPrepare(params) => {
+            let client = state
+                .preparation
+                .as_ref()
+                .ok_or_else(service_internal_error)?;
+            if let Some(status) = client.replay(&params)? {
+                return Ok(LocalResult::HarnessPreparation { status });
+            }
+            let task = state.bridge_install.prepare(
+                &state.vault,
+                &state.vault_path,
+                state.device_id,
+                params.selection.clone(),
+            )?;
+            client
+                .start(params, task)
+                .map(|status| LocalResult::HarnessPreparation { status })
+        }
         LocalRequest::HarnessProbe(params) => state
             .bridge_install
             .probe(&state.vault, state.device_id, params)

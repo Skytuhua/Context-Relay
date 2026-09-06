@@ -30,6 +30,25 @@ pub struct RetainedRuntime {
     reference: RetainedRuntimeReference,
 }
 
+/// Owns a durably prepared but unused copy. Dropping it removes only its holder;
+/// persist transfers that copy to the saved-plan lifecycle before sealing a plan.
+#[derive(Debug)]
+pub struct PreparedRuntime {
+    runtime: RetainedRuntime,
+    directory: tempfile::TempDir,
+}
+
+impl PreparedRuntime {
+    pub fn reference(&self) -> &RetainedRuntimeReference {
+        self.runtime.reference()
+    }
+    pub fn persist(self) -> RetainedRuntime {
+        let Self { runtime, directory } = self;
+        let _ = directory.keep();
+        runtime
+    }
+}
+
 /// Owns verified runtime file handles until the management process tree stops.
 /// The caller must transfer this entire value to the process guard; dropping it
 /// releases the locks. This is a byte lease, not an OS sandbox or launch approval.
@@ -76,6 +95,21 @@ impl CapturedRuntime {
         self.retain_controlled(&Control::new(cancelled, &mut report))
     }
 
+    pub fn prepare_owned_with_progress(
+        self,
+        cancelled: &AtomicBool,
+        mut report: impl FnMut(PreparationProgress),
+    ) -> Result<PreparedRuntime, ClientError> {
+        let control = Control::new(cancelled, &mut report);
+        let prepared = self.finish_retention(&control, |path| {
+            OsNativeFileSystem::new()
+                .synchronize_directory(path)
+                .map_err(|_| invalid())
+        })?;
+        control.ready();
+        Ok(prepared)
+    }
+
     pub(super) fn retain_controlled(
         self,
         control: &Control<'_>,
@@ -101,8 +135,18 @@ impl CapturedRuntime {
     fn retain_with_controlled_sync(
         self,
         control: &Control<'_>,
-        mut synchronize: impl FnMut(&Path) -> Result<(), ClientError>,
+        synchronize: impl FnMut(&Path) -> Result<(), ClientError>,
     ) -> Result<RetainedRuntime, ClientError> {
+        let runtime = self.finish_retention(control, synchronize)?.persist();
+        control.ready();
+        Ok(runtime)
+    }
+
+    fn finish_retention(
+        self,
+        control: &Control<'_>,
+        mut synchronize: impl FnMut(&Path) -> Result<(), ClientError>,
+    ) -> Result<PreparedRuntime, ClientError> {
         control.phase(PreparationPhase::Retaining)?;
         self.pin.verify_private().map_err(|_| invalid())?;
         self.container_pin.verify_private().map_err(|_| invalid())?;
@@ -170,14 +214,15 @@ impl CapturedRuntime {
             manifest,
             ..
         } = self;
-        let _ = _directory.keep();
-        control.ready();
-        Ok(RetainedRuntime {
-            pin,
-            container_pin,
-            root,
-            manifest,
-            reference,
+        Ok(PreparedRuntime {
+            runtime: RetainedRuntime {
+                pin,
+                container_pin,
+                root,
+                manifest,
+                reference,
+            },
+            directory: _directory,
         })
     }
 }
@@ -520,6 +565,42 @@ mod tests {
         )
         .unwrap();
         (temp, store, source, captured)
+    }
+
+    #[test]
+    fn unused_prepared_copy_is_removed_after_releasing_its_pins() {
+        let (_temp, store, source, captured) = fixture();
+        let prepared = captured
+            .prepare_owned_with_progress(&AtomicBool::new(false), |_| {})
+            .unwrap();
+        let holder = store.join(&prepared.reference().storage_key);
+        assert!(holder.exists());
+        drop(prepared);
+        assert!(!holder.exists());
+        assert_eq!(
+            fs::read(source.join("module.py")).unwrap(),
+            b"VALUE = 'approved'\n"
+        );
+    }
+
+    #[test]
+    fn prepared_copy_can_transfer_to_persisted_plan_ownership_after_ready() {
+        use std::sync::atomic::Ordering;
+        let (_temp, store, _source, captured) = fixture();
+        let cancelled = AtomicBool::new(false);
+        let prepared = captured
+            .prepare_owned_with_progress(&cancelled, |progress| {
+                if progress.phase == PreparationPhase::Ready {
+                    cancelled.store(true, Ordering::Release);
+                }
+            })
+            .unwrap();
+        let reference = prepared.reference().clone();
+        drop(prepared.persist());
+        RetainedRuntime::open(&store, &reference)
+            .unwrap()
+            .verify()
+            .unwrap();
     }
 
     #[test]

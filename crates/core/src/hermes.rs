@@ -130,6 +130,13 @@ pub struct HermesAdapter {
     retained_runtime: Option<retained_adapter::AdapterRuntime>,
 }
 
+enum DiscoveryVersion<'a> {
+    Probe,
+    Approved(&'a context_relay_protocol::SetupPlan),
+    #[cfg(windows)]
+    Preparation,
+}
+
 impl Clone for HermesAdapter {
     fn clone(&self) -> Self {
         Self {
@@ -215,7 +222,7 @@ impl HermesAdapter {
             project_id,
             origin_device,
             observed_hlc,
-            None,
+            DiscoveryVersion::Probe,
         )
     }
 
@@ -236,7 +243,29 @@ impl HermesAdapter {
             project_id,
             origin_device,
             observed_hlc,
-            Some(approved),
+            DiscoveryVersion::Approved(approved),
+        )
+    }
+
+    /// Resolves only Python installation metadata. Preparation must never run
+    /// the installed command, including when discovery finds a native binary.
+    #[cfg(windows)]
+    pub fn discover_for_preparation(
+        project_root: impl Into<PathBuf>,
+        working_directory: impl Into<PathBuf>,
+        requested_profile: &str,
+        project_id: ProjectId,
+        origin_device: DeviceId,
+        observed_hlc: HybridLogicalClock,
+    ) -> Result<Self, ClientError> {
+        Self::discover_inner(
+            project_root.into(),
+            working_directory.into(),
+            requested_profile,
+            project_id,
+            origin_device,
+            observed_hlc,
+            DiscoveryVersion::Preparation,
         )
     }
 
@@ -247,14 +276,14 @@ impl HermesAdapter {
         project_id: ProjectId,
         origin_device: DeviceId,
         observed_hlc: HybridLogicalClock,
-        approved: Option<&context_relay_protocol::SetupPlan>,
+        discovery: DiscoveryVersion<'_>,
     ) -> Result<Self, ClientError> {
         let default_hermes_home = default_hermes_home()?;
         let profile = profile::select_profile(&default_hermes_home, requested_profile)?;
         let executable =
             find_executable().ok_or_else(|| not_found("Hermes executable was not found"))?;
-        let (snapshot, version) = match approved {
-            Some(approved) => {
+        let (snapshot, version) = match discovery {
+            DiscoveryVersion::Approved(approved) => {
                 let snapshot = snapshot_executable(&executable)?;
                 let approved_path = fs::canonicalize(&executable)
                     .map_err(|_| invalid("Hermes executable cannot be safely resolved"))?;
@@ -266,7 +295,15 @@ impl HermesAdapter {
                 )?;
                 (snapshot, version)
             }
-            None => discover_executable_version(&executable)?,
+            #[cfg(windows)]
+            DiscoveryVersion::Preparation => {
+                let snapshot = snapshot_executable(&executable)?;
+                let installation = python_installation::inspect(&executable)?.ok_or_else(|| {
+                    invalid("This Hermes installation does not need Python runtime preparation")
+                })?;
+                (snapshot, installation.version)
+            }
+            DiscoveryVersion::Probe => discover_executable_version(&executable)?,
         };
         let installation_method = installation_method(&executable);
         Self::from_attested_layout(

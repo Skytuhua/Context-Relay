@@ -120,6 +120,9 @@ fn native_folder(path: &Path) -> WireNativeValue {
 
 #[derive(Default)]
 struct RecordingEngine {
+    preparation_starts: Arc<AtomicUsize>,
+    preparation_factories: AtomicUsize,
+    fail_repeated_preparation_factory: bool,
     reconciles: AtomicUsize,
     probes: Mutex<Vec<HarnessParams>>,
     previews: Mutex<Vec<(HarnessId, Option<String>)>>,
@@ -248,6 +251,40 @@ impl RecordingEngine {
 }
 
 impl BridgeInstallEngine for RecordingEngine {
+    fn prepare(
+        &self,
+        _vault: &Vault,
+        _vault_path: &Path,
+        _device_id: DeviceId,
+        _params: HarnessParams,
+    ) -> Result<context_relay_contextd::harness_preparation::PreparationTask, ClientError> {
+        if self.preparation_factories.fetch_add(1, Ordering::SeqCst) > 0
+            && self.fail_repeated_preparation_factory
+        {
+            return Err(conflict("Project path changed after preparation started"));
+        }
+        let starts = self.preparation_starts.clone();
+        Ok(Box::new(move |cancel, mut report| {
+            starts.fetch_add(1, Ordering::SeqCst);
+            report(
+                context_relay_core::hermes::python_runtime::PreparationProgress {
+                    phase: context_relay_core::hermes::python_runtime::PreparationPhase::Copying,
+                    completed_files: 3,
+                    completed_bytes: 65536,
+                },
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !cancel.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(ClientError {
+                code: ErrorCode::Canceled,
+                message: "Preparation canceled".into(),
+                field_path: None,
+                retryable: false,
+            })
+        }))
+    }
     fn probe(
         &self,
         _vault: &Vault,
@@ -782,6 +819,132 @@ fn adjacent_locator_attests_the_platform_named_bridge_without_launching_it() {
 
     assert_eq!(located.path, std::fs::canonicalize(&bridge).unwrap());
     assert!(!canary.exists());
+}
+
+#[tokio::test]
+async fn preparation_ipc_stays_responsive_and_is_desktop_only() {
+    use context_relay_protocol::{
+        EmptyParams, HarnessPreparationIdParams, HarnessPreparationPhase as Phase,
+        HarnessPrepareParams, OperationId,
+    };
+    use tokio::time::{Duration, timeout};
+    let engine = Arc::new(RecordingEngine {
+        fail_repeated_preparation_factory: true,
+        ..Default::default()
+    });
+    let fixture = Fixture::start("harness-preparation", engine.clone(), None).await;
+    let params = HarnessPrepareParams {
+        operation_id: OperationId::new(Uuid::now_v7()).unwrap(),
+        selection: HarnessParams {
+            project_id: None,
+            harness: HarnessId::Hermes,
+            hermes_profile: Some("default".into()),
+        },
+    };
+    let id = HarnessPreparationIdParams {
+        operation_id: params.operation_id,
+    };
+    for role in [
+        ClientRole::Installer,
+        ClientRole::McpBridge,
+        ClientRole::DesktopRecoveryHost,
+    ] {
+        let mut client = RawClient::connect(&fixture.runtime, role).await;
+        for request in [
+            LocalRequest::HarnessPrepare(params.clone()),
+            LocalRequest::HarnessPreparationStatus(id.clone()),
+            LocalRequest::HarnessPreparationCancel(id.clone()),
+        ] {
+            assert_eq!(
+                client.call(request).await.unwrap_err().code,
+                ErrorCode::ScopeDenied
+            );
+        }
+    }
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    assert!(matches!(
+        timeout(
+            Duration::from_secs(3),
+            client.call(LocalRequest::HarnessPrepare(params.clone()))
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        LocalResult::HarnessPreparation { .. }
+    ));
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let LocalResult::HarnessPreparation { status } = client
+                .call(LocalRequest::HarnessPreparationStatus(id.clone()))
+                .await
+                .unwrap()
+            else {
+                panic!("preparation status")
+            };
+            if status.phase == Phase::Copying {
+                assert_eq!(status.completed_bytes, 65536);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        timeout(
+            Duration::from_secs(3),
+            client.call(LocalRequest::ProjectsList(EmptyParams {}))
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        LocalResult::Projects { .. }
+    ));
+    client
+        .call(LocalRequest::HarnessPrepare(params))
+        .await
+        .unwrap();
+    assert_eq!(engine.preparation_starts.load(Ordering::SeqCst), 1);
+    assert_eq!(engine.preparation_factories.load(Ordering::SeqCst), 1);
+    let LocalResult::HarnessPreparation { status } = timeout(
+        Duration::from_secs(3),
+        client.call(LocalRequest::HarnessPreparationCancel(id.clone())),
+    )
+    .await
+    .unwrap()
+    .unwrap() else {
+        panic!("cancel status")
+    };
+    assert!(matches!(status.phase, Phase::Cancelling | Phase::Canceled));
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let LocalResult::HarnessPreparation { status } = client
+                .call(LocalRequest::HarnessPreparationStatus(id.clone()))
+                .await
+                .unwrap()
+            else {
+                panic!("preparation status")
+            };
+            if status.phase == Phase::Canceled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let config = fixture.stop().await;
+    let fixture = Fixture::from_config(config, engine).await;
+    let mut client = RawClient::connect(&fixture.runtime, ClientRole::Desktop).await;
+    assert_eq!(
+        client
+            .call(LocalRequest::HarnessPreparationStatus(id))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound
+    );
+    fixture.stop().await;
 }
 
 struct Fixture {

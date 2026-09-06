@@ -243,9 +243,9 @@ fn verify_server_proof(
 
 #[test]
 fn challenged_hmac_matches_frozen_vector() {
-    // The protocol bytes are part of the authenticated transcript. This 1.7
+    // The protocol bytes are part of the authenticated transcript. This 1.8
     // vector was independently checked with .NET HMACSHA256.
-    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 7 });
+    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 8 });
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
     let proof = create_proof(
         &token,
@@ -258,7 +258,7 @@ fn challenged_hmac_matches_frozen_vector() {
 
     assert_eq!(
         serde_json::to_string(&proof).unwrap(),
-        r#""itoDDW-_-x-X6lYNkdv4ZhaVwevYYKAbfrUG43kgbQE""#
+        r#""h2ShGJB9WDEkjDgUHkXeHQmXCjL8_XlIP7tyj4tCVeg""#
     );
     assert!(
         verify_proof(
@@ -442,7 +442,7 @@ fn auth_server_hello_is_strict_and_requires_a_32_byte_challenge() {
 
 #[test]
 fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
-    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 7 });
+    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 8 });
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
     let client_proof = create_proof(
         &token,
@@ -464,7 +464,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
 
     assert_eq!(
         serde_json::to_string(&server_proof).unwrap(),
-        r#""Gd5796ZMlG2VxuEzUskbxg6mFoLgvzfDE2g6LZ6xvdo""#
+        r#""Md0XCrMkyPiifISGGuo2rWv4oZ8eroQt_LP7H7gAYR0""#
     );
     assert!(
         verify_server_proof(

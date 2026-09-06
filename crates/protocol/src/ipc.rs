@@ -58,6 +58,54 @@ macro_rules! params { ($name:ident { $($(#[$field_attr:meta])* $field:ident : $t
     pub struct $name { $($(#[$field_attr])* pub $field:$ty),* }
 }; }
 params!(EmptyParams {});
+params!(HarnessPrepareParams {
+    operation_id: OperationId,
+    selection: HarnessParams
+});
+params!(HarnessPreparationIdParams {
+    operation_id: OperationId
+});
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessPreparationPhase {
+    Inspecting,
+    Copying,
+    CheckingSource,
+    CheckingCopy,
+    Retaining,
+    Cancelling,
+    Ready,
+    Canceled,
+    Failed,
+}
+
+params!(HarnessPreparationStatus {
+    operation_id: OperationId,
+    selection: HarnessParams,
+    phase: HarnessPreparationPhase,
+    completed_files: u32,
+    completed_bytes: u32,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    error: Option<ClientError>
+});
+
+impl HarnessPreparationStatus {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_harness_profile(&self.selection)?;
+        if self.selection.harness != HarnessId::Hermes
+            || self.completed_files > 32768
+            || self.completed_bytes > 1_073_741_824
+            || (self.phase == HarnessPreparationPhase::Failed) != self.error.is_some()
+        {
+            return Err(ValidationError::Invalid("harnessPreparation"));
+        }
+        if let Some(error) = &self.error {
+            required_text(&error.message, "harnessPreparation.error", MAX_TITLE_BYTES)?;
+        }
+        Ok(())
+    }
+}
 params!(ProjectParams {
     project_id: ProjectId
 });
@@ -566,6 +614,9 @@ pub enum LocalRequest {
     AccessGet(HarnessParams),
     AccessSet(AccessSetParams),
     HarnessProbe(HarnessParams),
+    HarnessPrepare(HarnessPrepareParams),
+    HarnessPreparationStatus(HarnessPreparationIdParams),
+    HarnessPreparationCancel(HarnessPreparationIdParams),
     HarnessPreview(HarnessParams),
     HarnessApply(PlanParams),
     HarnessRepair(HarnessParams),
@@ -680,6 +731,13 @@ impl LocalRequest {
             .validate(),
             Self::HarnessProbe(p) | Self::HarnessPreview(p) | Self::HarnessRepair(p) => {
                 validate_harness_profile(p)
+            }
+            Self::HarnessPrepare(p) => {
+                validate_harness_profile(&p.selection)?;
+                if p.selection.harness != HarnessId::Hermes {
+                    return Err(ValidationError::Invalid("harnessPrepare.selection"));
+                }
+                Ok(())
             }
             Self::AccessGet(p) if p.hermes_profile.is_some() => {
                 Err(ValidationError::Invalid("accessGet.hermesProfile"))
@@ -1010,6 +1068,9 @@ pub enum AccountDeletionState {
     rename_all_fields = "camelCase"
 )]
 pub enum LocalResult {
+    HarnessPreparation {
+        status: HarnessPreparationStatus,
+    },
     DesktopWrite {
         write: Option<crate::DesktopWrite>,
     },
@@ -1107,6 +1168,9 @@ pub enum LocalResult {
     deny_unknown_fields
 )]
 enum LocalResultSerde {
+    HarnessPreparation {
+        status: HarnessPreparationStatus,
+    },
     DesktopWrite {
         #[serde(deserialize_with = "crate::required_nullable")]
         write: Option<crate::DesktopWrite>,
@@ -1199,6 +1263,7 @@ enum LocalResultSerde {
 impl LocalResult {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::HarnessPreparation { status } => status.validate(),
             Self::DesktopWrite { write } => {
                 write.as_ref().map_or(Ok(()), crate::DesktopWrite::validate)
             }
