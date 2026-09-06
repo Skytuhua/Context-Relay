@@ -79,7 +79,7 @@ async fn actual_codex_exchanges_memory_and_tasks_with_the_production_dispatcher(
             )],
         )
         .unwrap();
-    let hooks = context_relay_core::native_memory::managed_memory_hooks(
+    let hooks = context_relay_contextd::test_support::test_managed_memory_hooks(
         HarnessId::Codex,
         &wire_path(&fs::canonicalize(&bridge_path).unwrap()),
     )

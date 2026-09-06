@@ -117,8 +117,11 @@ fn adapter_fixture() -> AdapterFixture {
     let user_skills_dir = root.path().join("home/.agents/skills");
     fs::create_dir_all(&codex_home).unwrap();
     fs::create_dir_all(&user_skills_dir).unwrap();
-    let quoted_project =
-        serde_json::to_string(fs::canonicalize(&project_root).unwrap().to_str().unwrap()).unwrap();
+    let physical_project = fs::canonicalize(&project_root).unwrap();
+    let project_key = physical_project.as_path();
+    #[cfg(windows)]
+    let project_key = dunce::simplified(project_key);
+    let quoted_project = serde_json::to_string(project_key.to_str().unwrap()).unwrap();
     fs::write(
         codex_home.join("config.toml"),
         format!("[projects.{quoted_project}]\ntrust_level = \"trusted\"\n"),

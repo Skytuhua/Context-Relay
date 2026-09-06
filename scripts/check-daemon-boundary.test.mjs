@@ -117,6 +117,24 @@ fn main() {
 
     const testSupport = cargo(['--features', 'daemon-test-support']);
     assert.equal(testSupport.status, 0, testSupport.stderr);
+
+    // Probe this helper alone so another missing authority symbol cannot hide
+    // an accidental production export in the combined contract above.
+    writeFileSync(
+      join(fixture, 'src/main.rs'),
+      `use context_relay_contextd::test_support::test_managed_memory_hooks;
+
+fn main() { let _ = test_managed_memory_hooks; }
+`,
+    );
+    const productionHooks = cargo();
+    assert.notEqual(productionHooks.status, 0, 'production build exposed managed memory hooks');
+    assert.match(
+      productionHooks.stderr,
+      /error\[E0432\]: unresolved import `context_relay_contextd::test_support::test_managed_memory_hooks`/,
+    );
+    const testSupportHooks = cargo(['--features', 'daemon-test-support']);
+    assert.equal(testSupportHooks.status, 0, testSupportHooks.stderr);
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }

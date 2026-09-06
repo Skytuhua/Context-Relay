@@ -73,10 +73,13 @@ fn fixture_with_requirements(source: &str, bind_requirements: bool) -> Fixture {
     let home = root.join("home");
     let project_root = root.join("project with spaces");
     let working_directory = project_root.join("service");
+    let project_key = project_root.as_path();
+    #[cfg(windows)]
+    let project_key = dunce::simplified(project_key);
     materialize_substituting(
         &codex_home,
         fixture["codexHome"].as_object().unwrap(),
-        &project_root,
+        project_key,
     );
     if let Some(extra) = fixture["nativeMemoryConfigToml"].as_str() {
         let config_path = codex_home.join("config.toml");
@@ -1020,7 +1023,10 @@ fn native_memory_disable_deduplicates_overlapping_global_and_project_config() {
     let mut layout = fixture.layout.clone();
     layout.codex_home = layout.project_root.join(".codex");
     let config = layout.codex_home.join("config.toml");
-    let trusted_root = toml_edit::Value::from(layout.project_root.display().to_string());
+    let project_key = layout.project_root.as_path();
+    #[cfg(windows)]
+    let project_key = dunce::simplified(project_key);
+    let trusted_root = toml_edit::Value::from(project_key.display().to_string());
     fs::write(&config, format!("[memories]\ngenerate_memories = true\n[projects.{trusted_root}]\ntrust_level = \"trusted\"\n")).unwrap();
     let device = DeviceId::from_str(DEVICE_ID).unwrap();
     let adapter = CodexAdapter::from_layout(
@@ -1477,6 +1483,59 @@ fn untrusted_projects_skip_project_config_hooks_and_rules() {
             .iter()
             .any(|component| component.name == "release")
     );
+}
+
+#[test]
+fn explicit_nested_distrust_blocks_setup_and_skips_only_that_native_layer() {
+    let fixture = fixture(include_str!("fixtures/codex-0.144.1.json"));
+    let config = fixture.codex_home.join("config.toml");
+    let child = fixture.layout.working_directory.as_path();
+    #[cfg(windows)]
+    let child = dunce::simplified(child);
+    let mut contents = fs::read_to_string(&config).unwrap();
+    contents.push_str(&format!(
+        "\n[projects.{}]\ntrust_level = 'untrusted'\n",
+        serde_json::to_string(child.to_str().unwrap()).unwrap()
+    ));
+    fs::write(&config, &contents).unwrap();
+    let report = fixture
+        .adapter
+        .probe(&ProbeContext {
+            harness: HarnessId::Codex,
+            requested_profile: None,
+        })
+        .unwrap();
+    assert_eq!(report.capability, CapabilityLevel::Blocked);
+    let imported = import_everything(&fixture);
+    let locations = imported
+        .components
+        .iter()
+        .flat_map(|component| component.metadata.iter())
+        .filter(|(key, _)| key == "structuralLocation")
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        locations
+            .iter()
+            .any(|value| value.starts_with("project/.codex/config.toml#")),
+        "{locations:?}"
+    );
+    assert!(
+        !locations
+            .iter()
+            .any(|value| value.starts_with("project/service/.codex/")),
+        "{locations:?}"
+    );
+    assert!(
+        fixture
+            .adapter
+            .render(&DesiredState {
+                components: vec![],
+                scopes: vec![]
+            })
+            .is_err()
+    );
+    assert_eq!(fs::read_to_string(config).unwrap(), contents);
 }
 
 #[test]

@@ -1065,10 +1065,13 @@ fn codex_matrix_fixture_with_version(version: &str) -> MatrixFixture {
     let home = root.join("home");
     let project_root = root.join("project");
     let working_directory = project_root.join("service");
+    let project_key = project_root.as_path();
+    #[cfg(windows)]
+    let project_key = dunce::simplified(project_key);
     materialize_json_substituting(
         &codex_home,
         source["codexHome"].as_object().unwrap(),
-        &project_root,
+        project_key,
     );
     materialize_json(
         &home.join(".agents/skills"),

@@ -444,3 +444,16 @@ production dispatch with isolated IPC credentials. All 66 MCP suite tests and
 all-target Clippy pass. See [native round-trip evidence](codex-mcp-roundtrip-2026-09-06.md)
 for the exact boundary; installed entry points, native trust readback, full setup
 and the unchanged installer still require acceptance.
+
+Codex project trust now uses native Windows lookup keys and respects explicit
+nested-directory decisions. Fourteen actual app-server readbacks match the
+adapter's effective layers; mixed-trust setups remain blocked. The affected
+201 source tests and core/daemon/MCP Clippy pass. See [project-trust evidence](codex-project-trust-2026-09-06.md).
+This removes a configuration-discovery mismatch without writing trust, enabling
+another Full version or changing the installed candidate.
+
+The previous native MCP fixture violated the client/core dependency policy in
+hosted CI. Its hook factory now uses the daemon's feature-gated test interface.
+The unchanged boundary checker, seven tests including an isolated compilation
+probe, and rebuilt real Codex round trips pass locally. The [MCP evidence](codex-mcp-roundtrip-2026-09-06.md)
+records the hosted failure and correction; installed acceptance remains open.

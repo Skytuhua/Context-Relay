@@ -164,3 +164,16 @@ passes memory and task exchanges on CLI/app-server with production dispatch,
 isolated authenticated IPC and daemon-restart persistence. The 66-test MCP suite
 and all-target Clippy pass. Installed process/credential binding, full native
 setup and effective trust readback remain open; this does not enable a Full version.
+
+2026-09-06 project-trust update: [native comparison](codex-project-trust-2026-09-06.md)
+identified Windows key normalization and nested-directory distrust mismatches.
+The adapter now matches fourteen actual app-server cases for the selected layer,
+with mixed-trust setup blocked. All 201 affected source tests and core/daemon/MCP
+Clippy pass. A live readiness endpoint and the remaining native/installed gates
+are still required; the full product goal remains incomplete.
+
+The native MCP test's direct core dependency, rejected by the previous hosted
+daemon-boundary job, is removed. Its replacement is a feature-gated daemon test
+helper with a standalone negative/positive compilation contract. The unchanged
+checker, all seven boundary tests and the rebuilt native round trips pass.
+This repairs the test architecture without relaxing the production boundary.

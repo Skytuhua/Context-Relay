@@ -74,6 +74,28 @@ Local logs under `.codex/context-relay-closeout-2026-09-05/`:
 `codex-mcp-discovery-clippy.log`. Intermediate native logs retain fixture-format
 diagnostics. No normal user data, installed configuration or native UI was used.
 
+## Test dependency correction
+
+The next hosted CI run, `34003571753`, caught a direct core dev-dependency in
+the native MCP fixture. The unchanged daemon-boundary checker correctly rejected
+it. The fixture now obtains production-generated hooks through the daemon's
+feature-gated test-support interface, removing the direct client/core dependency.
+The production dispatcher and client dependency policy are unchanged.
+
+The boundary checker and all seven boundary tests pass. A separate compilation
+probe imports only the new helper: it must fail with an unresolved import in a
+production build and compile with test support. This prevents another missing
+test-only symbol from masking an accidental export. Independent review approved
+the correction and the isolated probe. Core, daemon and MCP all-target Clippy
+with test support and warnings denied passes. After rebuilding the fixture,
+both real Codex sessions and restart readback pass again in 6.58 seconds.
+
+Evidence: `ci86-daemon-boundary.log`, `codex-native-boundary-red.log`,
+`codex-native-boundary-green.log`, `codex-native-boundary-tests-final.log`,
+`codex-project-trust-mcp-build.log`, `codex-project-trust-mcp-native.log` and
+`codex-project-trust-clippy-complete.log` in the same local evidence directory.
+Local success does not change the failed hosted result for the previous commit.
+
 ## Remaining acceptance
 
 This qualifies real Codex clients against production dispatcher logic, using an

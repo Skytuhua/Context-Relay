@@ -1136,19 +1136,28 @@ impl CodexAdapter {
     }
 
     fn project_is_trusted(&self) -> Result<bool, ClientError> {
+        Ok(self
+            .project_trust_layers()?
+            .iter()
+            .all(|(_, trusted)| *trusted))
+    }
+
+    fn project_trust_layers(&self) -> Result<Vec<(PathBuf, bool)>, ClientError> {
+        let layers = self.project_layers()?;
         let Some(bytes) = read_optional_file(&self.layout.codex_home.join("config.toml"))? else {
-            return Ok(false);
+            return Ok(layers.into_iter().map(|path| (path, false)).collect());
         };
         let document = bytes_to_document(&bytes)?;
-        let root = self.layout.project_root.to_string_lossy();
-        Ok(document
-            .get("projects")
-            .and_then(Item::as_table)
-            .and_then(|projects| projects.get(root.as_ref()))
-            .and_then(Item::as_table)
-            .and_then(|project| project.get("trust_level"))
-            .and_then(Item::as_str)
-            == Some("trusted"))
+        let root_level = project_trust_for_path(&document, &self.layout.project_root)?;
+        layers
+            .into_iter()
+            .map(|path| {
+                // A directory's explicit decision wins over the project default,
+                // including an explicit denial within a trusted repository.
+                let level = project_trust_for_path(&document, &path)?.or(root_level);
+                Ok((path, level == Some(true)))
+            })
+            .collect()
     }
 
     fn config_path(&self, scope: &ScopeRef) -> Result<PathBuf, ClientError> {
@@ -1517,7 +1526,9 @@ impl CodexAdapter {
                 )?;
             }
             ScopeRef::Project { project_id } => {
-                for (index, directory) in self.project_layers()?.into_iter().enumerate() {
+                for (index, (directory, trusted)) in
+                    self.project_trust_layers()?.into_iter().enumerate()
+                {
                     self.import_instruction(
                         &directory,
                         ScopeRef::Project { project_id },
@@ -1536,7 +1547,7 @@ impl CodexAdapter {
                         components,
                         digests,
                     )?;
-                    if self.project_is_trusted()? {
+                    if trusted {
                         self.import_config(
                             &directory.join(".codex/config.toml"),
                             ScopeRef::Project { project_id },
@@ -2471,13 +2482,12 @@ impl CodexAdapter {
 
     fn effective_config_paths(&self) -> Result<Vec<(PathBuf, bool)>, ClientError> {
         let mut paths = vec![(self.layout.codex_home.join("config.toml"), false)];
-        if self.project_is_trusted()? {
-            paths.extend(
-                self.project_layers()?
-                    .into_iter()
-                    .map(|layer| (layer.join(".codex/config.toml"), true)),
-            );
-        }
+        paths.extend(
+            self.project_trust_layers()?
+                .into_iter()
+                .filter(|(_, trusted)| *trusted)
+                .map(|(layer, _)| (layer.join(".codex/config.toml"), true)),
+        );
         Ok(paths)
     }
 
@@ -3734,6 +3744,58 @@ fn reviewed_skill_files(root: &Path) -> Result<Vec<PathBuf>, ClientError> {
 
 fn canonical_existing_path(path: &Path) -> Result<PathBuf, ClientError> {
     fs::canonicalize(path).map_err(|_| invalid("Codex path cannot be safely resolved"))
+}
+
+/// Match Codex's project-trust keys without changing the physical paths used
+/// for reads, approval fingerprints or writes. A normalized exact entry wins
+/// over older mixed-case entries; the remaining aliases use lexical order.
+fn project_trust_for_path(
+    document: &DocumentMut,
+    canonical_path: &Path,
+) -> Result<Option<bool>, ClientError> {
+    let Some(projects) = document.get("projects") else {
+        return Ok(None);
+    };
+    let projects = projects
+        .as_table_like()
+        .ok_or_else(|| invalid("Codex project trust configuration is invalid"))?;
+    let mut levels = BTreeMap::new();
+    for (key, project) in projects.iter() {
+        let project = project
+            .as_table_like()
+            .ok_or_else(|| invalid("Codex project trust configuration is invalid"))?;
+        if let Some(level) = project.get("trust_level") {
+            let trusted = match level.as_str() {
+                Some("trusted") => true,
+                Some("untrusted") => false,
+                _ => return Err(invalid("Codex project trust configuration is invalid")),
+            };
+            levels.insert(key, trusted);
+        }
+    }
+    #[cfg(windows)]
+    let native_path = dunce::simplified(canonical_path);
+    #[cfg(not(windows))]
+    let native_path = canonical_path;
+    let native_key = native_path
+        .to_str()
+        .ok_or_else(|| invalid("Codex project trust path is not UTF-8"))?;
+    let key = if cfg!(windows) {
+        native_key.to_ascii_lowercase()
+    } else {
+        native_key.to_owned()
+    };
+    if let Some(level) = levels.get(key.as_str()) {
+        return Ok(Some(*level));
+    }
+    if cfg!(windows)
+        && let Some((_, level)) = levels
+            .iter()
+            .find(|(candidate, _)| candidate.to_ascii_lowercase() == key)
+    {
+        return Ok(Some(*level));
+    }
+    Ok(None)
 }
 
 fn canonical_existing_directory(path: &Path) -> Result<PathBuf, ClientError> {
@@ -5131,7 +5193,10 @@ mod tests {
         let executable = root.join("codex");
         fs::write(&executable, b"\x7fELFtest executable").unwrap();
         let sentinel = root.join("configured-stdio-ran");
-        let quoted_project = serde_json::to_string(&project_root.to_string_lossy()).unwrap();
+        let project_key = project_root.as_path();
+        #[cfg(windows)]
+        let project_key = dunce::simplified(project_key);
+        let quoted_project = serde_json::to_string(&project_key.to_string_lossy()).unwrap();
         let quoted_sentinel = serde_json::to_string(&sentinel.to_string_lossy()).unwrap();
         let global_config = codex_home.join("config.toml");
         fs::write(
@@ -5201,6 +5266,164 @@ mod tests {
             ),
             resulting_digests: vec![],
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_project_trust_recognizes_codex_keys_and_preserves_explicit_distrust() {
+        let fixture = effective_validation_fixture();
+        let physical = fixture.adapter.layout.project_root.to_str().unwrap();
+        let native = physical.strip_prefix(r"\\?\").unwrap();
+        let lower = native.to_ascii_lowercase();
+        let upper = native.to_ascii_uppercase();
+        for (entries, expected) in [
+            (vec![(lower.clone(), "trusted")], true),
+            (vec![(upper.clone(), "trusted")], true),
+            (vec![(physical.to_owned(), "trusted")], false),
+            (
+                vec![(upper.clone(), "trusted"), (lower.clone(), "untrusted")],
+                false,
+            ),
+            (
+                vec![
+                    (physical.to_owned(), "trusted"),
+                    (lower.clone(), "untrusted"),
+                ],
+                false,
+            ),
+            (vec![(upper, "untrusted"), (lower, "trusted")], true),
+        ] {
+            let config = entries
+                .iter()
+                .map(|(key, trust)| {
+                    format!(
+                        "[projects.{}]\ntrust_level = {trust:?}\n",
+                        serde_json::to_string(key).unwrap()
+                    )
+                })
+                .collect::<String>();
+            fs::write(&fixture.global_config, config).unwrap();
+            assert_eq!(
+                fixture.adapter.project_is_trusted().unwrap(),
+                expected,
+                "{entries:?}"
+            );
+            assert_eq!(
+                fixture.adapter.effective_config_paths().unwrap().len(),
+                if expected { 3 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn project_trust_requires_a_valid_explicit_level_and_accepts_inline_tables() {
+        let project = Path::new(if cfg!(windows) {
+            r"C:\Project Ä"
+        } else {
+            "/tmp/Project Ä"
+        });
+        let key = serde_json::to_string(project.to_str().unwrap()).unwrap();
+        for (body, expected) in [
+            (String::new(), None),
+            (format!("[projects.{key}]\n"), None),
+            (
+                format!("projects = {{ {key} = {{ trust_level = 'trusted' }} }}\n"),
+                Some(true),
+            ),
+            (
+                format!("[projects.{key}]\ntrust_level = 'untrusted'\n"),
+                Some(false),
+            ),
+        ] {
+            assert_eq!(
+                project_trust_for_path(&body.parse().unwrap(), project).unwrap(),
+                expected
+            );
+        }
+        for body in [
+            "projects = false".to_owned(),
+            format!("[projects]\n{key} = 'trusted'"),
+            format!("[projects.{key}]\ntrust_level = true"),
+            format!("[projects.{key}]\ntrust_level = 'unknown'"),
+        ] {
+            assert!(project_trust_for_path(&body.parse().unwrap(), project).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_nested_distrust_excludes_its_effective_configuration() {
+        let fixture = effective_validation_fixture();
+        let child = fixture.adapter.layout.working_directory.as_path();
+        #[cfg(windows)]
+        let child = dunce::simplified(child);
+        let mut config = fs::read_to_string(&fixture.global_config).unwrap();
+        config.push_str(&format!(
+            "\n[projects.{}]\ntrust_level = 'untrusted'\n",
+            serde_json::to_string(child.to_str().unwrap()).unwrap()
+        ));
+        fs::write(&fixture.global_config, config).unwrap();
+        assert_eq!(
+            fixture.adapter.effective_config_paths().unwrap(),
+            vec![
+                (fixture.global_config.clone(), false),
+                (fixture.root_config.clone(), true)
+            ]
+        );
+        assert!(!fixture.adapter.project_is_trusted().unwrap());
+        assert!(
+            fixture
+                .adapter
+                .policy_conflicts()
+                .unwrap()
+                .contains(&"project_untrusted".to_owned())
+        );
+        assert!(
+            !fixture
+                .adapter
+                .imported_mcp_declarations()
+                .unwrap()
+                .contains_key("nested")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_project_trust_keeps_verbatim_only_names_and_does_not_fold_unicode() {
+        for path in [
+            r"\\?\C:\temp\NUL",
+            r"\\?\C:\temp\trailing.",
+            r"\\?\C:\temp\trailing ",
+        ] {
+            let body = format!(
+                "[projects.{}]\ntrust_level = 'trusted'",
+                serde_json::to_string(path).unwrap()
+            );
+            assert_eq!(
+                project_trust_for_path(&body.parse().unwrap(), Path::new(path)).unwrap(),
+                Some(true)
+            );
+        }
+        let body: DocumentMut = "[projects.'c:\\project ä']\ntrust_level = 'trusted'"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            project_trust_for_path(&body, Path::new(r"\\?\C:\Project Ä")).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_project_trust_preserves_case() {
+        let body: DocumentMut = "[projects.'/tmp/Project']\ntrust_level = 'trusted'\n[projects.'/tmp/project']\ntrust_level = 'untrusted'".parse().unwrap();
+        assert_eq!(
+            project_trust_for_path(&body, Path::new("/tmp/Project")).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            project_trust_for_path(&body, Path::new("/tmp/project")).unwrap(),
+            Some(false)
+        );
     }
 
     fn effective_validation_output(
@@ -5338,8 +5561,10 @@ mod tests {
         );
         assert!(!fixture.sentinel.exists());
 
-        let quoted_project =
-            serde_json::to_string(&fixture.adapter.layout.project_root.to_string_lossy()).unwrap();
+        let project_key = fixture.adapter.layout.project_root.as_path();
+        #[cfg(windows)]
+        let project_key = dunce::simplified(project_key);
+        let quoted_project = serde_json::to_string(&project_key.to_string_lossy()).unwrap();
         fs::write(
             &fixture.global_config,
             format!(

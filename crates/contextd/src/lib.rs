@@ -2123,6 +2123,14 @@ pub mod test_support {
         primary_memory_instruction_component(harness, project_id, origin_device, created_hlc)
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn test_managed_memory_hooks(
+        harness: HarnessId,
+        bridge_executable: &WireNativeValue,
+    ) -> Result<Vec<ComponentRecord>, ClientError> {
+        context_relay_core::native_memory::managed_memory_hooks(harness, bridge_executable)
+    }
+
     #[derive(Clone)]
     pub struct TestDaemonConfig {
         runtime: RuntimeConfig,
