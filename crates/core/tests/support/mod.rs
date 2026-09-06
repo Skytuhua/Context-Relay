@@ -124,7 +124,8 @@ impl Drop for TempVault {
 pub fn remove_native_memory_migrations_after_schema_23(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TABLE native_memory_source_supersessions;
+            "DROP TABLE desktop_writes;
+             DROP TABLE native_memory_source_supersessions;
              ALTER TABLE native_memory_sources DROP COLUMN last_applied_managed_digest;",
         )
         .unwrap();

@@ -86,7 +86,6 @@ fn migration_v24_adds_the_managed_owned_digest_binding() {
     drop(raw);
 
     let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
-    assert_eq!(LATEST_SCHEMA_VERSION, 25);
     assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     drop(vault);
 
