@@ -36,7 +36,7 @@ and 64-KiB output bound; the outer fixture has a 150-second deadline. The cleare
 environment supplies only Windows runtime paths, explicit synthetic homes,
 standard executable extensions and the dummy fixture key.
 
-The 24-session matrix passes:
+The expanded 32-session matrix passes:
 
 - Both CLI and app-server with ordinary paths, spaces/Chinese/apostrophe/`$HOME`,
   shell punctuation/brackets, and all four smart single quotes.
@@ -45,6 +45,9 @@ The 24-session matrix passes:
   following the pinned upstream test's `hooks.state` representation.
 - Trusted definitions deliver SessionStart and Stop with matching session IDs
   and project working directories. App-server reports both hooks completed.
+- Hooks use the default feature setting. The pinned runtime enables them by
+  default; no `hooks=true` override is supplied. Explicit `hooks=false` suppresses
+  both hooks even when their exact definitions are trusted.
 - Changing the definitions' status messages makes them modified and inactive.
 - Every session uses exactly one local model request and preserves config bytes.
   No trust-bypass flag is used; the executable digest is checked again at exit.
@@ -59,6 +62,8 @@ cargo test --config 'profile.dev.package.sha2.opt-level=3' -p context-relay-core
 Evidence under `.codex/context-relay-closeout-2026-09-05/`:
 `codex-native-hooks-red.log`, `codex-native-hooks-smart-quote-red.log`, and
 `codex-native-hooks-reviewed-runtime.log` (24 sessions, 15.56 seconds).
+The later `harness-setup-status-native.log` expands this to 32 sessions in
+20.15 seconds, including default activation and the explicit-disable case.
 Core library checks pass 107 tests with five opt-in tests ignored; Codex and
 Claude adapter checks pass 67 and 63. The 17 primary-memory setup tests cover
 the native transaction and recovery. Core/daemon/MCP all-target test-support
@@ -80,9 +85,11 @@ The final Windows end-to-end suite passes all 10 tests in 17.45 seconds;
 commit remain separate from this local verification.
 
 This evidence qualifies generated commands in the tested Windows environment.
-It does not implement the product's hook-trust review, qualify custom shells,
+It does not implement native trust readback in the product, qualify custom shells,
 prove live production bridge delivery, or qualify macOS/installed acceptance.
 Codex requires [review of the exact current definitions](https://learn.chatgpt.com/docs/hooks).
 The fixture's trust writes must not be reused to silently trust real user hooks.
+The [desktop setup result](harness-setup-status-2026-09-06.md) now explains the
+Codex CLI review step without treating saved settings as a verified connection.
 Codex 0.144.6 remains ImportOnly. The local unsigned 11d6740 installer is unchanged
 and predates these corrections. Full connection and the product goal remain open.

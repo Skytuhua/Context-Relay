@@ -27,7 +27,7 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 function open() { return render(<HarnessesScreen gateway={new LocalWorkspaceGateway()} projects={[project]} />); }
-function preview() { fireEvent.click(screen.getByRole('button', { name: 'Check connection' })); }
+function preview() { fireEvent.click(screen.getByRole('button', { name: 'Review setup' })); }
 
 it.each([
   ['import_only', /This version cannot connect automatically yet/i],
@@ -43,7 +43,7 @@ it.each([
   if (capability !== 'missing') expect(screen.getByText(/0\.144\.6/)).toBeVisible();
   expect(requests).toEqual([{ method: 'harness_probe', params }]);
   expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'Check connection' })).toBeEnabled();
+  expect(screen.getByRole('button', { name: 'Review setup' })).toBeEnabled();
 });
 
 it('requests a fresh exact plan only after Full discovery and still requires approval', async () => {
@@ -53,9 +53,9 @@ it('requests a fresh exact plan only after Full discovery and still requires app
     return { kind: 'plan', data: { plan: { ...fixture, expiresAt: String(Date.now() + 60_000), targetScopes: [{ scope: 'project', projectId, root: fixture.executablePath }] } } };
   });
   open(); preview();
-  expect(await screen.findByRole('heading', { name: 'Review connection changes' })).toBeVisible();
+  expect(await screen.findByRole('heading', { name: 'Review setup changes' })).toBeVisible();
   expect(requests).toEqual([{ method: 'harness_probe', params }, { method: 'harness_preview', params }]);
-  expect(screen.getByRole('button', { name: 'Connect harness' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled();
 });
 
 it('discards discovery after selection changes without requesting the obsolete plan', async () => {
@@ -69,7 +69,7 @@ it('discards discovery after selection changes without requesting the obsolete p
   fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'claude_code' } });
   await act(async () => resolve(response({ ...report, capability: 'full' })));
   expect(requests).toEqual([{ method: 'harness_probe', params }]);
-  expect(screen.queryByRole('heading', { name: 'Review connection changes' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('heading', { name: 'Review setup changes' })).not.toBeInTheDocument();
   expect(screen.queryByText(/0\.144\.6/)).not.toBeInTheDocument();
 });
 
@@ -83,7 +83,7 @@ it('binds Hermes discovery and approval to its canonical profile name', async ()
   fireEvent.change(screen.getByRole('combobox', { name: 'Harness' }), { target: { value: 'hermes' } });
   fireEvent.change(screen.getByRole('textbox', { name: 'Hermes profile' }), { target: { value: ' Coder ' } });
   preview();
-  expect(await screen.findByRole('heading', { name: 'Review connection changes' })).toBeVisible();
+  expect(await screen.findByRole('heading', { name: 'Review setup changes' })).toBeVisible();
   expect(requests).toEqual(['harness_probe', 'harness_preview'].map(method => ({ method, params: { harness: 'hermes', projectId, hermesProfile: 'coder' } })));
   expect(screen.getByRole('checkbox', { name: /I reviewed/ })).toBeEnabled();
 });
@@ -94,9 +94,9 @@ it('offers the default Hermes profile and explains that a folder path is invalid
   expect(screen.getByRole('textbox', { name: 'Hermes profile' })).toHaveValue('default');
   expect(screen.getByText(/Use a profile name, such as default or coder/)).toBeVisible();
   fireEvent.change(screen.getByRole('textbox', { name: 'Hermes profile' }), { target: { value: 'C:\\Users\\User\\AppData\\Local\\hermes' } });
-  expect(screen.getByRole('button', { name: 'Check connection' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Review setup' })).toBeDisabled();
   expect(screen.getByRole('textbox', { name: 'Hermes profile' })).toHaveAttribute('aria-invalid', 'true');
-  fireEvent.submit(screen.getByRole('form', { name: 'Check harness connection' }));
+  fireEvent.submit(screen.getByRole('form', { name: 'Review harness setup' }));
   expect(requests).toEqual([]);
 });
 
@@ -140,7 +140,7 @@ it.each([
 ])('rejects invalid discovery %# without exposing raw payloads or requesting a plan', async value => {
   invoke.mockImplementation(async (_command, { request }: { request: LocalRequest }) => { requests.push(request); return response(value); });
   open(); preview();
-  expect(await screen.findByRole('alert')).toHaveTextContent(/Could not check this connection/i);
+  expect(await screen.findByRole('alert')).toHaveTextContent(/Could not review this setup/i);
   expect(requests).toEqual([{ method: 'harness_probe', params }]);
   expect(screen.queryByText(/PRIVATE-/)).not.toBeInTheDocument();
   expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();

@@ -4,7 +4,7 @@ import { type HarnessGateway, validateHarnessPlan, validateHarnessProbe } from '
 
 const harnessNames: Record<HarnessId, string> = { claude_code: 'Claude Code', codex: 'Codex', hermes: 'Hermes' };
 type ReviewedPlan = { plan: SetupPlan; params: HarnessParams; projectName: string };
-type AppliedPlan = ReviewedPlan & { connectionNumber: number; connectedAt: number };
+type AppliedPlan = ReviewedPlan & { setupNumber: number; savedAt: number };
 type BusyAction = 'preview' | 'apply' | 'rollback' | null;
 
 export function HarnessesScreen({ gateway, projects, preferredProjectId, onProjectChange, onAddProject, onSaveContext, active = true }: { gateway: HarnessGateway; projects: ProjectIdentity[]; preferredProjectId?: string; onProjectChange?: (id: string) => void; onAddProject?: () => void; onSaveContext?: () => void; active?: boolean }) {
@@ -18,7 +18,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   const [discovery, setDiscovery] = useState<{ harness: HarnessId; report: ProbeReport } | null>(null);
   const [approved, setApproved] = useState(false);
   const [applied, setApplied] = useState<AppliedPlan[]>([]);
-  const nextConnectionNumber = useRef(1);
+  const nextSetupNumber = useRef(1);
   const [rollbackTarget, setRollbackTarget] = useState<PlanId | null>(null);
   const [busy, setBusy] = useState<BusyAction>(null);
   const [error, setError] = useState<string | null>(null);
@@ -118,14 +118,15 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
     try {
       await gateway.harnessApply(approvedReview.plan.planId);
       if (!mounted.current) return;
-      const connection = { ...approvedReview, connectionNumber: nextConnectionNumber.current++, connectedAt: Date.now() };
-      setApplied((items) => [...items.filter((item) => item.plan.planId !== approvedReview.plan.planId), connection]);
+      const saved = { ...approvedReview, setupNumber: nextSetupNumber.current++, savedAt: Date.now() };
+      setApplied((items) => [...items.filter((item) => item.plan.planId !== approvedReview.plan.planId), saved]);
       setReview(null);
-      setNotice(`Connected: ${label(approvedReview)}.`);
+      // Apply acknowledges the configuration transaction, not a live harness session.
+      setNotice(`Settings saved: ${label(approvedReview)}.`);
     } catch {
       if (mounted.current) {
         setReview(null);
-        setError('The connection could not be confirmed. Check the connection again to review the latest changes before retrying.');
+        setError('Saving these settings could not be confirmed. Select Review setup to see the latest changes before retrying.');
       }
     } finally { finish(); }
   }
@@ -139,7 +140,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
       if (!mounted.current) return;
       setApplied((items) => items.filter((current) => current.plan.planId !== item.plan.planId));
       setReview(null);
-      setNotice(`Connection changes undone: ${label(item)}.`);
+      setNotice(`Setup changes undone: ${label(item)}.`);
     } catch {
       if (mounted.current) setError('Undo could not be confirmed. Check the harness configuration before trying to undo these changes again.');
     } finally { finish(); }
@@ -154,9 +155,9 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
 
   return (
     <section className="screen-content harness-connection" aria-label="Harness connection">
-      <form className="capture-form" aria-label="Check harness connection" onSubmit={(event) => { event.preventDefault(); void previewSetup(); }}>
+      <form className="capture-form" aria-label="Review harness setup" onSubmit={(event) => { event.preventDefault(); void previewSetup(); }}>
         <h2>Connect a harness</h2>
-        <p>Choose your project and harness. Check compatibility, then review the changes before connecting.</p>
+        <p>Choose your project and harness to check compatibility and review the settings.</p>
         <div className="field">
           <label htmlFor="harness-project">Project</label>
           <select id="harness-project" value={projectId} disabled={busy === 'apply' || busy === 'rollback'} onChange={(event) => { clearReview(); if (onProjectChange) onProjectChange(event.target.value); else setProjectId(event.target.value); }}>
@@ -175,14 +176,14 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
           <input id="hermes-profile" value={profile} maxLength={64} required aria-invalid={!validProfile} aria-describedby="hermes-profile-help" disabled={busy === 'apply' || busy === 'rollback'} onChange={(event) => { clearReview(); setProfile(event.target.value); }} />
           <p id="hermes-profile-help">Use a profile name, such as default or coder. Leave default selected unless you created another profile. Folder paths are not profile names.</p>
         </div>}
-        <button className="primary-action" type="submit" disabled={!!busy || !project || (harness === 'hermes' && !validProfile)}>{busy === 'preview' ? 'Checking harness…' : 'Check connection'}</button>
+        <button className="primary-action" type="submit" disabled={!!busy || !project || (harness === 'hermes' && !validProfile)}>{busy === 'preview' ? 'Checking harness…' : 'Review setup'}</button>
       </form>
       {error && <p className="form-error" role="alert">{error}</p>}
       {notice && <p className="notice" role="status">{notice}</p>}
       {discovery && <section className="connection-result" aria-label="Harness availability">
         <h2>{harnessNames[discovery.harness]}{discovery.report.harnessVersion && discovery.report.harnessVersion !== 'unknown' ? ` ${discovery.report.harnessVersion}` : ''}</h2>
         <p role="status">{discovery.report.capability === 'missing'
-          ? `${harnessNames[discovery.harness]} was not found. Install it, restart Context Relay and check the connection again.`
+          ? `${harnessNames[discovery.harness]} was not found. Install it, restart Context Relay and select Review setup again.`
           : discovery.report.capability === 'blocked'
             ? 'Local policy prevents automatic setup. Check the restrictions configured for this harness before trying again.'
             : discovery.harness === 'hermes' && discovery.report.harnessVersion === 'unknown'
@@ -192,31 +193,33 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
         {onSaveContext && <button className="secondary-action" type="button" disabled={!!busy} onClick={onSaveContext}>Save context</button>}
         {discovery.report.executable && <details className="technical-details"><summary>Technical details</summary><p>Executable: {nativeText(discovery.report.executable)}</p></details>}
       </section>}
-      {busy && <p role="status">{busy === 'preview' ? 'Checking the installed harness…' : busy === 'apply' ? 'Connecting your harness…' : 'Undoing connection changes…'}</p>}
+      {busy && <p role="status">{busy === 'preview' ? 'Checking the installed harness…' : busy === 'apply' ? 'Saving harness settings…' : 'Undoing setup changes…'}</p>}
       {review && <section className="record-card" aria-labelledby="harness-review-title">
-        <h2 id="harness-review-title">Review connection changes</h2>
+        <h2 id="harness-review-title">Review setup changes</h2>
         <p>{label(review)}</p>
         <PlanDetails plan={review.plan} projectName={review.projectName} />
-        {expired && <p className="form-error">This connection check has expired. Check the connection again.</p>}
-        {conflicts && <p className="form-error">Resolve the conflicting settings shown above, then check the connection again.</p>}
-        {!matching && <p className="form-error">The project or harness changed. Check the connection again.</p>}
+        {review.params.harness === 'codex' && <p>After saving, review the Context Relay session hooks in the Codex CLI. Codex requires approval before new or changed hooks can run.</p>}
+        {expired && <p className="form-error">This setup review has expired. Select Review setup again.</p>}
+        {conflicts && <p className="form-error">Resolve the conflicting settings shown above, then select Review setup again.</p>}
+        {!matching && <p className="form-error">The project or harness changed. Select Review setup again.</p>}
         <label>
           <input type="checkbox" checked={approved} disabled={!!busy || expired || conflicts || !matching} onChange={(event) => setApproved(event.target.checked)} />
-          I reviewed and approve these connection changes.
+          I reviewed and approve these settings.
         </label>
-        <button className="primary-action" type="button" disabled={!canApply} onClick={() => void applySetup()}>{busy === 'apply' ? 'Connecting…' : 'Connect harness'}</button>
+        <button className="primary-action" type="button" disabled={!canApply} onClick={() => void applySetup()}>{busy === 'apply' ? 'Saving settings…' : 'Save settings'}</button>
       </section>}
-      {applied.length > 0 && <section aria-label="Recent connections">
-        <h2>Recent connections</h2>
+      {applied.length > 0 && <section aria-label="Recent setup changes">
+        <h2>Recent setup changes</h2>
         <ul className="record-list">{applied.map((item) => <li className="record-card" key={item.plan.planId}>
           <h3>{label(item)}</h3>
-          <p className="help-text">Connection {item.connectionNumber} · {new Date(item.connectedAt).toLocaleString()} · Version {item.plan.harnessVersion}</p>
-          <details className="connection-history-details"><summary>View these connection changes</summary><PlanDetails plan={item.plan} projectName={item.projectName} /></details>
-          <button className="secondary-action" type="button" disabled={!!busy} onClick={() => setRollbackTarget(item.plan.planId)}>Undo connection {item.connectionNumber} for {label(item)}</button>
+          <p className="help-text">Setup {item.setupNumber} · {new Date(item.savedAt).toLocaleString()} · Version {item.plan.harnessVersion}</p>
+          <SetupNextSteps item={item} />
+          <details className="connection-history-details"><summary>View saved changes</summary><PlanDetails plan={item.plan} projectName={item.projectName} /></details>
+          <button className="secondary-action" type="button" disabled={!!busy} onClick={() => setRollbackTarget(item.plan.planId)}>Undo setup {item.setupNumber} for {label(item)}</button>
           {rollbackTarget === item.plan.planId && <div role="group" aria-label={`Confirm rollback of ${label(item)}`}>
-            <p>Restore the configuration from before this connection? Context Relay will check for changes made since then.</p>
-            <button type="button" className="primary-action" disabled={!!busy} onClick={() => void rollbackSetup(item)}>Undo connection changes</button>
-            <button type="button" className="secondary-action" disabled={!!busy} onClick={() => setRollbackTarget(null)}>Keep connection</button>
+            <p>Restore the configuration from before this setup? Context Relay will check for changes made since then.</p>
+            <button type="button" className="primary-action" disabled={!!busy} onClick={() => void rollbackSetup(item)}>Undo setup changes</button>
+            <button type="button" className="secondary-action" disabled={!!busy} onClick={() => setRollbackTarget(null)}>Keep settings</button>
           </div>}
         </li>)}</ul>
       </section>}
@@ -224,23 +227,38 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   );
 }
 
+function SetupNextSteps({ item }: { item: ReviewedPlan }) {
+  return <section aria-label={`Finish setup for ${label(item)}`}>
+    <h4>Connection has not been verified</h4>
+    {item.params.harness === 'codex' ? <>
+      <p>Codex needs your approval to run the session hooks that load and collect context.</p>
+      <ol>
+        <li>Open the Codex CLI in the folder for {item.projectName}.</li>
+        <li>Enter <code>/hooks</code>. Review the Context Relay commands for <code>SessionStart</code> and <code>Stop</code>, then trust each command you approve.</li>
+        <li>Start a new Codex session in that project.</li>
+      </ol>
+      <p>If these hooks are already trusted, you can start a new session. New or changed commands need review again.</p>
+    </> : <p>Start a new {harnessNames[item.params.harness]} session for {item.projectName} to load the saved settings.</p>}
+  </section>;
+}
+
 function setupError(error: unknown, harness: HarnessId) {
   // Map only known daemon errors to fixed guidance. Never display raw native output.
   if (error && typeof error === 'object' && 'code' in error && 'message' in error && error.code === 'not_found') {
     if (harness === 'claude_code' && error.message === 'Claude Code executable was not found') {
-      return 'The Claude Code command-line executable was not found. Install the native Claude Code CLI and restart Context Relay, then check the connection again.';
+      return 'The Claude Code command-line executable was not found. Install the native Claude Code CLI and restart Context Relay, then select Review setup again.';
     }
     if (harness === 'hermes' && error.message === 'Hermes profile was not found') {
       return 'That Hermes profile was not found. Enter the name of an existing profile, or use default for your main Hermes profile.';
     }
     if (harness === 'hermes' && error.message === 'Hermes default profile was not found') {
-      return 'The Hermes home folder is unavailable. Open Hermes to check its setup, then check the connection again. The profile field takes a name such as default, not the home folder path.';
+      return 'The Hermes home folder is unavailable. Open Hermes to check its setup, then select Review setup again. The profile field takes a name such as default, not the home folder path.';
     }
     if (harness === 'hermes' && error.message === 'Hermes executable was not found') {
-      return 'The Hermes command-line executable was not found. Check your Hermes installation and restart Context Relay, then check the connection again.';
+      return 'The Hermes command-line executable was not found. Check your Hermes installation and restart Context Relay, then select Review setup again.';
     }
   }
-  return 'Could not check this connection. Try again. If it still fails, restart Context Relay and make sure the project folder is available.';
+  return 'Could not review this setup. Try again. If it still fails, restart Context Relay and make sure the project folder is available.';
 }
 
 function label(item: ReviewedPlan) {

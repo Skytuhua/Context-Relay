@@ -83,7 +83,7 @@ async function run(entry, args, action) {
   } finally { clearTimeout(timer); child.kill(); }
 }
 
-async function listedHooks(entry, session = false) {
+async function listedHooks(entry, session = false, expectedHooks = 2) {
   return (await run(entry, ['app-server', '--listen', 'stdio://'], async child => {
     let nextId = 0;
     const pending = new Map();
@@ -121,7 +121,7 @@ async function listedHooks(entry, session = false) {
       const listed = await request('hooks/list', { cwds: [entry.project] });
       assert.equal(listed.data.length, 1);
       assert.deepEqual(listed.data[0].errors, []);
-      assert.equal(listed.data[0].hooks.length, 2);
+      assert.equal(listed.data[0].hooks.length, expectedHooks);
       let sessionResult;
       if (session) {
         const started = await request('thread/start', { cwd: entry.project, ephemeral: true });
@@ -144,7 +144,7 @@ try {
       `approval_policy = "never"\nsandbox_mode = "danger-full-access"\n` +
       `[model_providers.fixture]\nname = "Local fixture"\nbase_url = "http://127.0.0.1:${server.address().port}/v1"\n` +
       `wire_api = "responses"\nenv_key = "CONTEXT_RELAY_FIXTURE_KEY"\nrequest_max_retries = 0\nstream_max_retries = 0\n` +
-      `[memories]\ngenerate_memories = false\nuse_memories = false\n[features]\nhooks = true\nshell_snapshot = false\n` +
+      `[memories]\ngenerate_memories = false\nuse_memories = false\n[features]\nshell_snapshot = false\n` +
       `[projects.${JSON.stringify(entry.project.toLowerCase())}]\ntrust_level = "trusted"\n`;
     fs.writeFileSync(configPath, config);
     const hookFile = join(entry.home, 'hooks.json');
@@ -154,14 +154,19 @@ try {
     // Only the two inert, fixture-owned definitions are trusted in this disposable
     // home. This matches upstream 0.144.6's trust_discovered_hooks test fixture.
     const trust = initial.map(hook => `\n[hooks.state.${JSON.stringify(hook.key)}]\ntrusted_hash = ${JSON.stringify(hook.currentHash)}\n`).join('');
-    for (const phase of ['untrusted', 'trusted', 'modified']) {
+    // Qualify the default enabled state used by native setup without introducing
+    // a product write to the user's feature flags. An explicit disable wins over trust.
+    for (const phase of ['untrusted', 'trusted', 'disabled', 'modified']) {
       if (phase === 'trusted') fs.writeFileSync(configPath, config + trust);
+      if (phase === 'disabled') fs.writeFileSync(configPath, config.replace('[features]\n', '[features]\nhooks = false\n') + trust);
       if (phase === 'modified') {
+        fs.writeFileSync(configPath, config + trust);
         const hooks = structuredClone(entry.hooks);
         for (const event of ['SessionStart', 'Stop']) hooks[event][0].hooks[0].statusMessage = 'Changed synthetic definition';
         fs.writeFileSync(hookFile, JSON.stringify({ hooks }));
       }
-      const { hooks: listed } = await listedHooks(entry);
+      const expectedHooks = phase === 'disabled' ? 0 : 2;
+      const { hooks: listed } = await listedHooks(entry, false, expectedHooks);
       assert.ok(listed.every(hook => hook.trustStatus === phase));
       const before = fs.readFileSync(configPath);
       for (const surface of ['exec', 'app-server']) {
@@ -175,7 +180,7 @@ try {
           threadId = events.find(event => event.type === 'thread.started').thread_id;
           detail = session.stderr;
         } else {
-          const { session } = await listedHooks(entry, true);
+          const { session } = await listedHooks(entry, true, expectedHooks);
           threadId = session.threadId;
           assert.equal(session.hooks.length, phase === 'trusted' ? 2 : 0);
           assert.ok(session.hooks.every(hook => hook.status === 'completed'), JSON.stringify(session.hooks));

@@ -426,3 +426,12 @@ The [hook evidence](codex-native-hooks-2026-09-06.md) records the runtime matrix
 review finding, source checks and the obsolete end-to-end test wrapper correction.
 Product trust review, full bridge connection and installed acceptance remain open;
 the local 11d6740 installer is unchanged.
+
+The desktop now reports saved settings separately from a verified connection,
+with project-bound Codex CLI hook-review instructions and exact-plan Undo. All
+143 frontend tests, lint, type checking and build pass, along with ten isolated
+desktop/narrow browser screenshots. The native matrix now covers 32 sessions:
+hooks work with Codex's default feature settings, while an explicit disable
+suppresses even trusted commands. See [setup status evidence](harness-setup-status-2026-09-06.md).
+Effective native trust readback, production bridge round trips and installed
+acceptance remain open. No Full gate or installer changed.

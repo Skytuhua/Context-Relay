@@ -150,3 +150,10 @@ modified-definition rejection. The obsolete daemon test wrapper now exercises
 the current native writer. Product trust review, production bridge delivery,
 custom runtime settings and installed acceptance remain open. No Full version
 is enabled; T10/T14/T20 and the full product goal remain incomplete.
+
+2026-09-06 setup status update: the desktop's apply result says settings were
+saved and explains the Codex CLI trust-review step without asserting a verified
+connection. The [evidence](harness-setup-status-2026-09-06.md) covers 143 frontend
+tests, desktop/narrow browser checks and an expanded 32-session native matrix
+with default-enabled and explicitly disabled hooks. Native trust readback,
+production bridge delivery and installed acceptance remain required.

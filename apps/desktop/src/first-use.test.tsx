@@ -42,7 +42,7 @@ it('offers a direct route from an empty Harnesses screen to adding a folder', as
   await screen.findByText('Ready on this computer');
   fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
   expect(screen.getByRole('heading', { name: 'Add a project first' })).toBeVisible();
-  expect(screen.queryByRole('button', { name: 'Check connection' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Review setup' })).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: 'Add a project' }));
   expect(screen.getByRole('form', { name: 'Add project' })).toBeVisible();
 });
@@ -58,7 +58,7 @@ it('keeps an unavailable harness actionable without exposing technical paths by 
   }} />);
   await screen.findByText('Ready on this computer');
   fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
-  fireEvent.click(screen.getByRole('button', { name: 'Check connection' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Review setup' }));
   const availability = await screen.findByRole('region', { name: 'Harness availability' });
   expect(within(availability).getByText(/Executable:/)).not.toBeVisible();
   expect(within(availability).getByText(/not connected/i)).toBeVisible();
