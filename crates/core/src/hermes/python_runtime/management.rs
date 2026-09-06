@@ -148,9 +148,16 @@ fn invalid() -> ClientError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::fs;
+
+    pub(in crate::hermes) fn management_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static CHECKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        CHECKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn management_home_is_private_and_drops_its_pin_before_cleanup() {
@@ -199,6 +206,25 @@ mod tests {
 
     #[test]
     fn management_facade_runs_only_the_owned_runtime_and_cleans_each_private_home() {
+        let _guard = management_test_guard();
+        let (_temp, runtime) = runtime_fixture(b"fixture launcher");
+        let identity = runtime.identity();
+        let (version, runtime) = runtime.check_version(&AtomicBool::new(false)).unwrap();
+        assert_eq!(version, "0.17.0");
+        assert_eq!(runtime.identity(), identity);
+        let (output, runtime) = runtime
+            .check_config(b"model: fixture\n", &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(runtime.identity(), identity);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let home = PathBuf::from(stdout.trim().strip_prefix("PROFILE=").unwrap());
+        assert!(!home.parent().unwrap().exists());
+        runtime.verify().unwrap();
+    }
+
+    pub(in crate::hermes) fn runtime_fixture(
+        launcher: &[u8],
+    ) -> (tempfile::TempDir, LockedRuntime) {
         use crate::hermes::python_runtime::{RuntimeSource, capture_inputs};
         use std::{os::windows::process::CommandExt as _, process::Command};
         let temp = tempfile::tempdir().unwrap();
@@ -224,8 +250,14 @@ fn main() {
             println!("Hermes Agent v0.17.0 (2026.6.19)\nPython: 3.11.15\nOpenAI SDK: 2.24.0");
         }
         ["config", "check"] => {
-            assert_eq!(config, "model: fixture\n");
-            println!("PROFILE={}", home.display());
+            if config == "model: adapter\n" {
+                println!("📋 Configuration Status\n\n  Config version: 32 ✓\n\n  Required:\n\n  Optional:");
+            } else if config == "model: stderr\n" {
+                eprintln!("fixture failure that must not be exposed");
+            } else {
+                assert_eq!(config, "model: fixture\n");
+                println!("PROFILE={}", home.display());
+            }
         }
         _ => panic!("unexpected command"),
     }
@@ -250,6 +282,8 @@ fn main() {
         );
         let bootstrap = root.join("bootstrap.py");
         fs::write(&bootstrap, b"# inert fixture, never interpreted\n").unwrap();
+        let launcher_source = root.join("launcher");
+        fs::write(&launcher_source, launcher).unwrap();
         let runtime = capture_inputs(
             &root,
             vec![
@@ -261,6 +295,10 @@ fn main() {
                     source: bootstrap,
                     destination: "bootstrap.py".into(),
                 },
+                RuntimeSource {
+                    source: launcher_source,
+                    destination: "metadata/hermes-launcher.exe".into(),
+                },
             ],
         )
         .unwrap()
@@ -268,17 +306,6 @@ fn main() {
         .unwrap()
         .lock()
         .unwrap();
-        let identity = runtime.identity();
-        let (version, runtime) = runtime.check_version(&AtomicBool::new(false)).unwrap();
-        assert_eq!(version, "0.17.0");
-        assert_eq!(runtime.identity(), identity);
-        let (output, runtime) = runtime
-            .check_config(b"model: fixture\n", &AtomicBool::new(false))
-            .unwrap();
-        assert_eq!(runtime.identity(), identity);
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let home = PathBuf::from(stdout.trim().strip_prefix("PROFILE=").unwrap());
-        assert!(!home.parent().unwrap().exists());
-        runtime.verify().unwrap();
+        (temp, runtime)
     }
 }

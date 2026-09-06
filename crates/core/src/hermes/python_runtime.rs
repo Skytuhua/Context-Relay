@@ -3,6 +3,8 @@
 mod literals;
 #[cfg(windows)]
 mod management;
+#[cfg(all(test, windows))]
+pub(super) use management::tests::{management_test_guard, runtime_fixture};
 mod projection;
 #[cfg(windows)]
 pub mod retained;

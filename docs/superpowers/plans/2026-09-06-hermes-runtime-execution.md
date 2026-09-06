@@ -64,6 +64,12 @@ Runtime inventory is verified before and after execution; nonzero exits and
 stderr fail. Hermes's version banner is parsed separately from Python/SDK versions.
 Evidence: 2026-09-07-hermes-management-facade-verification.md.
 
+HermesAdapter now owns this facade's locked runtime across clones and dispatches
+retained configuration checks through it. Passive preparation returns a durable
+reference; reopening checks the authenticated plan's adapter/profile/project and
+installation bindings before any command. Evidence and remaining daemon/UI work:
+2026-09-07-hermes-adapter-runtime-verification.md.
+
 Run focused Windows filesystem/runtime regressions and affected Rust Clippy/fmt
 checks. Refresh graphify after code changes. Request review of ownership and
 failure paths before recording the slice as verified.
