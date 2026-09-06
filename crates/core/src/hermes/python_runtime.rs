@@ -866,6 +866,68 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "opt-in retained Hermes management checks; requires an explicit installation path"]
+    fn installed_retained_management_checks_use_owned_runtime_and_isolated_home() {
+        use context_relay_native_runner::{
+            OsNativeFileSystem,
+            windows_management::{HermesManagementCommand, run_hermes_python},
+        };
+        use std::{sync::atomic::AtomicBool, time::Instant};
+        let executable = std::env::var_os("CONTEXT_RELAY_HERMES_METADATA_EXE")
+            .expect("select a Hermes installation explicitly");
+        let temp = tempfile::tempdir().unwrap();
+        let parent = fs::canonicalize(temp.path()).unwrap();
+        let started = Instant::now();
+        println!("Capturing selected runtime for owned management checks");
+        let captured = capture(Path::new(&executable), &parent).unwrap();
+        let retained = captured.retain().unwrap();
+        let reference = retained.reference().clone();
+        drop(retained);
+        let locked = retained::RetainedRuntime::open(&parent, &reference)
+            .unwrap()
+            .lock()
+            .unwrap();
+        println!(
+            "Reopened and locked {} runtime files at {:?}",
+            locked.manifest().files.len(),
+            started.elapsed()
+        );
+        let root = locked.root().to_owned();
+        let home = parent.join("management-home");
+        let home_pin = OsNativeFileSystem::new()
+            .create_private_directory(&home)
+            .unwrap();
+        fs::write(home.join("config.yaml"), b"{}\n").unwrap();
+        let mut owner = (locked, home_pin, temp);
+        for (command, marker) in [
+            (HermesManagementCommand::Version, "0.17.0"),
+            (HermesManagementCommand::ConfigCheck, "Configuration Status"),
+        ] {
+            println!(
+                "Starting {command:?} with isolated synthetic home at {:?}",
+                started.elapsed()
+            );
+            let (output, returned) =
+                run_hermes_python(&root, &home, command, owner, &AtomicBool::new(false)).unwrap();
+            owner = returned;
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            println!(
+                "{command:?} exit={} stdout={stdout} stderr={stderr}",
+                output.exit_code
+            );
+            assert_eq!(output.exit_code, 0);
+            assert!(stdout.contains(marker));
+            owner.0.verify().unwrap();
+        }
+        println!(
+            "Both retained Hermes management commands completed; inventory verified at {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     #[ignore = "opt-in capture and isolated copied-CPython probe; requires an explicit Hermes path"]
     fn installed_runtime_capture_has_only_staged_python_paths() {
         use process_wrap::std::{ChildWrapper, CommandWrap, CreationFlags, JobObject};

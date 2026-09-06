@@ -27,6 +27,10 @@ from privileged actors changing access controls.
 
 ## Process runner and integration
 
+The Windows process runner is implemented and independently reviewed; synthetic
+verification is recorded in 2026-09-06-hermes-management-runner-verification.md.
+Actual retained installation qualification and production integration remain open.
+
 - Own an unnamed kill-on-close Windows job; create the child suspended, assign and
   verify membership before resuming. Disable breakaway and bound process count.
 - Explicit executable, fixed bootstrap/closed arguments, isolated profile, cleared

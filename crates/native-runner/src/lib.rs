@@ -14,6 +14,8 @@ mod native_fs;
 mod path_policy;
 mod report_validation;
 mod stage;
+#[cfg(windows)]
+pub mod windows_management;
 
 pub use command::{
     RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, SidecarCommand, WorkingDirectory,

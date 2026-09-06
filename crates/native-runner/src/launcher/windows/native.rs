@@ -1380,13 +1380,13 @@ fn pipe_pair(host_reads: bool) -> Result<(File, OwnedHandle), LaunchError> {
     Ok((File::from(host), child))
 }
 
-struct ProcThreadAttributes {
+pub(crate) struct ProcThreadAttributes {
     heap: HANDLE,
-    list: LPPROC_THREAD_ATTRIBUTE_LIST,
+    pub(crate) list: LPPROC_THREAD_ATTRIBUTE_LIST,
 }
 
 impl ProcThreadAttributes {
-    fn new(count: u32) -> Result<Self, LaunchError> {
+    pub(crate) fn new(count: u32) -> Result<Self, LaunchError> {
         let mut bytes = 0usize;
         if unsafe { InitializeProcThreadAttributeList(null_mut(), count, 0, &mut bytes) } != 0
             || unsafe { windows_sys::Win32::Foundation::GetLastError() }
@@ -1413,7 +1413,7 @@ impl ProcThreadAttributes {
         Ok(Self { heap, list })
     }
 
-    fn update(
+    pub(crate) fn update(
         &self,
         attribute: usize,
         value: *const c_void,
@@ -1438,7 +1438,7 @@ impl Drop for ProcThreadAttributes {
     }
 }
 
-fn create_verified_kill_job() -> Result<OwnedHandle, LaunchError> {
+pub(crate) fn create_verified_kill_job() -> Result<OwnedHandle, LaunchError> {
     let raw = unsafe { CreateJobObjectW(null(), null()) };
     let job = owned_handle(raw)?;
     require_noninherited(raw_handle(&job))?;
