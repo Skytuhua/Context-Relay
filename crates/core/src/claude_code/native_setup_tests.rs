@@ -218,6 +218,12 @@ fn pinned_claude_fresh_settings_setup_restart_and_undo() {
     run_native_cases(&["fresh files"]);
 }
 
+#[test]
+#[ignore = "explicit pinned Claude CLI; synthetic project without a .claude directory"]
+fn pinned_claude_missing_project_directory_setup_restart_and_undo() {
+    run_native_cases(&["missing project directory"]);
+}
+
 fn run_native_cases(names: &[&str]) {
     let executable =
         PathBuf::from(env::var_os("CONTEXT_RELAY_TEST_CLAUDE_EXE").expect("explicit Claude"));
@@ -287,7 +293,7 @@ fn run_native_cases(names: &[&str]) {
     let _pinned_image = open_verified_claude_executable(&candidate, digest).unwrap();
     let root = fs::canonicalize(env::current_dir().unwrap()).unwrap();
     let crash = match root.file_name().unwrap().to_str().unwrap() {
-        "ordinary" | "fresh files" => None,
+        "ordinary" | "fresh files" | "missing project directory" => None,
         "after payload 專案 O'Brien" => Some(TransactionStep::WritePayloads),
         "after CLI 專案" => Some(TransactionStep::WriteActivationReferences),
         "after commit ‘quoted’" => Some(TransactionStep::CommitOwnershipAndReceipt),
@@ -300,11 +306,15 @@ fn run_case(root: &Path, crash: Option<TransactionStep>) {
     let config = root.join("custom claude");
     let project = root.join("project");
     let locks = root.join("vault");
-    for path in [project.join(".claude"), locks.clone()] {
+    let missing_project_directory = root.file_name().unwrap() == "missing project directory";
+    for path in [project.clone(), locks.clone()] {
         fs::create_dir_all(path).unwrap();
     }
+    if !missing_project_directory {
+        fs::create_dir(project.join(".claude")).unwrap();
+    }
     let project = fs::canonicalize(project).unwrap();
-    let fresh = root.file_name().unwrap() == "fresh files";
+    let fresh = root.file_name().unwrap() == "fresh files" || missing_project_directory;
     let state = config.join(".claude.json");
     let original_state = if fresh {
         None
@@ -327,6 +337,15 @@ fn run_case(root: &Path, crash: Option<TransactionStep>) {
     fs::write(&bridge, b"qualification marker only; never execute").unwrap();
     let id: ProjectId = "018f22e2-79b0-7cc8-98c4-dc0c0c073981".parse().unwrap();
     let adapter = discover(&project, id, NOW);
+    if missing_project_directory {
+        let capabilities = adapter.native_memory_capabilities().unwrap();
+        assert!(matches!(
+            capabilities.disable,
+            NativeMemoryDisable::WatchOnly
+        ));
+        assert!(!capabilities.sources.is_empty());
+        assert!(!project.join(".claude").exists());
+    }
     let keys = Keys::default();
     let database = locks.join("vault.db");
     let mut vault = Vault::open(&database, "claude-native-setup", &keys).unwrap();
@@ -346,6 +365,18 @@ fn run_case(root: &Path, crash: Option<TransactionStep>) {
     )
     .unwrap();
     let opened = open_plan(&vault.setup_plan(&setup.plan_id).unwrap().unwrap().payload).unwrap();
+    if missing_project_directory {
+        assert!(
+            !project.join(".claude").exists(),
+            "preview created a directory"
+        );
+        assert!(!opened.plan.native_memory_registrations.is_empty());
+        assert!(opened.plan.mutations.iter().all(|mutation| {
+            !decode_wire_path(&mutation.target)
+                .unwrap()
+                .starts_with(project.join(".claude"))
+        }));
+    }
     let originals = opened
         .plan
         .mutations
@@ -401,6 +432,12 @@ fn run_case(root: &Path, crash: Option<TransactionStep>) {
         }
     );
     if committed {
+        if missing_project_directory {
+            assert!(
+                !project.join(".claude").exists(),
+                "setup created a directory"
+            );
+        }
         assert!(
             discover(&project, id, NOW + 2)
                 .probe_managed_declaration()
@@ -454,5 +491,8 @@ fn run_case(root: &Path, crash: Option<TransactionStep>) {
         assert!(!project.join("CLAUDE.md").exists());
     }
     assert!(vault.native_memory_ledgers().unwrap().is_empty());
+    if missing_project_directory {
+        assert!(!project.join(".claude").exists(), "Undo left a directory");
+    }
     println!("Real Claude native save/reopen/reapply/Undo/recovery: {crash:?}");
 }
