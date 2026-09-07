@@ -11,7 +11,7 @@
     Pop $1
     Pop $0
     SetErrorLevel 1
-    Abort "Context Relay could not stop its local service. Close Context Relay and connected AI tools, then run Setup again. Your workspace has been kept."
+    Abort "Context Relay could not stop its local service. Close Context Relay and connected harnesses, then run Setup again. Your workspace has been kept."
   ${EndIf}
   Pop $1
   Pop $0
@@ -20,7 +20,7 @@
 !macro NSIS_HOOK_PREINSTALL
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
   ; Always use the new helper: older daemon binaries ignore --shutdown and start.
-  ; The embedded helper authenticates shutdown only for current and legacy 1.4 IPC.
+  ; The embedded helper authenticates shutdown only for current and qualified prior IPC versions.
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
   File /oname=context-relay-service-control.exe "${CONTEXT_RELAY_HOOK_DIR}\..\binaries\context-relay-contextd-x86_64-pc-windows-msvc.exe"

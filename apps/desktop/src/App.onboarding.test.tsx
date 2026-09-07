@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, within } from '@testing-librar
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import App from './App';
 import { PROTOCOL_VERSION, type ProjectIdentity } from './bindings';
-import { readPreferences } from './desktop-preferences';
+import { defaultPreferences, readPreferences, savePreferences } from './desktop-preferences';
 import type { WorkspaceGateway } from './workspace';
 
 const installer = { projectId: '018f22e2-79b0-7cc8-98c4-dc0c0c073980', name: 'Installer verification' } as ProjectIdentity;
@@ -21,6 +21,20 @@ function fixture() {
 }
 beforeEach(() => { localStorage.clear(); });
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+it('can start another guided setup after completion without reusing the prior test', async () => {
+  const preferences = defaultPreferences();
+  preferences.setup = { ...preferences.setup, status: 'complete', step: 'tour', projectId: project.projectId, noteId: installer.projectId, checkId: installer.projectId };
+  savePreferences(preferences);
+  const api = fixture();
+  render(<App gateway={api as unknown as WorkspaceGateway} />);
+  await screen.findByText('Ready on this computer');
+  fireEvent.click(screen.getByRole('button', { name: 'Help' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Set up harnesses' }));
+  expect(screen.getByRole('heading', { name: 'Choose harnesses' })).toBeVisible();
+  expect(readPreferences().setup).toMatchObject({ status: 'in_progress', step: 'harnesses', projectId: null, noteId: null, checkId: null });
+  expect(api.harnessApply).not.toHaveBeenCalled();
+});
 
 it('starts fresh in the five-step guide with no preselected harness or hidden writes', async () => {
   const api = fixture();

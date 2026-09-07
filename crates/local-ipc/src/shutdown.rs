@@ -97,6 +97,11 @@ async fn request_shutdown(
                     major: 1,
                     minor: 10,
                 })
+            && server_hello.protocol
+                != (ProtocolVersion {
+                    major: 1,
+                    minor: 11,
+                })
         {
             return Err(IpcError::ProtocolVersionUnsupported);
         }
@@ -263,6 +268,22 @@ mod tests {
     #[tokio::test]
     async fn authenticated_shutdown_accepts_the_previous_1_10_installer() {
         assert_shutdown_waits_for_exit("legacy-ack-1-10").await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_shutdown_accepts_the_previous_1_11_installer() {
+        assert_shutdown_waits_for_exit("legacy-ack-1-11").await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_client_still_rejects_the_previous_1_11_installer() {
+        let fixture = Fixture::start("legacy-client-1-11", false).await;
+        let stream = connect(&fixture.runtime).await.unwrap();
+        let result =
+            crate::Client::from_stream(stream, ClientRole::Desktop, &token().unwrap()).await;
+        assert!(matches!(result, Err(IpcError::ProtocolVersionUnsupported)));
+        assert!(!fixture.root.join("request").exists());
+        fixture.finish().await;
     }
 
     async fn assert_shutdown_waits_for_exit(mode: &str) {
@@ -532,13 +553,14 @@ mod tests {
                 "legacy-ack-1-8" => 8,
                 "legacy-ack-1-9" => 9,
                 "legacy-ack-1-10" => 10,
+                "legacy-ack-1-11" | "legacy-client-1-11" => 11,
                 _ => 4,
             },
         };
         let mut hello = ServerHelloV1::generate(generate_instance_nonce().unwrap()).unwrap();
         hello.protocol = protocol;
         write_json(&mut stream, &hello).await.unwrap();
-        if mode == "legacy-unsupported" {
+        if matches!(mode, "legacy-unsupported" | "legacy-client-1-11") {
             assert!(
                 read_json::<_, serde_json::Value>(&mut stream)
                     .await
@@ -598,7 +620,7 @@ mod tests {
             "legacy-extra-field" => response["unexpected"] = serde_json::json!(true),
             "legacy-jsonrpc" => response["jsonrpc"] = serde_json::json!("1.0"),
             "legacy-ack" | "legacy-ack-1-5" | "legacy-ack-1-6" | "legacy-ack-1-7"
-            | "legacy-ack-1-8" | "legacy-ack-1-9" | "legacy-ack-1-10" => {}
+            | "legacy-ack-1-8" | "legacy-ack-1-9" | "legacy-ack-1-10" | "legacy-ack-1-11" => {}
             _ => panic!("unexpected legacy fixture mode"),
         }
         write_json(&mut stream, &response).await.unwrap();
@@ -611,6 +633,7 @@ mod tests {
                 | "legacy-ack-1-8"
                 | "legacy-ack-1-9"
                 | "legacy-ack-1-10"
+                | "legacy-ack-1-11"
         ) {
             fs::write(root.join("ack"), b"").unwrap();
             wait_for(&root.join("exit")).await;

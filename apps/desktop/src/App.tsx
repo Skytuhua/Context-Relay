@@ -78,7 +78,12 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     catch { setPreferenceError('Your choices could not be saved on this computer. Keep this window open to continue setup.'); }
   }, [preferences]);
   const updateSetup = (setup: SetupProgress) => updatePreferences(current => ({ ...current, setup }));
-  const resumeSetup = () => updatePreferences(current => ({ ...current, setup: { ...current.setup, status: 'in_progress' } }));
+  const resumeSetup = () => {
+    setTestVerified(false);
+    updatePreferences(current => ({ ...current, setup: current.setup.status === 'complete'
+      ? { ...current.setup, status: 'in_progress', step: 'harnesses', projectId: null, noteId: null, checkId: null, testHarness: null }
+      : { ...current.setup, status: 'in_progress' } }));
+  };
   const startTour = () => {
     setTourStep(0);
     void selectScreen('home');
@@ -459,7 +464,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           {connectionState === 'connecting' && <p role="status">Opening your workspace…</p>}
         </>;
       case 'help':
-        return <HelpScreen onResumeSetup={resumeSetup} onStartTour={startTour} />;
+        return <HelpScreen setupComplete={preferences.setup.status === 'complete'} onResumeSetup={resumeSetup} onStartTour={startTour} />;
       case 'projects':
         return (
           <section className="screen-content">

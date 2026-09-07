@@ -1,9 +1,9 @@
 import { useEffect, useRef } from 'react';
 
-export function HelpScreen({ onResumeSetup, onStartTour }: { onResumeSetup: () => void; onStartTour: () => void }) {
+export function HelpScreen({ onResumeSetup, onStartTour, setupComplete = false }: { onResumeSetup: () => void; onStartTour: () => void; setupComplete?: boolean }) {
   return <div className="help-content">
     <p>Context Relay keeps useful notes and project progress available between coding sessions. This guide is available offline.</p>
-    <div className="form-actions"><button className="primary" onClick={onResumeSetup}>Resume setup</button><button onClick={onStartTour}>Start tour</button></div>
+    <div className="form-actions"><button className="primary-action" onClick={onResumeSetup}>{setupComplete ? 'Set up harnesses' : 'Resume setup'}</button><button onClick={onStartTour}>Start tour</button></div>
     <section><h2>Projects</h2><p>A project groups the context and tasks for one folder of work. Choose it in the project selector before saving a note or task.</p><p>For example, keep your website’s decisions separate from your mobile app’s decisions.</p></section>
     <section><h2>Saved context</h2><p>Context is a note your coding assistant can use in future sessions: a preference, decision, fact, or procedure.</p><p>Open Context, choose Saved, then Add context. Give the note a clear title and save it. For example: “Use clear, plain language and explain unfamiliar terms.”</p></section>
     <section><h2>Suggestions</h2><p>A suggestion is a possible note proposed by your harness. It waits for your review before becoming saved context.</p><p>Open Context, then Suggestions. Read the proposed note and its evidence. Accept useful notes; reject details you do not want to keep.</p></section>
