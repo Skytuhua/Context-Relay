@@ -787,12 +787,16 @@ fn project_binding(
             let root = decode_wire_path(&wire)?;
             let root = fs::canonicalize(&root)
                 .map_err(|_| not_found("Registered project path does not exist"))?;
+            // Adapters compare native scopes with their canonical project root.
+            // Normalize this preview binding without rewriting the saved path.
+            let mut registered_root = wire_native_path(&root);
+            registered_root.display = root.to_str().map(str::to_owned);
             Ok(ProjectBinding {
                 project_id,
                 root,
                 registered: Some(RegisteredProject {
                     project_id,
-                    root: wire,
+                    root: registered_root,
                 }),
             })
         }
@@ -1948,6 +1952,64 @@ pub(crate) mod tests {
             Ok(())
         }
     }
+    #[test]
+    fn project_binding_canonicalizes_preview_root_without_rewriting_saved_path() {
+        let temp = TempVault::new("canonical-project-binding");
+        let mut vault = Vault::open(
+            temp.path(),
+            "canonical-project-binding",
+            &MemoryKeyStore::default(),
+        )
+        .unwrap();
+        let project: ProjectId = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f".parse().unwrap();
+        let root = temp.path().parent().unwrap();
+        fs::create_dir(root.join("child")).unwrap();
+        let saved = wire_native_path(&root.join("child").join(".."));
+        vault.put_path(&project.to_string(), &saved).unwrap();
+
+        let binding = project_binding(&vault, Some(project)).unwrap();
+        let canonical = fs::canonicalize(root).unwrap();
+        assert_eq!(binding.root, canonical);
+        assert_eq!(binding.project_id, project);
+        let mut adapter_root = wire_native_path(&canonical);
+        adapter_root.display = canonical.to_str().map(str::to_owned);
+        assert_eq!(binding.registered.unwrap().root, adapter_root);
+        assert_eq!(vault.path(&project.to_string()).unwrap(), Some(saved));
+    }
+
+    #[test]
+    fn project_binding_keeps_different_registered_folders_distinct() {
+        let temp = TempVault::new("distinct-project-binding");
+        let mut vault = Vault::open(
+            temp.path(),
+            "distinct-project-binding",
+            &MemoryKeyStore::default(),
+        )
+        .unwrap();
+        let first: ProjectId = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f".parse().unwrap();
+        let second: ProjectId = "018f22e2-79b0-7cc8-98c4-dc0c0c073990".parse().unwrap();
+        let first_root = temp.path().parent().unwrap().join("first");
+        let second_root = temp.path().parent().unwrap().join("second");
+        fs::create_dir(&first_root).unwrap();
+        fs::create_dir(&second_root).unwrap();
+        vault
+            .put_path(&first.to_string(), &wire_native_path(&first_root))
+            .unwrap();
+        vault
+            .put_path(&second.to_string(), &wire_native_path(&second_root))
+            .unwrap();
+
+        let first_binding = project_binding(&vault, Some(first)).unwrap();
+        let second_binding = project_binding(&vault, Some(second)).unwrap();
+        assert_eq!(first_binding.root, fs::canonicalize(first_root).unwrap());
+        assert_eq!(second_binding.root, fs::canonicalize(second_root).unwrap());
+        assert_ne!(first_binding.root, second_binding.root);
+        assert_ne!(
+            first_binding.registered.unwrap().root,
+            second_binding.registered.unwrap().root
+        );
+    }
+
     struct LaunchProbe {
         executable: WireNativeValue,
     }

@@ -185,18 +185,23 @@ summary { min-height: 28px; padding-block: 3px; }
 .dashboard-section .record-card { padding-block: 10px; }
 
 /* A dedicated guided surface, with progress distinct from application navigation. */
-.onboarding-shell { display: grid; grid-template-columns: 200px minmax(0, 1fr); min-height: 100vh; max-width: 1200px; margin: 0 auto; }
-.onboarding-rail { padding: 24px 16px; background: var(--color-surface); border-right: 1px solid var(--color-border); }
+#root:has(> .onboarding-shell) { display: flex; flex-direction: column; height: 100dvh; }
+#root:has(> .onboarding-shell) > .form-error { flex: 0 0 auto; max-height: 20dvh; overflow: auto; margin: 8px 16px; }
+.onboarding-shell { display: grid; grid-template-columns: 200px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); flex: 1 1 0; width: 100%; height: 100dvh; min-height: 0; max-width: 1200px; margin: 0 auto; }
+.onboarding-rail { min-height: 0; overflow-y: auto; padding: 24px 16px; background: var(--color-surface); border-right: 1px solid var(--color-border); }
 .onboarding-rail ol { display: grid; gap: 8px; list-style: none; padding: 0; margin: 24px 0; counter-reset: setup-step; }
 .onboarding-rail li { display: flex; align-items: baseline; gap: 8px; min-height: 36px; padding: 8px; border-radius: var(--radius-control); color: var(--color-muted); counter-increment: setup-step; }
 .onboarding-rail li > span:first-child { font-variant-numeric: tabular-nums; flex: 0 0 16px; }
 .onboarding-rail li[aria-current='step'] { color: var(--color-primary-strong); background: var(--color-selected); font-weight: 650; }
 .onboarding-rail li[data-complete='true'] { color: var(--color-success); }
-.onboarding-content { display: flex; flex-direction: column; align-items: stretch; gap: 20px; min-width: 0; padding: 32px; }
+.onboarding-content { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 20px; min-width: 0; min-height: 0; padding: 32px; }
+/* Only the step body scrolls; the footer keeps its own visible grid row. */
+.onboarding-content > section { min-height: 0; min-width: 0; overflow-y: auto; overflow-wrap: anywhere; overscroll-behavior-y: contain; scrollbar-gutter: stable; padding: 4px; margin: -4px; scroll-padding-block: 8px; }
+.project-choices .status-row, .status-row:has(input[name='setup-project']) { justify-content: flex-start; flex-wrap: nowrap; gap: 12px; overflow-wrap: anywhere; }
 .onboarding-content > header h1, .onboarding-content > header p { margin: 0 0 8px; }
 .onboarding-content > header p { color: var(--color-muted); }
 .onboarding-content .screen-content { width: 100%; }
-.onboarding-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: auto; padding-top: 20px; border-top: 1px solid var(--color-border); }
+.onboarding-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 0; padding-top: 16px; border-top: 1px solid var(--color-border); background: var(--color-canvas); }
 .onboarding-footer > div { display: flex; flex-wrap: wrap; gap: 8px; }
 .harness-choices { display: grid; gap: 8px; }
 .harness-choice { display: flex; align-items: flex-start; gap: 12px; min-width: 0; padding: 12px; border: 1px solid var(--color-control-border); border-radius: var(--radius-panel); cursor: pointer; }
@@ -302,10 +307,10 @@ dialog h2, dialog p { margin: 0; }
   .dashboard-grid, .security-facts > div, .pairing-actions, .recovery-word-grid { grid-template-columns: minmax(0, 1fr); }
   .security-facts > div { gap: 4px; }
   .device-row { align-items: flex-start; flex-direction: column; }
-  .onboarding-rail { border-right: 0; border-bottom: 1px solid var(--color-border); padding: 16px; }
+  .onboarding-rail { max-height: 30dvh; border-right: 0; border-bottom: 1px solid var(--color-border); padding: 16px; }
   .onboarding-rail ol { display: flex; flex-wrap: wrap; gap: 4px; margin: 12px 0 0; }
   .onboarding-content { padding: 20px 16px; }
-  .onboarding-footer { margin-top: 12px; }
+  .onboarding-footer { gap: 8px; padding-top: 12px; }
 }
 @media (pointer: coarse) {
   button, input:not([type='checkbox']):not([type='radio']), select, summary, .sidebar nav button { min-height: 44px; }
