@@ -41,12 +41,39 @@ Logs use the `.codex/claude-memory-environment-` prefix: `red`, `green`,
 
 ## Qualification boundary
 
-This production correction covers settings-provided cowork directory overrides.
-The native cases also establish remote-base semantics, but production handling
-of `CLAUDE_CODE_REMOTE_MEMORY_DIR` and ambient directory overrides remains open.
+The first production correction covers settings-provided cowork directory
+overrides. The follow-up below handles qualified settings-provided remote bases.
+Ambient directory overrides remain open.
 Interactive trust, other managed settings sources, full native transaction/crash
 recovery, production credentials and installed acceptance remain unqualified.
 Claude 2.1.202 remains import-only. No version gate is expanded.
 
 The unsigned Windows installer from source `357f4a2` predates this correction.
 It has not been replaced or installed as part of this check.
+
+## Settings-provided remote memory base
+
+A second regression reproduced the adapter selecting the configuration directory
+despite a nonempty `env.CLAUDE_CODE_REMOTE_MEMORY_DIR`. The pinned native binary
+joins that base with `projects/<repository-key>/memory`, then normalizes the
+result to NFC; its native session cases above confirm selection and priority.
+
+The adapter now uses an absolute, safely bound remote base when neither the
+cowork override nor `autoMemoryDirectory` selects a root. Empty values retain the
+ordinary configuration base. The same user < project < local precedence,
+managed read-only behavior, alias rejection and plan freshness rules apply.
+Relative, drive-relative and UNC bases remain unavailable pending launch-context
+qualification. An unqualified base never silently selects the ordinary folder.
+Existing repository-key version gates remain in place; this does not enable a
+default or remote-derived source for Claude 2.1.202.
+
+The remote-base regression failed before the correction and passed afterward
+(`.codex/claude-remote-memory-red.log` and `green.log`). All 71 Claude adapter
+tests then passed in 1.80 seconds. New checks cover layered bases, explicit-root
+priority, empty values, unqualified paths and malformed values; existing alias
+and stale-plan checks now exercise both directory environment controls.
+Independent review found no actionable issues in the two-file follow-up diff.
+The affected library checks pass (30 tests, three opt-in cases excluded), as do
+all 17 primary-memory integration tests (39.18 seconds) and core/daemon all-target
+Clippy with test support and warnings denied (9.94 seconds). Formatting and diff
+checks pass. These logs use the `.codex/claude-remote-memory-` prefix.

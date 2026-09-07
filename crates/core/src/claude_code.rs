@@ -1112,6 +1112,7 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
         let Some(memory_root) = self.bound_native_memory_root(
             &configuration.effective,
             configuration.cowork_directory.as_deref(),
+            configuration.remote_directory.as_deref(),
             supported,
         )?
         else {
@@ -1213,6 +1214,7 @@ impl ClaudeCodeAdapter {
         &self,
         settings: &Map<String, Value>,
         cowork_directory: Option<&str>,
+        remote_directory: Option<&str>,
         supported: bool,
     ) -> Result<Option<PathBuf>, ClientError> {
         if let Some(value) = cowork_directory
@@ -1261,14 +1263,34 @@ impl ClaudeCodeAdapter {
         let Some(key) = memory_path::directory_key(&repository) else {
             return Ok(None);
         };
-        safe_memory_directory_binding(
-            &self
-                .layout
-                .config_dir
-                .join("projects")
-                .join(key)
-                .join("memory"),
-        )
+        let base = match remote_directory.filter(|value| !value.is_empty()) {
+            Some(value) => {
+                // Native remote bases are joined directly, without home expansion.
+                // Relative/drive-relative bases need launch-context qualification;
+                // never silently inspect the ordinary configuration instead.
+                let path = Path::new(value);
+                if !path.is_absolute() || value.len() > 4096 {
+                    return Ok(None);
+                }
+                path
+            }
+            None => &self.layout.config_dir,
+        };
+        let joined = base.join("projects").join(key).join("memory");
+        if remote_directory.is_some_and(|value| !value.is_empty()) {
+            let Some(value) = joined.to_str() else {
+                return Ok(None);
+            };
+            let Some(root) = memory_path::configured_directory(value, &self.layout.user_home)
+            else {
+                return Ok(None);
+            };
+            if root.as_os_str().len() > 4096 {
+                return Ok(None);
+            }
+            return safe_memory_directory_binding(&root);
+        }
+        safe_memory_directory_binding(&joined)
     }
 
     fn native_memory_sources(
@@ -1346,6 +1368,7 @@ impl ClaudeCodeAdapter {
             | local_environment;
         let mut effective = Map::new();
         let mut cowork_directory = None;
+        let mut remote_directory = None;
         // File settings for the selected project: user < project < local.
         // Launch flags, ambient environment and interactive trust need separate runtime
         // qualification; this does not enable additional supported versions.
@@ -1360,19 +1383,36 @@ impl ClaudeCodeAdapter {
             {
                 cowork_directory = Some(settings["env"][key].as_str().ok_or(())?.to_owned());
             }
+            if let Some(key) = settings_environment_key(settings, "CLAUDE_CODE_REMOTE_MEMORY_DIR")?
+            {
+                remote_directory = Some(settings["env"][key].as_str().ok_or(())?.to_owned());
+            }
         }
         let mut managed = false;
         let mut managed_directory = None::<Value>;
         let mut managed_cowork_directory = None;
+        let mut managed_remote_directory = None;
         for path in &self.layout.managed_settings_paths {
             let settings = mcp_state::read_object(path).map_err(|_| ())?;
             let managed_environment = memory_environment_key(&settings)?.is_some();
             let cowork_key =
                 settings_environment_key(&settings, "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE")?;
+            let remote_key = settings_environment_key(&settings, "CLAUDE_CODE_REMOTE_MEMORY_DIR")?;
             managed |= settings.contains_key("autoMemoryEnabled")
                 || settings.contains_key("autoMemoryDirectory")
                 || managed_environment
-                || cowork_key.is_some();
+                || cowork_key.is_some()
+                || remote_key.is_some();
+            if let Some(key) = remote_key {
+                let directory = settings["env"][key].as_str().ok_or(())?;
+                if managed_remote_directory
+                    .as_deref()
+                    .is_some_and(|current| current != directory)
+                {
+                    return Err(());
+                }
+                managed_remote_directory = Some(directory.to_owned());
+            }
             if let Some(key) = cowork_key {
                 let directory = settings["env"][key].as_str().ok_or(())?;
                 if managed_cowork_directory
@@ -1399,6 +1439,9 @@ impl ClaudeCodeAdapter {
         if managed_cowork_directory.is_some() {
             cowork_directory = managed_cowork_directory;
         }
+        if managed_remote_directory.is_some() {
+            remote_directory = managed_remote_directory;
+        }
         let (disable_path, disable_settings) =
             if local.contains_key("autoMemoryEnabled") || local_environment {
                 (local_path, local)
@@ -1408,6 +1451,7 @@ impl ClaudeCodeAdapter {
         Ok(EffectiveMemorySettings {
             effective,
             cowork_directory,
+            remote_directory,
             managed,
             environment_override,
             disable_path,
@@ -1526,6 +1570,7 @@ impl ClaudeCodeAdapter {
 struct EffectiveMemorySettings {
     effective: Map<String, Value>,
     cowork_directory: Option<String>,
+    remote_directory: Option<String>,
     managed: bool,
     environment_override: bool,
     disable_path: PathBuf,

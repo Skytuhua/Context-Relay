@@ -1136,6 +1136,10 @@ fn use_default_memory(fixture: &Fixture) {
 }
 
 fn expected_default_memory(fixture: &Fixture, repository: &Path) -> WireNativeValue {
+    expected_memory_under_base(&fixture.root.join("custom claude config"), repository)
+}
+
+fn expected_memory_under_base(base: &Path, repository: &Path) -> WireNativeValue {
     let key = repository
         .to_str()
         .unwrap()
@@ -1149,13 +1153,7 @@ fn expected_default_memory(fixture: &Fixture, repository: &Path) -> WireNativeVa
             }
         })
         .collect::<String>();
-    test_wire_path(
-        &fixture
-            .root
-            .join("custom claude config/projects")
-            .join(key)
-            .join("memory/MEMORY.md"),
-    )
+    test_wire_path(&base.join("projects").join(key).join("memory/MEMORY.md"))
 }
 
 #[test]
@@ -1231,6 +1229,132 @@ fn native_memory_claude_reads_user_project_and_local_directory_precedence() {
         let expected = fixture.root.join(expected).join("MEMORY.md");
         assert_eq!(capabilities.sources[0].path, test_wire_path(&expected));
     }
+}
+
+#[test]
+fn native_memory_claude_binds_the_settings_remote_memory_base() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let remote = fixture.root.join("remote memory 專案 O'Brien");
+    fs::create_dir_all(&remote).unwrap();
+    fs::write(fixture.adapter.project_settings_path(), b"{}").unwrap();
+    let settings = json!({"env":{
+        "CLAUDE_CODE_REMOTE_MEMORY_DIR": remote.to_string_lossy().trim_start_matches(r"\\?\")
+    }});
+    fs::write(
+        fixture.root.join("custom claude config/settings.json"),
+        serde_json::to_vec(&settings).unwrap(),
+    )
+    .unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert_eq!(
+        capabilities.sources[0].path,
+        expected_memory_under_base(&remote, &fixture.root.join("project with spaces"))
+    );
+}
+
+#[test]
+fn native_memory_claude_remote_memory_base_obeys_layers_and_explicit_roots() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let user = fixture.root.join("custom claude config/settings.json");
+    let project = fixture.adapter.project_settings_path();
+    let local = project.with_file_name("settings.local.json");
+    let managed = fixture.root.join("managed-settings.json");
+    fs::write(&project, b"{}").unwrap();
+    for (index, path) in [&user, &project, &local, &managed].into_iter().enumerate() {
+        let remote = fixture.root.join(format!("remote memory {index}"));
+        fs::create_dir_all(&remote).unwrap();
+        let key = if cfg!(windows) && index == 2 {
+            "Claude_Code_Remote_Memory_Dir"
+        } else {
+            "CLAUDE_CODE_REMOTE_MEMORY_DIR"
+        };
+        let mut settings = json!({"env":{
+            key:remote.to_string_lossy().trim_start_matches(r"\\?\")
+        }});
+        fs::write(path, serde_json::to_vec(&settings).unwrap()).unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        assert_eq!(
+            capabilities.sources[0].path,
+            expected_memory_under_base(&remote, &fixture.root.join("project with spaces"))
+        );
+        if index == 3 {
+            assert!(matches!(
+                capabilities.disable,
+                NativeMemoryDisable::WatchOnly
+            ));
+            for direct in ["autoMemoryDirectory", "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE"] {
+                let memory = fixture.root.join(direct);
+                let value = json!(memory.to_string_lossy().trim_start_matches(r"\\?\"));
+                if direct == "autoMemoryDirectory" {
+                    settings[direct] = value;
+                } else {
+                    settings["env"][direct] = value;
+                }
+                fs::write(path, serde_json::to_vec(&settings).unwrap()).unwrap();
+                let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+                assert_eq!(
+                    capabilities.sources[0].path,
+                    test_wire_path(&memory.join("MEMORY.md"))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn native_memory_claude_remote_memory_base_rejects_unqualified_paths_and_values() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let user = fixture.root.join("custom claude config/settings.json");
+    fs::write(fixture.adapter.project_settings_path(), b"{}").unwrap();
+    fs::write(&user, br#"{"env":{"CLAUDE_CODE_REMOTE_MEMORY_DIR":""}}"#).unwrap();
+    assert_eq!(
+        fixture
+            .adapter
+            .native_memory_capabilities()
+            .unwrap()
+            .sources[0]
+            .path,
+        expected_default_memory(&fixture, &fixture.root.join("project with spaces"))
+    );
+    for value in [
+        json!("relative"),
+        json!("~/remote"),
+        json!(r"C:remote"),
+        json!(r"\\server\share"),
+        json!(false),
+        Value::Null,
+        json!(["remote"]),
+    ] {
+        fs::write(
+            &user,
+            serde_json::to_vec(&json!({"env":{
+                "CLAUDE_CODE_REMOTE_MEMORY_DIR":value
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        assert!(matches!(
+            capabilities.disable,
+            NativeMemoryDisable::Unavailable
+        ));
+        assert!(capabilities.sources.is_empty());
+    }
+    let mut source: Value =
+        serde_json::from_str(include_str!("fixtures/claude-code-2.1.214.json")).unwrap();
+    source["version"] = json!("2.1.202");
+    let unknown = self::fixture(&source.to_string());
+    fs::write(unknown.adapter.project_settings_path(), serde_json::to_vec(&json!({"env":{
+        "CLAUDE_CODE_REMOTE_MEMORY_DIR":unknown.root.to_string_lossy().trim_start_matches(r"\\?\")
+    }})).unwrap()).unwrap();
+    assert!(
+        unknown
+            .adapter
+            .native_memory_capabilities()
+            .unwrap()
+            .sources
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1333,25 +1457,36 @@ fn native_memory_claude_environment_directory_preserves_native_fallback_rules() 
 #[test]
 fn native_memory_claude_environment_directory_rejects_windows_aliases() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
-    let settings = json!({"env":{
-        "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE":"C:/one",
-        "claude_cowork_memory_path_override":"C:/two"
-    }});
-    fs::write(
-        fixture.adapter.project_settings_path(),
-        serde_json::to_vec(&settings).unwrap(),
-    )
-    .unwrap();
-    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
-    assert!(matches!(
-        capabilities.disable,
-        NativeMemoryDisable::Unavailable
-    ));
-    assert!(capabilities.sources.is_empty());
+    for name in [
+        "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE",
+        "CLAUDE_CODE_REMOTE_MEMORY_DIR",
+    ] {
+        let settings = json!({"env":{name:"C:/one", name.to_ascii_lowercase():"C:/two"}});
+        fs::write(
+            fixture.adapter.project_settings_path(),
+            serde_json::to_vec(&settings).unwrap(),
+        )
+        .unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        assert!(matches!(
+            capabilities.disable,
+            NativeMemoryDisable::Unavailable
+        ));
+        assert!(capabilities.sources.is_empty());
+    }
 }
 
 #[test]
 fn native_memory_claude_environment_directory_change_invalidates_the_plan() {
+    for name in [
+        "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE",
+        "CLAUDE_CODE_REMOTE_MEMORY_DIR",
+    ] {
+        assert_memory_environment_plan_freshness(name);
+    }
+}
+
+fn assert_memory_environment_plan_freshness(variable: &str) {
     let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let user = fixture.root.join("custom claude config/settings.json");
     let mut plan = None;
@@ -1360,7 +1495,7 @@ fn native_memory_claude_environment_directory_change_invalidates_the_plan() {
         let memory = fixture.root.join(name);
         fs::create_dir_all(&memory).unwrap();
         let settings = json!({"env":{
-            "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE":
+            variable:
                 memory.to_string_lossy().trim_start_matches(r"\\?\")
         }});
         fs::write(&user, serde_json::to_vec(&settings).unwrap()).unwrap();

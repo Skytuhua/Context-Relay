@@ -12,8 +12,11 @@ The adapter watches the exactly bound project memory `MEMORY.md` and its
 bounded topic Markdown files. A settings-provided
 `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` takes precedence over `autoMemoryDirectory`,
 with user < project < local file precedence and managed controls read-only.
-An explicit supported `autoMemoryDirectory`
-takes precedence over the frozen default project-key mapping. Existing content
+An explicit supported `autoMemoryDirectory` takes precedence over the frozen
+default project-key mapping. For that mapping, a settings-provided absolute
+`CLAUDE_CODE_REMOTE_MEMORY_DIR` replaces the configuration base; empty values use
+the ordinary base, while unqualified relative/UNC paths are unavailable.
+Existing content
 is previewed once through the ordinary pending candidate queue. Later stable
 edits are observed by the daemon after 750 ms, including while the desktop is
 closed. Accepted records remain authoritative in the encrypted vault and are
@@ -26,7 +29,7 @@ scanned.
 
 The isolated Claude 2.1.202 session matrix verifies 25 root-selection/lifecycle
 cases. This does not expand its import-only gate. Ambient directory overrides,
-production handling of the remote memory base and installed acceptance remain
+other remote-base path forms and installed acceptance remain
 open. See [directory qualification](../../docs/verification/claude-memory-directory-2026-09-07.md).
 
 ## Managed hooks and privacy
