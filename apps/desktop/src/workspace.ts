@@ -25,6 +25,7 @@ import type {
   RecoveryEnrollmentStatus,
   Sha256Digest,
   StatusOutput,
+  SearchIndexStatus,
   TaskId,
   TaskRecord,
   TaskStatus,
@@ -32,7 +33,7 @@ import type {
 import { LocalClient } from './local-client';
 import { uuidV7 } from './uuid';
 import { type HarnessGateway, requireHarnessAcknowledgment, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
-import { validateHarnessPreparation, validateHarnessExecution, validateHarnessSetupRecord, validateHarnessSetupsPage } from './protocol-validation';
+import { validateHarnessPreparation, validateHarnessExecution, validateHarnessSetupRecord, validateHarnessSetupsPage, validateSearchIndexStatus } from './protocol-validation';
 
 export type PairingInviteResult = Extract<LocalResult, { kind: 'pairing_invite' }>;
 export type PairingRequestResult = Extract<LocalResult, { kind: 'pairing_request' }>;
@@ -110,6 +111,8 @@ export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
   ): Promise<MemoryRecord>;
   archiveMemory(memory: MemoryRecord): Promise<MemoryRecord>;
   searchMemories(query: string, projectId: string | null): Promise<MemoryRecord[]>;
+  searchIndexStatus(): Promise<SearchIndexStatus>;
+  searchIndexRetry(): Promise<SearchIndexStatus>;
   candidates(projectId: string | null): Promise<MemoryCandidate[]>;
   reviewCandidate(candidate: MemoryCandidate, accepted: boolean): Promise<MemoryCandidate>;
   tasks(projectId: string): Promise<TaskRecord[]>;
@@ -481,6 +484,18 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
       params: { query, projectId: projectId as ProjectId | null },
     });
     return result.kind === 'memories' ? result.data.memories : unexpected(result);
+  }
+
+  async searchIndexStatus() {
+    const result = await this.client.call({ method: 'search_index_status', params: {} });
+    if (result.kind !== 'search_index') return unexpected(result);
+    return validateSearchIndexStatus(result.data.status);
+  }
+
+  async searchIndexRetry() {
+    const result = await this.client.call({ method: 'search_index_retry', params: {} });
+    if (result.kind !== 'search_index') return unexpected(result);
+    return validateSearchIndexStatus(result.data.status);
   }
 
   async candidates(projectId: string | null) {

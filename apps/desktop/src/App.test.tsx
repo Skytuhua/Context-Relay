@@ -23,7 +23,7 @@ const gateway = {
   harnessSetupsList: async () => ({ setups: [], nextAfter: null }),
   pendingWrites: async () => ({ writes: [], nextCursor: null }),
   status: async () => ({
-    protocol: { min: { major: 1, minor: 10 }, max: { major: 1, minor: 10 } },
+    protocol: { min: { major: 1, minor: 11 }, max: { major: 1, minor: 11 } },
     vault: 'unlocked',
     resolvedProject: null,
     sync: 'offline',

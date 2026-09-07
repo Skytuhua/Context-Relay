@@ -119,6 +119,8 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         JsonRpcVersion,
         DaemonInstanceNonce,
         EmptyParams,
+        SearchIndexPhase,
+        SearchIndexStatus,
         HarnessPrepareParams,
         HarnessPreparationIdParams,
         HarnessPreparationPhase,

@@ -1,6 +1,6 @@
 import Ajv2020 from 'ajv/dist/2020.js';
 
-import type { HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
+import type { HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SearchIndexStatus, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
 
 const utf8 = new TextEncoder();
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -57,6 +57,13 @@ const id = (value: unknown, field: string) => {
 const u64 = (value: unknown, field: string) => {
   if (typeof value !== 'string' || value.length > 20 || !decimal.test(value) || BigInt(value) > u64Max) fail(field);
 };
+
+export function validateSearchIndexStatus(value: unknown): SearchIndexStatus {
+  const status = object(value, ['phase', 'revision'], 'search status');
+  choice(status.phase, ['disabled', 'preparing', 'ready', 'failed'], 'search phase');
+  u64(status.revision, 'search revision');
+  return value as SearchIndexStatus;
+}
 const sha = (value: unknown, field: string) => {
   if (typeof value !== 'string' || !digest.test(value)) fail(field);
 };

@@ -15,6 +15,8 @@ import type { WorkspaceGateway } from './workspace';
 const id = (suffix: string) => `018f22e2-79b0-7cc8-98c4-dc0c0c0739${suffix}`;
 
 class FakeWorkspaceGateway implements WorkspaceGateway {
+  async searchIndexStatus() { return { phase: 'disabled' as const, revision: '0' as import('./bindings').DecimalU64 }; }
+  async searchIndexRetry() { return this.searchIndexStatus(); }
   async harnessPrepare(): Promise<never> { throw new Error('Not used'); }
   async harnessPreparationStatus(): Promise<never> { throw new Error('Not used'); }
   async harnessPreparationCancel(): Promise<never> { throw new Error('Not used'); }
@@ -58,7 +60,7 @@ class FakeWorkspaceGateway implements WorkspaceGateway {
 
   async status(): Promise<StatusOutput> {
     return {
-      protocol: { min: { major: 1, minor: 10 }, max: { major: 1, minor: 10 } },
+      protocol: { min: { major: 1, minor: 11 }, max: { major: 1, minor: 11 } },
       vault: 'unlocked',
       resolvedProject: null,
       sync: 'offline',

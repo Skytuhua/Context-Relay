@@ -188,8 +188,8 @@ const nullAtPath = (value: unknown, path: readonly PropertyKey[]) => {
 };
 
 describe('generated protocol version', () => {
-  it('advertises the background harness preparation contract as v1.8', () => {
-    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 10 });
+  it('advertises the background search status contract as v1.11', () => {
+    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 11 });
   });
 });
 
@@ -314,7 +314,7 @@ describe('protocol schemas', () => {
     for (const protocol of [
       { min: { major: 2, minor: 0 }, max: { major: 2, minor: 0 } },
       { min: { major: 1, minor: 0 }, max: { major: 1, minor: 0 } },
-      { min: { major: 1, minor: 6 }, max: { major: 1, minor: 10 } },
+      { min: { major: 1, minor: 6 }, max: { major: 1, minor: 11 } },
       { min: { major: 1, minor: 1 }, max: { major: 1, minor: 0 } },
     ]) {
       expect(validate({ ...fixture, protocol }), JSON.stringify(protocol)).toBe(false);

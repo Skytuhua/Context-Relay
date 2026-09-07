@@ -12,6 +12,8 @@ import { DevicesScreen } from './devices';
 import { HarnessesScreen } from './harnesses';
 import { ProjectForm } from './project-form';
 import { WriteRecovery } from './write-recovery';
+import { SearchProgress } from './search-progress';
+import { useSearchProgress } from './use-search-progress';
 import { LocalWorkspaceGateway, RecoveryStorageFullError, type WorkspaceGateway } from './workspace';
 
 type ScreenId =
@@ -80,6 +82,10 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   }, []);
   const readGeneration = useRef(0);
   const [recordsLoading, setRecordsLoading] = useState(false);
+  const [submittedSearch, setSubmittedSearch] = useState<{ query: string } | null>(null);
+  const searchProgress = useSearchProgress(gateway, activeScreen === 'memory' && connectionState === 'ready');
+  const searchRevision = searchProgress.status?.revision;
+  const searchProjectId = activeProject?.projectId ?? null;
   const hasNavigatedRef = useRef(false);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
@@ -121,6 +127,25 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     if (hasNavigatedRef.current) headingRef.current?.focus();
   }, [activeScreen]);
 
+  useEffect(() => {
+    if (activeScreen !== 'memory' || !submittedSearch || connectionState !== 'ready') return;
+    const generation = ++readGeneration.current;
+    setRecordsLoading(true);
+    const query = submittedSearch.query;
+    let active = true;
+    void (query ? gateway.searchMemories(query, searchProjectId) : gateway.memories(searchProjectId))
+      .then((records) => {
+        if (!active || generation !== readGeneration.current) return;
+        setMemories(records);
+        setError(null);
+      }).catch(() => {
+        if (active && generation === readGeneration.current) setError('Search could not finish. Your saved context has not changed. Try searching again.');
+      }).finally(() => {
+        if (active && generation === readGeneration.current) setRecordsLoading(false);
+      });
+    return () => { active = false; };
+  }, [activeScreen, submittedSearch, searchRevision, searchProjectId, gateway, connectionState]);
+
   if (!currentScreen) return null;
 
   async function selectScreen(screen: ScreenId, scope = activeProject) {
@@ -132,6 +157,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     }
     const generation = ++readGeneration.current;
     hasNavigatedRef.current = true;
+    setSubmittedSearch(null);
     setActiveScreen(screen);
     setError(null);
     setNotice(null);
@@ -187,6 +213,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   function beginSave(action: SaveAction) {
     if (savingRef.current || projectBusyRef.current || connectionState !== 'ready') return false;
     savingRef.current = true;
+    setSubmittedSearch(null);
     readGeneration.current += 1;
     setRecordsLoading(false);
     setSaving(action);
@@ -269,20 +296,11 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     queueMicrotask(() => archiveDialogRef.current?.showModal());
   }
 
-  async function searchMemory(event: FormEvent<HTMLFormElement>) {
+  function searchMemory(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (savingRef.current) return;
-    const generation = ++readGeneration.current;
-    setRecordsLoading(true);
     const query = String(new FormData(event.currentTarget).get('query') ?? '').trim();
-    try {
-      const records = await (query ? gateway.searchMemories(query, activeProject?.projectId ?? null) : gateway.memories(activeProject?.projectId ?? null));
-      if (generation !== readGeneration.current) return;
-      setMemories(records);
-      setError(null);
-    } catch {
-      if (generation === readGeneration.current) setError('Search could not finish. Your saved context has not changed. Try searching again.');
-    } finally { if (generation === readGeneration.current) setRecordsLoading(false); }
+    setSubmittedSearch({ query });
   }
 
   async function review(candidate: MemoryCandidate, accepted: boolean) {
@@ -425,7 +443,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
                 <button className="secondary-action" disabled={!!saving} onClick={() => setEditingMemory(null)} type="button">Cancel edit</button>
               </form>
             )}
-            <RecordList title="Saved context" tools={<form aria-label="Context search" role="search" className="inline-form" onSubmit={searchMemory}>
+            <SearchProgress progress={searchProgress} />
+            <RecordList title="Saved context" tools={<form key={searchProjectId ?? 'global'} aria-label="Context search" role="search" className="inline-form" onSubmit={searchMemory}>
                 <label htmlFor="memory-query">Search saved context</label>
                 <input id="memory-query" name="query" type="search" disabled={!!saving} />
                 <button className="secondary-action" type="submit" disabled={!!saving}>Search</button>

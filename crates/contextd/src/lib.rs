@@ -51,6 +51,7 @@ pub mod harness_preparation;
 mod native_memory;
 mod pairing;
 mod recovery_enrollment;
+mod search_index;
 
 #[cfg(test)]
 pub(crate) mod unit_test_support {
@@ -178,6 +179,12 @@ trait WorkerHook: Send + Sync {
     fn before_execute(&self);
 
     fn after_enqueue(&self) {}
+
+    #[cfg(test)]
+    fn before_index(&self) {}
+
+    #[cfg(test)]
+    fn before_index_admission(&self) {}
 }
 
 #[cfg(test)]
@@ -931,6 +938,22 @@ async fn serve_request(
             connection.respond(id, result).await?;
             Ok(true)
         }
+        RoutedRequest::SearchIndexStatus => {
+            let result = begin_immediate(&registration).and_then(|()| {
+                if !service.worker.is_alive() {
+                    return Err(service_internal_error());
+                }
+                let snapshot = service.worker.status();
+                if snapshot.vault == VaultState::Locked {
+                    return Err(ClientError::vault_locked());
+                }
+                Ok(LocalResult::SearchIndex {
+                    status: snapshot.search,
+                })
+            });
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
         RoutedRequest::Shutdown => {
             let result = begin_immediate(&registration).map(|()| LocalResult::Empty);
             let accepted = result.is_ok();
@@ -979,6 +1002,7 @@ impl Drop for Daemon {
 
 #[derive(Debug)]
 enum RoutedRequest {
+    SearchIndexStatus,
     ExecutionCurrent,
     ExecutionStart(context_relay_protocol::HarnessExecutionParams),
     ExecutionStatus(context_relay_protocol::HarnessExecutionParams),
@@ -992,6 +1016,7 @@ enum RoutedRequest {
 
 #[derive(Debug)]
 enum VaultCommand {
+    SearchIndexRetry,
     Unlock,
     ProjectPathSet(ProjectPathParams),
     MemoryGet(MemoryParams),
@@ -1011,6 +1036,8 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
     if matches!(
         &request,
         LocalRequest::HarnessPrepare(_)
+            | LocalRequest::SearchIndexStatus(_)
+            | LocalRequest::SearchIndexRetry(_)
             | LocalRequest::HarnessExecutionStart(_)
             | LocalRequest::HarnessExecutionStatus(_)
             | LocalRequest::HarnessExecutionCurrent(_)
@@ -1035,6 +1062,8 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         return RoutedRequest::Immediate(Err(scope_denied_error()));
     }
     match request {
+        LocalRequest::SearchIndexStatus(_) => RoutedRequest::SearchIndexStatus,
+        LocalRequest::SearchIndexRetry(_) => RoutedRequest::Work(VaultCommand::SearchIndexRetry),
         LocalRequest::HarnessExecutionCurrent(_) => RoutedRequest::ExecutionCurrent,
         LocalRequest::HarnessExecutionStart(params) => RoutedRequest::ExecutionStart(params),
         LocalRequest::HarnessExecutionStatus(params) => RoutedRequest::ExecutionStatus(params),
@@ -1235,12 +1264,15 @@ impl WorkerClient {
             .admission
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if !*admission_gate {
-            return Err(busy_error());
-        }
         let Some(sender) = self.sender.upgrade() else {
             return Err(service_internal_error());
         };
+        if sender.is_closed() {
+            return Err(service_internal_error());
+        }
+        if !*admission_gate {
+            return Err(busy_error());
+        }
         let (response, receiver) = oneshot::channel();
         let item = WorkItem {
             command,
@@ -1276,6 +1308,7 @@ struct VaultWorker {
 struct ServiceStatusSnapshot {
     vault: VaultState,
     sync: SyncState,
+    search: context_relay_protocol::SearchIndexStatus,
 }
 
 struct ServiceStatus(Mutex<ServiceStatusSnapshot>);
@@ -1285,6 +1318,7 @@ impl ServiceStatus {
         Self(Mutex::new(ServiceStatusSnapshot {
             vault: VaultState::Unlocked,
             sync: SyncState::Offline,
+            search: search_index::SearchIndexJob::new(false).status,
         }))
     }
 
@@ -1298,6 +1332,13 @@ impl ServiceStatus {
             .unwrap_or_else(|error| error.into_inner())
             .vault = vault;
     }
+
+    fn set_search(&self, search: context_relay_protocol::SearchIndexStatus) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .search = search;
+    }
 }
 
 struct StoredExport {
@@ -1307,6 +1348,7 @@ struct StoredExport {
 }
 
 struct WorkspaceState {
+    search_index: search_index::SearchIndexJob,
     preparation: Option<PreparationClient>,
     vault: Vault,
     vault_path: PathBuf,
@@ -1403,6 +1445,7 @@ fn open_workspace(
         };
     Ok((
         WorkspaceState {
+            search_index: search_index::SearchIndexJob::new(vault.semantic_search_enabled()),
             preparation: config.preparation.clone(),
             vault,
             vault_path: config.path.clone(),
@@ -1425,6 +1468,7 @@ impl VaultWorker {
         let (ready_sender, ready_receiver) = oneshot::channel();
         let (exit_sender, exit_receiver) = oneshot::channel();
         let admission = Arc::new(Mutex::new(true));
+        let thread_admission = admission.clone();
         let worker_hook = config.worker_hook.clone();
         let thread_worker_hook = worker_hook.clone();
         let status = Arc::new(ServiceStatus::new());
@@ -1435,6 +1479,7 @@ impl VaultWorker {
                 let (state, ledgers) = match open_workspace(&mut config) {
                     Ok((workspace, ledgers)) => {
                         worker_status.set_vault(VaultState::Unlocked);
+                        worker_status.set_search(workspace.search_index.status);
                         (VaultWorkerState::Open(workspace), ledgers)
                     }
                     Err(WorkspaceOpenError::Locked) => {
@@ -1455,6 +1500,7 @@ impl VaultWorker {
                     &mut receiver,
                     thread_worker_hook.as_deref(),
                     &worker_status,
+                    &thread_admission,
                 );
                 let _ = exit_sender.send(());
             })
@@ -1517,6 +1563,7 @@ impl VaultWorker {
     }
 
     fn shutdown_and_join(&mut self) {
+        self.close_admission();
         self.sender.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -1524,6 +1571,7 @@ impl VaultWorker {
     }
 
     async fn shutdown_and_join_async(&mut self) {
+        self.close_admission();
         self.sender.take();
         if let Some(thread) = self.thread.take() {
             let _ = tokio::task::spawn_blocking(move || thread.join()).await;
@@ -1537,8 +1585,51 @@ fn run_vault_worker(
     receiver: &mut mpsc::Receiver<WorkItem>,
     worker_hook: Option<&dyn WorkerHook>,
     status: &ServiceStatus,
+    admission_gate: &Mutex<bool>,
 ) {
-    while let Some(item) = receiver.blocking_recv() {
+    loop {
+        let item = match receiver.try_recv() {
+            Ok(item) => item,
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                #[cfg(test)]
+                if let Some(worker_hook) = worker_hook {
+                    worker_hook.before_index_admission();
+                }
+                // Admit one record at a time. Never hold the admission/status lock
+                // during inference; control requests and shutdown remain available.
+                let gate = admission_gate
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                // try_submit uses this same gate. Recheck while holding it so a
+                // request that arrived after the first check wins this turn.
+                match receiver.try_recv() {
+                    Ok(item) => {
+                        drop(gate);
+                        item
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        let admitted = *gate
+                            && matches!(&state, VaultWorkerState::Open(workspace) if workspace.search_index.pending());
+                        drop(gate);
+                        if admitted && let VaultWorkerState::Open(workspace) = &mut state {
+                            #[cfg(test)]
+                            if let Some(worker_hook) = worker_hook {
+                                worker_hook.before_index();
+                            }
+                            workspace.search_index.tick(&mut workspace.vault);
+                            status.set_search(workspace.search_index.status);
+                            continue;
+                        }
+                        let Some(item) = receiver.blocking_recv() else {
+                            break;
+                        };
+                        item
+                    }
+                }
+            }
+        };
         let WorkItem {
             command,
             admission,
@@ -1555,6 +1646,11 @@ fn run_vault_worker(
         admission.finished(&result);
         let _ = response.send(result);
         drop(admission);
+        // Writes from desktop, harnesses, and native reconciliation all maintain
+        // the durable queue. Recheck it after requests without rescanning records.
+        if let VaultWorkerState::Open(workspace) = &mut state {
+            workspace.search_index.wake();
+        }
     }
 }
 
@@ -1575,6 +1671,7 @@ fn execute_vault_command(
         if let Some(updates) = &workspace.native_memory_updates {
             updates.send_replace(ledgers);
         }
+        status.set_search(workspace.search_index.status);
         *state = VaultWorkerState::Open(workspace);
         status.set_vault(VaultState::Unlocked);
         return Ok(LocalResult::Empty);
@@ -1584,6 +1681,13 @@ fn execute_vault_command(
         return Err(ClientError::vault_locked());
     };
     match command {
+        VaultCommand::SearchIndexRetry => {
+            state.search_index.retry();
+            status.set_search(state.search_index.status);
+            Ok(LocalResult::SearchIndex {
+                status: state.search_index.status,
+            })
+        }
         VaultCommand::Unlock => unreachable!("unlock is handled before open-state dispatch"),
         VaultCommand::ProjectPathSet(params) => state
             .vault
@@ -4870,6 +4974,225 @@ mod tests {
             serde_json::json!({"mode": "active_project_only", "readOnly": true})
         );
         worker.shutdown_and_join();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires verified BGE assets and ONNX Runtime"]
+    async fn real_search_worker_prepares_semantic_results_in_the_background() {
+        let path = unit_test_support::TempVault::new("background-semantic-search");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let model_directory = PathBuf::from(
+            std::env::var_os("CONTEXT_RELAY_MODEL_DIR").expect("verified model directory"),
+        );
+        let mut config = VaultConfig::new(path.path().to_owned(), "test-vault-key", keys);
+        config.startup_recovery = Some(Arc::new(move |vault| {
+            let params = serde_json::from_value(serde_json::json!({
+                "operationId": "018f22e2-79b0-7cc8-98c4-dc0c0c073990",
+                "scope": {"scope": "global"}, "kind": "note", "title": "Vehicle",
+                "bodyMarkdown": "Keep the car engine serviced and replace its oil regularly.", "tags": []
+            })).unwrap();
+            OfflineWorkspace::new(vault, stable_device_id(b"search-worker-fixture"))
+                .create_memory(params)
+                .unwrap();
+            vault.enable_semantic_search(
+                context_relay_core::search::PinnedModelEmbedder::load(&model_directory).unwrap(),
+            );
+            Ok(())
+        }));
+        let mut worker = VaultWorker::spawn(config).await.unwrap();
+        let client = worker.client();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        while tokio::time::Instant::now() < deadline {
+            let response = client
+                .try_submit(
+                    VaultCommand::Workspace(LocalRequest::MemorySearch(
+                        context_relay_protocol::SearchParams {
+                            query: "automobile maintenance".into(),
+                            project_id: None,
+                        },
+                    )),
+                    TestAdmission(true),
+                )
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(response, LocalResult::Memories { memories } if !memories.is_empty()) {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        worker.shutdown_and_join_async().await;
+        assert!(
+            found,
+            "the worker never prepared the queued semantic record"
+        );
+    }
+
+    #[test]
+    fn search_progress_and_retry_are_owner_only_even_when_routed_directly() {
+        for request in [
+            LocalRequest::SearchIndexStatus(EmptyParams {}),
+            LocalRequest::SearchIndexRetry(EmptyParams {}),
+        ] {
+            assert!(role_allows(ClientRole::Desktop, &request));
+            for role in [
+                ClientRole::McpBridge,
+                ClientRole::Installer,
+                ClientRole::DesktopRecoveryHost,
+            ] {
+                assert!(!role_allows(role, &request));
+                assert!(
+                    matches!(route_request(role, request.clone()), RoutedRequest::Immediate(Err(error)) if error == scope_denied_error())
+                );
+            }
+        }
+        assert!(matches!(
+            route_request(
+                ClientRole::Desktop,
+                LocalRequest::SearchIndexStatus(EmptyParams {})
+            ),
+            RoutedRequest::SearchIndexStatus
+        ));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    #[ignore = "requires verified BGE assets and ONNX Runtime"]
+    async fn real_search_progress_stays_responsive_and_indexing_yields_then_stops_on_shutdown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct IndexGate {
+            events: std::sync::mpsc::Sender<&'static str>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            batches: AtomicUsize,
+            admission_checks: AtomicUsize,
+        }
+        impl WorkerHook for IndexGate {
+            fn before_index_admission(&self) {
+                if self.admission_checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.events.send("admission").unwrap();
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(20))
+                        .unwrap();
+                }
+            }
+            fn before_execute(&self) {
+                self.events.send("request").unwrap();
+            }
+            fn before_index(&self) {
+                self.batches.fetch_add(1, Ordering::SeqCst);
+                self.events.send("index").unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(20))
+                    .unwrap();
+            }
+        }
+        let path = unit_test_support::TempVault::new("search-index-admission");
+        let runtime = test_runtime("search-index-admission");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut config = test_config(
+            runtime.clone(),
+            path.path().to_owned(),
+            keys.clone(),
+            Arc::new(FixedTokenProvider::default()),
+        );
+        let model_directory = PathBuf::from(
+            std::env::var_os("CONTEXT_RELAY_MODEL_DIR").expect("verified model directory"),
+        );
+        config.vault.startup_recovery = Some(Arc::new(move |vault| {
+            for index in 0..4 {
+                let params = serde_json::from_value(serde_json::json!({
+                    "operationId": format!("018f22e2-79b0-7cc8-98c4-dc0c0c07399{index}"),
+                    "scope": {"scope": "global"}, "kind": "note", "title": "Vehicle",
+                    "bodyMarkdown": "Keep the car engine serviced and replace its oil regularly.", "tags": []
+                })).unwrap();
+                OfflineWorkspace::new(vault, stable_device_id(b"search-admission-fixture"))
+                    .create_memory(params)
+                    .unwrap();
+            }
+            vault.enable_semantic_search(
+                context_relay_core::search::PinnedModelEmbedder::load(&model_directory).unwrap(),
+            );
+            Ok(())
+        }));
+        let (events, received) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let gate = Arc::new(IndexGate {
+            events,
+            release: Mutex::new(released),
+            batches: AtomicUsize::new(0),
+            admission_checks: AtomicUsize::new(0),
+        });
+        config.vault.worker_hook = Some(gate.clone());
+        let daemon = Daemon::start(config).await.unwrap();
+        let client = daemon.worker.client();
+        let handle = daemon.handle();
+        let owner = tokio::spawn(daemon.run());
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "admission"
+        );
+        let raced_request = client
+            .try_submit(
+                VaultCommand::Workspace(LocalRequest::ProjectsList(EmptyParams {})),
+                TestAdmission(true),
+            )
+            .unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "request",
+            "a request enqueued before indexing admission must win"
+        );
+        raced_request.await.unwrap().unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "index"
+        );
+        let mut desktop = RawClient::connect(&runtime, ClientRole::Desktop).await;
+        let progress = timeout(
+            Duration::from_secs(1),
+            desktop.call(LocalRequest::SearchIndexStatus(EmptyParams {})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(progress, LocalResult::SearchIndex { status } if status.phase == context_relay_protocol::SearchIndexPhase::Preparing)
+        );
+        let request = client
+            .try_submit(
+                VaultCommand::Workspace(LocalRequest::ProjectsList(EmptyParams {})),
+                TestAdmission(true),
+            )
+            .unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "request",
+            "queued work must precede a second inference"
+        );
+        assert!(matches!(
+            request.await.unwrap().unwrap(),
+            LocalResult::Projects { .. }
+        ));
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "index"
+        );
+        // The second slice is already admitted; shutdown may finish it, but must
+        // not admit either of the two remaining records.
+        *client.admission.lock().unwrap() = false;
+        release.send(()).unwrap();
+        assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+        owner.await.unwrap().unwrap();
+        assert_eq!(gate.batches.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(any(windows, target_os = "macos"))]

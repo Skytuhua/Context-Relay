@@ -77,4 +77,17 @@ total-change count, so indexing completion cannot use that count alone as its
 generation. Verify concurrent reads/writes, edits and scope changes mid-index,
 restart reuse, inference failure/retry, model-fingerprint changes, tag search, and
 collections/scope switches that exceed the in-memory cache. This is a reviewed
-follow-up direction, not an implemented or accepted production workflow.
+follow-up direction. Core persistence and cooperative service/desktop integration
+are now implemented and qualified in disposable tests; see the responsive-index
+plan and semantic-search verification ledger for results.
+
+Next: verify and stage pinned Windows model/runtime resources, initialize the
+model as background work after worker readiness, preserve keyword access on
+initialization failure, and make Retry repeat verification/initialization without
+deleting completed vectors. Production resource paths must derive from the
+installed executable, not ambient ORT_DYLIB_PATH. Use the runtime's explicit
+`ort::init_from` path before any default runtime initialization, retaining verified
+runtime file handles as needed to prevent replacement between checking/loading.
+Qualify missing/tampered resources, interrupted/retried loading, and actual search
+through an authenticated disposable daemon before enabling production or rebuilding
+the installer. Also check how harness search reports a still-preparing index.

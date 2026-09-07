@@ -206,6 +206,9 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::MemoryGet(_) => matches!(role, Desktop),
         LocalRequest::MemoryList(_) => matches!(role, Desktop),
         LocalRequest::MemorySearch(_) => matches!(role, Desktop),
+        LocalRequest::SearchIndexStatus(_) | LocalRequest::SearchIndexRetry(_) => {
+            matches!(role, Desktop)
+        }
         LocalRequest::MemoryCreate(_) => matches!(role, Desktop),
         LocalRequest::MemoryUpdate(_) => matches!(role, Desktop),
         LocalRequest::MemoryArchive(_) => matches!(role, Desktop),

@@ -58,6 +58,25 @@ macro_rules! params { ($name:ident { $($(#[$field_attr:meta])* $field:ident : $t
     pub struct $name { $($(#[$field_attr])* pub $field:$ty),* }
 }; }
 params!(EmptyParams {});
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchIndexPhase {
+    Disabled,
+    Preparing,
+    Ready,
+    Failed,
+}
+
+/// Owner-only status across saved context. Contains no record or project counts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchIndexStatus {
+    pub phase: SearchIndexPhase,
+    #[serde(with = "decimal_u64")]
+    #[ts(type = "DecimalU64")]
+    pub revision: u64,
+}
 params!(HarnessPrepareParams {
     operation_id: OperationId,
     selection: HarnessParams
@@ -601,6 +620,8 @@ pub enum LocalRequest {
     MemoryGet(MemoryParams),
     MemoryList(MemoryListParams),
     MemorySearch(SearchParams),
+    SearchIndexStatus(EmptyParams),
+    SearchIndexRetry(EmptyParams),
     MemoryCreate(MemoryCreateParams),
     MemoryUpdate(MemoryUpdateParams),
     MemoryArchive(MemoryArchiveParams),
@@ -1074,6 +1095,9 @@ pub enum AccountDeletionState {
     rename_all_fields = "camelCase"
 )]
 pub enum LocalResult {
+    SearchIndex {
+        status: SearchIndexStatus,
+    },
     HarnessExecutionCurrent {
         status: Option<crate::HarnessExecutionStatus>,
     },
@@ -1186,6 +1210,9 @@ pub enum LocalResult {
     deny_unknown_fields
 )]
 enum LocalResultSerde {
+    SearchIndex {
+        status: SearchIndexStatus,
+    },
     HarnessExecutionCurrent {
         #[serde(deserialize_with = "crate::required_nullable")]
         status: Option<crate::HarnessExecutionStatus>,
@@ -1305,7 +1332,10 @@ impl LocalResult {
                 write.as_ref().map_or(Ok(()), crate::DesktopWrite::validate)
             }
             Self::DesktopWrites { page } => page.validate(),
-            Self::Empty | Self::AccountDeletion { .. } | Self::Access { .. } => Ok(()),
+            Self::Empty
+            | Self::AccountDeletion { .. }
+            | Self::Access { .. }
+            | Self::SearchIndex { .. } => Ok(()),
             Self::Health { protocol, .. } => {
                 if protocol.major != crate::PROTOCOL_MAJOR {
                     return Err(ValidationError::Invalid("health.protocol"));

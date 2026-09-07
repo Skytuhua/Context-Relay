@@ -385,7 +385,7 @@ impl Vault {
         self.semantic_search = Some(Box::new(RefCell::new(SemanticSearch::new(model))));
     }
 
-    pub(crate) fn semantic_search_enabled(&self) -> bool {
+    pub fn semantic_search_enabled(&self) -> bool {
         self.semantic_search.is_some()
     }
 

@@ -1,0 +1,136 @@
+use std::time::Duration;
+
+use context_relay_core::vault::{SemanticIndexBatch, Vault, VaultError};
+use context_relay_protocol::{SearchIndexPhase, SearchIndexStatus};
+
+pub(super) struct SearchIndexJob {
+    pub(super) status: SearchIndexStatus,
+    pending: bool,
+}
+
+impl SearchIndexJob {
+    pub(super) fn new(enabled: bool) -> Self {
+        Self {
+            status: SearchIndexStatus {
+                phase: if enabled {
+                    SearchIndexPhase::Preparing
+                } else {
+                    SearchIndexPhase::Disabled
+                },
+                revision: 0,
+            },
+            pending: enabled,
+        }
+    }
+
+    pub(super) fn wake(&mut self) {
+        if matches!(
+            self.status.phase,
+            SearchIndexPhase::Preparing | SearchIndexPhase::Ready
+        ) {
+            self.pending = true;
+        }
+    }
+
+    pub(super) fn retry(&mut self) {
+        if self.status.phase == SearchIndexPhase::Failed {
+            self.change_phase(SearchIndexPhase::Preparing);
+            self.pending = true;
+        }
+    }
+
+    pub(super) fn pending(&self) -> bool {
+        self.pending
+    }
+
+    pub(super) fn tick(&mut self, vault: &mut Vault) {
+        // One inference cannot be preempted. The worker checks queued requests
+        // and shutdown again before admitting the next record.
+        self.finish(vault.index_semantic_batch(1, Duration::from_millis(50)));
+    }
+
+    fn finish(&mut self, result: Result<SemanticIndexBatch, VaultError>) {
+        match result {
+            Ok(batch) => {
+                self.pending = batch.remaining > 0;
+                if batch.processed > 0 {
+                    self.status.revision = self.status.revision.saturating_add(1);
+                }
+                self.change_phase(if self.pending {
+                    SearchIndexPhase::Preparing
+                } else {
+                    SearchIndexPhase::Ready
+                });
+            }
+            Err(_) => {
+                // Keep persisted vectors and pause until an explicit retry.
+                self.pending = false;
+                self.change_phase(SearchIndexPhase::Failed);
+            }
+        }
+    }
+
+    fn change_phase(&mut self, phase: SearchIndexPhase) {
+        if self.status.phase != phase {
+            self.status.phase = phase;
+            self.status.revision = self.status.revision.saturating_add(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_pauses_automatic_work_and_retry_preserves_progress() {
+        let mut job = SearchIndexJob::new(true);
+        job.finish(Ok(SemanticIndexBatch {
+            indexed: 1,
+            processed: 1,
+            remaining: 2,
+        }));
+        let published = job.status.revision;
+        job.finish(Err(VaultError::Validation("fixture error".into())));
+        assert_eq!(job.status.phase, SearchIndexPhase::Failed);
+        job.wake();
+        assert!(!job.pending());
+        job.retry();
+        assert!(job.pending());
+        assert!(job.status.revision > published);
+        let retry = job.status;
+        job.retry();
+        assert_eq!(job.status, retry);
+        job.finish(Ok(SemanticIndexBatch {
+            indexed: 1,
+            processed: 1,
+            remaining: 0,
+        }));
+        assert_eq!(job.status.phase, SearchIndexPhase::Ready);
+        assert!(!job.pending());
+    }
+
+    #[test]
+    fn empty_rechecks_do_not_flicker_or_advance_the_search_revision() {
+        let mut job = SearchIndexJob::new(true);
+        job.finish(Ok(SemanticIndexBatch {
+            indexed: 0,
+            processed: 0,
+            remaining: 0,
+        }));
+        let ready = job.status;
+        job.wake();
+        assert_eq!(job.status, ready);
+        job.finish(Ok(SemanticIndexBatch {
+            indexed: 0,
+            processed: 0,
+            remaining: 0,
+        }));
+        assert_eq!(job.status, ready);
+        let mut disabled = SearchIndexJob::new(false);
+        disabled.wake();
+        disabled.retry();
+        assert!(!disabled.pending());
+        assert_eq!(disabled.status.phase, SearchIndexPhase::Disabled);
+    }
+}

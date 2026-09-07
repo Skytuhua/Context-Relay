@@ -113,14 +113,43 @@ patch, explicitly excluding service/UI scheduling and packaging.
 The Windows installer still needs verified model/runtime resources and production
 startup wiring. Current model-backed vaults are explicitly configured by tests.
 Existing stored legacy vectors are preserved and never compared with BGE query
-vectors in this configured path. Service scheduling, authenticated desktop
-progress, and failure/retry composition still need qualification before production
-activation. The cache-capacity test above does not establish latency for diverse
+vectors in this configured path. Failure/reinitialization composition still needs
+qualification before production activation. The cache-capacity test above does not establish latency for diverse
 larger collections across supported platforms.
 
-The service must schedule the new batches cooperatively and yield to requests.
-Its current timeout only abandons the response; it cannot interrupt an inference.
-Core batch/progress APIs alone do not constitute the complete application workflow.
+The service now schedules one record per idle turn and rechecks queued requests
+under the shared admission lock before reserving an indexing turn. The lock is
+released before inference. Closing admission prevents new batches; an already
+admitted record can finish. The request timeout still cannot interrupt inference.
+
+Protocol 1.11 adds desktop-only search status and retry. Status is a cached phase
+and revision, served independently of the vault queue with no project/record
+counts. Index errors pause the job; retry preserves completed vectors. Saved
+context polls once per second while active, keeps visible results, refreshes the
+submitted search on a new revision, and discards superseded queries/navigation.
+Preparing, ready, stopped, and temporarily unavailable states have plain wording.
+
+The first actual-model worker regression failed because no background indexing
+was scheduled. Five focused service checks now pass in 2.69 seconds, including
+two actual-model fixtures. The second fixture gates inference, verifies an
+authenticated status response within one second, queues a request at the
+admission boundary and between records, then stops after the last admitted batch.
+Independent review found the initial enqueue/admission race; a locked recheck
+and deterministic regression resolve it. Three desktop progress/retry/stale-query
+tests pass, and the complete desktop suite passes 222 tests. Lint and the
+production web build pass. These are disposable worker and browser-DOM tests;
+the model is enabled by a test startup hook, not production resource loading.
+
+The final wider checks pass: 205 protocol/IPC tests, 74 daemon library tests,
+25 MCP memory-tool tests, and the two opt-in actual-model worker checks above.
+The 222-test desktop run is supplemented by the new gateway-contract test in a
+nine-test focused rerun (223 distinct desktop tests). Type checking and four-crate
+all-target Clippy pass with test support and warnings denied. The initial wider
+run caught a stopped-worker error classification regression; checking worker
+availability before returning Busy resolved it. Protocol 1.11's two frozen
+authentication vectors were recomputed independently with .NET HMACSHA256.
+Final read-only review approved the scheduler admission correction and desktop
+async behavior. Production runtime/model initialization remains outside this proof.
 
 The code graph was refreshed after the source changes: 16,758 nodes and 47,422
 edges across 768 communities. Optional SQL/OCaml parsers were unavailable and Cargo.toml produced no AST

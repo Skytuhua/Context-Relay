@@ -14,7 +14,24 @@ import { LocalClient } from './local-client';
 import { LocalWorkspaceGateway } from './workspace';
 
 beforeEach(() => {
-  invoke.mockReset();
+    invoke.mockReset();
+});
+
+it('reads and retries search preparation through the typed protocol and rejects malformed progress', async () => {
+  const gateway = new LocalWorkspaceGateway();
+  const status = { phase: 'preparing', revision: '4' };
+  invoke.mockResolvedValue({ kind: 'search_index', data: { status } });
+  await expect(gateway.searchIndexStatus()).resolves.toEqual(status);
+  await expect(gateway.searchIndexRetry()).resolves.toEqual(status);
+  expect(invoke.mock.calls.map((call) => call[1].request.method)).toEqual(['search_index_status', 'search_index_retry']);
+  for (const invalid of [
+    { phase: 'ready', revision: 4 }, { phase: 'ready', revision: '18446744073709551616' },
+    { phase: 'unknown', revision: '4' }, { phase: 'ready' },
+    { phase: 'ready', revision: '4', recordCount: 3 },
+  ]) {
+    invoke.mockResolvedValue({ kind: 'search_index', data: { status: invalid } });
+    await expect(gateway.searchIndexStatus()).rejects.toThrow();
+  }
 });
 
 it('opens the native folder picker without sending workspace mutations, including cancellation', async () => {

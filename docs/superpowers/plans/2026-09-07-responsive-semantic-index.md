@@ -65,10 +65,24 @@ The 16,401-record cache-capacity check passed in 91.54 seconds, using a real BGE
 vector reused for identical inputs to qualify scope switching and restart beyond
 the memory-cache limit. The final focused release rerun passed 10 tests in 8.50
 seconds, with the maximum-record batch at 752.714 ms.
-Step 6 (service scheduling and authenticated UI progress), failure/retry
-composition, and verified model/runtime packaging remain to be completed.
+Step 6 now schedules one record per idle worker turn, with a second queue check
+under the shared admission lock. Authenticated desktop-only status bypasses the
+worker queue; it exposes a phase and revision without project/record counts.
+The desktop polls only on Saved context, keeps existing results visible, refreshes
+the submitted search when the revision changes, and offers an idempotent retry.
+The wire contract is now 1.11, so older binaries cannot negotiate as compatible.
+Verified model/runtime packaging and production initialization remain open.
 
 Final core checkpoint: 53 selected tests pass, core/daemon all-target Clippy passes
 with test support and warnings denied, and format/diff checks pass. Final read-only
 review approved the core patch. The graph was updated to 16,758 nodes and 47,422
 edges. Service/UI and installed acceptance remain open.
+
+The service regression initially failed because no indexing work was scheduled.
+It now passes with the actual BGE model. A second real-model fixture checks the
+enqueue/admission race, request priority between records, status responses during
+a gated inference, and no further admission after shutdown. Five focused service
+checks pass. The desktop progress/retry/stale-result tests and the full 222-test
+suite pass; lint and the production web build pass. Failure/retry state tests
+preserve the completed revision; combined runtime failure/reinitialization and
+packaged installed acceptance still need qualification.
