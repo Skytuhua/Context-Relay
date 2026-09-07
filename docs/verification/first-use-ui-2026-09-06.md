@@ -71,3 +71,27 @@ Hermes availability, direct review and prepared review at desktop/narrow widths.
 The existing 13 preparation/Save/history/Undo flow views also passed with no browser
 errors or horizontal overflow. This is controlled frontend evidence, not installed
 harness connection acceptance. Local evidence uses `.codex/harness-result-focus-`.
+
+## Current installer frontend walkthrough — 2026-09-07
+
+The first-use browser fixture was refreshed for the production frontend in
+`6a612e8`: current Review setup/Save settings labels, saved-write and setup-history
+reads, and the current probe shape. The actual App and stylesheet pass the flow
+from an empty Home through folder selection, project creation, note saving,
+unavailable-harness guidance and setup review. Nine views cover 1166 × 800 and
+390 × 844. Save settings stays disabled before approval, enables when checked
+and disables again when unchecked. No setup write is submitted.
+
+No browser errors, alerts at the final review or horizontal document overflow
+were observed. The prior palette contrast measurements remain unchanged.
+Home, project form, added-project next steps, saved note, unavailable guidance
+and review screenshots were inspected. Full-page captures can include a fixed
+skip link above the scrolled viewport; paired viewport captures and bounding-box
+checks confirm the unfocused link remains outside the visible viewport.
+
+This uses disposable in-memory responses and loopback-only headless Edge. It
+does not access the ordinary service, native folder picker or harness settings,
+and does not replace installed GUI acceptance. No production code or installer
+changed during this follow-up. Local evidence:
+`.codex/verify-current-first-use-ui.mjs`, `.codex/current-first-use-ui.log` and
+`.codex/current-first-use-ui/results.json`.
