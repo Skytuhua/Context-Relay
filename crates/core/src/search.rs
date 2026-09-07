@@ -389,7 +389,12 @@ pub fn verify_pinned_model(directory: &Path) -> Result<(), ModelError> {
 
 pub struct PinnedModelEmbedder {
     model: TextEmbedding,
+    #[cfg(feature = "test-support")]
+    fail_next_inference: bool,
 }
+
+#[cfg(windows)]
+mod packaged_runtime;
 
 fn bounded_model_input(input: &str) -> &str {
     // Token limits alone still tokenize an entire megabyte-sized note first.
@@ -483,10 +488,31 @@ impl SemanticSearch {
 }
 
 impl PinnedModelEmbedder {
+    pub fn load_packaged(directory: &Path) -> Result<Self, ModelError> {
+        #[cfg(windows)]
+        {
+            let artifacts = read_model_artifacts(&directory.join("model"), PINNED_MODEL_MANIFEST)?;
+            packaged_runtime::initialize_packaged(&directory.join("runtime"))?;
+            Self::from_artifacts(artifacts)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = directory;
+            Err(ModelError::RuntimeInitialization)
+        }
+    }
+
     pub fn load(directory: &Path) -> Result<Self, ModelError> {
-        let mut artifacts = read_model_artifacts(directory, PINNED_MODEL_MANIFEST)?;
+        let artifacts = read_model_artifacts(directory, PINNED_MODEL_MANIFEST)?;
         // Context search is local; initialize before creating any model session.
+        #[cfg(windows)]
+        packaged_runtime::initialize_ambient()?;
+        #[cfg(not(windows))]
         ort::init().with_telemetry(false).commit();
+        Self::from_artifacts(artifacts)
+    }
+
+    fn from_artifacts(mut artifacts: BTreeMap<String, Vec<u8>>) -> Result<Self, ModelError> {
         // Move the bytes that passed verification into the runtime. Reopening
         // filenames here would allow replacement between verification and use.
         let mut read = |name: &str| {
@@ -513,7 +539,17 @@ impl PinnedModelEmbedder {
                 .with_max_length(512),
         )
         .map_err(|_| ModelError::RuntimeInitialization)?;
-        Ok(Self { model })
+        Ok(Self {
+            model,
+            #[cfg(feature = "test-support")]
+            fail_next_inference: false,
+        })
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn fail_next_inference_for_test(&mut self) {
+        self.fail_next_inference = true;
     }
 
     pub fn embed(
@@ -521,6 +557,10 @@ impl PinnedModelEmbedder {
         purpose: EmbeddingPurpose,
         input: &str,
     ) -> Result<Embedding384, ModelError> {
+        #[cfg(feature = "test-support")]
+        if std::mem::take(&mut self.fail_next_inference) {
+            return Err(ModelError::Inference);
+        }
         let model_input = bge_model_input(purpose, input);
         let mut output = self
             .model

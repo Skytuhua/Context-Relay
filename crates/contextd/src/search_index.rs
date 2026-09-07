@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use context_relay_core::vault::{SemanticIndexBatch, Vault, VaultError};
 use context_relay_protocol::{SearchIndexPhase, SearchIndexStatus};
@@ -6,6 +6,7 @@ use context_relay_protocol::{SearchIndexPhase, SearchIndexStatus};
 pub(super) struct SearchIndexJob {
     pub(super) status: SearchIndexStatus,
     pending: bool,
+    resources: Option<PathBuf>,
 }
 
 impl SearchIndexJob {
@@ -20,7 +21,17 @@ impl SearchIndexJob {
                 revision: 0,
             },
             pending: enabled,
+            resources: None,
         }
+    }
+
+    pub(super) fn with_resources(mut self, resources: Option<PathBuf>) -> Self {
+        if resources.is_some() {
+            self.status.phase = SearchIndexPhase::Preparing;
+            self.pending = true;
+        }
+        self.resources = resources;
+        self
     }
 
     pub(super) fn wake(&mut self) {
@@ -43,10 +54,31 @@ impl SearchIndexJob {
         self.pending
     }
 
+    pub(super) fn fail(&mut self) {
+        self.pending = false;
+        self.change_phase(SearchIndexPhase::Failed);
+    }
+
     pub(super) fn tick(&mut self, vault: &mut Vault) {
+        if !vault.semantic_search_enabled() {
+            let Some(resources) = &self.resources else {
+                self.fail();
+                return;
+            };
+            match context_relay_core::search::PinnedModelEmbedder::load_packaged(resources) {
+                Ok(model) => vault.enable_semantic_search(model),
+                Err(error) => self.finish(Err(error.into())),
+            }
+            // Return to the request queue between model loading and indexing.
+            return;
+        }
         // One inference cannot be preempted. The worker checks queued requests
         // and shutdown again before admitting the next record.
-        self.finish(vault.index_semantic_batch(1, Duration::from_millis(50)));
+        let result = vault.index_semantic_batch(1, Duration::from_millis(50));
+        if matches!(&result, Err(VaultError::SearchModel(_))) {
+            vault.reset_semantic_search();
+        }
+        self.finish(result);
     }
 
     fn finish(&mut self, result: Result<SemanticIndexBatch, VaultError>) {
@@ -64,8 +96,7 @@ impl SearchIndexJob {
             }
             Err(_) => {
                 // Keep persisted vectors and pause until an explicit retry.
-                self.pending = false;
-                self.change_phase(SearchIndexPhase::Failed);
+                self.fail();
             }
         }
     }

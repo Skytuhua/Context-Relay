@@ -724,6 +724,97 @@ fn search_10k_p95_is_below_150ms_with_warm_injected_query_embedding() {
 }
 
 #[test]
+fn keyword_results_remain_available_before_the_packaged_model_loads() {
+    use context_relay_core::service::OfflineWorkspace;
+    use context_relay_protocol::SearchParams;
+    let path = TempVault::new("keyword-model-fallback");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let mut record = memory(
+        ID_1,
+        ScopeRef::Global,
+        "Vehicle",
+        "Keep the car engine serviced.",
+    );
+    record.tags = vec!["uniquephonemicidentifier".into()];
+    vault
+        .put_memory(
+            &record,
+            &operation(ID_2, ID_1, RecordKind::Memory),
+            &basis(0),
+        )
+        .unwrap();
+    vault.prepare_semantic_search();
+    let scope = AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, None).unwrap();
+    assert!(
+        vault
+            .search("unseenword", &scope, &basis(0), 20)
+            .unwrap()
+            .is_empty(),
+        "preparing search must not return unrelated legacy-vector matches"
+    );
+    let matches = OfflineWorkspace::new(&mut vault, ID_8.parse().unwrap())
+        .search_memories(SearchParams {
+            query: "uniquephonemicidentifier".into(),
+            project_id: None,
+        })
+        .unwrap();
+    assert_eq!(
+        matches.iter().map(|m| m.id).collect::<Vec<_>>(),
+        [record.id]
+    );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+#[ignore = "requires verified BGE assets and ONNX Runtime"]
+fn real_query_failure_keeps_keywords_and_a_reloaded_session_recovers() {
+    let path = TempVault::new("query-model-fallback");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let record = memory(
+        ID_1,
+        ScopeRef::Global,
+        "Vehicle",
+        "Keep the car engine serviced.",
+    );
+    vault
+        .put_memory(
+            &record,
+            &operation(ID_2, ID_1, RecordKind::Memory),
+            &basis(0),
+        )
+        .unwrap();
+    let directory = std::path::PathBuf::from(std::env::var_os("CONTEXT_RELAY_MODEL_DIR").unwrap());
+    let mut model = PinnedModelEmbedder::load(&directory).unwrap();
+    model.fail_next_inference_for_test();
+    vault.enable_semantic_search(model);
+    let scope = AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, None).unwrap();
+    let hits = vault
+        .search("engine", &scope, &basis(0), 20)
+        .expect("keyword fallback after inference failure");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        vault
+            .search("unseenword", &scope, &basis(0), 20)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(vault.take_semantic_search_failure());
+    assert!(!vault.semantic_search_enabled());
+    assert!(!vault.take_semantic_search_failure());
+    vault.enable_semantic_search(PinnedModelEmbedder::load(&directory).unwrap());
+    finish_semantic_index(&mut vault);
+    assert_eq!(
+        vault
+            .search("automobile maintenance", &scope, &basis(0), 20)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 #[ignore = "requires verified BGE assets and ONNX Runtime"]
 fn real_cold_search_does_not_index_passages_on_the_request_path() {
     let path = TempVault::new("responsive-cold-search");

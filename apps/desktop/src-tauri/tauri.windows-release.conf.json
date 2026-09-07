@@ -12,7 +12,20 @@
     "icon": ["icons/icon.ico"],
     "resources": {
       "../../../LICENSE": "LICENSE",
-      "../../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+      "../../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "resources/search/model/model_optimized.onnx": "search/model/model_optimized.onnx",
+      "resources/search/model/config.json": "search/model/config.json",
+      "resources/search/model/special_tokens_map.json": "search/model/special_tokens_map.json",
+      "resources/search/model/tokenizer.json": "search/model/tokenizer.json",
+      "resources/search/model/tokenizer_config.json": "search/model/tokenizer_config.json",
+      "resources/search/runtime/vcruntime140.dll": "search/runtime/vcruntime140.dll",
+      "resources/search/runtime/vcruntime140_1.dll": "search/runtime/vcruntime140_1.dll",
+      "resources/search/runtime/msvcp140.dll": "search/runtime/msvcp140.dll",
+      "resources/search/runtime/msvcp140_1.dll": "search/runtime/msvcp140_1.dll",
+      "resources/search/runtime/onnxruntime_providers_shared.dll": "search/runtime/onnxruntime_providers_shared.dll",
+      "resources/search/runtime/onnxruntime.dll": "search/runtime/onnxruntime.dll",
+      "resources/search/runtime/LICENSE": "search/runtime/LICENSE",
+      "resources/search/runtime/ThirdPartyNotices.txt": "search/runtime/ThirdPartyNotices.txt"
     },
     "windows": {
       "nsis": {

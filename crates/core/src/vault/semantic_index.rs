@@ -67,6 +67,9 @@ impl Vault {
                 "index batches require 1 to 32 records and a positive time budget".into(),
             ));
         }
+        if self.semantic_search_failed.get() {
+            return Err(crate::search::ModelError::Inference.into());
+        }
         if self.semantic_search.is_none() {
             return Ok(SemanticIndexBatch {
                 indexed: 0,

@@ -47,5 +47,6 @@ Desktop.ini
 /secrets/
 
 # Local development workflow state
+/apps/desktop/src-tauri/resources/search/
 /.superpowers/
 /.worktrees/

@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stageWindowsSearchResources } from './search-resources.mjs';
 
 const target = 'x86_64-pc-windows-msvc';
 const workspace = fileURLToPath(new URL('../', import.meta.url));
@@ -83,6 +84,12 @@ async function main() {
     throw new Error('Cargo metadata did not provide an absolute target_directory');
   }
   const env = windowsReleaseEnvironment(process.env, targetDirectory);
+  const searchAssets = resolve(process.env.CONTEXT_RELAY_SEARCH_ASSETS ?? join(targetDirectory, 'search-assets'));
+  await stageWindowsSearchResources({
+    modelDirectory: join(searchAssets, 'bge-small-en-v1.5'),
+    runtimeDirectory: join(searchAssets, 'runtime'),
+    stagingDirectory: join(desktop, 'src-tauri', 'resources', 'search'),
+  });
   execFileSync('cargo.exe', [
     'build', '--locked', '--release', '--target', target,
     '--target-dir', targetDirectory,

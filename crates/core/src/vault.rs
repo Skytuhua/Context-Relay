@@ -1,4 +1,9 @@
-use std::{cell::RefCell, collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    path::Path,
+    time::Duration,
+};
 
 use context_relay_protocol::{
     ApplyReceipt, CandidateId, CandidateState, CheckpointV1, HarnessAccessPolicy, HarnessId,
@@ -211,6 +216,8 @@ pub struct Vault {
     connection: Connection,
     embedding_cache: BTreeMap<String, CachedEmbedding>,
     semantic_search: Option<Box<RefCell<SemanticSearch>>>,
+    semantic_search_configured: bool,
+    semantic_search_failed: Cell<bool>,
 }
 
 #[cfg(feature = "test-support")]
@@ -378,15 +385,43 @@ impl Vault {
             connection,
             embedding_cache,
             semantic_search: None,
+            semantic_search_configured: false,
+            semantic_search_failed: Cell::new(false),
         })
     }
 
     pub fn enable_semantic_search(&mut self, model: PinnedModelEmbedder) {
+        self.semantic_search_configured = true;
+        self.semantic_search_failed.set(false);
         self.semantic_search = Some(Box::new(RefCell::new(SemanticSearch::new(model))));
     }
 
+    /// Select keyword fallback while the packaged model is loading or unavailable.
+    pub fn prepare_semantic_search(&mut self) {
+        self.semantic_search_configured = true;
+    }
+
+    pub(crate) fn semantic_search_configured(&self) -> bool {
+        self.semantic_search_configured
+    }
+
     pub fn semantic_search_enabled(&self) -> bool {
-        self.semantic_search.is_some()
+        self.semantic_search.is_some() && !self.semantic_search_failed.get()
+    }
+
+    pub fn take_semantic_search_failure(&mut self) -> bool {
+        if !self.semantic_search_failed.get() {
+            return false;
+        }
+        self.reset_semantic_search();
+        true
+    }
+
+    /// Drop a failed session while preserving keyword search and persisted vectors.
+    pub fn reset_semantic_search(&mut self) {
+        self.semantic_search = None;
+        self.semantic_search_configured = true;
+        self.semantic_search_failed.set(false);
     }
 
     pub fn runtime_info(&self) -> Result<VaultRuntimeInfo, VaultError> {
@@ -1630,9 +1665,18 @@ impl Vault {
         };
 
         let mut semantic = Vec::with_capacity(self.embedding_cache.len());
+        if self.semantic_search_failed.get() {
+            return Ok(reciprocal_rank_fusion(&lexical, &[], limit));
+        }
         if let Some(engine) = &self.semantic_search {
             let mut engine = engine.borrow_mut();
-            let query_embedding = engine.query(query)?;
+            let query_embedding = match engine.query(query) {
+                Ok(embedding) => embedding,
+                Err(_) => {
+                    self.semantic_search_failed.set(true);
+                    return Ok(reciprocal_rank_fusion(&lexical, &[], limit));
+                }
+            };
             // total_changes observes our own writes; data_version observes commits
             // through another connection. Either invalidates the scope snapshot.
             let database_revision = (
@@ -1674,7 +1718,7 @@ impl Vault {
                 }
                 engine.remember_scope(scope, database_revision, &semantic);
             }
-        } else {
+        } else if !self.semantic_search_configured {
             for (record_id, cached) in &self.embedding_cache {
                 if !cached.approved || cached.archived || !cached.scope.allowed_by(scope) {
                     continue;

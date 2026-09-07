@@ -8,7 +8,7 @@ export function SearchProgress({ progress }: { progress: ReturnType<typeof useSe
     <p role="status">{status.phase === 'preparing'
       ? 'Preparing search across your saved context. Keyword results are available while this finishes.'
       : status.phase === 'ready' ? 'Search is ready.'
-        : 'Search preparation stopped. Your saved context is safe. Retry to continue where it stopped.'}</p>
+        : 'Search preparation stopped. Keyword search is still available. Retry to enable meaning-based search.'}</p>
     {(status.phase === 'failed' || retrying) && <button className="secondary-action" type="button" disabled={retrying} onClick={() => void retry()}>
       {retrying ? 'Retrying…' : 'Retry search preparation'}
     </button>}

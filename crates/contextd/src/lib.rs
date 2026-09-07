@@ -214,6 +214,7 @@ impl InstallationTokenProvider for PlatformInstallationTokenProvider {
 }
 
 struct VaultConfig {
+    search_resources: Option<PathBuf>,
     preparation: Option<PreparationClient>,
     path: PathBuf,
     credential_id: String,
@@ -242,6 +243,7 @@ impl VaultConfig {
     ) -> Self {
         Self {
             preparation: None,
+            search_resources: None,
             path,
             credential_id: credential_id.into(),
             key_store,
@@ -658,13 +660,26 @@ impl DaemonConfig {
         let root = dirs::data_local_dir()
             .ok_or(DaemonError::Startup)?
             .join("Context Relay");
+        let vault = VaultConfig::new(
+            root.join("vault-v1.db"),
+            VAULT_CREDENTIAL_ID,
+            Arc::new(PlatformKeyStore::default()),
+        );
+        #[cfg(windows)]
+        let vault = {
+            let mut vault = vault;
+            let executable = std::env::current_exe().map_err(|_| DaemonError::Startup)?;
+            vault.search_resources = Some(
+                executable
+                    .parent()
+                    .ok_or(DaemonError::Startup)?
+                    .join("search"),
+            );
+            vault
+        };
         Ok(Self::new(
             RuntimeConfig::production(),
-            VaultConfig::new(
-                root.join("vault-v1.db"),
-                VAULT_CREDENTIAL_ID,
-                Arc::new(PlatformKeyStore::default()),
-            ),
+            vault,
             Arc::new(PlatformInstallationTokenProvider),
         ))
     }
@@ -1443,9 +1458,13 @@ fn open_workspace(
         } else {
             None
         };
+    if config.search_resources.is_some() {
+        vault.prepare_semantic_search();
+    }
     Ok((
         WorkspaceState {
-            search_index: search_index::SearchIndexJob::new(vault.semantic_search_enabled()),
+            search_index: search_index::SearchIndexJob::new(vault.semantic_search_enabled())
+                .with_resources(config.search_resources.clone()),
             preparation: config.preparation.clone(),
             vault,
             vault_path: config.path.clone(),
@@ -1649,7 +1668,12 @@ fn run_vault_worker(
         // Writes from desktop, harnesses, and native reconciliation all maintain
         // the durable queue. Recheck it after requests without rescanning records.
         if let VaultWorkerState::Open(workspace) = &mut state {
-            workspace.search_index.wake();
+            if workspace.vault.take_semantic_search_failure() {
+                workspace.search_index.fail();
+                status.set_search(workspace.search_index.status);
+            } else {
+                workspace.search_index.wake();
+            }
         }
     }
 }
@@ -4977,6 +5001,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packaged_search_startup_keeps_keywords_when_resources_are_missing() {
+        use context_relay_protocol::SearchIndexPhase;
+        let path = unit_test_support::TempVault::new("missing-packaged-search");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut config = VaultConfig::new(path.path().to_owned(), "test-vault-key", keys);
+        config.search_resources = Some(path.path().with_file_name("absent-search-assets"));
+        config.startup_recovery = Some(Arc::new(|vault| {
+            let params = serde_json::from_value(serde_json::json!({
+                "operationId": "018f22e2-79b0-7cc8-98c4-dc0c0c073991",
+                "scope": {"scope": "global"}, "kind": "note", "title": "Vehicle",
+                "bodyMarkdown": "Keep the car engine serviced.", "tags": ["uniquephonemicidentifier"]
+            })).unwrap();
+            OfflineWorkspace::new(vault, stable_device_id(b"packaged-search-fixture"))
+                .create_memory(params)
+                .unwrap();
+            Ok(())
+        }));
+        let (mut workspace, _) =
+            open_workspace(&mut config).unwrap_or_else(|_| panic!("fixture workspace"));
+        assert_eq!(
+            workspace.search_index.status.phase,
+            SearchIndexPhase::Preparing
+        );
+        workspace.search_index.tick(&mut workspace.vault);
+        assert_eq!(
+            workspace.search_index.status.phase,
+            SearchIndexPhase::Failed
+        );
+        assert!(!workspace.search_index.pending());
+        let results = OfflineWorkspace::new(
+            &mut workspace.vault,
+            stable_device_id(b"packaged-search-fixture"),
+        )
+        .search_memories(context_relay_protocol::SearchParams {
+            query: "uniquephonemicidentifier".into(),
+            project_id: None,
+        })
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        workspace.search_index.retry();
+        assert!(workspace.search_index.pending());
+        workspace.search_index.tick(&mut workspace.vault);
+        assert_eq!(
+            workspace.search_index.status.phase,
+            SearchIndexPhase::Failed
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packaged_search_production_uses_resources_beside_the_executable() {
+        // Construct configuration only; do not start a normal daemon or open a vault.
+        let config = DaemonConfig::production().unwrap();
+        assert_eq!(
+            config.vault.search_resources,
+            Some(
+                std::env::current_exe()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("search")
+            )
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires verified BGE assets and ONNX Runtime"]
     async fn real_search_worker_prepares_semantic_results_in_the_background() {
         let path = unit_test_support::TempVault::new("background-semantic-search");
@@ -5029,6 +5119,166 @@ mod tests {
             found,
             "the worker never prepared the queued semantic record"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "ignored qualification must compile for ordinary non-static test builds"
+    )]
+    #[ignore = "requires explicit packaged assets and static CRT; runs only a disposable daemon"]
+    async fn packaged_search_daemon_retries_missing_and_damaged_assets_over_private_ipc() {
+        use context_relay_protocol::SearchIndexPhase;
+        use std::os::windows::process::CommandExt;
+        assert!(cfg!(target_feature = "crt-static"));
+        let Some(root) = std::env::var_os("CONTEXT_RELAY_PACKAGED_DAEMON_CHILD") else {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "tests::packaged_search_daemon_retries_missing_and_damaged_assets_over_private_ipc", "--nocapture"])
+                .env("CONTEXT_RELAY_PACKAGED_DAEMON_CHILD", root.path())
+                .env("ORT_DYLIB_PATH", root.path().join("unrelated-runtime.dll"))
+                .creation_flags(0x0800_0000).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            root.close().unwrap();
+            return;
+        };
+        async fn wait_phase(client: &mut RawClient, expected: SearchIndexPhase) {
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    let response = client.call(LocalRequest::SearchIndexStatus(EmptyParams {})).await.unwrap();
+                    if matches!(response, LocalResult::SearchIndex { status } if status.phase == expected) { break; }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.expect("search phase deadline");
+        }
+        async fn search(client: &mut RawClient, query: &str) -> usize {
+            let response = client
+                .call(LocalRequest::MemorySearch(
+                    context_relay_protocol::SearchParams {
+                        query: query.into(),
+                        project_id: None,
+                    },
+                ))
+                .await
+                .unwrap();
+            let LocalResult::Memories { memories } = response else {
+                panic!("search result");
+            };
+            memories.len()
+        }
+        let root = PathBuf::from(root);
+        let assets = root.join("search");
+        let runtime = test_runtime("packaged-search-daemon");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut config = test_config(
+            runtime.clone(),
+            root.join("vault.db"),
+            keys.clone(),
+            Arc::new(FixedTokenProvider::default()),
+        );
+        config.vault.search_resources = Some(assets.clone());
+        config.vault.startup_recovery = Some(Arc::new(|vault| {
+            let params = serde_json::from_value(serde_json::json!({
+                "operationId": "018f22e2-79b0-7cc8-98c4-dc0c0c073992",
+                "scope": {"scope": "global"}, "kind": "note", "title": "Vehicle",
+                "bodyMarkdown": "Keep the car engine serviced and replace its oil regularly.", "tags": ["uniquephonemicidentifier"]
+            })).unwrap();
+            OfflineWorkspace::new(vault, stable_device_id(b"packaged-daemon-fixture"))
+                .create_memory(params)
+                .unwrap();
+            Ok(())
+        }));
+        let daemon = Daemon::start(config).await.unwrap();
+        let handle = daemon.handle();
+        let owner = tokio::spawn(daemon.run());
+        let mut desktop = RawClient::connect(&runtime, ClientRole::Desktop).await;
+        wait_phase(&mut desktop, SearchIndexPhase::Failed).await;
+        assert_eq!(search(&mut desktop, "uniquephonemicidentifier").await, 1);
+        assert_eq!(search(&mut desktop, "unseenword").await, 0);
+        for (source_env, subdirectory, manifest) in [
+            (
+                "CONTEXT_RELAY_MODEL_DIR",
+                "model",
+                include_str!("../../core/models/bge-small-en-v1.5/manifest.json"),
+            ),
+            (
+                "CONTEXT_RELAY_RUNTIME_DIR",
+                "runtime",
+                include_str!("../../core/models/onnxruntime-win-x64-1.24.2/manifest.json"),
+            ),
+        ] {
+            let source = PathBuf::from(std::env::var_os(source_env).unwrap());
+            let destination = assets.join(subdirectory);
+            std::fs::create_dir_all(&destination).unwrap();
+            let manifest: serde_json::Value = serde_json::from_str(manifest).unwrap();
+            for artifact in manifest["artifacts"].as_array().unwrap() {
+                let file = artifact["file"].as_str().unwrap();
+                std::fs::copy(source.join(file), destination.join(file)).unwrap();
+            }
+        }
+        let damaged = assets.join("runtime/msvcp140_1.dll");
+        let good = std::fs::read(&damaged).unwrap();
+        let mut bad = good.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        std::fs::write(&damaged, bad).unwrap();
+        desktop
+            .call(LocalRequest::SearchIndexRetry(EmptyParams {}))
+            .await
+            .unwrap();
+        wait_phase(&mut desktop, SearchIndexPhase::Failed).await;
+        assert_eq!(search(&mut desktop, "uniquephonemicidentifier").await, 1);
+        std::fs::write(&damaged, good).unwrap();
+        desktop
+            .call(LocalRequest::SearchIndexRetry(EmptyParams {}))
+            .await
+            .unwrap();
+        wait_phase(&mut desktop, SearchIndexPhase::Ready).await;
+        assert_eq!(search(&mut desktop, "automobile maintenance").await, 1);
+        assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+        owner.await.unwrap().unwrap();
+        #[cfg(feature = "test-support")]
+        {
+            // Restart the same disposable vault with a fresh session that fails
+            // its next inference. Existing vectors require no passage inference,
+            // so the first interactive query exercises the worker failure path.
+            let mut config = test_config(
+                runtime.clone(),
+                root.join("vault.db"),
+                keys,
+                Arc::new(FixedTokenProvider::default()),
+            );
+            config.vault.search_resources = Some(assets.clone());
+            config.vault.startup_recovery = Some(Arc::new(move |vault| {
+                let mut model =
+                    context_relay_core::search::PinnedModelEmbedder::load_packaged(&assets)
+                        .unwrap();
+                model.fail_next_inference_for_test();
+                vault.enable_semantic_search(model);
+                Ok(())
+            }));
+            let daemon = Daemon::start(config).await.unwrap();
+            let handle = daemon.handle();
+            let owner = tokio::spawn(daemon.run());
+            let mut desktop = RawClient::connect(&runtime, ClientRole::Desktop).await;
+            wait_phase(&mut desktop, SearchIndexPhase::Ready).await;
+            assert_eq!(search(&mut desktop, "engine").await, 1);
+            wait_phase(&mut desktop, SearchIndexPhase::Failed).await;
+            assert_eq!(search(&mut desktop, "unseenword").await, 0);
+            desktop
+                .call(LocalRequest::SearchIndexRetry(EmptyParams {}))
+                .await
+                .unwrap();
+            wait_phase(&mut desktop, SearchIndexPhase::Ready).await;
+            assert_eq!(search(&mut desktop, "automobile maintenance").await, 1);
+            assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+            owner.await.unwrap().unwrap();
+        }
     }
 
     #[test]

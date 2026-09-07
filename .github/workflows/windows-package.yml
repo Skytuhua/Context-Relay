@@ -8,6 +8,7 @@ on:
       - 'apps/desktop/**'
       - 'crates/**'
       - 'scripts/package-windows*'
+      - 'scripts/*search-resources*'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -35,7 +36,12 @@ jobs:
       - run: npm install --global pnpm@11.9.0
       - run: pnpm install --frozen-lockfile
       - run: rustup show
-      - run: node --test scripts/package-windows.test.mjs
+      - name: Fetch verified search resources
+        shell: pwsh
+        run: ./scripts/fetch-search-resources.ps1
+      - run: node --test scripts/package-windows.test.mjs scripts/search-resources.test.mjs
+        env:
+          CONTEXT_RELAY_SEARCH_ASSETS: ${{ github.workspace }}/target/search-assets
       - run: pnpm package:windows
       - name: Record candidate checksums
         shell: pwsh
