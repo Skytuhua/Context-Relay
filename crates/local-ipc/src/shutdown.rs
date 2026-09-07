@@ -92,6 +92,11 @@ async fn request_shutdown(
             && server_hello.protocol != (ProtocolVersion { major: 1, minor: 7 })
             && server_hello.protocol != (ProtocolVersion { major: 1, minor: 8 })
             && server_hello.protocol != (ProtocolVersion { major: 1, minor: 9 })
+            && server_hello.protocol
+                != (ProtocolVersion {
+                    major: 1,
+                    minor: 10,
+                })
         {
             return Err(IpcError::ProtocolVersionUnsupported);
         }
@@ -253,6 +258,11 @@ mod tests {
         assert_shutdown_waits_for_exit("legacy-ack-1-7").await;
         assert_shutdown_waits_for_exit("legacy-ack-1-8").await;
         assert_shutdown_waits_for_exit("legacy-ack-1-9").await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_shutdown_accepts_the_previous_1_10_installer() {
+        assert_shutdown_waits_for_exit("legacy-ack-1-10").await;
     }
 
     async fn assert_shutdown_waits_for_exit(mode: &str) {
@@ -521,6 +531,7 @@ mod tests {
                 "legacy-ack-1-7" => 7,
                 "legacy-ack-1-8" => 8,
                 "legacy-ack-1-9" => 9,
+                "legacy-ack-1-10" => 10,
                 _ => 4,
             },
         };
@@ -587,7 +598,7 @@ mod tests {
             "legacy-extra-field" => response["unexpected"] = serde_json::json!(true),
             "legacy-jsonrpc" => response["jsonrpc"] = serde_json::json!("1.0"),
             "legacy-ack" | "legacy-ack-1-5" | "legacy-ack-1-6" | "legacy-ack-1-7"
-            | "legacy-ack-1-8" | "legacy-ack-1-9" => {}
+            | "legacy-ack-1-8" | "legacy-ack-1-9" | "legacy-ack-1-10" => {}
             _ => panic!("unexpected legacy fixture mode"),
         }
         write_json(&mut stream, &response).await.unwrap();
@@ -599,6 +610,7 @@ mod tests {
                 | "legacy-ack-1-7"
                 | "legacy-ack-1-8"
                 | "legacy-ack-1-9"
+                | "legacy-ack-1-10"
         ) {
             fs::write(root.join("ack"), b"").unwrap();
             wait_for(&root.join("exit")).await;
