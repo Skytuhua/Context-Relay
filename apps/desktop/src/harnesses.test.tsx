@@ -99,6 +99,28 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+it.each(['project', 'screen'])('ignores a late saved-setup failure after changing %s', async (change) => {
+  saved.set(preview.planId, { plan: preview, state: 'previewed', createdAt: '1900000000000' });
+  let reject!: (error: unknown) => void;
+  vi.spyOn(LocalWorkspaceGateway.prototype, 'harnessSetupGet').mockImplementation(() => new Promise((_, fail) => { reject = fail; }));
+  await open();
+  fireEvent.click(await screen.findByRole('button', { name: 'Review saved setup for Codex for Research' }));
+  if (change === 'project') {
+    fireEvent.change(screen.getByRole('combobox', { name: 'Project' }), { target: { value: secondProject } });
+    screen.getByRole('combobox', { name: 'Project' }).focus();
+  } else {
+    fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+  }
+  const focused = document.activeElement;
+  await act(async () => reject(new Error('late saved-setup failure')));
+  expect(document.activeElement).toBe(focused);
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  if (change === 'screen') {
+    fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  }
+});
+
 it('keeps an accepted save pending beyond 30 seconds without resending or claiming success', async () => {
   operation = async request => request.method === 'harness_preview' ? { kind: 'plan', data: { plan: preview } }
     : request.method === 'harness_execution_start' ? { kind: 'harness_execution', data: { status: { ...request.params, phase: 'running', error: null } } } : { kind: 'empty' };

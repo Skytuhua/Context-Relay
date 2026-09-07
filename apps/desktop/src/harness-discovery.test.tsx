@@ -118,6 +118,44 @@ it('explains a confirmed missing Claude Code executable instead of blaming setup
   expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
 });
 
+it('focuses a setup failure and focuses it again after a failed retry', async () => {
+  invoke.mockRejectedValue(new Error('private native details'));
+  await open();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    screen.getByRole('button', { name: 'Review setup' }).focus();
+    preview();
+    expect(await screen.findByRole('alert')).toHaveFocus();
+    expect(screen.getByRole('alert')).not.toHaveTextContent('private native details');
+  }
+});
+
+it('clears a previous project error when the parent selects another project', async () => {
+  invoke.mockRejectedValue(new Error('private native details'));
+  const gateway = new LocalWorkspaceGateway();
+  const second = { ...project, projectId: '018f22e2-79b0-7cc8-98c4-dc0c0c075002' as ProjectId, name: 'Website' };
+  const view = render(<HarnessesScreen gateway={gateway} projects={[project, second]} preferredProjectId={projectId} />);
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Review setup' })).toBeEnabled());
+  preview();
+  await screen.findByRole('alert');
+  view.rerender(<HarnessesScreen gateway={gateway} projects={[project, second]} preferredProjectId={second.projectId} />);
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+});
+
+it('does not focus a failed request after leaving Harnesses', async () => {
+  let reject!: (error: unknown) => void;
+  invoke.mockImplementation(() => new Promise((_, fail) => { reject = fail; }));
+  const gateway = new LocalWorkspaceGateway();
+  const view = render(<><button type="button">Another screen</button><HarnessesScreen gateway={gateway} projects={[project]} /></>);
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Review setup' })).toBeEnabled());
+  preview();
+  view.rerender(<><button type="button">Another screen</button><HarnessesScreen gateway={gateway} projects={[project]} active={false} /></>);
+  const other = screen.getByRole('button', { name: 'Another screen' });
+  other.focus();
+  await act(async () => reject(new Error('late failure')));
+  expect(other).toHaveFocus();
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+});
+
 it('explains an unqualified Hermes launcher without calling it a supported version', async () => {
   invoke.mockResolvedValue(response({ ...report, activeProfile: 'default', harnessVersion: 'unknown' }));
   await open();

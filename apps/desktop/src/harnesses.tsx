@@ -35,6 +35,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   const generation = useRef(0);
   const mounted = useRef(false);
   const resultHeadingRef = useRef<HTMLHeadingElement>(null);
+  const errorRef = useRef<HTMLParagraphElement>(null);
   const project = projects.find((item) => item.projectId === projectId);
   const expired = review !== null && BigInt(review.plan.expiresAt) <= BigInt(now);
   const conflicts = review?.plan.semanticChanges.some((change) => change.class === 'conflict') ?? false;
@@ -48,6 +49,12 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
     heading?.focus({ preventScroll: true });
     heading?.scrollIntoView?.({ block: 'start' });
   }, [active, discovery, review]);
+
+  useEffect(() => {
+    if (!active || !error) return;
+    errorRef.current?.focus({ preventScroll: true });
+    errorRef.current?.scrollIntoView?.({ block: 'center' });
+  }, [active, error]);
 
   useEffect(() => {
     if (!active || execution.busy) return;
@@ -75,6 +82,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   useEffect(() => {
     if (active) return;
     generation.current += 1;
+    setError(null);
     setReview(null);
     setDiscovery(null);
     setApproved(false);
@@ -83,6 +91,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
 
   useEffect(() => {
     generation.current += 1;
+    setError(null);
     setReview(current => current?.params.projectId === projectId || current?.params.projectId === null ? current : null);
     setDiscovery(null);
     setApproved(false);
@@ -202,7 +211,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
         }
         setApproved(false); setNow(Date.now()); setReview(restored);
       }
-    } catch { if (mounted.current) setError('Could not load this saved setup. Its changes have not been retried.'); }
+    } catch { if (mounted.current && revision === generation.current) setError('Could not load this saved setup. Its changes have not been retried.'); }
     finally { finish(); }
   }
 
@@ -250,7 +259,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
         </div>}
         <button className="primary-action" type="submit" disabled={!!busy || preparation.target !== null || !project || (harness === 'hermes' && !validProfile)}>{busy === 'preview' ? 'Checking harness…' : 'Review setup'}</button>
       </form>
-      {error && <p className="form-error" role="alert">{error}</p>}
+      {error && <p className="form-error" role="alert" ref={errorRef} tabIndex={-1}>{error}</p>}
       {preparation.error && <p className="form-error" role="alert">{preparation.error}{preparation.target && <button type="button" onClick={preparation.checkAgain}>Check preparation</button>}</p>}
       {preparation.target && <section className="record-card" aria-label="Harness preparation">
         <h2>Prepare Hermes setup</h2>

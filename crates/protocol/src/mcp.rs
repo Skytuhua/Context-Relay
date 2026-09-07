@@ -397,9 +397,8 @@ pub fn mcp_schema(name: &str) -> Option<McpToolSchema> {
         input["else"] = json!({"properties":{"expectedRevision":{"type":"null"}}});
     }
     if name == "context_relay_create_handoff" {
-        input["if"] =
-            json!({"properties":{"memoryIds":{"maxItems":0},"decisionIds":{"maxItems":0}}});
-        input["then"] = json!({"properties":{"taskIds":{"minItems":1}}});
+        input["if"] = json!({"properties":{"memoryIds":{"type":"array","maxItems":0},"decisionIds":{"type":"array","maxItems":0}}});
+        input["then"] = json!({"properties":{"taskIds":{"type":"array","minItems":1}}});
     }
     Some(McpToolSchema {
         input,

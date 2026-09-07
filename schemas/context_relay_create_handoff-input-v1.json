@@ -4,10 +4,12 @@
   "if": {
     "properties": {
       "decisionIds": {
-        "maxItems": 0
+        "maxItems": 0,
+        "type": "array"
       },
       "memoryIds": {
-        "maxItems": 0
+        "maxItems": 0,
+        "type": "array"
       }
     }
   },
@@ -61,7 +63,8 @@
   "then": {
     "properties": {
       "taskIds": {
-        "minItems": 1
+        "minItems": 1,
+        "type": "array"
       }
     }
   },
