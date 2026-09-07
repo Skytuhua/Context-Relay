@@ -532,3 +532,14 @@ were inspected. The preceding 11d6740 installer is preserved separately. The
 installed application remains unchanged. Codex 0.144.6 and Claude Code 2.1.202
 still require their remaining qualification gates. Signing, installed workflow
 and clean-machine acceptance remain open; native desktop control is paused.
+
+The subsequent [approved e09d206 update](service-version-feedback-2026-09-07.md)
+is now installed: all eighteen installed files match the candidate, and the
+restarted service uses protocol 1.11 with the existing unlocked vault. Direct
+installed bridge status calls pass for all three harness bindings. The
+[actual Codex session check](installed-codex-status-2026-09-07.md) additionally
+passes status-only requests through exec and app-server using temporary harness
+settings and the normal production credential path. Full setup, interactive
+trust, installed Claude/Hermes client sessions and clean-machine acceptance
+remain open. This qualification adds tests and documentation; the installed
+production binaries remain those from e09d206.

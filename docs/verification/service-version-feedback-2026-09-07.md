@@ -76,8 +76,10 @@ Authenticode `NotSigned`. Local evidence:
 ## Remaining work
 
 The installed service mismatch and production bridge credential/entry-point status
-path are verified after the approved update. Full harness setup, interactive
-trust, actual harness sessions against the installed service, clean-machine
+path are verified after the approved update. A subsequent
+[actual Codex check](installed-codex-status-2026-09-07.md) also passes status-only
+sessions through both exec and app-server against that installed service.
+Full harness setup, interactive trust, installed Claude/Hermes client sessions, clean-machine
 testing and the remaining version/platform matrix are still incomplete. Production
 harness version gates are unchanged. Permission to install and restart the service
 does not resume the earlier pause on general native desktop control.
