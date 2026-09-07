@@ -98,9 +98,26 @@ record writes are possible through the status-only check.
 Local packaging evidence: `.codex/windows-setup-promotion-package.log`,
 `.codex/windows-setup-promotion-inspection.log`,
 `.codex/windows-setup-promotion-packaged-status.log` and the archived
-`checksums.json`. The installed application still uses candidate e09d206;
-installation of this replacement remains pending separate authorization after
-the user's earlier pause. General native desktop control remains paused.
+`checksums.json`.
+
+## Approved installation
+
+The user explicitly approved this replacement installer and service restart.
+The exact archived candidate ran with `/S /UPDATE` and exited successfully. Its
+authenticated upgrade helper stopped the previous service. All five installed
+executables and thirteen search files match the candidate manifest.
+
+The updated daemon started from the installed directory and remains running.
+Read-only status calls through the installed MCP executable pass for Codex,
+Claude Code and Hermes bindings, returning protocol 1.11 and the existing unlocked
+vault. These are bridge checks, not full ordinary-profile harness sessions.
+No project, record or harness configuration mutations were requested.
+
+Evidence: `.codex/6a612e8-installed-update.log`,
+`.codex/6a612e8-installed-files.json`, `.codex/6a612e8-service-start.json`,
+`.codex/6a612e8-installed-path-bridge-success.log` and
+`.codex/6a612e8-installed-service-greeting.log`. General native desktop control
+remains paused separately; this installation approval has been fulfilled.
 
 ## Remaining acceptance
 
