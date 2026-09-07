@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::Read,
+    io::{Read, Write},
     path::{Component, Path},
 };
 
@@ -296,34 +296,67 @@ fn parse_manifest(bytes: &[u8]) -> Result<ModelManifest, ModelError> {
 }
 
 pub fn verify_model_manifest(directory: &Path, manifest_bytes: &[u8]) -> Result<(), ModelError> {
+    for artifact in parse_manifest(manifest_bytes)?.artifacts {
+        copy_verified_artifact(directory, &artifact, &mut std::io::sink())?;
+    }
+    Ok(())
+}
+
+fn read_model_artifacts(
+    directory: &Path,
+    manifest_bytes: &[u8],
+) -> Result<BTreeMap<String, Vec<u8>>, ModelError> {
     let manifest = parse_manifest(manifest_bytes)?;
+    let mut artifacts = BTreeMap::new();
     for artifact in manifest.artifacts {
-        let path = directory.join(&artifact.file);
-        let mut file =
-            File::open(&path).map_err(|_| ModelError::MissingArtifact(artifact.file.clone()))?;
-        let metadata = file
-            .metadata()
-            .map_err(|_| ModelError::MissingArtifact(artifact.file.clone()))?;
-        if !metadata.is_file() {
-            return Err(ModelError::MissingArtifact(artifact.file));
+        let mut bytes = Vec::new();
+        copy_verified_artifact(directory, &artifact, &mut bytes)?;
+        artifacts.insert(artifact.file, bytes);
+    }
+    Ok(artifacts)
+}
+
+fn copy_verified_artifact(
+    directory: &Path,
+    artifact: &ModelArtifact,
+    output: &mut impl Write,
+) -> Result<(), ModelError> {
+    let file = File::open(directory.join(&artifact.file))
+        .map_err(|_| ModelError::MissingArtifact(artifact.file.clone()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| ModelError::MissingArtifact(artifact.file.clone()))?;
+    if !metadata.is_file() {
+        return Err(ModelError::MissingArtifact(artifact.file.clone()));
+    }
+    if metadata.len() != artifact.bytes {
+        return Err(ModelError::SizeMismatch(artifact.file.clone()));
+    }
+    let mut input = file.take(artifact.bytes.saturating_add(1));
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut count = 0_u64;
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|_| ModelError::HashMismatch(artifact.file.clone()))?;
+        if read == 0 {
+            break;
         }
-        if metadata.len() != artifact.bytes {
-            return Err(ModelError::SizeMismatch(artifact.file));
+        count += read as u64;
+        if count > artifact.bytes {
+            return Err(ModelError::SizeMismatch(artifact.file.clone()));
         }
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .map_err(|_| ModelError::HashMismatch(artifact.file.clone()))?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        if format!("{:x}", hasher.finalize()) != artifact.sha256 {
-            return Err(ModelError::HashMismatch(artifact.file));
-        }
+        hasher.update(&buffer[..read]);
+        output
+            .write_all(&buffer[..read])
+            .map_err(|_| ModelError::HashMismatch(artifact.file.clone()))?;
+    }
+    if count != artifact.bytes {
+        return Err(ModelError::SizeMismatch(artifact.file.clone()));
+    }
+    if format!("{:x}", hasher.finalize()) != artifact.sha256 {
+        return Err(ModelError::HashMismatch(artifact.file.clone()));
     }
     Ok(())
 }
@@ -336,12 +369,107 @@ pub struct PinnedModelEmbedder {
     model: TextEmbedding,
 }
 
+/// Derived vectors are local to a vault and a single verified model instance.
+pub(crate) struct SemanticSearch {
+    model: PinnedModelEmbedder,
+    passages: BTreeMap<String, ([u8; 32], Embedding384)>,
+    snapshot: Option<SemanticSnapshot>,
+}
+
+struct SemanticSnapshot {
+    project_id: Option<ProjectId>,
+    allows_global: bool,
+    database_revision: (u64, i64),
+    record_ids: Vec<String>,
+}
+
+impl SemanticSearch {
+    pub(crate) fn new(model: PinnedModelEmbedder) -> Self {
+        Self {
+            model,
+            passages: BTreeMap::new(),
+            snapshot: None,
+        }
+    }
+
+    pub(crate) fn query(&mut self, query: &str) -> Result<Embedding384, ModelError> {
+        self.model.embed(EmbeddingPurpose::Query, query)
+    }
+
+    pub(crate) fn cached_scores(
+        &self,
+        scope: &AllowedSearchScope,
+        database_revision: (u64, i64),
+        query: &Embedding384,
+    ) -> Option<Vec<(String, f64)>> {
+        let snapshot = self.snapshot.as_ref()?;
+        if snapshot.project_id != scope.project_id()
+            || snapshot.allows_global != scope.allows_global()
+            || snapshot.database_revision != database_revision
+        {
+            return None;
+        }
+        snapshot
+            .record_ids
+            .iter()
+            .map(|id| {
+                let (_, embedding) = self.passages.get(id)?;
+                Some((id.clone(), embedding.cosine_similarity(query)))
+            })
+            .collect()
+    }
+
+    pub(crate) fn remember_scope(
+        &mut self,
+        scope: &AllowedSearchScope,
+        database_revision: (u64, i64),
+        scores: &[(String, f64)],
+    ) {
+        // Keep only the most recent scope, avoiding quadratic lists when many
+        // project scopes include the same global records.
+        self.snapshot = (scores.len() <= 16_384).then(|| SemanticSnapshot {
+            project_id: scope.project_id(),
+            allows_global: scope.allows_global(),
+            database_revision,
+            record_ids: scores.iter().map(|(id, _)| id.clone()).collect(),
+        });
+    }
+
+    pub(crate) fn passage(
+        &mut self,
+        record_id: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<Embedding384, ModelError> {
+        let input = format!("{title}\n{body}");
+        let digest: [u8; 32] = Sha256::digest(input.as_bytes()).into();
+        if let Some((cached_digest, embedding)) = self.passages.get(record_id)
+            && cached_digest == &digest
+        {
+            return Ok(embedding.clone());
+        }
+        let embedding = self.model.embed(EmbeddingPurpose::Passage, &input)?;
+        // Bound derived state even when many different project scopes are queried.
+        if self.passages.len() >= 16_384 && !self.passages.contains_key(record_id) {
+            self.passages.pop_first();
+        }
+        self.passages
+            .insert(record_id.to_owned(), (digest, embedding.clone()));
+        Ok(embedding)
+    }
+}
+
 impl PinnedModelEmbedder {
     pub fn load(directory: &Path) -> Result<Self, ModelError> {
-        verify_pinned_model(directory)?;
-        let read = |name: &str| {
-            std::fs::read(directory.join(name))
-                .map_err(|_| ModelError::MissingArtifact(name.to_owned()))
+        let mut artifacts = read_model_artifacts(directory, PINNED_MODEL_MANIFEST)?;
+        // Context search is local; initialize before creating any model session.
+        ort::init().with_telemetry(false).commit();
+        // Move the bytes that passed verification into the runtime. Reopening
+        // filenames here would allow replacement between verification and use.
+        let mut read = |name: &str| {
+            artifacts
+                .remove(name)
+                .ok_or_else(|| ModelError::MissingArtifact(name.to_owned()))
         };
         let tokenizer_files = TokenizerFiles {
             tokenizer_file: read("tokenizer.json")?,
@@ -353,9 +481,13 @@ impl PinnedModelEmbedder {
             UserDefinedEmbeddingModel::new(read("model_optimized.onnx")?, tokenizer_files)
                 .with_pooling(Pooling::Cls)
                 .with_quantization(QuantizationMode::Static);
-        let model =
-            TextEmbedding::try_new_from_user_defined(user_model, InitOptionsUserDefined::default())
-                .map_err(|_| ModelError::RuntimeInitialization)?;
+        // Queries and individual context records are small. A full-machine
+        // intra-op pool competes with the vault worker between inferences.
+        let model = TextEmbedding::try_new_from_user_defined(
+            user_model,
+            InitOptionsUserDefined::default().with_intra_threads(1),
+        )
+        .map_err(|_| ModelError::RuntimeInitialization)?;
         Ok(Self { model })
     }
 
@@ -379,6 +511,21 @@ impl PinnedModelEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verified_model_bytes_are_retained_after_source_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tiny.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let manifest = br#"{"schemaVersion":1,"model":"fixture/model","revision":"0123456789abcdef0123456789abcdef01234567","dimensions":384,"license":"MIT","artifacts":[{"file":"tiny.bin","bytes":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}]}"#;
+        let mut verified = read_model_artifacts(directory.path(), manifest).unwrap();
+        std::fs::write(&path, b"abd").unwrap();
+        assert_eq!(verified.remove("tiny.bin").unwrap(), b"abc");
+        assert!(matches!(
+            read_model_artifacts(directory.path(), manifest),
+            Err(ModelError::HashMismatch(_))
+        ));
+    }
 
     #[test]
     fn rrf_ties_break_by_record_id() {

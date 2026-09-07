@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{cell::RefCell, collections::BTreeMap, path::Path, time::Duration};
 
 use context_relay_protocol::{
     ApplyReceipt, CandidateId, CandidateState, CheckpointV1, HarnessAccessPolicy, HarnessId,
@@ -20,7 +20,8 @@ use crate::native_memory::{
     native_memory_title,
 };
 use crate::search::{
-    AllowedSearchScope, Embedding384, SearchHit, quote_fts_query, reciprocal_rank_fusion,
+    AllowedSearchScope, Embedding384, ModelError, PinnedModelEmbedder, SearchHit, SemanticSearch,
+    quote_fts_query, reciprocal_rank_fusion,
 };
 
 mod desktop_writes;
@@ -67,6 +68,8 @@ pub enum VaultError {
     Serialization(String),
     #[error("vault database failure: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error("the local search model failed")]
+    SearchModel(#[from] ModelError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,6 +208,7 @@ pub struct NativeHookSession {
 pub struct Vault {
     connection: Connection,
     embedding_cache: BTreeMap<String, CachedEmbedding>,
+    semantic_search: Option<Box<RefCell<SemanticSearch>>>,
 }
 
 #[cfg(feature = "test-support")]
@@ -371,7 +375,16 @@ impl Vault {
         Ok(Self {
             connection,
             embedding_cache,
+            semantic_search: None,
         })
+    }
+
+    pub fn enable_semantic_search(&mut self, model: PinnedModelEmbedder) {
+        self.semantic_search = Some(Box::new(RefCell::new(SemanticSearch::new(model))));
+    }
+
+    pub(crate) fn semantic_search_enabled(&self) -> bool {
+        self.semantic_search.is_some()
     }
 
     pub fn runtime_info(&self) -> Result<VaultRuntimeInfo, VaultError> {
@@ -1615,14 +1628,50 @@ impl Vault {
         };
 
         let mut semantic = Vec::with_capacity(self.embedding_cache.len());
-        for (record_id, cached) in &self.embedding_cache {
-            if !cached.approved || cached.archived || !cached.scope.allowed_by(scope) {
-                continue;
+        if let Some(engine) = &self.semantic_search {
+            let mut engine = engine.borrow_mut();
+            let query_embedding = engine.query(query)?;
+            // total_changes observes our own writes; data_version observes commits
+            // through another connection. Either invalidates the scope snapshot.
+            let database_revision = (
+                self.connection.total_changes(),
+                self.connection
+                    .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?,
+            );
+            if let Some(scores) = engine.cached_scores(scope, database_revision, &query_embedding) {
+                semantic = scores;
+            } else {
+                // Read the current projection, not stale caller-supplied vectors. Scope,
+                // approval and archive checks happen before any passage is embedded.
+                let mut statement = self.connection.prepare(
+                    "SELECT record_id, title, body FROM search_documents
+                 WHERE approved = 1 AND archived = 0 AND (
+                   (scope_kind = 'global' AND ?1 = 1)
+                   OR (scope_kind = 'project' AND project_id = ?2)
+                 ) ORDER BY record_id",
+                )?;
+                let mut rows = statement.query(params![allows_global, project_id.as_deref()])?;
+                while let Some(row) = rows.next()? {
+                    let record_id: String = row.get(0)?;
+                    let embedding = engine.passage(
+                        &record_id,
+                        &row.get::<_, String>(1)?,
+                        &row.get::<_, String>(2)?,
+                    )?;
+                    semantic.push((record_id, embedding.cosine_similarity(&query_embedding)));
+                }
+                engine.remember_scope(scope, database_revision, &semantic);
             }
-            semantic.push((
-                record_id.clone(),
-                cached.embedding.cosine_similarity(query_embedding),
-            ));
+        } else {
+            for (record_id, cached) in &self.embedding_cache {
+                if !cached.approved || cached.archived || !cached.scope.allowed_by(scope) {
+                    continue;
+                }
+                semantic.push((
+                    record_id.clone(),
+                    cached.embedding.cosine_similarity(query_embedding),
+                ));
+            }
         }
         semantic.sort_by(|left, right| {
             right

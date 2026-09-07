@@ -2192,6 +2192,7 @@ pub fn client_error_from_vault(error: VaultError) -> ClientError {
         | VaultError::Migration(_)
         | VaultError::Credential(_)
         | VaultError::Security(_)
+        | VaultError::SearchModel(_)
         | VaultError::Serialization(_)
         | VaultError::Database(_) => ClientError {
             code: ErrorCode::Internal,

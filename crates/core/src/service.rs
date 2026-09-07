@@ -640,7 +640,9 @@ impl<'a> OfflineWorkspace<'a> {
             let Some(memory) = vault(self.vault.memory(&id))? else {
                 continue;
             };
-            if memory_embedding(&memory)?.cosine_similarity(&query_embedding) > 0.0 {
+            if self.vault.semantic_search_enabled()
+                || memory_embedding(&memory)?.cosine_similarity(&query_embedding) > 0.0
+            {
                 memories.push(memory);
             }
         }

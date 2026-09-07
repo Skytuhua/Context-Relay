@@ -23,6 +23,7 @@ hkdf.workspace = true
 hmac.workspace = true
 keyring.workspace = true
 minicbor.workspace = true
+ort.workspace = true
 rand_core.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true

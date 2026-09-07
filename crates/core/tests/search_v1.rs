@@ -364,6 +364,11 @@ fn model_manifest_verifier_rejects_missing_and_hash_mismatched_artifacts() {
         verify_model_manifest(directory.path(), manifest),
         Err(ModelError::HashMismatch(_))
     ));
+    fs::write(directory.path().join("tiny.bin"), b"abcd").unwrap();
+    assert!(matches!(
+        verify_model_manifest(directory.path(), manifest),
+        Err(ModelError::SizeMismatch(_))
+    ));
     fs::write(directory.path().join("tiny.bin"), b"abc").unwrap();
     verify_model_manifest(directory.path(), manifest).unwrap();
 
@@ -376,10 +381,10 @@ fn model_manifest_verifier_rejects_missing_and_hash_mismatched_artifacts() {
 }
 
 #[test]
+#[ignore = "requires verified BGE assets and ONNX Runtime"]
 fn real_pinned_model_smoke_test_is_opt_in() {
-    let Some(directory) = std::env::var_os("CONTEXT_RELAY_MODEL_DIR") else {
-        return;
-    };
+    let directory = std::env::var_os("CONTEXT_RELAY_MODEL_DIR")
+        .expect("set CONTEXT_RELAY_MODEL_DIR to the verified pinned model directory");
     let mut model = PinnedModelEmbedder::load(std::path::Path::new(&directory)).unwrap();
     let embedding = model
         .embed(EmbeddingPurpose::Query, "context relay memory")
@@ -388,8 +393,191 @@ fn real_pinned_model_smoke_test_is_opt_in() {
 }
 
 #[test]
+#[ignore = "requires verified BGE assets and ONNX Runtime"]
+fn real_semantic_workspace_search_finds_a_paraphrase() {
+    use context_relay_core::service::OfflineWorkspace;
+    use context_relay_protocol::SearchParams;
+
+    let path = TempVault::new("semantic-workspace");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let car = memory(
+        ID_1,
+        ScopeRef::Global,
+        "Vehicle",
+        "Keep the car engine serviced and replace its oil regularly.",
+    );
+    let bread = memory(
+        ID_2,
+        ScopeRef::Global,
+        "Kitchen",
+        "Knead the dough and bake a fresh loaf of bread.",
+    );
+    for (record, operation_id) in [(&car, ID_3), (&bread, ID_4)] {
+        vault
+            .put_memory(
+                record,
+                &operation(operation_id, &record.id.to_string(), RecordKind::Memory),
+                &basis(0),
+            )
+            .unwrap();
+    }
+    let directory = std::env::var_os("CONTEXT_RELAY_MODEL_DIR")
+        .expect("set CONTEXT_RELAY_MODEL_DIR to the verified pinned model directory");
+    vault.enable_semantic_search(
+        PinnedModelEmbedder::load(std::path::Path::new(&directory)).unwrap(),
+    );
+    let search = |vault: &mut Vault, query: &str| {
+        OfflineWorkspace::new(vault, ID_8.parse().unwrap())
+            .search_memories(SearchParams {
+                query: query.to_owned(),
+                project_id: None,
+            })
+            .unwrap()
+    };
+    let hits = search(&mut vault, "automobile maintenance");
+    assert_eq!(hits.first().map(|record| record.id), Some(car.id));
+
+    // Warm vectors must change when the same record ID receives different text.
+    let mut changed = car.clone();
+    changed.title = "Garden".to_owned();
+    changed.body_markdown = "Plant tulips and water the flowers in spring.".to_owned();
+    vault
+        .put_memory(
+            &changed,
+            &operation(ID_5, ID_1, RecordKind::Memory),
+            &basis(0),
+        )
+        .unwrap();
+    assert_eq!(search(&mut vault, "flower cultivation")[0].id, car.id);
+    assert_eq!(search(&mut vault, "making sourdough")[0].id, bread.id);
+
+    // Even an exact semantic match in another project is excluded.
+    let hidden = memory(
+        ID_6,
+        ScopeRef::Project {
+            project_id: ID_7.parse().unwrap(),
+        },
+        "automobile maintenance",
+        "automobile maintenance",
+    );
+    vault
+        .put_memory(
+            &hidden,
+            &operation(ID_7, ID_6, RecordKind::Memory),
+            &basis(0),
+        )
+        .unwrap();
+    assert!(
+        !search(&mut vault, "automobile maintenance")
+            .iter()
+            .any(|record| record.id == hidden.id)
+    );
+
+    changed.archived = true;
+    vault
+        .put_memory(
+            &changed,
+            &operation(ID_8, ID_1, RecordKind::Memory),
+            &basis(0),
+        )
+        .unwrap();
+    assert!(
+        !search(&mut vault, "flower cultivation")
+            .iter()
+            .any(|record| record.id == car.id)
+    );
+
+    drop(vault);
+    let mut reopened = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    reopened.enable_semantic_search(
+        PinnedModelEmbedder::load(std::path::Path::new(&directory)).unwrap(),
+    );
+    assert_eq!(search(&mut reopened, "making sourdough")[0].id, bread.id);
+    assert!(
+        !search(&mut reopened, "flower cultivation")
+            .iter()
+            .any(|record| record.id == car.id)
+    );
+
+    let mut pending = candidate();
+    pending.proposed_memory = memory(
+        ID_5,
+        ScopeRef::Global,
+        "making sourdough",
+        "making sourdough",
+    );
+    reopened.put_candidate(&pending).unwrap();
+    assert!(
+        !search(&mut reopened, "making sourdough")
+            .iter()
+            .any(|record| record.id == pending.proposed_memory.id)
+    );
+
+    let rule_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073990";
+    let rule = instruction(
+        rule_id,
+        ScopeRef::Global,
+        "Credentials",
+        "Never disclose passwords or secret authentication tokens.",
+    );
+    reopened
+        .put_instruction(
+            &rule,
+            &operation(
+                "018f22e3-79b0-7cc8-98c4-dc0c0c073990",
+                rule_id,
+                RecordKind::Instruction,
+            ),
+            &basis(0),
+        )
+        .unwrap();
+    let scope = AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, None).unwrap();
+    let records = OfflineWorkspace::new(&mut reopened, ID_8.parse().unwrap())
+        .search_records("protect login information", &scope, 20)
+        .unwrap();
+    assert!(
+        matches!(records.first(), Some(context_relay_protocol::ReadableRecord::Instruction(value)) if value.id == rule.id)
+    );
+
+    // A commit through a second connection must invalidate warmed scope membership.
+    let mut other_connection = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let mut moved = bread.clone();
+    moved.scope = ScopeRef::Project {
+        project_id: ID_7.parse().unwrap(),
+    };
+    other_connection
+        .put_memory(
+            &moved,
+            &operation(
+                "018f22e3-79b0-7cc8-98c4-dc0c0c073991",
+                ID_2,
+                RecordKind::Memory,
+            ),
+            &basis(0),
+        )
+        .unwrap();
+    drop(other_connection);
+    assert!(
+        !search(&mut reopened, "making sourdough")
+            .iter()
+            .any(|record| record.id == bread.id)
+    );
+}
+
+#[test]
 #[ignore = "release-mode 10k-memory performance gate"]
 fn search_10k_p95_is_below_150ms_with_warm_injected_query_embedding() {
+    benchmark_search(false);
+}
+
+#[test]
+#[ignore = "release-mode 10k gate with verified BGE assets and ONNX Runtime"]
+fn semantic_search_10k_p95_includes_query_inference() {
+    benchmark_search(true);
+}
+
+fn benchmark_search(real_model: bool) {
     let path = TempVault::new("benchmark");
     let keys = MemoryKeyStore::default();
     let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
@@ -409,8 +597,23 @@ fn search_10k_p95_is_below_150ms_with_warm_injected_query_embedding() {
         ));
     }
     vault.put_memories_batch(&batch).unwrap();
+    if real_model {
+        let directory = std::env::var_os("CONTEXT_RELAY_MODEL_DIR")
+            .expect("set CONTEXT_RELAY_MODEL_DIR to the verified pinned model directory");
+        vault.enable_semantic_search(
+            PinnedModelEmbedder::load(std::path::Path::new(&directory)).unwrap(),
+        );
+    }
     let scope = AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, None).unwrap();
     let query_embedding = basis(17);
+    let cold_started = Instant::now();
+    vault
+        .search("needle", &scope, &query_embedding, 20)
+        .unwrap();
+    eprintln!(
+        "10k cold search: {:.3} seconds (real model: {real_model})",
+        cold_started.elapsed().as_secs_f64()
+    );
     for _ in 0..5 {
         vault
             .search("needle", &scope, &query_embedding, 20)
@@ -427,7 +630,7 @@ fn search_10k_p95_is_below_150ms_with_warm_injected_query_embedding() {
     samples.sort_unstable();
     let p95 = samples[94];
     eprintln!(
-        "10k search P95: {:.3} ms (warm DB, injected normalized query embedding)",
+        "10k search P95: {:.3} ms (warm DB, real model: {real_model})",
         p95.as_secs_f64() * 1000.0
     );
     assert!(p95.as_millis() < 150, "P95 was {p95:?}");
