@@ -1,5 +1,5 @@
-//! Candidate-version qualification. Only this disposable fixture opts an
-//! adapter into setup; the production version allowlist remains unchanged.
+//! Actual Windows x64 setup qualification through the production version gate.
+//! All native settings and transactions remain confined to disposable fixtures.
 use super::*;
 use crate::mcp::install::{BridgeExecutable, attest_bridge_executable};
 use crate::native_transaction::{
@@ -231,7 +231,7 @@ fn pinned_codex_native_setup_restart_reapply_and_undo() {
 
 fn discover(project: &Path, project_id: ProjectId, now_ms: u64) -> CodexAdapter {
     let device: DeviceId = "018f22e2-79b0-7cc8-98c4-dc0c0c073982".parse().unwrap();
-    let mut adapter = CodexAdapter::discover(
+    let adapter = CodexAdapter::discover(
         project,
         project,
         project_id,
@@ -244,9 +244,6 @@ fn discover(project: &Path, project_id: ProjectId, now_ms: u64) -> CodexAdapter 
         serde_json::to_value(adapter.executable_hash).unwrap(),
         PINNED_HASH
     );
-    assert_eq!(adapter.setup_capability(), CapabilityLevel::ImportOnly);
-    // Test-only candidate gate; no version spoofing or production enablement.
-    adapter.qualify_01446 = true;
     assert_eq!(adapter.setup_capability(), CapabilityLevel::Full);
     adapter
 }

@@ -75,9 +75,12 @@ changed; all 25 Windows IPC integration tests pass after the correction
 The hosted Windows installer job passed, but that preceding CI run
 contains the macOS test failure and is not a passing release check.
 
-The production version allowlist is unchanged. This work does not establish
+At the time of this run, the production version allowlist was unchanged. The
+subsequent [Windows x64 setup decision](windows-harness-setup-2026-09-07.md)
+combines this evidence with native session and installed-service checks to enable
+0.144.6 on that platform. This individual fixture does not establish
 installed bridge process/credential binding, native UI acceptance, a clean-machine
 installation, or the remaining harness/profile/platform matrix. Codex 0.144.6
-therefore remains ImportOnly. No normal harness configuration, credential,
+was therefore ImportOnly when this evidence was recorded. No normal harness configuration, credential,
 installed service or saved project record was modified. The existing installer
 predates these changes.

@@ -283,7 +283,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
         <p role="status">{discovery.report.capability === 'missing'
           ? `${harnessNames[discovery.harness]} was not found. Install it, restart Context Relay and select Review setup again.`
           : discovery.report.capability === 'blocked'
-            ? 'Local policy prevents automatic setup. Check the restrictions configured for this harness before trying again.'
+            ? blockedSetupGuidance(discovery.harness, discovery.report)
             : preparationAvailable(discovery.harness, discovery.report)
               ? 'Hermes needs a private runtime copy before you can review its setup. Preparation can take a few minutes and can be canceled.'
             : discovery.harness === 'hermes' && discovery.report.policyConflicts.includes('python_runtime_not_qualified')
@@ -427,6 +427,13 @@ function SetupNextSteps({ item }: { item: ReviewedPlan }) {
       <p>If these hooks are already trusted, you can start a new session. New or changed commands need review again.</p>
     </> : <p>Start a new {harnessNames[item.params.harness]} session for {item.projectName} to load the saved settings.</p>}
   </section>;
+}
+
+function blockedSetupGuidance(harness: HarnessId, report: ProbeReport): string {
+  if (harness === 'codex' && report.policyConflicts.includes('project_untrusted') && !report.policyConflicts.includes('managed_requirements_active')) {
+    return 'Codex needs your approval for this project folder. Open the project folder in the Codex CLI and review its trust prompt. Then return here and select Review setup again.';
+  }
+  return 'Local policy prevents automatic setup. Check the restrictions configured for this harness before trying again.';
 }
 
 function setupError(error: unknown, harness: HarnessId) {

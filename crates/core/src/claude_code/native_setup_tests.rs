@@ -1,4 +1,4 @@
-//! Real CLI qualification in disposable profiles; never enables a production version.
+//! Real Windows x64 CLI qualification through the production version gate.
 use super::*;
 use crate::{
     mcp::install::{BridgeExecutable, attest_bridge_executable},
@@ -183,7 +183,7 @@ fn discover_plan(plan: &NativeTransactionPlan, now: u64) -> ClaudeCodeAdapter {
     discover(&projects[0].1, projects[0].0, now)
 }
 fn discover(project: &Path, id: ProjectId, now: u64) -> ClaudeCodeAdapter {
-    let mut adapter = ClaudeCodeAdapter::discover(
+    let adapter = ClaudeCodeAdapter::discover(
         project,
         id,
         adapter_device(),
@@ -195,8 +195,6 @@ fn discover(project: &Path, id: ProjectId, now: u64) -> ClaudeCodeAdapter {
         serde_json::to_value(adapter.executable_hash).unwrap(),
         PINNED_HASH
     );
-    assert_eq!(adapter.capability(), CapabilityLevel::ImportOnly);
-    adapter.qualify_21202 = true;
     assert_eq!(adapter.capability(), CapabilityLevel::Full);
     adapter
 }

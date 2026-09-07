@@ -374,6 +374,72 @@ fn codex_native_plan(
 }
 
 #[test]
+fn qualified_windows_setup_version_preserves_native_and_policy_gates() {
+    let mut source: Value =
+        serde_json::from_str(include_str!("fixtures/codex-0.144.1.json")).unwrap();
+    let qualified = cfg!(all(windows, target_arch = "x86_64"));
+    let probe = |adapter: &CodexAdapter| {
+        adapter
+            .probe(&ProbeContext {
+                harness: HarnessId::Codex,
+                requested_profile: None,
+            })
+            .unwrap()
+            .capability
+    };
+    for version in ["0.144.6", "0.144.7", "0.144.60"] {
+        source["version"] = json!(version);
+        let item = fixture(&source.to_string());
+        assert_eq!(
+            probe(&item.adapter),
+            if qualified && version == "0.144.6" {
+                CapabilityLevel::Full
+            } else {
+                CapabilityLevel::ImportOnly
+            },
+            "{version}"
+        );
+    }
+    source["version"] = json!("0.144.6");
+    let managed = fixture_with_requirements(&source.to_string(), true);
+    assert_eq!(
+        probe(&managed.adapter),
+        if qualified {
+            CapabilityLevel::Blocked
+        } else {
+            CapabilityLevel::ImportOnly
+        }
+    );
+    let item = fixture(&source.to_string());
+    let config_path = item.codex_home.join("config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("trust_level = \"trusted\"", "trust_level = \"untrusted\"");
+    fs::write(&config_path, config).unwrap();
+    assert_eq!(
+        probe(&item.adapter),
+        if qualified {
+            CapabilityLevel::Blocked
+        } else {
+            CapabilityLevel::ImportOnly
+        }
+    );
+    let mut layout = item.layout.clone();
+    layout.executable = item.root.join("wrapper.cmd");
+    fs::write(&layout.executable, b"@echo off\n").unwrap();
+    layout.executable_kind = CodexExecutableKind::Wrapper;
+    let device = DeviceId::from_str(DEVICE_ID).unwrap();
+    let wrapper = CodexAdapter::from_layout(
+        layout,
+        item.project_id,
+        device,
+        HybridLogicalClock::new(1_900_000_000_000, 0, device),
+    )
+    .unwrap();
+    assert_eq!(probe(&wrapper), CapabilityLevel::ImportOnly);
+}
+
+#[test]
 fn supported_release_fixtures_import_reviewed_surfaces_without_secrets() {
     for source in [
         include_str!("fixtures/codex-0.144.1.json"),

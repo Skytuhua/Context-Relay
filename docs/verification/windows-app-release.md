@@ -548,3 +548,9 @@ production binaries remain those from e09d206.
 also passes against that installed service using a disposable native profile,
 normal bridge credential directories and a loopback model. The fixture allows
 only the status tool and preserves the ordinary service/configuration canaries.
+
+The cumulative [Windows x64 setup qualification](windows-harness-setup-2026-09-07.md)
+now supports automatic settings setup for exact Codex 0.144.6 and Claude Code
+2.1.202. Source gates enable only that platform, retaining trust, policy and
+transaction restrictions. Saved settings still do not assert a verified live
+connection. Replacement installer qualification is tracked in that report.

@@ -739,6 +739,42 @@ fn memory_hooks_rotate_executable_without_removing_user_lookalikes() {
 }
 
 #[test]
+fn qualified_windows_setup_version_preserves_exact_version_and_policy_evidence() {
+    let mut source: Value =
+        serde_json::from_str(include_str!("fixtures/claude-code-2.1.214.json")).unwrap();
+    for version in ["2.1.202", "2.1.201", "2.1.2020"] {
+        source["version"] = json!(version);
+        let item = fixture(&source.to_string());
+        let report = item
+            .adapter
+            .probe(&ProbeContext {
+                harness: HarnessId::ClaudeCode,
+                requested_profile: None,
+            })
+            .unwrap();
+        assert_eq!(
+            report.capability,
+            if cfg!(all(windows, target_arch = "x86_64")) && version == "2.1.202" {
+                CapabilityLevel::Full
+            } else {
+                CapabilityLevel::ImportOnly
+            },
+            "{version}"
+        );
+        assert!(
+            report
+                .policy_conflicts
+                .contains(&"managed_settings_active".to_owned())
+        );
+        assert!(
+            report
+                .policy_conflicts
+                .contains(&"project_mcp_approvals_configured".to_owned())
+        );
+    }
+}
+
+#[test]
 fn unknown_versions_are_import_only() {
     let mut source: Value =
         serde_json::from_str(include_str!("fixtures/claude-code-2.1.214.json")).unwrap();
@@ -1344,6 +1380,37 @@ fn native_memory_claude_binds_the_settings_remote_memory_base() {
     );
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[test]
+fn qualified_windows_setup_uses_default_and_remote_native_memory_roots() {
+    let mut source: Value =
+        serde_json::from_str(include_str!("fixtures/claude-code-2.1.214.json")).unwrap();
+    source["version"] = json!("2.1.202");
+    let item = fixture(&source.to_string());
+    use_default_memory(&item);
+    let project = item.root.join("project with spaces");
+    let capabilities = item.adapter.native_memory_capabilities().unwrap();
+    assert_eq!(
+        capabilities.sources[0].path,
+        expected_default_memory(&item, &project)
+    );
+    let remote = item.root.join("remote memory 專案 O'Brien");
+    fs::create_dir(&remote).unwrap();
+    fs::write(
+        item.root.join("custom claude config/settings.json"),
+        serde_json::to_vec(&json!({"env":{
+            "CLAUDE_CODE_REMOTE_MEMORY_DIR":remote.to_string_lossy().trim_start_matches(r"\\?\")
+        }}))
+        .unwrap(),
+    )
+    .unwrap();
+    let capabilities = item.adapter.native_memory_capabilities().unwrap();
+    assert_eq!(
+        capabilities.sources[0].path,
+        expected_memory_under_base(&remote, &project)
+    );
+}
+
 #[test]
 fn native_memory_claude_remote_memory_base_obeys_layers_and_explicit_roots() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
@@ -1434,7 +1501,7 @@ fn native_memory_claude_remote_memory_base_rejects_unqualified_paths_and_values(
     }
     let mut source: Value =
         serde_json::from_str(include_str!("fixtures/claude-code-2.1.214.json")).unwrap();
-    source["version"] = json!("2.1.202");
+    source["version"] = json!("2.1.201");
     let unknown = self::fixture(&source.to_string());
     fs::write(unknown.adapter.project_settings_path(), serde_json::to_vec(&json!({"env":{
         "CLAUDE_CODE_REMOTE_MEMORY_DIR":unknown.root.to_string_lossy().trim_start_matches(r"\\?\")

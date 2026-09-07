@@ -54,5 +54,7 @@ cases remain ignored.
 
 This closes actual Claude client status access to the installed service in a
 disposable profile. It does not qualify ordinary-profile setup, hooks or full
-Save/Undo behavior. Production Full-version gates are unchanged. Installed
+Save/Undo behavior. The subsequent [Windows x64 setup decision](windows-harness-setup-2026-09-07.md)
+uses this evidence alongside the native transaction fixtures to enable the exact
+qualified setup version on that platform. Installed
 Hermes client sessions and the broader first-use/release requirements remain open.

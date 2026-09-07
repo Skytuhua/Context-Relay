@@ -1242,7 +1242,12 @@ pub(crate) mod tests {
         );
         assert_eq!(
             missing.capability,
-            context_relay_protocol::CapabilityLevel::ImportOnly
+            if cfg!(all(windows, target_arch = "x86_64")) {
+                // This qualified version still cannot set up an untrusted project.
+                context_relay_protocol::CapabilityLevel::Blocked
+            } else {
+                context_relay_protocol::CapabilityLevel::ImportOnly
+            }
         );
         let component = context_relay_core::native_memory::managed_memory_hooks(
             HarnessId::Codex,

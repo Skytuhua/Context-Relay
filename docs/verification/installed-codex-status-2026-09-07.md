@@ -74,5 +74,7 @@ interactive hook trust, the complete setup/Save workflow or model-provider
 behavior. The subsequent [Claude check](installed-claude-status-2026-09-07.md)
 also passes actual client status access; Hermes still has direct installed bridge
 status evidence without an actual installed-service client session.
-The production Full-version gates remain unchanged. This test-only addition
+The subsequent [Windows x64 setup decision](windows-harness-setup-2026-09-07.md)
+uses this evidence alongside the native transaction fixtures to enable the exact
+qualified setup version on that platform. This test-only addition
 does not require rebuilding or reinstalling the `e09d206` application.

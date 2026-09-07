@@ -119,9 +119,6 @@ pub struct CodexAdapter {
     origin_device: DeviceId,
     observed_hlc: HybridLogicalClock,
     executable_hash: Sha256Digest,
-    // Candidate setup qualification in isolated unit-test profiles only.
-    #[cfg(all(test, windows))]
-    qualify_01446: bool,
 }
 
 /// An opened, digest-bound Codex executable identity.
@@ -579,8 +576,6 @@ impl CodexAdapter {
             origin_device,
             observed_hlc,
             executable_hash,
-            #[cfg(all(test, windows))]
-            qualify_01446: false,
         })
     }
 
@@ -1081,9 +1076,10 @@ impl CodexAdapter {
     }
 
     pub(crate) fn capability(&self) -> CapabilityLevel {
-        let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str());
-        #[cfg(all(test, windows))]
-        let supported = supported || (self.qualify_01446 && self.layout.version == "0.144.6");
+        // Native setup/recovery, hooks and installed bridge access are qualified
+        // for this exact release on Windows x64; other platforms retain their gate.
+        let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str())
+            || (cfg!(all(windows, target_arch = "x86_64")) && self.layout.version == "0.144.6");
         if supported && self.layout.executable_kind == CodexExecutableKind::Native {
             CapabilityLevel::Full
         } else {

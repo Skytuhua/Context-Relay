@@ -96,8 +96,6 @@ pub struct ClaudeCodeAdapter {
     origin_device: DeviceId,
     observed_hlc: HybridLogicalClock,
     executable_hash: Sha256Digest,
-    #[cfg(all(test, windows))]
-    qualify_21202: bool,
     #[cfg(test)]
     settings_read_hook: Option<fn(&Path)>,
 }
@@ -285,8 +283,6 @@ impl ClaudeCodeAdapter {
             origin_device,
             observed_hlc,
             executable_hash,
-            #[cfg(all(test, windows))]
-            qualify_21202: false,
             #[cfg(test)]
             settings_read_hook: None,
         })
@@ -613,9 +609,10 @@ impl ClaudeCodeAdapter {
     }
 
     pub(crate) fn capability(&self) -> CapabilityLevel {
-        let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str());
-        #[cfg(all(test, windows))]
-        let supported = supported || (self.qualify_21202 && self.layout.version == "2.1.202");
+        // Native setup/recovery, memory paths and installed bridge access are
+        // qualified for this exact Windows x64 release only.
+        let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str())
+            || (cfg!(all(windows, target_arch = "x86_64")) && self.layout.version == "2.1.202");
         if supported {
             CapabilityLevel::Full
         } else {

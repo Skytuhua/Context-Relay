@@ -118,6 +118,25 @@ it('explains a confirmed missing Claude Code executable instead of blaming setup
   expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
 });
 
+it('explains Codex folder trust before asking the user to retry setup', async () => {
+  invoke.mockImplementation(async (_command, { request }: { request: LocalRequest }) => {
+    requests.push(request);
+    return response({ ...report, capability: 'blocked', policyConflicts: ['project_untrusted'] });
+  });
+  await open(); preview();
+  expect(await screen.findByText(/Open the project folder in the Codex CLI and review its trust prompt/)).toBeVisible();
+  expect(screen.getByText(/return here and select Review setup again/)).toBeVisible();
+  expect(requests).toEqual([{ method: 'harness_probe', params }]);
+  expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+});
+
+it('keeps policy guidance when managed requirements also block an untrusted project', async () => {
+  invoke.mockResolvedValue(response({ ...report, capability: 'blocked', policyConflicts: ['project_untrusted', 'managed_requirements_active'] }));
+  await open(); preview();
+  expect(await screen.findByText(/Local policy prevents automatic setup/)).toBeVisible();
+  expect(screen.queryByText(/review its trust prompt/)).not.toBeInTheDocument();
+});
+
 it('explains an incompatible local service without blaming the harness installation', async () => {
   invoke.mockRejectedValue({ code: 'protocol_version_unsupported', message: 'PRIVATE NATIVE DETAILS', fieldPath: null, retryable: false });
   await open(); preview();
