@@ -1,6 +1,6 @@
 # Windows app release acceptance
 
-Current user feedback (2026-09-05): connecting AI apps and creating projects,
+Current user feedback (2026-09-05): connecting harnesses and creating projects,
 context or tasks failed during their own EXE test, and the interface was too
 hard to understand. Usability and successful ordinary-user workflows are release
 requirements. Passing source tests alone does not resolve this report.
@@ -45,6 +45,16 @@ Submitted-save restart recovery is tracked in [Desktop save recovery](desktop-sa
 - Preserve unrelated untracked workspace files and the historical reviewed branches.
 
 ## Progress
+
+2026-09-07: rebuilt and statically inspected the Windows x64 installer from
+`1d7b46d`, now including the Claude memory-directory corrections. It is
+11,522,177 bytes, SHA-256
+`4a7ab3f872a1e9357af9fa5a80316d50d294e0a953201edca8134dd6ef658051`,
+and unsigned. The [candidate record](windows-candidate-2026-09-07.md) preserves
+the preceding artifacts and image checks. Actual retained Hermes client and
+scripted CLI conversation tests pass; the macOS workspace Rust job passed at
+`19044f6`. This new candidate has not been installed or accepted through native
+UI, which remains paused after the earlier stop. The acceptance map remains open.
 
 2026-09-05: inspected current tree and live release/CI state. Corrected the initial assumption that daemon autostart was absent: it exists in `crates/local-ipc/src/connection.rs`. The immediate distribution defect is that the required sibling executables are not packaged. Installer assembly work starts on `codex/windows-app-release`, based on the reviewed PR #15 fingerprint fix.
 
