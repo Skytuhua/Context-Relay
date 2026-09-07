@@ -103,6 +103,8 @@ config and preserving the memory and credential canaries. The complete contained
 test passed in 1575.45 seconds, and its parent exited successfully.
 
 This covers the Python support design's production setup, configured bridge,
-restart and Undo qualification for the retained 0.17.0 runtime. Actual Hermes
-client/model validation, other harness versions and installed acceptance remain
+restart and Undo qualification for the retained 0.17.0 runtime. The separate
+[actual MCP client qualification](hermes-native-client-2026-09-07.md) now passes
+all eleven tools and context/task operations in a disposable profile. A full
+CLI/model conversation, other harness versions and installed acceptance remain
 separate work.

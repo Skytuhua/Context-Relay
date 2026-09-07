@@ -199,3 +199,22 @@ Exact native approval matching is qualified in disposable profiles. Effective
 runtime enablement, connection verification and the remaining release gates
 remain open. Protocol 1.6 preserves authenticated shutdown-only compatibility
 with 1.4 and 1.5 installed previews.
+
+2026-09-07 Hermes qualification update: the retained Windows 0.17.0 runtime now
+passes the [production setup composition](hermes-production-setup-2026-09-07.md),
+including tracked Save, readback through the actual saved bridge declaration,
+daemon/vault restart, idempotent reapply and exact Undo. Separately, the
+[actual Hermes MCP client](hermes-native-client-2026-09-07.md) discovers all eleven
+tools and passes project-bound context and task operations using synthetic YAML
+and credentials. These are distinct execution planes; neither establishes a
+full CLI/model conversation or installed credential acceptance. T12/T13/T20 and
+the full product goal remain incomplete. The
+[Windows installer candidate](windows-candidate-2026-09-07.md) is built and
+statically inspected, but has not passed installed or clean-machine acceptance.
+
+2026-09-07 Claude memory update: settings-provided cowork and qualified remote
+memory directory precedence are corrected, with exact dependency revalidation.
+The [evidence](claude-memory-directory-2026-09-07.md) distinguishes 25 actual
+isolated native sessions from the adapter and primary-memory tests. Full native
+setup/recovery and installed acceptance remain open, and Claude 2.1.202 remains
+import-only. The existing installer predates these source corrections.
