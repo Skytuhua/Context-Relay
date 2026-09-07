@@ -2,7 +2,8 @@
 
 Status: configured production setup qualification passed. The exact retained
 0.17.0 gate is enabled in source; this is not installed release acceptance.
-No replacement installer has been built or installed for this change.
+A [replacement Windows candidate](windows-candidate-2026-09-07.md) has been built
+and statically inspected. It has not been installed or accepted through native UI.
 
 ## Candidate behavior
 
@@ -103,5 +104,5 @@ test passed in 1575.45 seconds, and its parent exited successfully.
 
 This covers the Python support design's production setup, configured bridge,
 restart and Undo qualification for the retained 0.17.0 runtime. Actual Hermes
-client/model validation, other harness versions, rebuilt installer and installed
-acceptance remain separate work.
+client/model validation, other harness versions and installed acceptance remain
+separate work.

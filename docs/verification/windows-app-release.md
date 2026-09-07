@@ -514,8 +514,11 @@ passed Save, context readback, daemon/vault restart, reapply and exact Undo in
 ordinary Python launchers remain import-only. Installed release acceptance and
 an actual Hermes client/model session remain unverified.
 
-The local unsigned x64 installer remains the 11d6740 candidate, SHA-256
-`a18e2051f1fc30a9d7cf66dec71ac747f6f54facf03485fa826447d233d326bf`.
-It predates these source changes. Codex 0.144.6 and Claude Code 2.1.202 still
-require their remaining qualification gates. Signing, installed workflow and
-clean-machine acceptance remain open; native desktop control is paused.
+The [new local unsigned x64 candidate](windows-candidate-2026-09-07.md) was built
+from 357f4a2, SHA-256
+`b919653bd7ec50fb6befc33d9a4a9473cef67373a77aada98a79d53490a9e14b`.
+Its archive contents, expected Tauri bundle marker and executable dependencies
+were inspected. The preceding 11d6740 installer is preserved separately. The
+installed application remains unchanged. Codex 0.144.6 and Claude Code 2.1.202
+still require their remaining qualification gates. Signing, installed workflow
+and clean-machine acceptance remain open; native desktop control is paused.

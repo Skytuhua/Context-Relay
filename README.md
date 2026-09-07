@@ -98,8 +98,11 @@ an NSIS setup `.exe` under
 `target/x86_64-pc-windows-msvc/release/bundle/nsis/` (or your configured Cargo
 target directory). It installs for the current user and includes the WebView2
 bootstrapper; installing WebView2 requires internet if it is absent. Packaging
-uses static CRT linkage and locked Cargo dependencies. Relevant pull requests
-also build a candidate with checksums in GitHub Actions.
+requests static CRT linkage for Rust targets and uses locked Cargo dependencies.
+The desktop also imports Windows UCRT APIs, which are part of the supported
+Windows operating system. Relevant pull requests also build a candidate with
+checksums in GitHub Actions. See the [current local candidate inspection](docs/verification/windows-candidate-2026-09-07.md)
+for exact artifact hashes and dependency evidence.
 
 These are internal candidates. Signing, installed-product testing, hosted
 functionality and the remaining [release acceptance requirements](docs/verification/windows-app-release.md)
