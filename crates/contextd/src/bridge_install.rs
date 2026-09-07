@@ -1079,12 +1079,24 @@ pub(crate) mod tests {
         }
 
         for undo in [false, true] {
+            // macOS's normal temporary directory plus this test's socket name
+            // exceeds sockaddr_un's 103-byte path limit. Keep the owned private
+            // fixture under /tmp, as the daemon's other macOS IPC tests do.
+            #[cfg(target_os = "macos")]
+            let temp = tempfile::Builder::new()
+                .prefix("cr-pj-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            #[cfg(not(target_os = "macos"))]
             let temp = tempfile::tempdir().unwrap();
             let runtime = RuntimeConfig::for_test(
                 format!("pre-journal-{}", uuid::Uuid::now_v7()),
                 Some(temp.path().to_owned()),
             )
             .unwrap();
+            runtime
+                .endpoint_name()
+                .expect("fixture IPC path must be valid");
             let config = crate::test_support::TestDaemonConfig::new(
                 runtime.clone(),
                 temp.path().join("vault.db"),
