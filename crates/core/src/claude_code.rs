@@ -29,6 +29,8 @@ use command_context::ClaudeCommandContext;
 mod memory_path;
 mod memory_repository;
 #[cfg(all(test, windows))]
+mod native_setup_tests;
+#[cfg(all(test, windows))]
 mod session_tests;
 
 use crate::mcp::install::{
@@ -94,6 +96,8 @@ pub struct ClaudeCodeAdapter {
     origin_device: DeviceId,
     observed_hlc: HybridLogicalClock,
     executable_hash: Sha256Digest,
+    #[cfg(all(test, windows))]
+    qualify_21202: bool,
 }
 
 pub trait ClaudeCodeCommandRunner {
@@ -279,6 +283,8 @@ impl ClaudeCodeAdapter {
             origin_device,
             observed_hlc,
             executable_hash,
+            #[cfg(all(test, windows))]
+            qualify_21202: false,
         })
     }
 
@@ -433,25 +439,11 @@ impl ClaudeCodeAdapter {
             ),
             NativeState::Absent { .. } if component.archived => current.clone(),
             NativeState::Absent { .. } => {
-                let template_path = path.with_file_name(".mcp.json");
-                let template =
-                    OsNativeFileSystem::new()
-                        .snapshot(&template_path)
-                        .map_err(|_| {
-                            invalid_request(
-                                "Claude Code primary instruction metadata template is unavailable",
-                            )
-                        })?;
-                let NativeState::RegularFile { metadata, .. } = template.state() else {
-                    return Err(invalid_request(
-                        "Claude Code primary instruction needs an existing project-root metadata template",
-                    ));
-                };
-                let metadata = metadata
-                    .for_absent_sibling_creation(&current)
+                let metadata = OsNativeFileSystem::new()
+                    .metadata_for_new_private_file(&path)
                     .map_err(|_| {
                         invalid_request(
-                            "Claude Code primary instruction metadata template is not bound to the target parent",
+                            "Claude Code primary instruction creation metadata is unavailable",
                         )
                     })?;
                 NativeState::regular_file(
@@ -601,7 +593,10 @@ impl ClaudeCodeAdapter {
     }
 
     pub(crate) fn capability(&self) -> CapabilityLevel {
-        if SUPPORTED_VERSIONS.contains(&self.layout.version.as_str()) {
+        let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str());
+        #[cfg(all(test, windows))]
+        let supported = supported || (self.qualify_21202 && self.layout.version == "2.1.202");
+        if supported {
             CapabilityLevel::Full
         } else {
             CapabilityLevel::ImportOnly
@@ -1071,7 +1066,7 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
             }
         };
         let path = configuration.disable_path;
-        let supported = SUPPORTED_VERSIONS.contains(&self.layout.version.as_str());
+        let supported = self.capability() == CapabilityLevel::Full;
         let snapshot = match OsNativeFileSystem::new().snapshot(&path) {
             Ok(snapshot) => Some(snapshot),
             Err(context_relay_native_runner::RunnerError::Io)

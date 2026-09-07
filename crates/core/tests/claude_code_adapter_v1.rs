@@ -2400,6 +2400,7 @@ fn primary_memory_claude_markdown_handles_crlf_replacement_archive_and_absence()
     assert_eq!(archived, b"user prefix\r\nuser suffix\r\n");
 
     fs::remove_file(&path).unwrap();
+    fs::remove_file(fixture.root.join("project with spaces/.mcp.json")).unwrap();
     managed.archived = false;
     let created = fixture.adapter.plan_native_file(&managed).unwrap();
     let NativeState::RegularFile {
@@ -2407,7 +2408,7 @@ fn primary_memory_claude_markdown_handles_crlf_replacement_archive_and_absence()
         ..
     } = NativeState::decode_v1(&created.content).unwrap()
     else {
-        panic!("absent primary instruction is created from a metadata template")
+        panic!("absent primary instruction is created without another project file")
     };
     assert!(
         String::from_utf8(created_bytes.clone())
