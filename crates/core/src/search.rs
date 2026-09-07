@@ -18,7 +18,29 @@ use thiserror::Error;
 pub const EMBEDDING_DIMENSIONS: usize = 384;
 pub const BGE_QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
 const RRF_K: f64 = 60.0;
+const MAX_MODEL_INPUT_BYTES: usize = 16 * 1024;
 const PINNED_MODEL_MANIFEST: &[u8] = include_bytes!("../models/bge-small-en-v1.5/manifest.json");
+
+pub(crate) fn semantic_passage_input(title: &str, tags: &str, body: &str) -> String {
+    // Keep tags before long bodies so truncation cannot discard all tag metadata.
+    format!("{title}\n{tags}\n{body}")
+}
+
+pub(crate) fn semantic_input_digest(title: &str, tags: &str, body: &str) -> [u8; 32] {
+    Sha256::digest(semantic_passage_input(title, tags, body).as_bytes()).into()
+}
+
+pub(crate) fn semantic_model_fingerprint() -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(PINNED_MODEL_MANIFEST);
+    hash.update(BGE_QUERY_PREFIX);
+    hash.update(
+        b"title-newline-tags-newline-body/v1;cls;static;max512;normalized-f32-384;fastembed-5.17.3",
+    );
+    hash.update(b"utf8-prefix-before-tokenization/v1");
+    hash.update((MAX_MODEL_INPUT_BYTES as u64).to_le_bytes());
+    hash.finalize().into()
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Embedding384([f32; EMBEDDING_DIMENSIONS]);
@@ -369,6 +391,12 @@ pub struct PinnedModelEmbedder {
     model: TextEmbedding,
 }
 
+fn bounded_model_input(input: &str) -> &str {
+    // Token limits alone still tokenize an entire megabyte-sized note first.
+    // Bound preprocessing too; full text remains in the vault and FTS index.
+    &input[..input.floor_char_boundary(MAX_MODEL_INPUT_BYTES.min(input.len()))]
+}
+
 /// Derived vectors are local to a vault and a single verified model instance.
 pub(crate) struct SemanticSearch {
     model: PinnedModelEmbedder,
@@ -435,27 +463,22 @@ impl SemanticSearch {
         });
     }
 
-    pub(crate) fn passage(
+    pub(crate) fn cache_passage(
         &mut self,
         record_id: &str,
-        title: &str,
-        body: &str,
-    ) -> Result<Embedding384, ModelError> {
-        let input = format!("{title}\n{body}");
-        let digest: [u8; 32] = Sha256::digest(input.as_bytes()).into();
-        if let Some((cached_digest, embedding)) = self.passages.get(record_id)
-            && cached_digest == &digest
-        {
-            return Ok(embedding.clone());
-        }
-        let embedding = self.model.embed(EmbeddingPurpose::Passage, &input)?;
+        digest: [u8; 32],
+        embedding: Embedding384,
+    ) {
         // Bound derived state even when many different project scopes are queried.
         if self.passages.len() >= 16_384 && !self.passages.contains_key(record_id) {
             self.passages.pop_first();
         }
         self.passages
-            .insert(record_id.to_owned(), (digest, embedding.clone()));
-        Ok(embedding)
+            .insert(record_id.to_owned(), (digest, embedding));
+    }
+
+    pub(crate) fn embed_passage(&mut self, input: &str) -> Result<Embedding384, ModelError> {
+        self.model.embed(EmbeddingPurpose::Passage, input)
     }
 }
 
@@ -485,7 +508,9 @@ impl PinnedModelEmbedder {
         // intra-op pool competes with the vault worker between inferences.
         let model = TextEmbedding::try_new_from_user_defined(
             user_model,
-            InitOptionsUserDefined::default().with_intra_threads(1),
+            InitOptionsUserDefined::default()
+                .with_intra_threads(1)
+                .with_max_length(512),
         )
         .map_err(|_| ModelError::RuntimeInitialization)?;
         Ok(Self { model })
@@ -499,7 +524,7 @@ impl PinnedModelEmbedder {
         let model_input = bge_model_input(purpose, input);
         let mut output = self
             .model
-            .embed([model_input.as_ref()], None)
+            .embed([bounded_model_input(model_input.as_ref())], None)
             .map_err(|_| ModelError::Inference)?;
         if output.len() != 1 {
             return Err(ModelError::Inference);
@@ -511,6 +536,16 @@ impl PinnedModelEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_input_bound_preserves_utf8_and_short_text() {
+        let text = format!("xx{}", "界".repeat(MAX_MODEL_INPUT_BYTES));
+        let bounded = bounded_model_input(&text);
+        assert!(bounded.len() <= MAX_MODEL_INPUT_BYTES);
+        assert!(bounded.len() > MAX_MODEL_INPUT_BYTES - 3);
+        assert!(text.starts_with(bounded));
+        assert_eq!(bounded_model_input("short note"), "short note");
+    }
 
     #[test]
     fn verified_model_bytes_are_retained_after_source_replacement() {

@@ -21,6 +21,83 @@ use support::{
 
 const CREDENTIAL: &str = "task-6-search";
 
+fn finish_semantic_index(vault: &mut Vault) -> usize {
+    let mut indexed = 0;
+    loop {
+        let batch = vault
+            .index_semantic_batch(32, std::time::Duration::from_millis(100))
+            .unwrap();
+        indexed += batch.indexed;
+        if batch.remaining == 0 {
+            return indexed;
+        }
+        assert!(batch.processed > 0, "index batch must make progress");
+    }
+}
+
+fn open_keyed(path: &std::path::Path, key: &[u8; 32]) -> rusqlite::Connection {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    // SAFETY: this is the first SQLite operation, and the connection and key
+    // remain alive for the call. This key belongs only to the disposable fixture.
+    let result =
+        unsafe { rusqlite::ffi::sqlite3_key(connection.handle(), key.as_ptr().cast(), 32) };
+    assert_eq!(result, rusqlite::ffi::SQLITE_OK);
+    connection
+}
+
+fn downgrade_fixture_to_schema_26(path: &TempVault, keys: &MemoryKeyStore) {
+    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    raw.execute_batch(
+        "DROP TRIGGER semantic_document_insert;
+         DROP TRIGGER semantic_document_update;
+         DROP TABLE semantic_embeddings;
+         DROP TABLE semantic_index_queue;
+         DROP TABLE semantic_index_model;
+         ALTER TABLE search_documents DROP COLUMN input_digest;
+         ALTER TABLE search_documents DROP COLUMN tags;
+         DELETE FROM search_fts;
+         INSERT INTO search_fts(record_id,title,body) SELECT record_id,title,body FROM search_documents;
+         PRAGMA user_version=26;",
+    ).unwrap();
+}
+
+#[test]
+fn schema_26_upgrade_backfills_tags_without_changing_records_or_sync() {
+    let path = TempVault::new("semantic-metadata-upgrade");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let mut record = memory(ID_1, ScopeRef::Global, "Vehicle", "Keep it serviced.");
+    record.tags = vec!["automotive".into(), "maintenance".into()];
+    vault
+        .put_memory(
+            &record,
+            &operation(ID_3, ID_1, RecordKind::Memory),
+            &basis(0),
+        )
+        .unwrap();
+    let original_outbox = vault.outbox_operations().unwrap();
+    drop(vault);
+    downgrade_fixture_to_schema_26(&path, &keys);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(vault.memory(&record.id).unwrap(), Some(record.clone()));
+    assert_eq!(vault.outbox_operations().unwrap(), original_outbox);
+    let hits =
+        context_relay_core::service::OfflineWorkspace::new(&mut vault, ID_8.parse().unwrap())
+            .search_memories(context_relay_protocol::SearchParams {
+                query: "automotive".into(),
+                project_id: None,
+            })
+            .unwrap();
+    assert_eq!(hits.first().map(|hit| hit.id), Some(record.id));
+    drop(vault);
+    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    let metadata: (String, i64, i64) = raw.query_row(
+        "SELECT tags,length(input_digest),(SELECT count(*) FROM semantic_embeddings) FROM search_documents WHERE record_id=?1",
+        [ID_1], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).unwrap();
+    assert_eq!(metadata, ("automotive maintenance".into(), 32, 0));
+}
+
 fn hit_ids(
     vault: &Vault,
     query: &str,
@@ -435,8 +512,36 @@ fn real_semantic_workspace_search_finds_a_paraphrase() {
             })
             .unwrap()
     };
+    let outbox_before_index = vault.outbox_operations().unwrap();
+    assert_eq!(finish_semantic_index(&mut vault), 2);
+    assert_eq!(vault.outbox_operations().unwrap(), outbox_before_index);
     let hits = search(&mut vault, "automobile maintenance");
     assert_eq!(hits.first().map(|record| record.id), Some(car.id));
+
+    // Model mismatches invalidate both persisted readiness and warm snapshots.
+    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    raw.execute(
+        "UPDATE semantic_embeddings SET model_fingerprint=zeroblob(32) WHERE record_id=?1",
+        [ID_1],
+    )
+    .unwrap();
+    drop(raw);
+    let global_scope =
+        AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, None).unwrap();
+    assert_eq!(
+        vault
+            .semantic_index_progress(&global_scope)
+            .unwrap()
+            .unwrap()
+            .indexed_records,
+        1
+    );
+    assert!(
+        !search(&mut vault, "automobile maintenance")
+            .iter()
+            .any(|hit| hit.id == car.id)
+    );
+    assert_eq!(finish_semantic_index(&mut vault), 1);
 
     // Warm vectors must change when the same record ID receives different text.
     let mut changed = car.clone();
@@ -449,8 +554,39 @@ fn real_semantic_workspace_search_finds_a_paraphrase() {
             &basis(0),
         )
         .unwrap();
+    assert!(
+        !search(&mut vault, "flower cultivation")
+            .iter()
+            .any(|hit| hit.id == car.id),
+        "changed text must not use a stale vector"
+    );
+    assert_eq!(finish_semantic_index(&mut vault), 1);
     assert_eq!(search(&mut vault, "flower cultivation")[0].id, car.id);
     assert_eq!(search(&mut vault, "making sourdough")[0].id, bread.id);
+
+    // Tag-only edits are part of both keyword and semantic input.
+    changed.tags = vec!["horticulture".into()];
+    vault
+        .put_memory(
+            &changed,
+            &operation(
+                "018f22e3-79b0-7cc8-98c4-dc0c0c073992",
+                ID_1,
+                RecordKind::Memory,
+            ),
+            &basis(0),
+        )
+        .unwrap();
+    assert_eq!(
+        vault
+            .semantic_index_progress(&global_scope)
+            .unwrap()
+            .unwrap()
+            .indexed_records,
+        1
+    );
+    assert_eq!(search(&mut vault, "horticulture")[0].id, car.id);
+    assert_eq!(finish_semantic_index(&mut vault), 1);
 
     // Even an exact semantic match in another project is excluded.
     let hidden = memory(
@@ -473,6 +609,16 @@ fn real_semantic_workspace_search_finds_a_paraphrase() {
             .iter()
             .any(|record| record.id == hidden.id)
     );
+    assert_eq!(finish_semantic_index(&mut vault), 1);
+    let progress = vault
+        .semantic_index_progress(&global_scope)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (progress.indexed_records, progress.total_records),
+        (2, 2),
+        "other project counts are excluded"
+    );
 
     changed.archived = true;
     vault
@@ -492,6 +638,11 @@ fn real_semantic_workspace_search_finds_a_paraphrase() {
     let mut reopened = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
     reopened.enable_semantic_search(
         PinnedModelEmbedder::load(std::path::Path::new(&directory)).unwrap(),
+    );
+    assert_eq!(
+        finish_semantic_index(&mut reopened),
+        0,
+        "restart reuses stored vectors"
     );
     assert_eq!(search(&mut reopened, "making sourdough")[0].id, bread.id);
     assert!(
@@ -533,6 +684,7 @@ fn real_semantic_workspace_search_finds_a_paraphrase() {
         )
         .unwrap();
     let scope = AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, None).unwrap();
+    assert_eq!(finish_semantic_index(&mut reopened), 1);
     let records = OfflineWorkspace::new(&mut reopened, ID_8.parse().unwrap())
         .search_records("protect login information", &scope, 20)
         .unwrap();
@@ -572,9 +724,198 @@ fn search_10k_p95_is_below_150ms_with_warm_injected_query_embedding() {
 }
 
 #[test]
+#[ignore = "requires verified BGE assets and ONNX Runtime"]
+fn real_cold_search_does_not_index_passages_on_the_request_path() {
+    let path = TempVault::new("responsive-cold-search");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let mut batch = Vec::new();
+    for index in 0..40_u64 {
+        let id = format!("018f22e2-79b0-7cc8-98c4-{index:012x}");
+        let op = format!("018f22e3-79b0-7cc8-98c4-{index:012x}");
+        batch.push((
+            memory(
+                &id,
+                ScopeRef::Global,
+                "Vehicle",
+                "Keep the car engine serviced and replace its oil regularly.",
+            ),
+            operation(&op, &id, RecordKind::Memory),
+            basis(0),
+        ));
+    }
+    vault.put_memories_batch(&batch).unwrap();
+    let directory = std::env::var_os("CONTEXT_RELAY_MODEL_DIR").expect("verified BGE directory");
+    vault.enable_semantic_search(
+        PinnedModelEmbedder::load(std::path::Path::new(&directory)).unwrap(),
+    );
+    let scope = AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, None).unwrap();
+    let started = Instant::now();
+    let hits = vault.search("Vehicle", &scope, &basis(0), 20).unwrap();
+    assert!(
+        !hits.is_empty(),
+        "keyword results remain available while indexing"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "cold search blocked for {:?}",
+        started.elapsed()
+    );
+    let progress = vault.semantic_index_progress(&scope).unwrap().unwrap();
+    assert_eq!((progress.indexed_records, progress.total_records), (0, 40));
+    let batch = vault
+        .index_semantic_batch(1, std::time::Duration::from_nanos(1))
+        .unwrap();
+    assert_eq!((batch.indexed, batch.remaining), (1, 39));
+    let progress = vault.semantic_index_progress(&scope).unwrap().unwrap();
+    assert_eq!((progress.indexed_records, progress.total_records), (1, 40));
+}
+
+#[test]
 #[ignore = "release-mode 10k gate with verified BGE assets and ONNX Runtime"]
 fn semantic_search_10k_p95_includes_query_inference() {
     benchmark_search(true);
+}
+
+#[test]
+#[ignore = "requires verified BGE assets and ONNX Runtime"]
+fn real_maximum_document_indexing_yields_after_one_inference() {
+    let path = TempVault::new("semantic-maximum-document");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let body =
+        "car engine oil maintenance ".repeat(context_relay_protocol::MAX_MARKDOWN_BYTES / 27);
+    for (id, op) in [(ID_1, ID_3), (ID_2, ID_4)] {
+        let record = memory(id, ScopeRef::Global, "Vehicle", &body);
+        vault
+            .put_memory(&record, &operation(op, id, RecordKind::Memory), &basis(0))
+            .unwrap();
+    }
+    let directory = std::env::var_os("CONTEXT_RELAY_MODEL_DIR").expect("verified BGE directory");
+    vault.enable_semantic_search(
+        PinnedModelEmbedder::load(std::path::Path::new(&directory)).unwrap(),
+    );
+    let started = Instant::now();
+    let batch = vault
+        .index_semantic_batch(32, std::time::Duration::from_nanos(1))
+        .unwrap();
+    eprintln!(
+        "maximum-document batch: {:?} for {} body bytes",
+        started.elapsed(),
+        body.len()
+    );
+    assert_eq!((batch.indexed, batch.processed, batch.remaining), (1, 1, 1));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "one inference must fit the interactive worker allowance"
+    );
+}
+
+#[test]
+#[ignore = "release-mode cache-capacity check with verified BGE assets and ONNX Runtime"]
+fn semantic_cache_overflow_uses_persisted_vectors() {
+    let path = TempVault::new("semantic-cache-overflow");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let mut records = Vec::new();
+    let globals = 16_400_u64;
+    for index in 0..=globals {
+        let id = format!("018f22e2-79b0-7cc8-98c4-{index:012x}");
+        let op = format!("018f22e3-79b0-7cc8-98c4-{index:012x}");
+        let scope = if index == globals {
+            ScopeRef::Project {
+                project_id: ID_7.parse().unwrap(),
+            }
+        } else {
+            ScopeRef::Global
+        };
+        records.push((
+            memory(
+                &id,
+                scope,
+                "Vehicle",
+                "Keep the car engine serviced and replace its oil regularly.",
+            ),
+            operation(&op, &id, RecordKind::Memory),
+            basis(0),
+        ));
+    }
+    vault.put_memories_batch(&records).unwrap();
+    let directory = std::env::var_os("CONTEXT_RELAY_MODEL_DIR").expect("verified BGE directory");
+    vault.enable_semantic_search(
+        PinnedModelEmbedder::load(std::path::Path::new(&directory)).unwrap(),
+    );
+    assert_eq!(
+        vault
+            .index_semantic_batch(1, std::time::Duration::from_secs(1))
+            .unwrap()
+            .indexed,
+        1
+    );
+    // Every fixture has identical model input. Reuse the first actual BGE vector
+    // to exercise cache capacity without spending minutes repeating inference.
+    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    assert_eq!(
+        raw.execute(
+            "INSERT INTO semantic_embeddings(record_id,model_fingerprint,input_digest,vector)
+         SELECT d.record_id,e.model_fingerprint,d.input_digest,e.vector
+         FROM search_documents AS d JOIN semantic_embeddings AS e
+           ON e.record_id=?1 AND e.input_digest=d.input_digest
+         WHERE d.record_id != e.record_id",
+            [records[0].0.id.to_string()],
+        )
+        .unwrap(),
+        globals as usize
+    );
+    drop(raw);
+    assert_eq!(
+        finish_semantic_index(&mut vault),
+        0,
+        "matching persisted vectors need no inference"
+    );
+    let global = AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, None).unwrap();
+    let project = AllowedSearchScope::resolve(
+        Some(McpScopeSelector::ActiveProject),
+        &HarnessAccessPolicy::Default,
+        Some(ID_7.parse().unwrap()),
+    )
+    .unwrap();
+    let project_record = records.last().unwrap().0.id.to_string();
+    for _ in 0..2 {
+        let started = Instant::now();
+        let hits = vault
+            .search("automobile maintenance", &global, &basis(0), 20)
+            .unwrap();
+        assert_eq!(hits.len(), 20);
+        assert!(hits.iter().all(|hit| hit.record_id() != project_record));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "cache overflow must not re-embed the corpus"
+        );
+        let hits = vault
+            .search("automobile maintenance", &project, &basis(0), 20)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record_id(), project_record);
+    }
+    let progress = vault.semantic_index_progress(&global).unwrap().unwrap();
+    assert_eq!(
+        (progress.indexed_records, progress.total_records),
+        (globals, globals)
+    );
+    drop(vault);
+    let mut reopened = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    reopened.enable_semantic_search(
+        PinnedModelEmbedder::load(std::path::Path::new(&directory)).unwrap(),
+    );
+    assert_eq!(finish_semantic_index(&mut reopened), 0);
+    assert_eq!(
+        reopened
+            .search("automobile maintenance", &project, &basis(0), 20)
+            .unwrap()[0]
+            .record_id(),
+        project_record
+    );
 }
 
 fn benchmark_search(real_model: bool) {
@@ -598,10 +939,35 @@ fn benchmark_search(real_model: bool) {
     }
     vault.put_memories_batch(&batch).unwrap();
     if real_model {
+        drop(vault);
+        downgrade_fixture_to_schema_26(&path, &keys);
+        let upgrade_started = Instant::now();
+        vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+        eprintln!(
+            "10k vault metadata upgrade and open: {:?}",
+            upgrade_started.elapsed()
+        );
+        assert!(upgrade_started.elapsed() < std::time::Duration::from_secs(5));
         let directory = std::env::var_os("CONTEXT_RELAY_MODEL_DIR")
             .expect("set CONTEXT_RELAY_MODEL_DIR to the verified pinned model directory");
         vault.enable_semantic_search(
             PinnedModelEmbedder::load(std::path::Path::new(&directory)).unwrap(),
+        );
+        let scope = AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, None).unwrap();
+        let first_query = Instant::now();
+        assert!(
+            !vault
+                .search("needle", &scope, &basis(0), 20)
+                .unwrap()
+                .is_empty()
+        );
+        eprintln!("10k query before indexing: {:?}", first_query.elapsed());
+        assert!(first_query.elapsed() < std::time::Duration::from_millis(500));
+        let index_started = Instant::now();
+        assert_eq!(finish_semantic_index(&mut vault), 10_000);
+        eprintln!(
+            "10k resumable indexing: {:.3} seconds",
+            index_started.elapsed().as_secs_f64()
         );
     }
     let scope = AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, None).unwrap();

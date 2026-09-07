@@ -56,25 +56,72 @@ Model initialization disables runtime telemetry before creating a session.
 
 ## Open acceptance work
 
-Cold indexing must fit an explicit application workflow. A synchronous first
-search over 10,000 uncached passages exceeds the daemon's 29-second response
-deadline. Warm performance alone does not resolve this.
+The responsive-index follow-up separates passage inference from search requests.
+Schema 27 persists model/input-qualified vectors and a pending queue inside the
+encrypted vault, outside sync. It adds scoped progress and explicit resumable
+batches; current searches use only ready vectors plus keyword matches. Title,
+tags, and body determine the input digest, and tags also enter keyword search.
+Vector publication and queue removal recheck current record state. Restart and
+metadata-only changes reuse matching persisted vectors.
+
+Read-only review found repeated full scans in the initial migration and batch
+selection. Migration now clears FTS once and pages source records; batches visit
+the pending queue. Progress counts still scan the eligible corpus and should be
+polled at a controlled frequency, not after every slice.
+
+The first cold-request regression failed at 1.399 seconds for 40 records and then
+passed after removing passage inference from search. The storage/migration suite
+passes 36 tests, and a focused SQL race-boundary test rejects publication after
+edits, archival, loss of approval, or deletion. The real-model lifecycle covers
+fingerprint mismatch, tag-only edits, restart reuse, scope changes through another
+connection, pending candidates, and unchanged sync outbox contents.
+
+A release maximum-record test initially failed at 2.443 seconds for a 1,048,572-byte
+body: the tokenizer processed the whole input before applying 512-token truncation.
+The model now receives at most a 16 KiB UTF-8 prefix, and this preprocessing is part
+of its fingerprint. The record and full keyword index are preserved. The corrected
+test passed at 1.062 seconds, with 10 focused checks passing in 9.75 seconds. This is
+an observed single-record batch, not a hard preemption guarantee.
+The final focused rerun passed all 10 checks in 8.50 seconds and measured that batch
+at 752.714 ms.
+
+The subsequent actual-model 10k run passed all local gates. Metadata upgrade/open
+took **2.831 seconds** and a query before passage indexing took **136.369 ms**.
+Resumable indexing took **313.769 seconds**. The first query over the completed
+persisted index took **331 ms**, and warm P95 over 100 queries after five warmups
+was **84.450 ms**, including BGE query inference. Total test time was 365.23 seconds.
+The upgrade had first failed at 6.247 seconds, then 5.053 seconds; reusing prepared
+statements and rebuilding FTS with one bulk SQL insert resolved the repeated work.
+This remains a short-document fixture and repeated query on one Windows x64 host.
+It does not establish daemon request fairness, macOS performance, or installed
+first-use acceptance.
+
+A separate 16,401-record cache-capacity check passed in 91.54 seconds. It computes
+one real BGE vector, reuses it for records with identical model input, and checks
+global/project switching above the 16,384-entry memory-cache bound, followed by
+restart. Matching persisted vectors require no inference. This validates storage
+and cache behavior, not the cost or retrieval quality of embedding 16,401 distinct
+documents.
+
+Final validation for this core checkpoint totals 53 selected passing tests:
+10 focused search/model/lifecycle checks, the 10k gate, the cache-capacity check,
+36 storage/migration regressions, and five search/publication unit tests.
+Core and daemon all-target Clippy passes with test support and warnings denied;
+format and diff checks pass. Final independent read-only review approved the core
+patch, explicitly excluding service/UI scheduling and packaging.
 
 The Windows installer still needs verified model/runtime resources and production
 startup wiring. Current model-backed vaults are explicitly configured by tests.
-Model vectors are derived in memory from current scoped documents; existing
-stored legacy vectors are preserved and never compared with BGE query vectors in
-this configured path. Model cache persistence and indexing progress remain open.
+Existing stored legacy vectors are preserved and never compared with BGE query
+vectors in this configured path. Service scheduling, authenticated desktop
+progress, and failure/retry composition still need qualification before production
+activation. The cache-capacity test above does not establish latency for diverse
+larger collections across supported platforms.
 
-Semantic ranking currently uses document titles and bodies. Existing memory tag
-search behavior must also be preserved before production activation.
+The service must schedule the new batches cooperatively and yield to requests.
+Its current timeout only abandons the response; it cannot interrupt an inference.
+Core batch/progress APIs alone do not constitute the complete application workflow.
 
-The follow-up review recommends cooperative indexing batches on the existing
-vault thread, persisted model-qualified vectors in the encrypted database, and
-explicit progress while lexical results remain available. The current timeout
-only abandons the response; it does not interrupt inference. This workflow is
-planned, not implemented.
-
-The code graph was refreshed after the source changes: 16,717 nodes and 47,337
-edges. Optional SQL/OCaml parsers were unavailable and Cargo.toml produced no AST
+The code graph was refreshed after the source changes: 16,758 nodes and 47,422
+edges across 768 communities. Optional SQL/OCaml parsers were unavailable and Cargo.toml produced no AST
 nodes; graph navigation does not replace the source/tests above.

@@ -21,7 +21,7 @@ use crate::native_memory::{
 };
 use crate::search::{
     AllowedSearchScope, Embedding384, ModelError, PinnedModelEmbedder, SearchHit, SemanticSearch,
-    quote_fts_query, reciprocal_rank_fusion,
+    quote_fts_query, reciprocal_rank_fusion, semantic_input_digest, semantic_model_fingerprint,
 };
 
 mod desktop_writes;
@@ -35,8 +35,10 @@ mod recovery_restore;
 pub use recovery_restore::*;
 mod sync;
 pub use sync::*;
+mod semantic_index;
+pub use semantic_index::{SemanticIndexBatch, SemanticIndexProgress};
 
-pub const LATEST_SCHEMA_VERSION: u32 = 26;
+pub const LATEST_SCHEMA_VERSION: u32 = 27;
 pub const MAX_NATIVE_HOOK_SESSIONS: usize = 256;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
@@ -1641,24 +1643,34 @@ impl Vault {
             if let Some(scores) = engine.cached_scores(scope, database_revision, &query_embedding) {
                 semantic = scores;
             } else {
-                // Read the current projection, not stale caller-supplied vectors. Scope,
-                // approval and archive checks happen before any passage is embedded.
+                // Search only ready vectors. Passage inference belongs to resumable
+                // indexing batches, never to an interactive search request.
                 let mut statement = self.connection.prepare(
-                    "SELECT record_id, title, body FROM search_documents
-                 WHERE approved = 1 AND archived = 0 AND (
-                   (scope_kind = 'global' AND ?1 = 1)
-                   OR (scope_kind = 'project' AND project_id = ?2)
-                 ) ORDER BY record_id",
+                    "SELECT d.record_id, d.input_digest, e.vector
+                     FROM search_documents AS d JOIN semantic_embeddings AS e
+                       ON e.record_id = d.record_id AND e.input_digest = d.input_digest
+                       AND e.model_fingerprint = ?3
+                     WHERE d.approved = 1 AND d.archived = 0 AND (
+                       (d.scope_kind = 'global' AND ?1 = 1)
+                       OR (d.scope_kind = 'project' AND d.project_id = ?2)
+                     ) ORDER BY d.record_id",
                 )?;
-                let mut rows = statement.query(params![allows_global, project_id.as_deref()])?;
+                let fingerprint = semantic_model_fingerprint();
+                let mut rows = statement.query(params![
+                    allows_global,
+                    project_id.as_deref(),
+                    fingerprint.as_slice()
+                ])?;
                 while let Some(row) = rows.next()? {
                     let record_id: String = row.get(0)?;
-                    let embedding = engine.passage(
-                        &record_id,
-                        &row.get::<_, String>(1)?,
-                        &row.get::<_, String>(2)?,
-                    )?;
-                    semantic.push((record_id, embedding.cosine_similarity(&query_embedding)));
+                    let digest: [u8; 32] = row.get::<_, Vec<u8>>(1)?.try_into().map_err(|_| {
+                        VaultError::Validation("invalid semantic input digest".into())
+                    })?;
+                    let embedding = Embedding384::from_le_bytes(&row.get::<_, Vec<u8>>(2)?)
+                        .map_err(|_| VaultError::Validation("invalid semantic vector".into()))?;
+                    let score = embedding.cosine_similarity(&query_embedding);
+                    engine.cache_passage(&record_id, digest, embedding);
+                    semantic.push((record_id, score));
                 }
                 engine.remember_scope(scope, database_revision, &semantic);
             }
@@ -2168,6 +2180,20 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }
+    if found < 27 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0027_semantic_index.sql"))
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        semantic_index::backfill_search_metadata(&transaction)
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .pragma_update(None, "user_version", 27)
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
     Ok(())
 }
 
@@ -2450,12 +2476,13 @@ fn upsert_searchable_record(
     )?;
     transaction.execute(
         "INSERT INTO search_documents(
-            record_id, record_kind, scope_kind, project_id, archived, approved, title, body
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7)
+            record_id, record_kind, scope_kind, project_id, archived, approved, title, body, tags, input_digest
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9)
          ON CONFLICT(record_id) DO UPDATE SET record_kind = excluded.record_kind,
             scope_kind = excluded.scope_kind, project_id = excluded.project_id,
             archived = excluded.archived, approved = 1,
-            title = excluded.title, body = excluded.body",
+            title = excluded.title, body = excluded.body,
+            tags = excluded.tags, input_digest = excluded.input_digest",
         params![
             id,
             kind,
@@ -2464,6 +2491,8 @@ fn upsert_searchable_record(
             i64::from(archived),
             title,
             body,
+            handoff_projection.tags,
+            semantic_input_digest(title, &handoff_projection.tags, body).as_slice(),
         ],
     )?;
     transaction.execute(
@@ -2474,12 +2503,13 @@ fn upsert_searchable_record(
     transaction.execute("DELETE FROM search_fts WHERE record_id = ?1", [id])?;
     transaction.execute(
         "INSERT INTO search_fts(record_id, title, body) VALUES (?1, ?2, ?3)",
-        params![id, title, body],
+        params![id, title, format!("{}\n{body}", handoff_projection.tags)],
     )?;
     Ok(())
 }
 
 struct HandoffProjection {
+    tags: String,
     memory_kind: Option<&'static str>,
     updated_physical_sort: Option<String>,
     updated_logical: Option<i64>,
@@ -2489,6 +2519,7 @@ struct HandoffProjection {
 fn handoff_projection(record_kind: &str, payload: &[u8]) -> Result<HandoffProjection, VaultError> {
     if record_kind != "memory" {
         return Ok(HandoffProjection {
+            tags: String::new(),
             memory_kind: None,
             updated_physical_sort: None,
             updated_logical: None,
@@ -2497,6 +2528,7 @@ fn handoff_projection(record_kind: &str, payload: &[u8]) -> Result<HandoffProjec
     }
     let memory: MemoryRecord = from_json(payload)?;
     Ok(HandoffProjection {
+        tags: memory.tags.join(" "),
         memory_kind: Some(memory_kind(memory.kind)),
         updated_physical_sort: Some(format!("{:020}", memory.updated_hlc.physical_ms)),
         updated_logical: Some(i64::from(memory.updated_hlc.logical)),

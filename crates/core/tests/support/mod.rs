@@ -124,7 +124,14 @@ impl Drop for TempVault {
 pub fn remove_native_memory_migrations_after_schema_23(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TABLE desktop_writes;
+            "DROP TRIGGER semantic_document_insert;
+             DROP TRIGGER semantic_document_update;
+             DROP TABLE semantic_embeddings;
+             DROP TABLE semantic_index_queue;
+             DROP TABLE semantic_index_model;
+             ALTER TABLE search_documents DROP COLUMN input_digest;
+             ALTER TABLE search_documents DROP COLUMN tags;
+             DROP TABLE desktop_writes;
              DROP TABLE native_memory_source_supersessions;
              ALTER TABLE native_memory_sources DROP COLUMN last_applied_managed_digest;",
         )
