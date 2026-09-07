@@ -79,7 +79,9 @@ The installed service mismatch and production bridge credential/entry-point stat
 path are verified after the approved update. A subsequent
 [actual Codex check](installed-codex-status-2026-09-07.md) also passes status-only
 sessions through both exec and app-server against that installed service.
-Full harness setup, interactive trust, installed Claude/Hermes client sessions, clean-machine
+A subsequent [Claude client check](installed-claude-status-2026-09-07.md) passes
+the same installed-service status boundary. Full harness setup, interactive
+trust, installed Hermes client sessions, clean-machine
 testing and the remaining version/platform matrix are still incomplete. Production
 harness version gates are unchanged. Permission to install and restart the service
 does not resume the earlier pause on general native desktop control.

@@ -540,6 +540,11 @@ installed bridge status calls pass for all three harness bindings. The
 [actual Codex session check](installed-codex-status-2026-09-07.md) additionally
 passes status-only requests through exec and app-server using temporary harness
 settings and the normal production credential path. Full setup, interactive
-trust, installed Claude/Hermes client sessions and clean-machine acceptance
+trust, installed Hermes client sessions and clean-machine acceptance
 remain open. This qualification adds tests and documentation; the installed
 production binaries remain those from e09d206.
+
+[Actual Claude Code status access](installed-claude-status-2026-09-07.md) now
+also passes against that installed service using a disposable native profile,
+normal bridge credential directories and a loopback model. The fixture allows
+only the status tool and preserves the ordinary service/configuration canaries.

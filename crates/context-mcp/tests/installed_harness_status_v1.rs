@@ -25,7 +25,47 @@ mod windows_process;
 #[ignore = "requires explicit installed bridge/hash, pinned Codex, Node and an already-running unlocked service"]
 async fn actual_codex_reads_installed_service_status_without_workspace_changes() {
     const CODEX_SHA256: &str = "4b76ded066d0239115ca97473d010c92072bc5c5550a45dd7cbebe1e9eb956a7";
-    let codex = explicit_path("CONTEXT_RELAY_TEST_CODEX_EXE");
+    let real_home = explicit_path("USERPROFILE");
+    let real_codex_home =
+        env::var_os("CODEX_HOME").map_or_else(|| real_home.join(".codex"), PathBuf::from);
+    installed_status(
+        "CONTEXT_RELAY_TEST_CODEX_EXE",
+        CODEX_SHA256,
+        "installed-codex-status.mjs",
+        ["config.toml", "hooks.json", ".personality_migration"]
+            .map(|name| real_codex_home.join(name))
+            .to_vec(),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires explicit installed bridge/hash, pinned Claude, Node and an already-running unlocked service"]
+async fn actual_claude_reads_installed_service_status_without_workspace_changes() {
+    const CLAUDE_SHA256: &str = "7ff0787ebdc19fc509ccea8886ebf6a53ad8213407fa3a2b7c6d1446efc419f6";
+    let real_home = explicit_path("USERPROFILE");
+    let real_config =
+        env::var_os("CLAUDE_CONFIG_DIR").map_or_else(|| real_home.join(".claude"), PathBuf::from);
+    installed_status(
+        "CONTEXT_RELAY_TEST_CLAUDE_EXE",
+        CLAUDE_SHA256,
+        "installed-claude-status.mjs",
+        vec![
+            real_home.join(".claude.json"),
+            real_config.join(".claude.json"),
+            real_config.join("settings.json"),
+        ],
+    )
+    .await;
+}
+
+async fn installed_status(
+    executable_env: &str,
+    executable_hash: &str,
+    script: &str,
+    canary_paths: Vec<PathBuf>,
+) {
+    let executable = explicit_path(executable_env);
     let node = explicit_path("CONTEXT_RELAY_TEST_NODE_EXE");
     let installed = explicit_path("CONTEXT_RELAY_TEST_INSTALLED_MCP_EXE");
     let expected = env::var("CONTEXT_RELAY_TEST_INSTALLED_MCP_SHA256").unwrap();
@@ -38,14 +78,11 @@ async fn actual_codex_reads_installed_service_status_without_workspace_changes()
         .unwrap()
     );
     // Hold read-only handles that deny replacement/write for the whole session.
-    let _codex_pin = pin_executable(&codex, CODEX_SHA256);
+    let _executable_pin = pin_executable(&executable, executable_hash);
     let _installed_pin = pin_executable(&installed, &expected);
     let before = service_hello().await;
     let real_home = explicit_path("USERPROFILE");
-    let real_codex_home =
-        env::var_os("CODEX_HOME").map_or_else(|| real_home.join(".codex"), PathBuf::from);
-    let canaries: Vec<_> = ["config.toml", "hooks.json", ".personality_migration"]
-        .map(|name| real_codex_home.join(name))
+    let canaries: Vec<_> = canary_paths
         .into_iter()
         .map(|path| {
             let hash = optional_hash(&path);
@@ -59,6 +96,7 @@ async fn actual_codex_reads_installed_service_status_without_workspace_changes()
         "APPDATA",
         "LOCALAPPDATA",
         "PROGRAMDATA",
+        "ProgramFiles",
         "TEMP",
         "TMP",
         "XDG_CONFIG_HOME",
@@ -92,9 +130,10 @@ async fn actual_codex_reads_installed_service_status_without_workspace_changes()
     fs::write(
         &manifest,
         serde_json::to_vec(&json!({
-            "executable": codex, "sha256": CODEX_SHA256,
+            "executable": executable, "sha256": executable_hash,
             "bridge": bridge, "bridgeSha256": expected, "bridgeEnv": bridge_env,
             "root": root, "project": project, "home": home, "protocol": PROTOCOL_VERSION,
+            "toolNames": context_relay_protocol::MCP_TOOL_NAMES,
         }))
         .unwrap(),
     )
@@ -108,7 +147,9 @@ async fn actual_codex_reads_installed_service_status_without_workspace_changes()
     }
     command
         .arg(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/installed-codex-status.mjs"),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(script),
         )
         .arg(manifest)
         .current_dir(&root)
@@ -135,7 +176,7 @@ async fn actual_codex_reads_installed_service_status_without_workspace_changes()
         assert_eq!(
             optional_hash(&path),
             hash,
-            "ordinary Codex configuration changed"
+            "ordinary harness configuration changed"
         );
     }
     assert!(

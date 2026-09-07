@@ -8,7 +8,7 @@ working directory.
 
 ## Scope and isolation
 
-`crates/context-mcp/tests/installed_codex_status_v1.rs` runs the actual Codex
+`crates/context-mcp/tests/installed_harness_status_v1.rs` runs the actual Codex
 executable with a new profile and project on the local NTFS scratch volume.
 The Responses API is a loopback fixture with a dummy key; no account credentials
 are copied into Codex. Its configuration advertises only
@@ -52,7 +52,7 @@ verifying its hash against the candidate manifest. Required environment:
 
 ```powershell
 $env:CARGO_ENCODED_RUSTFLAGS='-Ctarget-feature=+crt-static'
-cargo test -p context-relay-context-mcp --release --target x86_64-pc-windows-msvc --test installed_codex_status_v1 -- --ignored --nocapture
+cargo test -p context-relay-context-mcp --release --target x86_64-pc-windows-msvc --test installed_harness_status_v1 actual_codex -- --ignored --nocapture
 ```
 
 The first run exposed an incorrect fixture expectation: status returns a
@@ -71,7 +71,8 @@ is ignored unless explicitly selected. The AST knowledge graph was refreshed.
 This verifies actual Codex sessions and production installed-service
 authentication for status. It does not qualify the normal Codex profile,
 interactive hook trust, the complete setup/Save workflow or model-provider
-behavior. Claude Code and Hermes have direct installed bridge status evidence,
-but their actual clients have not yet run against the installed service.
+behavior. The subsequent [Claude check](installed-claude-status-2026-09-07.md)
+also passes actual client status access; Hermes still has direct installed bridge
+status evidence without an actual installed-service client session.
 The production Full-version gates remain unchanged. This test-only addition
 does not require rebuilding or reinstalling the `e09d206` application.
