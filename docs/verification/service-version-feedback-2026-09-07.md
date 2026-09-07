@@ -50,12 +50,34 @@ Local evidence: `.codex/installed-service-greeting.log`,
 `.codex/service-version-mcp-tests.log`, and
 `.codex/service-version-ui/results.json`.
 
+## Approved installed update
+
+The user explicitly authorized installing the verified update and restarting the
+service. The `e09d206` NSIS installer ran with `/S /UPDATE` and exited successfully.
+Its authenticated upgrade helper stopped the old protocol 1.5 process. All five
+installed executables and thirteen search files match the candidate's manifest.
+The existing encrypted workspace was retained.
+
+The updated installed daemon started normally and now advertises protocol 1.11.
+The production MCP executable, running directly from its installed path with the
+normal environment and OS credential store, completed authenticated
+`context_relay_status` calls for Codex, Claude Code and Hermes bindings. All three
+returned protocol 1.11, an unlocked vault and no error. These are status calls
+from the bridge, not sessions launched by the three harnesses; no context or
+task mutations were requested. The daemon remained running after verification.
+
+Installed candidate: 75,738,674 bytes, SHA-256
+`4e43c2e6f0f8360b5e45bf4e219763e4b8e5c6b5b6d8bcbb5ab2e776d580bd9f`,
+Authenticode `NotSigned`. Local evidence:
+`.codex/e09d206-installed-update.log`, `.codex/e09d206-installed-files.json`,
+`.codex/e09d206-installed-service-greeting.log` and
+`.codex/e09d206-installed-path-bridge-success.log`.
+
 ## Remaining work
 
-These checks establish a real installed-version mismatch and improve its error
-reporting. They do not establish a successful authenticated tool call against the
-installed service or a working harness connection. The running service has not
-been stopped, replaced or upgraded: native desktop control is still paused.
-Installing the current build and restarting the service remain necessary before
-installed connection acceptance. The installer already has a shutdown-only
-compatibility path for protocol 1.5; that is not permission to run it while paused.
+The installed service mismatch and production bridge credential/entry-point status
+path are verified after the approved update. Full harness setup, interactive
+trust, actual harness sessions against the installed service, clean-machine
+testing and the remaining version/platform matrix are still incomplete. Production
+harness version gates are unchanged. Permission to install and restart the service
+does not resume the earlier pause on general native desktop control.
