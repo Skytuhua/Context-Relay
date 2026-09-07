@@ -1933,14 +1933,13 @@ fn execute_mcp_request(
         if let Ok(context_relay_protocol::GetOutput {
             record: Some(context_relay_protocol::ReadableRecord::Memory(memory)),
         }) = serde_json::from_value(output.clone())
+            && let Some(check) = &mut state.connection_check
         {
-            if let Some(check) = &mut state.connection_check {
-                check.observe(
-                    resolved.harness,
-                    resolved.active_project.map(|project| project.project_id),
-                    &memory,
-                );
-            }
+            check.observe(
+                resolved.harness,
+                resolved.active_project.map(|project| project.project_id),
+                &memory,
+            );
         }
     }
     Ok(LocalResult::McpOutput { name, output })

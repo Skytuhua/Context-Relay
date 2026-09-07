@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { ConnectionCheckStatus, HarnessId, HarnessParams, MemoryRecord, OperationId, ProjectIdentity } from './bindings';
 import type { WorkspaceGateway } from './workspace';
 import { HARNESS_NAMES } from './harness-names';
+import { copyHarnessCommand } from './harness-launch';
 
 interface Props {
   gateway: WorkspaceGateway;
@@ -12,6 +13,7 @@ interface Props {
   onProgress: (noteId: string | null, checkId: string | null, harness: HarnessId) => void;
   onVerified: (verified: boolean) => void;
   onOpenHarness: (selection: HarnessParams) => Promise<void> | void;
+  onCopyCommand?: (selection: HarnessParams) => Promise<void> | void;
   onCopyPrompt: (prompt: string) => Promise<void> | void;
   onBusy?: (busy: boolean) => void;
   hermesProfile?: string;
@@ -20,7 +22,7 @@ interface Props {
   onReceipt?: (receipt: ConnectionCheckStatus) => void;
 }
 
-export function ConnectionTest({ gateway, project, harnesses, noteId, checkId, onProgress, onVerified, onOpenHarness, onCopyPrompt, onBusy, hermesProfile = 'default', onDone, initialHarness, onReceipt }: Props) {
+export function ConnectionTest({ gateway, project, harnesses, noteId, checkId, onProgress, onVerified, onOpenHarness, onCopyCommand = copyHarnessCommand, onCopyPrompt, onBusy, hermesProfile = 'default', onDone, initialHarness, onReceipt }: Props) {
   const [harness, setHarness] = useState<HarnessId>(initialHarness && harnesses.includes(initialHarness) ? initialHarness : harnesses[0] ?? 'codex');
   const [body, setBody] = useState('Use clear, plain language and explain unfamiliar terms.');
   const [note, setNote] = useState<MemoryRecord | null>(null);
@@ -36,6 +38,8 @@ export function ConnectionTest({ gateway, project, harnesses, noteId, checkId, o
   callbacks.current = { onProgress, onVerified, onReceipt };
   const selection: HarnessParams = { harness, projectId: project.projectId, hermesProfile: harness === 'hermes' ? hermesProfile : null };
   const name = HARNESS_NAMES[harness];
+  const macos = navigator.userAgent.includes('Mac');
+  const terminal = macos ? 'Terminal' : 'PowerShell';
   const verified = check?.phase === 'verified';
   const prompt = note ? `Use the Context Relay context_relay_get tool to read saved context note ${note.id} in project ${project.projectId}. Read this exact note now, then quote its contents and explain how you will use it. Do not answer from an earlier message, a search result or another file.` : '';
 
@@ -150,8 +154,16 @@ export function ConnectionTest({ gateway, project, harnesses, noteId, checkId, o
       <blockquote>{note.bodyMarkdown}</blockquote>
       {check?.phase === 'waiting' && <>
         <p role="status">Waiting for {name} to read this note. The check expires in about {Math.max(1, Math.ceil(check.expiresInSeconds / 60))} minutes.</p>
-        <ol><li>Open {name} for this project. Complete any sign-in or project approval it requests.</li><li>Copy the test prompt below and send it in that harness.</li><li>Return here. Context Relay will confirm when the connected harness reads the note.</li></ol>
-        <div className="toolbar-actions"><button type="button" disabled={busy} onClick={() => void run(async () => { await onOpenHarness(selection); })}>Open {name}</button><button type="button" disabled={busy} onClick={() => void run(async () => { await onCopyPrompt(prompt); setNotice('Test prompt copied. Paste it into your harness.'); })}>Copy test prompt</button></div>
+        <ol><li>{macos ? `Copy the launch command and run it in Terminal to open ${name} for this project.` : `Open ${name} for this project.`} Complete any sign-in or project approval it requests.</li><li>Copy the test prompt below and send it in that harness.</li><li>Return here. Context Relay will confirm when the connected harness reads the note.</li></ol>
+        <div className="toolbar-actions">
+          {!macos && <button type="button" disabled={busy} onClick={() => void run(async () => { await onOpenHarness(selection); })}>Open {name}</button>}
+          <button type="button" className={macos ? 'primary-action' : 'secondary-action'} disabled={busy} onClick={() => void run(async () => {
+            await onCopyCommand(selection);
+            if (mounted.current) setNotice(`Launch command copied. Run it in ${terminal}, then send the test prompt in your harness.`);
+          })}>Copy launch command</button>
+          <button type="button" disabled={busy} onClick={() => void run(async () => { await onCopyPrompt(prompt); setNotice('Test prompt copied. Paste it into your harness.'); })}>Copy test prompt</button>
+        </div>
+        <p className="help-text">The launch command is for {terminal}. The test prompt is for your harness after it opens.</p>
         <details><summary>View test prompt</summary><p>{prompt}</p></details>
         <button type="button" disabled={busy} onClick={() => void run(async () => { await gateway.connectionCheckCancel(check.checkId); setCheck(null); callbacks.current.onProgress(note.id, null, harness); })}>Cancel check</button>
       </>}

@@ -4,6 +4,7 @@ import type { SetupProgress, SetupStep } from './desktop-preferences';
 import { ProjectForm } from './project-form';
 import type { WorkspaceGateway } from './workspace';
 import { HARNESS_NAMES } from './harness-names';
+import { projectHarnessSetups } from './harness-history';
 
 const STEPS: { id: SetupStep; label: string }[] = [
   { id: 'harnesses', label: 'Choose harnesses' }, { id: 'project', label: 'Choose a project' },
@@ -38,17 +39,18 @@ export function SetupWizard({ gateway, projects, progress, onChange, onProjectSa
   useEffect(() => {
     if (progress.step !== 'connect' || !progress.projectId || operationBusy) return;
     let active = true;
-    void Promise.resolve().then(() => gateway.harnessSetupsList()).then(page => {
+    const controller = new AbortController();
+    setSetupStates({});
+    void projectHarnessSetups(gateway, progress.projectId, controller.signal).then(records => {
       if (!active) return;
       const next: Partial<Record<HarnessId, string>> = {};
-      for (const record of [...page.setups].sort((a, b) => b.planId.localeCompare(a.planId))) {
-        if (!record.targetScopes.some(scope => scope.scope === 'global' || scope.projectId === progress.projectId) || next[record.harness]) continue;
+      for (const record of records) {
         if (record.harness === 'hermes' && record.harnessProfile !== progress.hermesProfile) continue;
         next[record.harness] = record.state === 'applied' ? 'Settings saved · test next' : record.state === 'previewed' ? 'Review ready · save next' : record.state === 'rolled_back' ? 'Setup undone' : 'Needs review';
       }
       setSetupStates(next);
     }).catch(() => { if (active) setSetupStates({}); });
-    return () => { active = false; };
+    return () => { active = false; controller.abort(); };
   }, [gateway, progress.step, progress.projectId, progress.hermesProfile, operationBusy]);
   const project = projects.find(item => item.projectId === progress.projectId);
   const harness = progress.harnesses.includes(activeHarness) ? activeHarness : progress.harnesses[0];

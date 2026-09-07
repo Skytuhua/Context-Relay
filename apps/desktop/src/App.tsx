@@ -21,6 +21,7 @@ import { readPreferences, savePreferences, type DesktopPreferences, type SetupPr
 import { WriteRecovery } from './write-recovery';
 import { SearchProgress } from './search-progress';
 import { useSearchProgress } from './use-search-progress';
+import { useScopedEditor } from './use-scoped-editor';
 import { isServiceVersionMismatch, SERVICE_UPDATE_GUIDANCE } from './service-error';
 import { LocalWorkspaceGateway, RecoveryStorageFullError, type WorkspaceGateway } from './workspace';
 
@@ -105,8 +106,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
   const [candidates, setCandidates] = useState<MemoryCandidate[]>([]);
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
-  const [editingMemory, setEditingMemory] = useState<MemoryRecord | null>(null);
-  const [editingTask, setEditingTask] = useState<TaskRecord | null>(null);
+  const [editingMemory, setEditingMemory, restoreMemoryEditor] = useScopedEditor<MemoryRecord>(activeProject?.projectId ?? null);
+  const [editingTask, setEditingTask, restoreTaskEditor] = useScopedEditor<TaskRecord>(activeProject?.projectId ?? null);
   const [archiveTarget, setArchiveTarget] = useState<MemoryRecord | null>(null);
   const [evidence, setEvidence] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
@@ -208,19 +209,32 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
 
   if (!currentScreen) return null;
 
-  async function selectScreen(screen: ScreenId, scope = activeProject) {
-    if (savingRef.current || projectBusyRef.current) return;
-    setRecoveryStorageFull(false);
-    if (scope?.projectId !== activeProject?.projectId) {
+  function transitionProject(project: ProjectIdentity | null) {
+    if (project?.projectId !== activeProject?.projectId) {
+      const nextScope = project?.projectId ?? 'global';
       editorSelections.current.set(draftScope, { memory: editingMemory, task: editingTask });
       attemptDrafts.current.set(`memory-${draftScope}`, memoryDraft.current);
       attemptDrafts.current.set(`task-${draftScope}`, taskDraft.current);
-      memoryDraft.current = attemptDrafts.current.get(`memory-${scope?.projectId ?? 'global'}`) ?? {};
-      taskDraft.current = attemptDrafts.current.get(`task-${scope?.projectId ?? 'global'}`) ?? {};
-      const selection = editorSelections.current.get(scope?.projectId ?? 'global');
-      setEditingMemory(selection?.memory ?? null);
-      setEditingTask(selection?.task ?? null);
+      memoryDraft.current = attemptDrafts.current.get(`memory-${nextScope}`) ?? {};
+      taskDraft.current = attemptDrafts.current.get(`task-${nextScope}`) ?? {};
+      const selection = editorSelections.current.get(nextScope);
+      restoreMemoryEditor(selection?.memory ?? null, project?.projectId ?? null);
+      restoreTaskEditor(selection?.task ?? null, project?.projectId ?? null);
+      setArchiveTarget(null);
+      readGeneration.current += 1;
+      setSubmittedSearch(null);
+      setRecordsLoading(false);
+      setMemories([]);
+      setCandidates([]);
+      setTasks([]);
     }
+    setActiveProject(project);
+  }
+
+  async function selectScreen(screen: ScreenId, scope = activeProject) {
+    if (savingRef.current || projectBusyRef.current) return;
+    setRecoveryStorageFull(false);
+    transitionProject(scope);
     const generation = ++readGeneration.current;
     hasNavigatedRef.current = true;
     setSubmittedSearch(null);
@@ -249,14 +263,17 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
 
   function selectProject(project: ProjectIdentity) {
     if (savingRef.current || projectBusyRef.current) return;
-    setActiveProject(project);
     void selectScreen(activeScreen, project);
   }
 
   function projectSaved(project: ProjectIdentity) {
     readGeneration.current += 1;
     setProjects((current) => [...current.filter((item) => item.projectId !== project.projectId), project]);
-    setActiveProject(project);
+    // Registration has succeeded, but ProjectForm still owns its busy flag.
+    // Complete the scope transition without treating it as another user action.
+    transitionProject(project);
+    setSubmittedSearch(null);
+    setRecordsLoading(false);
     setActiveScreen('home');
     setNotice('Project added');
     setError(null);
@@ -656,8 +673,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     {preferenceError && <p className="form-error" role="alert">{preferenceError}</p>}
     {error && <p className="form-error" role="alert">{error}</p>}
     <SetupWizard gateway={gateway} projects={projects} progress={preferences.setup}
-      onChange={next => { if (next.projectId !== preferences.setup.projectId) { setTestVerified(false); const project = projects.find(item => item.projectId === next.projectId); if (project) setActiveProject(project); } updateSetup(next); }}
-      onProjectSaved={project => { setProjects(current => current.some(item => item.projectId === project.projectId) ? current : [...current, project]); setActiveProject(project); }}
+      onChange={next => { if (next.projectId !== preferences.setup.projectId) { setTestVerified(false); const project = projects.find(item => item.projectId === next.projectId); if (project || next.projectId === null) transitionProject(project ?? null); } updateSetup(next); }}
+      onProjectSaved={project => { setProjects(current => current.some(item => item.projectId === project.projectId) ? current : [...current, project]); transitionProject(project); }}
       onFinishLater={() => updateSetup({ ...preferences.setup, status: 'deferred' })}
       onTour={() => { updateSetup({ ...preferences.setup, status: 'complete', step: 'tour' }); startTour(); }} onSkipTour={() => { updateSetup({ ...preferences.setup, status: 'complete' }); void selectScreen('home'); }}
       onOpenGuide={harness => { void openHarnessGuide(harness).catch(() => setError('The installation guide could not open. Check your default browser and try again.')); }}
@@ -734,7 +751,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           <div hidden={activeScreen !== 'harnesses'}>
             <HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
               const project = projects.find((item) => item.projectId === id);
-              if (project) setActiveProject(project);
+              if (project) selectProject(project);
             }} onAddProject={() => void selectScreen('projects')} onSaveContext={() => { setCreatingContext(true); setEditingMemory(null); void selectScreen('memory'); }} active={activeScreen === 'harnesses'} />
           </div>
           </div>

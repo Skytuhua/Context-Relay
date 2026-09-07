@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
-import type { HarnessSetupState, HarnessSetupSummary, MemoryRecord, TaskRecord, PlanId, ProjectIdentity } from './bindings';
+import type { HarnessSetupState, MemoryRecord, TaskRecord, ProjectIdentity } from './bindings';
 import type { WorkspaceGateway } from './workspace';
 import type { VerifiedRead } from './desktop-preferences';
+import { projectHarnessSetups } from './harness-history';
 
 type DashboardProps = {
   gateway: WorkspaceGateway;
@@ -18,17 +19,18 @@ type DashboardProps = {
 
 type Load<T> = { state: 'loading' } | { state: 'failed' } | { state: 'ready'; value: T };
 
-function useSection<T>(read: () => Promise<T>) {
+function useSection<T>(read: (signal: AbortSignal) => Promise<T>) {
   const [result, setResult] = useState<Load<T>>({ state: 'loading' });
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     let active = true;
+    const controller = new AbortController();
     setResult({ state: 'loading' });
-    void Promise.resolve().then(read).then(
+    void Promise.resolve().then(() => read(controller.signal)).then(
       value => { if (active) setResult({ state: 'ready', value }); },
       () => { if (active) setResult({ state: 'failed' }); },
     );
-    return () => { active = false; };
+    return () => { active = false; controller.abort(); };
   }, [read, attempt]);
   return { result, retry: () => setAttempt(value => value + 1) };
 }
@@ -62,32 +64,12 @@ const setupStates: Record<HarnessSetupState, { label: string; next: string }> = 
   expired: { label: 'Preview expired', next: 'Open Harnesses to prepare a fresh preview.' },
 };
 
-async function projectSetups(gateway: WorkspaceGateway, projectId: string) {
-  const records: HarnessSetupSummary[] = [];
-  let cursor: PlanId | null = null;
-  const seen = new Set<string>();
-  do {
-    const page = await gateway.harnessSetupsList(cursor);
-    records.push(...page.setups.filter(setup => setup.targetScopes.some(scope => scope.scope === 'global' || scope.projectId === projectId)));
-    cursor = page.nextAfter;
-    if (cursor && seen.has(cursor)) throw new Error('Setup history did not advance.');
-    if (cursor) seen.add(cursor);
-  } while (cursor);
-  // Summaries are setup history, not evidence that a harness can read context.
-  const latest = new Map<string, HarnessSetupSummary>();
-  for (const record of records.sort((a, b) => b.planId.localeCompare(a.planId))) {
-    const key = `${record.harness}:${record.harnessProfile ?? ''}`;
-    if (!latest.has(key)) latest.set(key, record);
-  }
-  return [...latest.values()];
-}
-
 function ProjectDashboard({ gateway, project, onNavigate, onAddContext, onNewTask, onOpenContext, onOpenTask }: Omit<DashboardProps, 'setupDeferred' | 'onResumeSetup'> & { project: ProjectIdentity }) {
   const projectId = project.projectId;
   const notes = useSection(useCallback(() => gateway.memories(projectId), [gateway, projectId]));
   const tasks = useSection(useCallback(() => gateway.tasks(projectId), [gateway, projectId]));
   const suggestions = useSection(useCallback(() => gateway.candidates(projectId), [gateway, projectId]));
-  const setups = useSection(useCallback(() => projectSetups(gateway, projectId), [gateway, projectId]));
+  const setups = useSection(useCallback((signal: AbortSignal) => projectHarnessSetups(gateway, projectId, signal), [gateway, projectId]));
   return <div className="dashboard-grid">
     <Section title="Saved context" description="Notes your harness can use so you do not have to explain the same details again."
       action={<button onClick={onAddContext ?? (() => onNavigate('memory'))}>Add context</button>} load={notes}>
