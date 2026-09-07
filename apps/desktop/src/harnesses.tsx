@@ -291,7 +291,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
         {!preparation.missing && <p role="status">{preparation.status ? preparationText(preparation.status.phase) : 'Checking preparation…'}</p>}
         {preparation.status && preparation.status.completedFiles > 0 && <p className="help-text">{preparation.status.completedFiles.toLocaleString()} files · {(preparation.status.completedBytes / 1024 / 1024).toLocaleString(undefined, { maximumFractionDigits: 1 })} MB processed</p>}
         <p>Preparation makes a private copy for Context Relay. Harness settings change only after you review and save them.</p>
-        {preparation.busy && <p>This can take a few minutes. You can use another screen and return to check progress.</p>}
+        {preparation.busy && <p>This can take a few minutes. Keep this window open while preparation finishes.</p>}
         {preparation.busy && <button type="button" className="secondary-action" disabled={preparation.canceling || preparation.status?.phase === 'cancelling'} onClick={() => void preparation.cancel()}>Cancel preparation</button>}
         {!preparation.busy && !preparation.missing && preparation.status?.phase === 'ready' && <button type="button" className="primary-action" disabled={!!busy} onClick={() => void reviewPreparedSetup()}>Review prepared setup</button>}
         {preparation.missing && <button type="button" className="primary-action" disabled={!!busy} onClick={() => void preparation.retry()}>Retry same preparation</button>}
@@ -325,7 +325,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
       </section>}
       {discovery?.report.codexSavedHookApproval && <SavedHookApprovals approval={discovery.report.codexSavedHookApproval} />}
       {busy && busy !== 'preparing' && <p role="status">{busy === 'preview' ? 'Checking the installed harness…' : busy === 'loading' ? 'Loading saved setup…' : busy === 'checking' ? 'Checking for unfinished setup…' : busy === 'apply' ? 'Saving harness settings…' : 'Undoing setup changes…'}</p>}
-      {execution.pending && <p className="help-text">This can take a few minutes. You can use another screen; return here to check the result.</p>}
+      {execution.pending && <p className="help-text">This can take a few minutes. Keep this window open while settings are saved or restored. The result will appear here.</p>}
       {review && <section className="record-card" aria-labelledby="harness-review-title">
         <h2 id="harness-review-title" ref={resultHeadingRef} tabIndex={-1}>Review setup changes</h2>
         <p>{label(review)}</p>
@@ -495,24 +495,55 @@ function expiryText(value: string) {
     : `${value} milliseconds since Unix epoch`;
 }
 
+function describeChange(change: SetupPlan['semanticChanges'][number], harness: HarnessId) {
+  const name = harnessNames[harness];
+  const action = { create: 'Add', update: 'Update', remove: 'Remove', enable: 'Enable', disable: 'Disable', preserve: 'Keep', conflict: 'Review a conflict in' }[change.class];
+  if (/^(codex-mcp\||claude-mcp:|hermes-config\|)/.test(change.target)) {
+    return { label: `${name} connection`, description: `${action} the Context Relay connection that lets ${name} retrieve your saved context.` };
+  }
+  if (/^native-memory-(source|watch):/.test(change.target)) {
+    return { label: `Existing ${name} memory`, description: 'Register existing memory so Context Relay can track it. The existing memory files stay in place.' };
+  }
+  if (change.summary === 'Add instructions for using saved context') {
+    return { label: 'Project instructions', description: `Add guidance that tells ${name} how to use your saved Context Relay notes.` };
+  }
+  if (change.summary === 'Add session hooks for saved context') {
+    return { label: 'Session hooks', description: 'Set up automatic session actions for saved context. Your harness may ask you to approve these actions.' };
+  }
+  if (change.summary === "Turn off the harness's built-in memory" || change.summary === 'Connect the harness and turn off its built-in memory') {
+    return { label: `${name} settings`, description: `Turn off ${name}’s built-in memory so Context Relay manages saved context instead. Existing memory files are kept.${change.summary.startsWith('Connect') ? ' Also connect the harness to Context Relay.' : ''}` };
+  }
+  if (change.summary === 'Export reviewed Context Relay memory to Hermes') {
+    return { label: 'Hermes memory', description: 'Copy the reviewed Context Relay memory into Hermes.' };
+  }
+  return { label: `${name} settings`, description: `${action} the selected harness settings. The exact changes are listed in Technical verification details.` };
+}
+
 function PlanDetails({ plan, projectName }: { plan: SetupPlan; projectName: string }) {
   return <div className="connection-plan">
     <section>
     <h3>Where changes apply</h3>
-    <ul>{plan.targetScopes.map((scope, index) => <li key={index}>{scope.scope === 'global' ? 'Harness settings for this user account' : `${projectName}: ${nativeText(scope.root)}`}</li>)}</ul>
+    <ul>{plan.targetScopes.map((scope, index) => <li key={index}>{scope.scope === 'global' ? 'Harness settings for this user account' : `Project: ${projectName}`}</li>)}</ul>
     </section>
     <section>
-    <h3>Changes and targets</h3>
-    {plan.semanticChanges.length ? <ul>{plan.semanticChanges.map((change, index) => <li key={index}><strong>{change.class}: {change.target}</strong><p>{change.summary}</p></li>)}</ul> : <p>No configuration changes.</p>}
+    <h3>What will change</h3>
+    {plan.semanticChanges.length ? <ul>{plan.semanticChanges.map((change, index) => {
+      const description = describeChange(change, plan.harness);
+      return <li key={index}><strong>{description.label}</strong><p>{description.description}</p></li>;
+    })}</ul> : <p>No configuration changes.</p>}
     </section>
     <Delta title="Permission changes" added={plan.permissionDelta.added} removed={plan.permissionDelta.removed} />
     <Delta title="Network changes" added={plan.networkDelta.added.map((endpoint) => `${endpoint.scheme}://${endpoint.host}:${endpoint.port}`)} removed={plan.networkDelta.removed.map((endpoint) => `${endpoint.scheme}://${endpoint.host}:${endpoint.port}`)} />
+    {plan.packageArtifacts.length ? <p><strong>Packages to install:</strong> {plan.packageArtifacts.length}. Review their exact files and sources in Technical verification details.</p> : <p>No packages to install.</p>}
+    <details className="technical-details">
+    <summary>Technical verification details</summary>
+    <h3>Exact changes and targets</h3>
+    <ul>{plan.targetScopes.map((scope, index) => <li key={index}>{scope.scope === 'global' ? 'Global user settings' : nativeText(scope.root)}</li>)}</ul>
+    <ul>{plan.semanticChanges.map((change, index) => <li key={index}><strong>{change.class}: {change.target}</strong><p>{change.summary}</p></li>)}</ul>
     {plan.packageArtifacts.length ? <section><h3>Packages to install</h3><ul>{plan.packageArtifacts.map((artifact, index) => <li key={index}>
       <p>{nativeText(artifact.artifactPath)}</p><p>Source: {artifact.immutableSourceRef}</p><p>Commit: {artifact.resolvedCommit}</p>
       {artifact.dependencies.length > 0 && <ul>{artifact.dependencies.map((dependency, childIndex) => <li key={childIndex}>{dependency.name} {dependency.version} — {dependency.immutableSourceRef}</li>)}</ul>}
     </li>)}</ul></section> : <p>No packages to install.</p>}
-    <details className="technical-details">
-    <summary>Technical verification details</summary>
     <p>Executable: {nativeText(plan.executablePath)}</p>
     <p>Version: {plan.harnessVersion}</p>
     <p>Review level: {plan.approvalClass}</p>
@@ -524,7 +555,7 @@ function PlanDetails({ plan, projectName }: { plan: SetupPlan; projectName: stri
       <ol aria-label="Arguments">{operation.arguments.map((argument, argumentIndex) => <li key={argumentIndex}>{nativeText(argument)}</li>)}</ol>
       <p>Timeout: {operation.timeoutMs} ms</p>
     </li>)}</ol> : <p>No Commands to run.</p>}
-      <pre style={{ whiteSpace: 'pre-wrap' }}>{JSON.stringify({ planId: plan.planId, adapterVersion: plan.adapterVersion, executablePath: plan.executablePath, executableHash: plan.executableHash, expectedNativeDigests: plan.expectedNativeDigests, scannerReportHash: plan.scannerReportHash, rulesyncVersion: plan.rulesyncVersion, rulesyncHash: plan.rulesyncHash, batchHash: plan.batchHash, packageArtifacts: plan.packageArtifacts }, null, 2)}</pre>
+      <pre style={{ whiteSpace: 'pre-wrap' }}>{JSON.stringify(plan, null, 2)}</pre>
     </details>
   </div>;
 }

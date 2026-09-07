@@ -65,3 +65,18 @@ it('asks for a project without fetching project records when none is selected', 
   expect(props.onNavigate).toHaveBeenCalledWith('projects');
   expect(memories).not.toHaveBeenCalled();
 });
+
+
+it('points completed setup to Harnesses while keeping past reads separate from session approvals', async () => {
+  const props = callbacks();
+  render(<Dashboard project={project} {...props}
+    lastVerifiedRead={{ harness: 'codex', projectId: 'p1', checkId: 'check-1', verifiedAt: '1900000000000' }}
+    gateway={gateway({ harnessSetupsList: async () => ({ setups: [{ planId: 's', harness: 'codex', state: 'applied', createdAt: '20', targetScopes: [{ scope: 'project', projectId: 'p1' }] }], nextAfter: null }) })} />);
+  expect(await screen.findByText('Settings saved')).toBeVisible();
+  expect(screen.getByText(/Last successful context read: Codex/)).toHaveTextContent('This is a past test result');
+  expect(screen.getByText(/Open Harnesses to review saved settings and any approvals/)).toHaveTextContent('Reading a test note does not approve those actions.');
+  expect(screen.queryByRole('button', { name: 'Resume setup' })).not.toBeInTheDocument();
+  expect(screen.queryByText(/Resume setup to approve access/)).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Open Harnesses' }));
+  expect(props.onNavigate).toHaveBeenCalledWith('harnesses');
+});

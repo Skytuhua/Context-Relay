@@ -436,8 +436,10 @@ it('distinguishes repeated connections and retains each original change review f
   expect(within(entries[0]).getByRole('button', { name: 'Undo setup 0C073990 for Codex for Research' })).toBeVisible();
   expect(within(entries[1]).getByRole('button', { name: 'Undo setup 0C07398F for Codex for Research' })).toBeVisible();
   fireEvent.click(within(entries[1]).getByText('View saved changes'));
+  fireEvent.click(within(entries[1]).getByText('Technical verification details'));
   expect(within(entries[1]).getByText('Register Context Relay')).toBeVisible();
   fireEvent.click(within(entries[0]).getByText('View saved changes'));
+  fireEvent.click(within(entries[0]).getByText('Technical verification details'));
   expect(within(entries[0]).getByText('Change the context permissions')).toBeVisible();
   fireEvent.click(within(entries[1]).getByRole('button', { name: /Undo setup .* for/ }));
   fireEvent.click(await screen.findByRole('button', { name: 'Undo setup changes' }));
@@ -509,7 +511,7 @@ it('shows review changes, permissions, network, CLI, artifacts and honest native
   }];
   await open(); await review();
   expect(screen.getAllByText(/windows bytes \(base64url\): YwA/).length).toBeGreaterThan(0);
-  expect(screen.getByText('<img src=x onerror=alert(1)>')).toBeVisible();
+  expect(screen.getByText('<img src=x onerror=alert(1)>')).not.toBeVisible();
   expect(document.querySelector('img')).toBeNull();
   expect(screen.getByText('Read project')).toBeVisible();
   expect(screen.getByText('https://example.com:443')).toBeVisible();
@@ -518,4 +520,44 @@ it('shows review changes, permissions, network, CLI, artifacts and honest native
   expect(screen.getByText('--register')).toBeVisible();
   expect(screen.getByText('bridge.zip')).toBeVisible();
   expect(screen.getByText('Technical verification details')).toBeVisible();
+});
+
+
+it('explains approved changes without exposing native identifiers, paths or JSON until expanded', async () => {
+  const root = String.raw`\\?\C:\Users\Person\Research`;
+  const rawConnection = '{"command":"C:\\private\\bridge.exe","args":["--harness","codex"]}';
+  preview.targetScopes = [{ scope: 'project', projectId, root: { ...preview.executablePath, display: root } }];
+  preview.semanticChanges = [
+    { class: 'create', target: 'codex-mcp|global|context-relay', summary: rawConnection },
+    { class: 'create', target: 'native-memory-source:' + 'a'.repeat(64), summary: 'Register a validated native memory fallback source' },
+    { class: 'update', target: root + '\\AGENTS.md', summary: 'Add instructions for using saved context' },
+    { class: 'update', target: root + '\\hooks.json', summary: 'Add session hooks for saved context' },
+    { class: 'update', target: root + '\\config.toml', summary: "Turn off the harness's built-in memory" },
+  ];
+  await open(); await review();
+  for (const label of ['Codex connection', 'Existing Codex memory', 'Project instructions', 'Session hooks', 'Codex settings']) {
+    expect(screen.getByText(label)).toBeVisible();
+  }
+  expect(screen.getByText(/Turn off Codex’s built-in memory so Context Relay manages saved context instead/)).toBeVisible();
+  expect(screen.getByText('Project: Research')).toBeVisible();
+  expect(screen.getByText(rawConnection)).not.toBeVisible();
+  const details = screen.getByText('Technical verification details').closest('details')!;
+  expect(details).not.toHaveAttribute('open');
+  for (const change of preview.semanticChanges) {
+    const target = screen.getByText(change.class + ': ' + change.target);
+    expect(details).toContainElement(target);
+    expect(target).not.toBeVisible();
+  }
+  expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled();
+  fireEvent.click(screen.getByText('Technical verification details'));
+  expect(screen.getByText(rawConnection)).toBeVisible();
+  expect(screen.getByText(root)).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Save settings' })).toBeDisabled();
+});
+
+it('does not claim built-in memory is disabled when no such change is planned', async () => {
+  preview.semanticChanges = [{ class: 'create', target: 'codex-mcp|global|context-relay', summary: '{"enabled":true}' }];
+  await open(); await review();
+  expect(screen.getByText('Codex connection')).toBeVisible();
+  expect(screen.queryByText(/Turn off Codex’s built-in memory/)).not.toBeInTheDocument();
 });

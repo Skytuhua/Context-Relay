@@ -53,7 +53,7 @@ const harnessNames = { codex: 'Codex', claude_code: 'Claude Code', hermes: 'Herm
 const setupStates: Record<HarnessSetupState, { label: string; next: string }> = {
   previewed: { label: 'Review needed', next: 'Review the proposed changes in Harnesses before saving.' },
   applying: { label: 'Saving settings', next: 'Open Harnesses to check progress or recovery options.' },
-  applied: { label: 'Settings saved', next: 'Resume setup to approve access in your harness and verify a test note.' },
+  applied: { label: 'Settings saved', next: 'Open Harnesses to review saved settings and any approvals for automatic session actions. Reading a test note does not approve those actions.' },
   apply_restored: { label: 'Settings restored', next: 'Open Harnesses to review why saving did not finish and retry.' },
   rolling_back: { label: 'Undo in progress', next: 'Open Harnesses to check Undo progress.' },
   rolled_back: { label: 'Setup undone', next: 'Open Harnesses when you are ready to set it up again.' },

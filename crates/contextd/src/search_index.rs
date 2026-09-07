@@ -3,6 +3,21 @@ use std::{path::PathBuf, time::Duration};
 use context_relay_core::vault::{SemanticIndexBatch, Vault, VaultError};
 use context_relay_protocol::{SearchIndexPhase, SearchIndexStatus};
 
+#[cfg(windows)]
+pub(super) fn resources_beside_executable(
+    executable: &std::path::Path,
+) -> Result<PathBuf, crate::DaemonError> {
+    // MSIX can redirect file opens while leaving directory resolution unchanged.
+    // Resolve the executable file before deriving the adjacent resource directory.
+    let executable = executable
+        .canonicalize()
+        .map_err(|_| crate::DaemonError::Startup)?;
+    Ok(executable
+        .parent()
+        .ok_or(crate::DaemonError::Startup)?
+        .join("search"))
+}
+
 pub(super) struct SearchIndexJob {
     pub(super) status: SearchIndexStatus,
     pending: bool,
@@ -112,6 +127,24 @@ impl SearchIndexJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn packaged_search_resources_follow_the_physical_executable_file() {
+        // A disposable LocalAppData directory also exercises MSIX file redirection
+        // when this test is launched from a packaged desktop application.
+        let base = std::env::var_os("LOCALAPPDATA").unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("context-relay-search-location-test-")
+            .tempdir_in(base)
+            .unwrap();
+        let executable = temp.path().join("fixture.exe");
+        std::fs::write(&executable, b"location fixture; never executed").unwrap();
+        let physical_file = std::fs::canonicalize(&executable).unwrap();
+        let expected = physical_file.parent().unwrap().join("search");
+        assert_eq!(resources_beside_executable(&executable).unwrap(), expected);
+        assert!(resources_beside_executable(&temp.path().join("missing.exe")).is_err());
+    }
 
     #[test]
     fn failure_pauses_automatic_work_and_retry_preserves_progress() {

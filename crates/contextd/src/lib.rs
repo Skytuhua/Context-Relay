@@ -670,12 +670,7 @@ impl DaemonConfig {
         let vault = {
             let mut vault = vault;
             let executable = std::env::current_exe().map_err(|_| DaemonError::Startup)?;
-            vault.search_resources = Some(
-                executable
-                    .parent()
-                    .ok_or(DaemonError::Startup)?
-                    .join("search"),
-            );
+            vault.search_resources = Some(search_index::resources_beside_executable(&executable)?);
             vault
         };
         Ok(Self::new(
@@ -5161,6 +5156,8 @@ mod tests {
             config.vault.search_resources,
             Some(
                 std::env::current_exe()
+                    .unwrap()
+                    .canonicalize()
                     .unwrap()
                     .parent()
                     .unwrap()
