@@ -204,15 +204,25 @@ fn discover(project: &Path, id: ProjectId, now: u64) -> ClaudeCodeAdapter {
 #[test]
 #[ignore = "explicit pinned Claude CLI; synthetic profiles, credentials and native transactions only"]
 fn pinned_claude_native_setup_restart_reapply_undo_and_recovery() {
+    run_native_cases(&[
+        "ordinary",
+        "after payload 專案 O'Brien",
+        "after CLI 專案",
+        "after commit ‘quoted’",
+    ]);
+}
+
+#[test]
+#[ignore = "explicit pinned Claude CLI; fresh synthetic settings and state files only"]
+fn pinned_claude_fresh_settings_setup_restart_and_undo() {
+    run_native_cases(&["fresh files"]);
+}
+
+fn run_native_cases(names: &[&str]) {
     let executable =
         PathBuf::from(env::var_os("CONTEXT_RELAY_TEST_CLAUDE_EXE").expect("explicit Claude"));
     if env::var_os("CONTEXT_RELAY_CLAUDE_SETUP_CHILD").is_none() {
-        for name in [
-            "ordinary",
-            "after payload 專案 O'Brien",
-            "after CLI 專案",
-            "after commit ‘quoted’",
-        ] {
+        for name in names {
             let outer = tempfile::tempdir().unwrap();
             let root = fs::canonicalize(outer.path()).unwrap().join(name);
             for directory in ["home/.claude", "custom claude", "scratch", "program files"] {
@@ -277,7 +287,7 @@ fn pinned_claude_native_setup_restart_reapply_undo_and_recovery() {
     let _pinned_image = open_verified_claude_executable(&candidate, digest).unwrap();
     let root = fs::canonicalize(env::current_dir().unwrap()).unwrap();
     let crash = match root.file_name().unwrap().to_str().unwrap() {
-        "ordinary" => None,
+        "ordinary" | "fresh files" => None,
         "after payload 專案 O'Brien" => Some(TransactionStep::WritePayloads),
         "after CLI 專案" => Some(TransactionStep::WriteActivationReferences),
         "after commit ‘quoted’" => Some(TransactionStep::CommitOwnershipAndReceipt),
@@ -294,20 +304,25 @@ fn run_case(root: &Path, crash: Option<TransactionStep>) {
         fs::create_dir_all(path).unwrap();
     }
     let project = fs::canonicalize(project).unwrap();
-    fs::write(
-        config.join("settings.json"),
-        b"{\"env\":{\"CLAUDE_CODE_DISABLE_AUTO_MEMORY\":\"false\"},\"keepUser\":true}\n",
-    )
-    .unwrap();
-    fs::write(
-        project.join(".claude/settings.json"),
-        b"{\"autoMemoryEnabled\":false,\"keepProject\":true}\n",
-    )
-    .unwrap();
-    fs::write(config.join("CLAUDE.md"), b"Existing user instruction\n").unwrap();
+    let fresh = root.file_name().unwrap() == "fresh files";
     let state = config.join(".claude.json");
-    fs::write(&state, b"{\"keepState\":true,\"mcpServers\":{\"other\":{\"type\":\"stdio\",\"command\":\"inert-other\",\"args\":[]}}}\n").unwrap();
-    let original_state: Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    let original_state = if fresh {
+        None
+    } else {
+        fs::write(
+            config.join("settings.json"),
+            b"{\"env\":{\"CLAUDE_CODE_DISABLE_AUTO_MEMORY\":\"false\"},\"keepUser\":true}\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join(".claude/settings.json"),
+            b"{\"autoMemoryEnabled\":false,\"keepProject\":true}\n",
+        )
+        .unwrap();
+        fs::write(config.join("CLAUDE.md"), b"Existing user instruction\n").unwrap();
+        fs::write(&state, b"{\"keepState\":true,\"mcpServers\":{\"other\":{\"type\":\"stdio\",\"command\":\"inert-other\",\"args\":[]}}}\n").unwrap();
+        Some(serde_json::from_slice::<Value>(&fs::read(&state).unwrap()).unwrap())
+    };
     let bridge = root.join("inert context bridge.exe");
     fs::write(&bridge, b"qualification marker only; never execute").unwrap();
     let id: ProjectId = "018f22e2-79b0-7cc8-98c4-dc0c0c073981".parse().unwrap();
@@ -425,8 +440,19 @@ fn run_case(root: &Path, crash: Option<TransactionStep>) {
             .is_none()
     );
     let final_state: Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
-    assert_eq!(final_state["keepState"], original_state["keepState"]);
-    assert_eq!(final_state["mcpServers"], original_state["mcpServers"]);
+    if let Some(original_state) = original_state {
+        assert_eq!(final_state["keepState"], original_state["keepState"]);
+        assert_eq!(final_state["mcpServers"], original_state["mcpServers"]);
+    } else {
+        assert!(final_state.get("mcpServers").is_none_or(|servers| {
+            servers
+                .as_object()
+                .is_some_and(|servers| servers.is_empty())
+        }));
+        assert!(!config.join("settings.json").exists());
+        assert!(!project.join(".claude/settings.json").exists());
+        assert!(!project.join("CLAUDE.md").exists());
+    }
     assert!(vault.native_memory_ledgers().unwrap().is_empty());
     println!("Real Claude native save/reopen/reapply/Undo/recovery: {crash:?}");
 }

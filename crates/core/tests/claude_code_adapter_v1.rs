@@ -337,6 +337,98 @@ fn memory_hooks_install_preserves_exact_unmarked_and_differently_marked_user_com
 }
 
 #[test]
+fn fresh_settings_files_create_hooks_without_a_prior_user_settings_file() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let path = fixture.root.join("custom claude config/settings.json");
+    fs::remove_file(&path).unwrap();
+    let bridge = executable_bridge(&fixture, "inert bridge", b"not executed");
+    let hooks = managed_memory_hooks(HarnessId::ClaudeCode, &test_wire_path(&bridge)).unwrap();
+    let mutation = fixture
+        .adapter
+        .plan_native_global_settings(&DesiredState {
+            components: hooks,
+            scopes: vec![NativeScope::Global],
+        })
+        .unwrap();
+    assert!(!path.exists(), "preview must not create the settings file");
+    let NativeState::RegularFile { bytes, .. } = NativeState::decode_v1(&mutation.content).unwrap()
+    else {
+        panic!("new settings must be a regular file");
+    };
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(value["hooks"]["SessionStart"].is_array());
+    assert!(value["hooks"]["Stop"].is_array());
+    assert_new_settings_apply_and_restore(&path, &mutation);
+    let mut archived =
+        managed_memory_hooks(HarnessId::ClaudeCode, &test_wire_path(&bridge)).unwrap();
+    for component in &mut archived {
+        component.archived = true;
+    }
+    let desired = DesiredState {
+        components: archived,
+        scopes: vec![NativeScope::Global],
+    };
+    let absent = fixture
+        .adapter
+        .plan_native_global_settings(&desired)
+        .unwrap();
+    assert!(matches!(
+        NativeState::decode_v1(&absent.content).unwrap(),
+        NativeState::Absent { .. }
+    ));
+    assert!(fixture.adapter.render(&desired).unwrap().files.is_empty());
+    assert!(!path.exists());
+}
+
+#[test]
+fn fresh_settings_files_disable_memory_without_a_sibling_metadata_template() {
+    let mut source: Value =
+        serde_json::from_str(include_str!("fixtures/claude-code-2.1.214.json")).unwrap();
+    source["project"] = serde_json::json!({"README.md": "Project canary\n"});
+    source["config"] = serde_json::json!({"CLAUDE.md": "User instruction canary\n"});
+    source["managedSettings"] = serde_json::json!({});
+    let fixture = fixture(&serde_json::to_string(&source).unwrap());
+    let folder = fixture.root.join("project with spaces/.claude");
+    fs::create_dir(&folder).unwrap();
+    let path = folder.join("settings.json");
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    let NativeMemoryDisable::Supported(mutations) = capabilities.disable else {
+        panic!("empty settings directory must support memory setup");
+    };
+    assert_eq!(mutations.len(), 1);
+    assert!(!path.exists(), "preview must not create the settings file");
+    let NativeState::RegularFile { bytes, .. } =
+        NativeState::decode_v1(&mutations[0].content).unwrap()
+    else {
+        panic!("new settings must be a regular file");
+    };
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        serde_json::json!({"autoMemoryEnabled": false})
+    );
+    assert_new_settings_apply_and_restore(&path, &mutations[0]);
+}
+
+fn assert_new_settings_apply_and_restore(
+    path: &Path,
+    mutation: &context_relay_core::native_transaction::ApprovedMutation,
+) {
+    let nonce = [46; 16];
+    let mut native = OsNativeTransactionFileSystem::new(nonce);
+    let images = native
+        .create_before_images(std::slice::from_ref(mutation))
+        .unwrap();
+    native.record_native_metadata(&images).unwrap();
+    native
+        .compare_and_swap_targets(std::slice::from_ref(mutation))
+        .unwrap();
+    native.apply_mutation(&nonce, mutation).unwrap();
+    assert!(path.is_file());
+    native.restore_matching_applied_targets(&nonce).unwrap();
+    assert!(!path.exists(), "Undo must restore prior absence");
+}
+
+#[test]
 fn memory_hooks_merge_deduplicate_reapply_and_rollback_exactly() {
     let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
     let bridge = executable_bridge(
@@ -1829,8 +1921,11 @@ fn memory_receipt(plan: &NativeTransactionPlan) -> context_relay_protocol::Apply
 
 #[test]
 fn native_memory_claude_verifies_intermediate_forward_and_inverse_settings() {
-    for local_override in [false, true] {
+    for (local_override, missing) in [(false, false), (true, false), (false, true)] {
         let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+        if missing {
+            fs::remove_file(fixture.adapter.project_settings_path()).unwrap();
+        }
         if local_override {
             fs::write(
                 fixture
@@ -1887,6 +1982,25 @@ fn native_memory_claude_verifies_intermediate_forward_and_inverse_settings() {
         NativeAdapter::reprobe_live_state(&mut fixture.adapter, &inverse).unwrap();
         NativeAdapter::compare_approved_digests(&mut fixture.adapter, &inverse).unwrap();
         native.restore_matching_applied_targets(&nonce).unwrap();
+        if missing {
+            // Recreating an already-restored absent file would inherit new
+            // parent timestamps, not those of the historical deleted file.
+            let path = fixture.adapter.project_settings_path();
+            let mut options = fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt as _;
+                options.access_mode(0x0100).custom_flags(0x0200_0000);
+            }
+            options
+                .open(path.parent().unwrap())
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_900_000_000),
+                ))
+                .unwrap();
+        }
         assert!(NativeAdapter::validate_effective(&mut fixture.adapter, &plan, &receipt).is_err());
         NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, &inverse).unwrap();
         NativeAdapter::validate_effective(
@@ -1895,6 +2009,24 @@ fn native_memory_claude_verifies_intermediate_forward_and_inverse_settings() {
             &memory_receipt(&inverse),
         )
         .unwrap();
+        if missing {
+            let path = fixture.adapter.project_settings_path();
+            fs::write(&path, b"{\"foreign\":true}").unwrap();
+            assert!(
+                NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, &inverse)
+                    .is_err()
+            );
+            fs::remove_file(&path).unwrap();
+            fs::write(
+                path.with_file_name("settings.local.json"),
+                b"{\"autoMemoryEnabled\":true}",
+            )
+            .unwrap();
+            assert!(
+                NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, &inverse)
+                    .is_err()
+            );
+        }
     }
 }
 

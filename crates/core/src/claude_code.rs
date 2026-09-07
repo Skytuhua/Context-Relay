@@ -98,6 +98,8 @@ pub struct ClaudeCodeAdapter {
     executable_hash: Sha256Digest,
     #[cfg(all(test, windows))]
     qualify_21202: bool,
+    #[cfg(test)]
+    settings_read_hook: Option<fn(&Path)>,
 }
 
 pub trait ClaudeCodeCommandRunner {
@@ -285,6 +287,8 @@ impl ClaudeCodeAdapter {
             executable_hash,
             #[cfg(all(test, windows))]
             qualify_21202: false,
+            #[cfg(test)]
+            settings_read_hook: None,
         })
     }
 
@@ -351,16 +355,32 @@ impl ClaudeCodeAdapter {
             .validate()
             .map_err(|_| invalid_request("Desired Claude Code state is invalid"))?;
         let path = settings_path(self, &scope)?;
-        let bytes = self.render_settings(&path, desired, scope)?;
         let snapshot = OsNativeFileSystem::new()
             .snapshot(&path)
             .map_err(|_| invalid_request("Claude Code settings cannot be safely inspected"))?;
-        let NativeState::RegularFile { metadata, .. } = snapshot.state() else {
-            return Err(invalid_request(
-                "Claude Code mixed settings must already exist",
-            ));
+        let existing = match snapshot.state() {
+            NativeState::RegularFile { bytes, .. } => Some(bytes.as_slice()),
+            NativeState::Absent { .. } => None,
         };
-        let intended = NativeState::regular_file(bytes, metadata.clone());
+        let bytes = self.render_settings_from_bytes(existing, desired, scope)?;
+        #[cfg(test)]
+        if let Some(hook) = self.settings_read_hook {
+            hook(&path);
+        }
+        let intended = match snapshot.state() {
+            NativeState::RegularFile { metadata, .. } => {
+                NativeState::regular_file(bytes, metadata.clone())
+            }
+            NativeState::Absent { .. } if bytes == b"{}" => snapshot.state().clone(),
+            NativeState::Absent { .. } => {
+                let metadata = OsNativeFileSystem::new()
+                    .metadata_for_new_private_file(&path)
+                    .map_err(|_| {
+                        invalid_request("Claude Code settings creation metadata is unavailable")
+                    })?;
+                NativeState::regular_file(bytes, metadata)
+            }
+        };
         Ok(ApprovedMutation {
             target: wire_path(&path),
             kind: MutationKind::Payload,
@@ -949,9 +969,19 @@ impl ClaudeCodeAdapter {
         desired: &DesiredState,
         scope: ScopeRef,
     ) -> Result<Vec<u8>, ClientError> {
-        let existing = read_optional_file(path)?
-            .ok_or_else(|| invalid_request("Claude Code mixed settings must already exist"))?;
-        let mut settings = parse_object(&existing, "Claude Code settings are invalid")?;
+        self.render_settings_from_bytes(read_optional_file(path)?.as_deref(), desired, scope)
+    }
+
+    fn render_settings_from_bytes(
+        &self,
+        existing: Option<&[u8]>,
+        desired: &DesiredState,
+        scope: ScopeRef,
+    ) -> Result<Vec<u8>, ClientError> {
+        let mut settings = match existing {
+            Some(existing) => parse_object(existing, "Claude Code settings are invalid")?,
+            None => Map::new(),
+        };
         for component in desired
             .components
             .iter()
@@ -1132,7 +1162,13 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
             (None, None, Some(snapshot))
                 if matches!(snapshot.state(), NativeState::Absent { .. }) =>
             {
-                let metadata = missing_project_settings_metadata(&path, snapshot.state())?;
+                let metadata = OsNativeFileSystem::new()
+                    .metadata_for_new_private_file(&path)
+                    .map_err(|_| {
+                        invalid_request(
+                            "Claude Code memory settings creation metadata is unavailable",
+                        )
+                    })?;
                 (Map::new(), metadata, *snapshot.fingerprint())
             }
             _ => {
@@ -1551,7 +1587,14 @@ impl ClaudeCodeAdapter {
                                 && mutation.expected == needed.expected
                                 && mutation.intended == needed.intended)
                                 || (mutation.expected == needed.intended
-                                    && mutation.intended == needed.expected))
+                                    && mutation.intended == needed.expected)
+                                // An approved deletion can restore exact absence.
+                                // Hypothetical recreation metadata uses today's
+                                // parent timestamps, not the deleted file's ones.
+                                || (mutation.intended == needed.expected
+                                    && matches!(NativeState::decode_v1(&mutation.content),
+                                        Ok(state @ NativeState::Absent { .. })
+                                        if RestorableStateFingerprint(Sha256Digest(state.fingerprint())) == mutation.intended)))
                     }) {
                         return Err(BoundaryError::new("Claude Code memory settings changed"));
                     }
@@ -1636,55 +1679,6 @@ fn safely_missing_project_settings(project_root: &Path, settings_path: &Path) ->
         }
         Ok(_) => false,
     }
-}
-
-fn missing_project_settings_metadata(
-    settings_path: &Path,
-    absent: &NativeState,
-) -> Result<context_relay_native_runner::NativeMetadata, ClientError> {
-    let parent = settings_path
-        .parent()
-        .ok_or_else(|| invalid_request("Claude Code memory settings parent is unavailable"))?;
-    let mut siblings = fs::read_dir(parent)
-        .map_err(|_| invalid_request("Claude Code memory settings parent cannot be inspected"))?
-        .map(|entry| {
-            entry.map(|entry| entry.path()).map_err(|_| {
-                invalid_request("Claude Code memory settings parent cannot be inspected")
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    siblings.sort();
-    for sibling in siblings {
-        // Recovery keeps adjacent backup/candidate files while undo runs.
-        // They are never user metadata templates (and the native filesystem
-        // deliberately refuses to open its reserved recovery names).
-        if sibling == settings_path
-            || sibling
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.to_ascii_lowercase().starts_with(".context-relay-"))
-        {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(&sibling).map_err(|_| {
-            invalid_request("Claude Code memory settings sibling cannot be inspected")
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            continue;
-        }
-        let snapshot = OsNativeFileSystem::new().snapshot(&sibling).map_err(|_| {
-            invalid_request("Claude Code memory settings sibling cannot be safely inspected")
-        })?;
-        let NativeState::RegularFile { metadata, .. } = snapshot.state() else {
-            continue;
-        };
-        return metadata.for_absent_sibling_creation(absent).map_err(|_| {
-            invalid_request("Claude Code memory settings sibling is not bound to the target parent")
-        });
-    }
-    Err(invalid_request(
-        "Claude Code memory settings need an existing same-directory metadata template",
-    ))
 }
 
 fn safe_memory_directory_binding(path: &Path) -> Result<Option<PathBuf>, ClientError> {
@@ -1858,6 +1852,9 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         for scope in settings_scopes {
             let path = settings_path(self, &scope)?;
             let bytes = self.render_settings(&path, desired, scope)?;
+            if bytes == b"{}" && read_optional_file(&path)?.is_none() {
+                continue;
+            }
             files.push(RenderedFile {
                 path: wire_path(&path),
                 bytes_sha256: digest(&bytes),
@@ -3774,6 +3771,60 @@ fn client_error(code: ErrorCode, message: &'static str, retryable: bool) -> Clie
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn settings_created_after_render_are_not_approved_for_overwrite() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let config = root.join("config");
+        let project = root.join("project");
+        let home = root.join("home");
+        for path in [&config, &project, &home] {
+            fs::create_dir(path).unwrap();
+        }
+        let executable = root.join(if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        });
+        fs::write(&executable, fixture_executable_bytes()).unwrap();
+        let device: DeviceId = "018f22e2-79b0-7cc8-98c4-dc0c0c073982".parse().unwrap();
+        let mut adapter = ClaudeCodeAdapter::from_layout(
+            ClaudeCodeLayout {
+                executable: executable.clone(),
+                version: "2.1.214".into(),
+                installation_method: InstallationMethod::PackageManager,
+                user_home: home,
+                config_dir: config.clone(),
+                state_path: config.join(".claude.json"),
+                project_root: project,
+                managed_settings_paths: vec![],
+            },
+            "018f22e2-79b0-7cc8-98c4-dc0c0c073981".parse().unwrap(),
+            device,
+            HybridLogicalClock::new(1_900_000_000_000, 0, device),
+        )
+        .unwrap();
+        adapter.settings_read_hook = Some(|path| fs::write(path, b"{\"foreign\":true}\n").unwrap());
+        let desired = DesiredState {
+            components: crate::native_memory::managed_memory_hooks(
+                HarnessId::ClaudeCode,
+                &wire_path(&executable),
+            )
+            .unwrap(),
+            scopes: vec![NativeScope::Global],
+        };
+        assert!(
+            adapter.plan_native_global_settings(&desired).is_err(),
+            "a new file must not become the expected state for bytes rendered while it was absent"
+        );
+        assert_eq!(
+            fs::read(config.join("settings.json")).unwrap(),
+            b"{\"foreign\":true}\n"
+        );
+    }
+
     // `VerifiedClaudeExecutable::open` enforces the native-executable policy
     // on every platform: Windows additionally requires the `.exe` extension
     // and a PE image header. Fixtures therefore carry the platform suffix
