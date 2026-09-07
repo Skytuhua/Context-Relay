@@ -7,6 +7,8 @@ use context_relay_protocol::{
     DaemonInstanceNonce, EmptyParams, HarnessId, HarnessParams, HarnessPreparationIdParams,
     HarnessPreparationPhase, HarnessPreparationStatus,
 };
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::PermissionsExt as _;
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::oneshot, task::JoinSet, time::timeout};
 
@@ -17,6 +19,7 @@ async fn status_cancel_and_health_cross_desktop_transport_while_a_vault_call_is_
     #[cfg(target_os = "macos")]
     let temp = tempfile::Builder::new()
         .prefix("cr-control-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir_in("/tmp")
         .unwrap();
     let runtime = RuntimeConfig::for_test(
@@ -24,6 +27,9 @@ async fn status_cancel_and_health_cross_desktop_transport_while_a_vault_call_is_
         Some(temp.path().to_owned()),
     )
     .unwrap();
+    runtime
+        .endpoint_name()
+        .expect("fixture socket path must fit");
     let mut instance = InstanceGuard::acquire(&runtime).unwrap();
     let mut listener = Listener::bind(&runtime, &mut instance).unwrap();
     let token = Arc::new(InstallationToken::from_bytes([0x48; 32]));
