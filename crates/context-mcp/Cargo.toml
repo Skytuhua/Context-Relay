@@ -26,7 +26,7 @@ uuid.workspace = true
 [dev-dependencies]
 sha2.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "process"] }
 
 [[example]]
 name = "codex-bridge-fixture"

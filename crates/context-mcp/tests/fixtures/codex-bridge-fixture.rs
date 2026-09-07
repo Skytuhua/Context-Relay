@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         Invocation::Hook {
-            harness: HarnessId::Codex,
+            harness: harness @ (HarnessId::Codex | HarnessId::ClaudeCode),
             event,
         } => {
             let bytes = read_hook_input(tokio::io::stdin()).await?;
@@ -52,10 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .duration_since(UNIX_EPOCH)?
                 .as_millis()
                 .try_into()?;
-            let output = execute_hook(daemon, HarnessId::Codex, event, &bytes, &cwd, now).await?;
+            let output = execute_hook(daemon, harness, event, &bytes, &cwd, now).await?;
             std::io::stdout().write_all(output.as_bytes())?;
         }
-        _ => return Err("fixture requires Codex".into()),
+        _ => return Err("fixture requires a supported native hook harness".into()),
     }
     Ok(())
 }
@@ -69,6 +69,9 @@ fn fixture_token(suffix: &str, harness: HarnessId) -> Option<[u8; 32]> {
         HarnessId::Hermes if suffix.starts_with("hermes-native-") && suffix.len() == 46 => {
             Some([0x5a; 32])
         }
+        HarnessId::ClaudeCode if suffix.starts_with("claude-native-") && suffix.len() == 46 => {
+            Some([0x62; 32])
+        }
         _ => None,
     }
 }
@@ -81,14 +84,24 @@ mod tests {
     fn test_runtime_binding_cannot_select_production_or_another_harness() {
         let codex = format!("codex-native-{}", "a".repeat(32));
         let hermes = format!("hermes-native-{}", "b".repeat(32));
+        let claude = format!("claude-native-{}", "c".repeat(32));
         assert_eq!(fixture_token(&codex, HarnessId::Codex), Some([0x71; 32]));
         assert_eq!(fixture_token(&hermes, HarnessId::Hermes), Some([0x5a; 32]));
+        assert_eq!(
+            fixture_token(&claude, HarnessId::ClaudeCode),
+            Some([0x62; 32])
+        );
         for (suffix, harness) in [
             ("main", HarnessId::Hermes),
             ("main", HarnessId::Codex),
+            ("main", HarnessId::ClaudeCode),
             (&codex, HarnessId::Hermes),
             (&hermes, HarnessId::Codex),
             (&hermes, HarnessId::ClaudeCode),
+            (&codex, HarnessId::ClaudeCode),
+            (&claude, HarnessId::Codex),
+            (&claude, HarnessId::Hermes),
+            ("claude-native-short", HarnessId::ClaudeCode),
             ("hermes-native-short", HarnessId::Hermes),
         ] {
             assert_eq!(fixture_token(suffix, harness), None);

@@ -388,24 +388,18 @@ pub fn mcp_schema(name: &str) -> Option<McpToolSchema> {
         _ => return None,
     };
     let mut input = strict(required, properties);
+    // Claude drops MCP tools with root anyOf/oneOf/allOf. Conditional schemas
+    // preserve the same cross-field constraints without those root keywords.
     if name == "context_relay_upsert_task" {
-        input.as_object_mut().expect("schema object").insert(
-            "anyOf".into(),
-            json!([
-                {"properties":{"taskId":{"type":"null"},"expectedRevision":{"type":"null"}}},
-                {"properties":{"taskId":uuid(),"expectedRevision":uuid()},"required":["taskId","expectedRevision"]}
-            ]),
-        );
+        input["if"] = json!({"properties":{"taskId":uuid()},"required":["taskId"]});
+        input["then"] =
+            json!({"properties":{"expectedRevision":uuid()},"required":["expectedRevision"]});
+        input["else"] = json!({"properties":{"expectedRevision":{"type":"null"}}});
     }
     if name == "context_relay_create_handoff" {
-        input.as_object_mut().expect("schema object").insert(
-            "anyOf".into(),
-            json!([
-                {"properties":{"memoryIds":{"type":"array","minItems":1}},"required":["memoryIds"]},
-                {"properties":{"decisionIds":{"type":"array","minItems":1}},"required":["decisionIds"]},
-                {"properties":{"taskIds":{"type":"array","minItems":1}},"required":["taskIds"]}
-            ]),
-        );
+        input["if"] =
+            json!({"properties":{"memoryIds":{"maxItems":0},"decisionIds":{"maxItems":0}}});
+        input["then"] = json!({"properties":{"taskIds":{"minItems":1}}});
     }
     Some(McpToolSchema {
         input,
