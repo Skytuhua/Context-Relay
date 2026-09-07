@@ -50,12 +50,26 @@ mod windows_process;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "explicit installed Hermes metadata source and test-only bridge; copied runtime, synthetic profile/IPC"]
 async fn actual_hermes_client_discovers_and_uses_the_production_bridge() {
+    run_native_fixture(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "explicit installed Hermes metadata source and test-only bridge; copied CLI, loopback model, synthetic profile/IPC"]
+async fn actual_hermes_cli_conversation_uses_the_production_bridge() {
+    run_native_fixture(true).await;
+}
+
+async fn run_native_fixture(model_session: bool) {
     use std::io::Read as _;
     if env::var_os("CONTEXT_RELAY_NATIVE_HERMES_CHILD").is_none() {
         let mut child = Command::new(env::current_exe().unwrap());
         child
             .args([
-                "actual_hermes_client_discovers_and_uses_the_production_bridge",
+                if model_session {
+                    "actual_hermes_cli_conversation_uses_the_production_bridge"
+                } else {
+                    "actual_hermes_client_discovers_and_uses_the_production_bridge"
+                },
                 "--exact",
                 "--ignored",
                 "--nocapture",
@@ -145,6 +159,7 @@ async fn actual_hermes_client_discovers_and_uses_the_production_bridge() {
     let manifest = root.join("manifest.json");
     fs::write(&manifest, serde_json::to_vec(&json!({
         "runtime":runtime.root(), "home":home, "project":project_root, "projectId":project.project_id,
+        "modelSession":model_session,
             "toolNames":context_relay_protocol::MCP_TOOL_NAMES, "operations":(0..3).map(|_|Uuid::now_v7().to_string()).collect::<Vec<_>>()
     })).unwrap()).unwrap();
     let daemon = config.start().await.unwrap();

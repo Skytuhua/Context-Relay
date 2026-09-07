@@ -206,8 +206,10 @@ including tracked Save, readback through the actual saved bridge declaration,
 daemon/vault restart, idempotent reapply and exact Undo. Separately, the
 [actual Hermes MCP client](hermes-native-client-2026-09-07.md) discovers all eleven
 tools and passes project-bound context and task operations using synthetic YAML
-and credentials. These are distinct execution planes; neither establishes a
-full CLI/model conversation or installed credential acceptance. T12/T13/T20 and
+and credentials. A subsequent actual Hermes CLI conversation passes eight
+requests against a scripted loopback model with context/task readback and final
+runtime/profile checks. These are distinct execution planes and do not establish
+real provider or installed credential acceptance. T12/T13/T20 and
 the full product goal remain incomplete. The
 [Windows installer candidate](windows-candidate-2026-09-07.md) is built and
 statically inspected, but has not passed installed or clean-machine acceptance.

@@ -69,3 +69,44 @@ This qualifies the actual MCP client and registry against synthetic saved
 settings, separately from the production Save/Undo composition. It is not an
 actual model conversation, full CLI session, installed credential check or
 installed release acceptance. No version or platform gate changes.
+
+## Full CLI conversation follow-up
+
+Status: the corrected contained CLI conversation passed in 664.28 seconds,
+including cleanup. The actual Hermes 0.17.0 CLI completed all eight model
+requests and the project/context/task assertions. Final runtime verification
+and exact original YAML/environment-file canaries also passed.
+
+The first contained CLI conversation execution failed after 893.67
+seconds. Runtime capture, retention and
+locking completed, and the copied CLI reached the scripted model server. The
+fixture rejected an unexpected API path and then failed to decode a tool result.
+Passive Hermes source inspection identifies an optional `/api/show` metadata
+probe and the native untrusted-content wrapper around MCP results. A synthetic
+probe reproduces the old parser's failure on that wrapper. The corrected fixture
+returns a normal 404 for the optional probe and validates/removes the native
+wrapper before decoding its payload. Focused review approved these corrections
+before the passing second run. In that run, capture completed at 391.14 seconds,
+retention at 469.61 seconds, inventory locking at 573.24 seconds and the complete
+round trip plus final verification at 657.68 seconds. The parent exited after
+664.28 seconds. The raw result is `.codex/hermes-cli-model-run-corrected.log`.
+
+The test uses a separate ignored entry point,
+`actual_hermes_cli_conversation_uses_the_production_bridge`, with the same copied
+runtime and synthetic bridge boundary. The copied `hermes_cli.main.main` runs
+`hermes -z` with the explicit `context-relay` toolset and a scripted loopback
+chat-completions server. Seven tool calls across eight model requests must
+establish project binding, remember/get/search and task create/complete/list;
+the model server checks the returned records before sending the final marker.
+
+The server requires exactly the eleven advertised MCP tools, a synthetic API
+key and a bounded request body. Captured CLI output is capped at 64 KiB before
+buffering. The imported Hermes version is asserted and reported. Focused review
+found and approved corrections to the original unbounded capture and missing
+CLI-path version assertion. A bundled non-Hermes Python probe verifies that
+output overflow, missing tool results and a wrong resolved project are rejected.
+
+The fixture temporarily adds only a loopback model configuration to its
+disposable YAML and restores the original bytes during cleanup. It does not
+establish use of real provider credentials, model judgment quality, the actual
+production Save-generated declaration or installed release acceptance.

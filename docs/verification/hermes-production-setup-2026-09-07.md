@@ -105,6 +105,7 @@ test passed in 1575.45 seconds, and its parent exited successfully.
 This covers the Python support design's production setup, configured bridge,
 restart and Undo qualification for the retained 0.17.0 runtime. The separate
 [actual MCP client qualification](hermes-native-client-2026-09-07.md) now passes
-all eleven tools and context/task operations in a disposable profile. A full
-CLI/model conversation, other harness versions and installed acceptance remain
-separate work.
+all eleven tools and context/task operations in a disposable profile, followed
+by an actual CLI conversation against a scripted loopback model. Real provider
+credentials, other harness versions and installed acceptance remain separate
+work.

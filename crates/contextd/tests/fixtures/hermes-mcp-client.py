@@ -46,6 +46,11 @@ def local_network_only(event, args):
         assert args[0] in ("localhost", "127.0.0.1", "::1"), "nonlocal DNS attempt"
 
 sys.addaudithook(local_network_only)
+if fixture.get("modelSession"):
+    model_script = Path(__file__).with_name("hermes-cli-model.py")
+    exec(compile(model_script.read_bytes(), str(model_script), "exec"), globals())
+    raise SystemExit(0)
+
 import hermes_cli
 from tools import mcp_tool
 from tools.registry import registry
