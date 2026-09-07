@@ -118,6 +118,15 @@ it('explains a confirmed missing Claude Code executable instead of blaming setup
   expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
 });
 
+it('explains an incompatible local service without blaming the harness installation', async () => {
+  invoke.mockRejectedValue({ code: 'protocol_version_unsupported', message: 'PRIVATE NATIVE DETAILS', fieldPath: null, retryable: false });
+  await open(); preview();
+  const error = await screen.findByRole('alert');
+  expect(error).toHaveTextContent('Context Relay and its local service use different versions');
+  expect(error).toHaveTextContent('run the latest installer');
+  expect(error).not.toHaveTextContent('PRIVATE NATIVE DETAILS');
+});
+
 it('focuses a setup failure and focuses it again after a failed retry', async () => {
   invoke.mockRejectedValue(new Error('private native details'));
   await open();

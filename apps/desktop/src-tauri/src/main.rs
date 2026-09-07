@@ -358,7 +358,15 @@ fn invalid_result_error() -> ClientError {
     }
 }
 
-fn safe_ipc_error(_: IpcError) -> ClientError {
+fn safe_ipc_error(error: IpcError) -> ClientError {
+    if matches!(error, IpcError::ProtocolVersionUnsupported) {
+        return ClientError {
+            code: ErrorCode::ProtocolVersionUnsupported,
+            message: "Context Relay and its local service use different versions. Close Context Relay, run the latest installer, then reopen it.".into(),
+            field_path: None,
+            retryable: false,
+        };
+    }
     ClientError {
         code: ErrorCode::Internal,
         message: "The local service is unavailable".into(),
@@ -729,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn every_ipc_error_has_the_same_safe_mapping() {
+    fn non_version_ipc_errors_keep_the_same_safe_mapping() {
         let expected = ClientError {
             code: ErrorCode::Internal,
             message: "The local service is unavailable".into(),
@@ -750,12 +758,20 @@ mod tests {
             IpcError::Credential,
             IpcError::Random,
             IpcError::HandshakeTimeout,
-            IpcError::ProtocolVersionUnsupported,
             IpcError::InvalidRequest,
             IpcError::ShutdownTimeout,
         ] {
             assert_eq!(safe_ipc_error(error), expected);
         }
+    }
+
+    #[test]
+    fn incompatible_service_keeps_its_code_and_fixed_update_guidance() {
+        let error = safe_ipc_error(IpcError::ProtocolVersionUnsupported);
+        assert_eq!(error.code, ErrorCode::ProtocolVersionUnsupported);
+        assert!(error.message.contains("run the latest installer"));
+        assert!(!error.retryable);
+        assert_eq!(error.field_path, None);
     }
 
     #[test]

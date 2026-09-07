@@ -106,6 +106,23 @@ describe('App', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
+  it('explains a service version mismatch and clears the guidance after reconnecting', async () => {
+    let mismatch = true;
+    render(<App gateway={{ ...gateway, status: async () => {
+      if (mismatch) throw { code: 'protocol_version_unsupported', message: 'PRIVATE NATIVE DETAILS' };
+      return gateway.status();
+    } }} />);
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Context Relay and its local service use different versions');
+    expect(alert).toHaveTextContent('run the latest installer');
+    expect(alert).not.toHaveTextContent('PRIVATE NATIVE DETAILS');
+    expect(screen.getByRole('button', { name: 'Add your project folder' })).toBeDisabled();
+    mismatch = false;
+    fireEvent.click(screen.getByRole('button', { name: 'Retry connection' }));
+    await screen.findByText('Ready on this computer');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
   it('uses the current protocol range in its status fixture', async () => {
     const status = await gateway.status();
     expect(status.protocol).toEqual({ min: PROTOCOL_VERSION, max: PROTOCOL_VERSION });

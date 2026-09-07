@@ -3,6 +3,7 @@ import type { HarnessId, HarnessParams, HarnessSetupRecord, HarnessSetupState, H
 import { type HarnessGateway, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
 import { useHarnessExecution } from './use-harness-execution';
 import { useHarnessPreparation } from './use-harness-preparation';
+import { isServiceVersionMismatch, SERVICE_UPDATE_GUIDANCE } from './service-error';
 
 const harnessNames: Record<HarnessId, string> = { claude_code: 'Claude Code', codex: 'Codex', hermes: 'Hermes' };
 type ReviewedPlan = { plan: SetupPlan; params: HarnessParams; projectName: string; state?: HarnessSetupState };
@@ -429,6 +430,7 @@ function SetupNextSteps({ item }: { item: ReviewedPlan }) {
 }
 
 function setupError(error: unknown, harness: HarnessId) {
+  if (isServiceVersionMismatch(error)) return SERVICE_UPDATE_GUIDANCE;
   // Map only known daemon errors to fixed guidance. Never display raw native output.
   if (error && typeof error === 'object' && 'code' in error && 'message' in error && error.code === 'not_found') {
     if (harness === 'claude_code' && error.message === 'Claude Code executable was not found') {

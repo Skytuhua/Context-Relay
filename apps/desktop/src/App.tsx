@@ -14,6 +14,7 @@ import { ProjectForm } from './project-form';
 import { WriteRecovery } from './write-recovery';
 import { SearchProgress } from './search-progress';
 import { useSearchProgress } from './use-search-progress';
+import { isServiceVersionMismatch, SERVICE_UPDATE_GUIDANCE } from './service-error';
 import { LocalWorkspaceGateway, RecoveryStorageFullError, type WorkspaceGateway } from './workspace';
 
 type ScreenId =
@@ -58,6 +59,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const [status, setStatus] = useState<StatusOutput | null>(null);
   const [connectionState, setConnectionState] = useState<'connecting' | 'ready' | 'failed'>('connecting');
   const [connectionAttempt, setConnectionAttempt] = useState(0);
+  const [serviceVersionMismatch, setServiceVersionMismatch] = useState(false);
   const [projects, setProjects] = useState<ProjectIdentity[]>([]);
   const [activeProject, setActiveProject] = useState<ProjectIdentity | null>(null);
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
@@ -97,6 +99,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   useEffect(() => {
     let active = true;
     setConnectionState('connecting');
+    setServiceVersionMismatch(false);
     // Bound the initial reads even if the native bridge never settles. Retrying
     // these reads must not replay any workspace mutation or accept stale results.
     const timeout = window.setTimeout(() => {
@@ -112,9 +115,10 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
         setActiveProject((current) => nextProjects.find((project) => project.projectId === current?.projectId) ?? nextProjects[0] ?? null);
         setConnectionState('ready');
       })
-      .catch(() => {
+      .catch((failure: unknown) => {
         if (!active) return;
         window.clearTimeout(timeout);
+        setServiceVersionMismatch(isServiceVersionMismatch(failure));
         setConnectionState('failed');
       });
     return () => {
@@ -623,7 +627,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           </header>
           {connectionState === 'failed' && (
             <div className="form-error" role="alert">
-              <p>Could not connect to the local workspace. Retry the connection to continue.</p>
+              <p>{serviceVersionMismatch ? SERVICE_UPDATE_GUIDANCE : 'Could not connect to the local workspace. Retry the connection to continue.'}</p>
               <button onClick={() => setConnectionAttempt((attempt) => attempt + 1)} type="button">Retry connection</button>
             </div>
           )}
