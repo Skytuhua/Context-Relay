@@ -1234,6 +1234,154 @@ fn native_memory_claude_reads_user_project_and_local_directory_precedence() {
 }
 
 #[test]
+fn native_memory_claude_binds_the_settings_environment_directory_override() {
+    for version in ["2.1.214", "2.1.202"] {
+        let mut source: Value =
+            serde_json::from_str(include_str!("fixtures/claude-code-2.1.214.json")).unwrap();
+        source["version"] = json!(version);
+        let fixture = fixture(&source.to_string());
+        let user = fixture.root.join("custom claude config/settings.json");
+        let memory = fixture.root.join("environment memory 專案 O'Brien");
+        fs::create_dir_all(&memory).unwrap();
+        fs::write(memory.join("MEMORY.md"), b"selected memory canary\n").unwrap();
+        let settings = json!({
+            "autoMemoryDirectory":"~/regular memory",
+            "env": {
+                "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE":
+                    memory.to_string_lossy().trim_start_matches(r"\\?\")
+            }
+        });
+        fs::write(&user, serde_json::to_vec(&settings).unwrap()).unwrap();
+        fs::write(fixture.adapter.project_settings_path(), b"{}").unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        assert_eq!(
+            capabilities.sources[0].path,
+            test_wire_path(&memory.join("MEMORY.md")),
+            "settings environment must select the native memory source for {version}"
+        );
+    }
+}
+
+#[test]
+fn native_memory_claude_environment_directory_obeys_layer_precedence() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let user = fixture.root.join("custom claude config/settings.json");
+    let project = fixture.adapter.project_settings_path();
+    let local = project.with_file_name("settings.local.json");
+    let managed = fixture.root.join("managed-settings.json");
+    for (index, path) in [&user, &project, &local, &managed].into_iter().enumerate() {
+        let memory = fixture.root.join(format!("environment memory {index}"));
+        fs::create_dir_all(&memory).unwrap();
+        let key = if cfg!(windows) && index == 2 {
+            "Claude_Cowork_Memory_Path_Override"
+        } else {
+            "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE"
+        };
+        let settings = json!({
+            "autoMemoryDirectory":"~/regular memory",
+            "env":{key:memory.to_string_lossy().trim_start_matches(r"\\?\")}
+        });
+        fs::write(path, serde_json::to_vec(&settings).unwrap()).unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        assert_eq!(
+            capabilities.sources[0].path,
+            test_wire_path(&memory.join("MEMORY.md"))
+        );
+        if index == 3 {
+            assert!(matches!(
+                capabilities.disable,
+                NativeMemoryDisable::WatchOnly
+            ));
+        }
+    }
+}
+
+#[test]
+fn native_memory_claude_environment_directory_preserves_native_fallback_rules() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let user = fixture.root.join("custom claude config/settings.json");
+    fs::write(fixture.adapter.project_settings_path(), b"{}").unwrap();
+    for value in ["", "~/ignored", r"~\ignored", "relative", r"\\server\share"] {
+        let settings = json!({
+            "autoMemoryDirectory":"~/regular memory",
+            "env":{"CLAUDE_COWORK_MEMORY_PATH_OVERRIDE":value}
+        });
+        fs::write(&user, serde_json::to_vec(&settings).unwrap()).unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        assert_eq!(
+            capabilities.sources[0].path,
+            test_wire_path(&fixture.root.join("regular memory/MEMORY.md")),
+            "invalid native override should fall through: {value}"
+        );
+    }
+    for value in [json!(false), json!(["directory"]), Value::Null] {
+        let settings = json!({
+            "autoMemoryDirectory":"~/regular memory",
+            "env":{"CLAUDE_COWORK_MEMORY_PATH_OVERRIDE":value}
+        });
+        fs::write(&user, serde_json::to_vec(&settings).unwrap()).unwrap();
+        let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+        assert!(matches!(
+            capabilities.disable,
+            NativeMemoryDisable::Unavailable
+        ));
+        assert!(capabilities.sources.is_empty());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn native_memory_claude_environment_directory_rejects_windows_aliases() {
+    let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let settings = json!({"env":{
+        "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE":"C:/one",
+        "claude_cowork_memory_path_override":"C:/two"
+    }});
+    fs::write(
+        fixture.adapter.project_settings_path(),
+        serde_json::to_vec(&settings).unwrap(),
+    )
+    .unwrap();
+    let capabilities = fixture.adapter.native_memory_capabilities().unwrap();
+    assert!(matches!(
+        capabilities.disable,
+        NativeMemoryDisable::Unavailable
+    ));
+    assert!(capabilities.sources.is_empty());
+}
+
+#[test]
+fn native_memory_claude_environment_directory_change_invalidates_the_plan() {
+    let mut fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));
+    let user = fixture.root.join("custom claude config/settings.json");
+    let mut plan = None;
+    let project_before = fs::read(fixture.adapter.project_settings_path()).unwrap();
+    for name in ["approved memory", "changed memory"] {
+        let memory = fixture.root.join(name);
+        fs::create_dir_all(&memory).unwrap();
+        let settings = json!({"env":{
+            "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE":
+                memory.to_string_lossy().trim_start_matches(r"\\?\")
+        }});
+        fs::write(&user, serde_json::to_vec(&settings).unwrap()).unwrap();
+        if let Some(plan) = &plan {
+            assert!(NativeAdapter::reprobe_live_state(&mut fixture.adapter, plan).is_err());
+            assert!(
+                NativeAdapter::verify_live_state_reservation(&mut fixture.adapter, plan).is_err()
+            );
+        } else {
+            let approved = claude_memory_plan(&fixture);
+            NativeAdapter::reprobe_live_state(&mut fixture.adapter, &approved).unwrap();
+            plan = Some(approved);
+        }
+    }
+    assert_eq!(
+        fs::read(fixture.adapter.project_settings_path()).unwrap(),
+        project_before
+    );
+}
+
+#[test]
 fn native_memory_claude_disables_the_local_override_and_rolls_it_back_exactly() {
     for enabled in [true, false] {
         let fixture = fixture(include_str!("fixtures/claude-code-2.1.214.json"));

@@ -1109,8 +1109,11 @@ impl NativeMemoryAdapter for ClaudeCodeAdapter {
                 "Claude Code memory settings changed during inspection",
             ));
         }
-        let Some(memory_root) =
-            self.bound_native_memory_root(&configuration.effective, supported)?
+        let Some(memory_root) = self.bound_native_memory_root(
+            &configuration.effective,
+            configuration.cowork_directory.as_deref(),
+            supported,
+        )?
         else {
             return Ok(NativeMemoryCapabilities {
                 disable: NativeMemoryDisable::Unavailable,
@@ -1209,8 +1212,26 @@ impl ClaudeCodeAdapter {
     fn bound_native_memory_root(
         &self,
         settings: &Map<String, Value>,
+        cowork_directory: Option<&str>,
         supported: bool,
     ) -> Result<Option<PathBuf>, ClientError> {
+        if let Some(value) = cowork_directory
+            // Unlike autoMemoryDirectory, the native environment override does
+            // not expand a leading home shorthand. Invalid values fall through.
+            && !value.starts_with("~/")
+            && !value.starts_with("~\\")
+            && let Some(configured) =
+                memory_path::configured_directory(value, &self.layout.user_home)
+        {
+            if configured.as_os_str().len() > 4096 {
+                return Ok(None);
+            }
+            let Some(root) = memory_path::bind_current_drive(configured, &self.layout.project_root)
+            else {
+                return Ok(None);
+            };
+            return safe_memory_directory_binding(&root);
+        }
         if let Some(value) = settings.get("autoMemoryDirectory") {
             let Some(value) = value.as_str() else {
                 return Ok(None);
@@ -1324,6 +1345,7 @@ impl ClaudeCodeAdapter {
             | memory_environment_key(&project)?.is_some()
             | local_environment;
         let mut effective = Map::new();
+        let mut cowork_directory = None;
         // File settings for the selected project: user < project < local.
         // Launch flags, ambient environment and interactive trust need separate runtime
         // qualification; this does not enable additional supported versions.
@@ -1333,15 +1355,34 @@ impl ClaudeCodeAdapter {
                     effective.insert(key.to_owned(), value.clone());
                 }
             }
+            if let Some(key) =
+                settings_environment_key(settings, "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE")?
+            {
+                cowork_directory = Some(settings["env"][key].as_str().ok_or(())?.to_owned());
+            }
         }
         let mut managed = false;
         let mut managed_directory = None::<Value>;
+        let mut managed_cowork_directory = None;
         for path in &self.layout.managed_settings_paths {
             let settings = mcp_state::read_object(path).map_err(|_| ())?;
             let managed_environment = memory_environment_key(&settings)?.is_some();
+            let cowork_key =
+                settings_environment_key(&settings, "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE")?;
             managed |= settings.contains_key("autoMemoryEnabled")
                 || settings.contains_key("autoMemoryDirectory")
-                || managed_environment;
+                || managed_environment
+                || cowork_key.is_some();
+            if let Some(key) = cowork_key {
+                let directory = settings["env"][key].as_str().ok_or(())?;
+                if managed_cowork_directory
+                    .as_deref()
+                    .is_some_and(|current| current != directory)
+                {
+                    return Err(());
+                }
+                managed_cowork_directory = Some(directory.to_owned());
+            }
             if let Some(directory) = settings.get("autoMemoryDirectory") {
                 if managed_directory
                     .as_ref()
@@ -1355,6 +1396,9 @@ impl ClaudeCodeAdapter {
         if let Some(directory) = managed_directory {
             effective.insert("autoMemoryDirectory".to_owned(), directory);
         }
+        if managed_cowork_directory.is_some() {
+            cowork_directory = managed_cowork_directory;
+        }
         let (disable_path, disable_settings) =
             if local.contains_key("autoMemoryEnabled") || local_environment {
                 (local_path, local)
@@ -1363,6 +1407,7 @@ impl ClaudeCodeAdapter {
             };
         Ok(EffectiveMemorySettings {
             effective,
+            cowork_directory,
             managed,
             environment_override,
             disable_path,
@@ -1480,6 +1525,7 @@ impl ClaudeCodeAdapter {
 
 struct EffectiveMemorySettings {
     effective: Map<String, Value>,
+    cowork_directory: Option<String>,
     managed: bool,
     environment_override: bool,
     disable_path: PathBuf,
@@ -1487,6 +1533,13 @@ struct EffectiveMemorySettings {
 }
 
 fn memory_environment_key(settings: &Map<String, Value>) -> Result<Option<&str>, ()> {
+    settings_environment_key(settings, "CLAUDE_CODE_DISABLE_AUTO_MEMORY")
+}
+
+fn settings_environment_key<'a>(
+    settings: &'a Map<String, Value>,
+    name: &str,
+) -> Result<Option<&'a str>, ()> {
     let Some(environment) = settings.get("env") else {
         return Ok(None);
     };
@@ -1494,9 +1547,9 @@ fn memory_environment_key(settings: &Map<String, Value>) -> Result<Option<&str>,
     let mut selected = None;
     for (key, value) in environment {
         let matches = if cfg!(windows) {
-            key.eq_ignore_ascii_case("CLAUDE_CODE_DISABLE_AUTO_MEMORY")
+            key.eq_ignore_ascii_case(name)
         } else {
-            key == "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+            key == name
         };
         if matches {
             // Windows aliases share one process variable. Reject conflicting

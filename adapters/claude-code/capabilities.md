@@ -4,11 +4,15 @@
 
 Claude Code `2.1.213` and `2.1.214` receive the shared Context Relay memory and
 task-ledger contract in the project-root `CLAUDE.md`. The reviewed setup writes
-only the supported project setting `autoMemoryEnabled: false`; prior values and
-unmanaged configuration remain in the transaction before-image.
+the supported project/local setting `autoMemoryEnabled: false` and an existing
+settings-provided `CLAUDE_CODE_DISABLE_AUTO_MEMORY` control when needed. Prior
+values and unmanaged configuration remain in the transaction before-image.
 
 The adapter watches the exactly bound project memory `MEMORY.md` and its
-bounded topic Markdown files. An explicit supported `autoMemoryDirectory`
+bounded topic Markdown files. A settings-provided
+`CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` takes precedence over `autoMemoryDirectory`,
+with user < project < local file precedence and managed controls read-only.
+An explicit supported `autoMemoryDirectory`
 takes precedence over the frozen default project-key mapping. Existing content
 is previewed once through the ordinary pending candidate queue. Later stable
 edits are observed by the daemon after 750 ms, including while the desktop is
@@ -19,6 +23,11 @@ Unknown versions never receive a guessed disable setting. If the exact source
 directory can still be bound safely, the capability is watch-only; otherwise
 the source is unavailable. Sibling project-memory directories are never
 scanned.
+
+The isolated Claude 2.1.202 session matrix verifies 25 root-selection/lifecycle
+cases. This does not expand its import-only gate. Ambient directory overrides,
+production handling of the remote memory base and installed acceptance remain
+open. See [directory qualification](../../docs/verification/claude-memory-directory-2026-09-07.md).
 
 ## Managed hooks and privacy
 

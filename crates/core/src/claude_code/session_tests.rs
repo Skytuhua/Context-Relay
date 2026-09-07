@@ -85,6 +85,11 @@ fn pinned_claude_sessions_use_effective_memory_and_deliver_generated_lifecycle_h
         "local-env-mixed-case-disabled",
         "user-env-conflicting-aliases",
         "user-env-lowercase-project-disabled",
+        "user-env-cowork-memory-directory",
+        "project-env-cowork-memory-directory",
+        "user-env-cowork-invalid-directory",
+        "user-env-remote-memory-directory",
+        "user-env-remote-with-explicit-directory",
     ] {
         let case = root.join(name);
         let home = case.join("home");
@@ -215,6 +220,46 @@ fn pinned_claude_sessions_use_effective_memory_and_deliver_generated_lifecycle_h
                 .join("memory");
             fs::create_dir_all(&wrong).unwrap();
             fs::write(wrong.join("MEMORY.md"), decoy).unwrap();
+        }
+        if matches!(
+            name,
+            "user-env-cowork-memory-directory" | "project-env-cowork-memory-directory"
+        ) {
+            let original = memory.clone();
+            memory = case.join("override memory 專案 O'Brien");
+            fs::create_dir_all(&original).unwrap();
+            fs::write(original.join("MEMORY.md"), decoy).unwrap();
+            if name == "user-env-cowork-memory-directory" {
+                user["env"] = json!({"CLAUDE_COWORK_MEMORY_PATH_OVERRIDE":memory});
+            } else {
+                let wrong = case.join("user environment memory");
+                fs::create_dir_all(&wrong).unwrap();
+                fs::write(wrong.join("MEMORY.md"), decoy).unwrap();
+                user["env"] = json!({"CLAUDE_COWORK_MEMORY_PATH_OVERRIDE":wrong});
+                project_settings["env"] = json!({"CLAUDE_COWORK_MEMORY_PATH_OVERRIDE":memory});
+            }
+        }
+        if name == "user-env-cowork-invalid-directory" {
+            user["env"] = json!({"CLAUDE_COWORK_MEMORY_PATH_OVERRIDE":"~/ignored"});
+        }
+        if matches!(
+            name,
+            "user-env-remote-memory-directory" | "user-env-remote-with-explicit-directory"
+        ) {
+            let remote = case.join("remote memory 專案 O'Brien");
+            let key = memory_path::directory_key(&project).unwrap();
+            let redirected = remote.join("projects").join(&key).join("memory");
+            user["env"] = json!({"CLAUDE_CODE_REMOTE_MEMORY_DIR":remote});
+            if name == "user-env-remote-memory-directory" {
+                user.as_object_mut().unwrap().remove("autoMemoryDirectory");
+                memory = redirected;
+                let wrong = config.join("projects").join(key).join("memory");
+                fs::create_dir_all(&wrong).unwrap();
+                fs::write(wrong.join("MEMORY.md"), decoy).unwrap();
+            } else {
+                fs::create_dir_all(&redirected).unwrap();
+                fs::write(redirected.join("MEMORY.md"), decoy).unwrap();
+            }
         }
         fs::create_dir_all(&memory).unwrap();
         fs::write(memory.join("MEMORY.md"), marker).unwrap();
