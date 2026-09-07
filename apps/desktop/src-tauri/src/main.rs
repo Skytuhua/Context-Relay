@@ -15,6 +15,9 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
+mod harness_launch;
+mod launch_plan;
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApplicationInfo {
@@ -389,6 +392,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             application_info,
             choose_project_folder,
+            harness_launch::open_harness,
+            harness_launch::harness_copy_command,
+            harness_launch::open_harness_guide,
             local_request,
             recovery_enrollment_begin,
             recovery_enrollment_confirm

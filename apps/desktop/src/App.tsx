@@ -11,6 +11,13 @@ import type {
 import { DevicesScreen } from './devices';
 import { HarnessesScreen } from './harnesses';
 import { ProjectForm } from './project-form';
+import { WorkspaceIcon } from './workspace-icon';
+import { Dashboard } from './dashboard';
+import { DashboardTour, HelpScreen } from './help-tour';
+import { SetupWizard } from './setup-wizard';
+import { ConnectionTest } from './connection-test';
+import { openHarness, openHarnessGuide } from './harness-launch';
+import { readPreferences, savePreferences, type DesktopPreferences, type SetupProgress, type Theme } from './desktop-preferences';
 import { WriteRecovery } from './write-recovery';
 import { SearchProgress } from './search-progress';
 import { useSearchProgress } from './use-search-progress';
@@ -25,23 +32,24 @@ type ScreenId =
   | 'tasks'
   | 'harnesses'
   | 'devices'
+  | 'help'
   | 'settings';
 
 const SCREENS: ReadonlyArray<{ id: ScreenId; label: string; summary: string }> = [
-  { id: 'home', label: 'Home', summary: 'Keep useful context for your next session.' },
+  { id: 'home', label: 'Dashboard', summary: 'Your project context, work and harness connections.' },
   { id: 'projects', label: 'Projects', summary: 'Choose the folders you work on with your harnesses.' },
-  { id: 'memory', label: 'Saved context', summary: 'Save decisions, preferences and notes for future AI sessions.' },
+  { id: 'memory', label: 'Context', summary: 'Decisions, preferences and project facts your connected harness can retrieve.' },
   { id: 'review', label: 'Suggestions', summary: 'Choose which notes from your harnesses are worth keeping.' },
   { id: 'tasks', label: 'Tasks', summary: 'Keep track of what to do next and what is finished.' },
   { id: 'harnesses', label: 'Harnesses', summary: 'Let Codex, Claude Code or Hermes use your saved context.' },
   { id: 'devices', label: 'Devices', summary: 'Review trusted local devices.' },
   { id: 'settings', label: 'Settings', summary: 'Review local security settings.' },
+  { id: 'help', label: 'Help', summary: 'Learn how to save context, continue work and connect your harnesses.' },
 ];
 
 const NAV_GROUPS: ReadonlyArray<{ label: string; screens: ScreenId[] }> = [
-  { label: 'Your work', screens: ['home', 'projects', 'memory', 'review', 'tasks'] },
-  { label: 'Connections', screens: ['harnesses', 'devices'] },
-  { label: 'App', screens: ['settings'] },
+  { label: 'Workspace', screens: ['home', 'memory', 'tasks', 'harnesses', 'projects'] },
+  { label: 'App', screens: ['help', 'settings'] },
 ];
 
 const DEFAULT_GATEWAY = new LocalWorkspaceGateway();
@@ -55,6 +63,33 @@ const SAVE_MESSAGES: Partial<Record<SaveAction, string>> = {
 };
 
 export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: WorkspaceGateway }) {
+  const [preferences, setPreferences] = useState(readPreferences);
+  const [preferenceError, setPreferenceError] = useState<string | null>(null);
+  const tourStep = preferences.tourStep;
+  const setTourStep = (tourStep: number | null) => updatePreferences(current => ({ ...current, tourStep }));
+  const [testVerified, setTestVerified] = useState(false);
+  const [setupBusy, setSetupBusy] = useState(false);
+  const showSetup = preferences.setup.status === 'new' || preferences.setup.status === 'in_progress';
+  const updatePreferences = useCallback((change: (current: DesktopPreferences) => DesktopPreferences) => {
+    setPreferences(change);
+  }, []);
+  useEffect(() => {
+    try { savePreferences(preferences); setPreferenceError(null); }
+    catch { setPreferenceError('Your choices could not be saved on this computer. Keep this window open to continue setup.'); }
+  }, [preferences]);
+  const updateSetup = (setup: SetupProgress) => updatePreferences(current => ({ ...current, setup }));
+  const resumeSetup = () => updatePreferences(current => ({ ...current, setup: { ...current.setup, status: 'in_progress' } }));
+  const startTour = () => {
+    setTourStep(0);
+    void selectScreen('home');
+  };
+  useEffect(() => {
+    const media = window.matchMedia?.('(prefers-color-scheme: dark)');
+    const apply = () => { document.documentElement.dataset.theme = preferences.theme === 'system' ? media?.matches ? 'dark' : 'light' : preferences.theme; };
+    apply();
+    media?.addEventListener('change', apply);
+    return () => media?.removeEventListener('change', apply);
+  }, [preferences.theme]);
   const [activeScreen, setActiveScreen] = useState<ScreenId>('home');
   const [status, setStatus] = useState<StatusOutput | null>(null);
   const [connectionState, setConnectionState] = useState<'connecting' | 'ready' | 'failed'>('connecting');
@@ -76,6 +111,17 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   const savingRef = useRef(false);
   const memoryDraft = useRef({});
   const taskDraft = useRef({});
+  const textDrafts = useRef(new Map<string, { title: string; body: string }>());
+  const attemptDrafts = useRef(new Map<string, object>());
+  const projectDraft = useRef({ name: '', path: '' });
+  const editorSelections = useRef(new Map<string, { memory: MemoryRecord | null; task: TaskRecord | null }>());
+  const [creatingContext, setCreatingContext] = useState(false);
+  const [creatingTask, setCreatingTask] = useState(false);
+  const draftScope = activeProject?.projectId ?? 'global';
+  function rememberDraft(form: HTMLFormElement, key: string) {
+    const data = new FormData(form);
+    textDrafts.current.set(key, { title: String(data.get('title') ?? ''), body: String(data.get('body') ?? '') });
+  }
   const [projectBusy, setProjectBusy] = useState(false);
   const projectBusyRef = useRef(false);
   const recoveryBusy = useCallback((value: boolean) => {
@@ -112,7 +158,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
         window.clearTimeout(timeout);
         setStatus(nextStatus);
         setProjects(nextProjects);
-        setActiveProject((current) => nextProjects.find((project) => project.projectId === current?.projectId) ?? nextProjects[0] ?? null);
+        setActiveProject((current) => nextProjects.find((project) => project.projectId === current?.projectId) ?? nextProjects.find(project => project.projectId === readPreferences().setup.projectId) ?? (readPreferences().setup.status === 'complete' ? nextProjects[0] ?? null : null));
         setConnectionState('ready');
       })
       .catch((failure: unknown) => {
@@ -130,6 +176,11 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   useEffect(() => {
     if (hasNavigatedRef.current) headingRef.current?.focus();
   }, [activeScreen]);
+
+  useEffect(() => {
+    if (activeScreen === 'memory' && creatingContext) document.getElementById('title-title')?.focus();
+    if (activeScreen === 'tasks' && creatingTask) document.getElementById('title-task-title')?.focus();
+  }, [activeScreen, creatingContext, creatingTask]);
 
   useEffect(() => {
     if (activeScreen !== 'memory' || !submittedSearch || connectionState !== 'ready') return;
@@ -155,9 +206,15 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   async function selectScreen(screen: ScreenId, scope = activeProject) {
     if (savingRef.current || projectBusyRef.current) return;
     setRecoveryStorageFull(false);
-    if (screen !== activeScreen || scope?.projectId !== activeProject?.projectId) {
-      memoryDraft.current = {};
-      taskDraft.current = {};
+    if (scope?.projectId !== activeProject?.projectId) {
+      editorSelections.current.set(draftScope, { memory: editingMemory, task: editingTask });
+      attemptDrafts.current.set(`memory-${draftScope}`, memoryDraft.current);
+      attemptDrafts.current.set(`task-${draftScope}`, taskDraft.current);
+      memoryDraft.current = attemptDrafts.current.get(`memory-${scope?.projectId ?? 'global'}`) ?? {};
+      taskDraft.current = attemptDrafts.current.get(`task-${scope?.projectId ?? 'global'}`) ?? {};
+      const selection = editorSelections.current.get(scope?.projectId ?? 'global');
+      setEditingMemory(selection?.memory ?? null);
+      setEditingTask(selection?.task ?? null);
     }
     const generation = ++readGeneration.current;
     hasNavigatedRef.current = true;
@@ -165,8 +222,6 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     setActiveScreen(screen);
     setError(null);
     setNotice(null);
-    setEditingMemory(null);
-    setEditingTask(null);
     setRecordsLoading(['memory', 'review', 'tasks'].includes(screen));
     setMemories([]);
     setCandidates([]);
@@ -254,6 +309,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       setNotice('Context saved');
       setError(null);
       form.reset();
+      textDrafts.current.delete(`memory-${draftScope}`);
+      setCreatingContext(false);
       memoryDraft.current = {};
       refreshSavedRecords('memory', activeProject?.projectId ?? null);
     } catch (failure) {
@@ -273,6 +330,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       const memory = await gateway.updateMemory(editingMemory, title, body);
       setMemories((current) => replaceRecord(current, memory, editingMemory.revision));
       setEditingMemory(null);
+      textDrafts.current.delete(`edit-memory-${editingMemory.id}`);
       setNotice('Memory updated');
       setError(null);
       refreshSavedRecords('memory', activeProject?.projectId ?? null);
@@ -336,6 +394,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       setError(null);
       form.reset();
       taskDraft.current = {};
+      textDrafts.current.delete(`task-${draftScope}`);
+      setCreatingTask(false);
       refreshSavedRecords('task', activeProject.projectId);
     } catch (failure) {
       reportSaveError(failure, 'We could not confirm the save. Your draft is still here. Choose Save task again to retry this draft.');
@@ -355,6 +415,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       setTasks((current) => replaceRecord(current, task, editingTask.revision));
       setEditingTask(null);
       setNotice('Task updated');
+      textDrafts.current.delete(`edit-task-${editingTask.id}`);
       refreshSavedRecords('task', activeProject.projectId);
     } catch (failure) {
       reportSaveError(failure, 'We could not confirm the update. Your draft is still here. Choose Update task again to retry these changes.');
@@ -390,27 +451,19 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
   function renderScreen(screen: ScreenId) {
     switch (screen) {
       case 'home':
-        return (
-          <section className="screen-content home-guide" aria-labelledby="home-start-title">
-            {connectionState === 'ready' && <WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} />}
-            <h2 id="home-start-title">{activeProject ? 'What would you like to remember?' : 'Stop explaining the same things again'}</h2>
-            <p>Save a decision, preference or project note once. A connected harness can find it when you start your next session.</p>
-            {!activeProject ? <>
-              <ol className="how-it-works" aria-label="How Context Relay works">
-                <li><h3>Choose a project</h3><p>Pick the folder you work in. Its notes and tasks stay together.</p></li>
-                <li><h3>Save useful context</h3><p>Add a preference or decision you want to keep, such as “Use TypeScript.”</p></li>
-                <li><h3>Connect a harness</h3><p>Connect Codex, Claude Code or Hermes so it can retrieve those notes.</p></li>
-              </ol>
-              <button className="primary-action" type="button" disabled={connectionState !== 'ready'} onClick={() => void selectScreen('projects')}>Add your project folder</button>
-            </> : <NextSteps onConnect={() => void selectScreen('harnesses')} onContext={() => void selectScreen('memory')} />}
-            <p className="workspace-status" role="status">{connectionState === 'failed' ? 'Local workspace unavailable' : connectionState === 'connecting' ? 'Opening your workspace…' : status?.vault === 'unlocked' ? 'Ready on this computer' : 'Workspace locked'}</p>
-            <p className="help-text">Saved on this computer. You can add notes and tasks before connecting a harness.</p>
-          </section>
-        );
+        return <>
+          {connectionState === 'ready' && <><WriteRecovery gateway={gateway} projects={projects} onBusy={recoveryBusy} />
+            <Dashboard gateway={gateway} project={activeProject} lastVerifiedRead={preferences.lastVerifiedRead} setupDeferred={preferences.setup.status === 'deferred'} onResumeSetup={resumeSetup} onNavigate={screen => void selectScreen(screen)}
+              onAddContext={() => { setCreatingContext(true); setEditingMemory(null); void selectScreen('memory'); }} onNewTask={() => { setCreatingTask(true); setEditingTask(null); void selectScreen('tasks'); }}
+              onOpenContext={note => { setCreatingContext(false); setEditingMemory(note); void selectScreen('memory'); }} onOpenTask={task => { setCreatingTask(false); setEditingTask(task); void selectScreen('tasks'); }} /></>}
+          {connectionState === 'connecting' && <p role="status">Opening your workspace…</p>}
+        </>;
+      case 'help':
+        return <HelpScreen onResumeSetup={resumeSetup} onStartTour={startTour} />;
       case 'projects':
         return (
           <section className="screen-content">
-            <ProjectForm gateway={gateway} ready={connectionState === 'ready'} onSaved={projectSaved} onBusy={(value) => { projectBusyRef.current = value; setProjectBusy(value); }} />
+            <ProjectForm gateway={gateway} ready={connectionState === 'ready'} initialDraft={projectDraft.current} onDraft={value => { projectDraft.current = value; }} onSaved={projectSaved} onBusy={(value) => { projectBusyRef.current = value; setProjectBusy(value); }} />
             <RecordList title="Projects">
               {projects.map((project) => (
                 <li key={project.projectId}>
@@ -430,39 +483,42 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
         );
       case 'memory':
         return (
-          <section className="screen-content">
-            <form key={'context-' + (activeProject?.projectId ?? 'global')} aria-describedby={error ? 'workspace-error' : undefined} aria-label="New context" className="capture-form" onSubmit={submitMemory}>
+          <section className="screen-content workbench">
+<div className="work-detail">
+            <form key={'context-' + (activeProject?.projectId ?? 'global')} aria-describedby={error ? 'workspace-error' : undefined} aria-label="New context" className="capture-form" hidden={!creatingContext} onChange={event => rememberDraft(event.currentTarget, `memory-${draftScope}`)} onSubmit={submitMemory}>
               <h2>Save something worth remembering</h2>
               <p>For example: “Use TypeScript for this project” or a decision you do not want to explain again.</p>
-              <Field label="Title" name="title" disabled={!!saving} placeholder="For example, Writing preferences" />
-              <Field label="What should your harness remember?" name="body" multiline disabled={!!saving} placeholder="A decision, preference or detail to use next time…" />
+              <Field label="Title" name="title" defaultValue={textDrafts.current.get(`memory-${draftScope}`)?.title} disabled={!!saving} placeholder="For example, Writing preferences" />
+              <Field label="What should your harness remember?" name="body" defaultValue={textDrafts.current.get(`memory-${draftScope}`)?.body} multiline disabled={!!saving} placeholder="A decision, preference or detail to use next time…" />
               <button className="primary-action" type="submit" disabled={!!saving || projectBusy || connectionState !== 'ready'}>{saving === 'memory' ? 'Saving…' : 'Save context'}</button>
             </form>
             {editingMemory && (
-              <form key={editingMemory.id} aria-describedby={error ? 'workspace-error' : undefined} aria-label="Edit context" className="capture-form edit-form" onSubmit={submitMemoryEdit}>
+              <form key={editingMemory.id} aria-describedby={error ? 'workspace-error' : undefined} aria-label="Edit context" className="capture-form edit-form" onChange={event => rememberDraft(event.currentTarget, `edit-memory-${editingMemory.id}`)} onSubmit={submitMemoryEdit}>
                 <h2>Edit context</h2>
-                <Field label="Edit title" name="title" defaultValue={editingMemory.title} disabled={!!saving} />
-                <Field label="Edit context" name="body" defaultValue={editingMemory.bodyMarkdown} multiline disabled={!!saving} />
+                <Field label="Edit title" name="title" defaultValue={textDrafts.current.get(`edit-memory-${editingMemory.id}`)?.title ?? editingMemory.title} disabled={!!saving} />
+                <Field label="Edit context" name="body" defaultValue={textDrafts.current.get(`edit-memory-${editingMemory.id}`)?.body ?? editingMemory.bodyMarkdown} multiline disabled={!!saving} />
                 <button className="primary-action" type="submit" disabled={!!saving || projectBusy || connectionState !== 'ready'}>{saving === 'memory-edit' ? 'Saving changes…' : 'Update context'}</button>
                 <button className="secondary-action" disabled={!!saving} onClick={() => setEditingMemory(null)} type="button">Cancel edit</button>
               </form>
             )}
+            {!creatingContext && !editingMemory && <p className="empty-message">Select Edit beside a note to review or change it, or choose Add context.</p>}
+            </div><div className="work-list">
             <SearchProgress progress={searchProgress} />
             <RecordList title="Saved context" tools={<form key={searchProjectId ?? 'global'} aria-label="Context search" role="search" className="inline-form" onSubmit={searchMemory}>
                 <label htmlFor="memory-query">Search saved context</label>
                 <input id="memory-query" name="query" type="search" disabled={!!saving} />
                 <button className="secondary-action" type="submit" disabled={!!saving}>Search</button>
               </form>}>
-              {memories.length === 0 && <li className="empty-message">Saved notes will appear here. Add one above, or try another search.</li>}
+              {memories.length === 0 && <li className="empty-message">Saved notes will appear here. Choose Add context to save a decision, preference or project fact.</li>}
               {memories.map((memory) => (
                 <li className="record-card" key={memory.id}>
                   <h3>{memory.title}</h3>
                   <p>{memory.bodyMarkdown}</p>
-                  <button aria-label={`Edit ${memory.title}`} disabled={!!saving} onClick={() => setEditingMemory(memory)} type="button">Edit</button>
+                  <button aria-label={`Edit ${memory.title}`} disabled={!!saving} onClick={() => { setCreatingContext(false); setEditingMemory(memory); }} type="button">Edit</button>
                   <button aria-label={`Archive ${memory.title}`} disabled={!!saving || projectBusy || connectionState !== 'ready'} onClick={(event) => openArchive(memory, event.currentTarget)} type="button">Archive</button>
                 </li>
               ))}
-            </RecordList>
+            </RecordList></div>
             <dialog
               aria-labelledby="archive-dialog-title"
               onClose={() => archiveTriggerRef.current?.focus()}
@@ -512,30 +568,31 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           <button className="primary-action" type="button" onClick={() => void selectScreen('projects')}>Add a project</button>
         </section>;
         return (
-          <section className="screen-content">
-            <form key={'task-' + activeProject.projectId} aria-describedby={error ? 'workspace-error' : undefined} aria-label="New task" className="capture-form" onSubmit={submitTask}>
+          <section className="screen-content workbench"><div className="work-detail">
+            <form key={'task-' + activeProject.projectId} aria-describedby={error ? 'workspace-error' : undefined} aria-label="New task" className="capture-form" hidden={!creatingTask} onChange={event => rememberDraft(event.currentTarget, `task-${draftScope}`)} onSubmit={submitTask}>
               <h2>New task</h2>
               <p>Write down the next piece of work so you or your harness can pick it up later.</p>
-              <Field label="Task title" name="title" disabled={!!saving} placeholder="For example, Fix the sign-in page" />
-              <Field label="Task details" name="body" multiline disabled={!!saving} />
+              <Field label="Task title" name="title" defaultValue={textDrafts.current.get(`task-${draftScope}`)?.title} disabled={!!saving} placeholder="For example, Fix the sign-in page" />
+              <Field label="Task details" name="body" defaultValue={textDrafts.current.get(`task-${draftScope}`)?.body} multiline disabled={!!saving} />
               <button className="primary-action" type="submit" disabled={!!saving || projectBusy || connectionState !== 'ready'}>{saving === 'task' ? 'Saving…' : 'Save task'}</button>
             </form>
             {editingTask && (
-              <form key={editingTask.id} aria-describedby={error ? 'workspace-error' : undefined} aria-label="Edit task" className="capture-form edit-form" onSubmit={submitTaskEdit}>
+              <form key={editingTask.id} aria-describedby={error ? 'workspace-error' : undefined} aria-label="Edit task" className="capture-form edit-form" onChange={event => rememberDraft(event.currentTarget, `edit-task-${editingTask.id}`)} onSubmit={submitTaskEdit}>
                 <h2>Edit task</h2>
-                <Field label="Edit task title" name="title" defaultValue={editingTask.title} disabled={!!saving} />
-                <Field label="Edit task details" name="body" defaultValue={editingTask.bodyMarkdown} multiline disabled={!!saving} />
+                <Field label="Edit task title" name="title" defaultValue={textDrafts.current.get(`edit-task-${editingTask.id}`)?.title ?? editingTask.title} disabled={!!saving} />
+                <Field label="Edit task details" name="body" defaultValue={textDrafts.current.get(`edit-task-${editingTask.id}`)?.body ?? editingTask.bodyMarkdown} multiline disabled={!!saving} />
                 <button className="primary-action" type="submit" disabled={!!saving || projectBusy || connectionState !== 'ready'}>{saving === 'task-edit' ? 'Saving changes…' : 'Update task'}</button>
               </form>
             )}
-            <RecordList title="Tasks">
-              {tasks.length === 0 && <li className="empty-message">No tasks yet. Add the next thing you want to work on above.</li>}
+            {!creatingTask && !editingTask && <p className="empty-message">Select Edit beside a task to review its details, or choose New task.</p>}
+            </div><div className="work-list"><RecordList title="Tasks">
+              {tasks.length === 0 && <li className="empty-message">No tasks yet. Choose New task to save work you want to continue later.</li>}
               {tasks.map((task) => (
                 <li className="record-card" key={task.id}>
                   <h3>{task.title}</h3>
                   <p>{task.bodyMarkdown}</p>
                   <p className="state-label">{task.status === 'done' ? 'Done' : task.status.replace('_', ' ')}</p>
-                  <button aria-label={`Edit ${task.title}`} disabled={!!saving} onClick={() => setEditingTask(task)} type="button">Edit</button>
+                  <button aria-label={`Edit ${task.title}`} disabled={!!saving} onClick={() => { setCreatingTask(false); setEditingTask(task); }} type="button">Edit</button>
                   {task.status !== 'done' && (
                     <>
                       <button aria-label={`Start ${task.title}`} disabled={!!saving || projectBusy || connectionState !== 'ready'} onClick={() => void transitionTask(task, 'in_progress')} type="button">Start</button>
@@ -553,7 +610,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
                   {task.evidence.map((item) => <p key={`${task.id}-${item.summary}`}>{item.summary}</p>)}
                 </li>
               ))}
-            </RecordList>
+            </RecordList></div>
           </section>
         );
       case 'harnesses':
@@ -563,6 +620,9 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       case 'settings':
         return (
           <section className="screen-content">
+            <h2>Appearance</h2>
+            <div className="field"><label htmlFor="appearance-theme">Theme</label><select id="appearance-theme" value={preferences.theme} onChange={event => updatePreferences(current => ({ ...current, theme: event.target.value as Theme }))}><option value="dark">Dark</option><option value="light">Light</option><option value="system">System</option></select><p>System follows your computer’s appearance setting.</p></div>
+            <h2>Devices</h2><p>Review the devices allowed to access this workspace.</p><button type="button" onClick={() => void selectScreen('devices')}>Manage devices</button>
             <h2>Storage on this computer</h2>
             <p>Your saved context and tasks are encrypted on this computer. Windows or macOS protects the keys used to open them.</p>
             <button className="secondary-action" onClick={(event) => openSecurityDetails(event.currentTarget)} type="button">Security details</button>
@@ -587,6 +647,22 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     dialogTriggerRef.current?.focus();
   }
 
+  if (showSetup && connectionState === 'ready') return <>
+    {preferenceError && <p className="form-error" role="alert">{preferenceError}</p>}
+    {error && <p className="form-error" role="alert">{error}</p>}
+    <SetupWizard gateway={gateway} projects={projects} progress={preferences.setup}
+      onChange={next => { if (next.projectId !== preferences.setup.projectId) { setTestVerified(false); const project = projects.find(item => item.projectId === next.projectId); if (project) setActiveProject(project); } updateSetup(next); }}
+      onProjectSaved={project => { setProjects(current => current.some(item => item.projectId === project.projectId) ? current : [...current, project]); setActiveProject(project); }}
+      onFinishLater={() => updateSetup({ ...preferences.setup, status: 'deferred' })}
+      onTour={() => { updateSetup({ ...preferences.setup, status: 'complete', step: 'tour' }); startTour(); }} onSkipTour={() => { updateSetup({ ...preferences.setup, status: 'complete' }); void selectScreen('home'); }}
+      onOpenGuide={harness => { void openHarnessGuide(harness).catch(() => setError('The installation guide could not open. Check your default browser and try again.')); }}
+      renderConnection={(project, harness) => <HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={project.projectId} preferredHarness={harness} preferredHermesProfile={preferences.setup.hermesProfile} onProfileChange={hermesProfile => { setTestVerified(false); updatePreferences(current => ({ ...current, setup: { ...current.setup, hermesProfile, checkId: null } })); }} embedded onBusy={setSetupBusy} />}
+      renderTest={(project, harnesses) => <ConnectionTest key={project.projectId} gateway={gateway} project={project} harnesses={harnesses} hermesProfile={preferences.setup.hermesProfile} noteId={preferences.setup.noteId} checkId={preferences.setup.checkId}
+        initialHarness={preferences.setup.testHarness} onProgress={(noteId, checkId, testHarness) => updatePreferences(current => ({ ...current, setup: { ...current.setup, noteId, checkId, testHarness } }))}
+        onVerified={setTestVerified} onReceipt={receipt => { if (receipt.verifiedAt && receipt.selection.projectId) updatePreferences(current => ({ ...current, lastVerifiedRead: { harness: receipt.selection.harness, projectId: receipt.selection.projectId!, checkId: receipt.checkId, verifiedAt: receipt.verifiedAt! } })); }} onBusy={setSetupBusy} onDone={() => { setSetupBusy(false); updatePreferences(current => ({ ...current, setup: { ...current.setup, step: 'tour' } })); }} onOpenHarness={openHarness} onCopyPrompt={prompt => navigator.clipboard.writeText(prompt)} />}
+      testComplete={testVerified} operationBusy={setupBusy} />
+  </>;
+
   return (
     <>
       <a className="skip-link" href="#workspace-main">Skip to workspace</a>
@@ -595,36 +671,44 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
           <div className="brand-block">
             <p className="brand-name">Context Relay</p>
             <p>Context for your harnesses</p>
+<span className="help-text" role="status">{connectionState === 'ready' ? status?.vault === 'unlocked' ? 'Ready on this computer' : 'Workspace locked' : connectionState === 'connecting' ? 'Opening workspace…' : 'Service unavailable'}</span>
           </div>
           <nav aria-label="Workspace">
             {NAV_GROUPS.map((group) => <div className="nav-group" key={group.label} role="group" aria-label={group.label}>
               <p className="nav-group-label">{group.label}</p>
-              {SCREENS.filter((screen) => group.screens.includes(screen.id)).map((screen) => (
+              {group.screens.map(id => SCREENS.find(screen => screen.id === id)!).map((screen) => (
               <button
-                aria-current={activeScreen === screen.id ? 'page' : undefined}
+                aria-current={activeScreen === screen.id || activeScreen === 'review' && screen.id === 'memory' ? 'page' : undefined}
                 key={screen.id}
                 disabled={!!saving || projectBusy}
                 onClick={() => void selectScreen(screen.id)}
                 type="button"
               >
-                {screen.label}
+                <WorkspaceIcon name={screen.id} />{screen.label}
               </button>
               ))}
             </div>)}
           </nav>
         </aside>
         <main id="workspace-main">
-          <header className="screen-header">
+          <header className="app-toolbar">
             <h1 ref={headingRef} tabIndex={-1}>{currentScreen.label}</h1>
-            <p>{currentScreen.summary}</p>
-            {['home', 'memory', 'review', 'tasks'].includes(activeScreen) && projects.length > 0 && <div className="field project-switcher">
+
+            {activeScreen === 'memory' && <button type="button" className="primary-action" disabled={!!saving} onClick={() => { setEditingMemory(null); setCreatingContext(true); }}>Add context</button>}
+            {activeScreen === 'tasks' && activeProject && <button type="button" className="primary-action" disabled={!!saving} onClick={() => { setEditingTask(null); setCreatingTask(true); }}>New task</button>}
+            {projects.length > 0 && <div className="field project-switcher">
               <label htmlFor="active-project">Current project</label>
               <select id="active-project" value={activeProject?.projectId ?? ''} disabled={!!saving || projectBusy} onChange={(event) => {
                 const project = projects.find((item) => item.projectId === event.target.value);
                 if (project) selectProject(project);
-              }}>{projects.map((project) => <option key={project.projectId} value={project.projectId}>{project.name}</option>)}</select>
+              }}><option value="">Choose a project</option>{projects.map((project) => <option key={project.projectId} value={project.projectId}>{project.name}</option>)}</select>
             </div>}
           </header>
+          <div className="workspace-content">
+          <p className="help-text">{currentScreen.summary}</p>
+          {preferenceError && <p role="alert" className="form-error">{preferenceError}</p>}
+          {tourStep !== null && <DashboardTour step={tourStep} onStep={setTourStep} onNavigate={screen => void selectScreen(screen)} onClose={() => { setTourStep(null); updatePreferences(current => ({ ...current, tourCompleted: true })); }} />}
+          {(activeScreen === 'memory' || activeScreen === 'review') && <div className="context-tabs" role="group" aria-label="Context views"><button type="button" aria-pressed={activeScreen === 'memory'} onClick={() => void selectScreen('memory')}>Saved</button><button type="button" aria-pressed={activeScreen === 'review'} onClick={() => void selectScreen('review')}>Suggestions</button></div>}
           {connectionState === 'failed' && (
             <div className="form-error" role="alert">
               <p>{serviceVersionMismatch ? SERVICE_UPDATE_GUIDANCE : 'Could not connect to the local workspace. Retry the connection to continue.'}</p>
@@ -646,7 +730,8 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
             <HarnessesScreen gateway={gateway} projects={projects} preferredProjectId={activeProject?.projectId} onProjectChange={(id) => {
               const project = projects.find((item) => item.projectId === id);
               if (project) setActiveProject(project);
-            }} onAddProject={() => void selectScreen('projects')} onSaveContext={() => void selectScreen('memory')} active={activeScreen === 'harnesses'} />
+            }} onAddProject={() => void selectScreen('projects')} onSaveContext={() => { setCreatingContext(true); setEditingMemory(null); void selectScreen('memory'); }} active={activeScreen === 'harnesses'} />
+          </div>
           </div>
         </main>
       </div>
@@ -690,13 +775,6 @@ function RecordList({ children, title, tools }: { children: React.ReactNode; tit
       <ul className="record-list">{children}</ul>
     </section>
   );
-}
-
-function NextSteps({ onConnect, onContext }: { onConnect: () => void; onContext: () => void }) {
-  return <div className="next-steps" role="group" aria-label="Next steps">
-    <div><h3>Save useful context</h3><p>Keep a writing preference, project decision or useful detail for next time.</p><button className="primary-action" type="button" onClick={onContext}>Save context</button></div>
-    <div><h3>Connect a harness when you’re ready</h3><p>Check whether Codex, Claude Code or Hermes can connect to this project.</p><button className="secondary-action" type="button" onClick={onConnect}>Connect a harness</button></div>
-  </div>;
 }
 
 function replaceRecord<T extends { id: string; revision: string }>(records: T[], replacement: T, expectedRevision: string) {

@@ -243,13 +243,13 @@ fn verify_server_proof(
 
 #[test]
 fn challenged_hmac_matches_frozen_vector() {
-    // The protocol bytes are part of the authenticated transcript. This 1.11
+    // The protocol bytes are part of the authenticated transcript. This 1.12
     // vector was independently checked with .NET HMACSHA256.
     assert_eq!(
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 11
+            minor: 12
         }
     );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
@@ -264,7 +264,7 @@ fn challenged_hmac_matches_frozen_vector() {
 
     assert_eq!(
         serde_json::to_string(&proof).unwrap(),
-        r#""ypfDJ-Ezk7zwhPAj47qsGcM2gfTCXOn8zSrqm0RgmS8""#
+        r#""TgRV8GnXECI_O__OdVoVyDoyzEr9zwXaOrZzBlmhZZA""#
     );
     assert!(
         verify_proof(
@@ -452,7 +452,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 11
+            minor: 12
         }
     );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
@@ -476,7 +476,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
 
     assert_eq!(
         serde_json::to_string(&server_proof).unwrap(),
-        r#""pJFUxuyNlhUIoFPKBZx_IsSquEYyQoH9NptTnfdhFIA""#
+        r#""GkaITPzrnG1268glpenZO_6hLqJXXP0Ylzb5lKLmyvE""#
     );
     assert!(
         verify_server_proof(
@@ -1844,5 +1844,31 @@ mod macos_transport_tests {
             runtime.endpoint_name(),
             Err(IpcError::InvalidRuntime)
         ));
+    }
+}
+
+#[test]
+fn guided_connection_and_launch_interfaces_are_desktop_only() {
+    let id = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
+    let selection = serde_json::json!({"harness":"codex","projectId":id,"hermesProfile":null});
+    for (method, params) in [
+        ("harness_launch_info", selection.clone()),
+        (
+            "connection_check_start",
+            serde_json::json!({"selection":selection,"memoryId":id,"expectedRevision":id}),
+        ),
+        ("connection_check_status", serde_json::json!({"checkId":id})),
+        ("connection_check_cancel", serde_json::json!({"checkId":id})),
+    ] {
+        let request: LocalRequest =
+            serde_json::from_value(serde_json::json!({"method":method,"params":params})).unwrap();
+        assert!(role_allows(ClientRole::Desktop, &request));
+        for role in [
+            ClientRole::McpBridge,
+            ClientRole::Installer,
+            ClientRole::DesktopRecoveryHost,
+        ] {
+            assert!(!role_allows(role, &request), "{method}: {role:?}");
+        }
     }
 }

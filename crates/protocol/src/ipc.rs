@@ -77,6 +77,38 @@ pub struct SearchIndexStatus {
     #[ts(type = "DecimalU64")]
     pub revision: u64,
 }
+params!(HarnessLaunchInfo {
+    selection: HarnessParams,
+    executable: WireNativeValue,
+    project_root: WireNativeValue
+});
+params!(ConnectionCheckStartParams {
+    selection: HarnessParams,
+    memory_id: MemoryId,
+    expected_revision: OperationId
+});
+params!(ConnectionCheckIdParams {
+    check_id: OperationId
+});
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionCheckPhase {
+    Waiting,
+    Verified,
+    Expired,
+    Canceled,
+    Invalidated,
+}
+params!(ConnectionCheckStatus {
+    check_id: OperationId,
+    selection: HarnessParams,
+    memory_id: MemoryId,
+    expected_revision: OperationId,
+    phase: ConnectionCheckPhase,
+    expires_in_seconds: u32,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    verified_at: Option<DecimalTimestamp>
+});
 params!(HarnessPrepareParams {
     operation_id: OperationId,
     selection: HarnessParams
@@ -635,6 +667,10 @@ pub enum LocalRequest {
     AccessGet(HarnessParams),
     AccessSet(AccessSetParams),
     HarnessProbe(HarnessParams),
+    HarnessLaunchInfo(HarnessParams),
+    ConnectionCheckStart(ConnectionCheckStartParams),
+    ConnectionCheckStatus(ConnectionCheckIdParams),
+    ConnectionCheckCancel(ConnectionCheckIdParams),
     HarnessPrepare(HarnessPrepareParams),
     HarnessPreparedPreview(HarnessPrepareParams),
     HarnessPreparationStatus(HarnessPreparationIdParams),
@@ -692,6 +728,20 @@ fn validate_tags(tags: &[String]) -> Result<(), ValidationError> {
 impl LocalRequest {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::HarnessLaunchInfo(p) => {
+                validate_harness_profile(p)?;
+                if p.project_id.is_none() {
+                    return Err(ValidationError::Invalid("harnessLaunch.projectId"));
+                }
+                Ok(())
+            }
+            Self::ConnectionCheckStart(p) => {
+                validate_harness_profile(&p.selection)?;
+                if p.selection.project_id.is_none() {
+                    return Err(ValidationError::Invalid("connectionCheck.projectId"));
+                }
+                Ok(())
+            }
             Self::DesktopWritePrepare(p) => p.write.validate(),
             Self::ProjectUpsert(p) => p.project.validate(),
             Self::ProjectRegister(p) => {
@@ -1110,6 +1160,12 @@ pub enum LocalResult {
     HarnessSetups {
         page: crate::HarnessSetupsPage,
     },
+    HarnessLaunchInfo {
+        info: HarnessLaunchInfo,
+    },
+    ConnectionCheck {
+        status: ConnectionCheckStatus,
+    },
     HarnessPreparation {
         status: HarnessPreparationStatus,
     },
@@ -1226,6 +1282,12 @@ enum LocalResultSerde {
     HarnessSetups {
         page: crate::HarnessSetupsPage,
     },
+    HarnessLaunchInfo {
+        info: HarnessLaunchInfo,
+    },
+    ConnectionCheck {
+        status: ConnectionCheckStatus,
+    },
     HarnessPreparation {
         status: HarnessPreparationStatus,
     },
@@ -1327,6 +1389,25 @@ impl LocalResult {
             Self::HarnessExecution { status } => status.validate(),
             Self::HarnessSetup { setup } => setup.validate(),
             Self::HarnessSetups { page } => page.validate(),
+            Self::HarnessLaunchInfo { info } => {
+                validate_harness_profile(&info.selection)?;
+                if info.selection.project_id.is_none() {
+                    return Err(ValidationError::Invalid("harnessLaunch.projectId"));
+                }
+                info.executable.validate()?;
+                info.project_root.validate()
+            }
+            Self::ConnectionCheck { status } => {
+                validate_harness_profile(&status.selection)?;
+                if status.selection.project_id.is_none()
+                    || status.expires_in_seconds > 300
+                    || (status.phase == ConnectionCheckPhase::Verified)
+                        != status.verified_at.is_some()
+                {
+                    return Err(ValidationError::Invalid("connectionCheck"));
+                }
+                Ok(())
+            }
             Self::HarnessPreparation { status } => status.validate(),
             Self::DesktopWrite { write } => {
                 write.as_ref().map_or(Ok(()), crate::DesktopWrite::validate)

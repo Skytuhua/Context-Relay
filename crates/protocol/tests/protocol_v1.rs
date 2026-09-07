@@ -79,7 +79,7 @@ fn exact_local_wire_versions_do_not_negotiate_across_saved_hook_approval() {
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 11
+            minor: 12
         }
     );
     assert!(negotiate_version(legacy, current).is_err());

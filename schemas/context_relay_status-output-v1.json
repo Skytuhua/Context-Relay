@@ -105,7 +105,7 @@
               "const": 1
             },
             "minor": {
-              "const": 11
+              "const": 12
             }
           },
           "required": [
@@ -121,7 +121,7 @@
               "const": 1
             },
             "minor": {
-              "const": 11
+              "const": 12
             }
           },
           "required": [

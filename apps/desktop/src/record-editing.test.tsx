@@ -6,8 +6,8 @@ import type { MemoryRecord, ProjectIdentity, TaskRecord } from './bindings';
 import type { WorkspaceGateway } from './workspace';
 
 const project = { projectId: '018f22e2-79b0-7cc8-98c4-dc0c0c073980', name: 'Research' } as ProjectIdentity;
-const first = { id: 'first', title: 'First record', bodyMarkdown: 'First text', status: 'todo', evidence: [] } as unknown as TaskRecord & MemoryRecord;
-const second = { ...first, id: 'second', title: 'Second record', bodyMarkdown: 'Second text' };
+const first = { id: 'first', title: 'First record', bodyMarkdown: 'First text', status: 'open', evidence: [], revision: '1', updatedHlc: { physicalMs: '1', logical: 0 } } as unknown as TaskRecord & MemoryRecord;
+const second = { ...first, id: 'second' as typeof first.id, title: 'Second record', bodyMarkdown: 'Second text' };
 const gateway = {
   pendingWrites: async () => ({ writes: [], nextCursor: null }),
   status: async () => ({ vault: 'unlocked', sync: 'offline' }),
@@ -16,8 +16,8 @@ const gateway = {
   tasks: async () => [first, second],
 } as unknown as WorkspaceGateway;
 const screens = [
-  { page: 'Saved context', form: 'Edit context', title: 'Edit title', body: 'Edit context', update: 'updateMemory', create: 'Save context' },
-  { page: 'Tasks', form: 'Edit task', title: 'Edit task title', body: 'Edit task details', update: 'updateTask', create: 'Save task' },
+  { page: 'Context', form: 'Edit context', title: 'Edit title', body: 'Edit context', update: 'updateMemory', create: 'Add context' },
+  { page: 'Tasks', form: 'Edit task', title: 'Edit task title', body: 'Edit task details', update: 'updateTask', create: 'New task' },
 ] as const;
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
@@ -52,12 +52,12 @@ it.each(screens)('$page keeps a pending edit attached to its record and preserve
   fireEvent.submit(edit);
   expect(save).toHaveBeenCalledTimes(1);
   expect(within(edit).getByRole('button', { name: 'Saving changes…' })).toBeDisabled();
-  expect(screen.getByRole('button', { name: 'Home' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Dashboard' })).toBeDisabled();
   expect(screen.getByRole('combobox', { name: 'Current project' })).toBeDisabled();
   expect(screen.getByRole('button', { name: 'Edit Second record' })).toBeDisabled();
   expect(screen.getByRole('button', { name: create })).toBeDisabled();
   expect(screen.getByRole('textbox', { name: body })).toBeDisabled();
-  fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Dashboard' }));
   expect(edit).toBeVisible();
   await act(async () => { reject(new Error('private native details')); });
   expect(screen.getByRole('alert')).toHaveTextContent('Your draft is still here.');
@@ -65,16 +65,17 @@ it.each(screens)('$page keeps a pending edit attached to its record and preserve
   expect(screen.getByLabelText(title)).toHaveValue('Updated title');
   expect(screen.getByRole('textbox', { name: body })).toHaveValue('Updated text');
   expect(screen.getByRole('textbox', { name: body })).toBeEnabled();
-  expect(screen.getByRole('button', { name: 'Home' })).toBeEnabled();
+  expect(screen.getByRole('button', { name: 'Dashboard' })).toBeEnabled();
 });
 
 it('keeps an acknowledged edit visible when an older search finishes later', async () => {
   let finishSearch!: (records: MemoryRecord[]) => void;
   const updated = { ...first, title: 'Saved new title', bodyMarkdown: 'Saved new text' };
-  const memories = vi.fn().mockResolvedValueOnce([first, second]).mockResolvedValue([updated, second]);
-  render(<App gateway={{ ...gateway, memories, updateMemory: async () => updated, searchMemories: () => new Promise((resolve) => { finishSearch = resolve; }) }} />);
+  let editSaved = false;
+  const memories = vi.fn(async () => [editSaved ? updated : first, second]);
+  render(<App gateway={{ ...gateway, memories, updateMemory: async () => { editSaved = true; return updated; }, searchMemories: () => new Promise((resolve) => { finishSearch = resolve; }) }} />);
   await screen.findByText('Ready on this computer');
-  fireEvent.click(screen.getByRole('button', { name: 'Saved context' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Context' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Edit First record' }));
   fireEvent.change(screen.getByLabelText('Search saved context'), { target: { value: 'First' } });
   fireEvent.submit(screen.getByRole('search', { name: 'Context search' }));
@@ -94,11 +95,12 @@ it('keeps a newer visible revision when an older uncertain edit is replayed and 
   const original = { ...first, revision: 'original' as MemoryRecord['revision'] };
   const oldSave = { ...original, revision: 'old-save' as MemoryRecord['revision'], bodyMarkdown: 'Earlier saved edit' };
   const current = { ...original, revision: 'latest' as MemoryRecord['revision'], bodyMarkdown: 'Newer saved text' };
-  const updateMemory = vi.fn().mockRejectedValueOnce(new Error('reply lost')).mockResolvedValue(oldSave);
-  const memories = vi.fn().mockResolvedValueOnce([original]).mockRejectedValue(new Error('refresh failed'));
+  let attempted = false;
+  const updateMemory = vi.fn().mockImplementationOnce(async () => { attempted = true; throw new Error('reply lost'); }).mockResolvedValue(oldSave);
+  const memories = vi.fn(() => attempted ? Promise.reject(new Error('refresh failed')) : Promise.resolve([original]));
   render(<App gateway={{ ...gateway, memories, updateMemory, searchMemories: async () => [current] }} />);
   await screen.findByText('Ready on this computer');
-  fireEvent.click(screen.getByRole('button', { name: 'Saved context' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Context' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Edit First record' }));
   fireEvent.change(screen.getByRole('textbox', { name: 'Edit context' }), { target: { value: oldSave.bodyMarkdown } });
   fireEvent.submit(screen.getByRole('form', { name: 'Edit context' }));
@@ -115,13 +117,15 @@ it('keeps a newer visible revision when an older uncertain edit is replayed and 
 it.each(['start', 'complete', 'archive'] as const)('does not let an edit refresh undo a later %s acknowledgment', async (action) => {
   let finishRefresh!: (records: (TaskRecord & MemoryRecord)[]) => void;
   const edited = { ...first, title: 'Edited record' };
-  const read = vi.fn().mockResolvedValueOnce([first]).mockImplementationOnce(() => new Promise((resolve) => { finishRefresh = resolve; }));
+  let editSaved = false;
+  // Dashboard and page reads see the same source; only the post-save refresh stalls.
+  const read = vi.fn(() => editSaved ? new Promise<(TaskRecord & MemoryRecord)[]>(resolve => { finishRefresh = resolve; }) : Promise.resolve([first]));
   const transitionTask = vi.fn().mockResolvedValue({ ...edited, status: 'in_progress' });
   const completeTask = vi.fn().mockResolvedValue({ ...edited, status: 'done', evidence: [{ summary: 'Verified work' }] });
   const archiveMemory = vi.fn().mockResolvedValue(undefined);
-  render(<App gateway={{ ...gateway, memories: read, tasks: read, updateMemory: async () => edited, updateTask: async () => edited, transitionTask, completeTask, archiveMemory }} />);
+  render(<App gateway={{ ...gateway, memories: read, tasks: read, updateMemory: async () => { editSaved = true; return edited; }, updateTask: async () => { editSaved = true; return edited; }, transitionTask, completeTask, archiveMemory }} />);
   await screen.findByText('Ready on this computer');
-  fireEvent.click(screen.getByRole('button', { name: action === 'archive' ? 'Saved context' : 'Tasks' }));
+  fireEvent.click(screen.getByRole('button', { name: action === 'archive' ? 'Context' : 'Tasks' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Edit First record' }));
   fireEvent.change(screen.getByLabelText(action === 'archive' ? 'Edit title' : 'Edit task title'), { target: { value: edited.title } });
   fireEvent.submit(screen.getByRole('form', { name: action === 'archive' ? 'Edit context' : 'Edit task' }));

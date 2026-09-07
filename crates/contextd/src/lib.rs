@@ -1,3 +1,4 @@
+mod connection_check;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -1036,6 +1037,7 @@ enum VaultCommand {
     ProjectPathSet(ProjectPathParams),
     MemoryGet(MemoryParams),
     Workspace(LocalRequest),
+    DesktopMcp(context_relay_protocol::McpCallParams),
     Pairing(LocalRequest),
     Recovery(LocalRequest),
     HarnessSetup(LocalRequest),
@@ -1050,7 +1052,11 @@ enum VaultCommand {
 fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
     if matches!(
         &request,
-        LocalRequest::HarnessPrepare(_)
+        LocalRequest::HarnessLaunchInfo(_)
+            | LocalRequest::ConnectionCheckStart(_)
+            | LocalRequest::ConnectionCheckStatus(_)
+            | LocalRequest::ConnectionCheckCancel(_)
+            | LocalRequest::HarnessPrepare(_)
             | LocalRequest::SearchIndexStatus(_)
             | LocalRequest::SearchIndexRetry(_)
             | LocalRequest::HarnessExecutionStart(_)
@@ -1077,6 +1083,9 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         return RoutedRequest::Immediate(Err(scope_denied_error()));
     }
     match request {
+        LocalRequest::McpCall(params) if role != ClientRole::McpBridge => {
+            RoutedRequest::Work(VaultCommand::DesktopMcp(params))
+        }
         LocalRequest::SearchIndexStatus(_) => RoutedRequest::SearchIndexStatus,
         LocalRequest::SearchIndexRetry(_) => RoutedRequest::Work(VaultCommand::SearchIndexRetry),
         LocalRequest::HarnessExecutionCurrent(_) => RoutedRequest::ExecutionCurrent,
@@ -1091,6 +1100,12 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         LocalRequest::Unlock(_) => RoutedRequest::Work(VaultCommand::Unlock),
         LocalRequest::ProjectPathSet(params) => {
             RoutedRequest::Work(VaultCommand::ProjectPathSet(params))
+        }
+        request @ (LocalRequest::HarnessLaunchInfo(_)
+        | LocalRequest::ConnectionCheckStart(_)
+        | LocalRequest::ConnectionCheckStatus(_)
+        | LocalRequest::ConnectionCheckCancel(_)) => {
+            RoutedRequest::Work(VaultCommand::Workspace(request))
         }
         LocalRequest::MemoryGet(params) => RoutedRequest::Work(VaultCommand::MemoryGet(params)),
         request @ (LocalRequest::McpCall(_)
@@ -1363,6 +1378,7 @@ struct StoredExport {
 }
 
 struct WorkspaceState {
+    connection_check: Option<connection_check::ConnectionCheck>,
     search_index: search_index::SearchIndexJob,
     preparation: Option<PreparationClient>,
     vault: Vault,
@@ -1463,6 +1479,7 @@ fn open_workspace(
     }
     Ok((
         WorkspaceState {
+            connection_check: None,
             search_index: search_index::SearchIndexJob::new(vault.semantic_search_enabled())
                 .with_resources(config.search_resources.clone()),
             preparation: config.preparation.clone(),
@@ -1723,6 +1740,7 @@ fn execute_vault_command(
             .memory(&params.memory_id)
             .map(|memory| LocalResult::Memory { memory })
             .map_err(client_error_from_vault),
+        VaultCommand::DesktopMcp(params) => execute_mcp_request(state, params, status, false),
         VaultCommand::Workspace(request) => execute_workspace_request(state, request, status),
         VaultCommand::Pairing(request) => execute_pairing_request(state, request),
         VaultCommand::Recovery(request) => execute_recovery_enrollment_request(state, request),
@@ -1878,24 +1896,109 @@ fn execute_harness_setup(
     }
 }
 
+fn connection_check_status(
+    state: &mut WorkspaceState,
+    id: context_relay_protocol::OperationId,
+) -> Result<LocalResult, ClientError> {
+    let check = state
+        .connection_check
+        .as_mut()
+        .filter(|check| check.status.check_id == id)
+        .ok_or_else(record_not_found_error)?;
+    let memory = state
+        .vault
+        .memory(&check.status.memory_id)
+        .map_err(client_error_from_vault)?;
+    check.refresh(memory.as_ref());
+    Ok(LocalResult::ConnectionCheck {
+        status: check.status.clone(),
+    })
+}
+
+fn execute_mcp_request(
+    state: &mut WorkspaceState,
+    params: context_relay_protocol::McpCallParams,
+    service_status: &ServiceStatus,
+    authenticated_bridge: bool,
+) -> Result<LocalResult, ClientError> {
+    let name = params.name.clone();
+    let binding = params.binding.clone();
+    let status = service_status.snapshot();
+    let output = McpWorkspace::with_service_status(
+        &mut state.vault,
+        state.device_id,
+        status.vault,
+        status.sync,
+    )
+    .call(params)?;
+    // Only the authenticated bridge route can reach this receipt boundary. All normal
+    // MCP resolution, policy, record-scope, output validation and admission checks passed.
+    if authenticated_bridge && name == "context_relay_get" && state.connection_check.is_some() {
+        let resolved = context_relay_core::mcp::binding::resolve_binding(&state.vault, &binding)?;
+        if let Ok(context_relay_protocol::GetOutput {
+            record: Some(context_relay_protocol::ReadableRecord::Memory(memory)),
+        }) = serde_json::from_value(output.clone())
+        {
+            if let Some(check) = &mut state.connection_check {
+                check.observe(
+                    resolved.harness,
+                    resolved.active_project.map(|project| project.project_id),
+                    &memory,
+                );
+            }
+        }
+    }
+    Ok(LocalResult::McpOutput { name, output })
+}
 fn execute_workspace_request(
     state: &mut WorkspaceState,
     request: LocalRequest,
     service_status: &ServiceStatus,
 ) -> Result<LocalResult, ClientError> {
     match request {
-        LocalRequest::McpCall(params) => {
-            let name = params.name.clone();
-            let status = service_status.snapshot();
-            McpWorkspace::with_service_status(
-                &mut state.vault,
-                state.device_id,
-                status.vault,
-                status.sync,
-            )
-            .call(params)
-            .map(|output| LocalResult::McpOutput { name, output })
+        LocalRequest::HarnessLaunchInfo(selection) => bridge_install::launch_info(
+            state.bridge_install.as_ref(),
+            &state.vault,
+            state.device_id,
+            selection,
+        )
+        .map(|info| LocalResult::HarnessLaunchInfo { info }),
+        LocalRequest::ConnectionCheckStart(params) => {
+            LocalRequest::ConnectionCheckStart(params.clone())
+                .validate()
+                .map_err(|_| invalid_request_error())?;
+            let note = state
+                .vault
+                .memory(&params.memory_id)
+                .map_err(client_error_from_vault)?
+                .ok_or_else(record_not_found_error)?;
+            if note.revision != params.expected_revision
+                || note.archived
+                || note.kind != MemoryKind::Note
+                || !matches!(note.scope, context_relay_protocol::ScopeRef::Project {project_id} if Some(project_id) == params.selection.project_id)
+            {
+                return Err(invalid_request_error());
+            }
+            let check = connection_check::ConnectionCheck::start(params);
+            let status = check.status.clone();
+            state.connection_check = Some(check);
+            Ok(LocalResult::ConnectionCheck { status })
         }
+        LocalRequest::ConnectionCheckCancel(params) => {
+            let check = state
+                .connection_check
+                .as_mut()
+                .filter(|check| check.status.check_id == params.check_id)
+                .ok_or_else(record_not_found_error)?;
+            check.cancel();
+            Ok(LocalResult::ConnectionCheck {
+                status: check.status.clone(),
+            })
+        }
+        LocalRequest::ConnectionCheckStatus(params) => {
+            connection_check_status(state, params.check_id)
+        }
+        LocalRequest::McpCall(params) => execute_mcp_request(state, params, service_status, true),
         LocalRequest::NativeHookEvent(params) => {
             let resolved = context_relay_core::mcp::binding::resolve_hook_binding(
                 &state.vault,
@@ -3889,7 +3992,7 @@ mod tests {
                 "Health" => assert!(matches!(routed, RoutedRequest::Health)),
                 "McpCall" => assert!(matches!(
                     routed,
-                    RoutedRequest::Work(VaultCommand::Workspace(LocalRequest::McpCall(_)))
+                    RoutedRequest::Work(VaultCommand::DesktopMcp(_))
                 )),
                 _ => assert!(!matches!(
                     routed,
@@ -5479,6 +5582,150 @@ mod tests {
         worker.shutdown_and_join();
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn connection_check_only_fresh_authenticated_bridge_note_read_verifies() {
+        let runtime = test_runtime("connection-check");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let path = unique_temp_path("connection-check").join("vault.db");
+        let root = canonical_test_directory("connection-check-project");
+        let project = seed_mcp_project(&path, keys.as_ref(), &root, HarnessAccessPolicy::Default);
+        let daemon = Daemon::start(test_config(
+            runtime.clone(),
+            path,
+            keys,
+            Arc::new(FixedTokenProvider::default()),
+        ))
+        .await
+        .unwrap();
+        let handle = daemon.handle();
+        let owner = tokio::spawn(daemon.run());
+        let mut desktop = RawClient::connect(&runtime, ClientRole::Desktop).await;
+        let mut bridge = RawClient::connect(&runtime, ClientRole::McpBridge).await;
+        let revision = uuid::Uuid::now_v7().to_string();
+        let note = desktop.call(request_fixture("memory_create", serde_json::json!({"operationId":revision,"scope":{"scope":"project","projectId":project},"kind":"note","title":"Connection check","bodyMarkdown":"Use clear language","tags":[]}))).await.unwrap();
+        let LocalResult::Memory { memory: Some(note) } = note else {
+            panic!("note")
+        };
+        let start = request_fixture(
+            "connection_check_start",
+            serde_json::json!({"selection":{"harness":"codex","projectId":project,"hermesProfile":null},"memoryId":note.id,"expectedRevision":note.revision}),
+        );
+        let read = mcp_request(
+            &root,
+            "context_relay_get",
+            serde_json::json!({"recordId":note.id}),
+        );
+        bridge.call(read.clone()).await.unwrap(); // An old read cannot be reused.
+        let started = desktop.call(start.clone()).await;
+        assert!(
+            started.is_ok(),
+            "saved-note connection check must start: {started:?}"
+        );
+        let LocalResult::ConnectionCheck { status } = started.unwrap() else {
+            panic!("check")
+        };
+        let status_request = request_fixture(
+            "connection_check_status",
+            serde_json::json!({"checkId":status.check_id}),
+        );
+        desktop.call(read.clone()).await.unwrap(); // Desktop MCP calls do not attest a harness.
+        desktop
+            .call(request_fixture(
+                "memory_get",
+                serde_json::json!({"memoryId":note.id}),
+            ))
+            .await
+            .unwrap();
+        bridge
+            .call(mcp_request(
+                &root,
+                "context_relay_status",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let LocalResult::ConnectionCheck { status } =
+            desktop.call(status_request.clone()).await.unwrap()
+        else {
+            panic!("check")
+        };
+        assert_eq!(
+            status.phase,
+            context_relay_protocol::ConnectionCheckPhase::Waiting
+        );
+        let outside = canonical_test_directory("connection-check-wrong-project");
+        assert!(
+            bridge
+                .call(mcp_request(
+                    &outside,
+                    "context_relay_get",
+                    serde_json::json!({"recordId":note.id})
+                ))
+                .await
+                .is_err()
+        );
+        let mut wrong_harness = read.clone();
+        if let LocalRequest::McpCall(params) = &mut wrong_harness {
+            params.binding.harness = HarnessId::ClaudeCode;
+        }
+        let _ = bridge.call(wrong_harness).await;
+        let LocalResult::ConnectionCheck { status } =
+            desktop.call(status_request.clone()).await.unwrap()
+        else {
+            panic!("check")
+        };
+        assert_eq!(
+            status.phase,
+            context_relay_protocol::ConnectionCheckPhase::Waiting
+        );
+        assert!(bridge.call(start.clone()).await.is_err());
+        bridge.call(read.clone()).await.unwrap();
+        let LocalResult::ConnectionCheck { status } =
+            desktop.call(status_request.clone()).await.unwrap()
+        else {
+            panic!("check")
+        };
+        assert_eq!(
+            status.phase,
+            context_relay_protocol::ConnectionCheckPhase::Verified
+        );
+        assert!(status.verified_at.is_some());
+        let LocalResult::ConnectionCheck { status: new } = desktop.call(start).await.unwrap()
+        else {
+            panic!("check")
+        };
+        assert_ne!(new.check_id, status.check_id);
+        assert_eq!(
+            new.phase,
+            context_relay_protocol::ConnectionCheckPhase::Waiting
+        );
+        assert!(desktop.call(status_request).await.is_err());
+        desktop
+            .call(request_fixture(
+                "connection_check_cancel",
+                serde_json::json!({"checkId":new.check_id}),
+            ))
+            .await
+            .unwrap();
+        bridge.call(read).await.unwrap();
+        let LocalResult::ConnectionCheck { status } = desktop
+            .call(request_fixture(
+                "connection_check_status",
+                serde_json::json!({"checkId":new.check_id}),
+            ))
+            .await
+            .unwrap()
+        else {
+            panic!("check")
+        };
+        assert_eq!(
+            status.phase,
+            context_relay_protocol::ConnectionCheckPhase::Canceled
+        );
+        assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+        assert_eq!(owner.await.unwrap(), Ok(()));
+    }
     #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn authenticated_bridge_executes_only_scoped_mcp_calls() {

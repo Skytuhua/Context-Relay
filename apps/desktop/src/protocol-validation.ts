@@ -1,6 +1,6 @@
 import Ajv2020 from 'ajv/dist/2020.js';
 
-import type { HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SearchIndexStatus, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
+import type { ConnectionCheckStatus, HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SearchIndexStatus, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
 
 const utf8 = new TextEncoder();
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -294,4 +294,21 @@ export function validateHarnessSetupsPage(value: unknown): HarnessSetupsPage {
     if (previous !== null && (page.nextAfter as string) > previous) fail('harnessSetups.nextAfter');
   }
   return value as HarnessSetupsPage;
+}
+
+export function validateConnectionCheckStatus(value: unknown): ConnectionCheckStatus {
+  const item = object(value, ['checkId', 'selection', 'memoryId', 'expectedRevision', 'phase', 'expiresInSeconds', 'verifiedAt'], 'connectionCheck');
+  id(item.checkId, 'connectionCheck.checkId');
+  id(item.memoryId, 'connectionCheck.memoryId');
+  id(item.expectedRevision, 'connectionCheck.expectedRevision');
+  const selection = object(item.selection, ['harness', 'projectId', 'hermesProfile'], 'connectionCheck.selection');
+  choice(selection.harness, ['codex', 'claude_code', 'hermes'], 'connectionCheck.harness');
+  id(selection.projectId, 'connectionCheck.projectId');
+  if (selection.harness === 'hermes') text(selection.hermesProfile, 512, 'connectionCheck.hermesProfile');
+  else if (selection.hermesProfile !== null) fail('connectionCheck.hermesProfile');
+  choice(item.phase, ['waiting', 'verified', 'expired', 'canceled', 'invalidated'], 'connectionCheck.phase');
+  uint(item.expiresInSeconds, 300, 'connectionCheck.expiresInSeconds');
+  if ((item.phase === 'verified') !== (item.verifiedAt !== null)) fail('connectionCheck.verifiedAt');
+  if (item.verifiedAt !== null) u64(item.verifiedAt, 'connectionCheck.verifiedAt');
+  return value as ConnectionCheckStatus;
 }

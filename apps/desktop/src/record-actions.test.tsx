@@ -21,37 +21,45 @@ const gateway = {
 const actions = [
   { action: 'start', page: 'Tasks', button: 'Start Verify changes', method: 'transitionTask', pending: 'Starting task…', notice: 'Task started', result: { ...task, status: 'in_progress' } },
   { action: 'complete', page: 'Tasks', button: 'Complete Verify changes', method: 'completeTask', pending: 'Completing task…', notice: 'Task completed', result: { ...task, status: 'done' } },
-  { action: 'archive', page: 'Saved context', button: 'Archive Project decision', method: 'archiveMemory', pending: 'Archiving context…', notice: 'Memory archived', result: memory },
+  { action: 'archive', page: 'Context', button: 'Archive Project decision', method: 'archiveMemory', pending: 'Archiving context…', notice: 'Memory archived', result: memory },
   { action: 'accept', page: 'Suggestions', button: 'Accept Project decision', method: 'reviewCandidate', pending: 'Saving your review…', notice: 'Candidate accepted', result: candidate },
   { action: 'reject', page: 'Suggestions', button: 'Reject Project decision', method: 'reviewCandidate', pending: 'Saving your review…', notice: 'Candidate rejected', result: candidate },
 ] as const;
 
 afterEach(cleanup);
 
-it.each(['context', 'task'] as const)('keeps the %s draft on reload and clears it when opening the other form', async (kind) => {
+it.each(['context', 'task'] as const)('keeps the %s draft on reload and after visiting the other form', async (kind) => {
   render(<App gateway={gateway} />);
   await screen.findByText('Ready on this computer');
-  const page = kind === 'context' ? 'Saved context' : 'Tasks';
+  const page = kind === 'context' ? 'Context' : 'Tasks';
   const formName = kind === 'context' ? 'New context' : 'New task';
   fireEvent.click(screen.getByRole('button', { name: page }));
+  fireEvent.click(screen.getByRole('button', { name: kind === 'context' ? 'Add context' : 'New task' }));
   const form = await screen.findByRole('form', { name: formName });
   fireEvent.change(within(form).getAllByRole('textbox')[0], { target: { value: 'Unsubmitted draft' } });
   fireEvent.click(screen.getByRole('button', { name: page }));
   expect(within(screen.getByRole('form', { name: formName })).getAllByRole('textbox')[0]).toHaveValue('Unsubmitted draft');
-  fireEvent.click(screen.getByRole('button', { name: kind === 'context' ? 'Tasks' : 'Saved context' }));
+  fireEvent.click(screen.getByRole('button', { name: kind === 'context' ? 'Tasks' : 'Context' }));
+  fireEvent.click(screen.getByRole('button', { name: kind === 'context' ? 'New task' : 'Add context' }));
   const next = await screen.findByRole('form', { name: kind === 'context' ? 'New task' : 'New context' });
   expect(within(next).getAllByRole('textbox')[0]).toHaveValue('');
+  fireEvent.click(screen.getByRole('button', { name: page }));
+  expect(within(screen.getByRole('form', { name: formName })).getAllByRole('textbox')[0]).toHaveValue('Unsubmitted draft');
 });
 
 it.each(['context', 'task'] as const)('does not duplicate or replace a visible %s with its older creation acknowledgment', async (kind) => {
   const current = kind === 'context' ? memory : task;
   const old = { ...current, bodyMarkdown: 'Earlier creation text' };
-  const read = vi.fn().mockResolvedValueOnce([current]).mockRejectedValue(new Error('refresh unavailable'));
-  render(<App gateway={{ ...gateway, memories: read, tasks: read,
-    createMemory: async () => old as MemoryRecord, createTask: async () => old as TaskRecord }} />);
+  let creationAcknowledged = false;
+  function read<T>(record: T): Promise<T[]> {
+    return creationAcknowledged ? Promise.reject(new Error('refresh unavailable')) : Promise.resolve([record]);
+  }
+  render(<App gateway={{ ...gateway, memories: () => read(memory), tasks: () => read(task),
+    createMemory: async () => { creationAcknowledged = true; return { ...memory, bodyMarkdown: old.bodyMarkdown }; }, createTask: async () => { creationAcknowledged = true; return { ...task, bodyMarkdown: old.bodyMarkdown }; } }} />);
   await screen.findByText('Ready on this computer');
-  fireEvent.click(screen.getByRole('button', { name: kind === 'context' ? 'Saved context' : 'Tasks' }));
+  fireEvent.click(screen.getByRole('button', { name: kind === 'context' ? 'Context' : 'Tasks' }));
   await screen.findByText(current.bodyMarkdown);
+  fireEvent.click(screen.getByRole('button', { name: kind === 'context' ? 'Add context' : 'New task' }));
   const form = screen.getByRole('form', { name: kind === 'context' ? 'New context' : 'New task' });
   const fields = within(form).getAllByRole('textbox');
   fireEvent.change(fields[0], { target: { value: current.title } });
@@ -82,19 +90,21 @@ it.each(actions)('$action waits for acknowledgment, rejects overlapping clicks a
   const save = vi.fn().mockImplementationOnce(() => new Promise((_, fail) => { reject = fail; })).mockResolvedValue(action.result);
   render(<App gateway={{ ...gateway, [action.method]: save }} />);
   await screen.findByText('Ready on this computer');
+  if (action.page === 'Suggestions') fireEvent.click(screen.getByRole('button', { name: 'Context' }));
   fireEvent.click(screen.getByRole('button', { name: action.page }));
+  if (action.page === 'Tasks') fireEvent.click(screen.getByRole('button', { name: 'New task' }));
   await screen.findByRole('button', { name: action.button });
   if (action.action === 'archive') prepareArchiveDialog();
   if (action.action === 'complete') fireEvent.change(screen.getByLabelText('Evidence for Verify changes'), { target: { value: 'All checks passed' } });
   await clickAction(action);
   fireEvent.click(screen.getByRole('button', { name: action.button }));
   expect(save).toHaveBeenCalledTimes(1);
-  expect(screen.getByRole('button', { name: 'Home' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Dashboard' })).toBeDisabled();
   expect(screen.getByRole('combobox', { name: 'Current project' })).toBeDisabled();
   expect(screen.getByRole('button', { name: action.button })).toBeDisabled();
   expect(screen.getByText(action.pending)).toHaveAttribute('role', 'status');
   expect(screen.queryByText(action.notice)).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Dashboard' }));
   expect(screen.getByRole('heading', { level: 1, name: action.page })).toBeVisible();
   if (action.page === 'Tasks') {
     expect(screen.getByRole('button', { name: 'Save task' })).toBeDisabled();
@@ -107,7 +117,7 @@ it.each(actions)('$action waits for acknowledgment, rejects overlapping clicks a
   expect(screen.getByRole('alert')).toHaveTextContent('could not confirm');
   expect(screen.getByRole('alert')).not.toHaveTextContent('private transport failure');
   expect(screen.getByRole('button', { name: action.button })).toBeEnabled();
-  expect(screen.getByRole('button', { name: 'Home' })).toBeEnabled();
+  expect(screen.getByRole('button', { name: 'Dashboard' })).toBeEnabled();
   if (action.action === 'complete') expect(screen.getByLabelText('Evidence for Verify changes')).toHaveValue('All checks passed');
   await clickAction(action);
   await screen.findByText(action.notice);
@@ -122,7 +132,7 @@ it('clears the editor only after archiving that context is acknowledged', async 
   let finish!: (value: MemoryRecord) => void;
   render(<App gateway={{ ...gateway, archiveMemory: () => new Promise((resolve) => { finish = resolve; }) }} />);
   await screen.findByText('Ready on this computer');
-  fireEvent.click(screen.getByRole('button', { name: 'Saved context' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Context' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Edit Project decision' }));
   prepareArchiveDialog();
   await clickAction(actions[2]);
@@ -140,6 +150,6 @@ it('does not lock the task screen when completion evidence is missing', async ()
   fireEvent.click(await screen.findByRole('button', { name: 'Complete Verify changes' }));
   expect(completeTask).not.toHaveBeenCalled();
   expect(screen.getByRole('alert')).toHaveTextContent('Enter completion evidence');
-  expect(screen.getByRole('button', { name: 'Home' })).toBeEnabled();
+  expect(screen.getByRole('button', { name: 'Dashboard' })).toBeEnabled();
   expect(screen.getByLabelText('Evidence for Verify changes')).toBeEnabled();
 });

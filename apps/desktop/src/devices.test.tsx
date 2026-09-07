@@ -276,7 +276,8 @@ describe('DevicesScreen', () => {
     await waitFor(() => expect(gateway.recoveryStatusCalls).toEqual([enrollmentId]));
     expect(await screen.findByRole('status')).toHaveTextContent('Recovery is ready.');
     expect(screen.queryByRole('button', { name: 'Set up recovery' })).not.toBeInTheDocument();
-    expect(localStorage.length).toBe(0);
+    expect(Object.keys(localStorage).filter(key => key !== 'context-relay.desktop-preferences.v1')).toEqual([]);
+    for (const canary of recoveryCanaries) expect(JSON.stringify(localStorage)).not.toContain(canary);
     expect(sessionStorage.length).toBe(0);
   });
 

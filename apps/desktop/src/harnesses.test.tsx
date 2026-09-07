@@ -7,6 +7,7 @@ const invoke = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
 import App from './App';
 import { LocalWorkspaceGateway } from './workspace';
+import { PROTOCOL_VERSION } from './bindings';
 
 const projectId = '018f22e2-79b0-7cc8-98c4-dc0c0c075001' as ProjectId;
 const secondProject = '018f22e2-79b0-7cc8-98c4-dc0c0c075002' as ProjectId;
@@ -35,10 +36,14 @@ beforeEach(() => {
     ? { kind: 'plan', data: { plan: preview } } : request.method === 'harness_execution_start' ? finished(request.params) : { kind: 'empty' };
   invoke.mockReset().mockImplementation(async (_command, { request }: { request: LocalRequest }) => {
     if (request.method === 'sync_status') return { kind: 'status', data: { status: {
-      protocol: { min: { major: 1, minor: 11 }, max: { major: 1, minor: 11 } }, vault: 'unlocked',
+      protocol: { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION }, vault: 'unlocked',
       resolvedProject: null, sync: 'offline', access: { mode: 'default' },
     } } };
     if (request.method === 'projects_list') return { kind: 'projects', data: { projects } };
+    // Dashboard reads are separate from the mutation lifecycle recorded below.
+    if (request.method === 'memory_list') return { kind: 'memories', data: { memories: [] } };
+    if (request.method === 'tasks_list') return { kind: 'tasks', data: { tasks: [] } };
+    if (request.method === 'candidates_list') return { kind: 'candidates', data: { candidates: [] } };
     // Discovery ordering and capabilities are exercised by harness-discovery.test.tsx.
     // This suite records the subsequent preview/apply/rollback lifecycle.
     if (request.method === 'harness_probe') return { kind: 'probe', data: { report: {
@@ -109,7 +114,7 @@ it.each(['project', 'screen'])('ignores a late saved-setup failure after changin
     fireEvent.change(screen.getByRole('combobox', { name: 'Project' }), { target: { value: secondProject } });
     screen.getByRole('combobox', { name: 'Project' }).focus();
   } else {
-    fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Dashboard' }));
   }
   const focused = document.activeElement;
   await act(async () => reject(new Error('late saved-setup failure')));
@@ -160,7 +165,7 @@ it('keeps the same pending save across a failed progress read', async () => {
   await screen.findByText('Saving harness settings…');
   vi.useFakeTimers();
   // Restart the observer so its retry timer is owned by this test clock.
-  fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Dashboard' }));
   await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Harnesses' })));
   await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
   expect(screen.getByRole('alert')).toHaveTextContent('Reconnecting to check the same setup');
@@ -183,9 +188,13 @@ it('discovers a running save after remount and postpones ordinary history reads'
   invoke.mockClear();
   await open(false);
   await screen.findByText('Saving harness settings…');
+  const dashboardHistoryReads = invoke.mock.calls.filter(call => call[1]?.request?.method === 'harness_setups_list').length;
+  expect(dashboardHistoryReads).toBe(1); // One dashboard read; Harnesses must defer its own history read.
+  fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
+  await act(async () => {});
   const observed = invoke.mock.calls.map(call => call[1]?.request?.method);
   expect(observed).toContain('harness_execution_current');
-  expect(observed).not.toContain('harness_setups_list');
+  expect(observed.filter(method => method === 'harness_setups_list')).toHaveLength(dashboardHistoryReads);
   expect(observed).not.toContain('harness_execution_start');
   expect(screen.queryByText(/Settings saved:/)).not.toBeInTheDocument();
 });
@@ -244,8 +253,10 @@ it('keeps pagination available when the first history page contains only exclude
   const cursor = 'ffffffff-ffff-7cc8-98c4-dc0c0c073990' as SetupPlan['planId'];
   saved.set(preview.planId, { plan: preview, state: 'applied', createdAt: '1900000000000' });
   const originalList = LocalWorkspaceGateway.prototype.harnessSetupsList;
-  const list = vi.spyOn(LocalWorkspaceGateway.prototype, 'harnessSetupsList').mockImplementationOnce(async () => ({ setups: [], nextAfter: cursor }))
-    .mockImplementation(function(this: LocalWorkspaceGateway, after) { return originalList.call(this, after); });
+  const list = vi.spyOn(LocalWorkspaceGateway.prototype, 'harnessSetupsList')
+    .mockImplementation(function(this: LocalWorkspaceGateway, after) {
+      return after == null ? Promise.resolve({ setups: [], nextAfter: cursor }) : originalList.call(this, after);
+    });
   await open();
   fireEvent.click(await screen.findByRole('button', { name: 'Load more setups' }));
   expect(await screen.findByRole('button', { name: 'Undo setup 0C07398F for Codex for Research' })).toBeVisible();
@@ -342,7 +353,7 @@ it('ignores preview responses after leaving the screen', async () => {
   await open();
   fireEvent.click(screen.getByRole('button', { name: 'Review setup' }));
   await waitFor(() => expect(requests).toHaveLength(1));
-  fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Dashboard' }));
   await act(async () => pending.resolve({ kind: 'plan', data: { plan: preview } }));
   fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
   expect(screen.queryByRole('heading', { name: 'Review setup changes' })).not.toBeInTheDocument();
@@ -406,7 +417,7 @@ it('keeps a pending apply exclusive across navigation and retains its acknowledg
   operation = async (request) => request.method === 'harness_preview'
     ? { kind: 'plan', data: { plan: preview } } : pending.promise;
   await open(); await review(); approve();
-  fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Dashboard' }));
   fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
   expect(screen.getByRole('button', { name: 'Review setup' })).toBeDisabled();
   await act(async () => pending.resolve(finished()));
@@ -439,7 +450,7 @@ it('distinguishes repeated connections and retains each original change review f
 it('requires fresh approval after navigating away from a reviewed preview', async () => {
   await open(); await review();
   fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed/ }));
-  fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Dashboard' }));
   fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
   expect(screen.queryByRole('button', { name: 'Save settings' })).not.toBeInTheDocument();
 });

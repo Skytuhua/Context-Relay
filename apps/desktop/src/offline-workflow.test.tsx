@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it } from 'vitest';
+import { defaultPreferences, savePreferences } from './desktop-preferences';
 
 import App from './App';
 import type {
@@ -15,6 +16,9 @@ import type { WorkspaceGateway } from './workspace';
 const id = (suffix: string) => `018f22e2-79b0-7cc8-98c4-dc0c0c0739${suffix}`;
 
 class FakeWorkspaceGateway implements WorkspaceGateway {
+  async connectionCheckStart(): Promise<never> { throw new Error('Not used'); }
+  async connectionCheckStatus(): Promise<never> { throw new Error('Not used'); }
+  async connectionCheckCancel(): Promise<never> { throw new Error('Not used'); }
   async searchIndexStatus() { return { phase: 'disabled' as const, revision: '0' as import('./bindings').DecimalU64 }; }
   async searchIndexRetry() { return this.searchIndexStatus(); }
   async harnessPrepare(): Promise<never> { throw new Error('Not used'); }
@@ -60,7 +64,7 @@ class FakeWorkspaceGateway implements WorkspaceGateway {
 
   async status(): Promise<StatusOutput> {
     return {
-      protocol: { min: { major: 1, minor: 11 }, max: { major: 1, minor: 11 } },
+      protocol: { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
       vault: 'unlocked',
       resolvedProject: null,
       sync: 'offline',
@@ -254,6 +258,12 @@ class FakeWorkspaceGateway implements WorkspaceGateway {
   }
 }
 
+beforeEach(() => {
+  localStorage.clear();
+  const preferences = defaultPreferences();
+  preferences.setup.status = 'complete';
+  savePreferences(preferences);
+});
 afterEach(cleanup);
 
 it('uses the current protocol range in the offline status fixture', async () => {
@@ -283,7 +293,8 @@ it('keeps daemon-owned project, review, and task state after the offline desktop
   fireEvent.submit(screen.getByRole('form', { name: 'Add project' }));
   expect(await screen.findByText('Context Relay')).toBeVisible();
 
-  fireEvent.click(screen.getByRole('button', { name: 'Saved context' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Context' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Add context' }));
   fireEvent.change(screen.getByRole('textbox', { name: 'Title' }), {
     target: { value: 'Portable validator' },
   });
@@ -317,6 +328,7 @@ it('keeps daemon-owned project, review, and task state after the offline desktop
   expect(await screen.findByText('Candidate rejected')).toBeVisible();
 
   fireEvent.click(screen.getByRole('button', { name: 'Tasks' }));
+  fireEvent.click(screen.getByRole('button', { name: 'New task' }));
   fireEvent.change(screen.getByRole('textbox', { name: 'Task title' }), {
     target: { value: 'Verify offline flow' },
   });

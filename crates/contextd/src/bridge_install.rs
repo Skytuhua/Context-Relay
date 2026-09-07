@@ -731,6 +731,43 @@ fn execute_persisted(
     }
 }
 
+pub(crate) fn launch_info(
+    engine: &dyn BridgeInstallEngine,
+    vault: &Vault,
+    device: DeviceId,
+    selection: HarnessParams,
+) -> Result<context_relay_protocol::HarnessLaunchInfo, ClientError> {
+    let project = selection
+        .project_id
+        .ok_or_else(|| invalid("Choose a registered project before opening a harness"))?;
+    if !vault
+        .projects()
+        .map_err(|_| internal("Projects cannot be loaded"))?
+        .iter()
+        .any(|item| item.project_id == project)
+    {
+        return Err(not_found("The selected project is no longer registered"));
+    }
+    let binding = project_binding(vault, Some(project))?;
+    if !binding.root.is_dir() {
+        return Err(not_found("The registered project folder is unavailable"));
+    }
+    let report = engine.probe(vault, device, selection.clone())?;
+    let executable = report
+        .executable
+        .ok_or_else(|| not_found("Install this harness, then check again"))?;
+    let path = decode_wire_path(&executable)?;
+    if !path.is_absolute() || !path.is_file() {
+        return Err(not_found(
+            "The discovered harness executable is unavailable",
+        ));
+    }
+    Ok(context_relay_protocol::HarnessLaunchInfo {
+        selection,
+        executable,
+        project_root: wire_native_path(&binding.root),
+    })
+}
 struct ProjectBinding {
     project_id: ProjectId,
     root: PathBuf,
@@ -1910,5 +1947,108 @@ pub(crate) mod tests {
                 .insert(credential_id.into(), key.to_vec());
             Ok(())
         }
+    }
+    struct LaunchProbe {
+        executable: WireNativeValue,
+    }
+    impl BridgeInstallEngine for LaunchProbe {
+        fn probe(
+            &self,
+            _: &Vault,
+            _: DeviceId,
+            _: HarnessParams,
+        ) -> Result<ProbeReport, ClientError> {
+            Ok(ProbeReport {
+                executable: Some(self.executable.clone()),
+                executable_sha256: None,
+                harness_version: None,
+                installation_method: context_relay_protocol::InstallationMethod::Manual,
+                config_roots: vec![],
+                active_profile: None,
+                policy_conflicts: vec![],
+                capability: context_relay_protocol::CapabilityLevel::Full,
+                codex_saved_hook_approval: None,
+            })
+        }
+        fn reconcile_after_native_recovery(
+            &self,
+            _: &mut Vault,
+            _: &Path,
+            _: DeviceId,
+        ) -> Result<(), ClientError> {
+            panic!("launch information must not mutate setup")
+        }
+        fn preview(
+            &self,
+            _: &mut Vault,
+            _: &Path,
+            _: DeviceId,
+            _: HarnessParams,
+        ) -> Result<SetupPlan, ClientError> {
+            panic!("launch information must not prepare setup")
+        }
+        fn apply(
+            &self,
+            _: &mut Vault,
+            _: &Path,
+            _: DeviceId,
+            _: PlanParams,
+        ) -> Result<(), ClientError> {
+            panic!("launch information must not apply setup")
+        }
+        fn rollback(
+            &self,
+            _: &mut Vault,
+            _: &Path,
+            _: DeviceId,
+            _: PlanParams,
+        ) -> Result<(), ClientError> {
+            panic!("launch information must not undo setup")
+        }
+    }
+    #[test]
+    fn connection_check_launch_info_only_returns_registered_existing_directory_and_discovered_executable()
+     {
+        let temp = TempVault::new("launch-info");
+        let mut vault =
+            Vault::open(temp.path(), "launch-info", &MemoryKeyStore::default()).unwrap();
+        let root = temp.path().parent().unwrap();
+        let executable = root.join("harness.exe");
+        fs::write(&executable, b"test fixture; never executed").unwrap();
+        let engine = LaunchProbe {
+            executable: wire_native_path(&executable),
+        };
+        let project: ProjectId = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f".parse().unwrap();
+        let device = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f".parse().unwrap();
+        let selection = HarnessParams {
+            harness: HarnessId::Codex,
+            project_id: Some(project),
+            hermes_profile: None,
+        };
+        assert!(launch_info(&engine, &vault, device, selection.clone()).is_err());
+        vault
+            .put_project(&context_relay_protocol::ProjectIdentity {
+                project_id: project,
+                github_repository_id: None,
+                git_remote_fingerprint: None,
+                monorepo_subdirectory: None,
+                name: "Launch fixture".into(),
+            })
+            .unwrap();
+        assert!(launch_info(&engine, &vault, device, selection.clone()).is_err());
+        vault
+            .put_path(&project.to_string(), &wire_native_path(root))
+            .unwrap();
+        let info = launch_info(&engine, &vault, device, selection.clone()).unwrap();
+        assert_eq!(info.selection, selection);
+        assert_eq!(
+            info.project_root,
+            wire_native_path(&fs::canonicalize(root).unwrap())
+        );
+        assert_eq!(info.executable, engine.executable);
+        vault
+            .put_path(&project.to_string(), &wire_native_path(&executable))
+            .unwrap();
+        assert!(launch_info(&engine, &vault, device, selection).is_err());
     }
 }

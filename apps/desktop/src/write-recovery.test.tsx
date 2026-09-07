@@ -30,6 +30,7 @@ it('refreshes suggestions after an inline recovered review clears a quota failur
   } as unknown as WorkspaceGateway;
   render(<App gateway={workspace} />);
   await screen.findByText('Ready on this computer');
+  fireEvent.click(screen.getByRole('button', { name: 'Context' }));
   fireEvent.click(screen.getByRole('button', { name: 'Suggestions' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Accept Use TypeScript' }));
   await screen.findByText(/Recovery storage is full/);
@@ -46,7 +47,8 @@ it('lets a user clear full recovery storage without leaving or losing the curren
   } as unknown as WorkspaceGateway;
   render(<App gateway={workspace} />);
   await screen.findByText('Ready on this computer');
-  fireEvent.click(screen.getByRole('button', { name: 'Saved context' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Context' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Add context' }));
   fireEvent.change(screen.getByRole('textbox', { name: 'Title' }), { target: { value: 'Unsaved decision' } });
   fireEvent.change(screen.getByRole('textbox', { name: 'What should your harness remember?' }), { target: { value: 'Do not lose this draft.' } });
   fireEvent.click(screen.getByRole('button', { name: 'Save context' }));
@@ -66,9 +68,9 @@ it('keeps App navigation locked until an explicit recovery retry finishes', asyn
   render(<App gateway={workspace} />);
   fireEvent.click(await screen.findByRole('button', { name: 'Review change: Use TypeScript' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Retry change' }));
-  expect(screen.getByRole('button', { name: 'Saved context' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Context' })).toBeDisabled();
   await act(async () => resolve({ cleanupPending: false }));
-  expect(screen.getByRole('button', { name: 'Saved context' })).toBeEnabled();
+  expect(screen.getByRole('button', { name: 'Context' })).toBeEnabled();
 });
 
 it('reads on startup and review, then retries only after an explicit click', async () => {

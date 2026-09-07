@@ -4,16 +4,17 @@ import { type HarnessGateway, validateHarnessPlan, validateHarnessProbe } from '
 import { useHarnessExecution } from './use-harness-execution';
 import { useHarnessPreparation } from './use-harness-preparation';
 import { isServiceVersionMismatch, SERVICE_UPDATE_GUIDANCE } from './service-error';
+import { copyHarnessCommand, openHarness } from './harness-launch';
 
 const harnessNames: Record<HarnessId, string> = { claude_code: 'Claude Code', codex: 'Codex', hermes: 'Hermes' };
 type ReviewedPlan = { plan: SetupPlan; params: HarnessParams; projectName: string; state?: HarnessSetupState };
 type BusyAction = 'preview' | 'loading' | 'checking' | 'preparing' | 'apply' | 'rollback' | null;
 
-export function HarnessesScreen({ gateway, projects, preferredProjectId, onProjectChange, onAddProject, onSaveContext, active = true }: { gateway: HarnessGateway; projects: ProjectIdentity[]; preferredProjectId?: string; onProjectChange?: (id: string) => void; onAddProject?: () => void; onSaveContext?: () => void; active?: boolean }) {
+export function HarnessesScreen({ gateway, projects, preferredProjectId, preferredHarness, preferredHermesProfile = 'default', onProfileChange, embedded = false, onBusy, onProjectChange, onAddProject, onSaveContext, active = true }: { gateway: HarnessGateway; projects: ProjectIdentity[]; preferredProjectId?: string; preferredHarness?: HarnessId; preferredHermesProfile?: string; onProfileChange?: (profile: string) => void; embedded?: boolean; onBusy?: (busy: boolean) => void; onProjectChange?: (id: string) => void; onAddProject?: () => void; onSaveContext?: () => void; active?: boolean }) {
   const [selectedProjectId, setProjectId] = useState<string | null>(null);
   const projectId = preferredProjectId ?? selectedProjectId ?? projects[0]?.projectId ?? '';
   const [harness, setHarness] = useState<HarnessId>('codex');
-  const [profile, setProfile] = useState('default');
+  const [profile, setProfile] = useState(preferredHermesProfile);
   const canonicalProfile = profile.trim().replace(/[A-Z]/g, (letter) => letter.toLowerCase());
   const validProfile = /^[a-z0-9][a-z0-9_-]{0,63}$/.test(canonicalProfile);
   const [review, setReview] = useState<ReviewedPlan | null>(null);
@@ -31,6 +32,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   const [localBusy, setBusy] = useState<BusyAction>(null);
   const busy: BusyAction = localBusy ?? (execution.busy ? execution.pending?.action ?? 'checking' : preparation.busy ? 'preparing' : null);
   const [error, setError] = useState<string | null>(null);
+  const [launchNotice, setLaunchNotice] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now);
   const busyRef = useRef<BusyAction>(null);
   const generation = useRef(0);
@@ -43,6 +45,17 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   const matching = review !== null && (review.params.projectId === null || review.params.projectId === project?.projectId) &&
     review.params.harness === harness && review.params.hermesProfile === (harness === 'hermes' ? canonicalProfile : null);
   const canApply = approved && matching && !expired && !conflicts && !busy;
+
+  useEffect(() => { onBusy?.(!!busy); }, [busy, onBusy]);
+
+  useEffect(() => {
+    if (!preferredHarness || preferredHarness === harness) return;
+    generation.current += 1;
+    setHarness(preferredHarness);
+    setReview(null);
+    setDiscovery(null);
+    setApproved(false);
+  }, [preferredHarness, harness]);
 
   useEffect(() => {
     if (!active) return;
@@ -238,28 +251,38 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
   return (
     <section className="screen-content harness-connection" aria-label="Harness connection">
       <form className="capture-form" aria-label="Review harness setup" onSubmit={(event) => { event.preventDefault(); void previewSetup(); }}>
-        <h2>Connect a harness</h2>
-        <p>Choose your project and harness to check compatibility and review the settings.</p>
-        <div className="field">
+        <h2>{embedded ? `Connect ${harnessNames[harness]}` : 'Connect a harness'}</h2>
+        <p>{embedded ? `Review the changes for ${project?.name ?? 'your project'}, then save the settings you approve.` : 'Choose your project and harness to check compatibility and review the settings.'}</p>
+        {!embedded && <div className="field">
           <label htmlFor="harness-project">Project</label>
           <select id="harness-project" value={projectId} disabled={busy === 'apply' || busy === 'rollback' || preparation.busy} onChange={(event) => { clearReview(); if (onProjectChange) onProjectChange(event.target.value); else setProjectId(event.target.value); }}>
             <option value="">Choose your project</option>
             {projects.map((item) => <option key={item.projectId} value={item.projectId}>{item.name}</option>)}
           </select>
-        </div>
-        <div className="field">
+        </div>}
+        {!embedded && <div className="field">
           <label htmlFor="harness-kind">Harness</label>
           <select id="harness-kind" value={harness} disabled={busy === 'apply' || busy === 'rollback' || preparation.busy} onChange={(event) => { clearReview(); setHarness(event.target.value as HarnessId); }}>
             {Object.entries(harnessNames).map(([id, name]) => <option key={id} value={id}>{name}</option>)}
           </select>
-        </div>
+        </div>}
         {harness === 'hermes' && <div className="field">
           <label htmlFor="hermes-profile">Hermes profile</label>
-          <input id="hermes-profile" value={profile} maxLength={64} required aria-invalid={!validProfile} aria-describedby="hermes-profile-help" disabled={busy === 'apply' || busy === 'rollback' || preparation.busy} onChange={(event) => { clearReview(); setProfile(event.target.value); }} />
+          <input id="hermes-profile" value={profile} maxLength={64} required aria-invalid={!validProfile} aria-describedby="hermes-profile-help" disabled={busy === 'apply' || busy === 'rollback' || preparation.busy} onChange={(event) => { clearReview(); setProfile(event.target.value); const next = event.target.value.trim().toLowerCase(); if (/^[a-z0-9][a-z0-9_-]{0,63}$/.test(next)) onProfileChange?.(next); }} />
           <p id="hermes-profile-help">Use a profile name, such as default or coder. Leave default selected unless you created another profile. Folder paths are not profile names.</p>
         </div>}
         <button className="primary-action" type="submit" disabled={!!busy || preparation.target !== null || !project || (harness === 'hermes' && !validProfile)}>{busy === 'preview' ? 'Checking harness…' : 'Review setup'}</button>
       </form>
+      {project && <section className="help-content" aria-label="Open harness for project">
+        <p>Open {harnessNames[harness]} in <strong>{project.name}</strong> to review its sign-in or project approval prompts. Return here and check again when you finish.</p>
+        <div className="toolbar-actions"><button type="button" disabled={!!busy} onClick={() => {
+          setLaunchNotice(null);
+          void openHarness({ harness, projectId: project.projectId, hermesProfile: harness === 'hermes' ? canonicalProfile : null }).then(() => setLaunchNotice('Harness window opened. Review any prompts there, then return here.')).catch(() => setError('The harness window could not open. Use Copy command and run it in PowerShell, or check that the harness is installed.'));
+        }}>Open {harnessNames[harness]} for this project</button><button type="button" disabled={!!busy} onClick={() => {
+          void copyHarnessCommand({ harness, projectId: project.projectId, hermesProfile: harness === 'hermes' ? canonicalProfile : null }).then(() => setLaunchNotice('Command copied. Paste it into PowerShell to open your harness in this project.')).catch(() => setError('The command could not be copied. Check the installed harness and registered project folder, then try again.'));
+        }}>Copy command</button><button type="button" disabled={!!busy} onClick={() => void previewSetup()}>Check again</button></div>
+        {launchNotice && <p role="status">{launchNotice}</p>}
+      </section>}
       {error && <p className="form-error" role="alert" ref={errorRef} tabIndex={-1}>{error}</p>}
       {preparation.error && <p className="form-error" role="alert">{preparation.error}{preparation.target && <button type="button" onClick={preparation.checkAgain}>Check preparation</button>}</p>}
       {preparation.target && <section className="record-card" aria-label="Harness preparation">
@@ -319,6 +342,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, onProje
         <button className="primary-action" type="button" disabled={!canApply} onClick={() => void applySetup()}>{review.state === 'applying' ? 'Resume save' : 'Save settings'}</button>
       </section>}
       {(history.length > 0 || nextAfter !== null || historyError || historyLoading) && <section aria-label="Recent setup changes">
+        <p className="help-text">Undo setup restores the harness settings from before that connection setup. Review the saved changes before you undo them.</p>
         <h2>Recent setup changes</h2>
         {historyError && <p className="form-error" role="alert">{historyError} <button type="button" disabled={!!busy} onClick={() => refreshHistory(value => value + 1)}>Reload history</button></p>}
         {historyLoading && <p role="status">Loading saved setups…</p>}
@@ -404,12 +428,12 @@ function SavedHookApprovals({ approval }: { approval: SavedMemoryHookApproval })
     changed: 'Changed — review again', disabled: 'Disabled in saved settings',
   };
   return <section className="record-card connection-result" aria-label="Saved Codex hook approvals">
-    <h3>Saved Codex hook approvals</h3>
+    <h3>Automatic context in Codex</h3>
     <dl>
-      <dt>Load context when a session starts</dt><dd>{labels[approval.sessionStart]}</dd>
-      <dt>Collect context when a response finishes</dt><dd>{labels[approval.stop]}</dd>
+      <dt>Allow Context Relay to load context when a session starts</dt><dd>{labels[approval.sessionStart]}</dd>
+      <dt>Allow Context Relay to collect suggestions after a response</dt><dd>{labels[approval.stop]}</dd>
     </dl>
-    <p>These saved approvals do not confirm that hooks are enabled or that context is being shared.</p>
+    <p>Loading context brings useful saved notes into a new session. Collected suggestions wait for your review before becoming saved context. Test a note to verify the connection.</p>
     <p className="help-text">This checks the user settings for the selected Codex installation. Select Review setup to refresh.</p>
   </section>;
 }
@@ -418,7 +442,7 @@ function SetupNextSteps({ item }: { item: ReviewedPlan }) {
   return <section aria-label={`Finish setup for ${label(item)}`}>
     <h4>Connection has not been verified</h4>
     {item.params.harness === 'codex' ? <>
-      <p>Codex needs your approval to run the session hooks that load and collect context.</p>
+      <p>Allow Context Relay to load context when a session starts, so you do not have to repeat project facts. Codex asks you to approve these automatic actions.</p>
       <ol>
         <li>Open the Codex CLI in the folder for {item.projectName}.</li>
         <li>Enter <code>/hooks</code>. Review the Context Relay commands for <code>SessionStart</code> and <code>Stop</code>, then trust each command you approve.</li>

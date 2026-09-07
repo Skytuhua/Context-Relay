@@ -27,7 +27,8 @@ it.each([
   fireEvent.click(screen.getByRole('button', { name: 'Review setup' }));
   const status = await screen.findByRole('region', { name: 'Saved Codex hook approvals' });
   expect(within(status).getAllByText(label)).toHaveLength(2);
-  expect(within(status).getByText(/do not confirm that hooks are enabled or that context is being shared/)).toBeVisible();
+  expect(within(status).getByRole('heading', { name: 'Automatic context in Codex' })).toBeVisible();
+  expect(within(status).getByText(/Test a note to verify the connection/)).toBeVisible();
   expect(gateway.harnessPreview).not.toHaveBeenCalled();
   expect(gateway.harnessApply).not.toHaveBeenCalled();
   expect(screen.queryByText('Connected')).not.toBeInTheDocument();

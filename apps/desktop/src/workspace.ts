@@ -1,5 +1,7 @@
 import type {
   Base64Url,
+  ConnectionCheckStatus,
+  ConnectionCheckStartParams,
   CandidateId,
   DesktopWrite,
   DesktopWritesPage,
@@ -33,7 +35,7 @@ import type {
 import { LocalClient } from './local-client';
 import { uuidV7 } from './uuid';
 import { type HarnessGateway, requireHarnessAcknowledgment, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
-import { validateHarnessPreparation, validateHarnessExecution, validateHarnessSetupRecord, validateHarnessSetupsPage, validateSearchIndexStatus } from './protocol-validation';
+import { validateConnectionCheckStatus, validateHarnessPreparation, validateHarnessExecution, validateHarnessSetupRecord, validateHarnessSetupsPage, validateSearchIndexStatus } from './protocol-validation';
 
 export type PairingInviteResult = Extract<LocalResult, { kind: 'pairing_invite' }>;
 export type PairingRequestResult = Extract<LocalResult, { kind: 'pairing_request' }>;
@@ -89,6 +91,9 @@ export interface DeviceGateway {
 }
 
 export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
+  connectionCheckStart(params: ConnectionCheckStartParams): Promise<ConnectionCheckStatus>;
+  connectionCheckStatus(checkId: OperationId): Promise<ConnectionCheckStatus>;
+  connectionCheckCancel(checkId: OperationId): Promise<ConnectionCheckStatus>;
   pendingWrites(after: OperationId | null): Promise<DesktopWritesPage>;
   pendingWrite(operationId: OperationId): Promise<DesktopWrite | null>;
   retryWrite(write: DesktopWrite): Promise<{ cleanupPending: boolean }>;
@@ -123,6 +128,28 @@ export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
 }
 
 export class LocalWorkspaceGateway implements WorkspaceGateway {
+  async connectionCheckStart(params: ConnectionCheckStartParams): Promise<ConnectionCheckStatus> {
+    const result = await this.call({ method: 'connection_check_start', params });
+    const status = validateConnectionCheckStatus(harnessResult(result, 'connection_check', 'status'));
+    if (status.memoryId !== params.memoryId || status.expectedRevision !== params.expectedRevision ||
+      status.selection.harness !== params.selection.harness || status.selection.projectId !== params.selection.projectId ||
+      status.selection.hermesProfile !== params.selection.hermesProfile) throw new Error('The connection check does not match your selection.');
+    return status;
+  }
+
+  async connectionCheckStatus(checkId: OperationId): Promise<ConnectionCheckStatus> {
+    const result = await this.call({ method: 'connection_check_status', params: { checkId } });
+    const status = validateConnectionCheckStatus(harnessResult(result, 'connection_check', 'status'));
+    if (status.checkId !== checkId) throw new Error('The connection check identity changed.');
+    return status;
+  }
+
+  async connectionCheckCancel(checkId: OperationId): Promise<ConnectionCheckStatus> {
+    const result = await this.call({ method: 'connection_check_cancel', params: { checkId } });
+    const status = validateConnectionCheckStatus(harnessResult(result, 'connection_check', 'status'));
+    if (status.checkId !== checkId) throw new Error('The connection check identity changed.');
+    return status;
+  }
   private pendingProject: { name: string; pathKey: string; project: ProjectIdentity } | null = null;
   private readonly pendingOperations = new Map<string, { operationId: OperationId; createsRecord: boolean }>();
   private readonly draftAttempts = new WeakMap<object, number>();

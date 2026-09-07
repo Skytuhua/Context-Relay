@@ -16,27 +16,29 @@ const gateway = {
 afterEach(cleanup);
 
 it('explains the ordered first-use journey before presenting a project form', async () => {
-  render(<App gateway={gateway} />);
-  await screen.findByText('Ready on this computer');
-  const steps = screen.getByRole('list', { name: 'How Context Relay works' });
-  expect(within(steps).getAllByRole('listitem').map((item) => within(item).getByRole('heading').textContent))
-    .toEqual(['Choose a project', 'Save useful context', 'Connect a harness']);
-  fireEvent.click(screen.getByRole('button', { name: 'Add your project folder' }));
+  localStorage.clear();
+  render(<App gateway={{ ...gateway, harnessProbe: async () => ({ capability: 'missing', harnessVersion: null }) as never }} />);
+  await screen.findByRole('heading', { name: 'Choose harnesses' });
+  const steps = screen.getByRole('list', { name: 'Setup progress' });
+  expect(within(steps).getAllByRole('listitem').map(item => item.textContent?.replace(/^\d/, '')))
+    .toEqual(['Choose harnesses', 'Choose a project', 'Connect harnesses', 'Try saved context', 'Explore your dashboard']);
+  expect(screen.queryByRole('form', { name: 'Add project' })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Codex' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
   expect(screen.getByRole('form', { name: 'Add project' })).toBeVisible();
 });
 
-it('returns a newly added project to Home with saving context before connecting', async () => {
+it('returns a newly added project to Dashboard with useful context and harness actions', async () => {
   render(<App gateway={{ ...gateway, createProject: async () => project }} />);
-  fireEvent.click(await screen.findByRole('button', { name: 'Add your project folder' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Choose a project' }));
   fireEvent.change(screen.getByLabelText('Project folder'), { target: { value: 'C:\\Work\\website' } });
   fireEvent.change(screen.getByLabelText('Project name'), { target: { value: project.name } });
   fireEvent.submit(screen.getByRole('form', { name: 'Add project' }));
   await screen.findByText('Project added');
-  expect(screen.getByRole('heading', { name: 'Home', level: 1 })).toBeVisible();
+  expect(screen.getByRole('heading', { name: 'Dashboard', level: 1 })).toBeVisible();
   expect(screen.getByRole('combobox', { name: 'Current project' })).toHaveValue(project.projectId);
-  const actions = within(screen.getByRole('group', { name: 'Next steps' })).getAllByRole('button');
-  expect(actions.map((button) => button.textContent)).toEqual(['Save context', 'Connect a harness']);
-  fireEvent.click(actions[0]);
+  expect(screen.getByRole('button', { name: 'Open Harnesses' })).toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: 'Add context' }));
   expect(screen.getByRole('form', { name: 'New context' })).toBeVisible();
 });
 

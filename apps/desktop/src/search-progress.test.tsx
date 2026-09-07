@@ -18,7 +18,7 @@ async function open(gateway: WorkspaceGateway) {
   vi.useFakeTimers();
   render(<App gateway={gateway} />);
   await act(async () => {});
-  fireEvent.click(screen.getByRole('button', { name: 'Saved context' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Context' }));
   await act(async () => {});
 }
 
@@ -64,9 +64,9 @@ it('ignores an old query result after a newer query and after leaving Saved cont
   expect(screen.queryByRole('heading', { name: 'Old match' })).not.toBeInTheDocument();
   fireEvent.change(input, { target: { value: 'old' } }); fireEvent.submit(screen.getByRole('search'));
   await act(async () => {});
-  fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Dashboard' }));
   await act(async () => { finishOld([record('Old match')]); });
-  fireEvent.click(screen.getByRole('button', { name: 'Saved context' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Context' }));
   await act(async () => {});
   expect(screen.getByRole('heading', { name: 'Keyword match' })).toBeVisible();
   expect(screen.queryByRole('heading', { name: 'Old match' })).not.toBeInTheDocument();

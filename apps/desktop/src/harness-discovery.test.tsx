@@ -46,7 +46,7 @@ it.each([
   });
   await open(); preview();
   expect(await screen.findByText(message)).toBeVisible();
-  expect(screen.getByRole('heading', { name: capability === 'missing' ? 'Codex' : 'Codex 0.144.6' })).toHaveFocus();
+  await waitFor(() => expect(screen.getByRole('heading', { name: capability === 'missing' ? 'Codex' : 'Codex 0.144.6' })).toHaveFocus());
   if (capability !== 'missing') expect(screen.getByText(/0\.144\.6/)).toBeVisible();
   expect(requests).toEqual([{ method: 'harness_probe', params }]);
   expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();

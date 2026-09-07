@@ -5,25 +5,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import App from './App';
 import { PROTOCOL_VERSION } from './bindings';
+import { defaultPreferences, savePreferences } from './desktop-preferences';
 import type { WorkspaceGateway } from './workspace';
 
-const destinations = [
-  'Home',
-  'Projects',
-  'Saved context',
-  'Suggestions',
-  'Tasks',
-  'Harnesses',
-  'Devices',
-  'Settings',
-] as const;
+const destinations = ['Dashboard', 'Context', 'Tasks', 'Harnesses', 'Projects', 'Help', 'Settings'] as const;
 
 const gateway = {
   harnessExecutionCurrent: async () => null,
   harnessSetupsList: async () => ({ setups: [], nextAfter: null }),
   pendingWrites: async () => ({ writes: [], nextCursor: null }),
   status: async () => ({
-    protocol: { min: { major: 1, minor: 11 }, max: { major: 1, minor: 11 } },
+    protocol: { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
     vault: 'unlocked',
     resolvedProject: null,
     sync: 'offline',
@@ -44,6 +36,10 @@ const gateway = {
 
 describe('App', () => {
   beforeEach(() => {
+    localStorage.clear();
+    const preferences = defaultPreferences();
+    preferences.setup.status = 'complete';
+    savePreferences(preferences);
     HTMLDialogElement.prototype.showModal = function showModal() {
       this.setAttribute('open', '');
     };
@@ -78,7 +74,7 @@ describe('App', () => {
     await act(async () => {});
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.getByLabelText('Project name')).toHaveValue('Unsaved project');
-    fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Dashboard' }));
     expect(screen.getByText('Ready on this computer')).toBeVisible();
     expect(screen.getByText('Ready on this computer')).toBeVisible();
   });
@@ -116,7 +112,8 @@ describe('App', () => {
     expect(alert).toHaveTextContent('Context Relay and its local service use different versions');
     expect(alert).toHaveTextContent('run the latest installer');
     expect(alert).not.toHaveTextContent('PRIVATE NATIVE DETAILS');
-    expect(screen.getByRole('button', { name: 'Add your project folder' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Projects' }));
+    expect(screen.getByRole('button', { name: 'Add project' })).toBeDisabled();
     mismatch = false;
     fireEvent.click(screen.getByRole('button', { name: 'Retry connection' }));
     await screen.findByText('Ready on this computer');
@@ -154,7 +151,8 @@ describe('App', () => {
   it('reports associated validation errors without echoing submitted plaintext', async () => {
     render(<App gateway={gateway} />);
     await screen.findByText('Ready on this computer');
-    fireEvent.click(screen.getByRole('button', { name: 'Saved context' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Context' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add context' }));
     const form = await screen.findByRole('form', { name: 'New context' });
     fireEvent.submit(form);
     expect(form).toHaveAttribute('aria-describedby', 'workspace-error');
@@ -162,11 +160,23 @@ describe('App', () => {
     expect(screen.getByRole('alert')).not.toHaveTextContent('Saved context');
   });
 
+  it('reaches device management through Settings and suggestions through Context', async () => {
+    render(<App gateway={gateway} />);
+    await screen.findByText('Ready on this computer');
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Manage devices' }));
+    expect(screen.getByRole('heading', { level: 1, name: 'Devices' })).toHaveFocus();
+    fireEvent.click(screen.getByRole('button', { name: 'Context' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Suggestions' }));
+    expect(screen.getByRole('heading', { level: 1, name: 'Suggestions' })).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Context' })).toHaveAttribute('aria-current', 'page');
+  });
+
   it('keeps all workspace persistence behind the typed client', () => {
     for (const file of ['App.tsx', 'devices.tsx', 'workspace.ts', 'local-client.ts']) {
       const source = readFileSync(new URL(file, import.meta.url), 'utf8');
       expect(source).not.toMatch(
-        /localStorage|sessionStorage|indexedDB|navigator\.clipboard|createObjectURL|\bdownload\b/,
+        /localStorage|sessionStorage|indexedDB|createObjectURL|\bdownload\b/,
       );
     }
   });
