@@ -186,7 +186,11 @@ it('discovers a running save after remount and postpones ordinary history reads'
   await screen.findByText('Saving harness settings…');
   view.unmount();
   invoke.mockClear();
-  await open(false);
+  render(<App gateway={new LocalWorkspaceGateway()} />);
+  await screen.findByText('Ready on this computer');
+  // Let the dashboard read start before navigating, rather than racing its cancellation.
+  await waitFor(() => expect(invoke.mock.calls.filter(call => call[1]?.request?.method === 'harness_setups_list')).toHaveLength(1));
+  fireEvent.click(screen.getByRole('button', { name: 'Harnesses' }));
   await screen.findByText('Saving harness settings…');
   const dashboardHistoryReads = invoke.mock.calls.filter(call => call[1]?.request?.method === 'harness_setups_list').length;
   expect(dashboardHistoryReads).toBe(1); // One dashboard read; Harnesses must defer its own history read.
