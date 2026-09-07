@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import type { HarnessExecutionParams, HarnessExecutionStatus, HarnessSetupRecord } from './bindings';
+import type { HarnessExecutionParams, HarnessExecutionStatus } from './bindings';
 import type { HarnessGateway } from './harness-gateway';
 
-export type HarnessOutcome = { status: HarnessExecutionStatus; setup: HarnessSetupRecord };
+import { observeHarnessExecution, type HarnessOutcome } from './harness-execution-observer';
+
+export type { HarnessOutcome } from './harness-execution-observer';
 
 /** Observing/reconnecting never retries a settings mutation. */
 export function useHarnessExecution(gateway: HarnessGateway, active: boolean) {
@@ -17,51 +19,12 @@ export function useHarnessExecution(gateway: HarnessGateway, active: boolean) {
 
   useEffect(() => {
     if (!active || starting) return;
-    let canceled = false;
-    let timer: number | undefined;
-    let key = target;
-    let discover = true;
-    setChecking(true);
-    async function poll() {
-      try {
-        let status: HarnessExecutionStatus | null;
-        if (discover) {
-          const current = await gateway.harnessExecutionCurrent();
-          if (canceled) return;
-          if (current && (current.phase === 'queued' || current.phase === 'running' || !key)) {
-            status = current;
-          } else {
-            status = key ? await gateway.harnessExecutionStatus(key) : current;
-          }
-          discover = false;
-        } else {
-          status = key ? await gateway.harnessExecutionStatus(key) : await gateway.harnessExecutionCurrent();
-        }
-        if (canceled) return;
-        if (!status) {
-          setChecking(false); setPending(null); setError(null);
-          return;
-        }
-        key = { planId: status.planId, action: status.action };
-        if (status.phase === 'queued' || status.phase === 'running') {
-          setPending(status); setChecking(false); setError(null);
-          timer = window.setTimeout(() => void poll(), 1000);
-          return;
-        }
-        // Finished is only an attempt hint. Read the exact persisted plan, including
-        // after Unknown (daemon restart), before displaying any result.
-        const setup = await gateway.harnessSetupGet(status.planId);
-        if (canceled) return;
-        setOutcome({ status, setup }); setPending(null); setChecking(false); setError(null);
-      } catch {
-        if (canceled) return;
-        setError(key ? 'The setup result could not be confirmed. Reconnecting to check the same setup…' : 'Could not load setup progress. Reconnecting…');
-        setChecking(false);
-        timer = window.setTimeout(() => void poll(), 2000);
-      }
-    }
-    void poll();
-    return () => { canceled = true; window.clearTimeout(timer); };
+    return observeHarnessExecution(gateway, target, {
+      onChecking: setChecking,
+      onPending: setPending,
+      onOutcome: setOutcome,
+      onError: setError,
+    });
   }, [active, gateway, target, starting, revision]);
 
   async function execute(key: HarnessExecutionParams) {
