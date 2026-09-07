@@ -1061,6 +1061,8 @@ pub(crate) mod tests {
         use context_relay_protocol::{
             ClientRole, EmptyParams, LocalRequest, LocalResult, RecordId,
         };
+        #[cfg(target_os = "macos")]
+        use std::os::unix::fs::PermissionsExt as _;
         use std::panic::{AssertUnwindSafe, catch_unwind};
         use std::sync::Arc;
 
@@ -1085,10 +1087,17 @@ pub(crate) mod tests {
             #[cfg(target_os = "macos")]
             let temp = tempfile::Builder::new()
                 .prefix("cr-pj-")
+                .permissions(std::fs::Permissions::from_mode(0o700))
                 .tempdir_in("/tmp")
                 .unwrap();
             #[cfg(not(target_os = "macos"))]
             let temp = tempfile::tempdir().unwrap();
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                std::fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "fixture IPC root must meet the transport's owner-only permission requirement"
+            );
             let runtime = RuntimeConfig::for_test(
                 format!("pre-journal-{}", uuid::Uuid::now_v7()),
                 Some(temp.path().to_owned()),
