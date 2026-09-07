@@ -20,6 +20,15 @@ pub(crate) fn run_in_owned_job(
     command: &mut Command,
     timeout: Duration,
 ) -> Result<std::process::ExitStatus, &'static str> {
+    run_in_owned_job_with_output_limit(command, timeout, &[], u64::MAX)
+}
+
+pub(crate) fn run_in_owned_job_with_output_limit(
+    command: &mut Command,
+    timeout: Duration,
+    output_paths: &[&std::path::Path],
+    output_limit: u64,
+) -> Result<std::process::ExitStatus, &'static str> {
     // SAFETY: null attributes create a non-inheritable handle owned below.
     let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     assert!(!raw.is_null(), "{}", std::io::Error::last_os_error());
@@ -50,6 +59,11 @@ pub(crate) fn run_in_owned_job(
     child.stdin.take().unwrap().write_all(b"run").unwrap();
     let started = Instant::now();
     loop {
+        if output_paths.iter().any(|path| {
+            std::fs::metadata(path).map_or(true, |metadata| metadata.len() > output_limit)
+        }) {
+            return Err("Contained fixture exceeded output limit");
+        }
         if let Some(status) = child.try_wait().unwrap() {
             return Ok(status);
         }
