@@ -565,3 +565,22 @@ it('does not claim built-in memory is disabled when no such change is planned', 
   expect(screen.getByText('Codex connection')).toBeVisible();
   expect(screen.queryByText(/Turn off Codex’s built-in memory/)).not.toBeInTheDocument();
 });
+
+
+it.each(['pending', 'failed'] as const)('keeps acknowledged Undo available when post-save history is %s', async mode => {
+  // An empty/filtered page is not evidence that the explicitly acknowledged
+  // setup is missing. The post-save history refresh is a separate read.
+  const history = vi.spyOn(LocalWorkspaceGateway.prototype, 'harnessSetupsList').mockResolvedValue({ setups: [], nextAfter: null });
+  await open(); await review();
+  await act(async () => {});
+  const page = deferred<Awaited<ReturnType<LocalWorkspaceGateway['harnessSetupsList']>>>();
+  history.mockImplementation(() => mode === 'pending' ? page.promise : Promise.reject(new Error('history unavailable')));
+  approve();
+  await screen.findByText(/Settings saved:/);
+  const undo = screen.getByRole('button', { name: 'Undo setup 0C07398F for Codex for Research' });
+  expect(undo).toBeEnabled();
+  fireEvent.click(undo);
+  // ClearOutcome while loading the confirmation must not discard this row.
+  expect(await screen.findByRole('button', { name: 'Undo setup changes' })).toBeEnabled();
+  expect(requests.filter(request => request.method === 'harness_execution_start')).toHaveLength(1);
+});

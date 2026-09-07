@@ -1,6 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { HarnessId, HarnessParams } from './bindings';
 
+/** Presentation only. Native commands remain responsible for validating the platform and paths. */
+export function harnessLaunchPresentation(userAgent = navigator.userAgent) {
+  const canOpenWindow = userAgent.includes('Windows');
+  return { canOpenWindow, terminal: canOpenWindow ? 'PowerShell' : 'Terminal' };
+}
+
 /** Opens an interactive terminal. The harness still owns sign-in and trust prompts. */
 export function openHarness(selection: HarnessParams): Promise<void> {
   return invoke<void>('open_harness', { selection });

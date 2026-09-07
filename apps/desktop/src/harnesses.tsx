@@ -4,7 +4,7 @@ import { type HarnessGateway, validateHarnessPlan, validateHarnessProbe } from '
 import { useHarnessExecution } from './use-harness-execution';
 import { useHarnessPreparation } from './use-harness-preparation';
 import { isServiceVersionMismatch, SERVICE_UPDATE_GUIDANCE } from './service-error';
-import { copyHarnessCommand, openHarness } from './harness-launch';
+import { copyHarnessCommand, harnessLaunchPresentation, openHarness } from './harness-launch';
 
 const harnessNames: Record<HarnessId, string> = { claude_code: 'Claude Code', codex: 'Codex', hermes: 'Hermes' };
 type ReviewedPlan = { plan: SetupPlan; params: HarnessParams; projectName: string; state?: HarnessSetupState };
@@ -23,6 +23,9 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
   const execution = useHarnessExecution(gateway, active);
   const preparation = useHarnessPreparation(gateway, active);
   const [history, setHistory] = useState<HarnessSetupSummary[]>([]);
+  const historyGeneration = useRef(0);
+  const historyReadInFlight = useRef(false);
+  const { canOpenWindow, terminal } = harnessLaunchPresentation();
   const [nextAfter, setNextAfter] = useState<PlanId | null>(null);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -45,6 +48,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
   const matching = review !== null && (review.params.projectId === null || review.params.projectId === project?.projectId) &&
     review.params.harness === harness && review.params.hermesProfile === (harness === 'hermes' ? canonicalProfile : null);
   const canApply = approved && matching && !expired && !conflicts && !busy;
+  const shownHistory = includeObservedSetup(history, execution.outcome?.setup);
 
   useEffect(() => { onBusy?.(!!busy); }, [busy, onBusy]);
 
@@ -52,6 +56,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
     if (!preferredHarness || preferredHarness === harness) return;
     generation.current += 1;
     setHarness(preferredHarness);
+    setLaunchNotice(null);
     setReview(null);
     setDiscovery(null);
     setApproved(false);
@@ -71,20 +76,26 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
   }, [active, error]);
 
   useEffect(() => {
-    if (!active || execution.busy) return;
+    const revision = ++historyGeneration.current;
+    historyReadInFlight.current = false;
+    if (!active || execution.busy) { setHistoryLoading(false); return; }
     let canceled = false;
+    const current = () => !canceled && revision === historyGeneration.current;
     setHistoryLoading(true);
     gateway.harnessSetupsList().then(page => {
-      if (canceled) return;
-      setHistory(page.setups); setNextAfter(page.nextAfter); setHistoryError(null);
-    }).catch(() => { if (!canceled) setHistoryError('Saved setup history could not be loaded.'); })
-      .finally(() => { if (!canceled) setHistoryLoading(false); });
-    return () => { canceled = true; };
+      if (!current()) return;
+      setHistory(includeObservedSetup(page.setups, execution.outcome?.setup)); setNextAfter(page.nextAfter); setHistoryError(null);
+    }).catch(() => { if (current()) setHistoryError('Saved setup history could not be loaded.'); })
+      .finally(() => { if (current()) setHistoryLoading(false); });
+    return () => { canceled = true; historyGeneration.current += 1; };
   }, [gateway, active, execution.busy, execution.outcome, historyRevision]);
 
   useEffect(() => {
     if (!execution.outcome) return;
     const setup = execution.outcome.setup;
+    // Preserve the acknowledged record when starting another explicit action
+    // clears the transient outcome, even if the list refresh is unavailable.
+    setHistory(current => includeObservedSetup(current, setup));
     setDetails(current => new Map(current).set(setup.plan.planId, setup));
   }, [execution.outcome]);
 
@@ -96,6 +107,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
   useEffect(() => {
     if (active) return;
     generation.current += 1;
+    setLaunchNotice(null);
     setError(null);
     setReview(null);
     setDiscovery(null);
@@ -105,6 +117,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
 
   useEffect(() => {
     generation.current += 1;
+    setLaunchNotice(null);
     setError(null);
     setReview(current => current?.params.projectId === projectId || current?.params.projectId === null ? current : null);
     setDiscovery(null);
@@ -120,6 +133,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
 
   function clearReview() {
     generation.current += 1;
+    setLaunchNotice(null);
     setReview(null);
     setDiscovery(null);
     setApproved(false);
@@ -230,15 +244,37 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
   }
 
   async function loadMoreHistory() {
-    if (!nextAfter || historyLoading || busy) return;
+    if (!active || !nextAfter || historyLoading || historyReadInFlight.current || busy) return;
+    const revision = historyGeneration.current;
+    const current = () => mounted.current && revision === historyGeneration.current;
+    historyReadInFlight.current = true;
     setHistoryLoading(true);
     try {
       const page = await gateway.harnessSetupsList(nextAfter);
-      if (!mounted.current) return;
-      setHistory(current => [...current, ...page.setups.filter(item => !current.some(existing => existing.planId === item.planId))]);
+      if (!current()) return;
+      setHistory(records => [...records, ...page.setups.filter(item => !records.some(existing => existing.planId === item.planId))]);
       setNextAfter(page.nextAfter); setHistoryError(null);
-    } catch { if (mounted.current) setHistoryError('More saved setups could not be loaded. Try again.'); }
-    finally { if (mounted.current) setHistoryLoading(false); }
+    } catch { if (current()) setHistoryError('More saved setups could not be loaded. Try again.'); }
+    finally {
+      if (current()) { historyReadInFlight.current = false; setHistoryLoading(false); }
+    }
+  }
+
+  async function launch(copy: boolean) {
+    if (!active || busy || !project || (harness === 'hermes' && !validProfile)) return;
+    const revision = generation.current;
+    const selection: HarnessParams = { harness, projectId: project.projectId, hermesProfile: harness === 'hermes' ? canonicalProfile : null };
+    setLaunchNotice(null); setError(null);
+    try {
+      if (copy) await copyHarnessCommand(selection); else await openHarness(selection);
+      if (!mounted.current || revision !== generation.current) return;
+      setLaunchNotice(copy ? 'Command copied. Paste it into ' + terminal + ' to open your harness in this project.'
+        : 'Harness window opened. Review any prompts there, then return here.');
+    } catch {
+      if (!mounted.current || revision !== generation.current) return;
+      setError(copy ? 'The command could not be copied. Check the installed harness and registered project folder, then try again.'
+        : 'The harness window could not open. Use Copy command and run it in ' + terminal + ', or check that the harness is installed.');
+    }
   }
 
   if (projects.length === 0) return <section className="screen-content empty-state" aria-label="Harness connection">
@@ -274,13 +310,12 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
         <button className="primary-action" type="submit" disabled={!!busy || preparation.target !== null || !project || (harness === 'hermes' && !validProfile)}>{busy === 'preview' ? 'Checking harness…' : 'Review setup'}</button>
       </form>
       {project && <section className="help-content" aria-label="Open harness for project">
-        <p>Open {harnessNames[harness]} in <strong>{project.name}</strong> to review its sign-in or project approval prompts. Return here and check again when you finish.</p>
-        <div className="toolbar-actions"><button type="button" disabled={!!busy} onClick={() => {
-          setLaunchNotice(null);
-          void openHarness({ harness, projectId: project.projectId, hermesProfile: harness === 'hermes' ? canonicalProfile : null }).then(() => setLaunchNotice('Harness window opened. Review any prompts there, then return here.')).catch(() => setError('The harness window could not open. Use Copy command and run it in PowerShell, or check that the harness is installed.'));
-        }}>Open {harnessNames[harness]} for this project</button><button type="button" disabled={!!busy} onClick={() => {
-          void copyHarnessCommand({ harness, projectId: project.projectId, hermesProfile: harness === 'hermes' ? canonicalProfile : null }).then(() => setLaunchNotice('Command copied. Paste it into PowerShell to open your harness in this project.')).catch(() => setError('The command could not be copied. Check the installed harness and registered project folder, then try again.'));
-        }}>Copy command</button><button type="button" disabled={!!busy} onClick={() => void previewSetup()}>Check again</button></div>
+        <p>{canOpenWindow ? 'Open ' : 'Copy the launch command to open '}{harnessNames[harness]} in <strong>{project.name}</strong>{canOpenWindow ? '' : ' using Terminal'} to review its sign-in or project approval prompts. Return here and check again when you finish.</p>
+        <div className="toolbar-actions">
+          {canOpenWindow && <button type="button" disabled={!!busy || (harness === 'hermes' && !validProfile)} onClick={() => void launch(false)}>Open {harnessNames[harness]} for this project</button>}
+          <button type="button" disabled={!!busy || (harness === 'hermes' && !validProfile)} onClick={() => void launch(true)}>Copy command</button>
+          <button type="button" disabled={!!busy} onClick={() => void previewSetup()}>Check again</button>
+        </div>
         {launchNotice && <p role="status">{launchNotice}</p>}
       </section>}
       {error && <p className="form-error" role="alert" ref={errorRef} tabIndex={-1}>{error}</p>}
@@ -341,12 +376,12 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
         </label>
         <button className="primary-action" type="button" disabled={!canApply} onClick={() => void applySetup()}>{review.state === 'applying' ? 'Resume save' : 'Save settings'}</button>
       </section>}
-      {(history.length > 0 || nextAfter !== null || historyError || historyLoading) && <section aria-label="Recent setup changes">
+      {(shownHistory.length > 0 || nextAfter !== null || historyError || historyLoading) && <section aria-label="Recent setup changes">
         <p className="help-text">Undo setup restores the harness settings from before that connection setup. Review the saved changes before you undo them.</p>
         <h2>Recent setup changes</h2>
         {historyError && <p className="form-error" role="alert">{historyError} <button type="button" disabled={!!busy} onClick={() => refreshHistory(value => value + 1)}>Reload history</button></p>}
         {historyLoading && <p role="status">Loading saved setups…</p>}
-        <ul className="record-list">{history.filter(summary => summary.planId !== review?.plan.planId).map(summary => {
+        <ul className="record-list">{shownHistory.filter(summary => summary.planId !== review?.plan.planId).map(summary => {
           const saved = execution.outcome?.setup.plan.planId === summary.planId ? execution.outcome.setup : details.get(summary.planId);
           const state = execution.outcome?.setup.plan.planId === summary.planId ? execution.outcome.setup.state : summary.state;
           const item = saved ? reviewed(saved, projects) : null;
@@ -564,4 +599,20 @@ function Delta({ title, added, removed }: { title: string; added: string[]; remo
   if (!added.length && !removed.length) return <p><strong>{title}:</strong> None.</p>;
   return <section><h3>{title}</h3>{added.length > 0 && <><p>Added</p><ul>{added.map((value, index) => <li key={index}>{value}</li>)}</ul></>}
     {removed.length > 0 && <><p>Removed</p><ul>{removed.map((value, index) => <li key={index}>{value}</li>)}</ul></>}</section>;
+}
+
+
+function includeObservedSetup(records: HarnessSetupSummary[], setup?: HarnessSetupRecord): HarnessSetupSummary[] {
+  if (!setup) return records;
+  const { plan } = setup;
+  const summary: HarnessSetupSummary = {
+    planId: plan.planId, harness: plan.harness, harnessProfile: plan.harnessProfile,
+    targetScopes: plan.targetScopes.map(scope => scope.scope === 'global'
+      ? { scope: 'global' } : { scope: 'project', projectId: scope.projectId }),
+    state: setup.state, createdAt: setup.createdAt, expiresAt: plan.expiresAt,
+  };
+  // A successful per-plan read is useful even when the first history page is
+  // empty, filtered, or unavailable. Undo still re-reads this exact saved plan.
+  return [summary, ...records.filter(record => record.planId !== summary.planId)]
+    .sort((a, b) => b.planId.localeCompare(a.planId));
 }

@@ -78,9 +78,18 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
     try { savePreferences(preferences); setPreferenceError(null); }
     catch { setPreferenceError('Your choices could not be saved on this computer. Keep this window open to continue setup.'); }
   }, [preferences]);
-  const updateSetup = (setup: SetupProgress) => updatePreferences(current => ({ ...current, setup }));
-  const resumeSetup = () => {
+  const updateSetup = (setup: SetupProgress) => {
+    // Navigation and selection changes require the test screen to revalidate.
     setTestVerified(false);
+    updatePreferences(current => ({ ...current, setup }));
+  };
+  const resumeSetup = () => {
+    if (savingRef.current || projectBusyRef.current) return;
+    setTestVerified(false);
+    // The workspace may have moved to another project while setup was deferred.
+    // Use the same transition that preserves editors and invalidates old reads.
+    transitionProject(preferences.setup.status === 'complete' ? null
+      : projects.find(project => project.projectId === preferences.setup.projectId) ?? null);
     updatePreferences(current => ({ ...current, setup: current.setup.status === 'complete'
       ? { ...current.setup, status: 'in_progress', step: 'harnesses', projectId: null, noteId: null, checkId: null, testHarness: null }
       : { ...current.setup, status: 'in_progress' } }));
