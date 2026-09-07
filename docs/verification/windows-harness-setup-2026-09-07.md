@@ -78,8 +78,29 @@ both crates and all targets passes with warnings denied. Independent review of
 the production and UI changes found no issues. Rust formatting and diff checks
 pass; the source knowledge graph was updated.
 
-The installed application still uses candidate e09d206. Packaging and installation
-of this setup promotion are not yet claimed.
+## Packaged candidate
+
+The Windows installer built successfully from production commit
+`6a612e8a0d798dc40d5052197baacb8d1546beef` and is archived at
+`E:/Context Relay Releases/6a612e8/Context Relay_0.1.0_x64-setup.exe`.
+It is 75,741,481 bytes, SHA-256
+`5bbe91c6748295082761228120ce50cf416fa3aa1507a9631a02b15a7e857e15`,
+with Authenticode status `NotSigned`.
+
+Static extraction verifies five AMD64 executables, exact companion and upgrade
+service-control bytes, the expected Tauri NSIS marker change, and all thirteen
+search files against their manifests. The extracted production bridge completes
+status calls for all three harness bindings against the existing protocol 1.11
+service and unlocked vault. Those checks use normal credential directories and
+a byte-identical bridge copy without a sibling daemon; no autostart, project or
+record writes are possible through the status-only check.
+
+Local packaging evidence: `.codex/windows-setup-promotion-package.log`,
+`.codex/windows-setup-promotion-inspection.log`,
+`.codex/windows-setup-promotion-packaged-status.log` and the archived
+`checksums.json`. The installed application still uses candidate e09d206;
+installation of this replacement remains pending separate authorization after
+the user's earlier pause. General native desktop control remains paused.
 
 ## Remaining acceptance
 
