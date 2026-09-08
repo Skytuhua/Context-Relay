@@ -26,10 +26,10 @@
 
 **Files:** `crates/core/src/devices/crypto.rs`, existing protocol pairing fixtures, `supabase/functions/enrollment/crypto.mjs`, new `supabase/functions/pairing/crypto.mjs` and its Node tests.
 
-- [ ] Freeze independent Rust/Edge vectors for canonical request and approved-payload validation. Reuse existing canonical readers and strict Ed25519/key checks.
-- [ ] Verify every request field and signature; verify the approval's issuer/child certificate, request digest, scope, epochs and encrypted grant without exposing its plaintext.
-- [ ] Define operation-specific device proofs binding verified Auth user/session and exact operation bytes. An approval signature alone must not bind a copied request to another session. Verify against the server-selected installed device key, never a caller-selected authority.
-- [ ] Exercise malformed encoding, oversized input, wrong keys, wrong session, substituted issuer and changed exact-retry bytes. Run Node checks and the corresponding Rust vectors, then review the immutable patch.
+- [x] Freeze independent Rust/Edge vectors for canonical request and approved-payload validation. Reuse existing canonical readers and strict Ed25519/key checks.
+- [x] Verify every request field and signature; verify the approval's issuer/child certificate, request digest, scope, epochs and encrypted grant without exposing its plaintext.
+- [x] Define operation-specific device proofs binding verified Auth user/session and exact operation bytes. An approval signature alone must not bind a copied request to another session. Verify against the server-selected installed device key, never a caller-selected authority.
+- [x] Exercise malformed encoding, oversized input, wrong keys, wrong session, substituted issuer and changed exact-retry bytes. Run Node checks and the corresponding Rust vectors, then review the immutable patch.
 
 ## Task 2: Atomic provider admission
 
@@ -43,8 +43,9 @@ scope and epochs. A Rust-generated public approval fixture is checked by both
 implementations. All 13 Rust pairing crypto tests and 68 affected Node checks
 pass. Request/approval possession-proof helpers now bind the original Auth
 user/session and exact payload under separate signing domains (14 Rust and 69
-affected Node checks pass). Endpoint enforcement and a frozen shared proof vector
-remain required; these helpers do not authorize admission or prove ciphertext
+affected Node checks pass). Frozen request and approval proof signatures are
+reproduced by Rust and verified at the Edge (70 Node checks pass). Endpoint enforcement
+remains required; these helpers do not authorize admission or prove ciphertext
 integrity. The joining
 device still authenticates the complete approval through the safety number and
 decrypts the grant before installing local trust. This is not live pairing evidence.

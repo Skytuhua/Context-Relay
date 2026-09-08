@@ -2,11 +2,21 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { verifyPairingApproval } from './approval.mjs';
+import { verifyPairingRequest } from './crypto.mjs';
+import { verifyPairingDeviceProof } from './proof.mjs';
 
 const fixtures = new URL('../../../crates/core/tests/fixtures/', import.meta.url);
 const fixture = JSON.parse(readFileSync(new URL('hosted-pairing-approval-v1.json', fixtures), 'utf8'));
 const approved = Buffer.from(fixture.canonicalApprovedPayload, 'hex');
 const request = Buffer.from(readFileSync(new URL('hosted-pairing-request-v1.hex', fixtures), 'utf8').trim(), 'hex');
+
+test('Rust-frozen request and approval possession proofs verify at the Edge', async () => {
+  const signed = await verifyPairingRequest(request);
+  const approval = await verifyPairingApproval(approved, request, fixture.trusted);
+  await verifyPairingDeviceProof(fixture.proofs, 'request', request, signed.signingPublicKey, Buffer.from(fixture.proofs.request, 'hex'));
+  await verifyPairingDeviceProof(fixture.proofs, 'approval', approved, approval.issuer.signingKey, Buffer.from(fixture.proofs.approval, 'hex'));
+  await assert.rejects(verifyPairingDeviceProof(fixture.proofs, 'approval', approved, approval.issuer.signingKey, Buffer.from(fixture.proofs.request, 'hex')));
+});
 
 test('Rust-generated approval verifies only against the selected authority and request', async () => {
   const result = await verifyPairingApproval(approved, request, fixture.trusted);

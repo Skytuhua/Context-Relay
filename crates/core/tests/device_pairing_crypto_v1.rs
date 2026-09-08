@@ -110,6 +110,39 @@ fn hosted_pairing_approval_fixture_verifies_the_exact_request() {
         serde_json::from_str(include_str!("fixtures/hosted-pairing-approval-v1.json")).unwrap();
     let canonical = decode(fixture["canonicalApprovedPayload"].as_str().unwrap());
     inspect_pairing_approval(&canonical, &signed).unwrap();
+    let user = fixture["proofs"]["authUserId"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let session = fixture["proofs"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let request_proof = context_relay_core::devices::crypto::sign_hosted_pairing_request_proof(
+        &DeviceKeys::from_seeds_for_test([0x71; 32], [0x72; 32]),
+        user,
+        session,
+        &signed,
+    )
+    .unwrap();
+    let approval_proof = context_relay_core::devices::crypto::sign_hosted_pairing_approval_proof(
+        &DeviceKeys::from_seeds_for_test([0x73; 32], [0x74; 32]),
+        user,
+        session,
+        &signed,
+        &decode_pairing_approved_payload_v1(&canonical).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        hex(&request_proof.0),
+        fixture["proofs"]["request"].as_str().unwrap()
+    );
+    assert_eq!(
+        hex(&approval_proof.0),
+        fixture["proofs"]["approval"].as_str().unwrap()
+    );
 }
 #[test]
 fn hosted_pairing_request_signature_matches_the_edge_fixture() {
