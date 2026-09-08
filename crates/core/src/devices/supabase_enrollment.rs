@@ -4,6 +4,7 @@ use super::{
         HostedEnrollmentChallenge, decode_recovery_enrollment_record_v1,
         sign_hosted_enrollment_proof,
     },
+    recovery_restore_transport::RecoveryRootSnapshot,
     recovery_transport::{
         RecoveryEnrollmentReceipt, RecoveryEnrollmentTransport, RecoveryRootStatus,
         RecoveryTransportError,
@@ -139,6 +140,14 @@ impl HostedEnrollmentClient {
         body: serde_json::Value,
         now: u64,
     ) -> Result<(T, u64), RecoveryTransportError> {
+        self.call_bounded(body, now, 16 * 1024)
+    }
+    fn call_bounded<T: serde::de::DeserializeOwned>(
+        &self,
+        body: serde_json::Value,
+        now: u64,
+        response_limit: usize,
+    ) -> Result<(T, u64), RecoveryTransportError> {
         let started = Instant::now();
         let session = self
             .owner
@@ -165,7 +174,7 @@ impl HostedEnrollmentClient {
             Duration::from_secs(15),
             body,
         )
-        .with_response_limit(16 * 1024);
+        .with_response_limit(response_limit);
         let response = self
             .http
             .execute(request)
@@ -188,13 +197,64 @@ impl HostedEnrollmentClient {
             400..=499 if response.status() != 429 => return Err(RecoveryTransportError::Invalid),
             _ => return Err(RecoveryTransportError::Transient),
         }
-        if response.body().len() > 16 * 1024 {
+        if response.body().len() > response_limit {
             return Err(RecoveryTransportError::Conflict);
         }
         let response = serde_json::from_slice(response.body())
             .map_err(|_| RecoveryTransportError::Conflict)?;
         Ok((response, finished))
     }
+    /// Discover the owner's canonical recovery record without granting device trust.
+    /// The restore coordinator must still prove possession of the recovery phrase.
+    pub fn snapshot(
+        &self,
+        now: u64,
+    ) -> Result<Option<RecoveryRootSnapshot>, RecoveryTransportError> {
+        let (response, _): (SnapshotResponse, _) = self.call_bounded(
+            serde_json::json!({"v":1,"action":"snapshot"}),
+            now,
+            68 * 1024,
+        )?;
+        if response.v != 1 {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        if response.snapshot.is_null() {
+            return Ok(None);
+        }
+        let wire: WireSnapshot = serde_json::from_value(response.snapshot)
+            .map_err(|_| RecoveryTransportError::Conflict)?;
+        let encoded = wire.canonical_record;
+        if encoded.is_empty()
+            || encoded.len() > 32768 * 2
+            || !encoded.len().is_multiple_of(2)
+            || !encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || wire.registered_at_ms.0 > i64::MAX as u64
+        {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        let canonical_record = (0..encoded.len())
+            .step_by(2)
+            .map(|index| {
+                u8::from_str_radix(&encoded[index..index + 2], 16)
+                    .map_err(|_| RecoveryTransportError::Conflict)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let snapshot = RecoveryRootSnapshot {
+            scope: crate::sync::SyncScope {
+                account_id: wire.account_id,
+                workspace_id: wire.workspace_id,
+            },
+            canonical_record,
+            canonical_record_sha256: wire.canonical_record_sha256,
+            registered_at_ms: wire.registered_at_ms.0,
+            recovery_generation: wire.recovery_generation.0,
+        };
+        snapshot.validate_for(snapshot.scope)?;
+        Ok(Some(snapshot))
+    }
+
     pub fn reserve(
         &self,
         operation: OperationId,
@@ -354,6 +414,22 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotResponse {
+    v: u8,
+    snapshot: serde_json::Value,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireSnapshot {
+    account_id: AccountId,
+    workspace_id: WorkspaceId,
+    canonical_record: String,
+    canonical_record_sha256: Sha256Digest,
+    registered_at_ms: DecimalTimestamp,
+    recovery_generation: DecimalTimestamp,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StatusResponse {

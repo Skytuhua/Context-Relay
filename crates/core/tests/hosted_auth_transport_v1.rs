@@ -57,6 +57,99 @@ impl LoginStore for Store {
 }
 
 #[test]
+fn native_recovery_snapshot_validates_bytes_and_preserves_session_identity() {
+    use context_relay_core::devices::supabase_enrollment::HostedEnrollmentClient;
+    use sha2::{Digest, Sha256};
+    let encoded = include_str!("fixtures/recovery-enrollment-record-v1.hex").trim();
+    let canonical: Vec<u8> = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|part| u8::from_str_radix(std::str::from_utf8(part).unwrap(), 16).unwrap())
+        .collect();
+    let record =
+        context_relay_core::devices::recovery_crypto::decode_recovery_enrollment_record_v1(
+            &canonical,
+        )
+        .unwrap();
+    let snapshot = json!({"accountId":record.account_id,"workspaceId":record.workspace_id,
+        "canonicalRecord":encoded,"canonicalRecordSha256":format!("{:x}",Sha256::digest(&canonical)),
+        "registeredAtMs":(NOW*1000).to_string(),"recoveryGeneration":"0"});
+    let mut invalid = Vec::new();
+    for (key, value) in [
+        ("canonicalRecordSha256", json!("00".repeat(32))),
+        ("accountId", json!(record.workspace_id)),
+        ("canonicalRecord", json!(encoded.to_uppercase())),
+        ("canonicalRecord", json!("0")),
+        ("canonicalRecord", json!("00".repeat(32769))),
+        ("recoveryGeneration", json!("9223372036854775808")),
+        ("registeredAtMs", json!("9223372036854775808")),
+        ("extra", json!(true)),
+    ] {
+        let mut changed = snapshot.clone();
+        changed[key] = value;
+        invalid.push(response(200, json!({"v":1,"snapshot":changed})));
+    }
+    invalid.push(response(200, json!({"v":1})));
+    invalid.push(response(200, json!({"v":2,"snapshot":null})));
+    invalid.push(response(200, json!({"v":1,"snapshot":null,"extra":true})));
+    let mut bad_signature = canonical.clone();
+    *bad_signature.last_mut().unwrap() ^= 1;
+    let mut forged = snapshot.clone();
+    forged["canonicalRecord"] = json!(
+        bad_signature
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    forged["canonicalRecordSha256"] = json!(format!("{:x}", Sha256::digest(&bad_signature)));
+    invalid.push(response(200, json!({"v":1,"snapshot":forged})));
+    let invalid_count = invalid.len();
+    let mut responses = vec![
+        tokens(&token(NOW + 900)),
+        response(200, json!({"id":USER})),
+        response(200, json!({"v":1,"snapshot":snapshot})),
+        response(200, json!({"v":1,"snapshot":null})),
+    ];
+    responses.extend(invalid);
+    let (auth, http) = client(PROJECT, responses);
+    let owner = Arc::new(HostedSessionOwner::new(
+        Arc::new(auth),
+        Arc::new(Store::default()),
+    ));
+    let attempt = owner.begin_login().unwrap();
+    let generation = attempt.cancellation();
+    let identity = owner.complete_login(attempt, exchange(), NOW).unwrap();
+    let client = HostedEnrollmentClient::with_http_client(
+        owner.clone(),
+        identity,
+        generation,
+        PROJECT,
+        "publishable-test",
+        http.clone(),
+    )
+    .unwrap();
+    let result = client.snapshot(NOW).unwrap().unwrap();
+    assert_eq!(result.canonical_record, canonical);
+    assert_eq!(result.scope.account_id, record.account_id);
+    assert_eq!(result.recovery_generation, 0);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            http.requests.lock().unwrap().last().unwrap().body()
+        )
+        .unwrap(),
+        json!({"v":1,"action":"snapshot"})
+    );
+    assert!(client.snapshot(NOW).unwrap().is_none());
+    for _ in 0..invalid_count {
+        assert!(client.snapshot(NOW).is_err());
+    }
+    let count = http.requests.lock().unwrap().len();
+    owner.begin_login().unwrap();
+    assert!(client.snapshot(NOW).is_err());
+    assert_eq!(http.requests.lock().unwrap().len(), count);
+}
+
+#[test]
 fn native_enrollment_status_and_commit_validate_the_record_receipt() {
     use context_relay_core::{
         crypto::DeviceKeys,

@@ -728,3 +728,25 @@ The migration is applied only to the disposable local database. Hosted deploymen
 native snapshot transport, signed restore submission/reconciliation, live acceptance
 and all signing/clean-machine gates remain incomplete. Supabase run 34255498040
 passed at a723fcb before this change; new-head managed CI must run separately.
+
+### Native recovery snapshot reader
+
+The existing hosted enrollment client now reads the snapshot action with the same
+original user/session/project checks before and after HTTP. Only snapshot responses
+allow 68 KiB for a hex-encoded 32 KiB record; other enrollment responses retain the
+16 KiB bound. The reader requires an explicit snapshot field, accepts explicit null,
+and rejects extra fields, invalid version/hex, oversized records, invalid timestamps
+or generations, altered scope/digest, and invalid signatures through the existing
+canonical recovery validator. Fetching a snapshot grants no device authority.
+
+All 19 hosted-auth transport tests pass, including a new snapshot regression with
+missing/null separation and a forged signature whose digest matches the forged bytes.
+An account-login replacement is rejected without sending another request. Initial
+compilation failed before the snapshot method existed. Read-only review found no
+additional P1/P2 beyond the missing/null issue, which was fixed before the final run.
+Logs: `.codex/pr16-native-snapshot-{red,test,final}.log`.
+This is the native reader, not completed restore: daemon restore wiring, root-signed
+claim admission/receipt reconciliation and real hosted/installed acceptance remain.
+Core all-target Clippy with test-support and warnings denied passes after replacing
+the manual even-length test with `is_multiple_of(2)`; formatting and whitespace
+checks pass. Log: `.codex/pr16-native-snapshot-clippy.log`.
