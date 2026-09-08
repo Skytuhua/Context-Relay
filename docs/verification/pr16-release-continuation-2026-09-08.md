@@ -479,3 +479,20 @@ session expiry during Auth/reservation lock waits. The initial 13 checks passed
 locally; review then tightened the retry check to hold the first transaction open
 and observe the second request blocked. The final variant passes all 13 checks
 on the disposable local PostgreSQL database. Log: `.codex/pr16-enrollment-postgres.log`.
+
+## Atomic enrollment commit
+
+Added the service-only transaction that creates the account at epochs one, recovery
+root, genesis certificate, active session binding and private canonical record/
+receipt together. The transaction binds all mutable reservation fields, rechecks
+the live session and expiry after possible insert waits, and returns the original
+receipt for an exact canonical-record retry. It rejects changed records and does
+not reactivate bindings on replay. The Edge verifier must supply the decoded
+fields; the production endpoint is still unfinished.
+
+All 15 disposable PostgreSQL checks pass, including rollback after a late
+certificate collision and session expiry during an account-insert FK wait.
+Log: `.codex/pr16-enrollment-commit-postgres.log`. Read-only review found no
+concrete P1/P2 issue. Supabase contract and whitespace checks pass. Managed
+Supabase migration/pgTAP qualification remains pending; local stub Auth tables
+cannot establish that evidence.

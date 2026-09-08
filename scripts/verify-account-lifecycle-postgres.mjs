@@ -113,9 +113,42 @@ async function enrollmentFixture() {
     select public.service_reserve_enrollment_for_session('${user}','${session}',
       '${reservation}','${id()}','${id()}',decode(repeat('42',32),'hex'));`;
   return { user, session, request,
-    cleanup: () => sql(`delete from auth.sessions where id='${session}';
+    cleanup: () => sql(`delete from public.accounts where owner_user_id='${user}';
+      delete from auth.sessions where id='${session}';
       delete from auth.users where id='${user}';`) };
 }
+
+// Synthetic decoded fields exercise the SQL transaction, not Edge cryptography.
+function enrollmentCommit(f, reservation, certificate = id()) {
+  return `set role service_role; select public.service_commit_enrollment_for_session(
+    '${f.user}','${f.session}','${reservation.reservationId}',decode('${reservation.nonce}','hex'),
+    '${reservation.accountId}','${reservation.workspaceId}','${id()}','${id()}','${certificate}','${id()}',
+    decode(repeat('43',32),'hex'),decode(repeat('44',32),'hex'),decode(repeat('45',32),'hex'),
+    decode(repeat('46',32),'hex'),decode(repeat('47',32),'hex'),decode(repeat('48',64),'hex'),
+    decode(repeat('49',80),'hex'),decode('010203','hex'));`;
+}
+
+test('enrollment commit is atomic, exact on retry, and rejects changed records', async () => {
+  const first = await enrollmentFixture(), second = await enrollmentFixture();
+  try {
+    const reservation = JSON.parse(await sql(first.request()));
+    const certificate = id();
+    const request = enrollmentCommit(first, reservation, certificate);
+    const receipt = JSON.parse(await sql(request));
+    assert.deepEqual(JSON.parse(await sql(request)), receipt);
+    await assert.rejects(sql(request.replace("decode('010203'", "decode('010204'")), /enrollment_conflict/);
+    assert.equal(await sql(`select count(*) from public.device_bindings
+      where auth_user_id='${first.user}' and state='active'`), '1');
+    assert.equal(await sql(`select control_epoch||':'||key_epoch from public.accounts
+      where id='${reservation.accountId}'`), '1:1');
+    const other = JSON.parse(await sql(second.request()));
+    await assert.rejects(sql(enrollmentCommit(second, other, certificate)), /duplicate key/);
+    assert.equal(await sql(`select count(*) from public.accounts where owner_user_id='${second.user}'`), '0');
+    assert.equal(await sql(`select count(*) from public.recovery_roots where account_id='${other.accountId}'`), '0');
+    assert.equal(await sql(`select count(*) from context_relay_private.enrollment_commits
+      where auth_user_id='${second.user}'`), '0');
+  } finally { await first.cleanup(); await second.cleanup(); }
+});
 
 test('concurrent enrollment retries retain one challenge and deny a competing operation', async () => {
   const f = await enrollmentFixture();
@@ -133,6 +166,31 @@ test('concurrent enrollment retries retain one challenge and deny a competing op
     assert.equal(await sql(`select request_count from context_relay_private.enrollment_reservations
       where auth_user_id='${f.user}'`), '1');
     assert.equal(await sql(`select count(*) from public.accounts where owner_user_id='${f.user}'`), '0');
+  } finally {
+    if (release) await release();
+    if (outcome) await outcome;
+    await f.cleanup();
+  }
+});
+
+test('enrollment commit rolls back when the session expires during an insert wait', async () => {
+  const f = await enrollmentFixture();
+  let release, outcome;
+  try {
+    const reservation = JSON.parse(await sql(f.request()));
+    await sql(`update auth.sessions set not_after=clock_timestamp()+interval '2 seconds' where id='${f.session}'`);
+    release = await holdLock(`select id from auth.users where id='${f.user}' for update`);
+    const application = `enrollment-insert-${randomUUID()}`;
+    outcome = sql(enrollmentCommit(f, reservation), application).then(value => ({ value }), error => ({ error }));
+    await waitUntilBlocked(application);
+    await sql(`select pg_sleep(greatest(0, extract(epoch from not_after-clock_timestamp())+0.1))
+      from auth.sessions where id='${f.session}'`);
+    await release(); release = null;
+    const result = await outcome;
+    assert.ok(result.error, `Expired session committed: ${result.value}`);
+    assert.match(result.error.stderr, /enrollment_session_denied/);
+    assert.equal(await sql(`select count(*) from public.accounts where owner_user_id='${f.user}'`), '0');
+    assert.equal(await sql(`select count(*) from context_relay_private.enrollment_commits where auth_user_id='${f.user}'`), '0');
   } finally {
     if (release) await release();
     if (outcome) await outcome;
