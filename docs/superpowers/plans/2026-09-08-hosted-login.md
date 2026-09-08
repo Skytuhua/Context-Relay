@@ -101,3 +101,47 @@ validation remains in the shared auth client and credential store. Builds with
 invalid hosted configuration fail startup with the existing sanitized diagnostic.
 Release automation must supply the verified project configuration before live
 acceptance; an offline candidate is not evidence of hosted release readiness.
+
+## Hosted first-device enrollment implementation sequence
+
+The existing `RecoveryEnrollmentCoordinator` and canonical
+`RecoveryEnrollmentRecordV1` already implement phrase confirmation, a recovery-root
+signature, the genesis device certificate, encrypted metadata and atomic local
+activation. Extend that path. Do not create an OAuth-only active device binding or
+a second recovery format. The production `RecoveryEnrollmentTransport` is the
+missing provider boundary; its in-memory implementation is test-support only.
+
+1. Add a private, expiring first-enrollment reservation keyed by authenticated
+   user, with server-assigned account/workspace UUIDs and random challenge. Derive
+   user/session from verified Auth, lock the live session, and recheck expiry after
+   waits. A reservation grants no device or sync authority. Existing accounts
+   require pairing/recovery and cannot use this path to overwrite a root. Bound
+   request sizes and rate-limit reservation attempts.
+2. Reuse the canonical reader/signature machinery from the sync Edge boundary to
+   validate the existing recovery record, including canonical encoding, root and
+   genesis signatures, epochs of one, scoped IDs, envelope bounds and key checks.
+   Add device proof over a domain-separated preimage containing reservation,
+   authenticated user/session, challenge and canonical-record digest. A root
+   signature alone does not prove possession of the installed device private key.
+   Freeze Rust-produced vectors and independently verify them at the Edge.
+3. Commit the account, root record, certificate and active session/device binding
+   in one service-only database transaction. Serialize by user/reservation, reject
+   changed records and competing enrollment, revalidate the session and challenge
+   after locks, and return the original receipt for an exact committed retry.
+   Authenticated/anonymous SQL callers must not bypass the verified Edge proof.
+4. Add the real recovery transport using the existing session owner and HTTP
+   client. Bind reservation and prepared registration to the original hosted
+   user/session/project. Preserve exact intent across ambiguous responses and
+   restart; logout/account replacement must prevent queued work from enrolling a
+   different identity. Reuse the encrypted Vault's prepared enrollment and exact
+   provider projection checks; do not persist the phrase or recovery private keys.
+5. Connect the existing trusted native recovery dialog and ordered daemon worker
+   after hosted scope discovery. Keep phrase-returning operations restricted to
+   DesktopRecoveryHost. Prove first enrollment, restart and second-device
+   pairing/recovery with real hosted sessions before enabling sync.
+
+Required failure evidence includes concurrent first enrollments, stale/logout
+sessions, post-lock expiry, changed-record retry, wrong device proof, provider-only
+root substitution, response loss before local activation, and account switch while
+an enrollment is queued. SQL privileges and live Auth behavior need separate
+integration checks; deterministic in-memory tests do not satisfy hosted acceptance.

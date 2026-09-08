@@ -373,3 +373,20 @@ configuration validation or packaging-variable propagation. These checks do not
 prove live GitHub login, native credential acceptance or signed release readiness.
 All-target daemon Clippy with test-support and warnings denied passes with the
 actual hosted configuration embedded. Whitespace and Graphify update pass.
+
+## Native Windows hosted-credential check
+
+Explicitly ran the normally ignored
+`auth::storage::tests::platform_login_roundtrip_and_clear` test in the core crate
+with test-support. It passed against this machine's native credential store using
+a random qualification profile and the synthetic `qualification.invalid` project.
+The check saved and reopened a synthetic refresh token, rejected oversized records
+and Windows-native oversized blobs without replacing the prior value, and cleared
+the entry twice. Log: `.codex/pr16-auth-native-store.log`.
+
+This proves the bounded credential operation on this Windows machine. It does not
+prove macOS Keychain behavior, a live provider token rotation, packaged first-run
+behavior or clean-machine acceptance. The first-device enrollment source audit
+confirmed the existing recovery coordinator/record should be extended through a
+real hosted transport; the implementation sequence and required race/failure checks
+are recorded in the hosted-login plan. Those hosted components remain unimplemented.
