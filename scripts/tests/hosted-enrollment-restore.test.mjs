@@ -7,6 +7,17 @@ const fixtures = new URL("../../crates/core/tests/fixtures/", import.meta.url);
 const bytes = name => Buffer.from(readFileSync(new URL(name, fixtures), "utf8").trim(), "hex");
 const claim = bytes("recovery-device-claim-v1.hex"), root = bytes("recovery-enrollment-record-v1.hex");
 
+test("recovery claim name uses the shared Rust-compatible text rules", () => {
+  const original = Buffer.from(decodeRecoveryClaim(claim).deviceName);
+  const offset = claim.indexOf(original);
+  assert.ok(offset > 0 && original.length < 24);
+  for (const name of ["\ufeff", "\ufeffLaptop"]) {
+    const value = Buffer.from(name);
+    const changed = Buffer.concat([claim.subarray(0, offset - 1), Buffer.of(0x60 + value.length), value, claim.subarray(offset + original.length)]);
+    assert.equal(decodeRecoveryClaim(changed).deviceName, name);
+  }
+});
+
 const context = { authUserId: "550e8400-e29b-41d4-a716-446655440000", sessionId: "550e8400-e29b-41d4-a716-446655440001" };
 const key = createPrivateKey({ key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), Buffer.alloc(32, 0x66)]), format: "der", type: "pkcs8" });
 function proof(input) {

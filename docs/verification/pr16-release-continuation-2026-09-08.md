@@ -1044,3 +1044,11 @@ At `2a83bcc`, GitHub CI run `34271537065` completed macOS all-target Clippy
 This supersedes the earlier full-build limitation from the Windows-only
 cross-check. Interactive native input, accessibility, installed behavior and the
 complete release matrix remain unverified.
+
+### Canonical text parity repair
+
+The shared Edge CBOR reader consumed a leading UTF-8 BOM and used JavaScript
+`trim`, which disagrees with Rust on U+0085 and U+FEFF. A failing regression
+reproduced the mismatch. Canonical text now preserves U+FEFF and checks Unicode
+White_Space, matching Rust's required-text validation. The JSON decoder is
+unchanged. The redundant recovery-name trim check was also removed after a second failing regression. All 66 affected sync, enrollment and pairing Node tests pass.

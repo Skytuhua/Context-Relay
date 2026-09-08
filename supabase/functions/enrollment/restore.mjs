@@ -68,7 +68,7 @@ export function decodeRecoveryClaim(input) {
     const deviceMaterialEnvelope = canonicalClaim.subarray(envelopeOffset, reader.position);
     const signatureOffset = reader.position;
     reader.expectUnsigned(14); const rootSignature = reader.fixedBytes(64);
-    if (reader.position !== canonicalClaim.length || ciphertext.length < 16 || deviceName.trim() === ""
+    if (reader.position !== canonicalClaim.length || ciphertext.length < 16
       || certificateAccount !== accountId || certificateWorkspace !== workspaceId
       || equal(deviceSigningKey, deviceWrappingKey)) throw invalid();
     const signingPreimage = new Uint8Array(DOMAIN.length + signatureOffset);

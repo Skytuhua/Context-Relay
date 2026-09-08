@@ -3,9 +3,23 @@ import { readFile } from 'node:fs/promises';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import test from 'node:test';
 import { decodePairingRequest, verifyPairingRequest } from './crypto.mjs';
+import { CanonicalReader } from '../sync/core.mjs';
 
 const fixture = Buffer.from((await readFile(new URL('../../../crates/protocol/tests/fixtures/pairing-request-v1.hex', import.meta.url), 'utf8')).trim(), 'hex');
 const preimage = Buffer.from((await readFile(new URL('../../../crates/protocol/tests/fixtures/pairing-request-signing-preimage-v1.hex', import.meta.url), 'utf8')).trim(), 'hex');
+
+test('canonical text preserves BOM and follows Rust Unicode whitespace', () => {
+  for (const value of ['\ufeff', '\ufeffLaptop', '\u0085Laptop']) {
+    const bytes = Buffer.from(value);
+    const reader = new CanonicalReader(Buffer.concat([Buffer.of(0x60 + bytes.length), bytes]));
+    assert.equal(reader.text(512), value);
+  }
+  for (const value of ['\u0085', '\u2003', ' \t']) {
+    const bytes = Buffer.from(value);
+    const reader = new CanonicalReader(Buffer.concat([Buffer.of(0x60 + bytes.length), bytes]));
+    assert.throws(() => reader.text(512));
+  }
+});
 
 test('the signed hosted fixture is shared with the Rust crypto verifier', async () => {
   const bytes = Buffer.from((await readFile(new URL('../../../crates/core/tests/fixtures/hosted-pairing-request-v1.hex', import.meta.url), 'utf8')).trim(), 'hex');
