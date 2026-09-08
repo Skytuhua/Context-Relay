@@ -19,6 +19,159 @@ const USER: &str = "550e8400-e29b-41d4-a716-446655440000";
 const SESSION: &str = "550e8400-e29b-41d4-a716-446655440001";
 const NOW: u64 = 1_800_000_000;
 
+#[test]
+fn hosted_pairing_join_checks_wire_receipts_proofs_and_logout() {
+    use context_relay_core::{
+        crypto::DeviceKeys,
+        devices::{
+            supabase_pairing::HostedPairingClient,
+            transport::{PairingJoinTransport, PairingTransportError},
+        },
+    };
+    use sha2::{Digest, Sha256};
+    let encoded = include_str!("fixtures/hosted-pairing-request-v1.hex").trim();
+    let canonical: Vec<u8> = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+        .collect();
+    let request = context_relay_protocol::decode_pairing_request_v1(&canonical).unwrap();
+    let digest = context_relay_protocol::Sha256Digest(Sha256::digest(&canonical).into());
+    let receipt =
+        json!({"pairingId":request.pairing_id,"requestDigest":digest,"requestedAt":"1000"});
+    let (auth, http) = client(
+        PROJECT,
+        vec![
+            tokens(&token(NOW + 900)),
+            response(200, json!({"id":USER})),
+            response(
+                200,
+                json!({"v":1,"result":{"status":"located","pairingId":request.pairing_id}}),
+            ),
+            response(200, json!({"v":1,"receipt":receipt})),
+            response(
+                200,
+                json!({"v":1,"result":{"status":"pending","extra":true}}),
+            ),
+            response(200, json!({"v":1,"result":{"status":"exhausted"}})),
+            SupabaseHttpResponse::new(204, vec![]),
+        ],
+    );
+    let owner = Arc::new(HostedSessionOwner::new(
+        Arc::new(auth),
+        Arc::new(Store::default()),
+    ));
+    let attempt = owner.begin_login().unwrap();
+    let generation = attempt.cancellation();
+    let identity = owner.complete_login(attempt, exchange(), NOW).unwrap();
+    let transport = HostedPairingClient::with_http_client(
+        owner.clone(),
+        identity,
+        generation,
+        PROJECT,
+        "public-test",
+        Arc::new(DeviceKeys::from_seeds_for_test([0x71; 32], [0x72; 32])),
+        http.clone(),
+    )
+    .unwrap();
+    let code = context_relay_protocol::PairingCode::new("ABCDE-FGHJK".into()).unwrap();
+    assert_eq!(
+        transport.resolve_code(&code, NOW * 1000).unwrap(),
+        request.pairing_id
+    );
+    assert_eq!(
+        transport
+            .submit_request(request.pairing_id, &canonical, NOW * 1000)
+            .unwrap()
+            .requested_at_ms,
+        1000
+    );
+    let requests = http.requests.lock().unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(requests.last().unwrap().body()).unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/hosted-pairing-approval-v1.json")).unwrap();
+    assert_eq!(sent["proof"], fixture["proofs"]["request"]);
+    assert!(
+        requests
+            .last()
+            .unwrap()
+            .url()
+            .ends_with("/functions/v1/pairing")
+    );
+    drop(requests);
+    assert_eq!(
+        transport
+            .result(request.pairing_id, digest, NOW * 1000)
+            .unwrap_err(),
+        PairingTransportError::Conflict
+    );
+    assert_eq!(
+        transport.resolve_code(&code, NOW * 1000).unwrap_err(),
+        PairingTransportError::Exhausted
+    );
+    let approved = fixture["canonicalApprovedPayload"].as_str().unwrap();
+    let approved_bytes: Vec<u8> = approved
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+        .collect();
+    let decision = json!({"pairingId":request.pairing_id,"requestDigest":digest,"decision":"approved",
+        "approvedPayloadDigest":format!("{:x}",Sha256::digest(&approved_bytes)),"decidedAt":"2000"});
+    for (field, value) in [
+        ("requestDigest", json!("00".repeat(32))),
+        ("approvedPayloadDigest", json!(null)),
+        ("decidedAt", json!("9223372036854775808")),
+        ("decision", json!("rejected")),
+        ("extra", json!(true)),
+    ] {
+        let mut bad = decision.clone();
+        bad[field] = value;
+        http.responses.lock().unwrap().push_front(response(
+            200,
+            json!({"v":1,"result":{
+            "status":"approved","canonicalApprovedPayload":approved,"receipt":bad}}),
+        ));
+        assert_eq!(
+            transport
+                .result(request.pairing_id, digest, NOW * 1000)
+                .unwrap_err(),
+            PairingTransportError::Conflict
+        );
+    }
+    let mut rejected = decision.clone();
+    rejected["decision"] = json!("rejected");
+    rejected
+        .as_object_mut()
+        .unwrap()
+        .remove("approvedPayloadDigest");
+    http.responses.lock().unwrap().push_front(response(
+        200,
+        json!({"v":1,"result":{"status":"rejected","receipt":rejected}}),
+    ));
+    assert_eq!(
+        transport
+            .result(request.pairing_id, digest, NOW * 1000)
+            .unwrap_err(),
+        PairingTransportError::Conflict
+    );
+    http.responses.lock().unwrap().push_front(response(
+        200,
+        json!({"v":1,"result":{
+        "status":"approved","canonicalApprovedPayload":approved,"receipt":decision}}),
+    ));
+    assert!(matches!(
+        transport
+            .result(request.pairing_id, digest, NOW * 1000)
+            .unwrap(),
+        context_relay_core::devices::transport::PairingResult::Approved(_)
+    ));
+    owner.logout().unwrap();
+    assert_eq!(
+        transport.resolve_code(&code, NOW * 1000).unwrap_err(),
+        PairingTransportError::Unauthorized
+    );
+}
+
 #[derive(Default)]
 struct Store {
     save_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,

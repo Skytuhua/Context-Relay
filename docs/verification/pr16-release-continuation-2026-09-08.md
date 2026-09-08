@@ -1289,3 +1289,23 @@ with warnings denied, formatting and diff checks pass. Independent review found
 one omitted schema-29 downgrade-fixture update; it is corrected and its real-row
 migration check passes. Graphify is updated. No live or full-release acceptance
 is claimed.
+
+### Native hosted joining client
+
+`devices/supabase_pairing.rs` now implements code resolution, signed request
+submission and result retrieval through the existing login owner and HTTP client.
+It binds proofs to the original verified Auth user/session, checks cancellation
+and project identity before and after HTTP, and validates bounded response
+shapes, IDs, timestamps and receipt/payload digests. Provider timestamps remain
+separate from the local clock used for login expiry.
+
+The new wire regression exposed Serde's acceptance of extra fields on unit enum
+variants; empty struct variants now reject them. Nullable decision digests must
+be explicitly present. Tests cover the frozen Rust/Edge proof, altered receipts,
+unknown/missing fields, timestamp overflow, approved payload hashes and logout.
+All 21 hosted transport tests and targeted Clippy with warnings denied pass
+(`.codex/pr16-pairing-native-full.log`, `.codex/pr16-pairing-native-clippy.log`).
+Bounded independent review found no P1/P2 issues. Full approval verification and
+human safety confirmation remain in the coordinator; this transport installs no
+trust. Approval operations, durable-intent enforcement, daemon wiring and live
+acceptance remain unfinished.
