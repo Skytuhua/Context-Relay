@@ -33,6 +33,14 @@
 
 ## Task 2: Atomic provider admission
 
+Task 1 progress: `supabase/functions/pairing/crypto.mjs` now structurally decodes
+and verifies the existing signed request using shared canonical/key validators.
+The Node test matches the frozen Rust signing preimage and exercises valid
+signatures, tampering, malformed encoding and noncontributory wrapping keys.
+The combined pairing/enrollment Node run passes 25 checks. Approval-payload
+validation and authenticated operation proofs remain unfinished; this is not
+provider admission or live pairing evidence.
+
 **Files:** new migration under `supabase/migrations/`, new `supabase/tests/0003_hosted_pairing_test.sql`, new `supabase/functions/pairing/{core,adapter}.mjs` and tests, `index.ts`, `supabase/config.toml`.
 
 - [ ] Add bounded private invites and failed-attempt accounting using existing ownership/role patterns. Generate 50 random locator bits; store only a peppered HMAC. Define expiry and cleanup without resetting exhausted live sessions.

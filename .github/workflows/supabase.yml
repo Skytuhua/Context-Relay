@@ -59,6 +59,7 @@ jobs:
       - run: node --test scripts/tests/supabase-sync-*.test.mjs
       - run: node --test scripts/tests/account-lifecycle-*.test.mjs
       - run: node --test scripts/tests/hosted-enrollment-*.test.mjs
+      - run: node --test supabase/functions/pairing/crypto.test.mjs
       - run: pnpm supabase:start:ci
       - run: pnpm supabase:reset
       - run: node scripts/verify-account-lifecycle-postgres.mjs
