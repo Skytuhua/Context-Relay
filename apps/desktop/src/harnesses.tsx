@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { HarnessId, HarnessParams, HarnessSetupRecord, HarnessSetupState, HarnessSetupSummary, PlanId, ProbeReport, ProjectIdentity, SavedHookApproval, SavedMemoryHookApproval, SetupPlan, WireNativeValue } from './bindings';
 import { type HarnessGateway, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
 import { useHarnessExecution } from './use-harness-execution';
@@ -74,14 +74,15 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
     setApproved(false);
   }, [preferredHarness, harness]);
 
-  useEffect(() => {
+  // Move focus with the visible result, before the browser can paint it.
+  useLayoutEffect(() => {
     if (!active) return;
     const heading = resultHeadingRef.current;
     heading?.focus({ preventScroll: true });
     heading?.scrollIntoView?.({ block: 'start' });
   }, [active, discovery, review]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!active || !error) return;
     errorRef.current?.focus({ preventScroll: true });
     errorRef.current?.scrollIntoView?.({ block: 'center' });
@@ -488,7 +489,7 @@ function SavedHookApprovals({ approval }: { approval: SavedMemoryHookApproval })
 function SetupNextSteps({ item, guided = false }: { item: ReviewedPlan; guided?: boolean }) {
   if (guided) return <section aria-label={`Finish setup for ${label(item)}`}>
     <h4>Test saved context next</h4>
-    <p>Choose Continue to save a test note and ask {harnessNames[item.params.harness]} to read it. The next screen has the launch button and the exact prompt to send.</p>
+    <p>Choose Continue to save a test note, select a harness, and ask it to read the note. The next screen has the launch command and the exact prompt to send.</p>
     <p>Settings are saved, but the connection has not been verified yet.</p>
     <details><summary>Automatic context and harness approvals</summary><SetupNextSteps item={item} /></details>
   </section>;
