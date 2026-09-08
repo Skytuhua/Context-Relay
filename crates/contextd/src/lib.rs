@@ -57,6 +57,8 @@ pub mod hosted_auth;
 pub mod hosted_login;
 mod native_memory;
 mod pairing;
+#[cfg(all(test, any(windows, target_os = "macos")))]
+mod pairing_test_provider;
 mod recovery_enrollment;
 mod search_index;
 
@@ -5187,6 +5189,17 @@ mod tests {
     #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn device_pairing_crosses_two_authenticated_daemons_without_exposing_joiner_safety() {
+        run_two_daemon_pairing(false).await;
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn hosted_pairing_crosses_two_daemons_and_resumes_lost_approval() {
+        run_two_daemon_pairing(true).await;
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    async fn run_two_daemon_pairing(hosted: bool) {
         let account_id = "018f22e2-79b0-7cc8-98c4-dc0c0c074101"
             .parse::<AccountId>()
             .unwrap();
@@ -5324,22 +5337,64 @@ mod tests {
                 UnavailablePairingApproval,
             )),
         );
-        let approver_config = DaemonConfig::new(
-            approver_runtime.clone(),
-            VaultConfig::new(
-                approver_path.clone(),
-                "test-vault-key",
-                approver_vault_keys.clone(),
+        let backend =
+            pairing_test_provider::Backend::new(provider.clone(), Arc::new(clock.clone()), scope);
+        let hosted_fixtures = hosted.then(|| {
+            let identity = |device_id,
+                            name: &str,
+                            store: &MemoryDeviceIdentityStore,
+                            credential| PairingIdentity {
+                device_id,
+                device_name: name.into(),
+                platform: NativePlatform::Macos,
+                keys: Arc::new(load_or_create_device_keys(store, credential).unwrap()),
+            };
+            (
+                pairing_test_provider::Fixture::new(
+                    backend.clone(),
+                    identity(
+                        approver_device_id,
+                        "Approving Mac",
+                        approver_identity_store.as_ref(),
+                        "pairing-approver-identity",
+                    ),
+                    "550e8400-e29b-41d4-a716-446655440001",
+                    true,
+                ),
+                pairing_test_provider::Fixture::new(
+                    backend.clone(),
+                    identity(
+                        joiner_device_id,
+                        "Joining Mac",
+                        joiner_identity_store.as_ref(),
+                        "pairing-joiner-identity",
+                    ),
+                    "550e8400-e29b-41d4-a716-446655440002",
+                    false,
+                ),
             )
-            .with_pairing_service(
-                approver_service,
-                approver_identity_store.clone(),
-                "pairing-approver-identity",
-                "Approving Mac",
-                NativePlatform::Macos,
-            ),
-            Arc::new(PairingTokenProvider(approver_token)),
-        );
+        });
+        let approver_config = || {
+            DaemonConfig::new(
+                approver_runtime.clone(),
+                VaultConfig::new(
+                    approver_path.clone(),
+                    "test-vault-key",
+                    approver_vault_keys.clone(),
+                )
+                .with_pairing_service(
+                    hosted_fixtures.as_ref().map_or_else(
+                        || approver_service.clone(),
+                        |(approver, _)| approver.service(),
+                    ),
+                    approver_identity_store.clone(),
+                    "pairing-approver-identity",
+                    "Approving Mac",
+                    NativePlatform::Macos,
+                ),
+                Arc::new(PairingTokenProvider(approver_token)),
+            )
+        };
         let joiner_config = DaemonConfig::new(
             joiner_runtime.clone(),
             VaultConfig::new(
@@ -5348,7 +5403,9 @@ mod tests {
                 joiner_vault_keys.clone(),
             )
             .with_pairing_service(
-                joiner_service,
+                hosted_fixtures
+                    .as_ref()
+                    .map_or(joiner_service, |(_, joiner)| joiner.service()),
                 joiner_identity_store.clone(),
                 "pairing-joiner-identity",
                 "Joining Mac",
@@ -5356,9 +5413,9 @@ mod tests {
             ),
             Arc::new(PairingTokenProvider(joiner_token)),
         );
-        let approver_daemon = Daemon::start(approver_config).await.unwrap();
-        let approver_handle = approver_daemon.handle();
-        let approver_owner = tokio::spawn(approver_daemon.run());
+        let approver_daemon = Daemon::start(approver_config()).await.unwrap();
+        let mut approver_handle = approver_daemon.handle();
+        let mut approver_owner = tokio::spawn(approver_daemon.run());
         let joiner_daemon = Daemon::start(joiner_config).await.unwrap();
         let joiner_handle = joiner_daemon.handle();
         let joiner_owner = tokio::spawn(joiner_daemon.run());
@@ -5417,7 +5474,11 @@ mod tests {
                 .await
                 .unwrap_err()
                 .code,
-            ErrorCode::InvalidRequest
+            if hosted {
+                ErrorCode::Conflict
+            } else {
+                ErrorCode::InvalidRequest
+            }
         );
 
         clock.set(1_002);
@@ -5436,15 +5497,40 @@ mod tests {
         assert_eq!(status, PairingState::Pending);
         assert_eq!(review.request_digest, submitted.request_digest);
         clock.set(1_003);
-        let LocalResult::PairingApproval { approval } = approver
+        backend
+            .lose_approval_response
+            .store(hosted, std::sync::atomic::Ordering::SeqCst);
+        let decision = approver
             .call(LocalRequest::PairingDecision(PairingDecisionParams {
                 pairing_id: invite.pairing_id,
                 request_digest: review.request_digest,
                 approve: true,
             }))
-            .await
-            .unwrap()
-        else {
+            .await;
+        let approval_result = if hosted {
+            assert_eq!(decision.unwrap_err().code, ErrorCode::Internal);
+            drop(approver);
+            assert_eq!(approver_handle.shutdown().await, DaemonState::Stopped);
+            assert_eq!(approver_owner.await.unwrap(), Ok(()));
+            let daemon = Daemon::start(approver_config()).await.unwrap();
+            approver_handle = daemon.handle();
+            approver_owner = tokio::spawn(daemon.run());
+            approver = RawClient::connect_with_token(
+                &approver_runtime,
+                ClientRole::Desktop,
+                approver_token,
+            )
+            .await;
+            approver
+                .call(LocalRequest::PairingStatus(PairingIdParams {
+                    pairing_id: invite.pairing_id,
+                }))
+                .await
+                .unwrap()
+        } else {
+            decision.unwrap()
+        };
+        let LocalResult::PairingApproval { approval } = approval_result else {
             panic!("expected approver safety number")
         };
 
@@ -5468,6 +5554,15 @@ mod tests {
                 .contains(approval.safety_number.as_str())
         );
 
+        if let Some((approver, joiner)) = &hosted_fixtures {
+            for fixture in [approver, joiner] {
+                let outcome = fixture.owner.logout().unwrap();
+                outcome.local.unwrap();
+                outcome.remote.unwrap().unwrap();
+            }
+        }
+        let calls_before_local_confirmation =
+            backend.calls.load(std::sync::atomic::Ordering::SeqCst);
         clock.set(1_005);
         let LocalResult::PairingCompletion { completion } = joiner
             .call(LocalRequest::PairingConfirm(PairingConfirmParams {
@@ -5481,6 +5576,10 @@ mod tests {
         };
         assert_eq!(completion.device.device_id, joiner_device_id);
         assert!(completion.device.is_current);
+        assert_eq!(
+            backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_before_local_confirmation
+        );
 
         let mut bridge =
             RawClient::connect_with_token(&approver_runtime, ClientRole::McpBridge, approver_token)
@@ -5516,16 +5615,20 @@ mod tests {
         let enrolled = approver_vault
             .enrolled_workspace_material(&approver_keys)
             .unwrap();
-        let offline_service = pairing::CoordinatorPairingService::new(
-            PairingCoordinator::new(
-                clock.clone(),
-                VaultPairingMaterialSource,
-                UnavailablePairingJoin,
-                UnavailablePairingApproval,
-            ),
-            scope,
-            issuer_certificate_id,
-        );
+        let offline_service: Arc<dyn PairingService> =
+            Arc::new(pairing::CoordinatorPairingService::new(
+                PairingCoordinator::new(
+                    clock.clone(),
+                    VaultPairingMaterialSource,
+                    UnavailablePairingJoin,
+                    UnavailablePairingApproval,
+                ),
+                scope,
+                issuer_certificate_id,
+            ));
+        let offline_service = hosted_fixtures
+            .as_ref()
+            .map_or(offline_service, |(approver, _)| approver.service());
         let offline_identity = PairingIdentity {
             device_id: approver_device_id,
             device_name: "Approving Mac".into(),
@@ -5552,6 +5655,10 @@ mod tests {
             };
             assert_eq!(offline_approval.request, review);
         }
+        assert_eq!(
+            backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_before_local_confirmation
+        );
         let reopened = PairingCoordinator::new(
             clock,
             VaultPairingMaterialSource,

@@ -94,8 +94,10 @@ while local terminal paths can use the saved identity after logout. Startup only
 validates pending local transcripts, and an explicit status request reconciles
 its own prepared approval. Active matching recovery-root certificates and local
 material establish approval authority; fresh joiners have no approval client.
-Two-device hosted approval/confirmation and terminal-after-logout qualification
-remain required before completing the integration checklist below.
+A composed simulated-HTTP test now exercises two native hosted services through
+authenticated daemon IPC, lost committed approval response, daemon/Vault reopen,
+exact replay, safety confirmation, and terminal reads after actual owner logout.
+This remains component evidence; installed live qualification is still required.
 
 **Files:** `crates/contextd/src/pairing.rs`, `lib.rs`, existing hosted Auth service and pairing daemon tests.
 

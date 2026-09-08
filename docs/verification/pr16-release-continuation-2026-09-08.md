@@ -1435,3 +1435,25 @@ This is component evidence. The function is still undeployed, and composed
 hosted two-device approval/confirmation, terminal behavior after logout and
 installed live acceptance remain required. No full-release checkbox or merge
 is justified by these results alone.
+
+
+### Composed native hosted pairing qualification
+
+The existing two-daemon pairing test now runs against both its memory transport
+and a simulated HTTP provider with real native hosted clients and Auth owners.
+The hosted variant verifies session proofs, commits an approval before dropping
+its response, reconstructs the approving daemon/Vault/service, and compares the
+replayed payload and receipt exactly. The joining daemon receives no full safety
+number from status and installs matching workspace material only after explicit
+confirmation. Both Auth owners execute logout before confirmation and accepted
+status/decision retries; these local operations make no pairing HTTP calls.
+Fresh joining-device approval and MCP bridge pairing remain denied.
+
+All 12 daemon pairing tests pass on this Windows host, including both composed
+variants (`.codex/pr16-hosted-two-daemon-final.log`). Bounded independent review
+found no P1/P2; its evidence correction replaced session invalidation with the
+actual logout method before the final run. This simulated provider does not
+qualify live Supabase revocation, deployment, installed macOS/Windows acceptance,
+signing, clean machines or the remaining full-release checklist. PR #16 stays open.
+
+Final daemon library/test Clippy with warnings denied also passes (.codex/pr16-hosted-two-daemon-clippy-final.log).
