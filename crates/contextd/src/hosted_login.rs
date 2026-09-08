@@ -34,9 +34,15 @@ pub struct DaemonLogin {
 
 impl DaemonLogin {
     pub async fn begin(project: &str, owner: Arc<HostedSessionOwner>) -> Result<Self, LoginError> {
+        Self::begin_with_cancellation(project, owner, LoginCancellation::default()).await
+    }
+    pub async fn begin_with_cancellation(
+        project: &str,
+        owner: Arc<HostedSessionOwner>,
+        cancellation: LoginCancellation,
+    ) -> Result<Self, LoginError> {
         let listener = LoopbackLogin::bind(project).await?;
         let runtime = tokio::runtime::Handle::current();
-        let cancellation = LoginCancellation::default();
         let mut flow = Self {
             owner: owner.clone(),
             listener: Some(listener),
@@ -82,6 +88,26 @@ impl DaemonLogin {
             self.cancellation = None;
         }
         result
+    }
+
+    pub async fn open_browser(
+        &self,
+        open: impl FnOnce(&Url) -> Result<(), LoginError> + Send + 'static,
+    ) -> Result<(), LoginError> {
+        let url = self.authorization_url()?;
+        let cancellation = self
+            .cancellation
+            .as_ref()
+            .ok_or(LoginError::Canceled)?
+            .clone();
+        tokio::task::spawn_blocking(move || {
+            if cancellation.is_canceled() {
+                return Err(LoginError::Canceled);
+            }
+            open(&url)
+        })
+        .await
+        .map_err(|_| LoginError::Unavailable)?
     }
 
     /// Returns only after the owner has processed cancellation and local cleanup.

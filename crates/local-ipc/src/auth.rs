@@ -188,6 +188,10 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
     use ClientRole::{Desktop, DesktopRecoveryHost, Installer, McpBridge};
 
     match request {
+        LocalRequest::HostedAuthStatus(_)
+        | LocalRequest::HostedAuthStart(_)
+        | LocalRequest::HostedAuthCancel(_)
+        | LocalRequest::HostedAuthLogout(_) => matches!(role, Desktop),
         LocalRequest::HarnessLaunchInfo(_)
         | LocalRequest::ConnectionCheckStart(_)
         | LocalRequest::ConnectionCheckStatus(_)

@@ -635,6 +635,10 @@ pub enum ClientRole {
 )]
 #[ts(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum LocalRequest {
+    HostedAuthStatus(EmptyParams),
+    HostedAuthStart(crate::HostedAuthStartParams),
+    HostedAuthCancel(crate::HostedAuthGenerationParams),
+    HostedAuthLogout(crate::HostedAuthGenerationParams),
     DesktopWritePrepare(DesktopWritePrepareParams),
     DesktopWritesList(DesktopWritesListParams),
     DesktopWriteGet(DesktopWriteIdParams),
@@ -1146,6 +1150,9 @@ pub enum AccountDeletionState {
     rename_all_fields = "camelCase"
 )]
 pub enum LocalResult {
+    HostedAuth {
+        status: crate::HostedAuthStatus,
+    },
     SearchIndex {
         status: SearchIndexStatus,
     },
@@ -1267,6 +1274,9 @@ pub enum LocalResult {
     deny_unknown_fields
 )]
 enum LocalResultSerde {
+    HostedAuth {
+        status: crate::HostedAuthStatus,
+    },
     SearchIndex {
         status: SearchIndexStatus,
     },
@@ -1415,6 +1425,7 @@ impl LocalResult {
             }
             Self::DesktopWrites { page } => page.validate(),
             Self::Empty
+            | Self::HostedAuth { .. }
             | Self::AccountDeletion { .. }
             | Self::Access { .. }
             | Self::SearchIndex { .. } => Ok(()),

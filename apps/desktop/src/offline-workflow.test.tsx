@@ -16,6 +16,10 @@ import type { WorkspaceGateway } from './workspace';
 const id = (suffix: string) => `018f22e2-79b0-7cc8-98c4-dc0c0c0739${suffix}`;
 
 class FakeWorkspaceGateway implements WorkspaceGateway {
+  async hostedAuthStatus(): Promise<never> { throw new Error('Not used'); }
+  async hostedAuthStart(): Promise<never> { throw new Error('Not used'); }
+  async hostedAuthCancel(): Promise<never> { throw new Error('Not used'); }
+  async hostedAuthLogout(): Promise<never> { throw new Error('Not used'); }
   async connectionCheckStart(): Promise<never> { throw new Error('Not used'); }
   async connectionCheckStatus(): Promise<never> { throw new Error('Not used'); }
   async connectionCheckCancel(): Promise<never> { throw new Error('Not used'); }

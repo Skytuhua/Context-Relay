@@ -59,3 +59,26 @@ the authorization code is single-use and short-lived; token exchange requires
 the original verifier. Use Auth's `/token` and `/logout` endpoints, not the
 separate OAuth-server APIs. Hosted redirect configuration and signing enrollment
 remain pending user input; tests must not create accounts or change providers.
+
+## Desktop control integration
+
+Use `hosted_auth_status`, `hosted_auth_start`, `hosted_auth_cancel` and
+`hosted_auth_logout`, restricted to the Desktop IPC role. Start carries a
+caller-owned operation ID and expected generation; cancel/logout carry the
+generation observed by the desktop. The service must reject stale controls and
+make repeated start requests idempotent. State contains a generation and a closed
+set of phases/failure reasons, never callback codes, provider details or tokens.
+Signed-out state distinguishes remote revocation from local credential deletion.
+
+The daemon owns one active flow and cancels it on replacement/shutdown. Route
+these operations outside the ordered vault worker. Reserve control state before
+async work, update completion only for the same generation, and open the system
+browser from native code only after the listener/attempt is ready. A failed
+browser launch must cancel the attempt. Session restoration, explicit retry and
+refresh must use the existing owner and enforce expiry in displayed state.
+
+Before committing this integration, advance the local protocol minor to 14,
+qualify shutdown-only compatibility with 1.13, independently recompute the HMAC
+vectors, regenerate bindings, update strict frontend validation and run protocol,
+IPC role/routing and daemon lifecycle checks. The current contract additions alone
+do not implement these service behaviors or activate hosted auth.

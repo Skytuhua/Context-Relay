@@ -8,6 +8,8 @@ import type {
   HarnessParams,
   HarnessPrepareParams,
   HarnessExecutionParams,
+  HostedAuthStartParams,
+  HostedAuthStatus,
   LocalRequest,
   LocalResult,
   MemoryCandidate,
@@ -33,6 +35,7 @@ import type {
   TaskStatus,
 } from './bindings';
 import { LocalClient } from './local-client';
+import { validateHostedAuthStatus } from './protocol-validation';
 import { uuidV7 } from './uuid';
 import { type HarnessGateway, requireHarnessAcknowledgment, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
 import { validateConnectionCheckStatus, validateHarnessPreparation, validateHarnessExecution, validateHarnessSetupRecord, validateHarnessSetupsPage, validateSearchIndexStatus } from './protocol-validation';
@@ -50,12 +53,12 @@ export type PairingStatusResult = Extract<
 >;
 export type PairingDecisionResult = PairingRequestResult | PairingApprovalResult;
 
-function harnessResult(result: unknown, kind: string, field: string): unknown {
+function controlResult(result: unknown, kind: string, field: string): unknown {
   if (!result || typeof result !== 'object' || Object.keys(result).length !== 2 ||
     !('kind' in result) || result.kind !== kind || !('data' in result) ||
     !result.data || typeof result.data !== 'object' || Array.isArray(result.data) ||
     Object.keys(result.data).length !== 1 || !(field in result.data)) {
-    throw new Error('The harness response was not confirmed.');
+    throw new Error('The local response was not confirmed.');
   }
   return (result.data as Record<string, unknown>)[field];
 }
@@ -91,6 +94,10 @@ export interface DeviceGateway {
 }
 
 export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
+  hostedAuthStatus(): Promise<HostedAuthStatus>;
+  hostedAuthStart(params: HostedAuthStartParams): Promise<HostedAuthStatus>;
+  hostedAuthCancel(generation: OperationId): Promise<HostedAuthStatus>;
+  hostedAuthLogout(generation: OperationId): Promise<HostedAuthStatus>;
   connectionCheckStart(params: ConnectionCheckStartParams): Promise<ConnectionCheckStatus>;
   connectionCheckStatus(checkId: OperationId): Promise<ConnectionCheckStatus>;
   connectionCheckCancel(checkId: OperationId): Promise<ConnectionCheckStatus>;
@@ -128,9 +135,29 @@ export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
 }
 
 export class LocalWorkspaceGateway implements WorkspaceGateway {
+  private async hostedAuth(request: Extract<LocalRequest, { method: 'hosted_auth_status' | 'hosted_auth_start' | 'hosted_auth_cancel' | 'hosted_auth_logout' }>): Promise<HostedAuthStatus> {
+    const result = await this.client.call(request);
+    return validateHostedAuthStatus(controlResult(result, 'hosted_auth', 'status'));
+  }
+  hostedAuthStatus() {
+    return this.hostedAuth({ method: 'hosted_auth_status', params: {} });
+  }
+  async hostedAuthStart(params: HostedAuthStartParams) {
+    const status = await this.hostedAuth({ method: 'hosted_auth_start', params });
+    if (status.state.phase !== 'disabled' && status.generation !== params.operationId) {
+      throw new Error('The sign-in attempt was not confirmed.');
+    }
+    return status;
+  }
+  hostedAuthCancel(generation: OperationId) {
+    return this.hostedAuth({ method: 'hosted_auth_cancel', params: { generation } });
+  }
+  hostedAuthLogout(generation: OperationId) {
+    return this.hostedAuth({ method: 'hosted_auth_logout', params: { generation } });
+  }
   async connectionCheckStart(params: ConnectionCheckStartParams): Promise<ConnectionCheckStatus> {
     const result = await this.call({ method: 'connection_check_start', params });
-    const status = validateConnectionCheckStatus(harnessResult(result, 'connection_check', 'status'));
+    const status = validateConnectionCheckStatus(controlResult(result, 'connection_check', 'status'));
     if (status.memoryId !== params.memoryId || status.expectedRevision !== params.expectedRevision ||
       status.selection.harness !== params.selection.harness || status.selection.projectId !== params.selection.projectId ||
       status.selection.hermesProfile !== params.selection.hermesProfile) throw new Error('The connection check does not match your selection.');
@@ -139,14 +166,14 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
 
   async connectionCheckStatus(checkId: OperationId): Promise<ConnectionCheckStatus> {
     const result = await this.call({ method: 'connection_check_status', params: { checkId } });
-    const status = validateConnectionCheckStatus(harnessResult(result, 'connection_check', 'status'));
+    const status = validateConnectionCheckStatus(controlResult(result, 'connection_check', 'status'));
     if (status.checkId !== checkId) throw new Error('The connection check identity changed.');
     return status;
   }
 
   async connectionCheckCancel(checkId: OperationId): Promise<ConnectionCheckStatus> {
     const result = await this.call({ method: 'connection_check_cancel', params: { checkId } });
-    const status = validateConnectionCheckStatus(harnessResult(result, 'connection_check', 'status'));
+    const status = validateConnectionCheckStatus(controlResult(result, 'connection_check', 'status'));
     if (status.checkId !== checkId) throw new Error('The connection check identity changed.');
     return status;
   }
@@ -242,27 +269,27 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
 
   private async harnessExecution(method: 'harness_execution_start' | 'harness_execution_status', params: HarnessExecutionParams) {
     const result = await this.call({ method, params });
-    const status = validateHarnessExecution(harnessResult(result, 'harness_execution', 'status'));
+    const status = validateHarnessExecution(controlResult(result, 'harness_execution', 'status'));
     if (status.planId !== params.planId || status.action !== params.action) throw new Error('Setup operation identity changed.');
     return status;
   }
 
   async harnessExecutionCurrent() {
     const result = await this.call({ method: 'harness_execution_current', params: {} });
-    const value = harnessResult(result, 'harness_execution_current', 'status');
+    const value = controlResult(result, 'harness_execution_current', 'status');
     return value === null ? null : validateHarnessExecution(value);
   }
 
   async harnessSetupGet(planId: PlanId) {
     const result = await this.call({ method: 'harness_setup_get', params: { planId } });
-    const setup = validateHarnessSetupRecord(harnessResult(result, 'harness_setup', 'setup'));
+    const setup = validateHarnessSetupRecord(controlResult(result, 'harness_setup', 'setup'));
     if (setup.plan.planId !== planId) throw new Error('Saved setup identity changed.');
     return setup;
   }
 
   async harnessSetupsList(after: PlanId | null = null) {
     const result = await this.call({ method: 'harness_setups_list', params: { after } });
-    const page = validateHarnessSetupsPage(harnessResult(result, 'harness_setups', 'page'));
+    const page = validateHarnessSetupsPage(controlResult(result, 'harness_setups', 'page'));
     if (after !== null && (page.setups.some(item => item.planId >= after) || (page.nextAfter !== null && page.nextAfter >= after))) {
       throw new Error('Setup history did not advance.');
     }
@@ -284,7 +311,7 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
   private async harnessPreparation(method: 'harness_prepare' | 'harness_preparation_status' | 'harness_preparation_cancel', params: HarnessPrepareParams) {
     const request: LocalRequest = method === 'harness_prepare' ? { method, params } : { method, params: { operationId: params.operationId } };
     const result = await this.call(request);
-    const status = validateHarnessPreparation(harnessResult(result, 'harness_preparation', 'status'));
+    const status = validateHarnessPreparation(controlResult(result, 'harness_preparation', 'status'));
     if (status.operationId !== params.operationId || status.selection.harness !== params.selection.harness ||
       status.selection.projectId !== params.selection.projectId || status.selection.hermesProfile !== params.selection.hermesProfile) {
       throw new Error('Preparation does not match the selected operation.');
@@ -294,7 +321,7 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
 
   async harnessPreparedPreview(params: HarnessPrepareParams) {
     const result = await this.call({ method: 'harness_prepared_preview', params });
-    return validateHarnessPlan(harnessResult(result, 'plan', 'plan'), params.selection);
+    return validateHarnessPlan(controlResult(result, 'plan', 'plan'), params.selection);
   }
 
   async harnessPreview(params: HarnessParams) {

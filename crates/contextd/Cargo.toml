@@ -35,3 +35,6 @@ tokio = { workspace = true, features = ["test-util", "process"] }
 [target.'cfg(windows)'.dev-dependencies]
 dunce = "1.0.5"
 windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_JobObjects"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

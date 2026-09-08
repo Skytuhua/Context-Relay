@@ -1,4 +1,5 @@
 import Ajv2020 from 'ajv/dist/2020.js';
+import type { HostedAuthStatus } from './bindings';
 
 import type { ConnectionCheckStatus, HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SearchIndexStatus, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
 
@@ -63,6 +64,17 @@ export function validateSearchIndexStatus(value: unknown): SearchIndexStatus {
   choice(status.phase, ['disabled', 'preparing', 'ready', 'failed'], 'search phase');
   u64(status.revision, 'search revision');
   return value as SearchIndexStatus;
+}
+export function validateHostedAuthStatus(value: unknown): HostedAuthStatus {
+  const status = object(value, ['generation', 'state'], 'hosted auth status');
+  id(status.generation, 'hosted auth generation');
+  const phase = status.state && (status.state as Record<string, unknown>).phase;
+  choice(phase, ['disabled', 'signed_out', 'signing_in', 'restoring', 'connected', 'signing_out', 'failed'], 'hosted auth phase');
+  const keys = phase === 'signed_out' ? ['phase', 'remoteRevoked'] : phase === 'failed' ? ['phase', 'reason'] : ['phase'];
+  const state = object(status.state, keys, 'hosted auth state');
+  if (phase === 'signed_out') choice(state.remoteRevoked, [null, true, false], 'remote revocation');
+  if (phase === 'failed') choice(state.reason, ['unavailable', 'denied', 'expired', 'credential_store'], 'hosted auth failure');
+  return value as HostedAuthStatus;
 }
 const sha = (value: unknown, field: string) => {
   if (typeof value !== 'string' || !digest.test(value)) fail(field);

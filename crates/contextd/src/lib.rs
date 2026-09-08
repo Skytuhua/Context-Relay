@@ -50,6 +50,7 @@ use tokio::{
 mod account_lifecycle;
 pub mod bridge_install;
 pub mod harness_preparation;
+pub mod hosted_auth;
 pub mod hosted_login;
 mod native_memory;
 mod pairing;
@@ -654,6 +655,7 @@ fn is_nonlaunching_recovery_identity(identity: &RecoverySandboxIdentity) -> bool
 }
 
 pub struct DaemonConfig {
+    hosted_auth: hosted_auth::HostedAuthService,
     runtime: RuntimeConfig,
     vault: VaultConfig,
     token_provider: Arc<dyn InstallationTokenProvider>,
@@ -666,6 +668,7 @@ impl DaemonConfig {
         token_provider: Arc<dyn InstallationTokenProvider>,
     ) -> Self {
         Self {
+            hosted_auth: hosted_auth::HostedAuthService::disabled(),
             runtime,
             vault,
             token_provider,
@@ -695,6 +698,11 @@ impl DaemonConfig {
         ))
     }
 
+    pub fn with_hosted_auth(mut self, service: hosted_auth::HostedAuthService) -> Self {
+        self.hosted_auth = service;
+        self
+    }
+
     #[cfg(test)]
     fn with_worker_hook(mut self, worker_hook: Arc<dyn WorkerHook>) -> Self {
         self.vault = self.vault.with_worker_hook(worker_hook);
@@ -709,6 +717,7 @@ impl DaemonConfig {
 }
 
 pub struct Daemon {
+    hosted_auth: hosted_auth::HostedAuthService,
     preparation: PreparationSupervisor,
     instance: Option<InstanceGuard>,
     listener: Option<Listener>,
@@ -751,6 +760,7 @@ impl Daemon {
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
         let (state_sender, state_receiver) = watch::channel(DaemonState::Running);
         Ok(Self {
+            hosted_auth: config.hosted_auth,
             instance: Some(instance),
             preparation,
             listener: Some(listener),
@@ -780,6 +790,7 @@ impl Daemon {
             .ok_or(DaemonError::Transport)?;
         let mut worker_exit = self.worker.take_exit();
         let service = ConnectionService {
+            hosted_auth: self.hosted_auth.clone(),
             execution: harness_execution::ExecutionClient::default(),
             preparation: self.preparation.client(),
             token: self.token.clone(),
@@ -820,6 +831,7 @@ impl Daemon {
         }
 
         self.worker.close_admission();
+        self.hosted_auth.shutdown().await;
         self.preparation.client().close();
         self.state_sender.send_replace(DaemonState::Draining);
         self.shutdown_sender.send_replace(true);
@@ -840,6 +852,7 @@ impl Daemon {
 
 #[derive(Clone)]
 struct ConnectionService {
+    hosted_auth: hosted_auth::HostedAuthService,
     execution: harness_execution::ExecutionClient,
     preparation: PreparationClient,
     token: Arc<InstallationToken>,
@@ -908,6 +921,14 @@ async fn serve_request(
     }
 
     match route_request(role, request) {
+        RoutedRequest::HostedAuth(request) => {
+            let result = match begin_immediate(&registration) {
+                Ok(()) => service.hosted_auth.handle(request).await,
+                Err(error) => Err(error),
+            };
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
         RoutedRequest::ExecutionCurrent => {
             let result =
                 begin_immediate(&registration).map(|()| LocalResult::HarnessExecutionCurrent {
@@ -1016,6 +1037,7 @@ fn begin_immediate(registration: &RequestRegistration) -> Result<(), ClientError
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        self.hosted_auth.close();
         self.listener.take();
         self.preparation.client().close();
         self.native_memory.shutdown_and_join();
@@ -1028,6 +1050,7 @@ impl Drop for Daemon {
 
 #[derive(Debug)]
 enum RoutedRequest {
+    HostedAuth(LocalRequest),
     SearchIndexStatus,
     ExecutionCurrent,
     ExecutionStart(context_relay_protocol::HarnessExecutionParams),
@@ -1062,7 +1085,11 @@ enum VaultCommand {
 fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
     if matches!(
         &request,
-        LocalRequest::HarnessLaunchInfo(_)
+        LocalRequest::HostedAuthStatus(_)
+            | LocalRequest::HostedAuthStart(_)
+            | LocalRequest::HostedAuthCancel(_)
+            | LocalRequest::HostedAuthLogout(_)
+            | LocalRequest::HarnessLaunchInfo(_)
             | LocalRequest::ConnectionCheckStart(_)
             | LocalRequest::ConnectionCheckStatus(_)
             | LocalRequest::ConnectionCheckCancel(_)
@@ -1093,6 +1120,10 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         return RoutedRequest::Immediate(Err(scope_denied_error()));
     }
     match request {
+        request @ (LocalRequest::HostedAuthStatus(_)
+        | LocalRequest::HostedAuthStart(_)
+        | LocalRequest::HostedAuthCancel(_)
+        | LocalRequest::HostedAuthLogout(_)) => RoutedRequest::HostedAuth(request),
         LocalRequest::McpCall(params) if role != ClientRole::McpBridge => {
             RoutedRequest::Work(VaultCommand::DesktopMcp(params))
         }
@@ -4067,7 +4098,7 @@ mod tests {
     #[test]
     fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 59);
+        assert_eq!(fixtures.len(), 63);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -4083,6 +4114,30 @@ mod tests {
                     routed,
                     RoutedRequest::Immediate(Err(error)) if error == unavailable_error()
                 )),
+            }
+        }
+    }
+
+    #[test]
+    fn hosted_auth_controls_are_desktop_only_and_bypass_the_vault_worker() {
+        let requests = all_request_fixtures()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("HostedAuth"))
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 4);
+        for (_, request) in requests {
+            assert!(matches!(
+                route_request(ClientRole::Desktop, request.clone()),
+                RoutedRequest::HostedAuth(_)
+            ));
+            for role in [
+                ClientRole::McpBridge,
+                ClientRole::Installer,
+                ClientRole::DesktopRecoveryHost,
+            ] {
+                assert!(
+                    matches!(route_request(role, request.clone()), RoutedRequest::Immediate(Err(error)) if error == scope_denied_error())
+                );
             }
         }
     }
@@ -7238,6 +7293,25 @@ mod tests {
             || serde_json::json!({"harness": "codex", "projectId": null, "hermesProfile": null});
 
         vec![
+            (
+                "HostedAuthStatus",
+                request_fixture("hosted_auth_status", empty()),
+            ),
+            (
+                "HostedAuthStart",
+                request_fixture(
+                    "hosted_auth_start",
+                    serde_json::json!({"operationId": ID, "expectedGeneration": ID}),
+                ),
+            ),
+            (
+                "HostedAuthCancel",
+                request_fixture("hosted_auth_cancel", serde_json::json!({"generation": ID})),
+            ),
+            (
+                "HostedAuthLogout",
+                request_fixture("hosted_auth_logout", serde_json::json!({"generation": ID})),
+            ),
             (
                 "DesktopWritesList",
                 request_fixture("desktop_writes_list", serde_json::json!({"after": null})),

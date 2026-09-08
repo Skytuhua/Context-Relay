@@ -19,6 +19,9 @@ impl LoginAttempt {
     }
 }
 impl LoginCancellation {
+    pub fn is_canceled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
     /// Immediately withdraws this generation; the owner performs credential cleanup.
     pub fn cancel(&self) {
         self.0.store(true, Ordering::SeqCst);
@@ -43,6 +46,12 @@ pub struct HostedSessionOwner {
     state: Mutex<State>,
 }
 impl HostedSessionOwner {
+    /// Withdraw in-memory authority at daemon shutdown without deleting restart credentials.
+    pub fn suspend(&self) -> Result<(), LoginError> {
+        let mut state = self.lock()?;
+        Self::invalidate(&mut state);
+        Ok(())
+    }
     pub fn new(client: Arc<SupabaseAuthClient>, store: Arc<dyn LoginStore>) -> Self {
         Self {
             client,

@@ -285,3 +285,31 @@ daemon flow plumbing; IPC routing, browser launch, production configuration and
 the remaining full-release gates are still unfinished.
 Core/daemon all-target Clippy passes with test-support and warnings denied;
 formatting, whitespace and Graphify update checks pass.
+
+## Hosted desktop controls (integration in progress)
+
+The daemon now routes Desktop-only hosted sign-in controls outside the vault
+worker. The service reserves generations before spawning work, opens the native
+browser after the loopback listener is ready, restores credentials asynchronously,
+and publishes only sanitized status for the current generation. Shutdown withdraws
+in-memory authority while preserving persisted restart credentials.
+
+Two service tests pass: duplicate starts and stale controls cannot replace newer
+state; a successful callback remains connected after a late Cancel, and shutdown
+retains credentials while withdrawing the session. Read-only review identified
+the late-Cancel race and confirmed the guard fixes it, with no additional concrete
+P1/P2 in the reviewed service/routing paths. Protocol 1.14 and shutdown-only 1.13
+compatibility pass all 223 protocol/local IPC tests. Generated bindings, schemas,
+MCP fixtures and strict desktop validation use the new version. The desktop
+gateway preserves caller-owned operation/generation values and rejects mismatched
+start acknowledgments or responses containing unexpected fields.
+
+Desktop typechecking, lint, build and all 347 tests pass. Twelve core auth tests
+and 25 MCP tests pass. The daemon unit suite passes 89 tests with four existing
+tests ignored; both callback lifecycle suites pass four tests each. These ignored
+tests and packaged/live acceptance are not proven by this run. Independent review
+also confirmed the frozen authentication vectors and gateway/routing changes.
+Core/daemon Clippy passes for all targets with test-support and warnings denied;
+generated bindings/schema checks, whitespace and Graphify update pass.
+Refresh/expiry handling, the desktop sign-in surface and production configuration remain
+unfinished. These checks do not establish live hosted or full-release acceptance.
