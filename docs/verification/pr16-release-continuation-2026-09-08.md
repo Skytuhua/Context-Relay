@@ -514,3 +514,17 @@ The canonical decoder now returns the exact encrypted metadata envelope slice fo
 the commit RPC; its eight Node tests pass. Read-only review found no concrete P1/P2
 issue. Contract and whitespace checks pass. The Edge HTTP endpoint/adapter and
 managed qualification of the new migrations remain unfinished.
+
+## Enrollment HTTP handler
+
+Added the bounded reserve/status/commit handler. It reuses the lifecycle streaming
+reader with a 68 KiB cap, rejects client ownership fields and malformed encodings,
+binds proofs to the authenticated identity and stored challenge, verifies canonical
+record signatures before commit, and checks the returned receipt against that record.
+Unknown provider failures return a closed transient error without provider text.
+
+All 26 enrollment/lifecycle Node checks pass. Read-only review found no concrete
+P1/P2 issue; contract and whitespace checks pass. Log: `.codex/pr16-enrollment-edge.log`.
+The production Supabase adapter and entrypoint remain unfinished; this handler is
+not a deployed endpoint. Atomic-commit Supabase run `34245086183` on `9ad81a2`
+passed; that run predates the status migration and this handler.

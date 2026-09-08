@@ -51,7 +51,7 @@ function strictAuthorization(request) {
   return header.slice("Bearer ".length);
 }
 
-async function readBoundedBody(request) {
+export async function readBoundedBody(request, maximumBytes = MAX_ACCOUNT_LIFECYCLE_REQUEST_BYTES) {
   if (request.body === null) return new Uint8Array();
   const reader = request.body.getReader();
   const chunks = [];
@@ -64,7 +64,7 @@ async function readBoundedBody(request) {
         throw new AccountLifecycleEdgeError(400, "invalid_request");
       }
       total += value.length;
-      if (total > MAX_ACCOUNT_LIFECYCLE_REQUEST_BYTES) {
+      if (total > maximumBytes) {
         try {
           await reader.cancel();
         } catch {
