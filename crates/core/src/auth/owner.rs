@@ -272,18 +272,39 @@ impl HostedSessionOwner {
     /// Daemon-only transport access; credentials must never be serialized to IPC.
     pub fn current_session(&self, now: u64) -> Result<Option<Arc<HostedSession>>, LoginError> {
         let state = self.lock()?;
+        Ok(Self::active_session(&state, now))
+    }
+    /// Resolves refreshed credentials only for the original login generation and
+    /// identity. Queued enrollment work must not adopt a later login's session.
+    pub fn session_for(
+        &self,
+        cancellation: &LoginCancellation,
+        identity: HostedIdentity,
+        now: u64,
+    ) -> Result<Arc<HostedSession>, LoginError> {
+        let state = self.lock()?;
+        if !Arc::ptr_eq(&cancellation.0, &state.generation) {
+            return Err(LoginError::Canceled);
+        }
+        let session = Self::active_session(&state, now).ok_or(LoginError::Expired)?;
+        if *session.identity() != identity {
+            return Err(LoginError::Denied);
+        }
+        Ok(session)
+    }
+    fn active_session(state: &State, now: u64) -> Option<Arc<HostedSession>> {
         if state.generation.load(Ordering::SeqCst)
             || !state
                 .session_deadline
                 .is_some_and(|deadline| Instant::now() < deadline)
         {
-            return Ok(None);
+            return None;
         }
-        Ok(state
+        state
             .session
             .as_ref()
             .filter(|s| s.expires_at() > now)
-            .cloned())
+            .cloned()
     }
     /// Local deletion and remote revocation have separate outcomes. In-memory
     /// state and pending work are invalidated even when local deletion fails.

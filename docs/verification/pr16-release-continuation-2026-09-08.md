@@ -547,3 +547,20 @@ mapping and sanitized failures. Read-only review found no concrete P1/P2 issue.
 Contract and whitespace checks pass. Logs: `.codex/pr16-enrollment-adapter.log`
 and `.codex/pr16-enrollment-adapter-sync.log`. Native transport integration and
 live hosted acceptance remain unfinished.
+
+## Native enrollment session ownership
+
+Added `HostedSessionOwner::session_for` to resolve credentials for an original
+login generation and verified identity under the same lock. It permits token
+refresh within that login and rejects replacement logins, including replacement
+with identical claims. Existing expiry/cancellation checks are shared with
+`current_session`. This is the guard required by the upcoming native transport;
+the returned session is a snapshot and must not be cached across operations.
+
+All 14 hosted-auth transport tests pass, including refresh, foreign identity,
+replacement and cancellation. Read-only review found no concrete P1/P2 issue.
+Core all-target Clippy with test-support and warnings denied, formatting and
+whitespace checks pass.
+Log: `.codex/pr16-enrollment-owner.log`. Status-migration Supabase run
+`34245530149` on `6c49e8c` passed; the later Edge adapter still needs managed
+qualification and live acceptance.

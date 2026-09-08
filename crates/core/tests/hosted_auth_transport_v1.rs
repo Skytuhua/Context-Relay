@@ -57,6 +57,47 @@ impl LoginStore for Store {
 }
 
 #[test]
+fn queued_session_access_keeps_identity_across_refresh_and_rejects_replacement() {
+    let (client, _) = client(
+        PROJECT,
+        vec![
+            tokens(&token(NOW + 900)),
+            response(200, json!({"id":USER})),
+            tokens(&token(NOW + 1200)),
+            response(200, json!({"id":USER})),
+            tokens(&token(NOW + 1400)),
+            response(200, json!({"id":USER})),
+        ],
+    );
+    let owner = HostedSessionOwner::new(Arc::new(client), Arc::new(Store::default()));
+    let attempt = owner.begin_login().unwrap();
+    let generation = attempt.cancellation();
+    let identity = owner.complete_login(attempt, exchange(), NOW).unwrap();
+    let original = owner.session_for(&generation, identity, NOW).unwrap();
+    owner.refresh(NOW + 1).unwrap();
+    let refreshed = owner.session_for(&generation, identity, NOW + 1).unwrap();
+    assert_ne!(original.access_token(), refreshed.access_token());
+    let mut foreign = identity;
+    foreign.session_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440002").unwrap();
+    assert!(matches!(
+        owner.session_for(&generation, foreign, NOW + 1),
+        Err(LoginError::Denied)
+    ));
+    let replacement = owner.begin_login().unwrap();
+    owner
+        .complete_login(replacement, exchange(), NOW + 2)
+        .unwrap();
+    // Even a later login with the same claims cannot revive the old generation.
+    assert!(matches!(
+        owner.session_for(&generation, identity, NOW + 2),
+        Err(LoginError::Canceled)
+    ));
+    let current = owner.cancellation().unwrap();
+    current.cancel();
+    assert!(owner.session_for(&current, identity, NOW + 2).is_err());
+}
+
+#[test]
 fn session_owner_persists_before_publication_and_invalidates_old_attempts() {
     let (client, http) = client(
         PROJECT,
