@@ -43,6 +43,9 @@ jobs:
         env:
           CONTEXT_RELAY_SEARCH_ASSETS: ${{ github.workspace }}/target/search-assets
       - run: pnpm package:windows
+        env:
+          CONTEXT_RELAY_HOSTED_URL: ${{ vars.CONTEXT_RELAY_HOSTED_URL }}
+          CONTEXT_RELAY_HOSTED_PUBLISHABLE_KEY: ${{ vars.CONTEXT_RELAY_HOSTED_PUBLISHABLE_KEY }}
       - name: Record candidate checksums
         shell: pwsh
         run: |

@@ -1,4 +1,7 @@
 mod connection_check;
+#[cfg(test)]
+#[path = "../build.rs"]
+mod hosted_build_config;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -655,7 +658,8 @@ fn is_nonlaunching_recovery_identity(identity: &RecoverySandboxIdentity) -> bool
 }
 
 pub struct DaemonConfig {
-    hosted_auth: hosted_auth::HostedAuthService,
+    // None selects build configuration after the instance guard is acquired.
+    hosted_auth: Option<hosted_auth::HostedAuthService>,
     runtime: RuntimeConfig,
     vault: VaultConfig,
     token_provider: Arc<dyn InstallationTokenProvider>,
@@ -668,7 +672,7 @@ impl DaemonConfig {
         token_provider: Arc<dyn InstallationTokenProvider>,
     ) -> Self {
         Self {
-            hosted_auth: hosted_auth::HostedAuthService::disabled(),
+            hosted_auth: Some(hosted_auth::HostedAuthService::disabled()),
             runtime,
             vault,
             token_provider,
@@ -691,15 +695,17 @@ impl DaemonConfig {
             vault.search_resources = Some(search_index::resources_beside_executable(&executable)?);
             vault
         };
-        Ok(Self::new(
+        let mut config = Self::new(
             RuntimeConfig::production(),
             vault,
             Arc::new(PlatformInstallationTokenProvider),
-        ))
+        );
+        config.hosted_auth = None;
+        Ok(config)
     }
 
     pub fn with_hosted_auth(mut self, service: hosted_auth::HostedAuthService) -> Self {
-        self.hosted_auth = service;
+        self.hosted_auth = Some(service);
         self
     }
 
@@ -734,6 +740,12 @@ pub struct Daemon {
 impl Daemon {
     pub async fn start(config: DaemonConfig) -> Result<Self, DaemonError> {
         let mut instance = InstanceGuard::acquire(&config.runtime).map_err(map_guard_error)?;
+        let hosted_auth = match config.hosted_auth {
+            Some(service) => service,
+            None => hosted_auth::HostedAuthService::production()
+                .await
+                .map_err(|_| DaemonError::Startup)?,
+        };
         let mut vault_config = config.vault.load_device_identity()?;
         let preparation = PreparationSupervisor::spawn().map_err(|_| DaemonError::Startup)?;
         vault_config.preparation = Some(preparation.client());
@@ -760,7 +772,7 @@ impl Daemon {
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
         let (state_sender, state_receiver) = watch::channel(DaemonState::Running);
         Ok(Self {
-            hosted_auth: config.hosted_auth,
+            hosted_auth,
             instance: Some(instance),
             preparation,
             listener: Some(listener),

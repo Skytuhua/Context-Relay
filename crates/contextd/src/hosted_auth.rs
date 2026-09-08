@@ -210,6 +210,31 @@ async fn maintain_session(
 }
 
 impl HostedAuthService {
+    /// Initialize only after acquiring the daemon instance guard. These values are
+    /// fixed by the build, so a launcher cannot redirect saved login credentials.
+    pub(crate) async fn production() -> Result<Self, LoginError> {
+        let (Some(project), Some(key)) = (
+            option_env!("CONTEXT_RELAY_HOSTED_URL"),
+            option_env!("CONTEXT_RELAY_HOSTED_PUBLISHABLE_KEY"),
+        ) else {
+            return Ok(Self::disabled());
+        };
+        let owner = tokio::task::spawn_blocking(move || {
+            use context_relay_core::auth::{PlatformLoginStore, SupabaseAuthClient};
+            Ok::<_, LoginError>(HostedSessionOwner::new(
+                Arc::new(SupabaseAuthClient::new(project, key)?),
+                Arc::new(PlatformLoginStore::new(project, "default")?),
+            ))
+        })
+        .await
+        .map_err(|_| LoginError::Unavailable)??;
+        Ok(Self::enabled(
+            project.into(),
+            Arc::new(owner),
+            Arc::new(SystemLoginBrowser),
+        ))
+    }
+
     pub fn disabled() -> Self {
         Self::build(None, String::new(), Arc::new(SystemLoginBrowser))
     }

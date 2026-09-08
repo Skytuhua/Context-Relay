@@ -82,3 +82,22 @@ qualify shutdown-only compatibility with 1.13, independently recompute the HMAC
 vectors, regenerate bindings, update strict frontend validation and run protocol,
 IPC role/routing and daemon lifecycle checks. The current contract additions alone
 do not implement these service behaviors or activate hosted auth.
+
+## Production build configuration
+
+Set `CONTEXT_RELAY_HOSTED_URL` and `CONTEXT_RELAY_HOSTED_PUBLISHABLE_KEY` in
+the environment that compiles `contextd`. The daemon embeds both values; runtime
+environment changes cannot redirect its credential store or token exchange.
+Omitting both produces an offline build with hosted sign-in disabled. Supplying
+only one fails the build, as do secret keys, legacy JWT keys and malformed
+publishable keys. Use a `sb_publishable_` key, never an administrative key.
+Supabase documents publishable keys as suitable for desktop applications in its
+[API-key guide](https://supabase.com/docs/guides/getting-started/api-keys).
+
+Production initialization happens after acquiring the daemon instance guard.
+HTTP-client and OS credential-store construction run on a blocking worker;
+the existing owner then restores and refreshes the saved login. Project URL
+validation remains in the shared auth client and credential store. Builds with
+invalid hosted configuration fail startup with the existing sanitized diagnostic.
+Release automation must supply the verified project configuration before live
+acceptance; an offline candidate is not evidence of hosted release readiness.

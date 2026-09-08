@@ -352,3 +352,24 @@ production build pass. Read-only review found no concrete P1/P2 issues.
 The built browser preview visually confirms the Settings layout; it has no native
 bridge and therefore does not establish native or live provider acceptance.
 Production hosted configuration and the remaining release gates are unfinished.
+
+## Hosted production configuration
+
+The daemon now reads hosted configuration embedded at compile time, initializes
+the HTTP client and OS credential store on a blocking worker, and begins restoring
+login only after acquiring its instance guard. Build validation requires both URL
+and publishable key, rejects secret/legacy JWT keys, and leaves unconfigured builds
+offline. Runtime URL validation uses the existing shared auth boundary.
+
+The existing enabled publishable key for project `brvzuycnxoswdzzipgvx` was read
+through the Supabase connector. Both public build values were saved as GitHub
+repository variables and wired into the Windows installer candidate workflow.
+No OAuth provider configuration or account enrollment was changed.
+
+The daemon library suite passes 92 tests with four existing ignored tests,
+including the build-validator regression check. The four hosted service tests
+also pass separately. Read-only review found no concrete P1/P2 in initialization,
+configuration validation or packaging-variable propagation. These checks do not
+prove live GitHub login, native credential acceptance or signed release readiness.
+All-target daemon Clippy with test-support and warnings denied passes with the
+actual hosted configuration embedded. Whitespace and Graphify update pass.
