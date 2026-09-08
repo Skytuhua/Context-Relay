@@ -256,3 +256,25 @@ fn failed_refresh_is_not_retried_and_logout_requires_revocation_confirmation() {
     assert!(client.logout(&original).is_err());
     assert_eq!(http.requests.lock().unwrap().len(), 4);
 }
+
+#[test]
+fn stored_login_requires_fresh_hosted_verification() {
+    let (client, http) = client(
+        PROJECT,
+        vec![
+            tokens(&token(NOW + 900)),
+            response(200, json!({"id":USER})),
+            tokens(&token(NOW + 1800)),
+            response(200, json!({"id":USER})),
+        ],
+    );
+    let session = client.exchange(exchange(), NOW).unwrap();
+    let stored = session.stored_login();
+    assert!(!format!("{stored:?}").contains("synthetic-refresh"));
+    let restored = client.restore(&stored, NOW + 900).unwrap();
+    assert!(restored.identity() == session.identity());
+    assert_eq!(http.requests.lock().unwrap().len(), 4);
+    let (wrong, http) = self::client("https://other.supabase.co", vec![]);
+    assert!(wrong.restore(&stored, NOW).is_err());
+    assert!(http.requests.lock().unwrap().is_empty());
+}

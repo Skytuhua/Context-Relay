@@ -1,6 +1,8 @@
 //! Daemon-owned GitHub PKCE attempts. This does not enroll a trusted device.
 
+mod storage;
 mod transport;
+pub use storage::{PlatformLoginStore, StoredLogin};
 pub use transport::{HostedIdentity, HostedSession, SupabaseAuthClient};
 
 use std::{
@@ -32,6 +34,8 @@ pub enum LoginError {
     Unavailable,
     #[error("hosted login response is invalid")]
     Provider,
+    #[error("login credential store is unavailable")]
+    CredentialStore,
 }
 
 pub struct PendingLogin {

@@ -215,3 +215,26 @@ Independent bounded review found no concrete P1/P2 issue. Core and daemon Clippy
 passes for all targets with test-support and warnings denied; formatting and
 whitespace checks pass. Secure persistence, refresh/logout coordination and all
 previously listed activation and release acceptance requirements remain open.
+
+## Restart credential persistence
+
+The OS login store persists a versioned refresh-only record bound to the hosted
+project, user and session, in a separate slot for each local profile/project.
+Access and GitHub provider tokens are not persisted. Loading yields unverified
+restart material; restoring it uses refresh and the same remote identity checks,
+including the original user/session binding. Malformed, extra-field and oversized
+records fail closed. Oversized encoded writes are rejected before replacing the
+previous credential, and native credential-store errors remain sanitized.
+
+The missing-restore test failed before implementation. Seven hosted transport
+tests pass. The record validation check and explicitly invoked Windows credential
+round-trip check pass; the latter creates a random synthetic slot, verifies that
+oversized writes preserve its prior value, reopens it, then deletes it and checks
+idempotent deletion. This is local Windows evidence, not clean-machine or macOS
+acceptance. The native Windows blob limit can reject records below the portable
+record limit; a failed save must prevent the manager from publishing that login.
+The session manager, persistence-before-publication and logout/refresh races are
+still required before production activation.
+Independent review verified closure of the encoded-size finding and reported
+no new issue. Core/daemon all-target Clippy passes with test-support and warnings
+denied; formatting, whitespace and Graphify update checks pass.

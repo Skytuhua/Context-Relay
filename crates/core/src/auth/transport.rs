@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::{LoginError, LoginExchange};
+use super::{LoginError, LoginExchange, StoredLogin};
 use crate::sync::supabase::{
     ReqwestHttpClient, SupabaseHttpClient, SupabaseHttpMethod, SupabaseHttpRequest,
     SupabaseHttpResponse, valid_header_secret, validated_project_url,
@@ -30,6 +30,13 @@ pub struct HostedSession {
 }
 
 impl HostedSession {
+    pub fn stored_login(&self) -> StoredLogin {
+        StoredLogin {
+            project: self.project.clone(),
+            identity: self.identity,
+            refresh_token: self.refresh_token.clone(),
+        }
+    }
     pub fn project_url(&self) -> &Url {
         &self.project
     }
@@ -121,14 +128,29 @@ impl SupabaseAuthClient {
         if session.project != self.project {
             return Err(LoginError::Configuration);
         }
+        self.refresh_credentials(session.refresh_token(), session.identity, now)
+    }
+
+    /// Stored credentials are not authenticated state until renewed and verified.
+    pub fn restore(&self, stored: &StoredLogin, now: u64) -> Result<HostedSession, LoginError> {
+        if stored.project != self.project {
+            return Err(LoginError::Configuration);
+        }
+        self.refresh_credentials(&stored.refresh_token, stored.identity, now)
+    }
+
+    fn refresh_credentials(
+        &self,
+        refresh_token: &str,
+        identity: HostedIdentity,
+        now: u64,
+    ) -> Result<HostedSession, LoginError> {
         #[derive(Serialize)]
         struct Refresh<'a> {
             refresh_token: &'a str,
         }
-        let body = serde_json::to_vec(&Refresh {
-            refresh_token: session.refresh_token(),
-        })
-        .map_err(|_| LoginError::Provider)?;
+        let body =
+            serde_json::to_vec(&Refresh { refresh_token }).map_err(|_| LoginError::Provider)?;
         let response = self.request(
             SupabaseHttpMethod::Post,
             "/auth/v1/token?grant_type=refresh_token",
@@ -136,7 +158,7 @@ impl SupabaseAuthClient {
             None,
             200,
         )?;
-        self.verify_tokens(response, now, Some(session.identity))
+        self.verify_tokens(response, now, Some(identity))
     }
 
     /// Remote revocation only; the owner must separately clear local credentials.
@@ -263,7 +285,7 @@ struct TokenResponse {
     refresh_token: Zeroizing<String>,
 }
 
-fn secret<'de, D: Deserializer<'de>>(d: D) -> Result<Zeroizing<String>, D::Error> {
+pub(super) fn secret<'de, D: Deserializer<'de>>(d: D) -> Result<Zeroizing<String>, D::Error> {
     String::deserialize(d).map(Zeroizing::new)
 }
 
@@ -312,7 +334,7 @@ fn claims(token: &str) -> Result<Claims, LoginError> {
     serde_json::from_slice(&payload).map_err(|_| LoginError::Provider)
 }
 
-fn canonical_uuid(value: &str) -> Result<Uuid, LoginError> {
+pub(super) fn canonical_uuid(value: &str) -> Result<Uuid, LoginError> {
     let id = Uuid::parse_str(value).map_err(|_| LoginError::Provider)?;
     if id.is_nil() || id.to_string() != value {
         return Err(LoginError::Provider);
