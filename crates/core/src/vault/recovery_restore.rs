@@ -308,10 +308,10 @@ impl Vault {
     ) -> Result<CommitDisposition, VaultError> {
         let transaction = self.connection.transaction()?;
         let stored = load_recovery_restore(&transaction)?.ok_or_else(validation)?;
+        // Provider acceptance and local preparation/completion use independent clocks.
         if projection.canonical_claim != stored.canonical_claim
             || &projection.receipt != receipt
-            || receipt.accepted_at_ms < stored.prepared_at_ms
-            || completed_at_ms < receipt.accepted_at_ms
+            || completed_at_ms < stored.prepared_at_ms
         {
             transaction.rollback()?;
             return Err(validation());
@@ -679,10 +679,8 @@ fn validate_stored_row(raw: RawRecoveryRestore) -> Result<StoredRecoveryRestore,
             activated_genesis_certificate_id == Some(record.genesis_certificate_id)
                 && activated_recovered_certificate_id == Some(claim.certificate_id)
                 && accepted_generation == expected_generation.checked_add(1)
-                && provider_accepted_at_ms.is_some_and(|value| value >= prepared_at_ms)
-                && completed_at_ms
-                    .zip(provider_accepted_at_ms)
-                    .is_some_and(|(completed, provider)| completed >= provider)
+                && provider_accepted_at_ms.is_some()
+                && completed_at_ms.is_some_and(|value| value >= prepared_at_ms)
                 && conflict_at_ms.is_none()
         }
         RecoveryRestorePersistenceState::Conflict => {

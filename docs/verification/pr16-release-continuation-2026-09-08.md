@@ -827,3 +827,34 @@ fixtures test transactional authority separately from the Edge's frozen crypto v
 they do not establish live Supabase or installed-product acceptance. Native restore
 transport, durable daemon/desktop restore workflow, deployment and full release gates
 remain required. No release has been published or PR merged.
+
+### Native hosted restore transport and clock domains
+
+The native restore transport now reuses the hosted client's original-session and
+project checks. It binds to the discovered canonical root, signs restore claims with
+the installed device key, and validates exact claim/receipt IDs, hashes, generation
+and bounded server timestamps. Projection reads distinguish a missing field from null
+and reject a different requested restore ID. No recovery phrase crosses this HTTP boundary.
+
+The transport-to-coordinator regression exposed a clock-domain defect: local activation
+compared server acceptance time to desktop preparation and pre-request completion time.
+The coordinator now samples completion after HTTP reconciliation. Vault schema 30 and
+runtime/reload validation retain server acceptance independently, while enforcing local
+completion at or after local preparation. The migration preserves existing restore rows.
+
+The regression covers signed fixture requests, altered receipts, login replacement,
+encrypted-vault restart and simulated HTTP time with server clocks five seconds ahead
+and behind. It failed with a terminal conflict before the clock fix. Read-only review
+confirmed the fix and found no further concrete P1/P2. Validation logs are
+`.codex/pr16-native-restore-{test,clock-red,green}.log`.
+
+Validation: 20 hosted Auth/transport tests, 13 recovery flow tests and nine vault tests
+pass. The additional schema-29 preservation test passes for both prepared and active
+rows (`.codex/pr16-native-restore-migration.log`).
+Core all-target Clippy with test-support and warnings denied passes
+(`.codex/pr16-native-restore-clippy.log`), as does `git diff --check`.
+
+This is the core transport, not the complete product workflow. Durable hosted restore
+intent must still bind the original Auth identity and project across daemon restart;
+trusted native phrase input and daemon/desktop commands remain required. Live hosted
+acceptance, signing, clean-machine qualification and the full release gates remain open.

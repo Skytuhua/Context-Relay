@@ -436,6 +436,58 @@ fn wrong_keys_forged_proof_and_terminal_conflict_install_no_trust() {
 }
 
 #[test]
+fn schema_29_preserves_prepared_and_active_restore_rows() {
+    for active in [false, true] {
+        let (provider, write) = provider_and_write(3_000);
+        let path = TempVault::new("restore-schema-29");
+        let keys = MemoryKeyStore::default();
+        let key = [0x92; 32];
+        keys.insert(CREDENTIAL, key);
+        let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+        vault.prepare_recovery_restore(&write).unwrap();
+        if active {
+            let transport = provider.restore_transport(scope());
+            let receipt = transport
+                .submit_restore(&write.canonical_claim, 3_500)
+                .unwrap();
+            let projection = transport
+                .restore_claim(receipt.restore_id)
+                .unwrap()
+                .unwrap();
+            vault
+                .activate_recovery_restore(&receipt, &projection, &recovered_device_keys(), 4_000)
+                .unwrap();
+        }
+        let before = vault.recovery_restore().unwrap().unwrap();
+        drop(vault);
+        let raw = open_keyed(path.path(), &key);
+        raw.execute_batch(
+            &include_str!("../migrations/0023_recovery_restore.sql").replace(
+                "CREATE TABLE recovery_restores (",
+                "CREATE TABLE recovery_restores_legacy (",
+            ),
+        )
+        .unwrap();
+        raw.execute_batch(
+            "INSERT INTO recovery_restores_legacy SELECT * FROM recovery_restores;
+            DROP TABLE recovery_restores;
+            ALTER TABLE recovery_restores_legacy RENAME TO recovery_restores;
+            PRAGMA user_version = 29;",
+        )
+        .unwrap();
+        drop(raw);
+        let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+        assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        assert_eq!(vault.recovery_restore().unwrap().unwrap(), before);
+        if active {
+            vault
+                .recovered_workspace_material(&recovered_device_keys())
+                .unwrap();
+        }
+    }
+}
+
+#[test]
 fn schema_22_real_rows_migrate_forward_without_rewrite() {
     let path = TempVault::new("recovery-restore-schema-22");
     let keys = MemoryKeyStore::default();

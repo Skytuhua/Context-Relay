@@ -57,6 +57,262 @@ impl LoginStore for Store {
 }
 
 #[test]
+fn native_restore_transport_checks_claims_receipts_and_original_session() {
+    use context_relay_core::{
+        crypto::DeviceKeys,
+        devices::{
+            recovery::RecoveryEnrollmentClock,
+            recovery_crypto::decode_recovery_enrollment_record_v1,
+            recovery_restore_crypto::decode_recovery_device_claim_v1,
+            recovery_restore_transport::RecoveryRestoreTransport,
+            supabase_enrollment::HostedEnrollmentClient,
+        },
+    };
+    use sha2::{Digest, Sha256};
+    struct Clock;
+    impl RecoveryEnrollmentClock for Clock {
+        fn now_ms(&self) -> u64 {
+            NOW * 1000
+        }
+    }
+    let decode = |encoded: &str| -> Vec<u8> {
+        encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|part| u8::from_str_radix(std::str::from_utf8(part).unwrap(), 16).unwrap())
+            .collect()
+    };
+    let root_hex = include_str!("fixtures/recovery-enrollment-record-v1.hex").trim();
+    let claim_hex = include_str!("fixtures/recovery-device-claim-v1.hex").trim();
+    let canonical = decode(claim_hex);
+    let record = decode_recovery_enrollment_record_v1(&decode(root_hex)).unwrap();
+    let claim = decode_recovery_device_claim_v1(&canonical).unwrap();
+    let snapshot = json!({"accountId":record.account_id,"workspaceId":record.workspace_id,
+        "canonicalRecord":root_hex,"canonicalRecordSha256":format!("{:x}",Sha256::digest(decode(root_hex))),
+        "registeredAtMs":(NOW*1000).to_string(),"recoveryGeneration":"0"});
+    let receipt = json!({"restoreId":claim.restore_id,"enrollmentId":record.enrollment_id,
+        "recoveryRootId":record.recovery_root_id,"accountId":record.account_id,"workspaceId":record.workspace_id,
+        "certificateId":claim.certificate_id,"canonicalRecordSha256":snapshot["canonicalRecordSha256"],
+        "canonicalClaimSha256":format!("{:x}",Sha256::digest(&canonical)),
+        "acceptedGeneration":(claim.expected_recovery_generation+1).to_string(),"acceptedAtMs":(NOW*1000-5000).to_string()});
+    let projection = json!({"canonicalClaim":claim_hex,"receipt":receipt});
+    let mut responses = vec![
+        tokens(&token(NOW + 900)),
+        response(200, json!({"id":USER})),
+        response(200, json!({"v":1,"snapshot":snapshot})),
+        response(200, json!({"v":1,"snapshot":snapshot})),
+        response(200, json!({"v":1,"receipt":receipt})),
+        response(200, json!({"v":1,"projection":projection})),
+        response(200, json!({"v":1,"projection":null})),
+    ];
+    let mut bad_receipts = Vec::new();
+    for (field, value) in [
+        ("acceptedGeneration", json!("0")),
+        ("acceptedAtMs", json!("9223372036854775808")),
+        ("canonicalClaimSha256", json!("00".repeat(32))),
+        ("certificateId", json!(record.genesis_certificate_id)),
+        ("accountId", json!(record.workspace_id)),
+        ("extra", json!(true)),
+    ] {
+        let mut bad = receipt.clone();
+        bad[field] = value;
+        bad_receipts.push(bad);
+    }
+    for bad in &bad_receipts {
+        responses.push(response(200, json!({"v":1,"receipt":bad})));
+    }
+    for bad in &bad_receipts {
+        responses.push(response(
+            200,
+            json!({"v":1,"projection":{"canonicalClaim":claim_hex,"receipt":bad}}),
+        ));
+    }
+    responses.extend([response(200,json!({"v":1})),response(200,json!({"v":2,"projection":null})),
+        response(200,json!({"v":1,"projection":{"canonicalClaim":claim_hex.to_uppercase(),"receipt":receipt}})),
+        response(200,json!({"v":1,"projection":projection}))]);
+    let (auth, http) = client(PROJECT, responses);
+    let owner = Arc::new(HostedSessionOwner::new(
+        Arc::new(auth),
+        Arc::new(Store::default()),
+    ));
+    let attempt = owner.begin_login().unwrap();
+    let generation = attempt.cancellation();
+    let identity = owner.complete_login(attempt, exchange(), NOW).unwrap();
+    let client = HostedEnrollmentClient::with_http_client(
+        owner.clone(),
+        identity,
+        generation,
+        PROJECT,
+        "public-test",
+        http.clone(),
+    )
+    .unwrap();
+    let initial = client.snapshot(NOW).unwrap().unwrap();
+    let transport = client
+        .into_restore_transport(
+            initial.clone(),
+            Arc::new(DeviceKeys::from_seeds_for_test([0x66; 32], [0x77; 32])),
+            Clock,
+        )
+        .unwrap();
+    assert_eq!(transport.root_snapshot().unwrap(), Some(initial));
+    let accepted = transport.submit_restore(&canonical, NOW * 1000).unwrap();
+    let proof: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/hosted-recovery-proof-v1.json")).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            http.requests.lock().unwrap().last().unwrap().body()
+        )
+        .unwrap(),
+        json!({"v":1,"action":"restore","claim":claim_hex,"proof":proof["signature"]})
+    );
+    assert_eq!(
+        transport
+            .restore_claim(claim.restore_id)
+            .unwrap()
+            .unwrap()
+            .receipt,
+        accepted
+    );
+    assert!(transport.restore_claim(claim.restore_id).unwrap().is_none());
+    for _ in &bad_receipts {
+        assert!(transport.submit_restore(&canonical, NOW * 1000).is_err());
+    }
+    for _ in 0..bad_receipts.len() + 3 {
+        assert!(transport.restore_claim(claim.restore_id).is_err());
+    }
+    assert!(
+        transport
+            .restore_claim("018f22e2-79b0-7cc8-98c4-dc0c0c073999".parse().unwrap())
+            .is_err()
+    );
+    let count = http.requests.lock().unwrap().len();
+    let mut corrupt = canonical.clone();
+    *corrupt.last_mut().unwrap() ^= 1;
+    assert!(transport.submit_restore(&corrupt, NOW * 1000).is_err());
+    owner.begin_login().unwrap();
+    assert!(transport.submit_restore(&canonical, NOW * 1000).is_err());
+    assert!(transport.restore_claim(claim.restore_id).is_err());
+    assert!(transport.root_snapshot().is_err());
+    assert_eq!(http.requests.lock().unwrap().len(), count);
+
+    use context_relay_core::{
+        devices::{
+            recovery::OsRecoveryEnrollmentEntropy,
+            recovery_restore::{
+                RecoveryRestoreCoordinator, RecoveryRestoreIdentity, RecoveryRestoreOutcome,
+            },
+            recovery_restore_crypto::RecoveryDeviceClaimArtifacts,
+        },
+        vault::{RecoveryRestoreWrite, Vault},
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    #[derive(Clone)]
+    struct AdvancingClock(Arc<AtomicU64>);
+    impl RecoveryEnrollmentClock for AdvancingClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    struct DelayedHttp {
+        http: Arc<Http>,
+        clock: AdvancingClock,
+    }
+    impl SupabaseHttpClient for DelayedHttp {
+        fn execute(
+            &self,
+            request: SupabaseHttpRequest,
+        ) -> Result<SupabaseHttpResponse, SupabaseHttpError> {
+            let result = self.http.execute(request);
+            self.clock.0.fetch_add(1000, Ordering::SeqCst);
+            result
+        }
+    }
+    for server_ms in [NOW * 1000 - 5000, NOW * 1000 + 5000] {
+        let mut receipt = receipt.clone();
+        receipt["acceptedAtMs"] = json!(server_ms.to_string());
+        let (auth, http) = self::client(
+            PROJECT,
+            vec![
+                tokens(&token(NOW + 900)),
+                response(200, json!({"id":USER})),
+                response(200, json!({"v":1,"snapshot":snapshot})),
+                response(200, json!({"v":1,"receipt":receipt})),
+                response(
+                    200,
+                    json!({"v":1,"projection":{"canonicalClaim":claim_hex,"receipt":receipt}}),
+                ),
+            ],
+        );
+        let owner = Arc::new(HostedSessionOwner::new(
+            Arc::new(auth),
+            Arc::new(Store::default()),
+        ));
+        let attempt = owner.begin_login().unwrap();
+        let generation = attempt.cancellation();
+        let identity = owner.complete_login(attempt, exchange(), NOW).unwrap();
+        let clock = AdvancingClock(Arc::new(AtomicU64::new(NOW * 1000)));
+        let client = HostedEnrollmentClient::with_http_client(
+            owner,
+            identity,
+            generation,
+            PROJECT,
+            "public-test",
+            Arc::new(DelayedHttp {
+                http,
+                clock: clock.clone(),
+            }),
+        )
+        .unwrap();
+        let mut initial = client.snapshot(NOW).unwrap().unwrap();
+        initial.recovery_generation = claim.expected_recovery_generation;
+        let device = Arc::new(DeviceKeys::from_seeds_for_test([0x66; 32], [0x77; 32]));
+        let write = RecoveryRestoreWrite::new(
+            initial.clone(),
+            RecoveryDeviceClaimArtifacts {
+                claim: claim.clone(),
+                canonical_claim: canonical.clone(),
+                canonical_claim_sha256: context_relay_protocol::Sha256Digest(
+                    Sha256::digest(&canonical).into(),
+                ),
+            },
+            clock.now_ms(),
+        )
+        .unwrap();
+        let path = support::TempVault::new("native-restore-clock");
+        let keys = support::MemoryKeyStore::default();
+        let mut vault = Vault::open(path.path(), "native-restore-clock", &keys).unwrap();
+        vault.prepare_recovery_restore(&write).unwrap();
+        drop(vault);
+        let mut vault = Vault::open(path.path(), "native-restore-clock", &keys).unwrap();
+        let transport = client
+            .into_restore_transport(initial, device.clone(), clock.clone())
+            .unwrap();
+        let coordinator = RecoveryRestoreCoordinator::new_for_test(
+            clock.clone(),
+            OsRecoveryEnrollmentEntropy,
+            transport,
+        );
+        let identity = RecoveryRestoreIdentity {
+            device_id: claim.certificate.device_id,
+            device_name: claim.device_name.clone(),
+            platform: claim.device_platform,
+            keys: &device,
+        };
+        assert!(matches!(
+            coordinator.resume_prepared(&mut vault, &identity).unwrap(),
+            RecoveryRestoreOutcome::Complete { .. }
+        ));
+        drop(vault);
+        let vault = Vault::open(path.path(), "native-restore-clock", &keys).unwrap();
+        let stored = vault.recovery_restore().unwrap().unwrap();
+        assert_eq!(stored.provider_accepted_at_ms, Some(server_ms));
+        assert_eq!(stored.completed_at_ms, Some(NOW * 1000 + 3000));
+        vault.recovered_workspace_material(&device).unwrap();
+    }
+}
+
+#[test]
 fn native_recovery_snapshot_validates_bytes_and_preserves_session_identity() {
     use context_relay_core::devices::supabase_enrollment::HostedEnrollmentClient;
     use sha2::{Digest, Sha256};

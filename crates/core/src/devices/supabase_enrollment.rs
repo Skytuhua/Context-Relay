@@ -4,7 +4,13 @@ use super::{
         HostedEnrollmentChallenge, decode_recovery_enrollment_record_v1,
         sign_hosted_enrollment_proof,
     },
-    recovery_restore_transport::RecoveryRootSnapshot,
+    recovery_restore_crypto::{
+        decode_recovery_device_claim_v1, sign_hosted_recovery_proof, verify_recovery_device_claim,
+    },
+    recovery_restore_transport::{
+        RecoveryRestoreProjection, RecoveryRestoreReceipt, RecoveryRestoreTransport,
+        RecoveryRootSnapshot,
+    },
     recovery_transport::{
         RecoveryEnrollmentReceipt, RecoveryEnrollmentTransport, RecoveryRootStatus,
         RecoveryTransportError,
@@ -19,7 +25,7 @@ use crate::{
 };
 use context_relay_protocol::{
     AccountId, DecimalTimestamp, DeviceCertificateId, OperationId, RecoveryEnrollmentId,
-    RecoveryRootId, Sha256Digest, WorkspaceId,
+    RecoveryRestoreId, RecoveryRootId, Sha256Digest, WorkspaceId,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -65,6 +71,25 @@ pub struct HostedEnrollmentClient {
     http: Arc<dyn SupabaseHttpClient>,
 }
 impl HostedEnrollmentClient {
+    /// Bind recovery to the discovered root and the client's original login session.
+    /// A caller resuming durable work must first match its persisted project and Auth identity.
+    pub fn into_restore_transport<C: RecoveryEnrollmentClock>(
+        self,
+        snapshot: RecoveryRootSnapshot,
+        device: Arc<crate::crypto::DeviceKeys>,
+        clock: C,
+    ) -> Result<HostedRecoveryRestoreTransport<C>, RecoveryTransportError> {
+        snapshot.validate_for(snapshot.scope)?;
+        if snapshot.registered_at_ms > i64::MAX as u64 {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        Ok(HostedRecoveryRestoreTransport {
+            client: self,
+            snapshot,
+            device,
+            clock,
+        })
+    }
     /// Bind the coordinator to the persisted reservation and installed device keys.
     pub fn into_transport<C: RecoveryEnrollmentClock>(
         self,
@@ -223,24 +248,10 @@ impl HostedEnrollmentClient {
         }
         let wire: WireSnapshot = serde_json::from_value(response.snapshot)
             .map_err(|_| RecoveryTransportError::Conflict)?;
-        let encoded = wire.canonical_record;
-        if encoded.is_empty()
-            || encoded.len() > 32768 * 2
-            || !encoded.len().is_multiple_of(2)
-            || !encoded
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || wire.registered_at_ms.0 > i64::MAX as u64
-        {
+        if wire.registered_at_ms.0 > i64::MAX as u64 {
             return Err(RecoveryTransportError::Conflict);
         }
-        let canonical_record = (0..encoded.len())
-            .step_by(2)
-            .map(|index| {
-                u8::from_str_radix(&encoded[index..index + 2], 16)
-                    .map_err(|_| RecoveryTransportError::Conflict)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let canonical_record = decode_hex(&wire.canonical_record)?;
         let snapshot = RecoveryRootSnapshot {
             scope: crate::sync::SyncScope {
                 account_id: wire.account_id,
@@ -375,6 +386,90 @@ impl HostedEnrollmentClient {
     }
 }
 
+pub struct HostedRecoveryRestoreTransport<C> {
+    client: HostedEnrollmentClient,
+    snapshot: RecoveryRootSnapshot,
+    device: Arc<crate::crypto::DeviceKeys>,
+    clock: C,
+}
+
+impl<C: RecoveryEnrollmentClock> RecoveryRestoreTransport for HostedRecoveryRestoreTransport<C> {
+    fn scope(&self) -> crate::sync::SyncScope {
+        self.snapshot.scope
+    }
+
+    fn root_snapshot(&self) -> Result<Option<RecoveryRootSnapshot>, RecoveryTransportError> {
+        let snapshot = self.client.snapshot(self.clock.now_ms() / 1000)?;
+        if let Some(current) = &snapshot
+            && (current.scope != self.snapshot.scope
+                || current.canonical_record != self.snapshot.canonical_record
+                || current.canonical_record_sha256 != self.snapshot.canonical_record_sha256
+                || current.registered_at_ms != self.snapshot.registered_at_ms
+                || current.recovery_generation < self.snapshot.recovery_generation)
+        {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        Ok(snapshot)
+    }
+
+    fn submit_restore(
+        &self,
+        canonical_claim: &[u8],
+        _now_ms: u64,
+    ) -> Result<RecoveryRestoreReceipt, RecoveryTransportError> {
+        let record = self.snapshot.validate_for(self.scope())?;
+        let claim = decode_recovery_device_claim_v1(canonical_claim)
+            .map_err(|_| RecoveryTransportError::Invalid)?;
+        verify_recovery_device_claim(&record, &claim)
+            .map_err(|_| RecoveryTransportError::Invalid)?;
+        let proof = sign_hosted_recovery_proof(
+            &self.device,
+            self.client.identity.user_id,
+            self.client.identity.session_id,
+            &claim,
+        )
+        .map_err(|_| RecoveryTransportError::Invalid)?;
+        let (response, _): (RestoreResponse, _) = self.client.call(
+            serde_json::json!({"v":1,"action":"restore","claim":hex(canonical_claim),"proof":hex(&proof.0)}),
+            self.clock.now_ms() / 1000,
+        )?;
+        if response.v != 1 {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        let receipt = response.receipt.into_receipt()?;
+        receipt.validate_for(self.scope(), &record, canonical_claim)?;
+        Ok(receipt)
+    }
+
+    fn restore_claim(
+        &self,
+        restore_id: RecoveryRestoreId,
+    ) -> Result<Option<RecoveryRestoreProjection>, RecoveryTransportError> {
+        let (response, _): (RestoreStatusResponse, _) = self.client.call_bounded(
+            serde_json::json!({"v":1,"action":"restore_status","restoreId":restore_id}),
+            self.clock.now_ms() / 1000,
+            68 * 1024,
+        )?;
+        if response.v != 1 {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        if response.projection.is_null() {
+            return Ok(None);
+        }
+        let wire: WireRestoreProjection = serde_json::from_value(response.projection)
+            .map_err(|_| RecoveryTransportError::Conflict)?;
+        let projection = RecoveryRestoreProjection {
+            canonical_claim: decode_hex(&wire.canonical_claim)?,
+            receipt: wire.receipt.into_receipt()?,
+        };
+        if projection.receipt.restore_id != restore_id {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        projection.validate_for(self.scope(), &self.snapshot.validate_for(self.scope())?)?;
+        Ok(Some(projection))
+    }
+}
+
 pub struct HostedRecoveryEnrollmentTransport<C> {
     client: HostedEnrollmentClient,
     reservation: HostedEnrollmentReservation,
@@ -412,6 +507,77 @@ impl<C: RecoveryEnrollmentClock> RecoveryEnrollmentTransport
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn decode_hex(encoded: &str) -> Result<Vec<u8>, RecoveryTransportError> {
+    if encoded.is_empty()
+        || encoded.len() > 32768 * 2
+        || !encoded.len().is_multiple_of(2)
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(RecoveryTransportError::Conflict);
+    }
+    (0..encoded.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&encoded[index..index + 2], 16)
+                .map_err(|_| RecoveryTransportError::Conflict)
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreResponse {
+    v: u8,
+    receipt: WireRestoreReceipt,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreStatusResponse {
+    v: u8,
+    projection: serde_json::Value,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireRestoreProjection {
+    canonical_claim: String,
+    receipt: WireRestoreReceipt,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireRestoreReceipt {
+    restore_id: RecoveryRestoreId,
+    enrollment_id: RecoveryEnrollmentId,
+    recovery_root_id: RecoveryRootId,
+    account_id: AccountId,
+    workspace_id: WorkspaceId,
+    certificate_id: DeviceCertificateId,
+    canonical_record_sha256: Sha256Digest,
+    canonical_claim_sha256: Sha256Digest,
+    accepted_generation: DecimalTimestamp,
+    accepted_at_ms: DecimalTimestamp,
+}
+impl WireRestoreReceipt {
+    fn into_receipt(self) -> Result<RecoveryRestoreReceipt, RecoveryTransportError> {
+        if self.accepted_at_ms.0 > i64::MAX as u64 {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        Ok(RecoveryRestoreReceipt {
+            restore_id: self.restore_id,
+            enrollment_id: self.enrollment_id,
+            recovery_root_id: self.recovery_root_id,
+            account_id: self.account_id,
+            workspace_id: self.workspace_id,
+            certificate_id: self.certificate_id,
+            canonical_record_sha256: self.canonical_record_sha256,
+            canonical_claim_sha256: self.canonical_claim_sha256,
+            accepted_generation: self.accepted_generation.0,
+            accepted_at_ms: self.accepted_at_ms.0,
+        })
+    }
 }
 
 #[derive(Deserialize)]

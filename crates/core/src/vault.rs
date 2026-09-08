@@ -43,7 +43,7 @@ pub use sync::*;
 mod semantic_index;
 pub use semantic_index::{SemanticIndexBatch, SemanticIndexProgress};
 
-pub const LATEST_SCHEMA_VERSION: u32 = 29;
+pub const LATEST_SCHEMA_VERSION: u32 = 30;
 pub const MAX_NATIVE_HOOK_SESSIONS: usize = 256;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
@@ -2259,6 +2259,16 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
                 "../migrations/0029_enrollment_clock_domains.sql"
             ))
             .and_then(|_| transaction.pragma_update(None, "user_version", 29))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 30 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0030_restore_clock_domains.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 30))
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }

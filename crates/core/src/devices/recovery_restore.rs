@@ -281,7 +281,9 @@ where
         {
             return self.mark_conflict(vault, &stored);
         }
-        match vault.activate_recovery_restore(&receipt, &projection, identity.keys, now_ms) {
+        let completed_at_ms = self.clock.now_ms().max(stored.prepared_at_ms);
+        match vault.activate_recovery_restore(&receipt, &projection, identity.keys, completed_at_ms)
+        {
             Ok(_) => {
                 let active = vault
                     .recovery_restore()
