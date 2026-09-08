@@ -36,6 +36,7 @@ mod devices;
 pub use devices::*;
 mod hosted_pairing;
 pub use hosted_pairing::*;
+mod pairing_review;
 mod recovery;
 pub use recovery::*;
 mod recovery_restore;
@@ -45,7 +46,7 @@ pub use sync::*;
 mod semantic_index;
 pub use semantic_index::{SemanticIndexBatch, SemanticIndexProgress};
 
-pub const LATEST_SCHEMA_VERSION: u32 = 32;
+pub const LATEST_SCHEMA_VERSION: u32 = 33;
 pub const MAX_NATIVE_HOOK_SESSIONS: usize = 256;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
@@ -2293,6 +2294,18 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
                 "../migrations/0032_hosted_pairing_intents.sql"
             ))
             .and_then(|_| transaction.pragma_update(None, "user_version", 32))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 33 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0033_pairing_request_reviews.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 33))
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }

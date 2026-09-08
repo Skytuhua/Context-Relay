@@ -5199,7 +5199,7 @@ mod tests {
         let joiner_keys =
             load_or_create_device_keys(joiner_identity_store.as_ref(), "pairing-joiner-identity")
                 .unwrap();
-        let approver_vault = Vault::open(
+        let mut approver_vault = Vault::open(
             &approver_path,
             "test-vault-key",
             approver_vault_keys.as_ref(),
@@ -5212,6 +5212,42 @@ mod tests {
         let enrolled = approver_vault
             .enrolled_workspace_material(&approver_keys)
             .unwrap();
+        let offline_service = pairing::CoordinatorPairingService::new(
+            PairingCoordinator::new(
+                clock.clone(),
+                VaultPairingMaterialSource,
+                UnavailablePairingJoin,
+                UnavailablePairingApproval,
+            ),
+            scope,
+            issuer_certificate_id,
+        );
+        let offline_identity = PairingIdentity {
+            device_id: approver_device_id,
+            device_name: "Approving Mac".into(),
+            platform: NativePlatform::Macos,
+            keys: Arc::new(approver_keys),
+        };
+        for request in [
+            LocalRequest::PairingStatus(PairingIdParams {
+                pairing_id: invite.pairing_id,
+            }),
+            LocalRequest::PairingDecision(PairingDecisionParams {
+                pairing_id: invite.pairing_id,
+                request_digest: review.request_digest,
+                approve: true,
+            }),
+        ] {
+            let LocalResult::PairingApproval {
+                approval: offline_approval,
+            } = offline_service
+                .execute(&mut approver_vault, &offline_identity, request)
+                .unwrap()
+            else {
+                panic!("expected local accepted approval")
+            };
+            assert_eq!(offline_approval.request, review);
+        }
         let reopened = PairingCoordinator::new(
             clock,
             VaultPairingMaterialSource,

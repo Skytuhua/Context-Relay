@@ -82,11 +82,13 @@ at the existing production recovery-service initialization. A fresh joiner has
 no scope or issuer certificate; the coordinator service now supports that role.
 Reconcile one requested prepared approval through `resume_prepared_decision`
 instead of replaying unrelated sessions. Startup must remain local while Auth
-restores, as it does for recovery. Before wiring terminal status, remove its
-fresh provider request lookup: accepted approval transcripts currently preserve
-the signed request and preparation time, but not the original provider request
-timestamp. Preserve that timestamp rather than silently replacing it with the
-approval preparation time. Keep certificate/epoch validation on local replay.
+restores, as it does for recovery. Schema 33 now saves immutable public request
+reviews with the original provider timestamp and scope before preparing a
+decision. Accepted status and approval retries use that review without a fresh
+provider lookup, preserving certificate/epoch validation. Legacy decisions
+without a saved review still need the existing provider lookup; migration must
+not invent their original timestamps. The hosted wrapper still needs local
+terminal handling while logged out, plus current Auth checks for provider work.
 
 **Files:** `crates/contextd/src/pairing.rs`, `lib.rs`, existing hosted Auth service and pairing daemon tests.
 

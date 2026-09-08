@@ -1381,3 +1381,31 @@ still demanded js-yaml 4.3.1. Its required version is now 4.3.2 and its rejectio
 pattern includes 4.3.1. The actual CI command sequence (frozen install, policy
 test, low-severity audit) passes locally with no known vulnerabilities
 (`.codex/pr16-node-policy-final.log`). Hosted CI must still qualify the new head.
+
+### Durable public request reviews
+
+Vault schema 33 saves the verified public signed request, original provider scope,
+digest and timestamp before decision preparation. Reads verify canonical bytes
+and signatures; writes accept only an exact replay. An unbound cached review
+cannot acquire a hosted identity. Cached metadata contains no approval payload
+or safety number and does not replace certificate/epoch or receipt validation.
+
+Accepted daemon status and decision retries prefer this saved review. Legacy
+approvals without a review retain the provider lookup; migration does not
+fabricate timestamps. The production hosted wrapper and live acceptance remain
+unfinished.
+
+Ten coordinator tests, 29 migration/persistence tests and the nine daemon pairing
+tests pass. The migration suite includes schema 31/32 upgrades, immutable
+timestamps/scope, changed digests, overflow, corrupted reads and unbound-review
+adoption denial; eight existing model/performance tests remain ignored.
+Core and daemon library/test Clippy with warnings denied passes. Independent
+review found no P1/P2 issues. Evidence is in
+`.codex/pr16-review-persistence-{core,migrations,daemon,clippy}.log`.
+The final two-daemon regression also passes after reconstructing the approver
+with both transports unavailable: accepted status and approval retry return the
+same original review (`.codex/pr16-review-persistence-offline-final.log`).
+
+GitHub dependency-policy job 102267351743 passed at e87860a. Six superseded
+workflow cancellation requests were accepted to free the runner queue; that
+historical head and local tests do not qualify the next pushed head for release.

@@ -4,6 +4,84 @@ use context_relay_core::vault::{HostedPairingIntent, HostedPairingRole, Vault};
 use support::{MemoryKeyStore, TempVault};
 
 #[test]
+fn request_review_is_immutable_validated_and_retains_provider_time_after_reopen() {
+    use context_relay_core::{devices::transport::StoredPairingRequest, sync::SyncScope};
+    use context_relay_protocol::decode_pairing_request_v1;
+    let canonical: Vec<u8> = include_str!("fixtures/hosted-pairing-request-v1.hex")
+        .trim()
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|bytes| u8::from_str_radix(std::str::from_utf8(bytes).unwrap(), 16).unwrap())
+        .collect();
+    let request = decode_pairing_request_v1(&canonical).unwrap();
+    let signed = context_relay_core::devices::crypto::verify_pairing_request(&request).unwrap();
+    let original = StoredPairingRequest {
+        pairing_id: request.pairing_id,
+        scope: SyncScope {
+            account_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074001".parse().unwrap(),
+            workspace_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074002".parse().unwrap(),
+        },
+        canonical_bytes: canonical,
+        request_digest: signed.digest(),
+        requested_at_ms: 1234,
+    };
+    let path = TempVault::new("pairing-request-review");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), "review", &keys).unwrap();
+    vault.store_pairing_request_review(&original).unwrap();
+    drop(vault);
+    let mut vault = Vault::open(path.path(), "review", &keys).unwrap();
+    assert_eq!(
+        vault.pairing_request_review(original.pairing_id).unwrap(),
+        Some(original.clone())
+    );
+    vault.store_pairing_request_review(&original).unwrap();
+    let mut changed = original.clone();
+    changed.requested_at_ms += 1;
+    assert!(vault.store_pairing_request_review(&changed).is_err());
+    changed = original.clone();
+    changed.scope.workspace_id = "018f22e2-79b0-7cc8-98c4-dc0c0c074099".parse().unwrap();
+    assert!(vault.store_pairing_request_review(&changed).is_err());
+    changed = original.clone();
+    changed.request_digest.0[0] ^= 1;
+    assert!(vault.store_pairing_request_review(&changed).is_err());
+    changed = original.clone();
+    changed.requested_at_ms = u64::MAX;
+    assert!(vault.store_pairing_request_review(&changed).is_err());
+    assert_eq!(
+        vault.pairing_request_review(original.pairing_id).unwrap(),
+        Some(original.clone())
+    );
+    let intent = HostedPairingIntent {
+        project_url: "https://example.supabase.co/".into(),
+        user_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+        session_id: "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+        role: HostedPairingRole::Approve,
+    };
+    assert!(
+        vault
+            .store_hosted_pairing_intent(original.pairing_id, &intent)
+            .is_err()
+    );
+    drop(vault);
+    let raw = rusqlite::Connection::open(path.path()).unwrap();
+    let key = keys.key("review");
+    // SAFETY: first SQLite operation; the key remains live for the call.
+    assert_eq!(
+        unsafe { rusqlite::ffi::sqlite3_key(raw.handle(), key.as_ptr().cast(), 32) },
+        rusqlite::ffi::SQLITE_OK
+    );
+    raw.execute(
+        "UPDATE pairing_request_reviews SET request_digest=zeroblob(32)",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+    let vault = Vault::open(path.path(), "review", &keys).unwrap();
+    assert!(vault.pairing_request_review(original.pairing_id).is_err());
+}
+
+#[test]
 fn coordinator_binds_before_submission_and_rejects_changed_or_missing_hosted_identity() {
     use context_relay_core::{
         crypto::DeviceKeys,
@@ -175,21 +253,30 @@ fn coordinator_binds_before_submission_and_rejects_changed_or_missing_hosted_ide
 }
 
 #[test]
-fn schema_31_upgrade_creates_an_empty_identity_table() {
-    let path = TempVault::new("hosted-pairing-schema31");
-    let keys = MemoryKeyStore::default();
-    drop(Vault::open(path.path(), "pairing-intent", &keys).unwrap());
-    let raw = rusqlite::Connection::open(path.path()).unwrap();
-    let key = keys.key("pairing-intent");
-    // SAFETY: first SQLite operation; the key remains live for the call.
-    let result = unsafe { rusqlite::ffi::sqlite3_key(raw.handle(), key.as_ptr().cast(), 32) };
-    assert_eq!(result, rusqlite::ffi::SQLITE_OK);
-    raw.execute_batch("DROP TABLE hosted_pairing_intents; PRAGMA user_version=31;")
-        .unwrap();
-    drop(raw);
-    let vault = Vault::open(path.path(), "pairing-intent", &keys).unwrap();
-    let id = "018f22e2-79b0-7cc8-98c4-dc0c0c073991".parse().unwrap();
-    assert!(vault.hosted_pairing_intent(id).unwrap().is_none());
+fn schema_31_and_32_upgrades_create_empty_pairing_metadata() {
+    for version in [31, 32] {
+        let path = TempVault::new("hosted-pairing-schema31");
+        let keys = MemoryKeyStore::default();
+        drop(Vault::open(path.path(), "pairing-intent", &keys).unwrap());
+        let raw = rusqlite::Connection::open(path.path()).unwrap();
+        let key = keys.key("pairing-intent");
+        // SAFETY: first SQLite operation; the key remains live for the call.
+        let result = unsafe { rusqlite::ffi::sqlite3_key(raw.handle(), key.as_ptr().cast(), 32) };
+        assert_eq!(result, rusqlite::ffi::SQLITE_OK);
+        raw.execute_batch("DROP TABLE pairing_request_reviews;")
+            .unwrap();
+        if version == 31 {
+            raw.execute_batch("DROP TABLE hosted_pairing_intents;")
+                .unwrap();
+        }
+        raw.pragma_update(None, "user_version", version).unwrap();
+        drop(raw);
+        let vault = Vault::open(path.path(), "pairing-intent", &keys).unwrap();
+        let id = "018f22e2-79b0-7cc8-98c4-dc0c0c073991".parse().unwrap();
+        assert!(vault.hosted_pairing_intent(id).unwrap().is_none());
+        assert!(vault.pairing_request_review(id).unwrap().is_none());
+        assert_eq!(vault.schema_version().unwrap(), 33);
+    }
 }
 
 #[test]

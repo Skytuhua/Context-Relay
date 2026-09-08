@@ -135,11 +135,7 @@ impl<
             LocalRequest::PairingStatus(params) => self.status(vault, identity, params.pairing_id),
             LocalRequest::PairingDecision(params) => {
                 let (scope, issuer_certificate_id) = self.approval_authority()?;
-                let review = self
-                    .coordinator
-                    .request_status(params.pairing_id)
-                    .map_err(pairing_error)?
-                    .ok_or_else(pairing_not_found)?;
+                let review = self.decision_review(vault, params.pairing_id)?;
                 if review.request_digest != params.request_digest {
                     return Err(pairing_conflict());
                 }
@@ -209,6 +205,24 @@ impl<
     A: PairingApprovalTransport,
 > CoordinatorPairingService<C, M, J, A>
 {
+    fn decision_review(
+        &self,
+        vault: &Vault,
+        pairing_id: PairingId,
+    ) -> Result<PairingRequestReview, ClientError> {
+        if let Some(review) = self
+            .coordinator
+            .saved_request_review(vault, pairing_id)
+            .map_err(pairing_error)?
+        {
+            return Ok(review);
+        }
+        self.coordinator
+            .request_status(pairing_id)
+            .map_err(pairing_error)?
+            .ok_or_else(pairing_not_found)
+    }
+
     fn status(
         &self,
         vault: &mut Vault,
@@ -257,11 +271,7 @@ impl<
             .accepted_decision_status(vault, pairing_id)
             .map_err(pairing_error)?
         {
-            let review = self
-                .coordinator
-                .request_status(pairing_id)
-                .map_err(pairing_error)?
-                .ok_or_else(pairing_not_found)?;
+            let review = self.decision_review(vault, pairing_id)?;
             if review.request_digest != accepted.request_digest {
                 return Err(pairing_conflict());
             }

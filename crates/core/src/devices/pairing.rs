@@ -370,6 +370,31 @@ impl<
         }))
     }
 
+    /// Recover only public request metadata; acceptance is validated separately.
+    pub fn saved_request_review(
+        &self,
+        vault: &Vault,
+        pairing_id: PairingId,
+    ) -> Result<Option<PairingRequestReview>, PairingCycleError> {
+        let Some(stored) = vault
+            .pairing_request_review(pairing_id)
+            .map_err(map_vault_error)?
+        else {
+            return Ok(None);
+        };
+        let request = decode_pairing_request_v1(&stored.canonical_bytes)
+            .map_err(|_| PairingCycleError::Invalid)?;
+        Ok(Some(PairingRequestReview {
+            pairing_id,
+            device_id: request.device_id,
+            device_name: request.device_name.clone(),
+            platform: request.platform,
+            requested_at_ms: stored.requested_at_ms,
+            key_fingerprint: pairing_request_fingerprint(&request),
+            request_digest: stored.request_digest,
+        }))
+    }
+
     pub fn decide(
         &self,
         vault: &mut Vault,
@@ -385,11 +410,17 @@ impl<
             true,
         )?;
         let now_ms = self.clock.now_ms();
-        let stored = self
-            .approval_transport
-            .request(pairing_id, now_ms)
-            .map_err(map_transport_error)?
-            .ok_or(PairingCycleError::Conflict)?;
+        let stored = match vault
+            .pairing_request_review(pairing_id)
+            .map_err(map_vault_error)?
+        {
+            Some(stored) => stored,
+            None => self
+                .approval_transport
+                .request(pairing_id, now_ms)
+                .map_err(map_transport_error)?
+                .ok_or(PairingCycleError::Conflict)?,
+        };
         let request = decode_pairing_request_v1(&stored.canonical_bytes)
             .map_err(|_| PairingCycleError::Invalid)?;
         let signed_request =
@@ -401,6 +432,9 @@ impl<
         {
             return Err(PairingCycleError::Conflict);
         }
+        vault
+            .store_pairing_request_review(&stored)
+            .map_err(map_vault_error)?;
         match decision {
             PairingDecisionInput::Reject => {
                 if vault
