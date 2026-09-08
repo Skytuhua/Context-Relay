@@ -1,11 +1,11 @@
 use context_relay_protocol::RecoveryPhraseWords;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 use zeroize::Zeroizing;
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 const MAX_INPUT: usize = 1024;
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 fn parse_input(input: &[u16]) -> Result<RecoveryPhraseWords, &'static str> {
     if input.len() > MAX_INPUT || input.iter().any(|unit| *unit > 0x7f) {
         return Err("Enter exactly 24 recovery words.");
@@ -22,16 +22,21 @@ fn parse_input(input: &[u16]) -> Result<RecoveryPhraseWords, &'static str> {
     .map_err(|_| "Enter exactly 24 recovery words.")
 }
 
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
 mod windows;
 
 pub async fn prompt(app: &tauri::AppHandle) -> Result<Option<RecoveryPhraseWords>, &'static str> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
+        #[cfg(windows)]
         use tauri::Manager;
         let (send, receive) = tokio::sync::oneshot::channel();
+        #[cfg(windows)]
         let app_copy = app.clone();
         app.run_on_main_thread(move || {
+            #[cfg(windows)]
             let result = app_copy
                 .get_webview_window("main")
                 .ok_or("The desktop window is unavailable.")
@@ -41,6 +46,8 @@ pub async fn prompt(app: &tauri::AppHandle) -> Result<Option<RecoveryPhraseWords
                         .map_err(|_| "The desktop window is unavailable.")
                 })
                 .and_then(|parent| windows::show(parent.0));
+            #[cfg(target_os = "macos")]
+            let result = macos::show();
             let _ = send.send(result);
         })
         .map_err(|_| "The recovery dialog could not be opened.")?;
@@ -48,7 +55,7 @@ pub async fn prompt(app: &tauri::AppHandle) -> Result<Option<RecoveryPhraseWords
             .await
             .map_err(|_| "The recovery dialog closed unexpectedly.")?
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = app;
         Err("Native recovery entry is not available on this platform yet.")

@@ -26,3 +26,8 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Cont
 [dev-dependencies]
 context-relay-local-ipc = { version = "0.1.0", path = "../../../crates/local-ipc", features = ["test-support"] }
 tempfile.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSAccessibilityProtocols", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSResponder", "NSSecureTextField", "NSTextField", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSGeometry", "NSString"] }

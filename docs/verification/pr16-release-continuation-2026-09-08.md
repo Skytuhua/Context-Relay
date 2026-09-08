@@ -974,3 +974,32 @@ screen remain pending. Non-Windows hosts currently return an explicit unavailabl
 error for this new command.
 
 Desktop all-target Clippy also passes with warnings denied (.codex/pr16-native-input-clippy.log). The daemon-boundary and whitespace checks pass.
+
+### macOS native recovery entry
+
+The same no-argument native recovery command now opens an AppKit NSAlert with an
+NSSecureTextField on the main thread. Recover and Escape/Cancel remain native; only
+public status returns through the command. The field has an accessibility label,
+initial focus and completion disabled. Submit commits current editing, reads at most
+1024 UTF-16 units into zeroizing Rust storage, and uses the shared 24-word parser.
+Submit/cancel abort editing and clear the field; invalid input presents another
+native attempt. Per-attempt autorelease pools release native temporary strings.
+This does not claim that AppKit's internal immutable string storage is zeroized.
+
+The actual macOS module and native-string-reader tests pass Apple-target type checking
+and Clippy with warnings denied using a temporary minimal crate that includes the
+source module and shared parser. This verifies AppKit 0.3.2 calls; it does not execute
+Mac tests or prove the complete desktop build. The full Apple-target check on Windows
+stopped at objc2-exception-helper because its C compiler was unavailable. Logs:
+`.codex/pr16-mac-input-{api-check,api-clippy,check}.log`. All 19 Windows desktop tests
+still pass (`.codex/pr16-mac-input-windows-test.log`). Independent source review found
+no concrete P1/P2. A real Mac build and interactive focus, Return/Escape, paste,
+invalid-input retry and accessibility acceptance remain required before merge.
+
+Separately, Windows CI run 34268002866 / job 102203605599 at 6d33098 passed both
+Cygwin dependency provisioning and exact builder verification, and reached the
+pinned runtime build. This confirms the package-selection fix; the entire build and
+current-head release qualification are not yet established.
+
+Windows desktop all-target Clippy also passes with warnings denied
+(`.codex/pr16-mac-input-windows-clippy.log`).
