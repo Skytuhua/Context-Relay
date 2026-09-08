@@ -1242,3 +1242,17 @@ the payload digest; native cryptographic verification and human safety-number
 confirmation remain mandatory before local installation. Native transport,
 daemon wiring, expired-invite cleanup and live/full-release acceptance remain
 unfinished.
+
+### Expired pairing cleanup
+
+Migration `20260909090000_prune_expired_pairing.sql` prunes expired pending and
+canceled invites during the next new invite creation for the same account.
+It preserves the complete one-hour creation-limit window, committed decision
+receipts, foreign request rows and exhausted live-session lookup counters.
+Cleanup shares the existing account lock and final Auth/expiry rechecks.
+
+The regression failed before the migration and passes afterward. All 39 local
+PostgreSQL checks pass (`.codex/pr16-cleanup-full.log`); `check:supabase`,
+whitespace checks and bounded independent review pass. Graphify is updated.
+These are disposable-database results, not deployed or live acceptance.
+Native hosted transport, daemon integration and all full-release gates remain.

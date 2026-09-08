@@ -128,15 +128,15 @@ function enrollmentCommit(f, reservation, certificate = id()) {
     decode(repeat('49',80),'hex'),decode('010203','hex'));`;
 }
 
-async function pairingDecisionFixture() {
+async function pairingDecisionFixture(code = '42') {
   const f = await enrollmentFixture(), joining = randomUUID(), pairing = id(), child = id(), certificate = id();
   const reservation = JSON.parse(await sql(f.request()));
   await sql(enrollmentCommit(f, reservation));
   const device = await sql(`select device_id from public.device_bindings where session_id='${f.session}'`);
   await sql(`set role service_role; select public.service_create_pairing_invite('${f.user}','${f.session}',
-    '${reservation.workspaceId}','${device}','${pairing}',decode(repeat('42',32),'hex'));`);
+    '${reservation.workspaceId}','${device}','${pairing}',decode(repeat('${code}',32),'hex'));`);
   await sql(`insert into auth.sessions(id,user_id) values ('${joining}','${f.user}')`);
-  await sql(`set role service_role; select public.service_resolve_pairing_code('${f.user}','${joining}',decode(repeat('42',32),'hex'));`);
+  await sql(`set role service_role; select public.service_resolve_pairing_code('${f.user}','${joining}',decode(repeat('${code}',32),'hex'));`);
   const receipt = JSON.parse(await sql(`set role service_role; select public.service_submit_pairing_request('${f.user}','${joining}','${pairing}',
     decode('010203','hex'),decode(repeat('51',32),'hex'),decode(repeat('52',32),'hex'));`));
   const decide = (action = 'approve', payload = '040506') => `set role service_role; select public.service_decide_pairing_request(
@@ -146,6 +146,39 @@ async function pairingDecisionFixture() {
     result: `set role service_role; select public.service_pairing_result_for_session('${f.user}','${joining}','${pairing}',decode('${receipt.requestDigest}','hex'));`,
     cleanup: async () => { await sql(`delete from auth.sessions where id='${joining}'`); await f.cleanup(); } };
 }
+
+test('new invites prune expired unfinished work without dropping receipts, foreign rows or attempt limits', async () => {
+  const f = await pairingDecisionFixture(), other = await pairingDecisionFixture('41');
+  try {
+    const receipt = JSON.parse(await sql(f.decide()));
+    const device = await sql(`select device_id from public.device_bindings where session_id='${f.session}'`);
+    const pending=id(), canceled=id();
+    const create=(pairing,code)=>`set role service_role; select public.service_create_pairing_invite('${f.user}','${f.session}',
+      '${f.reservation.workspaceId}','${device}','${pairing}',decode(repeat('${code}',32),'hex'));`;
+    await sql(create(pending,'43')); await sql(create(canceled,'44'));
+    await sql(`set role service_role; select public.service_control_pairing_invite('${f.user}','${f.session}',
+      '${f.reservation.workspaceId}','${device}','${canceled}','cancel');`);
+    // Synthetic stale rows also exercise a foreign legacy ID collision.
+    for (const [pairing,source] of [[pending,f.pairing],[canceled,other.pairing]]) await sql(`
+      insert into public.pairing_requests(id,account_id,workspace_id,request_payload,request_digest,
+        requester_signing_public_key,requester_wrapping_public_key,code_digest,expires_at)
+      select '${pairing}',account_id,workspace_id,request_payload,request_digest,
+        requester_signing_public_key,requester_wrapping_public_key,code_digest,expires_at
+      from public.pairing_requests where id='${source}'`);
+    await sql(`update context_relay_private.pairing_invites set created_at=statement_timestamp()-interval '2 hours',
+      expires_at=statement_timestamp()-interval '110 minutes' where account_id='${f.reservation.accountId}';
+      update context_relay_private.pairing_lookup_sessions set failed_attempts=5 where session_id='${f.joining}'`);
+    await sql(create(id(),'45'));
+    assert.equal(await sql(`select count(*) from context_relay_private.pairing_invites where id in ('${pending}','${canceled}')`),'0');
+    assert.equal(await sql(`select count(*) from public.pairing_requests where id='${pending}'`),'0');
+    assert.equal(await sql(`select count(*) from public.pairing_requests where id='${canceled}' and account_id='${other.reservation.accountId}'`),'1');
+    assert.deepEqual(JSON.parse(await sql(f.decide())),receipt);
+    assert.equal(await sql(`select failed_attempts from context_relay_private.pairing_lookup_sessions where session_id='${f.joining}'`),'5');
+    assert.equal(await sql(`select count(*) from context_relay_private.pairing_invites where id='${other.pairing}'`),'1');
+    for (let index=0;index<5;index++) await sql(create(id(),(0x50+index).toString(16)));
+    await assert.rejects(sql(create(id(),'60')),/pairing_rate_limited/);
+  } finally { await f.cleanup(); await other.cleanup(); }
+});
 
 test('pairing verification context selects original server authority and retains committed retry context', async () => {
   const f = await pairingDecisionFixture();
