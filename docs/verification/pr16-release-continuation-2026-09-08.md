@@ -793,3 +793,37 @@ identity and tampered claim signature. Read-only review found no concrete P1/P2.
 Logs: `.codex/pr16-recovery-proof-{red,native,node}.log`. Actual hosted restore
 admission, transport and daemon/desktop commands remain to be implemented.
 Core all-target Clippy with test-support and warnings denied also passes (.codex/pr16-recovery-proof-clippy.log).
+
+### Hosted restore admission and projection
+
+Added service-only restore commit/projection RPCs and connected the closed restore
+and restore_status actions to the existing enrollment endpoint. Admission selects the
+owner's stored root, verifies the canonical claim and session-bound device proof, and
+passes only decoded fields plus verified Auth identity to SQL. The returned receipt
+is checked independently against the original claim's IDs, hashes and next generation.
+Read projections require the requested restore ID and consistent exact claim/receipt.
+Only snapshot/projection reads permit a null provider result; commits cannot.
+
+The database serializes account/root updates, binds the original session and canonical
+claim to the durable receipt, rejects changed retries/stale generations/wrong owners,
+and inserts certificate, binding, generation and receipt in one transaction. Exact
+retries return their original receipt without reactivating revoked bindings, even
+after a later restore advances the generation. New restores require active account,
+unrevoked root, unused device/session and epochs matching the current genesis format.
+Auth session liveness is checked again after potentially blocking inserts.
+
+Evidence: 25 local PostgreSQL tests pass, including two competing claims proven blocked
+at a lock barrier, exact old receipt after a newer restore, revoked/deleting/wrong-owner
+denial and expiry after account/root locks. Expiry while a certificate insert waits
+rolls back certificate, binding, receipt and generation. The initial test failed before
+the RPC existed. All 23 enrollment Node tests pass, including cryptography-to-RPC
+mapping, invalid proof, absent root, altered receipt generation/hash and nullable reads.
+Supabase contract and whitespace checks pass. Read-only review found no concrete P1/P2.
+Logs: `.codex/pr16-restore-admission-{red,green,final}.log` and
+`.codex/pr16-restore-api-{red,green}.log`.
+
+The migration was applied only to disposable local PostgreSQL. These synthetic SQL
+fixtures test transactional authority separately from the Edge's frozen crypto vectors;
+they do not establish live Supabase or installed-product acceptance. Native restore
+transport, durable daemon/desktop restore workflow, deployment and full release gates
+remain required. No release has been published or PR merged.

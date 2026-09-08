@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createSupabaseEnrollmentDependencies } from "../../supabase/functions/enrollment/adapter.mjs";
+import { decodeRecoveryClaim } from "../../supabase/functions/enrollment/restore.mjs";
 import { decodeEnrollmentRecord } from "../../supabase/functions/enrollment/record.mjs";
 const fixtures = new URL("../../crates/core/tests/fixtures/", import.meta.url);
 const vector = JSON.parse(readFileSync(new URL("hosted-enrollment-proof-v1.json", fixtures)));
@@ -70,4 +71,22 @@ test("snapshot sends no client scope or enrollment reservation to its service RP
   f.setData(null);
   assert.equal(await f.dependencies.snapshot(identity), null);
   await assert.rejects(f.dependencies.status(identity, vector.reservationId), /^Error: transient$/);
+});
+
+test("restore RPCs receive only verified fields and preserve nullable read semantics", async () => {
+  const f=setup(), identity={userId:vector.authUserId,sessionId:vector.sessionId};
+  const claim=decodeRecoveryClaim(Buffer.from(readFileSync(new URL("recovery-device-claim-v1.hex",fixtures),"utf8").trim(),"hex"));
+  await f.dependencies.restore(identity,claim);
+  const call=f.calls.at(-1);
+  assert.equal(call.name,"service_commit_recovery_for_session");
+  assert.equal(Object.keys(call.args).length,16);
+  assert.equal(call.args.p_restore_id,claim.restoreId);
+  assert.equal(call.args.p_session_id,identity.sessionId);
+  assert.equal(call.args.p_canonical_claim,"\\x"+Buffer.from(claim.canonicalClaim).toString("hex"));
+  assert.equal(call.args.p_expected_generation,"0");
+  await f.dependencies.restoreStatus(identity,claim.restoreId);
+  assert.deepEqual(f.calls.at(-1),{name:"service_recovery_claim_for_session",args:{p_auth_user_id:identity.userId,p_session_id:identity.sessionId,p_restore_id:claim.restoreId}});
+  f.setData(null);
+  assert.equal(await f.dependencies.restoreStatus(identity,claim.restoreId),null);
+  await assert.rejects(f.dependencies.restore(identity,claim),/^Error: transient$/);
 });

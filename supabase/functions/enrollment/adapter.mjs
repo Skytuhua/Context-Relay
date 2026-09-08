@@ -2,7 +2,7 @@ import { createSupabaseSessionClients } from "../account-lifecycle/adapter.mjs";
 
 const safeCodes = new Set(["enrollment_session_denied", "enrollment_reservation_denied",
   "enrollment_reservation_expired", "enrollment_requires_pairing", "enrollment_conflict",
-  "enrollment_in_progress", "enrollment_rate_limited"]);
+  "enrollment_in_progress", "enrollment_rate_limited", "recovery_denied", "recovery_conflict"]);
 function failure(code = "transient") { return Object.assign(new Error(code), { code }); }
 function uuid(value, version = "[1-8]") {
   if (typeof value !== "string" || !new RegExp(`^[0-9a-f]{8}-[0-9a-f]{4}-${version}[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).test(value)) throw failure("invalid_request");
@@ -28,7 +28,8 @@ export function createSupabaseEnrollmentDependencies({ createClient, env }) {
     let result;
     try { result = await serviceClient.rpc(name, args); } catch { throw failure(); }
     if (result?.error) throw failure(safeCodes.has(result.error.message) ? result.error.message : "transient");
-    if (result?.error !== null || (result.data === null && operation !== undefined) || result.data === undefined) throw failure();
+    const nullable = name === "service_recovery_snapshot_for_session" || name === "service_recovery_claim_for_session";
+    if (result?.error !== null || (result.data === null && !nullable) || result.data === undefined) throw failure();
     return result.data;
   }
   return {
@@ -40,6 +41,19 @@ export function createSupabaseEnrollmentDependencies({ createClient, env }) {
       } catch { throw failure("auth_required"); }
     },
     snapshot(identity) { return rpc("service_recovery_snapshot_for_session", identity); },
+    restoreStatus(identity, restoreId) {
+      return rpc("service_recovery_claim_for_session",identity,undefined,{p_restore_id:uuid(restoreId,"7")});
+    },
+    restore(identity, claim) {
+      return rpc("service_commit_recovery_for_session",identity,undefined,{
+        p_restore_id:claim.restoreId,p_enrollment_id:claim.enrollmentId,p_root_id:claim.recoveryRootId,
+        p_account_id:claim.accountId,p_workspace_id:claim.workspaceId,p_certificate_id:claim.certificateId,
+        p_device_id:claim.deviceId,p_expected_generation:claim.expectedRecoveryGeneration,
+        p_record_sha256:bytea(claim.canonicalRecordSha256),p_canonical_claim:bytea(claim.canonicalClaim),
+        p_request_nonce:bytea(claim.requestNonce),p_device_signing_key:bytea(claim.deviceSigningKey),
+        p_device_wrapping_key:bytea(claim.deviceWrappingKey),p_certificate_signature:bytea(claim.certificateSignature),
+      });
+    },
     reserve(identity, operation) {
       return rpc("service_reserve_enrollment_for_session", identity, operation, {
         p_account_id: uuid7(), p_workspace_id: uuid7(), p_nonce: bytea(crypto.getRandomValues(new Uint8Array(32))),

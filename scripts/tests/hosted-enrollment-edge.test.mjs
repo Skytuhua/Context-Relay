@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { createEnrollmentEdgeHandler } from "../../supabase/functions/enrollment/core.mjs";
+import { decodeRecoveryClaim } from "../../supabase/functions/enrollment/restore.mjs";
 import { decodeEnrollmentRecord } from "../../supabase/functions/enrollment/record.mjs";
 const fixtures = new URL("../../crates/core/tests/fixtures/", import.meta.url);
 const vector = JSON.parse(readFileSync(new URL("hosted-enrollment-proof-v1.json", fixtures)));
@@ -87,4 +88,40 @@ test("snapshot reads only verified owner identity and validates the stored proje
   }
   f.dependencies.snapshot = async () => null;
   assert.deepEqual(await (await f.handler(request(body))).json(), { v: 1, snapshot: null });
+});
+
+test("restore admission uses the stored root, exact device proof and checked receipt", async () => {
+  const vector = JSON.parse(readFileSync(new URL("hosted-recovery-proof-v1.json", fixtures)));
+  const claim = readFileSync(new URL("recovery-device-claim-v1.hex", fixtures), "utf8").trim();
+  const decodedClaim = decodeRecoveryClaim(Buffer.from(claim,"hex")), f = setup();
+  const receipt = { restoreId:decodedClaim.restoreId,enrollmentId:decodedClaim.enrollmentId,
+    recoveryRootId:decodedClaim.recoveryRootId,accountId:decodedClaim.accountId,workspaceId:decodedClaim.workspaceId,
+    certificateId:decodedClaim.certificateId,canonicalRecordSha256:f.receipt.canonicalRecordSha256,
+    canonicalClaimSha256:createHash("sha256").update(Buffer.from(claim,"hex")).digest("hex"),acceptedGeneration:"1",acceptedAtMs:"123" };
+  f.dependencies.authenticate = async () => ({ userId:vector.authUserId,sessionId:vector.sessionId });
+  f.dependencies.snapshot = async () => ({ accountId:decoded.accountId,workspaceId:decoded.workspaceId,
+    canonicalRecord:record,canonicalRecordSha256:f.receipt.canonicalRecordSha256,registeredAtMs:"123",recoveryGeneration:"0" });
+  let commits=0;
+  f.dependencies.restore = async (identity, verified) => {
+    commits++; assert.equal(identity.sessionId,vector.sessionId);
+    assert.equal(Buffer.from(verified.canonicalClaim).toString("hex"),claim); return receipt;
+  };
+  const body = {v:1,action:"restore",claim,proof:vector.signature};
+  assert.deepEqual(await (await f.handler(request(body))).json(),{v:1,receipt});
+  for (const changed of [{...body,proof:"00".repeat(64)},{...body,accountId:decoded.accountId}]) {
+    assert.equal((await f.handler(request(changed))).status,400);
+  }
+  assert.equal(commits,1);
+  f.dependencies.restore = async () => ({...receipt,acceptedGeneration:"2"});
+  assert.equal((await f.handler(request(body))).status,409);
+  f.dependencies.restoreStatus = async () => ({canonicalClaim:claim,receipt});
+  assert.deepEqual(await (await f.handler(request({v:1,action:"restore_status",restoreId:decodedClaim.restoreId}))).json(),
+    {v:1,projection:{canonicalClaim:claim,receipt}});
+  f.dependencies.restoreStatus = async () => null;
+  assert.deepEqual(await (await f.handler(request({v:1,action:"restore_status",restoreId:decodedClaim.restoreId}))).json(),{v:1,projection:null});
+  f.dependencies.restoreStatus = async () => ({canonicalClaim:claim,receipt:{...receipt,canonicalClaimSha256:"00".repeat(32)}});
+  assert.equal((await f.handler(request({v:1,action:"restore_status",restoreId:decodedClaim.restoreId}))).status,409);
+  f.dependencies.snapshot = async () => null;
+  assert.equal((await f.handler(request(body))).status,403);
+  assert.equal(commits,1);
 });

@@ -188,6 +188,123 @@ for (const lock of ['account', 'root']) {
   });
 }
 
+async function restoreFixture() {
+  const f = await enrollmentFixture();
+  const reservation = JSON.parse(await sql(f.request()));
+  const receipt = JSON.parse(await sql(enrollmentCommit(f, reservation)));
+  const session = randomUUID(), restore = id(), device = id(), certificate = id();
+  await sql(`insert into auth.sessions(id,user_id) values ('${session}','${f.user}')`);
+  const request = `set role service_role; select public.service_commit_recovery_for_session(
+    '${f.user}','${session}','${restore}','${receipt.enrollmentId}','${receipt.recoveryRootId}',
+    '${reservation.accountId}','${reservation.workspaceId}','${certificate}','${device}',0,
+    decode('${receipt.canonicalRecordSha256}','hex'),decode('040506','hex'),
+    decode(repeat('61',32),'hex'),decode(repeat('62',32),'hex'),decode(repeat('63',32),'hex'),decode(repeat('64',64),'hex'));`;
+  return { ...f, reservation, receipt, session, restore, device, certificate, request,
+    projection: `set role service_role; select public.service_recovery_claim_for_session('${f.user}','${session}','${restore}');`,
+    cleanup: async () => { await sql(`delete from auth.sessions where id='${session}'`); await f.cleanup(); } };
+}
+
+test('restore admission is atomic, session-bound and idempotent without reactivating a revoked binding', async () => {
+  const f = await restoreFixture();
+  try {
+    assert.equal(JSON.parse(await sql(f.projection)),null);
+    const receipt = JSON.parse(await sql(f.request));
+    assert.equal(receipt.acceptedGeneration,'1');
+    assert.equal(receipt.restoreId,f.restore);
+    assert.deepEqual(JSON.parse(await sql(f.request)),receipt);
+    assert.deepEqual(JSON.parse(await sql(f.projection)),{ canonicalClaim:'040506', receipt });
+    assert.equal(await sql(`select recovery_generation from public.recovery_roots where id='${f.receipt.recoveryRootId}'`),'1');
+    for (const role of ['anon','authenticated']) await assert.rejects(sql(f.request.replace('set role service_role',`set role ${role}`)),/permission denied/);
+    await assert.rejects(sql(f.request.replace("decode('040506'","decode('040507'")),/recovery_conflict/);
+    await assert.rejects(sql(f.request.replace(f.session,randomUUID())),/enrollment_session_denied/);
+    await sql(`update public.device_bindings set state='revoked',revoked_at=clock_timestamp(),cutoff_device_sequence=0,
+      cutoff_hash=decode(repeat('00',32),'hex'),cutoff_signature=decode(repeat('00',64),'hex') where session_id='${f.session}'`);
+    assert.deepEqual(JSON.parse(await sql(f.request)),receipt);
+    assert.equal(await sql(`select state from public.device_bindings where session_id='${f.session}'`),'revoked');
+  } finally { await f.cleanup(); }
+});
+
+test('competing restores consume one generation and exact retries retain their original receipt', async () => {
+  const f = await restoreFixture(), session = randomUUID();
+  let release, pending;
+  try {
+    await sql(`insert into auth.sessions(id,user_id) values ('${session}','${f.user}')`);
+    const alternate = f.request.replace(f.session,session).replace(f.restore,id()).replace(f.certificate,id()).replace(f.device,id()).replace("decode('040506'","decode('040607'");
+    const requests = [f.request,alternate];
+    release = await holdLock(`select id from public.recovery_roots where id='${f.receipt.recoveryRootId}' for update`);
+    const applications = [0,1].map(()=>`restore-compete-${randomUUID()}`);
+    pending = Promise.allSettled(requests.map((request,index)=>sql(request,applications[index])));
+    await Promise.all(applications.map(waitUntilBlocked));
+    await release(); release=null;
+    const results = await pending;
+    assert.equal(results.filter(result=>result.status==='fulfilled').length,1);
+    const failed = results.findIndex(result=>result.status==='rejected');
+    assert.match(results[failed].reason.stderr,/recovery_conflict/);
+    const won = 1-failed, receipt = JSON.parse(results[won].value);
+    assert.equal(receipt.acceptedGeneration,'1');
+    assert.equal(await sql(`select count(*) from public.device_bindings where session_id in ('${f.session}','${session}')`),'1');
+    assert.equal(JSON.parse(await sql(requests[failed].replace(',0,',',1,'))).acceptedGeneration,'2');
+    assert.deepEqual(JSON.parse(await sql(requests[won])),receipt);
+    assert.equal(await sql(`select recovery_generation from public.recovery_roots where id='${f.receipt.recoveryRootId}'`),'2');
+    assert.equal(JSON.parse(await sql(f.projection.replace(f.session,session))),null);
+  } finally { if(release) await release(); if(pending) await pending; await sql(`delete from auth.sessions where id='${session}'`); await f.cleanup(); }
+});
+
+test('restore admission rolls back when session expiry occurs during certificate insertion', async () => {
+  const f = await restoreFixture(), other = await fixture(); let release, outcome;
+  try {
+    await sql(`update public.device_certificates set id='${f.certificate}' where account_id='${other.account}';
+      update auth.sessions set not_after=clock_timestamp()+interval '2 seconds' where id='${f.session}'`);
+    release = await holdLock(`delete from public.device_certificates where id='${f.certificate}'`);
+    const application = `restore-insert-${randomUUID()}`;
+    outcome = sql(f.request,application).then(value=>({value}),error=>({error}));
+    await waitUntilBlocked(application);
+    await sql(`select pg_sleep(greatest(0,extract(epoch from not_after-clock_timestamp())+0.1)) from auth.sessions where id='${f.session}'`);
+    await release(); release=null;
+    assert.match((await outcome).error?.stderr ?? '',/enrollment_session_denied/);
+    assert.equal(await sql(`select count(*) from public.device_certificates where id='${f.certificate}'`),'0');
+    assert.equal(await sql(`select count(*) from public.device_bindings where session_id='${f.session}'`),'0');
+    assert.equal(await sql(`select count(*) from context_relay_private.recovery_commits where restore_id='${f.restore}'`),'0');
+    assert.equal(await sql(`select recovery_generation from public.recovery_roots where id='${f.receipt.recoveryRootId}'`),'0');
+  } finally { if(release) await release(); if(outcome) await outcome; await f.cleanup(); await other.cleanup(); }
+});
+
+test('revoked roots, deleting accounts and wrong owners cannot admit a restore', async () => {
+  const f = await restoreFixture(), other = await enrollmentFixture();
+  try {
+    await assert.rejects(sql(f.request.replace(f.user,other.user).replace(f.session,other.session)),/recovery_denied/);
+    await assert.rejects(sql(f.request.replace(f.receipt.canonicalRecordSha256,'00'.repeat(32))),/recovery_conflict/);
+    await sql(`update public.recovery_roots set revoked_at=clock_timestamp() where id='${f.receipt.recoveryRootId}'`);
+    await assert.rejects(sql(f.request),/recovery_denied/);
+    await sql(`update public.recovery_roots set revoked_at=null where id='${f.receipt.recoveryRootId}';
+      update public.accounts set deletion_state='pending_delete',deletion_requested_at=clock_timestamp(),
+        deletion_scheduled_for=clock_timestamp()+interval '1 day' where id='${f.reservation.accountId}'`);
+    await assert.rejects(sql(f.request),/recovery_denied/);
+    assert.equal(await sql(`select count(*) from public.device_certificates where id='${f.certificate}'`),'0');
+    assert.equal(await sql(`select recovery_generation from public.recovery_roots where id='${f.receipt.recoveryRootId}'`),'0');
+  } finally { await f.cleanup(); await other.cleanup(); }
+});
+
+for (const lock of ['account','root']) {
+  test(`restore admission rechecks session expiry after the ${lock} lock`, async () => {
+    const f = await restoreFixture(); let release, outcome;
+    try {
+      await sql(`update auth.sessions set not_after=clock_timestamp()+interval '2 seconds' where id='${f.session}'`);
+      release = await holdLock(lock==='account'
+        ? `select id from public.accounts where id='${f.reservation.accountId}' for update`
+        : `select id from public.recovery_roots where id='${f.receipt.recoveryRootId}' for update`);
+      const application = `restore-wait-${randomUUID()}`;
+      outcome = sql(f.request,application).then(value=>({value}),error=>({error}));
+      await waitUntilBlocked(application);
+      await sql(`select pg_sleep(greatest(0,extract(epoch from not_after-clock_timestamp())+0.1)) from auth.sessions where id='${f.session}'`);
+      await release(); release=null;
+      assert.match((await outcome).error?.stderr ?? '',/enrollment_session_denied/);
+      assert.equal(await sql(`select recovery_generation from public.recovery_roots where id='${f.receipt.recoveryRootId}'`),'0');
+      assert.equal(await sql(`select count(*) from public.device_bindings where session_id='${f.session}'`),'0');
+    } finally { if(release) await release(); if(outcome) await outcome; await f.cleanup(); }
+  });
+}
+
 test('expired enrollment renewal rotates only the challenge and preserves committed receipts', async () => {
   const f = await enrollmentFixture();
   try {

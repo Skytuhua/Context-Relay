@@ -1,3 +1,4 @@
+import { decodeRecoveryClaim, verifyRecoveryClaim } from "./restore.mjs";
 import { readBoundedBody } from "../account-lifecycle/core.mjs";
 import { decodeEnrollmentRecord, verifyEnrollmentRecord } from "./record.mjs";
 
@@ -6,7 +7,7 @@ const headers = { "content-type": "application/json", "cache-control": "no-store
 const codes = { auth_required: 401, invalid_request: 400, request_too_large: 413,
   method_not_allowed: 405, enrollment_session_denied: 403, enrollment_reservation_denied: 403,
   enrollment_reservation_expired: 403, enrollment_requires_pairing: 409,
-  enrollment_conflict: 409, enrollment_in_progress: 409, enrollment_rate_limited: 429 };
+  recovery_denied: 403, recovery_conflict: 409, enrollment_conflict: 409, enrollment_in_progress: 409, enrollment_rate_limited: 429 };
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 const response = (status, body) => new Response(JSON.stringify(body), { status, headers });
 const exact = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value)
@@ -62,6 +63,26 @@ async function snapshot(value) {
   return { ...value };
 }
 
+async function restoreReceipt(value, claim) {
+  const ids = ["restoreId","enrollmentId","recoveryRootId","accountId","workspaceId","certificateId"];
+  if (!exact(value, [...ids,"canonicalRecordSha256","canonicalClaimSha256","acceptedGeneration","acceptedAtMs"])) fail("invalid_request");
+  value = {...value};
+  for (const key of ids) uuid(value[key]);
+  hex(value.canonicalRecordSha256,32); hex(value.canonicalClaimSha256,32);
+  timestamp(value.acceptedGeneration); timestamp(value.acceptedAtMs);
+  const digest = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",claim.canonicalClaim)),byte=>byte.toString(16).padStart(2,"0")).join("");
+  const recordDigest = Array.from(claim.canonicalRecordSha256,byte=>byte.toString(16).padStart(2,"0")).join("");
+  if (ids.some(key=>value[key]!==claim[key]) || value.canonicalClaimSha256!==digest
+    || value.canonicalRecordSha256!==recordDigest
+    || BigInt(value.acceptedGeneration)!==BigInt(claim.expectedRecoveryGeneration)+1n) fail("recovery_conflict");
+  return value;
+}
+const actionFields = {
+  reserve:["v","action","reservationId"], renew:["v","action","reservationId"],
+  status:["v","action","reservationId"], commit:["v","action","reservationId","record","proof"],
+  snapshot:["v","action"], restore:["v","action","claim","proof"], restore_status:["v","action","restoreId"],
+};
+
 export function createEnrollmentEdgeHandler(dependencies) {
   return async request => {
     try {
@@ -75,17 +96,39 @@ export function createEnrollmentEdgeHandler(dependencies) {
       let body;
       try { body = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await readBoundedBody(request, MAX_BYTES))); }
       catch (error) { fail(error?.code === "request_too_large" ? error.code : "invalid_request"); }
-      if (!body || body.v !== 1 || !["reserve", "renew", "status", "commit", "snapshot"].includes(body.action)
-        || !exact(body, body.action === "snapshot" ? ["v", "action"] : body.action === "commit" ? ["v", "action", "reservationId", "record", "proof"] : ["v", "action", "reservationId"])) fail("invalid_request");
-      const operation = body.action === "snapshot" ? null : uuid(body.reservationId);
-      const canonical = body.action === "commit" ? hex(body.record, 1, 32768) : null;
-      const proof = body.action === "commit" ? hex(body.proof, 64) : null;
+      if (!body || body.v !== 1 || typeof body.action !== "string" || !Object.hasOwn(actionFields,body.action)
+        || !exact(body,actionFields[body.action])) fail("invalid_request");
+      const operation = Object.hasOwn(body,"reservationId") ? uuid(body.reservationId) : null;
+      const canonical = body.action === "commit" ? hex(body.record,1,32768)
+        : body.action === "restore" ? hex(body.claim,1,32768) : null;
+      const proof = body.action === "commit" || body.action === "restore" ? hex(body.proof,64) : null;
+      const restoreId = body.action === "restore_status" ? uuid(body.restoreId) : null;
       const authorization = request.headers.get("authorization");
       if (authorization === null || !/^Bearer [^\s]+$/.test(authorization)) fail("auth_required");
       const authenticated = await dependencies.authenticate(authorization.slice(7));
       const identity = { userId: uuid(authenticated.userId, "[1-8]"), sessionId: uuid(authenticated.sessionId, "[1-8]") };
       if (body.action === "snapshot") {
         return response(200, { v: 1, snapshot: await snapshot(await dependencies.snapshot(identity)) });
+      }
+      if (body.action === "restore") {
+        const root = await snapshot(await dependencies.snapshot(identity));
+        if (root === null) fail("recovery_denied");
+        let verified;
+        try { verified = await verifyRecoveryClaim(canonical,hex(root.canonicalRecord,1,32768),
+          {authUserId:identity.userId,sessionId:identity.sessionId},proof); }
+        catch { fail("invalid_request"); }
+        const result = await dependencies.restore(identity,verified);
+        return response(200,{v:1,receipt:await restoreReceipt(result,decodeRecoveryClaim(canonical))});
+      }
+      if (body.action === "restore_status") {
+        const value = await dependencies.restoreStatus(identity,restoreId);
+        if (value === null) return response(200,{v:1,projection:null});
+        if (!exact(value,["canonicalClaim","receipt"])) fail("invalid_request");
+        const canonicalClaim = value.canonicalClaim;
+        let claim;
+        try { claim = decodeRecoveryClaim(hex(canonicalClaim,1,32768)); } catch { fail("invalid_request"); }
+        if (claim.restoreId!==restoreId) fail("recovery_conflict");
+        return response(200,{v:1,projection:{canonicalClaim,receipt:await restoreReceipt(value.receipt,claim)}});
       }
       if (body.action === "reserve" || body.action === "renew") {
         const result = reservation(await dependencies[body.action](identity, operation), operation, false);
