@@ -1457,3 +1457,21 @@ qualify live Supabase revocation, deployment, installed macOS/Windows acceptance
 signing, clean machines or the remaining full-release checklist. PR #16 stays open.
 
 Final daemon library/test Clippy with warnings denied also passes (.codex/pr16-hosted-two-daemon-clippy-final.log).
+
+
+### Joining-device restart before confirmation
+
+The two-daemon memory and hosted HTTP variants now send a guaranteed-different,
+well-formed safety number after logout. Both reject it with InvalidRequest.
+After stopping the joining daemon, direct Vault inspection proves no trusted
+device was installed and the awaiting-confirmation record remains durable.
+A reconstructed joining daemon returns the same public status, then accepts the
+correct number and installs the matching workspace material. The hosted case
+makes no pairing HTTP calls during wrong confirmation, restart/status or correct
+confirmation. Both composed tests pass on Windows
+(`.codex/pr16-pairing-joiner-restart.log`). This strengthens component recovery
+evidence and does not replace the required live installed acceptance matrix.
+
+Daemon library/test Clippy with warnings denied also passes
+(`.codex/pr16-pairing-joiner-restart-clippy.log`); independent bounded review
+found no P1/P2 issues.

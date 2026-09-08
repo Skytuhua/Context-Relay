@@ -5395,30 +5395,32 @@ mod tests {
                 Arc::new(PairingTokenProvider(approver_token)),
             )
         };
-        let joiner_config = DaemonConfig::new(
-            joiner_runtime.clone(),
-            VaultConfig::new(
-                joiner_path.clone(),
-                "test-vault-key",
-                joiner_vault_keys.clone(),
+        let joiner_config = || {
+            DaemonConfig::new(
+                joiner_runtime.clone(),
+                VaultConfig::new(
+                    joiner_path.clone(),
+                    "test-vault-key",
+                    joiner_vault_keys.clone(),
+                )
+                .with_pairing_service(
+                    hosted_fixtures
+                        .as_ref()
+                        .map_or_else(|| joiner_service.clone(), |(_, joiner)| joiner.service()),
+                    joiner_identity_store.clone(),
+                    "pairing-joiner-identity",
+                    "Joining Mac",
+                    NativePlatform::Macos,
+                ),
+                Arc::new(PairingTokenProvider(joiner_token)),
             )
-            .with_pairing_service(
-                hosted_fixtures
-                    .as_ref()
-                    .map_or(joiner_service, |(_, joiner)| joiner.service()),
-                joiner_identity_store.clone(),
-                "pairing-joiner-identity",
-                "Joining Mac",
-                NativePlatform::Macos,
-            ),
-            Arc::new(PairingTokenProvider(joiner_token)),
-        );
+        };
         let approver_daemon = Daemon::start(approver_config()).await.unwrap();
         let mut approver_handle = approver_daemon.handle();
         let mut approver_owner = tokio::spawn(approver_daemon.run());
-        let joiner_daemon = Daemon::start(joiner_config).await.unwrap();
-        let joiner_handle = joiner_daemon.handle();
-        let joiner_owner = tokio::spawn(joiner_daemon.run());
+        let joiner_daemon = Daemon::start(joiner_config()).await.unwrap();
+        let mut joiner_handle = joiner_daemon.handle();
+        let mut joiner_owner = tokio::spawn(joiner_daemon.run());
         let mut approver =
             RawClient::connect_with_token(&approver_runtime, ClientRole::Desktop, approver_token)
                 .await;
@@ -5563,6 +5565,54 @@ mod tests {
         }
         let calls_before_local_confirmation =
             backend.calls.load(std::sync::atomic::Ordering::SeqCst);
+        // A well-formed but different number must never install trust, even offline.
+        let mut wrong_number = approval.safety_number.as_str().to_owned();
+        wrong_number.replace_range(
+            ..1,
+            if wrong_number.starts_with('0') {
+                "1"
+            } else {
+                "0"
+            },
+        );
+        assert_eq!(
+            joiner
+                .call(LocalRequest::PairingConfirm(PairingConfirmParams {
+                    pairing_id: invite.pairing_id,
+                    safety_number: context_relay_protocol::PairingSafetyNumber::new(wrong_number)
+                        .unwrap(),
+                }))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        drop(joiner);
+        assert_eq!(joiner_handle.shutdown().await, DaemonState::Stopped);
+        assert_eq!(joiner_owner.await.unwrap(), Ok(()));
+        {
+            let vault =
+                Vault::open(&joiner_path, "test-vault-key", joiner_vault_keys.as_ref()).unwrap();
+            assert!(vault.devices(scope).unwrap().is_empty());
+            assert!(
+                vault
+                    .awaiting_pairing_confirmation(invite.pairing_id)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let daemon = Daemon::start(joiner_config()).await.unwrap();
+        joiner_handle = daemon.handle();
+        joiner_owner = tokio::spawn(daemon.run());
+        joiner =
+            RawClient::connect_with_token(&joiner_runtime, ClientRole::Desktop, joiner_token).await;
+        let resumed = joiner
+            .call(LocalRequest::PairingStatus(PairingIdParams {
+                pairing_id: invite.pairing_id,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resumed, joiner_status);
         clock.set(1_005);
         let LocalResult::PairingCompletion { completion } = joiner
             .call(LocalRequest::PairingConfirm(PairingConfirmParams {
