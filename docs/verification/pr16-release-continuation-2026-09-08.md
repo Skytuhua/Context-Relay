@@ -1273,3 +1273,19 @@ fingerprints are added to the existing exception ledger, with rationale and
 updated byte/digest pins. No detector or scanned ref is disabled. The pinned
 Gitleaks 8.30.1 full-ref scan returns zero after the correction; policy checks
 pass. This does not establish current-head GitHub CI or full release acceptance.
+
+### Native pairing identity persistence foundation
+
+Vault schema 32 stores the original hosted project, user, session and role for
+each pairing ID. Exact retries preserve that binding; changed identities and
+adoption of historical unbound requests, decisions or transcripts are rejected.
+The record contains no credentials or device secrets. Native transport and
+coordinator enforcement still need wiring before this protects hosted operations.
+
+All 27 affected pairing-intent, enrollment, restore and search tests pass, with
+eight existing model/performance tests ignored (`.codex/pr16-pairing-intent-full.log`).
+The new restart/identity and schema-31 migration checks pass; targeted Clippy
+with warnings denied, formatting and diff checks pass. Independent review found
+one omitted schema-29 downgrade-fixture update; it is corrected and its real-row
+migration check passes. Graphify is updated. No live or full-release acceptance
+is claimed.

@@ -69,6 +69,13 @@ decrypts the grant before installing local trust. This is not live pairing evide
 
 ## Task 4: Production daemon integration
 
+Task 3 persistence foundation: Vault schema 32 now provides immutable per-pairing
+project/user/session/role bindings. Exact retries retain the original identity;
+existing unbound requests, decisions and approval transcripts cannot acquire
+a new login. Native transport and coordinator must store/check this intent before
+preparing or resuming signed work. That wiring remains unfinished, so Task 3 is
+not checked complete.
+
 **Files:** `crates/contextd/src/pairing.rs`, `lib.rs`, existing hosted Auth service and pairing daemon tests.
 
 - [ ] Wire the hosted service into the existing ordered Vault worker. Fresh joiners can join/check/confirm without a preexisting scope or issuer; approval operations require verified active material.

@@ -545,6 +545,7 @@ fn schema_29_preserves_prepared_and_active_restore_rows() {
             "INSERT INTO recovery_restores_legacy SELECT * FROM recovery_restores;
             DROP TABLE recovery_restores;
             ALTER TABLE recovery_restores_legacy RENAME TO recovery_restores;
+            DROP TABLE hosted_pairing_intents;
             DROP TABLE hosted_restore_intent;
             PRAGMA user_version = 29;",
         )
