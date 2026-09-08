@@ -32,3 +32,19 @@ export async function verifyEnrollmentDeviceProof(context, canonicalRecord, devi
     throw invalid();
   }
 }
+
+// Exact claim retries are idempotent; user/session binding prevents a copied
+// root-signed claim from enrolling a different authenticated session.
+export async function verifyRecoveryDeviceProof(context, canonicalClaim, deviceKey, signature) {
+  if (!(canonicalClaim instanceof Uint8Array) || canonicalClaim.length === 0 || canonicalClaim.length > 32768) throw invalid();
+  canonicalClaim = Uint8Array.from(canonicalClaim);
+  deviceKey = Uint8Array.from(bytes(deviceKey, 32));
+  signature = Uint8Array.from(bytes(signature, 64));
+  const parts = [new TextEncoder().encode("context-relay/hosted-recovery-device-proof/v1\0"),
+    uuid(context.authUserId, "[1-8]"), uuid(context.sessionId, "[1-8]")];
+  parts.push(new Uint8Array(await crypto.subtle.digest("SHA-256", canonicalClaim)));
+  const preimage = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let offset = 0;
+  for (const part of parts) { preimage.set(part, offset); offset += part.length; }
+  await verifyEd25519Strict(deviceKey, signature, preimage);
+}

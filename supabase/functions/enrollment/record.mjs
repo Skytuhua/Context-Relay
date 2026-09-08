@@ -5,7 +5,7 @@ import { verifyEnrollmentDeviceProof } from "./proof.mjs";
 const DOMAIN = new TextEncoder().encode("context-relay/recovery-enrollment-record/v1\0");
 const hex = bytes => Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
 function invalid() { return new Error("invalid_enrollment_record"); }
-function id(reader) {
+export function readUuid7(reader) {
   const bytes = reader.fixedBytes(16);
   if (bytes[6] >> 4 !== 7 || bytes[8] >> 6 !== 2) throw invalid();
   const value = hex(bytes);
@@ -16,27 +16,36 @@ function id(reader) {
 // still bind this result to a live, unexpired reservation and commit atomically.
 export async function verifyEnrollmentRecord(input, context, proof) {
   try {
-    const record = decodeEnrollmentRecord(input);
     if (!(context.nonce instanceof Uint8Array) || context.nonce.length !== 32
       || !(proof instanceof Uint8Array) || proof.length !== 64) throw invalid();
     context = { reservationId: context.reservationId, authUserId: context.authUserId,
       sessionId: context.sessionId, nonce: Uint8Array.from(context.nonce) };
     proof = Uint8Array.from(proof);
-    const uuidBytes = value => Uint8Array.from(value.replaceAll("-", "").match(/../g), byte => Number.parseInt(byte, 16));
-    const certificatePreimage = Uint8Array.from([
-      ...new TextEncoder().encode("context-relay/device-certificate/v1\0"), 0,
-      ...record.recoverySigningKey, ...uuidBytes(record.accountId), ...uuidBytes(record.workspaceId),
-      0, 0, 0, 1, ...record.requestNonce, ...uuidBytes(record.deviceId),
-      ...record.deviceSigningKey, ...record.deviceWrappingKey,
-    ]);
-    await verifyEd25519Strict(record.recoverySigningKey, record.certificateSignature, certificatePreimage);
-    await verifyEd25519Strict(record.recoverySigningKey, record.rootSignature, record.signingPreimage);
-    for (const key of [record.recoveryWrappingKey, record.deviceWrappingKey, record.ephemeralKey]) {
-      await validateWrappingKey(key);
-    }
+    const record = await verifyRecoveryRecord(input);
     await verifyEnrollmentDeviceProof(context, record.canonicalRecord, record.deviceSigningKey, proof);
     return record;
   } catch { throw invalid(); }
+}
+
+export async function verifyRecoveryCertificate(record) {
+  const uuidBytes = value => Uint8Array.from(value.replaceAll("-", "").match(/../g), byte => Number.parseInt(byte, 16));
+  const certificatePreimage = Uint8Array.from([
+    ...new TextEncoder().encode("context-relay/device-certificate/v1\0"), 0,
+    ...record.recoverySigningKey, ...uuidBytes(record.accountId), ...uuidBytes(record.workspaceId),
+    0, 0, 0, 1, ...record.requestNonce, ...uuidBytes(record.deviceId),
+    ...record.deviceSigningKey, ...record.deviceWrappingKey,
+  ]);
+  await verifyEd25519Strict(record.recoverySigningKey, record.certificateSignature, certificatePreimage);
+}
+
+export async function verifyRecoveryRecord(input) {
+  const record = decodeEnrollmentRecord(input);
+  await verifyRecoveryCertificate(record);
+  await verifyEd25519Strict(record.recoverySigningKey, record.rootSignature, record.signingPreimage);
+  for (const key of [record.recoveryWrappingKey, record.deviceWrappingKey, record.ephemeralKey]) {
+    await validateWrappingKey(key);
+  }
+  return record;
 }
 
 // Structural decoding only: neither these fields nor their signatures confer
@@ -48,22 +57,22 @@ export function decodeEnrollmentRecord(input) {
     const reader = new CanonicalReader(canonicalRecord);
     reader.expectMap(14);
     reader.expectUnsigned(0); reader.expectUnsigned(1);
-    reader.expectUnsigned(1); const enrollmentId = id(reader);
-    reader.expectUnsigned(2); const recoveryRootId = id(reader);
-    reader.expectUnsigned(3); const accountId = id(reader);
-    reader.expectUnsigned(4); const workspaceId = id(reader);
+    reader.expectUnsigned(1); const enrollmentId = readUuid7(reader);
+    reader.expectUnsigned(2); const recoveryRootId = readUuid7(reader);
+    reader.expectUnsigned(3); const accountId = readUuid7(reader);
+    reader.expectUnsigned(4); const workspaceId = readUuid7(reader);
     reader.expectUnsigned(5); const recoverySigningKey = reader.fixedBytes(32);
     reader.expectUnsigned(6); const recoveryWrappingKey = reader.fixedBytes(32);
-    reader.expectUnsigned(7); const certificateId = id(reader);
+    reader.expectUnsigned(7); const certificateId = readUuid7(reader);
     reader.expectUnsigned(8); reader.expectMap(9);
     reader.expectUnsigned(0); reader.expectMap(2);
     reader.expectUnsigned(0); reader.expectUnsigned(0);
     reader.expectUnsigned(1); const issuerKey = reader.fixedBytes(32);
-    reader.expectUnsigned(1); const certificateAccount = id(reader);
-    reader.expectUnsigned(2); const certificateWorkspace = id(reader);
+    reader.expectUnsigned(1); const certificateAccount = readUuid7(reader);
+    reader.expectUnsigned(2); const certificateWorkspace = readUuid7(reader);
     reader.expectUnsigned(3); reader.expectUnsigned(1);
     reader.expectUnsigned(4); const requestNonce = reader.fixedBytes(32);
-    reader.expectUnsigned(5); const deviceId = id(reader);
+    reader.expectUnsigned(5); const deviceId = readUuid7(reader);
     reader.expectUnsigned(6); const deviceSigningKey = reader.fixedBytes(32);
     reader.expectUnsigned(7); const deviceWrappingKey = reader.fixedBytes(32);
     reader.expectUnsigned(8); const certificateSignature = reader.fixedBytes(64);

@@ -750,3 +750,30 @@ claim admission/receipt reconciliation and real hosted/installed acceptance rema
 Core all-target Clippy with test-support and warnings denied passes after replacing
 the manual even-length test with `is_multiple_of(2)`; formatting and whitespace
 checks pass. Log: `.codex/pr16-native-snapshot-clippy.log`.
+
+### Hosted signed-restore verifier
+
+Added the hosted verifier for the existing canonical 15-field recovery-device claim.
+It reuses the strict reader, recovery-record/certificate verification and WebCrypto
+signature/wrapping-key checks. Claim/root IDs, scope and record digest must agree;
+a claim cannot reuse the genesis device/certificate. Both epochs remain one, matching
+the existing genesis recovery-record format. The generation must be below i64::MAX.
+Input bytes and proof context are captured before asynchronous verification.
+
+Device possession is separately required: sign ASCII
+`context-relay/hosted-recovery-device-proof/v1` plus NUL, then authenticated user UUID
+bytes, session UUID bytes and SHA-256 of the canonical claim. UUID bytes use network
+order. The exact claim includes the restore ID and expected generation. No challenge
+nonce is introduced: admission must be atomic and idempotent for the exact claim and
+same session, with live-session/owner/root checks and a generation compare-and-set.
+The proof alone does not grant authority. Native proof signing and admission are pending.
+
+Verification: 20 enrollment Node tests pass, including the frozen Rust claim/preimage,
+truncation/trailing/noncanonical input, mutated records/signatures, caller-buffer
+mutation, wrong/missing device proof, and user/session substitution. Re-signing the
+outer claim cannot hide a corrupt inner certificate, wrapping key or record digest.
+Existing enrollment proof tests still pass after shared verification was extracted.
+Supabase contract and whitespace checks pass. Logs:
+`.codex/pr16-restore-verifier-{red,green}.log`. This adds no deployed restore endpoint,
+trusted binding, daemon restore command or completed release acceptance.
+Read-only review found no concrete P1/P2 in this verifier slice; admission remains separately required.
