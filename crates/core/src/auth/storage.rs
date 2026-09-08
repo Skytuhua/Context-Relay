@@ -13,6 +13,7 @@ use super::{
 use crate::sync::supabase::{valid_header_secret, validated_project_url};
 
 /// Unverified restart material, never a substitute for a verified HostedSession.
+#[derive(Clone)]
 pub struct StoredLogin {
     pub(super) project: Url,
     pub(super) identity: HostedIdentity,
@@ -91,6 +92,24 @@ impl StoredLogin {
 pub struct PlatformLoginStore {
     project: Url,
     entry: Entry,
+}
+
+pub trait LoginStore: Send + Sync {
+    fn load(&self) -> Result<Option<StoredLogin>, LoginError>;
+    fn save(&self, login: &StoredLogin) -> Result<(), LoginError>;
+    fn clear(&self) -> Result<(), LoginError>;
+}
+
+impl LoginStore for PlatformLoginStore {
+    fn load(&self) -> Result<Option<StoredLogin>, LoginError> {
+        Self::load(self)
+    }
+    fn save(&self, login: &StoredLogin) -> Result<(), LoginError> {
+        Self::save(self, login)
+    }
+    fn clear(&self) -> Result<(), LoginError> {
+        Self::clear(self)
+    }
 }
 
 impl PlatformLoginStore {

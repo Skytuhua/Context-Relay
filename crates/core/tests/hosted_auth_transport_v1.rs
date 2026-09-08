@@ -2,7 +2,9 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use context_relay_core::{
-    auth::{PendingLogin, SupabaseAuthClient},
+    auth::{
+        HostedSessionOwner, LoginError, LoginStore, PendingLogin, StoredLogin, SupabaseAuthClient,
+    },
     sync::{SupabaseHttpClient, SupabaseHttpError, SupabaseHttpRequest, SupabaseHttpResponse},
 };
 use serde_json::json;
@@ -17,15 +19,112 @@ const USER: &str = "550e8400-e29b-41d4-a716-446655440000";
 const SESSION: &str = "550e8400-e29b-41d4-a716-446655440001";
 const NOW: u64 = 1_800_000_000;
 
+#[derive(Default)]
+struct Store {
+    saved: Mutex<Option<StoredLogin>>,
+    fail_save: std::sync::atomic::AtomicBool,
+    fail_load: std::sync::atomic::AtomicBool,
+    fail_clear: std::sync::atomic::AtomicBool,
+}
+impl LoginStore for Store {
+    fn load(&self) -> Result<Option<StoredLogin>, LoginError> {
+        if self.fail_load.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(LoginError::CredentialStore);
+        }
+        Ok(self.saved.lock().unwrap().clone())
+    }
+    fn save(&self, login: &StoredLogin) -> Result<(), LoginError> {
+        if self.fail_save.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(LoginError::CredentialStore);
+        }
+        *self.saved.lock().unwrap() = Some(login.clone());
+        Ok(())
+    }
+    fn clear(&self) -> Result<(), LoginError> {
+        if self.fail_clear.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(LoginError::CredentialStore);
+        }
+        *self.saved.lock().unwrap() = None;
+        Ok(())
+    }
+}
+
+#[test]
+fn session_owner_persists_before_publication_and_invalidates_old_attempts() {
+    let (client, http) = client(
+        PROJECT,
+        vec![tokens(&token(NOW + 900)), response(200, json!({"id":USER}))],
+    );
+    let store = Arc::new(Store::default());
+    let owner = HostedSessionOwner::new(Arc::new(client), store.clone());
+    let old = owner.begin_login().unwrap();
+    let current = owner.begin_login().unwrap();
+    assert!(owner.complete_login(old, exchange(), NOW).is_err());
+    assert!(http.requests.lock().unwrap().is_empty());
+    store
+        .fail_save
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(owner.complete_login(current, exchange(), NOW).is_err());
+    assert!(owner.current_session(NOW).unwrap().is_none());
+    assert!(store.saved.lock().unwrap().is_none());
+    assert!(owner.restore(NOW).is_err());
+}
+
+#[test]
+fn startup_restore_can_retry_offline_failure_but_denied_refresh_clears_identity() {
+    let (client, _) = client(
+        PROJECT,
+        vec![
+            tokens(&token(NOW + 900)),
+            response(200, json!({"id":USER})),
+            response(500, json!({})),
+            tokens(&token(NOW + 1800)),
+            response(200, json!({"id":USER})),
+            response(401, json!({})),
+        ],
+    );
+    let client = Arc::new(client);
+    let store = Arc::new(Store::default());
+    let initial = HostedSessionOwner::new(client.clone(), store.clone());
+    initial
+        .complete_login(initial.begin_login().unwrap(), exchange(), NOW)
+        .unwrap();
+    let owner = HostedSessionOwner::new(client, store.clone());
+    store
+        .fail_load
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        owner.restore(NOW),
+        Err(LoginError::CredentialStore)
+    ));
+    store
+        .fail_load
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(owner.restore(NOW), Err(LoginError::Unavailable)));
+    assert!(owner.restore(NOW).unwrap().is_some());
+    assert!(matches!(owner.refresh(NOW), Err(LoginError::Denied)));
+    assert!(owner.current_session(NOW).unwrap().is_none());
+    assert!(store.saved.lock().unwrap().is_none());
+}
+
 struct Http {
     responses: Mutex<VecDeque<SupabaseHttpResponse>>,
     requests: Mutex<Vec<SupabaseHttpRequest>>,
+    refresh_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 impl SupabaseHttpClient for Http {
     fn execute(
         &self,
         request: SupabaseHttpRequest,
     ) -> Result<SupabaseHttpResponse, SupabaseHttpError> {
+        if request.url().ends_with("grant_type=refresh_token")
+            && let Some((started, release)) = self.refresh_gate.lock().unwrap().take()
+        {
+            started.send(()).unwrap();
+            release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
         self.requests.lock().unwrap().push(request);
         Ok(self
             .responses
@@ -76,11 +175,58 @@ fn client(project: &str, responses: Vec<SupabaseHttpResponse>) -> (SupabaseAuthC
     let http = Arc::new(Http {
         responses: Mutex::new(responses.into()),
         requests: Mutex::new(vec![]),
+        refresh_gate: Mutex::new(None),
     });
     (
         SupabaseAuthClient::with_http_client(project, "publishable-key", http.clone()).unwrap(),
         http,
     )
+}
+
+#[test]
+fn logout_invalidates_inflight_refresh_even_when_credential_deletion_fails() {
+    let (client, http) = client(
+        PROJECT,
+        vec![
+            tokens(&token(NOW + 900)),
+            response(200, json!({"id":USER})),
+            SupabaseHttpResponse::new(204, vec![]),
+            tokens(&token(NOW + 1800)),
+            response(200, json!({"id":USER})),
+        ],
+    );
+    let store = Arc::new(Store::default());
+    let owner = Arc::new(HostedSessionOwner::new(Arc::new(client), store.clone()));
+    owner
+        .complete_login(owner.begin_login().unwrap(), exchange(), NOW)
+        .unwrap();
+    assert!(owner.current_session(NOW).unwrap().is_some());
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *http.refresh_gate.lock().unwrap() = Some((started_tx, release_rx));
+    let worker = {
+        let owner = owner.clone();
+        std::thread::spawn(move || owner.refresh(NOW))
+    };
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    assert!(matches!(owner.refresh(NOW), Err(LoginError::Busy)));
+    store
+        .fail_clear
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let outcome = owner.logout().unwrap();
+    release_tx.send(()).unwrap();
+    assert!(matches!(worker.join().unwrap(), Err(LoginError::Canceled)));
+    assert!(outcome.local.is_err());
+    assert!(matches!(outcome.remote, Some(Ok(()))));
+    assert!(owner.current_session(NOW).unwrap().is_none());
+    assert!(owner.restore(NOW).is_err());
+    store
+        .fail_clear
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(owner.logout().unwrap().local.is_ok());
+    assert!(store.saved.lock().unwrap().is_none());
 }
 
 #[test]

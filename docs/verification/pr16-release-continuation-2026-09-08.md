@@ -238,3 +238,26 @@ still required before production activation.
 Independent review verified closure of the encoded-size finding and reported
 no new issue. Core/daemon all-target Clippy passes with test-support and warnings
 denied; formatting, whitespace and Graphify update checks pass.
+
+## Session ownership and cancellation
+
+The core session owner now serializes credential writes and publication while
+keeping network calls outside its state lock. Opaque generations reject results
+from superseded login/refresh work. Logout invalidates in-memory state even when
+the OS refuses deletion, and reports local deletion separately from remote
+revocation. Failed persistence never publishes a replacement. Startup restoration
+can explicitly retry temporary read/network failures; logout and ambiguous save
+failures cannot be undone by reloading credentials in the same owner. Terminal
+authentication failures withdraw the session and clear credentials. Expiry is
+checked after network and storage work.
+
+Missing-owner checks failed first. Review then found offline restore could not
+retry and terminal refresh denial retained a session; a regression reproduced the
+retry failure, both were fixed, and review confirmed closure. All ten hosted auth
+tests pass, including temporary OS-store read failure, offline retry, rejected
+publication, superseded attempts, and a controlled refresh/logout race with failed
+local deletion. The owner still needs daemon blocking-worker, loopback cancellation
+and IPC integration before production activation. This does not close the remaining
+hosted provisioning, product workflows, signing or clean-machine release gates.
+Core/daemon all-target Clippy passes with test-support and warnings denied;
+formatting, whitespace and Graphify update checks pass.

@@ -1,8 +1,10 @@
 //! Daemon-owned GitHub PKCE attempts. This does not enroll a trusted device.
 
+mod owner;
 mod storage;
+pub use owner::{HostedSessionOwner, LoginAttempt, LogoutOutcome};
 mod transport;
-pub use storage::{PlatformLoginStore, StoredLogin};
+pub use storage::{LoginStore, PlatformLoginStore, StoredLogin};
 pub use transport::{HostedIdentity, HostedSession, SupabaseAuthClient};
 
 use std::{
@@ -36,6 +38,10 @@ pub enum LoginError {
     Provider,
     #[error("login credential store is unavailable")]
     CredentialStore,
+    #[error("another session operation is in progress")]
+    Busy,
+    #[error("session operation was canceled")]
+    Canceled,
 }
 
 pub struct PendingLogin {
