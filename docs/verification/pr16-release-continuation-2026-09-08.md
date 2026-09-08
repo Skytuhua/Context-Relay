@@ -1343,3 +1343,24 @@ The regression reopens the vault, verifies byte-identical request reuse, and
 blocks submission/result calls for changed project, user, session, role or absent
 hosted metadata. Independent review found no P1/P2 issues. Production daemon
 integration and live installed acceptance remain required.
+
+### Fresh joining daemon authority
+
+The coordinator-backed daemon service now has a fresh-joiner constructor with
+no workspace or issuer certificate. Create, decision, cancel and approver-status
+operations require approval authority; joining status and human confirmation
+remain available. The authenticated two-daemon IPC regression now uses this
+constructor and explicitly checks those forbidden commands before completing
+pairing. All nine daemon pairing tests pass, and targeted daemon Clippy with
+warnings denied passes (`.codex/pr16-daemon-joiner-{green,clippy}.log`). Independent
+review of the authority refactor found no P1/P2 issues. Production hosted service
+wiring and live acceptance remain unfinished.
+
+### Newly reported Node dependency advisory
+
+GitHub job 102261628862 on head 83a8b58 failed for
+[GHSA-2883-xcg3-v3hh](https://github.com/advisories/GHSA-2883-xcg3-v3hh).
+The existing js-yaml override and lockfile now resolve 4.3.2, the patched version.
+Local pnpm audit reports no known vulnerabilities and desktop lint passes
+(`.codex/pr16-js-yaml-{audit,lint}.log`). Current-head CI remains required; this
+dependency fix does not complete any outstanding installed release gate.

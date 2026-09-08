@@ -5010,19 +5010,16 @@ mod tests {
                 scope,
                 issuer_certificate_id,
             ));
-        let joiner_service: Arc<dyn PairingService> =
-            Arc::new(pairing::CoordinatorPairingService::new(
-                PairingCoordinator::new(
-                    clock.clone(),
-                    VaultPairingMaterialSource,
-                    provider
-                        .join_session_client("contextd-joining-device")
-                        .unwrap(),
-                    UnavailablePairingApproval,
-                ),
-                scope,
-                issuer_certificate_id,
-            ));
+        let joiner_service: Arc<dyn PairingService> = Arc::new(
+            pairing::CoordinatorPairingService::new_joiner(PairingCoordinator::new(
+                clock.clone(),
+                VaultPairingMaterialSource,
+                provider
+                    .join_session_client("contextd-joining-device")
+                    .unwrap(),
+                UnavailablePairingApproval,
+            )),
+        );
         let approver_config = DaemonConfig::new(
             approver_runtime.clone(),
             VaultConfig::new(
@@ -5076,6 +5073,20 @@ mod tests {
         };
         assert_eq!(status, PairingState::Pending);
         clock.set(1_001);
+        for request in [
+            LocalRequest::PairingCreate(EmptyParams {}),
+            LocalRequest::PairingCancel(PairingIdParams {
+                pairing_id: invite.pairing_id,
+            }),
+            LocalRequest::PairingStatus(PairingIdParams {
+                pairing_id: invite.pairing_id,
+            }),
+        ] {
+            assert_eq!(
+                joiner.call(request).await.unwrap_err().code,
+                ErrorCode::InvalidRequest
+            );
+        }
         let LocalResult::PairingRequest {
             request: submitted,
             status,
@@ -5092,6 +5103,18 @@ mod tests {
         assert_eq!(status, PairingState::Pending);
         assert_eq!(submitted.pairing_id, invite.pairing_id);
         assert_eq!(submitted.platform, NativePlatform::Macos);
+        assert_eq!(
+            joiner
+                .call(LocalRequest::PairingDecision(PairingDecisionParams {
+                    pairing_id: invite.pairing_id,
+                    request_digest: submitted.request_digest,
+                    approve: true,
+                }))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
 
         clock.set(1_002);
         let LocalResult::PairingRequest {

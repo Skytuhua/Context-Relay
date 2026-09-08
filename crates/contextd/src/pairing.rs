@@ -53,8 +53,7 @@ pub(crate) trait PairingService: Send + Sync {
 
 pub(crate) struct CoordinatorPairingService<C, M, J, A> {
     coordinator: PairingCoordinator<C, M, J, A>,
-    scope: SyncScope,
-    issuer_certificate_id: DeviceCertificateId,
+    authority: Option<(SyncScope, DeviceCertificateId)>,
 }
 
 impl<C, M, J, A> CoordinatorPairingService<C, M, J, A> {
@@ -65,9 +64,19 @@ impl<C, M, J, A> CoordinatorPairingService<C, M, J, A> {
     ) -> Self {
         Self {
             coordinator,
-            scope,
-            issuer_certificate_id,
+            authority: Some((scope, issuer_certificate_id)),
         }
+    }
+
+    pub(crate) fn new_joiner(coordinator: PairingCoordinator<C, M, J, A>) -> Self {
+        Self {
+            coordinator,
+            authority: None,
+        }
+    }
+
+    fn approval_authority(&self) -> Result<(SyncScope, DeviceCertificateId), ClientError> {
+        self.authority.ok_or_else(pairing_invalid)
     }
 }
 
@@ -79,6 +88,14 @@ impl<
 > PairingService for CoordinatorPairingService<C, M, J, A>
 {
     fn resume_prepared_decisions(&self, vault: &mut Vault) -> Result<(), ClientError> {
+        if self.authority.is_none()
+            && !vault
+                .pending_pairing_approvals()
+                .map_err(|_| pairing_invalid())?
+                .is_empty()
+        {
+            return Err(pairing_invalid());
+        }
         self.coordinator
             .resume_prepared_decisions(vault)
             .map(|_| ())
@@ -93,6 +110,7 @@ impl<
     ) -> Result<LocalResult, ClientError> {
         match request {
             LocalRequest::PairingCreate(_) => {
+                self.approval_authority()?;
                 let invite = self.coordinator.create_invite().map_err(pairing_error)?;
                 Ok(invite_result(&invite, PairingState::Pending))
             }
@@ -116,6 +134,7 @@ impl<
             }
             LocalRequest::PairingStatus(params) => self.status(vault, identity, params.pairing_id),
             LocalRequest::PairingDecision(params) => {
+                let (scope, issuer_certificate_id) = self.approval_authority()?;
                 let review = self
                     .coordinator
                     .request_status(params.pairing_id)
@@ -126,8 +145,8 @@ impl<
                 }
                 let decision = if params.approve {
                     PairingDecisionInput::Approve(PairingApprovalAuthority {
-                        certificate_id: child_certificate_id(params.pairing_id, self.scope),
-                        issuer_certificate_id: self.issuer_certificate_id,
+                        certificate_id: child_certificate_id(params.pairing_id, scope),
+                        issuer_certificate_id,
                         issuer_keys: &identity.keys,
                     })
                 } else {
@@ -172,6 +191,7 @@ impl<
                 )
             }
             LocalRequest::PairingCancel(params) => {
+                self.approval_authority()?;
                 self.coordinator
                     .cancel(params.pairing_id)
                     .map_err(pairing_error)?;
@@ -231,6 +251,7 @@ impl<
             };
         }
 
+        self.approval_authority()?;
         if let Some(accepted) = self
             .coordinator
             .accepted_decision_status(vault, pairing_id)
