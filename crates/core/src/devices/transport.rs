@@ -277,6 +277,9 @@ impl fmt::Debug for PairingResult {
 }
 
 pub trait PairingJoinTransport: Send + Sync {
+    fn hosted_intent(&self) -> Option<crate::vault::HostedPairingIntent> {
+        None
+    }
     fn resolve_code(
         &self,
         code: &PairingCode,
@@ -299,6 +302,9 @@ pub trait PairingJoinTransport: Send + Sync {
 }
 
 pub trait PairingApprovalTransport: Send + Sync {
+    fn hosted_intent(&self) -> Option<crate::vault::HostedPairingIntent> {
+        None
+    }
     fn create_invite(&self, now_ms: u64) -> Result<PairingInvite, PairingTransportError>;
 
     fn invite_status(

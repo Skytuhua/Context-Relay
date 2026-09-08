@@ -22,8 +22,8 @@ use crate::{
     },
     sync::SyncScope,
     vault::{
-        DeviceCertificateState, PairingDecisionFinalState, StoredDeviceCertificate, Vault,
-        VaultError,
+        DeviceCertificateState, HostedPairingIntent, HostedPairingRole, PairingDecisionFinalState,
+        StoredDeviceCertificate, Vault, VaultError,
     },
 };
 
@@ -284,6 +284,13 @@ impl<
             .join_transport
             .resolve_code(code, now_ms)
             .map_err(map_transport_error)?;
+        bind_pairing_identity(
+            vault,
+            pairing_id,
+            self.join_transport.hosted_intent(),
+            HostedPairingRole::Join,
+            true,
+        )?;
         let signed_request = match vault
             .stored_pairing_join(pairing_id)
             .map_err(map_vault_error)?
@@ -370,6 +377,13 @@ impl<
         expected_request_digest: Sha256Digest,
         decision: PairingDecisionInput<'_>,
     ) -> Result<PairingDecisionStatus, PairingCycleError> {
+        bind_pairing_identity(
+            vault,
+            pairing_id,
+            self.approval_transport.hosted_intent(),
+            HostedPairingRole::Approve,
+            true,
+        )?;
         let now_ms = self.clock.now_ms();
         let stored = self
             .approval_transport
@@ -560,6 +574,13 @@ impl<
         vault: &mut Vault,
         pairing_id: PairingId,
     ) -> Result<PairingJoinStatus, PairingCycleError> {
+        bind_pairing_identity(
+            vault,
+            pairing_id,
+            self.join_transport.hosted_intent(),
+            HostedPairingRole::Join,
+            false,
+        )?;
         if vault
             .pairing_approval_transcript(pairing_id)
             .map_err(map_vault_error)?
@@ -633,6 +654,13 @@ impl<
         entered_safety_number: &str,
         joiner_keys: &DeviceKeys,
     ) -> Result<WorkspacePairingMaterial, PairingCycleError> {
+        bind_pairing_identity(
+            vault,
+            pairing_id,
+            self.join_transport.hosted_intent(),
+            HostedPairingRole::Join,
+            false,
+        )?;
         if let Some(stored) = vault
             .completed_pairing_transcript(pairing_id)
             .map_err(map_vault_error)?
@@ -709,6 +737,13 @@ impl<
         let mut resumed = 0;
         for stored in pending {
             let pairing_id = stored.pairing_id;
+            bind_pairing_identity(
+                vault,
+                pairing_id,
+                self.approval_transport.hosted_intent(),
+                HostedPairingRole::Approve,
+                false,
+            )?;
             let request_digest = stored.signed_request.digest();
             let receipt = self
                 .approval_transport
@@ -737,6 +772,31 @@ impl<
             resumed += 1;
         }
         Ok(resumed)
+    }
+}
+
+fn bind_pairing_identity(
+    vault: &mut Vault,
+    id: PairingId,
+    intent: Option<HostedPairingIntent>,
+    role: HostedPairingRole,
+    prepare: bool,
+) -> Result<(), PairingCycleError> {
+    let existing = vault.hosted_pairing_intent(id).map_err(map_vault_error)?;
+    match intent {
+        Some(intent) if intent.role == role => {
+            if prepare {
+                vault
+                    .store_hosted_pairing_intent(id, &intent)
+                    .map_err(map_vault_error)
+            } else if existing.as_ref() == Some(&intent) {
+                Ok(())
+            } else {
+                Err(PairingCycleError::Conflict)
+            }
+        }
+        None if existing.is_none() => Ok(()),
+        _ => Err(PairingCycleError::Conflict),
     }
 }
 

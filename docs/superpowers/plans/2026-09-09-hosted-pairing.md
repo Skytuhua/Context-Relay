@@ -62,8 +62,8 @@ decrypts the grant before installing local trust. This is not live pairing evide
 
 **Files:** new `crates/core/src/devices/supabase_pairing.rs`, `devices/mod.rs`, existing Vault pairing persistence, new hosted transport integration test.
 
-- [ ] Implement existing `PairingJoinTransport` and `PairingApprovalTransport` using the Auth/HTTP patterns in `supabase_enrollment.rs`. Validate exact response fields, lengths, IDs, digests and states; preserve safe errors and credential cancellation.
-- [ ] Persist the original hosted identity before first request/decision preparation. Reopen must reuse the exact signed request and approval; do not adopt an unbound historical prepared row.
+- [x] Implement existing `PairingJoinTransport` and `PairingApprovalTransport` using the Auth/HTTP patterns in `supabase_enrollment.rs`. Validate exact response fields, lengths, IDs, digests and states; preserve safe errors and credential cancellation.
+- [x] Persist the original hosted identity before first request/decision preparation. Reopen must reuse the exact signed request and approval; do not adopt an unbound historical prepared row.
 - [ ] Keep fresh joining and active approving authority distinct. Derive installed keys from the existing protected device identity.
 - [ ] Test lost responses, restart, expired/replaced sessions, malicious response projections and provider/local clock skew. Run targeted core tests with `test-support` and Clippy.
 
@@ -72,9 +72,10 @@ decrypts the grant before installing local trust. This is not live pairing evide
 Task 3 persistence foundation: Vault schema 32 now provides immutable per-pairing
 project/user/session/role bindings. Exact retries retain the original identity;
 existing unbound requests, decisions and approval transcripts cannot acquire
-a new login. Native transport and coordinator must store/check this intent before
-preparing or resuming signed work. That wiring remains unfinished, so Task 3 is
-not checked complete.
+a new login. Native transports now supply this identity to the coordinator, which
+stores/checks it before preparing or resuming signed work. Native approval proofs
+use the durable signed request rather than requiring a new server read. Production
+daemon integration and broader failure-path qualification remain unfinished.
 
 **Files:** `crates/contextd/src/pairing.rs`, `lib.rs`, existing hosted Auth service and pairing daemon tests.
 

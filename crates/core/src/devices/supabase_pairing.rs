@@ -229,6 +229,9 @@ impl HostedPairingApprovalClient {
     }
 }
 impl PairingApprovalTransport for HostedPairingApprovalClient {
+    fn hosted_intent(&self) -> Option<HostedPairingIntent> {
+        Some(self.client.original_intent(HostedPairingRole::Approve))
+    }
     fn create_invite(&self, now_ms: u64) -> Result<PairingInvite, Error> {
         let response: InviteResponse<CreatedInvite> = self.client.call(
             serde_json::json!({"v":1,"action":"create",
@@ -405,6 +408,9 @@ fn required_request<'de, D: serde::Deserializer<'de>>(
 }
 
 impl PairingJoinTransport for HostedPairingClient {
+    fn hosted_intent(&self) -> Option<HostedPairingIntent> {
+        Some(self.original_intent(HostedPairingRole::Join))
+    }
     fn resolve_code(&self, code: &PairingCode, now_ms: u64) -> Result<PairingId, Error> {
         let response: ResultResponse<Locator> = self.call(
             serde_json::json!({"v":1,"action":"resolve","code":code}),

@@ -1326,3 +1326,20 @@ one commit request, foreign scope, request-null versus missing fields, invalid
 invite lifetimes, rejection and confirmed cancellation. Independent review found
 no P1/P2 issues. Durable identity enforcement and production daemon wiring remain
 required before live hosted pairing qualification.
+
+### Coordinator enforcement of original hosted identity
+
+Native transports now expose their fixed project/user/session and joining or
+approving role. The coordinator persists that binding before signed preparation
+and submission, and requires an exact existing binding before polling,
+confirmation or approval resume. A transport without hosted identity cannot
+adopt a hosted-bound record. Code resolution necessarily precedes binding a new
+join because the pairing ID is not yet known; no signed request is submitted
+under a changed binding.
+
+All 34 affected coordinator, hosted transport and identity-persistence tests pass
+(`.codex/pr16-pairing-bind-full.log`); targeted Clippy with warnings denied passes.
+The regression reopens the vault, verifies byte-identical request reuse, and
+blocks submission/result calls for changed project, user, session, role or absent
+hosted metadata. Independent review found no P1/P2 issues. Production daemon
+integration and live installed acceptance remain required.
