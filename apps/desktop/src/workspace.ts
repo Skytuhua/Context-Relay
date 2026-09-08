@@ -27,6 +27,7 @@ import type {
   RecoveryEnrollmentHostConfirmResult,
   RecoveryEnrollmentId,
   RecoveryEnrollmentStatus,
+  RecoveryRestoreStatus,
   Sha256Digest,
   StatusOutput,
   SearchIndexStatus,
@@ -35,7 +36,7 @@ import type {
   TaskStatus,
 } from './bindings';
 import { LocalClient } from './local-client';
-import { validateHostedAuthStatus } from './protocol-validation';
+import { validateHostedAuthStatus, validateRecoveryRestoreStatus } from './protocol-validation';
 import { uuidV7 } from './uuid';
 import { type HarnessGateway, requireHarnessAcknowledgment, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
 import { validateConnectionCheckStatus, validateHarnessPreparation, validateHarnessExecution, validateHarnessSetupRecord, validateHarnessSetupsPage, validateSearchIndexStatus } from './protocol-validation';
@@ -70,6 +71,10 @@ export class RecoveryStorageFullError extends Error {
 }
 
 export interface DeviceGateway {
+  recoveryRestoreBegin(): Promise<RecoveryRestoreStatus | null>;
+  recoveryRestoreOverview(): Promise<RecoveryRestoreStatus>;
+  recoveryRestoreResume(): Promise<RecoveryRestoreStatus>;
+  recoveryRestoreCancel(): Promise<RecoveryRestoreStatus>;
   devices(): Promise<Extract<LocalResult, { kind: 'devices' }>['data']['devices']>;
   createPairingInvite(): Promise<PairingInviteResult>;
   joinPairing(code: PairingCode, deviceName: string): Promise<PairingRequestResult>;
@@ -414,6 +419,28 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
     return result.kind === 'challenge' || result.kind === 'status'
       ? result
       : unexpectedNativeResult(result);
+  }
+
+  async recoveryRestoreBegin() {
+    const status = await this.client.recoveryRestoreBegin();
+    return status === null ? null : validateRecoveryRestoreStatus(status);
+  }
+
+  async recoveryRestoreOverview() {
+    return validateRecoveryRestoreStatus(controlResult(
+      await this.call({ method: 'recovery_restore_overview', params: {} }), 'recovery_restore_status', 'status'));
+  }
+
+  async recoveryRestoreResume() {
+    return validateRecoveryRestoreStatus(controlResult(
+      await this.call({ method: 'recovery_restore_resume', params: {} }), 'recovery_restore_status', 'status'));
+  }
+
+  async recoveryRestoreCancel() {
+    const status = validateRecoveryRestoreStatus(controlResult(
+      await this.call({ method: 'recovery_restore_cancel', params: {} }), 'recovery_restore_status', 'status'));
+    if (status.state !== 'idle') throw new Error('Recovery cancellation was not confirmed.');
+    return status;
   }
 
   async recoveryEnrollmentOverview() {

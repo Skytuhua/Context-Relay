@@ -16,6 +16,10 @@ import type { WorkspaceGateway } from './workspace';
 const id = (suffix: string) => `018f22e2-79b0-7cc8-98c4-dc0c0c0739${suffix}`;
 
 class FakeWorkspaceGateway implements WorkspaceGateway {
+  async recoveryRestoreOverview() { return { state: 'idle' } as const; }
+  async recoveryRestoreBegin(): Promise<never> { throw new Error('Offline'); }
+  async recoveryRestoreResume(): Promise<never> { throw new Error('Offline'); }
+  async recoveryRestoreCancel() { return { state: 'idle' } as const; }
   async hostedAuthStatus(): Promise<never> { throw new Error('Not used'); }
   async hostedAuthStart(): Promise<never> { throw new Error('Not used'); }
   async hostedAuthCancel(): Promise<never> { throw new Error('Not used'); }

@@ -23,6 +23,7 @@ const gateway = {
   }),
   projects: async () => [],
   devices: async () => [],
+  recoveryRestoreOverview: async () => ({ state: 'idle' }),
   recoveryEnrollmentOverview: async () => ({
     enrollmentId: null,
     state: 'idle',

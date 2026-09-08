@@ -85,6 +85,10 @@ const request = (digest = requestDigest): PairingRequestResult => ({
 });
 
 class FakeDeviceGateway implements DeviceGateway {
+  async recoveryRestoreOverview() { return { state: 'idle' } as const; }
+  async recoveryRestoreBegin() { return null; }
+  async recoveryRestoreResume(): Promise<never> { throw new Error('No restore is prepared'); }
+  async recoveryRestoreCancel() { return { state: 'idle' } as const; }
   devicesValue: DeviceSummary[] = [currentDevice];
   createError: unknown = null;
   confirmError: unknown = null;
@@ -258,7 +262,7 @@ describe('DevicesScreen', () => {
       },
     ]);
     expect(gateway.recoveryBeginCalls).toBe(1);
-    expect(await screen.findByRole('status')).toHaveTextContent('Recovery is ready.');
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent('Recovery is ready.');
     expect(screen.getByRole('heading', { name: 'Recovery' })).toHaveFocus();
     expect(gateway.devicesCalls).toBe(2);
     for (const canary of recoveryCanaries) {
@@ -272,9 +276,9 @@ describe('DevicesScreen', () => {
     gateway.recoveryStatusQueue = [recoveryStatus('complete', enrollmentId)];
     render(<DevicesScreen gateway={gateway} pollIntervalMs={5} />);
 
-    expect(await screen.findByRole('status')).toHaveTextContent('Recovery setup is being secured.');
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent('Recovery setup is being secured.');
     await waitFor(() => expect(gateway.recoveryStatusCalls).toEqual([enrollmentId]));
-    expect(await screen.findByRole('status')).toHaveTextContent('Recovery is ready.');
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent('Recovery is ready.');
     expect(screen.queryByRole('button', { name: 'Set up recovery' })).not.toBeInTheDocument();
     expect(Object.keys(localStorage).filter(key => key !== 'context-relay.desktop-preferences.v1')).toEqual([]);
     for (const canary of recoveryCanaries) expect(JSON.stringify(localStorage)).not.toContain(canary);
@@ -286,7 +290,7 @@ describe('DevicesScreen', () => {
     gateway.recoveryOverviewValue = recoveryStatus('awaiting_confirmation', enrollmentId);
     render(<DevicesScreen gateway={gateway} />);
 
-    expect(await screen.findByRole('status')).toHaveTextContent(
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent(
       'The previous recovery phrase is no longer valid. Start setup again.',
     );
     expect(gateway.recoveryCancelCalls).toEqual([enrollmentId]);
@@ -308,7 +312,7 @@ describe('DevicesScreen', () => {
     } satisfies ClientError;
     render(<DevicesScreen gateway={gateway} />);
 
-    expect(await screen.findByRole('status')).toHaveTextContent(
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent(
       'The previous recovery phrase is no longer valid. Start setup again.',
     );
     expect(gateway.recoveryCancelCalls).toEqual([enrollmentId]);
@@ -335,7 +339,7 @@ describe('DevicesScreen', () => {
       'The previous recovery setup could not be canceled. Try again.',
     );
     fireEvent.click(retry);
-    expect(await screen.findByRole('status')).toHaveTextContent(
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent(
       'The previous recovery phrase is no longer valid. Start setup again.',
     );
     expect(gateway.recoveryCancelCalls).toEqual([enrollmentId, enrollmentId]);
@@ -365,12 +369,12 @@ describe('DevicesScreen', () => {
     fillRecoveryWords(form);
     fireEvent.submit(form);
 
-    expect(await screen.findByRole('status')).toHaveTextContent(
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent(
       'Recovery confirmation was canceled. Your four entries are still here.',
     );
     expect(within(form).getByRole('textbox', { name: 'Word 1' })).toHaveValue('abandon');
     fireEvent.click(within(form).getByRole('button', { name: 'Cancel recovery setup' }));
-    expect(await screen.findByRole('status')).toHaveTextContent(
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent(
       'Recovery setup canceled. The previous phrase is no longer valid.',
     );
     expect(gateway.recoveryCancelCalls).toEqual([enrollmentId]);
@@ -388,7 +392,7 @@ describe('DevicesScreen', () => {
     fillRecoveryWords(form);
     gateway.recoveryOverviewValue = recoveryStatus(state);
     fireEvent.submit(form);
-    expect(await screen.findByRole('status')).toHaveTextContent(
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent(
       state === 'complete' ? 'Recovery is ready.' : 'Recovery setup is being secured.',
     );
     expect(screen.queryByRole('button', { name: 'Set up recovery' })).not.toBeInTheDocument();
@@ -412,7 +416,7 @@ describe('DevicesScreen', () => {
     expect(screen.queryByRole('form', { name: 'Confirm recovery phrase' })).not.toBeInTheDocument();
     gateway.recoveryOverviewValue = recoveryStatus('complete');
     fireEvent.click(retry);
-    expect(await screen.findByRole('status')).toHaveTextContent('Recovery is ready.');
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent('Recovery is ready.');
     expect(gateway.recoveryBeginCalls).toBe(1);
     expect(gateway.recoveryCancelCalls).toEqual([]);
   });

@@ -1,5 +1,5 @@
 import Ajv2020 from 'ajv/dist/2020.js';
-import type { HostedAuthStatus } from './bindings';
+import type { HostedAuthStatus, RecoveryRestoreStatus } from './bindings';
 
 import type { ConnectionCheckStatus, HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SearchIndexStatus, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
 
@@ -64,6 +64,24 @@ export function validateSearchIndexStatus(value: unknown): SearchIndexStatus {
   choice(status.phase, ['disabled', 'preparing', 'ready', 'failed'], 'search phase');
   u64(status.revision, 'search revision');
   return value as SearchIndexStatus;
+}
+
+export function validateRecoveryRestoreStatus(value: unknown): RecoveryRestoreStatus {
+  if (!value || typeof value !== 'object' || !('state' in value)) fail('recovery status');
+  const state = (value as { state: unknown }).state;
+  choice(state, ['idle', 'submitting', 'complete', 'conflict'], 'recovery state');
+  const status = object(value, state === 'idle' ? ['state'] : state === 'complete'
+    ? ['state', 'restoreId', 'device'] : ['state', 'restoreId'], 'recovery status');
+  if (state !== 'idle') id(status.restoreId, 'restore id');
+  if (state === 'complete') {
+    const device = object(status.device, ['deviceId', 'name', 'platform', 'state', 'isCurrent'], 'recovered device');
+    id(device.deviceId, 'device id');
+    text(device.name, 512, 'device name');
+    choice(device.platform, ['windows', 'macos'], 'device platform');
+    choice(device.state, ['active'], 'device state');
+    choice(device.isCurrent, [true], 'current device');
+  }
+  return value as RecoveryRestoreStatus;
 }
 export function validateHostedAuthStatus(value: unknown): HostedAuthStatus {
   const status = object(value, ['generation', 'state'], 'hosted auth status');

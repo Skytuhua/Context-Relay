@@ -15,6 +15,7 @@ import type {
   RecoveryEnrollmentStatus,
 } from './bindings';
 import type { DeviceGateway, PairingStatusResult } from './workspace';
+import { RecoveryRestorePanel } from './recovery-restore';
 
 const PAIRING_CODE_PATTERN = /^[0-9A-HJKMNP-TV-Z]{5}-[0-9A-HJKMNP-TV-Z]{5}$/;
 const SAFETY_NUMBER_PATTERN = /^[0-9A-F]{4}(?:-[0-9A-F]{4}){4}$/;
@@ -380,6 +381,7 @@ export function DevicesScreen({
         onComplete={loadDevices}
         pollIntervalMs={pollIntervalMs}
       />
+      <RecoveryRestorePanel gateway={gateway} onComplete={loadDevices} />
 
       <section className="pairing-workspace" aria-labelledby="pair-device-title">
         <div>

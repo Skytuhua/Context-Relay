@@ -1003,3 +1003,30 @@ current-head release qualification are not yet established.
 
 Windows desktop all-target Clippy also passes with warnings denied
 (`.codex/pr16-mac-input-windows-clippy.log`).
+
+### Desktop recovery workflow
+
+The Devices screen now connects native phrase entry to public restore overview,
+resume and cancellation. A saved submitting attempt offers Resume without phrase
+entry. Lost responses reconcile against durable status; unknown status blocks Begin,
+and confirmed completion clears a stale error and refreshes trusted devices.
+Cancellation is available whenever Idle, including after remount when an unprepared
+hosted intent may remain. Prepared claims cannot be canceled by this screen.
+
+The gateway validates exact public-status shapes, UUIDs and recovered-device fields
+before exposing them to React. No phrase input or phrase-bearing command arguments
+exist in the renderer. Existing workspace styling is reused; action transitions to
+non-idle status focus the recovery heading, and status/errors are announced.
+
+Review found that error-only cancellation would hide Stop after remount. The new
+wrong-phrase/remount/cancel test first reproduced that bug, then passed after Stop
+was made independent of transient errors. Six panel tests cover this, StrictMode,
+cancellation, unknown-state retry and lost-response submitting/complete paths.
+The entire desktop suite passes: 366 tests across 42 files. After the final style/focus
+change, all six panel tests pass again. TypeScript and scoped ESLint pass. Logs:
+`.codex/pr16-restore-screen-{full,final,typecheck,lint,cancel-red}.log`.
+Independent follow-up review found no remaining concrete P1/P2.
+
+These are component and gateway checks. Installed visual/accessibility acceptance,
+real hosted enrollment/recovery across devices, full Mac execution, signing and the
+rest of the product release checklist remain required before merge.
