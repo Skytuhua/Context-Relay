@@ -140,3 +140,64 @@ it('clears a scheduled reconnect when its observer is disposed', async () => {
   const stop = f.start(); await nextTurn();
   assert.equal(f.timers[0].canceled, false); stop(); assert.equal(f.timers[0].canceled, true);
 });
+
+it.each(['planId', 'action'] as const)('rejects a status response with a different %s without following it', async field => {
+  const f = fixture();
+  const mismatch: HarnessExecutionStatus = field === 'planId'
+    ? { ...finished, planId: other.planId }
+    : { ...finished, action: 'rollback' };
+  f.gateway.harnessExecutionStatus = async requested => { f.calls.status.push(requested); return mismatch; };
+  f.gateway.harnessSetupGet = async id => { f.calls.setup.push(id); return { ...setup, plan: { ...setup.plan, planId: id } }; };
+  f.start(key); await nextTurn();
+  assert.equal(f.state.checking, true);
+  assert.equal(f.state.outcome, null);
+  assert.deepEqual(f.calls.setup, []);
+  assert.equal(f.timers[0].delay, 2000);
+  f.gateway.harnessExecutionStatus = async requested => { f.calls.status.push(requested); return finished; };
+  await f.retry();
+  assert.deepEqual(f.calls.status, [key, key]);
+  assert.deepEqual(f.state.outcome, { status: finished, setup });
+});
+
+it('does not interpret a missing requested status as an idle service', async () => {
+  const f = fixture();
+  f.gateway.harnessExecutionStatus = async () => null as unknown as HarnessExecutionStatus;
+  f.start(key); await nextTurn();
+  assert.equal(f.state.checking, true);
+  assert.equal(f.state.outcome, null);
+  assert.equal(f.timers[0].delay, 2000);
+});
+
+it('requires an explicit null discovery response before unlocking an idle service', async () => {
+  const f = fixture();
+  f.gateway.harnessExecutionCurrent = async () => undefined as unknown as HarnessExecutionStatus | null;
+  f.start(); await nextTurn();
+  assert.equal(f.state.checking, true);
+  assert.equal(f.state.outcome, null);
+  assert.equal(f.timers[0].delay, 2000);
+});
+
+it('snapshots the requested identity before asynchronous discovery starts', async () => {
+  const f = fixture();
+  const target = { ...key };
+  const discovery = deferred<HarnessExecutionStatus | null>();
+  f.gateway.harnessExecutionCurrent = () => discovery.promise;
+  f.start(target);
+  target.planId = other.planId;
+  target.action = 'rollback';
+  discovery.resolve(null); await nextTurn();
+  assert.deepEqual(f.calls.status, [key]);
+  assert.deepEqual(f.state.outcome, { status: finished, setup });
+});
+
+it('does not expose the retained identity for mutation by a status reader', async () => {
+  const f = fixture();
+  const target = { ...key };
+  f.gateway.harnessExecutionStatus = async requested => {
+    requested.planId = other.planId;
+    return finished;
+  };
+  f.start(target); await nextTurn();
+  assert.deepEqual(target, key);
+  assert.deepEqual(f.state.outcome, { status: finished, setup });
+});

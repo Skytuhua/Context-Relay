@@ -24,9 +24,18 @@ export function observeHarnessExecution(
 ): () => void {
   let canceled = false;
   let cancelTimer = () => {};
-  let key = target;
+  let key = target ? { ...target } : null;
   let discover = true;
   callbacks.onChecking(true);
+
+  async function readStatus(identity: HarnessExecutionParams): Promise<HarnessExecutionStatus> {
+    const expected = { ...identity };
+    const status = await gateway.harnessExecutionStatus({ ...expected });
+    if (!status || status.planId !== expected.planId || status.action !== expected.action) {
+      throw new Error('The execution status does not match the requested attempt.');
+    }
+    return status;
+  }
 
   async function poll() {
     try {
@@ -37,17 +46,18 @@ export function observeHarnessExecution(
         if (current && (current.phase === 'queued' || current.phase === 'running' || !key)) {
           status = current;
         } else {
-          status = key ? await gateway.harnessExecutionStatus(key) : current;
+          status = key ? await readStatus(key) : current;
         }
         discover = false;
       } else {
-        status = key ? await gateway.harnessExecutionStatus(key) : await gateway.harnessExecutionCurrent();
+        status = key ? await readStatus(key) : await gateway.harnessExecutionCurrent();
       }
       if (canceled) return;
-      if (!status) {
+      if (status === null) {
         callbacks.onPending(null); callbacks.onError(null); callbacks.onChecking(false);
         return;
       }
+      if (!status) throw new Error('Execution discovery was not confirmed.');
       key = { planId: status.planId, action: status.action };
       if (status.phase === 'queued' || status.phase === 'running') {
         callbacks.onPending(status); callbacks.onError(null); callbacks.onChecking(false);

@@ -47,3 +47,42 @@ it('does not unlock mutations until a finished attempt is reconciled with its pe
   expect(result.current.outcome).toEqual({ status: finished, setup });
   expect(result.current.busy).toBe(false);
 });
+
+it('blocks a same-render save immediately when a status recheck is requested', async () => {
+  const harnessExecutionCurrent = vi.fn<() => Promise<HarnessExecutionStatus | null>>().mockResolvedValue(null);
+  const harnessExecutionStart = vi.fn();
+  const gateway = { harnessExecutionCurrent, harnessExecutionStart } as unknown as HarnessGateway;
+  const { result } = renderHook(() => useHarnessExecution(gateway, true));
+  await act(async () => {});
+  expect(result.current.busy).toBe(false);
+  harnessExecutionCurrent.mockImplementation(() => new Promise<HarnessExecutionStatus | null>(() => {}));
+  const controls = result.current;
+  await act(async () => {
+    controls.checkAgain();
+    await controls.execute(key);
+  });
+  expect(harnessExecutionStart).not.toHaveBeenCalled();
+  expect(result.current.busy).toBe(true);
+});
+
+it('keeps a submitted operation bound to its original identity after caller mutation', async () => {
+  const target = { ...key };
+  let resolve!: (status: HarnessExecutionStatus) => void;
+  const harnessExecutionStart = vi.fn(() => new Promise<HarnessExecutionStatus>(done => { resolve = done; }));
+  const harnessExecutionStatus = vi.fn(async () => finished);
+  const gateway = {
+    harnessExecutionCurrent: vi.fn(async () => null),
+    harnessExecutionStart, harnessExecutionStatus,
+    harnessSetupGet: vi.fn(async () => setup),
+  } as unknown as HarnessGateway;
+  const { result } = renderHook(() => useHarnessExecution(gateway, true));
+  await act(async () => {});
+  let operation!: Promise<void>;
+  act(() => { operation = result.current.execute(target); });
+  target.action = 'rollback';
+  await act(async () => { resolve(finished); await operation; });
+  expect(harnessExecutionStart).toHaveBeenCalledTimes(1);
+  expect(harnessExecutionStart).toHaveBeenCalledWith(key);
+  expect(harnessExecutionStatus).toHaveBeenCalledWith(key);
+  expect(result.current.outcome).toEqual({ status: finished, setup });
+});
