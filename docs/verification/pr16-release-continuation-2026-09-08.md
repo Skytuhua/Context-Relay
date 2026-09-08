@@ -136,8 +136,25 @@ with Node HMAC-SHA256 before the passing IPC rerun. Generated binding/schema
 checks, daemon-boundary, formatting and whitespace checks pass. All 21 Edge,
 SQL-source and workflow checks pass; Graphify update completed. The prior
 local Clippy run was stopped intentionally to run the new regression cases;
-it does not establish a passing lint result for this change. A fresh Clippy run
-is rebuilding native dependencies on E:. Durable encrypted
+it does not establish a passing lint result for this change. The replacement
+Clippy run passed for protocol, core, local-ipc and contextd, all targets with
+test-support and warnings denied, at pushed commit `1ae7c3d`. Durable encrypted
 intent storage, original account/session binding and recovery UI remain absent.
 This interface change alone does not complete restart recovery or permit
 production lifecycle activation.
+
+Git's automatic maintenance after that commit failed because C: was full; the
+commit and push both succeeded. A read-only temporary pack remained. Automatic
+approval review rejected its forced removal without a detailed reason, so it
+remains untouched. Continued work uses a fresh checkout at
+`E:/Context Relay Releases/workspaces/pr16-release`, verified at the same commit.
+The hosted-login regression test first failed because the core auth module was
+absent. The initial two callback tests then passed after implementing a
+single-use PKCE attempt with exact loopback/state binding, monotonic expiry,
+bounded callback parsing and redacted secret exchange material. The existing
+HTTPS project-URL validation is shared with sync. Independent bounded review
+found no concrete P1/P2 issue. Both expanded callback/exchange-body tests, all
+nine existing Supabase transport tests and the fixed RFC PKCE vector pass.
+Core Clippy passes with all targets, test-support and warnings denied. Graphify
+update, formatting and whitespace checks pass. This is not yet a listener, token exchange, credential store,
+desktop sign-in surface, trusted-device provisioning or hosted acceptance.

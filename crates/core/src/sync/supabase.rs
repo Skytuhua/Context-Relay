@@ -278,19 +278,7 @@ impl SupabaseTransportConfig {
         publishable_key: impl Into<String>,
         access_token: impl Into<String>,
     ) -> Result<Self, TransportError> {
-        let project_url =
-            Url::parse(project_url.as_ref()).map_err(|_| TransportError::Configuration)?;
-        let path_is_root = project_url.path().is_empty() || project_url.path() == "/";
-        if project_url.scheme() != "https"
-            || project_url.host_str().is_none()
-            || !project_url.username().is_empty()
-            || project_url.password().is_some()
-            || !path_is_root
-            || project_url.query().is_some()
-            || project_url.fragment().is_some()
-        {
-            return Err(TransportError::Configuration);
-        }
+        let project_url = validated_project_url(project_url.as_ref())?;
         let publishable_key = publishable_key.into();
         let access_token = access_token.into();
         if !valid_header_secret(&publishable_key) || !valid_header_secret(&access_token) {
@@ -314,6 +302,21 @@ impl SupabaseTransportConfig {
     pub(crate) fn access_token(&self) -> &str {
         &self.access_token
     }
+}
+
+pub(crate) fn validated_project_url(value: &str) -> Result<Url, TransportError> {
+    let url = Url::parse(value).map_err(|_| TransportError::Configuration)?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !(url.path().is_empty() || url.path() == "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(TransportError::Configuration);
+    }
+    Ok(url)
 }
 
 fn valid_header_secret(value: &str) -> bool {
