@@ -3,7 +3,7 @@ import { spawn, execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
-import test from 'node:test';
+import test, { before, after } from 'node:test';
 
 // Run only against an explicitly selected disposable, loopback PostgreSQL instance.
 assert.equal(process.env.CONTEXT_RELAY_DISPOSABLE_POSTGRES, '1');
@@ -22,6 +22,19 @@ async function sql(query, application = 'context-relay-lifecycle-test') {
   return result.stdout.trim();
 }
 const id = () => randomUUID().replace(/^(.{14})./, (_, prefix) => `${prefix}7`);
+
+// Supabase's postgres role is not a superuser. Fixture administration needs
+// temporary owner membership; RPC assertions still explicitly SET ROLE service_role.
+let fixtureAuthority = false;
+before(async () => {
+  assert.equal(await sql(`select exists(select 1 from pg_auth_members
+    where roleid='context_relay_rls_owner'::regrole and member=current_user::regrole)`), 'f');
+  await sql('grant context_relay_rls_owner to current_user with inherit true, set true');
+  fixtureAuthority = true;
+});
+after(async () => {
+  if (fixtureAuthority) await sql('revoke context_relay_rls_owner from current_user');
+});
 
 async function fixture() {
   const user = randomUUID(), session = randomUUID(), account = id(), device = id(), workspace = id();
