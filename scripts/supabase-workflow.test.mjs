@@ -15,6 +15,8 @@ const expectedPaths = [
   'scripts/tests/verify-supabase-realtime.test.mjs',
   'scripts/tests/supabase-sync-*.test.mjs',
   'scripts/tests/account-lifecycle-*.test.mjs',
+  'scripts/tests/hosted-enrollment-*.test.mjs',
+  'crates/core/tests/fixtures/*enrollment*',
   'scripts/verify-account-lifecycle-postgres.mjs',
   'package.json',
   'pnpm-lock.yaml',
@@ -200,10 +202,12 @@ test('Supabase workflow preserves triggers and the local contract lifecycle', as
     'node --test scripts/tests/verify-supabase-realtime.test.mjs',
     'node --test scripts/tests/supabase-sync-*.test.mjs',
     'node --test scripts/tests/account-lifecycle-*.test.mjs',
+    'node --test scripts/tests/hosted-enrollment-*.test.mjs',
     'pnpm supabase:start:ci',
     'pnpm supabase:reset',
     'node scripts/verify-account-lifecycle-postgres.mjs',
     'pnpm supabase:test',
+    'pnpm exec supabase test db supabase/tests/0002_hosted_enrollment_test.sql',
     'pnpm supabase:lint',
   ]);
   assert.match(
