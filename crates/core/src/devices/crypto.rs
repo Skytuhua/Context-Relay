@@ -122,6 +122,70 @@ pub fn pairing_request_fingerprint(request: &PairingRequestV1) -> Sha256Digest {
     Sha256Digest(hash.finalize().into())
 }
 
+/// Hosted possession proofs bind the original Auth identity and exact payload.
+/// The provider still enforces live session, authority and atomic state checks.
+pub fn sign_hosted_pairing_request_proof(
+    device: &DeviceKeys,
+    user: uuid::Uuid,
+    session: uuid::Uuid,
+    request: &SignedPairingRequest,
+) -> Result<context_relay_protocol::Ed25519SignatureBytes, CryptoError> {
+    require_exact_signed_request(request)?;
+    if device.signing_public_key() != request.request().signing_public_key
+        || device.wrapping_public_key() != request.request().wrapping_public_key
+    {
+        return Err(CryptoError::InvalidKey);
+    }
+    hosted_pairing_proof(
+        device,
+        user,
+        session,
+        b"context-relay/hosted-pairing-request-proof/v1\0",
+        request.canonical_bytes(),
+    )
+}
+
+pub fn sign_hosted_pairing_approval_proof(
+    device: &DeviceKeys,
+    user: uuid::Uuid,
+    session: uuid::Uuid,
+    request: &SignedPairingRequest,
+    payload: &PairingApprovedPayloadV1,
+) -> Result<context_relay_protocol::Ed25519SignatureBytes, CryptoError> {
+    validate_approved_payload_bindings(payload, request)?;
+    if device.signing_public_key() != payload.issuer_certificate.signing_public_key
+        || device.wrapping_public_key() != payload.issuer_certificate.wrapping_public_key
+    {
+        return Err(CryptoError::InvalidKey);
+    }
+    hosted_pairing_proof(
+        device,
+        user,
+        session,
+        b"context-relay/hosted-pairing-approval-proof/v1\0",
+        &encode_pairing_approved_payload_v1(payload)?,
+    )
+}
+
+fn hosted_pairing_proof(
+    device: &DeviceKeys,
+    user: uuid::Uuid,
+    session: uuid::Uuid,
+    domain: &[u8],
+    canonical: &[u8],
+) -> Result<context_relay_protocol::Ed25519SignatureBytes, CryptoError> {
+    for id in [user, session] {
+        if id.get_variant() != uuid::Variant::RFC4122 || !(1..=8).contains(&id.get_version_num()) {
+            return Err(CryptoError::InvalidProtocolValue);
+        }
+    }
+    let mut preimage = domain.to_vec();
+    preimage.extend_from_slice(user.as_bytes());
+    preimage.extend_from_slice(session.as_bytes());
+    preimage.extend_from_slice(&Sha256::digest(canonical));
+    Ok(device.sign_hosted_device_proof(&preimage))
+}
+
 pub struct PairingKeyBundle {
     account_id: AccountId,
     workspace_id: WorkspaceId,

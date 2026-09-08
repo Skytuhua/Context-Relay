@@ -33,6 +33,69 @@ const ISSUER_CERTIFICATE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073987";
 const _: () = assert!(MAX_PAIRING_APPROVED_PAYLOAD_BYTES > MAX_PAIRING_GRANT_BYTES);
 
 #[test]
+fn hosted_pairing_proofs_bind_session_operation_and_installed_keys() {
+    use context_relay_core::devices::crypto::{
+        sign_hosted_pairing_approval_proof, sign_hosted_pairing_request_proof,
+    };
+    let user = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+    let session = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001").unwrap();
+    let joiner = DeviceKeys::generate().unwrap();
+    let issuer = DeviceKeys::generate().unwrap();
+    let request = signed_request(&joiner);
+    let payload = approved_payload(
+        &request,
+        &issuer,
+        issuer_certificate(&issuer),
+        id(ISSUER_CERTIFICATE_ID),
+    );
+    let request_proof =
+        sign_hosted_pairing_request_proof(&joiner, user, session, &request).unwrap();
+    let approval_proof =
+        sign_hosted_pairing_approval_proof(&issuer, user, session, &request, &payload).unwrap();
+    for (operation, bytes, keys, signature) in [
+        (
+            "request",
+            request.canonical_bytes().to_vec(),
+            &joiner,
+            request_proof,
+        ),
+        (
+            "approval",
+            encode_pairing_approved_payload_v1(&payload).unwrap(),
+            &issuer,
+            approval_proof,
+        ),
+    ] {
+        let mut preimage =
+            format!("context-relay/hosted-pairing-{operation}-proof/v1\0").into_bytes();
+        preimage.extend_from_slice(user.as_bytes());
+        preimage.extend_from_slice(session.as_bytes());
+        preimage.extend_from_slice(&Sha256::digest(bytes));
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&keys.signing_public_key().0).unwrap();
+        key.verify_strict(
+            &preimage,
+            &ed25519_dalek::Signature::from_bytes(&signature.0),
+        )
+        .unwrap();
+        preimage[0] ^= 1;
+        assert!(
+            key.verify_strict(
+                &preimage,
+                &ed25519_dalek::Signature::from_bytes(&signature.0)
+            )
+            .is_err()
+        );
+    }
+    assert!(sign_hosted_pairing_request_proof(&issuer, user, session, &request).is_err());
+    assert!(
+        sign_hosted_pairing_approval_proof(&joiner, user, session, &request, &payload).is_err()
+    );
+    assert!(
+        sign_hosted_pairing_request_proof(&joiner, uuid::Uuid::nil(), session, &request).is_err()
+    );
+}
+
+#[test]
 fn hosted_pairing_approval_fixture_verifies_the_exact_request() {
     let decode = |encoded: &str| -> Vec<u8> {
         (0..encoded.len())

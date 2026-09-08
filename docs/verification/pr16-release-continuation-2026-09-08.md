@@ -1062,3 +1062,14 @@ Caller-owned inputs are copied before asynchronous verification. All 13 Rust
 pairing crypto tests and 68 affected Node checks pass. Device operation proof,
 provider admission, live sessions and the joining device's safety confirmation
 remain required; this helper alone grants no authority.
+
+### Hosted pairing possession proofs
+
+Request and approval proofs use distinct domains followed by authenticated user
+UUID bytes, session UUID bytes and SHA-256 of the exact canonical payload. Rust
+signing validates existing payload bindings and both installed device keys;
+Edge verification snapshots inputs before asynchronous work. UUID validation
+agrees on RFC variant and versions 1 through 8. The affected Node suite passes
+69 checks and the Rust pairing crypto suite passes 14 tests. Independent review
+found no actionable P1/P2 issues. Live authorization and atomic admission remain
+mandatory and are not implemented by these helpers.

@@ -41,8 +41,11 @@ The approval verifier now checks the canonical nested grant and genesis/child
 certificates against the exact signed request and server-selected root, issuer,
 scope and epochs. A Rust-generated public approval fixture is checked by both
 implementations. All 13 Rust pairing crypto tests and 68 affected Node checks
-pass. Authenticated operation proofs remain unfinished; this public-cryptography
-helper does not authorize admission or prove ciphertext integrity. The joining
+pass. Request/approval possession-proof helpers now bind the original Auth
+user/session and exact payload under separate signing domains (14 Rust and 69
+affected Node checks pass). Endpoint enforcement and a frozen shared proof vector
+remain required; these helpers do not authorize admission or prove ciphertext
+integrity. The joining
 device still authenticates the complete approval through the safety number and
 decrypts the grant before installing local trust. This is not live pairing evidence.
 
