@@ -77,6 +77,17 @@ stores/checks it before preparing or resuming signed work. Native approval proof
 use the durable signed request rather than requiring a new server read. Production
 daemon integration and broader failure-path qualification remain unfinished.
 
+Integration findings: use the daemon-owned protected keys and current Auth owner
+at the existing production recovery-service initialization. A fresh joiner has
+no scope or issuer certificate; the coordinator service now supports that role.
+Reconcile one requested prepared approval through `resume_prepared_decision`
+instead of replaying unrelated sessions. Startup must remain local while Auth
+restores, as it does for recovery. Before wiring terminal status, remove its
+fresh provider request lookup: accepted approval transcripts currently preserve
+the signed request and preparation time, but not the original provider request
+timestamp. Preserve that timestamp rather than silently replacing it with the
+approval preparation time. Keep certificate/epoch validation on local replay.
+
 **Files:** `crates/contextd/src/pairing.rs`, `lib.rs`, existing hosted Auth service and pairing daemon tests.
 
 - [ ] Wire the hosted service into the existing ordered Vault worker. Fresh joiners can join/check/confirm without a preexisting scope or issuer; approval operations require verified active material.

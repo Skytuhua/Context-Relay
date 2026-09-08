@@ -1364,3 +1364,20 @@ The existing js-yaml override and lockfile now resolve 4.3.2, the patched versio
 Local pnpm audit reports no known vulnerabilities and desktop lint passes
 (`.codex/pr16-js-yaml-{audit,lint}.log`). Current-head CI remains required; this
 dependency fix does not complete any outstanding installed release gate.
+
+### Scoped prepared-approval resume and dependency policy follow-up
+
+The coordinator can now resume one requested prepared approval, using the same
+original-identity and exact-receipt checks as batch resume. A restart regression
+proves unrelated/missing IDs leave pending work intact, an accepted ID does not
+resubmit, and changed project/user/session/role or missing hosted metadata fails
+before provider submission. All 13 affected pairing coordinator and identity
+tests pass; targeted Clippy with warnings denied passes
+(`.codex/pr16-pairing-single-resume-final{,-clippy}.log`). Independent review of
+the resume implementation found no P1/P2 issues. Production wiring is still open.
+
+Current-head job 102265572882 exposed a missed dependency-policy assertion that
+still demanded js-yaml 4.3.1. Its required version is now 4.3.2 and its rejection
+pattern includes 4.3.1. The actual CI command sequence (frozen install, policy
+test, low-severity audit) passes locally with no known vulnerabilities
+(`.codex/pr16-node-policy-final.log`). Hosted CI must still qualify the new head.
