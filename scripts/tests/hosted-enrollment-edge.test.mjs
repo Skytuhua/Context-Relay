@@ -65,3 +65,26 @@ test("a forged commit receipt cannot substitute account identity", async () => {
   assert.equal(result.status, 409);
   assert.deepEqual(await result.json(), { v: 1, error: "enrollment_conflict" });
 });
+
+test("snapshot reads only verified owner identity and validates the stored projection", async () => {
+  const f = setup();
+  const snapshot = { accountId: decoded.accountId, workspaceId: decoded.workspaceId,
+    canonicalRecord: record, canonicalRecordSha256: f.receipt.canonicalRecordSha256,
+    registeredAtMs: "123", recoveryGeneration: "0" };
+  f.dependencies.snapshot = async identity => {
+    assert.deepEqual(identity, { userId: vector.authUserId, sessionId: vector.sessionId });
+    return snapshot;
+  };
+  const body = { v: 1, action: "snapshot" };
+  assert.deepEqual(await (await f.handler(request(body))).json(), { v: 1, snapshot });
+  for (const extra of [{ accountId: decoded.accountId }, { reservationId: vector.reservationId }]) {
+    assert.equal((await f.handler(request({ ...body, ...extra }))).status, 400);
+  }
+  for (const change of [{ canonicalRecordSha256: "00".repeat(32) }, { accountId: decoded.enrollmentId },
+    { recoveryGeneration: "-1" }, { secret: "private" }]) {
+    f.dependencies.snapshot = async () => ({ ...snapshot, ...change });
+    assert.equal((await f.handler(request(body))).status, 400);
+  }
+  f.dependencies.snapshot = async () => null;
+  assert.deepEqual(await (await f.handler(request(body))).json(), { v: 1, snapshot: null });
+});

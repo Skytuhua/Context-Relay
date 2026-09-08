@@ -8,6 +8,7 @@ const vector = JSON.parse(readFileSync(new URL("hosted-enrollment-proof-v1.json"
 const record = decodeEnrollmentRecord(Buffer.from(readFileSync(new URL("recovery-enrollment-record-v1.hex", fixtures), "utf8").trim(), "hex"));
 function setup() {
   const calls = [], clients = [];
+  let data = {};
   let claims = { sub: vector.authUserId, session_id: vector.sessionId }, error = null;
   const dependencies = createSupabaseEnrollmentDependencies({
     env: { SUPABASE_URL: "https://example.supabase.co", SUPABASE_PUBLISHABLE_KEY: "public-test", CONTEXT_RELAY_SUPABASE_SECRET_KEY: "server-test" },
@@ -15,10 +16,10 @@ function setup() {
       clients.push({ url, key, options });
       return key === "public-test" ? { auth: { async getClaims(token) {
         calls.push({ token }); return { data: { claims }, error };
-      } } } : { async rpc(name, args) { calls.push({ name, args }); return { data: {}, error }; } };
+      } } } : { async rpc(name, args) { calls.push({ name, args }); return { data, error }; } };
     },
   });
-  return { calls, clients, dependencies, setClaims: value => { claims = value; }, setError: value => { error = value; } };
+  return { calls, clients, dependencies, setData: value => { data = value; }, setClaims: value => { claims = value; }, setError: value => { error = value; } };
 }
 test("enrollment derives identity from verified claims and uses isolated clients", async () => {
   const f = setup();
@@ -58,5 +59,15 @@ test("enrollment generates server scope and passes canonical fields to the seale
   assert.equal(commit.args.p_encrypted_metadata, "\\x" + Buffer.from(record.encryptedMetadata).toString("hex"));
   assert.equal(commit.args.p_canonical_record, "\\x" + Buffer.from(record.canonicalRecord).toString("hex"));
   f.setError({ message: "private SQL detail" });
+  await assert.rejects(f.dependencies.status(identity, vector.reservationId), /^Error: transient$/);
+});
+
+test("snapshot sends no client scope or enrollment reservation to its service RPC", async () => {
+  const f = setup(), identity = { userId: vector.authUserId, sessionId: vector.sessionId };
+  await f.dependencies.snapshot(identity);
+  assert.deepEqual(f.calls.at(-1), { name: "service_recovery_snapshot_for_session",
+    args: { p_auth_user_id: identity.userId, p_session_id: identity.sessionId } });
+  f.setData(null);
+  assert.equal(await f.dependencies.snapshot(identity), null);
   await assert.rejects(f.dependencies.status(identity, vector.reservationId), /^Error: transient$/);
 });

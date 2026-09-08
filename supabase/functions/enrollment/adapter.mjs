@@ -23,11 +23,12 @@ export function createSupabaseEnrollmentDependencies({ createClient, env }) {
   const { authClient, serviceClient } = createSupabaseSessionClients({ createClient, env });
   async function rpc(name, identity, operation, parameters = {}) {
     const args = { p_auth_user_id: uuid(identity.userId), p_session_id: uuid(identity.sessionId),
-      p_reservation_id: uuid(operation, "7"), ...parameters };
+      ...parameters };
+    if (operation !== undefined) args.p_reservation_id = uuid(operation, "7");
     let result;
     try { result = await serviceClient.rpc(name, args); } catch { throw failure(); }
     if (result?.error) throw failure(safeCodes.has(result.error.message) ? result.error.message : "transient");
-    if (result?.error !== null || result.data === null || result.data === undefined) throw failure();
+    if (result?.error !== null || (result.data === null && operation !== undefined) || result.data === undefined) throw failure();
     return result.data;
   }
   return {
@@ -38,6 +39,7 @@ export function createSupabaseEnrollmentDependencies({ createClient, env }) {
         return { userId: uuid(result.data.claims.sub), sessionId: uuid(result.data.claims.session_id) };
       } catch { throw failure("auth_required"); }
     },
+    snapshot(identity) { return rpc("service_recovery_snapshot_for_session", identity); },
     reserve(identity, operation) {
       return rpc("service_reserve_enrollment_for_session", identity, operation, {
         p_account_id: uuid7(), p_workspace_id: uuid7(), p_nonce: bytea(crypto.getRandomValues(new Uint8Array(32))),

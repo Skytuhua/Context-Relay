@@ -703,3 +703,28 @@ TypeScript and ESLint pass. Read-only review found no concrete P1/P2 in this dif
 Logs: `.codex/pr16-recovery-ui-{red,green,suite}.log`.
 Managed Supabase run 34254584913 at 368c942 completed successfully. This does not
 replace live login, enrollment, second-device, signing or clean-machine acceptance.
+
+### Hosted recovery snapshot boundary
+
+Added the service-only `service_recovery_snapshot_for_session` RPC and the closed
+`{v:1, action:"snapshot"}` enrollment endpoint action. A live authenticated owner
+session can fetch its committed canonical recovery record without knowing the
+original enrollment reservation or holding a device binding. Account ownership,
+active deletion state and unrevoked root are checked under locks; session liveness
+is rechecked after waits. No device trust is granted by this read. The root now
+stores a nonnegative recovery generation, initially zero, for signed restore claims.
+The Edge checks exact projection fields, record encoding, scope and SHA-256.
+A live session is required; this read does not impose a recent-login age limit.
+
+Evidence: the new SQL test failed before the RPC existed. All 19 local PostgreSQL
+lifecycle/enrollment tests now pass, including fresh-session read, zero binding
+creation, cross-user denial, role denial, revoked/deleting exclusions, and expiry
+while waiting on account/root locks. All 16 enrollment Node tests pass, including
+closed snapshot input/projection, digest/scope rejection and null-result handling.
+Supabase contract and whitespace checks pass. Read-only review found no concrete
+P1/P2. Logs: `.codex/pr16-snapshot-{red,green,postgres,node,edge-red,edge-green}.log`.
+
+The migration is applied only to the disposable local database. Hosted deployment,
+native snapshot transport, signed restore submission/reconciliation, live acceptance
+and all signing/clean-machine gates remain incomplete. Supabase run 34255498040
+passed at a723fcb before this change; new-head managed CI must run separately.

@@ -1,5 +1,5 @@
 import { readBoundedBody } from "../account-lifecycle/core.mjs";
-import { verifyEnrollmentRecord } from "./record.mjs";
+import { decodeEnrollmentRecord, verifyEnrollmentRecord } from "./record.mjs";
 
 const MAX_BYTES = 68 * 1024;
 const headers = { "content-type": "application/json", "cache-control": "no-store" };
@@ -45,6 +45,23 @@ function reservation(value, reservationId, withReceipt) {
   return result;
 }
 
+async function snapshot(value) {
+  if (value === null) return null;
+  if (!exact(value, ["accountId", "workspaceId", "canonicalRecord", "canonicalRecordSha256",
+    "registeredAtMs", "recoveryGeneration"])) fail("invalid_request");
+  value = { ...value };
+  uuid(value.accountId); uuid(value.workspaceId);
+  timestamp(value.registeredAtMs); timestamp(value.recoveryGeneration);
+  hex(value.canonicalRecordSha256, 32);
+  const bytes = hex(value.canonicalRecord, 1, 32768);
+  let record;
+  try { record = decodeEnrollmentRecord(bytes); } catch { fail("invalid_request"); }
+  const digest = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)), byte => byte.toString(16).padStart(2, "0")).join("");
+  if (record.accountId !== value.accountId || record.workspaceId !== value.workspaceId
+    || digest !== value.canonicalRecordSha256) fail("invalid_request");
+  return { ...value };
+}
+
 export function createEnrollmentEdgeHandler(dependencies) {
   return async request => {
     try {
@@ -58,15 +75,18 @@ export function createEnrollmentEdgeHandler(dependencies) {
       let body;
       try { body = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await readBoundedBody(request, MAX_BYTES))); }
       catch (error) { fail(error?.code === "request_too_large" ? error.code : "invalid_request"); }
-      if (!body || body.v !== 1 || !["reserve", "renew", "status", "commit"].includes(body.action)
-        || !exact(body, body.action === "commit" ? ["v", "action", "reservationId", "record", "proof"] : ["v", "action", "reservationId"])) fail("invalid_request");
-      const operation = uuid(body.reservationId);
+      if (!body || body.v !== 1 || !["reserve", "renew", "status", "commit", "snapshot"].includes(body.action)
+        || !exact(body, body.action === "snapshot" ? ["v", "action"] : body.action === "commit" ? ["v", "action", "reservationId", "record", "proof"] : ["v", "action", "reservationId"])) fail("invalid_request");
+      const operation = body.action === "snapshot" ? null : uuid(body.reservationId);
       const canonical = body.action === "commit" ? hex(body.record, 1, 32768) : null;
       const proof = body.action === "commit" ? hex(body.proof, 64) : null;
       const authorization = request.headers.get("authorization");
       if (authorization === null || !/^Bearer [^\s]+$/.test(authorization)) fail("auth_required");
       const authenticated = await dependencies.authenticate(authorization.slice(7));
       const identity = { userId: uuid(authenticated.userId, "[1-8]"), sessionId: uuid(authenticated.sessionId, "[1-8]") };
+      if (body.action === "snapshot") {
+        return response(200, { v: 1, snapshot: await snapshot(await dependencies.snapshot(identity)) });
+      }
       if (body.action === "reserve" || body.action === "renew") {
         const result = reservation(await dependencies[body.action](identity, operation), operation, false);
         return response(200, { v: 1, reservation: result });

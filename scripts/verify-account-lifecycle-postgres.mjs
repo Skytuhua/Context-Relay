@@ -128,6 +128,66 @@ function enrollmentCommit(f, reservation, certificate = id()) {
     decode(repeat('49',80),'hex'),decode('010203','hex'));`;
 }
 
+test('recovery snapshot allows a fresh owner session without granting device trust', async () => {
+  const f = await enrollmentFixture(), other = await enrollmentFixture(), fresh = randomUUID();
+  const snapshot = (user = f.user, session = fresh) => `set role service_role;
+    select public.service_recovery_snapshot_for_session('${user}','${session}');`;
+  try {
+    const reservation = JSON.parse(await sql(f.request()));
+    const receipt = JSON.parse(await sql(enrollmentCommit(f, reservation)));
+    await sql(`insert into auth.sessions(id,user_id) values ('${fresh}','${f.user}');`);
+    const value = JSON.parse(await sql(snapshot()));
+    assert.deepEqual(value, { accountId: reservation.accountId, workspaceId: reservation.workspaceId,
+      canonicalRecord: '010203', canonicalRecordSha256: receipt.canonicalRecordSha256,
+      registeredAtMs: receipt.registeredAtMs, recoveryGeneration: '0' });
+    assert.equal(await sql(`select count(*) from public.device_bindings where session_id='${fresh}'`), '0');
+    assert.equal(JSON.parse(await sql(snapshot(other.user, other.session))), null);
+    await assert.rejects(sql(snapshot(f.user, other.session)), /enrollment_session_denied/);
+    for (const role of ['anon', 'authenticated']) {
+      await assert.rejects(sql(snapshot().replace('set role service_role', `set role ${role}`)), /permission denied/);
+    }
+    await sql(`update public.recovery_roots set revoked_at=clock_timestamp() where account_id='${reservation.accountId}'`);
+    assert.equal(JSON.parse(await sql(snapshot())), null);
+    await sql(`update public.recovery_roots set revoked_at=null where account_id='${reservation.accountId}';
+      update public.accounts set deletion_state='pending_delete', deletion_requested_at=clock_timestamp(),
+        deletion_scheduled_for=clock_timestamp()+interval '1 day' where id='${reservation.accountId}'`);
+    assert.equal(JSON.parse(await sql(snapshot())), null);
+    await sql(`update auth.sessions set not_after=clock_timestamp()-interval '1 second' where id='${fresh}'`);
+    await assert.rejects(sql(snapshot()), /enrollment_session_denied/);
+  } finally {
+    await sql(`delete from auth.sessions where id='${fresh}'`);
+    await f.cleanup(); await other.cleanup();
+  }
+});
+
+for (const lock of ['account', 'root']) {
+  test(`recovery snapshot rechecks session expiry after the ${lock} lock`, async () => {
+    const f = await enrollmentFixture();
+    let release, outcome;
+    try {
+      const reservation = JSON.parse(await sql(f.request()));
+      await sql(enrollmentCommit(f, reservation));
+      await sql(`update auth.sessions set not_after=clock_timestamp()+interval '2 seconds' where id='${f.session}'`);
+      release = await holdLock(lock === 'account'
+        ? `select id from public.accounts where id='${reservation.accountId}' for update`
+        : `select id from public.recovery_roots where account_id='${reservation.accountId}' for update`);
+      const application = `snapshot-wait-${randomUUID()}`;
+      outcome = sql(`set role service_role; select public.service_recovery_snapshot_for_session('${f.user}','${f.session}')`, application)
+        .then(value => ({ value }), error => ({ error }));
+      await waitUntilBlocked(application);
+      await sql(`select pg_sleep(greatest(0, extract(epoch from not_after-clock_timestamp())+0.1)) from auth.sessions where id='${f.session}'`);
+      await release(); release = null;
+      const result = await outcome;
+      assert.ok(result.error, `Expired session received a snapshot: ${result.value}`);
+      assert.match(result.error.stderr, /enrollment_session_denied/);
+    } finally {
+      if (release) await release();
+      if (outcome) await outcome;
+      await f.cleanup();
+    }
+  });
+}
+
 test('expired enrollment renewal rotates only the challenge and preserves committed receipts', async () => {
   const f = await enrollmentFixture();
   try {
