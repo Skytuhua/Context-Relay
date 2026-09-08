@@ -57,6 +57,64 @@ impl LoginStore for Store {
 }
 
 #[test]
+fn enrollment_reservation_uses_original_session_and_rejects_later_login() {
+    use context_relay_core::devices::supabase_enrollment::HostedEnrollmentClient;
+    let operation = "018f22e2-79b0-7cc8-98c4-dc0c0c073901";
+    let (client, http) = client(
+        PROJECT,
+        vec![
+            tokens(&token(NOW + 900)),
+            response(200, json!({"id":USER})),
+            response(
+                200,
+                json!({"v":1,"reservation":{
+            "reservationId":operation,"accountId":"018f22e2-79b0-7cc8-98c4-dc0c0c073902",
+            "workspaceId":"018f22e2-79b0-7cc8-98c4-dc0c0c073903","nonce":"42".repeat(32),
+            "expiresAt":((NOW+605)*1000).to_string()}}),
+            ),
+        ],
+    );
+    let owner = Arc::new(HostedSessionOwner::new(
+        Arc::new(client),
+        Arc::new(Store::default()),
+    ));
+    let attempt = owner.begin_login().unwrap();
+    let generation = attempt.cancellation();
+    let identity = owner.complete_login(attempt, exchange(), NOW).unwrap();
+    let transport = HostedEnrollmentClient::with_http_client(
+        owner.clone(),
+        identity,
+        generation,
+        PROJECT,
+        "publishable-test",
+        http.clone(),
+    )
+    .unwrap();
+    let id = serde_json::from_value(json!(operation)).unwrap();
+    let reserved = transport.reserve(id, NOW).unwrap();
+    assert_eq!(reserved.reservation_id, id);
+    // A server clock five seconds ahead still issues a valid ten-minute lease.
+    assert_eq!(reserved.expires_at.0, (NOW + 605) * 1000);
+    {
+        let requests = http.requests.lock().unwrap();
+        let request = requests.last().unwrap();
+        assert_eq!(
+            request.url(),
+            "https://example.supabase.co/functions/v1/enrollment"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(request.body()).unwrap(),
+            json!({"v":1,"action":"reserve","reservationId":operation})
+        );
+        assert_eq!(request.header("apikey"), Some("publishable-test"));
+    }
+    let count = http.requests.lock().unwrap().len();
+    owner.begin_login().unwrap();
+    assert!(transport.reserve(id, NOW).is_err());
+    assert_eq!(http.requests.lock().unwrap().len(), count);
+}
+
+#[test]
 fn queued_session_access_keeps_identity_across_refresh_and_rejects_replacement() {
     let (client, _) = client(
         PROJECT,

@@ -564,3 +564,20 @@ whitespace checks pass.
 Log: `.codex/pr16-enrollment-owner.log`. Status-migration Supabase run
 `34245530149` on `6c49e8c` passed; the later Edge adapter still needs managed
 qualification and live acceptance.
+
+## Native reservation HTTP client
+
+Added a daemon-owned reservation client using the existing HTTPS-only bounded
+HTTP implementation. It resolves credentials for the original identity/generation,
+checks the configured project, sends only the stable operation ID, and rechecks
+ownership after the request before returning a strictly decoded reservation.
+No credentials are included in the reservation. Status/commit and durable native
+enrollment integration remain unfinished.
+
+The 15 hosted-auth tests pass, including the native request shape and denial before
+network access after login replacement. Review caught an upper-bound expiry check
+that rejected normal server clock skew; it was removed and a server-ahead
+regression passes. The database remains authoritative for challenge expiry.
+Log: `.codex/pr16-enrollment-client-test.log`.
+Core all-target Clippy with test-support and warnings denied, formatting and
+whitespace checks pass.
