@@ -619,3 +619,34 @@ reservations or changed hosted sessions remain unfinished. This is local
 persistence evidence, not live enrollment or release acceptance. PR #16 stays open.
 Core all-target Clippy with test-support and warnings denied also passes.
 Log: `.codex/pr16-enrollment-intent-clippy.log`.
+
+## Native coordinator transport and clock domains (September 9)
+
+The hosted client now implements the existing recovery transport through an adapter
+bound to the saved project, Auth identity, reservation and installed device keys.
+It resolves credentials through the original login generation for every request.
+The coordinator retains canonical-record validation of status receipts.
+
+Review found a real clock-domain bug: activation compared the server receipt time
+to the desktop's request-start time. Schema 29 preserves enrollment rows while
+removing that cross-clock ordering. Server acceptance remains the exact receipt
+value; local completion is refreshed after networking and cannot precede local
+preparation. Signature, record digest, identity and certificate checks remain.
+
+The initial local run passed 17 hosted-auth/native-adapter tests, 12 enrollment
+end-to-end tests, 7 enrollment vault tests, 7 search tests and 21 general vault
+tests. Eight existing search asset/performance tests remain ignored. Follow-up
+coverage exercises lost commit responses and restart reconciliation under server
+clock skew, plus an active schema-28 enrollment upgrade. Final follow-up results
+are recorded below. This does not enable the daemon or establish live acceptance.
+
+Follow-up results: all 17 hosted-auth/native-adapter tests pass, including immediate
+and lost-response commits with server clocks five seconds ahead/behind, followed
+by vault reopen and coordinator reconciliation. Both native-memory drift tests
+pass after repairing their incomplete historical-schema fixture. The active-row
+schema-28 upgrade regression passes. Core all-target Clippy with test-support and
+warnings denied, formatting and whitespace checks pass. Read-only review closed
+the clock-domain finding and found no further concrete P1/P2.
+Logs: `.codex/pr16-enrollment-clock-{test,final,fixture,upgrade,clippy}.log`.
+Daemon wiring, reservation/session recovery, live acceptance and release gates
+remain incomplete; PR #16 is not merged.

@@ -91,6 +91,17 @@ fn native_enrollment_status_and_commit_validate_the_record_receipt() {
             response(200, json!({"v":1,"reservation":status})),
             response(200, json!({"v":1,"receipt":receipt})),
             response(200, json!({"v":1,"receipt":forged})),
+            response(
+                200,
+                json!({"v":1,"reservation":{
+                    "receipt":receipt,
+                    "reservationId":reservation["reservationId"],
+                    "accountId":reservation["accountId"],
+                    "workspaceId":reservation["workspaceId"],
+                    "nonce":reservation["nonce"],"expiresAt":reservation["expiresAt"]
+                }}),
+            ),
+            response(200, json!({"v":1,"receipt":receipt})),
         ],
     );
     let owner = Arc::new(HostedSessionOwner::new(
@@ -101,9 +112,9 @@ fn native_enrollment_status_and_commit_validate_the_record_receipt() {
     let generation = attempt.cancellation();
     let identity = owner.complete_login(attempt, exchange(), NOW).unwrap();
     let transport = HostedEnrollmentClient::with_http_client(
-        owner,
+        owner.clone(),
         identity,
-        generation,
+        generation.clone(),
         PROJECT,
         "public-test",
         http.clone(),
@@ -149,6 +160,62 @@ fn native_enrollment_status_and_commit_validate_the_record_receipt() {
             .commit(&reservation, &canonical, &device, NOW)
             .is_err()
     );
+    use context_relay_core::{
+        devices::{
+            recovery::RecoveryEnrollmentClock, recovery_transport::RecoveryEnrollmentTransport,
+        },
+        vault::HostedEnrollmentIntent,
+    };
+    struct Clock;
+    impl RecoveryEnrollmentClock for Clock {
+        fn now_ms(&self) -> u64 {
+            NOW * 1000
+        }
+    }
+    let intent = HostedEnrollmentIntent {
+        project_url: PROJECT.into(),
+        user_id: identity.user_id,
+        session_id: identity.session_id,
+        operation_id: reservation.reservation_id,
+        reservation: Some(reservation),
+    };
+    let device = Arc::new(device);
+    for wrong_project in [false, true] {
+        let mut wrong = intent.clone();
+        if wrong_project {
+            wrong.project_url = "https://other.supabase.co".into();
+        } else {
+            wrong.session_id = "550e8400-e29b-41d4-a716-446655440009".parse().unwrap();
+        }
+        let client = HostedEnrollmentClient::with_http_client(
+            owner.clone(),
+            identity,
+            generation.clone(),
+            PROJECT,
+            "public-test",
+            http.clone(),
+        )
+        .unwrap();
+        assert!(matches!(client.into_transport(&wrong, device.clone(), Clock), Err(context_relay_core::devices::recovery_transport::RecoveryTransportError::Unauthorized)));
+    }
+    let adapter = transport.into_transport(&intent, device, Clock).unwrap();
+    let status = adapter.root_status().unwrap().unwrap();
+    status
+        .validate_for(
+            adapter.scope(),
+            &record,
+            accepted.canonical_record_sha256,
+            accepted.registered_at_ms,
+        )
+        .unwrap();
+    assert_eq!(adapter.register(&canonical, NOW * 1000).unwrap(), accepted);
+    let request_count = http.requests.lock().unwrap().len();
+    let _replacement = owner.begin_login().unwrap();
+    assert!(matches!(
+        adapter.root_status(),
+        Err(context_relay_core::devices::recovery_transport::RecoveryTransportError::Unauthorized)
+    ));
+    assert_eq!(http.requests.lock().unwrap().len(), request_count);
 }
 
 #[test]
@@ -714,4 +781,166 @@ fn stored_login_requires_fresh_hosted_verification() {
     let (wrong, http) = self::client("https://other.supabase.co", vec![]);
     assert!(wrong.restore(&stored, NOW).is_err());
     assert!(http.requests.lock().unwrap().is_empty());
+}
+
+mod support;
+
+#[test]
+fn native_enrollment_coordinator_accepts_server_clock_skew_and_reopens() {
+    use context_relay_core::{
+        crypto::DeviceKeys,
+        devices::{
+            recovery::{
+                RecoveryEnrollmentBeginOutcome, RecoveryEnrollmentClock,
+                RecoveryEnrollmentConfirmOutcome, RecoveryEnrollmentCoordinator,
+            },
+            recovery_crypto::decode_recovery_enrollment_record_v1,
+            supabase_enrollment::HostedEnrollmentClient,
+        },
+        vault::{HostedEnrollmentIntent, Vault},
+    };
+    use context_relay_protocol::{
+        NativePlatform, RecoveryEnrollmentConfirmParams, RecoveryEnrollmentState,
+        RecoveryWordConfirmation,
+    };
+    use sha2::{Digest, Sha256};
+    #[derive(Clone, Copy)]
+    struct Clock;
+    impl RecoveryEnrollmentClock for Clock {
+        fn now_ms(&self) -> u64 {
+            NOW * 1000
+        }
+    }
+    struct EnrollmentHttp {
+        reservation: serde_json::Value,
+        receipt: Mutex<serde_json::Value>,
+        server_ms: u64,
+        lose_response: bool,
+    }
+    impl SupabaseHttpClient for EnrollmentHttp {
+        fn execute(
+            &self,
+            request: SupabaseHttpRequest,
+        ) -> Result<SupabaseHttpResponse, SupabaseHttpError> {
+            let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+            if body["action"] == "status" {
+                let mut reservation = self.reservation.clone();
+                reservation["receipt"] = self.receipt.lock().unwrap().clone();
+                return Ok(response(200, json!({"v":1,"reservation":reservation})));
+            }
+            assert_eq!(body["action"], "commit");
+            let canonical: Vec<u8> = body["record"]
+                .as_str()
+                .unwrap()
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|part| u8::from_str_radix(std::str::from_utf8(part).unwrap(), 16).unwrap())
+                .collect();
+            let record = decode_recovery_enrollment_record_v1(&canonical).unwrap();
+            let receipt = json!({"enrollmentId":record.enrollment_id,"recoveryRootId":record.recovery_root_id,
+                "accountId":record.account_id,"workspaceId":record.workspace_id,
+                "genesisCertificateId":record.genesis_certificate_id,
+                "canonicalRecordSha256":format!("{:x}",Sha256::digest(&canonical)),
+                "registeredAtMs":self.server_ms.to_string()});
+            *self.receipt.lock().unwrap() = receipt.clone();
+            if self.lose_response {
+                return Ok(response(503, json!({})));
+            }
+            Ok(response(200, json!({"v":1,"receipt":receipt})))
+        }
+    }
+    for (server_ms, lose_response) in [
+        (NOW * 1000 - 5000, false),
+        (NOW * 1000 + 5000, false),
+        (NOW * 1000 - 5000, true),
+        (NOW * 1000 + 5000, true),
+    ] {
+        let (auth, _) = client(
+            PROJECT,
+            vec![tokens(&token(NOW + 900)), response(200, json!({"id":USER}))],
+        );
+        let owner = Arc::new(HostedSessionOwner::new(
+            Arc::new(auth),
+            Arc::new(Store::default()),
+        ));
+        let attempt = owner.begin_login().unwrap();
+        let generation = attempt.cancellation();
+        let identity = owner.complete_login(attempt, exchange(), NOW).unwrap();
+        let reservation = json!({"reservationId":"018f22e2-79b0-7cc8-98c4-dc0c0c073901",
+            "accountId":"018f22e2-79b0-7cc8-98c4-dc0c0c073902",
+            "workspaceId":"018f22e2-79b0-7cc8-98c4-dc0c0c073903",
+            "nonce":"42".repeat(32),"expiresAt":((NOW+600)*1000).to_string()});
+        let intent = HostedEnrollmentIntent {
+            project_url: PROJECT.into(),
+            user_id: identity.user_id,
+            session_id: identity.session_id,
+            operation_id: serde_json::from_value(reservation["reservationId"].clone()).unwrap(),
+            reservation: Some(serde_json::from_value(reservation.clone()).unwrap()),
+        };
+        let http = Arc::new(EnrollmentHttp {
+            reservation,
+            receipt: Mutex::new(serde_json::Value::Null),
+            server_ms,
+            lose_response,
+        });
+        let device = Arc::new(DeviceKeys::from_seeds_for_test([0x11; 32], [0x22; 32]));
+        let make_transport = || {
+            HostedEnrollmentClient::with_http_client(
+                owner.clone(),
+                identity,
+                generation.clone(),
+                PROJECT,
+                "public-test",
+                http.clone(),
+            )
+            .unwrap()
+            .into_transport(&intent, device.clone(), Clock)
+            .unwrap()
+        };
+        let path = support::TempVault::new("native-enrollment-clock");
+        let keys = support::MemoryKeyStore::default();
+        let mut vault = Vault::open(path.path(), "native-enrollment-clock", &keys).unwrap();
+        vault.store_hosted_enrollment_intent(&intent).unwrap();
+        let mut coordinator = RecoveryEnrollmentCoordinator::new(Clock, make_transport());
+        let RecoveryEnrollmentBeginOutcome::Phrase(phrase) = coordinator
+            .begin(
+                &mut vault,
+                "018f22e2-79b0-7cc8-98c4-dc0c0c073904".parse().unwrap(),
+                "Test desktop",
+                NativePlatform::Windows,
+                &device,
+            )
+            .unwrap()
+        else {
+            panic!("expected phrase")
+        };
+        let params = RecoveryEnrollmentConfirmParams {
+            enrollment_id: phrase.enrollment_id,
+            confirmations: phrase
+                .confirmation_positions
+                .iter()
+                .map(|position| RecoveryWordConfirmation {
+                    position: *position,
+                    word: phrase.recovery_phrase_words.as_words()[usize::from(*position) - 1]
+                        .clone(),
+                })
+                .collect(),
+        };
+        let outcome = coordinator.confirm(&mut vault, params, &device).unwrap();
+        assert_eq!(
+            matches!(outcome, RecoveryEnrollmentConfirmOutcome::Complete(_)),
+            !lose_response
+        );
+        drop(coordinator);
+        drop(vault);
+        let mut vault = Vault::open(path.path(), "native-enrollment-clock", &keys).unwrap();
+        let mut coordinator = RecoveryEnrollmentCoordinator::new(Clock, make_transport());
+        assert_eq!(
+            coordinator.overview(&mut vault, &device).unwrap().state,
+            RecoveryEnrollmentState::Complete
+        );
+        let stored = vault.recovery_enrollment().unwrap().unwrap();
+        assert_eq!(stored.provider_accepted_at_ms, Some(server_ms));
+        assert_eq!(stored.completed_at_ms, Some(NOW * 1000));
+    }
 }

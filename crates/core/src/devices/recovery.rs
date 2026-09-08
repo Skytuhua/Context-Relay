@@ -383,6 +383,7 @@ where
                 ));
             }
         };
+        let now_ms = self.clock.now_ms().max(stored.prepared_at_ms);
         match self.activate(vault, &stored, &receipt, device_keys, now_ms) {
             Ok(completion) => Ok(RecoveryEnrollmentConfirmOutcome::Complete(completion)),
             Err(RecoveryEnrollmentCycleError::Conflict) => self
@@ -491,6 +492,7 @@ where
                             ) => return self.mark_conflict(vault, &stored, now_ms),
                         },
                     };
+                    let now_ms = self.clock.now_ms().max(stored.prepared_at_ms);
                     match self.activate(vault, &stored, &receipt, device_keys, now_ms) {
                         Ok(completion) => Ok(RecoveryEnrollmentStatus {
                             enrollment_id: Some(completion.enrollment_id),

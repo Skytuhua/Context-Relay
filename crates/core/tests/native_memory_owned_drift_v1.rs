@@ -75,13 +75,9 @@ fn migration_v24_adds_the_managed_owned_digest_binding() {
     let keys = MemoryKeyStore::default();
     let key = [0x52; 32];
     keys.insert(CREDENTIAL, key);
+    drop(Vault::open(path.path(), CREDENTIAL, &keys).unwrap());
     let raw = open_keyed(path.path(), &key);
-    raw.execute_batch(include_str!("../migrations/0001_vault.sql"))
-        .unwrap();
-    raw.execute_batch(include_str!(
-        "../migrations/0010_native_memory_reconciliation.sql"
-    ))
-    .unwrap();
+    support::remove_native_memory_migrations_after_schema_23(&raw);
     raw.pragma_update(None, "user_version", 24).unwrap();
     drop(raw);
 

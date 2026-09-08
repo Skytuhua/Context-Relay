@@ -245,6 +245,16 @@ fn prepared_enrollment_activates_exactly_and_reopens_sealed_material() {
     );
     drop(vault);
 
+    // Recreate the schema-28 table contract with an active row, then exercise
+    // the clock-domain migration without losing its certificate/material links.
+    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    raw.execute_batch("ALTER TABLE recovery_enrollments RENAME TO enrollment_fixture;")
+        .unwrap();
+    raw.execute_batch(include_str!("../migrations/0022_recovery_enrollment.sql"))
+        .unwrap();
+    raw.execute_batch("INSERT INTO recovery_enrollments SELECT * FROM enrollment_fixture; DROP TABLE enrollment_fixture;").unwrap();
+    raw.pragma_update(None, "user_version", 28).unwrap();
+    drop(raw);
     let reopened = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
     let stored = reopened.recovery_enrollment().unwrap().unwrap();
     assert_eq!(stored.state, RecoveryEnrollmentPersistenceState::Active);

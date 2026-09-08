@@ -13,7 +13,7 @@ pub struct HostedEnrollmentIntent {
 }
 
 impl HostedEnrollmentIntent {
-    fn validate(&self) -> Result<(), VaultError> {
+    pub(crate) fn validate(&self) -> Result<(), VaultError> {
         if self.project_url.len() > 2048
             || crate::sync::supabase::validated_project_url(&self.project_url).is_err()
             || [self.user_id, self.session_id].iter().any(|id| {
@@ -353,9 +353,9 @@ impl Vault {
                 receipt.registered_at_ms,
             )
             .map_err(|_| validation())?;
-        if receipt.registered_at_ms < stored.prepared_at_ms
-            || completed_at_ms < receipt.registered_at_ms
-        {
+        // Provider acceptance uses the server clock; preparation/completion use
+        // the local clock. Only timestamps within the same domain are ordered.
+        if completed_at_ms < stored.prepared_at_ms {
             transaction.rollback()?;
             return Err(validation());
         }
@@ -615,10 +615,8 @@ fn validate_stored_row(raw: RawRecoveryEnrollment) -> Result<StoredRecoveryEnrol
         }
         RecoveryEnrollmentPersistenceState::Active => {
             activated_certificate_id == Some(record.genesis_certificate_id)
-                && provider_accepted_at_ms.is_some_and(|value| value >= prepared_at_ms)
-                && completed_at_ms
-                    .zip(provider_accepted_at_ms)
-                    .is_some_and(|(completed, provider)| completed >= provider)
+                && provider_accepted_at_ms.is_some()
+                && completed_at_ms.is_some_and(|completed| completed >= prepared_at_ms)
                 && conflict_at_ms.is_none()
         }
         RecoveryEnrollmentPersistenceState::Conflict => {

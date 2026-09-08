@@ -1,9 +1,13 @@
 use super::{
+    recovery::RecoveryEnrollmentClock,
     recovery_crypto::{
         HostedEnrollmentChallenge, decode_recovery_enrollment_record_v1,
         sign_hosted_enrollment_proof,
     },
-    recovery_transport::{RecoveryEnrollmentReceipt, RecoveryTransportError},
+    recovery_transport::{
+        RecoveryEnrollmentReceipt, RecoveryEnrollmentTransport, RecoveryRootStatus,
+        RecoveryTransportError,
+    },
 };
 use crate::{
     auth::{HostedIdentity, HostedSessionOwner, LoginCancellation},
@@ -45,6 +49,35 @@ pub struct HostedEnrollmentClient {
     http: Arc<dyn SupabaseHttpClient>,
 }
 impl HostedEnrollmentClient {
+    /// Bind the coordinator to the persisted reservation and installed device keys.
+    pub fn into_transport<C: RecoveryEnrollmentClock>(
+        self,
+        intent: &crate::vault::HostedEnrollmentIntent,
+        device: Arc<crate::crypto::DeviceKeys>,
+        clock: C,
+    ) -> Result<HostedRecoveryEnrollmentTransport<C>, RecoveryTransportError> {
+        intent
+            .validate()
+            .map_err(|_| RecoveryTransportError::Invalid)?;
+        if intent.user_id != self.identity.user_id
+            || intent.session_id != self.identity.session_id
+            || validated_project_url(&intent.project_url)
+                .map_err(|_| RecoveryTransportError::Invalid)?
+                != self.project
+        {
+            return Err(RecoveryTransportError::Unauthorized);
+        }
+        let reservation = intent
+            .reservation
+            .clone()
+            .ok_or(RecoveryTransportError::Invalid)?;
+        Ok(HostedRecoveryEnrollmentTransport {
+            client: self,
+            reservation,
+            device,
+            clock,
+        })
+    }
     pub fn new(
         owner: Arc<HostedSessionOwner>,
         identity: HostedIdentity,
@@ -241,6 +274,42 @@ impl HostedEnrollmentClient {
             receipt.registered_at_ms,
         )?;
         Ok(receipt)
+    }
+}
+
+pub struct HostedRecoveryEnrollmentTransport<C> {
+    client: HostedEnrollmentClient,
+    reservation: HostedEnrollmentReservation,
+    device: Arc<crate::crypto::DeviceKeys>,
+    clock: C,
+}
+
+impl<C: RecoveryEnrollmentClock> RecoveryEnrollmentTransport
+    for HostedRecoveryEnrollmentTransport<C>
+{
+    fn scope(&self) -> crate::sync::SyncScope {
+        crate::sync::SyncScope {
+            account_id: self.reservation.account_id,
+            workspace_id: self.reservation.workspace_id,
+        }
+    }
+    fn root_status(&self) -> Result<Option<RecoveryRootStatus>, RecoveryTransportError> {
+        // The coordinator validates this projection against its durable record.
+        self.client
+            .status(&self.reservation, self.clock.now_ms() / 1000)
+            .map(|receipt| receipt.map(RecoveryEnrollmentReceipt::into_status))
+    }
+    fn register(
+        &self,
+        canonical_record: &[u8],
+        _now_ms: u64,
+    ) -> Result<RecoveryEnrollmentReceipt, RecoveryTransportError> {
+        self.client.commit(
+            &self.reservation,
+            canonical_record,
+            &self.device,
+            self.clock.now_ms() / 1000,
+        )
     }
 }
 fn hex(bytes: &[u8]) -> String {
