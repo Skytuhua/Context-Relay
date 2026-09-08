@@ -3518,10 +3518,14 @@ mod tests {
 
     use super::*;
 
+    const LIFECYCLE_BEGIN_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07a102";
+    const LIFECYCLE_CANCEL_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07a103";
+
     #[derive(Clone)]
     struct TestAccountLifecycleTransport {
         state: Arc<Mutex<AccountDeletionState>>,
         calls: Arc<AtomicUsize>,
+        operations: Arc<Mutex<Vec<context_relay_protocol::OperationId>>>,
     }
 
     impl TestAccountLifecycleTransport {
@@ -3529,6 +3533,7 @@ mod tests {
             Self {
                 state: Arc::new(Mutex::new(AccountDeletionState::Active)),
                 calls: Arc::new(AtomicUsize::new(0)),
+                operations: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -3553,7 +3558,9 @@ mod tests {
 
         fn begin_deletion(
             &self,
+            operation_id: context_relay_protocol::OperationId,
         ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+            self.operations.lock().unwrap().push(operation_id);
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut state = self.state.lock().unwrap();
             *state = AccountDeletionState::PendingDelete;
@@ -3563,7 +3570,9 @@ mod tests {
 
         fn cancel_deletion(
             &self,
+            operation_id: context_relay_protocol::OperationId,
         ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+            self.operations.lock().unwrap().push(operation_id);
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut state = self.state.lock().unwrap();
             *state = AccountDeletionState::Active;
@@ -5636,10 +5645,13 @@ mod tests {
         let client = worker.client();
         let requests = [
             LocalRequest::AccountDeletionBegin(context_relay_protocol::AccountDeletionParams {
+                operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
                 confirmation: "delete".into(),
             }),
             LocalRequest::AccountDeletionStatus(EmptyParams {}),
-            LocalRequest::AccountDeletionCancel(EmptyParams {}),
+            LocalRequest::AccountDeletionCancel(context_relay_protocol::RetryParams {
+                operation_id: LIFECYCLE_CANCEL_ID.parse().unwrap(),
+            }),
         ];
 
         for request in requests {
@@ -5820,6 +5832,7 @@ mod tests {
             .try_submit(
                 VaultCommand::Workspace(LocalRequest::AccountDeletionBegin(
                     context_relay_protocol::AccountDeletionParams {
+                        operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
                         confirmation: "not-delete".into(),
                     },
                 )),
@@ -5836,6 +5849,7 @@ mod tests {
             .try_submit(
                 VaultCommand::Workspace(LocalRequest::AccountDeletionBegin(
                     context_relay_protocol::AccountDeletionParams {
+                        operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
                         confirmation: "delete".into(),
                     },
                 )),
@@ -5880,7 +5894,11 @@ mod tests {
 
         let active = client
             .try_submit(
-                VaultCommand::Workspace(LocalRequest::AccountDeletionCancel(EmptyParams {})),
+                VaultCommand::Workspace(LocalRequest::AccountDeletionCancel(
+                    context_relay_protocol::RetryParams {
+                        operation_id: LIFECYCLE_CANCEL_ID.parse().unwrap(),
+                    },
+                )),
                 TestAdmission(true),
             )
             .unwrap()
@@ -5896,6 +5914,13 @@ mod tests {
             }
         ));
         assert_eq!(lifecycle.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            *lifecycle.operations.lock().unwrap(),
+            vec![
+                LIFECYCLE_BEGIN_ID.parse().unwrap(),
+                LIFECYCLE_CANCEL_ID.parse().unwrap(),
+            ]
+        );
         worker.shutdown_and_join();
     }
 
@@ -7542,7 +7567,7 @@ mod tests {
                 "AccountDeletionBegin",
                 request_fixture(
                     "account_deletion_begin",
-                    serde_json::json!({"confirmation": "delete"}),
+                    serde_json::json!({"operationId": ID, "confirmation": "delete"}),
                 ),
             ),
             (
@@ -7551,7 +7576,10 @@ mod tests {
             ),
             (
                 "AccountDeletionCancel",
-                request_fixture("account_deletion_cancel", empty()),
+                request_fixture(
+                    "account_deletion_cancel",
+                    serde_json::json!({"operationId": ID}),
+                ),
             ),
         ]
     }

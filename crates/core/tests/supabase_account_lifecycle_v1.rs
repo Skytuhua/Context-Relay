@@ -14,12 +14,14 @@ use context_relay_core::{
         SupabaseHttpResponse, SupabaseRetryRuntime, SupabaseTransportConfig,
     },
 };
-use context_relay_protocol::{AccountDeletionState, WorkspaceId};
+use context_relay_protocol::{AccountDeletionState, OperationId, WorkspaceId};
 
 const WORKSPACE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07a101";
 const ACCESS_TOKEN: &str = "task17-access-token-canary";
 const PUBLISHABLE_KEY: &str = "task17-publishable-key-canary";
 const SEVEN_DAYS_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const BEGIN_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07a102";
+const CANCEL_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07a103";
 
 #[derive(Default)]
 struct TestHttp {
@@ -107,13 +109,16 @@ fn hosted_deletion_is_session_bound_exact_and_idempotently_retryable() {
         transport.deletion_status().unwrap().state,
         AccountDeletionState::Active
     );
-    let pending = transport.begin_deletion().unwrap();
+    let pending = transport.begin_deletion(BEGIN_ID.parse().unwrap()).unwrap();
     assert_eq!(pending.state, AccountDeletionState::PendingDelete);
     assert_eq!(pending.requested_at_ms, Some(1_000));
     assert_eq!(pending.purge_deadline_ms, Some(1_000 + SEVEN_DAYS_MS));
     assert!(pending.export_available());
     assert_eq!(
-        transport.cancel_deletion().unwrap().state,
+        transport
+            .cancel_deletion(CANCEL_ID.parse().unwrap())
+            .unwrap()
+            .state,
         AccountDeletionState::Active
     );
 
@@ -159,6 +164,47 @@ fn hosted_deletion_is_session_bound_exact_and_idempotently_retryable() {
         );
     }
     assert_ne!(begin["requestId"], cancel["requestId"]);
+}
+
+#[test]
+fn operation_identity_survives_transport_recreation_and_does_not_depend_on_action() {
+    let http = Arc::new(TestHttp::default());
+    let operation_id: OperationId = BEGIN_ID.parse().unwrap();
+    for action in ["begin", "begin", "cancel"] {
+        http.push(
+            200,
+            r#"{"v":1,"state":"active","requestedAtMs":null,"purgeDeadlineMs":null}"#,
+        );
+        let transport = SupabaseAccountLifecycleTransport::with_http_client(
+            SupabaseTransportConfig::new(
+                "https://example.supabase.co",
+                PUBLISHABLE_KEY,
+                ACCESS_TOKEN,
+            )
+            .unwrap(),
+            WORKSPACE_ID.parse().unwrap(),
+            http.clone(),
+        )
+        .unwrap();
+        if action == "begin" {
+            transport.begin_deletion(operation_id).unwrap();
+        } else {
+            transport.cancel_deletion(operation_id).unwrap();
+        }
+    }
+    let requests = http.requests();
+    let bodies: Vec<serde_json::Value> = requests
+        .iter()
+        .map(|request| serde_json::from_slice(request.body()).unwrap())
+        .collect();
+    assert_eq!(bodies[0]["requestId"], bodies[1]["requestId"]);
+    assert_eq!(
+        bodies[0]["requestId"],
+        "477dd7b724d9a18d800b010d3b2edd60336bbd696e661a60544e4e0977304016"
+    );
+    // Reusing an operation for another action must reach the server's bound-receipt
+    // conflict check, rather than acquiring a new identity and authorizing it.
+    assert_eq!(bodies[0]["requestId"], bodies[2]["requestId"]);
 }
 
 #[test]

@@ -243,13 +243,13 @@ fn verify_server_proof(
 
 #[test]
 fn challenged_hmac_matches_frozen_vector() {
-    // The protocol bytes are part of the authenticated transcript. This 1.12
-    // vector was independently checked with .NET HMACSHA256.
+    // The protocol bytes are part of the authenticated transcript. These 1.13
+    // client/server vectors were independently checked with Node HMAC-SHA256.
     assert_eq!(
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 12
+            minor: 13
         }
     );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
@@ -264,7 +264,7 @@ fn challenged_hmac_matches_frozen_vector() {
 
     assert_eq!(
         serde_json::to_string(&proof).unwrap(),
-        r#""TgRV8GnXECI_O__OdVoVyDoyzEr9zwXaOrZzBlmhZZA""#
+        r#""vurbvV7cE_KrzFV2FQZUc4fX9uHgrmgZHPkwB6ltTJ8""#
     );
     assert!(
         verify_proof(
@@ -452,7 +452,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 12
+            minor: 13
         }
     );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
@@ -476,7 +476,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
 
     assert_eq!(
         serde_json::to_string(&server_proof).unwrap(),
-        r#""GkaITPzrnG1268glpenZO_6hLqJXXP0Ylzb5lKLmyvE""#
+        r#""IYJKrC8lipmXNPBLKKe2GxQKEftHGOtJYpdef4_ChW8""#
     );
     assert!(
         verify_server_proof(
@@ -1094,7 +1094,7 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
             "AccountDeletionBegin",
             request_fixture(
                 "account_deletion_begin",
-                serde_json::json!({"confirmation": "delete"}),
+                serde_json::json!({"operationId": ID, "confirmation": "delete"}),
             ),
         ),
         (
@@ -1103,7 +1103,10 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         ),
         (
             "AccountDeletionCancel",
-            request_fixture("account_deletion_cancel", empty()),
+            request_fixture(
+                "account_deletion_cancel",
+                serde_json::json!({"operationId": ID}),
+            ),
         ),
     ]
 }

@@ -1,8 +1,9 @@
 use std::{fmt, sync::Arc, time::Duration};
 
-use context_relay_protocol::{AccountDeletionState, WorkspaceId};
+use context_relay_protocol::{AccountDeletionState, OperationId, WorkspaceId};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     devices::account_lifecycle::{
@@ -112,20 +113,23 @@ impl SupabaseAccountLifecycleTransport {
     fn call(
         &self,
         action: AccountLifecycleAction,
+        operation_id: Option<OperationId>,
     ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
         let body = serde_json::to_vec(&AccountLifecycleRequest {
             v: 1,
             action,
             workspace_id: self.workspace_id,
-            request_id: if matches!(action, AccountLifecycleAction::Status) {
-                None
-            } else {
-                let mut bytes = [0_u8; 32];
-                OsRng
-                    .try_fill_bytes(&mut bytes)
-                    .map_err(|_| AccountLifecycleTransportError::Transient)?;
-                Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-            },
+            // Keep one identity across retries and transport recreation. Excluding
+            // the action preserves the server's bound-receipt conflict check.
+            request_id: operation_id.map(|id| {
+                format!(
+                    "{:x}",
+                    Sha256::new()
+                        .chain_update(b"context-relay/account-lifecycle-request/v1\0")
+                        .chain_update(id.as_bytes())
+                        .finalize()
+                )
+            }),
         })
         .map_err(|_| AccountLifecycleTransportError::Invalid)?;
         let request = SupabaseHttpRequest::new(
@@ -212,15 +216,21 @@ impl SupabaseAccountLifecycleTransport {
 
 impl AccountLifecycleTransport for SupabaseAccountLifecycleTransport {
     fn deletion_status(&self) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
-        self.call(AccountLifecycleAction::Status)
+        self.call(AccountLifecycleAction::Status, None)
     }
 
-    fn begin_deletion(&self) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
-        self.call(AccountLifecycleAction::BeginDeletion)
+    fn begin_deletion(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+        self.call(AccountLifecycleAction::BeginDeletion, Some(operation_id))
     }
 
-    fn cancel_deletion(&self) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
-        self.call(AccountLifecycleAction::CancelDeletion)
+    fn cancel_deletion(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+        self.call(AccountLifecycleAction::CancelDeletion, Some(operation_id))
     }
 }
 

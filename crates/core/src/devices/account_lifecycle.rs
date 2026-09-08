@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use context_relay_protocol::AccountDeletionState;
+use context_relay_protocol::{AccountDeletionState, OperationId};
 
 pub const ACCOUNT_DELETION_GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
@@ -80,10 +80,18 @@ impl AccountDeletionProjection {
 ///
 /// A concrete implementation owns its authenticated hosted session. Callers cannot supply an
 /// account identifier, session identifier, transition timestamp, or provider projection.
+/// Mutation callers retain the same operation ID for every retry of one explicit intent,
+/// including after restart. A different action requires a new operation ID.
 pub trait AccountLifecycleTransport: Send + Sync {
     fn deletion_status(&self) -> Result<AccountDeletionProjection, AccountLifecycleTransportError>;
 
-    fn begin_deletion(&self) -> Result<AccountDeletionProjection, AccountLifecycleTransportError>;
+    fn begin_deletion(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError>;
 
-    fn cancel_deletion(&self) -> Result<AccountDeletionProjection, AccountLifecycleTransportError>;
+    fn cancel_deletion(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError>;
 }

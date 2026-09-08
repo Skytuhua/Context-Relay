@@ -84,3 +84,60 @@ The existing encrypted `desktop_writes` storage is a candidate for retaining
 intent, but its protocol currently excludes lifecycle operations. Production
 activation requires that boundary, daemon-owned authenticated sessions, and
 the remaining release gates; this recovery does not satisfy them.
+
+## Full Supabase follow-up
+
+At `9910011629701b209ea02b9d342d761bd42c10b4`,
+[Supabase CI 34217794460](https://github.com/Skytuhua/Context-Relay/actions/runs/34217794460)
+passed migration reset, all ten concurrent lifecycle checks, all 520 pgTAP
+assertions and database lint. Earlier attempts exposed fixture-role assumptions:
+Supabase's non-superuser `postgres` retains an admin-only owner membership.
+The verifier now temporarily adds a self-grant and restores only that grant's
+previous options, preserving managed grants. A local non-superuser run passed
+all ten checks and confirmed its separate admin-only membership survived.
+Independent review found no further P1/P2 issues in this correction.
+
+The three focused Rust core/transport tests passed. Daemon validation initially
+failed during linking when C: filled up (LNK1201). After copying and verifying
+the generated cache on E:, both configured and unavailable daemon lifecycle
+tests passed (88 unrelated unit tests filtered out). Automatic approval review
+rejected removing the old C: cache without a detailed reason, so it remains
+untouched; subsequent builds use E:. Clippy remains in progress.
+
+Browser inspection confirmed no GitHub OAuth apps under Skytuhua and the GitHub
+provider disabled on the Context Relay Supabase project. A registration form
+is prepared for Context Relay with the exact hosted `/auth/v1/callback` URL;
+wildcard matching and device flow remain disabled. Registration awaits the
+browser tool's required confirmation. No OAuth app, client secret, hosted
+provider change, signing account, or paid enrollment has been created.
+
+## Caller operation identity
+
+Protocol 1.13 requires the existing validated UUIDv7 operation ID for deletion
+begin and cancel. The daemon forwards it unchanged; the hosted transport hashes
+the fixed domain prefix and UUID bytes into the existing 32-byte receipt key.
+The operation keeps its ID across repeated calls and recreated transports;
+changing an action under that ID still encounters the server's receipt conflict
+check. A fixed hash vector protects this mapping from accidental changes.
+
+The missing-IPC-field and transport-call tests failed before implementation.
+All 130 protocol tests and all 345 frontend tests now pass; frontend typecheck,
+lint and production build also pass. Bindings and schemas were regenerated.
+Independent review identified that the version bump would prevent shutdown of
+a running 1.12 daemon during installer upgrade. A frozen-version regression
+reproduced that failure, then passed after adding explicit shutdown-only 1.12
+compatibility. All 16 shutdown tests pass, with one internal child fixture
+ignored in the parent test run; ordinary clients still reject 1.12.
+
+All four core lifecycle tests, both daemon lifecycle tests, 26 IPC integration
+tests and 25 MCP memory tests pass. The protocol bump also required updating
+the two frozen authentication transcript vectors, independently recalculated
+with Node HMAC-SHA256 before the passing IPC rerun. Generated binding/schema
+checks, daemon-boundary, formatting and whitespace checks pass. All 21 Edge,
+SQL-source and workflow checks pass; Graphify update completed. The prior
+local Clippy run was stopped intentionally to run the new regression cases;
+it does not establish a passing lint result for this change. A fresh Clippy run
+is rebuilding native dependencies on E:. Durable encrypted
+intent storage, original account/session binding and recovery UI remain absent.
+This interface change alone does not complete restart recovery or permit
+production lifecycle activation.

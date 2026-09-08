@@ -35,6 +35,26 @@
 
 ## 5. Define durable caller operation identity before activation
 
+The IPC boundary will require the existing strict UUIDv7 `OperationId` on both
+begin and cancel. The daemon forwards it unchanged to the transport. The
+transport derives the existing 32-byte server request identifier with SHA-256
+over `context-relay/account-lifecycle-request/v1\0` and the UUID bytes. Neither
+action nor current credentials enter that derivation: changing an action under
+one ID must encounter the server receipt's conflict check, and refreshing a
+credential must not mint a new mutation. Status remains read-only and ID-free.
+This changes the local protocol minor version and regenerates its bindings.
+
+This interface step does not supply restart recovery for the desktop. Existing
+`DesktopWrite` deliberately accepts record changes only; retain that restriction.
+Before production activation, persist explicit lifecycle intents in the encrypted
+vault with their original action, operation ID and authenticated account/session/
+workspace binding. Reuse of an ID under changed authority must fail locally;
+never silently rebind an old intent. A recovery status read must not submit the
+mutation. The renderer will expose unresolved intent and require an explicit
+retry with the original ID; a new confirmed action receives a new ID. Server
+fresh-auth checks remain mandatory on every attempt. Account/session ownership
+must come from daemon-owned login/provisioning, which remains separately open.
+
 - [ ] Trace desktop→IPC→ordered worker→vault and reuse durable write/operation storage where compatible. A begin/cancel intent must retain one request ID across a lost acknowledgment and restart; explicit new user actions get new IDs.
 - [ ] Write the bounded interface/storage design with exact retry and cancellation semantics before implementation. Existing empty cancel params and begin confirmation alone do not express durable identity.
 - [ ] Test lost acknowledgment, daemon restart and intervening opposite actions. Status reconciliation must not replay a mutation or manufacture fresh credential approval.

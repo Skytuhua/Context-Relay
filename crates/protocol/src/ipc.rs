@@ -330,6 +330,7 @@ params!(AccessSetParams {
     policy: HarnessAccessPolicy
 });
 params!(AccountDeletionParams {
+    operation_id: OperationId,
     confirmation: String
 });
 
@@ -706,7 +707,7 @@ pub enum LocalRequest {
     ExportChunk(ExportChunkParams),
     AccountDeletionBegin(AccountDeletionParams),
     AccountDeletionStatus(EmptyParams),
-    AccountDeletionCancel(EmptyParams),
+    AccountDeletionCancel(RetryParams),
 }
 
 fn validate_tags(tags: &[String]) -> Result<(), ValidationError> {

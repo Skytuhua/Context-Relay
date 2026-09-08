@@ -4,7 +4,9 @@ use context_relay_core::{
     },
     vault::Vault,
 };
-use context_relay_protocol::{ClientError, DecimalTimestamp, ErrorCode, LocalRequest, LocalResult};
+use context_relay_protocol::{
+    ClientError, DecimalTimestamp, ErrorCode, LocalRequest, LocalResult, OperationId,
+};
 
 /// Daemon-owned account lifecycle boundary.
 ///
@@ -28,11 +30,17 @@ impl AccountLifecycleTransport for UnavailableAccountLifecycleTransport {
         Err(AccountLifecycleTransportError::Unavailable)
     }
 
-    fn begin_deletion(&self) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+    fn begin_deletion(
+        &self,
+        _operation_id: OperationId,
+    ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
         Err(AccountLifecycleTransportError::Unavailable)
     }
 
-    fn cancel_deletion(&self) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+    fn cancel_deletion(
+        &self,
+        _operation_id: OperationId,
+    ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
         Err(AccountLifecycleTransportError::Unavailable)
     }
 }
@@ -50,9 +58,13 @@ impl<T: AccountLifecycleTransport> AccountLifecycleService for TransportAccountL
         request: LocalRequest,
     ) -> Result<LocalResult, ClientError> {
         let projection = match request {
-            LocalRequest::AccountDeletionBegin(_) => self.transport.begin_deletion(),
+            LocalRequest::AccountDeletionBegin(params) => {
+                self.transport.begin_deletion(params.operation_id)
+            }
             LocalRequest::AccountDeletionStatus(_) => self.transport.deletion_status(),
-            LocalRequest::AccountDeletionCancel(_) => self.transport.cancel_deletion(),
+            LocalRequest::AccountDeletionCancel(params) => {
+                self.transport.cancel_deletion(params.operation_id)
+            }
             _ => return Err(invalid_request_error()),
         }
         .map_err(transport_error)?;
