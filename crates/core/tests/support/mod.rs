@@ -124,7 +124,8 @@ impl Drop for TempVault {
 pub fn remove_native_memory_migrations_after_schema_23(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TRIGGER semantic_document_insert;
+            "DROP TABLE hosted_enrollment_intent;
+             DROP TRIGGER semantic_document_insert;
              DROP TRIGGER semantic_document_update;
              DROP TABLE semantic_embeddings;
              DROP TABLE semantic_index_queue;

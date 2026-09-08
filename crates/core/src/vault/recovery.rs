@@ -1,5 +1,104 @@
 use std::fmt;
 
+/// Public enrollment intent stored inside the encrypted vault before networking.
+/// Never contains login tokens, the recovery phrase, or private keys.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostedEnrollmentIntent {
+    pub project_url: String,
+    pub user_id: uuid::Uuid,
+    pub session_id: uuid::Uuid,
+    pub operation_id: context_relay_protocol::OperationId,
+    pub reservation: Option<crate::devices::supabase_enrollment::HostedEnrollmentReservation>,
+}
+
+impl HostedEnrollmentIntent {
+    fn validate(&self) -> Result<(), VaultError> {
+        if self.project_url.len() > 2048
+            || crate::sync::supabase::validated_project_url(&self.project_url).is_err()
+            || [self.user_id, self.session_id].iter().any(|id| {
+                id.get_variant() != uuid::Variant::RFC4122
+                    || !(1..=8).contains(&id.get_version_num())
+            })
+            || self.reservation.as_ref().is_some_and(|reservation| {
+                reservation.reservation_id != self.operation_id
+                    || reservation.expires_at.0 == 0
+                    || reservation.expires_at.0 > i64::MAX as u64
+            })
+        {
+            return Err(VaultError::Validation(
+                "invalid hosted enrollment intent".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn load_hosted_intent(
+    connection: &Connection,
+) -> Result<Option<HostedEnrollmentIntent>, VaultError> {
+    let payload: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT payload FROM hosted_enrollment_intent WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    payload
+        .map(|bytes| {
+            if bytes.len() > 8192 {
+                return Err(VaultError::Validation(
+                    "invalid hosted enrollment intent".into(),
+                ));
+            }
+            let intent: HostedEnrollmentIntent = serde_json::from_slice(&bytes)
+                .map_err(|_| VaultError::Validation("invalid hosted enrollment intent".into()))?;
+            intent.validate()?;
+            Ok(intent)
+        })
+        .transpose()
+}
+
+impl Vault {
+    pub fn hosted_enrollment_intent(&self) -> Result<Option<HostedEnrollmentIntent>, VaultError> {
+        load_hosted_intent(&self.connection)
+    }
+    /// Only the exact initial intent may acquire its reservation. Once present,
+    /// the challenge cannot be replaced by a retry or a different hosted login.
+    pub fn store_hosted_enrollment_intent(
+        &mut self,
+        intent: &HostedEnrollmentIntent,
+    ) -> Result<(), VaultError> {
+        intent.validate()?;
+        let payload = serde_json::to_vec(intent)
+            .map_err(|_| VaultError::Validation("invalid hosted enrollment intent".into()))?;
+        if payload.len() > 8192 {
+            return Err(VaultError::Validation(
+                "invalid hosted enrollment intent".into(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        if let Some(mut existing) = load_hosted_intent(&transaction)? {
+            if existing.reservation.is_none() {
+                existing.reservation = intent.reservation.clone();
+            }
+            if existing != *intent {
+                return Err(VaultError::OperationConflict);
+            }
+        } else if load_recovery_enrollment(&transaction)?.is_some() {
+            // An already prepared enrollment cannot acquire a different hosted owner.
+            return Err(VaultError::OperationConflict);
+        }
+        transaction.execute(
+            "INSERT INTO hosted_enrollment_intent(singleton,payload) VALUES(1,?1)
+            ON CONFLICT(singleton) DO UPDATE SET payload=excluded.payload",
+            params![payload],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
 use context_relay_protocol::{
     AccountId, DeviceCertificateId, DeviceId, Ed25519PublicKeyBytes, RecoveryEnrollmentId,
     RecoveryRootId, Sha256Digest, WorkspaceId, X25519PublicKeyBytes,
@@ -133,6 +232,14 @@ impl Vault {
     ) -> Result<CommitDisposition, VaultError> {
         let candidate = validate_write(write)?;
         let transaction = self.connection.transaction()?;
+        if let Some(intent) = load_hosted_intent(&transaction)? {
+            let reservation = intent.reservation.ok_or(VaultError::OperationConflict)?;
+            if candidate.record.account_id != reservation.account_id
+                || candidate.record.workspace_id != reservation.workspace_id
+            {
+                return Err(VaultError::OperationConflict);
+            }
+        }
         if let Some(existing) = load_recovery_enrollment(&transaction)? {
             let exact = exact_prepared_write(&existing, write)?;
             if exact {

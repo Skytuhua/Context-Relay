@@ -132,6 +132,78 @@ fn open_keyed(path: &Path, key: &[u8; 32]) -> Connection {
 }
 
 #[test]
+fn hosted_intent_survives_restart_and_cannot_change_identity_or_challenge() {
+    use context_relay_core::{
+        devices::supabase_enrollment::HostedEnrollmentReservation, vault::HostedEnrollmentIntent,
+    };
+    use context_relay_protocol::{DecimalTimestamp, Sha256Digest};
+    let path = TempVault::new("hosted-intent");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let mut intent = HostedEnrollmentIntent {
+        project_url: "https://example.supabase.co/".into(),
+        user_id: id("550e8400-e29b-41d4-a716-446655440000"),
+        session_id: id("550e8400-e29b-41d4-a716-446655440001"),
+        operation_id: id(ENROLLMENT_ID),
+        reservation: None,
+    };
+    vault.store_hosted_enrollment_intent(&intent).unwrap();
+    let fixture = fixture();
+    assert!(
+        vault
+            .prepare_recovery_enrollment(&write(&fixture.artifacts, 2_000))
+            .is_err()
+    );
+    drop(vault);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(
+        vault.hosted_enrollment_intent().unwrap(),
+        Some(intent.clone())
+    );
+    intent.reservation = Some(HostedEnrollmentReservation {
+        reservation_id: intent.operation_id,
+        account_id: id(ACCOUNT_ID),
+        workspace_id: id(WORKSPACE_ID),
+        nonce: Sha256Digest([42; 32]),
+        expires_at: DecimalTimestamp(600_000),
+    });
+    vault.store_hosted_enrollment_intent(&intent).unwrap();
+    vault.store_hosted_enrollment_intent(&intent).unwrap();
+    for change in [0, 1, 2] {
+        let mut changed = intent.clone();
+        match change {
+            0 => changed.session_id = id("550e8400-e29b-41d4-a716-446655440002"),
+            1 => changed.reservation.as_mut().unwrap().nonce = Sha256Digest([43; 32]),
+            _ => changed.reservation = None,
+        }
+        assert!(matches!(
+            vault.store_hosted_enrollment_intent(&changed),
+            Err(VaultError::OperationConflict)
+        ));
+    }
+    vault
+        .prepare_recovery_enrollment(&write(&fixture.artifacts, 2_000))
+        .unwrap();
+    drop(vault);
+    let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(
+        vault.hosted_enrollment_intent().unwrap(),
+        Some(intent.clone())
+    );
+
+    let legacy_path = TempVault::new("hosted-intent-existing-enrollment");
+    let mut legacy = Vault::open(legacy_path.path(), CREDENTIAL, &keys).unwrap();
+    legacy
+        .prepare_recovery_enrollment(&write(&fixture.artifacts, 2_000))
+        .unwrap();
+    assert!(matches!(
+        legacy.store_hosted_enrollment_intent(&intent),
+        Err(VaultError::OperationConflict)
+    ));
+    assert_eq!(legacy.hosted_enrollment_intent().unwrap(), None);
+}
+
+#[test]
 fn prepared_enrollment_activates_exactly_and_reopens_sealed_material() {
     let path = TempVault::new("recovery-enrollment-lifecycle");
     let keys = MemoryKeyStore::default();

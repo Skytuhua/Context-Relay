@@ -597,3 +597,25 @@ regression passes. The database remains authoritative for challenge expiry.
 Log: `.codex/pr16-enrollment-client-test.log`.
 Core all-target Clippy with test-support and warnings denied, formatting and
 whitespace checks pass.
+
+## Durable hosted enrollment intent (September 9)
+
+Schema 28 stores the public project/hosted identity/operation intent in the encrypted
+vault before networking. Only that exact intent may acquire its reservation;
+subsequent identity, scope or challenge replacement is rejected. An existing
+prepared enrollment cannot acquire a hosted intent, and hosted preparation requires
+the reserved account/workspace. No token, phrase or private key enters this record.
+
+Local verification: 7 enrollment vault tests, 21 general vault tests and 7 search
+tests pass. The search suite's 8 existing asset/performance tests remain ignored;
+this run does not qualify those release gates. Historical-schema fixture teardown
+now removes schema 28 before exercising earlier upgrades. Read-only review found
+no concrete P1/P2 in this persistence slice. Graphify update completed.
+Logs: `.codex/pr16-enrollment-intent-test-final.log` and
+`.codex/pr16-enrollment-intent-graph.log`.
+
+The production transport/coordinator integration and explicit handling of expired
+reservations or changed hosted sessions remain unfinished. This is local
+persistence evidence, not live enrollment or release acceptance. PR #16 stays open.
+Core all-target Clippy with test-support and warnings denied also passes.
+Log: `.codex/pr16-enrollment-intent-clippy.log`.

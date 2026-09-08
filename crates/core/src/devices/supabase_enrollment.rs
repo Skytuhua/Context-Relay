@@ -24,7 +24,7 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostedEnrollmentReservation {
     pub reservation_id: OperationId,
