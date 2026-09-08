@@ -328,6 +328,51 @@ pub trait PairingApprovalTransport: Send + Sync {
     fn cancel(&self, pairing_id: PairingId, now_ms: u64) -> Result<(), PairingTransportError>;
 }
 
+/// Fresh joining devices have no approval authority or scoped approval client.
+impl<T: PairingApprovalTransport> PairingApprovalTransport for Option<T> {
+    fn hosted_intent(&self) -> Option<crate::vault::HostedPairingIntent> {
+        self.as_ref()
+            .and_then(PairingApprovalTransport::hosted_intent)
+    }
+    fn create_invite(&self, now_ms: u64) -> Result<PairingInvite, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .create_invite(now_ms)
+    }
+    fn invite_status(
+        &self,
+        id: PairingId,
+        now_ms: u64,
+    ) -> Result<PairingInviteStatus, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .invite_status(id, now_ms)
+    }
+    fn request(
+        &self,
+        id: PairingId,
+        now_ms: u64,
+    ) -> Result<Option<StoredPairingRequest>, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .request(id, now_ms)
+    }
+    fn decide(
+        &self,
+        envelope: PairingDecisionEnvelope,
+        now_ms: u64,
+    ) -> Result<PairingDecisionReceipt, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .decide(envelope, now_ms)
+    }
+    fn cancel(&self, id: PairingId, now_ms: u64) -> Result<(), PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .cancel(id, now_ms)
+    }
+}
+
 pub trait PairingTransport: Send + Sync {
     type JoinClient: PairingJoinTransport;
     type ApprovalClient: PairingApprovalTransport;

@@ -1409,3 +1409,29 @@ same original review (`.codex/pr16-review-persistence-offline-final.log`).
 GitHub dependency-policy job 102267351743 passed at e87860a. Six superseded
 workflow cancellation requests were accepted to free the runner queue; that
 historical head and local tests do not qualify the next pushed head for release.
+
+### Production hosted pairing client wiring
+
+Daemon startup now configures pairing beside hosted recovery using the same
+Auth owner and protected device identity. The service derives approval authority
+from a unique active matching recovery-root certificate and validated local
+workspace material. Fresh joiners have no scoped approval client. Saved pairing
+IDs keep their original project/user/session/role, and every provider call still
+checks current session authority. Startup validates local pending transcripts
+without network work; explicit status resumes only its own prepared approval.
+
+All 40 affected core tests and the full daemon suite pass (97 passed, four
+pre-existing ignored). Library/test Clippy with warnings denied and a normal
+daemon library check without test-support pass. Two final hosted guard tests
+pass, covering offline startup, login-before-join, fresh-device approval denial,
+lost submission response with identical bytes after reopen, wrong keys/project/
+role, logout and replacement-session denial before provider submission.
+Logs: `.codex/pr16-hosted-pairing-{core-final,daemon-all,clippy,normal-check,guards-final}.log`.
+Independent bounded review found no P1/P2 issues. An initial test directory setup
+error was fixed; normal-build validation also confirmed that opaque transcript
+fields remain private.
+
+This is component evidence. The function is still undeployed, and composed
+hosted two-device approval/confirmation, terminal behavior after logout and
+installed live acceptance remain required. No full-release checkbox or merge
+is justified by these results alone.

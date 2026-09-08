@@ -99,7 +99,18 @@ fn hosted_pairing_approval_checks_scope_proofs_receipts_and_cancel() {
         http.clone(),
     )
     .unwrap();
-    let approver = client.approval_client(scope, device);
+    let absent: Option<context_relay_core::devices::supabase_pairing::HostedPairingApprovalClient> =
+        None;
+    assert!(absent.hosted_intent().is_none());
+    assert_eq!(
+        absent.create_invite(NOW * 1000).unwrap_err(),
+        PairingTransportError::Unauthorized
+    );
+    let approver = Some(client.approval_client(scope, device));
+    assert_eq!(
+        approver.hosted_intent(),
+        Some(client.original_intent(context_relay_core::vault::HostedPairingRole::Approve))
+    );
     assert_eq!(
         approver.create_invite(NOW * 1000).unwrap().expires_at_ms,
         601000

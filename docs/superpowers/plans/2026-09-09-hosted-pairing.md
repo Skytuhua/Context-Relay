@@ -75,7 +75,7 @@ existing unbound requests, decisions and approval transcripts cannot acquire
 a new login. Native transports now supply this identity to the coordinator, which
 stores/checks it before preparing or resuming signed work. Native approval proofs
 use the durable signed request rather than requiring a new server read. Production
-daemon integration and broader failure-path qualification remain unfinished.
+daemon integration is implemented; broader failure-path qualification remains unfinished.
 
 Integration findings: use the daemon-owned protected keys and current Auth owner
 at the existing production recovery-service initialization. A fresh joiner has
@@ -87,8 +87,15 @@ reviews with the original provider timestamp and scope before preparing a
 decision. Accepted status and approval retries use that review without a fresh
 provider lookup, preserving certificate/epoch validation. Legacy decisions
 without a saved review still need the existing provider lookup; migration must
-not invent their original timestamps. The hosted wrapper still needs local
-terminal handling while logged out, plus current Auth checks for provider work.
+not invent their original timestamps. The production wrapper now builds clients
+from the daemon Auth owner and protected identity. Saved IDs retain their original
+project/user/session/role; provider calls require the current matching session,
+while local terminal paths can use the saved identity after logout. Startup only
+validates pending local transcripts, and an explicit status request reconciles
+its own prepared approval. Active matching recovery-root certificates and local
+material establish approval authority; fresh joiners have no approval client.
+Two-device hosted approval/confirmation and terminal-after-logout qualification
+remain required before completing the integration checklist below.
 
 **Files:** `crates/contextd/src/pairing.rs`, `lib.rs`, existing hosted Auth service and pairing daemon tests.
 

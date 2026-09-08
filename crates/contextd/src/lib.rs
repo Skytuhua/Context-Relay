@@ -766,17 +766,21 @@ impl Daemon {
                 .map_err(|_| DaemonError::Startup)?,
             );
             vault_config.device_keys = Some(keys.clone());
+            let identity = PairingIdentity {
+                device_id: vault_config.device_id,
+                device_name: vault_config.device_name.clone(),
+                platform: vault_config.platform,
+                keys,
+            };
+            vault_config.pairing_service = Some(Arc::new(pairing::HostedPairingService::new(
+                owner.clone(),
+                project,
+                key,
+                identity.clone(),
+            )));
             vault_config.recovery_enrollment_service = Some(Arc::new(
                 recovery_enrollment::HostedRecoveryEnrollmentService::new(
-                    owner,
-                    project,
-                    key,
-                    PairingIdentity {
-                        device_id: vault_config.device_id,
-                        device_name: vault_config.device_name.clone(),
-                        platform: vault_config.platform,
-                        keys,
-                    },
+                    owner, project, key, identity,
                 ),
             ));
         }
@@ -4318,6 +4322,306 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, unavailable_error());
         worker.shutdown_and_join();
+    }
+
+    #[test]
+    fn hosted_pairing_starts_offline_and_requires_login_before_joining() {
+        use context_relay_core::auth::{
+            HostedSessionOwner, LoginError, LoginStore, StoredLogin, SupabaseAuthClient,
+        };
+        struct NoLogin;
+        impl LoginStore for NoLogin {
+            fn load(&self) -> Result<Option<StoredLogin>, LoginError> {
+                Ok(None)
+            }
+            fn save(&self, _: &StoredLogin) -> Result<(), LoginError> {
+                Err(LoginError::CredentialStore)
+            }
+            fn clear(&self) -> Result<(), LoginError> {
+                Ok(())
+            }
+        }
+        let owner = Arc::new(HostedSessionOwner::new(
+            Arc::new(
+                SupabaseAuthClient::new("https://example.supabase.co", "public-test").unwrap(),
+            ),
+            Arc::new(NoLogin),
+        ));
+        let identity = PairingIdentity {
+            device_id: stable_device_id(b"hosted-pairing-offline"),
+            device_name: "Fresh desktop".into(),
+            platform: NativePlatform::Windows,
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
+        };
+        let service = pairing::HostedPairingService::new(
+            owner,
+            "https://example.supabase.co",
+            "public-test",
+            identity.clone(),
+        );
+        let path = unique_temp_path("hosted-pairing-offline").join("vault.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut vault = Vault::open(&path, "test-vault-key", &MemoryKeyStore::default()).unwrap();
+        service.resume_prepared_decisions(&mut vault).unwrap();
+        assert_eq!(
+            service
+                .execute(
+                    &mut vault,
+                    &identity,
+                    LocalRequest::PairingJoin(PairingJoinParams {
+                        code: context_relay_protocol::PairingCode::new("ABCDE-FGHJK".into())
+                            .unwrap(),
+                        device_name: identity.device_name.clone(),
+                    })
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::ScopeDenied
+        );
+        assert!(vault.all_devices().unwrap().is_empty());
+        assert!(vault.pending_pairing_approvals().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hosted_pairing_restarts_exact_join_and_rejects_replaced_login() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use context_relay_core::{
+            auth::{
+                HostedSessionOwner, LoginError, LoginStore, PendingLogin, StoredLogin,
+                SupabaseAuthClient,
+            },
+            devices::recovery::{RecoveryEnrollmentClock, SystemRecoveryEnrollmentClock},
+            sync::{
+                SupabaseHttpClient, SupabaseHttpError, SupabaseHttpRequest, SupabaseHttpResponse,
+            },
+        };
+        use serde_json::{Value, json};
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        const PROJECT: &str = "https://example.supabase.co";
+        const USER: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const PAIRING: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074091";
+        struct Login;
+        impl LoginStore for Login {
+            fn load(&self) -> Result<Option<StoredLogin>, LoginError> {
+                Ok(None)
+            }
+            fn save(&self, _: &StoredLogin) -> Result<(), LoginError> {
+                Ok(())
+            }
+            fn clear(&self) -> Result<(), LoginError> {
+                Ok(())
+            }
+        }
+        struct Http {
+            now: u64,
+            replaced: AtomicBool,
+            lost: AtomicBool,
+            calls: AtomicUsize,
+            submitted: Mutex<Vec<String>>,
+        }
+        impl SupabaseHttpClient for Http {
+            fn execute(
+                &self,
+                request: SupabaseHttpRequest,
+            ) -> Result<SupabaseHttpResponse, SupabaseHttpError> {
+                let reply = |body: Value| {
+                    Ok(SupabaseHttpResponse::new(
+                        200,
+                        serde_json::to_vec(&body).unwrap(),
+                    ))
+                };
+                if request.url().ends_with("/user") {
+                    return reply(json!({"id":USER}));
+                }
+                if request.url().contains("/auth/v1/token") {
+                    let session = if self.replaced.load(Ordering::SeqCst) {
+                        "550e8400-e29b-41d4-a716-446655440002"
+                    } else {
+                        "550e8400-e29b-41d4-a716-446655440001"
+                    };
+                    let claims = json!({"iss":format!("{PROJECT}/auth/v1"),"aud":"authenticated","sub":USER,"session_id":session,"exp":self.now+3600});
+                    return reply(
+                        json!({"token_type":"bearer","access_token":format!("e30.{}.signature",URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())),"refresh_token":"synthetic-refresh"}),
+                    );
+                }
+                assert!(request.url().ends_with("/functions/v1/pairing"));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let body: Value = serde_json::from_slice(request.body()).unwrap();
+                match body["action"].as_str().unwrap() {
+                    "resolve" => {
+                        reply(json!({"v":1,"result":{"status":"located","pairingId":PAIRING}}))
+                    }
+                    "submit" => {
+                        let canonical = body["canonicalRequest"].as_str().unwrap();
+                        self.submitted.lock().unwrap().push(canonical.into());
+                        if self.lost.swap(false, Ordering::SeqCst) {
+                            return Err(SupabaseHttpError::Transient);
+                        }
+                        let bytes: Vec<u8> = canonical
+                            .as_bytes()
+                            .chunks_exact(2)
+                            .map(|pair| {
+                                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()
+                            })
+                            .collect();
+                        reply(
+                            json!({"v":1,"receipt":{"pairingId":PAIRING,"requestDigest":format!("{:x}",Sha256::digest(bytes)),"requestedAt":(self.now*1000).to_string()}}),
+                        )
+                    }
+                    "result" => reply(json!({"v":1,"result":{"status":"pending"}})),
+                    other => panic!("unexpected pairing action {other}"),
+                }
+            }
+        }
+        let now = SystemRecoveryEnrollmentClock.now_ms() / 1000;
+        let http = Arc::new(Http {
+            now,
+            replaced: AtomicBool::new(false),
+            lost: AtomicBool::new(true),
+            calls: AtomicUsize::new(0),
+            submitted: Mutex::new(Vec::new()),
+        });
+        let owner = Arc::new(HostedSessionOwner::new(
+            Arc::new(
+                SupabaseAuthClient::with_http_client(PROJECT, "public-test", http.clone()).unwrap(),
+            ),
+            Arc::new(Login),
+        ));
+        let login = || {
+            let instant = std::time::Instant::now();
+            let mut pending =
+                PendingLogin::new(PROJECT, "127.0.0.1:41783".parse().unwrap(), instant).unwrap();
+            let url = pending.authorization_url();
+            let redirect = url
+                .query_pairs()
+                .find(|(key, _)| key == "redirect_to")
+                .unwrap()
+                .1
+                .into_owned();
+            let mut callback = url.join(&redirect).unwrap();
+            callback
+                .query_pairs_mut()
+                .append_pair("code", "synthetic-code");
+            owner
+                .complete_login(
+                    owner.begin_login().unwrap(),
+                    pending.take_callback(&callback, instant).unwrap(),
+                    now,
+                )
+                .unwrap();
+        };
+        login();
+        let identity = PairingIdentity {
+            device_id: stable_device_id(b"hosted-pairing-restart"),
+            device_name: "Fresh desktop".into(),
+            platform: NativePlatform::Windows,
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
+        };
+        let make = || {
+            let mut service = pairing::HostedPairingService::new(
+                owner.clone(),
+                PROJECT,
+                "public-test",
+                identity.clone(),
+            );
+            service.http = Some(http.clone());
+            service
+        };
+        let path = unique_temp_path("hosted-pairing-restart").join("vault.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(&path, "test-vault-key", &keys).unwrap();
+        let service = make();
+        assert!(
+            service
+                .execute(
+                    &mut vault,
+                    &identity,
+                    LocalRequest::PairingCreate(EmptyParams {})
+                )
+                .is_err()
+        );
+        assert_eq!(http.calls.load(Ordering::SeqCst), 0);
+        let join = || {
+            LocalRequest::PairingJoin(PairingJoinParams {
+                code: context_relay_protocol::PairingCode::new("ABCDE-FGHJK".into()).unwrap(),
+                device_name: identity.device_name.clone(),
+            })
+        };
+        assert!(service.execute(&mut vault, &identity, join()).is_err());
+        let saved = vault
+            .hosted_pairing_intent(PAIRING.parse().unwrap())
+            .unwrap()
+            .unwrap();
+        drop(vault);
+        let mut vault = Vault::open(&path, "test-vault-key", &keys).unwrap();
+        let service = make();
+        service.resume_prepared_decisions(&mut vault).unwrap();
+        assert!(matches!(
+            service.execute(&mut vault, &identity, join()).unwrap(),
+            LocalResult::PairingRequest {
+                status: PairingState::Pending,
+                ..
+            }
+        ));
+        let requests = http.submitted.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        drop(requests);
+        let status = || {
+            LocalRequest::PairingStatus(PairingIdParams {
+                pairing_id: PAIRING.parse().unwrap(),
+            })
+        };
+        assert!(service.execute(&mut vault, &identity, status()).is_ok());
+        let calls = http.calls.load(Ordering::SeqCst);
+        let stored = vault
+            .stored_pairing_join(PAIRING.parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            service
+                .execute(
+                    &mut vault,
+                    &identity,
+                    LocalRequest::PairingDecision(PairingDecisionParams {
+                        pairing_id: PAIRING.parse().unwrap(),
+                        request_digest: stored.request_sha256,
+                        approve: true,
+                    })
+                )
+                .is_err()
+        );
+        let mut wrong_keys = identity.clone();
+        wrong_keys.keys = Arc::new(DeviceKeys::generate().unwrap());
+        assert!(service.execute(&mut vault, &wrong_keys, status()).is_err());
+        let mut other_project = pairing::HostedPairingService::new(
+            owner.clone(),
+            "https://other.supabase.co",
+            "public-test",
+            identity.clone(),
+        );
+        other_project.http = Some(http.clone());
+        assert!(
+            other_project
+                .execute(&mut vault, &identity, status())
+                .is_err()
+        );
+        assert_eq!(http.calls.load(Ordering::SeqCst), calls);
+        owner.begin_login().unwrap();
+        assert!(service.execute(&mut vault, &identity, status()).is_err());
+        http.replaced.store(true, Ordering::SeqCst);
+        login();
+        assert!(service.execute(&mut vault, &identity, status()).is_err());
+        assert_eq!(http.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(
+            vault
+                .hosted_pairing_intent(PAIRING.parse().unwrap())
+                .unwrap(),
+            Some(saved)
+        );
+        assert!(vault.all_devices().unwrap().is_empty());
     }
 
     #[tokio::test]
