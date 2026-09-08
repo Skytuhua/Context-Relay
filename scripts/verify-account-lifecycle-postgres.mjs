@@ -128,6 +128,92 @@ function enrollmentCommit(f, reservation, certificate = id()) {
     decode(repeat('49',80),'hex'),decode('010203','hex'));`;
 }
 
+async function pairingDecisionFixture() {
+  const f = await enrollmentFixture(), joining = randomUUID(), pairing = id(), child = id(), certificate = id();
+  const reservation = JSON.parse(await sql(f.request()));
+  await sql(enrollmentCommit(f, reservation));
+  const device = await sql(`select device_id from public.device_bindings where session_id='${f.session}'`);
+  await sql(`set role service_role; select public.service_create_pairing_invite('${f.user}','${f.session}',
+    '${reservation.workspaceId}','${device}','${pairing}',decode(repeat('42',32),'hex'));`);
+  await sql(`insert into auth.sessions(id,user_id) values ('${joining}','${f.user}')`);
+  await sql(`set role service_role; select public.service_resolve_pairing_code('${f.user}','${joining}',decode(repeat('42',32),'hex'));`);
+  const receipt = JSON.parse(await sql(`set role service_role; select public.service_submit_pairing_request('${f.user}','${joining}','${pairing}',
+    decode('010203','hex'),decode(repeat('51',32),'hex'),decode(repeat('52',32),'hex'));`));
+  const decide = (action = 'approve', payload = '040506') => `set role service_role; select public.service_decide_pairing_request(
+    '${f.user}','${f.session}','${reservation.workspaceId}','${device}','${pairing}',decode('${receipt.requestDigest}','hex'),
+    '${action}',1,1,${action === 'approve' ? `decode('${payload}','hex'),'${certificate}','${child}',decode(repeat('53',32),'hex'),decode(repeat('54',64),'hex')` : 'null,null,null,null,null'});`;
+  return { ...f, joining, pairing, child, certificate, reservation, decide,
+    result: `set role service_role; select public.service_pairing_result_for_session('${f.user}','${joining}','${pairing}',decode('${receipt.requestDigest}','hex'));`,
+    cleanup: async () => { await sql(`delete from auth.sessions where id='${joining}'`); await f.cleanup(); } };
+}
+
+for (const action of ['approve','reject']) test(`pairing ${action} commits one durable decision without reactivating trust`, async () => {
+  const f = await pairingDecisionFixture();
+  try {
+    assert.deepEqual(JSON.parse(await sql(f.result)), { status: 'pending' });
+    await assert.rejects(sql(f.decide(action).replace(',1,1,', ',2,1,')), /pairing_conflict/);
+    await assert.rejects(sql(f.decide(action).replace(f.session, f.joining)), /pairing_denied/);
+    const receipt = JSON.parse(await sql(f.decide(action)));
+    assert.equal(receipt.decision, action === 'approve' ? 'approved' : 'rejected');
+    assert.deepEqual(JSON.parse(await sql(f.decide(action))), receipt);
+    assert.equal(await sql(`select count(*) from public.device_bindings where session_id='${f.joining}'`), action === 'approve' ? '1' : '0');
+    const result = JSON.parse(await sql(f.result));
+    assert.equal(result.status, receipt.decision);
+    assert.deepEqual(result.receipt, receipt);
+    await sql(`update context_relay_private.pairing_invites set created_at=statement_timestamp()-interval '10 minutes',
+      expires_at=statement_timestamp() where id='${f.pairing}'`);
+    assert.deepEqual(JSON.parse(await sql(f.decide(action))), receipt);
+    assert.deepEqual(JSON.parse(await sql(f.result)), result);
+    if (action === 'approve') {
+      assert.equal(result.canonicalApprovedPayload, '040506');
+      await assert.rejects(sql(f.decide('approve','040507')), /pairing_conflict/);
+      await sql(`update public.device_bindings set state='revoked',revoked_at=clock_timestamp(),cutoff_device_sequence=0,
+        cutoff_hash=decode(repeat('00',32),'hex'),cutoff_signature=decode(repeat('00',64),'hex') where session_id='${f.joining}'`);
+      assert.deepEqual(JSON.parse(await sql(f.decide(action))), receipt);
+      assert.equal(await sql(`select state from public.device_bindings where session_id='${f.joining}'`), 'revoked');
+    }
+    await assert.rejects(sql(f.decide(action === 'approve' ? 'reject' : 'approve')), /pairing_conflict/);
+    for (const role of ['anon','authenticated']) await assert.rejects(sql(f.decide(action).replace('set role service_role',`set role ${role}`)), /permission denied/);
+    await assert.rejects(sql(f.result.replace(f.joining, f.session)), /pairing_denied/);
+  } finally { await f.cleanup(); }
+});
+
+test('competing pairing decisions publish only one result', async () => {
+  const f = await pairingDecisionFixture();
+  try {
+    const results = await Promise.allSettled([sql(f.decide('approve')), sql(f.decide('reject'))]);
+    assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+    assert.match(results.find(result => result.status === 'rejected').reason.stderr, /pairing_conflict/);
+    const receipt = JSON.parse(results.find(result => result.status === 'fulfilled').value);
+    assert.deepEqual(JSON.parse(await sql(f.result)).receipt, receipt);
+    assert.equal(await sql(`select count(*) from public.device_bindings where session_id='${f.joining}'`), receipt.decision === 'approved' ? '1' : '0');
+  } finally { await f.cleanup(); }
+});
+
+test('pairing approval rolls back all writes after joining-session expiry during certificate insertion', async () => {
+  const f = await pairingDecisionFixture(), other = await fixture();
+  let release, outcome;
+  try {
+    await sql(`update public.device_certificates set id='${f.certificate}' where account_id='${other.account}';
+      update auth.sessions set not_after=clock_timestamp()+interval '2 seconds' where id='${f.joining}'`);
+    release = await holdLock(`delete from public.device_certificates where id='${f.certificate}'`);
+    const application = `pairing-decision-${randomUUID()}`;
+    outcome = sql(f.decide(), application).then(value => ({ value }), error => ({ error }));
+    await waitUntilBlocked(application);
+    await sql(`select pg_sleep(greatest(0,extract(epoch from not_after-clock_timestamp())+0.1)) from auth.sessions where id='${f.joining}'`);
+    await release(); release = null;
+    assert.match((await outcome).error?.stderr ?? '', /pairing_denied/);
+    assert.equal(await sql(`select count(*) from public.device_certificates where id='${f.certificate}'`), '0');
+    assert.equal(await sql(`select count(*) from public.device_bindings where session_id='${f.joining}'`), '0');
+    assert.equal(await sql(`select state='pending' and decision_receipt is null from context_relay_private.pairing_invites where id='${f.pairing}'`), 't');
+    assert.equal(await sql(`select state='pending' and decided_at is null from public.pairing_requests where id='${f.pairing}'`), 't');
+  } finally {
+    if (release) await release();
+    if (outcome) await outcome;
+    await f.cleanup(); await other.cleanup();
+  }
+});
+
 test('pairing requests retain exact bytes and original-session receipts without granting trust', async () => {
   const f = await enrollmentFixture(), joining = randomUUID();
   try {

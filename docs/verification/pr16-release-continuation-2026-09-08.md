@@ -1177,3 +1177,24 @@ tests use synthetic decoded fields; Edge signature/proof enforcement, approval
 admission, native wiring and live hosted acceptance remain required. No device
 binding is created by request submission. Only the local disposable database
 has been migrated.
+
+### Atomic hosted pairing decisions and results
+
+Migration `20260909070000_decide_hosted_pairing.sql` commits approval as one
+transaction: child certificate, original joining-session binding, request state,
+approved bytes and receipt. It reuses current issuer checks, locks both Auth
+sessions before account/device locks, and rechecks authority and invite expiry
+after writes. Rejection installs no trust. Exact decisions return their stored
+receipt without reinstalling or reactivating a binding, including after expiry.
+Joining-result retrieval requires the original session and exact request digest.
+
+All 37 local PostgreSQL tests pass (`.codex/pr16-decision-full.log`). New tests
+cover approval/rejection, conflicting decisions, concurrent arbitration, revoked
+binding retries and an observed certificate-insertion wait where joining-session
+expiry rolls back every write. Two decision tests pass again with additional
+wrong-session, changed-epoch and post-expiry receipt assertions
+(`.codex/pr16-decision-final-extra.log`). `check:supabase`, diff checks and a
+bounded independent SQL review pass. The tests use synthetic decoded fields;
+the service RPC requires Edge canonical/signature/proof verification, which is
+not yet wired. This migration has only run in the local disposable database.
+Live hosted and full release acceptance remain unproven.
