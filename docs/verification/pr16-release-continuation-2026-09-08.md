@@ -561,6 +561,22 @@ All 14 hosted-auth transport tests pass, including refresh, foreign identity,
 replacement and cancellation. Read-only review found no concrete P1/P2 issue.
 Core all-target Clippy with test-support and warnings denied, formatting and
 whitespace checks pass.
+
+## Native enrollment status and commit
+
+Extended the session-bound native client with status and commit calls sharing the
+same bounded HTTP/ownership checks. Status must match the complete original
+reservation. Commit decodes the canonical record, checks its reserved scope,
+signs the original identity/challenge with the installed device keys, and verifies
+the returned receipt against the record IDs and digest.
+
+All 16 hosted-auth tests pass. The new test checks status, the actual submitted
+proof signature and canonical bytes, and rejection of a forged receipt digest.
+Read-only review found no new concrete P1/P2 issue. Durable coordinator integration
+must still validate status receipts against the intended local record before
+activation. Log: `.codex/pr16-enrollment-commit-client-test.log`.
+Core all-target Clippy with test-support and warnings denied, formatting and
+whitespace checks pass.
 Log: `.codex/pr16-enrollment-owner.log`. Status-migration Supabase run
 `34245530149` on `6c49e8c` passed; the later Edge adapter still needs managed
 qualification and live acceptance.

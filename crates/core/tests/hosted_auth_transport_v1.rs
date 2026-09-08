@@ -57,6 +57,101 @@ impl LoginStore for Store {
 }
 
 #[test]
+fn native_enrollment_status_and_commit_validate_the_record_receipt() {
+    use context_relay_core::{
+        crypto::DeviceKeys,
+        devices::{
+            recovery_crypto::decode_recovery_enrollment_record_v1,
+            supabase_enrollment::{HostedEnrollmentClient, HostedEnrollmentReservation},
+        },
+    };
+    use sha2::{Digest, Sha256};
+    let encoded = include_str!("fixtures/recovery-enrollment-record-v1.hex").trim();
+    let canonical: Vec<u8> = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|part| u8::from_str_radix(std::str::from_utf8(part).unwrap(), 16).unwrap())
+        .collect();
+    let record = decode_recovery_enrollment_record_v1(&canonical).unwrap();
+    let reservation = json!({"reservationId":"018f22e2-79b0-7cc8-98c4-dc0c0c073901",
+        "accountId":record.account_id,"workspaceId":record.workspace_id,"nonce":"42".repeat(32),
+        "expiresAt":((NOW+600)*1000).to_string()});
+    let mut status = reservation.clone();
+    status["receipt"] = serde_json::Value::Null;
+    let receipt = json!({"enrollmentId":record.enrollment_id,"recoveryRootId":record.recovery_root_id,
+        "accountId":record.account_id,"workspaceId":record.workspace_id,"genesisCertificateId":record.genesis_certificate_id,
+        "canonicalRecordSha256":format!("{:x}",Sha256::digest(&canonical)),"registeredAtMs":(NOW*1000).to_string()});
+    let mut forged = receipt.clone();
+    forged["canonicalRecordSha256"] = json!("00".repeat(32));
+    let (client, http) = client(
+        PROJECT,
+        vec![
+            tokens(&token(NOW + 900)),
+            response(200, json!({"id":USER})),
+            response(200, json!({"v":1,"reservation":status})),
+            response(200, json!({"v":1,"receipt":receipt})),
+            response(200, json!({"v":1,"receipt":forged})),
+        ],
+    );
+    let owner = Arc::new(HostedSessionOwner::new(
+        Arc::new(client),
+        Arc::new(Store::default()),
+    ));
+    let attempt = owner.begin_login().unwrap();
+    let generation = attempt.cancellation();
+    let identity = owner.complete_login(attempt, exchange(), NOW).unwrap();
+    let transport = HostedEnrollmentClient::with_http_client(
+        owner,
+        identity,
+        generation,
+        PROJECT,
+        "public-test",
+        http.clone(),
+    )
+    .unwrap();
+    let reservation: HostedEnrollmentReservation = serde_json::from_value(reservation).unwrap();
+    assert!(transport.status(&reservation, NOW).unwrap().is_none());
+    let device = DeviceKeys::from_seeds_for_test([0x11; 32], [0x22; 32]);
+    let accepted = transport
+        .commit(&reservation, &canonical, &device, NOW)
+        .unwrap();
+    assert_eq!(accepted.enrollment_id, record.enrollment_id);
+    let requests = http.requests.lock().unwrap();
+    let body: serde_json::Value = serde_json::from_slice(requests.last().unwrap().body()).unwrap();
+    assert_eq!(body["record"], encoded);
+    assert_eq!(body["action"], "commit");
+    let proof = body["proof"].as_str().unwrap();
+    assert_eq!(proof.len(), 128);
+    let signature = context_relay_protocol::Ed25519SignatureBytes(
+        proof
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|part| u8::from_str_radix(std::str::from_utf8(part).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap(),
+    );
+    let preimage = context_relay_core::devices::recovery_crypto::hosted_enrollment_proof_preimage(
+        &context_relay_core::devices::recovery_crypto::HostedEnrollmentChallenge {
+            reservation_id: reservation.reservation_id,
+            auth_user_id: identity.user_id,
+            session_id: identity.session_id,
+            nonce: reservation.nonce.0,
+        },
+        &record,
+    )
+    .unwrap();
+    context_relay_core::crypto::verify_signature(device.signing_public_key(), &preimage, signature)
+        .unwrap();
+    drop(requests);
+    assert!(
+        transport
+            .commit(&reservation, &canonical, &device, NOW)
+            .is_err()
+    );
+}
+
+#[test]
 fn enrollment_reservation_uses_original_session_and_rejects_later_login() {
     use context_relay_core::devices::supabase_enrollment::HostedEnrollmentClient;
     let operation = "018f22e2-79b0-7cc8-98c4-dc0c0c073901";

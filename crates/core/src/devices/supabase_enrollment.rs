@@ -1,4 +1,10 @@
-use super::recovery_transport::RecoveryTransportError;
+use super::{
+    recovery_crypto::{
+        HostedEnrollmentChallenge, decode_recovery_enrollment_record_v1,
+        sign_hosted_enrollment_proof,
+    },
+    recovery_transport::{RecoveryEnrollmentReceipt, RecoveryTransportError},
+};
 use crate::{
     auth::{HostedIdentity, HostedSessionOwner, LoginCancellation},
     sync::supabase::{
@@ -6,15 +12,19 @@ use crate::{
         valid_header_secret, validated_project_url,
     },
 };
-use context_relay_protocol::{AccountId, DecimalTimestamp, OperationId, Sha256Digest, WorkspaceId};
+use context_relay_protocol::{
+    AccountId, DecimalTimestamp, DeviceCertificateId, OperationId, RecoveryEnrollmentId,
+    RecoveryRootId, Sha256Digest, WorkspaceId,
+};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostedEnrollmentReservation {
     pub reservation_id: OperationId,
@@ -76,11 +86,11 @@ impl HostedEnrollmentClient {
             http,
         })
     }
-    pub fn reserve(
+    fn call<T: serde::de::DeserializeOwned>(
         &self,
-        operation: OperationId,
+        body: serde_json::Value,
         now: u64,
-    ) -> Result<HostedEnrollmentReservation, RecoveryTransportError> {
+    ) -> Result<(T, u64), RecoveryTransportError> {
         let started = Instant::now();
         let session = self
             .owner
@@ -89,10 +99,7 @@ impl HostedEnrollmentClient {
         if session.project_url() != &self.project {
             return Err(RecoveryTransportError::Unauthorized);
         }
-        let body = serde_json::to_vec(
-            &serde_json::json!({"v":1,"action":"reserve","reservationId":operation}),
-        )
-        .map_err(|_| RecoveryTransportError::Invalid)?;
+        let body = serde_json::to_vec(&body).map_err(|_| RecoveryTransportError::Invalid)?;
         let request = SupabaseHttpRequest::new(
             SupabaseHttpMethod::Post,
             self.project
@@ -129,8 +136,19 @@ impl HostedEnrollmentClient {
         if response.body().len() > 16 * 1024 {
             return Err(RecoveryTransportError::Conflict);
         }
-        let response: ReservationResponse = serde_json::from_slice(response.body())
+        let response = serde_json::from_slice(response.body())
             .map_err(|_| RecoveryTransportError::Conflict)?;
+        Ok((response, finished))
+    }
+    pub fn reserve(
+        &self,
+        operation: OperationId,
+        now: u64,
+    ) -> Result<HostedEnrollmentReservation, RecoveryTransportError> {
+        let (response, finished): (ReservationResponse, _) = self.call(
+            serde_json::json!({"v":1,"action":"reserve","reservationId":operation}),
+            now,
+        )?;
         if response.v != 1
             || response.reservation.reservation_id != operation
             || response.reservation.expires_at.0 <= finished.saturating_mul(1000)
@@ -140,6 +158,129 @@ impl HostedEnrollmentClient {
         // The server enforces its ten-minute lifetime using its own clock.
         // Comparing an upper bound to the desktop clock rejects ordinary skew.
         Ok(response.reservation)
+    }
+
+    pub fn status(
+        &self,
+        expected: &HostedEnrollmentReservation,
+        now: u64,
+    ) -> Result<Option<RecoveryEnrollmentReceipt>, RecoveryTransportError> {
+        let (mut response, _): (StatusResponse, _) = self.call(
+            serde_json::json!({"v":1,"action":"status","reservationId":expected.reservation_id}),
+            now,
+        )?;
+        if response.v != 1 {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        let receipt = response
+            .reservation
+            .as_object_mut()
+            .and_then(|value| value.remove("receipt"))
+            .ok_or(RecoveryTransportError::Conflict)?;
+        let reservation: HostedEnrollmentReservation = serde_json::from_value(response.reservation)
+            .map_err(|_| RecoveryTransportError::Conflict)?;
+        if reservation != *expected {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        if receipt.is_null() {
+            return Ok(None);
+        }
+        let receipt: WireReceipt =
+            serde_json::from_value(receipt).map_err(|_| RecoveryTransportError::Conflict)?;
+        if receipt.account_id != expected.account_id
+            || receipt.workspace_id != expected.workspace_id
+        {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        Ok(Some(receipt.into_receipt()))
+    }
+
+    pub fn commit(
+        &self,
+        reservation: &HostedEnrollmentReservation,
+        canonical: &[u8],
+        device: &crate::crypto::DeviceKeys,
+        now: u64,
+    ) -> Result<RecoveryEnrollmentReceipt, RecoveryTransportError> {
+        let record = decode_recovery_enrollment_record_v1(canonical)
+            .map_err(|_| RecoveryTransportError::Invalid)?;
+        if record.account_id != reservation.account_id
+            || record.workspace_id != reservation.workspace_id
+        {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        let proof = sign_hosted_enrollment_proof(
+            device,
+            &HostedEnrollmentChallenge {
+                reservation_id: reservation.reservation_id,
+                auth_user_id: self.identity.user_id,
+                session_id: self.identity.session_id,
+                nonce: reservation.nonce.0,
+            },
+            &record,
+        )
+        .map_err(|_| RecoveryTransportError::Invalid)?;
+        let (response, _): (CommitResponse, _) = self.call(
+            serde_json::json!({
+                "v":1,"action":"commit","reservationId":reservation.reservation_id,
+                "record":hex(canonical),"proof":hex(&proof.0),
+            }),
+            now,
+        )?;
+        if response.v != 1 {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        let receipt = response.receipt.into_receipt();
+        receipt.validate_for(
+            crate::sync::SyncScope {
+                account_id: reservation.account_id,
+                workspace_id: reservation.workspace_id,
+            },
+            &record,
+            Sha256Digest(Sha256::digest(canonical).into()),
+            receipt.registered_at_ms,
+        )?;
+        Ok(receipt)
+    }
+}
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatusResponse {
+    v: u8,
+    reservation: serde_json::Value,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommitResponse {
+    v: u8,
+    receipt: WireReceipt,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireReceipt {
+    enrollment_id: RecoveryEnrollmentId,
+    recovery_root_id: RecoveryRootId,
+    account_id: AccountId,
+    workspace_id: WorkspaceId,
+    genesis_certificate_id: DeviceCertificateId,
+    canonical_record_sha256: Sha256Digest,
+    registered_at_ms: DecimalTimestamp,
+}
+impl WireReceipt {
+    fn into_receipt(self) -> RecoveryEnrollmentReceipt {
+        RecoveryEnrollmentReceipt {
+            enrollment_id: self.enrollment_id,
+            recovery_root_id: self.recovery_root_id,
+            account_id: self.account_id,
+            workspace_id: self.workspace_id,
+            genesis_certificate_id: self.genesis_certificate_id,
+            canonical_record_sha256: self.canonical_record_sha256,
+            registered_at_ms: self.registered_at_ms.0,
+        }
     }
 }
 #[derive(Deserialize)]
