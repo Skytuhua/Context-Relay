@@ -105,6 +105,71 @@ async function waitUntilBlocked(application) {
   throw new Error('Lifecycle request did not reach the expected lock');
 }
 
+async function enrollmentFixture() {
+  const user = randomUUID(), session = randomUUID(), operation = id();
+  await sql(`insert into auth.users(id) values ('${user}');
+    insert into auth.sessions(id,user_id) values ('${session}','${user}');`);
+  const request = (reservation = operation) => `set role service_role;
+    select public.service_reserve_enrollment_for_session('${user}','${session}',
+      '${reservation}','${id()}','${id()}',decode(repeat('42',32),'hex'));`;
+  return { user, session, request,
+    cleanup: () => sql(`delete from auth.sessions where id='${session}';
+      delete from auth.users where id='${user}';`) };
+}
+
+test('concurrent enrollment retries retain one challenge and deny a competing operation', async () => {
+  const f = await enrollmentFixture();
+  let release, outcome;
+  try {
+    release = await holdLock(f.request());
+    const application = `enrollment-conflict-${randomUUID()}`;
+    outcome = sql(f.request(), application).then(value => ({ value }), error => ({ error }));
+    await waitUntilBlocked(application);
+    await release(); release = null;
+    const reply = await outcome;
+    assert.ifError(reply.error);
+    assert.deepEqual(JSON.parse(reply.value), JSON.parse(await sql(f.request())));
+    await assert.rejects(sql(f.request(id())), /enrollment_in_progress/);
+    assert.equal(await sql(`select request_count from context_relay_private.enrollment_reservations
+      where auth_user_id='${f.user}'`), '1');
+    assert.equal(await sql(`select count(*) from public.accounts where owner_user_id='${f.user}'`), '0');
+  } finally {
+    if (release) await release();
+    if (outcome) await outcome;
+    await f.cleanup();
+  }
+});
+
+for (const lock of ['reservation', 'auth_session']) {
+  test(`enrollment rechecks session expiry after the ${lock} lock`, async () => {
+    const f = await enrollmentFixture();
+    let release, outcome;
+    try {
+      const original = await sql(f.request());
+      await sql(`update auth.sessions set not_after=clock_timestamp()+interval '2 seconds'
+        where id='${f.session}'`);
+      release = await holdLock(lock === 'reservation'
+        ? `select auth_user_id from context_relay_private.enrollment_reservations where auth_user_id='${f.user}' for update`
+        : `select id from auth.sessions where id='${f.session}' for update`);
+      const application = `enrollment-wait-${randomUUID()}`;
+      outcome = sql(f.request(), application).then(value => ({ value }), error => ({ error }));
+      await waitUntilBlocked(application);
+      await sql(`select pg_sleep(greatest(0, extract(epoch from not_after-clock_timestamp())+0.1))
+        from auth.sessions where id='${f.session}'`);
+      await release(); release = null;
+      const result = await outcome;
+      assert.ok(result.error, `Expired session accepted: ${result.value}`);
+      assert.match(result.error.stderr, /enrollment_session_denied/);
+      assert.equal(await sql(`select account_id from context_relay_private.enrollment_reservations
+        where auth_user_id='${f.user}'`), JSON.parse(original).accountId);
+    } finally {
+      if (release) await release();
+      if (outcome) await outcome;
+      await f.cleanup();
+    }
+  });
+}
+
 for (const [first, second, expected] of [['begin', 'cancel', 'active'], ['cancel', 'begin', 'pending_delete']]) {
   test(`replayed ${first} preserves the later ${second} and returns current state`, async () => {
     const f = await fixture();

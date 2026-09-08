@@ -467,3 +467,15 @@ These database assertions are pending execution; concurrent lock-wait expiry is
 also unverified. Read-only review found no concrete P1/P2 issue in this slice.
 Supabase contract and whitespace checks pass. The preceding crypto commit
 `2a809e9` passed Supabase run `34243369285` and Secret Scan run `34243369314`.
+
+The first reservation CI run (`34243901193`) exposed an ownership transition
+error before the pgTAP assertions: Supabase's migration role could not enable RLS
+after transferring the table. The migration now switches to the table owner
+immediately after that transfer. Local PostgreSQL's superuser did not expose this
+managed-role difference; a successful Supabase rerun remains required.
+
+Extended the existing disposable PostgreSQL harness with enrollment retries and
+session expiry during Auth/reservation lock waits. The initial 13 checks passed
+locally; review then tightened the retry check to hold the first transaction open
+and observe the second request blocked. The final variant passes all 13 checks
+on the disposable local PostgreSQL database. Log: `.codex/pr16-enrollment-postgres.log`.
