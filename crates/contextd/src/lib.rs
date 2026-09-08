@@ -47,6 +47,7 @@ use tokio::{
     time::timeout,
 };
 
+mod account_lifecycle;
 pub mod bridge_install;
 pub mod harness_preparation;
 mod native_memory;
@@ -108,6 +109,9 @@ pub(crate) mod unit_test_support {
     }
 }
 
+use account_lifecycle::{
+    AccountLifecycleService, TransportAccountLifecycleService, UnavailableAccountLifecycleTransport,
+};
 use bridge_install::{BridgeInstallEngine, ProductionBridgeInstallEngine};
 use harness_preparation::{PreparationClient, PreparationSupervisor};
 mod harness_execution;
@@ -227,6 +231,7 @@ struct VaultConfig {
     native_memory_updates: Option<NativeMemoryUpdateSender>,
     pairing_service: Option<Arc<dyn PairingService>>,
     recovery_enrollment_service: Option<Arc<dyn RecoveryEnrollmentService>>,
+    account_lifecycle_service: Arc<dyn AccountLifecycleService>,
     device_keys: Option<DeviceKeys>,
     device_identity_credential_id: String,
     device_identity_store: Arc<dyn DeviceIdentityStore>,
@@ -258,6 +263,9 @@ impl VaultConfig {
             native_memory_updates: None,
             pairing_service: None,
             recovery_enrollment_service: None,
+            account_lifecycle_service: Arc::new(TransportAccountLifecycleService::new(
+                UnavailableAccountLifecycleTransport,
+            )),
             device_keys: None,
             device_identity_credential_id: DEVICE_IDENTITY_CREDENTIAL_ID.into(),
             device_identity_store: Arc::new(PlatformDeviceIdentityStore),
@@ -324,6 +332,12 @@ impl VaultConfig {
         self.device_identity_credential_id = credential_id.into();
         self.device_name = device_name.into();
         self.platform = platform;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_account_lifecycle_service(mut self, service: Arc<dyn AccountLifecycleService>) -> Self {
+        self.account_lifecycle_service = service;
         self
     }
 
@@ -1384,6 +1398,7 @@ struct WorkspaceState {
     native_memory_updates: Option<NativeMemoryUpdateSender>,
     pairing_service: Option<Arc<dyn PairingService>>,
     recovery_enrollment_service: Option<Arc<dyn RecoveryEnrollmentService>>,
+    account_lifecycle_service: Arc<dyn AccountLifecycleService>,
     pairing_identity: Option<PairingIdentity>,
 }
 
@@ -1486,6 +1501,7 @@ fn open_workspace(
             native_memory_updates: config.native_memory_updates.clone(),
             pairing_service: config.pairing_service.clone(),
             recovery_enrollment_service: config.recovery_enrollment_service.clone(),
+            account_lifecycle_service: config.account_lifecycle_service.clone(),
             pairing_identity,
         },
         ledgers,
@@ -2140,9 +2156,11 @@ fn execute_workspace_request(
         LocalRequest::ExportChunk(params) => {
             export_chunk(state, params.export_id, params.chunk_index)
         }
-        LocalRequest::AccountDeletionBegin(_)
+        request @ (LocalRequest::AccountDeletionBegin(_)
         | LocalRequest::AccountDeletionStatus(_)
-        | LocalRequest::AccountDeletionCancel(_) => Err(account_lifecycle_unavailable_error()),
+        | LocalRequest::AccountDeletionCancel(_)) => {
+            execute_account_lifecycle_request(state, request)
+        }
         _ => Err(invalid_request_error()),
     }
 }
@@ -2312,15 +2330,19 @@ fn export_record_count(vault: &Vault) -> Result<u32, ClientError> {
     u32::try_from(count).map_err(|_| service_internal_error())
 }
 
-fn account_lifecycle_unavailable_error() -> ClientError {
-    ClientError {
-        code: ErrorCode::HarnessUnsupported,
-        message:
-            "Account lifecycle needs the hosted workspace service and is not available in this build."
-                .into(),
-        field_path: None,
-        retryable: false,
+fn execute_account_lifecycle_request(
+    state: &mut WorkspaceState,
+    request: LocalRequest,
+) -> Result<LocalResult, ClientError> {
+    if matches!(
+        &request,
+        LocalRequest::AccountDeletionBegin(params)
+            if !params.confirmation.eq_ignore_ascii_case("delete")
+    ) {
+        return Err(invalid_request_error());
     }
+    let service = state.account_lifecycle_service.clone();
+    service.execute(&mut state.vault, request)
 }
 
 fn stable_device_id(seed: &[u8]) -> DeviceId {
@@ -3442,6 +3464,10 @@ mod tests {
             CertificateFieldsV1, DeviceCertificateV1, DeviceKeys, RecoveryKeys, RecoveryPhrase,
         },
         devices::{
+            account_lifecycle::{
+                ACCOUNT_DELETION_GRACE_MS, AccountDeletionProjection, AccountLifecycleTransport,
+                AccountLifecycleTransportError,
+            },
             identity::{DeviceIdentityError, StoreIfAbsent},
             memory_transport::InMemoryPairingProvider,
             pairing::{
@@ -3477,11 +3503,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     use context_relay_protocol::ApplyReceipt;
     use context_relay_protocol::{
-        AccountId, CancelParams, ClientRole, DeviceCertificateId, EmptyParams, HelloParams,
-        JsonRpcErrorV1, JsonRpcRequestV1, JsonRpcSuccessV1, JsonRpcVersion, LocalRequest,
-        NativePlatform, PROTOCOL_VERSION, PairingConfirmParams, PairingDecisionParams,
-        PairingIdParams, PairingJoinParams, PairingRequestNonce, PairingState, PlanId, RecordId,
-        RecoveryPhraseWords, Sha256Digest, WorkspaceId,
+        AccountDeletionState, AccountId, CancelParams, ClientRole, DecimalTimestamp,
+        DeviceCertificateId, EmptyParams, HelloParams, JsonRpcErrorV1, JsonRpcRequestV1,
+        JsonRpcSuccessV1, JsonRpcVersion, LocalRequest, NativePlatform, PROTOCOL_VERSION,
+        PairingConfirmParams, PairingDecisionParams, PairingIdParams, PairingJoinParams,
+        PairingRequestNonce, PairingState, PlanId, RecordId, RecoveryPhraseWords, Sha256Digest,
+        WorkspaceId,
     };
     #[cfg(any(windows, target_os = "macos"))]
     use context_relay_protocol::{
@@ -3490,6 +3517,60 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct TestAccountLifecycleTransport {
+        state: Arc<Mutex<AccountDeletionState>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl TestAccountLifecycleTransport {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(AccountDeletionState::Active)),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn projection(&self) -> AccountDeletionProjection {
+            let state = *self.state.lock().unwrap();
+            AccountDeletionProjection {
+                state,
+                requested_at_ms: (state == AccountDeletionState::PendingDelete).then_some(1_000),
+                purge_deadline_ms: (state == AccountDeletionState::PendingDelete)
+                    .then_some(1_000 + ACCOUNT_DELETION_GRACE_MS),
+            }
+        }
+    }
+
+    impl AccountLifecycleTransport for TestAccountLifecycleTransport {
+        fn deletion_status(
+            &self,
+        ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.projection())
+        }
+
+        fn begin_deletion(
+            &self,
+        ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut state = self.state.lock().unwrap();
+            *state = AccountDeletionState::PendingDelete;
+            drop(state);
+            Ok(self.projection())
+        }
+
+        fn cancel_deletion(
+            &self,
+        ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut state = self.state.lock().unwrap();
+            *state = AccountDeletionState::Active;
+            drop(state);
+            Ok(self.projection())
+        }
+    }
 
     #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
@@ -5722,6 +5803,102 @@ mod tests {
         assert_eq!(handle.shutdown().await, DaemonState::Stopped);
         assert_eq!(owner.await.unwrap(), Ok(()));
     }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn configured_account_lifecycle_runs_only_through_the_ordered_vault_worker() {
+        let path = unique_temp_path("account-lifecycle-configured").join("vault.db");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let lifecycle = TestAccountLifecycleTransport::new();
+        let config = VaultConfig::new(path, "test-vault-key", keys).with_account_lifecycle_service(
+            Arc::new(TransportAccountLifecycleService::new(lifecycle.clone())),
+        );
+        let mut worker = VaultWorker::spawn(config).await.unwrap();
+        let client = worker.client();
+
+        let invalid = client
+            .try_submit(
+                VaultCommand::Workspace(LocalRequest::AccountDeletionBegin(
+                    context_relay_protocol::AccountDeletionParams {
+                        confirmation: "not-delete".into(),
+                    },
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(invalid.code, ErrorCode::InvalidRequest);
+        assert_eq!(lifecycle.calls.load(Ordering::SeqCst), 0);
+
+        let pending = client
+            .try_submit(
+                VaultCommand::Workspace(LocalRequest::AccountDeletionBegin(
+                    context_relay_protocol::AccountDeletionParams {
+                        confirmation: "delete".into(),
+                    },
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let LocalResult::AccountDeletion {
+            state,
+            purge_deadline,
+            export_available,
+        } = pending
+        else {
+            panic!("expected hosted account deletion projection")
+        };
+        assert_eq!(state, AccountDeletionState::PendingDelete);
+        assert_eq!(
+            purge_deadline,
+            Some(DecimalTimestamp(1_000 + ACCOUNT_DELETION_GRACE_MS))
+        );
+        assert!(export_available);
+
+        let status = client
+            .try_submit(
+                VaultCommand::Workspace(LocalRequest::AccountDeletionStatus(EmptyParams {})),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            status,
+            LocalResult::AccountDeletion {
+                state,
+                purge_deadline,
+                export_available,
+            }
+        );
+
+        let active = client
+            .try_submit(
+                VaultCommand::Workspace(LocalRequest::AccountDeletionCancel(EmptyParams {})),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            active,
+            LocalResult::AccountDeletion {
+                state: AccountDeletionState::Active,
+                purge_deadline: None,
+                export_available: false,
+            }
+        ));
+        assert_eq!(lifecycle.calls.load(Ordering::SeqCst), 3);
+        worker.shutdown_and_join();
+    }
+
     #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn authenticated_bridge_executes_only_scoped_mcp_calls() {

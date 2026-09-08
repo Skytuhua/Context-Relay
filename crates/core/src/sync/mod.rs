@@ -7,7 +7,7 @@ mod identity;
 mod memory;
 mod merge;
 mod operation;
-mod supabase;
+pub(crate) mod supabase;
 mod transport;
 
 pub use admission::{

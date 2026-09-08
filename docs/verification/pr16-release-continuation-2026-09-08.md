@@ -49,3 +49,38 @@ runtime exists. Hosted production is not a disposable SQL test database.
 Signing identities and clean Windows/macOS acceptance-machine availability have
 been requested from the user. Neither those gates nor installed-product
 acceptance is claimed complete. PR #16 remains unmerged.
+
+## Account lifecycle recovery: local evidence
+
+Recovered the bounded `6eb5ec8` implementation onto the current branch without
+merging its historical branch. Preserved both the current connection-check test
+and the restored ordered-worker lifecycle test when resolving their overlapping
+insertion. Production still uses the unavailable lifecycle transport.
+
+An independent review found two defects: transaction-start timestamps could
+accept authority that expired during a lock wait, and replaying an old receipt
+could show obsolete state after an opposite action. The migration now checks
+Auth-session expiry after acquiring its row lock, checks binding expiry after
+both authority locks, and returns current locked state for a matching receipt
+without repeating the transition. Legacy service-role entrypoints stay revoked;
+their old pgTAP expectations were corrected.
+
+On a dedicated loopback PostgreSQL 17.11 instance, the original six regression
+cases produced five failures. After the fixes, all four migrations applied from
+an empty database and all ten checks in
+`scripts/verify-account-lifecycle-postgres.mjs` passed. They cover both replay
+directions, binding/session expiry behind either lock, credential expiry behind
+the account lock, stale credentials, foreign workspace, deleted session, stale
+epoch, opposite-action receipt reuse, legacy privilege denial and rate limits.
+The workflow now runs this script before its existing full pgTAP suite.
+
+The 21 focused Node workflow/Edge/boundary checks also pass. Rust verification
+is still running; full Supabase pgTAP execution remains pending. The portable
+database uses minimal Auth/Storage/Realtime schema substitutes, so these local
+results establish PostgreSQL behavior only, not Supabase or hosted acceptance.
+
+Durable caller request identity across IPC retries and restart is still absent.
+The existing encrypted `desktop_writes` storage is a candidate for retaining
+intent, but its protocol currently excludes lifecycle operations. Production
+activation requires that boundary, daemon-owned authenticated sessions, and
+the remaining release gates; this recovery does not satisfy them.

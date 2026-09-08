@@ -23,3 +23,9 @@ file_size_limit = "33554432"
 # trusted-certificate lookup, or service RPC.
 [functions.sync]
 verify_jwt = false
+
+# New publishable keys are not JWTs. This function validates the caller's
+# access token with auth.getClaims() and derives the account only from the
+# verified sub/session_id binding before invoking service-only RPCs.
+[functions.account-lifecycle]
+verify_jwt = false

@@ -9,6 +9,8 @@ on:
       - 'scripts/verify-supabase-realtime.mjs'
       - 'scripts/tests/verify-supabase-realtime.test.mjs'
       - 'scripts/tests/supabase-sync-*.test.mjs'
+      - 'scripts/tests/account-lifecycle-*.test.mjs'
+      - 'scripts/verify-account-lifecycle-postgres.mjs'
       - 'package.json'
       - 'pnpm-lock.yaml'
       - '.github/workflows/supabase.yml'
@@ -20,6 +22,8 @@ on:
       - 'scripts/verify-supabase-realtime.mjs'
       - 'scripts/tests/verify-supabase-realtime.test.mjs'
       - 'scripts/tests/supabase-sync-*.test.mjs'
+      - 'scripts/tests/account-lifecycle-*.test.mjs'
+      - 'scripts/verify-account-lifecycle-postgres.mjs'
       - 'package.json'
       - 'pnpm-lock.yaml'
       - '.github/workflows/supabase.yml'
@@ -47,8 +51,17 @@ jobs:
       - run: node --test scripts/tests/check-supabase-contract.test.mjs
       - run: node --test scripts/tests/verify-supabase-realtime.test.mjs
       - run: node --test scripts/tests/supabase-sync-*.test.mjs
+      - run: node --test scripts/tests/account-lifecycle-*.test.mjs
       - run: pnpm supabase:start:ci
       - run: pnpm supabase:reset
+      - run: node scripts/verify-account-lifecycle-postgres.mjs
+        env:
+          CONTEXT_RELAY_DISPOSABLE_POSTGRES: '1'
+          PGHOST: 127.0.0.1
+          PGPORT: '54322'
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: postgres
       - run: pnpm supabase:test
       - run: pnpm supabase:lint
       - if: always()
