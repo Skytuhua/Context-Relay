@@ -199,3 +199,19 @@ that a session remains live indefinitely. Production callers must enforce expiry
 and use the live server authorization checks for protected actions. Credential
 storage, refresh/logout, IPC/browser wiring, provisioning and real hosted
 acceptance remain required before activation.
+
+## Refresh and remote logout transport
+
+Refresh now rejects a changed project, user or session and verifies the renewed
+access token through the same hosted identity checks as initial login. It returns
+replacement credentials without mutating the original session or automatically
+retrying a failed request. Remote logout explicitly uses `scope=local` and requires
+HTTP 204; local credential deletion remains the session owner's responsibility.
+
+The missing-method tests failed before implementation. All six hosted transport
+tests pass, including rotated tokens, identity substitution, wrong-project calls,
+failed refresh without replay and refusal to accept HTTP 200 as logout confirmation.
+Independent bounded review found no concrete P1/P2 issue. Core and daemon Clippy
+passes for all targets with test-support and warnings denied; formatting and
+whitespace checks pass. Secure persistence, refresh/logout coordination and all
+previously listed activation and release acceptance requirements remain open.

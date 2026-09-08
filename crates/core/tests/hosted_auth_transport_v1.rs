@@ -170,3 +170,89 @@ fn invalid_identity_claims_are_rejected_before_the_user_lookup() {
         assert_eq!(http.requests.lock().unwrap().len(), 1);
     }
 }
+
+#[test]
+fn refresh_preserves_identity_and_logout_revokes_only_that_session() {
+    let renewed_access = token(NOW + 1800);
+    let (client, http) = client(
+        PROJECT,
+        vec![
+            tokens(&token(NOW + 900)),
+            response(200, json!({"id":USER})),
+            response(
+                200,
+                json!({"token_type":"bearer","access_token":renewed_access,"refresh_token":"rotated-refresh"}),
+            ),
+            response(200, json!({"id":USER})),
+            SupabaseHttpResponse::new(204, vec![]),
+        ],
+    );
+    let original = client.exchange(exchange(), NOW).unwrap();
+    let renewed = client.refresh(&original, NOW + 900).unwrap();
+    assert!(renewed.identity() == original.identity());
+    assert_eq!(renewed.refresh_token(), "rotated-refresh");
+    assert_eq!(original.refresh_token(), "synthetic-refresh");
+    client.logout(&renewed).unwrap();
+    let requests = http.requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        requests[2].url(),
+        format!("{PROJECT}/auth/v1/token?grant_type=refresh_token")
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(requests[2].body()).unwrap(),
+        json!({"refresh_token":"synthetic-refresh"})
+    );
+    assert!(requests[2].header("authorization").is_none());
+    assert_eq!(
+        requests[4].url(),
+        format!("{PROJECT}/auth/v1/logout?scope=local")
+    );
+    assert_eq!(
+        requests[4].header("authorization"),
+        Some(format!("Bearer {renewed_access}").as_str())
+    );
+    assert!(requests[4].body().is_empty());
+}
+
+#[test]
+fn refresh_cannot_change_identity_and_session_operations_cannot_change_project() {
+    for field in ["sub", "session_id"] {
+        let mut changed = json!({"iss":format!("{PROJECT}/auth/v1"),"aud":"authenticated","sub":USER,"session_id":SESSION,"exp":NOW + 1800});
+        changed[field] = json!("550e8400-e29b-41d4-a716-446655440099");
+        let (client, http) = client(
+            PROJECT,
+            vec![
+                tokens(&token(NOW + 900)),
+                response(200, json!({"id":USER})),
+                tokens(&token_claims(changed)),
+            ],
+        );
+        let original = client.exchange(exchange(), NOW).unwrap();
+        assert!(client.refresh(&original, NOW + 900).is_err());
+        assert_eq!(http.requests.lock().unwrap().len(), 3);
+        let (wrong, wrong_http) = self::client("https://other.supabase.co", vec![]);
+        assert!(wrong.refresh(&original, NOW).is_err());
+        assert!(wrong.logout(&original).is_err());
+        assert!(wrong_http.requests.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn failed_refresh_is_not_retried_and_logout_requires_revocation_confirmation() {
+    let (client, http) = client(
+        PROJECT,
+        vec![
+            tokens(&token(NOW + 900)),
+            response(200, json!({"id":USER})),
+            response(500, json!({"message":"private-provider-secret"})),
+            response(200, json!({})),
+        ],
+    );
+    let original = client.exchange(exchange(), NOW).unwrap();
+    assert!(client.refresh(&original, NOW + 900).is_err());
+    assert_eq!(http.requests.lock().unwrap().len(), 3);
+    assert_eq!(original.refresh_token(), "synthetic-refresh");
+    assert!(client.logout(&original).is_err());
+    assert_eq!(http.requests.lock().unwrap().len(), 4);
+}

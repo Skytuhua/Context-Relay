@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::Url;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -111,7 +111,55 @@ impl SupabaseAuthClient {
             "/auth/v1/token?grant_type=pkce",
             std::mem::take(&mut *body),
             None,
+            200,
         )?;
+        self.verify_tokens(response, now, None)
+    }
+
+    /// The caller must persist replacement credentials before publishing them.
+    pub fn refresh(&self, session: &HostedSession, now: u64) -> Result<HostedSession, LoginError> {
+        if session.project != self.project {
+            return Err(LoginError::Configuration);
+        }
+        #[derive(Serialize)]
+        struct Refresh<'a> {
+            refresh_token: &'a str,
+        }
+        let body = serde_json::to_vec(&Refresh {
+            refresh_token: session.refresh_token(),
+        })
+        .map_err(|_| LoginError::Provider)?;
+        let response = self.request(
+            SupabaseHttpMethod::Post,
+            "/auth/v1/token?grant_type=refresh_token",
+            body,
+            None,
+            200,
+        )?;
+        self.verify_tokens(response, now, Some(session.identity))
+    }
+
+    /// Remote revocation only; the owner must separately clear local credentials.
+    pub fn logout(&self, session: &HostedSession) -> Result<(), LoginError> {
+        if session.project != self.project {
+            return Err(LoginError::Configuration);
+        }
+        self.request(
+            SupabaseHttpMethod::Post,
+            "/auth/v1/logout?scope=local",
+            vec![],
+            Some(session.access_token()),
+            204,
+        )?;
+        Ok(())
+    }
+
+    fn verify_tokens(
+        &self,
+        response: SupabaseHttpResponse,
+        now: u64,
+        expected: Option<HostedIdentity>,
+    ) -> Result<HostedSession, LoginError> {
         let tokens: TokenResponse =
             serde_json::from_slice(response.body()).map_err(|_| LoginError::Provider)?;
         if !tokens.token_type.eq_ignore_ascii_case("bearer")
@@ -144,11 +192,15 @@ impl SupabaseAuthClient {
             user_id: canonical_uuid(&claims.sub)?,
             session_id: canonical_uuid(&claims.session_id)?,
         };
+        if expected.is_some_and(|expected| expected != identity) {
+            return Err(LoginError::Provider);
+        }
         let response = self.request(
             SupabaseHttpMethod::Get,
             "/auth/v1/user",
             vec![],
             Some(&tokens.access_token),
+            200,
         )?;
         let user: User =
             serde_json::from_slice(response.body()).map_err(|_| LoginError::Provider)?;
@@ -170,6 +222,7 @@ impl SupabaseAuthClient {
         path: &str,
         body: Vec<u8>,
         token: Option<&str>,
+        expected_status: u16,
     ) -> Result<SupabaseHttpResponse, LoginError> {
         let url = self
             .project
@@ -194,7 +247,7 @@ impl SupabaseAuthClient {
             return Err(LoginError::Provider);
         }
         match response.status() {
-            200 => Ok(response),
+            status if status == expected_status => Ok(response),
             400 | 401 | 403 | 422 => Err(LoginError::Denied),
             _ => Err(LoginError::Unavailable),
         }
