@@ -1040,6 +1040,25 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
             request_fixture("pairing_cancel", serde_json::json!({"pairingId": ID})),
         ),
         (
+            "RecoveryRestoreBegin",
+            request_fixture(
+                "recovery_restore_begin",
+                serde_json::json!({"recoveryPhraseWords":vec!["abandon";24]}),
+            ),
+        ),
+        (
+            "RecoveryRestoreOverview",
+            request_fixture("recovery_restore_overview", empty()),
+        ),
+        (
+            "RecoveryRestoreCancel",
+            request_fixture("recovery_restore_cancel", empty()),
+        ),
+        (
+            "RecoveryRestoreResume",
+            request_fixture("recovery_restore_resume", empty()),
+        ),
+        (
             "RecoveryEnrollmentBegin",
             request_fixture("recovery_enrollment_begin", empty()),
         ),
@@ -1114,7 +1133,7 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
 #[test]
 fn role_allowlist_covers_core_and_tracked_setup_requests() {
     let fixtures = all_request_fixtures();
-    assert_eq!(fixtures.len(), 63);
+    assert_eq!(fixtures.len(), 67);
 
     for (name, request) in &fixtures {
         let common = matches!(*name, "Cancel" | "Health");
@@ -1136,7 +1155,10 @@ fn role_allowlist_covers_core_and_tracked_setup_requests() {
             role_allows(ClientRole::Desktop, request),
             !matches!(
                 *name,
-                "Hello" | "RecoveryEnrollmentBegin" | "RecoveryEnrollmentConfirm"
+                "Hello"
+                    | "RecoveryEnrollmentBegin"
+                    | "RecoveryEnrollmentConfirm"
+                    | "RecoveryRestoreBegin"
             ),
             "Desktop matrix mismatch for {name}"
         );
@@ -1145,6 +1167,10 @@ fn role_allowlist_covers_core_and_tracked_setup_requests() {
             matches!(
                 *name,
                 "Cancel"
+                    | "RecoveryRestoreBegin"
+                    | "RecoveryRestoreOverview"
+                    | "RecoveryRestoreResume"
+                    | "RecoveryRestoreCancel"
                     | "RecoveryEnrollmentBegin"
                     | "RecoveryEnrollmentConfirm"
                     | "RecoveryEnrollmentCancel"
@@ -1168,14 +1194,14 @@ fn role_allowlist_covers_core_and_tracked_setup_requests() {
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::Desktop, request))
             .count(),
-        60
+        63
     );
     assert_eq!(
         fixtures
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::DesktopRecoveryHost, request))
             .count(),
-        4
+        8
     );
     assert_eq!(
         fixtures

@@ -91,6 +91,16 @@ it('rejects phrase-bearing recovery methods on the generic renderer bridge', asy
   expect(invoke).not.toHaveBeenCalled();
 });
 
+it('rejects restore phrase submission through the generic renderer bridge', async () => {
+  await expect(
+    new LocalClient().call({
+      method: 'recovery_restore_begin',
+      params: { recoveryPhraseWords: Array<string>(24).fill('abandon') },
+    }),
+  ).rejects.toThrow('dedicated native recovery command');
+  expect(invoke).not.toHaveBeenCalled();
+});
+
 it('routes only overview, status, and cancel through authenticated local_request', async () => {
   const enrollmentId =
     '018f22e2-79b0-7cc8-98c4-dc0c0c076001' as RecoveryEnrollmentId;

@@ -257,6 +257,12 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::PairingConfirm(_) => matches!(role, Desktop),
         LocalRequest::PairingCancel(_) => matches!(role, Desktop),
         LocalRequest::RecoveryEnrollmentBegin(_) => matches!(role, DesktopRecoveryHost),
+        LocalRequest::RecoveryRestoreBegin(_) => matches!(role, DesktopRecoveryHost),
+        LocalRequest::RecoveryRestoreOverview(_)
+        | LocalRequest::RecoveryRestoreResume(_)
+        | LocalRequest::RecoveryRestoreCancel(_) => {
+            matches!(role, Desktop | DesktopRecoveryHost)
+        }
         LocalRequest::RecoveryEnrollmentOverview(_) => matches!(role, Desktop),
         LocalRequest::RecoveryEnrollmentConfirm(_) => matches!(role, DesktopRecoveryHost),
         LocalRequest::RecoveryEnrollmentStatus(_) => matches!(role, Desktop),

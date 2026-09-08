@@ -228,7 +228,9 @@ where
     }
     if matches!(
         request,
-        LocalRequest::RecoveryEnrollmentBegin(_) | LocalRequest::RecoveryEnrollmentConfirm(_)
+        LocalRequest::RecoveryEnrollmentBegin(_)
+            | LocalRequest::RecoveryEnrollmentConfirm(_)
+            | LocalRequest::RecoveryRestoreBegin(_)
     ) {
         return Err(ClientError {
             code: ErrorCode::ScopeDenied,
@@ -529,6 +531,10 @@ mod tests {
     async fn generic_request_rejects_sensitive_recovery_methods_before_delegate() {
         for request in [
             LocalRequest::RecoveryEnrollmentBegin(EmptyParams {}),
+            LocalRequest::RecoveryRestoreBegin(context_relay_protocol::RecoveryRestoreParams {
+                recovery_phrase_words: RecoveryPhraseWords::new(vec!["abandon".into(); 24])
+                    .unwrap(),
+            }),
             LocalRequest::RecoveryEnrollmentConfirm(RecoveryEnrollmentConfirmParams {
                 enrollment_id: enrollment_id(),
                 confirmations: vec![

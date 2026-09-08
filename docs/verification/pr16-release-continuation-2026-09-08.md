@@ -887,3 +887,44 @@ core all-target Clippy with test-support and warnings denied (40 tests total;
 This establishes durable core provenance. Daemon orchestration must still persist/read
 the intent and dispatch recovery through the native phrase-input flow; it is not yet
 installed-product or live hosted acceptance.
+
+### Daemon recovery commands
+
+The production hosted recovery service now handles restore begin, overview, resume
+and cancel through the existing ordered vault worker. Begin is restricted to the
+authenticated native recovery host. Desktop/native-host overview and resume expose
+only public status; the generic renderer bridge rejects phrase submission in both
+TypeScript and Tauri. The phrase wrapper remains zeroizing and debug-redacted.
+
+Begin saves the original hosted intent before fetching the owner's root and preparing
+the claim. Resume validates the installed device identity, original Auth user/session,
+project and canonical root, then retries the durable claim. Completed local material
+and overview remain available without login. Cancel discards only an unprepared intent;
+prepared claims remain intact. Successful unprepared enrollment cancellation also clears
+its hosted intent and cached coordinator so it cannot block a subsequent restore.
+
+The hosted regression checks login gating, intent-before-network ordering, enrollment
+cancellation, wrong-phrase cancellation, prepared-cancel rejection and a lost restore
+response followed by reopening the vault and service. The same claim completes without
+reentering the phrase. Protocol testing caught and fixed an empty-status serde variant
+that accepted extra fields; Idle now uses a strict empty struct variant. These are local
+synthetic provider tests, not live hosted or installed acceptance.
+
+Validation so far: nine protocol tests, 26 local IPC tests and the full daemon unit
+suite pass (95 passed, four existing ignored). The seven renderer bridge tests and
+TypeScript/ESLint checks pass. Logs are `.codex/pr16-restore-{protocol-test,ipc-test,
+daemon-final,renderer-test,typecheck,renderer-lint}.log`; the protocol regression's
+initial failure is `.codex/pr16-restore-protocol-red.log`. Read-only review found no
+remaining concrete P1/P2 after the cancellation fixes.
+
+Trusted native phrase-input UI and desktop recovery screens remain to be connected.
+Signing, clean-machine qualification and the other full release gates are still open.
+
+The Tauri boundary regression passes (one test), and all-target Clippy for the
+protocol, local IPC and daemon crates passes with test support and warnings denied.
+Logs: `.codex/pr16-restore-tauri-test.log` and `.codex/pr16-restore-daemon-clippy.log`.
+
+Previous-head CI at b876ed5 has a failed Windows Semgrep build-a job
+(34264073501 / 102191165003): exact builder verification rejects the installed
+Cygwin version against pinned 3.6.10. Its log does not report the observed version.
+This environment qualification remains unresolved; the version check is retained.

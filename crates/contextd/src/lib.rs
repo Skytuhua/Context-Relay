@@ -1156,6 +1156,10 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
     if matches!(
         &request,
         LocalRequest::RecoveryEnrollmentBegin(_)
+            | LocalRequest::RecoveryRestoreBegin(_)
+            | LocalRequest::RecoveryRestoreOverview(_)
+            | LocalRequest::RecoveryRestoreResume(_)
+            | LocalRequest::RecoveryRestoreCancel(_)
             | LocalRequest::RecoveryEnrollmentOverview(_)
             | LocalRequest::RecoveryEnrollmentConfirm(_)
             | LocalRequest::RecoveryEnrollmentStatus(_)
@@ -1248,6 +1252,10 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         | LocalRequest::PairingConfirm(_)
         | LocalRequest::PairingCancel(_)) => RoutedRequest::Work(VaultCommand::Pairing(request)),
         request @ (LocalRequest::RecoveryEnrollmentBegin(_)
+        | LocalRequest::RecoveryRestoreBegin(_)
+        | LocalRequest::RecoveryRestoreOverview(_)
+        | LocalRequest::RecoveryRestoreResume(_)
+        | LocalRequest::RecoveryRestoreCancel(_)
         | LocalRequest::RecoveryEnrollmentOverview(_)
         | LocalRequest::RecoveryEnrollmentConfirm(_)
         | LocalRequest::RecoveryEnrollmentStatus(_)
@@ -4143,7 +4151,7 @@ mod tests {
     #[test]
     fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 63);
+        assert_eq!(fixtures.len(), 67);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -4207,9 +4215,9 @@ mod tests {
     fn recovery_enrollment_commands_are_role_checked_before_the_ordered_vault_worker() {
         let recovery = all_request_fixtures()
             .into_iter()
-            .filter(|(name, _)| name.starts_with("RecoveryEnrollment"))
+            .filter(|(name, _)| name.starts_with("Recovery"))
             .collect::<Vec<_>>();
-        assert_eq!(recovery.len(), 5);
+        assert_eq!(recovery.len(), 9);
 
         for (name, request) in recovery {
             for role in [
@@ -4222,12 +4230,19 @@ mod tests {
                     ClientRole::Desktop => matches!(
                         name,
                         "RecoveryEnrollmentOverview"
+                            | "RecoveryRestoreOverview"
+                            | "RecoveryRestoreResume"
+                            | "RecoveryRestoreCancel"
                             | "RecoveryEnrollmentStatus"
                             | "RecoveryEnrollmentCancel"
                     ),
                     ClientRole::DesktopRecoveryHost => matches!(
                         name,
                         "RecoveryEnrollmentBegin"
+                            | "RecoveryRestoreBegin"
+                            | "RecoveryRestoreOverview"
+                            | "RecoveryRestoreResume"
+                            | "RecoveryRestoreCancel"
                             | "RecoveryEnrollmentConfirm"
                             | "RecoveryEnrollmentCancel"
                     ),
@@ -7631,6 +7646,25 @@ mod tests {
             (
                 "PairingCancel",
                 request_fixture("pairing_cancel", serde_json::json!({"pairingId": ID})),
+            ),
+            (
+                "RecoveryRestoreBegin",
+                request_fixture(
+                    "recovery_restore_begin",
+                    serde_json::json!({"recoveryPhraseWords":vec!["abandon";24]}),
+                ),
+            ),
+            (
+                "RecoveryRestoreOverview",
+                request_fixture("recovery_restore_overview", empty()),
+            ),
+            (
+                "RecoveryRestoreCancel",
+                request_fixture("recovery_restore_cancel", empty()),
+            ),
+            (
+                "RecoveryRestoreResume",
+                request_fixture("recovery_restore_resume", empty()),
             ),
             (
                 "RecoveryEnrollmentBegin",

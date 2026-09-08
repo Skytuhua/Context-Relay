@@ -12,9 +12,9 @@ use crate::{
     ExportId, HandoffPayload, HarnessAccessPolicy, HarnessId, InstallationTokenProof,
     MAX_MARKDOWN_BYTES, MAX_TAG_BYTES, MAX_TAGS, MAX_TITLE_BYTES, MemoryCandidate, MemoryId,
     MemoryKind, MemoryRecord, NativePlatform, OperationId, PairingId, PlanId, ProbeReport,
-    ProjectId, ProjectIdentity, ProtocolVersion, RecordId, RecoveryEnrollmentId, ScopeRef,
-    SetupPlan, Sha256Digest, StatusOutput, TaskId, TaskRecord, TaskStatus, ValidationError,
-    WireNativeValue, decimal_u64, required_text,
+    ProjectId, ProjectIdentity, ProtocolVersion, RecordId, RecoveryEnrollmentId, RecoveryRestoreId,
+    ScopeRef, SetupPlan, Sha256Digest, StatusOutput, TaskId, TaskRecord, TaskStatus,
+    ValidationError, WireNativeValue, decimal_u64, required_text,
 };
 
 pub const RECOVERY_ENROLLMENT_SESSION_MS: u64 = 600_000;
@@ -337,6 +337,30 @@ params!(AccountDeletionParams {
 #[derive(Clone, Eq, PartialEq, TS)]
 #[ts(type = "Array<string>")]
 pub struct RecoveryPhraseWords(Vec<String>);
+params!(RecoveryRestoreParams {
+    recovery_phrase_words: RecoveryPhraseWords
+});
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "state",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RecoveryRestoreStatus {
+    Idle {},
+    Submitting {
+        restore_id: RecoveryRestoreId,
+    },
+    Complete {
+        restore_id: RecoveryRestoreId,
+        device: DeviceSummary,
+    },
+    Conflict {
+        restore_id: RecoveryRestoreId,
+    },
+}
 impl fmt::Debug for RecoveryPhraseWords {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RecoveryPhraseWords([REDACTED])")
@@ -703,6 +727,10 @@ pub enum LocalRequest {
     PairingConfirm(PairingConfirmParams),
     PairingCancel(PairingIdParams),
     RecoveryEnrollmentBegin(EmptyParams),
+    RecoveryRestoreBegin(RecoveryRestoreParams),
+    RecoveryRestoreOverview(EmptyParams),
+    RecoveryRestoreResume(EmptyParams),
+    RecoveryRestoreCancel(EmptyParams),
     RecoveryEnrollmentOverview(EmptyParams),
     RecoveryEnrollmentConfirm(RecoveryEnrollmentConfirmParams),
     RecoveryEnrollmentStatus(RecoveryEnrollmentIdParams),
@@ -1150,6 +1178,9 @@ pub enum AccountDeletionState {
     rename_all_fields = "camelCase"
 )]
 pub enum LocalResult {
+    RecoveryRestoreStatus {
+        status: RecoveryRestoreStatus,
+    },
     HostedAuth {
         status: crate::HostedAuthStatus,
     },
@@ -1274,6 +1305,9 @@ pub enum LocalResult {
     deny_unknown_fields
 )]
 enum LocalResultSerde {
+    RecoveryRestoreStatus {
+        status: RecoveryRestoreStatus,
+    },
     HostedAuth {
         status: crate::HostedAuthStatus,
     },
@@ -1481,6 +1515,15 @@ impl LocalResult {
             Self::PairingApproval { approval } => approval.request.validate(),
             Self::PairingCompletion { completion } => completion.device.validate(),
             Self::RecoveryEnrollmentPhrase { phrase } => phrase.validate(),
+            Self::RecoveryRestoreStatus {
+                status:
+                    RecoveryRestoreStatus::Idle {}
+                    | RecoveryRestoreStatus::Submitting { .. }
+                    | RecoveryRestoreStatus::Conflict { .. },
+            } => Ok(()),
+            Self::RecoveryRestoreStatus {
+                status: RecoveryRestoreStatus::Complete { device, .. },
+            } => device.validate(),
             Self::RecoveryEnrollmentStatus { status } => status.validate(),
             Self::RecoveryEnrollmentComplete { completion } => completion.device.validate(),
             Self::Export { payload } => payload.validate(),

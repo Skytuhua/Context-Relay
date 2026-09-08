@@ -34,6 +34,7 @@ export type OperationId = UuidV7 & {{ readonly __operationId: unique symbol }};\
 export type RecordId = UuidV7 & {{ readonly __recordId: unique symbol }};\n\
 export type PairingId = UuidV7 & {{ readonly __pairingId: unique symbol }};\n\
 export type RecoveryEnrollmentId = UuidV7 & {{ readonly __recoveryEnrollmentId: unique symbol }};\n\
+export type RecoveryRestoreId = UuidV7 & {{ readonly __recoveryRestoreId: unique symbol }};\n\
 export type RecoveryRootId = UuidV7 & {{ readonly __recoveryRootId: unique symbol }};\n\
 export type DeviceCertificateId = UuidV7 & {{ readonly __deviceCertificateId: unique symbol }};\n\
 export type DeviceId = UuidV7 & {{ readonly __deviceId: unique symbol }};\n\
@@ -171,6 +172,8 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         RetryParams,
         ExportParams,
         RecoveryEnrollmentIdParams,
+        RecoveryRestoreParams,
+        RecoveryRestoreStatus,
         RecoveryWordConfirmation,
         RecoveryEnrollmentConfirmParams,
         DeviceRevokeParams,
