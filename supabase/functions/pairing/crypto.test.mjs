@@ -7,6 +7,13 @@ import { decodePairingRequest, verifyPairingRequest } from './crypto.mjs';
 const fixture = Buffer.from((await readFile(new URL('../../../crates/protocol/tests/fixtures/pairing-request-v1.hex', import.meta.url), 'utf8')).trim(), 'hex');
 const preimage = Buffer.from((await readFile(new URL('../../../crates/protocol/tests/fixtures/pairing-request-signing-preimage-v1.hex', import.meta.url), 'utf8')).trim(), 'hex');
 
+test('the signed hosted fixture is shared with the Rust crypto verifier', async () => {
+  const bytes = Buffer.from((await readFile(new URL('../../../crates/core/tests/fixtures/hosted-pairing-request-v1.hex', import.meta.url), 'utf8')).trim(), 'hex');
+  const request = await verifyPairingRequest(bytes);
+  assert.equal(request.deviceName, 'new laptop');
+  assert.deepEqual(Buffer.from(request.canonicalRequest), bytes);
+});
+
 test('pairing request matches the frozen Rust canonical preimage', () => {
   const request = decodePairingRequest(fixture);
   assert.deepEqual(Buffer.from(request.signingPreimage), preimage);

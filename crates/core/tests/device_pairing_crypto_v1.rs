@@ -33,6 +33,22 @@ const ISSUER_CERTIFICATE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073987";
 const _: () = assert!(MAX_PAIRING_APPROVED_PAYLOAD_BYTES > MAX_PAIRING_GRANT_BYTES);
 
 #[test]
+fn hosted_pairing_request_signature_matches_the_edge_fixture() {
+    let encoded = include_str!("fixtures/hosted-pairing-request-v1.hex").trim();
+    let bytes: Vec<u8> = (0..encoded.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&encoded[offset..offset + 2], 16).unwrap())
+        .collect();
+    let request = context_relay_protocol::decode_pairing_request_v1(&bytes).unwrap();
+    let verified = verify_pairing_request(&request).unwrap();
+    assert_eq!(verified.canonical_bytes(), bytes);
+    assert_eq!(
+        verified.digest().0.as_slice(),
+        Sha256::digest(&bytes).as_slice()
+    );
+}
+
+#[test]
 fn signed_pairing_requests_verify_exact_fields_and_separate_algorithms() {
     let keys = DeviceKeys::generate().unwrap();
     let signed = signed_request(&keys);

@@ -1030,3 +1030,17 @@ Independent follow-up review found no remaining concrete P1/P2.
 These are component and gateway checks. Installed visual/accessibility acceptance,
 real hosted enrollment/recovery across devices, full Mac execution, signing and the
 rest of the product release checklist remain required before merge.
+
+### Hosted pairing request compatibility and macOS build
+
+The signed `hosted-pairing-request-v1.hex` fixture is consumed by both the Rust
+pairing crypto test and the Edge verifier. It was generated with Node Ed25519
+using fixed test-only seeds; it contains public request data and a signature.
+All 12 Rust pairing crypto tests and 26 combined Node pairing/enrollment checks
+pass. Approval verification and hosted admission remain incomplete.
+
+At `2a83bcc`, GitHub CI run `34271537065` completed macOS all-target Clippy
+(job `102214057767`) and the full macOS Tauri build (`102214058208`) successfully.
+This supersedes the earlier full-build limitation from the Windows-only
+cross-check. Interactive native input, accessibility, installed behavior and the
+complete release matrix remain unverified.
