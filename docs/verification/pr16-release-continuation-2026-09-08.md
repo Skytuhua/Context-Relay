@@ -1256,3 +1256,20 @@ PostgreSQL checks pass (`.codex/pr16-cleanup-full.log`); `check:supabase`,
 whitespace checks and bounded independent review pass. Graphify is updated.
 These are disposable-database results, not deployed or live acceptance.
 Native hosted transport, daemon integration and all full-release gates remain.
+
+### Current-head dependency and secret-scan corrections
+
+GitHub at `75b7add` failed Node dependency policy for
+[GHSA-82fw-gwwq-j7x9](https://github.com/advisories/GHSA-82fw-gwwq-j7x9).
+Vitest and its mocker now resolve to patched 4.1.11. All 366 desktop tests in
+42 files pass on the new major version; TypeScript and production build pass,
+and `pnpm audit --audit-level moderate` reports no known vulnerabilities.
+The dependency-floor regression fails before the upgrade and passes afterward.
+
+The same head's full-history secret scan found three public verification keys
+in historical synthetic pairing fixtures. Both exact historical objects and
+their companion Rust tests were independently reviewed. Only the three exact
+fingerprints are added to the existing exception ledger, with rationale and
+updated byte/digest pins. No detector or scanned ref is disabled. The pinned
+Gitleaks 8.30.1 full-ref scan returns zero after the correction; policy checks
+pass. This does not establish current-head GitHub CI or full release acceptance.

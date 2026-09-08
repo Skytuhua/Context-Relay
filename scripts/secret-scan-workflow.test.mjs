@@ -32,9 +32,12 @@ const reviewedExceptionFingerprints = [
   '3c2a371aef74f4962af64d0fe71545557244f21a:crates/core/tests/hermes_adapter_v1.rs:curl-auth-header:2480',
   'b357b29ad4379fae191a288fb653dd55e69f340c:crates/core/src/hermes/yaml.rs:private-key:464',
   '770a39d5754f22039cc9267932aa43bb7260d99c:crates/core/tests/fixtures/hosted-enrollment-proof-v1.json:generic-api-key:3',
+  '5bd19cfc2125ddaa1e101ef4bd80d8923a114955:crates/core/tests/fixtures/hosted-pairing-approval-v1.json:generic-api-key:14',
+  '1d1ee66c443e50d824ea10224e9f1e517582592d:crates/core/tests/fixtures/hosted-pairing-approval-v1.json:generic-api-key:8',
+  '1d1ee66c443e50d824ea10224e9f1e517582592d:crates/core/tests/fixtures/hosted-pairing-approval-v1.json:generic-api-key:10',
 ].join('\n') + '\n';
-const reviewedIgnoreByteLength = 1309;
-const reviewedIgnoreSha256 = '2b4a732088ee1b6b0325942496a960e60306f786cfa3d6885b7c666ec0e23e6d';
+const reviewedIgnoreByteLength = 1665;
+const reviewedIgnoreSha256 = '93727a02280384fd9577b0cf24231851bff3b4a4f62a122390b6f06b8bae5a31';
 const allowedExceptionClassifications = new Set([
   'detector-literal',
   'synthetic-negative-test',
@@ -84,7 +87,7 @@ test('repository secret scan verifies pinned Gitleaks and scans every Git ref', 
   assert.match(source, /17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c/);
   assert.match(source, /\.github\/repository\.gitleaksignore/);
   assert.doesNotMatch(source, /third_party\/sidecars\/policies\/repository\.gitleaksignore/);
-  assert.match(source, /\(Get-Item -LiteralPath \$ignore\)\.Length -ne 1309/);
+  assert.match(source, /\(Get-Item -LiteralPath \$ignore\)\.Length -ne 1665/);
   assert.match(source, new RegExp(reviewedIgnoreSha256));
   assert.match(source, /--gitleaks-ignore-path/);
   assert.match(source, /--ignore-gitleaks-allow/);
