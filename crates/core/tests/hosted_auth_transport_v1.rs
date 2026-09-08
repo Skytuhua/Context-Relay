@@ -134,6 +134,40 @@ fn canceled_queued_begin_cannot_clear_a_newer_login() {
 }
 
 #[test]
+fn delayed_refresh_cannot_capture_or_clear_a_newer_login() {
+    let (client, http) = client(
+        PROJECT,
+        vec![
+            tokens(&token(NOW + 900)),
+            response(200, json!({"id":USER})),
+            response(401, json!({})),
+        ],
+    );
+    let store = Arc::new(Store::default());
+    let owner = HostedSessionOwner::new(Arc::new(client), store.clone());
+    let delayed = owner.cancellation().unwrap();
+    owner
+        .complete_login(owner.begin_login().unwrap(), exchange(), NOW)
+        .unwrap();
+    for reservation in [
+        delayed,
+        context_relay_core::auth::LoginCancellation::default(),
+    ] {
+        assert!(matches!(
+            owner.refresh_cancellable(&reservation, NOW),
+            Err(LoginError::Canceled)
+        ));
+        assert!(matches!(
+            owner.restore_cancellable(&reservation, NOW),
+            Err(LoginError::Canceled)
+        ));
+    }
+    assert_eq!(http.requests.lock().unwrap().len(), 2);
+    assert!(owner.current_session(NOW).unwrap().is_some());
+    assert!(store.saved.lock().unwrap().is_some());
+}
+
+#[test]
 fn startup_restore_can_retry_offline_failure_but_denied_refresh_clears_identity() {
     let (client, _) = client(
         PROJECT,

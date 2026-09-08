@@ -7,7 +7,7 @@ use context_relay_protocol::{
 use reqwest::Url;
 use std::{
     sync::{Arc, Mutex, Weak},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::task::JoinHandle;
 
@@ -62,6 +62,7 @@ impl LoginBrowser for SystemLoginBrowser {
 
 struct State {
     status: HostedAuthStatus,
+    valid_until: Option<(u64, tokio::time::Instant)>,
     start_expected: Option<OperationId>,
     pending: Option<JoinHandle<()>>,
     cancellation: Option<LoginCancellation>,
@@ -125,6 +126,86 @@ fn publish(inner: &Weak<Inner>, generation: OperationId, phase: HostedAuthState)
         && state.status.generation == generation
     {
         state.status.state = phase;
+        state.valid_until = None;
+    }
+}
+
+fn session_metadata(owner: &HostedSessionOwner) -> Result<(u64, LoginCancellation), LoginError> {
+    let session = owner.current_session(now()?)?.ok_or(LoginError::Expired)?;
+    Ok((session.expires_at(), owner.cancellation()?))
+}
+
+async fn maintain_session(
+    weak: Weak<Inner>,
+    generation: OperationId,
+    owner: Arc<HostedSessionOwner>,
+) {
+    let initial_owner = owner.clone();
+    let mut metadata = tokio::task::spawn_blocking(move || session_metadata(&initial_owner))
+        .await
+        .unwrap_or(Err(LoginError::Unavailable));
+    loop {
+        let (expires, cancellation) = match metadata {
+            Ok(value) => value,
+            Err(error) => {
+                publish(&weak, generation, failed(error));
+                return;
+            }
+        };
+        let remaining = match now() {
+            Ok(now) if now < expires => expires - now,
+            _ => {
+                publish(&weak, generation, failed(LoginError::Expired));
+                return;
+            }
+        };
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(remaining.saturating_sub(1));
+        {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let Ok(mut state) = inner.state.lock() else {
+                return;
+            };
+            if state.closed || state.status.generation != generation || cancellation.is_canceled() {
+                return;
+            }
+            state.cancellation = Some(cancellation.clone());
+            state.valid_until = Some((expires, deadline));
+            state.status.state = HostedAuthState::Connected {};
+        }
+        // Recheck wall time periodically; the monotonic deadline also prevents clock rollback
+        // from extending the lifetime displayed by the daemon.
+        loop {
+            let wall = expires.saturating_sub(now().unwrap_or(expires));
+            let monotonic = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_secs();
+            let delay = wall.min(monotonic).saturating_sub(60).clamp(1, 30);
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+            if now().map_or(true, |now| now.saturating_add(60) >= expires)
+                || tokio::time::Instant::now() + Duration::from_secs(60) >= deadline
+            {
+                break;
+            }
+        }
+        let mut retry = Duration::from_secs(5);
+        loop {
+            let refreshing_owner = owner.clone();
+            let refreshing_cancellation = cancellation.clone();
+            metadata = tokio::task::spawn_blocking(move || {
+                refreshing_owner.refresh_cancellable(&refreshing_cancellation, now()?)?;
+                session_metadata(&refreshing_owner)
+            })
+            .await
+            .unwrap_or(Err(LoginError::Unavailable));
+            if !matches!(metadata, Err(LoginError::Unavailable | LoginError::Busy)) {
+                break;
+            }
+            tokio::time::sleep(retry).await;
+            retry = (retry * 2).min(Duration::from_secs(60));
+        }
     }
 }
 
@@ -143,16 +224,50 @@ impl HostedAuthService {
         state.status.state = HostedAuthState::Restoring {};
         let generation = state.status.generation;
         state.pending = Some(tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || owner.restore(now()?)).await;
-            let phase = match result {
-                Ok(Ok(Some(_))) => HostedAuthState::Connected {},
-                Ok(Ok(None)) => HostedAuthState::SignedOut {
-                    remote_revoked: None,
-                },
-                Ok(Err(error)) => failed(error),
-                Err(_) => failed(LoginError::Unavailable),
-            };
-            publish(&weak, generation, phase);
+            let mut retry = Duration::from_secs(5);
+            loop {
+                let restoring_owner = owner.clone();
+                let restoring_service = weak.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let cancellation = restoring_owner.cancellation()?;
+                    {
+                        let inner = restoring_service.upgrade().ok_or(LoginError::Canceled)?;
+                        let mut state = inner.state.lock().map_err(|_| LoginError::Unavailable)?;
+                        if state.closed || state.status.generation != generation {
+                            return Err(LoginError::Canceled);
+                        }
+                        state.cancellation = Some(cancellation.clone());
+                    }
+                    restoring_owner.restore_cancellable(&cancellation, now()?)
+                })
+                .await
+                .unwrap_or(Err(LoginError::Unavailable));
+                match result {
+                    Ok(Some(_)) => {
+                        maintain_session(weak, generation, owner).await;
+                        return;
+                    }
+                    Ok(None) => {
+                        publish(
+                            &weak,
+                            generation,
+                            HostedAuthState::SignedOut {
+                                remote_revoked: None,
+                            },
+                        );
+                        return;
+                    }
+                    Err(LoginError::Unavailable) => {
+                        publish(&weak, generation, failed(LoginError::Unavailable));
+                        tokio::time::sleep(retry).await;
+                        retry = (retry * 2).min(Duration::from_secs(60));
+                    }
+                    Err(error) => {
+                        publish(&weak, generation, failed(error));
+                        return;
+                    }
+                }
+            }
         }));
         drop(state);
         service
@@ -171,6 +286,7 @@ impl HostedAuthService {
                     generation: generation(),
                     state: HostedAuthState::Disabled {},
                 },
+                valid_until: None,
                 pending: None,
                 cancellation: None,
                 start_expected: None,
@@ -201,6 +317,13 @@ impl HostedAuthService {
                 ErrorCode::Canceled,
                 "Hosted sign-in is shutting down",
             ));
+        }
+        if matches!(state.status.state, HostedAuthState::Connected {})
+            && !state.valid_until.is_some_and(|(expires, deadline)| {
+                now().is_ok_and(|now| now < expires) && tokio::time::Instant::now() < deadline
+            })
+        {
+            state.status.state = failed(LoginError::Expired);
         }
         if matches!(request, LocalRequest::HostedAuthStatus(_)) || self.0.owner.is_none() {
             return Ok(LocalResult::HostedAuth {
@@ -235,6 +358,9 @@ impl HostedAuthService {
                         "Finish the current sign-in operation first",
                     ));
                 }
+                if let Some(cancellation) = state.cancellation.take() {
+                    cancellation.cancel();
+                }
                 if let Some(job) = state.pending.take() {
                     job.abort();
                 }
@@ -243,6 +369,7 @@ impl HostedAuthService {
                     state: HostedAuthState::SigningIn {},
                 };
                 state.start_expected = Some(params.expected_generation);
+                state.valid_until = None;
                 let cancellation = LoginCancellation::default();
                 state.cancellation = Some(cancellation.clone());
                 let weak = Arc::downgrade(&self.0);
@@ -250,21 +377,20 @@ impl HostedAuthService {
                 let browser = self.0.browser.clone();
                 state.pending = Some(tokio::spawn(async move {
                     let result = async {
-                        let flow =
-                            DaemonLogin::begin_with_cancellation(&project, owner, cancellation)
-                                .await?;
+                        let flow = DaemonLogin::begin_with_cancellation(
+                            &project,
+                            owner.clone(),
+                            cancellation,
+                        )
+                        .await?;
                         flow.open_browser(move |url| browser.open(url)).await?;
                         flow.wait().await
                     }
                     .await;
-                    publish(
-                        &weak,
-                        params.operation_id,
-                        match result {
-                            Ok(_) => HostedAuthState::Connected {},
-                            Err(error) => failed(error),
-                        },
-                    );
+                    match result {
+                        Ok(_) => maintain_session(weak, params.operation_id, owner).await,
+                        Err(error) => publish(&weak, params.operation_id, failed(error)),
+                    }
                 }));
             }
             LocalRequest::HostedAuthCancel(params) | LocalRequest::HostedAuthLogout(params) => {
@@ -398,7 +524,20 @@ mod tests {
             Ok(())
         }
     }
-    struct AuthHttp;
+    struct AuthHttp {
+        lifetime: u64,
+        fail_refresh: std::sync::atomic::AtomicBool,
+        refreshes: AtomicUsize,
+    }
+    impl Default for AuthHttp {
+        fn default() -> Self {
+            Self {
+                lifetime: 900,
+                fail_refresh: false.into(),
+                refreshes: 0.into(),
+            }
+        }
+    }
     impl SupabaseHttpClient for AuthHttp {
         fn execute(
             &self,
@@ -410,8 +549,17 @@ mod tests {
             let body = if request.url().ends_with("/user") {
                 json!({"id":user})
             } else {
-                assert!(request.url().ends_with("grant_type=pkce"));
-                let claims = json!({"iss":"https://example.supabase.co/auth/v1","aud":"authenticated","sub":user,"session_id":"550e8400-e29b-41d4-a716-446655440001","exp":now().unwrap()+900});
+                let refresh = request.url().ends_with("grant_type=refresh_token");
+                if refresh {
+                    self.refreshes.fetch_add(1, Ordering::SeqCst);
+                    if self.fail_refresh.load(Ordering::SeqCst) {
+                        return Ok(SupabaseHttpResponse::new(503, Vec::new()));
+                    }
+                } else {
+                    assert!(request.url().ends_with("grant_type=pkce"));
+                }
+                let lifetime = if refresh { 900 } else { self.lifetime };
+                let claims = json!({"iss":"https://example.supabase.co/auth/v1","aud":"authenticated","sub":user,"session_id":"550e8400-e29b-41d4-a716-446655440001","exp":now().unwrap()+lifetime});
                 let token = format!(
                     "e30.{}.signature",
                     URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
@@ -482,6 +630,134 @@ mod tests {
         .unwrap()
     }
     #[tokio::test]
+    async fn startup_restoration_retries_transient_failure_without_a_browser() {
+        let project = "https://example.supabase.co";
+        let http = Arc::new(AuthHttp::default());
+        let store = Arc::new(SavedStore::default());
+        let client = Arc::new(
+            SupabaseAuthClient::with_http_client(project, "publishable-key", http.clone()).unwrap(),
+        );
+        let initial = HostedAuthService::enabled(
+            project.into(),
+            Arc::new(HostedSessionOwner::new(client.clone(), store.clone())),
+            Arc::new(CallbackBrowser),
+        );
+        let signed_out = settled(&initial).await;
+        initial
+            .handle(LocalRequest::HostedAuthStart(HostedAuthStartParams {
+                operation_id: generation(),
+                expected_generation: signed_out.generation,
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            settled(&initial).await.state,
+            HostedAuthState::Connected {}
+        ));
+        initial.shutdown().await;
+        http.fail_refresh.store(true, Ordering::SeqCst);
+        let browser = Arc::new(Browser(AtomicUsize::new(0)));
+        let service = HostedAuthService::enabled(
+            project.into(),
+            Arc::new(HostedSessionOwner::new(client, store.clone())),
+            browser.clone(),
+        );
+        let offline = settled(&service).await;
+        assert!(matches!(
+            offline.state,
+            HostedAuthState::Failed {
+                reason: HostedAuthFailure::Unavailable
+            }
+        ));
+        http.fail_refresh.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !matches!(settled(&service).await.state, HostedAuthState::Connected {}) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(browser.0.load(Ordering::SeqCst), 0);
+        assert!(store.load().unwrap().is_some());
+        service.shutdown().await;
+    }
+    #[tokio::test]
+    async fn expired_session_is_not_connected_and_transient_refresh_recovers() {
+        let project = "https://example.supabase.co";
+        let http = Arc::new(AuthHttp {
+            lifetime: 5,
+            fail_refresh: true.into(),
+            refreshes: 0.into(),
+        });
+        let store = Arc::new(SavedStore::default());
+        let owner = Arc::new(HostedSessionOwner::new(
+            Arc::new(
+                SupabaseAuthClient::with_http_client(project, "publishable-key", http.clone())
+                    .unwrap(),
+            ),
+            store.clone(),
+        ));
+        let service =
+            HostedAuthService::enabled(project.into(), owner.clone(), Arc::new(CallbackBrowser));
+        let initial = settled(&service).await;
+        service
+            .handle(LocalRequest::HostedAuthStart(HostedAuthStartParams {
+                operation_id: generation(),
+                expected_generation: initial.generation,
+            }))
+            .await
+            .unwrap();
+        let connected = settled(&service).await;
+        assert!(matches!(connected.state, HostedAuthState::Connected {}));
+        let expires = owner
+            .current_session(now().unwrap())
+            .unwrap()
+            .unwrap()
+            .expires_at();
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            while now().unwrap() < expires {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let expired = settled(&service).await;
+        assert!(matches!(
+            expired.state,
+            HostedAuthState::Failed {
+                reason: HostedAuthFailure::Expired
+            }
+        ));
+        assert!(http.refreshes.load(Ordering::SeqCst) > 0);
+        assert!(
+            owner.current_session(expires - 1).unwrap().is_none(),
+            "clock rollback must not revive an expired transport session"
+        );
+        assert!(store.load().unwrap().is_some());
+        http.fail_refresh.store(false, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                let current = settled(&service).await;
+                if matches!(current.state, HostedAuthState::Connected {}) {
+                    assert_eq!(current.generation, connected.generation);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            owner
+                .current_session(now().unwrap())
+                .unwrap()
+                .unwrap()
+                .expires_at()
+                > expires
+        );
+        service.shutdown().await;
+    }
+    #[tokio::test]
     async fn late_cancel_preserves_connected_session_and_shutdown_preserves_credentials() {
         let project = "https://example.supabase.co";
         let store = Arc::new(SavedStore::default());
@@ -490,7 +766,7 @@ mod tests {
                 SupabaseAuthClient::with_http_client(
                     project,
                     "publishable-key",
-                    Arc::new(AuthHttp),
+                    Arc::new(AuthHttp::default()),
                 )
                 .unwrap(),
             ),

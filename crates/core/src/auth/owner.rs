@@ -6,7 +6,7 @@ use std::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// Opaque, single-use ownership of a browser login attempt.
@@ -36,6 +36,7 @@ struct State {
     initialized: bool,
     busy: bool,
     session: Option<Arc<HostedSession>>,
+    session_deadline: Option<Instant>,
 }
 
 /// One owner per daemon login slot. Call blocking methods on a blocking worker,
@@ -46,6 +47,10 @@ pub struct HostedSessionOwner {
     state: Mutex<State>,
 }
 impl HostedSessionOwner {
+    /// Allows the daemon to withdraw a restored session before queued cleanup runs.
+    pub fn cancellation(&self) -> Result<LoginCancellation, LoginError> {
+        Ok(LoginCancellation(self.lock()?.generation.clone()))
+    }
     /// Withdraw in-memory authority at daemon shutdown without deleting restart credentials.
     pub fn suspend(&self) -> Result<(), LoginError> {
         let mut state = self.lock()?;
@@ -61,6 +66,7 @@ impl HostedSessionOwner {
                 initialized: false,
                 busy: false,
                 session: None,
+                session_deadline: None,
             }),
         }
     }
@@ -73,6 +79,7 @@ impl HostedSessionOwner {
         state.initialized = true;
         state.busy = false;
         state.session = None;
+        state.session_deadline = None;
     }
     /// Call before starting the loopback listener/browser flow. Supersedes old work.
     pub fn begin_login(&self) -> Result<LoginAttempt, LoginError> {
@@ -133,9 +140,19 @@ impl HostedSessionOwner {
     /// Restore is allowed before login/logout, with explicit transient retries. A failed logout cannot be
     /// undone by reloading credentials that the OS refused to delete.
     pub fn restore(&self, now: u64) -> Result<Option<HostedIdentity>, LoginError> {
+        self.restore_cancellable(&self.cancellation()?, now)
+    }
+    pub fn restore_cancellable(
+        &self,
+        cancellation: &LoginCancellation,
+        now: u64,
+    ) -> Result<Option<HostedIdentity>, LoginError> {
         let (generation, stored) = {
             let mut state = self.lock()?;
-            if state.initialized {
+            if state.initialized
+                || !Arc::ptr_eq(&cancellation.0, &state.generation)
+                || cancellation.is_canceled()
+            {
                 return Err(LoginError::Canceled);
             }
             let stored = self.store.load()?;
@@ -162,9 +179,18 @@ impl HostedSessionOwner {
         result
     }
     pub fn refresh(&self, now: u64) -> Result<HostedIdentity, LoginError> {
+        self.refresh_cancellable(&self.cancellation()?, now)
+    }
+    pub fn refresh_cancellable(
+        &self,
+        cancellation: &LoginCancellation,
+        now: u64,
+    ) -> Result<HostedIdentity, LoginError> {
         let (generation, session) = {
             let mut state = self.lock()?;
-            if state.generation.load(Ordering::SeqCst) {
+            if !Arc::ptr_eq(&cancellation.0, &state.generation)
+                || state.generation.load(Ordering::SeqCst)
+            {
                 return Err(LoginError::Canceled);
             }
             if state.busy {
@@ -233,13 +259,24 @@ impl HostedSessionOwner {
             return Err(LoginError::Expired);
         }
         let identity = *session.identity();
+        // `now` has whole-second precision. Round lifetime down so clock rollback
+        // cannot extend transport authority beyond the original token lifetime.
+        let remaining = session
+            .expires_at()
+            .saturating_sub(now.saturating_add(started.elapsed().as_secs()))
+            .saturating_sub(1);
+        state.session_deadline = Some(Instant::now() + Duration::from_secs(remaining));
         state.session = Some(Arc::new(session));
         Ok(Some(identity))
     }
     /// Daemon-only transport access; credentials must never be serialized to IPC.
     pub fn current_session(&self, now: u64) -> Result<Option<Arc<HostedSession>>, LoginError> {
         let state = self.lock()?;
-        if state.generation.load(Ordering::SeqCst) {
+        if state.generation.load(Ordering::SeqCst)
+            || !state
+                .session_deadline
+                .is_some_and(|deadline| Instant::now() < deadline)
+        {
             return Ok(None);
         }
         Ok(state

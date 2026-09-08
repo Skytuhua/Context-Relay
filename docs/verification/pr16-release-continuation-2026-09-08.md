@@ -313,3 +313,26 @@ Core/daemon Clippy passes for all targets with test-support and warnings denied;
 generated bindings/schema checks, whitespace and Graphify update pass.
 Refresh/expiry handling, the desktop sign-in surface and production configuration remain
 unfinished. These checks do not establish live hosted or full-release acceptance.
+
+## Hosted session maintenance
+
+The daemon refreshes established sessions before expiry and retries temporary
+refresh or startup network failures with delays increasing from five to sixty
+seconds. Refresh failures retain credentials; terminal provider failures remain
+subject to the owner's credential cleanup. Displayed status and transport access
+both use monotonic expiry bounds, so clock rollback cannot extend the original
+session lifetime. Every queued refresh/restore checks its original cancellation
+reservation under the owner lock before accessing a session or stored credentials.
+
+Regression checks first reproduced stale Connected status, clock-rollback revival,
+and startup recovery failing to retry. All 13 core auth tests and four daemon
+service tests now pass, including expired-session recovery without credential loss,
+offline startup recovery without browser launch, and delayed work preserving a
+newer login. Review found a queued-refresh generation race and confirmed its fix;
+the startup cancellation review found no additional concrete P1/P2.
+Both existing callback lifecycle suites pass all eight tests. Core/daemon
+all-target Clippy with test-support and warnings denied, whitespace and Graphify
+update checks pass.
+
+Production hosted configuration remains disabled. The desktop sign-in surface,
+live provider acceptance and full release checklist remain unfinished.
