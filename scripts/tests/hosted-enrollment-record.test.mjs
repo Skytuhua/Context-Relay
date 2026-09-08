@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createHash, createPrivateKey, createPublicKey, hkdfSync, pbkdf2Sync, sign } from "node:crypto";
 import { decodeEnrollmentRecord, verifyEnrollmentRecord } from "../../supabase/functions/enrollment/record.mjs";
+import { CanonicalReader } from "../../supabase/functions/sync/core.mjs";
 
 const fixtures = new URL("../../crates/core/tests/fixtures/", import.meta.url);
 const record = Buffer.from(readFileSync(new URL("recovery-enrollment-record-v1.hex", fixtures), "utf8").trim(), "hex");
@@ -48,6 +49,12 @@ test("hosted decoder agrees with the canonical Rust record and signing preimage"
   const decoded = decodeEnrollmentRecord(record);
   assert.equal(decoded.accountId, "018f22e2-79b0-7cc8-98c4-dc0c0c07398f");
   assert.equal(decoded.workspaceId, "018f22e2-79b0-7cc8-98c4-dc0c0c07398e");
+  const metadata = new CanonicalReader(decoded.encryptedMetadata);
+  metadata.expectMap(3);
+  metadata.expectUnsigned(0); assert.deepEqual(metadata.fixedBytes(32), decoded.ephemeralKey);
+  metadata.expectUnsigned(1); assert.deepEqual(metadata.fixedBytes(24), decoded.nonce);
+  metadata.expectUnsigned(2); assert.deepEqual(metadata.byteString(32768), decoded.ciphertext);
+  assert.equal(metadata.position, decoded.encryptedMetadata.length);
   assert.equal(Buffer.from(decoded.signingPreimage).toString("hex"), readFileSync(new URL("recovery-enrollment-signing-preimage-v1.hex", fixtures), "utf8").trim());
   const input = Buffer.from(record);
   const owned = decodeEnrollmentRecord(input);

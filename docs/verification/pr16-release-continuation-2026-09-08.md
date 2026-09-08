@@ -496,3 +496,21 @@ Log: `.codex/pr16-enrollment-commit-postgres.log`. Read-only review found no
 concrete P1/P2 issue. Supabase contract and whitespace checks pass. Managed
 Supabase migration/pgTAP qualification remains pending; local stub Auth tables
 cannot establish that evidence.
+
+## Enrollment status lookup
+
+The reservation correction passed managed Supabase run `34244491895` on
+`99590b6`: all 520 existing and ten enrollment pgTAP assertions passed. This
+evidence predates the atomic-commit and status migrations.
+
+Added a service-only status RPC bound to the verified user, session and reservation.
+It rechecks the live Auth session after the reservation lock and permits an expired
+challenge only when returning its committed receipt. It grants no direct table
+access. All 15 local PostgreSQL checks pass with expired committed receipts,
+foreign/deleted sessions and denied authenticated-role calls covered.
+Log: `.codex/pr16-enrollment-status-postgres.log`.
+
+The canonical decoder now returns the exact encrypted metadata envelope slice for
+the commit RPC; its eight Node tests pass. Read-only review found no concrete P1/P2
+issue. Contract and whitespace checks pass. The Edge HTTP endpoint/adapter and
+managed qualification of the new migrations remain unfinished.

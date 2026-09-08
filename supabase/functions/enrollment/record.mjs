@@ -70,10 +70,11 @@ export function decodeEnrollmentRecord(input) {
     reader.expectUnsigned(9); const deviceName = reader.text(256);
     reader.expectUnsigned(10); const platform = Number(reader.unsigned(1n));
     reader.expectUnsigned(11); reader.expectUnsigned(1);
-    reader.expectUnsigned(12); reader.expectMap(3);
+    reader.expectUnsigned(12); const metadataOffset = reader.position; reader.expectMap(3);
     reader.expectUnsigned(0); const ephemeralKey = reader.fixedBytes(32);
     reader.expectUnsigned(1); const nonce = reader.fixedBytes(24);
     reader.expectUnsigned(2); const ciphertext = reader.byteString(32768);
+    const encryptedMetadata = canonicalRecord.subarray(metadataOffset, reader.position);
     const signatureOffset = reader.position;
     reader.expectUnsigned(13); const rootSignature = reader.fixedBytes(64);
     if (reader.position !== canonicalRecord.length || ciphertext.length < 16
@@ -88,7 +89,7 @@ export function decodeEnrollmentRecord(input) {
     return { canonicalRecord, signingPreimage, enrollmentId, recoveryRootId,
       accountId, workspaceId, recoverySigningKey, recoveryWrappingKey, certificateId,
       requestNonce, deviceId, deviceSigningKey, deviceWrappingKey, certificateSignature,
-      deviceName, platform, ephemeralKey, nonce, ciphertext, rootSignature };
+      deviceName, platform, ephemeralKey, nonce, ciphertext, encryptedMetadata, rootSignature };
   } catch {
     throw invalid();
   }

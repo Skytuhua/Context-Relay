@@ -136,6 +136,13 @@ test('enrollment commit is atomic, exact on retry, and rejects changed records',
     const request = enrollmentCommit(first, reservation, certificate);
     const receipt = JSON.parse(await sql(request));
     assert.deepEqual(JSON.parse(await sql(request)), receipt);
+    const statusRequest = `set role service_role; select public.service_enrollment_status_for_session(
+      '${first.user}','${first.session}','${reservation.reservationId}');`;
+    await sql(`update context_relay_private.enrollment_reservations set expires_at=clock_timestamp()-interval '1 second'
+      where auth_user_id='${first.user}'`);
+    assert.deepEqual(JSON.parse(await sql(statusRequest)).receipt, receipt);
+    await assert.rejects(sql(statusRequest.replace(first.session, second.session)), /enrollment_reservation_denied/);
+    await assert.rejects(sql(statusRequest.replace('set role service_role', 'set role authenticated')), /permission denied/);
     await assert.rejects(sql(request.replace("decode('010203'", "decode('010204'")), /enrollment_conflict/);
     assert.equal(await sql(`select count(*) from public.device_bindings
       where auth_user_id='${first.user}' and state='active'`), '1');
@@ -147,6 +154,8 @@ test('enrollment commit is atomic, exact on retry, and rejects changed records',
     assert.equal(await sql(`select count(*) from public.recovery_roots where account_id='${other.accountId}'`), '0');
     assert.equal(await sql(`select count(*) from context_relay_private.enrollment_commits
       where auth_user_id='${second.user}'`), '0');
+    await sql(`delete from auth.sessions where id='${first.session}'`);
+    await assert.rejects(sql(statusRequest), /enrollment_session_denied/);
   } finally { await first.cleanup(); await second.cleanup(); }
 });
 
