@@ -1,5 +1,8 @@
 //! Daemon-owned GitHub PKCE attempts. This does not enroll a trusted device.
 
+mod transport;
+pub use transport::{HostedIdentity, HostedSession, SupabaseAuthClient};
+
 use std::{
     fmt,
     net::SocketAddr,
@@ -27,9 +30,12 @@ pub enum LoginError {
     Denied,
     #[error("login is unavailable")]
     Unavailable,
+    #[error("hosted login response is invalid")]
+    Provider,
 }
 
 pub struct PendingLogin {
+    project: Url,
     authorization: Url,
     callback: Url,
     state: String,
@@ -46,6 +52,7 @@ impl fmt::Debug for PendingLogin {
 
 /// Secret exchange material; send only to the configured HTTPS Auth endpoint.
 pub struct LoginExchange {
+    project: Url,
     code: Zeroizing<String>,
     verifier: Zeroizing<String>,
 }
@@ -77,6 +84,7 @@ impl PendingLogin {
     pub fn new(project: &str, address: SocketAddr, now: Instant) -> Result<Self, LoginError> {
         let mut authorization = crate::sync::supabase::validated_project_url(project)
             .map_err(|_| LoginError::Configuration)?;
+        let project = authorization.clone();
         if !address.ip().is_loopback() || address.port() == 0 {
             return Err(LoginError::Configuration);
         }
@@ -94,6 +102,7 @@ impl PendingLogin {
             .append_pair("code_challenge", &challenge(&verifier))
             .append_pair("code_challenge_method", "s256");
         Ok(Self {
+            project,
             authorization,
             callback,
             state: state.to_string(),
@@ -155,6 +164,7 @@ impl PendingLogin {
             return Err(LoginError::Callback);
         }
         Ok(LoginExchange {
+            project: self.project.clone(),
             code: Zeroizing::new(code.into_owned()),
             verifier: self.verifier.take().ok_or(LoginError::Callback)?,
         })

@@ -53,6 +53,7 @@ pub struct SupabaseHttpRequest {
     headers: Vec<(String, String)>,
     timeout: Duration,
     body: Vec<u8>,
+    max_response_bytes: usize,
 }
 
 impl SupabaseHttpRequest {
@@ -69,7 +70,13 @@ impl SupabaseHttpRequest {
             headers,
             timeout,
             body,
+            max_response_bytes: MAX_RESPONSE_BYTES,
         }
+    }
+
+    pub(crate) fn with_response_limit(mut self, limit: usize) -> Self {
+        self.max_response_bytes = limit.min(MAX_RESPONSE_BYTES);
+        self
     }
 }
 
@@ -104,12 +111,19 @@ impl Drop for SupabaseHttpRequest {
         for (_, value) in &mut self.headers {
             value.zeroize();
         }
+        self.body.zeroize();
     }
 }
 
 pub struct SupabaseHttpResponse {
     status: u16,
     body: Vec<u8>,
+}
+
+impl Drop for SupabaseHttpResponse {
+    fn drop(&mut self) {
+        self.body.zeroize();
+    }
 }
 
 impl SupabaseHttpResponse {
@@ -228,20 +242,23 @@ impl SupabaseHttpClient for ReqwestHttpClient {
         let response = builder.send().map_err(classify_reqwest_error)?;
         if response
             .content_length()
-            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+            .is_some_and(|length| length > request.max_response_bytes as u64)
         {
             return Err(SupabaseHttpError::ResponseTooLarge);
         }
         let status = response.status().as_u16();
-        let mut body = Vec::new();
+        let mut body = Zeroizing::new(Vec::new());
         response
-            .take(MAX_RESPONSE_BYTES as u64 + 1)
+            .take(request.max_response_bytes as u64 + 1)
             .read_to_end(&mut body)
             .map_err(|_| SupabaseHttpError::Transient)?;
-        if body.len() > MAX_RESPONSE_BYTES {
+        if body.len() > request.max_response_bytes {
             return Err(SupabaseHttpError::ResponseTooLarge);
         }
-        Ok(SupabaseHttpResponse { status, body })
+        Ok(SupabaseHttpResponse {
+            status,
+            body: std::mem::take(&mut *body),
+        })
     }
 }
 
@@ -319,7 +336,7 @@ pub(crate) fn validated_project_url(value: &str) -> Result<Url, TransportError> 
     Ok(url)
 }
 
-fn valid_header_secret(value: &str) -> bool {
+pub(crate) fn valid_header_secret(value: &str) -> bool {
     !value.is_empty() && value.trim() == value && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
@@ -413,13 +430,7 @@ impl SupabaseTransport {
         if let Some(idempotency_key) = idempotency_key {
             headers.push(("idempotency-key".to_owned(), idempotency_key));
         }
-        SupabaseHttpRequest {
-            method,
-            url,
-            headers,
-            timeout: REQUEST_TIMEOUT,
-            body,
-        }
+        SupabaseHttpRequest::new(method, url, headers, REQUEST_TIMEOUT, body)
     }
 
     fn execute(

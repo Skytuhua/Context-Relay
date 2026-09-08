@@ -176,3 +176,26 @@ found no concrete P1/P2 issue; its suggested socket cases were added. Core and
 daemon Clippy passes for all targets with test-support and warnings denied;
 Graphify update, formatting and whitespace checks pass. IPC ownership, opening the system browser, exchanging/storing tokens,
 refresh/logout, provisioning and real hosted acceptance remain unfinished.
+
+## Hosted token exchange
+
+The core client now binds an exchange to its original project, sends its code
+and verifier to the PKCE token endpoint without automatic replay, and checks
+the returned identity against `/user` using that exact access token. Parsed JWT
+fields are metadata until that hosted verification succeeds. Issuer, audience,
+canonical nonnil user/session IDs and expiry are checked; provider tokens are
+discarded. The session retains its originating project and redacts credentials.
+The shared HTTP client enforces a 64 KiB response limit for Auth requests and
+clears retained request/response buffers, including response-read failures.
+
+The missing-client test failed before implementation. The initial 17 login,
+sync and lifecycle transport tests passed. Independent review found no confirmed
+P1/P2 issue and requested more malformed-identity cases. All 18 expanded tests
+pass, including rejection before `/user` for malformed IDs, issuer, audience
+and excessive expiry. Core/daemon Clippy passes for all targets with test-support
+and warnings denied; the two HTTP-boundary Node checks, formatting, whitespace
+and Graphify update also pass. `/user` verification is not device authorization or proof
+that a session remains live indefinitely. Production callers must enforce expiry
+and use the live server authorization checks for protected actions. Credential
+storage, refresh/logout, IPC/browser wiring, provisioning and real hosted
+acceptance remain required before activation.
