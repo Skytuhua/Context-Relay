@@ -20,6 +20,7 @@ import { openHarness, openHarnessGuide } from './harness-launch';
 import { readPreferences, savePreferences, type DesktopPreferences, type SetupProgress, type Theme } from './desktop-preferences';
 import { WriteRecovery } from './write-recovery';
 import { SearchProgress } from './search-progress';
+import { HostedSignIn } from './hosted-sign-in';
 import { useSearchProgress } from './use-search-progress';
 import { useScopedEditor } from './use-scoped-editor';
 import { isServiceVersionMismatch, SERVICE_UPDATE_GUIDANCE } from './service-error';
@@ -651,6 +652,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
       case 'settings':
         return (
           <section className="screen-content">
+            <HostedSignIn gateway={gateway} />
             <h2>Appearance</h2>
             <div className="field"><label htmlFor="appearance-theme">Theme</label><select id="appearance-theme" value={preferences.theme} onChange={event => updatePreferences(current => ({ ...current, theme: event.target.value as Theme }))}><option value="dark">Dark</option><option value="light">Light</option><option value="system">System</option></select><p>System follows your computer’s appearance setting.</p></div>
             <h2>Devices</h2><p>Review the devices allowed to access this workspace.</p><button type="button" onClick={() => void selectScreen('devices')}>Manage devices</button>

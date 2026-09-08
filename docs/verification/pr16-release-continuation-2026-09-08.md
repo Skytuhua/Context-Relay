@@ -336,3 +336,19 @@ update checks pass.
 
 Production hosted configuration remains disabled. The desktop sign-in surface,
 live provider acceptance and full release checklist remain unfinished.
+
+## Desktop hosted sign-in controls
+
+Settings now displays daemon-owned sign-in status and offers GitHub sign-in,
+cancellation and sign-out for the acknowledged generation. Uncertain start
+responses retain the caller's operation ID for retry. Polls cannot overwrite a
+newer action, and results from an obsolete gateway are ignored. Errors use closed,
+sanitized messages; local sign-out distinguishes confirmed remote revocation.
+
+All five new panel tests pass, including duplicate-click prevention, uncertain
+retry, stale polling, gateway replacement and remote logout wording. The full
+desktop suite passes 352 tests across 41 files; typechecking, lint and the
+production build pass. Read-only review found no concrete P1/P2 issues.
+The built browser preview visually confirms the Settings layout; it has no native
+bridge and therefore does not establish native or live provider acceptance.
+Production hosted configuration and the remaining release gates are unfinished.
