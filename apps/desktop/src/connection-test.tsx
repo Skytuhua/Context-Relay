@@ -84,6 +84,7 @@ export function ConnectionTest({ gateway, project, harnesses, noteId, checkId, o
     if (!noteId) return;
     let active = true;
     let noteMissing = false;
+    let readingCheck = false;
     observation.current += 1;
     setRestoring(true); setRestoreFailed(false); setCheckError(null); setError(null);
     callbacks.current.onVerified(false);
@@ -96,6 +97,7 @@ export function ConnectionTest({ gateway, project, harnesses, noteId, checkId, o
         throw new Error('The test note is no longer available. Save a new test note to continue.');
       }
       setNote(record);
+      readingCheck = checkId !== null;
       const current = checkId ? await gateway.connectionCheckStatus(checkId as OperationId) : null;
       if (!active) return;
       if (current && (current.checkId !== checkId || !matches(current, record))) {
@@ -109,10 +111,12 @@ export function ConnectionTest({ gateway, project, harnesses, noteId, checkId, o
       callbacks.current.onVerified(false);
       // A failed read is not proof of a missing note or a dead check. Preserve
       // the persisted identity and offer a read retry, not a duplicate mutation.
-      const unavailable = noteMissing || failure instanceof CheckBindingError || missingCheck(failure);
+      // NotFound from the note list cannot prove that this check disappeared.
+      const checkMissing = readingCheck && missingCheck(failure);
+      const unavailable = noteMissing || failure instanceof CheckBindingError || checkMissing;
       setRestoreFailed(!unavailable);
       setError(noteMissing || failure instanceof CheckBindingError ? failure.message
-        : missingCheck(failure) ? 'This check is no longer available. The service may have restarted. Start a new check.'
+        : checkMissing ? 'This check is no longer available. The service may have restarted. Start a new check.'
           : 'This test could not be restored. Retry restoring the same test when the local service is available.');
     }).finally(() => { if (active) setRestoring(false); });
     return () => { active = false; };
