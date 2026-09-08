@@ -67,7 +67,7 @@ pub fn sign_hosted_enrollment_proof(
     {
         return Err(RecoveryEnrollmentCryptoError::InvalidRecord);
     }
-    Ok(device.sign_hosted_enrollment_proof(&hosted_enrollment_proof_preimage(challenge, record)?))
+    Ok(device.sign_hosted_device_proof(&hosted_enrollment_proof_preimage(challenge, record)?))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]

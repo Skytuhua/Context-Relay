@@ -777,3 +777,19 @@ Supabase contract and whitespace checks pass. Logs:
 `.codex/pr16-restore-verifier-{red,green}.log`. This adds no deployed restore endpoint,
 trusted binding, daemon restore command or completed release acceptance.
 Read-only review found no concrete P1/P2 in this verifier slice; admission remains separately required.
+
+### Native recovery device proof
+
+Added native proof construction/signing for the hosted recovery domain. The signer
+checks both installed device public keys against the claim and validates the signed
+canonical claim before hashing. The existing internal signing primitive is reused;
+first-enrollment proof bytes remain unchanged. The Node-generated
+`hosted-recovery-proof-v1.json` is consumed by both native and hosted tests; CI watches
+recovery fixture changes as well as enrollment fixtures.
+
+Native enrollment crypto: 7 passed; native restore crypto: 7 passed. Hosted enrollment
+Node tests: 21 passed. New native tests also reject a changed wrapping key, nil user
+identity and tampered claim signature. Read-only review found no concrete P1/P2.
+Logs: `.codex/pr16-recovery-proof-{red,native,node}.log`. Actual hosted restore
+admission, transport and daemon/desktop commands remain to be implemented.
+Core all-target Clippy with test-support and warnings denied also passes (.codex/pr16-recovery-proof-clippy.log).

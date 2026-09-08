@@ -16,6 +16,13 @@ function proof(input) {
 }
 const verify = (input, rootInput) => verifyRecoveryClaim(input, rootInput, context, proof(input));
 
+test("hosted recovery proof consumes the shared native vector", async () => {
+  const vector = JSON.parse(readFileSync(new URL("hosted-recovery-proof-v1.json", fixtures)));
+  assert.equal(proof(claim).toString("hex"), vector.signature);
+  assert.equal((await verifyRecoveryClaim(claim, root, vector, Buffer.from(vector.signature, "hex"))).restoreId,
+    decodeRecoveryClaim(claim).restoreId);
+});
+
 test("hosted restore verifier agrees with the frozen Rust claim and signing preimage", async () => {
   const decoded = await verify(claim, root);
   assert.deepEqual(Buffer.from(decoded.canonicalClaim), claim);
