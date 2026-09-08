@@ -379,6 +379,65 @@ describe('DevicesScreen', () => {
     }
   });
 
+  it.each(['complete', 'submitting'] as const)('reconciles a failed confirmation to %s without starting over', async (state) => {
+    const gateway = new FakeDeviceGateway();
+    gateway.recoveryConfirmError = new Error('private provider detail');
+    render(<DevicesScreen gateway={gateway} pollIntervalMs={60_000} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Set up recovery' }));
+    const form = await screen.findByRole('form', { name: 'Confirm recovery phrase' });
+    fillRecoveryWords(form);
+    gateway.recoveryOverviewValue = recoveryStatus(state);
+    fireEvent.submit(form);
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      state === 'complete' ? 'Recovery is ready.' : 'Recovery setup is being secured.',
+    );
+    expect(screen.queryByRole('button', { name: 'Set up recovery' })).not.toBeInTheDocument();
+    expect(gateway.recoveryCancelCalls).toEqual([]);
+    for (const canary of recoveryCanaries) {
+      expect(document.documentElement.outerHTML).not.toContain(canary);
+    }
+  });
+
+  it('keeps an unknown confirmation outcome closed until status can be retried', async () => {
+    const gateway = new FakeDeviceGateway();
+    gateway.recoveryConfirmError = new Error('private provider detail');
+    render(<DevicesScreen gateway={gateway} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Set up recovery' }));
+    const form = await screen.findByRole('form', { name: 'Confirm recovery phrase' });
+    fillRecoveryWords(form);
+    vi.spyOn(gateway, 'recoveryEnrollmentOverview').mockRejectedValueOnce(new Error('offline'));
+    fireEvent.submit(form);
+    const retry = await screen.findByRole('button', { name: 'Retry recovery status' });
+    expect(screen.queryByRole('button', { name: 'Set up recovery' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('form', { name: 'Confirm recovery phrase' })).not.toBeInTheDocument();
+    gateway.recoveryOverviewValue = recoveryStatus('complete');
+    fireEvent.click(retry);
+    expect(await screen.findByRole('status')).toHaveTextContent('Recovery is ready.');
+    expect(gateway.recoveryBeginCalls).toBe(1);
+    expect(gateway.recoveryCancelCalls).toEqual([]);
+  });
+
+  it('retries status after a submitting poll fails without replacing enrollment', async () => {
+    const gateway = new FakeDeviceGateway();
+    gateway.recoveryOverviewValue = recoveryStatus('submitting', enrollmentId);
+    vi.spyOn(gateway, 'recoveryEnrollmentStatus').mockRejectedValueOnce(new Error('offline'));
+    render(<DevicesScreen gateway={gateway} pollIntervalMs={5} />);
+    const retry = await screen.findByRole('button', { name: 'Retry recovery status' });
+    expect(screen.queryByRole('button', { name: 'Set up recovery' })).not.toBeInTheDocument();
+    gateway.recoveryOverviewValue = recoveryStatus('complete', enrollmentId);
+    fireEvent.click(retry);
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Recovery is ready.'));
+    expect(gateway.recoveryBeginCalls).toBe(0);
+  });
+
+  it('retries an unavailable initial recovery status', async () => {
+    const gateway = new FakeDeviceGateway();
+    vi.spyOn(gateway, 'recoveryEnrollmentOverview').mockRejectedValueOnce(new Error('offline'));
+    render(<DevicesScreen gateway={gateway} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry recovery status' }));
+    expect(await screen.findByRole('button', { name: 'Set up recovery' })).toBeEnabled();
+  });
+
   it('clears every entered word on mismatch and on unmount', async () => {
     const gateway = new FakeDeviceGateway();
     gateway.recoveryConfirmError = {

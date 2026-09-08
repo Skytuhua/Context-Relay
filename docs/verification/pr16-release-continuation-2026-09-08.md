@@ -688,3 +688,18 @@ Core and daemon all-target Clippy with test-support and warnings denied pass;
 three nested-condition style fixes were applied, then formatting/whitespace checks
 passed. Logs: `.codex/pr16-enrollment-renew-postgres-final.log` and
 `.codex/pr16-enrollment-renew-clippy-fix.log`.
+
+### Desktop recovery reconciliation
+
+Confirmation failures now read the daemon's saved enrollment status before offering
+new setup. Completed/submitting records remain visible, and an unavailable status
+keeps setup closed with an explicit retry. Initial overview and submitting-poll
+failures use the same retry action. Entered words are cleared after failed confirmation.
+
+Verification: five new cases cover completed/submitting outcomes, an unavailable
+confirmation status, initial-load failure and failed polling. The four initial cases
+failed before the fix. The full desktop suite passes 357 tests across 41 files;
+TypeScript and ESLint pass. Read-only review found no concrete P1/P2 in this diff.
+Logs: `.codex/pr16-recovery-ui-{red,green,suite}.log`.
+Managed Supabase run 34254584913 at 368c942 completed successfully. This does not
+replace live login, enrollment, second-device, signing or clean-machine acceptance.
