@@ -1114,3 +1114,26 @@ and the observed wait regression; all 140 contract tests and check:supabase pass
 The migration has only been applied to the disposable local database. Lookup,
 five-attempt exhaustion, cancellation, request/approval commits, endpoint wiring
 and real hosted acceptance remain unfinished.
+
+### Hosted code lookup and session reservation
+
+Migration `20260909040000_resolve_hosted_pairing.sql` adds a private failed-guess
+counter tied to the live Auth session. Concurrent guesses serialize on that row;
+the fifth failure persists and exhausts later lookups. Session deletion cleans
+up its counter. Only invites owned by the authenticated account can be located,
+and the first successful joining session reserves the invite permanently.
+Lookup rechecks current issuer binding, root, epochs and server expiry after
+locks. It creates no certificate or device trust.
+
+The local PostgreSQL suite passes 29 tests. The two new tests cover competing
+sessions, foreign ownership, eight concurrent guesses, exact retry, expiry,
+SQL permissions and an observed account-lock wait with joining-session expiry.
+Both lookup tests pass again after adding an Auth recheck following the counter
+lock. `check:supabase` passes; independent review found no P1/P2 in this slice.
+Only the disposable local database has been migrated. Cancellation, request and
+decision admission, Edge wiring, native transport and live pairing remain open.
+
+CI run `34271537065` at `2a83bcc` additionally reports successful macOS native
+Semgrep build-a and native-isolation jobs. Windows Rust tests and native Semgrep
+build-a remain in progress. This is scoped historical evidence, not current-head
+or installed-product qualification.

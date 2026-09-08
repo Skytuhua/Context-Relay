@@ -128,6 +128,71 @@ function enrollmentCommit(f, reservation, certificate = id()) {
     decode(repeat('49',80),'hex'),decode('010203','hex'));`;
 }
 
+test('pairing lookup reserves one session and persists the fifth failed guess', async () => {
+  const f = await enrollmentFixture(), other = await enrollmentFixture();
+  const sessions = [randomUUID(), randomUUID(), randomUUID()];
+  try {
+    const reservation = JSON.parse(await sql(f.request()));
+    await sql(enrollmentCommit(f, reservation));
+    const device = await sql(`select device_id from public.device_bindings where session_id='${f.session}'`);
+    const pairing = id();
+    await sql(`insert into auth.sessions(id,user_id) values ${sessions.map(session => `('${session}','${f.user}')`).join(',')}`);
+    await sql(`set role service_role; select public.service_create_pairing_invite('${f.user}','${f.session}',
+      '${reservation.workspaceId}','${device}','${pairing}',decode(repeat('42',32),'hex'));`);
+    const lookup = (session, digest = '42', user = f.user) => `set role service_role;
+      select public.service_resolve_pairing_code('${user}','${session}',decode(repeat('${digest}',32),'hex'));`;
+    const foreign = JSON.parse(await sql(lookup(other.session, '42', other.user)));
+    assert.deepEqual(foreign, { status: 'invalid' });
+    const results = await Promise.all(sessions.slice(0, 2).map(session => sql(lookup(session)).then(JSON.parse)));
+    assert.equal(results.filter(result => result.status === 'located').length, 1);
+    const winner = sessions[results.findIndex(result => result.status === 'located')];
+    assert.deepEqual(JSON.parse(await sql(lookup(winner))), { status: 'located', pairingId: pairing });
+    const guesses = await Promise.all(Array.from({ length: 8 }, () => sql(lookup(sessions[2], '43')).then(JSON.parse)));
+    assert.equal(guesses.filter(result => result.status === 'invalid').length, 4);
+    assert.equal(guesses.filter(result => result.status === 'exhausted').length, 4);
+    assert.deepEqual(JSON.parse(await sql(lookup(sessions[2]))), { status: 'exhausted' });
+    assert.equal(await sql(`select failed_attempts from context_relay_private.pairing_lookup_sessions where session_id='${sessions[2]}'`), '5');
+    await sql(`update context_relay_private.pairing_invites set created_at=statement_timestamp()-interval '10 minutes',
+      expires_at=statement_timestamp() where id='${pairing}'`);
+    assert.deepEqual(JSON.parse(await sql(lookup(winner))), { status: 'expired' });
+    for (const role of ['anon', 'authenticated']) await assert.rejects(sql(lookup(winner).replace('set role service_role', `set role ${role}`)), /permission denied/);
+    await assert.rejects(sql(lookup(winner, '42', other.user)), /pairing_denied/);
+    assert.equal(await sql(`select has_table_privilege('service_role','context_relay_private.pairing_lookup_sessions','select')`), 'f');
+  } finally {
+    await sql(`delete from auth.sessions where id in (${sessions.map(session => `'${session}'`).join(',')})`);
+    await f.cleanup(); await other.cleanup();
+  }
+});
+
+test('pairing lookup rolls back reservation when Auth expires during an account lock wait', async () => {
+  const f = await enrollmentFixture(), joining = randomUUID();
+  let release, outcome;
+  try {
+    const reservation = JSON.parse(await sql(f.request()));
+    await sql(enrollmentCommit(f, reservation));
+    const device = await sql(`select device_id from public.device_bindings where session_id='${f.session}'`);
+    const pairing = id();
+    await sql(`set role service_role; select public.service_create_pairing_invite('${f.user}','${f.session}',
+      '${reservation.workspaceId}','${device}','${pairing}',decode(repeat('42',32),'hex'));`);
+    await sql(`insert into auth.sessions(id,user_id,not_after) values ('${joining}','${f.user}',clock_timestamp()+interval '2 seconds')`);
+    release = await holdLock(`select id from public.accounts where id='${reservation.accountId}' for update`);
+    const application = `pairing-lookup-${randomUUID()}`;
+    outcome = sql(`set role service_role; select public.service_resolve_pairing_code('${f.user}','${joining}',decode(repeat('42',32),'hex'));`, application)
+      .then(value => ({ value }), error => ({ error }));
+    await waitUntilBlocked(application);
+    await sql(`select pg_sleep(greatest(0,extract(epoch from not_after-clock_timestamp())+0.1)) from auth.sessions where id='${joining}'`);
+    await release(); release = null;
+    assert.match((await outcome).error?.stderr ?? '', /pairing_denied/);
+    assert.equal(await sql(`select located_session_id is null from context_relay_private.pairing_invites where id='${pairing}'`), 't');
+    assert.equal(await sql(`select count(*) from context_relay_private.pairing_lookup_sessions where session_id='${joining}'`), '0');
+  } finally {
+    if (release) await release();
+    if (outcome) await outcome;
+    await sql(`delete from auth.sessions where id='${joining}'`);
+    await f.cleanup();
+  }
+});
+
 test('pairing invites require live device authority and preserve exact bounded retries', async () => {
   const f = await enrollmentFixture();
   try {
