@@ -1087,3 +1087,13 @@ successfully. Its downloaded log is retained locally. Existing opt-in model,
 credential and installation tests remain ignored, so this does not close the
 physical/credentialed release matrix. Full macOS build and Clippy previously
 passed on that same head. Current-head qualification remains required.
+
+### Hosted pairing locator boundary
+
+Pairing locators use ten uniformly random Crockford symbols (50 bits), rendered
+as `XXXXX-XXXXX`. Lookup uses HMAC-SHA256 over the ten symbols without the hyphen,
+matching the existing Rust provider. The helper accepts only the strict protocol
+format and copies/clears its temporary pepper buffer. Tests verify the digest
+against Node's independent HMAC implementation, rejected formats and input
+mutation isolation. All 71 affected Node checks pass. No invite table, expiry,
+lookup-attempt accounting or endpoint admission is claimed by this helper.
