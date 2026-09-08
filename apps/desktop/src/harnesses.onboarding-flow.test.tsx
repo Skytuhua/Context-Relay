@@ -129,7 +129,9 @@ it('separates review, acknowledged save, and the note test without claiming a ve
   // The separate approval instructions remain available, including exact commands.
   expect(within(approvals!).getByText('/hooks')).toBeInTheDocument();
   expect(f.api.createMemory).not.toHaveBeenCalled();
-  fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+  const next = screen.getByRole('button', { name: 'Continue' });
+  await waitFor(() => expect(next).toBeEnabled());
+  fireEvent.click(next);
   expect(screen.getByRole('region', { name: 'Read-note step' })).toBeVisible();
   expect(f.api.harnessExecutionStart).toHaveBeenCalledTimes(1);
 });
@@ -165,7 +167,9 @@ it('does not present an old harness result as the next step for a newly selected
   render(<f.Host />);
   await reviewAndApprove();
   await screen.findByRole('heading', { name: 'Test saved context next' });
-  fireEvent.click(screen.getByRole('button', { name: /Claude Code/ }));
+  const claude = screen.getByRole('button', { name: /Claude Code/ });
+  await waitFor(() => expect(claude).toBeEnabled());
+  fireEvent.click(claude);
   await screen.findByRole('heading', { name: 'Connect Claude Code' });
   expect(screen.queryByRole('region', { name: 'Setup result' })).not.toBeInTheDocument();
   expect(screen.queryByRole('heading', { name: 'Test saved context next' })).not.toBeInTheDocument();
