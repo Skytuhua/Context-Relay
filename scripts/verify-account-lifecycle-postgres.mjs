@@ -147,6 +147,34 @@ async function pairingDecisionFixture() {
     cleanup: async () => { await sql(`delete from auth.sessions where id='${joining}'`); await f.cleanup(); } };
 }
 
+test('pairing verification context selects original server authority and retains committed retry context', async () => {
+  const f = await pairingDecisionFixture();
+  try {
+    const issuer = await sql(`select device_id from public.device_bindings where session_id='${f.session}'`);
+    const context = `set role service_role; select public.service_pairing_verification_context('${f.user}','${f.session}',
+      '${f.reservation.workspaceId}','${issuer}','${f.pairing}');`;
+    const projection = JSON.parse(await sql(context));
+    assert.equal(projection.canonicalRequest, '010203');
+    assert.equal(projection.trusted.accountId, f.reservation.accountId);
+    assert.equal(projection.trusted.workspaceId, f.reservation.workspaceId);
+    assert.equal(projection.trusted.issuerDeviceId, issuer);
+    assert.equal(projection.trusted.controlEpoch, 1);
+    assert.equal(projection.trusted.keyEpoch, 1);
+    assert.equal(projection.trusted.issuerSigningKey, '46'.repeat(32));
+    assert.equal(projection.trusted.recoverySigningKey, '44'.repeat(32));
+    await assert.rejects(sql(context.replace(f.session,f.joining)), /pairing_denied/);
+    await assert.rejects(sql(context.replace(f.reservation.workspaceId,id())), /pairing_denied/);
+    await sql(`update public.recovery_roots set revoked_at=clock_timestamp() where account_id='${f.reservation.accountId}'`);
+    await assert.rejects(sql(context), /pairing_denied/);
+    await sql(`update public.recovery_roots set revoked_at=null where account_id='${f.reservation.accountId}'`);
+    const receipt = JSON.parse(await sql(f.decide()));
+    await sql(`update public.recovery_roots set revoked_at=clock_timestamp() where account_id='${f.reservation.accountId}'`);
+    assert.deepEqual(JSON.parse(await sql(context)), projection);
+    assert.deepEqual(JSON.parse(await sql(f.decide())), receipt);
+    for (const role of ['anon','authenticated']) await assert.rejects(sql(context.replace('set role service_role',`set role ${role}`)), /permission denied/);
+  } finally { await f.cleanup(); }
+});
+
 for (const action of ['approve','reject']) test(`pairing ${action} commits one durable decision without reactivating trust`, async () => {
   const f = await pairingDecisionFixture();
   try {

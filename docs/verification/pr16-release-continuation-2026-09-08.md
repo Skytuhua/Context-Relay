@@ -1198,3 +1198,25 @@ bounded independent SQL review pass. The tests use synthetic decoded fields;
 the service RPC requires Edge canonical/signature/proof verification, which is
 not yet wired. This migration has only run in the local disposable database.
 Live hosted and full release acceptance remain unproven.
+
+### Pairing verification context and Supabase adapter
+
+Migration `20260909080000_pairing_verification_context.sql` selects the stored
+request and original issuer/root keys for Edge approval verification. New
+decisions require live authority; committed decisions retain historical context
+for exact receipt replay after revocation. Original issuer session, account and
+workspace checks apply to both. The commit RPC remains the authority to install
+new trust.
+
+The pairing adapter maps all provider operations to service-only RPCs, hashes
+codes with a required 32-byte pepper, and sanitizes provider errors. It reuses
+the existing Supabase session clients and enrollment authentication/encoding
+helpers. No pairing HTTP endpoint is enabled by this change.
+
+All 38 local PostgreSQL tests pass (`.codex/pr16-context-full.log`); all 50
+affected enrollment, sync and pairing Node tests pass
+(`.codex/pr16-pairing-adapter-full.log`). Tests verify active versus historical
+context, wrong session/scope, keyed-only code storage and RPC field/error
+mapping. `check:supabase`, diff checks and bounded independent review pass.
+Strict HTTP request/response validation, endpoint proof enforcement, native
+integration and live/full-release acceptance remain required.
