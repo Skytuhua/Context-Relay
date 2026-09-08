@@ -433,4 +433,21 @@ cryptographic values, with no provider credential or private key. Added only tha
 commit/path/rule/line fingerprint to the reviewed ignore file and rationale ledger,
 updating its pinned byte count and digest. All five secret-scan workflow tests pass.
 Scanner detectors, full-history coverage and redaction remain unchanged. A clean
-full-history result for the updated commit must still be confirmed in CI.
+full-history result was confirmed by local Gitleaks (exit 0) and GitHub Secret Scan
+run `34242184513` on `adb65877c33354c6531fd913238f8b2d99a1d896` (success).
+
+## Hosted enrollment cryptographic verification
+
+The composed verifier now checks the recovery-root signature, genesis certificate
+signature and reservation-bound device proof over the Rust-compatible preimages.
+Native Web Crypto performs Ed25519 verification and X25519 contributory checks;
+explicit canonical-point and small-order rejection match the Rust key boundary.
+The verifier owns input, nonce and proof bytes before asynchronous work.
+
+The enrollment and sync Node suites pass 46 tests. Regressions include weak and
+noncanonical points, noncanonical signature scalars, caller-buffer mutation,
+invalid certificates and invalid wrapping keys even with valid outer signatures.
+The five secret-scan policy tests and Supabase contract check pass. Read-only
+review found no concrete P1/P2 issues. This verifies cryptography only: live
+reservation/session authorization, atomic hosted commit and production transport
+remain unfinished. No hosted endpoint or device authority is enabled by this work.

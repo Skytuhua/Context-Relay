@@ -1,3 +1,5 @@
+import { verifyEd25519Strict } from "./crypto.mjs";
+
 const DOMAIN = new TextEncoder().encode("context-relay/hosted-enrollment-device-proof/v1\0");
 
 function invalid() {
@@ -25,8 +27,7 @@ export async function verifyEnrollmentDeviceProof(context, canonicalRecord, devi
   let offset = 0;
   for (const part of parts) { preimage.set(part, offset); offset += part.length; }
   try {
-    const key = await crypto.subtle.importKey("raw", bytes(deviceKey, 32), { name: "Ed25519" }, false, ["verify"]);
-    if (!await crypto.subtle.verify("Ed25519", key, bytes(signature, 64), preimage)) throw invalid();
+    await verifyEd25519Strict(bytes(deviceKey, 32), bytes(signature, 64), preimage);
   } catch {
     throw invalid();
   }

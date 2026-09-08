@@ -1,4 +1,6 @@
 import { CanonicalReader } from "../sync/core.mjs";
+import { verifyEd25519Strict, validateWrappingKey } from "./crypto.mjs";
+import { verifyEnrollmentDeviceProof } from "./proof.mjs";
 
 const DOMAIN = new TextEncoder().encode("context-relay/recovery-enrollment-record/v1\0");
 const hex = bytes => Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
@@ -8,6 +10,33 @@ function id(reader) {
   if (bytes[6] >> 4 !== 7 || bytes[8] >> 6 !== 2) throw invalid();
   const value = hex(bytes);
   return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+}
+
+// Cryptographic verification does not authorize enrollment. The service must
+// still bind this result to a live, unexpired reservation and commit atomically.
+export async function verifyEnrollmentRecord(input, context, proof) {
+  try {
+    const record = decodeEnrollmentRecord(input);
+    if (!(context.nonce instanceof Uint8Array) || context.nonce.length !== 32
+      || !(proof instanceof Uint8Array) || proof.length !== 64) throw invalid();
+    context = { reservationId: context.reservationId, authUserId: context.authUserId,
+      sessionId: context.sessionId, nonce: Uint8Array.from(context.nonce) };
+    proof = Uint8Array.from(proof);
+    const uuidBytes = value => Uint8Array.from(value.replaceAll("-", "").match(/../g), byte => Number.parseInt(byte, 16));
+    const certificatePreimage = Uint8Array.from([
+      ...new TextEncoder().encode("context-relay/device-certificate/v1\0"), 0,
+      ...record.recoverySigningKey, ...uuidBytes(record.accountId), ...uuidBytes(record.workspaceId),
+      0, 0, 0, 1, ...record.requestNonce, ...uuidBytes(record.deviceId),
+      ...record.deviceSigningKey, ...record.deviceWrappingKey,
+    ]);
+    await verifyEd25519Strict(record.recoverySigningKey, record.certificateSignature, certificatePreimage);
+    await verifyEd25519Strict(record.recoverySigningKey, record.rootSignature, record.signingPreimage);
+    for (const key of [record.recoveryWrappingKey, record.deviceWrappingKey, record.ephemeralKey]) {
+      await validateWrappingKey(key);
+    }
+    await verifyEnrollmentDeviceProof(context, record.canonicalRecord, record.deviceSigningKey, proof);
+    return record;
+  } catch { throw invalid(); }
 }
 
 // Structural decoding only: neither these fields nor their signatures confer

@@ -1,10 +1,48 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { decodeEnrollmentRecord } from "../../supabase/functions/enrollment/record.mjs";
+import { createHash, createPrivateKey, createPublicKey, hkdfSync, pbkdf2Sync, sign } from "node:crypto";
+import { decodeEnrollmentRecord, verifyEnrollmentRecord } from "../../supabase/functions/enrollment/record.mjs";
 
 const fixtures = new URL("../../crates/core/tests/fixtures/", import.meta.url);
 const record = Buffer.from(readFileSync(new URL("recovery-enrollment-record-v1.hex", fixtures), "utf8").trim(), "hex");
+
+test("hosted verification requires valid record, certificate and device signatures", async () => {
+  const vector = JSON.parse(readFileSync(new URL("hosted-enrollment-proof-v1.json", fixtures)));
+  const context = { ...vector, nonce: Buffer.from(vector.nonce, "hex") };
+  const proof = Buffer.from(vector.signature, "hex");
+  const verified = await verifyEnrollmentRecord(record, context, proof);
+  assert.equal(verified.deviceId, "018f22e2-79b0-7cc8-98c4-dc0c0c07398b");
+  const changed = Buffer.from(record); changed[changed.length - 1] ^= 1;
+  await assert.rejects(verifyEnrollmentRecord(changed, context, proof));
+  await assert.rejects(verifyEnrollmentRecord(record, context, Buffer.alloc(64)));
+  const input = Buffer.from(record);
+  const pending = verifyEnrollmentRecord(input, context, proof);
+  input.fill(0); context.nonce.fill(0); context.sessionId = "changed"; proof.fill(0);
+  assert.deepEqual(Buffer.from((await pending).canonicalRecord), record);
+});
+
+test("valid outer signatures cannot conceal a bad certificate or wrapping key", async () => {
+  const vector = JSON.parse(readFileSync(new URL("hosted-enrollment-proof-v1.json", fixtures)));
+  const context = { ...vector, nonce: Buffer.from(vector.nonce, "hex") };
+  const privateKey = seed => createPrivateKey({ key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), Buffer.from(seed)]), format: "der", type: "pkcs8" });
+  // The existing fixture uses the public BIP39 zero-entropy test vector.
+  const seed = pbkdf2Sync([...Array(23).fill("abandon"), "art"].join(" "), "mnemonic", 2048, 64, "sha512");
+  const rootKey = privateKey(hkdfSync("sha256", seed, "context-relay/recovery/v1", "context-relay/recovery/signing/v1", 32));
+  const deviceKey = privateKey(Buffer.alloc(32, 0x11));
+  const decoded = decodeEnrollmentRecord(record);
+  assert.deepEqual(createPublicKey(rootKey).export({ format: "der", type: "spki" }).subarray(-32), Buffer.from(decoded.recoverySigningKey));
+  for (const field of ["certificateSignature", "recoveryWrappingKey", "ephemeralKey"]) {
+    const changed = Buffer.from(record);
+    const offset = record.indexOf(decoded[field]);
+    assert.ok(offset >= 0);
+    changed.fill(0, offset, offset + decoded[field].length);
+    const parsed = decodeEnrollmentRecord(changed);
+    changed.set(sign(null, parsed.signingPreimage, rootKey), changed.length - 64);
+    const proofPreimage = Buffer.concat([Buffer.from(vector.preimage, "hex").subarray(0, -32), createHash("sha256").update(changed).digest()]);
+    await assert.rejects(verifyEnrollmentRecord(changed, context, sign(null, proofPreimage, deviceKey)));
+  }
+});
 
 test("hosted decoder agrees with the canonical Rust record and signing preimage", () => {
   const decoded = decodeEnrollmentRecord(record);
