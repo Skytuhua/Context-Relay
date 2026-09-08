@@ -29,3 +29,8 @@ verify_jwt = false
 # verified sub/session_id binding before invoking service-only RPCs.
 [functions.account-lifecycle]
 verify_jwt = false
+
+# Enrollment derives user/session only through auth.getClaims(), then verifies
+# the reserved device proof before the service-only atomic commit.
+[functions.enrollment]
+verify_jwt = false

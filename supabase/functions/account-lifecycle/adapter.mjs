@@ -114,6 +114,15 @@ function exactProjection(value) {
   };
 }
 
+export function createSupabaseSessionClients({ createClient, env }) {
+  if (typeof createClient !== "function") throw providerError(null, "configuration_error");
+  const url = projectUrl(requiredEnvironment(env, "SUPABASE_URL"));
+  const publishableKey = requiredEnvironment(env, "SUPABASE_PUBLISHABLE_KEY");
+  const secretKey = requiredEnvironment(env, "CONTEXT_RELAY_SUPABASE_SECRET_KEY");
+  return { authClient: createClient(url, publishableKey, CLIENT_OPTIONS),
+    serviceClient: createClient(url, secretKey, CLIENT_OPTIONS) };
+}
+
 export function createSupabaseAccountLifecycleDependencies({
   createClient,
   env,
@@ -122,11 +131,7 @@ export function createSupabaseAccountLifecycleDependencies({
   if (typeof createClient !== "function" || typeof nowSeconds !== "function") {
     throw providerError(null, "configuration_error");
   }
-  const url = projectUrl(requiredEnvironment(env, "SUPABASE_URL"));
-  const publishableKey = requiredEnvironment(env, "SUPABASE_PUBLISHABLE_KEY");
-  const secretKey = requiredEnvironment(env, "CONTEXT_RELAY_SUPABASE_SECRET_KEY");
-  const authClient = createClient(url, publishableKey, CLIENT_OPTIONS);
-  const serviceClient = createClient(url, secretKey, CLIENT_OPTIONS);
+  const { authClient, serviceClient } = createSupabaseSessionClients({ createClient, env });
 
   return {
     async authenticate(token, { requireFreshCredential }) {

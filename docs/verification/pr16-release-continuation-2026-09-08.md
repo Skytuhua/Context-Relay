@@ -528,3 +528,22 @@ P1/P2 issue; contract and whitespace checks pass. Log: `.codex/pr16-enrollment-e
 The production Supabase adapter and entrypoint remain unfinished; this handler is
 not a deployed endpoint. Atomic-commit Supabase run `34245086183` on `9ad81a2`
 passed; that run predates the status migration and this handler.
+
+## Enrollment Supabase adapter and entrypoint
+
+Wired the handler to separate non-persisting Auth/service clients, reusing the
+lifecycle client's configuration validation. Authentication derives identity only
+from verified `getClaims` results. Reservation calls generate UUIDv7 account and
+workspace IDs and a random 32-byte nonce on the server. Commit maps the verified
+record to the 18-argument service-only transaction. Provider text stays internal.
+
+Added the pinned Supabase entrypoint and function configuration; platform JWT
+verification is disabled because the handler verifies the caller's Auth token in
+code before all service calls. Nothing has been deployed.
+
+All 28 enrollment/lifecycle and 38 sync Node checks pass, including client
+isolation, missing verified claims, server-generated scope, canonical metadata
+mapping and sanitized failures. Read-only review found no concrete P1/P2 issue.
+Contract and whitespace checks pass. Logs: `.codex/pr16-enrollment-adapter.log`
+and `.codex/pr16-enrollment-adapter-sync.log`. Native transport integration and
+live hosted acceptance remain unfinished.
