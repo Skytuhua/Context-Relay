@@ -50,7 +50,19 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
   const canApply = approved && matching && !expired && !conflicts && !busy;
   const shownHistory = includeObservedSetup(history, execution.outcome?.setup);
 
-  useEffect(() => { onBusy?.(!!busy); }, [busy, onBusy]);
+  // Read-only discovery can block settings changes without trapping navigation.
+  // Once a mutation is submitted or discovered, keep its navigation guard.
+  const navigationBusy = localBusy !== null || execution.starting || execution.pending !== null || preparation.busy;
+  const resultSelection = execution.outcome ? reviewed(execution.outcome.setup, projects).params : null;
+  const currentResult = resultSelection !== null && resultSelection.harness === harness &&
+    resultSelection.projectId === projectId && resultSelection.hermesProfile === (harness === 'hermes' ? canonicalProfile : null);
+  const guidedSaved = embedded && currentResult && execution.outcome?.setup.state === 'applied' && execution.outcome.status.error === null;
+  const needsProjectTrust = discovery?.harness === harness && harness === 'codex' &&
+    discovery.report.capability === 'blocked' && discovery.report.policyConflicts.includes('project_untrusted') &&
+    !discovery.report.policyConflicts.includes('managed_requirements_active');
+  const showLaunchHelp = !embedded || (!busy && !review && !preparation.target && needsProjectTrust);
+
+  useEffect(() => { onBusy?.(navigationBusy); }, [navigationBusy, onBusy]);
 
   useEffect(() => {
     if (!preferredHarness || preferredHarness === harness) return;
@@ -307,9 +319,9 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
           <input id="hermes-profile" value={profile} maxLength={64} required aria-invalid={!validProfile} aria-describedby="hermes-profile-help" disabled={busy === 'apply' || busy === 'rollback' || preparation.busy} onChange={(event) => { clearReview(); setProfile(event.target.value); const next = event.target.value.trim().toLowerCase(); if (/^[a-z0-9][a-z0-9_-]{0,63}$/.test(next)) onProfileChange?.(next); }} />
           <p id="hermes-profile-help">Use a profile name, such as default or coder. Leave default selected unless you created another profile. Folder paths are not profile names.</p>
         </div>}
-        <button className="primary-action" type="submit" disabled={!!busy || preparation.target !== null || !project || (harness === 'hermes' && !validProfile)}>{busy === 'preview' ? 'Checking harness…' : 'Review setup'}</button>
+        <button className={embedded && (review || guidedSaved) ? 'secondary-action' : 'primary-action'} type="submit" disabled={!!busy || preparation.target !== null || !project || (harness === 'hermes' && !validProfile)}>{busy === 'preview' ? 'Checking harness…' : 'Review setup'}</button>
       </form>
-      {project && <section className="help-content" aria-label="Open harness for project">
+      {project && showLaunchHelp && <section className="help-content" aria-label="Open harness for project">
         <p>{canOpenWindow ? 'Open ' : 'Copy the launch command to open '}{harnessNames[harness]} in <strong>{project.name}</strong>{canOpenWindow ? '' : ' using Terminal'} to review its sign-in or project approval prompts. Return here and check again when you finish.</p>
         <div className="toolbar-actions">
           {canOpenWindow && <button type="button" disabled={!!busy || (harness === 'hermes' && !validProfile)} onClick={() => void launch(false)}>Open {harnessNames[harness]} for this project</button>}
@@ -333,9 +345,9 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
         {!preparation.busy && !preparation.missing && <button type="button" className="secondary-action" disabled={!!busy} onClick={preparation.dismiss}>Dismiss preparation</button>}
       </section>}
       {execution.error && <p className="form-error" role="alert">{execution.error} <button type="button" onClick={execution.checkAgain}>Check again</button></p>}
-      {execution.outcome && <section aria-label="Setup result"><p className={execution.outcome.status.error ? 'form-error' : 'notice'} role={execution.outcome.status.error ? 'alert' : 'status'}>
+      {execution.outcome && (!embedded || currentResult) && <section aria-label="Setup result"><p className={execution.outcome.status.error ? 'form-error' : 'notice'} role={execution.outcome.status.error ? 'alert' : 'status'}>
         {outcomeText(execution.outcome.status.action, execution.outcome.setup.state, execution.outcome.status.error !== null)} {label(reviewed(execution.outcome.setup, projects))}.
-      </p>{execution.outcome.setup.state === 'applied' && <SetupNextSteps item={reviewed(execution.outcome.setup, projects)} />}</section>}
+      </p>{execution.outcome.setup.state === 'applied' && <SetupNextSteps item={reviewed(execution.outcome.setup, projects)} guided={guidedSaved} />}</section>}
       {discovery && discovery.report.capability !== 'full' && <section className="connection-result" aria-label="Harness availability">
         <h2 ref={resultHeadingRef} tabIndex={-1}>{harnessNames[discovery.harness]}{discovery.report.harnessVersion && discovery.report.harnessVersion !== 'unknown' ? ` ${discovery.report.harnessVersion}` : ''}</h2>
         <p role="status">{discovery.report.capability === 'missing'
@@ -391,7 +403,7 @@ export function HarnessesScreen({ gateway, projects, preferredProjectId, preferr
           <h3>{name} · setup {reference}</h3>
           <p>{execution.pending?.planId === summary.planId ? (execution.pending.action === 'apply' ? 'Saving settings…' : 'Undoing setup changes…') : setupStateText(state)}</p>
           <p className="help-text">{expiryText(summary.createdAt)}</p>
-          {item && state === 'applied' && saved?.state === 'applied' && execution.outcome?.setup.plan.planId !== summary.planId && <SetupNextSteps item={item} />}
+          {!embedded && item && state === 'applied' && saved?.state === 'applied' && execution.outcome?.setup.plan.planId !== summary.planId && <SetupNextSteps item={item} />}
           {item ? <details className="connection-history-details"><summary>View saved changes</summary><PlanDetails plan={item.plan} projectName={item.projectName} /></details>
             : <button type="button" className="secondary-action" disabled={!!busy} onClick={() => void loadSetup(summary.planId, 'details')}>View saved changes for {name}</button>}
           {(state === 'previewed' || state === 'applying') && <button type="button" className="secondary-action" disabled={!!busy} onClick={() => void loadSetup(summary.planId, 'review')}>Review saved setup for {name}</button>}
@@ -473,7 +485,13 @@ function SavedHookApprovals({ approval }: { approval: SavedMemoryHookApproval })
   </section>;
 }
 
-function SetupNextSteps({ item }: { item: ReviewedPlan }) {
+function SetupNextSteps({ item, guided = false }: { item: ReviewedPlan; guided?: boolean }) {
+  if (guided) return <section aria-label={`Finish setup for ${label(item)}`}>
+    <h4>Test saved context next</h4>
+    <p>Choose Continue to save a test note and ask {harnessNames[item.params.harness]} to read it. The next screen has the launch button and the exact prompt to send.</p>
+    <p>Settings are saved, but the connection has not been verified yet.</p>
+    <details><summary>Automatic context and harness approvals</summary><SetupNextSteps item={item} /></details>
+  </section>;
   return <section aria-label={`Finish setup for ${label(item)}`}>
     <h4>Connection has not been verified</h4>
     {item.params.harness === 'codex' ? <>
