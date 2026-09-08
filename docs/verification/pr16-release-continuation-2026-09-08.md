@@ -451,3 +451,19 @@ The five secret-scan policy tests and Supabase contract check pass. Read-only
 review found no concrete P1/P2 issues. This verifies cryptography only: live
 reservation/session authorization, atomic hosted commit and production transport
 remain unfinished. No hosted endpoint or device authority is enabled by this work.
+
+## First-device reservation qualification in progress
+
+Added a private per-user reservation and service-only RPC. It checks live Auth
+before insertion and after reservation locks, denies existing-account enrollment,
+returns the original challenge on a live same-operation retry, rejects competing
+operations, and permits bounded replacement after expiry. Reservations create no
+account or device authority. Scope IDs and nonce must come from the trusted Edge
+service; that endpoint and the atomic enrollment commit remain unfinished.
+
+Added ten pgTAP assertions and a dedicated Supabase CI step for permissions,
+stable retries, competing requests, expiry, rate limiting and expired sessions.
+These database assertions are pending execution; concurrent lock-wait expiry is
+also unverified. Read-only review found no concrete P1/P2 issue in this slice.
+Supabase contract and whitespace checks pass. The preceding crypto commit
+`2a809e9` passed Supabase run `34243369285` and Secret Scan run `34243369314`.

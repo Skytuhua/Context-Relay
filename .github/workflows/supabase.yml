@@ -68,6 +68,7 @@ jobs:
           PGPASSWORD: postgres
           PGDATABASE: postgres
       - run: pnpm supabase:test
+      - run: pnpm exec supabase test db supabase/tests/0002_hosted_enrollment_test.sql
       - run: pnpm supabase:lint
       - if: always()
         run: pnpm supabase:stop
