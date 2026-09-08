@@ -26,14 +26,20 @@ const id = () => randomUUID().replace(/^(.{14})./, (_, prefix) => `${prefix}7`);
 // Supabase's postgres role is not a superuser. Fixture administration needs
 // temporary owner membership; RPC assertions still explicitly SET ROLE service_role.
 let fixtureAuthority = false;
+let previousGrant;
 before(async () => {
-  assert.equal(await sql(`select exists(select 1 from pg_auth_members
-    where roleid='context_relay_rls_owner'::regrole and member=current_user::regrole)`), 'f');
-  await sql('grant context_relay_rls_owner to current_user with inherit true, set true');
+  previousGrant = JSON.parse(await sql(`select coalesce((select json_build_object(
+    'admin', admin_option, 'inherit', inherit_option, 'set', set_option)
+    from pg_auth_members where roleid='context_relay_rls_owner'::regrole
+      and member=current_user::regrole and grantor=current_user::regrole), 'null'::json)`));
+  await sql('grant context_relay_rls_owner to current_user with inherit true, set true granted by current_user');
   fixtureAuthority = true;
 });
 after(async () => {
-  if (fixtureAuthority) await sql('revoke context_relay_rls_owner from current_user');
+  if (fixtureAuthority) await sql(previousGrant
+    ? `grant context_relay_rls_owner to current_user with admin ${previousGrant.admin},
+        inherit ${previousGrant.inherit}, set ${previousGrant.set} granted by current_user`
+    : 'revoke context_relay_rls_owner from current_user granted by current_user');
 });
 
 async function fixture() {
