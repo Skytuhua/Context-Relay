@@ -1220,3 +1220,25 @@ context, wrong session/scope, keyed-only code storage and RPC field/error
 mapping. `check:supabase`, diff checks and bounded independent review pass.
 Strict HTTP request/response validation, endpoint proof enforcement, native
 integration and live/full-release acceptance remain required.
+
+### Pairing HTTP proof enforcement
+
+The pairing HTTP handler now covers create, resolve, status, cancel, request,
+submit, approve, reject and result. It verifies Auth claims, closes request and
+response shapes, bounds streamed bodies and canonical bytes, and checks IDs,
+scope, timestamps and receipt digests. Request and approval signatures plus
+original-session possession proofs are verified before their mutation RPCs.
+Approval verification uses server-selected authority. Reject/cancel continue
+to require original issuer authorization in SQL and install no trust.
+
+All 53 affected Node tests pass (`.codex/pr16-pairing-http-full.log`); all four
+handler tests pass after adding a composed HTTP/adapter test
+(`.codex/pr16-pairing-http-composed.log`). They use frozen Rust/Edge proofs,
+reject changed sessions/proofs/payloads, unknown fields and oversized requests,
+and verify bad proofs never reach the approval commit RPC. `check:supabase`,
+diff checks and bounded independent review pass. The function entry point and
+configuration are present but have not been deployed. Result retrieval checks
+the payload digest; native cryptographic verification and human safety-number
+confirmation remain mandatory before local installation. Native transport,
+daemon wiring, expired-invite cleanup and live/full-release acceptance remain
+unfinished.

@@ -12,6 +12,7 @@ const fail = code => { throw Object.assign(new Error(code), { code }); };
 const response = (status, body) => new Response(JSON.stringify(body), { status, headers });
 const exact = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value)
   && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+export { exact, uuid, hex, timestamp };
 function uuid(value, version = "7") {
   if (typeof value !== "string" || !new RegExp(`^[0-9a-f]{8}-[0-9a-f]{4}-${version}[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).test(value)) fail("invalid_request");
   return value;

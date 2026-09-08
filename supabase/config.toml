@@ -34,3 +34,7 @@ verify_jwt = false
 # the reserved device proof before the service-only atomic commit.
 [functions.enrollment]
 verify_jwt = false
+
+# Pairing verifies Auth claims and original-session device proofs before admission.
+[functions.pairing]
+verify_jwt = false
