@@ -17,6 +17,7 @@ use zeroize::Zeroizing;
 
 mod harness_launch;
 mod launch_plan;
+mod recovery_input;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -354,6 +355,66 @@ fn new_request_id() -> RecordId {
     RecordId::new(uuid::Uuid::now_v7()).expect("UUID v7 is a valid RecordId")
 }
 
+async fn recovery_restore_begin_with<P, F, D>(
+    prompt: P,
+    delegate: &mut D,
+) -> Result<Option<context_relay_protocol::RecoveryRestoreStatus>, ClientError>
+where
+    P: FnOnce() -> F,
+    F: Future<Output = Result<Option<context_relay_protocol::RecoveryPhraseWords>, &'static str>>,
+    D: RecoveryHostDelegate,
+{
+    use context_relay_protocol::{EmptyParams, RecoveryRestoreParams, RecoveryRestoreStatus};
+    let overview = delegate
+        .call(
+            ClientRole::DesktopRecoveryHost,
+            new_request_id(),
+            LocalRequest::RecoveryRestoreOverview(EmptyParams {}),
+        )
+        .await?;
+    match overview {
+        LocalResult::RecoveryRestoreStatus {
+            status: RecoveryRestoreStatus::Idle {},
+        } => {}
+        LocalResult::RecoveryRestoreStatus { status } => return Ok(Some(status)),
+        _ => return Err(invalid_result_error()),
+    }
+    let Some(words) = prompt().await.map_err(|message| ClientError {
+        code: ErrorCode::Internal,
+        message: message.into(),
+        field_path: None,
+        retryable: true,
+    })?
+    else {
+        return Ok(None);
+    };
+    match delegate
+        .call(
+            ClientRole::DesktopRecoveryHost,
+            new_request_id(),
+            LocalRequest::RecoveryRestoreBegin(RecoveryRestoreParams {
+                recovery_phrase_words: words,
+            }),
+        )
+        .await?
+    {
+        LocalResult::RecoveryRestoreStatus { status } => Ok(Some(status)),
+        _ => Err(invalid_result_error()),
+    }
+}
+
+#[tauri::command]
+async fn recovery_restore_begin(
+    app: AppHandle,
+    state: State<'_, DesktopRecoveryHostState>,
+) -> Result<Option<context_relay_protocol::RecoveryRestoreStatus>, ClientError> {
+    let mut client = state.client.lock().await;
+    let mut delegate = CachedRecoveryHostDelegate {
+        client: &mut client,
+    };
+    recovery_restore_begin_with(|| recovery_input::prompt(&app), &mut delegate).await
+}
+
 fn invalid_result_error() -> ClientError {
     ClientError {
         code: ErrorCode::InvalidRequest,
@@ -399,7 +460,8 @@ fn main() {
             harness_launch::open_harness_guide,
             local_request,
             recovery_enrollment_begin,
-            recovery_enrollment_confirm
+            recovery_enrollment_confirm,
+            recovery_restore_begin
         ])
         .run(tauri::generate_context!())
         .expect("Context Relay desktop shell should run");
@@ -467,6 +529,78 @@ mod tests {
     }
 
     struct PhrasePrompt(bool);
+
+    #[tokio::test]
+    async fn restore_input_cancel_never_submits_and_prepared_status_never_prompts() {
+        use context_relay_protocol::RecoveryRestoreStatus;
+        let mut canceled = RecordingDelegate {
+            results: [Ok(LocalResult::RecoveryRestoreStatus {
+                status: RecoveryRestoreStatus::Idle {},
+            })]
+            .into(),
+            ..Default::default()
+        };
+        let result = super::recovery_restore_begin_with(|| ready(Ok(None)), &mut canceled)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert_eq!(canceled.calls.len(), 1);
+        assert_eq!(canceled.calls[0].0, ClientRole::DesktopRecoveryHost);
+
+        let mut pending = RecordingDelegate {
+            results: [Ok(LocalResult::RecoveryRestoreStatus {
+                status: RecoveryRestoreStatus::Conflict {
+                    restore_id: "018f22e2-79b0-7cc8-98c4-dc0c0c075602".parse().unwrap(),
+                },
+            })]
+            .into(),
+            ..Default::default()
+        };
+        let result = super::recovery_restore_begin_with(
+            || async { panic!("must not prompt again") },
+            &mut pending,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Some(RecoveryRestoreStatus::Conflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn restore_input_submits_only_through_native_host_and_returns_public_status() {
+        use context_relay_protocol::RecoveryRestoreStatus;
+        let mut delegate = RecordingDelegate {
+            results: [
+                Ok(LocalResult::RecoveryRestoreStatus {
+                    status: RecoveryRestoreStatus::Idle {},
+                }),
+                Ok(LocalResult::RecoveryRestoreStatus {
+                    status: RecoveryRestoreStatus::Submitting {
+                        restore_id: "018f22e2-79b0-7cc8-98c4-dc0c0c075602".parse().unwrap(),
+                    },
+                }),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let result = super::recovery_restore_begin_with(
+            || ready(Ok(Some(phrase().recovery_phrase_words))),
+            &mut delegate,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Some(RecoveryRestoreStatus::Submitting { .. })
+        ));
+        assert_eq!(delegate.calls.len(), 2);
+        assert_eq!(delegate.calls[1].0, ClientRole::DesktopRecoveryHost);
+        assert!(
+            matches!(&delegate.calls[1].1, LocalRequest::RecoveryRestoreBegin(params) if params.recovery_phrase_words.as_words().len() == 24)
+        );
+    }
 
     impl RecoveryPhrasePrompt for PhrasePrompt {
         fn show(&self, phrase: &RecoveryEnrollmentPhrase) -> bool {

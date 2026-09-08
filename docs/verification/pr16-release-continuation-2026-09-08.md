@@ -944,3 +944,33 @@ The package is present in the mirror index inspected on September 9. The support
 All 25 native workflow checks pass; the added pin check first failed before the fix
 (`.codex/pr16-cygwin-pin-{red,green}.log`). Actual hosted build qualification is still
 required; this local check alone does not establish a successful Cygwin install.
+
+### Windows native recovery phrase entry
+
+The dedicated `recovery_restore_begin` Tauri command takes no phrase parameters
+from the renderer. It holds the existing native-host mutex, reads local overview,
+and opens the input dialog only while idle. Existing submitting/complete/conflict
+states return directly. Cancel sends no Begin request. Accepted words travel only
+through the authenticated native recovery-host IPC role; the command returns public
+status or cancellation.
+
+Windows uses a parent-owned Win32 modal dialog with a password edit control,
+Recover/Cancel buttons, keyboard navigation, a 1024-character input limit and a
+DWORD-aligned template. Rust temporary phrase buffers are zeroizing; input and undo
+buffers are cleared on completion, cancellation and destruction. Invalid characters
+are rejected before allocating decoded text. Uppercase ASCII words normalize to
+lowercase and exactly 24 words are required; the daemon performs cryptographic
+validation. The implementation follows the platform's
+[modal dialog contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-dialogboxindirectparamw).
+
+All 19 desktop Rust tests pass, including the real Win32 template/control/callback
+accept and cancel paths (closed during initialization, before display). Native host
+regressions verify no repeat prompt for durable state, no submit on cancellation,
+and native-only submission. Eight renderer bridge tests, TypeScript and scoped
+ESLint pass. Logs are `.codex/pr16-native-input-{red,final,renderer,typecheck}.log`.
+Independent read-only review found no concrete P1/P2. This is not interactive installed
+acceptance: visual/accessibility checks, macOS native input and the desktop recovery
+screen remain pending. Non-Windows hosts currently return an explicit unavailable
+error for this new command.
+
+Desktop all-target Clippy also passes with warnings denied (.codex/pr16-native-input-clippy.log). The daemon-boundary and whitespace checks pass.

@@ -17,6 +17,12 @@ beforeEach(() => {
     invoke.mockReset();
 });
 
+it('opens native recovery input without passing phrase data through invoke', async () => {
+  invoke.mockResolvedValueOnce(null);
+  await expect(new LocalClient().recoveryRestoreBegin()).resolves.toBeNull();
+  expect(invoke).toHaveBeenCalledExactlyOnceWith('recovery_restore_begin');
+});
+
 it('reads and retries search preparation through the typed protocol and rejects malformed progress', async () => {
   const gateway = new LocalWorkspaceGateway();
   const status = { phase: 'preparing', revision: '4' };
