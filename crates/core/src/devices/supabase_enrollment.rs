@@ -72,13 +72,24 @@ pub struct HostedEnrollmentClient {
 }
 impl HostedEnrollmentClient {
     /// Bind recovery to the discovered root and the client's original login session.
-    /// A caller resuming durable work must first match its persisted project and Auth identity.
     pub fn into_restore_transport<C: RecoveryEnrollmentClock>(
         self,
+        intent: &crate::vault::HostedRestoreIntent,
         snapshot: RecoveryRootSnapshot,
         device: Arc<crate::crypto::DeviceKeys>,
         clock: C,
     ) -> Result<HostedRecoveryRestoreTransport<C>, RecoveryTransportError> {
+        intent
+            .validate()
+            .map_err(|_| RecoveryTransportError::Invalid)?;
+        if intent.user_id != self.identity.user_id
+            || intent.session_id != self.identity.session_id
+            || validated_project_url(&intent.project_url)
+                .map_err(|_| RecoveryTransportError::Invalid)?
+                != self.project
+        {
+            return Err(RecoveryTransportError::Unauthorized);
+        }
         snapshot.validate_for(snapshot.scope)?;
         if snapshot.registered_at_ms > i64::MAX as u64 {
             return Err(RecoveryTransportError::Conflict);

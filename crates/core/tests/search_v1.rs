@@ -48,7 +48,8 @@ fn open_keyed(path: &std::path::Path, key: &[u8; 32]) -> rusqlite::Connection {
 fn downgrade_fixture_to_schema_26(path: &TempVault, keys: &MemoryKeyStore) {
     let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
     raw.execute_batch(
-        "DROP TABLE hosted_enrollment_intent;
+        "DROP TABLE hosted_restore_intent;
+         DROP TABLE hosted_enrollment_intent;
          DROP TRIGGER semantic_document_insert;
          DROP TRIGGER semantic_document_update;
          DROP TABLE semantic_embeddings;

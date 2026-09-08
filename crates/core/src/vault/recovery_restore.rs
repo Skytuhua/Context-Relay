@@ -1,5 +1,103 @@
 use std::fmt;
 
+/// Original hosted identity for recovery. Contains no credentials or recovery phrase.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostedRestoreIntent {
+    pub project_url: String,
+    pub user_id: uuid::Uuid,
+    pub session_id: uuid::Uuid,
+}
+
+impl HostedRestoreIntent {
+    pub(crate) fn validate(&self) -> Result<(), VaultError> {
+        if self.project_url.len() > 2048
+            || crate::sync::supabase::validated_project_url(&self.project_url).is_err()
+            || [self.user_id, self.session_id].iter().any(|id| {
+                id.get_variant() != uuid::Variant::RFC4122
+                    || !(1..=8).contains(&id.get_version_num())
+            })
+        {
+            return Err(validation());
+        }
+        Ok(())
+    }
+}
+
+fn load_hosted_restore_intent(
+    connection: &Connection,
+) -> Result<Option<HostedRestoreIntent>, VaultError> {
+    let payload: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT payload FROM hosted_restore_intent WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    payload
+        .map(|bytes| {
+            if bytes.len() > 8192 {
+                return Err(validation());
+            }
+            let intent: HostedRestoreIntent =
+                serde_json::from_slice(&bytes).map_err(|_| validation())?;
+            intent.validate()?;
+            Ok(intent)
+        })
+        .transpose()
+}
+
+impl Vault {
+    pub fn hosted_restore_intent(&self) -> Result<Option<HostedRestoreIntent>, VaultError> {
+        load_hosted_restore_intent(&self.connection)
+    }
+
+    /// Bind the original login before any claim is prepared or submitted.
+    pub fn store_hosted_restore_intent(
+        &mut self,
+        intent: &HostedRestoreIntent,
+    ) -> Result<(), VaultError> {
+        intent.validate()?;
+        let payload = serde_json::to_vec(intent).map_err(|_| validation())?;
+        if payload.len() > 8192 {
+            return Err(validation());
+        }
+        let transaction = self.connection.transaction()?;
+        if let Some(existing) = load_hosted_restore_intent(&transaction)? {
+            if existing != *intent {
+                return Err(VaultError::OperationConflict);
+            }
+        } else {
+            require_pristine_vault(&transaction)?;
+            if load_recovery_restore(&transaction)?.is_some() {
+                return Err(VaultError::OperationConflict);
+            }
+            transaction.execute(
+                "INSERT INTO hosted_restore_intent(singleton,payload) VALUES(1,?1)",
+                params![payload],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Only an exact, unprepared attempt can be abandoned for another login.
+    pub fn discard_unprepared_hosted_restore_intent(
+        &mut self,
+        expected: &HostedRestoreIntent,
+    ) -> Result<(), VaultError> {
+        let transaction = self.connection.transaction()?;
+        if load_recovery_restore(&transaction)?.is_some()
+            || load_hosted_restore_intent(&transaction)?.as_ref() != Some(expected)
+        {
+            return Err(VaultError::OperationConflict);
+        }
+        transaction.execute("DELETE FROM hosted_restore_intent WHERE singleton=1", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
 use context_relay_protocol::{
     AccountId, DeviceCertificateId, DeviceId, Ed25519PublicKeyBytes, RecoveryEnrollmentId,
     RecoveryRestoreId, RecoveryRootId, Sha256Digest, WorkspaceId, X25519PublicKeyBytes,
@@ -491,6 +589,11 @@ fn require_pristine_vault(transaction: &Transaction<'_>) -> Result<(), VaultErro
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
     for table in tables {
+        if table == "hosted_restore_intent" {
+            // The original hosted identity is durable before claim preparation.
+            load_hosted_restore_intent(transaction)?;
+            continue;
+        }
         if table == "recovery_restores"
             || table.starts_with("search_documents_")
             || table.starts_with("search_fts_")

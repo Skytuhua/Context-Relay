@@ -105,6 +105,79 @@ fn open_keyed(path: &Path, key: &[u8; 32]) -> Connection {
 }
 
 #[test]
+fn hosted_restore_intent_survives_restart_and_cannot_retarget_prepared_claims() {
+    use context_relay_core::vault::HostedRestoreIntent;
+    let path = TempVault::new("hosted-restore-intent");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let intent = HostedRestoreIntent {
+        project_url: "https://example.supabase.co".into(),
+        user_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+        session_id: "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+    };
+    vault.store_hosted_restore_intent(&intent).unwrap();
+    vault.store_hosted_restore_intent(&intent).unwrap();
+    let enrollment = context_relay_core::vault::HostedEnrollmentIntent {
+        project_url: intent.project_url.clone(),
+        user_id: intent.user_id,
+        session_id: intent.session_id,
+        operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c073901".parse().unwrap(),
+        reservation: None,
+    };
+    assert!(vault.store_hosted_enrollment_intent(&enrollment).is_err());
+    let mut changed = intent.clone();
+    changed.session_id = intent.user_id;
+    assert!(vault.store_hosted_restore_intent(&changed).is_err());
+    assert!(
+        vault
+            .discard_unprepared_hosted_restore_intent(&changed)
+            .is_err()
+    );
+    vault
+        .discard_unprepared_hosted_restore_intent(&intent)
+        .unwrap();
+    assert!(vault.hosted_restore_intent().unwrap().is_none());
+    vault.store_hosted_enrollment_intent(&enrollment).unwrap();
+    assert!(vault.store_hosted_restore_intent(&intent).is_err());
+    vault
+        .discard_unprepared_hosted_enrollment_intent(&enrollment)
+        .unwrap();
+    for invalid in [
+        HostedRestoreIntent {
+            project_url: "http://example.supabase.co".into(),
+            ..intent.clone()
+        },
+        HostedRestoreIntent {
+            user_id: uuid::Uuid::nil(),
+            ..intent.clone()
+        },
+    ] {
+        assert!(vault.store_hosted_restore_intent(&invalid).is_err());
+    }
+    vault.store_hosted_restore_intent(&intent).unwrap();
+    let (_, write) = provider_and_write(3_000);
+    vault.prepare_recovery_restore(&write).unwrap();
+    drop(vault);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(vault.hosted_restore_intent().unwrap(), Some(intent.clone()));
+    vault.store_hosted_restore_intent(&intent).unwrap();
+    assert!(
+        vault
+            .discard_unprepared_hosted_restore_intent(&intent)
+            .is_err()
+    );
+    assert!(vault.store_hosted_restore_intent(&changed).is_err());
+    let stored = vault.recovery_restore().unwrap().unwrap();
+    assert_eq!(stored.canonical_claim, write.canonical_claim);
+    assert_eq!(stored.state, RecoveryRestorePersistenceState::Prepared);
+    // Existing claims without hosted provenance must not acquire an arbitrary owner.
+    let other_path = TempVault::new("unbound-restore-intent");
+    let mut other = Vault::open(other_path.path(), CREDENTIAL, &keys).unwrap();
+    other.prepare_recovery_restore(&write).unwrap();
+    assert!(other.store_hosted_restore_intent(&intent).is_err());
+}
+
+#[test]
 fn prepared_restore_is_exact_without_installing_either_certificate() {
     let provider = InMemoryRecoveryEnrollmentProvider::new();
     provider
@@ -472,6 +545,7 @@ fn schema_29_preserves_prepared_and_active_restore_rows() {
             "INSERT INTO recovery_restores_legacy SELECT * FROM recovery_restores;
             DROP TABLE recovery_restores;
             ALTER TABLE recovery_restores_legacy RENAME TO recovery_restores;
+            DROP TABLE hosted_restore_intent;
             PRAGMA user_version = 29;",
         )
         .unwrap();

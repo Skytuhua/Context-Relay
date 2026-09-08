@@ -858,3 +858,32 @@ This is the core transport, not the complete product workflow. Durable hosted re
 intent must still bind the original Auth identity and project across daemon restart;
 trusted native phrase input and daemon/desktop commands remain required. Live hosted
 acceptance, signing, clean-machine qualification and the full release gates remain open.
+
+### Durable hosted restore identity
+
+Vault schema 31 adds a bounded public restore intent containing only the original
+Supabase project, Auth user and session. It is saved before claim preparation, survives
+restart, permits exact retries and cannot be reassigned to a different login. An existing
+claim without hosted provenance cannot acquire an arbitrary owner. Only the exact intent
+without a prepared claim may be discarded. Pending enrollment and restore intents are
+mutually exclusive.
+
+The native restore constructor now requires this intent and checks its project/user/session
+against the authenticated client. The pristine-vault check validates and permits the
+restore intent itself while preserving unrelated-data blockers. Its first regression
+failed when preparation incorrectly treated that required row as conflicting data.
+Existing schema downgrade fixtures now remove the new table before exercising migration.
+
+All 20 hosted Auth/transport tests, seven enrollment vault tests and 11 restore vault
+tests pass (`.codex/pr16-restore-intent-green.log`). These include original-project,
+user and session mismatch denial, exact restart replay, unprepared discard, mutual
+intent exclusion, missing provenance, migration and existing tamper rejection. The
+initial failure is retained in `.codex/pr16-restore-intent-red.log`; read-only review
+confirmed its fix and found no further concrete P1/P2.
+The schema-26 search and schema-24 native-memory migration checks also pass, as does
+core all-target Clippy with test-support and warnings denied (40 tests total;
+`.codex/pr16-restore-intent-{search-migration,native-migration,clippy}.log`).
+
+This establishes durable core provenance. Daemon orchestration must still persist/read
+the intent and dispatch recovery through the native phrase-input flow; it is not yet
+installed-product or live hosted acceptance.

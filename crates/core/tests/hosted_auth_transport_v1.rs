@@ -148,8 +148,52 @@ fn native_restore_transport_checks_claims_receipts_and_original_session() {
     )
     .unwrap();
     let initial = client.snapshot(NOW).unwrap().unwrap();
+    let original_intent = context_relay_core::vault::HostedRestoreIntent {
+        project_url: PROJECT.into(),
+        user_id: identity.user_id,
+        session_id: identity.session_id,
+    };
+    for changed in [
+        context_relay_core::vault::HostedRestoreIntent {
+            project_url: "https://another.supabase.co".into(),
+            ..original_intent.clone()
+        },
+        context_relay_core::vault::HostedRestoreIntent {
+            user_id: identity.session_id,
+            ..original_intent.clone()
+        },
+        context_relay_core::vault::HostedRestoreIntent {
+            session_id: identity.user_id,
+            ..original_intent.clone()
+        },
+    ] {
+        let bound = HostedEnrollmentClient::with_http_client(
+            owner.clone(),
+            identity,
+            owner.cancellation().unwrap(),
+            PROJECT,
+            "public-test",
+            http.clone(),
+        )
+        .unwrap();
+        assert!(
+            bound
+                .into_restore_transport(
+                    &changed,
+                    initial.clone(),
+                    Arc::new(DeviceKeys::from_seeds_for_test([0x66; 32], [0x77; 32])),
+                    Clock
+                )
+                .is_err()
+        );
+    }
     let transport = client
         .into_restore_transport(
+            &context_relay_core::vault::HostedRestoreIntent {
+                project_url: PROJECT.into(),
+                user_id: identity.user_id,
+                session_id: identity.session_id,
+            },
             initial.clone(),
             Arc::new(DeviceKeys::from_seeds_for_test([0x66; 32], [0x77; 32])),
             Clock,
@@ -282,11 +326,22 @@ fn native_restore_transport_checks_claims_receipts_and_original_session() {
         let path = support::TempVault::new("native-restore-clock");
         let keys = support::MemoryKeyStore::default();
         let mut vault = Vault::open(path.path(), "native-restore-clock", &keys).unwrap();
+        let intent = context_relay_core::vault::HostedRestoreIntent {
+            project_url: PROJECT.into(),
+            user_id: identity.user_id,
+            session_id: identity.session_id,
+        };
+        vault.store_hosted_restore_intent(&intent).unwrap();
         vault.prepare_recovery_restore(&write).unwrap();
         drop(vault);
         let mut vault = Vault::open(path.path(), "native-restore-clock", &keys).unwrap();
         let transport = client
-            .into_restore_transport(initial, device.clone(), clock.clone())
+            .into_restore_transport(
+                &vault.hosted_restore_intent().unwrap().unwrap(),
+                initial,
+                device.clone(),
+                clock.clone(),
+            )
             .unwrap();
         let coordinator = RecoveryRestoreCoordinator::new_for_test(
             clock.clone(),

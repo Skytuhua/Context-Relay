@@ -307,6 +307,8 @@ fn prepared_enrollment_activates_exactly_and_reopens_sealed_material() {
     raw.execute_batch(include_str!("../migrations/0022_recovery_enrollment.sql"))
         .unwrap();
     raw.execute_batch("INSERT INTO recovery_enrollments SELECT * FROM enrollment_fixture; DROP TABLE enrollment_fixture;").unwrap();
+    raw.execute_batch("DROP TABLE hosted_restore_intent;")
+        .unwrap();
     raw.pragma_update(None, "user_version", 28).unwrap();
     drop(raw);
     let reopened = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();

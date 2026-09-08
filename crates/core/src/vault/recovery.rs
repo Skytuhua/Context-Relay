@@ -133,7 +133,13 @@ impl Vault {
             if existing != *intent {
                 return Err(VaultError::OperationConflict);
             }
-        } else if load_recovery_enrollment(&transaction)?.is_some() {
+        } else if load_recovery_enrollment(&transaction)?.is_some()
+            || transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hosted_restore_intent)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
             // An already prepared enrollment cannot acquire a different hosted owner.
             return Err(VaultError::OperationConflict);
         }
@@ -280,6 +286,13 @@ impl Vault {
     ) -> Result<CommitDisposition, VaultError> {
         let candidate = validate_write(write)?;
         let transaction = self.connection.transaction()?;
+        if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hosted_restore_intent)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )? {
+            return Err(VaultError::OperationConflict);
+        }
         if let Some(intent) = load_hosted_intent(&transaction)? {
             let reservation = intent.reservation.ok_or(VaultError::OperationConflict)?;
             if candidate.record.account_id != reservation.account_id
