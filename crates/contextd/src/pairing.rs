@@ -37,7 +37,7 @@ pub(crate) struct PairingIdentity {
     pub(crate) device_id: DeviceId,
     pub(crate) device_name: String,
     pub(crate) platform: NativePlatform,
-    pub(crate) keys: DeviceKeys,
+    pub(crate) keys: std::sync::Arc<DeviceKeys>,
 }
 
 pub(crate) trait PairingService: Send + Sync {

@@ -650,3 +650,41 @@ the clock-domain finding and found no further concrete P1/P2.
 Logs: `.codex/pr16-enrollment-clock-{test,final,fixture,upgrade,clippy}.log`.
 Daemon wiring, reservation/session recovery, live acceptance and release gates
 remain incomplete; PR #16 is not merged.
+
+## Production daemon enrollment and expiry recovery (September 9)
+
+The build-configured daemon now connects hosted Auth to the existing enrollment
+coordinator through its ordered vault worker and shares its installed device keys.
+Startup validates local enrollment state without requiring hosted Auth restoration
+or network availability. An initial overview is read-only; Begin persists a scoped
+intent before reserve, then persists the challenge before creating the coordinator.
+
+Review found and corrected two expiry failures. The native transport now preserves
+an exact reservation-expired response separately from authentication denial. An
+explicit Begin may discard only an exact unprepared expired intent. Prepared
+records remain intact after expired commits. A service-only renewal RPC locks the
+original reservation, checks its live Auth session, and rotates only an expired,
+uncommitted challenge, retaining the operation/account/workspace and rate limit.
+Live and committed renewal retries keep their challenge. The vault compares the
+old intent before storing renewal; no prepared canonical record is replaced.
+
+Local evidence:
+- Earlier full daemon run: 93 passed, 4 existing ignored.
+- Expired-error transport/enrollment/recovery run: 17 + 12 + 13 passed.
+- Renewal native transport and vault run: 18 + 7 passed.
+- Updated daemon recovery tests: 6 passed, including lost reserve response/reset
+  and expired commit/renewal/reconciliation with identical canonical record bytes.
+  The mock checks durable intent before reserve and durable preparation before commit.
+- Local PostgreSQL: 16 passed, including scope-preserving renewal, unchanged retry,
+  old-nonce denial, runtime role/session denial and committed receipt preservation.
+- Enrollment Edge tests: 14 passed. Supabase contract check passed.
+
+Logs: `.codex/pr16-enrollment-{daemon-test,expired-test,renew-native-test,expiry-flow,
+renew-postgres,renew-node}.log`. This SQL migration was applied only to the local
+disposable PostgreSQL database. Managed Supabase CI and live product acceptance
+remain required. No hosted deployment or release publication has occurred.
+The final PostgreSQL run also passes the renewal rate-limit assertion (16/16).
+Core and daemon all-target Clippy with test-support and warnings denied pass;
+three nested-condition style fixes were applied, then formatting/whitespace checks
+passed. Logs: `.codex/pr16-enrollment-renew-postgres-final.log` and
+`.codex/pr16-enrollment-renew-clippy-fix.log`.

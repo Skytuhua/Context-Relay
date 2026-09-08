@@ -37,6 +37,21 @@ pub struct HostedEnrollmentReservation {
     pub nonce: Sha256Digest,
     pub expires_at: DecimalTimestamp,
 }
+impl HostedEnrollmentReservation {
+    pub(crate) fn validate_renewal(&self, previous: &Self) -> Result<(), RecoveryTransportError> {
+        if self.reservation_id != previous.reservation_id
+            || self.account_id != previous.account_id
+            || self.workspace_id != previous.workspace_id
+            || self.expires_at.0 < previous.expires_at.0
+            || self.expires_at.0 == 0
+            || self.expires_at.0 > i64::MAX as u64
+            || (self.expires_at == previous.expires_at) != (self.nonce == previous.nonce)
+        {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        Ok(())
+    }
+}
 
 /// Daemon-owned client. Credentials are resolved afresh for each operation and
 /// never persisted with the public reservation or passed to renderer IPC.
@@ -159,6 +174,13 @@ impl HostedEnrollmentClient {
         self.owner
             .session_for(&self.generation, self.identity, finished)
             .map_err(|_| RecoveryTransportError::Unauthorized)?;
+        if response.status() == 403
+            && response.body().len() <= 16 * 1024
+            && serde_json::from_slice::<serde_json::Value>(response.body()).ok()
+                == Some(serde_json::json!({"v":1,"error":"enrollment_reservation_expired"}))
+        {
+            return Err(RecoveryTransportError::Expired);
+        }
         match response.status() {
             200 => {}
             401 | 403 => return Err(RecoveryTransportError::Unauthorized),
@@ -226,6 +248,22 @@ impl HostedEnrollmentClient {
             return Err(RecoveryTransportError::Conflict);
         }
         Ok(Some(receipt.into_receipt()))
+    }
+
+    pub fn renew(
+        &self,
+        previous: &HostedEnrollmentReservation,
+        now: u64,
+    ) -> Result<HostedEnrollmentReservation, RecoveryTransportError> {
+        let (response, _): (ReservationResponse, _) = self.call(
+            serde_json::json!({"v":1,"action":"renew","reservationId":previous.reservation_id}),
+            now,
+        )?;
+        if response.v != 1 {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        response.reservation.validate_renewal(previous)?;
+        Ok(response.reservation)
     }
 
     pub fn commit(

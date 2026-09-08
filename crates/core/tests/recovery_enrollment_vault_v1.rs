@@ -148,6 +148,18 @@ fn hosted_intent_survives_restart_and_cannot_change_identity_or_challenge() {
         reservation: None,
     };
     vault.store_hosted_enrollment_intent(&intent).unwrap();
+    let mut foreign = intent.clone();
+    foreign.session_id = id("550e8400-e29b-41d4-a716-446655440009");
+    assert!(
+        vault
+            .discard_unprepared_hosted_enrollment_intent(&foreign)
+            .is_err()
+    );
+    vault
+        .discard_unprepared_hosted_enrollment_intent(&intent)
+        .unwrap();
+    assert!(vault.hosted_enrollment_intent().unwrap().is_none());
+    vault.store_hosted_enrollment_intent(&intent).unwrap();
     let fixture = fixture();
     assert!(
         vault
@@ -189,6 +201,48 @@ fn hosted_intent_survives_restart_and_cannot_change_identity_or_challenge() {
     assert_eq!(
         vault.hosted_enrollment_intent().unwrap(),
         Some(intent.clone())
+    );
+    let mut vault = vault;
+    assert!(matches!(
+        vault.discard_unprepared_hosted_enrollment_intent(&intent),
+        Err(VaultError::OperationConflict)
+    ));
+    let canonical = vault
+        .recovery_enrollment()
+        .unwrap()
+        .unwrap()
+        .canonical_record;
+    let mut renewed = intent.reservation.clone().unwrap();
+    renewed.nonce = Sha256Digest([44; 32]);
+    renewed.expires_at = DecimalTimestamp(1_200_000);
+    let mut wrong_scope = renewed.clone();
+    wrong_scope.workspace_id = id(OTHER_ID);
+    assert!(
+        vault
+            .renew_hosted_enrollment_intent(&intent, wrong_scope)
+            .is_err()
+    );
+    let replacement = vault
+        .renew_hosted_enrollment_intent(&intent, renewed.clone())
+        .unwrap();
+    assert!(
+        vault
+            .renew_hosted_enrollment_intent(&intent, renewed.clone())
+            .is_err()
+    );
+    assert_eq!(
+        vault
+            .renew_hosted_enrollment_intent(&replacement, renewed)
+            .unwrap(),
+        replacement
+    );
+    assert_eq!(
+        vault
+            .recovery_enrollment()
+            .unwrap()
+            .unwrap()
+            .canonical_record,
+        canonical
     );
 
     let legacy_path = TempVault::new("hosted-intent-existing-enrollment");

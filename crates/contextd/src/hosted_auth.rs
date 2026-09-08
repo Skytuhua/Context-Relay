@@ -210,6 +210,9 @@ async fn maintain_session(
 }
 
 impl HostedAuthService {
+    pub(crate) fn session_owner(&self) -> Option<Arc<HostedSessionOwner>> {
+        self.0.owner.clone()
+    }
     /// Initialize only after acquiring the daemon instance guard. These values are
     /// fixed by the build, so a launcher cannot redirect saved login credentials.
     pub(crate) async fn production() -> Result<Self, LoginError> {

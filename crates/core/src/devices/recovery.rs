@@ -362,6 +362,9 @@ where
             .ok_or(RecoveryEnrollmentCycleError::Conflict)?;
         let receipt = match self.transport.register(&stored.canonical_record, now_ms) {
             Ok(receipt) => receipt,
+            Err(RecoveryTransportError::Expired) => {
+                return Err(RecoveryEnrollmentCycleError::Expired);
+            }
             Err(RecoveryTransportError::Transient) => {
                 return Ok(RecoveryEnrollmentConfirmOutcome::Status(
                     status_from_stored(&stored),
@@ -481,6 +484,9 @@ where
                         }
                         None => match self.transport.register(&stored.canonical_record, now_ms) {
                             Ok(receipt) => receipt,
+                            Err(RecoveryTransportError::Expired) => {
+                                return Err(RecoveryEnrollmentCycleError::Expired);
+                            }
                             Err(RecoveryTransportError::Transient) => {
                                 return Ok(status_from_stored(&stored));
                             }
@@ -759,6 +765,7 @@ fn map_transport_error(error: RecoveryTransportError) -> RecoveryEnrollmentCycle
             RecoveryEnrollmentCycleError::Conflict
         }
         RecoveryTransportError::Unauthorized => RecoveryEnrollmentCycleError::Unauthorized,
+        RecoveryTransportError::Expired => RecoveryEnrollmentCycleError::Expired,
         RecoveryTransportError::Transient => RecoveryEnrollmentCycleError::Transient,
     }
 }

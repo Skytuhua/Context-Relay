@@ -237,7 +237,7 @@ struct VaultConfig {
     pairing_service: Option<Arc<dyn PairingService>>,
     recovery_enrollment_service: Option<Arc<dyn RecoveryEnrollmentService>>,
     account_lifecycle_service: Arc<dyn AccountLifecycleService>,
-    device_keys: Option<DeviceKeys>,
+    device_keys: Option<Arc<DeviceKeys>>,
     device_identity_credential_id: String,
     device_identity_store: Arc<dyn DeviceIdentityStore>,
     device_name: String,
@@ -356,13 +356,13 @@ impl VaultConfig {
         if self.device_keys.is_none()
             && (self.pairing_service.is_some() || self.recovery_enrollment_service.is_some())
         {
-            self.device_keys = Some(
+            self.device_keys = Some(Arc::new(
                 load_or_create_device_keys(
                     self.device_identity_store.as_ref(),
                     &self.device_identity_credential_id,
                 )
                 .map_err(|_| DaemonError::Startup)?,
-            );
+            ));
         }
         Ok(self)
     }
@@ -740,17 +740,50 @@ pub struct Daemon {
 impl Daemon {
     pub async fn start(config: DaemonConfig) -> Result<Self, DaemonError> {
         let mut instance = InstanceGuard::acquire(&config.runtime).map_err(map_guard_error)?;
+        let production_hosted = config.hosted_auth.is_none();
         let hosted_auth = match config.hosted_auth {
             Some(service) => service,
             None => hosted_auth::HostedAuthService::production()
                 .await
                 .map_err(|_| DaemonError::Startup)?,
         };
-        let mut vault_config = config.vault.load_device_identity()?;
+        let token = Arc::new(config.token_provider.load_or_create()?);
+        let mut vault_config = config
+            .vault
+            .with_device_id(stable_device_id(token.as_bytes()));
+        if production_hosted
+            && let (Some(owner), Some(project), Some(key)) = (
+                hosted_auth.session_owner(),
+                option_env!("CONTEXT_RELAY_HOSTED_URL"),
+                option_env!("CONTEXT_RELAY_HOSTED_PUBLISHABLE_KEY"),
+            )
+        {
+            let keys = Arc::new(
+                load_or_create_device_keys(
+                    vault_config.device_identity_store.as_ref(),
+                    &vault_config.device_identity_credential_id,
+                )
+                .map_err(|_| DaemonError::Startup)?,
+            );
+            vault_config.device_keys = Some(keys.clone());
+            vault_config.recovery_enrollment_service = Some(Arc::new(
+                recovery_enrollment::HostedRecoveryEnrollmentService::new(
+                    owner,
+                    project,
+                    key,
+                    PairingIdentity {
+                        device_id: vault_config.device_id,
+                        device_name: vault_config.device_name.clone(),
+                        platform: vault_config.platform,
+                        keys,
+                    },
+                ),
+            ));
+        }
+        let mut vault_config = vault_config.load_device_identity()?;
         let preparation = PreparationSupervisor::spawn().map_err(|_| DaemonError::Startup)?;
         vault_config.preparation = Some(preparation.client());
         let native_memory_probe = vault_config.native_memory_probe.clone();
-        let token = Arc::new(config.token_provider.load_or_create()?);
         let instance_nonce = generate_instance_nonce().map_err(|_| DaemonError::Startup)?;
         let (native_memory_updates, native_memory_update_receiver) = native_memory_update_channel();
         let mut worker = VaultWorker::spawn(
@@ -4595,7 +4628,7 @@ mod tests {
             device_id,
             device_name: "Restarted Approver".into(),
             platform: NativePlatform::Macos,
-            keys: DeviceKeys::generate().unwrap(),
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
         };
         let path = unique_temp_path("pairing-invite-restart").join("vault.db");
         let vault_keys = MemoryKeyStore::default();
@@ -4724,7 +4757,7 @@ mod tests {
             device_id: approver_device_id,
             device_name: "Approver".into(),
             platform: NativePlatform::Macos,
-            keys: DeviceKeys::generate().unwrap(),
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
         };
         let joiner_keys = DeviceKeys::generate().unwrap();
         let approver_path = unique_temp_path("pairing-rejected-approver").join("vault.db");

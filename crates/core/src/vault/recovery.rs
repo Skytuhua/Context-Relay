@@ -60,6 +60,54 @@ fn load_hosted_intent(
 }
 
 impl Vault {
+    /// Persist a server-renewed challenge without replacing the prepared record.
+    pub fn renew_hosted_enrollment_intent(
+        &mut self,
+        expected: &HostedEnrollmentIntent,
+        reservation: crate::devices::supabase_enrollment::HostedEnrollmentReservation,
+    ) -> Result<HostedEnrollmentIntent, VaultError> {
+        reservation
+            .validate_renewal(
+                expected
+                    .reservation
+                    .as_ref()
+                    .ok_or(VaultError::OperationConflict)?,
+            )
+            .map_err(|_| VaultError::OperationConflict)?;
+        let mut renewed = expected.clone();
+        renewed.reservation = Some(reservation);
+        renewed.validate()?;
+        let payload = serde_json::to_vec(&renewed).map_err(|_| validation())?;
+        if payload.len() > 8192 {
+            return Err(validation());
+        }
+        let transaction = self.connection.transaction()?;
+        if load_hosted_intent(&transaction)?.as_ref() != Some(expected) {
+            return Err(VaultError::OperationConflict);
+        }
+        transaction.execute(
+            "UPDATE hosted_enrollment_intent SET payload=?1 WHERE singleton=1",
+            params![payload],
+        )?;
+        transaction.commit()?;
+        Ok(renewed)
+    }
+    /// Discard only the exact unprepared intent. Prepared/accepted enrollment
+    /// records must be reconciled, never retargeted to a new hosted identity.
+    pub fn discard_unprepared_hosted_enrollment_intent(
+        &mut self,
+        expected: &HostedEnrollmentIntent,
+    ) -> Result<(), VaultError> {
+        let transaction = self.connection.transaction()?;
+        if load_recovery_enrollment(&transaction)?.is_some()
+            || load_hosted_intent(&transaction)?.as_ref() != Some(expected)
+        {
+            return Err(VaultError::OperationConflict);
+        }
+        transaction.execute("DELETE FROM hosted_enrollment_intent WHERE singleton=1", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
     pub fn hosted_enrollment_intent(&self) -> Result<Option<HostedEnrollmentIntent>, VaultError> {
         load_hosted_intent(&self.connection)
     }

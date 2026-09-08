@@ -237,7 +237,7 @@ where
             .submit_restore(&stored.canonical_claim, now_ms)
         {
             Ok(receipt) => receipt,
-            Err(RecoveryTransportError::Transient) => {
+            Err(RecoveryTransportError::Transient | RecoveryTransportError::Expired) => {
                 return Ok(RecoveryRestoreOutcome::Submitting { restore_id });
             }
             Err(RecoveryTransportError::Unauthorized) => {
@@ -267,7 +267,7 @@ where
             Err(RecoveryTransportError::Unauthorized) => {
                 return Err(RecoveryRestoreCycleError::Unauthorized);
             }
-            Err(RecoveryTransportError::Transient) => {
+            Err(RecoveryTransportError::Transient | RecoveryTransportError::Expired) => {
                 return Ok(RecoveryRestoreOutcome::Submitting { restore_id });
             }
         };
@@ -433,7 +433,9 @@ fn map_initial_transport_error(error: RecoveryTransportError) -> RecoveryRestore
             RecoveryRestoreCycleError::Conflict
         }
         RecoveryTransportError::Unauthorized => RecoveryRestoreCycleError::Unauthorized,
-        RecoveryTransportError::Transient => RecoveryRestoreCycleError::Transient,
+        RecoveryTransportError::Transient | RecoveryTransportError::Expired => {
+            RecoveryRestoreCycleError::Transient
+        }
     }
 }
 

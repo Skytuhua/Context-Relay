@@ -44,6 +44,11 @@ export function createSupabaseEnrollmentDependencies({ createClient, env }) {
       });
     },
     status(identity, operation) { return rpc("service_enrollment_status_for_session", identity, operation); },
+    renew(identity, operation) {
+      return rpc("service_renew_enrollment_for_session", identity, operation, {
+        p_nonce: bytea(crypto.getRandomValues(new Uint8Array(32))),
+      });
+    },
     commit(identity, operation, nonce, record) {
       return rpc("service_commit_enrollment_for_session", identity, operation, {
         p_nonce: bytea(nonce), p_account_id: record.accountId, p_workspace_id: record.workspaceId,

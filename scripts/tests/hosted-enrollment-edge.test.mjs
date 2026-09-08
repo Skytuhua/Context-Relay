@@ -19,6 +19,7 @@ function setup() {
   const dependencies = {
     async authenticate() { calls.push("auth"); return { userId: vector.authUserId, sessionId: vector.sessionId }; },
     async reserve() { calls.push("reserve"); return reservation; },
+    async renew() { calls.push("renew"); return reservation; },
     async status() { calls.push("status"); return { ...reservation, receipt: null }; },
     async commit(identity, operation, nonce, verified) {
       calls.push("commit");
@@ -50,7 +51,7 @@ test("invalid proof, client ownership fields and oversized streaming bodies cann
   assert.deepEqual(f.calls, []);
 });
 test("reserve/status use verified identity and closed provider projections", async () => {
-  for (const action of ["reserve", "status"]) {
+  for (const action of ["reserve", "renew", "status"]) {
     const f = setup();
     assert.equal((await f.handler(request({ v: 1, action, reservationId: vector.reservationId }))).status, 200);
     assert.deepEqual(f.calls, ["auth", action]);

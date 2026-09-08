@@ -128,6 +128,31 @@ function enrollmentCommit(f, reservation, certificate = id()) {
     decode(repeat('49',80),'hex'),decode('010203','hex'));`;
 }
 
+test('expired enrollment renewal rotates only the challenge and preserves committed receipts', async () => {
+  const f = await enrollmentFixture();
+  try {
+    const previous = JSON.parse(await sql(f.request()));
+    const renew = `set role service_role; select public.service_renew_enrollment_for_session(
+      '${f.user}','${f.session}','${previous.reservationId}',decode(repeat('51',32),'hex'));`;
+    assert.deepEqual(JSON.parse(await sql(renew)), previous);
+    await sql(`update context_relay_private.enrollment_reservations set expires_at=clock_timestamp()-interval '1 second' where auth_user_id='${f.user}'`);
+    const next = JSON.parse(await sql(renew));
+    for (const key of ['reservationId','accountId','workspaceId']) assert.equal(next[key],previous[key]);
+    assert.notEqual(next.nonce,previous.nonce);
+    assert.deepEqual(JSON.parse(await sql(renew.replace("repeat('51'", "repeat('52'"))),next);
+    await assert.rejects(sql(renew.replace('set role service_role','set role authenticated')), /permission denied/);
+    await assert.rejects(sql(renew.replace(f.session,randomUUID())), /enrollment_reservation_denied/);
+    await assert.rejects(sql(enrollmentCommit(f,previous)), /enrollment_reservation_denied/);
+    assert.equal(await sql(`select request_count from context_relay_private.enrollment_reservations where auth_user_id='${f.user}'`),'2');
+    await sql(`update context_relay_private.enrollment_reservations set request_count=6, expires_at=clock_timestamp()-interval '1 second' where auth_user_id='${f.user}'`);
+    await assert.rejects(sql(renew), /enrollment_rate_limited/);
+    await sql(`update context_relay_private.enrollment_reservations set request_count=2, expires_at=to_timestamp(${next.expiresAt}::numeric/1000) where auth_user_id='${f.user}'`);
+    const committed = JSON.parse(await sql(enrollmentCommit(f,next)));
+    assert.deepEqual(JSON.parse(await sql(renew)),next);
+    assert.deepEqual(JSON.parse(await sql(`set role service_role; select public.service_enrollment_status_for_session('${f.user}','${f.session}','${next.reservationId}');`)).receipt,committed);
+  } finally { await f.cleanup(); }
+});
+
 test('enrollment commit is atomic, exact on retry, and rejects changed records', async () => {
   const first = await enrollmentFixture(), second = await enrollmentFixture();
   try {

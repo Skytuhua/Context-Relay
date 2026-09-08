@@ -234,6 +234,12 @@ fn enrollment_reservation_uses_original_session_and_rejects_later_login() {
             "workspaceId":"018f22e2-79b0-7cc8-98c4-dc0c0c073903","nonce":"42".repeat(32),
             "expiresAt":((NOW+605)*1000).to_string()}}),
             ),
+            response(403, json!({"v":1,"error":"enrollment_reservation_expired"})),
+            response(403, json!({"v":1,"error":"enrollment_session_denied"})),
+            response(
+                403,
+                json!({"v":1,"error":"enrollment_reservation_expired","extra":true}),
+            ),
         ],
     );
     let owner = Arc::new(HostedSessionOwner::new(
@@ -270,6 +276,19 @@ fn enrollment_reservation_uses_original_session_and_rejects_later_login() {
         );
         assert_eq!(request.header("apikey"), Some("publishable-test"));
     }
+    use context_relay_core::devices::recovery_transport::RecoveryTransportError;
+    assert!(matches!(
+        transport.reserve(id, NOW),
+        Err(RecoveryTransportError::Expired)
+    ));
+    assert!(matches!(
+        transport.reserve(id, NOW),
+        Err(RecoveryTransportError::Unauthorized)
+    ));
+    assert!(matches!(
+        transport.reserve(id, NOW),
+        Err(RecoveryTransportError::Unauthorized)
+    ));
     let count = http.requests.lock().unwrap().len();
     owner.begin_login().unwrap();
     assert!(transport.reserve(id, NOW).is_err());
@@ -943,4 +962,58 @@ fn native_enrollment_coordinator_accepts_server_clock_skew_and_reopens() {
         assert_eq!(stored.provider_accepted_at_ms, Some(server_ms));
         assert_eq!(stored.completed_at_ms, Some(NOW * 1000));
     }
+}
+
+#[test]
+fn native_renewal_preserves_scope_and_requires_a_fresh_challenge() {
+    use context_relay_core::devices::supabase_enrollment::{
+        HostedEnrollmentClient, HostedEnrollmentReservation,
+    };
+    let previous = json!({"reservationId":"018f22e2-79b0-7cc8-98c4-dc0c0c073901",
+        "accountId":"018f22e2-79b0-7cc8-98c4-dc0c0c073902","workspaceId":"018f22e2-79b0-7cc8-98c4-dc0c0c073903",
+        "nonce":"42".repeat(32),"expiresAt":(NOW*1000).to_string()});
+    let mut renewed = previous.clone();
+    renewed["nonce"] = json!("43".repeat(32));
+    renewed["expiresAt"] = json!(((NOW + 600) * 1000).to_string());
+    let mut wrong_scope = renewed.clone();
+    wrong_scope["workspaceId"] = previous["accountId"].clone();
+    let mut old_nonce = renewed.clone();
+    old_nonce["nonce"] = previous["nonce"].clone();
+    let (auth, http) = client(
+        PROJECT,
+        vec![
+            tokens(&token(NOW + 900)),
+            response(200, json!({"id":USER})),
+            response(200, json!({"v":1,"reservation":renewed})),
+            response(200, json!({"v":1,"reservation":wrong_scope})),
+            response(200, json!({"v":1,"reservation":old_nonce})),
+        ],
+    );
+    let owner = Arc::new(HostedSessionOwner::new(
+        Arc::new(auth),
+        Arc::new(Store::default()),
+    ));
+    let attempt = owner.begin_login().unwrap();
+    let generation = attempt.cancellation();
+    let identity = owner.complete_login(attempt, exchange(), NOW).unwrap();
+    let client = HostedEnrollmentClient::with_http_client(
+        owner,
+        identity,
+        generation,
+        PROJECT,
+        "public-test",
+        http.clone(),
+    )
+    .unwrap();
+    let previous: HostedEnrollmentReservation = serde_json::from_value(previous).unwrap();
+    let next = client.renew(&previous, NOW).unwrap();
+    assert_eq!(serde_json::to_value(next).unwrap(), renewed);
+    let requests = http.requests.lock().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(requests.last().unwrap().body()).unwrap(),
+        json!({"v":1,"action":"renew","reservationId":previous.reservation_id})
+    );
+    drop(requests);
+    assert!(client.renew(&previous, NOW).is_err());
+    assert!(client.renew(&previous, NOW).is_err());
 }

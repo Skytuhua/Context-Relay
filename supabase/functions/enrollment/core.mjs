@@ -58,7 +58,7 @@ export function createEnrollmentEdgeHandler(dependencies) {
       let body;
       try { body = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await readBoundedBody(request, MAX_BYTES))); }
       catch (error) { fail(error?.code === "request_too_large" ? error.code : "invalid_request"); }
-      if (!body || body.v !== 1 || !["reserve", "status", "commit"].includes(body.action)
+      if (!body || body.v !== 1 || !["reserve", "renew", "status", "commit"].includes(body.action)
         || !exact(body, body.action === "commit" ? ["v", "action", "reservationId", "record", "proof"] : ["v", "action", "reservationId"])) fail("invalid_request");
       const operation = uuid(body.reservationId);
       const canonical = body.action === "commit" ? hex(body.record, 1, 32768) : null;
@@ -67,8 +67,8 @@ export function createEnrollmentEdgeHandler(dependencies) {
       if (authorization === null || !/^Bearer [^\s]+$/.test(authorization)) fail("auth_required");
       const authenticated = await dependencies.authenticate(authorization.slice(7));
       const identity = { userId: uuid(authenticated.userId, "[1-8]"), sessionId: uuid(authenticated.sessionId, "[1-8]") };
-      if (body.action === "reserve") {
-        const result = reservation(await dependencies.reserve(identity, operation), operation, false);
+      if (body.action === "reserve" || body.action === "renew") {
+        const result = reservation(await dependencies[body.action](identity, operation), operation, false);
         return response(200, { v: 1, reservation: result });
       }
       const status = reservation(await dependencies.status(identity, operation), operation, true);

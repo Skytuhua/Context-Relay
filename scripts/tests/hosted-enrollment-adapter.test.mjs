@@ -45,6 +45,10 @@ test("enrollment generates server scope and passes canonical fields to the seale
   assert.match(args.p_nonce, /^\\x[0-9a-f]{64}$/);
   await f.dependencies.status(identity, vector.reservationId);
   assert.equal(f.calls.at(-1).name, "service_enrollment_status_for_session");
+  await f.dependencies.renew(identity, vector.reservationId);
+  assert.equal(f.calls.at(-1).name, "service_renew_enrollment_for_session");
+  assert.deepEqual(Object.keys(f.calls.at(-1).args).sort(), ["p_auth_user_id", "p_nonce", "p_reservation_id", "p_session_id"]);
+  assert.match(f.calls.at(-1).args.p_nonce, /^\\x[0-9a-f]{64}$/);
   await f.dependencies.commit(identity, vector.reservationId, Buffer.from(vector.nonce, "hex"), record);
   const commit = f.calls.at(-1);
   assert.equal(commit.name, "service_commit_enrollment_for_session");
