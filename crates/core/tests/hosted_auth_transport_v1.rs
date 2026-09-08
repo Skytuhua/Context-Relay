@@ -21,6 +21,7 @@ const NOW: u64 = 1_800_000_000;
 
 #[derive(Default)]
 struct Store {
+    save_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     saved: Mutex<Option<StoredLogin>>,
     fail_save: std::sync::atomic::AtomicBool,
     fail_load: std::sync::atomic::AtomicBool,
@@ -34,6 +35,12 @@ impl LoginStore for Store {
         Ok(self.saved.lock().unwrap().clone())
     }
     fn save(&self, login: &StoredLogin) -> Result<(), LoginError> {
+        if let Some((started, release)) = self.save_gate.lock().unwrap().take() {
+            started.send(()).unwrap();
+            release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
         if self.fail_save.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(LoginError::CredentialStore);
         }
@@ -58,7 +65,15 @@ fn session_owner_persists_before_publication_and_invalidates_old_attempts() {
     let store = Arc::new(Store::default());
     let owner = HostedSessionOwner::new(Arc::new(client), store.clone());
     let old = owner.begin_login().unwrap();
+    let cancellation = old.cancellation();
+    cancellation.cancel();
+    assert!(owner.complete_login(old, exchange(), NOW).is_err());
+    let old = owner.begin_login().unwrap();
     let current = owner.begin_login().unwrap();
+    assert!(matches!(
+        owner.cancel_attempt(old.cancellation()),
+        Err(LoginError::Canceled)
+    ));
     assert!(owner.complete_login(old, exchange(), NOW).is_err());
     assert!(http.requests.lock().unwrap().is_empty());
     store
@@ -68,6 +83,54 @@ fn session_owner_persists_before_publication_and_invalidates_old_attempts() {
     assert!(owner.current_session(NOW).unwrap().is_none());
     assert!(store.saved.lock().unwrap().is_none());
     assert!(owner.restore(NOW).is_err());
+}
+
+#[test]
+fn cancellation_during_credential_write_clears_the_result_before_publication() {
+    let (client, _) = client(
+        PROJECT,
+        vec![tokens(&token(NOW + 900)), response(200, json!({"id":USER}))],
+    );
+    let store = Arc::new(Store::default());
+    let owner = Arc::new(HostedSessionOwner::new(Arc::new(client), store.clone()));
+    let attempt = owner.begin_login().unwrap();
+    let cancellation = attempt.cancellation();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *store.save_gate.lock().unwrap() = Some((started_tx, release_rx));
+    let worker = {
+        let owner = owner.clone();
+        std::thread::spawn(move || owner.complete_login(attempt, exchange(), NOW))
+    };
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    cancellation.cancel();
+    release_tx.send(()).unwrap();
+    assert!(matches!(worker.join().unwrap(), Err(LoginError::Canceled)));
+    assert!(store.saved.lock().unwrap().is_none());
+    assert!(owner.current_session(NOW).unwrap().is_none());
+}
+
+#[test]
+fn canceled_queued_begin_cannot_clear_a_newer_login() {
+    let (client, _) = client(
+        PROJECT,
+        vec![tokens(&token(NOW + 900)), response(200, json!({"id":USER}))],
+    );
+    let store = Arc::new(Store::default());
+    let owner = HostedSessionOwner::new(Arc::new(client), store.clone());
+    let delayed = context_relay_core::auth::LoginCancellation::default();
+    delayed.cancel();
+    owner
+        .complete_login(owner.begin_login().unwrap(), exchange(), NOW)
+        .unwrap();
+    assert!(matches!(
+        owner.begin_login_cancellable(delayed),
+        Err(LoginError::Canceled)
+    ));
+    assert!(owner.current_session(NOW).unwrap().is_some());
+    assert!(store.saved.lock().unwrap().is_some());
 }
 
 #[test]

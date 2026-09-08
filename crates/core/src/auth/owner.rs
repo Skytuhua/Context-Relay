@@ -2,18 +2,34 @@ use super::{
     HostedIdentity, HostedSession, LoginError, LoginExchange, LoginStore, SupabaseAuthClient,
 };
 use std::{
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
 /// Opaque, single-use ownership of a browser login attempt.
-pub struct LoginAttempt(Arc<()>);
+pub struct LoginAttempt(Arc<AtomicBool>);
+#[derive(Clone, Default)]
+pub struct LoginCancellation(Arc<AtomicBool>);
+impl LoginAttempt {
+    pub fn cancellation(&self) -> LoginCancellation {
+        LoginCancellation(self.0.clone())
+    }
+}
+impl LoginCancellation {
+    /// Immediately withdraws this generation; the owner performs credential cleanup.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
 pub struct LogoutOutcome {
     pub local: Result<(), LoginError>,
     pub remote: Option<Result<(), LoginError>>,
 }
 struct State {
-    generation: Arc<()>,
+    generation: Arc<AtomicBool>,
     initialized: bool,
     busy: bool,
     session: Option<Arc<HostedSession>>,
@@ -32,7 +48,7 @@ impl HostedSessionOwner {
             client,
             store,
             state: Mutex::new(State {
-                generation: Arc::new(()),
+                generation: Arc::new(AtomicBool::new(false)),
                 initialized: false,
                 busy: false,
                 session: None,
@@ -43,26 +59,43 @@ impl HostedSessionOwner {
         self.state.lock().map_err(|_| LoginError::Unavailable)
     }
     fn invalidate(state: &mut State) {
-        state.generation = Arc::new(());
+        state.generation.store(true, Ordering::SeqCst);
+        state.generation = Arc::new(AtomicBool::new(false));
         state.initialized = true;
         state.busy = false;
         state.session = None;
     }
     /// Call before starting the loopback listener/browser flow. Supersedes old work.
     pub fn begin_login(&self) -> Result<LoginAttempt, LoginError> {
+        self.begin_login_cancellable(LoginCancellation::default())
+    }
+    /// A queued worker must check its reservation before mutating a newer login.
+    pub fn begin_login_cancellable(
+        &self,
+        cancellation: LoginCancellation,
+    ) -> Result<LoginAttempt, LoginError> {
         let mut state = self.lock()?;
+        if cancellation.0.load(Ordering::SeqCst) || Arc::ptr_eq(&cancellation.0, &state.generation)
+        {
+            return Err(LoginError::Canceled);
+        }
         Self::invalidate(&mut state);
+        state.generation = cancellation.0;
         self.store.clear()?;
         state.busy = true;
         Ok(LoginAttempt(state.generation.clone()))
     }
     pub fn cancel_login(&self, attempt: LoginAttempt) -> Result<(), LoginError> {
+        self.cancel_attempt(attempt.cancellation())
+    }
+    pub fn cancel_attempt(&self, cancellation: LoginCancellation) -> Result<(), LoginError> {
+        cancellation.cancel();
         let mut state = self.lock()?;
-        if !Arc::ptr_eq(&attempt.0, &state.generation) {
+        if !Arc::ptr_eq(&cancellation.0, &state.generation) {
             return Err(LoginError::Canceled);
         }
         Self::invalidate(&mut state);
-        Ok(())
+        self.store.clear()
     }
     pub fn complete_login(
         &self,
@@ -72,7 +105,10 @@ impl HostedSessionOwner {
     ) -> Result<HostedIdentity, LoginError> {
         {
             let state = self.lock()?;
-            if !state.busy || !Arc::ptr_eq(&attempt.0, &state.generation) {
+            if !state.busy
+                || attempt.0.load(Ordering::SeqCst)
+                || !Arc::ptr_eq(&attempt.0, &state.generation)
+            {
                 return Err(LoginError::Canceled);
             }
         }
@@ -119,6 +155,9 @@ impl HostedSessionOwner {
     pub fn refresh(&self, now: u64) -> Result<HostedIdentity, LoginError> {
         let (generation, session) = {
             let mut state = self.lock()?;
+            if state.generation.load(Ordering::SeqCst) {
+                return Err(LoginError::Canceled);
+            }
             if state.busy {
                 return Err(LoginError::Busy);
             }
@@ -137,7 +176,7 @@ impl HostedSessionOwner {
     }
     fn finish(
         &self,
-        generation: Arc<()>,
+        generation: Arc<AtomicBool>,
         result: Result<Option<HostedSession>, LoginError>,
         now: u64,
     ) -> Result<Option<HostedIdentity>, LoginError> {
@@ -147,6 +186,11 @@ impl HostedSessionOwner {
             return Err(LoginError::Canceled);
         }
         state.busy = false;
+        if generation.load(Ordering::SeqCst) {
+            state.session = None;
+            self.store.clear()?;
+            return Err(LoginError::Canceled);
+        }
         let result = match result {
             Err(error @ (LoginError::Denied | LoginError::Provider | LoginError::Expired)) => {
                 state.session = None;
@@ -169,6 +213,11 @@ impl HostedSessionOwner {
             self.store.clear()?;
             return Err(error);
         }
+        if generation.load(Ordering::SeqCst) {
+            state.session = None;
+            self.store.clear()?;
+            return Err(LoginError::Canceled);
+        }
         if session.expires_at() <= now.saturating_add(started.elapsed().as_secs()) {
             state.session = None;
             self.store.clear()?;
@@ -180,8 +229,11 @@ impl HostedSessionOwner {
     }
     /// Daemon-only transport access; credentials must never be serialized to IPC.
     pub fn current_session(&self, now: u64) -> Result<Option<Arc<HostedSession>>, LoginError> {
-        Ok(self
-            .lock()?
+        let state = self.lock()?;
+        if state.generation.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        Ok(state
             .session
             .as_ref()
             .filter(|s| s.expires_at() > now)

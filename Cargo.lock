@@ -730,6 +730,7 @@ dependencies = [
 name = "context-relay-contextd"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "context-relay-core",
  "context-relay-local-ipc",
  "context-relay-native-runner",

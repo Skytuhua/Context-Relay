@@ -2,7 +2,7 @@
 
 mod owner;
 mod storage;
-pub use owner::{HostedSessionOwner, LoginAttempt, LogoutOutcome};
+pub use owner::{HostedSessionOwner, LoginAttempt, LoginCancellation, LogoutOutcome};
 mod transport;
 pub use storage::{LoginStore, PlatformLoginStore, StoredLogin};
 pub use transport::{HostedIdentity, HostedSession, SupabaseAuthClient};

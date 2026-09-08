@@ -2,10 +2,14 @@
 
 use std::{
     net::SocketAddr,
-    time::{Duration, Instant},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use context_relay_core::auth::{LoginError, LoginExchange, PendingLogin};
+use context_relay_core::auth::{
+    HostedIdentity, HostedSessionOwner, LoginAttempt, LoginCancellation, LoginError, LoginExchange,
+    PendingLogin,
+};
 use reqwest::Url;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -16,6 +20,92 @@ pub struct LoopbackLogin {
     listener: TcpListener,
     pending: PendingLogin,
     deadline: tokio::time::Instant,
+}
+
+/// Owns the listener and session attempt together. Dropping it withdraws the
+/// attempt immediately and schedules blocking credential cleanup on the runtime.
+pub struct DaemonLogin {
+    owner: Arc<HostedSessionOwner>,
+    listener: Option<LoopbackLogin>,
+    attempt: Option<LoginAttempt>,
+    cancellation: Option<LoginCancellation>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl DaemonLogin {
+    pub async fn begin(project: &str, owner: Arc<HostedSessionOwner>) -> Result<Self, LoginError> {
+        let listener = LoopbackLogin::bind(project).await?;
+        let runtime = tokio::runtime::Handle::current();
+        let cancellation = LoginCancellation::default();
+        let mut flow = Self {
+            owner: owner.clone(),
+            listener: Some(listener),
+            attempt: None,
+            cancellation: Some(cancellation.clone()),
+            runtime,
+        };
+        let attempt =
+            tokio::task::spawn_blocking(move || owner.begin_login_cancellable(cancellation))
+                .await
+                .map_err(|_| LoginError::Unavailable)??;
+        flow.attempt = Some(attempt);
+        Ok(flow)
+    }
+
+    /// Open this URL only after begin succeeds; it contains no verifier or tokens.
+    pub fn authorization_url(&self) -> Result<Url, LoginError> {
+        self.listener
+            .as_ref()
+            .map(LoopbackLogin::authorization_url)
+            .ok_or(LoginError::Canceled)
+    }
+
+    pub async fn wait(mut self) -> Result<HostedIdentity, LoginError> {
+        let exchange = self
+            .listener
+            .take()
+            .ok_or(LoginError::Canceled)?
+            .wait()
+            .await?;
+        let attempt = self.attempt.take().ok_or(LoginError::Canceled)?;
+        let owner = self.owner.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| LoginError::Unavailable)?
+                .as_secs();
+            owner.complete_login(attempt, exchange, now)
+        })
+        .await
+        .map_err(|_| LoginError::Unavailable)?;
+        if result.is_ok() {
+            self.cancellation = None;
+        }
+        result
+    }
+
+    /// Returns only after the owner has processed cancellation and local cleanup.
+    pub async fn cancel(mut self) -> Result<(), LoginError> {
+        self.listener = None;
+        let cancellation = self.cancellation.take().ok_or(LoginError::Canceled)?;
+        cancellation.cancel();
+        let owner = self.owner.clone();
+        tokio::task::spawn_blocking(move || owner.cancel_attempt(cancellation))
+            .await
+            .map_err(|_| LoginError::Unavailable)?
+    }
+}
+
+impl Drop for DaemonLogin {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.cancellation.take() {
+            cancellation.cancel();
+            let owner = self.owner.clone();
+            self.runtime.spawn_blocking(move || {
+                let _ = owner.cancel_attempt(cancellation);
+            });
+        }
+    }
 }
 
 impl LoopbackLogin {

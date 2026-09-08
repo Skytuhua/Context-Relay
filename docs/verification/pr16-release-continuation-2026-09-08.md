@@ -261,3 +261,27 @@ and IPC integration before production activation. This does not close the remain
 hosted provisioning, product workflows, signing or clean-machine release gates.
 Core/daemon all-target Clippy passes with test-support and warnings denied;
 formatting, whitespace and Graphify update checks pass.
+
+## Daemon loopback/session integration
+
+`DaemonLogin` now owns the callback listener and session attempt together. It
+creates cancellation ownership before dispatching blocking work; a canceled
+queued worker checks that reservation under the owner lock before mutating state.
+Callback exchange and credential persistence run outside the async runtime's
+workers and outside the ordered vault worker. Dropping a flow immediately marks
+its generation canceled and schedules conditional cleanup; explicit cancellation
+waits for cleanup and reports failures. Successful completion disarms that guard.
+The owner rejects canceled generations before exchange and after credential writes,
+and no longer exposes canceled sessions through its transport accessor.
+
+The missing cancellation check failed before implementation. Twelve core auth
+tests pass, including cancellation during an OS-store write and rejection of a
+canceled queued start without clearing a newer login. Four existing loopback tests
+pass. Four daemon flow tests cover successful persisted login, listener cleanup,
+aborted exchange and canceled queued start; runtime draining verifies detached
+work cannot publish late. Independent review identified the queued-start race,
+then verified its fix with no remaining concrete P1/P2 finding. This is tested
+daemon flow plumbing; IPC routing, browser launch, production configuration and
+the remaining full-release gates are still unfinished.
+Core/daemon all-target Clippy passes with test-support and warnings denied;
+formatting, whitespace and Graphify update checks pass.
