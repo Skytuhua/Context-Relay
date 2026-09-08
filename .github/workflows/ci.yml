@@ -453,6 +453,7 @@ jobs:
           $cygwinSetup = 'C:\cygwin\setup-x86_64.exe'
           if (-not (Test-Path -LiteralPath $cygwinSetup -PathType Leaf)) { throw 'the pinned setup-ocaml Cygwin installer is missing' }
           $packages = @(
+            'cygwin=3.6.10-1',
             'mingw64-i686-curl',
             'mingw64-i686-gmp',
             'mingw64-i686-pcre2',

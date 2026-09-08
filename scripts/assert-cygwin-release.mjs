@@ -11,7 +11,7 @@ export function acceptsCygwinRelease(release, version) {
 if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename)) {
   const [release, version] = process.argv.slice(2);
   if (!acceptsCygwinRelease(release, version)) {
-    process.stderr.write(`Cygwin ${version ?? '<missing>'} is required\n`);
+    process.stderr.write(`Cygwin ${version ?? '<missing>'} is required; received ${JSON.stringify(release ?? '<missing>')}\n`);
     process.exitCode = 1;
   }
 }

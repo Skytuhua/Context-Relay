@@ -928,3 +928,19 @@ Previous-head CI at b876ed5 has a failed Windows Semgrep build-a job
 (34264073501 / 102191165003): exact builder verification rejects the installed
 Cygwin version against pinned 3.6.10. Its log does not report the observed version.
 This environment qualification remains unresolved; the version check is retained.
+
+### Windows Cygwin provisioning correction
+
+The complete b876ed5 job log shows setup-ocaml installed
+`cygwin 3.7.0-0.590.gdae171e433cd` from the current mirror. The setup action's
+cache key was 3.6.9, but that key does not pin the package selected by its installer.
+The signed-metadata installer now explicitly requests `cygwin=3.6.10-1` in the
+existing dependency provisioning step. Exact runtime/provenance verification remains
+unchanged, and rejection now reports the observed runtime version.
+
+The package is present in the mirror index inspected on September 9. The supported
+`--packages package=version` syntax is documented in the
+[Cygwin setup change](https://cygwin.com/pipermail/cygwin-apps-cvs/2021q2/002308.html).
+All 25 native workflow checks pass; the added pin check first failed before the fix
+(`.codex/pr16-cygwin-pin-{red,green}.log`). Actual hosted build qualification is still
+required; this local check alone does not establish a successful Cygwin install.

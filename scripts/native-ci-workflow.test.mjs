@@ -231,6 +231,7 @@ test('Windows native CI pins and records its exact AMD64 toolchain', async () =>
   assert.match(windows, /v24\.14\.0/);
   assert.match(windows, /cygcheck\.exe -cd/);
   assert.match(windows, /assert-cygwin-release\.mjs/);
+  assert.match(windows, /'cygwin=3\.6\.10-1'/);
   assert.match(windows, /--windows-evidence/);
   assert.match(windows, /--windows-stable-toolchain/);
   for (const block of windows.split(/(?=      - name:|      - uses:)/)) {
