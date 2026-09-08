@@ -50,6 +50,7 @@ use tokio::{
 mod account_lifecycle;
 pub mod bridge_install;
 pub mod harness_preparation;
+pub mod hosted_login;
 mod native_memory;
 mod pairing;
 mod recovery_enrollment;

@@ -737,6 +737,7 @@ dependencies = [
  "dirs",
  "dunce",
  "keyring",
+ "reqwest",
  "serde_json",
  "serde_yaml_ng",
  "sha2",

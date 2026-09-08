@@ -156,5 +156,23 @@ HTTPS project-URL validation is shared with sync. Independent bounded review
 found no concrete P1/P2 issue. Both expanded callback/exchange-body tests, all
 nine existing Supabase transport tests and the fixed RFC PKCE vector pass.
 Core Clippy passes with all targets, test-support and warnings denied. Graphify
-update, formatting and whitespace checks pass. This is not yet a listener, token exchange, credential store,
-desktop sign-in surface, trusted-device provisioning or hosted acceptance.
+update, formatting and whitespace checks pass. At `365a4a7` this did not yet
+include a listener, token exchange, credential store, desktop sign-in surface,
+trusted-device provisioning or hosted acceptance.
+
+## Loopback callback receiver
+
+The daemon library now binds an ephemeral IPv4 loopback listener before exposing
+the authorization URL. It checks the exact Host and callback state/path, accepts
+only bodyless GET requests, bounds headers/targets, limits each socket and the
+overall lifetime, and closes when its owning future is aborted. Browser
+responses contain no callback code or provider details. Valid provider denial
+ends the attempt after checking its state.
+
+The missing listener and denial tests failed before implementation. All four
+socket tests and three core login tests pass, including idle/oversized traffic,
+denial, replay, cancellation and deadline cleanup. Independent bounded review
+found no concrete P1/P2 issue; its suggested socket cases were added. Core and
+daemon Clippy passes for all targets with test-support and warnings denied;
+Graphify update, formatting and whitespace checks pass. IPC ownership, opening the system browser, exchanging/storing tokens,
+refresh/logout, provisioning and real hosted acceptance remain unfinished.

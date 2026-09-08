@@ -23,6 +23,10 @@ pub enum LoginError {
     Callback,
     #[error("login attempt expired")]
     Expired,
+    #[error("sign-in was denied")]
+    Denied,
+    #[error("login is unavailable")]
+    Unavailable,
 }
 
 pub struct PendingLogin {
@@ -120,14 +124,30 @@ impl PendingLogin {
         }
         let mut state = None;
         let mut code = None;
+        let mut error = None;
+        let mut error_code = false;
+        let mut error_description = false;
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
                 "state" if state.is_none() => state = Some(value),
                 "code" if code.is_none() => code = Some(value),
+                "error" if error.is_none() => error = Some(value),
+                "error_code" if !error_code => error_code = true,
+                "error_description" if !error_description => error_description = true,
                 _ => return Err(LoginError::Callback),
             }
         }
         if state.as_deref() != Some(self.state.as_str()) {
+            return Err(LoginError::Callback);
+        }
+        if let Some(error) = error {
+            if code.is_some() || error.is_empty() || !error.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(LoginError::Callback);
+            }
+            self.verifier.take().ok_or(LoginError::Callback)?;
+            return Err(LoginError::Denied);
+        }
+        if error_code || error_description {
             return Err(LoginError::Callback);
         }
         let code = code.ok_or(LoginError::Callback)?;

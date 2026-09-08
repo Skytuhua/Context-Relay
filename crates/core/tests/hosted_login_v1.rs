@@ -4,7 +4,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use context_relay_core::auth::PendingLogin;
+use context_relay_core::auth::{LoginError, PendingLogin};
 use reqwest::Url;
 use sha2::{Digest, Sha256};
 
@@ -109,4 +109,31 @@ fn expired_login_and_untrusted_endpoints_are_rejected() {
                 .is_err()
         );
     }
+}
+
+#[test]
+fn provider_denial_is_bound_to_the_attempt_and_ends_it() {
+    let now = Instant::now();
+    let address = "127.0.0.1:41783".parse().unwrap();
+    let mut attempt = PendingLogin::new("https://example.supabase.co", address, now).unwrap();
+    let valid = callback(&attempt.authorization_url());
+    let denied = Url::parse(&valid.as_str().replace(
+        "code=synthetic-code",
+        "error=access_denied&error_description=private-provider-detail",
+    ))
+    .unwrap();
+    assert_eq!(
+        attempt
+            .take_callback(
+                &Url::parse(&denied.as_str().replace("state=", "state=wrong")).unwrap(),
+                now
+            )
+            .unwrap_err(),
+        LoginError::Callback
+    );
+    assert_eq!(
+        attempt.take_callback(&denied, now).unwrap_err(),
+        LoginError::Denied
+    );
+    assert!(attempt.take_callback(&valid, now).is_err());
 }
