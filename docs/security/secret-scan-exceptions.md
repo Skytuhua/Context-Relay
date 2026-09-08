@@ -140,3 +140,13 @@ security purpose; it is not a general allowlist.
 - Classification: `detector-literal`
 - Non-credential basis: The exact squash-merge object was inspected at lines 464–466. These are static string comparisons in `scan_text_secret`, with no key body, issuer, account, or private-key capability. They match the detector logic independently inspected in the earlier historical object at `3c2a371aef74f4962af64d0fe71545557244f21a`.
 - Security purpose: The comparisons reject private-key-shaped content before Hermes YAML enters normalized context. Squashing PR #12 gave the same detector a new immutable commit and line fingerprint; this entry admits only that inspected object and leaves every detector and full-history scanning enabled.
+
+### `770a39d5754f22039cc9267932aa43bb7260d99c:crates/core/tests/fixtures/hosted-enrollment-proof-v1.json:generic-api-key:3`
+
+- Historical commit: `770a39d5754f22039cc9267932aa43bb7260d99c`
+- Historical path: `crates/core/tests/fixtures/hosted-enrollment-proof-v1.json`
+- Rule: `generic-api-key`
+- Line: `3`
+- Classification: `synthetic-negative-test`
+- Non-credential basis: The exact historical Git object contains deterministic fixture identifiers and public cryptographic material. Its companion Rust test uses fixed synthetic device seeds. The JSON contains neither a private key nor a provider-issued credential; read-only review confirmed the exact object.
+- Security purpose: The fixture verifies cross-language enrollment-proof parity and rejection of substituted reservation, user, session, nonce, record, key or signature.

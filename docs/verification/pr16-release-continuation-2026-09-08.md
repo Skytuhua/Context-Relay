@@ -408,3 +408,29 @@ concrete P1/P2 issues. Supabase contract and whitespace checks pass.
 Core all-target Clippy with test-support and warnings denied, and Graphify update,
 also pass.
 Logs: `.codex/pr16-enrollment-proof{,-red,-clippy,-graph}.log`.
+
+## Hosted recovery-record decoding
+
+Added the structural Edge decoder for the existing Rust canonical recovery record,
+reusing the sync canonical reader. It checks exact map/key order, UUIDv7 fields,
+initial epochs, platform values, bounded UTF-8 and ciphertext, matching certificate
+scope/root key, distinct signing/wrapping keys, and complete input consumption.
+It owns its input bytes and constructs the same root-signature preimage as Rust.
+This is structural decoding only; cryptographic key/signature verification and
+live reservation authorization remain required before any hosted activation.
+
+The decoder test first failed for the missing module. The combined Node enrollment
+and sync suites now pass 42 tests, including every truncated record prefix,
+noncanonical/trailing data, scope/key substitution, invalid UUID and malformed
+UTF-8, plus exact agreement with the Rust record/signing-preimage fixtures.
+Supabase contract, whitespace, Graphify update and read-only decoder review pass.
+Log: `.codex/pr16-enrollment-record.log`.
+
+CI Secret Scan run `34241019698` flagged the exact synthetic enrollment-proof
+fixture fingerprint from commit `770a39d`. Inspection of the historical Git object
+and independent review confirmed deterministic test identifiers and public
+cryptographic values, with no provider credential or private key. Added only that
+commit/path/rule/line fingerprint to the reviewed ignore file and rationale ledger,
+updating its pinned byte count and digest. All five secret-scan workflow tests pass.
+Scanner detectors, full-history coverage and redaction remain unchanged. A clean
+full-history result for the updated commit must still be confirmed in CI.

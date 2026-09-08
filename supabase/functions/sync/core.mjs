@@ -32,7 +32,7 @@ class SyncEdgeError extends Error {
   }
 }
 
-class CanonicalReader {
+export class CanonicalReader {
   constructor(bytes) {
     this.bytes = bytes;
     this.position = 0;
