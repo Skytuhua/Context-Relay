@@ -37,9 +37,14 @@ Task 1 progress: `supabase/functions/pairing/crypto.mjs` now structurally decode
 and verifies the existing signed request using shared canonical/key validators.
 The Node test matches the frozen Rust signing preimage and exercises valid
 signatures, tampering, malformed encoding and noncontributory wrapping keys.
-The combined pairing/enrollment Node run passes 25 checks. Approval-payload
-validation and authenticated operation proofs remain unfinished; this is not
-provider admission or live pairing evidence.
+The approval verifier now checks the canonical nested grant and genesis/child
+certificates against the exact signed request and server-selected root, issuer,
+scope and epochs. A Rust-generated public approval fixture is checked by both
+implementations. All 13 Rust pairing crypto tests and 68 affected Node checks
+pass. Authenticated operation proofs remain unfinished; this public-cryptography
+helper does not authorize admission or prove ciphertext integrity. The joining
+device still authenticates the complete approval through the safety number and
+decrypts the grant before installing local trust. This is not live pairing evidence.
 
 **Files:** new migration under `supabase/migrations/`, new `supabase/tests/0003_hosted_pairing_test.sql`, new `supabase/functions/pairing/{core,adapter}.mjs` and tests, `index.ts`, `supabase/config.toml`.
 

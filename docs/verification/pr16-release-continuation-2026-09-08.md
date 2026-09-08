@@ -1052,3 +1052,13 @@ The shared Edge CBOR reader consumed a leading UTF-8 BOM and used JavaScript
 reproduced the mismatch. Canonical text now preserves U+FEFF and checks Unicode
 White_Space, matching Rust's required-text validation. The JSON decoder is
 unchanged. The redundant recovery-name trim check was also removed after a second failing regression. All 66 affected sync, enrollment and pairing Node tests pass.
+
+### Hosted approval public-cryptography verifier
+
+The new Edge approval verifier consumes a real Rust-generated public fixture.
+It checks canonical grant/certificate structure, both signatures, exact request
+bindings, selected root/issuer/scope/epochs, wrapping keys and bounded ciphertext.
+Caller-owned inputs are copied before asynchronous verification. All 13 Rust
+pairing crypto tests and 68 affected Node checks pass. Device operation proof,
+provider admission, live sessions and the joining device's safety confirmation
+remain required; this helper alone grants no authority.
