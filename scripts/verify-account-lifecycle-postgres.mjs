@@ -128,6 +128,76 @@ function enrollmentCommit(f, reservation, certificate = id()) {
     decode(repeat('49',80),'hex'),decode('010203','hex'));`;
 }
 
+test('pairing cancellation is final, owner-session-bound and survives its original expiry', async () => {
+  const f = await enrollmentFixture(), joining = randomUUID();
+  try {
+    const reservation = JSON.parse(await sql(f.request()));
+    await sql(enrollmentCommit(f, reservation));
+    const device = await sql(`select device_id from public.device_bindings where session_id='${f.session}'`);
+    const pairing = id();
+    const invite = JSON.parse(await sql(`set role service_role; select public.service_create_pairing_invite('${f.user}','${f.session}',
+      '${reservation.workspaceId}','${device}','${pairing}',decode(repeat('42',32),'hex'));`));
+    const control = (action, session = f.session) => `set role service_role;
+      select public.service_control_pairing_invite('${f.user}','${session}','${reservation.workspaceId}','${device}','${pairing}','${action}');`;
+    await sql(`insert into auth.sessions(id,user_id) values ('${joining}','${f.user}')`);
+    assert.deepEqual(JSON.parse(await sql(control('status'))), { ...invite, state: 'pending' });
+    await assert.rejects(sql(control('cancel', joining)), /pairing_denied/);
+    await assert.rejects(sql(control('approve')), /invalid_pairing_request/);
+    const canceled = { ...invite, state: 'canceled' };
+    assert.deepEqual(await Promise.all([sql(control('cancel')).then(JSON.parse), sql(control('cancel')).then(JSON.parse)]), [canceled, canceled]);
+    assert.deepEqual(JSON.parse(await sql(control('status'))), canceled);
+    const lookup = `set role service_role; select public.service_resolve_pairing_code('${f.user}','${joining}',decode(repeat('42',32),'hex'));`;
+    assert.deepEqual(JSON.parse(await sql(lookup)), { status: 'canceled' });
+    await sql(`update context_relay_private.pairing_invites set created_at=statement_timestamp()-interval '10 minutes',
+      expires_at=statement_timestamp() where id='${pairing}'`);
+    assert.equal(JSON.parse(await sql(control('cancel'))).state, 'canceled');
+    assert.deepEqual(JSON.parse(await sql(lookup)), { status: 'canceled' });
+    for (const role of ['anon','authenticated']) await assert.rejects(sql(control('status').replace('set role service_role', `set role ${role}`)), /permission denied/);
+    await sql(`update context_relay_private.pairing_invites set state='pending' where id='${pairing}'`);
+    await assert.rejects(sql(control('cancel')), /pairing_expired/);
+    assert.equal(await sql(`select state from context_relay_private.pairing_invites where id='${pairing}'`), 'pending');
+    // Synthetic terminal states check cancellation arbitration; approval admission is separate.
+    for (const [state, error] of [['approved', /pairing_conflict/], ['rejected', /pairing_rejected/]]) {
+      await sql(`update context_relay_private.pairing_invites set state='${state}' where id='${pairing}'`);
+      await assert.rejects(sql(control('cancel')), error);
+      assert.equal(JSON.parse(await sql(control('status'))).state, state);
+    }
+    await sql(`update public.recovery_roots set revoked_at=clock_timestamp() where account_id='${reservation.accountId}'`);
+    await assert.rejects(sql(control('status')), /pairing_denied/);
+  } finally {
+    await sql(`delete from auth.sessions where id='${joining}'`);
+    await f.cleanup();
+  }
+});
+
+test('pairing cancellation rechecks issuer binding expiry after an account lock wait', async () => {
+  const f = await enrollmentFixture();
+  let release, outcome;
+  try {
+    const reservation = JSON.parse(await sql(f.request()));
+    await sql(enrollmentCommit(f, reservation));
+    const device = await sql(`select device_id from public.device_bindings where session_id='${f.session}'`);
+    const pairing = id();
+    await sql(`set role service_role; select public.service_create_pairing_invite('${f.user}','${f.session}',
+      '${reservation.workspaceId}','${device}','${pairing}',decode(repeat('42',32),'hex'));`);
+    await sql(`update public.device_bindings set expires_at=clock_timestamp()+interval '2 seconds' where session_id='${f.session}'`);
+    release = await holdLock(`select id from public.accounts where id='${reservation.accountId}' for update`);
+    const application = `pairing-cancel-${randomUUID()}`;
+    outcome = sql(`set role service_role; select public.service_control_pairing_invite('${f.user}','${f.session}',
+      '${reservation.workspaceId}','${device}','${pairing}','cancel');`, application)
+      .then(value => ({ value }), error => ({ error }));
+    await waitUntilBlocked(application);
+    await sql(`select pg_sleep(greatest(0,extract(epoch from expires_at-clock_timestamp())+0.1)) from public.device_bindings where session_id='${f.session}'`);
+    await release(); release = null;
+    assert.match((await outcome).error?.stderr ?? '', /pairing_denied/);
+    assert.equal(await sql(`select state from context_relay_private.pairing_invites where id='${pairing}'`), 'pending');
+  } finally {
+    if (release) await release();
+    if (outcome) await outcome;
+    await f.cleanup();
+  }
+});
+
 test('pairing lookup reserves one session and persists the fifth failed guess', async () => {
   const f = await enrollmentFixture(), other = await enrollmentFixture();
   const sessions = [randomUUID(), randomUUID(), randomUUID()];

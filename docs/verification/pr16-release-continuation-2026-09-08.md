@@ -1137,3 +1137,21 @@ CI run `34271537065` at `2a83bcc` additionally reports successful macOS native
 Semgrep build-a and native-isolation jobs. Windows Rust tests and native Semgrep
 build-a remain in progress. This is scoped historical evidence, not current-head
 or installed-product qualification.
+
+### Hosted invite cancellation and status
+
+Migration `20260909050000_control_hosted_pairing.sql` adds terminal invite state
+and an original-issuer-session-only status/cancel RPC. It checks live Auth,
+account, binding, certificate, root and epochs under locks, then rechecks time.
+Cancellation is idempotent and cannot overwrite approval or rejection. Terminal
+states survive the invite deadline; pending invites cannot be canceled after
+expiry. Lookup now rejects canceled, rejected and approved invites.
+
+All 31 local PostgreSQL tests pass (`.codex/pr16-cancel-full.log`), including an
+observed account-lock wait where issuer binding expiry prevents cancellation.
+Tests also cover concurrent cancellation, wrong session, invalid action,
+SQL permissions, revoked roots and terminal precedence. Approved/rejected rows
+in this test are synthetic arbitration fixtures, not approval admission evidence.
+`check:supabase` and diff checks pass; independent review found no P1/P2. Only
+the disposable local database has been migrated. Request/decision admission,
+Edge/native wiring and the full release gates remain unfinished.
