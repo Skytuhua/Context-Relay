@@ -1155,3 +1155,25 @@ in this test are synthetic arbitration fixtures, not approval admission evidence
 `check:supabase` and diff checks pass; independent review found no P1/P2. Only
 the disposable local database has been migrated. Request/decision admission,
 Edge/native wiring and the full release gates remain unfinished.
+
+### Hosted request storage and approver retrieval
+
+Migration `20260909060000_submit_hosted_pairing.sql` stores exact request bytes
+and server-calculated SHA-256 in the existing request table. Submission requires
+the original located joining session and current issuer authority. Both Auth
+sessions are locked before account locks. Exact retries retain their first
+receipt; changed bytes or keys conflict. Post-write Auth/authority checks roll
+back delayed writes after expiry. Approver retrieval uses the original issuer
+session; canceled requests cannot be retrieved. Cancellation also updates the
+public request state while retaining exact submission receipts.
+
+All 33 local PostgreSQL tests pass on the final functions
+(`.codex/pr16-request-final.log`), including an observed request-row wait with
+joining-session expiry. A synthetic legacy row with a colliding ID reproduced
+a missing scope check in the initial fetch. Retrieval and cancellation now
+match account/workspace as well as ID; the regression verifies neither foreign
+read nor cancellation occurs. `check:supabase` and diff checks pass. These SQL
+tests use synthetic decoded fields; Edge signature/proof enforcement, approval
+admission, native wiring and live hosted acceptance remain required. No device
+binding is created by request submission. Only the local disposable database
+has been migrated.
