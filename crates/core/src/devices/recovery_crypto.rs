@@ -31,6 +31,45 @@ const RECOVERY_METADATA_AAD_DOMAIN: &[u8] = b"context-relay/recovery-metadata/v1
 const DEVICE_WORKSPACE_MATERIAL_AAD_DOMAIN: &[u8] = b"context-relay/device-workspace-material/v1\0";
 const MIN_WRAPPED_CIPHERTEXT_BYTES: usize = 16;
 
+/// Server reservation context; the provider must independently check ownership,
+/// expiry and exact nonce before accepting the proof. This grants no authority alone.
+pub struct HostedEnrollmentChallenge {
+    pub reservation_id: context_relay_protocol::OperationId,
+    pub auth_user_id: uuid::Uuid,
+    pub session_id: uuid::Uuid,
+    pub nonce: [u8; 32],
+}
+
+pub fn hosted_enrollment_proof_preimage(
+    challenge: &HostedEnrollmentChallenge,
+    record: &RecoveryEnrollmentRecordV1,
+) -> Result<Vec<u8>, RecoveryEnrollmentCryptoError> {
+    if challenge.auth_user_id.is_nil() || challenge.session_id.is_nil() {
+        return Err(RecoveryEnrollmentCryptoError::InvalidRecord);
+    }
+    let canonical = encode_recovery_enrollment_record_v1(record)?;
+    let mut preimage = b"context-relay/hosted-enrollment-device-proof/v1\0".to_vec();
+    preimage.extend_from_slice(challenge.reservation_id.as_bytes());
+    preimage.extend_from_slice(challenge.auth_user_id.as_bytes());
+    preimage.extend_from_slice(challenge.session_id.as_bytes());
+    preimage.extend_from_slice(&challenge.nonce);
+    preimage.extend_from_slice(&Sha256::digest(canonical));
+    Ok(preimage)
+}
+
+pub fn sign_hosted_enrollment_proof(
+    device: &DeviceKeys,
+    challenge: &HostedEnrollmentChallenge,
+    record: &RecoveryEnrollmentRecordV1,
+) -> Result<Ed25519SignatureBytes, RecoveryEnrollmentCryptoError> {
+    if device.signing_public_key() != record.genesis_certificate.signing_public_key
+        || device.wrapping_public_key() != record.genesis_certificate.wrapping_public_key
+    {
+        return Err(RecoveryEnrollmentCryptoError::InvalidRecord);
+    }
+    Ok(device.sign_hosted_enrollment_proof(&hosted_enrollment_proof_preimage(challenge, record)?))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RecoveryEnrollmentCryptoError {
     #[error("invalid recovery enrollment record")]

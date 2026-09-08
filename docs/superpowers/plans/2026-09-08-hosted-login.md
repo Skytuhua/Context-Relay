@@ -145,3 +145,22 @@ sessions, post-lock expiry, changed-record retry, wrong device proof, provider-o
 root substitution, response loss before local activation, and account switch while
 an enrollment is queued. SQL privileges and live Auth behavior need separate
 integration checks; deterministic in-memory tests do not satisfy hosted acceptance.
+
+### Device proof v1
+
+The proof preimage is the ASCII domain
+`context-relay/hosted-enrollment-device-proof/v1` followed by one NUL byte,
+then reservation UUID bytes (16), authenticated user UUID bytes (16), session UUID
+bytes (16), server nonce (32), and SHA-256 of the canonical recovery record (32),
+in that order. UUID bytes use network order. Sign with the enrolled device's
+Ed25519 key. The client validates the existing recovery record and checks both
+device public keys against its genesis certificate before signing.
+
+`supabase/functions/enrollment/proof.mjs` verifies this proof only. Its caller
+must first validate the canonical record/certificate chain and compare the
+reservation to the live authenticated session, including expiry and nonce.
+The future transactional commit must recheck those mutable predicates after locks.
+No endpoint or trusted device binding is created by the proof helper.
+The frozen `hosted-enrollment-proof-v1.json` vector is generated with Node's
+Ed25519 implementation and checked by Rust against the existing recovery-record
+fixture; the Edge check consumes the same vector.

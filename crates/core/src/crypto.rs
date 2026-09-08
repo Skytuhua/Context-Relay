@@ -303,6 +303,10 @@ impl DeviceKeys {
         verify_pairing_request_signature(request)
     }
 
+    pub(crate) fn sign_hosted_enrollment_proof(&self, preimage: &[u8]) -> Ed25519SignatureBytes {
+        self.sign(preimage)
+    }
+
     fn sign(&self, message: &[u8]) -> Ed25519SignatureBytes {
         sign(&self.signing_secret, message)
     }
