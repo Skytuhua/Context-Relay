@@ -130,6 +130,7 @@ pub struct PairingDecisionEnvelope {
     pub pairing_id: PairingId,
     pub request_digest: Sha256Digest,
     decision: PairingDecision,
+    canonical_request: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -150,7 +151,25 @@ impl PairingDecisionEnvelope {
             decision: PairingDecision::Approve {
                 canonical_approved_payload,
             },
+            canonical_request: None,
         }
+    }
+
+    pub fn approve_request(
+        request: &super::crypto::SignedPairingRequest,
+        canonical_approved_payload: Vec<u8>,
+    ) -> Self {
+        let mut envelope = Self::approve(
+            request.request().pairing_id,
+            request.digest(),
+            canonical_approved_payload,
+        );
+        envelope.canonical_request = Some(request.canonical_bytes().to_vec());
+        envelope
+    }
+
+    pub(crate) fn canonical_request(&self) -> Option<&[u8]> {
+        self.canonical_request.as_deref()
     }
 
     pub const fn reject(pairing_id: PairingId, request_digest: Sha256Digest) -> Self {
@@ -158,6 +177,7 @@ impl PairingDecisionEnvelope {
             pairing_id,
             request_digest,
             decision: PairingDecision::Reject,
+            canonical_request: None,
         }
     }
 

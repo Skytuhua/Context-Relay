@@ -20,6 +20,215 @@ const SESSION: &str = "550e8400-e29b-41d4-a716-446655440001";
 const NOW: u64 = 1_800_000_000;
 
 #[test]
+fn hosted_pairing_approval_checks_scope_proofs_receipts_and_cancel() {
+    use context_relay_core::{
+        crypto::DeviceKeys,
+        devices::{
+            supabase_pairing::HostedPairingClient,
+            transport::{
+                PairingApprovalTransport, PairingDecisionEnvelope, PairingDecisionKind,
+                PairingTransportError,
+            },
+        },
+    };
+    use sha2::{Digest, Sha256};
+    let decode = |s: &str| -> Vec<u8> {
+        s.as_bytes()
+            .chunks_exact(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect()
+    };
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/hosted-pairing-approval-v1.json")).unwrap();
+    let request_hex = include_str!("fixtures/hosted-pairing-request-v1.hex").trim();
+    let canonical = decode(request_hex);
+    let request = context_relay_protocol::decode_pairing_request_v1(&canonical).unwrap();
+    let digest = context_relay_protocol::Sha256Digest(Sha256::digest(&canonical).into());
+    let scope = context_relay_core::sync::SyncScope {
+        account_id: fixture["trusted"]["accountId"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
+        workspace_id: fixture["trusted"]["workspaceId"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
+    };
+    let device = fixture["trusted"]["issuerDeviceId"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let payload = decode(fixture["canonicalApprovedPayload"].as_str().unwrap());
+    let stored = json!({"pairingId":request.pairing_id,"accountId":scope.account_id,"workspaceId":scope.workspace_id,
+        "canonicalRequest":request_hex,"requestDigest":digest,"requestedAt":"1000"});
+    let receipt = json!({"pairingId":request.pairing_id,"requestDigest":digest,"decision":"approved",
+        "approvedPayloadDigest":format!("{:x}",Sha256::digest(&payload)),"decidedAt":"2000"});
+    let invite = json!({"pairingId":request.pairing_id,"createdAt":"1000","expiresAt":"601000","code":"ABCDE-FGHJK"});
+    let status = json!({"pairingId":request.pairing_id,"createdAt":"1000","expiresAt":"601000","state":"pending"});
+    let mut canceled = status.clone();
+    canceled["state"] = json!("canceled");
+    let (auth, http) = client(
+        PROJECT,
+        vec![
+            tokens(&token(NOW + 900)),
+            response(200, json!({"id":USER})),
+            response(200, json!({"v":1,"invite":invite})),
+            response(200, json!({"v":1,"invite":status})),
+            response(200, json!({"v":1,"request":stored})),
+            response(200, json!({"v":1,"receipt":receipt})),
+            response(200, json!({"v":1,"invite":canceled})),
+        ],
+    );
+    let owner = Arc::new(HostedSessionOwner::new(
+        Arc::new(auth),
+        Arc::new(Store::default()),
+    ));
+    let attempt = owner.begin_login().unwrap();
+    let generation = attempt.cancellation();
+    let identity = owner.complete_login(attempt, exchange(), NOW).unwrap();
+    let client = HostedPairingClient::with_http_client(
+        owner,
+        identity,
+        generation,
+        PROJECT,
+        "public-test",
+        Arc::new(DeviceKeys::from_seeds_for_test([0x73; 32], [0x74; 32])),
+        http.clone(),
+    )
+    .unwrap();
+    let approver = client.approval_client(scope, device);
+    assert_eq!(
+        approver.create_invite(NOW * 1000).unwrap().expires_at_ms,
+        601000
+    );
+    assert_eq!(
+        approver
+            .invite_status(request.pairing_id, NOW * 1000)
+            .unwrap()
+            .pairing_id,
+        request.pairing_id
+    );
+    let signed = context_relay_core::devices::crypto::verify_pairing_request(&request).unwrap();
+    assert_eq!(
+        approver
+            .request(request.pairing_id, NOW * 1000)
+            .unwrap()
+            .unwrap()
+            .request_digest,
+        digest
+    );
+    let decided = approver
+        .decide(
+            PairingDecisionEnvelope::approve_request(&signed, payload.clone()),
+            NOW * 1000,
+        )
+        .unwrap();
+    assert_eq!(decided.decision, PairingDecisionKind::Approved);
+    let sent: serde_json::Value =
+        serde_json::from_slice(http.requests.lock().unwrap().last().unwrap().body()).unwrap();
+    assert_eq!(sent["proof"], fixture["proofs"]["approval"]);
+    approver.cancel(request.pairing_id, NOW * 1000).unwrap();
+    let mut foreign = stored.clone();
+    foreign["accountId"] = json!(scope.workspace_id);
+    http.responses
+        .lock()
+        .unwrap()
+        .push_back(response(200, json!({"v":1,"request":foreign})));
+    assert_eq!(
+        approver
+            .request(request.pairing_id, NOW * 1000)
+            .unwrap_err(),
+        PairingTransportError::Conflict
+    );
+    http.responses
+        .lock()
+        .unwrap()
+        .push_back(response(200, json!({"v":1,"invite":status})));
+    assert_eq!(
+        approver.cancel(request.pairing_id, NOW * 1000).unwrap_err(),
+        PairingTransportError::Conflict
+    );
+    // Exact replay carries its durable signed request and needs only the commit.
+    let count = http.requests.lock().unwrap().len();
+    http.responses
+        .lock()
+        .unwrap()
+        .push_back(response(200, json!({"v":1,"receipt":receipt})));
+    assert_eq!(
+        approver
+            .decide(
+                PairingDecisionEnvelope::approve_request(&signed, payload.clone()),
+                NOW * 1000
+            )
+            .unwrap(),
+        decided
+    );
+    assert_eq!(http.requests.lock().unwrap().len(), count + 1);
+    assert_eq!(
+        approver
+            .decide(
+                PairingDecisionEnvelope::approve(request.pairing_id, digest, payload),
+                NOW * 1000
+            )
+            .unwrap_err(),
+        PairingTransportError::Invalid
+    );
+    assert_eq!(http.requests.lock().unwrap().len(), count + 1);
+    for expires in ["601001", "9223372036854775808"] {
+        let mut bad = invite.clone();
+        bad["expiresAt"] = json!(expires);
+        http.responses
+            .lock()
+            .unwrap()
+            .push_back(response(200, json!({"v":1,"invite":bad})));
+        assert_eq!(
+            approver.create_invite(NOW * 1000).unwrap_err(),
+            PairingTransportError::Conflict
+        );
+    }
+    http.responses
+        .lock()
+        .unwrap()
+        .push_back(response(200, json!({"v":1})));
+    assert_eq!(
+        approver
+            .request(request.pairing_id, NOW * 1000)
+            .unwrap_err(),
+        PairingTransportError::Conflict
+    );
+    http.responses
+        .lock()
+        .unwrap()
+        .push_back(response(200, json!({"v":1,"request":null})));
+    assert!(
+        approver
+            .request(request.pairing_id, NOW * 1000)
+            .unwrap()
+            .is_none()
+    );
+    let mut rejected = receipt.clone();
+    rejected["decision"] = json!("rejected");
+    rejected["approvedPayloadDigest"] = json!(null);
+    http.responses
+        .lock()
+        .unwrap()
+        .push_back(response(200, json!({"v":1,"receipt":rejected})));
+    assert_eq!(
+        approver
+            .decide(
+                PairingDecisionEnvelope::reject(request.pairing_id, digest),
+                NOW * 1000
+            )
+            .unwrap()
+            .decision,
+        PairingDecisionKind::Rejected
+    );
+}
+
+#[test]
 fn hosted_pairing_join_checks_wire_receipts_proofs_and_logout() {
     use context_relay_core::{
         crypto::DeviceKeys,

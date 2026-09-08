@@ -1,13 +1,19 @@
 use super::{
-    crypto::{sign_hosted_pairing_request_proof, verify_pairing_request},
+    crypto::{
+        decode_pairing_approved_payload_v1, sign_hosted_pairing_approval_proof,
+        sign_hosted_pairing_request_proof, verify_pairing_request,
+    },
     transport::{
-        PairingApprovedResult, PairingDecisionKind, PairingDecisionReceipt, PairingJoinTransport,
-        PairingRequestReceipt, PairingResult, PairingTransportError as Error,
+        PairingApprovalTransport, PairingApprovedResult, PairingDecision, PairingDecisionEnvelope,
+        PairingDecisionKind, PairingDecisionReceipt, PairingInvite, PairingInviteState,
+        PairingInviteStatus, PairingJoinTransport, PairingRequestReceipt, PairingResult,
+        PairingTransportError as Error, StoredPairingRequest,
     },
 };
 use crate::{
     auth::{HostedIdentity, HostedSessionOwner, LoginCancellation},
     crypto::DeviceKeys,
+    sync::SyncScope,
     sync::supabase::{
         ReqwestHttpClient, SupabaseHttpClient, SupabaseHttpMethod, SupabaseHttpRequest,
         valid_header_secret, validated_project_url,
@@ -15,7 +21,8 @@ use crate::{
     vault::{HostedPairingIntent, HostedPairingRole},
 };
 use context_relay_protocol::{
-    DecimalTimestamp, PairingCode, PairingId, Sha256Digest, decode_pairing_request_v1,
+    AccountId, DecimalTimestamp, DeviceId, PairingCode, PairingId, Sha256Digest, WorkspaceId,
+    decode_pairing_request_v1,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -28,6 +35,7 @@ use zeroize::Zeroizing;
 const RESPONSE_LIMIT: usize = 68 * 1024;
 
 /// Native-only client bound to one verified login generation and device key pair.
+#[derive(Clone)]
 pub struct HostedPairingClient {
     owner: Arc<HostedSessionOwner>,
     identity: HostedIdentity,
@@ -39,6 +47,17 @@ pub struct HostedPairingClient {
 }
 
 impl HostedPairingClient {
+    pub fn approval_client(
+        &self,
+        scope: SyncScope,
+        device_id: DeviceId,
+    ) -> HostedPairingApprovalClient {
+        HostedPairingApprovalClient {
+            client: self.clone(),
+            scope,
+            device_id,
+        }
+    }
     pub fn new(
         owner: Arc<HostedSessionOwner>,
         identity: HostedIdentity,
@@ -172,6 +191,217 @@ impl HostedPairingClient {
             _ => Err(Error::Transient),
         }
     }
+}
+
+pub struct HostedPairingApprovalClient {
+    client: HostedPairingClient,
+    scope: SyncScope,
+    device_id: DeviceId,
+}
+impl HostedPairingApprovalClient {
+    fn body(&self, action: &str, id: PairingId) -> serde_json::Value {
+        serde_json::json!({"v":1,"action":action,"workspaceId":self.scope.workspace_id,"deviceId":self.device_id,"pairingId":id})
+    }
+    fn control(
+        &self,
+        action: &str,
+        id: PairingId,
+        now_ms: u64,
+    ) -> Result<PairingInviteStatus, Error> {
+        let response: InviteResponse<InviteStatus> =
+            self.client.call(self.body(action, id), now_ms)?;
+        let r = response.invite;
+        if response.v != 1 || r.pairing_id != id {
+            return Err(Error::Conflict);
+        }
+        invite_times(r.created_at, r.expires_at)?;
+        Ok(PairingInviteStatus {
+            pairing_id: id,
+            created_at_ms: r.created_at.0,
+            expires_at_ms: r.expires_at.0,
+            state: match r.state {
+                InviteState::Pending => PairingInviteState::Pending,
+                InviteState::Approved => PairingInviteState::Approved,
+                InviteState::Rejected => PairingInviteState::Rejected,
+                InviteState::Canceled => PairingInviteState::Canceled,
+            },
+        })
+    }
+}
+impl PairingApprovalTransport for HostedPairingApprovalClient {
+    fn create_invite(&self, now_ms: u64) -> Result<PairingInvite, Error> {
+        let response: InviteResponse<CreatedInvite> = self.client.call(
+            serde_json::json!({"v":1,"action":"create",
+            "workspaceId":self.scope.workspace_id,"deviceId":self.device_id}),
+            now_ms,
+        )?;
+        let r = response.invite;
+        if response.v != 1 {
+            return Err(Error::Conflict);
+        }
+        invite_times(r.created_at, r.expires_at)?;
+        Ok(PairingInvite {
+            pairing_id: r.pairing_id,
+            code: r.code,
+            created_at_ms: r.created_at.0,
+            expires_at_ms: r.expires_at.0,
+        })
+    }
+    fn invite_status(&self, id: PairingId, now_ms: u64) -> Result<PairingInviteStatus, Error> {
+        self.control("status", id, now_ms)
+    }
+    fn cancel(&self, id: PairingId, now_ms: u64) -> Result<(), Error> {
+        if self.control("cancel", id, now_ms)?.state != PairingInviteState::Canceled {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+    fn request(&self, id: PairingId, now_ms: u64) -> Result<Option<StoredPairingRequest>, Error> {
+        let response: RequestResponse = self.client.call(self.body("request", id), now_ms)?;
+        if response.v != 1 {
+            return Err(Error::Conflict);
+        }
+        let Some(r) = response.request else {
+            return Ok(None);
+        };
+        if r.pairing_id != id
+            || r.account_id != self.scope.account_id
+            || r.workspace_id != self.scope.workspace_id
+            || r.canonical_request.len() > 16384
+        {
+            return Err(Error::Conflict);
+        }
+        let canonical = decode_hex(&r.canonical_request)?;
+        let request = decode_pairing_request_v1(&canonical).map_err(|_| Error::Conflict)?;
+        let signed = verify_pairing_request(&request).map_err(|_| Error::Conflict)?;
+        if request.pairing_id != id || signed.digest() != r.request_digest {
+            return Err(Error::Conflict);
+        }
+        Ok(Some(StoredPairingRequest {
+            pairing_id: id,
+            scope: self.scope,
+            canonical_bytes: canonical,
+            request_digest: r.request_digest,
+            requested_at_ms: timestamp(r.requested_at)?,
+        }))
+    }
+    fn decide(
+        &self,
+        envelope: PairingDecisionEnvelope,
+        now_ms: u64,
+    ) -> Result<PairingDecisionReceipt, Error> {
+        let (body, kind, hash) = match envelope.decision() {
+            PairingDecision::Reject => {
+                let mut body = self.body("reject", envelope.pairing_id);
+                body["requestDigest"] = serde_json::json!(envelope.request_digest);
+                (body, PairingDecisionKind::Rejected, None)
+            }
+            PairingDecision::Approve {
+                canonical_approved_payload,
+            } => {
+                let canonical = envelope.canonical_request().ok_or(Error::Invalid)?;
+                if canonical.len() > 8192 || canonical_approved_payload.len() > 32768 {
+                    return Err(Error::Invalid);
+                }
+                let request = decode_pairing_request_v1(canonical).map_err(|_| Error::Invalid)?;
+                let signed = verify_pairing_request(&request).map_err(|_| Error::Invalid)?;
+                let payload = decode_pairing_approved_payload_v1(canonical_approved_payload)
+                    .map_err(|_| Error::Invalid)?;
+                if request.pairing_id != envelope.pairing_id
+                    || signed.digest() != envelope.request_digest
+                    || payload.issuer_certificate.account_id != self.scope.account_id
+                    || payload.issuer_certificate.workspace_id != self.scope.workspace_id
+                    || payload.issuer_certificate.device_id != self.device_id
+                {
+                    return Err(Error::Conflict);
+                }
+                let proof = sign_hosted_pairing_approval_proof(
+                    &self.client.keys,
+                    self.client.identity.user_id,
+                    self.client.identity.session_id,
+                    &signed,
+                    &payload,
+                )
+                .map_err(|_| Error::Invalid)?;
+                let mut body = self.body("approve", envelope.pairing_id);
+                body["canonicalApprovedPayload"] =
+                    serde_json::json!(hex(canonical_approved_payload));
+                body["proof"] = serde_json::json!(hex(&proof.0));
+                (
+                    body,
+                    PairingDecisionKind::Approved,
+                    Some(Sha256Digest(
+                        Sha256::digest(canonical_approved_payload).into(),
+                    )),
+                )
+            }
+        };
+        let response: ReceiptResponse<DecisionReceipt> = self.client.call(body, now_ms)?;
+        if response.v != 1 {
+            return Err(Error::Conflict);
+        }
+        response
+            .receipt
+            .validate(envelope.pairing_id, envelope.request_digest, kind, hash)
+    }
+}
+fn invite_times(created: DecimalTimestamp, expires: DecimalTimestamp) -> Result<(), Error> {
+    if timestamp(expires)?.checked_sub(timestamp(created)?) != Some(600000) {
+        return Err(Error::Conflict);
+    }
+    Ok(())
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InviteResponse<T> {
+    v: u8,
+    invite: T,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreatedInvite {
+    pairing_id: PairingId,
+    created_at: DecimalTimestamp,
+    expires_at: DecimalTimestamp,
+    code: PairingCode,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InviteStatus {
+    pairing_id: PairingId,
+    created_at: DecimalTimestamp,
+    expires_at: DecimalTimestamp,
+    state: InviteState,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum InviteState {
+    Pending,
+    Approved,
+    Rejected,
+    Canceled,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestResponse {
+    v: u8,
+    #[serde(deserialize_with = "required_request")]
+    request: Option<WireRequest>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireRequest {
+    pairing_id: PairingId,
+    account_id: AccountId,
+    workspace_id: WorkspaceId,
+    canonical_request: String,
+    request_digest: Sha256Digest,
+    requested_at: DecimalTimestamp,
+}
+fn required_request<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<WireRequest>, D::Error> {
+    Option::<WireRequest>::deserialize(deserializer)
 }
 
 impl PairingJoinTransport for HostedPairingClient {

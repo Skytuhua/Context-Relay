@@ -1309,3 +1309,20 @@ Bounded independent review found no P1/P2 issues. Full approval verification and
 human safety confirmation remain in the coordinator; this transport installs no
 trust. Approval operations, durable-intent enforcement, daemon wiring and live
 acceptance remain unfinished.
+
+### Native hosted approval client
+
+The native client now implements create, status, request review, approval,
+rejection and cancellation with frozen account/workspace/device scope. Approval
+envelopes carry the original signed request from the durable coordinator record;
+all three preparation/retry paths supply it. Proof signing therefore needs no
+fresh request lookup that could fail after revocation. Raw legacy envelopes are
+rejected by the hosted transport before networking.
+
+All 39 affected hosted transport, in-memory transport and pairing coordinator
+tests pass (`.codex/pr16-native-approval-full.log`), as does targeted Clippy with
+warnings denied. Wire checks exercise frozen approval proofs, exact replay with
+one commit request, foreign scope, request-null versus missing fields, invalid
+invite lifetimes, rejection and confirmed cancellation. Independent review found
+no P1/P2 issues. Durable identity enforcement and production daemon wiring remain
+required before live hosted pairing qualification.

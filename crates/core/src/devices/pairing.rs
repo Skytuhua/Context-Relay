@@ -473,9 +473,8 @@ impl<
                     let receipt = self
                         .approval_transport
                         .decide(
-                            PairingDecisionEnvelope::approve(
-                                pairing_id,
-                                expected_request_digest,
+                            PairingDecisionEnvelope::approve_request(
+                                &existing.signed_request,
                                 existing.approval.canonical_bytes().to_vec(),
                             ),
                             now_ms,
@@ -531,9 +530,8 @@ impl<
                 let receipt = self
                     .approval_transport
                     .decide(
-                        PairingDecisionEnvelope::approve(
-                            pairing_id,
-                            expected_request_digest,
+                        PairingDecisionEnvelope::approve_request(
+                            &signed_request,
                             canonical.clone(),
                         ),
                         now_ms,
@@ -715,9 +713,8 @@ impl<
             let receipt = self
                 .approval_transport
                 .decide(
-                    PairingDecisionEnvelope::approve(
-                        pairing_id,
-                        request_digest,
+                    PairingDecisionEnvelope::approve_request(
+                        &stored.signed_request,
                         stored.approval.canonical_bytes().to_vec(),
                     ),
                     self.clock.now_ms(),
