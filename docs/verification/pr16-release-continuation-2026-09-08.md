@@ -1097,3 +1097,20 @@ format and copies/clears its temporary pepper buffer. Tests verify the digest
 against Node's independent HMAC implementation, rejected formats and input
 mutation isolation. All 71 affected Node checks pass. No invite table, expiry,
 lookup-attempt accounting or endpoint admission is claimed by this helper.
+
+### Hosted invite creation transaction
+
+Migration `20260909030000_hosted_pairing_invites.sql` adds private invite storage
+and a service-only create RPC. It requires live Auth, an active account/device
+binding, a current genesis certificate and an unrevoked root. Account locking
+serializes a six-per-hour creation limit; exact retries retain the original
+10-minute lifetime and changed inputs conflict. Only the keyed code digest is
+stored. API roles cannot read the table or bypass the service boundary.
+
+An observed unique-index wait reproduced expiry-after-insert acceptance in the
+initial function. The final post-write Auth/time check rolls back that case.
+The final local PostgreSQL suite passes 27 tests, including concurrent creation
+and the observed wait regression; all 140 contract tests and check:supabase pass.
+The migration has only been applied to the disposable local database. Lookup,
+five-attempt exhaustion, cancellation, request/approval commits, endpoint wiring
+and real hosted acceptance remain unfinished.

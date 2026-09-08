@@ -128,6 +128,59 @@ function enrollmentCommit(f, reservation, certificate = id()) {
     decode(repeat('49',80),'hex'),decode('010203','hex'));`;
 }
 
+test('pairing invites require live device authority and preserve exact bounded retries', async () => {
+  const f = await enrollmentFixture();
+  try {
+    const reservation = JSON.parse(await sql(f.request()));
+    await sql(enrollmentCommit(f, reservation));
+    const device = await sql(`select device_id from public.device_bindings where session_id='${f.session}'`);
+    const pairing = id();
+    const create = (operation = pairing, digest = '42', session = f.session) => `set role service_role;
+      select public.service_create_pairing_invite('${f.user}','${session}','${reservation.workspaceId}',
+        '${device.trim()}','${operation}',decode(repeat('${digest}',32),'hex'));`;
+    const invite = JSON.parse(await sql(create()));
+    assert.equal(invite.pairingId, pairing);
+    assert.equal(BigInt(invite.expiresAt) - BigInt(invite.createdAt), 600000n);
+    assert.deepEqual(JSON.parse(await sql(create())), invite);
+    await assert.rejects(sql(create(pairing, '43')), /pairing_conflict/);
+    await assert.rejects(sql(create(pairing, '42', randomUUID())), /pairing_denied/);
+    const competing = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => sql(create(id(), (0x50 + index).toString(16)))));
+    assert.equal(competing.filter(result => result.status === 'fulfilled').length, 5);
+    for (const result of competing.filter(result => result.status === 'rejected')) assert.match(result.reason.message, /pairing_rate_limited/);
+    await assert.rejects(sql(create(id(), '60')), /pairing_rate_limited/);
+    await sql(`update context_relay_private.pairing_invites set created_at=created_at-interval '11 minutes', expires_at=expires_at-interval '11 minutes' where id='${pairing}'`);
+    await assert.rejects(sql(create()), /pairing_expired/);
+    assert.equal(await sql(`select has_table_privilege('service_role','context_relay_private.pairing_invites','select')`), 'f');
+    assert.equal(await sql(`select has_function_privilege('authenticated','public.service_create_pairing_invite(uuid,uuid,uuid,uuid,uuid,bytea)','execute')`), 'f');
+  } finally { await f.cleanup(); }
+});
+
+test('pairing invite insertion rolls back if Auth expires during a unique-index wait', async () => {
+  const f = await enrollmentFixture(), other = await enrollmentFixture();
+  let release, outcome;
+  const pairing = id();
+  try {
+    const requests = [];
+    for (const [index, item] of [other, f].entries()) {
+      const reservation = JSON.parse(await sql(item.request()));
+      await sql(enrollmentCommit(item, reservation));
+      const device = await sql(`select device_id from public.device_bindings where session_id='${item.session}'`);
+      requests.push(`set role service_role; select public.service_create_pairing_invite('${item.user}','${item.session}',
+        '${reservation.workspaceId}','${device.trim()}','${index === 0 ? id() : pairing}',decode(repeat('42',32),'hex'));`);
+    }
+    const existing = JSON.parse(await sql(requests[0]));
+    await sql(`update auth.sessions set not_after=clock_timestamp()+interval '2 seconds' where id='${f.session}'`);
+    release = await holdLock(`delete from context_relay_private.pairing_invites where id='${existing.pairingId}'`);
+    const application = `pairing-insert-${randomUUID()}`;
+    outcome = sql(requests[1], application).then(value => ({ value }), error => ({ error }));
+    await waitUntilBlocked(application);
+    await sql(`select pg_sleep(greatest(0,extract(epoch from not_after-clock_timestamp())+0.1)) from auth.sessions where id='${f.session}'`);
+    await release(); release = null;
+    assert.match((await outcome).error?.stderr ?? '', /pairing_denied/);
+    assert.equal(await sql(`select count(*) from context_relay_private.pairing_invites where id='${pairing}'`), '0');
+  } finally { if (release) await release(); if (outcome) await outcome; await f.cleanup(); await other.cleanup(); }
+});
+
 test('recovery snapshot allows a fresh owner session without granting device trust', async () => {
   const f = await enrollmentFixture(), other = await enrollmentFixture(), fresh = randomUUID();
   const snapshot = (user = f.user, session = fresh) => `set role service_role;
