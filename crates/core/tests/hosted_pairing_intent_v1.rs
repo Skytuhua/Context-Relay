@@ -277,7 +277,10 @@ fn schema_31_and_32_upgrades_create_empty_pairing_metadata() {
         let id = "018f22e2-79b0-7cc8-98c4-dc0c0c073991".parse().unwrap();
         assert!(vault.hosted_pairing_intent(id).unwrap().is_none());
         assert!(vault.pairing_request_review(id).unwrap().is_none());
-        assert_eq!(vault.schema_version().unwrap(), 34);
+        assert_eq!(
+            vault.schema_version().unwrap(),
+            context_relay_core::vault::LATEST_SCHEMA_VERSION
+        );
     }
 }
 

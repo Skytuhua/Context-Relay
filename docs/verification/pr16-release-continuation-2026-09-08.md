@@ -1,5 +1,28 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Durable candidate approval receipts — 2026-09-09
+
+Candidate approval now binds its operation ID to the original candidate and
+decision before mutation. Reused IDs from another operation, candidate or
+decision are rejected. Exact retries return the original response after restart.
+The approval receipt, candidate decision and accepted memory share the existing
+transaction. Recording a receipt for an already accepted legacy decision does
+not overwrite later edits to its memory.
+
+Schema 35 adds the dedicated candidate_review operation kind while preserving
+existing bindings, response bytes and foreign keys. Validation passes all 20
+service, three offline-workspace, 21 storage and four pairing-intent tests. The
+regression reproduced ignored operation IDs, then verified receipt-failure
+rollback, restart replay and preservation of later memory edits. The migration
+test preserves an existing v10 receipt and checks foreign-key integrity.
+Independent review found one stale schema-version assertion; it now uses the
+current schema constant and its pairing migration test passes.
+Scoped Clippy with warnings denied and the normal daemon library check also pass.
+
+These are local approval receipts. Signing the candidate and accepted-memory
+operations atomically remains unfinished, as do native-import and legacy sync
+reconciliation, production daemon configuration and full release acceptance.
+
 ## Atomic configured MCP proposal writes — 2026-09-09
 
 Configured proposal creation now signs an UpsertMemoryCandidate through the

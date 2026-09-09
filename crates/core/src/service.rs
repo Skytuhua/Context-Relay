@@ -815,29 +815,53 @@ impl<'a> OfflineWorkspace<'a> {
         &mut self,
         params: CandidateReviewParams,
     ) -> Result<context_relay_protocol::MemoryCandidate, ClientError> {
-        let mut candidate =
-            vault(self.vault.candidate(&params.candidate_id))?.ok_or_else(not_found)?;
         let state = if params.accepted {
             CandidateState::Accepted
         } else {
             CandidateState::Rejected
         };
-        if candidate.state == state {
-            return Ok(candidate);
+        let binding = local_operation_binding(
+            params.operation_id,
+            LocalOperationKind::CandidateReview,
+            params.candidate_id.to_string(),
+            None,
+            &params,
+        )?;
+        match vault(self.vault.local_operation_replay(&binding))? {
+            LocalOperationReplay::Snapshot(snapshot) => {
+                let candidate: MemoryCandidate =
+                    serde_json::from_slice(&snapshot).map_err(|_| internal())?;
+                candidate.validate().map_err(|_| internal())?;
+                if candidate.id != params.candidate_id || candidate.state != state {
+                    return Err(internal());
+                }
+                return Ok(candidate);
+            }
+            LocalOperationReplay::Legacy => return Err(internal()),
+            LocalOperationReplay::Fresh => {}
         }
-        if candidate.state != CandidateState::Pending {
+        let mut candidate =
+            vault(self.vault.candidate(&params.candidate_id))?.ok_or_else(not_found)?;
+        if candidate.state != CandidateState::Pending && candidate.state != state {
             return Err(conflict("The candidate was already reviewed"));
         }
         if params.accepted {
             let embedding = memory_embedding(&candidate.proposed_memory)?;
-            vault(self.vault.review_candidate(
+            vault(self.vault.review_candidate_with_binding(
                 candidate.id,
                 state,
                 Some(&candidate.proposed_memory),
                 Some(&embedding),
+                &binding,
             ))?;
         } else {
-            vault(self.vault.review_candidate(candidate.id, state, None, None))?;
+            vault(self.vault.review_candidate_with_binding(
+                candidate.id,
+                state,
+                None,
+                None,
+                &binding,
+            ))?;
         }
         candidate.state = state;
         Ok(candidate)

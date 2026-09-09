@@ -25,6 +25,103 @@ use support::{
 const CREDENTIAL: &str = "offline-service-tests";
 
 #[test]
+fn candidate_review_binds_operation_and_rolls_back_its_receipt_with_the_decision() {
+    let fixture = Fixture::new("candidate-review-binding");
+    let database_key = [0x73; 32];
+    fixture.keys.insert(CREDENTIAL, database_key);
+    let mut vault = fixture.vault();
+    let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap());
+    let pending = service
+        .propose_memory(
+            ProposeMemoryInput {
+                operation_id: ID_1.parse().unwrap(),
+                kind: MemoryKind::Fact,
+                title: "Review".into(),
+                markdown: "Original".into(),
+                tags: vec![],
+                evidence_summary: "Observed".into(),
+                scope: McpScopeSelector::Global,
+            },
+            ScopeRef::Global,
+            HarnessId::Codex,
+        )
+        .unwrap();
+    let mut review = CandidateReviewParams {
+        candidate_id: pending.id,
+        accepted: true,
+        operation_id: ID_1.parse().unwrap(),
+    };
+    assert_eq!(
+        service.review_candidate(review.clone()).unwrap_err().code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(service.candidates(None).unwrap(), vec![pending.clone()]);
+    review.operation_id = ID_2.parse().unwrap();
+    let raw = open_keyed(fixture.path.path(), &database_key);
+    raw.execute_batch("CREATE TRIGGER fail_review_receipt BEFORE INSERT ON local_operation_results BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+    assert!(service.review_candidate(review.clone()).is_err());
+    assert_eq!(service.candidates(None).unwrap(), vec![pending.clone()]);
+    assert!(
+        service
+            .memory(pending.proposed_memory.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM local_operation_bindings WHERE operation_id = ?1",
+            [ID_2],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    raw.execute_batch("DROP TRIGGER fail_review_receipt;")
+        .unwrap();
+    drop(raw);
+    let accepted = service.review_candidate(review.clone()).unwrap();
+    service
+        .update_memory(MemoryUpdateParams {
+            operation_id: ID_3.parse().unwrap(),
+            memory_id: pending.proposed_memory.id,
+            expected_revision: pending.proposed_memory.revision,
+            title: None,
+            body_markdown: Some("Later edit".into()),
+            tags: None,
+        })
+        .unwrap();
+    let mut additional_receipt = review.clone();
+    additional_receipt.operation_id = ID_5.parse().unwrap();
+    assert_eq!(
+        service.review_candidate(additional_receipt).unwrap(),
+        accepted
+    );
+    drop(vault);
+    let mut vault = fixture.vault();
+    let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap());
+    assert_eq!(service.review_candidate(review.clone()).unwrap(), accepted);
+    assert_eq!(
+        service
+            .memory(pending.proposed_memory.id)
+            .unwrap()
+            .unwrap()
+            .body_markdown,
+        "Later edit"
+    );
+    review.accepted = false;
+    assert_eq!(
+        service.review_candidate(review.clone()).unwrap_err().code,
+        ErrorCode::Conflict
+    );
+    review.accepted = true;
+    review.candidate_id = ID_4.parse().unwrap();
+    assert_eq!(
+        service.review_candidate(review).unwrap_err().code,
+        ErrorCode::Conflict
+    );
+}
+
+#[test]
 fn configured_proposal_sync_rolls_back_and_replays_without_materializing_memory() {
     use context_relay_core::{
         crypto::{ContentKey, DeviceKeys},
@@ -538,11 +635,39 @@ fn migration_v10_through_latest_preserves_existing_workspace_rows() {
         ],
     )
     .unwrap();
+    let original_response = serde_json::to_vec(&task).unwrap();
+    raw.execute(
+        "INSERT INTO local_operation_bindings(operation_id, operation_kind, target_id, expected_revision, canonical_payload) VALUES (?1, 'task_upsert', ?1, NULL, ?2)",
+        params![task.id.to_string(), original_response],
+    ).unwrap();
+    raw.execute(
+        "INSERT INTO local_operation_results(operation_id, canonical_response) VALUES (?1, ?2)",
+        params![task.id.to_string(), original_response],
+    )
+    .unwrap();
     raw.pragma_update(None, "user_version", 10).unwrap();
     drop(raw);
 
     let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
     assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+    let raw = open_keyed(path.path(), &key);
+    assert_eq!(
+        raw.query_row(
+            "SELECT canonical_response FROM local_operation_results WHERE operation_id = ?1",
+            [task.id.to_string()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .unwrap(),
+        original_response
+    );
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        0
+    );
+    drop(raw);
     assert_eq!(vault.projects().unwrap(), vec![project]);
     assert_eq!(vault.task(&task.id).unwrap(), Some(task));
     assert!(

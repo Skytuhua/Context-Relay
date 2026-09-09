@@ -45,8 +45,8 @@ saved response replay also accepts the original shared-ID format. Native-import
 proposals still use shared IDs, and existing candidates retain their saved IDs.
 The sync owner table binds each record ID to a single record kind, so legacy
 candidate synchronization still needs explicit reconciliation. Preserve that
-ownership check. CandidateReviewParams already includes an operation ID, but
-the service does not bind or use it yet. Acceptance updates candidate and memory
-in one transaction; retain that atomic boundary when signing both mutations.
-The current local-operation kind constraint also needs a forward-compatible
-approval binding. Do not reuse a task or memory mutation kind for that receipt.
+ownership check. CandidateReviewParams now has a dedicated durable operation-ID
+binding, including exact replay and changed-request rejection. Schema 35 preserves
+existing receipts while adding the candidate_review kind. Acceptance updates
+candidate, memory and receipt in one transaction; retain that atomic boundary
+when signing both mutations. Signed approval itself remains unfinished.

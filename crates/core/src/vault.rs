@@ -48,7 +48,7 @@ pub use sync::*;
 mod semantic_index;
 pub use semantic_index::{SemanticIndexBatch, SemanticIndexProgress};
 
-pub const LATEST_SCHEMA_VERSION: u32 = 34;
+pub const LATEST_SCHEMA_VERSION: u32 = 35;
 pub const MAX_NATIVE_HOOK_SESSIONS: usize = 256;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
@@ -93,6 +93,7 @@ pub(crate) enum LocalOperationKind {
     TaskUpsert,
     TaskComplete,
     TaskTransition,
+    CandidateReview,
 }
 
 impl LocalOperationKind {
@@ -105,6 +106,7 @@ impl LocalOperationKind {
             Self::TaskUpsert => "task_upsert",
             Self::TaskComplete => "task_complete",
             Self::TaskTransition => "task_transition",
+            Self::CandidateReview => "candidate_review",
         }
     }
 }
@@ -1023,6 +1025,28 @@ impl Vault {
         memory: Option<&MemoryRecord>,
         embedding: Option<&Embedding384>,
     ) -> Result<(), VaultError> {
+        self.review_candidate_inner(id, state, memory, embedding, None)
+    }
+
+    pub(crate) fn review_candidate_with_binding(
+        &mut self,
+        id: CandidateId,
+        state: CandidateState,
+        memory: Option<&MemoryRecord>,
+        embedding: Option<&Embedding384>,
+        binding: &LocalOperationBinding,
+    ) -> Result<(), VaultError> {
+        self.review_candidate_inner(id, state, memory, embedding, Some(binding))
+    }
+
+    fn review_candidate_inner(
+        &mut self,
+        id: CandidateId,
+        state: CandidateState,
+        memory: Option<&MemoryRecord>,
+        embedding: Option<&Embedding384>,
+        binding: Option<&LocalOperationBinding>,
+    ) -> Result<(), VaultError> {
         if state == CandidateState::Pending {
             return Err(VaultError::Validation(
                 "candidate review must accept or reject".to_owned(),
@@ -1038,6 +1062,20 @@ impl Vault {
             .optional()?
             .ok_or_else(|| VaultError::Validation("candidate does not exist".to_owned()))?;
         let mut candidate: MemoryCandidate = from_json(&payload)?;
+        let already_reviewed = binding.is_some() && candidate.state == state;
+        if let Some(binding) = binding {
+            if binding.operation_kind != LocalOperationKind::CandidateReview
+                || binding.target_id != id.to_string()
+                || (candidate.state != CandidateState::Pending && candidate.state != state)
+            {
+                return Err(VaultError::OperationConflict);
+            }
+            let mut response = candidate.clone();
+            response.state = state;
+            if !insert_local_operation_binding(&transaction, binding, &to_json(&response)?)? {
+                return Err(VaultError::OperationConflict);
+            }
+        }
         match (state, memory, embedding) {
             (CandidateState::Accepted, Some(memory), Some(embedding))
                 if memory == &candidate.proposed_memory =>
@@ -1045,18 +1083,20 @@ impl Vault {
                 memory
                     .validate()
                     .map_err(|error| VaultError::Validation(error.to_string()))?;
-                upsert_searchable_record(
-                    &transaction,
-                    &memory.id.to_string(),
-                    "memory",
-                    &memory.scope,
-                    memory.archived,
-                    &memory.title,
-                    &memory.body_markdown,
-                    &to_json(memory)?,
-                    &memory.provenance,
-                    embedding,
-                )?;
+                if !already_reviewed {
+                    upsert_searchable_record(
+                        &transaction,
+                        &memory.id.to_string(),
+                        "memory",
+                        &memory.scope,
+                        memory.archived,
+                        &memory.title,
+                        &memory.body_markdown,
+                        &to_json(memory)?,
+                        &memory.provenance,
+                        embedding,
+                    )?;
+                }
             }
             (CandidateState::Rejected, None, None) => {}
             _ => {
@@ -1071,7 +1111,7 @@ impl Vault {
             params![id.to_string(), candidate_state(state), to_json(&candidate)?],
         )?;
         transaction.commit()?;
-        if let (Some(memory), Some(embedding)) = (memory, embedding) {
+        if !already_reviewed && let (Some(memory), Some(embedding)) = (memory, embedding) {
             self.embedding_cache.insert(
                 memory.id.to_string(),
                 cached_embedding(&memory.scope, memory.archived, embedding),
@@ -2320,6 +2360,18 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
                 "../migrations/0034_account_lifecycle_intents.sql"
             ))
             .and_then(|_| transaction.pragma_update(None, "user_version", 34))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 35 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0035_candidate_review_bindings.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 35))
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }
