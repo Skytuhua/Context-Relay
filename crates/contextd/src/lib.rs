@@ -1207,6 +1207,7 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         request @ (LocalRequest::McpCall(_)
         | LocalRequest::NativeHookEvent(_)
         | LocalRequest::DesktopWritePrepare(_)
+        | LocalRequest::AccountDeletionIntents(_)
         | LocalRequest::DesktopWritesList(_)
         | LocalRequest::DesktopWriteGet(_)
         | LocalRequest::DesktopWriteForget(_)
@@ -2121,6 +2122,21 @@ fn execute_workspace_request(
             .vault
             .prepare_desktop_write(&params.write)
             .map(|()| LocalResult::Empty)
+            .map_err(client_error_from_vault),
+        LocalRequest::AccountDeletionIntents(params) => state
+            .vault
+            .account_lifecycle_intents(params.after)
+            .map(|intents| LocalResult::AccountDeletionIntents {
+                intents: intents
+                    .into_iter()
+                    .map(
+                        |intent| context_relay_protocol::AccountDeletionIntentSummary {
+                            operation_id: intent.operation_id,
+                            action: intent.action,
+                        },
+                    )
+                    .collect(),
+            })
             .map_err(client_error_from_vault),
         LocalRequest::DesktopWritesList(params) => state
             .vault
@@ -4157,7 +4173,7 @@ mod tests {
     #[test]
     fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 67);
+        assert_eq!(fixtures.len(), 68);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -6452,6 +6468,66 @@ mod tests {
         assert_eq!(owner.await.unwrap(), Ok(()));
     }
 
+    #[tokio::test]
+    async fn lifecycle_discovery_reads_original_actions_after_worker_restart() {
+        use context_relay_core::vault::{AccountLifecycleIntent, AccountLifecycleIntentAction};
+        let path = unit_test_support::TempVault::new("lifecycle-discovery-worker");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let intent = AccountLifecycleIntent {
+            operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
+            action: AccountLifecycleIntentAction::BeginDeletion,
+            project_url: "https://example.supabase.co/".into(),
+            user_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+            session_id: "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+            account_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074002".parse().unwrap(),
+            workspace_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074003".parse().unwrap(),
+        };
+        let mut vault = Vault::open(path.path(), "discovery-worker", keys.as_ref()).unwrap();
+        vault.store_account_lifecycle_intent(&intent).unwrap();
+        drop(vault);
+        for _ in 0..2 {
+            let mut worker = VaultWorker::spawn(VaultConfig::new(
+                path.path().into(),
+                "discovery-worker",
+                keys.clone(),
+            ))
+            .await
+            .unwrap();
+            for after in [None, Some(intent.operation_id)] {
+                let result = worker
+                    .client()
+                    .try_submit(
+                        VaultCommand::Workspace(request_fixture(
+                            "account_deletion_intents",
+                            serde_json::json!({"after":after}),
+                        )),
+                        TestAdmission(true),
+                    )
+                    .unwrap()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let expected = if after.is_none() {
+                    vec![
+                        serde_json::json!({"operationId":intent.operation_id,"action":"beginDeletion"}),
+                    ]
+                } else {
+                    vec![]
+                };
+                assert_eq!(
+                    serde_json::to_value(result).unwrap(),
+                    serde_json::json!({"kind":"account_deletion_intents","data":{"intents":expected}})
+                );
+            }
+            worker.shutdown_and_join();
+        }
+        let vault = Vault::open(path.path(), "discovery-worker", keys.as_ref()).unwrap();
+        assert_eq!(
+            vault.account_lifecycle_intent(intent.operation_id).unwrap(),
+            Some(intent)
+        );
+    }
+
     #[test]
     fn hosted_lifecycle_intent_is_durable_before_dispatch_and_status_never_replays() {
         use context_relay_core::vault::{AccountLifecycleIntent, AccountLifecycleIntentAction};
@@ -8373,6 +8449,13 @@ mod tests {
                 request_fixture(
                     "account_deletion_begin",
                     serde_json::json!({"operationId": ID, "confirmation": "delete"}),
+                ),
+            ),
+            (
+                "AccountDeletionIntents",
+                request_fixture(
+                    "account_deletion_intents",
+                    serde_json::json!({"after":null}),
                 ),
             ),
             (

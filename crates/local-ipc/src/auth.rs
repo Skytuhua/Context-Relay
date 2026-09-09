@@ -272,7 +272,9 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::ExportRecords(_) => matches!(role, Desktop),
         LocalRequest::ExportChunk(_) => matches!(role, Desktop),
         LocalRequest::AccountDeletionBegin(_) => matches!(role, Desktop),
-        LocalRequest::AccountDeletionStatus(_) => matches!(role, Desktop),
+        LocalRequest::AccountDeletionStatus(_) | LocalRequest::AccountDeletionIntents(_) => {
+            matches!(role, Desktop)
+        }
         LocalRequest::AccountDeletionCancel(_) => matches!(role, Desktop),
     }
 }

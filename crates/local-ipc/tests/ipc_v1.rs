@@ -243,13 +243,13 @@ fn verify_server_proof(
 
 #[test]
 fn challenged_hmac_matches_frozen_vector() {
-    // The protocol bytes are part of the authenticated transcript. These 1.14
-    // client/server vectors were independently checked with Node HMAC-SHA256.
+    // The protocol bytes are part of the authenticated transcript. These 1.15
+    // client/server vectors were independently checked with Python stdlib HMAC-SHA256.
     assert_eq!(
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 14
+            minor: 15
         }
     );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
@@ -264,7 +264,7 @@ fn challenged_hmac_matches_frozen_vector() {
 
     assert_eq!(
         serde_json::to_string(&proof).unwrap(),
-        r#""gm-frfzAan1TtbieBF6RiiGYvqh84St26xZWJRi95MA""#
+        r#""ulh4Ld9oAi1UkHJsSNxkYoAizyyRxYTmeocJZjmaVtM""#
     );
     assert!(
         verify_proof(
@@ -452,7 +452,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 14
+            minor: 15
         }
     );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
@@ -476,7 +476,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
 
     assert_eq!(
         serde_json::to_string(&server_proof).unwrap(),
-        r#""LdMJ097MvXw75LtVMlQbBAKdAoDkIS_TEpz1oha0MqA""#
+        r#""PzkXMpOhpyFTGswqMihkhRda73CAxSyWCcFGtUfnSU0""#
     );
     assert!(
         verify_server_proof(
@@ -1117,6 +1117,13 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
             ),
         ),
         (
+            "AccountDeletionIntents",
+            request_fixture(
+                "account_deletion_intents",
+                serde_json::json!({"after":null}),
+            ),
+        ),
+        (
             "AccountDeletionStatus",
             request_fixture("account_deletion_status", empty()),
         ),
@@ -1133,7 +1140,7 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
 #[test]
 fn role_allowlist_covers_core_and_tracked_setup_requests() {
     let fixtures = all_request_fixtures();
-    assert_eq!(fixtures.len(), 67);
+    assert_eq!(fixtures.len(), 68);
 
     for (name, request) in &fixtures {
         let common = matches!(*name, "Cancel" | "Health");
@@ -1194,7 +1201,7 @@ fn role_allowlist_covers_core_and_tracked_setup_requests() {
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::Desktop, request))
             .count(),
-        63
+        64
     );
     assert_eq!(
         fixtures

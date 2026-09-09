@@ -1599,3 +1599,44 @@ now records that distinction. Paired devices have an existing
 `completed_pairing_approval` path that checks protected keys and reopens the
 validated confirmed transcript. Full hosted, signing and installed release
 acceptance is still required before merge.
+
+### Desktop-only lifecycle discovery IPC
+
+Protocol 1.15 adds `account_deletion_intents` with an explicit nullable operation
+cursor. The ordered worker reads the existing bounded vault query and returns
+only original operation IDs and begin/cancel actions. Project, account, user and
+session bindings stay in the vault. Summaries must be ordered, unique and at
+most 50 entries. Discovery does not call the lifecycle provider or infer whether
+an operation committed. The core action enum is re-exported from protocol with
+unchanged stored serde values. Bindings and status schema are regenerated.
+
+The new protocol request failed before implementation. All 227 protocol/local
+IPC tests now pass (three existing ignored fixtures); 19 frontend protocol tests
+and TypeScript checks pass. The first full IPC run exposed the desktop-method
+count changing from 63 to 64; each role's per-method assertions pass after its
+expected count was corrected. Independent review identified a protocol upgrade
+regression: 1.15 needed explicit shutdown-only support for the prior 1.14 daemon.
+The frozen test reproduced ProtocolVersionUnsupported; explicit compatibility
+and frozen accept/ordinary-client-reject tests now pass. Review closed that P2.
+
+Evidence: `.codex/pr16-lifecycle-ipc-red.log`,
+`.codex/pr16-lifecycle-ipc-contracts-final.log`,
+`.codex/pr16-lifecycle-ipc-upgrade-red.log`,
+`.codex/pr16-lifecycle-ipc-frontend.log`, and
+`.codex/pr16-lifecycle-ipc-typecheck.log`.
+Production lifecycle scope/transport activation and the explicit retry UI remain
+required. No live account transition or full-release acceptance is claimed.
+
+The five daemon lifecycle tests and routing test pass. The new worker test reads
+original summaries across two worker lifetimes with the provider unavailable,
+checks exclusive-cursor exhaustion and confirms the stored intent is unchanged.
+All 27 affected core tests pass. Scoped protocol/local IPC/daemon/core Clippy
+passes with warnings denied, as do frontend lint and generated binding/schema
+and daemon-boundary checks. Evidence: `.codex/pr16-lifecycle-ipc-daemon.log`,
+`.codex/pr16-lifecycle-ipc-core.log`, `.codex/pr16-lifecycle-ipc-clippy.log`,
+`.codex/pr16-lifecycle-ipc-frontend-lint.log`, and
+`.codex/pr16-lifecycle-ipc-check-generated.log`. Graphify completed after the
+final code change (17,751 nodes).
+
+A normal daemon library check without test-support also passes:
+`.codex/pr16-lifecycle-ipc-production-check.log`.

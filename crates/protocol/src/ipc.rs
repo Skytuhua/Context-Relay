@@ -739,6 +739,7 @@ pub enum LocalRequest {
     ExportChunk(ExportChunkParams),
     AccountDeletionBegin(AccountDeletionParams),
     AccountDeletionStatus(EmptyParams),
+    AccountDeletionIntents(AccountDeletionIntentsParams),
     AccountDeletionCancel(RetryParams),
 }
 
@@ -1170,6 +1171,20 @@ pub enum AccountDeletionState {
     PendingDelete,
     Purged,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum AccountLifecycleIntentAction {
+    BeginDeletion,
+    CancelDeletion,
+}
+params!(AccountDeletionIntentSummary {
+    operation_id: OperationId,
+    action: AccountLifecycleIntentAction
+});
+params!(AccountDeletionIntentsParams {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    after: Option<OperationId>
+});
 #[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(
     tag = "kind",
@@ -1284,6 +1299,9 @@ pub enum LocalResult {
     },
     Export {
         payload: ExportPayload,
+    },
+    AccountDeletionIntents {
+        intents: Vec<AccountDeletionIntentSummary>,
     },
     AccountDeletion {
         state: AccountDeletionState,
@@ -1414,6 +1432,9 @@ enum LocalResultSerde {
     Export {
         payload: ExportPayload,
     },
+    AccountDeletionIntents {
+        intents: Vec<AccountDeletionIntentSummary>,
+    },
     AccountDeletion {
         state: AccountDeletionState,
         #[serde(deserialize_with = "crate::required_nullable")]
@@ -1458,6 +1479,16 @@ impl LocalResult {
                 write.as_ref().map_or(Ok(()), crate::DesktopWrite::validate)
             }
             Self::DesktopWrites { page } => page.validate(),
+            Self::AccountDeletionIntents { intents } => {
+                if intents.len() > 50
+                    || intents
+                        .windows(2)
+                        .any(|pair| pair[0].operation_id >= pair[1].operation_id)
+                {
+                    return Err(ValidationError::Invalid("accountDeletionIntents"));
+                }
+                Ok(())
+            }
             Self::Empty
             | Self::HostedAuth { .. }
             | Self::AccountDeletion { .. }

@@ -2,12 +2,7 @@ use super::{HostedRestoreIntent, Vault, VaultError};
 use context_relay_protocol::{AccountId, OperationId, WorkspaceId};
 use rusqlite::{OptionalExtension, params};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum AccountLifecycleIntentAction {
-    BeginDeletion,
-    CancelDeletion,
-}
+pub use context_relay_protocol::AccountLifecycleIntentAction;
 
 /// Original explicit operation authority. Contains no credentials and authorizes no replay.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]

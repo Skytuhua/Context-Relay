@@ -100,3 +100,15 @@ provisioning evidence and protected-key checks. `trusted_workspace_material()`
 currently covers active enrollment or recovery restore only, not paired joiners.
 The production scope path must support paired devices without replacing this
 verification with a certificate-row-only inference.
+
+### Desktop discovery contract (protocol 1.15)
+
+The desktop-only `account_deletion_intents` request takes `{after:null}` initially
+and then the last returned operation ID. Its response contains at most 50
+ordered summaries with only `operationId` and `action`; an empty page ends the
+read. Use this for previous-request discovery after restart. The presence of an
+intent does not mean pending, completed or safe to replay. The UI must describe
+it as a previous request, read current provider state separately, and require an
+explicit retry of its original action and ID. Begin still requires the existing
+`delete` confirmation. Original authority and provider freshness checks remain
+mandatory; a different login must not adopt previous work.
