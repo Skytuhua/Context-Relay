@@ -25,6 +25,143 @@ use support::{
 const CREDENTIAL: &str = "offline-service-tests";
 
 #[test]
+fn configured_approval_commits_all_signed_operations_or_none() {
+    use context_relay_core::{
+        crypto::{ContentKey, DeviceKeys},
+        sync::SyncIdentity,
+    };
+    for accepted in [false, true] {
+        let fixture = Fixture::new(if accepted {
+            "signed-approval-accept"
+        } else {
+            "signed-approval-reject"
+        });
+        let database_key = [0x74; 32];
+        fixture.keys.insert(CREDENTIAL, database_key);
+        let keys = DeviceKeys::generate().unwrap();
+        let content = ContentKey::from_bytes([0x75; 32]);
+        let identity = || SyncIdentity {
+            account_id: ID_6.parse().unwrap(),
+            workspace_id: ID_8.parse().unwrap(),
+            device_id: ID_9.parse().unwrap(),
+            control_epoch: 1,
+            key_epoch: 1,
+            device_keys: &keys,
+            content_key: &content,
+        };
+        let mut vault = fixture.vault();
+        let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
+            .with_sync_identity(identity())
+            .unwrap();
+        let pending = service
+            .propose_memory(
+                ProposeMemoryInput {
+                    operation_id: ID_1.parse().unwrap(),
+                    kind: MemoryKind::Fact,
+                    title: "Approve".into(),
+                    markdown: "Signed acceptance".into(),
+                    tags: vec![],
+                    evidence_summary: "Observed".into(),
+                    scope: McpScopeSelector::Global,
+                },
+                ScopeRef::Global,
+                HarnessId::Codex,
+            )
+            .unwrap();
+        let review = CandidateReviewParams {
+            candidate_id: pending.id,
+            accepted,
+            operation_id: ID_2.parse().unwrap(),
+        };
+        let raw = open_keyed(fixture.path.path(), &database_key);
+        raw.execute_batch(&format!("CREATE TRIGGER fail_signed_review BEFORE INSERT ON outbox WHEN (SELECT count(*) FROM outbox) = {} BEGIN SELECT RAISE(ABORT, 'injected'); END;", if accepted { 2 } else { 1 })).unwrap();
+        assert!(service.review_candidate(review.clone()).is_err());
+        assert_eq!(service.candidates(None).unwrap(), vec![pending.clone()]);
+        assert!(
+            service
+                .memory(pending.proposed_memory.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            raw.query_row("SELECT count(*) FROM outbox", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            raw.query_row(
+                "SELECT count(*) FROM local_operation_bindings WHERE operation_id = ?1",
+                [ID_2],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        raw.execute_batch("DROP TRIGGER fail_signed_review;")
+            .unwrap();
+        drop(raw);
+        let decided = service.review_candidate(review.clone()).unwrap();
+        assert_eq!(
+            decided.state,
+            if accepted {
+                CandidateState::Accepted
+            } else {
+                CandidateState::Rejected
+            }
+        );
+        assert_eq!(
+            service
+                .memory(pending.proposed_memory.id)
+                .unwrap()
+                .is_some(),
+            accepted
+        );
+        let bytes = vault
+            .due_outbox(u64::MAX, 10)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.canonical_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(bytes.len(), if accepted { 3 } else { 2 });
+        let mut operations = bytes
+            .iter()
+            .map(|bytes| context_relay_protocol::decode_sync_operation_v1(bytes).unwrap())
+            .collect::<Vec<_>>();
+        operations.sort_by_key(|operation| operation.device_sequence);
+        assert_eq!(operations[1].operation_id, review.operation_id);
+        if accepted {
+            assert_eq!(
+                operations[2].record_kind,
+                context_relay_protocol::RecordKind::Memory
+            );
+            assert_eq!(operations[2].device_sequence, 3);
+            assert!(
+                operations[2]
+                    .causal_frontier
+                    .iter()
+                    .any(|entry| entry.device_id == identity().device_id && entry.sequence == 2)
+            );
+        }
+        drop(vault);
+        let mut vault = fixture.vault();
+        let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
+            .with_sync_identity(identity())
+            .unwrap();
+        assert_eq!(service.review_candidate(review).unwrap(), decided);
+        assert_eq!(
+            vault
+                .due_outbox(u64::MAX, 10)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.canonical_bytes)
+                .collect::<Vec<_>>(),
+            bytes
+        );
+    }
+}
+
+#[test]
 fn candidate_review_binds_operation_and_rolls_back_its_receipt_with_the_decision() {
     let fixture = Fixture::new("candidate-review-binding");
     let database_key = [0x73; 32];
@@ -215,6 +352,10 @@ fn configured_proposal_sync_rolls_back_and_replays_without_materializing_memory(
 
 #[test]
 fn legacy_proposal_identity_replays_and_accepts_without_rewriting_saved_ids() {
+    use context_relay_core::{
+        crypto::{ContentKey, DeviceKeys},
+        sync::SyncIdentity,
+    };
     let fixture = Fixture::new("legacy-proposal-identity");
     let database_key = [0x61; 32];
     fixture.keys.insert(CREDENTIAL, database_key);
@@ -248,7 +389,19 @@ fn legacy_proposal_identity_replays_and_accepts_without_rewriting_saved_ids() {
     .unwrap();
     drop(raw);
     let mut vault = fixture.vault();
-    let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap());
+    let keys = DeviceKeys::generate().unwrap();
+    let content = ContentKey::from_bytes([0x62; 32]);
+    let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
+        .with_sync_identity(SyncIdentity {
+            account_id: ID_6.parse().unwrap(),
+            workspace_id: ID_8.parse().unwrap(),
+            device_id: ID_9.parse().unwrap(),
+            control_epoch: 1,
+            key_epoch: 1,
+            device_keys: &keys,
+            content_key: &content,
+        })
+        .unwrap();
     assert_eq!(
         service
             .propose_memory(input.clone(), ScopeRef::Global, HarnessId::Codex)

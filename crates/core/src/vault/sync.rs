@@ -743,137 +743,75 @@ impl Vault {
         {
             return Err(VaultError::OperationConflict);
         }
-        if exact_replay(&transaction, built)? {
-            return Ok(CommitDisposition::ExactReplay);
-        }
-
-        ensure_sync_record_owner(
-            &transaction,
-            None,
-            built.operation.account_id,
-            built.operation.workspace_id,
-            built.operation.record_id,
-            built.operation.record_kind,
-        )?;
-
-        validate_device_chain(&transaction, &built.operation)?;
-        let current_heads = load_record_heads(
-            &transaction,
-            built.operation.workspace_id,
-            built.operation.record_id,
-        )?;
-        if current_heads
-            .iter()
-            .any(|head| compare_operations(&built.operation, &head.operation) != CausalOrder::After)
-        {
-            return Err(VaultError::Validation(
-                "outgoing operation must causally follow every current record head".to_owned(),
-            ));
-        }
-        let cache_change = materialize_mutation(&transaction, mutation, embedding)?;
-        let operation = &built.operation;
-        let operation_id = operation.operation_id.to_string();
-        transaction.execute(
-            "INSERT INTO operations(id, record_id, payload_json) VALUES (?1, ?2, ?3)",
-            params![
-                operation_id,
-                operation.record_id.to_string(),
-                to_json(operation)?
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO sync_operation_meta(
-                 operation_id, account_id, workspace_id, device_id, device_sequence,
-                 canonical_sha256, direction, state
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'outgoing', 'queued')",
-            params![
-                operation_id,
-                operation.account_id.to_string(),
-                operation.workspace_id.to_string(),
-                operation.device_id.to_string(),
-                operation.device_sequence.to_string(),
-                built.canonical_hash.0.as_slice(),
-            ],
-        )?;
-        note_checkpoint_operation(
-            &transaction,
-            operation.account_id,
-            operation.workspace_id,
-            committed_at_ms,
-        )?;
-        transaction.execute(
-            "INSERT INTO outbox(operation_id) VALUES (?1)",
-            [&operation_id],
-        )?;
-        transaction.execute(
-            "INSERT INTO sync_device_heads(
-                 workspace_id, device_id, device_sequence, canonical_sha256
-             ) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(workspace_id, device_id) DO UPDATE SET
-                 device_sequence = excluded.device_sequence,
-                 canonical_sha256 = excluded.canonical_sha256",
-            params![
-                operation.workspace_id.to_string(),
-                operation.device_id.to_string(),
-                operation.device_sequence.to_string(),
-                built.canonical_hash.0.as_slice(),
-            ],
-        )?;
-        transaction.execute(
-            "DELETE FROM sync_record_heads
-             WHERE workspace_id = ?1 AND record_id = ?2",
-            params![
-                operation.workspace_id.to_string(),
-                operation.record_id.to_string()
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO sync_record_heads(
-                 workspace_id, record_id, operation_id, record_kind, mutation_kind,
-                 canonical_sha256
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                operation.workspace_id.to_string(),
-                operation.record_id.to_string(),
-                operation_id,
-                record_kind_name(operation.record_kind),
-                mutation_kind_name(operation.mutation_kind),
-                built.canonical_hash.0.as_slice(),
-            ],
-        )?;
-        transaction.execute(
-            "DELETE FROM conflicts WHERE record_id = ?1",
-            [operation.record_id.to_string()],
-        )?;
-        transaction.execute(
-            "INSERT INTO sync_nonces(key_epoch, nonce, operation_id) VALUES (?1, ?2, ?3)",
-            params![
-                i64::from(operation.key_epoch),
-                operation.nonce.0.as_slice(),
-                operation_id,
-            ],
-        )?;
+        let (disposition, cache_change) =
+            persist_outgoing(&transaction, mutation, built, embedding, committed_at_ms)?;
         transaction.commit()?;
+        apply_cache_change(&mut self.embedding_cache, cache_change);
+        Ok(disposition)
+    }
 
-        match cache_change {
-            CacheChange::PutMemory(record, embedding) => {
-                self.embedding_cache.insert(
-                    record.id.to_string(),
-                    cached_embedding(&record.scope, record.archived, embedding),
-                );
-            }
-            CacheChange::PutInstruction(record, embedding) => {
-                self.embedding_cache.insert(
-                    record.id.to_string(),
-                    cached_embedding(&record.scope, record.archived, embedding),
-                );
-            }
-            CacheChange::Remove(record_id) => {
-                self.embedding_cache.remove(&record_id);
-            }
-            CacheChange::None => {}
+    pub(crate) fn has_sync_record_owner(&self, record_id: RecordId) -> Result<bool, VaultError> {
+        Ok(stored_sync_record_owner(&self.connection, record_id)?.is_some())
+    }
+
+    pub(crate) fn commit_signed_candidate_review(
+        &mut self,
+        candidate: &MemoryCandidate,
+        decision: &BuiltOperation,
+        accepted: Option<(&BuiltOperation, &Embedding384)>,
+        binding: &super::LocalOperationBinding,
+    ) -> Result<(), VaultError> {
+        use context_relay_protocol::CandidateState;
+        let transaction = self.connection.transaction()?;
+        let payload: Vec<u8> = transaction.query_row(
+            "SELECT payload_json FROM candidates WHERE id = ?1",
+            [candidate.id.to_string()],
+            |row| row.get(0),
+        )?;
+        let mut current: MemoryCandidate = from_json(&payload)?;
+        if current.state != CandidateState::Pending
+            || binding.operation_kind != super::LocalOperationKind::CandidateReview
+            || binding.operation_id != decision.operation.operation_id
+            || binding.target_id != candidate.id.to_string()
+            || binding.expected_revision.is_some()
+        {
+            return Err(VaultError::OperationConflict);
         }
-        Ok(CommitDisposition::Inserted)
+        current.state = candidate.state;
+        if &current != candidate
+            || !matches!(
+                (candidate.state, accepted.is_some()),
+                (CandidateState::Accepted, true) | (CandidateState::Rejected, false)
+            )
+        {
+            return Err(VaultError::OperationConflict);
+        }
+        if !super::insert_local_operation_binding(&transaction, binding, &to_json(candidate)?)? {
+            return Err(VaultError::OperationConflict);
+        }
+        let now = local_unix_ms()?;
+        let mutation = RecordMutationV1::UpsertMemoryCandidate(candidate.clone());
+        persist_outgoing(&transaction, &mutation, decision, None, now)?;
+        let memory = RecordMutationV1::UpsertMemory(candidate.proposed_memory.clone());
+        let cache_change = if let Some((built, embedding)) = accepted {
+            let first = &decision.operation;
+            let second = &built.operation;
+            if first.account_id != second.account_id
+                || first.workspace_id != second.workspace_id
+                || first.device_id != second.device_id
+                || first.key_epoch != second.key_epoch
+                || first.control_epoch != second.control_epoch
+                || first.project_id != second.project_id
+            {
+                return Err(VaultError::OperationConflict);
+            }
+            persist_outgoing(&transaction, &memory, built, Some(embedding), now)?.1
+        } else {
+            CacheChange::None
+        };
+        transaction.commit()?;
+        apply_cache_change(&mut self.embedding_cache, cache_change);
+        Ok(())
     }
 
     pub fn due_outbox(
@@ -2366,6 +2304,127 @@ fn upsert_cursor(
         ],
     )?;
     Ok(())
+}
+
+fn persist_outgoing<'a>(
+    transaction: &Transaction<'_>,
+    mutation: &'a RecordMutationV1,
+    built: &BuiltOperation,
+    embedding: Option<&'a Embedding384>,
+    committed_at_ms: u64,
+) -> Result<(CommitDisposition, CacheChange<'a>), VaultError> {
+    validate_commit(mutation, built)?;
+    if exact_replay(transaction, built)? {
+        return Ok((CommitDisposition::ExactReplay, CacheChange::None));
+    }
+
+    ensure_sync_record_owner(
+        transaction,
+        None,
+        built.operation.account_id,
+        built.operation.workspace_id,
+        built.operation.record_id,
+        built.operation.record_kind,
+    )?;
+
+    validate_device_chain(transaction, &built.operation)?;
+    let current_heads = load_record_heads(
+        transaction,
+        built.operation.workspace_id,
+        built.operation.record_id,
+    )?;
+    if current_heads
+        .iter()
+        .any(|head| compare_operations(&built.operation, &head.operation) != CausalOrder::After)
+    {
+        return Err(VaultError::Validation(
+            "outgoing operation must causally follow every current record head".to_owned(),
+        ));
+    }
+    let cache_change = materialize_mutation(transaction, mutation, embedding)?;
+    let operation = &built.operation;
+    let operation_id = operation.operation_id.to_string();
+    transaction.execute(
+        "INSERT INTO operations(id, record_id, payload_json) VALUES (?1, ?2, ?3)",
+        params![
+            operation_id,
+            operation.record_id.to_string(),
+            to_json(operation)?
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO sync_operation_meta(
+                 operation_id, account_id, workspace_id, device_id, device_sequence,
+                 canonical_sha256, direction, state
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'outgoing', 'queued')",
+        params![
+            operation_id,
+            operation.account_id.to_string(),
+            operation.workspace_id.to_string(),
+            operation.device_id.to_string(),
+            operation.device_sequence.to_string(),
+            built.canonical_hash.0.as_slice(),
+        ],
+    )?;
+    note_checkpoint_operation(
+        transaction,
+        operation.account_id,
+        operation.workspace_id,
+        committed_at_ms,
+    )?;
+    transaction.execute(
+        "INSERT INTO outbox(operation_id) VALUES (?1)",
+        [&operation_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO sync_device_heads(
+                 workspace_id, device_id, device_sequence, canonical_sha256
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(workspace_id, device_id) DO UPDATE SET
+                 device_sequence = excluded.device_sequence,
+                 canonical_sha256 = excluded.canonical_sha256",
+        params![
+            operation.workspace_id.to_string(),
+            operation.device_id.to_string(),
+            operation.device_sequence.to_string(),
+            built.canonical_hash.0.as_slice(),
+        ],
+    )?;
+    transaction.execute(
+        "DELETE FROM sync_record_heads
+             WHERE workspace_id = ?1 AND record_id = ?2",
+        params![
+            operation.workspace_id.to_string(),
+            operation.record_id.to_string()
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO sync_record_heads(
+                 workspace_id, record_id, operation_id, record_kind, mutation_kind,
+                 canonical_sha256
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            operation.workspace_id.to_string(),
+            operation.record_id.to_string(),
+            operation_id,
+            record_kind_name(operation.record_kind),
+            mutation_kind_name(operation.mutation_kind),
+            built.canonical_hash.0.as_slice(),
+        ],
+    )?;
+    transaction.execute(
+        "DELETE FROM conflicts WHERE record_id = ?1",
+        [operation.record_id.to_string()],
+    )?;
+    transaction.execute(
+        "INSERT INTO sync_nonces(key_epoch, nonce, operation_id) VALUES (?1, ?2, ?3)",
+        params![
+            i64::from(operation.key_epoch),
+            operation.nonce.0.as_slice(),
+            operation_id,
+        ],
+    )?;
+    Ok((CommitDisposition::Inserted, cache_change))
 }
 
 fn apply_cache_change(

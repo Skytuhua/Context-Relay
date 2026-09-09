@@ -1,5 +1,28 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Atomic configured candidate decisions — 2026-09-09
+
+Configured review of a sync-owned pending candidate now commits its signed
+decision, optional signed accepted memory, original request/response receipt,
+outbox and device chain in one transaction. The accepted memory operation has
+a separate domain-derived ID and follows the decision in its chain and causal
+frontier. Shared outgoing persistence retains the existing validation and only
+updates the search cache after commit.
+
+The regression first reproduced missing queued operations. It now verifies
+rollback when rejection enqueue fails or the second acceptance enqueue fails,
+then successful retry and exact response/operation bytes after reopening.
+All 21 service and 14 sync-storage tests pass. Scoped Clippy with warnings
+denied and the normal production daemon library check pass.
+Review caught an ownerless legacy-candidate compatibility issue;
+the corrected path retains local review and its saved memory ID after sync is
+configured. The extended legacy regression passes; re-review has no remaining
+actionable findings. Graphify update completed.
+
+Ownerless offline/native candidates still require explicit sync migration.
+Production daemon sync configuration, installed hosted qualification, signing,
+clean-machine acceptance and the remaining full-release gates are unfinished.
+
 ## Durable candidate approval receipts — 2026-09-09
 
 Candidate approval now binds its operation ID to the original candidate and

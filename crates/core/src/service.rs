@@ -108,27 +108,50 @@ impl<'a> OfflineWorkspace<'a> {
         embedding: Option<&Embedding384>,
         created_hlc: HybridLogicalClock,
     ) -> Result<(), ClientError> {
+        let built =
+            self.build_signed_mutation(mutation, binding.operation_id, created_hlc, None)?;
+        let response = match mutation {
+            context_relay_protocol::RecordMutationV1::UpsertMemory(value) => {
+                serde_json::to_vec(value)
+            }
+            context_relay_protocol::RecordMutationV1::UpsertTask(value) => {
+                serde_json::to_vec(value)
+            }
+            context_relay_protocol::RecordMutationV1::UpsertMemoryCandidate(value) => {
+                serde_json::to_vec(value)
+            }
+            _ => return Err(internal()),
+        }
+        .map_err(|_| internal())?;
+        vault(self.vault.commit_outgoing_operation_with_binding(
+            mutation, &built, embedding, binding, &response,
+        ))
+        .map(|_| ())
+    }
+
+    fn build_signed_mutation(
+        &self,
+        mutation: &context_relay_protocol::RecordMutationV1,
+        operation_id: OperationId,
+        created_hlc: HybridLogicalClock,
+        preceding: Option<&crate::sync::BuiltOperation>,
+    ) -> Result<crate::sync::BuiltOperation, ClientError> {
         use context_relay_protocol::RecordMutationV1;
         let identity = self.sync_identity.as_ref().ok_or_else(internal)?;
-        let (project_id, response) = match mutation {
-            RecordMutationV1::UpsertMemory(memory) => (
-                match memory.scope {
-                    ScopeRef::Global => None,
-                    ScopeRef::Project { project_id } => Some(project_id),
-                },
-                serde_json::to_vec(memory),
-            ),
-            RecordMutationV1::UpsertTask(task) => (Some(task.project_id), serde_json::to_vec(task)),
-            RecordMutationV1::UpsertMemoryCandidate(candidate) => (
-                match candidate.proposed_memory.scope {
-                    ScopeRef::Global => None,
-                    ScopeRef::Project { project_id } => Some(project_id),
-                },
-                serde_json::to_vec(candidate),
-            ),
+        let project_id = match mutation {
+            RecordMutationV1::UpsertMemory(memory) => memory.scope.clone(),
+            RecordMutationV1::UpsertTask(task) => ScopeRef::Project {
+                project_id: task.project_id,
+            },
+            RecordMutationV1::UpsertMemoryCandidate(candidate) => {
+                candidate.proposed_memory.scope.clone()
+            }
             _ => return Err(internal()),
         };
-        let response = response.map_err(|_| internal())?;
+        let project_id = match project_id {
+            ScopeRef::Global => None,
+            ScopeRef::Project { project_id } => Some(project_id),
+        };
         use crate::sync::{
             OperationBuildRequest, OperationBuilder, OperationChainHead, SyncIdentity, SyncScope,
         };
@@ -136,7 +159,7 @@ impl<'a> OfflineWorkspace<'a> {
             account_id: identity.account_id,
             workspace_id: identity.workspace_id,
         };
-        let previous = vault(
+        let mut previous = vault(
             self.vault
                 .device_head(identity.workspace_id, self.device_id),
         )?
@@ -144,7 +167,20 @@ impl<'a> OfflineWorkspace<'a> {
             sequence: head.sequence,
             canonical_hash: head.canonical_hash,
         });
-        let built = OperationBuilder::new(SyncIdentity {
+        let mut causal_frontier = vault(self.vault.sync_checkpoint_frontier(scope))?;
+        if let Some(built) = preceding {
+            previous = Some(OperationChainHead {
+                sequence: built.operation.device_sequence,
+                canonical_hash: built.canonical_hash,
+            });
+            causal_frontier.retain(|entry| entry.device_id != self.device_id);
+            causal_frontier.push(context_relay_protocol::DeviceSequence {
+                device_id: self.device_id,
+                sequence: built.operation.device_sequence,
+            });
+            causal_frontier.sort_by_key(|entry| entry.device_id);
+        }
+        OperationBuilder::new(SyncIdentity {
             account_id: identity.account_id,
             workspace_id: identity.workspace_id,
             device_id: identity.device_id,
@@ -154,19 +190,15 @@ impl<'a> OfflineWorkspace<'a> {
             content_key: identity.content_key,
         })
         .build(OperationBuildRequest {
-            operation_id: binding.operation_id,
+            operation_id,
             project_id,
             mutation,
-            causal_frontier: vault(self.vault.sync_checkpoint_frontier(scope))?,
+            causal_frontier,
             previous,
             blob_refs: vec![],
             created_hlc,
         })
-        .map_err(|_| internal())?;
-        vault(self.vault.commit_outgoing_operation_with_binding(
-            mutation, &built, embedding, binding, &response,
-        ))
-        .map(|_| ())
+        .map_err(|_| internal())
     }
 
     pub fn handle_native_hook_event(
@@ -845,6 +877,53 @@ impl<'a> OfflineWorkspace<'a> {
         if candidate.state != CandidateState::Pending && candidate.state != state {
             return Err(conflict("The candidate was already reviewed"));
         }
+        // Ownerless offline/native candidates retain local review until explicit sync migration.
+        if self.sync_identity.is_some()
+            && candidate.state == CandidateState::Pending
+            && vault(self.vault.has_sync_record_owner(
+                RecordId::new(candidate.id.into_uuid()).map_err(|_| internal())?,
+            ))?
+        {
+            candidate.state = state;
+            let clock = operation_clock(params.operation_id, self.device_id);
+            let decision = self.build_signed_mutation(
+                &context_relay_protocol::RecordMutationV1::UpsertMemoryCandidate(candidate.clone()),
+                params.operation_id,
+                clock,
+                None,
+            )?;
+            let accepted = if params.accepted {
+                let operation_id = OperationId::new(derived_uuid(
+                    params.operation_id.as_bytes(),
+                    b"context-relay.candidate-review-memory.v1",
+                )?)
+                .map_err(|_| internal())?;
+                Some((
+                    self.build_signed_mutation(
+                        &context_relay_protocol::RecordMutationV1::UpsertMemory(
+                            candidate.proposed_memory.clone(),
+                        ),
+                        operation_id,
+                        clock,
+                        Some(&decision),
+                    )?,
+                    memory_embedding(&candidate.proposed_memory)?,
+                ))
+            } else {
+                None
+            };
+            vault(
+                self.vault.commit_signed_candidate_review(
+                    &candidate,
+                    &decision,
+                    accepted
+                        .as_ref()
+                        .map(|(built, embedding)| (built, embedding)),
+                    &binding,
+                ),
+            )?;
+            return Ok(candidate);
+        }
         if params.accepted {
             let embedding = memory_embedding(&candidate.proposed_memory)?;
             vault(self.vault.review_candidate_with_binding(
@@ -1289,18 +1368,26 @@ fn candidate_snapshot(
 }
 
 fn proposed_memory_id(candidate: CandidateId) -> Result<MemoryId, ClientError> {
+    MemoryId::new(derived_uuid(
+        candidate.as_bytes(),
+        b"context-relay.proposed-memory.v1",
+    )?)
+    .map_err(|_| internal())
+}
+
+fn derived_uuid(source: &[u8; 16], domain: &[u8]) -> Result<uuid::Uuid, ClientError> {
     let mut hasher = Sha256::new();
-    hasher.update(b"context-relay.proposed-memory.v1");
-    hasher.update(candidate.as_bytes());
+    hasher.update(domain);
+    hasher.update(source);
     let digest = hasher.finalize();
-    let mut bytes = *candidate.as_bytes();
+    let mut bytes = *source;
     bytes[6..].copy_from_slice(&digest[..10]);
     bytes[6] = (bytes[6] & 0x0f) | 0x70;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    if &bytes == candidate.as_bytes() {
+    if &bytes == source {
         return Err(internal());
     }
-    MemoryId::new(uuid::Uuid::from_bytes(bytes)).map_err(|_| internal())
+    Ok(uuid::Uuid::from_bytes(bytes))
 }
 
 fn task_snapshot(
