@@ -1559,3 +1559,21 @@ core/daemon library and test Clippy with warnings denied. Logs:
 its missing optional SQL/OCaml parsers do not affect these executable checks.
 The new metadata test covers withdrawn/replaced authority, not a timed-expiry
 case. Existing provider freshness checks remain mandatory on every mutation.
+
+### Required nullable lifecycle response fields
+
+The shared native lifecycle decoder now requires both `requestedAtMs` and
+`purgeDeadlineMs` keys while accepting explicit null. Previously Serde treated
+omitted optional fields as null, accepting malformed active/purged projections
+that the Edge contract rejects. This applies to status, begin and cancel.
+
+The regression reproduced acceptance of an active response missing
+`requestedAtMs` before the fix. One test covers either/both missing keys for
+active/purged across all three actions and verifies valid explicit-null replies.
+All 28 affected lifecycle/Auth tests and scoped core library/test Clippy with
+warnings denied pass. Independent bounded review found no semantic issues.
+Evidence: `.codex/pr16-lifecycle-null-red.log`,
+`.codex/pr16-lifecycle-null-final.log`, and
+`.codex/pr16-lifecycle-null-clippy.log`. Graphify update completed (17,737 nodes).
+These are local boundary checks; production lifecycle activation, live provider
+acceptance and the full release gates remain unfinished.

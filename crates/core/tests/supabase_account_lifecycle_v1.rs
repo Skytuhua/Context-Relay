@@ -237,3 +237,48 @@ fn hosted_deletion_rejects_forged_projections_and_sanitizes_provider_errors() {
     assert!(!debug.contains(ACCESS_TOKEN));
     assert!(!debug.contains(PUBLISHABLE_KEY));
 }
+
+#[test]
+fn lifecycle_replies_require_explicit_nullable_timestamps_for_every_action() {
+    for state in ["active", "purged"] {
+        for missing in 1..=3 {
+            for action in ["status", "begin", "cancel"] {
+                let http = Arc::new(TestHttp::default());
+                let mut body = serde_json::json!({"v":1,"state":state,"requestedAtMs":null,"purgeDeadlineMs":null});
+                if missing & 1 != 0 {
+                    body.as_object_mut().unwrap().remove("requestedAtMs");
+                }
+                if missing & 2 != 0 {
+                    body.as_object_mut().unwrap().remove("purgeDeadlineMs");
+                }
+                http.push(200, &body.to_string());
+                http.push(200, &serde_json::json!({"v":1,"state":state,"requestedAtMs":null,"purgeDeadlineMs":null}).to_string());
+                let transport = SupabaseAccountLifecycleTransport::with_http_client(
+                    SupabaseTransportConfig::new(
+                        "https://example.supabase.co",
+                        PUBLISHABLE_KEY,
+                        ACCESS_TOKEN,
+                    )
+                    .unwrap(),
+                    WORKSPACE_ID.parse().unwrap(),
+                    http,
+                )
+                .unwrap();
+                let result = match action {
+                    "status" => transport.deletion_status(),
+                    "begin" => transport.begin_deletion(BEGIN_ID.parse().unwrap()),
+                    _ => transport.cancel_deletion(BEGIN_ID.parse().unwrap()),
+                };
+                assert_eq!(
+                    result,
+                    Err(AccountLifecycleTransportError::Conflict),
+                    "{state} {missing} {action}"
+                );
+                assert_eq!(
+                    serde_json::to_value(transport.deletion_status().unwrap().state).unwrap(),
+                    serde_json::json!(state)
+                );
+            }
+        }
+    }
+}

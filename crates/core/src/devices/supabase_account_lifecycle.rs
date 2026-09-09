@@ -341,7 +341,9 @@ struct AccountLifecycleRequest {
 struct AccountLifecycleResponse {
     v: u8,
     state: AccountDeletionState,
+    #[serde(deserialize_with = "Option::deserialize")]
     requested_at_ms: Option<String>,
+    #[serde(deserialize_with = "Option::deserialize")]
     purge_deadline_ms: Option<String>,
 }
 
