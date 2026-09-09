@@ -2751,3 +2751,30 @@ tip independently; deriving the pin from the same history defeats rollback check
 This API does not prove hosted acceptance, cutoff ancestry or decryptability, and
 has not yet been wired into sync authority/key activation. Those integrations and
 the full release checklist remain required before merge.
+
+
+### Retry transient source-archive HTTP failures (2026-09-09)
+
+Older CI run 34337253370 (c9aaf05), macOS Semgrep producer job 102419480412,
+failed while fetching the pinned domain-name 0.5.0 archive: GitHub returned HTTP
+500 for SHA-256 `9ec7ae2c22772c150b84cfa3f21d9bf25fae14a796f31e20df52d86f46499d89`.
+The job log was retrieved through the jobs API while the overall run was active:
+`.codex/pr16-ci-c9aaf05-macos-semgrep-failed.log`. Cancellation does not erase this
+failure or count as a successful gate.
+
+The shared source-archive downloader previously attempted each URL once. It now
+makes at most three attempts for transient HTTP 408/429/500/502/503/504 responses,
+with 250/500ms backoff, sharing the existing deadline across retries and redirects.
+Non-200 response streams are released before retry, redirect or failure. URL,
+redirect, checksum, size-budget and atomic-cache publication checks are retained.
+The regression initially reproduced HTTP 500, then passed with recovery on the
+second attempt, bounded exhaustion, immediate 404 failure and checksum-drift rejection.
+All 27 source-bundle tests and 39 inventory/resealing/native-workflow tests pass.
+Read-only review found no P1/P2. A live fetch of the exact failing archive returned
+9,413 bytes and passed both locked SHA-256 and SHA-512 checks; this does not prove
+that the macOS native build passes. Logs: `.codex/pr16-archive-retry-{red,tests,regressions,live}.log`.
+
+Four superseded workflows were verified terminal/canceled after preserving the
+failure: 34339932913, 34338206278, 34337253370 and 34339932921. Current-head CI,
+full native producer qualification and all remaining product-release gates remain
+required before merge.
