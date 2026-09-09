@@ -1222,6 +1222,31 @@ impl Vault {
         Ok(())
     }
 
+    /// Resume only the specified reason in a verified workspace after its state changes.
+    pub fn unblock_scoped_outbox_after_state_change(
+        &mut self,
+        scope: SyncScope,
+        reason: OutboxUnblockReason,
+        now_ms: u64,
+    ) -> Result<usize, VaultError> {
+        let now_ms = i64::try_from(now_ms).map_err(|_| {
+            VaultError::Validation("outbox unblock time exceeds SQLite integer range".into())
+        })?;
+        Ok(self.connection.execute(
+            "UPDATE outbox SET next_attempt_ms = ?1, safe_error_code = NULL
+             WHERE safe_error_code = ?2 AND EXISTS (
+                 SELECT 1 FROM sync_operation_meta m WHERE m.operation_id = outbox.operation_id
+                 AND m.account_id = ?3 AND m.workspace_id = ?4 AND m.direction = 'outgoing'
+             )",
+            params![
+                now_ms,
+                reason.blocked_code(),
+                scope.account_id.to_string(),
+                scope.workspace_id.to_string()
+            ],
+        )?)
+    }
+
     pub fn unblock_outbox_after_state_change(
         &mut self,
         ids: &[OperationId],

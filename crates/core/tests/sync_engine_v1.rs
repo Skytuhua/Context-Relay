@@ -1832,6 +1832,58 @@ fn permanent_outbox_blocks_resume_only_after_matching_explicit_state_change() {
         vec![(auth_id, 1), (quota_id, 1)]
     );
     assert!(!due.iter().any(|row| row.operation_id == integrity_id));
+    vault
+        .defer_outbox(&[auth_id], i64::MAX as u64, "auth_required")
+        .unwrap();
+    for other in [
+        SyncScope {
+            account_id: id(ID_3),
+            ..scope()
+        },
+        SyncScope {
+            workspace_id: id(ID_3),
+            ..scope()
+        },
+    ] {
+        assert_eq!(
+            vault
+                .unblock_scoped_outbox_after_state_change(
+                    other,
+                    OutboxUnblockReason::AuthenticationChanged,
+                    2_000
+                )
+                .unwrap(),
+            0
+        );
+    }
+    assert_eq!(
+        vault
+            .unblock_scoped_outbox_after_state_change(
+                scope(),
+                OutboxUnblockReason::AuthenticationChanged,
+                2_000
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        vault
+            .unblock_scoped_outbox_after_state_change(
+                scope(),
+                OutboxUnblockReason::AuthenticationChanged,
+                2_000
+            )
+            .unwrap(),
+        0
+    );
+    drop(vault);
+    let reopened = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let due = reopened.due_outbox(2_000, 256).unwrap();
+    assert_eq!(due.len(), 2);
+    let auth = due.iter().find(|row| row.operation_id == auth_id).unwrap();
+    assert_eq!(auth.attempt_count, 2);
+    assert_eq!(auth.canonical_bytes, canonical(&operations[0].1).bytes);
+    assert!(!due.iter().any(|row| row.operation_id == integrity_id));
 }
 
 #[test]

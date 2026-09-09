@@ -2282,3 +2282,41 @@ The full release acceptance checklist remains required before merge.
 Core library/test Clippy with warnings denied and the normal production daemon
 library check pass. Logs: `.codex/pr16-staged-pull-{clippy,production}.log`.
 GitHub checks remained queued at the preceding pushed head.
+
+### Daemon operation-sync supervisor (2026-09-09, integration in progress)
+
+The daemon now wires SyncRetry and a single-flight periodic supervisor to the
+shared engine stages. Actual Supabase transport calls run outside the sole vault
+actor. Each queued stage rechecks its original Auth session/generation, hosted
+project and verified local workspace scope, then rebuilds current local trust.
+Shutdown closes admission and aborts the supervisor; already-running HTTP remains
+bounded by the transport's deadlines and cannot submit its late result.
+
+Review identified three integration gaps, now fixed in source: preserve pending
+push work through pull completion; clear stale Syncing status after authority
+loss; and recover authentication-blocked outgoing rows only on an admitted
+verified session change. Completion rechecks newly due writes; pending work runs
+another bounded cycle. Scoped unblock preserves attempt counts, bytes and other
+block reasons. No further actionable issue was found in the bounded follow-up.
+
+The focused authenticated-transport stall test passes: ordinary reads and
+supervisor shutdown remain responsive, and reopening preserves queued bytes and
+attempt counts. The scoped unblock regression passes for wrong account/workspace,
+matching reason, repeated invocation and reopen. These are simulated HTTP and
+component checks. They do not prove an installed sync cycle, HTTP cancellation,
+certificate refresh or checkpoint acceptance. Certificate refresh and checkpoint
+staging remain required before production cross-device qualification.
+
+All 103 active daemon library tests pass (207.59 seconds); four existing tests
+remain ignored. Logs: `.codex/pr16-sync-supervisor-{tests,all-tests}.log` and
+`.codex/pr16-sync-unblock-tests.log`. Graphify update completed.
+
+After the enum storage adjustment, the expanded focused regression also passes
+(6.44 seconds): it acknowledges a push through the real Supabase adapter, stalls
+the subsequent pull, and verifies shutdown and the acknowledged queue after
+reopening. Evidence: `.codex/pr16-sync-supervisor-final-focus.log`.
+
+Final core/daemon library and test Clippy with warnings denied passes, as does the
+normal production daemon library check. Logs:
+`.codex/pr16-sync-supervisor-clippy-final.log` and
+`.codex/pr16-sync-supervisor-production.log`. Final Graphify update completed.

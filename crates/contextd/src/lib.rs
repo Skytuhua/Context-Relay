@@ -55,6 +55,7 @@ pub mod bridge_install;
 pub mod harness_preparation;
 pub mod hosted_auth;
 pub mod hosted_login;
+mod hosted_sync;
 mod native_memory;
 mod pairing;
 #[cfg(all(test, any(windows, target_os = "macos")))]
@@ -725,6 +726,7 @@ impl DaemonConfig {
 }
 
 pub struct Daemon {
+    sync: hosted_sync::Supervisor,
     hosted_auth: hosted_auth::HostedAuthService,
     preparation: PreparationSupervisor,
     instance: Option<InstanceGuard>,
@@ -793,6 +795,21 @@ impl Daemon {
                 ),
             ));
         }
+        let sync_config = if production_hosted {
+            hosted_auth.session_owner().and_then(|owner| {
+                Some(hosted_sync::Config {
+                    owner,
+                    project: option_env!("CONTEXT_RELAY_HOSTED_URL")?.into(),
+                    key: option_env!("CONTEXT_RELAY_HOSTED_PUBLISHABLE_KEY")?
+                        .to_string()
+                        .into(),
+                    #[cfg(test)]
+                    http: None,
+                })
+            })
+        } else {
+            None
+        };
         let mut vault_config = vault_config.load_device_identity()?;
         let preparation = PreparationSupervisor::spawn().map_err(|_| DaemonError::Startup)?;
         vault_config.preparation = Some(preparation.client());
@@ -805,6 +822,7 @@ impl Daemon {
                 .with_device_id(stable_device_id(token.as_bytes())),
         )
         .await?;
+        let sync = hosted_sync::Supervisor::spawn(worker.client(), sync_config);
         let native_memory_ledgers = worker.take_native_memory_ledgers();
         let listener =
             Listener::bind(&config.runtime, &mut instance).map_err(map_transport_error)?;
@@ -818,6 +836,7 @@ impl Daemon {
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
         let (state_sender, state_receiver) = watch::channel(DaemonState::Running);
         Ok(Self {
+            sync,
             hosted_auth,
             instance: Some(instance),
             preparation,
@@ -848,6 +867,7 @@ impl Daemon {
             .ok_or(DaemonError::Transport)?;
         let mut worker_exit = self.worker.take_exit();
         let service = ConnectionService {
+            sync: self.sync.client(),
             hosted_auth: self.hosted_auth.clone(),
             execution: harness_execution::ExecutionClient::default(),
             preparation: self.preparation.client(),
@@ -889,6 +909,7 @@ impl Daemon {
         }
 
         self.worker.close_admission();
+        self.sync.shutdown().await;
         self.hosted_auth.shutdown().await;
         self.preparation.client().close();
         self.state_sender.send_replace(DaemonState::Draining);
@@ -910,6 +931,7 @@ impl Daemon {
 
 #[derive(Clone)]
 struct ConnectionService {
+    sync: hosted_sync::Client,
     hosted_auth: hosted_auth::HostedAuthService,
     execution: harness_execution::ExecutionClient,
     preparation: PreparationClient,
@@ -979,6 +1001,11 @@ async fn serve_request(
     }
 
     match route_request(role, request) {
+        RoutedRequest::SyncRetry => {
+            let result = begin_immediate(&registration).and_then(|()| service.sync.retry());
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
         RoutedRequest::HostedAuth(request) => {
             let result = match begin_immediate(&registration) {
                 Ok(()) => service.hosted_auth.handle(request).await,
@@ -1095,6 +1122,7 @@ fn begin_immediate(registration: &RequestRegistration) -> Result<(), ClientError
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        self.sync.close();
         self.hosted_auth.close();
         self.listener.take();
         self.preparation.client().close();
@@ -1108,6 +1136,7 @@ impl Drop for Daemon {
 
 #[derive(Debug)]
 enum RoutedRequest {
+    SyncRetry,
     HostedAuth(LocalRequest),
     SearchIndexStatus,
     ExecutionCurrent,
@@ -1123,6 +1152,7 @@ enum RoutedRequest {
 
 #[derive(Debug)]
 enum VaultCommand {
+    Sync(Box<hosted_sync::Work>),
     SearchIndexRetry,
     Unlock,
     ProjectPathSet(ProjectPathParams),
@@ -1276,11 +1306,12 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         | LocalRequest::RecoveryEnrollmentCancel(_)) => {
             RoutedRequest::Work(VaultCommand::Recovery(request))
         }
-        LocalRequest::SyncRetry(_)
-        | LocalRequest::DeviceRename(_)
-        | LocalRequest::DeviceRevoke(_) => RoutedRequest::Immediate(Err(unsupported_error(
-            "Hosted workspace configuration is not available",
-        ))),
+        LocalRequest::SyncRetry(_) => RoutedRequest::SyncRetry,
+        LocalRequest::DeviceRename(_) | LocalRequest::DeviceRevoke(_) => {
+            RoutedRequest::Immediate(Err(unsupported_error(
+                "Hosted workspace configuration is not available",
+            )))
+        }
     }
 }
 
@@ -1886,6 +1917,7 @@ fn execute_vault_command(
         return Err(ClientError::vault_locked());
     };
     match command {
+        VaultCommand::Sync(work) => work.execute(state, status),
         VaultCommand::SearchIndexRetry => {
             state.search_index.retry();
             status.set_search(state.search_index.status);
@@ -8955,6 +8987,64 @@ mod tests {
         ))
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
+    fn enroll_sync_test_workspace(state: &mut WorkspaceState) -> (PairingIdentity, SyncScope) {
+        let identity = PairingIdentity {
+            device_id: state.device_id,
+            device_name: "Local signing".into(),
+            platform: NativePlatform::Windows,
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
+        };
+        let scope = SyncScope {
+            account_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074201".parse().unwrap(),
+            workspace_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074202".parse().unwrap(),
+        };
+        let clock = PairingTestClock(Arc::new(AtomicU64::new(900)));
+        let recovery = recovery_enrollment::CoordinatorRecoveryEnrollmentService::new(
+            RecoveryEnrollmentCoordinator::new(clock.clone(), RecoveryTestTransport::new(scope)),
+            identity.device_id,
+            &identity.device_name,
+            identity.platform,
+        );
+        let LocalResult::RecoveryEnrollmentPhrase { phrase } = recovery
+            .execute(
+                &mut state.vault,
+                &identity.keys,
+                LocalRequest::RecoveryEnrollmentBegin(EmptyParams {}),
+            )
+            .unwrap()
+        else {
+            panic!("phrase")
+        };
+        state.pairing_identity = Some(identity.clone());
+        assert!(local_sync_material(state).unwrap().is_none());
+        clock.set(950);
+        let confirmations = phrase
+            .confirmation_positions
+            .iter()
+            .map(
+                |position| context_relay_protocol::RecoveryWordConfirmation {
+                    position: *position,
+                    word: phrase.recovery_phrase_words.as_words()[usize::from(*position) - 1]
+                        .clone(),
+                },
+            )
+            .collect();
+        recovery
+            .execute(
+                &mut state.vault,
+                &identity.keys,
+                LocalRequest::RecoveryEnrollmentConfirm(
+                    context_relay_protocol::RecoveryEnrollmentConfirmParams {
+                        enrollment_id: phrase.enrollment_id,
+                        confirmations,
+                    },
+                ),
+            )
+            .unwrap();
+        (identity, scope)
+    }
+
     #[test]
     #[cfg(any(windows, target_os = "macos"))]
     fn enrolled_daemon_signs_desktop_and_mcp_writes_without_network_auth() {
@@ -8992,59 +9082,7 @@ mod tests {
         )
         .unwrap();
         assert!(state.vault.due_outbox(u64::MAX, 10).unwrap().is_empty());
-        let identity = PairingIdentity {
-            device_id: state.device_id,
-            device_name: "Local signing".into(),
-            platform: NativePlatform::Windows,
-            keys: Arc::new(DeviceKeys::generate().unwrap()),
-        };
-        let scope = SyncScope {
-            account_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074201".parse().unwrap(),
-            workspace_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074202".parse().unwrap(),
-        };
-        let clock = PairingTestClock(Arc::new(AtomicU64::new(900)));
-        let recovery = recovery_enrollment::CoordinatorRecoveryEnrollmentService::new(
-            RecoveryEnrollmentCoordinator::new(clock.clone(), RecoveryTestTransport::new(scope)),
-            identity.device_id,
-            &identity.device_name,
-            identity.platform,
-        );
-        let LocalResult::RecoveryEnrollmentPhrase { phrase } = recovery
-            .execute(
-                &mut state.vault,
-                &identity.keys,
-                LocalRequest::RecoveryEnrollmentBegin(EmptyParams {}),
-            )
-            .unwrap()
-        else {
-            panic!("phrase")
-        };
-        state.pairing_identity = Some(identity.clone());
-        assert!(local_sync_material(&state).unwrap().is_none());
-        clock.set(950);
-        let confirmations = phrase
-            .confirmation_positions
-            .iter()
-            .map(
-                |position| context_relay_protocol::RecoveryWordConfirmation {
-                    position: *position,
-                    word: phrase.recovery_phrase_words.as_words()[usize::from(*position) - 1]
-                        .clone(),
-                },
-            )
-            .collect();
-        recovery
-            .execute(
-                &mut state.vault,
-                &identity.keys,
-                LocalRequest::RecoveryEnrollmentConfirm(
-                    context_relay_protocol::RecoveryEnrollmentConfirmParams {
-                        enrollment_id: phrase.enrollment_id,
-                        confirmations,
-                    },
-                ),
-            )
-            .unwrap();
+        let (identity, _) = enroll_sync_test_workspace(&mut state);
         execute_workspace_request(
             &mut state,
             LocalRequest::MemoryUpdate(context_relay_protocol::MemoryUpdateParams {
@@ -9184,6 +9222,71 @@ mod tests {
         let vault = Vault::open(path.path(), "test-vault-key", config.key_store.as_ref()).unwrap();
         assert_eq!(vault.due_outbox(u64::MAX, 10).unwrap().len(), 5);
         assert_eq!(vault.memory(&pending.id).unwrap(), Some(pending));
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "macos"))]
+    fn hosted_sync_keeps_reads_and_shutdown_responsive_during_http() {
+        let path = unit_test_support::TempVault::new("sync-supervisor");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut config = VaultConfig::new(path.path().to_owned(), "test-vault-key", keys);
+        let (mut state, _) = open_workspace(&mut config).unwrap_or_else(|_| panic!("open"));
+        let (identity, scope) = enroll_sync_test_workspace(&mut state);
+        let status = ServiceStatus::new();
+        execute_workspace_request(
+            &mut state,
+            LocalRequest::MemoryCreate(context_relay_protocol::MemoryCreateParams {
+                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074301".parse().unwrap(),
+                scope: ScopeRef::Global,
+                kind: context_relay_protocol::MemoryKind::Fact,
+                title: "Sync worker".into(),
+                body_markdown: "Readable while HTTP stalls".into(),
+                tags: vec![],
+            }),
+            &status,
+        )
+        .unwrap();
+        let before = state.vault.due_outbox(u64::MAX, 10).unwrap();
+        let backend = pairing_test_provider::Backend::new(
+            InMemoryPairingProvider::new().unwrap(),
+            Arc::new(PairingTestClock(Arc::new(AtomicU64::new(1000)))),
+            scope,
+        );
+        let fixture = pairing_test_provider::Fixture::new(
+            backend,
+            identity.clone(),
+            "550e8400-e29b-41d4-a716-446655440001",
+            true,
+        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(hosted_sync::verify_stalled_worker(
+                state,
+                fixture.owner.clone(),
+                false,
+            ));
+        let vault = Vault::open(path.path(), "test-vault-key", config.key_store.as_ref()).unwrap();
+        let after = vault.due_outbox(u64::MAX, 10).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before[0].canonical_bytes, after[0].canonical_bytes);
+        assert_eq!(before[0].attempt_count, after[0].attempt_count);
+        drop(vault);
+        fixture.login();
+        let (mut state, _) = open_workspace(&mut config).unwrap_or_else(|_| panic!("reopen"));
+        state.pairing_identity = Some(identity);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(hosted_sync::verify_stalled_worker(
+                state,
+                fixture.owner,
+                true,
+            ));
+        let vault = Vault::open(path.path(), "test-vault-key", config.key_store.as_ref()).unwrap();
+        assert!(vault.due_outbox(u64::MAX, 10).unwrap().is_empty());
     }
 
     fn test_config(
