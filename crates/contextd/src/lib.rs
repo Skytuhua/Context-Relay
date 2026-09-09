@@ -996,6 +996,7 @@ async fn serve_request(
         registration,
     } = request;
     if *service.shutdown.borrow() {
+        drop(registration);
         connection.respond(id, Err(busy_error())).await?;
         return Ok(false);
     }
@@ -1003,6 +1004,7 @@ async fn serve_request(
     match route_request(role, request) {
         RoutedRequest::SyncRetry => {
             let result = begin_immediate(&registration).and_then(|()| service.sync.retry());
+            drop(registration);
             connection.respond(id, result).await?;
             Ok(true)
         }
@@ -1011,6 +1013,7 @@ async fn serve_request(
                 Ok(()) => service.hosted_auth.handle(request).await,
                 Err(error) => Err(error),
             };
+            drop(registration);
             connection.respond(id, result).await?;
             Ok(true)
         }
@@ -1019,6 +1022,7 @@ async fn serve_request(
                 begin_immediate(&registration).map(|()| LocalResult::HarnessExecutionCurrent {
                     status: service.execution.current(),
                 });
+            drop(registration);
             connection.respond(id, result).await?;
             Ok(true)
         }
@@ -1026,6 +1030,7 @@ async fn serve_request(
             let result = begin_immediate(&registration)
                 .and_then(|()| service.execution.start(&service.worker, params))
                 .map(|status| LocalResult::HarnessExecution { status });
+            drop(registration);
             connection.respond(id, result).await?;
             Ok(true)
         }
@@ -1033,6 +1038,7 @@ async fn serve_request(
             let result = begin_immediate(&registration).map(|()| LocalResult::HarnessExecution {
                 status: service.execution.status(&params),
             });
+            drop(registration);
             connection.respond(id, result).await?;
             Ok(true)
         }
@@ -1040,6 +1046,7 @@ async fn serve_request(
             let result = begin_immediate(&registration)
                 .and_then(|()| service.preparation.status(params.operation_id))
                 .map(|status| LocalResult::HarnessPreparation { status });
+            drop(registration);
             connection.respond(id, result).await?;
             Ok(true)
         }
@@ -1047,11 +1054,13 @@ async fn serve_request(
             let result = begin_immediate(&registration)
                 .and_then(|()| service.preparation.cancel(params.operation_id))
                 .map(|status| LocalResult::HarnessPreparation { status });
+            drop(registration);
             connection.respond(id, result).await?;
             Ok(true)
         }
         RoutedRequest::Immediate(result) => {
             let result = begin_immediate(&registration).and(result);
+            drop(registration);
             connection.respond(id, result).await?;
             Ok(true)
         }
@@ -1067,6 +1076,7 @@ async fn serve_request(
                     Err(service_internal_error())
                 }
             });
+            drop(registration);
             connection.respond(id, result).await?;
             Ok(true)
         }
@@ -1083,12 +1093,14 @@ async fn serve_request(
                     status: snapshot.search,
                 })
             });
+            drop(registration);
             connection.respond(id, result).await?;
             Ok(true)
         }
         RoutedRequest::Shutdown => {
             let result = begin_immediate(&registration).map(|()| LocalResult::Empty);
             let accepted = result.is_ok();
+            drop(registration);
             connection.respond(id, result).await?;
             if accepted {
                 service.shutdown.send_replace(true);
@@ -1874,8 +1886,9 @@ fn run_vault_worker(
             Err(canceled_error())
         };
         admission.finished(&result);
-        let _ = response.send(result);
+        // Release the request ID before a client can observe completion and replay it.
         drop(admission);
+        let _ = response.send(result);
         // Writes from desktop, harnesses, and native reconciliation all maintain
         // the durable queue. Recheck it after requests without rescanning records.
         if let VaultWorkerState::Open(workspace) = &mut state {
@@ -7964,6 +7977,24 @@ mod tests {
                 vault_locked: true,
             }
         );
+        // A completed immediate request can be reused on another connection.
+        let mut other = RawClient::connect(&runtime, ClientRole::Desktop).await;
+        let health_id = next_record_id();
+        for _ in 0..32 {
+            for client in [&mut desktop, &mut other] {
+                assert_eq!(
+                    client
+                        .call_with_id(health_id, LocalRequest::Health(EmptyParams {}))
+                        .await
+                        .unwrap(),
+                    LocalResult::Health {
+                        protocol: PROTOCOL_VERSION,
+                        vault_locked: true
+                    },
+                );
+            }
+        }
+        drop(other);
         let locked = mcp
             .call(mcp_request(
                 &root,
@@ -8444,6 +8475,67 @@ mod tests {
 
     fn next_record_id() -> RecordId {
         RecordId::new(uuid::Uuid::now_v7()).unwrap()
+    }
+
+    #[test]
+    fn worker_releases_admission_before_publishing_response() {
+        struct ObservedAdmission {
+            accepted: bool,
+            received: Mutex<oneshot::Receiver<Result<LocalResult, ClientError>>>,
+            released_before_response: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl WorkAdmission for ObservedAdmission {
+            fn begin(&self) -> bool {
+                self.accepted
+            }
+        }
+        impl Drop for ObservedAdmission {
+            fn drop(&mut self) {
+                self.released_before_response.store(
+                    matches!(
+                        self.received.get_mut().unwrap().try_recv(),
+                        Err(oneshot::error::TryRecvError::Empty)
+                    ),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+        }
+        for accepted in [true, false] {
+            let path = tempfile::tempdir().unwrap();
+            let config = VaultConfig::new(
+                path.path().join("unused.db"),
+                "test-vault-key",
+                Arc::new(MemoryKeyStore::default()),
+            );
+            let (sender, mut receiver) = mpsc::channel(1);
+            let (response, received) = oneshot::channel();
+            let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            sender
+                .try_send(WorkItem {
+                    command: VaultCommand::MemoryGet(MemoryParams {
+                        memory_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074208".parse().unwrap(),
+                    }),
+                    admission: Box::new(ObservedAdmission {
+                        accepted,
+                        received: Mutex::new(received),
+                        released_before_response: released.clone(),
+                    }),
+                    response,
+                })
+                .unwrap();
+            drop(sender);
+            run_vault_worker(
+                VaultWorkerState::Locked(config),
+                &mut receiver,
+                None,
+                &ServiceStatus::new(),
+                &Mutex::new(true),
+            );
+            assert!(
+                released.load(std::sync::atomic::Ordering::SeqCst),
+                "response became visible before admission was released (accepted={accepted})"
+            );
+        }
     }
 
     struct TestAdmission(bool);

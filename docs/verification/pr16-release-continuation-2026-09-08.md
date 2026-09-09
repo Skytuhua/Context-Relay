@@ -2993,3 +2993,31 @@ the expected build-time digest and actual runtime loading still need integration
 Windows Clippy, macOS-target `cargo check` and Clippy for the library/probe, Python
 syntax validation, and the two selected native workflow contracts pass. Cross
 compilation checks API/type correctness; it does not execute the native preflight.
+
+
+### Request completion ordering — September 9
+
+The macOS Rust job `102496544044` at `3815959` failed the real-socket
+`authenticated_status_replay_restart_and_stdout_purity_use_real_sockets` test:
+the second sequential request received `Conflict` because its ID was still active.
+The vault worker published its response before dropping request admission; immediate
+routes also retained registration while writing the response. Both paths now release
+completed registration before publishing completion. Timed-out worker requests retain
+registration until execution actually ends.
+
+A deterministic worker regression observed a published response from admission's
+Drop and failed before the fix. It covers accepted and canceled admission. The
+existing locked-vault endpoint test now reuses a Health request ID across two
+connections. Reviewer found no actionable P1/P2 issues in the working diff.
+The full daemon library suite passed all 105 active tests (four existing tests
+ignored), including both new regressions. All ten MCP real-socket integration tests
+also passed, including the original replay failure, queued cancellation and
+unknown-outcome timeout. These are local Windows results; macOS CI must verify
+the new revision after push. Daemon library/test Clippy with warnings denied,
+formatting and whitespace checks also pass; the code graph was updated.
+
+Separately, macOS native job `102496544204` at `3815959` completed successfully:
+all five C and five Rust library-constraint checks passed, and Tauri assembled
+`Context Relay.app`. This does not establish production signing, installed inference,
+or clean-machine acceptance. Dedicated qualification `34356117600` also completed
+both macOS builders and native macOS isolation; Windows jobs remain in progress.
