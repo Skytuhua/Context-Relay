@@ -25,6 +25,155 @@ use support::{
 const CREDENTIAL: &str = "offline-service-tests";
 
 #[test]
+fn configured_task_sync_covers_transitions_completion_hooks_and_rollback() {
+    use context_relay_core::{
+        crypto::{ContentKey, DeviceKeys},
+        sync::SyncIdentity,
+    };
+    for native in [false, true] {
+        let fixture = Fixture::new(if native {
+            "task-sync-hook"
+        } else {
+            "task-sync-direct"
+        });
+        let database_key = [0x51; 32];
+        fixture.keys.insert(CREDENTIAL, database_key);
+        let keys = DeviceKeys::generate().unwrap();
+        let content = ContentKey::from_bytes([0x52; 32]);
+        let identity = || SyncIdentity {
+            account_id: ID_6.parse().unwrap(),
+            workspace_id: ID_8.parse().unwrap(),
+            device_id: ID_9.parse().unwrap(),
+            control_epoch: 1,
+            key_epoch: 1,
+            device_keys: &keys,
+            content_key: &content,
+        };
+        let create = TaskUpsertParams {
+            operation_id: ID_1.parse().unwrap(),
+            task_id: None,
+            project_id: ID_7.parse().unwrap(),
+            title: "Synced task".into(),
+            body_markdown: "Durable task".into(),
+            status: TaskStatus::Open,
+            expected_revision: None,
+        };
+        let mut vault = fixture.vault();
+        let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
+            .with_sync_identity(identity())
+            .unwrap();
+        service
+            .upsert_project(ProjectIdentity {
+                project_id: ID_7.parse().unwrap(),
+                github_repository_id: None,
+                git_remote_fingerprint: None,
+                monorepo_subdirectory: None,
+                name: "Sync project".into(),
+            })
+            .unwrap();
+        let first = service.upsert_task(create.clone()).unwrap();
+        let transition = TaskTransitionParams {
+            operation_id: ID_2.parse().unwrap(),
+            task_id: first.id,
+            expected_revision: first.revision,
+            status: TaskStatus::InProgress,
+        };
+        let raw = open_keyed(fixture.path.path(), &database_key);
+        raw.execute_batch("CREATE TRIGGER fail_task_outbox BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(service.transition_task(transition.clone()).is_err());
+        assert_eq!(
+            service.tasks(ID_7.parse().unwrap()).unwrap(),
+            vec![first.clone()]
+        );
+        raw.execute_batch("DROP TRIGGER fail_task_outbox;").unwrap();
+        drop(raw);
+        let changed = service.transition_task(transition).unwrap();
+        let evidence = vec![CompletionEvidenceInput {
+            summary: "Verified".into(),
+            kind: "test".into(),
+            reference: None,
+        }];
+        if native {
+            service
+                .handle_native_hook_event(
+                    ID_7.parse().unwrap(),
+                    hook_params(
+                        HarnessId::Codex,
+                        "sync-task-session",
+                        |session_id| NativeHookEvent::SessionStart { session_id },
+                        100,
+                    ),
+                )
+                .unwrap();
+            let event = hook_params(
+                HarnessId::Codex,
+                "sync-task-session",
+                |session_id| NativeHookEvent::TaskEvidence {
+                    session_id,
+                    task_id: first.id,
+                    evidence,
+                },
+                200,
+            );
+            service
+                .handle_native_hook_event(ID_7.parse().unwrap(), event.clone())
+                .unwrap();
+            service
+                .handle_native_hook_event(ID_7.parse().unwrap(), event)
+                .unwrap();
+        } else {
+            let complete = TaskCompleteParams {
+                operation_id: ID_3.parse().unwrap(),
+                task_id: first.id,
+                expected_revision: changed.revision,
+                evidence,
+            };
+            service.complete_task(complete.clone()).unwrap();
+            service.complete_task(complete).unwrap();
+        }
+        assert_eq!(
+            service.tasks(ID_7.parse().unwrap()).unwrap()[0].status,
+            TaskStatus::Done
+        );
+        let bytes = vault
+            .due_outbox(u64::MAX, 10)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.canonical_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(bytes.len(), 3);
+        let last = bytes
+            .iter()
+            .map(|bytes| context_relay_protocol::decode_sync_operation_v1(bytes).unwrap())
+            .max_by_key(|operation| operation.device_sequence)
+            .unwrap();
+        assert_eq!(last.device_sequence, 3);
+        if native {
+            assert_eq!(last.created_hlc.physical_ms, 200);
+        }
+        drop(vault);
+        let mut reopened = fixture.vault();
+        let mut service = OfflineWorkspace::new(&mut reopened, ID_9.parse().unwrap())
+            .with_sync_identity(identity())
+            .unwrap();
+        assert_eq!(service.upsert_task(create).unwrap(), first);
+        assert_eq!(
+            service.tasks(ID_7.parse().unwrap()).unwrap()[0].status,
+            TaskStatus::Done
+        );
+        assert_eq!(
+            reopened
+                .due_outbox(u64::MAX, 10)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.canonical_bytes)
+                .collect::<Vec<_>>(),
+            bytes
+        );
+    }
+}
+
+#[test]
 fn configured_memory_sync_is_atomic_and_replays_original_bytes_after_restart() {
     use context_relay_core::{
         crypto::{ContentKey, DeviceKeys},

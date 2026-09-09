@@ -67,13 +67,61 @@ impl<'a> OfflineWorkspace<'a> {
         prepared: &PreparedLocalMutation<MemoryRecord>,
     ) -> Result<(), ClientError> {
         let embedding = memory_embedding(&prepared.value)?;
-        let Some(identity) = &self.sync_identity else {
+        if self.sync_identity.is_none() {
             return vault(self.vault.put_local_memory_with_binding(
                 &prepared.value,
                 &embedding,
                 &prepared.binding,
             ));
+        }
+        self.persist_signed_mutation(
+            &context_relay_protocol::RecordMutationV1::UpsertMemory(prepared.value.clone()),
+            &prepared.binding,
+            Some(&embedding),
+            prepared.value.updated_hlc,
+        )
+    }
+
+    fn persist_task(
+        &mut self,
+        prepared: &PreparedLocalMutation<TaskRecord>,
+        created_hlc: HybridLogicalClock,
+    ) -> Result<(), ClientError> {
+        if self.sync_identity.is_none() {
+            return vault(
+                self.vault
+                    .put_task_with_binding(&prepared.value, &prepared.binding),
+            );
+        }
+        self.persist_signed_mutation(
+            &context_relay_protocol::RecordMutationV1::UpsertTask(prepared.value.clone()),
+            &prepared.binding,
+            None,
+            created_hlc,
+        )
+    }
+
+    fn persist_signed_mutation(
+        &mut self,
+        mutation: &context_relay_protocol::RecordMutationV1,
+        binding: &LocalOperationBinding,
+        embedding: Option<&Embedding384>,
+        created_hlc: HybridLogicalClock,
+    ) -> Result<(), ClientError> {
+        use context_relay_protocol::RecordMutationV1;
+        let identity = self.sync_identity.as_ref().ok_or_else(internal)?;
+        let (project_id, response) = match mutation {
+            RecordMutationV1::UpsertMemory(memory) => (
+                match memory.scope {
+                    ScopeRef::Global => None,
+                    ScopeRef::Project { project_id } => Some(project_id),
+                },
+                serde_json::to_vec(memory),
+            ),
+            RecordMutationV1::UpsertTask(task) => (Some(task.project_id), serde_json::to_vec(task)),
+            _ => return Err(internal()),
         };
+        let response = response.map_err(|_| internal())?;
         use crate::sync::{
             OperationBuildRequest, OperationBuilder, OperationChainHead, SyncIdentity, SyncScope,
         };
@@ -89,8 +137,6 @@ impl<'a> OfflineWorkspace<'a> {
             sequence: head.sequence,
             canonical_hash: head.canonical_hash,
         });
-        let mutation =
-            context_relay_protocol::RecordMutationV1::UpsertMemory(prepared.value.clone());
         let built = OperationBuilder::new(SyncIdentity {
             account_id: identity.account_id,
             workspace_id: identity.workspace_id,
@@ -101,25 +147,17 @@ impl<'a> OfflineWorkspace<'a> {
             content_key: identity.content_key,
         })
         .build(OperationBuildRequest {
-            operation_id: prepared.binding.operation_id,
-            project_id: match prepared.value.scope {
-                ScopeRef::Global => None,
-                ScopeRef::Project { project_id } => Some(project_id),
-            },
-            mutation: &mutation,
+            operation_id: binding.operation_id,
+            project_id,
+            mutation,
             causal_frontier: vault(self.vault.sync_checkpoint_frontier(scope))?,
             previous,
             blob_refs: vec![],
-            created_hlc: prepared.value.updated_hlc,
+            created_hlc,
         })
         .map_err(|_| internal())?;
-        let response = serde_json::to_vec(&prepared.value).map_err(|_| internal())?;
         vault(self.vault.commit_outgoing_operation_with_binding(
-            &mutation,
-            &built,
-            Some(&embedding),
-            &prepared.binding,
-            &response,
+            mutation, &built, embedding, binding, &response,
         ))
         .map(|_| ())
     }
@@ -798,9 +836,9 @@ impl<'a> OfflineWorkspace<'a> {
     pub fn upsert_task(&mut self, params: TaskUpsertParams) -> Result<TaskRecord, ClientError> {
         let prepared = self.prepare_task_upsert(&params)?;
         if prepared.should_write {
-            vault(
-                self.vault
-                    .put_task_with_binding(&prepared.value, &prepared.binding),
+            self.persist_task(
+                &prepared,
+                operation_clock(prepared.binding.operation_id, self.device_id),
             )?;
         }
         Ok(prepared.value)
@@ -892,9 +930,9 @@ impl<'a> OfflineWorkspace<'a> {
     ) -> Result<TaskRecord, ClientError> {
         let prepared = self.prepare_task_transition(&params)?;
         if prepared.should_write {
-            vault(
-                self.vault
-                    .put_task_with_binding(&prepared.value, &prepared.binding),
+            self.persist_task(
+                &prepared,
+                operation_clock(prepared.binding.operation_id, self.device_id),
             )?;
         }
         Ok(prepared.value)
@@ -967,10 +1005,7 @@ impl<'a> OfflineWorkspace<'a> {
     ) -> Result<TaskRecord, ClientError> {
         let prepared = self.prepare_task_completion(&params, recorded_hlc)?;
         if prepared.should_write {
-            vault(
-                self.vault
-                    .put_task_with_binding(&prepared.value, &prepared.binding),
-            )?;
+            self.persist_task(&prepared, recorded_hlc)?;
         }
         Ok(prepared.value)
     }

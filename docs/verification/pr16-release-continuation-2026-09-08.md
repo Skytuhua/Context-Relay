@@ -1,5 +1,26 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Atomic configured task writes — 2026-09-09
+
+Task upsert, transition and completion now use the shared signed mutation helper
+when OfflineWorkspace has a configured identity. Native-hook completion reaches
+the same transaction and preserves its recorded event clock. Original request
+replay remains ahead of signing; unconfigured local behavior is unchanged.
+
+All 17 offline-service tests pass, including both direct and native-hook task
+completion. The new regression first failed because a transition bypassed the
+outbox; it now verifies an injected outbox failure leaves the task unchanged,
+then retries, completes, reopens and checks the original response and signed
+bytes without duplicate operations. Scoped Clippy with warnings denied and the
+normal production daemon library check pass. Independent review found no
+concrete correctness issues.
+
+This remains configured core behavior, not installed daemon sync acceptance.
+Candidate review/proposal, other record kinds, offline data binding, verified
+trust material and live two-device operation remain open. Candidate and proposed
+memory IDs currently overlap; resolve that compatibility issue before signing
+both kinds, without weakening the single-kind sync ownership invariant.
+
 ## Atomic configured memory writes — 2026-09-09
 
 OfflineWorkspace accepts an optional sync identity and uses the existing signed

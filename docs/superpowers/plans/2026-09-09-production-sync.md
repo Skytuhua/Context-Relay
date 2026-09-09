@@ -7,9 +7,10 @@ and sync Edge Function are deployed; native daemon integration remains open.
 Current source: contextd routes SyncRetry to unavailable and status starts offline.
 SyncEngine and SupabaseTransport implement the replica protocol. The native
 transport now supports original-session guards and refreshed bearer tokens.
-OfflineWorkspace can sign memory create/update/archive with an explicitly
-configured identity; original request receipts join the existing atomic Vault
-record/operation/outbox transaction. The daemon does not yet configure this path.
+OfflineWorkspace can sign memory create/update/archive and task
+upsert/transition/completion with an explicitly configured identity, including
+native-hook task evidence. Original request receipts join the existing atomic
+Vault record/operation/outbox transaction. The daemon does not yet configure this path.
 Other record kinds, trust material and complete mutation routing remain required
 before enabling sync. Unconfigured offline-only work remains functional.
 
@@ -38,3 +39,10 @@ Begin with the native session guard, then trace each mutation transaction before
 choosing its integration point. No new provider, schema replacement or alternate
 Vault writer is implied by this plan. Signing/clean-machine/product/security/beta
 requirements remain prerequisites for merge.
+
+Candidate integration requires an identity decision before wiring proposal writes:
+prepare_memory_proposal currently gives the candidate and proposed memory the
+same UUID. The sync owner table binds each record ID to a single record kind, so
+naively signing both would fail acceptance. Preserve the ownership check and
+existing pending/reviewed records when resolving this. Acceptance also updates
+the candidate and memory in one transaction; retain that atomic boundary.
