@@ -40,9 +40,11 @@ choosing its integration point. No new provider, schema replacement or alternate
 Vault writer is implied by this plan. Signing/clean-machine/product/security/beta
 requirements remain prerequisites for merge.
 
-Candidate integration requires an identity decision before wiring proposal writes:
-prepare_memory_proposal currently gives the candidate and proposed memory the
-same UUID. The sync owner table binds each record ID to a single record kind, so
-naively signing both would fail acceptance. Preserve the ownership check and
-existing pending/reviewed records when resolving this. Acceptance also updates
-the candidate and memory in one transaction; retain that atomic boundary.
+Fresh MCP proposals now derive a separate memory ID from their candidate ID;
+saved response replay also accepts the original shared-ID format. Native-import
+proposals still use shared IDs, and existing candidates retain their saved IDs.
+The sync owner table binds each record ID to a single record kind, so legacy
+candidate synchronization still needs explicit reconciliation. Preserve that
+ownership check. CandidateReviewParams already includes an operation ID, but
+the service does not bind or use it yet. Acceptance updates candidate and memory
+in one transaction; retain that atomic boundary when signing both mutations.

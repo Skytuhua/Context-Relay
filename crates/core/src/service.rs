@@ -550,8 +550,7 @@ impl<'a> OfflineWorkspace<'a> {
         if vault(self.vault.candidate(&id))?.is_some() {
             return Err(operation_conflict());
         }
-        let memory_id =
-            MemoryId::new(input.operation_id.into_uuid()).map_err(|_| invalid_request())?;
+        let memory_id = proposed_memory_id(id)?;
         let clock = operation_clock(input.operation_id, self.device_id);
         let proposed_memory = MemoryRecord {
             id: memory_id,
@@ -1237,13 +1236,29 @@ fn candidate_snapshot(
         serde_json::from_slice(canonical_response).map_err(|_| internal())?;
     candidate.validate().map_err(|_| internal())?;
     if candidate.id != expected_id
-        || candidate.proposed_memory.id.to_string() != expected_id.to_string()
+        || (candidate.proposed_memory.id.as_bytes() != expected_id.as_bytes()
+            && candidate.proposed_memory.id != proposed_memory_id(expected_id)?)
         || candidate.proposed_memory.revision != expected_revision
         || candidate.state != CandidateState::Pending
     {
         return Err(internal());
     }
     Ok(candidate)
+}
+
+fn proposed_memory_id(candidate: CandidateId) -> Result<MemoryId, ClientError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"context-relay.proposed-memory.v1");
+    hasher.update(candidate.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = *candidate.as_bytes();
+    bytes[6..].copy_from_slice(&digest[..10]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    if &bytes == candidate.as_bytes() {
+        return Err(internal());
+    }
+    MemoryId::new(uuid::Uuid::from_bytes(bytes)).map_err(|_| internal())
 }
 
 fn task_snapshot(

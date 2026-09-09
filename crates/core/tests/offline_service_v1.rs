@@ -25,6 +25,67 @@ use support::{
 const CREDENTIAL: &str = "offline-service-tests";
 
 #[test]
+fn legacy_proposal_identity_replays_and_accepts_without_rewriting_saved_ids() {
+    let fixture = Fixture::new("legacy-proposal-identity");
+    let database_key = [0x61; 32];
+    fixture.keys.insert(CREDENTIAL, database_key);
+    let input = ProposeMemoryInput {
+        operation_id: ID_1.parse().unwrap(),
+        kind: MemoryKind::Fact,
+        title: "Legacy".into(),
+        markdown: "Existing proposal".into(),
+        tags: vec![],
+        evidence_summary: "Observed".into(),
+        scope: McpScopeSelector::Global,
+    };
+    let mut vault = fixture.vault();
+    let mut pending = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
+        .propose_memory(input.clone(), ScopeRef::Global, HarnessId::Codex)
+        .unwrap();
+    drop(vault);
+    // Reproduce the previously persisted v1 identity and response shape.
+    pending.proposed_memory.id = ID_1.parse().unwrap();
+    let raw = open_keyed(fixture.path.path(), &database_key);
+    let payload = serde_json::to_vec(&pending).unwrap();
+    raw.execute(
+        "UPDATE candidates SET payload_json = ?1 WHERE id = ?2",
+        params![payload, ID_1],
+    )
+    .unwrap();
+    raw.execute(
+        "UPDATE local_operation_results SET canonical_response = ?1 WHERE operation_id = ?2",
+        params![payload, ID_1],
+    )
+    .unwrap();
+    drop(raw);
+    let mut vault = fixture.vault();
+    let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap());
+    assert_eq!(
+        service
+            .propose_memory(input.clone(), ScopeRef::Global, HarnessId::Codex)
+            .unwrap(),
+        pending
+    );
+    service
+        .review_candidate(CandidateReviewParams {
+            candidate_id: pending.id,
+            accepted: true,
+            operation_id: ID_2.parse().unwrap(),
+        })
+        .unwrap();
+    assert_eq!(
+        service.memory(pending.proposed_memory.id).unwrap(),
+        Some(pending.proposed_memory.clone())
+    );
+    assert_eq!(
+        service
+            .propose_memory(input, ScopeRef::Global, HarnessId::Codex)
+            .unwrap(),
+        pending
+    );
+}
+
+#[test]
 fn configured_task_sync_covers_transitions_completion_hooks_and_rollback() {
     use context_relay_core::{
         crypto::{ContentKey, DeviceKeys},
@@ -1315,6 +1376,7 @@ fn proposal_replay_returns_the_pending_snapshot_after_review() {
         let pending = service
             .propose_memory(input.clone(), ScopeRef::Global, HarnessId::Codex)
             .unwrap();
+        assert_ne!(pending.id.as_bytes(), pending.proposed_memory.id.as_bytes());
         let reviewed = service
             .review_candidate(CandidateReviewParams {
                 candidate_id: pending.id,

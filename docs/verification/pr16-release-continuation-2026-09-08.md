@@ -1,5 +1,24 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Separate fresh proposal and memory identities — 2026-09-09
+
+Fresh MCP proposals derive a distinct proposed-memory ID using a versioned hash
+domain and the candidate ID, preserving UUIDv7 timestamp/version/variant fields.
+Candidate IDs and request IDs remain unchanged. Saved response replay accepts
+either that mapping or the old shared-ID format; existing candidates and accepted
+memories are not rewritten. This avoids a new candidate/memory record-kind
+collision without weakening sync ownership validation.
+
+The fresh-ID regression failed before the change and now passes. A saved v1
+row/receipt fixture verifies legacy replay and acceptance preserve the original
+memory ID. All 18 service tests, scoped Clippy with warnings denied and the
+normal daemon library check pass. Independent review found no actionable issues.
+
+Native-import identities still use their existing mapping. Legacy candidate sync
+reconciliation, proposal signing and atomic signed approval remain unfinished.
+Correction to earlier investigation: CandidateReviewParams has an operation ID;
+the current service ignores it. Bind it when integrating approval retries.
+
 ## Atomic configured task writes — 2026-09-09
 
 Task upsert, transition and completion now use the shared signed mutation helper
