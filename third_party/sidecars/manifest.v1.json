@@ -323,7 +323,7 @@
         {
           "role": "source-bundle-generator",
           "path": "scripts/semgrep-source-bundle.mjs",
-          "sha256": "367f3abd61c7ff848032aa89e21d8bc66c55701332ebea5eb38d69dd36480888"
+          "sha256": "d51cb59c41ddb0c1e090c1c9a5d465681ec898ea04b5f6fb5ba197338e0188ca"
         },
         {
           "role": "source-bundle-evidence",

@@ -3,7 +3,10 @@ import { mkdir, open, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 const modelManifest = new URL('../crates/core/models/bge-small-en-v1.5/manifest.json', import.meta.url);
-const runtimeManifest = new URL('../crates/core/models/onnxruntime-win-x64-1.24.2/manifest.json', import.meta.url);
+const runtimeManifests = new Map([
+  ['x86_64-pc-windows-msvc', new URL('../crates/core/models/onnxruntime-win-x64-1.24.2/manifest.json', import.meta.url)],
+  ['aarch64-apple-darwin', new URL('../crates/core/models/onnxruntime-osx-arm64-1.24.2/manifest.json', import.meta.url)],
+]);
 
 async function readPinned(directory, artifact) {
   const { file, bytes, sha256 } = artifact;
@@ -29,7 +32,9 @@ async function readPinned(directory, artifact) {
   } finally { await handle.close(); }
 }
 
-export async function stageWindowsSearchResources({ modelDirectory, runtimeDirectory, stagingDirectory }) {
+export async function stageSearchResources({ target, modelDirectory, runtimeDirectory, stagingDirectory }) {
+  const runtimeManifest = runtimeManifests.get(target);
+  if (!runtimeManifest) throw new Error(`Unsupported search target: ${target}`);
   const pending = [];
   for (const [manifestPath, source, destination] of [
     [modelManifest, modelDirectory, 'model'], [runtimeManifest, runtimeDirectory, 'runtime'],

@@ -2797,3 +2797,40 @@ license/hydration tests pass. Read-only review found no P1/P2. Evidence:
 `.codex/pr16-license-retry-failure.log`, `.codex/pr16-license-pin-{check,tests}.log`.
 New CI must verify this correction. Native Semgrep remains disabled pending its
 required build evidence; the broader release checklist is unchanged.
+
+
+### Pin and stage macOS arm64 search inputs (2026-09-09)
+
+The shared search-resource stager now selects the Windows x64 or macOS arm64
+runtime manifest from an explicit target. Windows packaging uses the same verified
+staging path. Unsupported targets fail before reading/writing resources; the full
+model/runtime set is verified before any staged file is changed.
+
+Microsoft's exact ONNX Runtime 1.24.2 macOS archive matched the release API's
+31,604,221-byte size and SHA-256. Its selected regular dylib/license/notice members
+are pinned in `crates/core/models/onnxruntime-osx-arm64-1.24.2/manifest.json`;
+the adjacent README records provenance, member paths and static Mach-O inspection.
+No native Mac library was loaded or executed on this Windows host.
+
+The test initially failed with the missing target-aware staging export. With real
+pinned model, Windows runtime and Mac runtime files, all 18 packaging/resource/icon
+tests pass without skips. They verify exact runtime bytes, reject same-size dylib
+tampering without replacing prior output, reject Windows inputs for the Mac target,
+and retain Windows C++ dependency and companion tests. The full license/material
+gate passes. Logs: `.codex/pr16-macos-search-stage-{red,tests}.log` and
+`.codex/pr16-macos-search-license.log`. Native loader, Mac application packaging,
+signing and clean-machine acceptance remain unfinished; input hashes are not proof
+of a signed output. Full release scope remains required before merge.
+
+
+The latest b1975c5 licenses failure (CI 34341326601, job 102432541817) exposed a
+line-ending mistake in the previous pin correction: the local generator had CRLF,
+while `.gitattributes` stores/checks it out with LF. The previous hash matched only
+the Windows working copy. The manifest now pins the exact Git blob SHA-256
+`d51cb59c41ddb0c1e090c1c9a5d465681ec898ea04b5f6fb5ba197338e0188ca`; the local file
+was restored to those same LF bytes. No generator logic or historical evidence was
+changed. The full license/material check and all 46 combined packaging/resource/
+license/hydration tests pass, with real Mac and Windows assets and no skips.
+Logs: `.codex/pr16-license-pin-lf-{ci,check}.log` and
+`.codex/pr16-macos-search-stage-final.log`. Read-only review of staging found no
+P1/P2. Native macOS loading and current-head CI remain unverified.
