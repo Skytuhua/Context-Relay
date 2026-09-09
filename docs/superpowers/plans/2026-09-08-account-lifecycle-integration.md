@@ -116,6 +116,8 @@ mandatory; a different login must not adopt previous work.
 
 The Settings lifecycle panel now implements the desktop discovery/retry contract,
 with strict gateway validation, explicit confirmation, stale-result/duplicate
-submission guards and managed keyboard focus. The production lifecycle service
-remains unavailable pending verified local scope and guarded transport wiring;
-installed/live qualification is still required after integration.
+submission guards and managed keyboard focus. Configured production startup now
+wires the native lifecycle service. Each dispatch derives verified local scope
+and requires a matching active installed device, current project/login and the
+existing immutable intent check. Composed daemon IPC and installed/live
+qualification remain required.

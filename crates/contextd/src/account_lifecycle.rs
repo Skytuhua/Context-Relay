@@ -105,6 +105,115 @@ impl<T: AccountLifecycleTransport> AccountLifecycleService for TransportAccountL
     }
 }
 
+pub(crate) struct HostedAccountLifecycleService {
+    owner: std::sync::Arc<context_relay_core::auth::HostedSessionOwner>,
+    project: String,
+    publishable_key: zeroize::Zeroizing<String>,
+    identity: crate::pairing::PairingIdentity,
+    #[cfg(test)]
+    pub(crate) http: Option<std::sync::Arc<dyn context_relay_core::sync::SupabaseHttpClient>>,
+}
+
+impl HostedAccountLifecycleService {
+    pub(crate) fn new(
+        owner: std::sync::Arc<context_relay_core::auth::HostedSessionOwner>,
+        project: &str,
+        publishable_key: &str,
+        identity: crate::pairing::PairingIdentity,
+    ) -> Self {
+        Self {
+            owner,
+            project: project.into(),
+            publishable_key: zeroize::Zeroizing::new(publishable_key.into()),
+            identity,
+            #[cfg(test)]
+            http: None,
+        }
+    }
+}
+
+impl AccountLifecycleService for HostedAccountLifecycleService {
+    fn execute(
+        &self,
+        vault: &mut Vault,
+        request: LocalRequest,
+    ) -> Result<LocalResult, ClientError> {
+        use context_relay_core::{
+            devices::{
+                recovery::{RecoveryEnrollmentClock, SystemRecoveryEnrollmentClock},
+                supabase_account_lifecycle::SupabaseAccountLifecycleTransport,
+            },
+            sync::SupabaseTransportConfig,
+            vault::DeviceCertificateState,
+        };
+        if !matches!(
+            request,
+            LocalRequest::AccountDeletionBegin(_)
+                | LocalRequest::AccountDeletionCancel(_)
+                | LocalRequest::AccountDeletionStatus(_)
+        ) {
+            return Err(invalid_request_error());
+        }
+        let denied = || transport_error(AccountLifecycleTransportError::Unauthorized);
+        let now = SystemRecoveryEnrollmentClock.now_ms() / 1000;
+        let generation = self.owner.cancellation().map_err(|_| denied())?;
+        let session = self
+            .owner
+            .current_session(now)
+            .map_err(|_| denied())?
+            .ok_or_else(denied)?;
+        let identity = *session.identity();
+        self.owner
+            .session_for(&generation, identity, now)
+            .map_err(|_| denied())?;
+        if reqwest::Url::parse(&self.project).ok().as_ref() != Some(session.project_url()) {
+            return Err(denied());
+        }
+        let material = vault
+            .trusted_workspace_material(&self.identity.keys)
+            .map_err(intent_error)?;
+        let scope = material.scope();
+        let devices = vault.all_devices().map_err(intent_error)?;
+        let mut matching = devices.iter().filter(|stored| {
+            let certificate = &stored.certificate;
+            stored.state == DeviceCertificateState::Active
+                && certificate.device_id == self.identity.device_id
+                && certificate.account_id == scope.account_id
+                && certificate.workspace_id == scope.workspace_id
+                && certificate.control_epoch == material.control_epoch()
+                && certificate.signing_public_key == self.identity.keys.signing_public_key()
+                && certificate.wrapping_public_key == self.identity.keys.wrapping_public_key()
+        });
+        if matching.next().is_none() || matching.next().is_some() {
+            return Err(denied());
+        }
+        let config = SupabaseTransportConfig::new(
+            &self.project,
+            self.publishable_key.to_string(),
+            session.access_token(),
+        )
+        .map_err(|_| invalid_request_error())?;
+        #[cfg(test)]
+        let transport = match &self.http {
+            Some(http) => SupabaseAccountLifecycleTransport::with_http_client(
+                config,
+                scope.workspace_id,
+                http.clone(),
+            ),
+            None => SupabaseAccountLifecycleTransport::new(config, scope.workspace_id),
+        };
+        #[cfg(not(test))]
+        let transport = SupabaseAccountLifecycleTransport::new(config, scope.workspace_id);
+        let transport = transport.map_err(transport_error)?.with_session_owner(
+            self.owner.clone(),
+            identity,
+            generation,
+            scope.account_id,
+        );
+        TransportAccountLifecycleService::new(transport).execute(vault, request)
+    }
+}
+
 fn result(projection: AccountDeletionProjection) -> Result<LocalResult, ClientError> {
     projection.validate().map_err(transport_error)?;
     Ok(LocalResult::AccountDeletion {

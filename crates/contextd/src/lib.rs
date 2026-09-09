@@ -780,6 +780,13 @@ impl Daemon {
                 key,
                 identity.clone(),
             )));
+            vault_config.account_lifecycle_service =
+                Arc::new(account_lifecycle::HostedAccountLifecycleService::new(
+                    owner.clone(),
+                    project,
+                    key,
+                    identity.clone(),
+                ));
             vault_config.recovery_enrollment_service = Some(Arc::new(
                 recovery_enrollment::HostedRecoveryEnrollmentService::new(
                     owner, project, key, identity,
@@ -6522,6 +6529,208 @@ mod tests {
             worker.shutdown_and_join();
         }
         let vault = Vault::open(path.path(), "discovery-worker", keys.as_ref()).unwrap();
+        assert_eq!(
+            vault.account_lifecycle_intent(intent.operation_id).unwrap(),
+            Some(intent)
+        );
+    }
+
+    #[test]
+    fn native_lifecycle_uses_verified_scope_and_rejects_replacement_login() {
+        use context_relay_core::sync::{
+            SupabaseHttpClient, SupabaseHttpError, SupabaseHttpRequest, SupabaseHttpResponse,
+        };
+        use std::sync::atomic::AtomicBool;
+        struct Http {
+            lost: AtomicBool,
+            requests: Mutex<Vec<Vec<u8>>>,
+        }
+        impl SupabaseHttpClient for Http {
+            fn execute(
+                &self,
+                request: SupabaseHttpRequest,
+            ) -> Result<SupabaseHttpResponse, SupabaseHttpError> {
+                assert!(request.url().ends_with("/functions/v1/account-lifecycle"));
+                let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+                assert_eq!(body["workspaceId"], "018f22e2-79b0-7cc8-98c4-dc0c0c074102");
+                self.requests.lock().unwrap().push(request.body().to_vec());
+                if self.lost.load(Ordering::SeqCst) {
+                    return Err(SupabaseHttpError::Transient);
+                }
+                Ok(SupabaseHttpResponse::new(
+                    200,
+                    br#"{"v":1,"state":"active","requestedAtMs":null,"purgeDeadlineMs":null}"#
+                        .to_vec(),
+                ))
+            }
+        }
+        let scope = SyncScope {
+            account_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074101".parse().unwrap(),
+            workspace_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074102".parse().unwrap(),
+        };
+        let identity = PairingIdentity {
+            device_id: stable_device_id(b"native-lifecycle"),
+            device_name: "Desktop".into(),
+            platform: NativePlatform::Windows,
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
+        };
+        let clock = PairingTestClock::default();
+        clock.set(900);
+        let backend = pairing_test_provider::Backend::new(
+            InMemoryPairingProvider::new().unwrap(),
+            Arc::new(clock.clone()),
+            scope,
+        );
+        let fixture = |session| {
+            pairing_test_provider::Fixture::new(backend.clone(), identity.clone(), session, true)
+        };
+        let original = fixture("550e8400-e29b-41d4-a716-446655440001");
+        let http = Arc::new(Http {
+            lost: AtomicBool::new(false),
+            requests: Mutex::new(Vec::new()),
+        });
+        let make = |owner, identity| {
+            let mut service = account_lifecycle::HostedAccountLifecycleService::new(
+                owner,
+                "https://example.supabase.co",
+                "public-test",
+                identity,
+            );
+            service.http = Some(http.clone());
+            service
+        };
+        let path = unit_test_support::TempVault::new("native-lifecycle");
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(path.path(), "lifecycle", &keys).unwrap();
+        let status = || LocalRequest::AccountDeletionStatus(EmptyParams {});
+        assert!(
+            make(original.owner.clone(), identity.clone())
+                .execute(&mut vault, status())
+                .is_err()
+        );
+        assert!(http.requests.lock().unwrap().is_empty());
+        let recovery = recovery_enrollment::CoordinatorRecoveryEnrollmentService::new(
+            RecoveryEnrollmentCoordinator::new(clock.clone(), RecoveryTestTransport::new(scope)),
+            identity.device_id,
+            &identity.device_name,
+            identity.platform,
+        );
+        let LocalResult::RecoveryEnrollmentPhrase { phrase } = recovery
+            .execute(
+                &mut vault,
+                &identity.keys,
+                LocalRequest::RecoveryEnrollmentBegin(EmptyParams {}),
+            )
+            .unwrap()
+        else {
+            panic!("expected phrase")
+        };
+        clock.set(950);
+        let confirmations = phrase
+            .confirmation_positions
+            .iter()
+            .map(
+                |position| context_relay_protocol::RecoveryWordConfirmation {
+                    position: *position,
+                    word: phrase.recovery_phrase_words.as_words()[usize::from(*position) - 1]
+                        .clone(),
+                },
+            )
+            .collect();
+        recovery
+            .execute(
+                &mut vault,
+                &identity.keys,
+                LocalRequest::RecoveryEnrollmentConfirm(
+                    context_relay_protocol::RecoveryEnrollmentConfirmParams {
+                        enrollment_id: phrase.enrollment_id,
+                        confirmations,
+                    },
+                ),
+            )
+            .unwrap();
+        let begin = || {
+            LocalRequest::AccountDeletionBegin(context_relay_protocol::AccountDeletionParams {
+                operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
+                confirmation: "delete".into(),
+            })
+        };
+        http.lost.store(true, Ordering::SeqCst);
+        assert_eq!(
+            make(original.owner.clone(), identity.clone())
+                .execute(&mut vault, begin())
+                .unwrap_err()
+                .code,
+            ErrorCode::Internal
+        );
+        let intent = vault
+            .account_lifecycle_intent(LIFECYCLE_BEGIN_ID.parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.account_id, scope.account_id);
+        assert_eq!(intent.workspace_id, scope.workspace_id);
+        let first = http.requests.lock().unwrap()[0].clone();
+        drop(vault);
+        let mut vault = Vault::open(path.path(), "lifecycle", &keys).unwrap();
+        http.lost.store(false, Ordering::SeqCst);
+        make(original.owner.clone(), identity.clone())
+            .execute(&mut vault, begin())
+            .unwrap();
+        assert!(
+            http.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|body| *body == first)
+        );
+        let before = http.requests.lock().unwrap().len();
+        let replacement = fixture("550e8400-e29b-41d4-a716-446655440002");
+        assert_eq!(
+            make(replacement.owner.clone(), identity.clone())
+                .execute(&mut vault, begin())
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            make(original.owner.clone(), identity.clone())
+                .execute(
+                    &mut vault,
+                    LocalRequest::AccountDeletionCancel(context_relay_protocol::RetryParams {
+                        operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
+                    })
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict,
+        );
+        let mut wrong_project = account_lifecycle::HostedAccountLifecycleService::new(
+            original.owner.clone(),
+            "https://other.supabase.co",
+            "public-test",
+            identity.clone(),
+        );
+        wrong_project.http = Some(http.clone());
+        assert!(wrong_project.execute(&mut vault, status()).is_err());
+        let mut wrong = identity.clone();
+        wrong.device_id = stable_device_id(b"other-device");
+        assert!(
+            make(original.owner.clone(), wrong)
+                .execute(&mut vault, status())
+                .is_err()
+        );
+        assert_eq!(http.requests.lock().unwrap().len(), before);
+        make(original.owner.clone(), identity.clone())
+            .execute(&mut vault, status())
+            .unwrap();
+        assert_eq!(http.requests.lock().unwrap().len(), before + 1);
+        original.owner.logout().unwrap();
+        assert!(
+            make(original.owner.clone(), identity.clone())
+                .execute(&mut vault, status())
+                .is_err()
+        );
+        assert_eq!(http.requests.lock().unwrap().len(), before + 1);
         assert_eq!(
             vault.account_lifecycle_intent(intent.operation_id).unwrap(),
             Some(intent)

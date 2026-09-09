@@ -1702,3 +1702,38 @@ Evidence: `.codex/pr16-paired-scope-red.log`,
 This is a local authority prerequisite. Production lifecycle wiring and composed
 service qualification, live hosted acceptance and every broader release gate
 remain unfinished. PR #16 remains open.
+
+
+### Production account lifecycle wiring (2026-09-09)
+
+Configured daemon startup now installs `HostedAccountLifecycleService` alongside
+hosted pairing and recovery. Before constructing the native transport, it checks
+the Auth owner/current project, obtains workspace material from verified local
+provisioning, and requires one active certificate matching the installed device,
+both protected public keys, scope and control epoch. The existing guarded
+transport checks original session authority around HTTP attempts, and the ordered
+service commits immutable intent before begin/cancel dispatch. Changed login,
+project, scope or action cannot adopt the original operation. Status never replays
+an intent; existing desktop-role and explicit deletion-confirmation guards remain.
+
+The native-service regression uses the existing simulated Auth fixture and a
+bounded lifecycle HTTP fixture. It verifies no dispatch before provisioning,
+correct workspace selection, lost-response retry after reopening the vault with
+identical request bytes, replacement-login and changed-action rejection,
+wrong-project/device denial, read-only status and logout denial. The first build
+failed because the production service was missing; the implemented test passes.
+This test calls the service directly; composed lifecycle through authenticated
+IPC and live provider/installed qualification remain required.
+
+Validation: all 101 daemon library tests passed, with four pre-existing ignored;
+daemon library/test Clippy with warnings denied and normal production library
+check without test-support passed. Independent read-only review found no
+actionable P1/P2. Graphify update completed. Logs:
+`.codex/pr16-native-lifecycle-red.log`,
+`.codex/pr16-native-lifecycle-focused.log`,
+`.codex/pr16-native-lifecycle-daemon.log`,
+`.codex/pr16-native-lifecycle-clippy.log`,
+`.codex/pr16-native-lifecycle-production.log`.
+
+No live hosted deployment, signing, clean-machine acceptance or merge is claimed.
+The full release checklist remains the merge prerequisite.
