@@ -56,7 +56,7 @@ jobs:
       - run: pnpm check:supabase
       - run: node --test scripts/tests/check-supabase-contract.test.mjs
       - run: node --test scripts/tests/verify-supabase-realtime.test.mjs
-      - run: node --test scripts/tests/supabase-sync-*.test.mjs
+      - run: node --test scripts/tests/supabase-sync-*.test.mjs scripts/tests/supabase-edge-environment.test.mjs
       - run: node --test scripts/tests/account-lifecycle-*.test.mjs
       - run: node --test scripts/tests/hosted-enrollment-*.test.mjs
       - run: node --test supabase/functions/pairing/*.test.mjs

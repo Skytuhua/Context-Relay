@@ -1768,3 +1768,41 @@ migrations `20260805153409` and `20260805155753`, no Edge Functions, zero Auth u
 zero sync operations and zero sync checkpoints. The 15 subsequent repository
 migrations and four Edge Functions therefore remain deployment work; reconcile
 existing migration identities before rollout. No hosted mutation occurred.
+
+
+### Hosted schema and initial Edge deployment (2026-09-09)
+
+The two hosted baseline SQL statements were read back and exactly matched the
+repository sources after CRLF normalization and trimming. Their original remote
+versions were preserved. All 15 later repository migrations were applied in
+order to `brvzuycnxoswdzzipgvx`; all 17 stored statements then matched their
+repository source. Version mapping and deployed bundle digests are recorded in
+[the deployment evidence](hosted-deployment-2026-09-09.json).
+
+All public/private tables have RLS enabled. None of the 32 public service
+functions is executable by anon or authenticated. Six existing private helpers
+retain the baseline grants required by RLS/storage policies. Security advisors
+report no error/warning and 12 informational RLS-without-policy notices for
+private/service-only tables that deliberately deny direct client access. Auth
+users, accounts, sync operations and checkpoints remained empty.
+
+Deployment exposed an environment-contract gap: entrypoints read a singular
+publishable variable, while managed Supabase supplies named key JSON maps.
+All four now use a shared reader for SUPABASE_PUBLISHABLE_KEYS and
+SUPABASE_SECRET_KEYS defaults, preserving explicit overrides and sanitizing JSON
+parse errors. Forty-one affected Node checks and the Supabase contract check
+pass; independent review found no actionable P1/P2. Graphify update completed.
+Evidence: `.codex/pr16-edge-environment-{red,tests,contract,graph}.log`.
+
+Sync, account-lifecycle and enrollment were deployed at version 1 with exact
+source dependencies. Their own Auth validation remains mandatory with gateway
+verify_jwt=false. Valid request shapes with missing and invalid bearer tokens
+returned HTTP 401/auth_required on all three; initial malformed-body probes
+returned 400 and were not counted as authentication proof. Results are in
+`.codex/pr16-hosted-edge-auth.json` and the deployment evidence above.
+
+Pairing remains undeployed until its persistent random pepper can be configured.
+The dashboard requires user sign-in; CLI secret inspection failed with
+LegacyProfileLoadError. A sign-in request is pending. No secret was placed in
+source or logs. Anonymous rejection does not establish authenticated functionality,
+credential restoration, installed acceptance or full release completion.
