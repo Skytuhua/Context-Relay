@@ -882,6 +882,9 @@ impl Vault {
         {
             return Err(VaultError::OperationConflict);
         }
+        if let Some((binding, _)) = binding {
+            bind_local_update_owner(&transaction, mutation, &built.operation, binding)?;
+        }
         let (disposition, cache_change) =
             persist_outgoing(&transaction, mutation, built, embedding, committed_at_ms)?;
         transaction.commit()?;
@@ -2443,6 +2446,66 @@ fn upsert_cursor(
         ],
     )?;
     Ok(())
+}
+
+fn bind_local_update_owner(
+    transaction: &Transaction<'_>,
+    mutation: &RecordMutationV1,
+    operation: &SyncOperationV1,
+    binding: &super::LocalOperationBinding,
+) -> Result<(), VaultError> {
+    use super::LocalOperationKind;
+    let Some(expected_revision) = binding.expected_revision else {
+        return Ok(());
+    };
+    if stored_sync_record_owner(transaction, operation.record_id)?.is_some() {
+        return Ok(());
+    }
+    let Some(current) =
+        load_materialized_mutation(transaction, operation.record_id, operation.record_kind)?
+    else {
+        return Err(VaultError::OperationConflict);
+    };
+    let matches = match (&current, mutation, binding.operation_kind) {
+        (
+            RecordMutationV1::UpsertMemory(old),
+            RecordMutationV1::UpsertMemory(new),
+            LocalOperationKind::Update | LocalOperationKind::Archive,
+        ) => {
+            old.id == new.id
+                && old.scope == new.scope
+                && old.revision == expected_revision
+                && new.revision == binding.operation_id
+        }
+        (
+            RecordMutationV1::UpsertTask(old),
+            RecordMutationV1::UpsertTask(new),
+            LocalOperationKind::TaskUpsert
+            | LocalOperationKind::TaskTransition
+            | LocalOperationKind::TaskComplete,
+        ) => {
+            old.id == new.id
+                && old.project_id == new.project_id
+                && old.revision == expected_revision
+                && new.revision == binding.operation_id
+        }
+        _ => false,
+    };
+    if !matches
+        || materialized_record_kinds(transaction, operation.record_id)?.as_slice()
+            != [operation.record_kind]
+    {
+        return Err(VaultError::OperationConflict);
+    }
+    // Only an explicit local update can bind an offline record. Remote admission
+    // and unbound outgoing operations retain the existing ownerless-record guard.
+    insert_or_verify_sync_record_owner(
+        transaction,
+        operation.account_id,
+        operation.workspace_id,
+        operation.record_id,
+        operation.record_kind,
+    )
 }
 
 fn persist_outgoing<'a>(

@@ -1,5 +1,28 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Bind offline records during signed updates — 2026-09-09
+
+The first signed local update to an ownerless memory or task now binds it to
+the configured sync scope inside the existing transaction. Binding requires
+the expected stored revision, unchanged ID and scope/project, an allowed local
+update kind and exactly one materialized record kind. Existing owners retain
+their normal checks; remote admission and unbound outgoing writes cannot use
+this path to claim local records.
+
+The memory regression reproduced the ownerless update failure. Memory and task
+regressions now verify owner/record rollback on outbox failure, successful retry,
+unchanged IDs, original create receipts and exact signed bytes after reopening.
+All 23 service tests and six ownership-focused sync tests pass. The extended
+daemon dispatcher test also passes: it creates a note before enrollment and
+updates it afterward, alongside signed desktop/MCP writes and invalid-key guards.
+Scoped Clippy with warnings denied and the normal production daemon library
+check pass. Independent review found no trust-boundary or rollback issues.
+Graphify update completed after the code changes.
+
+This binds records when explicitly updated. Backfill of untouched offline
+records, shared-ID legacy candidate migration, native imports and hosted sync
+cycles still remain, alongside the rest of the full-release checklist.
+
 ## Daemon-owned local signing — 2026-09-09
 
 Enrolled daemon desktop memory/task/candidate mutations and native-hook writes

@@ -25,6 +25,172 @@ use support::{
 const CREDENTIAL: &str = "offline-service-tests";
 
 #[test]
+fn first_signed_task_transition_binds_offline_task_atomically() {
+    use context_relay_core::{
+        crypto::{ContentKey, DeviceKeys},
+        sync::SyncIdentity,
+    };
+    let fixture = Fixture::new("offline-task-sync-binding");
+    let database_key = [0x79; 32];
+    fixture.keys.insert(CREDENTIAL, database_key);
+    let mut vault = fixture.vault();
+    let mut local = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap());
+    local
+        .upsert_project(ProjectIdentity {
+            project_id: ID_7.parse().unwrap(),
+            github_repository_id: None,
+            git_remote_fingerprint: None,
+            monorepo_subdirectory: None,
+            name: "Tasks".into(),
+        })
+        .unwrap();
+    let create = TaskUpsertParams {
+        operation_id: ID_1.parse().unwrap(),
+        task_id: None,
+        project_id: ID_7.parse().unwrap(),
+        title: "Offline task".into(),
+        body_markdown: "Original task".into(),
+        status: TaskStatus::Open,
+        expected_revision: None,
+    };
+    let original = local.upsert_task(create.clone()).unwrap();
+    let keys = DeviceKeys::generate().unwrap();
+    let content = ContentKey::from_bytes([0x7a; 32]);
+    let identity = SyncIdentity {
+        account_id: ID_6.parse().unwrap(),
+        workspace_id: ID_8.parse().unwrap(),
+        device_id: ID_9.parse().unwrap(),
+        control_epoch: 1,
+        key_epoch: 1,
+        device_keys: &keys,
+        content_key: &content,
+    };
+    let change = TaskTransitionParams {
+        operation_id: ID_2.parse().unwrap(),
+        task_id: original.id,
+        expected_revision: original.revision,
+        status: TaskStatus::InProgress,
+    };
+    let raw = open_keyed(fixture.path.path(), &database_key);
+    raw.execute_batch("CREATE TRIGGER fail_task_binding BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(
+        OfflineWorkspace::new(&mut vault, identity.device_id)
+            .with_sync_identity(identity)
+            .unwrap()
+            .transition_task(change.clone())
+            .is_err()
+    );
+    assert_eq!(vault.task(&original.id).unwrap(), Some(original.clone()));
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM sync_record_owners", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    raw.execute_batch("DROP TRIGGER fail_task_binding;")
+        .unwrap();
+    drop(raw);
+    let changed = OfflineWorkspace::new(&mut vault, identity.device_id)
+        .with_sync_identity(identity)
+        .unwrap()
+        .transition_task(change.clone())
+        .unwrap();
+    let bytes = vault.due_outbox(u64::MAX, 10).unwrap();
+    assert_eq!(bytes.len(), 1);
+    drop(vault);
+    let mut vault = fixture.vault();
+    let mut service = OfflineWorkspace::new(&mut vault, identity.device_id)
+        .with_sync_identity(identity)
+        .unwrap();
+    assert_eq!(service.upsert_task(create).unwrap(), original);
+    assert_eq!(service.transition_task(change).unwrap(), changed);
+    assert_eq!(
+        vault.due_outbox(u64::MAX, 10).unwrap()[0].canonical_bytes,
+        bytes[0].canonical_bytes
+    );
+}
+
+#[test]
+fn first_signed_update_binds_offline_record_atomically_and_preserves_original_receipt() {
+    use context_relay_core::{
+        crypto::{ContentKey, DeviceKeys},
+        sync::SyncIdentity,
+    };
+    let fixture = Fixture::new("offline-record-sync-binding");
+    let database_key = [0x77; 32];
+    fixture.keys.insert(CREDENTIAL, database_key);
+    let mut vault = fixture.vault();
+    let create = MemoryCreateParams {
+        operation_id: ID_1.parse().unwrap(),
+        scope: ScopeRef::Global,
+        kind: MemoryKind::Fact,
+        title: "Offline".into(),
+        body_markdown: "Original record".into(),
+        tags: vec![],
+    };
+    let original = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
+        .create_memory(create.clone())
+        .unwrap();
+    let keys = DeviceKeys::generate().unwrap();
+    let content = ContentKey::from_bytes([0x78; 32]);
+    let identity = SyncIdentity {
+        account_id: ID_6.parse().unwrap(),
+        workspace_id: ID_8.parse().unwrap(),
+        device_id: ID_9.parse().unwrap(),
+        control_epoch: 1,
+        key_epoch: 1,
+        device_keys: &keys,
+        content_key: &content,
+    };
+    let update = MemoryUpdateParams {
+        operation_id: ID_2.parse().unwrap(),
+        memory_id: original.id,
+        expected_revision: original.revision,
+        title: Some("Now synced".into()),
+        body_markdown: None,
+        tags: None,
+    };
+    let raw = open_keyed(fixture.path.path(), &database_key);
+    raw.execute_batch("CREATE TRIGGER fail_owner_update BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(
+        OfflineWorkspace::new(&mut vault, identity.device_id)
+            .with_sync_identity(identity)
+            .unwrap()
+            .update_memory(update.clone())
+            .is_err()
+    );
+    assert_eq!(vault.memory(&original.id).unwrap(), Some(original.clone()));
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM sync_record_owners", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    raw.execute_batch("DROP TRIGGER fail_owner_update;")
+        .unwrap();
+    drop(raw);
+    let updated = OfflineWorkspace::new(&mut vault, identity.device_id)
+        .with_sync_identity(identity)
+        .unwrap()
+        .update_memory(update.clone())
+        .unwrap();
+    assert_eq!(updated.id, original.id);
+    let bytes = vault.due_outbox(u64::MAX, 10).unwrap();
+    assert_eq!(bytes.len(), 1);
+    drop(vault);
+    let mut vault = fixture.vault();
+    let mut service = OfflineWorkspace::new(&mut vault, identity.device_id)
+        .with_sync_identity(identity)
+        .unwrap();
+    assert_eq!(service.create_memory(create).unwrap(), original);
+    assert_eq!(service.update_memory(update).unwrap(), updated);
+    assert_eq!(
+        vault.due_outbox(u64::MAX, 10).unwrap()[0].canonical_bytes,
+        bytes[0].canonical_bytes
+    );
+}
+
+#[test]
 fn configured_approval_commits_all_signed_operations_or_none() {
     use context_relay_core::{
         crypto::{ContentKey, DeviceKeys},

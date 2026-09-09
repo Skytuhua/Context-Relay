@@ -8911,6 +8911,20 @@ mod tests {
             open_workspace(&mut config).unwrap_or_else(|_| panic!("open workspace"));
         let status = ServiceStatus::new();
         assert!(local_sync_material(&state).unwrap().is_none());
+        execute_workspace_request(
+            &mut state,
+            LocalRequest::MemoryCreate(context_relay_protocol::MemoryCreateParams {
+                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074205".parse().unwrap(),
+                scope: ScopeRef::Global,
+                kind: context_relay_protocol::MemoryKind::Fact,
+                title: "Before enrollment".into(),
+                body_markdown: "Offline record".into(),
+                tags: vec![],
+            }),
+            &status,
+        )
+        .unwrap();
+        assert!(state.vault.due_outbox(u64::MAX, 10).unwrap().is_empty());
         let identity = PairingIdentity {
             device_id: state.device_id,
             device_name: "Local signing".into(),
@@ -8964,6 +8978,19 @@ mod tests {
                 ),
             )
             .unwrap();
+        execute_workspace_request(
+            &mut state,
+            LocalRequest::MemoryUpdate(context_relay_protocol::MemoryUpdateParams {
+                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074206".parse().unwrap(),
+                memory_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074205".parse().unwrap(),
+                expected_revision: "018f22e2-79b0-7cc8-98c4-dc0c0c074205".parse().unwrap(),
+                title: Some("After enrollment".into()),
+                body_markdown: None,
+                tags: None,
+            }),
+            &status,
+        )
+        .unwrap();
         let create = LocalRequest::MemoryCreate(context_relay_protocol::MemoryCreateParams {
             operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074203".parse().unwrap(),
             scope: ScopeRef::Global,
@@ -8982,7 +9009,7 @@ mod tests {
         );
         execute_workspace_request(&mut state, mcp, &status).unwrap();
         let before = state.vault.due_outbox(u64::MAX, 10).unwrap();
-        assert_eq!(before.len(), 2);
+        assert_eq!(before.len(), 3);
         assert_eq!(
             execute_workspace_request(&mut state, create.clone(), &status).unwrap(),
             output
