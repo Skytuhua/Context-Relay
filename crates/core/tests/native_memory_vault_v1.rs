@@ -1587,7 +1587,7 @@ fn reverting_to_seen_content_advances_the_ledger_without_rewriting_the_candidate
             )
             .unwrap();
         }
-        let preserved = if reviewed_state == CandidateState::Pending {
+        let mut preserved = if reviewed_state == CandidateState::Pending {
             initial.clone()
         } else {
             OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
@@ -1598,6 +1598,26 @@ fn reverting_to_seen_content_advances_the_ledger_without_rewriting_the_candidate
                 })
                 .unwrap()
         };
+        let original_review = preserved.clone();
+        if legacy_ids {
+            let old_id = initial.id.to_string();
+            preserved.id = ID_1.parse().unwrap();
+            let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+            raw.execute(
+                "UPDATE candidates SET id = ?2, payload_json = ?3 WHERE id = ?1",
+                params![
+                    old_id,
+                    preserved.id.to_string(),
+                    serde_json::to_vec(&preserved).unwrap()
+                ],
+            )
+            .unwrap();
+            raw.execute(
+                "INSERT INTO candidate_aliases(legacy_id, canonical_id) VALUES (?1,?2)",
+                params![old_id, preserved.id.to_string()],
+            )
+            .unwrap();
+        }
 
         let live = OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
             .reconcile_native_memory(ready_live(source.clone(), "content B"))
@@ -1643,7 +1663,7 @@ fn reverting_to_seen_content_advances_the_ledger_without_rewriting_the_candidate
                         operation_id: ID_7.parse().unwrap(),
                     })
                     .unwrap(),
-                preserved
+                original_review
             );
         }
     }

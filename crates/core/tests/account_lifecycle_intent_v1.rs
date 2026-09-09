@@ -116,7 +116,7 @@ fn schema_33_upgrade_never_invents_lifecycle_authority() {
         unsafe { rusqlite::ffi::sqlite3_key(raw.handle(), key.as_ptr().cast(), 32) },
         rusqlite::ffi::SQLITE_OK
     );
-    raw.execute_batch("DROP TABLE account_lifecycle_intents; PRAGMA user_version=33;")
+    raw.execute_batch("DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; PRAGMA user_version=33;")
         .unwrap();
     drop(raw);
     let vault = Vault::open(path.path(), "migration", &keys).unwrap();

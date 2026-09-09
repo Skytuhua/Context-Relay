@@ -31,6 +31,19 @@ pub fn health_descriptor() -> HealthDescriptor {
     }
 }
 
+pub(crate) fn derived_record_uuid(source: &[u8; 16], domain: &[u8]) -> Option<uuid::Uuid> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(source);
+    let digest = hasher.finalize();
+    let mut bytes = *source;
+    bytes[6..].copy_from_slice(&digest[..10]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    (&bytes != source).then(|| uuid::Uuid::from_bytes(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{HealthDescriptor, health_descriptor};

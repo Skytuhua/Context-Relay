@@ -48,7 +48,7 @@ pub use sync::*;
 mod semantic_index;
 pub use semantic_index::{SemanticIndexBatch, SemanticIndexProgress};
 
-pub const LATEST_SCHEMA_VERSION: u32 = 35;
+pub const LATEST_SCHEMA_VERSION: u32 = 36;
 pub const MAX_NATIVE_HOOK_SESSIONS: usize = 256;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
@@ -760,6 +760,9 @@ impl Vault {
     }
 
     pub fn put_candidate(&mut self, candidate: &MemoryCandidate) -> Result<(), VaultError> {
+        if self.canonical_candidate_id(candidate.id)? != candidate.id {
+            return Err(VaultError::OperationConflict);
+        }
         candidate
             .validate()
             .map_err(|error| VaultError::Validation(error.to_string()))?;
@@ -781,6 +784,9 @@ impl Vault {
         candidate: &MemoryCandidate,
         binding: &LocalOperationBinding,
     ) -> Result<(), VaultError> {
+        if self.canonical_candidate_id(candidate.id)? != candidate.id {
+            return Err(VaultError::OperationConflict);
+        }
         candidate
             .validate()
             .map_err(|error| VaultError::Validation(error.to_string()))?;
@@ -807,8 +813,17 @@ impl Vault {
         load_json(
             &self.connection,
             "SELECT payload_json FROM candidates WHERE id = ?1",
-            &id.to_string(),
+            &resolve_candidate_id(&self.connection, &id.to_string())?,
         )
+    }
+
+    pub(crate) fn canonical_candidate_id(
+        &self,
+        id: CandidateId,
+    ) -> Result<CandidateId, VaultError> {
+        resolve_candidate_id(&self.connection, &id.to_string())?
+            .parse()
+            .map_err(|_| VaultError::OperationConflict)
     }
 
     pub fn candidates(
@@ -966,10 +981,11 @@ impl Vault {
                 NativeMemoryChangeKind::InitialPreview
             };
             let canonical_candidate = to_json(candidate)?;
+            let canonical_id = resolve_candidate_id(&transaction, &candidate.id.to_string())?;
             let existing = transaction
                 .query_row(
                     "SELECT payload_json FROM candidates WHERE id = ?1",
-                    [candidate.id.to_string()],
+                    [&canonical_id],
                     |row| row.get::<_, Vec<u8>>(0),
                 )
                 .optional()?;
@@ -996,9 +1012,23 @@ impl Vault {
                         .validate()
                         .map_err(|error| VaultError::Validation(error.to_string()))?;
                     native_memory_change_kind(&existing_candidate)?;
-                    if !same_native_candidate_identity(&existing_candidate, candidate) {
+                    let mut comparison = existing_candidate.clone();
+                    if comparison.id.to_string() != canonical_id {
                         return Err(VaultError::OperationConflict);
                     }
+                    comparison.id = candidate.id;
+                    if !same_native_candidate_identity(&comparison, candidate) {
+                        return Err(VaultError::OperationConflict);
+                    }
+                    let expected_change_kind = if prior_ledger
+                        .as_ref()
+                        .is_some_and(|(_, payload)| payload == &canonical_ledger)
+                        && existing_candidate.evidence_summary == candidate.evidence_summary
+                    {
+                        native_memory_change_kind(candidate)?
+                    } else {
+                        expected_change_kind
+                    };
                     validate_native_memory_candidate(
                         source,
                         ledger,
@@ -1008,6 +1038,9 @@ impl Vault {
                     )?;
                 }
             } else {
+                if canonical_id != candidate.id.to_string() {
+                    return Err(VaultError::OperationConflict);
+                }
                 validate_native_memory_candidate(
                     source,
                     ledger,
@@ -1060,6 +1093,7 @@ impl Vault {
                 "candidate review must accept or reject".to_owned(),
             ));
         }
+        let id = self.canonical_candidate_id(id)?;
         let transaction = self.connection.transaction()?;
         let payload = transaction
             .query_row(
@@ -1073,13 +1107,17 @@ impl Vault {
         let already_reviewed = binding.is_some() && candidate.state == state;
         if let Some(binding) = binding {
             if binding.operation_kind != LocalOperationKind::CandidateReview
-                || binding.target_id != id.to_string()
+                || resolve_candidate_id(&transaction, &binding.target_id)? != id.to_string()
                 || (candidate.state != CandidateState::Pending && candidate.state != state)
             {
                 return Err(VaultError::OperationConflict);
             }
             let mut response = candidate.clone();
             response.state = state;
+            response.id = binding
+                .target_id
+                .parse()
+                .map_err(|_| VaultError::OperationConflict)?;
             if !insert_local_operation_binding(&transaction, binding, &to_json(&response)?)? {
                 return Err(VaultError::OperationConflict);
             }
@@ -2389,7 +2427,28 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }
+    if found < 36 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0036_candidate_aliases.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 36))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
     Ok(())
+}
+
+fn resolve_candidate_id(connection: &Connection, id: &str) -> Result<String, VaultError> {
+    Ok(connection
+        .query_row(
+            "SELECT canonical_id FROM candidate_aliases WHERE legacy_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| id.to_owned()))
 }
 
 const fn task_status(status: TaskStatus) -> &'static str {

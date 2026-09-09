@@ -298,6 +298,7 @@ impl Vault {
             });
         let now = local_unix_ms()?;
         let transaction = self.connection.transaction()?;
+        migrate_legacy_candidate_ids(&transaction, limit.min(32))?;
         let records = {
             let mut statement = transaction.prepare(
                 "SELECT id, kind FROM (
@@ -1015,7 +1016,8 @@ impl Vault {
         if current.state != CandidateState::Pending
             || binding.operation_kind != super::LocalOperationKind::CandidateReview
             || binding.operation_id != decision.operation.operation_id
-            || binding.target_id != candidate.id.to_string()
+            || super::resolve_candidate_id(&transaction, &binding.target_id)?
+                != candidate.id.to_string()
             || binding.expected_revision.is_some()
         {
             return Err(VaultError::OperationConflict);
@@ -1029,7 +1031,12 @@ impl Vault {
         {
             return Err(VaultError::OperationConflict);
         }
-        if !super::insert_local_operation_binding(&transaction, binding, &to_json(candidate)?)? {
+        let mut response = candidate.clone();
+        response.id = binding
+            .target_id
+            .parse()
+            .map_err(|_| VaultError::OperationConflict)?;
+        if !super::insert_local_operation_binding(&transaction, binding, &to_json(&response)?)? {
             return Err(VaultError::OperationConflict);
         }
         let now = local_unix_ms()?;
@@ -2609,6 +2616,67 @@ fn bind_local_update_owner(
     )
 }
 
+fn migrate_legacy_candidate_ids(
+    transaction: &Transaction<'_>,
+    limit: usize,
+) -> Result<(), VaultError> {
+    let candidates = {
+        let mut statement = transaction.prepare(
+            "SELECT id, payload_json FROM candidates
+             WHERE id = json_extract(CAST(payload_json AS TEXT), '$.proposedMemory.id')
+             ORDER BY id LIMIT ?1",
+        )?;
+        statement
+            .query_map(
+                [i64::try_from(limit).map_err(|_| VaultError::OperationConflict)?],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (old_id, payload) in candidates {
+        let mut candidate: MemoryCandidate = from_json(&payload)?;
+        candidate
+            .validate()
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        let old_record = parse_record_id(&old_id)?;
+        if candidate.id.to_string() != old_id
+            || stored_sync_record_owner(transaction, old_record)?.is_some()
+            || materialized_record_kinds(transaction, old_record)?
+                .iter()
+                .any(|kind| !matches!(kind, RecordKind::Memory | RecordKind::MemoryCandidate))
+        {
+            return Err(VaultError::OperationConflict);
+        }
+        let new_uuid = crate::derived_record_uuid(
+            candidate.id.as_bytes(),
+            b"context-relay.legacy-candidate.v1",
+        )
+        .ok_or(VaultError::OperationConflict)?;
+        let new_record = RecordId::new(new_uuid).map_err(|_| VaultError::OperationConflict)?;
+        let new_id = new_record.to_string();
+        let alias_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM candidate_aliases WHERE legacy_id IN (?1,?2) OR canonical_id IN (?1,?2))",
+            params![old_id, new_id], |row| row.get(0))?;
+        if alias_exists
+            || !materialized_record_kinds(transaction, new_record)?.is_empty()
+            || stored_sync_record_owner(transaction, new_record)?.is_some()
+        {
+            return Err(VaultError::OperationConflict);
+        }
+        candidate.id = context_relay_protocol::CandidateId::new(new_uuid)
+            .map_err(|_| VaultError::OperationConflict)?;
+        transaction.execute(
+            "UPDATE candidates SET id = ?2, payload_json = ?3 WHERE id = ?1",
+            params![old_id, new_id, to_json(&candidate)?],
+        )?;
+        transaction.execute(
+            "INSERT INTO candidate_aliases(legacy_id, canonical_id) VALUES (?1,?2)",
+            params![old_id, new_id],
+        )?;
+    }
+    Ok(())
+}
+
 fn persist_outgoing<'a>(
     transaction: &Transaction<'_>,
     mutation: &'a RecordMutationV1,
@@ -3348,6 +3416,11 @@ fn materialize_mutation<'a>(
             Ok(CacheChange::PutMemory(record, embedding))
         }
         RecordMutationV1::UpsertMemoryCandidate(record) => {
+            if super::resolve_candidate_id(transaction, &record.id.to_string())?
+                != record.id.to_string()
+            {
+                return Err(VaultError::OperationConflict);
+            }
             transaction.execute(
                 "INSERT INTO candidates(id, state, payload_json) VALUES (?1, ?2, ?3)
                  ON CONFLICT(id) DO UPDATE SET state = excluded.state,

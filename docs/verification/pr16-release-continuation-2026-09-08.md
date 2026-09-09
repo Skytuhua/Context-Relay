@@ -2122,3 +2122,34 @@ The dashboard requires user sign-in; CLI secret inspection failed with
 LegacyProfileLoadError. A sign-in request is pending. No secret was placed in
 source or logs. Anonymous rejection does not establish authenticated functionality,
 credential restoration, installed acceptance or full release completion.
+
+### Local shared-ID candidate migration (2026-09-09)
+
+Schema 36 stores local aliases for legacy candidates whose ID equals their
+proposed memory ID. Bounded signed backfill renames those candidate IDs and
+creates aliases in its existing transaction. Accepted memory IDs and original
+request receipts remain unchanged. Old-ID review requests return their original
+requested ID while signed operations use the canonical candidate ID. Native
+re-observation and content reversion resolve the same stored candidate.
+
+The focused regression verifies rollback on outbox failure, alias preservation,
+signed old-ID approval and exact retry after reopening. The final service,
+lifecycle, pairing and sync-storage regression passes 43 tests; four affected
+schema-upgrade checks pass. The native-vault suite passed 28 tests before the
+final acknowledgment and downgrade-fixture corrections. Core library/test Clippy
+with warnings denied and a production daemon library check both pass. Review's
+acknowledgment-ID and downgrade-fixture findings are fixed. Graphify update
+completed. Logs: `.codex/pr16-candidate-alias-{final-test,final-regression,upgrades,clippy,production,graph}.log`.
+
+This is local migration evidence. Incoming canonical candidates do not yet
+reconstruct aliases on another device; validated receive/replay and collision
+handling remain required before network sync acceptance. Legacy queue migration,
+hosted sync cycles and all installed/signing/clean-machine gates remain open.
+
+Signing enrollment is being prepared in regular Chrome. Apple requires account
+sign-in. A one-year Certum Standard Cloud certificate cart quotes EUR 209 with
+Taiwan selected, but account creation, purchase and identity verification are
+unfinished. No certificate purchase or agreement acceptance is claimed.
+Supabase CLI access works with the existing `supabase` profile; no new Supabase
+sign-in is needed. Pairing deployment still requires the persistent pepper whose
+configuration was rejected by automatic approval review.

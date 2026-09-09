@@ -205,16 +205,61 @@ fn backfill_queues_unchanged_offline_records_atomically_and_resumes_after_reopen
     legacy.id = id(support::ID_5);
     legacy.proposed_memory.id = id(support::ID_5);
     vault.put_candidate(&legacy).unwrap();
+    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    raw.execute_batch("CREATE TRIGGER fail_alias_backfill BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
     assert!(
         vault
             .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 32)
             .is_err()
     );
     assert_eq!(vault.due_outbox(u64::MAX, 32).unwrap().len(), 9);
-    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
-    raw.execute("DELETE FROM candidates WHERE id = ?1", [support::ID_5])
+    assert_eq!(vault.candidate(&legacy.id).unwrap(), Some(legacy.clone()));
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM candidate_aliases", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    raw.execute_batch("DROP TRIGGER fail_alias_backfill;")
         .unwrap();
     drop(raw);
+    assert_eq!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 32)
+            .unwrap(),
+        1
+    );
+    let migrated = vault.candidate(&legacy.id).unwrap().unwrap();
+    assert_ne!(migrated.id, legacy.id);
+    assert_eq!(migrated.proposed_memory, legacy.proposed_memory);
+    assert!(vault.put_candidate(&legacy).is_err());
+    let review = context_relay_protocol::CandidateReviewParams {
+        candidate_id: legacy.id,
+        accepted: true,
+        operation_id: id(support::ID_8),
+    };
+    let material = vault.trusted_sync_material(&fixture.device_keys).unwrap();
+    let identity = material
+        .local_identity(id(DEVICE_ID), &fixture.device_keys)
+        .unwrap();
+    let reviewed = OfflineWorkspace::new(&mut vault, id(DEVICE_ID))
+        .with_sync_identity(identity)
+        .unwrap()
+        .review_candidate(review.clone())
+        .unwrap();
+    assert_eq!(reviewed.id, legacy.id);
+    assert_eq!(
+        vault.memory(&legacy.proposed_memory.id).unwrap(),
+        Some(legacy.proposed_memory.clone())
+    );
+    drop(vault);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(
+        OfflineWorkspace::new(&mut vault, id(DEVICE_ID))
+            .review_candidate(review)
+            .unwrap(),
+        reviewed
+    );
     legacy.id = id(support::ID_1);
     vault.put_candidate(&legacy).unwrap();
     assert!(
@@ -222,7 +267,7 @@ fn backfill_queues_unchanged_offline_records_atomically_and_resumes_after_reopen
             .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 32)
             .is_err()
     );
-    assert_eq!(vault.due_outbox(u64::MAX, 32).unwrap().len(), 9);
+    assert_eq!(vault.due_outbox(u64::MAX, 32).unwrap().len(), 12);
 }
 
 #[test]
@@ -642,7 +687,7 @@ fn prepared_enrollment_activates_exactly_and_reopens_sealed_material() {
     raw.execute_batch(include_str!("../migrations/0022_recovery_enrollment.sql"))
         .unwrap();
     raw.execute_batch("INSERT INTO recovery_enrollments SELECT * FROM enrollment_fixture; DROP TABLE enrollment_fixture;").unwrap();
-    raw.execute_batch("DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews; DROP TABLE hosted_pairing_intents; DROP TABLE hosted_restore_intent;")
+    raw.execute_batch("DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews; DROP TABLE hosted_pairing_intents; DROP TABLE hosted_restore_intent;")
         .unwrap();
     raw.pragma_update(None, "user_version", 28).unwrap();
     drop(raw);

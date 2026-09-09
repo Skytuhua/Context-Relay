@@ -864,7 +864,11 @@ impl<'a> OfflineWorkspace<'a> {
                 let candidate: MemoryCandidate =
                     serde_json::from_slice(&snapshot).map_err(|_| internal())?;
                 candidate.validate().map_err(|_| internal())?;
-                if candidate.id != params.candidate_id || candidate.state != state {
+                if (candidate.id != params.candidate_id
+                    && candidate.id
+                        != vault(self.vault.canonical_candidate_id(params.candidate_id))?)
+                    || candidate.state != state
+                {
                     return Err(internal());
                 }
                 return Ok(candidate);
@@ -922,6 +926,7 @@ impl<'a> OfflineWorkspace<'a> {
                     &binding,
                 ),
             )?;
+            candidate.id = params.candidate_id;
             return Ok(candidate);
         }
         if params.accepted {
@@ -943,6 +948,7 @@ impl<'a> OfflineWorkspace<'a> {
             ))?;
         }
         candidate.state = state;
+        candidate.id = params.candidate_id;
         Ok(candidate)
     }
 
@@ -1376,18 +1382,7 @@ fn proposed_memory_id(candidate: CandidateId) -> Result<MemoryId, ClientError> {
 }
 
 fn derived_uuid(source: &[u8; 16], domain: &[u8]) -> Result<uuid::Uuid, ClientError> {
-    let mut hasher = Sha256::new();
-    hasher.update(domain);
-    hasher.update(source);
-    let digest = hasher.finalize();
-    let mut bytes = *source;
-    bytes[6..].copy_from_slice(&digest[..10]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x70;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    if &bytes == source {
-        return Err(internal());
-    }
-    Ok(uuid::Uuid::from_bytes(bytes))
+    crate::derived_record_uuid(source, domain).ok_or_else(internal)
 }
 
 fn task_snapshot(
