@@ -360,13 +360,49 @@ impl Vault {
                 kind,
             )?;
             persist_outgoing(&transaction, &mutation, &built, None, now, false)?;
+            retire_legacy_queue_for_record(&transaction, id, kind)?;
             previous = Some(OperationChainHead {
                 sequence: built.operation.device_sequence,
                 canonical_hash: built.canonical_hash,
             });
         }
+        let pending_legacy = {
+            let mut statement = transaction.prepare(
+                "SELECT DISTINCT owner.record_id, owner.record_kind
+                 FROM sync_record_owners owner JOIN operations ON operations.record_id = owner.record_id
+                 JOIN outbox ON outbox.operation_id = operations.id
+                 WHERE owner.account_id = ?1 AND owner.workspace_id = ?2 AND owner.binding_state = 'verified'
+                 AND NOT EXISTS(SELECT 1 FROM sync_operation_meta WHERE operation_id = operations.id)
+                 ORDER BY owner.record_id LIMIT ?3",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        scope.account_id.to_string(),
+                        scope.workspace_id.to_string(),
+                        limit.min(32) as i64
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (record_id, kind) in &pending_legacy {
+            let record_id = parse_record_id(record_id)?;
+            let kind = parse_record_kind(kind)?;
+            if !legacy_owner_matches_materialization(
+                &transaction,
+                &material,
+                scope.account_id,
+                scope.workspace_id,
+                record_id,
+                kind,
+            )? {
+                return Err(VaultError::OperationConflict);
+            }
+            retire_legacy_queue_for_record(&transaction, record_id, kind)?;
+        }
         transaction.commit()?;
-        Ok(records.len())
+        Ok(records.len() + pending_legacy.len())
     }
 
     /// Presence is not authority: callers must still load and verify the complete proof.
@@ -2698,6 +2734,43 @@ fn restore_received_candidate_alias(
         "INSERT INTO candidate_aliases(legacy_id, canonical_id) VALUES (?1,?2)",
         params![old_id, new_id],
     )?;
+    Ok(())
+}
+
+fn retire_legacy_queue_for_record(
+    transaction: &Transaction<'_>,
+    record_id: RecordId,
+    record_kind: RecordKind,
+) -> Result<(), VaultError> {
+    let legacy = {
+        let mut statement = transaction.prepare(
+            "SELECT operations.id, operations.payload_json FROM operations
+             JOIN outbox ON outbox.operation_id = operations.id
+             WHERE operations.record_id = ?1
+             AND NOT EXISTS(SELECT 1 FROM sync_operation_meta WHERE operation_id = operations.id)
+             ORDER BY operations.id LIMIT 32",
+        )?;
+        statement
+            .query_map([record_id.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (id, payload) in legacy {
+        let operation: SyncOperationV1 = from_json(&payload)?;
+        super::validate_operation_for(&operation, &record_id.to_string(), record_kind)?;
+        let referenced: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_record_heads WHERE operation_id = ?1 UNION ALL SELECT 1 FROM sync_nonces WHERE operation_id = ?1)",
+            [&id],
+            |row| row.get(0),
+        )?;
+        if operation.operation_id.to_string() != id || referenced {
+            return Err(VaultError::OperationConflict);
+        }
+        // The replacement snapshot is already durable in this transaction.
+        // Keep original operation bytes and receipts; retire only its queue entry.
+        transaction.execute("DELETE FROM outbox WHERE operation_id = ?1", [id])?;
+    }
     Ok(())
 }
 

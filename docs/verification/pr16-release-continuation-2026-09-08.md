@@ -2179,3 +2179,32 @@ check pass. Graphify update completed. Logs are
 `.codex/pr16-candidate-alias-receive-{red,order-final,owners,clippy,production,graph-final}.log`.
 This remains component evidence; hosted network-cycle wiring and installed
 cross-device/full-release acceptance are not complete.
+
+### Retiring superseded legacy queue entries (2026-09-09)
+
+Signed backfill now retires legacy queue entries for the replaced record in the
+same transaction, retaining original operation payloads and receipts. It validates
+operation identity, record kind and upsert shape. Entries referenced by signed
+nonce storage or record heads cannot be retired merely because metadata is
+missing. Cleanup processes at most 32 legacy entries per selected record.
+
+Already-backfilled records also receive bounded cleanup. Their matching verified
+owner and signed representative must rehydrate to the current materialized state
+before an old queue entry can be retired. This handles restart from earlier PR
+checkpoints that had signed the snapshot but left its legacy envelope queued.
+Unverifiable replacements and orphaned legacy entries are not silently discarded.
+
+The regression first reproduced the stale ninth queue entry, then verifies its
+removal with original operation preservation, transactional rollback when queue
+deletion fails, cleanup after reopening an already-backfilled vault, and signed
+receive/replay after migration. A real signed creation followed by signed review
+also verifies that removing only the creation's metadata cannot cause retirement
+of its queued predecessor. Both focused backfill tests pass. The review's restart
+and signed-predecessor findings are fixed and closed.
+
+This remains local migration evidence. Orphan/corrupt legacy queue handling,
+production hosted sync integration and installed/full-release gates remain open.
+
+Core library/test Clippy with warnings denied and the normal production daemon
+library check pass. Graphify update completed. Evidence logs:
+`.codex/pr16-legacy-queue-{red,protected,clippy,production,graph}.log`.

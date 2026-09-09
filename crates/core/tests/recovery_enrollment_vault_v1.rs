@@ -253,6 +253,23 @@ fn backfill_queues_unchanged_offline_records_atomically_and_resumes_after_reopen
         rusqlite::params![support::ID_8, serde_json::to_vec(&component).unwrap()],
     )
     .unwrap();
+    raw.execute_batch("CREATE TRIGGER fail_retire BEFORE DELETE ON outbox BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 32)
+            .is_err()
+    );
+    assert_eq!(vault.due_outbox(u64::MAX, 32).unwrap().len(), 3);
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM sync_record_owners WHERE record_id = ?1",
+            [support::ID_4],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    raw.execute_batch("DROP TRIGGER fail_retire;").unwrap();
     drop(raw);
     assert_eq!(
         vault
@@ -261,7 +278,52 @@ fn backfill_queues_unchanged_offline_records_atomically_and_resumes_after_reopen
         6
     );
     let queued = vault.due_outbox(u64::MAX, 32).unwrap();
-    assert_eq!(queued.len(), 9); // Includes the instruction's pre-existing legacy operation.
+    assert_eq!(queued.len(), 8);
+    assert!(
+        !queued
+            .iter()
+            .any(|row| row.operation_id == id(support::ID_4))
+    );
+    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    let original_payload: Vec<u8> = raw
+        .query_row(
+            "SELECT payload_json FROM operations WHERE id = ?1",
+            [support::ID_4],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<context_relay_protocol::SyncOperationV1>(&original_payload)
+            .unwrap(),
+        support::operation(
+            support::ID_4,
+            support::ID_4,
+            context_relay_protocol::RecordKind::Instruction
+        )
+    );
+    // Simulate a vault backfilled by the previous version, which retained
+    // the old queue row despite having a signed replacement and owner.
+    raw.execute(
+        "INSERT INTO outbox(operation_id) VALUES (?1)",
+        [support::ID_4],
+    )
+    .unwrap();
+    drop(raw);
+    drop(vault);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 1)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 1)
+            .unwrap(),
+        0
+    );
+    assert_eq!(vault.due_outbox(u64::MAX, 32).unwrap().len(), 8);
     let kinds = queued
         .iter()
         .filter(|row| row.operation_id != id(support::ID_4))
@@ -286,7 +348,7 @@ fn backfill_queues_unchanged_offline_records_atomically_and_resumes_after_reopen
             .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 32)
             .is_err()
     );
-    assert_eq!(vault.due_outbox(u64::MAX, 32).unwrap().len(), 9);
+    assert_eq!(vault.due_outbox(u64::MAX, 32).unwrap().len(), 8);
     assert_eq!(vault.candidate(&legacy.id).unwrap(), Some(legacy.clone()));
     assert_eq!(
         raw.query_row("SELECT count(*) FROM candidate_aliases", [], |row| row
@@ -438,6 +500,54 @@ fn backfill_queues_unchanged_offline_records_atomically_and_resumes_after_reopen
         receiver.memory(&legacy.proposed_memory.id).unwrap(),
         Some(legacy.proposed_memory.clone())
     );
+    // A signed candidate creation is no longer the record head after its
+    // signed review. Missing metadata must not retire that chain ancestor.
+    let ancestor = incoming
+        .iter()
+        .find(|row| {
+            let operation =
+                context_relay_protocol::decode_sync_operation_v1(&row.canonical_bytes).unwrap();
+            operation.record_id.to_string() == migrated.id.to_string()
+        })
+        .unwrap()
+        .operation_id;
+    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM sync_record_heads WHERE operation_id = ?1",
+            [ancestor.to_string()],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    raw.execute(
+        "CREATE TEMP TABLE saved_meta AS SELECT * FROM sync_operation_meta WHERE operation_id = ?1",
+        [ancestor.to_string()],
+    )
+    .unwrap();
+    raw.execute(
+        "DELETE FROM sync_operation_meta WHERE operation_id = ?1",
+        [ancestor.to_string()],
+    )
+    .unwrap();
+    assert!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 32)
+            .is_err()
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM outbox WHERE operation_id = ?1",
+            [ancestor.to_string()],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    raw.execute_batch("INSERT INTO sync_operation_meta SELECT * FROM saved_meta;")
+        .unwrap();
+    drop(raw);
     legacy.id = id(support::ID_1);
     vault.put_candidate(&legacy).unwrap();
     assert!(
@@ -445,7 +555,7 @@ fn backfill_queues_unchanged_offline_records_atomically_and_resumes_after_reopen
             .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 32)
             .is_err()
     );
-    assert_eq!(vault.due_outbox(u64::MAX, 32).unwrap().len(), 12);
+    assert_eq!(vault.due_outbox(u64::MAX, 32).unwrap().len(), 11);
 }
 
 #[test]
