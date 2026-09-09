@@ -1,5 +1,30 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Bounded offline record backfill — 2026-09-09
+
+The vault can now queue up to 32 unchanged offline snapshots in one transaction
+using verified enrollment/recovery/pairing authority and matching device keys.
+It reuses signed persistence for ownership, causal/device chains and outbox
+entries while preserving record contents, revisions, search caches and original
+request receipts. Committed ownership makes subsequent batches resumable without
+replacing signed bytes. Ambiguous record kinds and legacy candidates sharing
+their proposed memory ID fail without committing the batch.
+
+The focused regression passes for all seven record kinds, injected second-enqueue
+failure, bounded batches, reopen/replay and legacy collision rejection. The
+instruction fixture retains its pre-existing legacy queue entry separately from
+the eight newly signed snapshots. Independent implementation review found no
+actionable trust-boundary or transaction issues.
+
+All 23 service and 14 sync-storage regressions pass, along with the focused
+backfill test (38 total). Scoped Clippy with warnings denied and the normal
+production daemon library check pass. Graphify update completed. Local evidence:
+`.codex/pr16-backfill-{all-kinds,regression,clippy,production,graph}.log`.
+
+This is a storage primitive; production scheduling does not invoke it yet.
+Legacy queue/shared-ID migration, native import reconciliation, hosted transport
+cycles and the full installed/signing/clean-machine release gates remain open.
+
 ## Bind offline records during signed updates — 2026-09-09
 
 The first signed local update to an ownerless memory or task now binds it to

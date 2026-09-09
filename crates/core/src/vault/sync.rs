@@ -271,6 +271,101 @@ impl TrustedSyncMaterial for VaultSyncMaterial {
 }
 
 impl Vault {
+    /// Queue at most 32 unchanged offline records; one batch commits or rolls back together.
+    pub fn backfill_sync_records(
+        &mut self,
+        device_id: DeviceId,
+        keys: &crate::crypto::DeviceKeys,
+        limit: usize,
+    ) -> Result<usize, VaultError> {
+        use crate::sync::{OperationBuildRequest, OperationBuilder, OperationChainHead};
+        if limit == 0 {
+            return Ok(0);
+        }
+        let material = self.trusted_sync_material(keys)?;
+        let identity = material
+            .local_identity(device_id, keys)
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        let scope = SyncScope {
+            account_id: identity.account_id,
+            workspace_id: identity.workspace_id,
+        };
+        let mut previous = self
+            .device_head(scope.workspace_id, device_id)?
+            .map(|head| OperationChainHead {
+                sequence: head.sequence,
+                canonical_hash: head.canonical_hash,
+            });
+        let now = local_unix_ms()?;
+        let transaction = self.connection.transaction()?;
+        let records = {
+            let mut statement = transaction.prepare(
+                "SELECT id, kind FROM (
+                     SELECT id, kind FROM records
+                     UNION ALL SELECT id, 'task' FROM tasks
+                     UNION ALL SELECT id, 'memory_candidate' FROM candidates
+                     UNION ALL SELECT id, 'secret_ref' FROM secret_refs
+                     UNION ALL SELECT id, 'component' FROM components
+                     UNION ALL SELECT id, 'project' FROM projects
+                 ) AS local_record
+                 WHERE NOT EXISTS(SELECT 1 FROM sync_record_owners owner WHERE owner.record_id = local_record.id AND owner.record_kind = local_record.kind)
+                 ORDER BY CASE kind WHEN 'project' THEN 0 ELSE 1 END, id, kind LIMIT ?1",
+            )?;
+            statement
+                .query_map(
+                    [i64::try_from(limit.min(32)).expect("bounded batch")],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, kind) in &records {
+            let id = parse_record_id(id)?;
+            let kind = parse_record_kind(kind)?;
+            if materialized_record_kinds(&transaction, id)?.as_slice() != [kind] {
+                return Err(VaultError::OperationConflict);
+            }
+            let mutation = load_materialized_mutation(&transaction, id, kind)?
+                .ok_or(VaultError::OperationConflict)?;
+            if matches!(&mutation, RecordMutationV1::UpsertMemoryCandidate(candidate)
+                if candidate.id.as_bytes() == candidate.proposed_memory.id.as_bytes())
+            {
+                return Err(VaultError::OperationConflict);
+            }
+            let project_id = match materialized_scope(&transaction, id, kind)?
+                .ok_or(VaultError::OperationConflict)?
+            {
+                ScopeRef::Global => None,
+                ScopeRef::Project { project_id } => Some(project_id),
+            };
+            let built = OperationBuilder::new(identity)
+                .build(OperationBuildRequest {
+                    operation_id: OperationId::new(uuid::Uuid::now_v7())
+                        .map_err(|_| VaultError::OperationConflict)?,
+                    project_id,
+                    mutation: &mutation,
+                    causal_frontier: load_checkpoint_frontier(&transaction, scope)?,
+                    previous,
+                    blob_refs: vec![],
+                    created_hlc: context_relay_protocol::HybridLogicalClock::new(now, 0, device_id),
+                })
+                .map_err(|error| VaultError::Validation(error.to_string()))?;
+            insert_or_verify_sync_record_owner(
+                &transaction,
+                scope.account_id,
+                scope.workspace_id,
+                id,
+                kind,
+            )?;
+            persist_outgoing(&transaction, &mutation, &built, None, now, false)?;
+            previous = Some(OperationChainHead {
+                sequence: built.operation.device_sequence,
+                canonical_hash: built.canonical_hash,
+            });
+        }
+        transaction.commit()?;
+        Ok(records.len())
+    }
+
     /// Presence is not authority: callers must still load and verify the complete proof.
     pub fn has_sync_authority(&self) -> Result<bool, VaultError> {
         Ok(self.connection.query_row(
@@ -885,8 +980,14 @@ impl Vault {
         if let Some((binding, _)) = binding {
             bind_local_update_owner(&transaction, mutation, &built.operation, binding)?;
         }
-        let (disposition, cache_change) =
-            persist_outgoing(&transaction, mutation, built, embedding, committed_at_ms)?;
+        let (disposition, cache_change) = persist_outgoing(
+            &transaction,
+            mutation,
+            built,
+            embedding,
+            committed_at_ms,
+            true,
+        )?;
         transaction.commit()?;
         apply_cache_change(&mut self.embedding_cache, cache_change);
         Ok(disposition)
@@ -933,7 +1034,7 @@ impl Vault {
         }
         let now = local_unix_ms()?;
         let mutation = RecordMutationV1::UpsertMemoryCandidate(candidate.clone());
-        persist_outgoing(&transaction, &mutation, decision, None, now)?;
+        persist_outgoing(&transaction, &mutation, decision, None, now, true)?;
         let memory = RecordMutationV1::UpsertMemory(candidate.proposed_memory.clone());
         let cache_change = if let Some((built, embedding)) = accepted {
             let first = &decision.operation;
@@ -947,7 +1048,7 @@ impl Vault {
             {
                 return Err(VaultError::OperationConflict);
             }
-            persist_outgoing(&transaction, &memory, built, Some(embedding), now)?.1
+            persist_outgoing(&transaction, &memory, built, Some(embedding), now, true)?.1
         } else {
             CacheChange::None
         };
@@ -2514,6 +2615,7 @@ fn persist_outgoing<'a>(
     built: &BuiltOperation,
     embedding: Option<&'a Embedding384>,
     committed_at_ms: u64,
+    materialize: bool,
 ) -> Result<(CommitDisposition, CacheChange<'a>), VaultError> {
     validate_commit(mutation, built)?;
     if exact_replay(transaction, built)? {
@@ -2543,7 +2645,21 @@ fn persist_outgoing<'a>(
             "outgoing operation must causally follow every current record head".to_owned(),
         ));
     }
-    let cache_change = materialize_mutation(transaction, mutation, embedding)?;
+    let cache_change = if materialize {
+        materialize_mutation(transaction, mutation, embedding)?
+    } else {
+        if load_materialized_mutation(
+            transaction,
+            built.operation.record_id,
+            built.operation.record_kind,
+        )?
+        .as_ref()
+            != Some(mutation)
+        {
+            return Err(VaultError::OperationConflict);
+        }
+        CacheChange::None
+    };
     let operation = &built.operation;
     let operation_id = operation.operation_id.to_string();
     transaction.execute(

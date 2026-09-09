@@ -36,6 +36,196 @@ const CERTIFICATE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073986";
 const OTHER_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073987";
 
 #[test]
+fn backfill_queues_unchanged_offline_records_atomically_and_resumes_after_reopen() {
+    use context_relay_core::service::OfflineWorkspace;
+    use context_relay_protocol::{MemoryCreateParams, MemoryKind, ScopeRef};
+    let fixture = fixture();
+    let path = TempVault::new("sync-backfill");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let create = MemoryCreateParams {
+        operation_id: id(support::ID_1),
+        scope: ScopeRef::Global,
+        kind: MemoryKind::Fact,
+        title: "Offline note".into(),
+        body_markdown: "Keep the original".into(),
+        tags: vec![],
+    };
+    let original = OfflineWorkspace::new(&mut vault, id(DEVICE_ID))
+        .create_memory(create.clone())
+        .unwrap();
+    let mut other = create.clone();
+    other.operation_id = id(support::ID_2);
+    OfflineWorkspace::new(&mut vault, id(DEVICE_ID))
+        .create_memory(other)
+        .unwrap();
+    assert!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 2)
+            .is_err()
+    );
+    vault
+        .prepare_recovery_enrollment(&write(&fixture.artifacts, 1000))
+        .unwrap();
+    vault
+        .activate_recovery_enrollment(
+            &receipt(&fixture.artifacts, 2000),
+            &fixture.device_keys,
+            3000,
+        )
+        .unwrap();
+    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    raw.execute_batch("CREATE TRIGGER fail_backfill BEFORE INSERT ON outbox WHEN (SELECT count(*) FROM outbox) = 1 BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 2)
+            .is_err()
+    );
+    assert!(vault.due_outbox(u64::MAX, 10).unwrap().is_empty());
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM sync_record_owners", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(vault.memory(&original.id).unwrap(), Some(original.clone()));
+    raw.execute_batch("DROP TRIGGER fail_backfill;").unwrap();
+    drop(raw);
+    assert_eq!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 1)
+            .unwrap(),
+        1
+    );
+    let first = vault.due_outbox(u64::MAX, 10).unwrap()[0]
+        .canonical_bytes
+        .clone();
+    drop(vault);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 1)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 1)
+            .unwrap(),
+        0
+    );
+    let queued = vault.due_outbox(u64::MAX, 10).unwrap();
+    assert_eq!(queued.len(), 2);
+    assert!(queued.iter().any(|row| row.canonical_bytes == first));
+    assert_eq!(
+        OfflineWorkspace::new(&mut vault, id(DEVICE_ID))
+            .create_memory(create)
+            .unwrap(),
+        original
+    );
+    let project = context_relay_protocol::ProjectIdentity {
+        project_id: id(support::ID_7),
+        github_repository_id: None,
+        git_remote_fingerprint: None,
+        monorepo_subdirectory: None,
+        name: "Offline project".into(),
+    };
+    vault.put_project(&project).unwrap();
+    vault.put_task(&support::task()).unwrap();
+    vault
+        .put_instruction(
+            &support::instruction(
+                support::ID_4,
+                ScopeRef::Global,
+                "Instruction",
+                "Keep instruction",
+            ),
+            &support::operation(
+                support::ID_4,
+                support::ID_4,
+                context_relay_protocol::RecordKind::Instruction,
+            ),
+            &support::basis(0),
+        )
+        .unwrap();
+    let mut candidate = support::candidate();
+    candidate.id = id(support::ID_9);
+    candidate.proposed_memory.id = id(support::ID_5);
+    vault.put_candidate(&candidate).unwrap();
+    let secret = context_relay_protocol::SecretRef {
+        id: id(support::ID_6),
+        name: "Reference only".into(),
+        provider: "local-keychain".into(),
+        required_on_device: true,
+    };
+    let component = context_relay_protocol::ComponentRecord {
+        id: id(support::ID_8),
+        scope: ScopeRef::Global,
+        kind: context_relay_protocol::ComponentKind::Rule,
+        name: "Rule".into(),
+        body_markdown: "Keep rule".into(),
+        metadata: vec![],
+        provenance: original.provenance.clone(),
+        archived: false,
+    };
+    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    raw.execute(
+        "INSERT INTO secret_refs(id,payload_json) VALUES (?1,?2)",
+        rusqlite::params![support::ID_6, serde_json::to_vec(&secret).unwrap()],
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO components(id,payload_json) VALUES (?1,?2)",
+        rusqlite::params![support::ID_8, serde_json::to_vec(&component).unwrap()],
+    )
+    .unwrap();
+    drop(raw);
+    assert_eq!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 32)
+            .unwrap(),
+        6
+    );
+    let queued = vault.due_outbox(u64::MAX, 32).unwrap();
+    assert_eq!(queued.len(), 9); // Includes the instruction's pre-existing legacy operation.
+    let kinds = queued
+        .iter()
+        .filter(|row| row.operation_id != id(support::ID_4))
+        .map(|row| {
+            format!(
+                "{:?}",
+                context_relay_protocol::decode_sync_operation_v1(&row.canonical_bytes)
+                    .unwrap()
+                    .record_kind
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(kinds.len(), 7);
+    let mut legacy = support::candidate();
+    legacy.id = id(support::ID_5);
+    legacy.proposed_memory.id = id(support::ID_5);
+    vault.put_candidate(&legacy).unwrap();
+    assert!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 32)
+            .is_err()
+    );
+    assert_eq!(vault.due_outbox(u64::MAX, 32).unwrap().len(), 9);
+    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    raw.execute("DELETE FROM candidates WHERE id = ?1", [support::ID_5])
+        .unwrap();
+    drop(raw);
+    legacy.id = id(support::ID_1);
+    vault.put_candidate(&legacy).unwrap();
+    assert!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 32)
+            .is_err()
+    );
+    assert_eq!(vault.due_outbox(u64::MAX, 32).unwrap().len(), 9);
+}
+
+#[test]
 fn sync_material_uses_verified_enrollment_and_rejects_untrusted_devices() {
     use context_relay_core::{
         sync::{SyncError, TrustedSyncMaterial},
