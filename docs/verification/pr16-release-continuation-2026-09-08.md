@@ -2834,3 +2834,40 @@ license/hydration tests pass, with real Mac and Windows assets and no skips.
 Logs: `.codex/pr16-license-pin-lf-{ci,check}.log` and
 `.codex/pr16-macos-search-stage-final.log`. Read-only review of staging found no
 P1/P2. Native macOS loading and current-head CI remain unverified.
+
+
+### Refresh pending source-bundle evidence from actual assemblies (2026-09-09)
+
+The archive retry change also changes the generator bundled under `support/`.
+The license pin correction alone therefore left native builders rejecting the
+historical evidence. The restored committed-evidence generator check reproduced
+this mismatch before the evidence update.
+
+Three actual CI assemblies returned the same verified deterministic tar result:
+
+- [Windows, 2e867b5](https://github.com/Skytuhua/Context-Relay/actions/runs/34340949348/job/102431371187).
+- [macOS, 2e867b5](https://github.com/Skytuhua/Context-Relay/actions/runs/34340949348/job/102431371275).
+- [Windows, b1975c5](https://github.com/Skytuhua/Context-Relay/actions/runs/34341326601/job/102432686898).
+
+Each completed `--build`, which verifies the deterministic tar before reporting
+its result, then failed the subsequent stale generator-evidence check. The
+reported SHA-256 is
+`67d52f6a45cad45f2dbf1fbea46787867348f885df4387c08a1ee5fb1532526f`,
+size 1,149,643,776 bytes, 39,542 payload entries and 222 recorded links.
+All default support inputs and the source lock are unchanged from 2e867b5 to
+b5440d3. Their Git blobs use canonical LF. The generator digest is
+`d51cb59c41ddb0c1e090c1c9a5d465681ec898ea04b5f6fb5ba197338e0188ca`.
+
+The pending bundle record now names these observed bytes; its manifest pin is
+updated with it. Historical generator `092fe285...72007` and bundle
+`a7367b50...ac626` remain recorded in the preceding Git revisions. Qualification
+stays at `source_bundle_v1_native_builds_pending`, one build and no two-build
+qualification claim. These assembly results do not prove native executable
+builds, runtime closure, sandbox acceptance or published corresponding source.
+The source URL remains predeclared; the named GitHub release does not exist yet.
+
+All 80 hydration, license-metadata, source-bundle and native-workflow tests pass
+with no skips; the full license metadata gate passes. The actual generator-byte
+comparison is restored in the early hydration test to catch future evidence
+drift. Current-head remote native verification remains required. Full release
+acceptance and PR16 merge remain incomplete.

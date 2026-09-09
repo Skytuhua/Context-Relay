@@ -1109,14 +1109,15 @@ test('Semgrep records the V1 source bundle but remains disabled pending release 
   );
   assert.equal('sourceAssetUrl' in lock, false);
   assert.equal('sourceBundleSha256' in lock, false);
-  assert.equal(bundleEvidence.bundle.sha256, 'a7367b50b602540384f2879bf31b55c15fc95c5b0ec739517795c46004bac626');
-  assert.equal(bundleEvidence.bundle.size, 1149642752);
+  assert.equal(bundleEvidence.bundle.sha256, '67d52f6a45cad45f2dbf1fbea46787867348f885df4387c08a1ee5fb1532526f');
+  assert.equal(bundleEvidence.bundle.size, 1149643776);
   assert.equal(bundleEvidence.bundle.payloadEntries, 39542);
   assert.equal(bundleEvidence.bundle.recordedLinks, 222);
   assert.equal(bundleEvidence.sourceLockSha256, '0d85427b09343615126fde5ad9bd8ad7f157908692a69fea846b4d033f6cb3c0');
-  assert.equal(bundleEvidence.bundleGeneratorSha256, '092fe2855df51267ca3c8525c0b404c3ca0587470cedfc63bf1818df60e72007');
-  // This evidence describes the recorded bundle, not later generator revisions.
-  // The committed-manifest test above verifies the current generator's byte pin.
+  assert.equal(bundleEvidence.bundleGeneratorSha256, 'd51cb59c41ddb0c1e090c1c9a5d465681ec898ea04b5f6fb5ba197338e0188ca');
+  assert.equal(bundleEvidence.bundleGeneratorSha256, sha256(await readFile(
+    new URL('./semgrep-source-bundle.mjs', import.meta.url),
+  )));
   assert.equal(lock.researchEvidence.usableForHydration, false);
   assert.equal(lock.researchEvidence.usableForPackaging, false);
   assert.deepEqual(
