@@ -97,7 +97,8 @@ Before deriving production scope, do not treat `all_devices()` as cryptographic
 chain verification: its reader checks canonical encoding, digest and indexed
 metadata, but does not itself verify certificate signatures. Reuse the verified
 provisioning evidence and protected-key checks. `trusted_workspace_material()`
-currently covers active enrollment or recovery restore only, not paired joiners.
+now also opens exactly one completed paired-joiner transcript, validating its
+protected keys and active certificate graph through the existing pairing reader.
 The production scope path must support paired devices without replacing this
 verification with a certificate-row-only inference.
 

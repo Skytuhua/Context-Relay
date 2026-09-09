@@ -1678,3 +1678,27 @@ P1/P2, including these follow-ups.
 Production lifecycle transport/scope activation, installed Windows/macOS native
 qualification, live Auth/account transitions, export/purge and the full release
 gates remain open. This browser fixture is not live or clean-machine acceptance.
+
+
+### Confirmed paired workspace authority (2026-09-09)
+
+`trusted_workspace_material` now supports a paired joiner only when neither
+recovery enrollment nor restore is present and exactly one completed joiner
+transcript exists. It reuses `completed_pairing_approval`, including matching
+protected keys, verified sealed material, durable join metadata and active
+issuer/child certificates. No authority is inferred from certificate rows alone.
+Daemon pairing approval still requires a recovery-root-issued certificate.
+
+The existing restart regression failed before the fix. It now verifies the
+exact scope, epochs and both keys after a completed-vault reopen, denial before
+confirmation, wrong-key denial and denial after certificate revocation.
+All 37 affected pairing-vault, recovery-vault and recovery end-to-end tests pass;
+the final expanded regression and scoped core library/test Clippy with warnings
+denied also pass. Independent read-only review found no actionable P1/P2.
+Evidence: `.codex/pr16-paired-scope-red.log`,
+`.codex/pr16-paired-scope-tests.log`, `.codex/pr16-paired-scope-final.log`,
+`.codex/pr16-paired-scope-clippy.log`. Graphify update completed.
+
+This is a local authority prerequisite. Production lifecycle wiring and composed
+service qualification, live hosted acceptance and every broader release gate
+remain unfinished. PR #16 remains open.

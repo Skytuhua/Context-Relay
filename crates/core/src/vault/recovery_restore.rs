@@ -548,6 +548,33 @@ impl Vault {
             (None, Some(restore)) if restore.state == RecoveryRestorePersistenceState::Active => {
                 self.recovered_workspace_material(device_keys)
             }
+            (None, None) => {
+                let mut statement = self.connection.prepare(
+                    "SELECT pairing_id FROM pairing_approval_transcripts
+                     WHERE role = 'joiner' AND state = 'completed' LIMIT 2",
+                )?;
+                let ids = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let [pairing_id] = ids.as_slice() else {
+                    return Err(validation());
+                };
+                let confirmed = self
+                    .completed_pairing_approval(parse_id(pairing_id)?, device_keys)?
+                    .ok_or_else(validation)?;
+                let material = confirmed.key_bundle();
+                WorkspacePairingMaterial::new(
+                    SyncScope {
+                        account_id: material.account_id(),
+                        workspace_id: material.workspace_id(),
+                    },
+                    material.control_epoch(),
+                    material.key_epoch(),
+                    *material.workspace_root_key(),
+                    *material.active_epoch_key(),
+                )
+                .map_err(|_| validation())
+            }
             _ => Err(validation()),
         }
     }
