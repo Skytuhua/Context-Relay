@@ -355,7 +355,9 @@ jobs:
         run: test "$(uname -m)" = arm64
       - name: Verify macOS library constraint enforcement
         if: ${{ runner.os == 'macOS' }}
-        run: python3 scripts/verify-macos-library-constraints.py
+        run: |
+          cargo build --locked --release --target aarch64-apple-darwin -p context-relay-native-runner --features test-support --example macos-library-constraint-probe
+          python3 scripts/verify-macos-library-constraints.py target/aarch64-apple-darwin/release/examples/macos-library-constraint-probe
       - run: node --test scripts/fetch-macos-search-resources.test.mjs
       - name: Verify macOS search input acquisition
         if: ${{ runner.os == 'macOS' }}

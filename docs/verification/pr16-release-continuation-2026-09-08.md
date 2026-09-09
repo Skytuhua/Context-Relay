@@ -2965,3 +2965,31 @@ fixtures. The short help output did not advertise `library-constraint`; this is
 not evidence that the actual option is unsupported. The premature check was
 removed. The checked signing invocation and positive/negative execution controls
 remain responsible for establishing support and enforcement on the next run.
+
+On revision `4cad942`, [macOS job 102489165559](https://github.com/Skytuhua/Context-Relay/actions/runs/34358494284/job/102489165559)
+passed all five C-library controls and built `Context Relay.app`. The actual log
+records the two unconstrained evil markers, the constrained good marker, both
+constrained rejections without a marker, and successful Tauri app bundling. This
+establishes native candidate assembly and the bounded ad-hoc enforcement test;
+it does not establish Developer ID signing, production search or installed acceptance.
+
+### Running-process constraint preflight (2026-09-09)
+
+The Rust preflight inspects only bounded thin-arm64 Mach-O and SHA-256
+CodeDirectory formats. It compares the signed library-constraint slot and blob
+with an expected digest supplied by trusted build inputs. It then validates the
+running process through public `SecCode` APIs with the inspected CodeDirectory
+hash as an explicit requirement. macOS 14+, valid hardened execution, and absence
+of debugged/get-task-allow state are required. Private constraint APIs and a DER
+interpreter are not used.
+
+Two portable tests cover truncation, structural/hash alteration and dynamic
+status rejection. The native test now also signs a disposable Rust probe and
+checks missing/wrong constraints and replacement of the running executable's
+pathname, with an identical-replacement positive control. These native Rust
+results remain pending. The verifier is not yet wired into production ORT loading;
+the expected build-time digest and actual runtime loading still need integration.
+
+Windows Clippy, macOS-target `cargo check` and Clippy for the library/probe, Python
+syntax validation, and the two selected native workflow contracts pass. Cross
+compilation checks API/type correctness; it does not execute the native preflight.

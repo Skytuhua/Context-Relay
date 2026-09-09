@@ -6,6 +6,8 @@ mod helper_protocol;
 mod hydration;
 mod launcher;
 mod macos_identity;
+#[cfg(any(target_os = "macos", test))]
+mod macos_library_constraint;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub mod macos_spawn;
@@ -36,6 +38,8 @@ pub use launcher::macos;
 #[cfg(windows)]
 pub use launcher::windows;
 pub use macos_identity::{MacRootIdentity, MacRootIdentityError};
+#[cfg(target_os = "macos")]
+pub use macos_library_constraint::verify_current_library_constraint;
 #[cfg(feature = "ci-candidate-sidecar-smoke")]
 pub use manifest::verify_ci_candidate_closure;
 pub use manifest::{

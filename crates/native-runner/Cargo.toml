@@ -12,6 +12,10 @@ default = []
 test-support = []
 ci-candidate-sidecar-smoke = []
 
+[[example]]
+name = "macos-library-constraint-probe"
+required-features = ["test-support"]
+
 [[bin]]
 name = "context-relay-native-helper"
 path = "src/bin/context-relay-native-helper.rs"

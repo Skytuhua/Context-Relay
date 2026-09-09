@@ -4,12 +4,15 @@ Run on macOS 14+ arm64. This tests OS enforcement with disposable ad-hoc code,
 not Developer ID signing, notarization, or the production ONNX loader.
 """
 import os
+import hashlib
 from pathlib import Path
 import platform
 import plistlib
 import re
 import shutil
 import subprocess
+import struct
+import sys
 import tempfile
 
 
@@ -100,6 +103,59 @@ int main(int argc, char **argv) {
             if result.returncode != expected_code or actual_marker != expected_marker:
                 raise RuntimeError(f"{loader}/{target}: exit={result.returncode}, marker={actual_marker!r}, stderr={result.stderr!r}")
             print(f"PASS {loader}/{target}: exit={result.returncode}, marker={actual_marker!r}", flush=True)
+
+        if len(sys.argv) != 2:
+            raise RuntimeError("provide the compiled Rust qualification executable")
+        probe = Path(sys.argv[1]).resolve(strict=True)
+        for name in ("rust-control", "rust-constrained"):
+            output = root / name
+            shutil.copyfile(probe, output)
+            output.chmod(0o755)
+            args = ["/usr/bin/codesign", "--force", "--sign", "-", "--options", "runtime", "--entitlements", str(entitlements)]
+            if name == "rust-constrained":
+                args += ["--library-constraint", str(constraint)]
+            run(args + [str(output)])
+            run(["/usr/bin/codesign", "--verify", "--strict", str(output)])
+        # Extract only from our freshly signed fixture. The production parser is
+        # independently tested against truncated, overlapping and altered input.
+        image = (root / "rust-constrained").read_bytes()
+        offset = 32
+        signature = None
+        for _ in range(struct.unpack_from("<I", image, 16)[0]):
+            command, size = struct.unpack_from("<II", image, offset)
+            if command == 0x1d:
+                start, length = struct.unpack_from("<II", image, offset + 8)
+                signature = image[start:start + length]
+            offset += size
+        if signature is None:
+            raise RuntimeError("fixture has no signature")
+        expected = None
+        for index in range(struct.unpack_from(">I", signature, 8)[0]):
+            slot, offset = struct.unpack_from(">II", signature, 12 + index * 8)
+            if slot == 11:
+                length = struct.unpack_from(">I", signature, offset + 4)[0]
+                expected = hashlib.sha256(signature[offset:offset + length]).hexdigest()
+        if expected is None:
+            raise RuntimeError("fixture has no library constraint blob")
+        for name, digest, code in (("rust-constrained", expected, 0),
+                                  ("rust-control", expected, 20),
+                                  ("rust-constrained", "00" * 32, 20)):
+            result = subprocess.run([str(root / name), digest], capture_output=True, timeout=30)
+            if result.returncode != code or result.stdout != (b"verified running constraint\n" if code == 0 else b""):
+                raise RuntimeError(f"{name}: exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}")
+            print(f"PASS {name}/digest-{digest[:8]}: exit={code}", flush=True)
+        # Positive control for the identical rename path, followed by the attack.
+        for name, code in (("rust-constrained", 0), ("rust-control", 20)):
+            running = root / "running"
+            replacement = root / "replacement"
+            shutil.copyfile(root / name, running)
+            running.chmod(0o755)
+            shutil.copyfile(root / "rust-constrained", replacement)
+            replacement.chmod(0o755)
+            result = subprocess.run([str(running), expected, str(replacement)], capture_output=True, timeout=30)
+            if result.returncode != code or result.stdout != (b"verified running constraint\n" if code == 0 else b""):
+                raise RuntimeError(f"{name}/path-replacement: exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}")
+            print(f"PASS {name}/path-replacement: exit={code}", flush=True)
 
 
 if __name__ == "__main__":
