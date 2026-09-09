@@ -11,6 +11,7 @@ pub mod recovery_restore;
 pub mod recovery_restore_crypto;
 pub mod recovery_restore_transport;
 pub mod recovery_transport;
+pub mod revocation_crypto;
 pub mod supabase_account_lifecycle;
 pub mod supabase_enrollment;
 pub mod supabase_pairing;

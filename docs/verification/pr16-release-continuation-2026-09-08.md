@@ -2447,3 +2447,29 @@ still running. No full CI or release qualification is claimed.
 
 Graphify update completed (18246 nodes);
 `.codex/pr16-remote-receive-graph.log`.
+
+## Native device-revocation statement (2026-09-09)
+
+Added a domain-separated fixed-width signed statement binding revocation operation,
+account/workspace, issuer/target, current epochs, cutoff sequence/hash and the digest
+of the complete canonical key-rotation transition. It rejects non-incrementable
+epochs, sequences outside PostgreSQL bigint, inconsistent empty cutoffs and empty
+transition digests. Signing requires both installed public keys to match the issuer
+certificate. Older immutable certificates are permitted; future/zero certificate
+epochs and mismatched scope/device are rejected.
+
+This primitive deliberately does not establish certificate-chain trust, current
+roster authorization or transition correctness. Its caller must independently
+recompute the full transition digest and enforce current authority and atomic epoch
+changes. Hosted revocation, encrypted rotation manifests, historical-key/cutoff
+admission, daemon wiring and installed acceptance remain unfinished. The execution
+plan is `docs/superpowers/plans/2026-09-09-device-revocation.md`.
+
+The regression first failed for the missing API, then passed (2.99 seconds). It
+includes an independently generated Node Ed25519 vector, byte-by-byte preimage
+tampering, certificate scope and installed-key mismatches, epoch/sequence bounds,
+empty-cutoff rules and self-revocation statement support. Core library plus focused
+test Clippy with warnings denied passed (30.73 seconds). Bounded read-only review
+found no actionable security/correctness issue. Local logs:
+`.codex/pr16-revocation-red.log`, `.codex/pr16-revocation-test.log`,
+`.codex/pr16-revocation-clippy.log`. No full revocation or release acceptance claimed.
