@@ -1,3 +1,4 @@
+import { AccountLifecyclePanel } from './account-lifecycle';
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 
 import type {
@@ -653,6 +654,7 @@ export default function App({ gateway = DEFAULT_GATEWAY }: { gateway?: Workspace
         return (
           <section className="screen-content">
             <HostedSignIn gateway={gateway} />
+            <AccountLifecyclePanel gateway={gateway} />
             <h2>Appearance</h2>
             <div className="field"><label htmlFor="appearance-theme">Theme</label><select id="appearance-theme" value={preferences.theme} onChange={event => updatePreferences(current => ({ ...current, theme: event.target.value as Theme }))}><option value="dark">Dark</option><option value="light">Light</option><option value="system">System</option></select><p>System follows your computer’s appearance setting.</p></div>
             <h2>Devices</h2><p>Review the devices allowed to access this workspace.</p><button type="button" onClick={() => void selectScreen('devices')}>Manage devices</button>

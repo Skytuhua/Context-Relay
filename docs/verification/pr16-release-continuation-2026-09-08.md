@@ -1640,3 +1640,41 @@ final code change (17,751 nodes).
 
 A normal daemon library check without test-support also passes:
 `.codex/pr16-lifecycle-ipc-production-check.log`.
+
+### Desktop lifecycle confirmation and explicit retry controls
+
+Settings now includes account lifecycle status, confirmed begin/cancel actions,
+and bounded previous-request pages. Refresh performs reads only. A failed
+mutation retains its original ID in the open review, clears the confirmation and
+requires a status refresh before explicit retry. Reopening the panel discovers
+durable original action/ID summaries through daemon IPC. The UI describes these
+as previous requests, not proof of provider completion. Unknown status disables
+submission; the unavailable production transport produces an honest unavailable
+message. The gateway validates closed response fields, state/deadline/export
+consistency, strict operation IDs and advancing bounded history pages.
+
+All 375 frontend tests pass, including nine new focused cases covering lost
+responses/exact retry, StrictMode, remount discovery, no replay on reads,
+unknown state, duplicate submission, stale gateway responses, pagination, request
+ID generation failure and focus restoration. TypeScript, ESLint and the production
+frontend build pass. Logs: `.codex/pr16-lifecycle-ui-full-final.log`,
+`.codex/pr16-lifecycle-ui-typecheck-final.log`,
+`.codex/pr16-lifecycle-ui-lint-final.log`, and
+`.codex/pr16-lifecycle-ui-build-final.log`.
+
+A temporary local Vite fixture with an in-memory gateway was inspected in the
+Codex browser. It exposed lost keyboard focus when the opening trigger vanished;
+the regression failed before fixing focus entry to the confirmation input or
+cancellation legend. The final browser pass verified disabled-until-confirmed
+submission, the simulated pending result, heading focus after completion/close,
+and Tab reaching Refresh. No hosted request occurred. The temporary fixture was
+removed and its server stopped. A separate regression exposed request-ID creation
+outside the cleanup boundary; generation now runs inside try/finally, releasing
+the busy guard on failure. Focus and RNG red logs:
+`.codex/pr16-lifecycle-ui-focus-red.log` and
+`.codex/pr16-lifecycle-ui-random-red.log`. Independent review found no actionable
+P1/P2, including these follow-ups.
+
+Production lifecycle transport/scope activation, installed Windows/macOS native
+qualification, live Auth/account transitions, export/purge and the full release
+gates remain open. This browser fixture is not live or clean-machine acceptance.

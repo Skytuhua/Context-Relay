@@ -1,4 +1,5 @@
 import type {
+  AccountDeletionIntentSummary,
   Base64Url,
   ConnectionCheckStatus,
   ConnectionCheckStartParams,
@@ -36,7 +37,7 @@ import type {
   TaskStatus,
 } from './bindings';
 import { LocalClient } from './local-client';
-import { validateHostedAuthStatus, validateRecoveryRestoreStatus } from './protocol-validation';
+import { validateAccountDeletion, validateAccountDeletionIntents, validateHostedAuthStatus, validateRecoveryRestoreStatus } from './protocol-validation';
 import { uuidV7 } from './uuid';
 import { type HarnessGateway, requireHarnessAcknowledgment, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
 import { validateConnectionCheckStatus, validateHarnessPreparation, validateHarnessExecution, validateHarnessSetupRecord, validateHarnessSetupsPage, validateSearchIndexStatus } from './protocol-validation';
@@ -99,6 +100,10 @@ export interface DeviceGateway {
 }
 
 export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
+  accountDeletionStatus(): Promise<Extract<LocalResult, { kind: 'account_deletion' }>['data']>;
+  accountDeletionIntents(after: OperationId | null): Promise<AccountDeletionIntentSummary[]>;
+  accountDeletionBegin(operationId: OperationId, confirmation: string): Promise<Extract<LocalResult, { kind: 'account_deletion' }>['data']>;
+  accountDeletionCancel(operationId: OperationId): Promise<Extract<LocalResult, { kind: 'account_deletion' }>['data']>;
   hostedAuthStatus(): Promise<HostedAuthStatus>;
   hostedAuthStart(params: HostedAuthStartParams): Promise<HostedAuthStatus>;
   hostedAuthCancel(generation: OperationId): Promise<HostedAuthStatus>;
@@ -140,6 +145,20 @@ export interface WorkspaceGateway extends DeviceGateway, HarnessGateway {
 }
 
 export class LocalWorkspaceGateway implements WorkspaceGateway {
+  async accountDeletionStatus() {
+    return validateAccountDeletion(await this.client.call({ method: 'account_deletion_status', params: {} }));
+  }
+  async accountDeletionIntents(after: OperationId | null) {
+    const result = await this.client.call({ method: 'account_deletion_intents', params: { after } });
+    return validateAccountDeletionIntents(controlResult(result, 'account_deletion_intents', 'intents'), after);
+  }
+  async accountDeletionBegin(operationId: OperationId, confirmation: string) {
+    return validateAccountDeletion(await this.client.call({ method: 'account_deletion_begin', params: { operationId, confirmation } }));
+  }
+  async accountDeletionCancel(operationId: OperationId) {
+    return validateAccountDeletion(await this.client.call({ method: 'account_deletion_cancel', params: { operationId } }));
+  }
+
   private async hostedAuth(request: Extract<LocalRequest, { method: 'hosted_auth_status' | 'hosted_auth_start' | 'hosted_auth_cancel' | 'hosted_auth_logout' }>): Promise<HostedAuthStatus> {
     const result = await this.client.call(request);
     return validateHostedAuthStatus(controlResult(result, 'hosted_auth', 'status'));

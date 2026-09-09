@@ -1,5 +1,5 @@
 import Ajv2020 from 'ajv/dist/2020.js';
-import type { HostedAuthStatus, RecoveryRestoreStatus } from './bindings';
+import type { AccountDeletionIntentSummary, LocalResult, OperationId, HostedAuthStatus, RecoveryRestoreStatus } from './bindings';
 
 import type { ConnectionCheckStatus, HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SearchIndexStatus, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
 
@@ -341,4 +341,28 @@ export function validateConnectionCheckStatus(value: unknown): ConnectionCheckSt
   if ((item.phase === 'verified') !== (item.verifiedAt !== null)) fail('connectionCheck.verifiedAt');
   if (item.verifiedAt !== null) u64(item.verifiedAt, 'connectionCheck.verifiedAt');
   return value as ConnectionCheckStatus;
+}
+
+export function validateAccountDeletion(value: unknown): Extract<LocalResult, { kind: 'account_deletion' }>['data'] {
+  const envelope = object(value, ['kind', 'data'], 'account lifecycle reply');
+  choice(envelope.kind, ['account_deletion'], 'account lifecycle reply');
+  const status = object(envelope.data, ['state', 'purgeDeadline', 'exportAvailable'], 'account lifecycle status');
+  choice(status.state, ['active', 'pending_delete', 'purged'], 'account lifecycle state');
+  const pending = status.state === 'pending_delete';
+  if (status.exportAvailable !== pending) fail('account lifecycle export');
+  if (pending) u64(status.purgeDeadline, 'account lifecycle deadline');
+  else if (status.purgeDeadline !== null) fail('account lifecycle deadline');
+  return envelope.data as Extract<LocalResult, { kind: 'account_deletion' }>['data'];
+}
+
+export function validateAccountDeletionIntents(value: unknown, after: OperationId | null): AccountDeletionIntentSummary[] {
+  let previous = after ?? '';
+  for (const item of list(value, 50, 'account lifecycle requests')) {
+    const intent = object(item, ['operationId', 'action'], 'account lifecycle request');
+    id(intent.operationId, 'account lifecycle operation');
+    choice(intent.action, ['beginDeletion', 'cancelDeletion'], 'account lifecycle action');
+    if ((intent.operationId as string) <= previous) fail('account lifecycle cursor');
+    previous = intent.operationId as string;
+  }
+  return value as AccountDeletionIntentSummary[];
 }

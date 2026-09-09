@@ -112,3 +112,9 @@ it as a previous request, read current provider state separately, and require an
 explicit retry of its original action and ID. Begin still requires the existing
 `delete` confirmation. Original authority and provider freshness checks remain
 mandatory; a different login must not adopt previous work.
+
+The Settings lifecycle panel now implements the desktop discovery/retry contract,
+with strict gateway validation, explicit confirmation, stale-result/duplicate
+submission guards and managed keyboard focus. The production lifecycle service
+remains unavailable pending verified local scope and guarded transport wiring;
+installed/live qualification is still required after integration.
