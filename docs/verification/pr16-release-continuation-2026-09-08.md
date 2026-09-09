@@ -1,5 +1,42 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Atomic configured memory writes — 2026-09-09
+
+OfflineWorkspace accepts an optional sync identity and uses the existing signed
+operation builder for memory create, update and archive. The persisted device
+head and workspace frontier determine sequence and causality. The existing Vault
+transaction now also stores the original local request binding and response,
+alongside the record, signed operation, outbox and chain state. Unconfigured
+workspaces retain their offline behavior. Checkpoint timing uses commit time,
+not a caller-supplied operation timestamp.
+
+All 16 offline-service and 14 sync-Vault tests pass. The new regression injects
+an outbox insertion failure, checks complete rollback, then verifies three memory
+mutations and original response/byte replay after reopening. Changed request reuse
+is rejected. Scoped Clippy with warnings denied and the normal daemon library
+check pass; independent review found no actionable P1/P2. These tests do not
+directly exercise a local update after incoming remote operations.
+
+The daemon does not configure this path yet. Other record kinds, candidate review,
+existing offline data, verified trust material, incoming merge integration and
+installed two-device qualification remain required. This is staged integration,
+not evidence of complete hosted sync or release acceptance.
+
+## Existing Supabase CLI access recovered — 2026-09-09
+
+`pnpm exec supabase secrets list --project-ref brvzuycnxoswdzzipgvx --profile
+supabase` succeeds with the existing saved login. The failure without the profile
+flag is configuration selection, not evidence of an expired login. This supersedes
+the earlier dashboard sign-in requirement. The user explicitly prohibits the
+in-app browser because it does not preserve their regular browser cookies.
+
+The authenticated list confirms the pairing pepper is absent. Automatic approval
+review rejected the attempted secure random secret setup before execution, with
+only "blocked by policy" and no specific reason. Pairing remains undeployed;
+do not retry through another route to evade that rejection. No secret value or
+credential is stored in this ledger. Production sync and every full-release gate
+remain open.
+
 ## Native sync session guard — 2026-09-09
 
 The shared Supabase sync executor can now bind requests to the original Auth

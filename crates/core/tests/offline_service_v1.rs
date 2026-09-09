@@ -24,6 +24,127 @@ use support::{
 
 const CREDENTIAL: &str = "offline-service-tests";
 
+#[test]
+fn configured_memory_sync_is_atomic_and_replays_original_bytes_after_restart() {
+    use context_relay_core::{
+        crypto::{ContentKey, DeviceKeys},
+        sync::SyncIdentity,
+    };
+    let fixture = Fixture::new("configured-memory-sync");
+    let database_key = [0x42; 32];
+    fixture.keys.insert(CREDENTIAL, database_key);
+    let keys = DeviceKeys::generate().unwrap();
+    let content = ContentKey::from_bytes([0x43; 32]);
+    let identity = || SyncIdentity {
+        account_id: ID_7.parse().unwrap(),
+        workspace_id: ID_8.parse().unwrap(),
+        device_id: ID_9.parse().unwrap(),
+        control_epoch: 1,
+        key_epoch: 1,
+        device_keys: &keys,
+        content_key: &content,
+    };
+    let create = MemoryCreateParams {
+        operation_id: ID_1.parse().unwrap(),
+        scope: ScopeRef::Global,
+        kind: MemoryKind::Fact,
+        title: "Synced memory".into(),
+        body_markdown: "Atomic sync canary".into(),
+        tags: vec![],
+    };
+    drop(fixture.vault());
+    let raw = open_keyed(fixture.path.path(), &database_key);
+    raw.execute_batch("CREATE TRIGGER fail_outbox BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+    {
+        let mut vault = fixture.vault();
+        let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
+            .with_sync_identity(identity())
+            .unwrap();
+        assert!(service.create_memory(create.clone()).is_err());
+        assert!(service.memory(ID_1.parse().unwrap()).unwrap().is_none());
+    }
+    for table in [
+        "records",
+        "operations",
+        "outbox",
+        "local_operation_bindings",
+        "local_operation_results",
+        "sync_device_heads",
+    ] {
+        assert_eq!(
+            raw.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "{table}"
+        );
+    }
+    raw.execute_batch("DROP TRIGGER fail_outbox;").unwrap();
+    drop(raw);
+    let first;
+    let original_bytes;
+    {
+        let mut vault = fixture.vault();
+        let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
+            .with_sync_identity(identity())
+            .unwrap();
+        first = service.create_memory(create.clone()).unwrap();
+        service
+            .update_memory(MemoryUpdateParams {
+                operation_id: ID_2.parse().unwrap(),
+                memory_id: first.id,
+                expected_revision: first.revision,
+                title: None,
+                body_markdown: Some("Updated".into()),
+                tags: None,
+            })
+            .unwrap();
+        service
+            .archive_memory(MemoryArchiveParams {
+                operation_id: ID_3.parse().unwrap(),
+                memory_id: first.id,
+                expected_revision: ID_2.parse().unwrap(),
+            })
+            .unwrap();
+        original_bytes = vault
+            .due_outbox(u64::MAX, 10)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.canonical_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(original_bytes.len(), 3);
+        assert_eq!(
+            vault
+                .device_head(ID_8.parse().unwrap(), ID_9.parse().unwrap())
+                .unwrap()
+                .unwrap()
+                .sequence,
+            3
+        );
+    }
+    let mut vault = fixture.vault();
+    let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
+        .with_sync_identity(identity())
+        .unwrap();
+    assert_eq!(service.create_memory(create.clone()).unwrap(), first);
+    let mut changed = create;
+    changed.title = "Conflicting reuse".into();
+    assert_eq!(
+        service.create_memory(changed).unwrap_err().code,
+        ErrorCode::Conflict
+    );
+    assert!(service.memory(first.id).unwrap().unwrap().archived);
+    assert_eq!(
+        vault
+            .due_outbox(u64::MAX, 10)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.canonical_bytes)
+            .collect::<Vec<_>>(),
+        original_bytes
+    );
+}
+
 struct Fixture {
     path: TempVault,
     keys: MemoryKeyStore,

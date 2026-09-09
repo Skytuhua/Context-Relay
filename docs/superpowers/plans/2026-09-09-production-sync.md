@@ -5,10 +5,13 @@ transport cycle or a successful unauthenticated endpoint probe. The hosted schem
 and sync Edge Function are deployed; native daemon integration remains open.
 
 Current source: contextd routes SyncRetry to unavailable and status starts offline.
-SyncEngine and SupabaseTransport implement the replica protocol, but the native
-transport owns a static bearer token. OperationBuilder has no production callers;
-OfflineWorkspace/MCP writes must join the signed-operation path before enabling
-sync. Preserve fully functional offline-only work when unconfigured.
+SyncEngine and SupabaseTransport implement the replica protocol. The native
+transport now supports original-session guards and refreshed bearer tokens.
+OfflineWorkspace can sign memory create/update/archive with an explicitly
+configured identity; original request receipts join the existing atomic Vault
+record/operation/outbox transaction. The daemon does not yet configure this path.
+Other record kinds, trust material and complete mutation routing remain required
+before enabling sync. Unconfigured offline-only work remains functional.
 
 1. Bind every native sync HTTP attempt and response to the current original Auth
    generation/identity and configured project, including retries and response-size

@@ -25,13 +25,19 @@ Continue the authorized full PR16 release on existing project
    and lifecycle with installed devices. Anonymous rejection is not evidence of
    authenticated functionality or full release acceptance.
 
-The current browser requires Supabase sign-in and CLI secret inspection fails
-with LegacyProfileLoadError. Resolve secret configuration through an authenticated
-supported interface; do not embed secrets in source or weaken pairing hashing.
+Existing CLI authentication works when commands explicitly select `--profile
+supabase`. The default profile loader fails with LegacyProfileLoadError before
+authentication; a fresh browser login is unnecessary. Do not use the in-app
+browser: the user explicitly rejected its separate cookie session.
+Automatic approval review rejected the attempted pairing-secret configuration
+without a specific reason. No secret was set by that command. Resolve that
+remaining action through an allowed interface; do not embed secrets in source
+or weaken pairing hashing.
 Full signing, product, security, clean-machine and beta gates still precede merge.
 
 
 Current evidence: all 15 later migrations applied and all 17 remote statements
 match source. Sync/account-lifecycle/enrollment version 1 are active and reject
-missing/invalid Auth with 401. Pairing awaits its pepper; user dashboard sign-in
-is pending. See docs/verification/hosted-deployment-2026-09-09.json.
+missing/invalid Auth with 401. Pairing awaits its pepper; authenticated CLI secret
+inspection succeeded and confirmed it absent. See
+docs/verification/hosted-deployment-2026-09-09.json.

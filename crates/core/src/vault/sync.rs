@@ -699,9 +699,50 @@ impl Vault {
         embedding: Option<&Embedding384>,
         committed_at_ms: u64,
     ) -> Result<CommitDisposition, VaultError> {
+        self.commit_outgoing_operation_with_binding_at(
+            mutation,
+            built,
+            embedding,
+            committed_at_ms,
+            None,
+        )
+    }
+
+    pub(crate) fn commit_outgoing_operation_with_binding(
+        &mut self,
+        mutation: &RecordMutationV1,
+        built: &BuiltOperation,
+        embedding: Option<&Embedding384>,
+        binding: &super::LocalOperationBinding,
+        response: &[u8],
+    ) -> Result<CommitDisposition, VaultError> {
+        self.commit_outgoing_operation_with_binding_at(
+            mutation,
+            built,
+            embedding,
+            local_unix_ms()?,
+            Some((binding, response)),
+        )
+    }
+
+    fn commit_outgoing_operation_with_binding_at(
+        &mut self,
+        mutation: &RecordMutationV1,
+        built: &BuiltOperation,
+        embedding: Option<&Embedding384>,
+        committed_at_ms: u64,
+        binding: Option<(&super::LocalOperationBinding, &[u8])>,
+    ) -> Result<CommitDisposition, VaultError> {
         validate_commit(mutation, built)?;
 
         let transaction = self.connection.transaction()?;
+        if let Some((binding, response)) = binding
+            && (binding.operation_id != built.operation.operation_id
+                || binding.target_id != built.operation.record_id.to_string()
+                || !super::insert_local_operation_binding(&transaction, binding, response)?)
+        {
+            return Err(VaultError::OperationConflict);
+        }
         if exact_replay(&transaction, built)? {
             return Ok(CommitDisposition::ExactReplay);
         }

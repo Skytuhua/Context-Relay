@@ -28,6 +28,7 @@ use crate::{
 pub struct OfflineWorkspace<'a> {
     vault: &'a mut Vault,
     device_id: DeviceId,
+    sync_identity: Option<crate::sync::SyncIdentity<'a>>,
 }
 
 struct PreparedLocalMutation<T> {
@@ -38,7 +39,89 @@ struct PreparedLocalMutation<T> {
 
 impl<'a> OfflineWorkspace<'a> {
     pub const fn new(vault: &'a mut Vault, device_id: DeviceId) -> Self {
-        Self { vault, device_id }
+        Self {
+            vault,
+            device_id,
+            sync_identity: None,
+        }
+    }
+
+    /// Configure local signing with material verified by the owning daemon.
+    /// Network authentication is separate: local writes remain available offline.
+    pub fn with_sync_identity(
+        mut self,
+        identity: crate::sync::SyncIdentity<'a>,
+    ) -> Result<Self, ClientError> {
+        if identity.device_id != self.device_id
+            || identity.control_epoch == 0
+            || identity.key_epoch == 0
+        {
+            return Err(invalid_request());
+        }
+        self.sync_identity = Some(identity);
+        Ok(self)
+    }
+
+    fn persist_memory(
+        &mut self,
+        prepared: &PreparedLocalMutation<MemoryRecord>,
+    ) -> Result<(), ClientError> {
+        let embedding = memory_embedding(&prepared.value)?;
+        let Some(identity) = &self.sync_identity else {
+            return vault(self.vault.put_local_memory_with_binding(
+                &prepared.value,
+                &embedding,
+                &prepared.binding,
+            ));
+        };
+        use crate::sync::{
+            OperationBuildRequest, OperationBuilder, OperationChainHead, SyncIdentity, SyncScope,
+        };
+        let scope = SyncScope {
+            account_id: identity.account_id,
+            workspace_id: identity.workspace_id,
+        };
+        let previous = vault(
+            self.vault
+                .device_head(identity.workspace_id, self.device_id),
+        )?
+        .map(|head| OperationChainHead {
+            sequence: head.sequence,
+            canonical_hash: head.canonical_hash,
+        });
+        let mutation =
+            context_relay_protocol::RecordMutationV1::UpsertMemory(prepared.value.clone());
+        let built = OperationBuilder::new(SyncIdentity {
+            account_id: identity.account_id,
+            workspace_id: identity.workspace_id,
+            device_id: identity.device_id,
+            control_epoch: identity.control_epoch,
+            key_epoch: identity.key_epoch,
+            device_keys: identity.device_keys,
+            content_key: identity.content_key,
+        })
+        .build(OperationBuildRequest {
+            operation_id: prepared.binding.operation_id,
+            project_id: match prepared.value.scope {
+                ScopeRef::Global => None,
+                ScopeRef::Project { project_id } => Some(project_id),
+            },
+            mutation: &mutation,
+            causal_frontier: vault(self.vault.sync_checkpoint_frontier(scope))?,
+            previous,
+            blob_refs: vec![],
+            created_hlc: prepared.value.updated_hlc,
+        })
+        .map_err(|_| internal())?;
+        let response = serde_json::to_vec(&prepared.value).map_err(|_| internal())?;
+        vault(self.vault.commit_outgoing_operation_with_binding(
+            &mutation,
+            &built,
+            Some(&embedding),
+            &prepared.binding,
+            &response,
+        ))
+        .map(|_| ())
     }
 
     pub fn handle_native_hook_event(
@@ -274,11 +357,7 @@ impl<'a> OfflineWorkspace<'a> {
     ) -> Result<MemoryRecord, ClientError> {
         let prepared = self.prepare_memory_create(&params)?;
         if prepared.should_write {
-            vault(self.vault.put_local_memory_with_binding(
-                &prepared.value,
-                &memory_embedding(&prepared.value)?,
-                &prepared.binding,
-            ))?;
+            self.persist_memory(&prepared)?;
         }
         Ok(prepared.value)
     }
@@ -476,11 +555,7 @@ impl<'a> OfflineWorkspace<'a> {
     ) -> Result<MemoryRecord, ClientError> {
         let prepared = self.prepare_memory_update(&params)?;
         if prepared.should_write {
-            vault(self.vault.put_local_memory_with_binding(
-                &prepared.value,
-                &memory_embedding(&prepared.value)?,
-                &prepared.binding,
-            ))?;
+            self.persist_memory(&prepared)?;
         }
         Ok(prepared.value)
     }
@@ -550,11 +625,7 @@ impl<'a> OfflineWorkspace<'a> {
     ) -> Result<MemoryRecord, ClientError> {
         let prepared = self.prepare_memory_archive(&params)?;
         if prepared.should_write {
-            vault(self.vault.put_local_memory_with_binding(
-                &prepared.value,
-                &memory_embedding(&prepared.value)?,
-                &prepared.binding,
-            ))?;
+            self.persist_memory(&prepared)?;
         }
         Ok(prepared.value)
     }
