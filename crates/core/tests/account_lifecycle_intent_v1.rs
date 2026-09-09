@@ -23,9 +23,31 @@ fn lifecycle_intent_survives_restart_and_never_rebinds() {
             .is_none()
     );
     vault.store_account_lifecycle_intent(&original).unwrap();
+    let mut expected = Vec::new();
+    for n in (1..=51).rev() {
+        let mut intent = original.clone();
+        intent.operation_id = format!("018f22e2-79b0-7cc8-98c4-{n:012x}").parse().unwrap();
+        vault.store_account_lifecycle_intent(&intent).unwrap();
+        expected.push(intent);
+    }
+    expected.reverse();
+    expected.push(original.clone());
     drop(vault);
     let mut vault = Vault::open(path.path(), "intent", &keys).unwrap();
+    let first = vault.account_lifecycle_intents(None).unwrap();
+    assert_eq!(first, expected[..50]);
+    let second = vault
+        .account_lifecycle_intents(Some(first.last().unwrap().operation_id))
+        .unwrap();
+    assert_eq!(second, expected[50..]);
+    assert!(
+        vault
+            .account_lifecycle_intents(Some(second.last().unwrap().operation_id))
+            .unwrap()
+            .is_empty()
+    );
     vault.store_account_lifecycle_intent(&original).unwrap();
+    assert_eq!(vault.account_lifecycle_intents(None).unwrap(), first);
     for field in 0..6 {
         let mut changed = original.clone();
         match field {
@@ -74,6 +96,7 @@ fn lifecycle_intent_survives_restart_and_never_rebinds() {
     .unwrap();
     drop(raw);
     let vault = Vault::open(path.path(), "intent", &keys).unwrap();
+    assert!(vault.account_lifecycle_intents(None).is_err());
     assert!(
         vault
             .account_lifecycle_intent(original.operation_id)

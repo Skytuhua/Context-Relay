@@ -84,3 +84,19 @@ Schema migration creates an empty table and never invents historical authority.
 This storage step alone does not activate lifecycle: current-owner guards before
 and after every HTTP attempt, verified scope, explicit retry UI and full provider
 qualification remain prerequisites.
+
+### Restart discovery and scope follow-up (2026-09-09)
+
+The vault can now discover immutable lifecycle intents in exclusive operation-ID
+pages of 50, reusing the existing exact-identity decoder. Continue from the last
+ID until an empty page. These records are history of explicit intent, not proof
+of provider completion or permission to replay. Daemon IPC and explicit retry UI
+must preserve that distinction and original session binding.
+
+Before deriving production scope, do not treat `all_devices()` as cryptographic
+chain verification: its reader checks canonical encoding, digest and indexed
+metadata, but does not itself verify certificate signatures. Reuse the verified
+provisioning evidence and protected-key checks. `trusted_workspace_material()`
+currently covers active enrollment or recovery restore only, not paired joiners.
+The production scope path must support paired devices without replacing this
+verification with a certificate-row-only inference.

@@ -1577,3 +1577,25 @@ Evidence: `.codex/pr16-lifecycle-null-red.log`,
 `.codex/pr16-lifecycle-null-clippy.log`. Graphify update completed (17,737 nodes).
 These are local boundary checks; production lifecycle activation, live provider
 acceptance and the full release gates remain unfinished.
+
+### Lifecycle intent discovery after restart
+
+Added a read-only vault query returning at most 50 original lifecycle intents,
+ordered by operation ID and exclusively after an optional cursor. It reuses the
+existing bounded payload and exact embedded-ID validation. Discovery does not
+classify provider completion or submit/rebind any operation. No migration needed.
+
+The missing-API test failed before implementation. Both lifecycle intent tests
+pass, including 52 stored intents inserted out of order, restart, exclusive
+pagination, exhaustion, exact repeat and corrupted payload rejection. Scoped
+core library/test Clippy passes with warnings denied. Independent review found
+no actionable P1/P2. Logs: `.codex/pr16-lifecycle-discovery-red.log`,
+`.codex/pr16-lifecycle-discovery-final.log`, and
+`.codex/pr16-lifecycle-discovery-clippy.log`.
+
+Daemon discovery IPC, explicit retry UI and production scope integration remain
+open. Certificate-row decoding is not signature-chain verification; the plan
+now records that distinction. Paired devices have an existing
+`completed_pairing_approval` path that checks protected keys and reopens the
+validated confirmed transcript. Full hosted, signing and installed release
+acceptance is still required before merge.

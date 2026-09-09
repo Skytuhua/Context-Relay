@@ -59,6 +59,28 @@ fn load(
         .transpose()
 }
 impl Vault {
+    /// Read up to 50 original intents in operation-ID order, exclusively after the cursor.
+    /// Continue from the last returned ID until an empty page. Presence does not indicate
+    /// whether the provider committed an operation and never authorizes automatic replay.
+    pub fn account_lifecycle_intents(
+        &self,
+        after: Option<OperationId>,
+    ) -> Result<Vec<AccountLifecycleIntent>, VaultError> {
+        let mut statement = self.connection.prepare(
+            "SELECT operation_id FROM account_lifecycle_intents
+             WHERE operation_id > ?1 ORDER BY operation_id LIMIT 50",
+        )?;
+        let rows = statement.query_map(
+            [after.map(|id| id.to_string()).unwrap_or_default()],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.map(|row| {
+            let id = row?.parse().map_err(|_| VaultError::OperationConflict)?;
+            load(&self.connection, id)?.ok_or(VaultError::OperationConflict)
+        })
+        .collect()
+    }
+
     pub fn account_lifecycle_intent(
         &self,
         id: OperationId,
