@@ -2,7 +2,7 @@ use context_relay_core::{
     devices::account_lifecycle::{
         AccountDeletionProjection, AccountLifecycleTransport, AccountLifecycleTransportError,
     },
-    vault::Vault,
+    vault::{AccountLifecycleIntentAction, Vault, VaultError},
 };
 use context_relay_protocol::{
     ClientError, DecimalTimestamp, ErrorCode, LocalRequest, LocalResult, OperationId,
@@ -54,9 +54,42 @@ impl<T> TransportAccountLifecycleService<T> {
 impl<T: AccountLifecycleTransport> AccountLifecycleService for TransportAccountLifecycleService<T> {
     fn execute(
         &self,
-        _vault: &mut Vault,
+        vault: &mut Vault,
         request: LocalRequest,
     ) -> Result<LocalResult, ClientError> {
+        let mutation = match &request {
+            LocalRequest::AccountDeletionBegin(params) => Some((
+                params.operation_id,
+                AccountLifecycleIntentAction::BeginDeletion,
+            )),
+            LocalRequest::AccountDeletionCancel(params) => Some((
+                params.operation_id,
+                AccountLifecycleIntentAction::CancelDeletion,
+            )),
+            LocalRequest::AccountDeletionStatus(_) => None,
+            _ => return Err(invalid_request_error()),
+        };
+        if let Some((operation_id, action)) = mutation {
+            if let Some(intent) = self
+                .transport
+                .hosted_intent(operation_id, action)
+                .map_err(transport_error)?
+            {
+                if intent.operation_id != operation_id || intent.action != action {
+                    return Err(transport_error(AccountLifecycleTransportError::Conflict));
+                }
+                vault
+                    .store_account_lifecycle_intent(&intent)
+                    .map_err(intent_error)?;
+            } else if vault
+                .account_lifecycle_intent(operation_id)
+                .map_err(intent_error)?
+                .is_some()
+            {
+                // An unbound transport cannot adopt previously authenticated work.
+                return Err(transport_error(AccountLifecycleTransportError::Conflict));
+            }
+        }
         let projection = match request {
             LocalRequest::AccountDeletionBegin(params) => {
                 self.transport.begin_deletion(params.operation_id)
@@ -119,4 +152,13 @@ fn transport_error(error: AccountLifecycleTransportError) -> ClientError {
 
 fn invalid_request_error() -> ClientError {
     transport_error(AccountLifecycleTransportError::Invalid)
+}
+
+fn intent_error(error: VaultError) -> ClientError {
+    transport_error(match error {
+        VaultError::OperationConflict | VaultError::Validation(_) => {
+            AccountLifecycleTransportError::Conflict
+        }
+        _ => AccountLifecycleTransportError::Transient,
+    })
 }

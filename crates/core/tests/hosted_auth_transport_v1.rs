@@ -1918,7 +1918,12 @@ fn lifecycle_session_guard_checks_dispatch_response_and_backoff() {
             Arc::new(Retry(owner.clone(), mode == "refresh", now)),
         )
         .unwrap()
-        .with_session_owner(owner.clone(), identity, generation);
+        .with_session_owner(
+            owner.clone(),
+            identity,
+            generation,
+            "018f22e2-79b0-7cc8-98c4-dc0c0c074099".parse().unwrap(),
+        );
         if mode == "before" {
             owner.suspend().unwrap();
         }
@@ -1927,6 +1932,33 @@ fn lifecycle_session_guard_checks_dispatch_response_and_backoff() {
                 .complete_login(owner.begin_login().unwrap(), exchange(), now)
                 .unwrap();
         }
+        let metadata = transport.hosted_intent(
+            "018f22e2-79b0-7cc8-98c4-dc0c0c074002".parse().unwrap(),
+            context_relay_core::vault::AccountLifecycleIntentAction::BeginDeletion,
+        );
+        if matches!(
+            mode,
+            "before" | "replacement" | "wrong_project" | "wrong_identity"
+        ) {
+            assert_eq!(
+                metadata.unwrap_err(),
+                AccountLifecycleTransportError::Unauthorized
+            );
+        } else {
+            let intent = metadata.unwrap().unwrap();
+            assert_eq!(intent.project_url, format!("{PROJECT}/"));
+            assert_eq!(intent.user_id.to_string(), USER);
+            assert_eq!(intent.session_id.to_string(), SESSION);
+            assert_eq!(
+                intent.account_id.to_string(),
+                "018f22e2-79b0-7cc8-98c4-dc0c0c074099"
+            );
+            assert_eq!(
+                intent.workspace_id.to_string(),
+                "018f22e2-79b0-7cc8-98c4-dc0c0c074001"
+            );
+        }
+        assert_eq!(http.calls.load(Ordering::SeqCst), 0);
         let result =
             transport.begin_deletion("018f22e2-79b0-7cc8-98c4-dc0c0c074002".parse().unwrap());
         if matches!(mode, "success" | "refresh") {

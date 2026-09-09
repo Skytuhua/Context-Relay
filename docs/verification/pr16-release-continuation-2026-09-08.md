@@ -1526,3 +1526,36 @@ retry/reconciliation UI remain required before activation.
 
 Core library and all three affected integration-test targets pass Clippy with
 warnings denied (`.codex/pr16-lifecycle-session-clippy.log`).
+
+
+### Lifecycle intent persistence before daemon dispatch
+
+The existing ordered daemon service now obtains read-only authenticated intent
+metadata from its transport and commits it before begin/cancel dispatch. It rejects
+metadata with a different operation/action and refuses an unbound transport's
+attempt to adopt an existing hosted intent. Status bypasses mutation intent
+handling and cannot replay a begin/cancel. Storage errors stop dispatch.
+The guarded native transport supplies normalized project, original user/session,
+workspace and the daemon-provided account after checking current session authority;
+this metadata read performs no HTTP call.
+
+Four daemon lifecycle tests pass. The new test opens a separate Vault from inside
+the simulated transport call, proving the original intent was already committed.
+It then exercises a lost response, service/Vault reconstruction, exact retry,
+status-only reconciliation and changed-session/action/unbound denial. Independent
+bounded review found no P1/P2. Evidence: `.codex/pr16-lifecycle-dispatch.log`.
+The initial test also needed its OperationId import corrected after exposing the
+missing transport metadata method.
+
+Production still selects the unavailable lifecycle transport. Derivation of
+verified account/workspace authority, discovery of unresolved operations and the
+explicit retry UI remain necessary before production activation. No live account
+transition, export, purge or full-release acceptance is implied.
+
+Final validation also passes all 27 affected core Auth/lifecycle tests, and
+core/daemon library and test Clippy with warnings denied. Logs:
+`.codex/pr16-lifecycle-dispatch-core.log` and
+`.codex/pr16-lifecycle-dispatch-clippy.log`. Graphify completed with 17,735 nodes;
+its missing optional SQL/OCaml parsers do not affect these executable checks.
+The new metadata test covers withdrawn/replaced authority, not a timed-expiry
+case. Existing provider freshness checks remain mandatory on every mutation.

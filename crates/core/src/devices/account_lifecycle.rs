@@ -83,6 +83,16 @@ impl AccountDeletionProjection {
 /// Mutation callers retain the same operation ID for every retry of one explicit intent,
 /// including after restart. A different action requires a new operation ID.
 pub trait AccountLifecycleTransport: Send + Sync {
+    /// Original authenticated metadata for persistence before an explicit mutation.
+    /// This read must not submit or replay a provider operation.
+    fn hosted_intent(
+        &self,
+        _operation_id: OperationId,
+        _action: crate::vault::AccountLifecycleIntentAction,
+    ) -> Result<Option<crate::vault::AccountLifecycleIntent>, AccountLifecycleTransportError> {
+        Ok(None)
+    }
+
     fn deletion_status(&self) -> Result<AccountDeletionProjection, AccountLifecycleTransportError>;
 
     fn begin_deletion(

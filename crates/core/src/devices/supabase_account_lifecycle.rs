@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc, time::Duration};
 
-use context_relay_protocol::{AccountDeletionState, OperationId, WorkspaceId};
+use context_relay_protocol::{AccountDeletionState, AccountId, OperationId, WorkspaceId};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,6 +51,7 @@ struct HostedAuthority {
     owner: Arc<HostedSessionOwner>,
     identity: HostedIdentity,
     generation: LoginCancellation,
+    account_id: AccountId,
 }
 
 impl fmt::Debug for SupabaseAccountLifecycleTransport {
@@ -115,16 +116,19 @@ impl SupabaseAccountLifecycleTransport {
 
     /// Bind every dispatch and response to the original daemon-owned login.
     /// The current session supplies the token, including after a valid refresh.
+    /// The daemon must derive account_id from verified local workspace authority.
     pub fn with_session_owner(
         mut self,
         owner: Arc<HostedSessionOwner>,
         identity: HostedIdentity,
         generation: LoginCancellation,
+        account_id: AccountId,
     ) -> Self {
         self.hosted = Some(HostedAuthority {
             owner,
             identity,
             generation,
+            account_id,
         });
         self
     }
@@ -274,6 +278,27 @@ impl SupabaseAccountLifecycleTransport {
 }
 
 impl AccountLifecycleTransport for SupabaseAccountLifecycleTransport {
+    fn hosted_intent(
+        &self,
+        operation_id: OperationId,
+        action: crate::vault::AccountLifecycleIntentAction,
+    ) -> Result<Option<crate::vault::AccountLifecycleIntent>, AccountLifecycleTransportError> {
+        use super::recovery::{RecoveryEnrollmentClock, SystemRecoveryEnrollmentClock};
+        self.session(SystemRecoveryEnrollmentClock.now_ms() / 1000)?;
+        Ok(self
+            .hosted
+            .as_ref()
+            .map(|authority| crate::vault::AccountLifecycleIntent {
+                operation_id,
+                action,
+                project_url: self.config.project_url().as_str().into(),
+                user_id: authority.identity.user_id,
+                session_id: authority.identity.session_id,
+                account_id: authority.account_id,
+                workspace_id: self.workspace_id,
+            }))
+    }
+
     fn deletion_status(&self) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
         self.call(AccountLifecycleAction::Status, None)
     }

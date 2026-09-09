@@ -6452,6 +6452,137 @@ mod tests {
         assert_eq!(owner.await.unwrap(), Ok(()));
     }
 
+    #[test]
+    fn hosted_lifecycle_intent_is_durable_before_dispatch_and_status_never_replays() {
+        use context_relay_core::vault::{AccountLifecycleIntent, AccountLifecycleIntentAction};
+        use context_relay_protocol::OperationId;
+        struct Transport {
+            intent: AccountLifecycleIntent,
+            path: std::path::PathBuf,
+            keys: Arc<MemoryKeyStore>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl AccountLifecycleTransport for Transport {
+            fn hosted_intent(
+                &self,
+                id: OperationId,
+                action: AccountLifecycleIntentAction,
+            ) -> Result<Option<AccountLifecycleIntent>, AccountLifecycleTransportError>
+            {
+                let mut intent = self.intent.clone();
+                intent.operation_id = id;
+                intent.action = action;
+                Ok(Some(intent))
+            }
+            fn deletion_status(
+                &self,
+            ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+                Ok(AccountDeletionProjection {
+                    state: AccountDeletionState::Active,
+                    requested_at_ms: None,
+                    purge_deadline_ms: None,
+                })
+            }
+            fn begin_deletion(
+                &self,
+                id: OperationId,
+            ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+                let vault = Vault::open(&self.path, "intent-dispatch", self.keys.as_ref()).unwrap();
+                assert_eq!(
+                    vault.account_lifecycle_intent(id).unwrap(),
+                    Some(self.intent.clone())
+                );
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(AccountLifecycleTransportError::Transient)
+            }
+            fn cancel_deletion(
+                &self,
+                _: OperationId,
+            ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+                panic!("changed action must not reach provider")
+            }
+        }
+        let path = unit_test_support::TempVault::new("lifecycle-dispatch");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let intent = AccountLifecycleIntent {
+            operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
+            action: AccountLifecycleIntentAction::BeginDeletion,
+            project_url: "https://example.supabase.co/".into(),
+            user_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+            session_id: "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+            account_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074002".parse().unwrap(),
+            workspace_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074003".parse().unwrap(),
+        };
+        let service = |intent| {
+            TransportAccountLifecycleService::new(Transport {
+                intent,
+                path: path.path().into(),
+                keys: keys.clone(),
+                calls: calls.clone(),
+            })
+        };
+        let request = || {
+            LocalRequest::AccountDeletionBegin(context_relay_protocol::AccountDeletionParams {
+                operation_id: intent.operation_id,
+                confirmation: "delete".into(),
+            })
+        };
+        for _ in 0..2 {
+            let mut vault = Vault::open(path.path(), "intent-dispatch", keys.as_ref()).unwrap();
+            assert_eq!(
+                service(intent.clone())
+                    .execute(&mut vault, request())
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Internal
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let mut vault = Vault::open(path.path(), "intent-dispatch", keys.as_ref()).unwrap();
+        service(intent.clone())
+            .execute(
+                &mut vault,
+                LocalRequest::AccountDeletionStatus(EmptyParams {}),
+            )
+            .unwrap();
+        let mut changed = intent.clone();
+        changed.session_id = intent.user_id;
+        assert_eq!(
+            service(changed)
+                .execute(&mut vault, request())
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            service(intent.clone())
+                .execute(
+                    &mut vault,
+                    LocalRequest::AccountDeletionCancel(context_relay_protocol::RetryParams {
+                        operation_id: intent.operation_id
+                    })
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        let unbound = TestAccountLifecycleTransport::new();
+        assert_eq!(
+            TransportAccountLifecycleService::new(unbound.clone())
+                .execute(&mut vault, request())
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(unbound.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            vault.account_lifecycle_intent(intent.operation_id).unwrap(),
+            Some(intent)
+        );
+    }
+
     #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn configured_account_lifecycle_runs_only_through_the_ordered_vault_worker() {
