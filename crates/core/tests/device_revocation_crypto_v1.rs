@@ -4,8 +4,7 @@ use context_relay_core::{
 };
 use context_relay_protocol::{PairingRequestNonce, Sha256Digest};
 
-#[test]
-fn revocation_binds_scope_cutoff_epochs_and_rotation_to_installed_keys() {
+fn fixture() -> (DeviceRevocationStatementV1, DeviceCertificateV1, DeviceKeys) {
     let keys = DeviceKeys::generate().unwrap();
     let statement = DeviceRevocationStatementV1 {
         schema_version: 1,
@@ -34,6 +33,12 @@ fn revocation_binds_scope_cutoff_epochs_and_rotation_to_installed_keys() {
         &keys,
     )
     .unwrap();
+    (statement, certificate, keys)
+}
+
+#[test]
+fn revocation_binds_scope_cutoff_epochs_and_rotation_to_installed_keys() {
+    let (statement, certificate, keys) = fixture();
     let signature = statement.sign(&certificate, &keys).unwrap();
     statement.verify(&certificate, signature).unwrap();
     // Every signed byte, including domain and field boundaries, matters.
@@ -118,4 +123,142 @@ fn revocation_binds_scope_cutoff_epochs_and_rotation_to_installed_keys() {
 fn hex_bytes<const N: usize>(value: &str) -> [u8; N] {
     assert_eq!(value.len(), N * 2);
     std::array::from_fn(|i| u8::from_str_radix(&value[i * 2..i * 2 + 2], 16).unwrap())
+}
+
+#[test]
+fn rotation_requires_exact_current_roster_epochs_recovery_and_signed_bytes() {
+    use context_relay_core::{
+        crypto::wrap_secret,
+        devices::revocation_crypto::{
+            DeviceRotationEnvelopeV1, RevocationControlState, RevocationTransitionV1,
+        },
+        sync::SyncScope,
+    };
+    use std::collections::BTreeMap;
+    let (mut statement, issuer, keys) = fixture();
+    let target_keys = DeviceKeys::generate().unwrap();
+    let mut target = issuer.clone();
+    target.device_id = statement.target_device_id;
+    target.signing_public_key = target_keys.signing_public_key();
+    target.wrapping_public_key = target_keys.wrapping_public_key();
+    // Control-state certificates are assumed already authenticated by the caller;
+    // this fixture tests exact roster equality, not certificate-chain admission.
+    let active = BTreeMap::from([
+        (issuer.device_id, issuer.clone()),
+        (target.device_id, target.clone()),
+    ]);
+    let recovery = DeviceKeys::generate().unwrap();
+    let state = RevocationControlState {
+        scope: SyncScope {
+            account_id: statement.account_id,
+            workspace_id: statement.workspace_id,
+        },
+        control_epoch: 2,
+        key_epoch: 2,
+        state_sha256: Sha256Digest([9; 32]),
+        active_devices: &active,
+        recovery_root_id: "018f22e2-79b0-7cc8-98c4-dc0c0c073985".parse().unwrap(),
+        recovery_wrapping_public_key: recovery.wrapping_public_key(),
+    };
+    let transition = RevocationTransitionV1 {
+        previous_state_sha256: state.state_sha256,
+        control_epoch: 3,
+        key_epoch: 3,
+        key_material_sha256: Sha256Digest([10; 32]),
+        devices: vec![DeviceRotationEnvelopeV1 {
+            certificate: issuer.clone(),
+            envelope: wrap_secret(keys.wrapping_public_key(), &[5; 64], b"rotation-test").unwrap(),
+        }],
+        recovery_root_id: state.recovery_root_id,
+        recovery_wrapping_public_key: state.recovery_wrapping_public_key,
+        recovery_envelope: wrap_secret(recovery.wrapping_public_key(), &[5; 64], b"rotation-test")
+            .unwrap(),
+    };
+    statement.transition_sha256 = transition.digest().unwrap();
+    let signature = statement.sign(&issuer, &keys).unwrap();
+    transition.verify(&statement, signature, &state).unwrap();
+    let resign = |changed: &RevocationTransitionV1| {
+        let mut s = statement.clone();
+        s.transition_sha256 = changed.digest().unwrap();
+        let sig = s.sign(&issuer, &keys).unwrap();
+        (s, sig)
+    };
+    // Even an authentic issuer cannot bypass the exact current-state contract.
+    for mutate in [
+        |t: &mut RevocationTransitionV1| t.devices.clear(),
+        |t: &mut RevocationTransitionV1| t.previous_state_sha256 = Sha256Digest([6; 32]),
+        |t: &mut RevocationTransitionV1| t.control_epoch = 4,
+        |t: &mut RevocationTransitionV1| t.key_epoch = 4,
+        |t: &mut RevocationTransitionV1| t.devices[0].certificate.request_nonce.0[0] ^= 1,
+    ] {
+        let mut changed = transition.clone();
+        mutate(&mut changed);
+        let (s, sig) = resign(&changed);
+        assert!(changed.verify(&s, sig, &state).is_err());
+    }
+    let mut changed = transition.clone();
+    changed.devices[0].certificate = target;
+    let (s, sig) = resign(&changed);
+    assert!(changed.verify(&s, sig, &state).is_err());
+    changed = transition.clone();
+    changed.recovery_wrapping_public_key = keys.wrapping_public_key();
+    let (s, sig) = resign(&changed);
+    assert!(changed.verify(&s, sig, &state).is_err());
+    changed = transition.clone();
+    changed.devices[0].envelope.ciphertext[0] ^= 1;
+    assert!(changed.verify(&statement, signature, &state).is_err());
+    changed = transition.clone();
+    changed.devices.push(changed.devices[0].clone());
+    assert!(changed.digest().is_err());
+    changed = transition.clone();
+    changed.recovery_envelope.ciphertext.clear();
+    assert!(changed.digest().is_err());
+    changed = transition.clone();
+    changed.devices[0].envelope.ephemeral_public_key.0 = [0; 32];
+    assert!(changed.digest().is_err());
+    changed = transition.clone();
+    changed.devices[0].envelope.ciphertext.resize(1025, 0);
+    assert!(changed.digest().is_err());
+    changed = transition.clone();
+    changed.key_material_sha256 = Sha256Digest([0; 32]);
+    assert!(changed.digest().is_err());
+    changed = transition.clone();
+    changed.recovery_root_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073989".parse().unwrap();
+    let (s, sig) = resign(&changed);
+    assert!(changed.verify(&s, sig, &state).is_err());
+    changed = transition.clone();
+    changed.recovery_envelope.ciphertext[0] ^= 1;
+    assert!(changed.verify(&statement, signature, &state).is_err());
+    let stale = RevocationControlState {
+        control_epoch: 3,
+        ..state
+    };
+    assert!(transition.verify(&statement, signature, &stale).is_err());
+    let stale = RevocationControlState {
+        key_epoch: 3,
+        ..state
+    };
+    assert!(transition.verify(&statement, signature, &stale).is_err());
+    let removed_issuer = BTreeMap::from([(
+        statement.target_device_id,
+        active[&statement.target_device_id].clone(),
+    )]);
+    let stale = RevocationControlState {
+        active_devices: &removed_issuer,
+        ..state
+    };
+    assert!(transition.verify(&statement, signature, &stale).is_err());
+    // Last-device self-revocation retains a recovery envelope but no device envelope.
+    let only_issuer = BTreeMap::from([(issuer.device_id, issuer.clone())]);
+    let solo = RevocationControlState {
+        active_devices: &only_issuer,
+        ..state
+    };
+    let mut self_revoke = statement.clone();
+    self_revoke.target_device_id = issuer.device_id;
+    changed = transition.clone();
+    changed.devices.clear();
+    self_revoke.transition_sha256 = changed.digest().unwrap();
+    let sig = self_revoke.sign(&issuer, &keys).unwrap();
+    changed.verify(&self_revoke, sig, &solo).unwrap();
 }

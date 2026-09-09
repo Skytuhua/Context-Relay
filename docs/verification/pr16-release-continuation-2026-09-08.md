@@ -2473,3 +2473,33 @@ test Clippy with warnings denied passed (30.73 seconds). Bounded read-only revie
 found no actionable security/correctness issue. Local logs:
 `.codex/pr16-revocation-red.log`, `.codex/pr16-revocation-test.log`,
 `.codex/pr16-revocation-clippy.log`. No full revocation or release acceptance claimed.
+
+## Canonical revocation rotation transition (2026-09-09)
+
+The native revocation module now canonically encodes and verifies the complete
+public rotation manifest: previous control-state hash, next control/key epochs,
+canonical plaintext key-bundle commitment, sorted remaining-device certificates
+and encrypted envelopes, and the recovery root/wrapping key/envelope. Encoding is
+length-delimited, limits the roster to 4096 and ciphertexts to 1024 bytes, and
+rejects duplicate/unsorted recipients, empty commitments and invalid envelope keys.
+The statement signature binds the digest of all these bytes.
+
+Verification takes a separate caller-authenticated current control state. It requires
+an active issuer and target, matching account/workspace and current epochs, exact
+one-step epoch advancement, the expected previous-state hash and recovery recipient,
+and every remaining current certificate exactly once. A signed request cannot omit
+another active device, include the revoked target or substitute certificate fields.
+Last-device self-revocation preserves a recovery envelope with no device recipients.
+
+The two focused crypto regressions pass (3.12 seconds); core library and focused-test
+Clippy with warnings denied passes (21.11 seconds). The new API first failed its
+regression as missing, before implementation. Review found no actionable P1/P2.
+Logs: `.codex/pr16-rotation-red.log`, `.codex/pr16-rotation-test.log`, and
+`.codex/pr16-rotation-clippy.log`.
+
+This is canonical native manifest verification, not completed key rotation. Wire
+decoding, secure key generation/envelope construction and recipient decryption with
+AAD/plaintext-commitment checks, historical-key persistence, cutoff/head CAS, hosted
+atomic mutation, control propagation and installed acceptance remain required.
+Opaque ciphertext cannot prove that recipients received equivalent valid keys;
+recipients must verify their decrypted canonical bundle against the signed digest.
