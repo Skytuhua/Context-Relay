@@ -1,3 +1,6 @@
+mod pull;
+pub use pull::{PreparedPull, PullProgress, PullRequest, PullResponse};
+
 use std::{collections::BTreeSet, error::Error, fmt};
 
 use context_relay_protocol::{
@@ -229,214 +232,41 @@ impl<G> SyncEngine<G> {
         E: RepresentativeEmbeddingResolver,
         G: RetryRandomSource,
     {
-        let mut report = SyncCycleReport::empty();
-        self.push_due(vault, transport, now_ms, &mut report)?;
-
-        let mut processed = 0usize;
-        let mut processed_bytes = 0usize;
-        while processed < self.max_operations {
-            let cursor = vault
-                .sync_cursor(self.scope.workspace_id, self.provider.as_str())
-                .map_err(local_error)?;
-            let page_limit = (self.max_operations - processed).min(MAX_BATCH);
-            let mut page = transport
-                .pull_operations(self.scope, cursor.as_ref(), page_limit)
-                .map_err(transport_error)?;
-            validate_page(
-                cursor.as_ref(),
-                &page.rows,
-                page.next_cursor.as_ref(),
-                page_limit,
-            )?;
-            if page.rows.is_empty() {
-                break;
-            }
-            page.rows.sort_by(compare_received);
-            report.pulled = report.pulled.saturating_add(page.rows.len());
-
-            for row in page.rows {
-                validate_receipt_binding(&row)?;
-                if processed == self.max_operations {
-                    report.more_work = true;
+        let mut pushed = SyncCycleReport::empty();
+        self.push_due(vault, transport, now_ms, &mut pushed)?;
+        let mut progress = self.prepare_pull(vault)?;
+        loop {
+            progress = match progress {
+                PullProgress::Complete(mut report) => {
+                    report.pushed += pushed.pushed;
+                    report.duplicates += pushed.duplicates;
+                    report.more_work |= pushed.more_work;
                     return Ok(report);
                 }
-                if let Some(stored) = self.existing_quarantine(vault, &row)? {
-                    validate_existing_quarantine(&stored, &row)?;
-                    self.persist_quarantine(vault, &row, &stored.safe_error_code, now_ms, true)?;
-                    report.quarantined += 1;
-                    processed += 1;
-                    continue;
+                PullProgress::Request(prepared) => {
+                    let response = match prepared.request() {
+                        PullRequest::Operations { cursor, limit } => PullResponse::Operations(
+                            transport
+                                .pull_operations(prepared.scope(), cursor.as_ref(), *limit)
+                                .map_err(transport_error)?,
+                        ),
+                        PullRequest::DeviceRange { device, range } => PullResponse::DeviceRange(
+                            transport
+                                .pull_device_range(prepared.scope(), *device, range.clone())
+                                .map_err(transport_error)?,
+                        ),
+                    };
+                    self.finish_pull(
+                        vault,
+                        *prepared,
+                        response,
+                        trusted_material,
+                        embedding_resolver,
+                        now_ms,
+                    )?
                 }
-                if let Some(stored) = self.existing_rejection(vault, &row)? {
-                    validate_existing_rejection(&stored, &row)?;
-                    self.persist_rejection(vault, &row, now_ms, true)?;
-                    report.quarantined += 1;
-                    processed += 1;
-                    continue;
-                }
-                if row.operation.bytes.len() > MAX_CBOR_OPERATION_BYTES {
-                    self.persist_rejection(vault, &row, now_ms, true)?;
-                    report.quarantined += 1;
-                    processed += 1;
-                    continue;
-                }
-                if !reserve_bytes(
-                    &mut processed_bytes,
-                    row.operation.bytes.len(),
-                    self.max_bytes,
-                ) {
-                    report.more_work = true;
-                    return Ok(report);
-                }
-                if validate_received(self.scope, &row).is_err() {
-                    self.persist_quarantine(vault, &row, "integrity_quarantined", now_ms, true)?;
-                    report.quarantined += 1;
-                    processed += 1;
-                    continue;
-                }
-                match admit_operation(vault, &row.operation.bytes, trusted_material) {
-                    Ok(AdmissionDecision::ExactReplay(operation_id)) => {
-                        if operation_id != row.operation.operation_id {
-                            return Err(SyncCycleError::new("integrity_quarantined"));
-                        }
-                        vault
-                            .advance_replay_cursor(
-                                self.scope.workspace_id,
-                                self.provider.as_str(),
-                                &row.cursor.received_at,
-                                operation_id,
-                            )
-                            .map_err(local_error)?;
-                        processed += 1;
-                    }
-                    Ok(AdmissionDecision::Admitted(admitted)) => {
-                        let decision = vault
-                            .apply_admitted_operation_at(
-                                &admitted,
-                                trusted_material,
-                                self.provider.as_str(),
-                                &row.cursor.received_at,
-                                embedding_resolver,
-                                now_ms,
-                            )
-                            .map_err(local_error)?;
-                        record_apply(&mut report, decision);
-                        processed += 1;
-                    }
-                    Ok(AdmissionDecision::Gap(range)) => {
-                        processed_bytes -= row.operation.bytes.len();
-                        match self.repair_gap(
-                            vault,
-                            transport,
-                            trusted_material,
-                            embedding_resolver,
-                            row.operation.device_id,
-                            range,
-                            &mut processed,
-                            &mut processed_bytes,
-                            &mut report,
-                            now_ms,
-                        )? {
-                            GapRepairOutcome::Complete => {}
-                            GapRepairOutcome::Pending => {
-                                report.more_work = true;
-                                return Ok(report);
-                            }
-                            GapRepairOutcome::BlockedByQuarantine => {
-                                if processed == self.max_operations
-                                    || !reserve_bytes(
-                                        &mut processed_bytes,
-                                        row.operation.bytes.len(),
-                                        self.max_bytes,
-                                    )
-                                {
-                                    report.more_work = true;
-                                    return Ok(report);
-                                }
-                                self.persist_quarantine(vault, &row, "gap_pending", now_ms, true)?;
-                                report.quarantined += 1;
-                                processed += 1;
-                                continue;
-                            }
-                        }
-                        if processed == self.max_operations {
-                            report.more_work = true;
-                            return Ok(report);
-                        }
-                        if !reserve_bytes(
-                            &mut processed_bytes,
-                            row.operation.bytes.len(),
-                            self.max_bytes,
-                        ) {
-                            report.more_work = true;
-                            return Ok(report);
-                        }
-                        match admit_operation(vault, &row.operation.bytes, trusted_material) {
-                            Ok(AdmissionDecision::Admitted(admitted)) => {
-                                let decision = vault
-                                    .apply_admitted_operation_at(
-                                        &admitted,
-                                        trusted_material,
-                                        self.provider.as_str(),
-                                        &row.cursor.received_at,
-                                        embedding_resolver,
-                                        now_ms,
-                                    )
-                                    .map_err(local_error)?;
-                                record_apply(&mut report, decision);
-                                processed += 1;
-                            }
-                            Ok(AdmissionDecision::ExactReplay(operation_id)) => {
-                                if operation_id != row.operation.operation_id {
-                                    return Err(SyncCycleError::new("integrity_quarantined"));
-                                }
-                                vault
-                                    .advance_replay_cursor(
-                                        self.scope.workspace_id,
-                                        self.provider.as_str(),
-                                        &row.cursor.received_at,
-                                        operation_id,
-                                    )
-                                    .map_err(local_error)?;
-                                processed += 1;
-                            }
-                            Ok(AdmissionDecision::Gap(_)) => {
-                                report.more_work = true;
-                                return Ok(report);
-                            }
-                            Err(error) => {
-                                require_quarantinable(error)?;
-                                self.persist_quarantine(
-                                    vault,
-                                    &row,
-                                    "integrity_quarantined",
-                                    now_ms,
-                                    true,
-                                )?;
-                                report.quarantined += 1;
-                                processed += 1;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        require_quarantinable(error)?;
-                        self.persist_quarantine(
-                            vault,
-                            &row,
-                            "integrity_quarantined",
-                            now_ms,
-                            true,
-                        )?;
-                        report.quarantined += 1;
-                        processed += 1;
-                    }
-                }
-            }
+            };
         }
-        if processed == self.max_operations {
-            report.more_work = true;
-        }
-        Ok(report)
     }
 
     pub fn sync_once_with_checkpoint<T, M, E>(
@@ -1029,115 +859,6 @@ impl<G> SyncEngine<G> {
         vault
             .defer_outbox_individual(&retries, error.safe_code())
             .map_err(local_error)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn repair_gap<T, M, R>(
-        &self,
-        vault: &mut Vault,
-        transport: &mut T,
-        trusted_material: &M,
-        embedding_resolver: &R,
-        device: context_relay_protocol::DeviceId,
-        range: std::ops::RangeInclusive<u64>,
-        processed: &mut usize,
-        processed_bytes: &mut usize,
-        report: &mut SyncCycleReport,
-        now_ms: u64,
-    ) -> Result<GapRepairOutcome, SyncCycleError>
-    where
-        T: SyncTransport,
-        M: TrustedSyncMaterial,
-        R: RepresentativeEmbeddingResolver,
-    {
-        let mut next = *range.start();
-        let end = *range.end();
-        while next <= end {
-            if *processed == self.max_operations {
-                return Ok(GapRepairOutcome::Pending);
-            }
-            let capacity = (self.max_operations - *processed).min(MAX_BATCH) as u64;
-            let chunk_end = next.saturating_add(capacity.saturating_sub(1)).min(end);
-            let mut rows = transport
-                .pull_device_range(self.scope, device, next..=chunk_end)
-                .map_err(transport_error)?;
-            rows.sort_by_key(|row| row.operation.device_sequence);
-            let expected_count = usize::try_from(chunk_end - next + 1)
-                .map_err(|_| SyncCycleError::new("configuration_error"))?;
-            if rows.len() != expected_count {
-                return Ok(GapRepairOutcome::Pending);
-            }
-            for (offset, row) in rows.iter().enumerate() {
-                let expected = next + offset as u64;
-                if row.operation.device_id != device || row.operation.device_sequence != expected {
-                    return Err(SyncCycleError::new("integrity_quarantined"));
-                }
-                validate_receipt_binding(row)?;
-            }
-            for row in rows {
-                if let Some(stored) = self.existing_quarantine(vault, &row)? {
-                    validate_existing_quarantine(&stored, &row)?;
-                    report.quarantined += 1;
-                    return Ok(GapRepairOutcome::BlockedByQuarantine);
-                }
-                if let Some(stored) = self.existing_rejection(vault, &row)? {
-                    validate_existing_rejection(&stored, &row)?;
-                    report.quarantined += 1;
-                    return Ok(GapRepairOutcome::BlockedByQuarantine);
-                }
-                if row.operation.bytes.len() > MAX_CBOR_OPERATION_BYTES {
-                    self.persist_rejection(vault, &row, now_ms, false)?;
-                    report.quarantined += 1;
-                    return Ok(GapRepairOutcome::BlockedByQuarantine);
-                }
-                if !reserve_bytes(processed_bytes, row.operation.bytes.len(), self.max_bytes) {
-                    return Ok(GapRepairOutcome::Pending);
-                }
-                if validate_received(self.scope, &row).is_err() {
-                    self.persist_quarantine(vault, &row, "integrity_quarantined", now_ms, false)?;
-                    report.quarantined += 1;
-                    return Ok(GapRepairOutcome::BlockedByQuarantine);
-                }
-                match admit_operation(vault, &row.operation.bytes, trusted_material) {
-                    Ok(AdmissionDecision::Admitted(admitted)) => {
-                        let decision = vault
-                            .apply_repaired_operation_at(
-                                &admitted,
-                                trusted_material,
-                                &row.cursor.received_at,
-                                embedding_resolver,
-                                now_ms,
-                            )
-                            .map_err(local_error)?;
-                        record_apply(report, decision);
-                    }
-                    Ok(AdmissionDecision::ExactReplay(operation_id))
-                        if operation_id == row.operation.operation_id => {}
-                    Ok(AdmissionDecision::ExactReplay(_)) | Ok(AdmissionDecision::Gap(_)) => {
-                        return Err(SyncCycleError::new("integrity_quarantined"));
-                    }
-                    Err(error) => {
-                        require_quarantinable(error)?;
-                        self.persist_quarantine(
-                            vault,
-                            &row,
-                            "integrity_quarantined",
-                            now_ms,
-                            false,
-                        )?;
-                        report.quarantined += 1;
-                        return Ok(GapRepairOutcome::BlockedByQuarantine);
-                    }
-                }
-                *processed += 1;
-                report.gaps_repaired += 1;
-            }
-            next = match chunk_end.checked_add(1) {
-                Some(value) => value,
-                None => break,
-            };
-        }
-        Ok(GapRepairOutcome::Complete)
     }
 }
 

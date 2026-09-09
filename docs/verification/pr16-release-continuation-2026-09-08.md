@@ -2258,3 +2258,27 @@ Core library/test Clippy with warnings denied and the normal production daemon
 library check also pass. Logs: `.codex/pr16-staged-push-{clippy,production}.log`.
 GitHub current-head CI was still queued at this checkpoint; no CI/release/merge
 completion is inferred from local checks.
+
+### Resumable pull and gap repair (2026-09-09)
+
+SyncEngine now returns owned operation-page and device-range requests between
+local vault turns. The existing synchronous driver uses these same stages, so
+page validation, operation/byte budgets, quarantine, gap repair and transactional
+cursor advancement share one implementation. Completion rejects a changed scope,
+provider, budget configuration or durable cursor before applying a response.
+The host must still recheck the original authenticated session and current trust.
+
+All 45 sync-engine tests pass (179.60 seconds). The new staged regression performs
+ordinary local work while a range request is pending, repairs the gap, rejects a
+stale page completion and verifies the device head, cursor and local record after
+reopening. Bounded review found no actionable issue. Graphify update completed.
+Evidence: `.codex/pr16-staged-pull-{focus,tests,graph}.log`.
+
+This completes core push/pull operation staging, not production daemon sync.
+SyncRetry remains unsupported until the single-flight supervisor, original-session
+completion checks, refreshed trust and checkpoint stages are wired and verified.
+The full release acceptance checklist remains required before merge.
+
+Core library/test Clippy with warnings denied and the normal production daemon
+library check pass. Logs: `.codex/pr16-staged-pull-{clippy,production}.log`.
+GitHub checks remained queued at the preceding pushed head.

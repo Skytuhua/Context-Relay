@@ -25,8 +25,8 @@ pub use checkpoint::{
     verify_checkpoint,
 };
 pub use engine::{
-    PreparedPush, RetryRandomSource, SyncCycleError, SyncCycleReport, SyncEngine, SyncProvider,
-    SystemRetryRandom,
+    PreparedPull, PreparedPush, PullProgress, PullRequest, PullResponse, RetryRandomSource,
+    SyncCycleError, SyncCycleReport, SyncEngine, SyncProvider, SystemRetryRandom,
 };
 pub use identity::{OperationChainHead, SyncIdentity};
 pub use memory::{FaultSchedule, InMemoryTransport};

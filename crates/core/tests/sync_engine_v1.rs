@@ -8,9 +8,10 @@ use context_relay_core::{
     sync::{
         CanonicalCheckpoint, CanonicalOperation, CheckpointBuildContext, CheckpointCursor,
         CheckpointPage, CheckpointReceipt, FaultSchedule, InMemoryTransport, OperationBuildRequest,
-        OperationBuilder, OperationChainHead, PullPage, PushReceipt, ReceivedOperation,
-        RepresentativeEmbeddingResolver, RetryRandomSource, SyncEngine, SyncError, SyncIdentity,
-        SyncProvider, SyncScope, SyncTransport, TransportError, TrustedDevice, TrustedSyncMaterial,
+        OperationBuilder, OperationChainHead, PullPage, PullProgress, PullRequest, PullResponse,
+        PushReceipt, ReceivedOperation, RepresentativeEmbeddingResolver, RetryRandomSource,
+        SyncEngine, SyncError, SyncIdentity, SyncProvider, SyncScope, SyncTransport,
+        TransportError, TrustedDevice, TrustedSyncMaterial,
     },
     vault::{
         CommitDisposition, LATEST_SCHEMA_VERSION, OutboxUnblockReason, SyncCheckpointSchedule,
@@ -79,6 +80,99 @@ impl RepresentativeEmbeddingResolver for NoEmbeddings {
     ) -> Result<Option<Embedding384>, SyncError> {
         Ok(None)
     }
+}
+
+#[test]
+fn staged_pull_repairs_gaps_between_vault_turns_and_rejects_stale_completion() {
+    let device = device(ID_3, 36);
+    let trust = trust(&device);
+    let operations = chain(&device, 2, 5_000);
+    let mut provider = InMemoryTransport::new();
+    provider
+        .push_operations(scope(), &[canonical(&operations[1].1)])
+        .unwrap();
+    provider
+        .push_operations(scope(), &[canonical(&operations[0].1)])
+        .unwrap();
+    let path = TempVault::new("staged-pull");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let engine = SyncEngine::new(scope(), SyncProvider::Memory);
+    let PullProgress::Request(stale) = engine.prepare_pull(&vault).unwrap() else {
+        panic!("expected pull");
+    };
+    let stale_page = provider.pull_operations(scope(), None, 256).unwrap();
+    let mut progress = engine.prepare_pull(&vault).unwrap();
+    let mut repairs = 0;
+    let report = loop {
+        progress = match progress {
+            PullProgress::Complete(report) => break report,
+            PullProgress::Request(prepared) => {
+                let response = match prepared.request() {
+                    PullRequest::Operations { cursor, limit } => PullResponse::Operations(
+                        provider
+                            .pull_operations(prepared.scope(), cursor.as_ref(), *limit)
+                            .unwrap(),
+                    ),
+                    PullRequest::DeviceRange { device, range } => {
+                        repairs += 1;
+                        assert!(
+                            vault
+                                .device_head(scope().workspace_id, *device)
+                                .unwrap()
+                                .is_none()
+                        );
+                        // Normal vault work can run while range HTTP is pending.
+                        vault.put_candidate(&support::candidate()).unwrap();
+                        PullResponse::DeviceRange(
+                            provider
+                                .pull_device_range(prepared.scope(), *device, range.clone())
+                                .unwrap(),
+                        )
+                    }
+                };
+                engine
+                    .finish_pull(&mut vault, *prepared, response, &trust, &NoEmbeddings, 0)
+                    .unwrap()
+            }
+        };
+    };
+    assert_eq!((repairs, report.applied, report.gaps_repaired), (1, 2, 1));
+    let cursor = vault.sync_cursor(scope().workspace_id, "memory").unwrap();
+    assert!(
+        engine
+            .finish_pull(
+                &mut vault,
+                *stale,
+                PullResponse::Operations(stale_page),
+                &trust,
+                &NoEmbeddings,
+                1
+            )
+            .is_err()
+    );
+    assert_eq!(
+        vault.sync_cursor(scope().workspace_id, "memory").unwrap(),
+        cursor
+    );
+    drop(vault);
+    let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(
+        vault
+            .device_head(scope().workspace_id, device.certificate.device_id)
+            .unwrap()
+            .unwrap()
+            .sequence,
+        2
+    );
+    assert_eq!(
+        vault.sync_cursor(scope().workspace_id, "memory").unwrap(),
+        cursor
+    );
+    assert_eq!(
+        vault.candidate(&support::candidate().id).unwrap(),
+        Some(support::candidate())
+    );
 }
 
 #[test]
