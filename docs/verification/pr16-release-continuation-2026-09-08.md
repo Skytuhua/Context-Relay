@@ -3021,3 +3021,26 @@ all five C and five Rust library-constraint checks passed, and Tauri assembled
 `Context Relay.app`. This does not establish production signing, installed inference,
 or clean-machine acceptance. Dedicated qualification `34356117600` also completed
 both macOS builders and native macOS isolation; Windows jobs remain in progress.
+
+
+### macOS packaged loader integration — September 9
+
+The core packaged search entry point now has a macOS loader. It requires compiled
+final signed-runtime SHA/size and library-constraint SHA metadata, verifies the
+running process constraint before loading, rejects missing/altered/nonregular
+runtime files, and attests ORT's actual API pointer before creating its environment.
+All ORT initialization in this path shares one origin mutex. A successfully loaded
+module is retained even if configuration fails, preventing ambient fallback.
+
+The build-trust regression failed before implementation and passes locally;
+Windows core library/test Clippy passes. A macOS-only file test covers valid bytes,
+hash/size mismatch, absence, symlinks and FIFOs. The local arm64 cross-check stopped
+in aws-lc-sys because this Windows host lacks the required C compiler; it did not
+verify the macOS loader. Native CI compilation and those native tests remain pending.
+Review found no actionable P1/P2 source issues.
+
+The signing pipeline must still derive these pins together from the final signed
+ORT file, compile the consumers, sign the assembled executables with the matching
+constraint and run actual inference from the assembled app. No build metadata is
+supplied yet, so packaged macOS loading refuses initialization. Production daemon
+resource discovery remains disabled until that pipeline and native inference pass.

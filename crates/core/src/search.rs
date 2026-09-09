@@ -396,6 +396,11 @@ pub struct PinnedModelEmbedder {
 #[cfg(windows)]
 mod packaged_runtime;
 
+#[cfg(any(target_os = "macos", test))]
+mod macos_packaged_runtime;
+#[cfg(target_os = "macos")]
+use macos_packaged_runtime as packaged_runtime;
+
 fn bounded_model_input(input: &str) -> &str {
     // Token limits alone still tokenize an entire megabyte-sized note first.
     // Bound preprocessing too; full text remains in the vault and FTS index.
@@ -489,13 +494,13 @@ impl SemanticSearch {
 
 impl PinnedModelEmbedder {
     pub fn load_packaged(directory: &Path) -> Result<Self, ModelError> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let artifacts = read_model_artifacts(&directory.join("model"), PINNED_MODEL_MANIFEST)?;
             packaged_runtime::initialize_packaged(&directory.join("runtime"))?;
             Self::from_artifacts(artifacts)
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = directory;
             Err(ModelError::RuntimeInitialization)
@@ -505,9 +510,9 @@ impl PinnedModelEmbedder {
     pub fn load(directory: &Path) -> Result<Self, ModelError> {
         let artifacts = read_model_artifacts(directory, PINNED_MODEL_MANIFEST)?;
         // Context search is local; initialize before creating any model session.
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         packaged_runtime::initialize_ambient()?;
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         ort::init().with_telemetry(false).commit();
         Self::from_artifacts(artifacts)
     }
