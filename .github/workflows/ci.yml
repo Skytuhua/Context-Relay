@@ -353,6 +353,11 @@ jobs:
       - if: ${{ runner.os == 'macOS' }}
         shell: bash
         run: test "$(uname -m)" = arm64
+      - run: node --test scripts/fetch-macos-search-resources.test.mjs
+      - name: Verify macOS search input acquisition
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: node scripts/fetch-macos-search-resources.mjs "$RUNNER_TEMP/macos-search-resources"
       - run: rustup target add ${{ matrix.target }}
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @context-relay/desktop tauri build --target ${{ matrix.target }}

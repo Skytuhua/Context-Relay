@@ -2897,3 +2897,19 @@ This qualifies acquisition of macOS inputs on the tested host only. Execution
 of this command on macOS, packaged runtime loading, the app resource map,
 signing, notarization and installed clean-machine acceptance remain required.
 The full release gate and PR16 merge remain open.
+
+
+### Schedule macOS acquisition on its native CI host (2026-09-09)
+
+The existing native build job now runs the acquisition regression test on both
+supported hosts. Its macOS arm64 branch also executes the real pinned download
+command into `$RUNNER_TEMP/macos-search-resources` after checking host architecture.
+This schedules direct macOS acquisition evidence without claiming that the staged
+files are loaded or included in the app bundle.
+
+All 33 selected workflow and acquisition checks pass locally. An initial full
+34-test invocation failed only the existing whitespace integration fixture because
+it launches `/bin/bash`, absent on this Windows host. The selected rerun explicitly
+excluded that fixture; neither it nor the remote whitespace gate was changed.
+The new remote acquisition step still needs a successful run before macOS-host
+acquisition can be claimed verified.
