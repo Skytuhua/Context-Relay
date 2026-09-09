@@ -6,8 +6,9 @@ use context_relay_protocol::{
     McpScopeSelector, MemoryArchiveParams, MemoryCandidate, MemoryCreateParams, MemoryId,
     MemoryOrigin, MemoryRecord, MemoryUpdateParams, NativeHookEvent, NativeHookEventParams,
     OperationId, ProjectId, ProjectIdentity, ProposeMemoryInput, Provenance, ReadableRecord,
-    RecordId, ScopeRef, SearchParams, Sha256Digest, TaskCompleteParams, TaskEvidence, TaskId,
-    TaskRecord, TaskStatus, TaskTransitionParams, TaskUpsertParams, WireNativeValue,
+    RecordId, RecordMutationV1, ScopeRef, SearchParams, Sha256Digest, TaskCompleteParams,
+    TaskEvidence, TaskId, TaskRecord, TaskStatus, TaskTransitionParams, TaskUpsertParams,
+    WireNativeValue,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -1396,6 +1397,27 @@ fn task_snapshot(
         return Err(internal());
     }
     Ok(task)
+}
+
+/// Rebuilds the local lexical vector for the exact admitted sync representative.
+/// Model-derived semantic vectors remain local, resumable indexing work.
+pub fn sync_embedding(
+    _operation_id: OperationId,
+    mutation: &RecordMutationV1,
+) -> Result<Option<Embedding384>, crate::sync::SyncError> {
+    mutation
+        .validate()
+        .map_err(|_| crate::sync::SyncError::InvalidMutation)?;
+    match mutation {
+        RecordMutationV1::UpsertMemory(memory) => memory_embedding(memory).map(Some),
+        RecordMutationV1::UpsertInstruction(instruction) => text_embedding(&format!(
+            "{} {}",
+            instruction.title, instruction.body_markdown
+        ))
+        .map(Some),
+        _ => Ok(None),
+    }
+    .map_err(|_| crate::sync::SyncError::InvalidMutation)
 }
 
 fn memory_embedding(memory: &MemoryRecord) -> Result<Embedding384, ClientError> {

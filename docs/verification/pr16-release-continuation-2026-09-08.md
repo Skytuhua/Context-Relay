@@ -2208,3 +2208,25 @@ production hosted sync integration and installed/full-release gates remain open.
 Core library/test Clippy with warnings denied and the normal production daemon
 library check pass. Graphify update completed. Evidence logs:
 `.codex/pr16-legacy-queue-{red,protected,clippy,production,graph}.log`.
+
+### Search projection for signed receive (2026-09-09)
+
+The shared service `sync_embedding` resolver validates the admitted mutation and
+reuses local lexical embedding logic for memory and instruction representatives.
+Other record kinds need no vector. Model-derived semantic vectors remain local,
+resumable indexing work. The real signed-chain receiver regression now uses this
+resolver instead of a constant fixture vector and verifies the accepted memory
+is searchable after reopening. Both focused backfill/receive tests pass; bounded
+review found no actionable issue.
+
+Daemon tracing confirms SyncRetry remains unsupported. Production startup already
+owns the Auth session and protected device identity, and SupabaseTransport checks
+that original session around HTTP attempts. SyncEngine currently holds a mutable
+vault through synchronous transport calls; safe daemon integration must separate
+network waits from local vault admission without creating stale search caches or
+allowing canceled/replaced sessions to apply results. This integration is still
+required before installed hosted acceptance.
+
+Core library/test Clippy with warnings denied and the production daemon library
+check pass; Graphify update completed. Logs:
+`.codex/pr16-sync-search{,-clippy,-production,-graph}.log`.

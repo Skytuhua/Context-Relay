@@ -477,7 +477,7 @@ fn backfill_queues_unchanged_offline_records_atomically_and_resumes_after_reopen
                 &material,
                 "memory",
                 "2026-09-09T00:00:00Z",
-                &|_, _: &context_relay_protocol::RecordMutationV1| Ok(Some(support::basis(0))),
+                &context_relay_core::service::sync_embedding,
             )
             .unwrap();
         receiver
@@ -486,12 +486,22 @@ fn backfill_queues_unchanged_offline_records_atomically_and_resumes_after_reopen
                 &material,
                 "memory",
                 "2026-09-09T00:00:00Z",
-                &|_, _: &context_relay_protocol::RecordMutationV1| Ok(Some(support::basis(0))),
+                &context_relay_core::service::sync_embedding,
             )
             .unwrap();
     }
     drop(receiver);
-    let receiver = Vault::open(receiver_path.path(), CREDENTIAL, &receiver_keys).unwrap();
+    let mut receiver = Vault::open(receiver_path.path(), CREDENTIAL, &receiver_keys).unwrap();
+    assert!(
+        OfflineWorkspace::new(&mut receiver, id(DEVICE_ID))
+            .search_memories(context_relay_protocol::SearchParams {
+                query: "pending needle".into(),
+                project_id: None
+            })
+            .unwrap()
+            .iter()
+            .any(|memory| memory.id == legacy.proposed_memory.id)
+    );
     assert_eq!(
         receiver.candidate(&legacy.id).unwrap(),
         vault.candidate(&legacy.id).unwrap()
