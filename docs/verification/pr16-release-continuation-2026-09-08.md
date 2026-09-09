@@ -2565,3 +2565,27 @@ These functions do not persist intent, activate new keys or mutate hosted state.
 Durable exact-artifact retries, historical keys/control-chain storage, signed cutoff
 admission/head CAS, hosted atomic mutation, daemon wiring and installed acceptance
 remain required before revocation is a complete release workflow.
+
+2026-09-09 revocation intent persistence: schema 37 adds SQLCipher storage for
+exact signed revocation statements, canonical rotation envelopes, issuer
+certificates and original project/user/session identity. A new intent verifies
+caller-supplied current control authority before insertion. Existing operation
+IDs accept only identical artifacts, preserving generated keys across restarts;
+storage acceptance is not permission to replay HTTP after a session change and
+is not hosted acceptance or local key activation. Listing uses bounded canonical
+operation IDs; loading bounds byte lengths before allocation and verifies the
+stored signature, canonical encodings and manifest digest.
+
+The affected account lifecycle, pairing, enrollment, recovery and search suites
+passed 49 active tests, with eight existing model/performance tests ignored
+(`.codex/pr16-revocation-intent-migrations.log`). Schema downgrade fixtures now
+remove the new table before representing older databases. Independent review
+found a SQLite embedded-NUL text-length bypass and unbounded/noncanonical listed
+IDs. The added regression failed before correction; final persistence and
+schema-36 upgrade tests passed 2/2 in 6.99s, including exact recovered key equality,
+changed-payload rejection and corrupt-storage SQL NULL rejection before Rust
+allocation (`.codex/pr16-revocation-bounds-{red,test}.log`). Core library/all-test
+Clippy with test-support and -D warnings passed in 1m48s. Reviewer reinspection
+closed the finding. Graph update completed with 18,305 nodes and 51,684 edges.
+Historical epoch/control-chain persistence, hosted atomic mutation, receiving
+admission, daemon integration and full live/installed acceptance remain open.

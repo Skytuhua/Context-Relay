@@ -43,12 +43,14 @@ mod recovery;
 pub use recovery::*;
 mod recovery_restore;
 pub use recovery_restore::*;
+mod revocation;
+pub use revocation::*;
 mod sync;
 pub use sync::*;
 mod semantic_index;
 pub use semantic_index::{SemanticIndexBatch, SemanticIndexProgress};
 
-pub const LATEST_SCHEMA_VERSION: u32 = 36;
+pub const LATEST_SCHEMA_VERSION: u32 = 37;
 pub const MAX_NATIVE_HOOK_SESSIONS: usize = 256;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
@@ -2434,6 +2436,18 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
         transaction
             .execute_batch(include_str!("../migrations/0036_candidate_aliases.sql"))
             .and_then(|_| transaction.pragma_update(None, "user_version", 36))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 37 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0037_device_revocation_intents.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 37))
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }
