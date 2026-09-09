@@ -40,6 +40,96 @@ pub struct RevocationControlState<'a> {
     pub recovery_wrapping_public_key: X25519PublicKeyBytes,
 }
 
+/// Derive the pre-rotation anchor from an independently pinned enrollment record.
+/// The pin must come from authenticated enrollment/recovery or a signed pairing
+/// transcript, never from the same untrusted response as the record. The caller
+/// must separately establish roster completeness and that this is the initial
+/// epoch; this function authenticates supplied certificates, not freshness.
+pub fn initial_revocation_control_state<'a>(
+    record: &crate::devices::recovery_crypto::RecoveryEnrollmentRecordV1,
+    pinned_record_sha256: Sha256Digest,
+    scope: SyncScope,
+    active_devices: &'a BTreeMap<DeviceId, DeviceCertificateV1>,
+) -> Result<RevocationControlState<'a>, CryptoError> {
+    use crate::crypto::{CertificateIssuerV1, validate_ed25519_public_key};
+    let invalid = CryptoError::AuthenticationFailed;
+    if active_devices.is_empty()
+        || active_devices.len() > MAX_ROTATION_DEVICES
+        || record.account_id != scope.account_id
+        || record.workspace_id != scope.workspace_id
+        || active_devices.get(&record.genesis_certificate.device_id)
+            != Some(&record.genesis_certificate)
+    {
+        return Err(invalid);
+    }
+    let canonical = crate::devices::recovery_crypto::encode_recovery_enrollment_record_v1(record)
+        .map_err(|_| invalid)?;
+    if Sha256Digest(Sha256::digest(canonical).into()) != pinned_record_sha256 {
+        return Err(invalid);
+    }
+    for (id, certificate) in active_devices {
+        if *id != certificate.device_id
+            || certificate.account_id != scope.account_id
+            || certificate.workspace_id != scope.workspace_id
+            || certificate.control_epoch != 1
+        {
+            return Err(invalid);
+        }
+        validate_ed25519_public_key(certificate.signing_public_key)?;
+        validate_x25519_public_key(certificate.wrapping_public_key)?;
+    }
+    let mut authenticated = std::collections::BTreeSet::new();
+    // ponytail: bounded O(n^2) traversal matches existing vault roster discovery;
+    // use a child adjacency map if the 4096-device ceiling grows.
+    loop {
+        let before = authenticated.len();
+        for (id, certificate) in active_devices {
+            if authenticated.contains(id) {
+                continue;
+            }
+            let anchored = match certificate.issuer {
+                CertificateIssuerV1::RecoveryRoot(key) => key == record.recovery_signing_public_key,
+                CertificateIssuerV1::Device {
+                    device_id,
+                    signing_public_key,
+                } => {
+                    authenticated.contains(&device_id)
+                        && active_devices
+                            .get(&device_id)
+                            .is_some_and(|issuer| issuer.signing_public_key == signing_public_key)
+                }
+            };
+            if anchored {
+                certificate.verify_issued_by(&certificate.issuer)?;
+                authenticated.insert(*id);
+            }
+        }
+        if authenticated.len() == active_devices.len() {
+            break;
+        }
+        if authenticated.len() == before {
+            return Err(invalid);
+        }
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"context-relay/revocation-anchor/v1\0");
+    hash.update(pinned_record_sha256.0);
+    hash.update((active_devices.len() as u32).to_be_bytes());
+    for (id, certificate) in active_devices {
+        hash.update(id.as_bytes());
+        hash.update(certificate_digest(certificate)?.0);
+    }
+    Ok(RevocationControlState {
+        scope,
+        control_epoch: 1,
+        key_epoch: 1,
+        state_sha256: Sha256Digest(hash.finalize().into()),
+        active_devices,
+        recovery_root_id: record.recovery_root_id,
+        recovery_wrapping_public_key: record.recovery_wrapping_public_key,
+    })
+}
+
 /// Authenticated public control state after one revocation. This verifies neither
 /// hosted acceptance nor envelope decryptability, and does not activate any keys.
 /// Only `verify_and_advance` constructs it, from caller-authenticated prior state.

@@ -2661,3 +2661,36 @@ atomic key activation, hosted/daemon propagation and full release acceptance
 remain required; no merge or live release qualification is claimed.
 Core and daemon library/all-test Clippy with test-support and -D warnings passed
 in 1m20s (`.codex/pr16-control-history-clippy.log`).
+
+2026-09-09 initial revocation trust anchor: `initial_revocation_control_state`
+requires an independently pinned enrollment-record hash and expected account/
+workspace. The existing canonical enrollment encoder verifies record and genesis
+signatures. The helper requires the exact genesis certificate, a nonempty roster
+of at most 4096 devices, matching map IDs/scope, epoch-one certificates and valid
+public keys. Every supplied chain must terminate at the pinned recovery root;
+orphan/cyclic chains fail when no progress is possible. The bounded traversal
+matches existing vault roster discovery and never invents a root from a server
+response. Completeness, freshness and provenance of the pin remain caller duties.
+
+The initial state hash is SHA-256 of `context-relay/revocation-anchor/v1\0`,
+32-byte canonical enrollment-record hash, four-byte big-endian device count, then
+sorted pairs of raw 16-byte device ID and 32-byte canonical certificate digest.
+It binds membership and the complete signed recovery record, including the
+recovery-wrapping recipient. This is only an initial-epoch commitment; later
+state must advance through verified history rather than reconstruct a fresh
+initial roster after revocation.
+
+The focused enrollment test failed with the missing API before implementation,
+then passed in 0.82s. It builds a first rotation from real enrollment/child
+certificates and rejects changed pins/records/scope/signatures/keys/epochs,
+self-cycles and missing genesis. Existing revocation crypto/history and intent
+regressions passed 5/5 (12.35s and 5.69s). Focused core library/test Clippy with
+test-support and -D warnings passed in 13.53s. Read-only review found no
+P1/P2. Evidence: `.codex/pr16-revocation-anchor-{red,test,regressions,clippy}.log`.
+
+Source tracing identified a remaining pairing prerequisite: its current key
+bundle and approval do not provide an authenticated enrollment-record pin.
+Obtain that pin through signed pairing before allowing a newly paired device to
+bootstrap control history; do not trust a digest accompanying the same untrusted
+record. Production history loading, cutoff admission, key activation/distribution,
+hosted lifecycle and the full release acceptance gates remain unfinished.

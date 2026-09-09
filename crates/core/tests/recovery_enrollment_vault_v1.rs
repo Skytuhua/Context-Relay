@@ -1561,3 +1561,156 @@ fn schema_21_rows_survive_schema_22_upgrade_and_material_plaintext_is_absent() {
         }));
     }
 }
+
+#[test]
+fn revocation_anchor_requires_pinned_enrollment_and_valid_initial_certificate_chains() {
+    use context_relay_core::devices::revocation_crypto::{
+        DeviceRevocationStatementV1, RevocationTransitionV1, initial_revocation_control_state,
+    };
+    use context_relay_protocol::Sha256Digest;
+    use std::collections::BTreeMap;
+    let fixture = fixture();
+    let record = &fixture.artifacts.record;
+    let scope = SyncScope {
+        account_id: fixture.material.account_id(),
+        workspace_id: fixture.material.workspace_id(),
+    };
+    let child_keys = DeviceKeys::generate().unwrap();
+    let child = DeviceCertificateV1::issue_by_device(
+        CertificateFieldsV1 {
+            account_id: scope.account_id,
+            workspace_id: scope.workspace_id,
+            control_epoch: 1,
+            request_nonce: PairingRequestNonce([2; 32]),
+            device_id: id(OTHER_ID),
+            signing_public_key: child_keys.signing_public_key(),
+            wrapping_public_key: child_keys.wrapping_public_key(),
+        },
+        record.genesis_certificate.device_id,
+        &fixture.device_keys,
+    )
+    .unwrap();
+    let active = BTreeMap::from([
+        (
+            record.genesis_certificate.device_id,
+            record.genesis_certificate.clone(),
+        ),
+        (child.device_id, child.clone()),
+    ]);
+    let anchor = initial_revocation_control_state(
+        record,
+        fixture.artifacts.canonical_record_sha256,
+        scope,
+        &active,
+    )
+    .unwrap();
+    assert_eq!((anchor.control_epoch, anchor.key_epoch), (1, 1));
+    assert_eq!(anchor.recovery_root_id, record.recovery_root_id);
+    let request = DeviceRevocationStatementV1 {
+        schema_version: 1,
+        revocation_id: id(support::ID_8),
+        account_id: scope.account_id,
+        workspace_id: scope.workspace_id,
+        issuer_device_id: record.genesis_certificate.device_id,
+        target_device_id: child.device_id,
+        control_epoch: 1,
+        key_epoch: 1,
+        cutoff_sequence: 0,
+        cutoff_hash: Sha256Digest([0; 32]),
+        transition_sha256: Sha256Digest([0; 32]),
+    };
+    let (statement, transition, signature) =
+        RevocationTransitionV1::build(request, &fixture.device_keys, &anchor).unwrap();
+    transition
+        .verify_and_advance(&statement, signature, &anchor)
+        .unwrap();
+    let parent_only = BTreeMap::from([(
+        record.genesis_certificate.device_id,
+        record.genesis_certificate.clone(),
+    )]);
+    assert_ne!(
+        anchor.state_sha256,
+        initial_revocation_control_state(
+            record,
+            fixture.artifacts.canonical_record_sha256,
+            scope,
+            &parent_only
+        )
+        .unwrap()
+        .state_sha256
+    );
+    assert!(
+        initial_revocation_control_state(record, Sha256Digest([0; 32]), scope, &active).is_err()
+    );
+    let other = self::fixture();
+    assert!(
+        initial_revocation_control_state(
+            &other.artifacts.record,
+            fixture.artifacts.canonical_record_sha256,
+            scope,
+            &active
+        )
+        .is_err()
+    );
+    let wrong_scope = SyncScope {
+        workspace_id: id(support::ID_1),
+        ..scope
+    };
+    assert!(
+        initial_revocation_control_state(
+            record,
+            fixture.artifacts.canonical_record_sha256,
+            wrong_scope,
+            &active
+        )
+        .is_err()
+    );
+    let mut damaged = record.clone();
+    damaged.recovery_root_signature.0[0] ^= 1;
+    assert!(
+        initial_revocation_control_state(
+            &damaged,
+            fixture.artifacts.canonical_record_sha256,
+            scope,
+            &active
+        )
+        .is_err()
+    );
+    for field in 0..6 {
+        let mut invalid = active.clone();
+        let certificate = invalid.get_mut(&child.device_id).unwrap();
+        match field {
+            0 => certificate.control_epoch = 2,
+            1 => certificate.signature.0[0] ^= 1,
+            2 => certificate.workspace_id = id(support::ID_1),
+            3 => certificate.signing_public_key.0 = [0; 32],
+            4 => certificate.wrapping_public_key.0 = [0; 32],
+            _ => {
+                certificate.issuer = context_relay_core::crypto::CertificateIssuerV1::Device {
+                    device_id: child.device_id,
+                    signing_public_key: child.signing_public_key,
+                }
+            }
+        }
+        assert!(
+            initial_revocation_control_state(
+                record,
+                fixture.artifacts.canonical_record_sha256,
+                scope,
+                &invalid
+            )
+            .is_err(),
+            "field {field}"
+        );
+    }
+    let orphan = BTreeMap::from([(child.device_id, child)]);
+    assert!(
+        initial_revocation_control_state(
+            record,
+            fixture.artifacts.canonical_record_sha256,
+            scope,
+            &orphan
+        )
+        .is_err()
+    );
+}
