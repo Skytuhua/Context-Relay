@@ -1980,3 +1980,158 @@ fn lifecycle_session_guard_checks_dispatch_response_and_backoff() {
         );
     }
 }
+
+#[test]
+fn sync_session_guard_uses_refreshed_tokens_and_rejects_withdrawn_authority() {
+    use context_relay_core::{
+        devices::recovery::{RecoveryEnrollmentClock, SystemRecoveryEnrollmentClock},
+        sync::{
+            SupabaseRetryRuntime, SupabaseTransport, SupabaseTransportConfig, SyncScope,
+            SyncTransport, TransportError,
+        },
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Endpoint {
+        owner: Arc<HostedSessionOwner>,
+        mode: &'static str,
+        now: u64,
+        calls: AtomicUsize,
+        original: Mutex<Option<SupabaseHttpRequest>>,
+    }
+    impl SupabaseHttpClient for Endpoint {
+        fn execute(
+            &self,
+            request: SupabaseHttpRequest,
+        ) -> Result<SupabaseHttpResponse, SupabaseHttpError> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            let expected = format!(
+                "Bearer {}",
+                token(self.now + if attempt == 0 { 900 } else { 1800 })
+            );
+            assert_eq!(request.header("authorization"), Some(expected.as_str()));
+            let mut original = self.original.lock().unwrap();
+            if let Some(first) = original.as_ref() {
+                assert_eq!(request.url(), first.url());
+                assert_eq!(request.body(), first.body());
+                assert_eq!(request.header("apikey"), first.header("apikey"));
+            } else {
+                *original = Some(request.clone());
+            }
+            if matches!(self.mode, "response" | "error" | "oversize") {
+                self.owner.suspend().unwrap();
+            }
+            if self.mode == "error" {
+                return Err(SupabaseHttpError::Transient);
+            }
+            if self.mode == "oversize" {
+                return Err(SupabaseHttpError::ResponseTooLarge);
+            }
+            if self.mode == "refresh" && attempt == 0 {
+                self.owner.refresh(self.now).unwrap();
+                return Ok(response(503, json!({"v":1,"error":"transient"})));
+            }
+            if self.mode == "backoff" {
+                return Ok(response(503, json!({"v":1,"error":"transient"})));
+            }
+            Ok(response(200, json!([])))
+        }
+    }
+    struct Retry(Arc<HostedSessionOwner>, bool);
+    impl SupabaseRetryRuntime for Retry {
+        fn random_u64(&self, _: u32) -> u64 {
+            0
+        }
+        fn sleep(&self, _: std::time::Duration) {
+            if self.1 {
+                self.0.suspend().unwrap();
+            }
+        }
+    }
+    for mode in [
+        "before",
+        "response",
+        "error",
+        "oversize",
+        "refresh",
+        "success",
+        "backoff",
+        "wrong_project",
+        "wrong_identity",
+        "replacement",
+    ] {
+        let now = SystemRecoveryEnrollmentClock.now_ms() / 1000;
+        let (auth, _) = client(
+            PROJECT,
+            vec![
+                tokens(&token(now + 900)),
+                response(200, json!({"id":USER})),
+                tokens(&token(now + 1800)),
+                response(200, json!({"id":USER})),
+            ],
+        );
+        let owner = Arc::new(HostedSessionOwner::new(
+            Arc::new(auth),
+            Arc::new(Store::default()),
+        ));
+        owner
+            .complete_login(owner.begin_login().unwrap(), exchange(), now)
+            .unwrap();
+        let mut identity = *owner.current_session(now).unwrap().unwrap().identity();
+        if mode == "wrong_identity" {
+            identity.session_id = USER.parse().unwrap();
+        }
+        let generation = owner.cancellation().unwrap();
+        let http = Arc::new(Endpoint {
+            owner: owner.clone(),
+            mode,
+            now,
+            calls: AtomicUsize::new(0),
+            original: Mutex::new(None),
+        });
+        let project = if mode == "wrong_project" {
+            "https://other.supabase.co"
+        } else {
+            PROJECT
+        };
+        let mut transport = SupabaseTransport::with_http_client_and_retry_runtime(
+            SupabaseTransportConfig::new(project, "public-test", "stale-token-never-send").unwrap(),
+            http.clone(),
+            Arc::new(Retry(owner.clone(), mode == "backoff")),
+        )
+        .unwrap()
+        .with_session_owner(owner.clone(), identity, generation);
+        if mode == "before" {
+            owner.suspend().unwrap();
+        }
+        if mode == "replacement" {
+            owner
+                .complete_login(owner.begin_login().unwrap(), exchange(), now)
+                .unwrap();
+        }
+        let result = transport.pull_operations(
+            SyncScope {
+                account_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074099".parse().unwrap(),
+                workspace_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074001".parse().unwrap(),
+            },
+            None,
+            2,
+        );
+        if matches!(mode, "success" | "refresh") {
+            assert!(result.unwrap().rows.is_empty());
+        } else {
+            assert_eq!(result.unwrap_err(), TransportError::AuthRequired, "{mode}");
+        }
+        assert_eq!(
+            http.calls.load(Ordering::SeqCst),
+            if mode == "refresh" {
+                2
+            } else {
+                usize::from(matches!(
+                    mode,
+                    "success" | "response" | "error" | "oversize" | "backoff"
+                ))
+            },
+            "{mode}"
+        );
+    }
+}

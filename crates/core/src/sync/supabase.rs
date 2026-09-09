@@ -344,6 +344,13 @@ pub struct SupabaseTransport {
     config: SupabaseTransportConfig,
     http: Arc<dyn SupabaseHttpClient>,
     retry_runtime: Arc<dyn SupabaseRetryRuntime>,
+    hosted: Option<HostedAuthority>,
+}
+
+struct HostedAuthority {
+    owner: Arc<crate::auth::HostedSessionOwner>,
+    identity: crate::auth::HostedIdentity,
+    generation: crate::auth::LoginCancellation,
 }
 
 impl SupabaseTransport {
@@ -353,6 +360,7 @@ impl SupabaseTransport {
             config,
             http,
             retry_runtime: Arc::new(SystemRetryRuntime),
+            hosted: None,
         })
     }
 
@@ -365,6 +373,7 @@ impl SupabaseTransport {
             config,
             http,
             retry_runtime: Arc::new(SystemRetryRuntime),
+            hosted: None,
         })
     }
 
@@ -378,7 +387,39 @@ impl SupabaseTransport {
             config,
             http,
             retry_runtime,
+            hosted: None,
         })
+    }
+
+    /// Use only the current matching session token, including after refresh.
+    pub fn with_session_owner(
+        mut self,
+        owner: Arc<crate::auth::HostedSessionOwner>,
+        identity: crate::auth::HostedIdentity,
+        generation: crate::auth::LoginCancellation,
+    ) -> Self {
+        self.hosted = Some(HostedAuthority {
+            owner,
+            identity,
+            generation,
+        });
+        self
+    }
+
+    fn session(&self, now: u64) -> Result<Option<Arc<crate::auth::HostedSession>>, TransportError> {
+        self.hosted
+            .as_ref()
+            .map(|authority| {
+                let session = authority
+                    .owner
+                    .session_for(&authority.generation, authority.identity, now)
+                    .map_err(|_| TransportError::AuthRequired)?;
+                if session.project_url() != &self.config.project_url {
+                    return Err(TransportError::AuthRequired);
+                }
+                Ok(session)
+            })
+            .transpose()
     }
 
     pub fn update_access_token(
@@ -437,8 +478,28 @@ impl SupabaseTransport {
         &self,
         request: SupabaseHttpRequest,
     ) -> Result<SupabaseHttpResponse, SupabaseRequestError> {
+        let started = std::time::Instant::now();
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| SupabaseRequestError::Transport(TransportError::Configuration))?
+            .as_secs();
         for attempt in 0..MAX_ATTEMPTS {
-            let response = match self.http.execute(request.clone()) {
+            let session = self
+                .session(epoch.saturating_add(started.elapsed().as_secs()))
+                .map_err(SupabaseRequestError::Transport)?;
+            let mut attempt_request = request.clone();
+            if let Some(session) = session {
+                for (name, value) in &mut attempt_request.headers {
+                    if name.eq_ignore_ascii_case("authorization") {
+                        value.zeroize();
+                        *value = format!("Bearer {}", session.access_token());
+                    }
+                }
+            }
+            let response = self.http.execute(attempt_request);
+            self.session(epoch.saturating_add(started.elapsed().as_secs()))
+                .map_err(SupabaseRequestError::Transport)?;
+            let response = match response {
                 Ok(response) => response,
                 Err(SupabaseHttpError::ResponseTooLarge) => {
                     return Err(SupabaseRequestError::ResponseTooLarge);

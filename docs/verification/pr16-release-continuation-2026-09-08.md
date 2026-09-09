@@ -1,5 +1,25 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Native sync session guard — 2026-09-09
+
+The shared Supabase sync executor can now bind requests to the original Auth
+owner, generation, identity and project. Each attempt uses the current matching
+session token; every response or HTTP error is checked again before processing.
+Logout, replacement login and authority withdrawal during backoff stop retries.
+Existing request bodies and idempotency headers are preserved by cloning the
+original request and replacing only its authorization value.
+
+Validation: all 24 hosted-auth transport tests and nine Supabase sync transport
+tests pass. Scoped core library/test Clippy with warnings denied and a normal
+daemon library check without test-support pass. Independent read-only review
+found no actionable correctness or security issues. The new guard regression
+uses GET requests; its refresh test does not directly prove mutation-body replay.
+
+This is transport foundation only. Production sync still needs verified trust
+material, atomic signed local mutations/outbox integration, bounded daemon
+cycles and installed two-device qualification. The production-sync plan records
+those remaining steps. Full signing, product, security and beta gates still apply.
+
 The user explicitly requires the complete product-release checklist before merging
 PR #16. Passing the current desktop/setup checks is insufficient. The
 [Windows acceptance ledger](windows-app-release.md) and
