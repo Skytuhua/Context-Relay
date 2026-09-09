@@ -2612,3 +2612,52 @@ with test-support and -D warnings passed in 13.15s. Logs are local
 `.codex/pr16-retained-certificate-clippy.log`. Read-only review found no actionable
 P1/P2. Historical epoch/control-chain storage, hosted mutation, cutoff admission
 and full installed acceptance remain required before merge.
+
+2026-09-09 authenticated revocation history: a verified state-advance operation
+now checks each transition against its preceding authenticated roster, then
+returns a privately constructed next roster, epochs and signed cutoff evidence.
+This preserves a retained child's authority after its issuer is revoked, without
+allowing the revoked issuer to authorize a later transition. The control-state
+commitment is SHA-256 of `context-relay/revocation-control-state/v1\0`, followed
+by the exact 197-byte statement signing preimage and 64-byte signature. The
+statement commits to the transition, which commits to the preceding state.
+Independent Python UUID/struct/hashlib generation over the existing Ed25519
+vector yields `16011f91fb578aa91814bbe5af72d4495d4c2067ded3f9b25a8f3bb25f6f4aea`.
+
+Schema 38 stores exact signed entries and encrypted rotation envelopes, using
+an immediate SQLCipher transaction to compare the pinned previous hash/epochs
+before appending. Exact retries preserve existing rows; conflicting branches
+fail. Bounded one-entry reads check canonical bytes and metadata, but explicitly
+do not establish authority. The caller must reauthenticate every link from a
+trusted anchor and verify hosted acceptance separately. Existing rotation keys
+can be reopened from retained envelopes; this does not yet distribute historical
+keys to newly joined devices or activate keys in the production workspace loader.
+
+The new APIs had failing missing-API regressions before implementation. Final
+crypto/history and intent suites passed 5/5 (12.19s and 5.15s). Coverage includes
+reopen and full two-step chain reauthentication, old/new recovery keys, wrong
+pinned-tip rejection, same-epoch competing branches, revoked-issuer reuse,
+altered cutoffs, replay/skipped entries and damaged stored signatures. Nine
+selected older-schema migrations passed. Read-only review found no actionable
+P1/P2. Local evidence: `.codex/pr16-control-history-red.log`,
+`.codex/pr16-control-store-{red,final}.log`, and
+`.codex/pr16-control-history-migrations.log`.
+
+Superseded CI run 34331420501 at 9cab71f reported a Windows daemon failure:
+the composed sync/checkpoint test exceeded its ten-second functional completion
+limit (103 passed, one failed, four ignored). The failure was retained in
+`.codex/pr16-ci-9cab-windows-failed.log`. The test-only completion budget is now
+60 seconds for full-suite SQLCipher contention; separate one-second read and
+shutdown assertions remain. The full local daemon library suite passed all
+104 active tests with four existing ignored tests in 212.08s, including the
+previously failing test and HTTP-stall responsiveness
+(`.codex/pr16-control-history-daemon.log`). Current-head hosted CI must still pass.
+
+Superseded runs 34334576281, 34334576362, 34331420501 and 34330392647 were
+confirmed terminal/cancelled; the observed failure above is not erased by that
+workflow conclusion. Final graph update completed: 18,319 nodes, 51,747 edges.
+Production trusted-anchor reconstruction, cutoff-aware historical admission,
+atomic key activation, hosted/daemon propagation and full release acceptance
+remain required; no merge or live release qualification is claimed.
+Core and daemon library/all-test Clippy with test-support and -D warnings passed
+in 1m20s (`.codex/pr16-control-history-clippy.log`).

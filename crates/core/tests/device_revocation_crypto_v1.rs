@@ -1,3 +1,5 @@
+mod support;
+
 use context_relay_core::{
     crypto::{CertificateFieldsV1, DeviceCertificateV1, DeviceKeys},
     devices::revocation_crypto::DeviceRevocationStatementV1,
@@ -526,4 +528,264 @@ fn rotation_requires_exact_current_roster_epochs_recovery_and_signed_bytes() {
     self_transition
         .open_recovery_material(&self_statement, self_signature, &solo, &recovery)
         .unwrap();
+}
+
+#[test]
+fn verified_control_history_chains_cutoffs_and_retains_a_revoked_issuers_child() {
+    use context_relay_core::{
+        crypto::{RecoveryKeys, RecoveryPhrase},
+        devices::revocation_crypto::{RevocationControlState, RevocationTransitionV1},
+        sync::SyncScope,
+    };
+    use std::collections::BTreeMap;
+    let (mut request, _, parent_keys) = fixture();
+    let recovery = RecoveryKeys::derive(&RecoveryPhrase::generate().unwrap()).unwrap();
+    let fields = CertificateFieldsV1 {
+        account_id: request.account_id,
+        workspace_id: request.workspace_id,
+        control_epoch: 1,
+        request_nonce: PairingRequestNonce([1; 32]),
+        device_id: request.issuer_device_id,
+        signing_public_key: parent_keys.signing_public_key(),
+        wrapping_public_key: parent_keys.wrapping_public_key(),
+    };
+    let parent = DeviceCertificateV1::issue_genesis(fields.clone(), &recovery).unwrap();
+    let child_keys = DeviceKeys::generate().unwrap();
+    let child = DeviceCertificateV1::issue_by_device(
+        CertificateFieldsV1 {
+            device_id: request.target_device_id,
+            signing_public_key: child_keys.signing_public_key(),
+            wrapping_public_key: child_keys.wrapping_public_key(),
+            ..fields
+        },
+        parent.device_id,
+        &parent_keys,
+    )
+    .unwrap();
+    let active = BTreeMap::from([
+        (parent.device_id, parent.clone()),
+        (child.device_id, child.clone()),
+    ]);
+    let anchor = RevocationControlState {
+        scope: SyncScope {
+            account_id: request.account_id,
+            workspace_id: request.workspace_id,
+        },
+        control_epoch: 2,
+        key_epoch: 2,
+        state_sha256: Sha256Digest([9; 32]),
+        active_devices: &active,
+        recovery_root_id: "018f22e2-79b0-7cc8-98c4-dc0c0c073985".parse().unwrap(),
+        recovery_wrapping_public_key: recovery.wrapping_public_key(),
+    };
+    request.target_device_id = parent.device_id;
+    let (first, rotation, signature) =
+        RevocationTransitionV1::build(request, &parent_keys, &anchor).unwrap();
+    let advanced = rotation
+        .verify_and_advance(&first, signature, &anchor)
+        .unwrap();
+    let path = support::TempVault::new("revocation-history");
+    let store = support::MemoryKeyStore::default();
+    let first_record = context_relay_core::vault::StoredRevocationControl {
+        statement: first.clone(),
+        transition: rotation.clone(),
+        signature,
+    };
+    let mut vault = context_relay_core::vault::Vault::open(path.path(), "history", &store).unwrap();
+    vault
+        .commit_device_revocation_control(&first_record, &anchor)
+        .unwrap();
+    vault
+        .commit_device_revocation_control(&first_record, &anchor)
+        .unwrap();
+    drop(vault);
+    let mut vault = context_relay_core::vault::Vault::open(path.path(), "history", &store).unwrap();
+    let stored = vault
+        .device_revocation_control(anchor.scope, 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored, first_record);
+    stored
+        .transition
+        .verify_and_advance(&stored.statement, stored.signature, &anchor)
+        .unwrap();
+    let current = advanced.state();
+    assert_eq!((current.control_epoch, current.key_epoch), (3, 3));
+    assert_eq!(
+        current.active_devices,
+        &BTreeMap::from([(child.device_id, child.clone())])
+    );
+    assert_eq!(
+        current.state_sha256,
+        first.control_state_sha256(signature).unwrap()
+    );
+    assert_eq!(advanced.statement(), &first);
+    assert!(
+        rotation
+            .verify_and_advance(&first, signature, &current)
+            .is_err()
+    );
+    rotation
+        .open_device_material(&first, signature, &anchor, child.device_id, &child_keys)
+        .unwrap();
+    let mut altered_cutoff = first.clone();
+    altered_cutoff.cutoff_sequence += 1;
+    let altered_signature = altered_cutoff.sign(&parent, &parent_keys).unwrap();
+    assert_ne!(
+        altered_cutoff
+            .control_state_sha256(altered_signature)
+            .unwrap(),
+        current.state_sha256
+    );
+    let mut next = first.clone();
+    next.revocation_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073986".parse().unwrap();
+    next.issuer_device_id = child.device_id;
+    next.target_device_id = child.device_id;
+    next.control_epoch = current.control_epoch;
+    next.key_epoch = current.key_epoch;
+    let (second, second_rotation, second_signature) =
+        RevocationTransitionV1::build(next, &child_keys, &current).unwrap();
+    let final_state = second_rotation
+        .verify_and_advance(&second, second_signature, &current)
+        .unwrap();
+    let second_record = context_relay_core::vault::StoredRevocationControl {
+        statement: second.clone(),
+        transition: second_rotation.clone(),
+        signature: second_signature,
+    };
+    // A cryptographically valid transition cannot append from a different
+    // trusted-tip claim than the history already pinned in this vault.
+    let wrong_tip = RevocationControlState {
+        state_sha256: Sha256Digest([44; 32]),
+        ..current
+    };
+    let (statement, transition, signature) =
+        RevocationTransitionV1::build(second.clone(), &child_keys, &wrong_tip).unwrap();
+    let wrong_branch = context_relay_core::vault::StoredRevocationControl {
+        statement,
+        transition,
+        signature,
+    };
+    assert!(
+        vault
+            .commit_device_revocation_control(&wrong_branch, &wrong_tip)
+            .is_err()
+    );
+    vault
+        .commit_device_revocation_control(&second_record, &current)
+        .unwrap();
+    // A separately signed branch at the same epoch cannot replace the pinned chain.
+    let mut alternate = second.clone();
+    alternate.revocation_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073987".parse().unwrap();
+    let (statement, transition, signature) =
+        RevocationTransitionV1::build(alternate, &child_keys, &current).unwrap();
+    let competing = context_relay_core::vault::StoredRevocationControl {
+        statement,
+        transition,
+        signature,
+    };
+    assert!(
+        vault
+            .commit_device_revocation_control(&competing, &current)
+            .is_err()
+    );
+    assert_eq!(
+        vault
+            .device_revocation_control(anchor.scope, 4)
+            .unwrap()
+            .unwrap(),
+        second_record
+    );
+    drop(vault);
+    let vault = context_relay_core::vault::Vault::open(path.path(), "history", &store).unwrap();
+    let old = vault
+        .device_revocation_control(anchor.scope, 3)
+        .unwrap()
+        .unwrap();
+    let tip = vault
+        .device_revocation_control(anchor.scope, 4)
+        .unwrap()
+        .unwrap();
+    let verified_old = old
+        .transition
+        .verify_and_advance(&old.statement, old.signature, &anchor)
+        .unwrap();
+    let verified_tip = tip
+        .transition
+        .verify_and_advance(&tip.statement, tip.signature, &verified_old.state())
+        .unwrap();
+    assert_eq!(
+        verified_tip.state().state_sha256,
+        final_state.state().state_sha256
+    );
+    let old_keys = old
+        .transition
+        .open_recovery_material(&old.statement, old.signature, &anchor, &recovery)
+        .unwrap();
+    let tip_keys = tip
+        .transition
+        .open_recovery_material(
+            &tip.statement,
+            tip.signature,
+            &verified_old.state(),
+            &recovery,
+        )
+        .unwrap();
+    assert_ne!(old_keys.active_epoch_key(), tip_keys.active_epoch_key());
+    drop(vault);
+    let raw = rusqlite::Connection::open(path.path()).unwrap();
+    let database_key = store.key("history");
+    // SAFETY: keying is the first SQLite operation; key is live for this call.
+    assert_eq!(
+        unsafe { rusqlite::ffi::sqlite3_key(raw.handle(), database_key.as_ptr().cast(), 32) },
+        rusqlite::ffi::SQLITE_OK
+    );
+    raw.execute(
+        "UPDATE revocation_control_history SET signature=zeroblob(64) WHERE control_epoch=3",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+    let vault = context_relay_core::vault::Vault::open(path.path(), "history", &store).unwrap();
+    assert!(vault.device_revocation_control(anchor.scope, 3).is_err());
+    assert!(final_state.state().active_devices.is_empty());
+    assert_eq!(final_state.state().control_epoch, 4);
+    second_rotation
+        .open_recovery_material(&second, second_signature, &current, &recovery)
+        .unwrap();
+    assert!(
+        second_rotation
+            .verify_and_advance(&second, second_signature, &anchor)
+            .is_err()
+    );
+    let wrong_chain = RevocationControlState {
+        state_sha256: altered_cutoff
+            .control_state_sha256(altered_signature)
+            .unwrap(),
+        ..current
+    };
+    assert!(
+        second_rotation
+            .verify_and_advance(&second, second_signature, &wrong_chain)
+            .is_err()
+    );
+    let mut revoked_issuer = second.clone();
+    revoked_issuer.issuer_device_id = parent.device_id;
+    let forged = revoked_issuer.sign(&parent, &parent_keys).unwrap();
+    assert!(
+        second_rotation
+            .verify_and_advance(&revoked_issuer, forged, &advanced.state())
+            .is_err()
+    );
+    // Independent Python hashlib/struct/UUID vector over the original fixed statement.
+    let (vector, _, _) = fixture();
+    let signature = context_relay_protocol::Ed25519SignatureBytes(hex_bytes(
+        "95e069a5ba7a49aa1fb1fdf06f7af9067dfa180dd9947c36ca24702101a13e45677c08f38fceb20c854fd8156c3509eca4fe1d3b178c5ca4ef22281f9aed8b0b",
+    ));
+    assert_eq!(
+        vector.control_state_sha256(signature).unwrap(),
+        Sha256Digest(hex_bytes(
+            "16011f91fb578aa91814bbe5af72d4495d4c2067ded3f9b25a8f3bb25f6f4aea"
+        ))
+    );
 }

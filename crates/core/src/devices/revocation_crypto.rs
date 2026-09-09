@@ -40,6 +40,39 @@ pub struct RevocationControlState<'a> {
     pub recovery_wrapping_public_key: X25519PublicKeyBytes,
 }
 
+/// Authenticated public control state after one revocation. This verifies neither
+/// hosted acceptance nor envelope decryptability, and does not activate any keys.
+/// Only `verify_and_advance` constructs it, from caller-authenticated prior state.
+pub struct VerifiedRevocationControl {
+    statement: DeviceRevocationStatementV1,
+    state_sha256: Sha256Digest,
+    active_devices: BTreeMap<DeviceId, DeviceCertificateV1>,
+    recovery_root_id: RecoveryRootId,
+    recovery_wrapping_public_key: X25519PublicKeyBytes,
+}
+
+impl VerifiedRevocationControl {
+    pub fn state(&self) -> RevocationControlState<'_> {
+        RevocationControlState {
+            scope: SyncScope {
+                account_id: self.statement.account_id,
+                workspace_id: self.statement.workspace_id,
+            },
+            control_epoch: self.statement.control_epoch + 1,
+            key_epoch: self.statement.key_epoch + 1,
+            state_sha256: self.state_sha256,
+            active_devices: &self.active_devices,
+            recovery_root_id: self.recovery_root_id,
+            recovery_wrapping_public_key: self.recovery_wrapping_public_key,
+        }
+    }
+
+    /// Signed cutoff evidence; operation-chain/cutoff admission is still required.
+    pub const fn statement(&self) -> &DeviceRevocationStatementV1 {
+        &self.statement
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceRotationEnvelopeV1 {
     pub certificate: DeviceCertificateV1,
@@ -63,6 +96,29 @@ pub struct RevocationTransitionV1 {
 }
 
 impl RevocationTransitionV1 {
+    /// Verify against the authenticated previous roster, then derive the next
+    /// state. Never authenticate history against the final roster: an earlier
+    /// issuer can legitimately be revoked by a later transition.
+    pub fn verify_and_advance(
+        &self,
+        statement: &DeviceRevocationStatementV1,
+        signature: Ed25519SignatureBytes,
+        current: &RevocationControlState<'_>,
+    ) -> Result<VerifiedRevocationControl, CryptoError> {
+        self.verify(statement, signature, current)?;
+        Ok(VerifiedRevocationControl {
+            statement: statement.clone(),
+            state_sha256: statement.control_state_sha256(signature)?,
+            active_devices: self
+                .devices
+                .iter()
+                .map(|entry| (entry.certificate.device_id, entry.certificate.clone()))
+                .collect(),
+            recovery_root_id: self.recovery_root_id,
+            recovery_wrapping_public_key: self.recovery_wrapping_public_key,
+        })
+    }
+
     /// Generate fresh workspace/epoch keys and sign their encrypted distribution.
     /// Replaces the input statement's transition digest. Persist these exact
     /// artifacts for retries; do not regenerate them for the same operation ID.
@@ -408,6 +464,19 @@ pub struct DeviceRevocationStatementV1 {
 }
 
 impl DeviceRevocationStatementV1 {
+    /// Commitment to the entire signed control entry, including its cutoff and
+    /// transition digest. Computing this hash alone proves no authorization.
+    pub fn control_state_sha256(
+        &self,
+        signature: Ed25519SignatureBytes,
+    ) -> Result<Sha256Digest, CryptoError> {
+        let mut hash = Sha256::new();
+        hash.update(b"context-relay/revocation-control-state/v1\0");
+        hash.update(self.signing_preimage()?);
+        hash.update(signature.0);
+        Ok(Sha256Digest(hash.finalize().into()))
+    }
+
     /// Decode the exact signing preimage; signature/current-authority verification
     /// is a separate required step. IDs retain the protocol's UUIDv7 validation.
     pub fn from_signing_preimage(bytes: &[u8]) -> Result<Self, CryptoError> {

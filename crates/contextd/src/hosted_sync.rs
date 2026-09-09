@@ -1043,7 +1043,9 @@ pub(crate) async fn verify_checkpoint_worker(
             &worker_gate,
         )
     });
-    let result = tokio::time::timeout(Duration::from_secs(10), cycle(&client, authority)).await;
+    // Functional completion, including SQLCipher work under full-suite contention.
+    // Responsiveness has separate one-second checks in the stalled-HTTP test.
+    let result = tokio::time::timeout(Duration::from_secs(60), cycle(&client, authority)).await;
     // Always close the actor before asserting: failed validation must release the vault too.
     *gate.lock().unwrap() = false;
     drop(sender);
