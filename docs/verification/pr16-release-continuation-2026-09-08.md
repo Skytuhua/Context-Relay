@@ -1,5 +1,23 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Atomic configured MCP proposal writes — 2026-09-09
+
+Configured proposal creation now signs an UpsertMemoryCandidate through the
+existing atomic record/operation/outbox/request-receipt transaction. Its scope
+comes from the proposed memory. It does not materialize an accepted memory;
+unconfigured local creation and original response replay retain their behavior.
+
+The regression failed before integration because proposal creation bypassed the
+outbox. It now verifies rollback on an injected outbox failure, a single candidate
+operation without the plaintext canary, absence of accepted memory, exact bytes
+and response after reopening, and rejection of a changed request. All 19 service
+tests, scoped Clippy with warnings denied and the normal daemon library check
+pass. Independent review found no actionable issues.
+
+Approval, native-import proposals, legacy sync reconciliation and production
+daemon configuration remain unfinished. Signed approval must preserve its
+two-record atomic update and use its own durable operation-kind binding.
+
 ## Separate fresh proposal and memory identities — 2026-09-09
 
 Fresh MCP proposals derive a distinct proposed-memory ID using a versioned hash

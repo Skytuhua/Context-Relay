@@ -119,6 +119,13 @@ impl<'a> OfflineWorkspace<'a> {
                 serde_json::to_vec(memory),
             ),
             RecordMutationV1::UpsertTask(task) => (Some(task.project_id), serde_json::to_vec(task)),
+            RecordMutationV1::UpsertMemoryCandidate(candidate) => (
+                match candidate.proposed_memory.scope {
+                    ScopeRef::Global => None,
+                    ScopeRef::Project { project_id } => Some(project_id),
+                },
+                serde_json::to_vec(candidate),
+            ),
             _ => return Err(internal()),
         };
         let response = response.map_err(|_| internal())?;
@@ -496,10 +503,21 @@ impl<'a> OfflineWorkspace<'a> {
     ) -> Result<MemoryCandidate, ClientError> {
         let prepared = self.prepare_memory_proposal(&input, &scope, harness)?;
         if prepared.should_write {
-            vault(
-                self.vault
-                    .put_candidate_with_binding(&prepared.value, &prepared.binding),
-            )?;
+            if self.sync_identity.is_some() {
+                self.persist_signed_mutation(
+                    &context_relay_protocol::RecordMutationV1::UpsertMemoryCandidate(
+                        prepared.value.clone(),
+                    ),
+                    &prepared.binding,
+                    None,
+                    prepared.value.proposed_memory.updated_hlc,
+                )?;
+            } else {
+                vault(
+                    self.vault
+                        .put_candidate_with_binding(&prepared.value, &prepared.binding),
+                )?;
+            }
         }
         Ok(prepared.value)
     }

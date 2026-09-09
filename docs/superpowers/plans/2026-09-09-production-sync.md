@@ -7,8 +7,8 @@ and sync Edge Function are deployed; native daemon integration remains open.
 Current source: contextd routes SyncRetry to unavailable and status starts offline.
 SyncEngine and SupabaseTransport implement the replica protocol. The native
 transport now supports original-session guards and refreshed bearer tokens.
-OfflineWorkspace can sign memory create/update/archive and task
-upsert/transition/completion with an explicitly configured identity, including
+OfflineWorkspace can sign memory create/update/archive, MCP proposal creation,
+and task upsert/transition/completion with an explicitly configured identity, including
 native-hook task evidence. Original request receipts join the existing atomic
 Vault record/operation/outbox transaction. The daemon does not yet configure this path.
 Other record kinds, trust material and complete mutation routing remain required
@@ -48,3 +48,5 @@ candidate synchronization still needs explicit reconciliation. Preserve that
 ownership check. CandidateReviewParams already includes an operation ID, but
 the service does not bind or use it yet. Acceptance updates candidate and memory
 in one transaction; retain that atomic boundary when signing both mutations.
+The current local-operation kind constraint also needs a forward-compatible
+approval binding. Do not reuse a task or memory mutation kind for that receipt.

@@ -25,6 +25,98 @@ use support::{
 const CREDENTIAL: &str = "offline-service-tests";
 
 #[test]
+fn configured_proposal_sync_rolls_back_and_replays_without_materializing_memory() {
+    use context_relay_core::{
+        crypto::{ContentKey, DeviceKeys},
+        sync::SyncIdentity,
+    };
+    let fixture = Fixture::new("configured-proposal-sync");
+    let database_key = [0x71; 32];
+    fixture.keys.insert(CREDENTIAL, database_key);
+    let keys = DeviceKeys::generate().unwrap();
+    let content = ContentKey::from_bytes([0x72; 32]);
+    let identity = || SyncIdentity {
+        account_id: ID_6.parse().unwrap(),
+        workspace_id: ID_8.parse().unwrap(),
+        device_id: ID_9.parse().unwrap(),
+        control_epoch: 1,
+        key_epoch: 1,
+        device_keys: &keys,
+        content_key: &content,
+    };
+    let input = ProposeMemoryInput {
+        operation_id: ID_1.parse().unwrap(),
+        kind: MemoryKind::Fact,
+        title: "Pending".into(),
+        markdown: "PROPOSAL_SYNC_CANARY".into(),
+        tags: vec![],
+        evidence_summary: "Observed".into(),
+        scope: McpScopeSelector::Global,
+    };
+    let mut vault = fixture.vault();
+    let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
+        .with_sync_identity(identity())
+        .unwrap();
+    let raw = open_keyed(fixture.path.path(), &database_key);
+    raw.execute_batch("CREATE TRIGGER fail_proposal_outbox BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+    assert!(
+        service
+            .propose_memory(input.clone(), ScopeRef::Global, HarnessId::Codex)
+            .is_err()
+    );
+    assert!(service.candidates(None).unwrap().is_empty());
+    raw.execute_batch("DROP TRIGGER fail_proposal_outbox;")
+        .unwrap();
+    drop(raw);
+    let pending = service
+        .propose_memory(input.clone(), ScopeRef::Global, HarnessId::Codex)
+        .unwrap();
+    assert!(
+        service
+            .memory(pending.proposed_memory.id)
+            .unwrap()
+            .is_none()
+    );
+    let rows = vault.due_outbox(u64::MAX, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    let bytes = rows[0].canonical_bytes.clone();
+    let operation = context_relay_protocol::decode_sync_operation_v1(&bytes).unwrap();
+    assert_eq!(
+        operation.record_kind,
+        context_relay_protocol::RecordKind::MemoryCandidate
+    );
+    assert_eq!(operation.record_id.as_bytes(), pending.id.as_bytes());
+    assert!(
+        !bytes
+            .windows(input.markdown.len())
+            .any(|part| part == input.markdown.as_bytes())
+    );
+    drop(vault);
+    let mut vault = fixture.vault();
+    let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
+        .with_sync_identity(identity())
+        .unwrap();
+    assert_eq!(
+        service
+            .propose_memory(input.clone(), ScopeRef::Global, HarnessId::Codex)
+            .unwrap(),
+        pending
+    );
+    let mut changed = input;
+    changed.markdown = "Changed request".into();
+    assert_eq!(
+        service
+            .propose_memory(changed, ScopeRef::Global, HarnessId::Codex)
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    let rows = vault.due_outbox(u64::MAX, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].canonical_bytes, bytes);
+}
+
+#[test]
 fn legacy_proposal_identity_replays_and_accepts_without_rewriting_saved_ids() {
     let fixture = Fixture::new("legacy-proposal-identity");
     let database_key = [0x61; 32];
