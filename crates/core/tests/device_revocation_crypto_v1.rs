@@ -43,6 +43,16 @@ fn revocation_binds_scope_cutoff_epochs_and_rotation_to_installed_keys() {
     statement.verify(&certificate, signature).unwrap();
     // Every signed byte, including domain and field boundaries, matters.
     let preimage = statement.signing_preimage().unwrap();
+    assert_eq!(
+        DeviceRevocationStatementV1::from_signing_preimage(&preimage).unwrap(),
+        statement
+    );
+    for end in 0..preimage.len() {
+        assert!(DeviceRevocationStatementV1::from_signing_preimage(&preimage[..end]).is_err());
+    }
+    let mut trailing = preimage.clone();
+    trailing.push(0);
+    assert!(DeviceRevocationStatementV1::from_signing_preimage(&trailing).is_err());
     // Independent Node crypto vector: Ed25519 seed [1; 32], explicit Buffer
     // concatenation with BE integer fields and raw UUIDs (no Rust encoder).
     use sha2::{Digest, Sha256};
@@ -177,6 +187,50 @@ fn rotation_requires_exact_current_roster_epochs_recovery_and_signed_bytes() {
     statement.transition_sha256 = transition.digest().unwrap();
     let signature = statement.sign(&issuer, &keys).unwrap();
     transition.verify(&statement, signature, &state).unwrap();
+    let wire = transition.canonical_bytes().unwrap();
+    let decoded = RevocationTransitionV1::from_canonical_bytes(&wire).unwrap();
+    assert_eq!(decoded, transition);
+    decoded.verify(&statement, signature, &state).unwrap();
+    for end in 0..wire.len() {
+        assert!(RevocationTransitionV1::from_canonical_bytes(&wire[..end]).is_err());
+    }
+    let mut trailing = wire.clone();
+    trailing.push(0);
+    assert!(RevocationTransitionV1::from_canonical_bytes(&trailing).is_err());
+    let count_offset = b"context-relay/device-revocation-transition/v1\0".len() + 32 + 8 + 32;
+    for offset in [count_offset, count_offset + 4] {
+        let mut hostile = wire.clone();
+        hostile[offset..offset + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(RevocationTransitionV1::from_canonical_bytes(&hostile).is_err());
+    }
+    // The nested CBOR decoder may accept a nonminimal map length; the outer
+    // boundary must reject it instead of silently changing the signed digest.
+    let certificate_offset = count_offset + 8;
+    let certificate_len = u32::from_be_bytes(
+        wire[count_offset + 4..certificate_offset]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(wire[certificate_offset], 0xa9);
+    let mut noncanonical = wire.clone();
+    noncanonical[certificate_offset] = 0xb8;
+    noncanonical.insert(certificate_offset + 1, 9);
+    noncanonical[count_offset + 4..certificate_offset]
+        .copy_from_slice(&(certificate_len + 1).to_be_bytes());
+    assert!(RevocationTransitionV1::from_canonical_bytes(&noncanonical).is_err());
+    let mut hostile = wire.clone();
+    let ciphertext_len_offset = certificate_offset + certificate_len as usize + 32 + 24;
+    hostile[ciphertext_len_offset..ciphertext_len_offset + 4]
+        .copy_from_slice(&u32::MAX.to_be_bytes());
+    assert!(RevocationTransitionV1::from_canonical_bytes(&hostile).is_err());
+    for index in 0..wire.len() {
+        let mut mutated = wire.clone();
+        mutated[index] ^= 0xff;
+        if let Ok(parsed) = RevocationTransitionV1::from_canonical_bytes(&mutated) {
+            assert_eq!(parsed.canonical_bytes().unwrap(), mutated);
+            assert!(parsed.verify(&statement, signature, &state).is_err());
+        }
+    }
     let resign = |changed: &RevocationTransitionV1| {
         let mut s = statement.clone();
         s.transition_sha256 = changed.digest().unwrap();

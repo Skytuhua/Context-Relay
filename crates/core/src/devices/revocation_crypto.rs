@@ -2,20 +2,24 @@ use std::collections::BTreeMap;
 
 use context_relay_protocol::{
     AccountId, DeviceId, Ed25519SignatureBytes, OperationId, RecoveryRootId, Sha256Digest,
-    WorkspaceId, X25519PublicKeyBytes,
+    WorkspaceId, X25519PublicKeyBytes, XChaChaNonce,
 };
-use minicbor::Encoder;
+use minicbor::{Decoder, Encoder};
 use sha2::{Digest, Sha256};
 
 use crate::crypto::{CryptoError, DeviceCertificateV1, DeviceKeys, verify_signature};
 use crate::{
     crypto::{WrappedKeyEnvelope, validate_x25519_public_key},
-    devices::crypto::encode_certificate_v1,
+    devices::crypto::{decode_certificate_v1, encode_certificate_v1},
     sync::SyncScope,
 };
 
 const MAX_ROTATION_DEVICES: usize = 4096;
 const MAX_ROTATION_CIPHERTEXT_BYTES: usize = 1024;
+const MAX_ROTATION_CERTIFICATE_BYTES: usize = 512;
+const MAX_ROTATION_BYTES: usize = 8 * 1024 * 1024;
+const ROTATION_DOMAIN: &[u8] = b"context-relay/device-revocation-transition/v1\0";
+const STATEMENT_DOMAIN: &[u8] = b"context-relay/device-revocation/v1\0";
 
 /// Trusted inputs from the authenticated control chain, never from the submitted
 /// transition. The caller must recheck this state atomically when committing.
@@ -52,6 +56,55 @@ pub struct RevocationTransitionV1 {
 }
 
 impl RevocationTransitionV1 {
+    /// Parses bounded canonical wire bytes without authenticating the transition.
+    /// Call verify against independently authenticated current state before use.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let invalid = CryptoError::InvalidProtocolValue;
+        if bytes.len() > MAX_ROTATION_BYTES {
+            return Err(invalid);
+        }
+        let mut input = bytes.strip_prefix(ROTATION_DOMAIN).ok_or(invalid)?;
+        let previous_state_sha256 = Sha256Digest(read_fixed(&mut input)?);
+        let control_epoch = u32::from_be_bytes(read_fixed(&mut input)?);
+        let key_epoch = u32::from_be_bytes(read_fixed(&mut input)?);
+        let key_material_sha256 = Sha256Digest(read_fixed(&mut input)?);
+        let count = u32::from_be_bytes(read_fixed(&mut input)?) as usize;
+        if count > MAX_ROTATION_DEVICES {
+            return Err(invalid);
+        }
+        let mut devices = Vec::new();
+        for _ in 0..count {
+            let certificate_bytes = read_sized(&mut input, MAX_ROTATION_CERTIFICATE_BYTES)?;
+            let mut decoder = Decoder::new(certificate_bytes);
+            let certificate = decode_certificate_v1(&mut decoder)?;
+            if decoder.position() != certificate_bytes.len() {
+                return Err(invalid);
+            }
+            devices.push(DeviceRotationEnvelopeV1 {
+                certificate,
+                envelope: read_rotation_envelope(&mut input)?,
+            });
+        }
+        let recovery_root_id = RecoveryRootId::new(uuid::Uuid::from_bytes(read_fixed(&mut input)?))
+            .map_err(|_| invalid)?;
+        let recovery_wrapping_public_key = X25519PublicKeyBytes(read_fixed(&mut input)?);
+        let recovery_envelope = read_rotation_envelope(&mut input)?;
+        let transition = Self {
+            previous_state_sha256,
+            control_epoch,
+            key_epoch,
+            key_material_sha256,
+            devices,
+            recovery_root_id,
+            recovery_wrapping_public_key,
+            recovery_envelope,
+        };
+        if !input.is_empty() || transition.canonical_bytes()? != bytes {
+            return Err(invalid);
+        }
+        Ok(transition)
+    }
+
     /// Domain, previous-state hash, next epochs, plaintext commitment, recipient
     /// count, each length-prefixed canonical certificate and envelope, recovery
     /// root ID/public key/envelope. Integers and lengths are u32 big-endian;
@@ -70,7 +123,7 @@ impl RevocationTransitionV1 {
             return Err(CryptoError::InvalidProtocolValue);
         }
         validate_x25519_public_key(self.recovery_wrapping_public_key)?;
-        let mut bytes = b"context-relay/device-revocation-transition/v1\0".to_vec();
+        let mut bytes = ROTATION_DOMAIN.to_vec();
         bytes.extend_from_slice(&self.previous_state_sha256.0);
         bytes.extend_from_slice(&self.control_epoch.to_be_bytes());
         bytes.extend_from_slice(&self.key_epoch.to_be_bytes());
@@ -187,6 +240,38 @@ pub struct DeviceRevocationStatementV1 {
 }
 
 impl DeviceRevocationStatementV1 {
+    /// Decode the exact signing preimage; signature/current-authority verification
+    /// is a separate required step. IDs retain the protocol's UUIDv7 validation.
+    pub fn from_signing_preimage(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let invalid = CryptoError::InvalidProtocolValue;
+        if bytes.len() != STATEMENT_DOMAIN.len() + 2 + 5 * 16 + 2 * 4 + 8 + 2 * 32 {
+            return Err(invalid);
+        }
+        let mut input = bytes.strip_prefix(STATEMENT_DOMAIN).ok_or(invalid)?;
+        let statement = Self {
+            schema_version: u16::from_be_bytes(read_fixed(&mut input)?),
+            revocation_id: OperationId::new(uuid::Uuid::from_bytes(read_fixed(&mut input)?))
+                .map_err(|_| invalid)?,
+            account_id: AccountId::new(uuid::Uuid::from_bytes(read_fixed(&mut input)?))
+                .map_err(|_| invalid)?,
+            workspace_id: WorkspaceId::new(uuid::Uuid::from_bytes(read_fixed(&mut input)?))
+                .map_err(|_| invalid)?,
+            issuer_device_id: DeviceId::new(uuid::Uuid::from_bytes(read_fixed(&mut input)?))
+                .map_err(|_| invalid)?,
+            target_device_id: DeviceId::new(uuid::Uuid::from_bytes(read_fixed(&mut input)?))
+                .map_err(|_| invalid)?,
+            control_epoch: u32::from_be_bytes(read_fixed(&mut input)?),
+            key_epoch: u32::from_be_bytes(read_fixed(&mut input)?),
+            cutoff_sequence: u64::from_be_bytes(read_fixed(&mut input)?),
+            cutoff_hash: Sha256Digest(read_fixed(&mut input)?),
+            transition_sha256: Sha256Digest(read_fixed(&mut input)?),
+        };
+        if !input.is_empty() || statement.signing_preimage()? != bytes {
+            return Err(invalid);
+        }
+        Ok(statement)
+    }
+
     /// Domain, schema, five UUIDs, two epochs, sequence and two digests, in field
     /// order. UUIDs/digests are raw bytes; integers are fixed-width big-endian.
     pub fn signing_preimage(&self) -> Result<Vec<u8>, CryptoError> {
@@ -199,7 +284,7 @@ impl DeviceRevocationStatementV1 {
         {
             return Err(CryptoError::InvalidProtocolValue);
         }
-        let mut bytes = b"context-relay/device-revocation/v1\0".to_vec();
+        let mut bytes = STATEMENT_DOMAIN.to_vec();
         bytes.extend_from_slice(&self.schema_version.to_be_bytes());
         bytes.extend_from_slice(self.revocation_id.as_bytes());
         bytes.extend_from_slice(self.account_id.as_bytes());
@@ -251,4 +336,40 @@ impl DeviceRevocationStatementV1 {
         self.check_issuer(certificate)?;
         verify_signature(certificate.signing_public_key, &preimage, signature)
     }
+}
+
+fn read_fixed<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], CryptoError> {
+    let (bytes, rest) = input
+        .split_at_checked(N)
+        .ok_or(CryptoError::InvalidProtocolValue)?;
+    *input = rest;
+    bytes
+        .try_into()
+        .map_err(|_| CryptoError::InvalidProtocolValue)
+}
+
+fn read_sized<'a>(input: &mut &'a [u8], maximum: usize) -> Result<&'a [u8], CryptoError> {
+    let size = u32::from_be_bytes(read_fixed(input)?) as usize;
+    if size > maximum {
+        return Err(CryptoError::InvalidProtocolValue);
+    }
+    let (bytes, rest) = input
+        .split_at_checked(size)
+        .ok_or(CryptoError::InvalidProtocolValue)?;
+    *input = rest;
+    Ok(bytes)
+}
+
+fn read_rotation_envelope(input: &mut &[u8]) -> Result<WrappedKeyEnvelope, CryptoError> {
+    let ephemeral_public_key = X25519PublicKeyBytes(read_fixed(input)?);
+    let nonce = XChaChaNonce(read_fixed(input)?);
+    let ciphertext = read_sized(input, MAX_ROTATION_CIPHERTEXT_BYTES)?;
+    if ciphertext.len() < 16 {
+        return Err(CryptoError::InvalidProtocolValue);
+    }
+    Ok(WrappedKeyEnvelope {
+        ephemeral_public_key,
+        nonce,
+        ciphertext: ciphertext.to_vec(),
+    })
 }

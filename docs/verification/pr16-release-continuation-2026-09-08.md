@@ -2503,3 +2503,29 @@ AAD/plaintext-commitment checks, historical-key persistence, cutoff/head CAS, ho
 atomic mutation, control propagation and installed acceptance remain required.
 Opaque ciphertext cannot prove that recipients received equivalent valid keys;
 recipients must verify their decrypted canonical bundle against the signed digest.
+
+## Bounded revocation wire decoding (2026-09-09)
+
+Added strict decoders for the signed statement preimage and canonical rotation
+transition. Both preserve typed UUIDv7 validation and require exact re-encoding;
+nonminimal nested CBOR certificates and trailing data cannot silently change the
+bytes covered by the signature. The transition decoder bounds total input to 8 MiB,
+recipient count to 4096, certificate slices to 512 bytes and encrypted payloads to
+1024 bytes before allocation. It reuses the existing certificate decoder and uses
+checked borrowed slices for fixed-width fields and length-prefixed input.
+
+Regression coverage includes every truncated prefix, oversized counts/certificate
+and ciphertext lengths, a nonminimal nested CBOR map length, trailing bytes and
+single-byte mutations across the complete wire payload. Any accepted mutation must
+round-trip byte-exactly and fail the original signed-state verification. The first
+statement round-trip caught an incorrect fixed-length guard; the corrected layout
+matches the independent 197-byte vector. Both focused regressions pass (13.39 seconds)
+and core library/focused-test Clippy with warnings denied passes (14.60 seconds).
+Bounded review found no actionable P1/P2. Logs:
+`.codex/pr16-rotation-decode-red.log`, `.codex/pr16-rotation-decode-test.log`,
+`.codex/pr16-rotation-decode-clippy.log`.
+
+Decoding does not authenticate a sender. Callers must still verify the decoded
+statement/transition against independently authenticated current control state.
+Secure envelope construction/decryption, durable historical-key/cutoff handling,
+hosted atomic revocation and installed acceptance remain unfinished.
