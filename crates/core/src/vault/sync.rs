@@ -200,7 +200,109 @@ enum CacheChange<'a> {
     None,
 }
 
+/// Verified, cycle-local device authority and decrypted active content key.
+pub struct VaultSyncMaterial {
+    scope: SyncScope,
+    control_epoch: u32,
+    key_epoch: u32,
+    content_key: crate::crypto::ContentKey,
+    certificates: std::collections::BTreeMap<DeviceId, crate::crypto::DeviceCertificateV1>,
+}
+
+impl TrustedSyncMaterial for VaultSyncMaterial {
+    fn trusted_device(
+        &self,
+        account: AccountId,
+        workspace: WorkspaceId,
+        device: DeviceId,
+    ) -> Result<crate::sync::TrustedDevice, crate::sync::SyncError> {
+        if account != self.scope.account_id || workspace != self.scope.workspace_id {
+            return Err(crate::sync::SyncError::InvalidScope);
+        }
+        let certificate = self
+            .certificates
+            .get(&device)
+            .ok_or(crate::sync::SyncError::InvalidIdentity)?
+            .clone();
+        Ok(crate::sync::TrustedDevice {
+            certificate,
+            active_control_epoch: self.control_epoch,
+            active_key_epoch: self.key_epoch,
+        })
+    }
+
+    fn content_key(
+        &self,
+        workspace: WorkspaceId,
+        key_epoch: u32,
+    ) -> Result<&crate::crypto::ContentKey, crate::sync::SyncError> {
+        if workspace != self.scope.workspace_id || key_epoch != self.key_epoch {
+            return Err(crate::sync::SyncError::InvalidScope);
+        }
+        Ok(&self.content_key)
+    }
+}
+
 impl Vault {
+    /// Rebuild for each sync cycle; this snapshot never establishes trust from raw rows alone.
+    pub fn trusted_sync_material(
+        &self,
+        device_keys: &crate::crypto::DeviceKeys,
+    ) -> Result<VaultSyncMaterial, VaultError> {
+        use crate::crypto::CertificateIssuerV1;
+        let (material, anchors) = self.trusted_workspace_material_and_certificates(device_keys)?;
+        let scope = material.scope();
+        let stored = self.devices(scope)?;
+        let mut certificates = std::collections::BTreeMap::new();
+        for anchor in &anchors {
+            if !stored.iter().any(|row| {
+                row.state == super::DeviceCertificateState::Active && &row.certificate == anchor
+            }) {
+                return Err(VaultError::Validation(
+                    "sync trust anchor is not active".into(),
+                ));
+            }
+            certificates.insert(anchor.device_id, anchor.clone());
+        }
+        // Each pass must add a certificate, so orphaned or cyclic issuers terminate.
+        loop {
+            let before = certificates.len();
+            for row in &stored {
+                let certificate = &row.certificate;
+                if row.state != super::DeviceCertificateState::Active
+                    || certificate.control_epoch != material.control_epoch()
+                    || certificates.contains_key(&certificate.device_id)
+                {
+                    continue;
+                }
+                let issuer_trusted = match &certificate.issuer {
+                    CertificateIssuerV1::RecoveryRoot(key) => anchors
+                        .iter()
+                        .any(|anchor| anchor.issuer == CertificateIssuerV1::RecoveryRoot(*key)),
+                    CertificateIssuerV1::Device {
+                        device_id,
+                        signing_public_key,
+                    } => certificates
+                        .get(device_id)
+                        .is_some_and(|issuer| issuer.signing_public_key == *signing_public_key),
+                };
+                if issuer_trusted && certificate.verify_issued_by(&certificate.issuer).is_ok() {
+                    certificates.insert(certificate.device_id, certificate.clone());
+                }
+            }
+            if certificates.len() == before {
+                break;
+            }
+        }
+        Ok(VaultSyncMaterial {
+            scope,
+            control_epoch: material.control_epoch(),
+            key_epoch: material.key_epoch(),
+            content_key: crate::crypto::ContentKey::from_bytes(*material.active_epoch_key()),
+            certificates,
+        })
+    }
+
     pub fn quarantine_sync_receipt(
         &mut self,
         write: &SyncQuarantineWrite<'_>,

@@ -35,6 +35,151 @@ const DEVICE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073985";
 const CERTIFICATE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073986";
 const OTHER_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073987";
 
+#[test]
+fn sync_material_uses_verified_enrollment_and_rejects_untrusted_devices() {
+    use context_relay_core::{
+        sync::{SyncError, TrustedSyncMaterial},
+        vault::DeviceDisplayMetadata,
+    };
+    let fixture = fixture();
+    let path = TempVault::new("verified-sync-material");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert!(vault.trusted_sync_material(&fixture.device_keys).is_err());
+    vault
+        .prepare_recovery_enrollment(&write(&fixture.artifacts, 1000))
+        .unwrap();
+    assert!(vault.trusted_sync_material(&fixture.device_keys).is_err());
+    vault
+        .activate_recovery_enrollment(
+            &receipt(&fixture.artifacts, 2000),
+            &fixture.device_keys,
+            3000,
+        )
+        .unwrap();
+    let child_keys = DeviceKeys::generate().unwrap();
+    let fields = CertificateFieldsV1 {
+        account_id: id(ACCOUNT_ID),
+        workspace_id: id(WORKSPACE_ID),
+        control_epoch: 1,
+        request_nonce: PairingRequestNonce([0x91; 32]),
+        device_id: id(OTHER_ID),
+        signing_public_key: child_keys.signing_public_key(),
+        wrapping_public_key: child_keys.wrapping_public_key(),
+    };
+    let child =
+        DeviceCertificateV1::issue_by_device(fields.clone(), id(DEVICE_ID), &fixture.device_keys)
+            .unwrap();
+    vault
+        .store_device_certificate(
+            id(OTHER_ID),
+            &child,
+            DeviceCertificateState::Active,
+            &DeviceDisplayMetadata {
+                device_name: "Child".into(),
+                platform: NativePlatform::Windows,
+            },
+            4000,
+        )
+        .unwrap();
+    let untrusted_recovery =
+        RecoveryKeys::derive(&RecoveryPhrase::from_entropy_for_test([0x92; 32]).unwrap()).unwrap();
+    let mut untrusted_fields = fields;
+    untrusted_fields.device_id = id(ENROLLMENT_ID);
+    let untrusted =
+        DeviceCertificateV1::issue_genesis(untrusted_fields, &untrusted_recovery).unwrap();
+    vault
+        .store_device_certificate(
+            id(RECOVERY_ROOT_ID),
+            &untrusted,
+            DeviceCertificateState::Active,
+            &DeviceDisplayMetadata {
+                device_name: "Untrusted root".into(),
+                platform: NativePlatform::Windows,
+            },
+            4001,
+        )
+        .unwrap();
+    let trusted = vault.trusted_sync_material(&fixture.device_keys).unwrap();
+    assert_eq!(
+        trusted.trusted_device(id(ACCOUNT_ID), id(WORKSPACE_ID), id(ENROLLMENT_ID)),
+        Err(SyncError::InvalidIdentity)
+    );
+    assert_eq!(
+        trusted
+            .trusted_device(id(ACCOUNT_ID), id(WORKSPACE_ID), id(OTHER_ID))
+            .unwrap()
+            .certificate,
+        child
+    );
+    assert!(trusted.content_key(id(WORKSPACE_ID), 1).is_ok());
+    assert!(trusted.content_key(id(WORKSPACE_ID), 2).is_err());
+    assert!(trusted.content_key(id(OTHER_ID), 1).is_err());
+    assert!(
+        trusted
+            .trusted_device(id(OTHER_ID), id(WORKSPACE_ID), id(DEVICE_ID))
+            .is_err()
+    );
+    assert!(vault.trusted_sync_material(&child_keys).is_err());
+    use context_relay_core::sync::{
+        AdmissionDecision, OperationBuildRequest, OperationBuilder, SyncIdentity, admit_operation,
+    };
+    let mutation = context_relay_protocol::RecordMutationV1::UpsertMemory(support::memory(
+        support::ID_1,
+        context_relay_protocol::ScopeRef::Global,
+        "Remote note",
+        "Verified child",
+    ));
+    let operation = OperationBuilder::new(SyncIdentity {
+        account_id: id(ACCOUNT_ID),
+        workspace_id: id(WORKSPACE_ID),
+        device_id: id(OTHER_ID),
+        control_epoch: 1,
+        key_epoch: 1,
+        device_keys: &child_keys,
+        content_key: trusted.content_key(id(WORKSPACE_ID), 1).unwrap(),
+    })
+    .build(OperationBuildRequest {
+        operation_id: id(support::ID_2),
+        project_id: None,
+        mutation: &mutation,
+        causal_frontier: vec![],
+        previous: None,
+        blob_refs: vec![],
+        created_hlc: context_relay_protocol::HybridLogicalClock::new(5000, 0, id(OTHER_ID)),
+    })
+    .unwrap();
+    assert!(matches!(
+        admit_operation(&vault, &operation.canonical_bytes, &trusted).unwrap(),
+        AdmissionDecision::Admitted(_)
+    ));
+    drop(trusted);
+    drop(vault);
+    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    raw.execute(
+        "UPDATE device_certificates SET state = 'revoked' WHERE certificate_id = ?1",
+        [OTHER_ID],
+    )
+    .unwrap();
+    drop(raw);
+    let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert!(
+        admit_operation(
+            &vault,
+            &operation.canonical_bytes,
+            &vault.trusted_sync_material(&fixture.device_keys).unwrap()
+        )
+        .is_err()
+    );
+    assert_eq!(
+        vault
+            .trusted_sync_material(&fixture.device_keys)
+            .unwrap()
+            .trusted_device(id(ACCOUNT_ID), id(WORKSPACE_ID), id(OTHER_ID)),
+        Err(SyncError::InvalidIdentity)
+    );
+}
+
 fn id<T: FromStr>(value: &str) -> T
 where
     T::Err: std::fmt::Debug,

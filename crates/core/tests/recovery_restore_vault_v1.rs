@@ -306,6 +306,22 @@ fn exact_provider_proof_activates_both_certificates_and_reopens_material() {
 
     let reopened = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
     let material = reopened.recovered_workspace_material(&device_keys).unwrap();
+    let sync_material = reopened.trusted_sync_material(&device_keys).unwrap();
+    use context_relay_core::sync::TrustedSyncMaterial;
+    assert!(sync_material.content_key(scope().workspace_id, 1).is_ok());
+    for row in reopened.devices(scope()).unwrap() {
+        assert_eq!(
+            sync_material
+                .trusted_device(
+                    scope().account_id,
+                    scope().workspace_id,
+                    row.certificate.device_id
+                )
+                .unwrap()
+                .certificate,
+            row.certificate
+        );
+    }
     assert_eq!(material.scope(), scope());
     assert_eq!(material.control_epoch(), 1);
     assert_eq!(material.key_epoch(), 1);

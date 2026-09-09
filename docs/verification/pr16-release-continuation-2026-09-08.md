@@ -1,5 +1,28 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Verified vault sync authority — 2026-09-09
+
+VaultSyncMaterial now implements the sync engine's TrustedSyncMaterial contract
+using existing verified enrollment, recovery or completed pairing proofs. The
+shared material loader also returns their exact certificate anchors. Anchors
+must match active stored certificates; additional devices require active rows,
+the same workspace/control epoch and valid signatures from trusted issuers.
+Unknown roots, orphaned issuers and revoked devices do not gain authority.
+The decrypted content key is limited to its workspace and active key epoch.
+Snapshots must be rebuilt for each cycle to observe local revocation changes.
+
+All 32 enrollment/recovery/pairing vault tests pass. The added regression covers
+absent/prepared enrollment, active trusted children, an untrusted recovery root,
+wrong keys/scope/epoch and revocation after reopening. Its final focused check
+also admits a valid child-signed operation and rejects that operation after
+revocation. Scoped Clippy with warnings denied and the normal production daemon
+library check pass. Independent review found no actionable P1/P2. Graphify
+update completed after the final test change.
+
+This provides the production trust implementation; daemon transport/cycle
+wiring, certificate refresh and installed two-device acceptance remain open.
+All other full-release requirements remain in force before merge.
+
 ## Atomic configured candidate decisions — 2026-09-09
 
 Configured review of a sync-owned pending candidate now commits its signed

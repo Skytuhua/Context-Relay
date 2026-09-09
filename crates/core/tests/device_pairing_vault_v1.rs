@@ -799,6 +799,28 @@ fn join_confirmation_is_durable_atomic_and_reopens_sealed_material() {
     assert_eq!(trusted.scope(), confirmation_scope());
     assert_eq!(trusted.control_epoch(), 7);
     assert_eq!(trusted.key_epoch(), 11);
+    let sync_material = reopened
+        .trusted_sync_material(&fixture.joiner_keys)
+        .unwrap();
+    use context_relay_core::sync::TrustedSyncMaterial;
+    assert!(
+        sync_material
+            .content_key(confirmation_scope().workspace_id, 11)
+            .is_ok()
+    );
+    for row in reopened.devices(confirmation_scope()).unwrap() {
+        assert_eq!(
+            sync_material
+                .trusted_device(
+                    confirmation_scope().account_id,
+                    confirmation_scope().workspace_id,
+                    row.certificate.device_id
+                )
+                .unwrap()
+                .certificate,
+            row.certificate
+        );
+    }
     let reopened_material = reopened
         .completed_pairing_approval(pairing_id, &fixture.joiner_keys)
         .unwrap()

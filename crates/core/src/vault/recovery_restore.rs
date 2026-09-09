@@ -537,16 +537,39 @@ impl Vault {
         &self,
         device_keys: &DeviceKeys,
     ) -> Result<WorkspacePairingMaterial, VaultError> {
+        self.trusted_workspace_material_and_certificates(device_keys)
+            .map(|(material, _)| material)
+    }
+
+    pub(super) fn trusted_workspace_material_and_certificates(
+        &self,
+        device_keys: &DeviceKeys,
+    ) -> Result<
+        (
+            WorkspacePairingMaterial,
+            Vec<crate::crypto::DeviceCertificateV1>,
+        ),
+        VaultError,
+    > {
         let enrollment = self.recovery_enrollment()?;
         let restore = self.recovery_restore()?;
         match (enrollment, restore) {
             (Some(enrollment), None)
                 if enrollment.state == RecoveryEnrollmentPersistenceState::Active =>
             {
-                self.enrolled_workspace_material(device_keys)
+                Ok((
+                    self.enrolled_workspace_material(device_keys)?,
+                    vec![enrollment.record.genesis_certificate],
+                ))
             }
             (None, Some(restore)) if restore.state == RecoveryRestorePersistenceState::Active => {
-                self.recovered_workspace_material(device_keys)
+                Ok((
+                    self.recovered_workspace_material(device_keys)?,
+                    vec![
+                        restore.record.genesis_certificate,
+                        restore.claim.certificate,
+                    ],
+                ))
             }
             (None, None) => {
                 let mut statement = self.connection.prepare(
@@ -563,7 +586,7 @@ impl Vault {
                     .completed_pairing_approval(parse_id(pairing_id)?, device_keys)?
                     .ok_or_else(validation)?;
                 let material = confirmed.key_bundle();
-                WorkspacePairingMaterial::new(
+                let workspace = WorkspacePairingMaterial::new(
                     SyncScope {
                         account_id: material.account_id(),
                         workspace_id: material.workspace_id(),
@@ -573,7 +596,15 @@ impl Vault {
                     *material.workspace_root_key(),
                     *material.active_epoch_key(),
                 )
-                .map_err(|_| validation())
+                .map_err(|_| validation())?;
+                let approval = confirmed.approved_payload();
+                Ok((
+                    workspace,
+                    vec![
+                        approval.issuer_certificate.clone(),
+                        approval.grant.certificate.clone(),
+                    ],
+                ))
             }
             _ => Err(validation()),
         }
