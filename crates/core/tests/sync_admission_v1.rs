@@ -488,3 +488,52 @@ where
 {
     value.parse().unwrap()
 }
+
+#[test]
+fn current_roster_authorizes_older_certificate_without_accepting_stale_operations() {
+    let path = TempVault::new("retained-certificate-admission");
+    let store = MemoryKeyStore::default();
+    let vault = Vault::open(path.path(), CREDENTIAL, &store).unwrap();
+    let mut device = device(ID_3, 31);
+    device.certificate.control_epoch = CONTROL_EPOCH - 1;
+    let key = ContentKey::from_bytes([41; 32]);
+    let mutation = secret(ID_6, "retained device");
+    let built = build(&device, &key, ID_7, &mutation, vec![], None);
+    let mut trust = Trust::new(&[&device], key);
+    assert!(matches!(
+        admit_operation(&vault, &built.canonical_bytes, &trust).unwrap(),
+        AdmissionDecision::Admitted(_)
+    ));
+    for epoch in [0, CONTROL_EPOCH + 1] {
+        trust
+            .devices
+            .get_mut(&device.certificate.device_id)
+            .unwrap()
+            .control_epoch = epoch;
+        trust.key_requests.set(0);
+        assert_eq!(
+            admit_operation(&vault, &built.canonical_bytes, &trust),
+            Err(SyncError::InvalidIdentity)
+        );
+        assert_eq!(trust.key_requests.get(), 0);
+    }
+    trust
+        .devices
+        .insert(device.certificate.device_id, device.certificate.clone());
+    for epoch in [CONTROL_EPOCH - 1, CONTROL_EPOCH + 1] {
+        let mut changed = built.operation.clone();
+        changed.control_epoch = epoch;
+        reseal_with_plaintext(&mut changed, &device.keys, &trust.key, &mutation);
+        trust.key_requests.set(0);
+        assert_eq!(
+            admit_operation(&vault, &encode_sync_operation_v1(&changed).unwrap(), &trust),
+            Err(SyncError::InvalidIdentity)
+        );
+        assert_eq!(trust.key_requests.get(), 0);
+    }
+    trust.devices.clear();
+    assert_eq!(
+        admit_operation(&vault, &built.canonical_bytes, &trust),
+        Err(SyncError::InvalidIdentity)
+    );
+}

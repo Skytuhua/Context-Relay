@@ -241,6 +241,7 @@ impl<'a> OperationBuilder<'a> {
 
 pub struct TrustedOperationContext<'a> {
     certificate: &'a DeviceCertificateV1,
+    expected_control_epoch: u32,
     expected_key_epoch: u32,
     previous: Option<OperationChainHead>,
     existing_record_scope: Option<ScopeRef>,
@@ -254,10 +255,19 @@ impl<'a> TrustedOperationContext<'a> {
     ) -> Self {
         Self {
             certificate,
+            expected_control_epoch: certificate.control_epoch,
             expected_key_epoch,
             previous,
             existing_record_scope: None,
         }
+    }
+
+    /// The authenticated current roster must authorize this exact certificate.
+    /// An older issuance epoch alone never establishes continuing authority.
+    #[must_use]
+    pub(crate) const fn with_current_control_epoch(mut self, epoch: u32) -> Self {
+        self.expected_control_epoch = epoch;
+        self
     }
 
     /// Supplies caller-admitted existing-record scope for tombstone verification.
@@ -363,7 +373,9 @@ fn validate_trusted_fields(
     if operation.account_id != certificate.account_id
         || operation.workspace_id != certificate.workspace_id
         || operation.device_id != certificate.device_id
-        || operation.control_epoch != certificate.control_epoch
+        || certificate.control_epoch == 0
+        || certificate.control_epoch > trusted.expected_control_epoch
+        || operation.control_epoch != trusted.expected_control_epoch
         || operation.key_epoch != trusted.expected_key_epoch
         || operation.created_hlc.node != operation.device_id
     {

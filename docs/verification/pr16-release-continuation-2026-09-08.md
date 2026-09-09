@@ -2589,3 +2589,26 @@ Clippy with test-support and -D warnings passed in 1m48s. Reviewer reinspection
 closed the finding. Graph update completed with 18,305 nodes and 51,684 edges.
 Historical epoch/control-chain persistence, hosted atomic mutation, receiving
 admission, daemon integration and full live/installed acceptance remain open.
+
+2026-09-09 retained-certificate admission prerequisite: immutable device
+certificates can precede the current control epoch when the authenticated current
+roster explicitly retains them. The previous operation and checkpoint checks
+incorrectly required issuance/current epoch equality. One shared identity check
+now enforces scope, device, positive issuance epoch no later than current control,
+and exact positive current key epoch. Operation verification receives the
+caller-authenticated control epoch internally and still requires exact operation
+epoch equality; the public legacy context constructor retains certificate-epoch
+behavior. Missing current-roster devices and zero/future certificates remain
+rejected before requesting decryption keys. Vault roster discovery remains strict
+until authenticated control-chain persistence exists; this does not enable
+production rotation or admit historical operations beyond a signed cutoff.
+
+Both new admission/checkpoint regressions failed with InvalidIdentity before the
+fix. All 27 tests in sync_operation_v1, sync_admission_v1 and sync_checkpoint_v1
+passed (19.44s admission, 12.77s checkpoint, 0.28s operation); focused core Clippy
+with test-support and -D warnings passed in 13.15s. Logs are local
+`.codex/pr16-retained-{certificate,checkpoint}-red.log`,
+`.codex/pr16-retained-certificate-test.log` and
+`.codex/pr16-retained-certificate-clippy.log`. Read-only review found no actionable
+P1/P2. Historical epoch/control-chain storage, hosted mutation, cutoff admission
+and full installed acceptance remain required before merge.
