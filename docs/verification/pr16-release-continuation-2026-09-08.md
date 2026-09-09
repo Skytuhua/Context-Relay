@@ -2389,3 +2389,31 @@ checkpoint slice. Evidence:
 `.codex/pr16-checkpoint-stages-final-tests.log`,
 `.codex/pr16-checkpoint-daemon-final-tests.log`, and
 `.codex/pr16-checkpoint-stages-production.log`.
+
+
+### Complete daemon checkpoint cycle and reopen (2026-09-09)
+
+A new simulated-HTTP test drives the real Supabase adapter and daemon cycle through
+signed operation upload, checkpoint publication, exact history/tail confirmation
+and local pin acceptance on the sole vault actor. Reopening checks the canonical
+pin bytes, cleared checkpoint request and empty outbox. A second cycle retains the
+provider checkpoint and verifies that no duplicate checkpoint is published.
+The fixture checks exact account/workspace/version and hash/cursor filters.
+
+Both hosted-sync daemon regressions pass (21.72 seconds), including the existing
+stalled push/pull/checkpoint read/shutdown test. Daemon library/test Clippy with
+warnings denied passes (52.03 seconds). Logs:
+`.codex/pr16-checkpoint-completion-tests.log` and
+`.codex/pr16-checkpoint-completion-clippy.log`.
+
+This slice changes only test code and reuses the existing signed enrollment and
+verified-session fixtures. It does not prove Auth restoration after process
+restart, a live provider, second-device receive/search or installed acceptance.
+Bounded review found no actionable P1/P2. The full release gates remain open.
+
+Fourteen superseded queued/running PR workflows were canceled and confirmed
+completed/cancelled, preserving the then-current e1fd562 workflows. Their old
+commits ranged from dae8a954 to e2dad0e. Current-head CI is not yet qualified.
+
+Graphify update completed (18243 nodes); log:
+`.codex/pr16-checkpoint-completion-graph.log`.

@@ -9306,6 +9306,79 @@ mod tests {
         assert!(vault.sync_checkpoint_schedule(scope).unwrap().requested);
     }
 
+    #[test]
+    #[cfg(any(windows, target_os = "macos"))]
+    fn hosted_sync_publishes_checkpoint_and_recovers_pin_after_restart() {
+        let path = unit_test_support::TempVault::new("sync-checkpoint-completion");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut config = VaultConfig::new(path.path().to_owned(), "test-vault-key", keys);
+        let (mut state, _) = open_workspace(&mut config).unwrap_or_else(|_| panic!("open"));
+        let (identity, scope) = enroll_sync_test_workspace(&mut state);
+        execute_workspace_request(
+            &mut state,
+            LocalRequest::MemoryCreate(context_relay_protocol::MemoryCreateParams {
+                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074302".parse().unwrap(),
+                scope: ScopeRef::Global,
+                kind: context_relay_protocol::MemoryKind::Fact,
+                title: "Checkpoint receipt".into(),
+                body_markdown: "Retained after a complete sync and restart".into(),
+                tags: vec![],
+            }),
+            &ServiceStatus::new(),
+        )
+        .unwrap();
+        state.vault.request_sync_checkpoint(scope).unwrap();
+        let backend = pairing_test_provider::Backend::new(
+            InMemoryPairingProvider::new().unwrap(),
+            Arc::new(PairingTestClock(Arc::new(AtomicU64::new(1000)))),
+            scope,
+        );
+        let fixture = pairing_test_provider::Fixture::new(
+            backend,
+            identity.clone(),
+            "550e8400-e29b-41d4-a716-446655440001",
+            true,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let checkpoint = runtime.block_on(hosted_sync::verify_checkpoint_worker(
+            state,
+            fixture.owner.clone(),
+            None,
+        ));
+        assert!(!checkpoint.checkpoint.causal_frontier.is_empty());
+        let (mut state, _) = open_workspace(&mut config).unwrap_or_else(|_| panic!("reopen"));
+        state.pairing_identity = Some(identity);
+        let pin = state.vault.sync_checkpoint_pin(scope).unwrap().unwrap();
+        assert_eq!(pin.canonical_bytes, checkpoint.bytes);
+        assert!(
+            !state
+                .vault
+                .sync_checkpoint_schedule(scope)
+                .unwrap()
+                .requested
+        );
+        assert!(state.vault.due_outbox(u64::MAX, 10).unwrap().is_empty());
+        let repeated = runtime.block_on(hosted_sync::verify_checkpoint_worker(
+            state,
+            fixture.owner,
+            Some(checkpoint.clone()),
+        ));
+        assert_eq!(repeated, checkpoint);
+        let vault = Vault::open(path.path(), "test-vault-key", config.key_store.as_ref()).unwrap();
+        assert_eq!(
+            vault
+                .sync_checkpoint_pin(scope)
+                .unwrap()
+                .unwrap()
+                .canonical_bytes,
+            checkpoint.bytes
+        );
+        assert!(!vault.sync_checkpoint_schedule(scope).unwrap().requested);
+    }
+
     fn test_config(
         runtime: RuntimeConfig,
         path: PathBuf,

@@ -682,19 +682,7 @@ pub(crate) async fn verify_stalled_worker(
             ))
         }
     }
-    let certificates = state.vault.all_devices().unwrap().iter().map(|row| {
-        use context_relay_core::crypto::CertificateIssuerV1;
-        let cert = &row.certificate;
-        let bytea = |bytes: &[u8]| format!("\\x{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
-        let (kind, device, root, issuer) = match cert.issuer {
-            CertificateIssuerV1::RecoveryRoot(key) => ("recovery_root", None, Some(bytea(&key.0)), key),
-            CertificateIssuerV1::Device { device_id, signing_public_key } => ("device", Some(device_id), None, signing_public_key),
-        };
-        serde_json::json!({"id":row.certificate_id,"account_id":cert.account_id,"workspace_id":cert.workspace_id,
-            "control_epoch":cert.control_epoch,"request_nonce":bytea(&cert.request_nonce.0),"device_id":cert.device_id,
-            "issuer_kind":kind,"issuer_device_id":device,"issuer_recovery_public_key":root,"issuer_signing_public_key":bytea(&issuer.0),
-            "device_signing_public_key":bytea(&cert.signing_public_key.0),"device_wrapping_public_key":bytea(&cert.wrapping_public_key.0),"signature":bytea(&cert.signature.0)})
-    }).collect::<Vec<_>>();
+    let certificates = certificate_rows(&state.vault);
     let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
     let (release, released) = std::sync::mpsc::channel();
     let config = Config {
@@ -767,4 +755,217 @@ pub(crate) async fn verify_stalled_worker(
     drop(sender);
     thread.join().unwrap();
     release.send(()).unwrap();
+}
+
+#[cfg(all(test, any(windows, target_os = "macos")))]
+fn certificate_rows(vault: &context_relay_core::vault::Vault) -> Vec<serde_json::Value> {
+    vault.all_devices().unwrap().iter().map(|row| {
+        use context_relay_core::crypto::CertificateIssuerV1;
+        let cert = &row.certificate;
+        let bytea = |bytes: &[u8]| format!("\\x{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let (kind, device, root, issuer) = match cert.issuer {
+            CertificateIssuerV1::RecoveryRoot(key) => ("recovery_root", None, Some(bytea(&key.0)), key),
+            CertificateIssuerV1::Device { device_id, signing_public_key } => ("device", Some(device_id), None, signing_public_key),
+        };
+        serde_json::json!({"id":row.certificate_id,"account_id":cert.account_id,"workspace_id":cert.workspace_id,
+            "control_epoch":cert.control_epoch,"request_nonce":bytea(&cert.request_nonce.0),"device_id":cert.device_id,
+            "issuer_kind":kind,"issuer_device_id":device,"issuer_recovery_public_key":root,"issuer_signing_public_key":bytea(&issuer.0),
+            "device_signing_public_key":bytea(&cert.signing_public_key.0),"device_wrapping_public_key":bytea(&cert.wrapping_public_key.0),"signature":bytea(&cert.signature.0)})
+    }).collect::<Vec<_>>()
+}
+
+#[cfg(all(test, any(windows, target_os = "macos")))]
+pub(crate) async fn verify_checkpoint_worker(
+    state: WorkspaceState,
+    owner: Arc<HostedSessionOwner>,
+    previous: Option<context_relay_core::sync::CanonicalCheckpoint>,
+) -> context_relay_core::sync::CanonicalCheckpoint {
+    use super::{VaultWorkerState, WorkItem, run_vault_worker};
+    use context_relay_core::sync::{
+        CanonicalCheckpoint, SupabaseHttpClient, SupabaseHttpError, SupabaseHttpRequest,
+        SupabaseHttpResponse,
+    };
+    use std::sync::Mutex;
+    struct Http {
+        scope: SyncScope,
+        certificates: Vec<u8>,
+        checkpoint: Mutex<Option<CanonicalCheckpoint>>,
+        pushes: std::sync::atomic::AtomicUsize,
+    }
+    fn bytea(bytes: &[u8]) -> String {
+        format!(
+            "\\x{}",
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        )
+    }
+    impl SupabaseHttpClient for Http {
+        fn execute(
+            &self,
+            request: SupabaseHttpRequest,
+        ) -> Result<SupabaseHttpResponse, SupabaseHttpError> {
+            use base64::Engine as _;
+            let url = reqwest::Url::parse(request.url()).unwrap();
+            assert!(request.header("authorization").is_some());
+            let query = url
+                .query_pairs()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let result = match url.path() {
+                "/rest/v1/device_certificates" => {
+                    assert_eq!(query["account_id"], format!("eq.{}", self.scope.account_id));
+                    assert_eq!(
+                        query["workspace_id"],
+                        format!("eq.{}", self.scope.workspace_id)
+                    );
+                    return Ok(SupabaseHttpResponse::new(200, self.certificates.clone()));
+                }
+                "/rest/v1/sync_operations" => serde_json::json!([]),
+                "/functions/v1/sync" => {
+                    let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+                    assert!(request.header("idempotency-key").is_some());
+                    match body["action"].as_str().unwrap() {
+                        "push_operations" => {
+                            let ids = body["operations"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|value| {
+                                    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                        .decode(value.as_str().unwrap())
+                                        .unwrap();
+                                    context_relay_protocol::decode_sync_operation_v1(&bytes)
+                                        .unwrap()
+                                        .operation_id
+                                })
+                                .collect::<Vec<_>>();
+                            serde_json::json!({"v":1,"accepted":ids,"duplicates":[]})
+                        }
+                        "push_checkpoint" => {
+                            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                .decode(body["checkpoint"].as_str().unwrap())
+                                .unwrap();
+                            let decoded =
+                                context_relay_protocol::decode_checkpoint_v1(&bytes).unwrap();
+                            assert_eq!(decoded.account_id, self.scope.account_id);
+                            assert_eq!(decoded.workspace_id, self.scope.workspace_id);
+                            let checkpoint = CanonicalCheckpoint::from_checkpoint(decoded).unwrap();
+                            assert_eq!(checkpoint.bytes, bytes);
+                            let mut stored = self.checkpoint.lock().unwrap();
+                            assert!(
+                                stored.is_none(),
+                                "a completed checkpoint must not be published again after restart"
+                            );
+                            let hash = checkpoint.canonical_hash;
+                            *stored = Some(checkpoint);
+                            self.pushes.fetch_add(1, Ordering::SeqCst);
+                            serde_json::json!({"v":1,"canonicalHash":hash,"duplicate":false})
+                        }
+                        other => panic!("unexpected sync action: {other}"),
+                    }
+                }
+                "/rest/v1/sync_checkpoints" => {
+                    assert_eq!(query["account_id"], format!("eq.{}", self.scope.account_id));
+                    assert_eq!(
+                        query["workspace_id"],
+                        format!("eq.{}", self.scope.workspace_id)
+                    );
+                    assert_eq!(query["schema_version"], "eq.2");
+                    let stored = self.checkpoint.lock().unwrap();
+                    if let Some(checkpoint) = stored.as_ref() {
+                        if let Some(hash) = query.get("canonical_sha256") {
+                            assert_eq!(
+                                *hash,
+                                format!("eq.{}", bytea(&checkpoint.canonical_hash.0))
+                            );
+                        }
+                        if let Some(after) = query.get("or") {
+                            let timestamp = "2026-09-09T00:00:00.000001Z";
+                            assert_eq!(
+                                *after,
+                                format!(
+                                    "(received_at.gt.{timestamp},and(received_at.eq.{timestamp},canonical_sha256.gt.{}))",
+                                    bytea(&checkpoint.canonical_hash.0)
+                                )
+                            );
+                            serde_json::json!([])
+                        } else {
+                            let decoded = &checkpoint.checkpoint;
+                            serde_json::json!([{
+                                "account_id":decoded.account_id,"workspace_id":decoded.workspace_id,
+                                "schema_version":decoded.schema_version,"previous_checkpoint_hash":bytea(&decoded.previous_checkpoint_hash.0),
+                                "causal_frontier":decoded.causal_frontier,"state_hash":bytea(&decoded.state_hash.0),
+                                "key_epoch":decoded.key_epoch,"creator_device_id":decoded.creator_device,"created_hlc":decoded.created_hlc,
+                                "signature":bytea(&decoded.signature.0),"canonical_sha256":bytea(&checkpoint.canonical_hash.0),
+                                "received_at":"2026-09-09T00:00:00.000001Z"
+                            }])
+                        }
+                    } else {
+                        serde_json::json!([])
+                    }
+                }
+                other => panic!("unexpected sync path: {other}"),
+            };
+            Ok(SupabaseHttpResponse::new(
+                200,
+                serde_json::to_vec(&result).unwrap(),
+            ))
+        }
+    }
+    let (keys, material) = local_sync_material(&state).unwrap().unwrap();
+    let identity = material.local_identity(state.device_id, &keys).unwrap();
+    let scope = SyncScope {
+        account_id: identity.account_id,
+        workspace_id: identity.workspace_id,
+    };
+    let expected_pushes = usize::from(previous.is_none());
+    let http = Arc::new(Http {
+        scope,
+        certificates: serde_json::to_vec(&certificate_rows(&state.vault)).unwrap(),
+        checkpoint: Mutex::new(previous),
+        pushes: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let config = Arc::new(Config {
+        owner: owner.clone(),
+        project: "https://example.supabase.co".into(),
+        key: "public-test".to_string().into(),
+        http: Some(http.clone()),
+    });
+    let session = owner.current_session(now_ms() / 1000).unwrap().unwrap();
+    let authority = Arc::new(Authority {
+        certificates: std::sync::OnceLock::new(),
+        authentication_changed: true,
+        change_admitted: AtomicBool::new(false),
+        config,
+        identity: *session.identity(),
+        generation: owner.cancellation().unwrap(),
+        stopped: Arc::new(AtomicBool::new(false)),
+    });
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<WorkItem>(8);
+    let gate = Arc::new(Mutex::new(true));
+    let status = Arc::new(ServiceStatus::new());
+    let client = WorkerClient {
+        sender: sender.downgrade(),
+        admission: gate.clone(),
+        worker_hook: None,
+        status: status.clone(),
+    };
+    let worker_gate = gate.clone();
+    let worker_status = status.clone();
+    let thread = std::thread::spawn(move || {
+        run_vault_worker(
+            VaultWorkerState::Open(state),
+            &mut receiver,
+            None,
+            &worker_status,
+            &worker_gate,
+        )
+    });
+    let result = tokio::time::timeout(Duration::from_secs(10), cycle(&client, authority)).await;
+    // Always close the actor before asserting: failed validation must release the vault too.
+    *gate.lock().unwrap() = false;
+    drop(sender);
+    thread.join().unwrap();
+    assert!(!result.unwrap().unwrap());
+    assert_eq!(status.snapshot().sync, SyncState::Idle);
+    assert_eq!(http.pushes.load(Ordering::SeqCst), expected_pushes);
+    http.checkpoint.lock().unwrap().clone().unwrap()
 }
