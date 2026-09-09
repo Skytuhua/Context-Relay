@@ -23,6 +23,18 @@ these three files alongside the five shared BGE model/tokenizer files. It verifi
 the complete set before changing existing output and copies the bytes it verified.
 An unsupported target or a Windows runtime directory is rejected.
 
+To acquire and stage these inputs with Node, curl and tar installed, run:
+
+```sh
+node scripts/fetch-macos-search-resources.mjs target/macos-search-resources
+```
+
+The command downloads the five pinned model files and the pinned Microsoft
+archive over HTTPS. It extracts only the three required members to bounded
+memory, verifies their size and SHA-256, and stages `model/` and `runtime/`
+only after the complete set validates. Temporary downloads are removed on
+success or failure. It does not install or execute the runtime.
+
 The macOS native loader, application resource map/build command, signing and
 installed acceptance are still required. These hashes describe the upstream
 input bytes; if signing changes the dylib, release verification must bind the

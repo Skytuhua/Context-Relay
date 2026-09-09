@@ -2871,3 +2871,29 @@ with no skips; the full license metadata gate passes. The actual generator-byte
 comparison is restored in the early hydration test to catch future evidence
 drift. Current-head remote native verification remains required. Full release
 acceptance and PR16 merge remain incomplete.
+
+
+### Repeatable macOS search input acquisition (2026-09-09)
+
+`scripts/fetch-macos-search-resources.mjs STAGING_DIRECTORY` now downloads the
+five pinned BGE files and Microsoft's pinned macOS arm64 ONNX Runtime archive.
+It uses curl with configuration-file loading disabled, HTTPS-only protocols and
+redirects, bounded output and timeout, then verifies exact byte counts and
+SHA-256. The three fixed archive members are extracted through bounded tar
+stdout, hashed, and passed through the existing complete-set staging verifier.
+No archive paths are extracted into the filesystem and no runtime is executed.
+Temporary downloads are removed in `finally`; acquisition/verification failures
+happen before existing staged resources are replaced.
+
+The regression test first failed for the missing module, then proved an invalid
+download cannot alter prior output. All 19 acquisition/resource/Windows-packaging/
+icon tests pass with the real pinned asset fixtures and no skips. Two actual
+HTTPS CLI acquisitions completed on this Windows host, including a final run
+with curl configuration disabled. They produced verified `model/` and `runtime/`
+directories in disposable `.codex/macos-fetched` and `macos-fetched-final`.
+Review found no actionable P1/P2 issues.
+
+This qualifies acquisition of macOS inputs on the tested host only. Execution
+of this command on macOS, packaged runtime loading, the app resource map,
+signing, notarization and installed clean-machine acceptance remain required.
+The full release gate and PR16 merge remain open.
