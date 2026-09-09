@@ -42,6 +42,16 @@ pub(crate) struct Backend {
     approved: Mutex<BTreeMap<PairingId, Value>>,
     pub(crate) lose_approval_response: AtomicBool,
     pub(crate) calls: AtomicUsize,
+    pub(crate) lose_lifecycle_response: AtomicBool,
+    pub(crate) lifecycle: Mutex<LifecycleState>,
+}
+
+#[derive(Default)]
+pub(crate) struct LifecycleState {
+    pending: bool,
+    intents: BTreeMap<String, (String, Vec<u8>)>,
+    pub(crate) mutations: usize,
+    pub(crate) calls: Vec<Vec<u8>>,
 }
 impl Backend {
     pub(crate) fn new(
@@ -56,6 +66,8 @@ impl Backend {
             approved: Mutex::new(BTreeMap::new()),
             lose_approval_response: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
+            lose_lifecycle_response: AtomicBool::new(false),
+            lifecycle: Mutex::new(LifecycleState::default()),
         })
     }
 }
@@ -97,6 +109,11 @@ impl Fixture {
             ),
             Arc::new(Login),
         ));
+        let fixture = Self { owner, http };
+        fixture.login();
+        fixture
+    }
+    pub(crate) fn login(&self) {
         let instant = std::time::Instant::now();
         let mut pending =
             PendingLogin::new(PROJECT, "127.0.0.1:41783".parse().unwrap(), instant).unwrap();
@@ -111,14 +128,25 @@ impl Fixture {
         callback
             .query_pairs_mut()
             .append_pair("code", "synthetic-code");
-        owner
+        self.owner
             .complete_login(
-                owner.begin_login().unwrap(),
+                self.owner.begin_login().unwrap(),
                 pending.take_callback(&callback, instant).unwrap(),
-                now,
+                self.http.now,
             )
             .unwrap();
-        Self { owner, http }
+    }
+    pub(crate) fn lifecycle_service(
+        &self,
+    ) -> Arc<dyn crate::account_lifecycle::AccountLifecycleService> {
+        let mut service = crate::account_lifecycle::HostedAccountLifecycleService::new(
+            self.owner.clone(),
+            PROJECT,
+            "public-test",
+            self.http.identity.clone(),
+        );
+        service.http = Some(self.http.clone());
+        Arc::new(service)
     }
     pub(crate) fn service(&self) -> Arc<dyn PairingService> {
         let mut service = HostedPairingService::new(
@@ -188,6 +216,39 @@ impl SupabaseHttpClient for Endpoint {
         }
         if request.url().ends_with("/user") {
             return reply(json!({"id":USER}));
+        }
+        if request.url().ends_with("/functions/v1/account-lifecycle") {
+            let body: Value = serde_json::from_slice(request.body()).unwrap();
+            assert_eq!(body["workspaceId"], json!(self.backend.scope.workspace_id));
+            let action = body["action"].as_str().unwrap();
+            let mut state = self.backend.lifecycle.lock().unwrap();
+            state.calls.push(request.body().to_vec());
+            match action {
+                "status" => assert!(body.get("requestId").is_none()),
+                "begin_deletion" | "cancel_deletion" => {
+                    let id = body["requestId"].as_str().unwrap();
+                    let intent = (self.session.clone(), request.body().to_vec());
+                    if let Some(original) = state.intents.get(id) {
+                        assert_eq!(original, &intent);
+                    } else {
+                        state.intents.insert(id.into(), intent);
+                        state.pending = action == "begin_deletion";
+                        state.mutations += 1;
+                    }
+                    if self.backend.lose_lifecycle_response.load(Ordering::SeqCst) {
+                        return Err(SupabaseHttpError::Transient);
+                    }
+                }
+                other => panic!("unexpected lifecycle action {other}"),
+            }
+            return if state.pending {
+                reply(
+                    json!({"v":1,"state":"pending_delete","requestedAtMs":"1000",
+                    "purgeDeadlineMs":(1000 + context_relay_core::devices::account_lifecycle::ACCOUNT_DELETION_GRACE_MS).to_string()}),
+                )
+            } else {
+                reply(json!({"v":1,"state":"active","requestedAtMs":null,"purgeDeadlineMs":null}))
+            };
         }
         assert!(request.url().ends_with("/functions/v1/pairing"));
         self.backend.calls.fetch_add(1, Ordering::SeqCst);

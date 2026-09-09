@@ -5748,6 +5748,137 @@ mod tests {
         assert_eq!(enrolled.key_epoch(), reopened.key_epoch());
         assert_eq!(enrolled.workspace_root_key(), reopened.workspace_root_key());
         assert_eq!(enrolled.active_epoch_key(), reopened.active_epoch_key());
+        drop((approver_vault, joiner_vault));
+        if let Some((_, fixture)) = &hosted_fixtures {
+            fixture.login();
+            let config = || {
+                let mut config = joiner_config();
+                config.vault.account_lifecycle_service = fixture.lifecycle_service();
+                config
+            };
+            let daemon = Daemon::start(config()).await.unwrap();
+            let handle = daemon.handle();
+            let owner = tokio::spawn(daemon.run());
+            let mut desktop =
+                RawClient::connect_with_token(&joiner_runtime, ClientRole::Desktop, joiner_token)
+                    .await;
+            let begin = || {
+                LocalRequest::AccountDeletionBegin(context_relay_protocol::AccountDeletionParams {
+                    operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
+                    confirmation: "delete".into(),
+                })
+            };
+            let mut bridge =
+                RawClient::connect_with_token(&joiner_runtime, ClientRole::McpBridge, joiner_token)
+                    .await;
+            assert_eq!(
+                bridge.call(begin()).await.unwrap_err().code,
+                ErrorCode::ScopeDenied
+            );
+            assert_eq!(
+                desktop
+                    .call(LocalRequest::AccountDeletionBegin(
+                        context_relay_protocol::AccountDeletionParams {
+                            operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
+                            confirmation: "wrong".into(),
+                        }
+                    ))
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidRequest
+            );
+            assert!(backend.lifecycle.lock().unwrap().calls.is_empty());
+            backend
+                .lose_lifecycle_response
+                .store(true, Ordering::SeqCst);
+            assert_eq!(
+                desktop.call(begin()).await.unwrap_err().code,
+                ErrorCode::Internal
+            );
+            let submitted = backend.lifecycle.lock().unwrap().calls[0].clone();
+            assert_eq!(backend.lifecycle.lock().unwrap().mutations, 1);
+            drop((desktop, bridge));
+            assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+            assert_eq!(owner.await.unwrap(), Ok(()));
+            backend
+                .lose_lifecycle_response
+                .store(false, Ordering::SeqCst);
+            let calls = backend.lifecycle.lock().unwrap().calls.len();
+            let daemon = Daemon::start(config()).await.unwrap();
+            let handle = daemon.handle();
+            let owner = tokio::spawn(daemon.run());
+            let mut desktop =
+                RawClient::connect_with_token(&joiner_runtime, ClientRole::Desktop, joiner_token)
+                    .await;
+            let LocalResult::AccountDeletionIntents { intents } = desktop
+                .call(LocalRequest::AccountDeletionIntents(
+                    context_relay_protocol::AccountDeletionIntentsParams { after: None },
+                ))
+                .await
+                .unwrap()
+            else {
+                panic!("expected intents")
+            };
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].operation_id, LIFECYCLE_BEGIN_ID.parse().unwrap());
+            assert_eq!(
+                intents[0].action,
+                context_relay_protocol::AccountLifecycleIntentAction::BeginDeletion
+            );
+            assert_eq!(backend.lifecycle.lock().unwrap().calls.len(), calls);
+            let pending = desktop
+                .call(LocalRequest::AccountDeletionStatus(EmptyParams {}))
+                .await
+                .unwrap();
+            assert!(matches!(
+                pending,
+                LocalResult::AccountDeletion {
+                    state: AccountDeletionState::PendingDelete,
+                    export_available: true,
+                    ..
+                }
+            ));
+            assert_eq!(desktop.call(begin()).await.unwrap(), pending);
+            assert_eq!(
+                backend.lifecycle.lock().unwrap().calls.last().unwrap(),
+                &submitted
+            );
+            assert_eq!(backend.lifecycle.lock().unwrap().mutations, 1);
+            let active = desktop
+                .call(LocalRequest::AccountDeletionCancel(
+                    context_relay_protocol::RetryParams {
+                        operation_id: LIFECYCLE_CANCEL_ID.parse().unwrap(),
+                    },
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                active,
+                LocalResult::AccountDeletion {
+                    state: AccountDeletionState::Active,
+                    purge_deadline: None,
+                    export_available: false
+                }
+            ));
+            // An old exact retry returns current state without restarting deletion.
+            assert_eq!(desktop.call(begin()).await.unwrap(), active);
+            assert_eq!(backend.lifecycle.lock().unwrap().mutations, 2);
+            fixture.owner.logout().unwrap().local.unwrap();
+            let calls = backend.lifecycle.lock().unwrap().calls.len();
+            assert_eq!(
+                desktop
+                    .call(LocalRequest::AccountDeletionStatus(EmptyParams {}))
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::ScopeDenied
+            );
+            assert_eq!(backend.lifecycle.lock().unwrap().calls.len(), calls);
+            drop(desktop);
+            assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+            assert_eq!(owner.await.unwrap(), Ok(()));
+        }
     }
 
     #[test]

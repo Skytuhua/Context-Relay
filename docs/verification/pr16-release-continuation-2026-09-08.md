@@ -1737,3 +1737,34 @@ actionable P1/P2. Graphify update completed. Logs:
 
 No live hosted deployment, signing, clean-machine acceptance or merge is claimed.
 The full release checklist remains the merge prerequisite.
+
+
+### Paired-device lifecycle over authenticated IPC (2026-09-09)
+
+The existing two-daemon hosted-pairing scenario now continues with the confirmed
+paired device and native lifecycle service over authenticated local IPC. It
+checks MCP denial and incorrect confirmation before provider access, a committed
+begin whose responses are lost, daemon/vault restart, read-only discovery of the
+original action/operation ID, pending status, exact request bytes on retry,
+cancellation, and an old begin retry returning current active state without
+restarting deletion. Logout prevents further lifecycle HTTP dispatch.
+
+The simulated provider retains original session/request bytes and counts actual
+state transitions independently of requests. The scenario passes, as does the
+affected direct native-service regression and daemon library/test Clippy with
+warnings denied. Independent review found no concrete P1/P2. Evidence:
+`.codex/pr16-lifecycle-ipc-composed.log`,
+`.codex/pr16-lifecycle-ipc-composed-native.log`,
+`.codex/pr16-lifecycle-ipc-composed-clippy.log`.
+
+Limits: the test explicitly injects the native service and retains the same Auth
+owner across daemon restart. It does not test production startup selection or
+credential-store restoration. HTTP is simulated; server SQL idempotency, live
+OAuth/provider behavior and installed acceptance require their own evidence.
+
+Hosted deployment inventory was rechecked read-only: project
+`brvzuycnxoswdzzipgvx` is ACTIVE_HEALTHY, PostgreSQL 17.6.1.155. It still has only
+migrations `20260805153409` and `20260805155753`, no Edge Functions, zero Auth users,
+zero sync operations and zero sync checkpoints. The 15 subsequent repository
+migrations and four Edge Functions therefore remain deployment work; reconcile
+existing migration identities before rollout. No hosted mutation occurred.

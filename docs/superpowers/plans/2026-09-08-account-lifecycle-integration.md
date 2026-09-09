@@ -119,5 +119,8 @@ with strict gateway validation, explicit confirmation, stale-result/duplicate
 submission guards and managed keyboard focus. Configured production startup now
 wires the native lifecycle service. Each dispatch derives verified local scope
 and requires a matching active installed device, current project/login and the
-existing immutable intent check. Composed daemon IPC and installed/live
-qualification remain required.
+existing immutable intent check. Paired-device authenticated IPC now covers
+committed response loss, restart/discovery, exact retry, cancellation and logout
+using simulated HTTP. That test injects the service and retains the Auth owner;
+credential restoration, production startup and installed/live qualification
+remain required.
