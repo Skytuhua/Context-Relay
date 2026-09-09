@@ -2958,3 +2958,10 @@ and [enforcement overview](https://developer.apple.com/documentation/security/ap
 This script passed Python syntax compilation and rejects a Windows host. Its
 native result is pending: do not infer enforcement, production loader safety,
 Developer ID signing or notarization from those local checks.
+
+The first native attempt, [job 102486263187](https://github.com/Skytuhua/Context-Relay/actions/runs/34357640524/job/102486263187),
+stopped at the test's `codesign --help` text check, before compiling or signing
+fixtures. The short help output did not advertise `library-constraint`; this is
+not evidence that the actual option is unsupported. The premature check was
+removed. The checked signing invocation and positive/negative execution controls
+remain responsible for establishing support and enforcement on the next run.

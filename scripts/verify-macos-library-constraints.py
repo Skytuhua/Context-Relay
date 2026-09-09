@@ -22,10 +22,6 @@ def main():
         raise RuntimeError("requires native arm64 macOS")
     if int(platform.mac_ver()[0].split(".")[0]) < 14:
         raise RuntimeError("library constraints require macOS 14+")
-    # Read the installed tool's supported interface before using the signing flag.
-    help_result = subprocess.run(["/usr/bin/codesign", "--help"], capture_output=True, timeout=10)
-    if b"library-constraint" not in help_result.stdout + help_result.stderr:
-        raise RuntimeError("codesign does not advertise library constraints")
     with tempfile.TemporaryDirectory(prefix="context-relay-library-constraint-") as temporary:
         root = Path(temporary)
         library = root / "library.c"
