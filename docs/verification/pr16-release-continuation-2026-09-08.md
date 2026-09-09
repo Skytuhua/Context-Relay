@@ -2940,3 +2940,21 @@ on Windows. The pinned Tauri config schema accepts the merged configuration
 rejects this Windows host before building. This is local validation, not a native
 macOS app-build result. Loader activation and production resource discovery are
 still missing, and signing, notarization and installed acceptance remain open.
+
+### macOS library-constraint prerequisite (2026-09-09)
+
+The native CI job now runs `scripts/verify-macos-library-constraints.py` before
+app assembly. This disposable experiment embeds a good library's exact CDHash
+in an ad-hoc-signed loader. It checks accepted good loading and rejected
+same-identifier/different-code loading, including replacement after opening the
+original inode. Unconstrained positive controls must execute the marker-writing
+library for both direct and replacement paths; constrained rejection must leave
+no marker. The test-only library-validation exception is not a product entitlement.
+
+Apple documents that library constraints are enforced from macOS 14, matching
+the existing supported minimum, and can use binary CDHash values. See
+[Apple's constraint definitions](https://developer.apple.com/documentation/security/defining-launch-environment-and-library-constraints)
+and [enforcement overview](https://developer.apple.com/documentation/security/applying-launch-environment-and-library-constraints).
+This script passed Python syntax compilation and rejects a Windows host. Its
+native result is pending: do not infer enforcement, production loader safety,
+Developer ID signing or notarization from those local checks.

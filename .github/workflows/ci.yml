@@ -353,6 +353,9 @@ jobs:
       - if: ${{ runner.os == 'macOS' }}
         shell: bash
         run: test "$(uname -m)" = arm64
+      - name: Verify macOS library constraint enforcement
+        if: ${{ runner.os == 'macOS' }}
+        run: python3 scripts/verify-macos-library-constraints.py
       - run: node --test scripts/fetch-macos-search-resources.test.mjs
       - name: Verify macOS search input acquisition
         if: ${{ runner.os == 'macOS' }}
