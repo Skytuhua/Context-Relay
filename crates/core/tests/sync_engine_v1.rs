@@ -82,6 +82,78 @@ impl RepresentativeEmbeddingResolver for NoEmbeddings {
 }
 
 #[test]
+fn staged_push_releases_vault_and_preserves_captured_retry_bytes_after_reopen() {
+    let device = device(ID_3, 34);
+    let operations = chain(&device, 3, 3_000);
+    let path = TempVault::new("staged-push");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    vault
+        .commit_outgoing_operation(&operations[0].0, &operations[0].1, None)
+        .unwrap();
+    let engine =
+        SyncEngine::new(scope(), SyncProvider::Memory).with_retry_random_source(AttemptBoundRandom);
+    let prepared = engine.prepare_push(&mut vault, 0).unwrap().unwrap();
+    let foreign = SyncEngine::new(
+        SyncScope {
+            account_id: generated_id(999),
+            workspace_id: scope().workspace_id,
+        },
+        SyncProvider::Memory,
+    );
+    assert!(
+        foreign
+            .finish_push(&mut vault, prepared, Err(TransportError::Transient), 0)
+            .is_err()
+    );
+    assert_eq!(vault.due_outbox(0, 10).unwrap().len(), 1);
+    let prepared = engine.prepare_push(&mut vault, 0).unwrap().unwrap();
+    let sent = prepared.operations()[0].bytes.clone();
+    let mut provider = InMemoryTransport::default();
+    provider
+        .push_operations(prepared.scope(), prepared.operations())
+        .unwrap();
+    // Local work remains possible while the prepared push is away on HTTP.
+    vault
+        .commit_outgoing_operation(&operations[1].0, &operations[1].1, None)
+        .unwrap();
+    assert_eq!(
+        engine
+            .finish_push(&mut vault, prepared, Err(TransportError::Transient), 0)
+            .unwrap_err()
+            .safe_code(),
+        "transient"
+    );
+    assert_eq!(vault.due_outbox(999, 10).unwrap().len(), 1);
+    drop(vault);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let prepared = engine.prepare_push(&mut vault, 1_000).unwrap().unwrap();
+    assert!(
+        prepared
+            .operations()
+            .iter()
+            .any(|operation| operation.bytes == sent)
+    );
+    let receipt = provider
+        .push_operations(prepared.scope(), prepared.operations())
+        .unwrap();
+    vault
+        .commit_outgoing_operation(&operations[2].0, &operations[2].1, None)
+        .unwrap();
+    let report = engine
+        .finish_push(&mut vault, prepared, Ok(receipt), 1_000)
+        .unwrap();
+    assert_eq!((report.pushed, report.duplicates), (1, 1));
+    assert!(report.more_work);
+    let queued = vault.due_outbox(1_000, 10).unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(
+        queued[0].operation_id,
+        operations[2].1.operation.operation_id
+    );
+}
+
+#[test]
 fn provider_scopes_exact_duplicates_and_device_sequences() {
     let device = device(ID_3, 31);
     let operations = chain(&device, 2, 100);

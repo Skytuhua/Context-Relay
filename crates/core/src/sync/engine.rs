@@ -82,6 +82,25 @@ impl SyncCycleReport {
     }
 }
 
+/// Immutable push work prepared on the vault owner, movable across network waits.
+/// Hosts must revalidate the original session before finishing on that same owner.
+pub struct PreparedPush {
+    scope: SyncScope,
+    provider: SyncProvider,
+    due: Vec<DueOutboxOperation>,
+    operations: Vec<CanonicalOperation>,
+    more_work: bool,
+}
+
+impl PreparedPush {
+    pub const fn scope(&self) -> SyncScope {
+        self.scope
+    }
+    pub fn operations(&self) -> &[CanonicalOperation] {
+        &self.operations
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SyncCycleError {
     safe_code: &'static str,
@@ -802,13 +821,29 @@ impl<G> SyncEngine<G> {
     where
         G: RetryRandomSource,
     {
-        let due = vault.due_outbox(now_ms, MAX_BATCH).map_err(local_error)?;
-        if due.is_empty() {
+        let Some(prepared) = self.prepare_push(vault, now_ms)? else {
             return Ok(());
+        };
+        let response = transport.push_operations(prepared.scope(), prepared.operations());
+        let finished = self.finish_push(vault, prepared, response, now_ms)?;
+        report.more_work |= finished.more_work;
+        report.pushed += finished.pushed;
+        report.duplicates += finished.duplicates;
+        Ok(())
+    }
+
+    /// Select and validate a bounded push without performing network I/O.
+    pub fn prepare_push(
+        &self,
+        vault: &mut Vault,
+        now_ms: u64,
+    ) -> Result<Option<PreparedPush>, SyncCycleError> {
+        let mut due = vault.due_outbox(now_ms, MAX_BATCH).map_err(local_error)?;
+        if due.is_empty() {
+            return Ok(None);
         }
-        report.more_work |= due.len() == MAX_BATCH;
+        let mut more_work = due.len() == MAX_BATCH;
         let mut batch = Vec::with_capacity(due.len());
-        let mut ids = Vec::with_capacity(due.len());
         let mut total_bytes = 0usize;
         for row in &due {
             let Some(next_total) = total_bytes.checked_add(row.canonical_bytes.len()) else {
@@ -821,7 +856,7 @@ impl<G> SyncEngine<G> {
                     )?;
                     return Err(SyncCycleError::new("configuration_error"));
                 }
-                report.more_work = true;
+                more_work = true;
                 break;
             };
             if next_total > self.max_bytes || next_total > MAX_REQUEST_BYTES {
@@ -834,7 +869,7 @@ impl<G> SyncEngine<G> {
                     )?;
                     return Err(SyncCycleError::new("configuration_error"));
                 }
-                report.more_work = true;
+                more_work = true;
                 break;
             }
             let operation = match decode_sync_operation_v1(&row.canonical_bytes) {
@@ -849,7 +884,7 @@ impl<G> SyncEngine<G> {
                         )?;
                         return Err(SyncCycleError::new("integrity_quarantined"));
                     }
-                    report.more_work = true;
+                    more_work = true;
                     break;
                 }
             };
@@ -865,7 +900,7 @@ impl<G> SyncEngine<G> {
                         )?;
                         return Err(SyncCycleError::new("integrity_quarantined"));
                     }
-                    report.more_work = true;
+                    more_work = true;
                     break;
                 }
             };
@@ -883,11 +918,10 @@ impl<G> SyncEngine<G> {
                     )?;
                     return Err(SyncCycleError::new("integrity_quarantined"));
                 }
-                report.more_work = true;
+                more_work = true;
                 break;
             }
             total_bytes = next_total;
-            ids.push(row.operation_id);
             batch.push(CanonicalOperation {
                 operation_id: operation.operation_id,
                 device_id: operation.device_id,
@@ -896,10 +930,51 @@ impl<G> SyncEngine<G> {
             });
         }
 
-        let receipt = match transport.push_operations(self.scope, &batch) {
+        due.truncate(batch.len());
+        Ok(Some(PreparedPush {
+            scope: self.scope,
+            provider: self.provider,
+            due,
+            operations: batch,
+            more_work,
+        }))
+    }
+
+    /// Apply a response only to the immutable operations selected before HTTP.
+    pub fn finish_push(
+        &self,
+        vault: &mut Vault,
+        prepared: PreparedPush,
+        response: Result<super::PushReceipt, TransportError>,
+        now_ms: u64,
+    ) -> Result<SyncCycleReport, SyncCycleError>
+    where
+        G: RetryRandomSource,
+    {
+        if prepared.scope != self.scope || prepared.provider != self.provider {
+            return Err(SyncCycleError::new("integrity_quarantined"));
+        }
+        for operation in &prepared.operations {
+            if vault
+                .stored_sync_operation(operation.operation_id)
+                .map_err(local_error)?
+                .as_ref()
+                != Some(&operation.bytes)
+            {
+                return Err(SyncCycleError::new("integrity_quarantined"));
+            }
+        }
+        let ids = prepared
+            .operations
+            .iter()
+            .map(|operation| operation.operation_id)
+            .collect::<Vec<_>>();
+        let mut report = SyncCycleReport::empty();
+        report.more_work = prepared.more_work;
+        let receipt = match response {
             Ok(receipt) => receipt,
             Err(error) => {
-                self.defer_transport_failure(vault, &due[..ids.len()], now_ms, error)?;
+                self.defer_transport_failure(vault, &prepared.due, now_ms, error)?;
                 return Err(transport_error(error));
             }
         };
@@ -915,7 +990,8 @@ impl<G> SyncEngine<G> {
             .map_err(local_error)?;
         report.pushed += receipt.accepted.len();
         report.duplicates += receipt.duplicates.len();
-        Ok(())
+        report.more_work |= !vault.due_outbox(now_ms, 1).map_err(local_error)?.is_empty();
+        Ok(report)
     }
 
     fn defer_transport_failure(

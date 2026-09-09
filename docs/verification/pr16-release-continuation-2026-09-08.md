@@ -2230,3 +2230,31 @@ required before installed hosted acceptance.
 Core library/test Clippy with warnings denied and the production daemon library
 check pass; Graphify update completed. Logs:
 `.codex/pr16-sync-search{,-clippy,-production,-graph}.log`.
+
+### Resumable push stages (2026-09-09)
+
+SyncEngine now separates bounded push preparation from receipt completion. The
+prepared value owns immutable canonical operations, scope/provider and captured
+retry attempts, with no vault borrow across HTTP. Finishing validates scope and
+stored bytes, then applies the existing receipt and backoff rules only to the
+captured IDs. The existing synchronous driver calls these same stages.
+
+The staged regression exercises wrong-scope rejection, committed remote push with
+lost acknowledgment, local writes during the network interval, exact retry after
+reopening and a newer queue entry surviving the older acknowledgment. It first
+exposed a missing more-work signal for intervening writes; finishing now rechecks
+for due work. Review found no additional actionable issue. This is a core stage
+extraction, not a completed daemon network driver: the host still must revalidate
+the original session before accepting queued completions and use completion time
+for retry deadlines. Pull/repair stages and the single-flight daemon supervisor
+remain required, along with the full release checklist.
+
+All 44 sync-engine tests pass (175.74 seconds), including malformed push receipts,
+byte limits, scoped cursor/receipt binding, lost acknowledgments, durable retries,
+gap repair and checkpoint flows through the existing driver. Graphify update
+completed. Evidence: `.codex/pr16-staged-push-{red,tests,graph}.log`.
+
+Core library/test Clippy with warnings denied and the normal production daemon
+library check also pass. Logs: `.codex/pr16-staged-push-{clippy,production}.log`.
+GitHub current-head CI was still queued at this checkpoint; no CI/release/merge
+completion is inferred from local checks.
