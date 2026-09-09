@@ -2153,3 +2153,27 @@ unfinished. No certificate purchase or agreement acceptance is claimed.
 Supabase CLI access works with the existing `supabase` profile; no new Supabase
 sign-in is needed. Pairing deployment still requires the persistent pepper whose
 configuration was rejected by automatic approval review.
+
+### Receiving migrated candidates (2026-09-09)
+
+A two-vault regression reproduced loss of old-ID candidate lookup after receiving
+an actual migrated signed chain and reopening. The receive transaction now
+reconstructs deterministic legacy aliases, rejects unrelated local candidates,
+ownerless memory collisions and incompatible existing owners, and rolls alias
+creation back with failed operation persistence. Admission and persistence check
+the canonical candidate's ownership before permitting use of an aliased memory
+ID; explicit ownership binding applies the same check.
+
+Review found that accepted legacy memory could precede its canonical candidate
+in a one-record backfill batch. Backfill now selects migrated candidates before
+other records, after projects. The regression uses IDs for which ordinary UUID
+ordering would select memory first, then verifies candidate-first signing,
+reopening, rejection of foreign binding and completion without duplicate work.
+The signed receive regression also checks exact replay, local candidate
+collision preservation and injected-write rollback. Both focused tests pass;
+six existing signed-sync ownership tests passed before the final ordering and
+public-binding corrections. Both bounded review findings are closed.
+
+Final Clippy, production check and graph evidence will be recorded after their
+running processes finish. This remains component evidence; hosted network-cycle
+wiring and installed cross-device/full-release acceptance are not complete.

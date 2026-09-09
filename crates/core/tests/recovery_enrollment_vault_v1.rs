@@ -36,6 +36,80 @@ const CERTIFICATE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073986";
 const OTHER_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073987";
 
 #[test]
+fn accepted_legacy_candidate_backfills_before_memory_in_single_record_batches() {
+    let fixture = fixture();
+    let path = TempVault::new("accepted-alias-backfill");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let mut legacy = support::candidate();
+    legacy.id = id(support::ID_6);
+    legacy.proposed_memory.id = id(support::ID_6);
+    legacy.state = context_relay_protocol::CandidateState::Accepted;
+    vault.put_candidate(&legacy).unwrap();
+    vault
+        .put_local_memory(&legacy.proposed_memory, &support::basis(0))
+        .unwrap();
+    vault
+        .prepare_recovery_enrollment(&write(&fixture.artifacts, 1000))
+        .unwrap();
+    vault
+        .activate_recovery_enrollment(
+            &receipt(&fixture.artifacts, 2000),
+            &fixture.device_keys,
+            3000,
+        )
+        .unwrap();
+    assert_eq!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 1)
+            .unwrap(),
+        1
+    );
+    assert!(legacy.id < vault.candidate(&legacy.id).unwrap().unwrap().id);
+    let first = vault.due_outbox(u64::MAX, 10).unwrap();
+    assert_eq!(
+        context_relay_protocol::decode_sync_operation_v1(&first[0].canonical_bytes)
+            .unwrap()
+            .record_kind,
+        context_relay_protocol::RecordKind::MemoryCandidate
+    );
+    drop(vault);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert!(
+        vault
+            .bind_sync_record_owner(
+                SyncScope {
+                    account_id: id(OTHER_ID),
+                    workspace_id: id(WORKSPACE_ID)
+                },
+                id(&legacy.id.to_string()),
+                context_relay_protocol::RecordKind::Memory,
+            )
+            .is_err()
+    );
+    assert_eq!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 1)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 1)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        vault.memory(&legacy.proposed_memory.id).unwrap(),
+        Some(legacy.proposed_memory.clone())
+    );
+    assert_eq!(
+        vault.candidate(&legacy.id).unwrap().unwrap().state,
+        legacy.state
+    );
+}
+
+#[test]
 fn backfill_queues_unchanged_offline_records_atomically_and_resumes_after_reopen() {
     use context_relay_core::service::OfflineWorkspace;
     use context_relay_protocol::{MemoryCreateParams, MemoryKind, ScopeRef};
@@ -259,6 +333,110 @@ fn backfill_queues_unchanged_offline_records_atomically_and_resumes_after_reopen
             .review_candidate(review)
             .unwrap(),
         reviewed
+    );
+    // A second vault receives the actual signed chain, including the migration
+    // and accepted memory; old-ID lookup must survive receive and reopening.
+    let receiver_path = TempVault::new("candidate-alias-receiver");
+    let receiver_keys = MemoryKeyStore::default();
+    let mut receiver = Vault::open(receiver_path.path(), CREDENTIAL, &receiver_keys).unwrap();
+    let material = vault.trusted_sync_material(&fixture.device_keys).unwrap();
+    let mut incoming = vault.due_outbox(u64::MAX, 32).unwrap();
+    incoming.retain(|row| row.operation_id != id(support::ID_4));
+    incoming.sort_by_key(|row| {
+        context_relay_protocol::decode_sync_operation_v1(&row.canonical_bytes)
+            .unwrap()
+            .device_sequence
+    });
+    for row in &incoming {
+        let admitted = match context_relay_core::sync::admit_operation(
+            &receiver,
+            &row.canonical_bytes,
+            &material,
+        )
+        .unwrap()
+        {
+            context_relay_core::sync::AdmissionDecision::Admitted(admitted) => admitted,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        if receiver.candidate(&migrated.id).unwrap().is_none()
+            && admitted.operation().record_id.to_string() == migrated.id.to_string()
+        {
+            let raw = open_keyed(receiver_path.path(), &receiver_keys.key(CREDENTIAL));
+            receiver.put_candidate(&legacy).unwrap();
+            assert!(
+                receiver
+                    .apply_admitted_operation(
+                        &admitted,
+                        &material,
+                        "memory",
+                        "2026-09-09T00:00:00Z",
+                        &|_, _: &context_relay_protocol::RecordMutationV1| Ok(Some(
+                            support::basis(0)
+                        )),
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                receiver.candidate(&legacy.id).unwrap(),
+                Some(legacy.clone())
+            );
+            raw.execute(
+                "DELETE FROM candidates WHERE id = ?1",
+                [legacy.id.to_string()],
+            )
+            .unwrap();
+            raw.execute_batch("CREATE TRIGGER fail_received_alias BEFORE INSERT ON sync_nonces BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+            assert!(
+                receiver
+                    .apply_admitted_operation(
+                        &admitted,
+                        &material,
+                        "memory",
+                        "2026-09-09T00:00:00Z",
+                        &|_, _: &context_relay_protocol::RecordMutationV1| Ok(Some(
+                            support::basis(0)
+                        )),
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                raw.query_row("SELECT count(*) FROM candidate_aliases", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert!(receiver.candidate(&migrated.id).unwrap().is_none());
+            raw.execute_batch("DROP TRIGGER fail_received_alias;")
+                .unwrap();
+        }
+        receiver
+            .apply_admitted_operation(
+                &admitted,
+                &material,
+                "memory",
+                "2026-09-09T00:00:00Z",
+                &|_, _: &context_relay_protocol::RecordMutationV1| Ok(Some(support::basis(0))),
+            )
+            .unwrap();
+        receiver
+            .apply_admitted_operation(
+                &admitted,
+                &material,
+                "memory",
+                "2026-09-09T00:00:00Z",
+                &|_, _: &context_relay_protocol::RecordMutationV1| Ok(Some(support::basis(0))),
+            )
+            .unwrap();
+    }
+    drop(receiver);
+    let receiver = Vault::open(receiver_path.path(), CREDENTIAL, &receiver_keys).unwrap();
+    assert_eq!(
+        receiver.candidate(&legacy.id).unwrap(),
+        vault.candidate(&legacy.id).unwrap()
+    );
+    assert_eq!(
+        receiver.memory(&legacy.proposed_memory.id).unwrap(),
+        Some(legacy.proposed_memory.clone())
     );
     legacy.id = id(support::ID_1);
     vault.put_candidate(&legacy).unwrap();

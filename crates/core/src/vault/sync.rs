@@ -310,7 +310,9 @@ impl Vault {
                      UNION ALL SELECT id, 'project' FROM projects
                  ) AS local_record
                  WHERE NOT EXISTS(SELECT 1 FROM sync_record_owners owner WHERE owner.record_id = local_record.id AND owner.record_kind = local_record.kind)
-                 ORDER BY CASE kind WHEN 'project' THEN 0 ELSE 1 END, id, kind LIMIT ?1",
+                 ORDER BY CASE WHEN kind = 'project' THEN 0
+                     WHEN kind = 'memory_candidate' AND EXISTS(SELECT 1 FROM candidate_aliases WHERE canonical_id = local_record.id) THEN 1
+                     ELSE 2 END, id, kind LIMIT ?1",
             )?;
             statement
                 .query_map(
@@ -746,6 +748,14 @@ impl Vault {
             admitted.operation().record_id,
             admitted.operation().record_kind,
         )?;
+        if let RecordMutationV1::UpsertMemoryCandidate(candidate) = admitted.mutation() {
+            restore_received_candidate_alias(
+                &transaction,
+                candidate,
+                admitted.operation().account_id,
+                admitted.operation().workspace_id,
+            )?;
+        }
         let current = load_record_heads(
             &transaction,
             admitted.operation().workspace_id,
@@ -1688,6 +1698,15 @@ impl Vault {
         record_kind: RecordKind,
     ) -> Result<(), VaultError> {
         let transaction = self.connection.transaction()?;
+        if !candidate_alias_allows_scope(
+            &transaction,
+            scope.account_id,
+            scope.workspace_id,
+            record_id,
+            record_kind,
+        )? {
+            return Err(VaultError::OperationConflict);
+        }
         let materialized = materialized_record_kinds(&transaction, record_id)?;
         if let Some(owner) = stored_sync_record_owner(&transaction, record_id)?
             && owner.state == SyncRecordOwnerState::LegacyPending
@@ -2616,6 +2635,72 @@ fn bind_local_update_owner(
     )
 }
 
+fn candidate_alias_allows_scope(
+    connection: &Connection,
+    account_id: AccountId,
+    workspace_id: WorkspaceId,
+    record_id: RecordId,
+    record_kind: RecordKind,
+) -> Result<bool, VaultError> {
+    let resolved = super::resolve_candidate_id(connection, &record_id.to_string())?;
+    if resolved == record_id.to_string() {
+        return Ok(true);
+    }
+    let owner = stored_sync_record_owner(connection, parse_record_id(&resolved)?)?;
+    Ok(record_kind == RecordKind::Memory
+        && owner.is_some_and(|owner| {
+            owner.account_id == account_id
+                && owner.workspace_id == workspace_id
+                && owner.record_kind == RecordKind::MemoryCandidate
+                && owner.state == SyncRecordOwnerState::Verified
+        }))
+}
+
+fn restore_received_candidate_alias(
+    connection: &Connection,
+    candidate: &MemoryCandidate,
+    account_id: AccountId,
+    workspace_id: WorkspaceId,
+) -> Result<(), VaultError> {
+    let expected = crate::derived_record_uuid(
+        candidate.proposed_memory.id.as_bytes(),
+        b"context-relay.legacy-candidate.v1",
+    )
+    .ok_or(VaultError::OperationConflict)?;
+    if candidate.id.as_bytes() != expected.as_bytes() {
+        return Ok(());
+    }
+    let old_id = candidate.proposed_memory.id.to_string();
+    let new_id = candidate.id.to_string();
+    let resolved = super::resolve_candidate_id(connection, &old_id)?;
+    if resolved == new_id {
+        return Ok(());
+    }
+    let alias_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM candidate_aliases WHERE legacy_id IN (?1,?2) OR canonical_id IN (?1,?2))",
+        params![old_id, new_id], |row| row.get(0))?;
+    let old_record = parse_record_id(&old_id)?;
+    let kinds = materialized_record_kinds(connection, old_record)?;
+    let owner = stored_sync_record_owner(connection, old_record)?;
+    if alias_exists
+        || kinds.iter().any(|kind| *kind != RecordKind::Memory)
+        || owner.as_ref().is_some_and(|owner| {
+            owner.account_id != account_id
+                || owner.workspace_id != workspace_id
+                || owner.record_kind != RecordKind::Memory
+                || owner.state != SyncRecordOwnerState::Verified
+        })
+        || (owner.is_none() && !kinds.is_empty())
+    {
+        return Err(VaultError::OperationConflict);
+    }
+    connection.execute(
+        "INSERT INTO candidate_aliases(legacy_id, canonical_id) VALUES (?1,?2)",
+        params![old_id, new_id],
+    )?;
+    Ok(())
+}
+
 fn migrate_legacy_candidate_ids(
     transaction: &Transaction<'_>,
     limit: usize,
@@ -2931,6 +3016,10 @@ fn record_belongs_to_sync_scope(
     record_id: RecordId,
     record_kind: RecordKind,
 ) -> Result<bool, VaultError> {
+    if !candidate_alias_allows_scope(connection, account_id, workspace_id, record_id, record_kind)?
+    {
+        return Ok(false);
+    }
     match stored_sync_record_owner(connection, record_id)? {
         Some(owner)
             if (owner.account_id, owner.workspace_id, owner.record_kind)
@@ -2959,6 +3048,10 @@ fn ensure_sync_record_owner(
     record_id: RecordId,
     record_kind: RecordKind,
 ) -> Result<(), VaultError> {
+    if !candidate_alias_allows_scope(connection, account_id, workspace_id, record_id, record_kind)?
+    {
+        return Err(VaultError::OperationConflict);
+    }
     match stored_sync_record_owner(connection, record_id)? {
         Some(owner)
             if (owner.account_id, owner.workspace_id, owner.record_kind)
