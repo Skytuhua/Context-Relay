@@ -1502,3 +1502,27 @@ Logs: `.codex/pr16-lifecycle-intent.log`,
 `.codex/pr16-lifecycle-intent-clippy.log`. Graphify updated to 17,725 nodes;
 optional SQL/OCaml parsers remain unavailable. Six superseded GitHub workflow
 cancellation requests were accepted; current-head CI is still required.
+
+
+### Account-lifecycle session guards
+
+The existing lifecycle transport can now bind to the daemon Auth owner and an
+original identity/generation. Every attempt validates that binding and the
+configured project, obtains the current session token, and checks authority again
+after HTTP completion (including errors). Backoff cannot revive canceled work;
+valid refresh changes the token while preserving exact operation/request bytes.
+The response limit is supplied to the HTTP client as well as checked after read.
+Existing static transport construction remains available for its prior boundary;
+production must select the guarded path when lifecycle integration is completed.
+
+The missing guard regression failed before implementation. All 27 affected Auth
+and lifecycle tests pass. The new check covers withdrawn authority before send,
+during HTTP success/error and during backoff; wrong project/identity; same-identity
+replacement login; successful requests; and valid refresh between identical retries.
+Independent bounded review found no P1/P2. Evidence:
+`.codex/pr16-lifecycle-session-final.log`. No live request or production lifecycle
+activation occurred. Durable intent dispatch, verified scope and explicit
+retry/reconciliation UI remain required before activation.
+
+Core library and all three affected integration-test targets pass Clippy with
+warnings denied (`.codex/pr16-lifecycle-session-clippy.log`).

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    auth::{HostedIdentity, HostedSession, HostedSessionOwner, LoginCancellation},
     devices::account_lifecycle::{
         AccountDeletionProjection, AccountLifecycleTransport, AccountLifecycleTransportError,
     },
@@ -43,6 +44,13 @@ pub struct SupabaseAccountLifecycleTransport {
     workspace_id: WorkspaceId,
     http: Arc<dyn SupabaseHttpClient>,
     retry_runtime: Arc<dyn SupabaseRetryRuntime>,
+    hosted: Option<HostedAuthority>,
+}
+
+struct HostedAuthority {
+    owner: Arc<HostedSessionOwner>,
+    identity: HostedIdentity,
+    generation: LoginCancellation,
 }
 
 impl fmt::Debug for SupabaseAccountLifecycleTransport {
@@ -70,6 +78,7 @@ impl SupabaseAccountLifecycleTransport {
             workspace_id,
             http,
             retry_runtime: Arc::new(SystemRetryRuntime),
+            hosted: None,
         })
     }
 
@@ -84,6 +93,7 @@ impl SupabaseAccountLifecycleTransport {
             workspace_id,
             http,
             retry_runtime: Arc::new(SystemRetryRuntime),
+            hosted: None,
         })
     }
 
@@ -99,7 +109,43 @@ impl SupabaseAccountLifecycleTransport {
             workspace_id,
             http,
             retry_runtime,
+            hosted: None,
         })
+    }
+
+    /// Bind every dispatch and response to the original daemon-owned login.
+    /// The current session supplies the token, including after a valid refresh.
+    pub fn with_session_owner(
+        mut self,
+        owner: Arc<HostedSessionOwner>,
+        identity: HostedIdentity,
+        generation: LoginCancellation,
+    ) -> Self {
+        self.hosted = Some(HostedAuthority {
+            owner,
+            identity,
+            generation,
+        });
+        self
+    }
+
+    fn session(
+        &self,
+        now: u64,
+    ) -> Result<Option<Arc<HostedSession>>, AccountLifecycleTransportError> {
+        self.hosted
+            .as_ref()
+            .map(|authority| {
+                let session = authority
+                    .owner
+                    .session_for(&authority.generation, authority.identity, now)
+                    .map_err(|_| AccountLifecycleTransportError::Unauthorized)?;
+                if session.project_url() != self.config.project_url() {
+                    return Err(AccountLifecycleTransportError::Unauthorized);
+                }
+                Ok(session)
+            })
+            .transpose()
     }
 
     fn endpoint(&self) -> Result<String, AccountLifecycleTransportError> {
@@ -132,25 +178,7 @@ impl SupabaseAccountLifecycleTransport {
             }),
         })
         .map_err(|_| AccountLifecycleTransportError::Invalid)?;
-        let request = SupabaseHttpRequest::new(
-            SupabaseHttpMethod::Post,
-            self.endpoint()?,
-            vec![
-                (
-                    "authorization".to_owned(),
-                    format!("Bearer {}", self.config.access_token()),
-                ),
-                (
-                    "apikey".to_owned(),
-                    self.config.publishable_key().to_owned(),
-                ),
-                ("content-type".to_owned(), "application/json".to_owned()),
-                ("accept".to_owned(), "application/json".to_owned()),
-            ],
-            REQUEST_TIMEOUT,
-            body,
-        );
-        let response = self.execute(request)?;
+        let response = self.execute(body)?;
         let response: AccountLifecycleResponse = serde_json::from_slice(response.body())
             .map_err(|_| AccountLifecycleTransportError::Conflict)?;
         if response.v != 1 {
@@ -167,10 +195,41 @@ impl SupabaseAccountLifecycleTransport {
 
     fn execute(
         &self,
-        request: SupabaseHttpRequest,
+        body: Vec<u8>,
     ) -> Result<SupabaseHttpResponse, AccountLifecycleTransportError> {
+        use super::recovery::{RecoveryEnrollmentClock, SystemRecoveryEnrollmentClock};
+        let now = SystemRecoveryEnrollmentClock.now_ms() / 1000;
+        let started = std::time::Instant::now();
         for attempt in 0..MAX_ATTEMPTS {
-            let response = match self.http.execute(request.clone()) {
+            let session = self.session(now.saturating_add(started.elapsed().as_secs()))?;
+            let request = SupabaseHttpRequest::new(
+                SupabaseHttpMethod::Post,
+                self.endpoint()?,
+                vec![
+                    (
+                        "authorization".to_owned(),
+                        format!(
+                            "Bearer {}",
+                            session.as_ref().map_or_else(
+                                || self.config.access_token(),
+                                |session| session.access_token()
+                            )
+                        ),
+                    ),
+                    (
+                        "apikey".to_owned(),
+                        self.config.publishable_key().to_owned(),
+                    ),
+                    ("content-type".to_owned(), "application/json".to_owned()),
+                    ("accept".to_owned(), "application/json".to_owned()),
+                ],
+                REQUEST_TIMEOUT,
+                body.clone(),
+            )
+            .with_response_limit(MAX_RESPONSE_BYTES);
+            let response = self.http.execute(request);
+            self.session(now.saturating_add(started.elapsed().as_secs()))?;
+            let response = match response {
                 Ok(response) => response,
                 Err(error) => {
                     let error = match error {
