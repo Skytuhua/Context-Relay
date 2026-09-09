@@ -2032,6 +2032,8 @@ fn native_candidate_review_preserves_import_ledger_for_accept_and_reject() {
             .unwrap();
         let ledger_before = vault.native_memory_ledger(&source.id).unwrap().unwrap();
 
+        assert_ne!(pending.id.as_bytes(), pending.proposed_memory.id.as_bytes());
+
         let reviewed = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
             .review_candidate(CandidateReviewParams {
                 candidate_id: pending.id,

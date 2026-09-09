@@ -988,6 +988,7 @@ impl Vault {
                         ledger,
                         candidate,
                         replay_change_kind,
+                        true,
                     )?;
                 } else {
                     let existing_candidate: MemoryCandidate = from_json(&existing)?;
@@ -1003,10 +1004,17 @@ impl Vault {
                         ledger,
                         candidate,
                         expected_change_kind,
+                        true,
                     )?;
                 }
             } else {
-                validate_native_memory_candidate(source, ledger, candidate, expected_change_kind)?;
+                validate_native_memory_candidate(
+                    source,
+                    ledger,
+                    candidate,
+                    expected_change_kind,
+                    false,
+                )?;
                 transaction.execute(
                     "INSERT INTO candidates(id, state, payload_json) VALUES (?1, 'pending', ?2)",
                     params![candidate.id.to_string(), canonical_candidate],
@@ -1804,6 +1812,7 @@ fn validate_native_memory_candidate(
     ledger: &NativeMemoryLedger,
     candidate: &MemoryCandidate,
     expected_change_kind: NativeMemoryChangeKind,
+    existing_candidate: bool,
 ) -> Result<(), VaultError> {
     let unmanaged_digest = ledger.last_imported_digest.ok_or_else(|| {
         VaultError::Validation("native memory candidate requires an imported digest".to_owned())
@@ -1817,7 +1826,8 @@ fn validate_native_memory_candidate(
     if extracted.managed_body.is_some()
         || extracted.unmanaged_digest != unmanaged_digest
         || candidate.id != expected_candidate_id
-        || memory.id != expected_memory_id
+        || (memory.id != expected_memory_id
+            && !(existing_candidate && memory.id.as_bytes() == expected_candidate_id.as_bytes()))
         || memory.revision != expected_operation_id
         || candidate.state != CandidateState::Pending
         || candidate.source_harness != source.harness
@@ -1856,6 +1866,10 @@ fn native_memory_change_kind(
 
 fn same_native_candidate_identity(existing: &MemoryCandidate, incoming: &MemoryCandidate) -> bool {
     let mut normalized = existing.clone();
+    // Old imports shared IDs. Re-observation must retain their saved memory/receipt identity.
+    if normalized.proposed_memory.id.as_bytes() == normalized.id.as_bytes() {
+        normalized.proposed_memory.id = incoming.proposed_memory.id;
+    }
     normalized
         .evidence_summary
         .clone_from(&incoming.evidence_summary);

@@ -1,5 +1,33 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Distinct IDs for fresh native proposals — 2026-09-09
+
+Native reconciliation still created shared candidate/proposed-memory IDs, which
+would stop the new backfill worker. Fresh native proposals now derive the memory
+ID under a separate hash domain while preserving the existing candidate ID and
+revision derivation. This prevents new cross-kind ownership collisions.
+
+Persistence rejects newly introduced shared IDs. Existing legacy candidates
+retain their stored identity: exact replay and source-content reversion accept
+their old memory ID without rewriting the candidate, accepted memory or review
+receipt. The compatibility comparison still checks all other immutable fields,
+and source/ledger validation remains mandatory. Independent review found no
+actionable boundary or compatibility issue.
+
+The original duplicate-ID assertion reproduced the defect. All 26 native engine,
+28 native vault and 23 service tests pass (77 total). New coverage rejects fresh
+shared-ID persistence and verifies deterministic distinct IDs, pending/accepted/
+rejected legacy content reversion, unchanged accepted-memory identity, and exact
+review receipt replay after reopening.
+
+Scoped Clippy with warnings denied and the normal production daemon library
+check pass. Graphify update completed after the final code change. Local logs:
+`.codex/pr16-native-ids-{red,tests,green,clippy,production,graph}.log`.
+
+Saved shared-ID candidates still require migration before signed backfill can
+own them. This change prevents new collisions; it does not complete legacy
+migration, native signed updates, hosted sync or full release acceptance.
+
 ## Daemon background backfill admission — 2026-09-09
 
 The production vault worker now admits one offline-record backfill operation
