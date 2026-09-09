@@ -759,19 +759,44 @@ pub(crate) async fn verify_stalled_worker(
 
 #[cfg(all(test, any(windows, target_os = "macos")))]
 fn certificate_rows(vault: &context_relay_core::vault::Vault) -> Vec<serde_json::Value> {
-    vault.all_devices().unwrap().iter().map(|row| {
-        use context_relay_core::crypto::CertificateIssuerV1;
-        let cert = &row.certificate;
-        let bytea = |bytes: &[u8]| format!("\\x{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
-        let (kind, device, root, issuer) = match cert.issuer {
-            CertificateIssuerV1::RecoveryRoot(key) => ("recovery_root", None, Some(bytea(&key.0)), key),
-            CertificateIssuerV1::Device { device_id, signing_public_key } => ("device", Some(device_id), None, signing_public_key),
-        };
-        serde_json::json!({"id":row.certificate_id,"account_id":cert.account_id,"workspace_id":cert.workspace_id,
+    vault
+        .all_devices()
+        .unwrap()
+        .iter()
+        .map(|row| certificate_row(row.certificate_id, &row.certificate))
+        .collect()
+}
+
+#[cfg(all(test, any(windows, target_os = "macos")))]
+fn certificate_row(
+    certificate_id: context_relay_protocol::DeviceCertificateId,
+    cert: &context_relay_core::crypto::DeviceCertificateV1,
+) -> serde_json::Value {
+    use context_relay_core::crypto::CertificateIssuerV1;
+    let bytea = |bytes: &[u8]| {
+        format!(
+            "\\x{}",
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        )
+    };
+    let (kind, device, root, issuer) = match cert.issuer {
+        CertificateIssuerV1::RecoveryRoot(key) => ("recovery_root", None, Some(bytea(&key.0)), key),
+        CertificateIssuerV1::Device {
+            device_id,
+            signing_public_key,
+        } => ("device", Some(device_id), None, signing_public_key),
+    };
+    serde_json::json!({"id":certificate_id,"account_id":cert.account_id,"workspace_id":cert.workspace_id,
             "control_epoch":cert.control_epoch,"request_nonce":bytea(&cert.request_nonce.0),"device_id":cert.device_id,
             "issuer_kind":kind,"issuer_device_id":device,"issuer_recovery_public_key":root,"issuer_signing_public_key":bytea(&issuer.0),
             "device_signing_public_key":bytea(&cert.signing_public_key.0),"device_wrapping_public_key":bytea(&cert.wrapping_public_key.0),"signature":bytea(&cert.signature.0)})
-    }).collect::<Vec<_>>()
+}
+
+#[cfg(all(test, any(windows, target_os = "macos")))]
+pub(crate) struct IncomingOperation {
+    pub certificate_id: context_relay_protocol::DeviceCertificateId,
+    pub certificate: context_relay_core::crypto::DeviceCertificateV1,
+    pub operation: context_relay_core::sync::CanonicalOperation,
 }
 
 #[cfg(all(test, any(windows, target_os = "macos")))]
@@ -779,6 +804,7 @@ pub(crate) async fn verify_checkpoint_worker(
     state: WorkspaceState,
     owner: Arc<HostedSessionOwner>,
     previous: Option<context_relay_core::sync::CanonicalCheckpoint>,
+    incoming: &IncomingOperation,
 ) -> context_relay_core::sync::CanonicalCheckpoint {
     use super::{VaultWorkerState, WorkItem, run_vault_worker};
     use context_relay_core::sync::{
@@ -789,6 +815,9 @@ pub(crate) async fn verify_checkpoint_worker(
     struct Http {
         scope: SyncScope,
         certificates: Vec<u8>,
+        initial_certificates: Vec<u8>,
+        incoming: context_relay_core::sync::CanonicalOperation,
+        received_page: AtomicBool,
         checkpoint: Mutex<Option<CanonicalCheckpoint>>,
         pushes: std::sync::atomic::AtomicUsize,
     }
@@ -816,9 +845,49 @@ pub(crate) async fn verify_checkpoint_worker(
                         query["workspace_id"],
                         format!("eq.{}", self.scope.workspace_id)
                     );
-                    return Ok(SupabaseHttpResponse::new(200, self.certificates.clone()));
+                    return Ok(SupabaseHttpResponse::new(
+                        200,
+                        if self.received_page.load(Ordering::SeqCst) {
+                            self.certificates.clone()
+                        } else {
+                            self.initial_certificates.clone()
+                        },
+                    ));
                 }
-                "/rest/v1/sync_operations" => serde_json::json!([]),
+                "/rest/v1/sync_operations" => {
+                    use sha2::{Digest, Sha256};
+                    assert_eq!(query["account_id"], format!("eq.{}", self.scope.account_id));
+                    assert_eq!(
+                        query["workspace_id"],
+                        format!("eq.{}", self.scope.workspace_id)
+                    );
+                    self.received_page.store(true, Ordering::SeqCst);
+                    let timestamp = "2026-09-09T00:00:00.000001Z";
+                    if let Some(after) = query.get("or") {
+                        assert_eq!(
+                            *after,
+                            format!(
+                                "(received_at.gt.{timestamp},and(received_at.eq.{timestamp},id.gt.{}))",
+                                self.incoming.operation_id
+                            )
+                        );
+                        serde_json::json!([])
+                    } else {
+                        let decoded =
+                            context_relay_protocol::decode_sync_operation_v1(&self.incoming.bytes)
+                                .unwrap();
+                        serde_json::json!([{
+                            "id":decoded.operation_id,"account_id":decoded.account_id,"workspace_id":decoded.workspace_id,
+                            "project_id":decoded.project_id,"record_id":decoded.record_id,"record_kind":decoded.record_kind,
+                            "mutation_kind":decoded.mutation_kind,"device_id":decoded.device_id,"schema_version":decoded.schema_version,
+                            "device_sequence":decoded.device_sequence,"causal_frontier":decoded.causal_frontier,"control_epoch":decoded.control_epoch,
+                            "key_epoch":decoded.key_epoch,"previous_device_hash":bytea(&decoded.previous_device_hash.0),
+                            "nonce":bytea(&decoded.nonce.0),"ciphertext":bytea(decoded.ciphertext.as_slice()),"ciphertext_hash":bytea(&decoded.ciphertext_hash.0),
+                            "blob_refs":decoded.blob_refs,"created_hlc":decoded.created_hlc,"signature":bytea(&decoded.signature.0),
+                            "canonical_sha256":bytea(&Sha256::digest(&self.incoming.bytes)),"received_at":timestamp
+                        }])
+                    }
+                }
                 "/functions/v1/sync" => {
                     let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
                     assert!(request.header("idempotency-key").is_some());
@@ -917,9 +986,24 @@ pub(crate) async fn verify_checkpoint_worker(
         workspace_id: identity.workspace_id,
     };
     let expected_pushes = usize::from(previous.is_none());
+    let mut certificates = certificate_rows(&state.vault);
+    let initial_certificates = serde_json::to_vec(&certificates).unwrap();
+    assert!(
+        !certificates
+            .iter()
+            .any(|row| row["device_id"] == serde_json::json!(incoming.certificate.device_id))
+    );
+    certificates.push(certificate_row(
+        incoming.certificate_id,
+        &incoming.certificate,
+    ));
+    certificates.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     let http = Arc::new(Http {
         scope,
-        certificates: serde_json::to_vec(&certificate_rows(&state.vault)).unwrap(),
+        certificates: serde_json::to_vec(&certificates).unwrap(),
+        initial_certificates,
+        incoming: incoming.operation.clone(),
+        received_page: AtomicBool::new(false),
         checkpoint: Mutex::new(previous),
         pushes: std::sync::atomic::AtomicUsize::new(0),
     });

@@ -9308,7 +9308,7 @@ mod tests {
 
     #[test]
     #[cfg(any(windows, target_os = "macos"))]
-    fn hosted_sync_publishes_checkpoint_and_recovers_pin_after_restart() {
+    fn hosted_sync_receives_searchable_remote_memory_and_recovers_checkpoint_after_restart() {
         let path = unit_test_support::TempVault::new("sync-checkpoint-completion");
         let keys = Arc::new(MemoryKeyStore::default());
         let mut config = VaultConfig::new(path.path().to_owned(), "test-vault-key", keys);
@@ -9328,6 +9328,68 @@ mod tests {
         )
         .unwrap();
         state.vault.request_sync_checkpoint(scope).unwrap();
+        let (incoming, remote_memory) = {
+            use context_relay_core::{
+                crypto::{CertificateFieldsV1, DeviceCertificateV1},
+                sync::{CanonicalOperation, SyncIdentity},
+            };
+            let (local_keys, material) = local_sync_material(&state).unwrap().unwrap();
+            let local = material
+                .local_identity(state.device_id, &local_keys)
+                .unwrap();
+            let remote_device = "018f22e2-79b0-7cc8-98c4-dc0c0c074303".parse().unwrap();
+            let remote_keys = DeviceKeys::generate().unwrap();
+            let certificate = DeviceCertificateV1::issue_by_device(
+                CertificateFieldsV1 {
+                    account_id: scope.account_id,
+                    workspace_id: scope.workspace_id,
+                    control_epoch: local.control_epoch,
+                    request_nonce: context_relay_protocol::PairingRequestNonce([0x84; 32]),
+                    device_id: remote_device,
+                    signing_public_key: remote_keys.signing_public_key(),
+                    wrapping_public_key: remote_keys.wrapping_public_key(),
+                },
+                state.device_id,
+                &local_keys,
+            )
+            .unwrap();
+            let source_path = unit_test_support::TempVault::new("sync-remote-source");
+            let source_keys = MemoryKeyStore::default();
+            let mut source = Vault::open(source_path.path(), "source-key", &source_keys).unwrap();
+            let memory = OfflineWorkspace::new(&mut source, remote_device)
+                .with_sync_identity(SyncIdentity {
+                    device_id: remote_device,
+                    device_keys: &remote_keys,
+                    ..local
+                })
+                .unwrap()
+                .create_memory(context_relay_protocol::MemoryCreateParams {
+                    operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074305".parse().unwrap(),
+                    scope: ScopeRef::Global,
+                    kind: context_relay_protocol::MemoryKind::Fact,
+                    title: "Remote hummingbird".into(),
+                    body_markdown:
+                        "remotehummingbird received from a newly certified second device".into(),
+                    tags: vec![],
+                })
+                .unwrap();
+            let queued = source.due_outbox(u64::MAX, 1).unwrap().remove(0);
+            let decoded =
+                context_relay_protocol::decode_sync_operation_v1(&queued.canonical_bytes).unwrap();
+            (
+                hosted_sync::IncomingOperation {
+                    certificate_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074304".parse().unwrap(),
+                    certificate,
+                    operation: CanonicalOperation {
+                        operation_id: decoded.operation_id,
+                        device_id: decoded.device_id,
+                        device_sequence: decoded.device_sequence,
+                        bytes: queued.canonical_bytes,
+                    },
+                },
+                memory,
+            )
+        };
         let backend = pairing_test_provider::Backend::new(
             InMemoryPairingProvider::new().unwrap(),
             Arc::new(PairingTestClock(Arc::new(AtomicU64::new(1000)))),
@@ -9347,10 +9409,34 @@ mod tests {
             state,
             fixture.owner.clone(),
             None,
+            &incoming,
         ));
-        assert!(!checkpoint.checkpoint.causal_frontier.is_empty());
+        assert_eq!(checkpoint.checkpoint.causal_frontier.len(), 2);
+        assert!(
+            checkpoint
+                .checkpoint
+                .causal_frontier
+                .iter()
+                .any(|entry| entry.device_id == incoming.operation.device_id)
+        );
         let (mut state, _) = open_workspace(&mut config).unwrap_or_else(|_| panic!("reopen"));
         state.pairing_identity = Some(identity);
+        assert_eq!(
+            state.vault.memory(&remote_memory.id).unwrap(),
+            Some(remote_memory.clone())
+        );
+        let LocalResult::Memories { memories } = execute_workspace_request(
+            &mut state,
+            LocalRequest::MemorySearch(context_relay_protocol::SearchParams {
+                query: "remotehummingbird".into(),
+                project_id: None,
+            }),
+            &ServiceStatus::new(),
+        )
+        .unwrap() else {
+            panic!("memory search result");
+        };
+        assert!(memories.iter().any(|memory| memory.id == remote_memory.id));
         let pin = state.vault.sync_checkpoint_pin(scope).unwrap().unwrap();
         assert_eq!(pin.canonical_bytes, checkpoint.bytes);
         assert!(
@@ -9365,6 +9451,7 @@ mod tests {
             state,
             fixture.owner,
             Some(checkpoint.clone()),
+            &incoming,
         ));
         assert_eq!(repeated, checkpoint);
         let vault = Vault::open(path.path(), "test-vault-key", config.key_store.as_ref()).unwrap();
@@ -9377,6 +9464,17 @@ mod tests {
             checkpoint.bytes
         );
         assert!(!vault.sync_checkpoint_schedule(scope).unwrap().requested);
+        assert_eq!(
+            vault.memory(&remote_memory.id).unwrap(),
+            Some(remote_memory)
+        );
+        assert!(
+            vault
+                .all_devices()
+                .unwrap()
+                .iter()
+                .all(|row| row.certificate.device_id != incoming.operation.device_id)
+        );
     }
 
     fn test_config(

@@ -2417,3 +2417,33 @@ commits ranged from dae8a954 to e2dad0e. Current-head CI is not yet qualified.
 
 Graphify update completed (18243 nodes); log:
 `.codex/pr16-checkpoint-completion-graph.log`.
+
+
+### Second-device receive and search through the daemon (2026-09-09)
+
+The composed checkpoint test now includes a real signed memory created in a
+separate source vault, using a second device certificate issued by the enrolled
+local device. The HTTP fixture withholds that certificate until after returning
+the operation page, requiring the daemon's post-response certificate refresh.
+It serves the same canonical operation and exact scoped cursor across reopen.
+
+After the receive and checkpoint cycle, reopening verifies the exact memory,
+finds it through the daemon MemorySearch path, and checks a checkpoint frontier
+containing both devices. A second cycle reuses the durable operation cursor and
+pin without republishing. Remote certificate metadata remains absent from local
+storage, so the reopened cycle fetches trust again.
+
+Both hosted-sync regressions pass (26.90 seconds); daemon library/test Clippy with
+warnings denied passes (13.29 seconds). Bounded review found no actionable P1/P2.
+Logs: `.codex/pr16-remote-receive-tests.log` and
+`.codex/pr16-remote-receive-clippy.log`. This extends test coverage only.
+It proves composed signed receive and lexical search with simulated HTTP, not
+actual pairing, Auth restoration, live-provider or installed acceptance.
+
+On bae554d, GitHub's macOS native build, frontend lint/typecheck/tests/build,
+Supabase contract, schema/binding/boundary and secret/dependency/license checks
+passed at observation. Windows/macOS Rust tests/lint and native Semgrep work were
+still running. No full CI or release qualification is claimed.
+
+Graphify update completed (18246 nodes);
+`.codex/pr16-remote-receive-graph.log`.
