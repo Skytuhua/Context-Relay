@@ -360,7 +360,14 @@ jobs:
         run: node scripts/fetch-macos-search-resources.mjs "$RUNNER_TEMP/macos-search-resources"
       - run: rustup target add ${{ matrix.target }}
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @context-relay/desktop tauri build --target ${{ matrix.target }}
+      - run: node --test scripts/package-macos.test.mjs
+      - if: ${{ runner.os == 'Windows' }}
+        run: pnpm --filter @context-relay/desktop tauri build --target ${{ matrix.target }}
+      - name: Assemble macOS app candidate
+        if: ${{ runner.os == 'macOS' }}
+        run: pnpm package:macos
+        env:
+          CONTEXT_RELAY_SEARCH_ASSETS: ${{ runner.temp }}/macos-search-resources
 
   semgrep-materials:
     runs-on: ubuntu-24.04

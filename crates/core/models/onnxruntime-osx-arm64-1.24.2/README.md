@@ -35,8 +35,15 @@ memory, verifies their size and SHA-256, and stages `model/` and `runtime/`
 only after the complete set validates. Temporary downloads are removed on
 success or failure. It does not install or execute the runtime.
 
-The macOS native loader, application resource map/build command, signing and
-installed acceptance are still required. These hashes describe the upstream
+On an arm64 macOS host, `pnpm package:macos` stages these inputs, builds the
+four companion executables, and assembles the Tauri `.app` candidate with the
+explicit macOS resource map. It reads `target/macos-search-resources` by default;
+set `CONTEXT_RELAY_SEARCH_ASSETS` when using another acquisition directory.
+The native CI job runs this command. A successful native run is still required
+to establish packaging, and packaging alone does not activate semantic search.
+
+The macOS native loader, production resource discovery, signing and installed
+acceptance are still required. These hashes describe the upstream
 input bytes; if signing changes the dylib, release verification must bind the
 resulting signed bytes rather than reuse these input hashes. No packaged macOS
 search capability is claimed by this manifest.

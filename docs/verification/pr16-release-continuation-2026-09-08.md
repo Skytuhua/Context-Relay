@@ -2920,3 +2920,23 @@ acquisition can be claimed verified.
 Manual run [34355371028](https://github.com/Skytuhua/Context-Relay/actions/runs/34355371028) failed before starting jobs. GitHub reported that the reusable CI workflow requested `actions: read` beyond the caller's implicit `actions: none`, and its nested publication job requested `contents: write` beyond `contents: read`. The qualification call now explicitly permits both at the calling job; the workflow default remains read-only. The callee still restricts publication dispatch to protected `main` push events, so manual qualification cannot publish.
 
 The existing workflow contract test reproduced the missing permission declaration before the change. All 25 native CI workflow tests pass after it, including the protected-push publication guard. Hosted startup and two-build qualification must still be rerun; this does not establish reproducibility, signing, publication or installed acceptance.
+
+### macOS app assembly command (2026-09-09)
+
+`pnpm package:macos` now builds the four companion executables on arm64 macOS
+with locked Cargo inputs and a shared absolute target directory. Before staging
+companions, it validates all four thin arm64 Mach-O executable headers and bounded
+load-command tables. It writes the validated bytes with executable permissions.
+The explicit Tauri app resource map includes all five model files, the pinned
+macOS runtime and its licenses, plus the product licenses. Search resources reuse
+the existing complete-set verifier. Native macOS CI now invokes this packaging
+command using the assets acquired earlier in the same job.
+
+The new packaging test first failed because the command was absent; the CI
+contract then failed because native CI did not invoke it. After implementation,
+39 packaging/native-workflow tests and two selected native CI contract tests pass
+on Windows. The pinned Tauri config schema accepts the merged configuration
+(Ajv uses non-Unicode regex mode for an upstream schema pattern). The command
+rejects this Windows host before building. This is local validation, not a native
+macOS app-build result. Loader activation and production resource discovery are
+still missing, and signing, notarization and installed acceptance remain open.
