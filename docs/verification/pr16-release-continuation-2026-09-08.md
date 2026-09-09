@@ -2174,6 +2174,8 @@ collision preservation and injected-write rollback. Both focused tests pass;
 six existing signed-sync ownership tests passed before the final ordering and
 public-binding corrections. Both bounded review findings are closed.
 
-Final Clippy, production check and graph evidence will be recorded after their
-running processes finish. This remains component evidence; hosted network-cycle
-wiring and installed cross-device/full-release acceptance are not complete.
+Core library/test Clippy with warnings denied and the production daemon library
+check pass. Graphify update completed. Logs are
+`.codex/pr16-candidate-alias-receive-{red,order-final,owners,clippy,production,graph-final}.log`.
+This remains component evidence; hosted network-cycle wiring and installed
+cross-device/full-release acceptance are not complete.
