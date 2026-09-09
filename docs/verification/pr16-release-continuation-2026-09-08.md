@@ -1,5 +1,30 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Daemon-owned local signing — 2026-09-09
+
+Enrolled daemon desktop memory/task/candidate mutations and native-hook writes
+now load verified vault material and match the installed device's signing and
+wrapping keys before configuring OfflineWorkspace. Established sync ownership
+cannot silently fall back to unsigned writes when keys/proofs are unavailable.
+Fresh or pending unenrolled workspaces retain local operation. Reads do not load
+signing material and remain available offline.
+
+MCP mutation dispatch passes the same verified identity into McpWorkspace, which
+now propagates it to its underlying workspace service. Its regression reproduced
+a successful MCP write with zero outbox entries, then verified signed persistence
+and original response/bytes after reopening. The daemon dispatcher regression
+completes enrollment, signs desktop and MCP writes without a network session,
+checks exact retries, rejects mismatched/missing keys and preserves read access.
+All 102 daemon tests pass (four pre-existing ignored), as do 26 MCP memory and
+17 MCP task/handoff tests. Core/daemon library and test Clippy with warnings
+denied and the normal production daemon library check pass. Independent review
+found no new actionable issues. Graphify update completed after the final code change.
+
+Updates to pre-enrollment ownerless memory/task records still need explicit
+migration before signed persistence can accept them. Native-import migration,
+hosted transport/cycle wiring, certificate refresh, installed acceptance,
+signing and all other full-release gates remain open.
+
 ## Verified vault sync authority — 2026-09-09
 
 VaultSyncMaterial now implements the sync engine's TrustedSyncMaterial contract

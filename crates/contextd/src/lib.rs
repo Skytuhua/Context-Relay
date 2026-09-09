@@ -2025,6 +2025,49 @@ fn connection_check_status(
     })
 }
 
+fn local_sync_material(
+    state: &WorkspaceState,
+) -> Result<
+    Option<(
+        Arc<DeviceKeys>,
+        context_relay_core::vault::VaultSyncMaterial,
+    )>,
+    ClientError,
+> {
+    if !state
+        .vault
+        .has_sync_authority()
+        .map_err(client_error_from_vault)?
+    {
+        return Ok(None);
+    }
+    let identity = state
+        .pairing_identity
+        .as_ref()
+        .ok_or_else(service_internal_error)?;
+    let material = state
+        .vault
+        .trusted_sync_material(&identity.keys)
+        .map_err(client_error_from_vault)?;
+    Ok(Some((identity.keys.clone(), material)))
+}
+
+fn with_local_workspace<R>(
+    state: &mut WorkspaceState,
+    action: impl FnOnce(OfflineWorkspace<'_>) -> Result<R, ClientError>,
+) -> Result<R, ClientError> {
+    let material = local_sync_material(state)?;
+    let mut workspace = OfflineWorkspace::new(&mut state.vault, state.device_id);
+    if let Some((keys, material)) = &material {
+        workspace = workspace.with_sync_identity(
+            material
+                .local_identity(state.device_id, keys)
+                .map_err(|_| service_internal_error())?,
+        )?;
+    }
+    action(workspace)
+}
+
 fn execute_mcp_request(
     state: &mut WorkspaceState,
     params: context_relay_protocol::McpCallParams,
@@ -2034,13 +2077,33 @@ fn execute_mcp_request(
     let name = params.name.clone();
     let binding = params.binding.clone();
     let status = service_status.snapshot();
-    let output = McpWorkspace::with_service_status(
+    let material = if matches!(
+        name.as_str(),
+        "context_relay_remember"
+            | "context_relay_update_memory"
+            | "context_relay_archive_memory"
+            | "context_relay_propose_memory"
+            | "context_relay_upsert_task"
+            | "context_relay_complete_task"
+    ) {
+        local_sync_material(state)?
+    } else {
+        None
+    };
+    let mut workspace = McpWorkspace::with_service_status(
         &mut state.vault,
         state.device_id,
         status.vault,
         status.sync,
-    )
-    .call(params)?;
+    );
+    if let Some((keys, material)) = &material {
+        workspace = workspace.with_sync_identity(
+            material
+                .local_identity(state.device_id, keys)
+                .map_err(|_| service_internal_error())?,
+        )?;
+    }
+    let output = workspace.call(params)?;
     // Only the authenticated bridge route can reach this receipt boundary. All normal
     // MCP resolution, policy, record-scope, output validation and admission checks passed.
     if authenticated_bridge && name == "context_relay_get" && state.connection_check.is_some() {
@@ -2121,9 +2184,10 @@ fn execute_workspace_request(
                 context_relay_protocol::NativeHookEvent::TaskEvidence { .. }
             );
             let project_id = resolved.access.require_tasks(task_write)?;
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .handle_native_hook_event(project_id, params)
-                .map(|()| LocalResult::Empty)
+            with_local_workspace(state, |mut workspace| {
+                workspace.handle_native_hook_event(project_id, params)
+            })
+            .map(|()| LocalResult::Empty)
         }
         LocalRequest::DesktopWritePrepare(params) => state
             .vault
@@ -2184,25 +2248,25 @@ fn execute_workspace_request(
             .map_err(client_error_from_vault)
             .map(|memories| LocalResult::Memories { memories }),
         LocalRequest::MemoryCreate(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .create_memory(params)
-                .map(|memory| LocalResult::Memory {
+            with_local_workspace(state, |mut workspace| workspace.create_memory(params)).map(
+                |memory| LocalResult::Memory {
                     memory: Some(memory),
-                })
+                },
+            )
         }
         LocalRequest::MemoryUpdate(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .update_memory(params)
-                .map(|memory| LocalResult::Memory {
+            with_local_workspace(state, |mut workspace| workspace.update_memory(params)).map(
+                |memory| LocalResult::Memory {
                     memory: Some(memory),
-                })
+                },
+            )
         }
         LocalRequest::MemoryArchive(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .archive_memory(params)
-                .map(|memory| LocalResult::Memory {
+            with_local_workspace(state, |mut workspace| workspace.archive_memory(params)).map(
+                |memory| LocalResult::Memory {
                     memory: Some(memory),
-                })
+                },
+            )
         }
         LocalRequest::CandidatesList(params) => {
             OfflineWorkspace::new(&mut state.vault, state.device_id)
@@ -2210,28 +2274,25 @@ fn execute_workspace_request(
                 .map(|candidates| LocalResult::Candidates { candidates })
         }
         LocalRequest::CandidateReview(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .review_candidate(params)
-                .map(|candidate| LocalResult::Candidates {
+            with_local_workspace(state, |mut workspace| workspace.review_candidate(params)).map(
+                |candidate| LocalResult::Candidates {
                     candidates: vec![candidate],
-                })
+                },
+            )
         }
         LocalRequest::TasksList(params) => OfflineWorkspace::new(&mut state.vault, state.device_id)
             .tasks(params.project_id)
             .map(|tasks| LocalResult::Tasks { tasks }),
         LocalRequest::TaskUpsert(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .upsert_task(params)
+            with_local_workspace(state, |mut workspace| workspace.upsert_task(params))
                 .map(|task| LocalResult::Tasks { tasks: vec![task] })
         }
         LocalRequest::TaskComplete(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .complete_task(params)
+            with_local_workspace(state, |mut workspace| workspace.complete_task(params))
                 .map(|task| LocalResult::Tasks { tasks: vec![task] })
         }
         LocalRequest::TaskTransition(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .transition_task(params)
+            with_local_workspace(state, |mut workspace| workspace.transition_task(params))
                 .map(|task| LocalResult::Tasks { tasks: vec![task] })
         }
         LocalRequest::HandoffCreate(params) => create_handoff(state, params),
@@ -8838,6 +8899,111 @@ mod tests {
             "context-relay-contextd-{label}-{}",
             uuid::Uuid::now_v7()
         ))
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "macos"))]
+    fn enrolled_daemon_signs_desktop_and_mcp_writes_without_network_auth() {
+        let path = unit_test_support::TempVault::new("daemon-local-signing");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut config = VaultConfig::new(path.path().to_owned(), "test-vault-key", keys);
+        let (mut state, _) =
+            open_workspace(&mut config).unwrap_or_else(|_| panic!("open workspace"));
+        let status = ServiceStatus::new();
+        assert!(local_sync_material(&state).unwrap().is_none());
+        let identity = PairingIdentity {
+            device_id: state.device_id,
+            device_name: "Local signing".into(),
+            platform: NativePlatform::Windows,
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
+        };
+        let scope = SyncScope {
+            account_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074201".parse().unwrap(),
+            workspace_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074202".parse().unwrap(),
+        };
+        let clock = PairingTestClock(Arc::new(AtomicU64::new(900)));
+        let recovery = recovery_enrollment::CoordinatorRecoveryEnrollmentService::new(
+            RecoveryEnrollmentCoordinator::new(clock.clone(), RecoveryTestTransport::new(scope)),
+            identity.device_id,
+            &identity.device_name,
+            identity.platform,
+        );
+        let LocalResult::RecoveryEnrollmentPhrase { phrase } = recovery
+            .execute(
+                &mut state.vault,
+                &identity.keys,
+                LocalRequest::RecoveryEnrollmentBegin(EmptyParams {}),
+            )
+            .unwrap()
+        else {
+            panic!("phrase")
+        };
+        state.pairing_identity = Some(identity.clone());
+        assert!(local_sync_material(&state).unwrap().is_none());
+        clock.set(950);
+        let confirmations = phrase
+            .confirmation_positions
+            .iter()
+            .map(
+                |position| context_relay_protocol::RecoveryWordConfirmation {
+                    position: *position,
+                    word: phrase.recovery_phrase_words.as_words()[usize::from(*position) - 1]
+                        .clone(),
+                },
+            )
+            .collect();
+        recovery
+            .execute(
+                &mut state.vault,
+                &identity.keys,
+                LocalRequest::RecoveryEnrollmentConfirm(
+                    context_relay_protocol::RecoveryEnrollmentConfirmParams {
+                        enrollment_id: phrase.enrollment_id,
+                        confirmations,
+                    },
+                ),
+            )
+            .unwrap();
+        let create = LocalRequest::MemoryCreate(context_relay_protocol::MemoryCreateParams {
+            operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074203".parse().unwrap(),
+            scope: ScopeRef::Global,
+            kind: context_relay_protocol::MemoryKind::Fact,
+            title: "Desktop".into(),
+            body_markdown: "Signed local write".into(),
+            tags: vec![],
+        });
+        let output = execute_workspace_request(&mut state, create.clone(), &status).unwrap();
+        let mcp = mcp_request(
+            path.path().parent().unwrap(),
+            "context_relay_remember",
+            serde_json::json!({
+                "operationId":"018f22e2-79b0-7cc8-98c4-dc0c0c074204", "kind":"fact", "title":"MCP", "markdown":"Signed MCP write", "tags":[], "scope":{"scope":"global"}
+            }),
+        );
+        execute_workspace_request(&mut state, mcp, &status).unwrap();
+        let before = state.vault.due_outbox(u64::MAX, 10).unwrap();
+        assert_eq!(before.len(), 2);
+        assert_eq!(
+            execute_workspace_request(&mut state, create.clone(), &status).unwrap(),
+            output
+        );
+        assert_eq!(
+            state.vault.due_outbox(u64::MAX, 10).unwrap()[0].canonical_bytes,
+            before[0].canonical_bytes
+        );
+        state.pairing_identity.as_mut().unwrap().keys = Arc::new(DeviceKeys::generate().unwrap());
+        assert!(execute_workspace_request(&mut state, create, &status).is_err());
+        execute_workspace_request(
+            &mut state,
+            LocalRequest::MemoryList(context_relay_protocol::MemoryListParams {
+                project_id: None,
+                include_archived: false,
+            }),
+            &status,
+        )
+        .unwrap();
+        state.pairing_identity = None;
+        assert!(local_sync_material(&state).is_err());
     }
 
     fn test_config(

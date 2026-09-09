@@ -209,6 +209,33 @@ pub struct VaultSyncMaterial {
     certificates: std::collections::BTreeMap<DeviceId, crate::crypto::DeviceCertificateV1>,
 }
 
+impl VaultSyncMaterial {
+    pub fn local_identity<'a>(
+        &'a self,
+        device_id: DeviceId,
+        keys: &'a crate::crypto::DeviceKeys,
+    ) -> Result<crate::sync::SyncIdentity<'a>, crate::sync::SyncError> {
+        let certificate = self
+            .certificates
+            .get(&device_id)
+            .ok_or(crate::sync::SyncError::InvalidIdentity)?;
+        if certificate.signing_public_key != keys.signing_public_key()
+            || certificate.wrapping_public_key != keys.wrapping_public_key()
+        {
+            return Err(crate::sync::SyncError::InvalidIdentity);
+        }
+        Ok(crate::sync::SyncIdentity {
+            account_id: self.scope.account_id,
+            workspace_id: self.scope.workspace_id,
+            device_id,
+            control_epoch: self.control_epoch,
+            key_epoch: self.key_epoch,
+            device_keys: keys,
+            content_key: &self.content_key,
+        })
+    }
+}
+
 impl TrustedSyncMaterial for VaultSyncMaterial {
     fn trusted_device(
         &self,
@@ -244,6 +271,16 @@ impl TrustedSyncMaterial for VaultSyncMaterial {
 }
 
 impl Vault {
+    /// Presence is not authority: callers must still load and verify the complete proof.
+    pub fn has_sync_authority(&self) -> Result<bool, VaultError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM recovery_enrollments WHERE state = 'active')
+                 OR EXISTS(SELECT 1 FROM recovery_restores WHERE state = 'active')
+                 OR EXISTS(SELECT 1 FROM pairing_approval_transcripts WHERE role = 'joiner' AND state = 'completed')
+                 OR EXISTS(SELECT 1 FROM sync_record_owners)", [], |row| row.get(0),
+        )?)
+    }
+
     /// Rebuild for each sync cycle; this snapshot never establishes trust from raw rows alone.
     pub fn trusted_sync_material(
         &self,
