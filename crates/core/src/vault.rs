@@ -34,6 +34,8 @@ mod native_transactions;
 pub use native_transactions::*;
 mod devices;
 pub use devices::*;
+mod account_lifecycle_intent;
+pub use account_lifecycle_intent::*;
 mod hosted_pairing;
 pub use hosted_pairing::*;
 mod pairing_review;
@@ -46,7 +48,7 @@ pub use sync::*;
 mod semantic_index;
 pub use semantic_index::{SemanticIndexBatch, SemanticIndexProgress};
 
-pub const LATEST_SCHEMA_VERSION: u32 = 33;
+pub const LATEST_SCHEMA_VERSION: u32 = 34;
 pub const MAX_NATIVE_HOOK_SESSIONS: usize = 256;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
@@ -2306,6 +2308,18 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
                 "../migrations/0033_pairing_request_reviews.sql"
             ))
             .and_then(|_| transaction.pragma_update(None, "user_version", 33))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 34 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0034_account_lifecycle_intents.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 34))
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }

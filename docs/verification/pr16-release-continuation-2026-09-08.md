@@ -1475,3 +1475,30 @@ evidence and does not replace the required live installed acceptance matrix.
 Daemon library/test Clippy with warnings denied also passes
 (`.codex/pr16-pairing-joiner-restart-clippy.log`); independent bounded review
 found no P1/P2 issues.
+
+
+### Durable account-lifecycle intent prerequisite
+
+Vault schema 34 stores the original operation ID, begin/cancel action, hosted
+project, Auth user/session, account and workspace in an immutable bounded payload.
+It reuses hosted-identity validation, validates reads and rejects an embedded ID
+that differs from the requested key. Exact writes are idempotent; changed action
+or authority conflicts. No credentials, automatic mutation, rebinding or deletion
+API is introduced. Migration creates no historical authority records.
+
+The first test failed for missing storage APIs. The implemented storage tests
+pass, covering reopen, every immutable identity field, invalid new identities,
+corrupted key/payload association and schema-33 upgrade. Independent read-only
+review found no P1/P2. Production account lifecycle remains unavailable: it still
+needs current-session checks around each HTTP attempt, verified scope, intent
+persistence before dispatch, and explicit retry/reconciliation UI. Storing an
+intent alone is not permission to replay a mutation or evidence of hosted deletion.
+
+Final validation: two lifecycle intent tests and 29 affected pairing/recovery/
+search tests pass; eight existing model/performance cases remain ignored.
+Core library and the new integration-test Clippy check pass with warnings denied.
+Logs: `.codex/pr16-lifecycle-intent.log`,
+`.codex/pr16-lifecycle-intent-migrations.log`, and
+`.codex/pr16-lifecycle-intent-clippy.log`. Graphify updated to 17,725 nodes;
+optional SQL/OCaml parsers remain unavailable. Six superseded GitHub workflow
+cancellation requests were accepted; current-head CI is still required.

@@ -263,8 +263,10 @@ fn schema_31_and_32_upgrades_create_empty_pairing_metadata() {
         // SAFETY: first SQLite operation; the key remains live for the call.
         let result = unsafe { rusqlite::ffi::sqlite3_key(raw.handle(), key.as_ptr().cast(), 32) };
         assert_eq!(result, rusqlite::ffi::SQLITE_OK);
-        raw.execute_batch("DROP TABLE pairing_request_reviews;")
-            .unwrap();
+        raw.execute_batch(
+            "DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews;",
+        )
+        .unwrap();
         if version == 31 {
             raw.execute_batch("DROP TABLE hosted_pairing_intents;")
                 .unwrap();
@@ -275,7 +277,7 @@ fn schema_31_and_32_upgrades_create_empty_pairing_metadata() {
         let id = "018f22e2-79b0-7cc8-98c4-dc0c0c073991".parse().unwrap();
         assert!(vault.hosted_pairing_intent(id).unwrap().is_none());
         assert!(vault.pairing_request_review(id).unwrap().is_none());
-        assert_eq!(vault.schema_version().unwrap(), 33);
+        assert_eq!(vault.schema_version().unwrap(), 34);
     }
 }
 

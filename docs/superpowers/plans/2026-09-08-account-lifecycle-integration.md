@@ -69,3 +69,18 @@ must come from daemon-owned login/provisioning, which remains separately open.
 ## Separately required release work
 
 Production OAuth/session provisioning and refresh, sync and pairing/recovery transport wiring, reassociation/revocation/rotation, native recovery phrase entry, final purge/export, package workflows, remaining desktop surfaces, signing and physical qualification remain necessary after this boundary is repaired. This plan does not mark any of them complete.
+
+
+### Durable intent storage contract (2026-09-09)
+
+Add an encrypted-vault table keyed by strict OperationId with a bounded 8 KiB
+payload containing that same ID, begin/cancel action, original hosted project,
+Auth user/session, account and workspace. Reuse the existing hosted identity
+validator and transaction pattern. Insert before the first network mutation;
+exact repeats succeed, any changed field conflicts. Validate on read and compare
+the embedded operation ID with the requested key. No access tokens, automatic
+replay, deletion or rebinding API. Read-only status does not create an intent.
+Schema migration creates an empty table and never invents historical authority.
+This storage step alone does not activate lifecycle: current-owner guards before
+and after every HTTP attempt, verified scope, explicit retry UI and full provider
+qualification remain prerequisites.
