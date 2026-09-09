@@ -1,5 +1,36 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Daemon background backfill admission — 2026-09-09
+
+The production vault worker now admits one offline-record backfill operation
+when its request queue is empty and search indexing has no pending work. It
+rechecks requests under the existing submission/shutdown gate, releases that
+gate before vault work, and returns to admission after each record. Opening a
+workspace schedules a check; commands wake idle backfill so enrollment and new
+offline records are discovered. Unenrolled workspaces become idle without keys.
+
+Verification or migration failure pauses backfill for the rest of that worker
+run and publishes SyncState::Error. Later reads do not silently clear the error
+or repeatedly retry failed work. Restart permits another attempt. Local queue
+success retains Offline; it does not claim hosted synchronization. Independent
+review found no actionable admission, trust or error-state issue.
+
+All 102 daemon library tests pass (four pre-existing ignored). The extended
+enrollment regression covers unenrolled idle state, unchanged snapshot backfill,
+verified-key failure and failure pausing. It also runs the actual worker loop:
+a read arriving at background admission wins, one record is then backfilled,
+and shutdown/reopen preserves the record and queued operation. This is local
+worker evidence, not live hosted or installed acceptance.
+
+Daemon library/test Clippy with warnings denied and the normal production
+library check pass. Graphify update completed after the final code change.
+Local logs: `.codex/pr16-backfill-worker-{suite,clippy,production,graph}.log`.
+
+Legacy shared-ID/queue migration, native mutation reconciliation, hosted network
+cycles, certificate refresh and the full installed/signing acceptance gates
+remain unfinished. An explicit sync retry must eventually coordinate these
+parts; this change does not redefine the currently unsupported network retry.
+
 ## Bounded offline record backfill — 2026-09-09
 
 The vault can now queue up to 32 unchanged offline snapshots in one transaction

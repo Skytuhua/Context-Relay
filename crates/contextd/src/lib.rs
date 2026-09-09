@@ -1477,6 +1477,13 @@ impl ServiceStatus {
             .unwrap_or_else(|error| error.into_inner())
             .search = search;
     }
+
+    fn set_sync(&self, sync: SyncState) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .sync = sync;
+    }
 }
 
 struct StoredExport {
@@ -1488,6 +1495,7 @@ struct StoredExport {
 struct WorkspaceState {
     connection_check: Option<connection_check::ConnectionCheck>,
     search_index: search_index::SearchIndexJob,
+    sync_backfill: SyncBackfill,
     preparation: Option<PreparationClient>,
     vault: Vault,
     vault_path: PathBuf,
@@ -1499,6 +1507,46 @@ struct WorkspaceState {
     recovery_enrollment_service: Option<Arc<dyn RecoveryEnrollmentService>>,
     account_lifecycle_service: Arc<dyn AccountLifecycleService>,
     pairing_identity: Option<PairingIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncBackfill {
+    Pending,
+    Idle,
+    Failed,
+}
+
+impl WorkspaceState {
+    fn wake_sync_backfill(&mut self) {
+        if self.sync_backfill != SyncBackfill::Failed {
+            self.sync_backfill = SyncBackfill::Pending;
+        }
+    }
+
+    fn tick_sync_backfill(&mut self, status: &ServiceStatus) {
+        if self.sync_backfill != SyncBackfill::Pending {
+            return;
+        }
+        let result = (|| {
+            if !self.vault.has_sync_authority()? {
+                return Ok(0);
+            }
+            let identity = self
+                .pairing_identity
+                .as_ref()
+                .ok_or(VaultError::OperationConflict)?;
+            self.vault
+                .backfill_sync_records(self.device_id, &identity.keys, 1)
+        })();
+        self.sync_backfill = match result {
+            Ok(0) => SyncBackfill::Idle,
+            Ok(_) => SyncBackfill::Pending,
+            Err(_) => {
+                status.set_sync(SyncState::Error);
+                SyncBackfill::Failed
+            }
+        };
+    }
 }
 
 enum VaultWorkerState {
@@ -1589,6 +1637,7 @@ fn open_workspace(
     Ok((
         WorkspaceState {
             connection_check: None,
+            sync_backfill: SyncBackfill::Pending,
             search_index: search_index::SearchIndexJob::new(vault.semantic_search_enabled())
                 .with_resources(config.search_resources.clone()),
             preparation: config.preparation.clone(),
@@ -1757,9 +1806,13 @@ fn run_vault_worker(
                     Err(mpsc::error::TryRecvError::Disconnected) => break,
                     Err(mpsc::error::TryRecvError::Empty) => {
                         let admitted = *gate
-                            && matches!(&state, VaultWorkerState::Open(workspace) if workspace.search_index.pending());
+                            && matches!(&state, VaultWorkerState::Open(workspace) if workspace.search_index.pending() || workspace.sync_backfill == SyncBackfill::Pending);
                         drop(gate);
                         if admitted && let VaultWorkerState::Open(workspace) = &mut state {
+                            if !workspace.search_index.pending() {
+                                workspace.tick_sync_backfill(status);
+                                continue;
+                            }
                             #[cfg(test)]
                             if let Some(worker_hook) = worker_hook {
                                 worker_hook.before_index();
@@ -1795,6 +1848,7 @@ fn run_vault_worker(
         // Writes from desktop, harnesses, and native reconciliation all maintain
         // the durable queue. Recheck it after requests without rescanning records.
         if let VaultWorkerState::Open(workspace) = &mut state {
+            workspace.wake_sync_backfill();
             if workspace.vault.take_semantic_search_failure() {
                 workspace.search_index.fail();
                 status.set_search(workspace.search_index.status);
@@ -8911,6 +8965,19 @@ mod tests {
             open_workspace(&mut config).unwrap_or_else(|_| panic!("open workspace"));
         let status = ServiceStatus::new();
         assert!(local_sync_material(&state).unwrap().is_none());
+        state.tick_sync_backfill(&status);
+        assert_eq!(state.sync_backfill, SyncBackfill::Idle);
+        assert_eq!(status.snapshot().sync, SyncState::Offline);
+        let untouched = OfflineWorkspace::new(&mut state.vault, state.device_id)
+            .create_memory(context_relay_protocol::MemoryCreateParams {
+                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074207".parse().unwrap(),
+                scope: ScopeRef::Global,
+                kind: context_relay_protocol::MemoryKind::Fact,
+                title: "Untouched offline note".into(),
+                body_markdown: "Preserve on enrollment".into(),
+                tags: vec![],
+            })
+            .unwrap();
         execute_workspace_request(
             &mut state,
             LocalRequest::MemoryCreate(context_relay_protocol::MemoryCreateParams {
@@ -9008,8 +9075,15 @@ mod tests {
             }),
         );
         execute_workspace_request(&mut state, mcp, &status).unwrap();
+        state.wake_sync_backfill();
+        state.tick_sync_backfill(&status);
+        assert_eq!(state.sync_backfill, SyncBackfill::Pending);
+        assert_eq!(state.vault.memory(&untouched.id).unwrap(), Some(untouched));
+        state.tick_sync_backfill(&status);
+        assert_eq!(state.sync_backfill, SyncBackfill::Idle);
+        assert_eq!(status.snapshot().sync, SyncState::Offline);
         let before = state.vault.due_outbox(u64::MAX, 10).unwrap();
-        assert_eq!(before.len(), 3);
+        assert_eq!(before.len(), 4);
         assert_eq!(
             execute_workspace_request(&mut state, create.clone(), &status).unwrap(),
             output
@@ -9019,6 +9093,12 @@ mod tests {
             before[0].canonical_bytes
         );
         state.pairing_identity.as_mut().unwrap().keys = Arc::new(DeviceKeys::generate().unwrap());
+        state.wake_sync_backfill();
+        state.tick_sync_backfill(&status);
+        assert_eq!(state.sync_backfill, SyncBackfill::Failed);
+        assert_eq!(status.snapshot().sync, SyncState::Error);
+        state.wake_sync_backfill();
+        assert_eq!(state.sync_backfill, SyncBackfill::Failed);
         assert!(execute_workspace_request(&mut state, create, &status).is_err());
         execute_workspace_request(
             &mut state,
@@ -9031,6 +9111,79 @@ mod tests {
         .unwrap();
         state.pairing_identity = None;
         assert!(local_sync_material(&state).is_err());
+
+        // Exercise the real worker admission loop with a request racing background work.
+        state.pairing_identity = Some(identity);
+        state.sync_backfill = SyncBackfill::Pending;
+        let pending = OfflineWorkspace::new(&mut state.vault, state.device_id)
+            .create_memory(context_relay_protocol::MemoryCreateParams {
+                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074208".parse().unwrap(),
+                scope: ScopeRef::Global,
+                kind: context_relay_protocol::MemoryKind::Fact,
+                title: "Worker backfill".into(),
+                body_markdown: "Preserve queued read".into(),
+                tags: vec![],
+            })
+            .unwrap();
+        struct BackfillGate {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl WorkerHook for BackfillGate {
+            fn before_execute(&self) {}
+
+            fn before_index_admission(&self) {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(20))
+                    .unwrap();
+            }
+        }
+        let (entered, entries) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let gate = BackfillGate {
+            entered,
+            release: Mutex::new(released),
+        };
+        let (sender, mut receiver) = mpsc::channel(2);
+        let admission = Arc::new(Mutex::new(true));
+        let worker_admission = admission.clone();
+        let worker = std::thread::spawn(move || {
+            run_vault_worker(
+                VaultWorkerState::Open(state),
+                &mut receiver,
+                Some(&gate),
+                &ServiceStatus::new(),
+                &worker_admission,
+            );
+        });
+        entries.recv_timeout(Duration::from_secs(20)).unwrap();
+        let (response, received) = oneshot::channel();
+        sender
+            .try_send(WorkItem {
+                command: VaultCommand::MemoryGet(MemoryParams {
+                    memory_id: pending.id,
+                }),
+                admission: Box::new(TestAdmission(true)),
+                response,
+            })
+            .unwrap();
+        release.send(()).unwrap();
+        assert!(
+            matches!(received.blocking_recv().unwrap().unwrap(), LocalResult::Memory { memory: Some(memory) } if memory == pending)
+        );
+        entries.recv_timeout(Duration::from_secs(20)).unwrap();
+        release.send(()).unwrap();
+        entries.recv_timeout(Duration::from_secs(20)).unwrap();
+        *admission.lock().unwrap() = false;
+        drop(sender);
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        let vault = Vault::open(path.path(), "test-vault-key", config.key_store.as_ref()).unwrap();
+        assert_eq!(vault.due_outbox(u64::MAX, 10).unwrap().len(), 5);
+        assert_eq!(vault.memory(&pending.id).unwrap(), Some(pending));
     }
 
     fn test_config(
