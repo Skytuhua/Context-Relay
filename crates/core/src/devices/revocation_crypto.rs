@@ -5,12 +5,17 @@ use context_relay_protocol::{
     WorkspaceId, X25519PublicKeyBytes, XChaChaNonce,
 };
 use minicbor::{Decoder, Encoder};
+use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::crypto::{CryptoError, DeviceCertificateV1, DeviceKeys, verify_signature};
 use crate::{
-    crypto::{WrappedKeyEnvelope, validate_x25519_public_key},
-    devices::crypto::{decode_certificate_v1, encode_certificate_v1},
+    crypto::{RecoveryKeys, WrappedKeyEnvelope, validate_x25519_public_key, wrap_secret},
+    devices::crypto::{
+        PairingKeyBundle, certificate_digest, decode_certificate_v1, decode_pairing_key_bundle_v1,
+        encode_certificate_v1, encode_pairing_key_bundle_v1,
+    },
     sync::SyncScope,
 };
 
@@ -20,6 +25,8 @@ const MAX_ROTATION_CERTIFICATE_BYTES: usize = 512;
 const MAX_ROTATION_BYTES: usize = 8 * 1024 * 1024;
 const ROTATION_DOMAIN: &[u8] = b"context-relay/device-revocation-transition/v1\0";
 const STATEMENT_DOMAIN: &[u8] = b"context-relay/device-revocation/v1\0";
+const DEVICE_MATERIAL_DOMAIN: &[u8] = b"context-relay/revocation-device-material/v1\0";
+const RECOVERY_MATERIAL_DOMAIN: &[u8] = b"context-relay/revocation-recovery-material/v1\0";
 
 /// Trusted inputs from the authenticated control chain, never from the submitted
 /// transition. The caller must recheck this state atomically when committing.
@@ -56,6 +63,167 @@ pub struct RevocationTransitionV1 {
 }
 
 impl RevocationTransitionV1 {
+    /// Generate fresh workspace/epoch keys and sign their encrypted distribution.
+    /// Replaces the input statement's transition digest. Persist these exact
+    /// artifacts for retries; do not regenerate them for the same operation ID.
+    /// No local or hosted control state is changed by this function.
+    pub fn build(
+        mut statement: DeviceRevocationStatementV1,
+        device: &DeviceKeys,
+        current: &RevocationControlState<'_>,
+    ) -> Result<(DeviceRevocationStatementV1, Self, Ed25519SignatureBytes), CryptoError> {
+        statement.context_preimage()?;
+        let invalid = CryptoError::AuthenticationFailed;
+        let issuer = current
+            .active_devices
+            .get(&statement.issuer_device_id)
+            .ok_or(invalid)?;
+        statement.check_signer(issuer, device)?;
+        if current.active_devices.len() > MAX_ROTATION_DEVICES
+            || statement.account_id != current.scope.account_id
+            || statement.workspace_id != current.scope.workspace_id
+            || statement.control_epoch != current.control_epoch
+            || statement.key_epoch != current.key_epoch
+            || !current
+                .active_devices
+                .contains_key(&statement.target_device_id)
+            || current.state_sha256.0 == [0; 32]
+        {
+            return Err(invalid);
+        }
+        let mut root_key = Zeroizing::new([0; 32]);
+        let mut epoch_key = Zeroizing::new([0; 32]);
+        OsRng
+            .try_fill_bytes(&mut *root_key)
+            .map_err(|_| CryptoError::RandomnessUnavailable)?;
+        OsRng
+            .try_fill_bytes(&mut *epoch_key)
+            .map_err(|_| CryptoError::RandomnessUnavailable)?;
+        let material = PairingKeyBundle::new(
+            current.scope,
+            current.control_epoch + 1,
+            current.key_epoch + 1,
+            *root_key,
+            *epoch_key,
+        )?;
+        let plaintext = encode_pairing_key_bundle_v1(&material)?;
+        let commitment = Sha256Digest(Sha256::digest(&*plaintext).into());
+        let mut devices = Vec::new();
+        for certificate in current
+            .active_devices
+            .values()
+            .filter(|certificate| certificate.device_id != statement.target_device_id)
+        {
+            let aad = rotation_material_aad(
+                &statement,
+                current.state_sha256,
+                commitment,
+                DEVICE_MATERIAL_DOMAIN,
+                certificate.device_id.as_bytes(),
+                &certificate_digest(certificate)?.0,
+            )?;
+            devices.push(DeviceRotationEnvelopeV1 {
+                certificate: certificate.clone(),
+                envelope: wrap_secret(certificate.wrapping_public_key, &plaintext, &aad)?,
+            });
+        }
+        let aad = rotation_material_aad(
+            &statement,
+            current.state_sha256,
+            commitment,
+            RECOVERY_MATERIAL_DOMAIN,
+            current.recovery_root_id.as_bytes(),
+            &current.recovery_wrapping_public_key.0,
+        )?;
+        let transition = Self {
+            previous_state_sha256: current.state_sha256,
+            control_epoch: material.control_epoch(),
+            key_epoch: material.key_epoch(),
+            key_material_sha256: commitment,
+            devices,
+            recovery_root_id: current.recovery_root_id,
+            recovery_wrapping_public_key: current.recovery_wrapping_public_key,
+            recovery_envelope: wrap_secret(current.recovery_wrapping_public_key, &plaintext, &aad)?,
+        };
+        statement.transition_sha256 = transition.digest()?;
+        let signature = statement.sign(issuer, device)?;
+        transition.verify(&statement, signature, current)?;
+        Ok((statement, transition, signature))
+    }
+
+    pub fn open_device_material(
+        &self,
+        statement: &DeviceRevocationStatementV1,
+        signature: Ed25519SignatureBytes,
+        current: &RevocationControlState<'_>,
+        device_id: DeviceId,
+        keys: &DeviceKeys,
+    ) -> Result<PairingKeyBundle, CryptoError> {
+        self.verify(statement, signature, current)?;
+        let recipient = self
+            .devices
+            .iter()
+            .find(|entry| entry.certificate.device_id == device_id)
+            .ok_or(CryptoError::AuthenticationFailed)?;
+        if recipient.certificate.signing_public_key != keys.signing_public_key()
+            || recipient.certificate.wrapping_public_key != keys.wrapping_public_key()
+        {
+            return Err(CryptoError::InvalidKey);
+        }
+        let aad = rotation_material_aad(
+            statement,
+            self.previous_state_sha256,
+            self.key_material_sha256,
+            DEVICE_MATERIAL_DOMAIN,
+            device_id.as_bytes(),
+            &certificate_digest(&recipient.certificate)?.0,
+        )?;
+        let plaintext = keys.unwrap_secret(&recipient.envelope, &aad)?;
+        self.opened_material(statement, plaintext.expose())
+    }
+
+    pub fn open_recovery_material(
+        &self,
+        statement: &DeviceRevocationStatementV1,
+        signature: Ed25519SignatureBytes,
+        current: &RevocationControlState<'_>,
+        keys: &RecoveryKeys,
+    ) -> Result<PairingKeyBundle, CryptoError> {
+        self.verify(statement, signature, current)?;
+        if keys.wrapping_public_key() != self.recovery_wrapping_public_key {
+            return Err(CryptoError::InvalidKey);
+        }
+        let aad = rotation_material_aad(
+            statement,
+            self.previous_state_sha256,
+            self.key_material_sha256,
+            RECOVERY_MATERIAL_DOMAIN,
+            self.recovery_root_id.as_bytes(),
+            &self.recovery_wrapping_public_key.0,
+        )?;
+        let plaintext = keys.unwrap_secret(&self.recovery_envelope, &aad)?;
+        self.opened_material(statement, plaintext.expose())
+    }
+
+    fn opened_material(
+        &self,
+        statement: &DeviceRevocationStatementV1,
+        plaintext: &[u8],
+    ) -> Result<PairingKeyBundle, CryptoError> {
+        if Sha256Digest(Sha256::digest(plaintext).into()) != self.key_material_sha256 {
+            return Err(CryptoError::AuthenticationFailed);
+        }
+        let material = decode_pairing_key_bundle_v1(plaintext)?;
+        if material.account_id() != statement.account_id
+            || material.workspace_id() != statement.workspace_id
+            || material.control_epoch() != self.control_epoch
+            || material.key_epoch() != self.key_epoch
+        {
+            return Err(CryptoError::AuthenticationFailed);
+        }
+        Ok(material)
+    }
+
     /// Parses bounded canonical wire bytes without authenticating the transition.
     /// Call verify against independently authenticated current state before use.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
@@ -275,12 +443,20 @@ impl DeviceRevocationStatementV1 {
     /// Domain, schema, five UUIDs, two epochs, sequence and two digests, in field
     /// order. UUIDs/digests are raw bytes; integers are fixed-width big-endian.
     pub fn signing_preimage(&self) -> Result<Vec<u8>, CryptoError> {
+        if self.transition_sha256.0 == [0; 32] {
+            return Err(CryptoError::InvalidProtocolValue);
+        }
+        let mut bytes = self.context_preimage()?;
+        bytes.extend_from_slice(&self.transition_sha256.0);
+        Ok(bytes)
+    }
+
+    fn context_preimage(&self) -> Result<Vec<u8>, CryptoError> {
         if self.schema_version != 1
             || !(1..u32::MAX).contains(&self.control_epoch)
             || !(1..u32::MAX).contains(&self.key_epoch)
             || self.cutoff_sequence > i64::MAX as u64
             || (self.cutoff_sequence == 0) != (self.cutoff_hash.0 == [0; 32])
-            || self.transition_sha256.0 == [0; 32]
         {
             return Err(CryptoError::InvalidProtocolValue);
         }
@@ -295,7 +471,6 @@ impl DeviceRevocationStatementV1 {
         bytes.extend_from_slice(&self.key_epoch.to_be_bytes());
         bytes.extend_from_slice(&self.cutoff_sequence.to_be_bytes());
         bytes.extend_from_slice(&self.cutoff_hash.0);
-        bytes.extend_from_slice(&self.transition_sha256.0);
         Ok(bytes)
     }
 
@@ -316,13 +491,22 @@ impl DeviceRevocationStatementV1 {
         certificate: &DeviceCertificateV1,
         device: &DeviceKeys,
     ) -> Result<Ed25519SignatureBytes, CryptoError> {
+        self.check_signer(certificate, device)?;
+        Ok(device.sign_hosted_device_proof(&self.signing_preimage()?))
+    }
+
+    fn check_signer(
+        &self,
+        certificate: &DeviceCertificateV1,
+        device: &DeviceKeys,
+    ) -> Result<(), CryptoError> {
         self.check_issuer(certificate)?;
         if certificate.signing_public_key != device.signing_public_key()
             || certificate.wrapping_public_key != device.wrapping_public_key()
         {
             return Err(CryptoError::InvalidKey);
         }
-        Ok(device.sign_hosted_device_proof(&self.signing_preimage()?))
+        Ok(())
     }
 
     /// The supplied certificate must already be authenticated and authorized by
@@ -336,6 +520,26 @@ impl DeviceRevocationStatementV1 {
         self.check_issuer(certificate)?;
         verify_signature(certificate.signing_public_key, &preimage, signature)
     }
+}
+
+// Bind the immutable statement context (everything except its final transition
+// digest), previous state, plaintext commitment and exact recipient. Omitting
+// the final digest avoids a circular dependency on the ciphertext being built.
+fn rotation_material_aad(
+    statement: &DeviceRevocationStatementV1,
+    previous: Sha256Digest,
+    commitment: Sha256Digest,
+    domain: &[u8],
+    recipient_id: &[u8; 16],
+    recipient_binding: &[u8; 32],
+) -> Result<Vec<u8>, CryptoError> {
+    let mut bytes = domain.to_vec();
+    bytes.extend_from_slice(&statement.context_preimage()?);
+    bytes.extend_from_slice(&previous.0);
+    bytes.extend_from_slice(&commitment.0);
+    bytes.extend_from_slice(recipient_id);
+    bytes.extend_from_slice(recipient_binding);
+    Ok(bytes)
 }
 
 fn read_fixed<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], CryptoError> {

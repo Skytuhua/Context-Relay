@@ -2529,3 +2529,39 @@ Decoding does not authenticate a sender. Callers must still verify the decoded
 statement/transition against independently authenticated current control state.
 Secure envelope construction/decryption, durable historical-key/cutoff handling,
 hosted atomic revocation and installed acceptance remain unfinished.
+
+## Native rotation key generation and opening (2026-09-09)
+
+The rotation builder now generates independent fresh workspace-root and epoch keys
+with OS randomness in zeroizing buffers, encodes them with the existing canonical
+zeroizing key-bundle codec and wraps the same bundle separately for every remaining
+active device and the recovery root. It computes the plaintext commitment, signs
+the completed manifest and verifies it against the supplied current authority.
+The statement's final transition digest is replaced by the generated manifest hash.
+Exact generated artifacts must be persisted for retries; rebuilding an operation
+would generate different key material and is not an idempotent retry mechanism.
+
+Separate device/recovery AAD domains bind the immutable statement context (all
+signed fields except the final transition digest), previous control-state hash,
+plaintext commitment, recipient ID and either complete certificate digest or
+recovery wrapping public key. Excluding the final transition hash avoids a circular
+ciphertext dependency. The existing statement golden vector remains unchanged.
+
+Opening verifies the full signed manifest/current authority first, checks installed
+keys, authenticates the envelope and verifies the canonical plaintext commitment,
+account/workspace and next epochs before returning zeroizing material. The regression
+proves identical keys for two remaining devices and recovery, fresh keys between
+builds, target exclusion, wrong-key rejection, a resigned cross-rotation envelope
+transplant, and validly signed/authenticated envelopes with a wrong commitment or
+epoch. Last-device self-revocation leaves recovery access with no device envelope.
+
+Both focused regressions pass (13.68 seconds); core library/focused-test Clippy with
+warnings denied passes (15.55 seconds). Initial regression failed for the missing
+builder API before implementation. Bounded review found no actionable P1/P2.
+Logs: `.codex/pr16-rotation-material-red.log`, `.codex/pr16-rotation-material-test.log`
+and `.codex/pr16-rotation-material-clippy.log`.
+
+These functions do not persist intent, activate new keys or mutate hosted state.
+Durable exact-artifact retries, historical keys/control-chain storage, signed cutoff
+admission/head CAS, hosted atomic mutation, daemon wiring and installed acceptance
+remain required before revocation is a complete release workflow.
