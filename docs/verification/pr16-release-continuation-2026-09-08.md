@@ -2913,3 +2913,10 @@ it launches `/bin/bash`, absent on this Windows host. The selected rerun explici
 excluded that fixture; neither it nor the remote whitespace gate was changed.
 The new remote acquisition step still needs a successful run before macOS-host
 acquisition can be claimed verified.
+
+
+### Native release qualification caller permissions (2026-09-09)
+
+Manual run [34355371028](https://github.com/Skytuhua/Context-Relay/actions/runs/34355371028) failed before starting jobs. GitHub reported that the reusable CI workflow requested `actions: read` beyond the caller's implicit `actions: none`, and its nested publication job requested `contents: write` beyond `contents: read`. The qualification call now explicitly permits both at the calling job; the workflow default remains read-only. The callee still restricts publication dispatch to protected `main` push events, so manual qualification cannot publish.
+
+The existing workflow contract test reproduced the missing permission declaration before the change. All 25 native CI workflow tests pass after it, including the protected-push publication guard. Hosted startup and two-build qualification must still be rerun; this does not establish reproducibility, signing, publication or installed acceptance.

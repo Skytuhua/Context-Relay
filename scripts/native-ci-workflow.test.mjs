@@ -113,6 +113,9 @@ test('normal CI uses one native builder per platform and defers A/B qualificatio
   assert.match(qualification, /workflow_dispatch:/);
   assert.match(qualification, /uses:\s*\.\/\.github\/workflows\/ci\.yml/);
   assert.match(qualification, /semgrep_release_qualification:\s*true/);
+  const caller = job(qualification, 'qualification');
+  assert.match(caller, /permissions:\s*\n\s+actions: read\s*\n\s+contents: write/);
+  assert.match(source, /github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' && github\.ref_protected == true/);
 });
 
 test('normal V1 retries reuse successful native artifacts across workflow attempts', async () => {
