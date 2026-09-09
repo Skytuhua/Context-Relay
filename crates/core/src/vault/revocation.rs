@@ -264,6 +264,49 @@ impl Vault {
         load_control(&self.connection, scope, control_epoch)
     }
 
+    /// Reauthenticate a contiguous history in one database read snapshot.
+    /// Both the anchor and expected tip must be independently trusted by the caller;
+    /// taking the tip from this same storage does not protect against rollback.
+    /// Reads one bounded entry at a time. This proves the signed chain only, not
+    /// hosted acceptance, cutoff ancestry, envelope decryptability or key activation.
+    pub fn verify_device_revocation_history(
+        &self,
+        anchor: &RevocationControlState<'_>,
+        expected_control_epoch: u32,
+        expected_state_sha256: context_relay_protocol::Sha256Digest,
+    ) -> Result<crate::devices::revocation_crypto::VerifiedRevocationControl, VaultError> {
+        if anchor.control_epoch == 0
+            || expected_control_epoch <= anchor.control_epoch
+            || expected_state_sha256.0 == [0; 32]
+        {
+            return Err(VaultError::OperationConflict);
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut verified: Option<crate::devices::revocation_crypto::VerifiedRevocationControl> =
+            None;
+        for epoch in anchor.control_epoch + 1..=expected_control_epoch {
+            let record = load_control(&transaction, anchor.scope, epoch)?
+                .ok_or(VaultError::OperationConflict)?;
+            let previous = verified.as_ref().map(|control| control.state());
+            verified = Some(
+                record
+                    .transition
+                    .verify_and_advance(
+                        &record.statement,
+                        record.signature,
+                        previous.as_ref().unwrap_or(anchor),
+                    )
+                    .map_err(|_| VaultError::OperationConflict)?,
+            );
+        }
+        let verified = verified.ok_or(VaultError::OperationConflict)?;
+        if verified.state().state_sha256 != expected_state_sha256 {
+            return Err(VaultError::OperationConflict);
+        }
+        transaction.commit()?;
+        Ok(verified)
+    }
+
     /// Append exact signed envelopes before activating rotated keys. The caller
     /// must authenticate the supplied prior state and hosted acceptance separately.
     /// An exact retry only confirms storage; it never advances authority again.

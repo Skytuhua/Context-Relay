@@ -718,6 +718,44 @@ fn verified_control_history_chains_cutoffs_and_retains_a_revoked_issuers_child()
         verified_tip.state().state_sha256,
         final_state.state().state_sha256
     );
+    let loaded = vault
+        .verify_device_revocation_history(&anchor, 4, final_state.state().state_sha256)
+        .unwrap();
+    assert_eq!(
+        loaded.state().active_devices,
+        final_state.state().active_devices
+    );
+    assert_eq!(loaded.statement(), &second);
+    assert_eq!(
+        loaded.state().state_sha256,
+        final_state.state().state_sha256
+    );
+    // The separately trusted tip prevents accepting a valid but truncated prefix.
+    for (epoch, hash) in [
+        (2, anchor.state_sha256),
+        (3, final_state.state().state_sha256),
+        (4, Sha256Digest([99; 32])),
+        (5, final_state.state().state_sha256),
+    ] {
+        assert!(
+            vault
+                .verify_device_revocation_history(&anchor, epoch, hash)
+                .is_err()
+        );
+    }
+    let prefix = vault
+        .verify_device_revocation_history(&anchor, 3, current.state_sha256)
+        .unwrap();
+    assert_eq!(prefix.state().active_devices, current.active_devices);
+    let wrong_anchor = RevocationControlState {
+        state_sha256: Sha256Digest([99; 32]),
+        ..anchor
+    };
+    assert!(
+        vault
+            .verify_device_revocation_history(&wrong_anchor, 4, final_state.state().state_sha256)
+            .is_err()
+    );
     let old_keys = old
         .transition
         .open_recovery_material(&old.statement, old.signature, &anchor, &recovery)
@@ -748,6 +786,67 @@ fn verified_control_history_chains_cutoffs_and_retains_a_revoked_issuers_child()
     drop(raw);
     let vault = context_relay_core::vault::Vault::open(path.path(), "history", &store).unwrap();
     assert!(vault.device_revocation_control(anchor.scope, 3).is_err());
+    assert!(
+        vault
+            .verify_device_revocation_history(&anchor, 4, final_state.state().state_sha256)
+            .is_err()
+    );
+    drop(vault);
+    let raw = rusqlite::Connection::open(path.path()).unwrap();
+    // SAFETY: keying is the first SQLite operation; key is live for this call.
+    assert_eq!(
+        unsafe { rusqlite::ffi::sqlite3_key(raw.handle(), database_key.as_ptr().cast(), 32) },
+        rusqlite::ffi::SQLITE_OK
+    );
+    let forged_hash = first
+        .control_state_sha256(context_relay_protocol::Ed25519SignatureBytes([0; 64]))
+        .unwrap();
+    raw.execute(
+        "UPDATE revocation_control_history SET state_sha256=?1 WHERE control_epoch=3",
+        [forged_hash.0.as_slice()],
+    )
+    .unwrap();
+    drop(raw);
+    let vault = context_relay_core::vault::Vault::open(path.path(), "history", &store).unwrap();
+    // Canonical integrity is insufficient: even with a matching stored hash, the
+    // forged signature must fail while reconstructing authority.
+    assert!(
+        vault
+            .device_revocation_control(anchor.scope, 3)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        vault
+            .verify_device_revocation_history(&anchor, 4, final_state.state().state_sha256)
+            .is_err()
+    );
+    drop(vault);
+    let raw = rusqlite::Connection::open(path.path()).unwrap();
+    // SAFETY: keying is the first SQLite operation; key is live for this call.
+    assert_eq!(
+        unsafe { rusqlite::ffi::sqlite3_key(raw.handle(), database_key.as_ptr().cast(), 32) },
+        rusqlite::ffi::SQLITE_OK
+    );
+    raw.execute(
+        "DELETE FROM revocation_control_history WHERE control_epoch=3",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+    let vault = context_relay_core::vault::Vault::open(path.path(), "history", &store).unwrap();
+    assert!(
+        vault
+            .device_revocation_control(anchor.scope, 4)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        vault
+            .verify_device_revocation_history(&anchor, 4, final_state.state().state_sha256)
+            .is_err()
+    );
+
     assert!(final_state.state().active_devices.is_empty());
     assert_eq!(final_state.state().control_epoch, 4);
     second_rotation

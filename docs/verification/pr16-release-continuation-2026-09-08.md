@@ -2725,3 +2725,29 @@ Production initial-roster provenance/history loading, historical cutoff admissio
 and key distribution, atomic activation, hosted mutation and daemon propagation
 remain unfinished, along with all broader release acceptance gates. No merge or
 full release qualification is claimed.
+
+
+### Reauthenticate stored control history against a pinned tip (2026-09-09)
+
+`Vault::verify_device_revocation_history` now reads a contiguous sequence from a
+caller-authenticated anchor through an independently trusted final epoch/hash.
+One database transaction keeps all reads in the same snapshot. Each bounded entry
+passes the existing full transition verifier against the preceding verified state;
+only the final verified state is returned, after its hash matches the supplied pin.
+A valid prefix cannot satisfy a later tip. A missing entry is an error, not the end
+of history. Reading one manifest at a time avoids buffering the entire history.
+
+The existing two-rotation/reopen regression initially failed with the missing API.
+It now verifies the full history and an explicitly pinned prefix, rejects wrong
+anchors, final hashes and epochs, and checks missing intermediate entries. It also
+replaces an old signature with zeros and recomputes its stored hash: the canonical
+single-entry read succeeds, while the new chain verifier rejects the signature.
+All five revocation crypto/history/intent tests pass (12.40s and 5.25s); focused
+core library/test Clippy with test-support and `-D warnings` passes in 9.55s.
+Read-only review found no P1/P2. Logs: `.codex/pr16-history-loader-{red,tests,clippy}.log`.
+
+The caller still must establish initial-roster provenance and persist the accepted
+tip independently; deriving the pin from the same history defeats rollback checks.
+This API does not prove hosted acceptance, cutoff ancestry or decryptability, and
+has not yet been wired into sync authority/key activation. Those integrations and
+the full release checklist remain required before merge.
