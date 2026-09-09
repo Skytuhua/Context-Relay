@@ -335,6 +335,8 @@ pub(crate) fn verify_checkpoint_chain_extension(
     {
         return Err(SyncError::InvalidChain);
     }
+    // An owned continuation can outlive the trust used to authenticate its anchor.
+    authenticate_checkpoint(scope, &anchor.checkpoint, trusted_material)?;
     let authenticated = authenticate_checkpoint(scope, received, trusted_material)?;
     verify_local_checkpoint_state(vault, scope, &authenticated.checkpoint)?;
     let current_pin_hash = vault

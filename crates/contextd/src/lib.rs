@@ -9265,7 +9265,7 @@ mod tests {
             .block_on(hosted_sync::verify_stalled_worker(
                 state,
                 fixture.owner.clone(),
-                false,
+                hosted_sync::StallAt::Push,
             ));
         let vault = Vault::open(path.path(), "test-vault-key", config.key_store.as_ref()).unwrap();
         let after = vault.due_outbox(u64::MAX, 10).unwrap();
@@ -9275,7 +9275,23 @@ mod tests {
         drop(vault);
         fixture.login();
         let (mut state, _) = open_workspace(&mut config).unwrap_or_else(|_| panic!("reopen"));
+        state.pairing_identity = Some(identity.clone());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(hosted_sync::verify_stalled_worker(
+                state,
+                fixture.owner.clone(),
+                hosted_sync::StallAt::Pull,
+            ));
+        let vault = Vault::open(path.path(), "test-vault-key", config.key_store.as_ref()).unwrap();
+        assert!(vault.due_outbox(u64::MAX, 10).unwrap().is_empty());
+        drop(vault);
+        fixture.login();
+        let (mut state, _) = open_workspace(&mut config).unwrap_or_else(|_| panic!("reopen"));
         state.pairing_identity = Some(identity);
+        state.vault.request_sync_checkpoint(scope).unwrap();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -9283,10 +9299,11 @@ mod tests {
             .block_on(hosted_sync::verify_stalled_worker(
                 state,
                 fixture.owner,
-                true,
+                hosted_sync::StallAt::Checkpoint,
             ));
         let vault = Vault::open(path.path(), "test-vault-key", config.key_store.as_ref()).unwrap();
-        assert!(vault.due_outbox(u64::MAX, 10).unwrap().is_empty());
+        assert!(vault.sync_checkpoint_pin(scope).unwrap().is_none());
+        assert!(vault.sync_checkpoint_schedule(scope).unwrap().requested);
     }
 
     fn test_config(

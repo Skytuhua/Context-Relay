@@ -557,6 +557,199 @@ fn blocked_outbox_classes_never_become_time_due() {
 }
 
 #[test]
+fn staged_checkpoint_revalidates_local_writes_and_rejects_stale_completion() {
+    use context_relay_core::sync::{CheckpointProgress, CheckpointRequest, CheckpointResponse};
+    let device = device(ID_3, 92);
+    let trust = trust(&device);
+    let operations = chain(&device, 2, 22_000);
+    let path = TempVault::new("staged-checkpoint");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    vault
+        .commit_outgoing_operation(&operations[0].0, &operations[0].1, None)
+        .unwrap();
+    vault.request_sync_checkpoint(scope()).unwrap();
+    let mut provider = InMemoryTransport::new();
+    let engine = SyncEngine::new(scope(), SyncProvider::Memory);
+    let context = CheckpointBuildContext {
+        scope: scope(),
+        creator_device: device.certificate.device_id,
+        active_key_epoch: KEY_EPOCH,
+        device_keys: &device.keys,
+        created_hlc: HybridLogicalClock::new(22_100, 0, device.certificate.device_id),
+    };
+    let CheckpointProgress::Request(stale) = engine.prepare_checkpoint(&vault).unwrap() else {
+        panic!("expected history request");
+    };
+    let stale_page = provider
+        .pull_checkpoints(scope(), CHECKPOINT_SCHEMA_VERSION, None, 256)
+        .unwrap();
+    let mut progress = engine.prepare_checkpoint(&vault).unwrap();
+    let mut wrote = false;
+    let error = loop {
+        let CheckpointProgress::Request(prepared) = progress else {
+            panic!("must not pin a checkpoint whose local state changed during HTTP");
+        };
+        let response = match prepared.request() {
+            CheckpointRequest::ByHash(hash) => CheckpointResponse::ByHash(
+                provider
+                    .checkpoint_by_hash(scope(), CHECKPOINT_SCHEMA_VERSION, *hash)
+                    .unwrap()
+                    .map(Box::new),
+            ),
+            CheckpointRequest::Page { after, limit } => {
+                // The vault remains available while checkpoint HTTP is outstanding.
+                vault.put_candidate(&support::candidate()).unwrap();
+                CheckpointResponse::Page(
+                    provider
+                        .pull_checkpoints(
+                            scope(),
+                            CHECKPOINT_SCHEMA_VERSION,
+                            after.as_ref(),
+                            *limit,
+                        )
+                        .unwrap(),
+                )
+            }
+            CheckpointRequest::Push(checkpoint) => {
+                let receipt = provider
+                    .push_checkpoint(scope(), CHECKPOINT_SCHEMA_VERSION, checkpoint)
+                    .unwrap();
+                vault
+                    .commit_outgoing_operation(&operations[1].0, &operations[1].1, None)
+                    .unwrap();
+                wrote = true;
+                CheckpointResponse::Push(receipt)
+            }
+        };
+        match engine.finish_checkpoint(&mut vault, *prepared, response, &trust, 22_101, &context) {
+            Ok(next) => progress = next,
+            Err(error) => break error,
+        }
+    };
+    assert!(wrote);
+    assert_eq!(error.safe_code(), "integrity_quarantined");
+    assert!(vault.sync_checkpoint_pin(scope()).unwrap().is_none());
+    assert!(vault.sync_checkpoint_schedule(scope()).unwrap().requested);
+    drop(vault);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let report = engine
+        .sync_once_with_checkpoint(
+            &mut vault,
+            &mut provider,
+            &trust,
+            &NoEmbeddings,
+            22_200,
+            &context,
+        )
+        .unwrap();
+    assert!(report.checkpointed);
+    let pin = vault.sync_checkpoint_pin(scope()).unwrap().unwrap();
+    assert_eq!(pin.accepted_at_ms, 22_200);
+    assert!(
+        engine
+            .finish_checkpoint(
+                &mut vault,
+                *stale,
+                CheckpointResponse::Page(stale_page),
+                &trust,
+                22_201,
+                &context
+            )
+            .is_err()
+    );
+    assert_eq!(
+        vault.sync_checkpoint_pin(scope()).unwrap(),
+        Some(pin.clone())
+    );
+    drop(vault);
+    let reopened = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(reopened.sync_checkpoint_pin(scope()).unwrap(), Some(pin));
+    assert!(
+        reopened
+            .candidate(&support::candidate().id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn staged_checkpoint_rechecks_anchor_trust_after_upload() {
+    use context_relay_core::sync::{CheckpointProgress, CheckpointRequest, CheckpointResponse};
+    let local = device(ID_3, 94);
+    let remote = device(ID_2, 95);
+    let mut trusted = trust(&local);
+    trusted
+        .devices
+        .insert(remote.certificate.device_id, remote.certificate.clone());
+    let path = TempVault::new("staged-checkpoint-anchor-trust");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let context = CheckpointBuildContext {
+        scope: scope(),
+        creator_device: local.certificate.device_id,
+        active_key_epoch: KEY_EPOCH,
+        device_keys: &local.keys,
+        created_hlc: HybridLogicalClock::new(22_100, 0, local.certificate.device_id),
+    };
+    let anchor = context_relay_core::sync::build_checkpoint(
+        &vault,
+        &CheckpointBuildContext {
+            creator_device: remote.certificate.device_id,
+            device_keys: &remote.keys,
+            created_hlc: HybridLogicalClock::new(22_000, 0, remote.certificate.device_id),
+            ..context
+        },
+        &trusted,
+    )
+    .unwrap();
+    let operation = chain(&local, 1, 22_050).remove(0);
+    vault
+        .commit_outgoing_operation(&operation.0, &operation.1, None)
+        .unwrap();
+    vault.request_sync_checkpoint(scope()).unwrap();
+    let mut provider = InMemoryTransport::new();
+    provider
+        .push_checkpoint(scope(), CHECKPOINT_SCHEMA_VERSION, &anchor)
+        .unwrap();
+    let engine = SyncEngine::new(scope(), SyncProvider::Memory);
+    let mut progress = engine.prepare_checkpoint(&vault).unwrap();
+    loop {
+        let CheckpointProgress::Request(prepared) = progress else {
+            panic!("must reject an anchor whose creator is no longer trusted");
+        };
+        let response = match prepared.request() {
+            CheckpointRequest::ByHash(hash) => CheckpointResponse::ByHash(
+                provider
+                    .checkpoint_by_hash(scope(), CHECKPOINT_SCHEMA_VERSION, *hash)
+                    .unwrap()
+                    .map(Box::new),
+            ),
+            CheckpointRequest::Page { after, limit } => CheckpointResponse::Page(
+                provider
+                    .pull_checkpoints(scope(), CHECKPOINT_SCHEMA_VERSION, after.as_ref(), *limit)
+                    .unwrap(),
+            ),
+            CheckpointRequest::Push(checkpoint) => {
+                let receipt = provider
+                    .push_checkpoint(scope(), CHECKPOINT_SCHEMA_VERSION, checkpoint)
+                    .unwrap();
+                trusted.devices.remove(&remote.certificate.device_id);
+                CheckpointResponse::Push(receipt)
+            }
+        };
+        match engine.finish_checkpoint(&mut vault, *prepared, response, &trusted, 22_101, &context)
+        {
+            Ok(next) => progress = next,
+            Err(_) => break,
+        }
+    }
+    assert!(!trusted.devices.contains_key(&remote.certificate.device_id));
+    assert!(vault.sync_checkpoint_pin(scope()).unwrap().is_none());
+    assert!(vault.sync_checkpoint_schedule(scope()).unwrap().requested);
+}
+
+#[test]
 fn explicit_checkpoint_is_pushed_verified_pinned_and_durable() {
     let device = device(ID_3, 92);
     let trust = trust(&device);

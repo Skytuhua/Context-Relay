@@ -1,3 +1,7 @@
+mod checkpoints;
+pub use checkpoints::{
+    CheckpointProgress, CheckpointRequest, CheckpointResponse, PreparedCheckpoint,
+};
 mod pull;
 pub use pull::{PreparedPull, PullProgress, PullRequest, PullResponse};
 
@@ -35,25 +39,6 @@ enum GapRepairOutcome {
     Complete,
     Pending,
     BlockedByQuarantine,
-}
-
-struct CheckpointPullResult {
-    accepted: usize,
-    more_work: bool,
-    chain_anchor: Option<CheckpointChainAnchor>,
-    append_anchor: Option<CheckpointAppendAnchor>,
-}
-
-struct CheckpointChainAnchor {
-    verified: VerifiedCheckpointChainAnchor,
-}
-
-enum CheckpointAppendAnchor {
-    Empty,
-    Endpoint {
-        cursor: CheckpointCursor,
-        canonical_hash: Sha256Digest,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -294,266 +279,49 @@ impl<G> SyncEngine<G> {
             embedding_resolver,
             now_ms,
         )?;
-        let checkpoint_pull =
-            self.pull_checkpoint_chain(vault, transport, trusted_material, now_ms)?;
-        if checkpoint_pull.accepted > 0 {
-            report.checkpointed = true;
-        }
-        report.more_work |= checkpoint_pull.more_work;
-        if checkpoint_pull.more_work {
-            return Ok(report);
-        }
-        let schedule = vault
-            .sync_checkpoint_schedule(self.scope)
-            .map_err(checkpoint_vault_error)?;
-        if !schedule.is_due(now_ms) {
-            return Ok(report);
-        }
-        let checkpoint = if let Some(anchor) = checkpoint_pull.chain_anchor.as_ref() {
-            build_checkpoint_after_chain(
-                vault,
-                checkpoint_context,
-                trusted_material,
-                &anchor.verified,
-            )
-            .map_err(sync_error)?
-        } else {
-            build_checkpoint(vault, checkpoint_context, trusted_material).map_err(sync_error)?
-        };
-        let receipt = transport
-            .push_checkpoint(self.scope, CHECKPOINT_SCHEMA_VERSION, &checkpoint)
-            .map_err(transport_error)?;
-        if receipt.canonical_hash != checkpoint.canonical_hash {
-            return Err(SyncCycleError::new("integrity_quarantined"));
-        }
-        let append_anchor = checkpoint_pull
-            .append_anchor
-            .as_ref()
-            .ok_or_else(|| SyncCycleError::new("integrity_quarantined"))?;
-        self.confirm_checkpoint_append(transport, append_anchor, &checkpoint, trusted_material)?;
-        if let Some(anchor) = checkpoint_pull.chain_anchor.as_ref() {
-            let verified = verify_checkpoint_chain_extension(
-                vault,
-                self.scope,
-                &checkpoint,
-                &anchor.verified,
-                trusted_material,
-            )
-            .map_err(sync_error)?;
-            vault
-                .accept_sync_checkpoint_chain_extension(
-                    &verified,
-                    now_ms,
-                    self.provider.as_str(),
-                    anchor.verified.checkpoint.canonical_hash,
-                )
-                .map_err(checkpoint_vault_error)?;
-        } else {
-            let verified = verify_checkpoint(vault, self.scope, &checkpoint, trusted_material)
-                .map_err(sync_error)?;
-            vault
-                .accept_sync_checkpoint(&verified, now_ms)
-                .map_err(checkpoint_vault_error)?;
-        }
-        report.checkpointed = true;
-        Ok(report)
-    }
-
-    fn pull_checkpoint_chain<T, M>(
-        &self,
-        vault: &mut Vault,
-        transport: &mut T,
-        trusted_material: &M,
-        now_ms: u64,
-    ) -> Result<CheckpointPullResult, SyncCycleError>
-    where
-        T: SyncTransport,
-        M: TrustedSyncMaterial,
-    {
-        let initial_pin = vault
-            .sync_checkpoint_pin(self.scope)
-            .map_err(checkpoint_vault_error)?;
-        if let Some(pin) = initial_pin.as_ref() {
-            let remote_pin = transport
-                .checkpoint_by_hash(self.scope, CHECKPOINT_SCHEMA_VERSION, pin.canonical_hash)
-                .map_err(transport_error)?
-                .ok_or_else(|| SyncCycleError::new("integrity_quarantined"))?;
-            if remote_pin.bytes != pin.canonical_bytes || remote_pin.state_hash != pin.state_hash {
-                return Err(SyncCycleError::new("integrity_quarantined"));
-            }
-        }
-        let scan = vault
-            .sync_checkpoint_scan(self.scope, self.provider.as_str())
-            .map_err(checkpoint_vault_error)?;
-        let base_pin_hash = initial_pin.as_ref().map(|pin| pin.canonical_hash);
-        if scan
-            .as_ref()
-            .is_some_and(|scan| scan.base_pin_hash != base_pin_hash)
-        {
-            return Err(SyncCycleError::new("integrity_quarantined"));
-        }
-        let mut found_pin = scan
-            .as_ref()
-            .map_or(initial_pin.is_none(), |scan| scan.pin_seen);
-        let mut after = scan.as_ref().map(|scan| scan.cursor.clone());
-        let mut expected_previous = scan
-            .as_ref()
-            .map_or(Sha256Digest([0; 32]), |scan| scan.checkpoint.canonical_hash);
-        let mut scanned = 0usize;
+        let mut progress = self.prepare_checkpoint(vault)?;
         loop {
-            let remaining = self.max_operations.saturating_sub(scanned);
-            if remaining == 0 {
-                return Ok(CheckpointPullResult {
-                    accepted: 0,
-                    more_work: true,
-                    chain_anchor: None,
-                    append_anchor: None,
-                });
-            }
-            let limit = remaining.min(MAX_BATCH);
-            let page = transport
-                .pull_checkpoints(self.scope, CHECKPOINT_SCHEMA_VERSION, after.as_ref(), limit)
-                .map_err(transport_error)?;
-            validate_checkpoint_page(after.as_ref(), &page.rows, page.next_cursor.as_ref(), limit)?;
-            if page.rows.is_empty() {
-                if !found_pin {
-                    return Err(SyncCycleError::new("integrity_quarantined"));
+            progress = match progress {
+                CheckpointProgress::Complete(checkpoints) => {
+                    report.checkpointed |= checkpoints.checkpointed;
+                    report.more_work |= checkpoints.more_work;
+                    return Ok(report);
                 }
-                let Some(scan) = vault
-                    .sync_checkpoint_scan(self.scope, self.provider.as_str())
-                    .map_err(checkpoint_vault_error)?
-                else {
-                    return Ok(CheckpointPullResult {
-                        accepted: 0,
-                        more_work: false,
-                        chain_anchor: None,
-                        append_anchor: Some(CheckpointAppendAnchor::Empty),
-                    });
-                };
-                let (chain_anchor, verified) = verify_checkpoint_after_chain(
-                    vault,
-                    self.scope,
-                    &scan.checkpoint,
-                    scan.base_pin_hash,
-                    trusted_material,
-                )
-                .map_err(sync_error)?;
-                if let Some(verified) = verified {
-                    vault
-                        .accept_sync_checkpoint_endpoint(&verified, now_ms, self.provider.as_str())
-                        .map_err(checkpoint_vault_error)?;
-                    return Ok(CheckpointPullResult {
-                        accepted: 1,
-                        more_work: false,
-                        chain_anchor: None,
-                        append_anchor: Some(CheckpointAppendAnchor::Endpoint {
-                            cursor: scan.cursor,
-                            canonical_hash: chain_anchor.checkpoint.canonical_hash,
-                        }),
-                    });
+                CheckpointProgress::Request(prepared) => {
+                    let response = match prepared.request() {
+                        CheckpointRequest::ByHash(hash) => CheckpointResponse::ByHash(
+                            transport
+                                .checkpoint_by_hash(self.scope, CHECKPOINT_SCHEMA_VERSION, *hash)
+                                .map_err(transport_error)?
+                                .map(Box::new),
+                        ),
+                        CheckpointRequest::Page { after, limit } => CheckpointResponse::Page(
+                            transport
+                                .pull_checkpoints(
+                                    self.scope,
+                                    CHECKPOINT_SCHEMA_VERSION,
+                                    after.as_ref(),
+                                    *limit,
+                                )
+                                .map_err(transport_error)?,
+                        ),
+                        CheckpointRequest::Push(checkpoint) => CheckpointResponse::Push(
+                            transport
+                                .push_checkpoint(self.scope, CHECKPOINT_SCHEMA_VERSION, checkpoint)
+                                .map_err(transport_error)?,
+                        ),
+                    };
+                    self.finish_checkpoint(
+                        vault,
+                        *prepared,
+                        response,
+                        trusted_material,
+                        now_ms,
+                        checkpoint_context,
+                    )?
                 }
-                let append_cursor = scan.cursor.clone();
-                let append_hash = chain_anchor.checkpoint.canonical_hash;
-                return Ok(CheckpointPullResult {
-                    accepted: 0,
-                    more_work: false,
-                    chain_anchor: Some(CheckpointChainAnchor {
-                        verified: chain_anchor,
-                    }),
-                    append_anchor: Some(CheckpointAppendAnchor::Endpoint {
-                        cursor: append_cursor,
-                        canonical_hash: append_hash,
-                    }),
-                });
-            }
-            for row in page.rows {
-                scanned = scanned.saturating_add(1);
-                validate_received_checkpoint(&row)?;
-                let authenticated = verify_checkpoint_link(
-                    self.scope,
-                    &row.checkpoint,
-                    expected_previous,
-                    trusted_material,
-                )
-                .map_err(sync_error)?;
-                if let Some(pin) = initial_pin.as_ref()
-                    && row.checkpoint.canonical_hash == pin.canonical_hash
-                {
-                    if row.checkpoint.bytes != pin.canonical_bytes
-                        || row.checkpoint.state_hash != pin.state_hash
-                    {
-                        return Err(SyncCycleError::new("integrity_quarantined"));
-                    }
-                    found_pin = true;
-                }
-                vault
-                    .save_sync_checkpoint_scan(
-                        self.scope,
-                        self.provider.as_str(),
-                        &row.cursor,
-                        &authenticated,
-                        base_pin_hash,
-                        found_pin,
-                    )
-                    .map_err(checkpoint_vault_error)?;
-                expected_previous = row.checkpoint.canonical_hash;
-                after = Some(row.cursor);
-            }
-            if scanned == self.max_operations {
-                return Ok(CheckpointPullResult {
-                    accepted: 0,
-                    more_work: true,
-                    chain_anchor: None,
-                    append_anchor: None,
-                });
-            }
+            };
         }
-    }
-
-    fn confirm_checkpoint_append<T, M>(
-        &self,
-        transport: &mut T,
-        anchor: &CheckpointAppendAnchor,
-        checkpoint: &super::CanonicalCheckpoint,
-        trusted_material: &M,
-    ) -> Result<(), SyncCycleError>
-    where
-        T: SyncTransport,
-        M: TrustedSyncMaterial,
-    {
-        let (after, expected_previous) = match anchor {
-            CheckpointAppendAnchor::Empty => (None, Sha256Digest([0; 32])),
-            CheckpointAppendAnchor::Endpoint {
-                cursor,
-                canonical_hash,
-            } => (Some(cursor), *canonical_hash),
-        };
-        let page = transport
-            .pull_checkpoints(self.scope, CHECKPOINT_SCHEMA_VERSION, after, 2)
-            .map_err(transport_error)?;
-        validate_checkpoint_page(after, &page.rows, page.next_cursor.as_ref(), 2)?;
-        let [row] = page.rows.as_slice() else {
-            return Err(SyncCycleError::new("integrity_quarantined"));
-        };
-        validate_received_checkpoint(row)?;
-        let authenticated = verify_checkpoint_link(
-            self.scope,
-            &row.checkpoint,
-            expected_previous,
-            trusted_material,
-        )
-        .map_err(sync_error)?;
-        if authenticated.checkpoint != *checkpoint {
-            return Err(SyncCycleError::new("integrity_quarantined"));
-        }
-        let tail = transport
-            .pull_checkpoints(self.scope, CHECKPOINT_SCHEMA_VERSION, Some(&row.cursor), 1)
-            .map_err(transport_error)?;
-        validate_checkpoint_page(Some(&row.cursor), &tail.rows, tail.next_cursor.as_ref(), 1)?;
-        if !tail.rows.is_empty() {
-            return Err(SyncCycleError::new("integrity_quarantined"));
-        }
-        Ok(())
     }
 
     fn existing_quarantine(

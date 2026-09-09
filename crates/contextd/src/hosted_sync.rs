@@ -6,9 +6,10 @@ use context_relay_core::{
     auth::{HostedIdentity, HostedSessionOwner, LoginCancellation},
     service::sync_embedding,
     sync::{
-        PreparedPull, PreparedPush, PullProgress, PullRequest, PullResponse, PushReceipt,
-        SupabaseTransport, SupabaseTransportConfig, SyncEngine, SyncProvider, SyncScope,
-        SyncTransport, TransportError,
+        CheckpointBuildContext, CheckpointProgress, CheckpointRequest, CheckpointResponse,
+        PreparedCheckpoint, PreparedPull, PreparedPush, PullProgress, PullRequest, PullResponse,
+        PushReceipt, SupabaseTransport, SupabaseTransportConfig, SyncEngine, SyncProvider,
+        SyncScope, SyncTransport, TransportError,
     },
 };
 use context_relay_protocol::{ClientError, LocalResult, SyncState};
@@ -162,6 +163,12 @@ enum Step {
         PullResponse,
         context_relay_core::sync::DeviceCertificateSnapshot,
     ),
+    BeginCheckpoint,
+    Checkpoint(
+        Box<PreparedCheckpoint>,
+        CheckpointResponse,
+        context_relay_core::sync::DeviceCertificateSnapshot,
+    ),
     Complete(bool),
     Failed,
 }
@@ -170,6 +177,7 @@ enum Progress {
     Push(PreparedPush),
     Pull(PullProgress),
     Pushed(bool, PullProgress),
+    Checkpoint(CheckpointProgress),
     Complete(bool),
     Failed,
 }
@@ -214,7 +222,7 @@ fn apply(
     authority.check()?;
     let (keys, mut material) = local_sync_material(state)?.ok_or_else(scope_denied_error)?;
     let snapshot = match &step {
-        Step::Pull(_, _, snapshot) => Some(snapshot),
+        Step::Pull(_, _, snapshot) | Step::Checkpoint(_, _, snapshot) => Some(snapshot),
         _ => authority.certificates.get(),
     };
     if let Some(snapshot) = snapshot {
@@ -309,6 +317,56 @@ fn apply(
                     .map_err(failure)?,
             )
         }
+        Step::BeginCheckpoint => {
+            Progress::Checkpoint(engine.prepare_checkpoint(&state.vault).map_err(failure)?)
+        }
+        Step::Checkpoint(prepared, response, _) => {
+            use context_relay_core::sync::TrustedSyncMaterial as _;
+            let check_creator = |checkpoint: &context_relay_core::sync::CanonicalCheckpoint| {
+                material
+                    .trusted_device(
+                        scope.account_id,
+                        scope.workspace_id,
+                        checkpoint.checkpoint.creator_device,
+                    )
+                    .map_err(|_| scope_denied_error())
+            };
+            match &response {
+                CheckpointResponse::ByHash(Some(checkpoint)) => {
+                    check_creator(checkpoint)?;
+                }
+                CheckpointResponse::Page(page) => {
+                    for row in &page.rows {
+                        check_creator(&row.checkpoint)?;
+                    }
+                }
+                _ => {}
+            }
+            let now = now_ms();
+            let context = CheckpointBuildContext {
+                scope,
+                creator_device: state.device_id,
+                active_key_epoch: identity.key_epoch,
+                device_keys: &keys,
+                created_hlc: context_relay_protocol::HybridLogicalClock::new(
+                    now,
+                    0,
+                    state.device_id,
+                ),
+            };
+            Progress::Checkpoint(
+                engine
+                    .finish_checkpoint(
+                        &mut state.vault,
+                        *prepared,
+                        response,
+                        &material,
+                        now,
+                        &context,
+                    )
+                    .map_err(failure)?,
+            )
+        }
         Step::Complete(more_work) => {
             let more_work = more_work
                 || !state
@@ -380,6 +438,10 @@ async fn cycle(worker: &WorkerClient, authority: Arc<Authority>) -> Result<bool,
                 Progress::Pull(pull)
             }
             Progress::Pull(PullProgress::Complete(report)) => {
+                more_work |= report.more_work;
+                submit(worker, &authority, cycle_scope, Step::BeginCheckpoint).await?
+            }
+            Progress::Checkpoint(CheckpointProgress::Complete(report)) => {
                 submit(
                     worker,
                     &authority,
@@ -387,6 +449,55 @@ async fn cycle(worker: &WorkerClient, authority: Arc<Authority>) -> Result<bool,
                     Step::Complete(more_work || report.more_work),
                 )
                 .await?
+            }
+            Progress::Checkpoint(CheckpointProgress::Request(prepared)) => {
+                let scope = prepared.scope();
+                let network_authority = authority.clone();
+                let (prepared, response) = tokio::task::spawn_blocking(move || {
+                    let response = network_authority
+                        .transport()
+                        .map_err(|_| TransportError::AuthRequired)
+                        .and_then(|mut transport| {
+                            let response = match prepared.request() {
+                                CheckpointRequest::ByHash(hash) => transport
+                                    .checkpoint_by_hash(
+                                        scope,
+                                        context_relay_protocol::CHECKPOINT_SCHEMA_VERSION,
+                                        *hash,
+                                    )
+                                    .map(|checkpoint| {
+                                        CheckpointResponse::ByHash(checkpoint.map(Box::new))
+                                    }),
+                                CheckpointRequest::Page { after, limit } => transport
+                                    .pull_checkpoints(
+                                        scope,
+                                        context_relay_protocol::CHECKPOINT_SCHEMA_VERSION,
+                                        after.as_ref(),
+                                        *limit,
+                                    )
+                                    .map(CheckpointResponse::Page),
+                                CheckpointRequest::Push(checkpoint) => transport
+                                    .push_checkpoint(
+                                        scope,
+                                        context_relay_protocol::CHECKPOINT_SCHEMA_VERSION,
+                                        checkpoint,
+                                    )
+                                    .map(CheckpointResponse::Push),
+                            }?;
+                            let certificates = transport.fetch_device_certificates(scope)?;
+                            Ok((response, certificates))
+                        });
+                    (prepared, response)
+                })
+                .await
+                .map_err(|_| service_internal_error())?;
+                let step = match response {
+                    Ok((response, certificates)) => {
+                        Step::Checkpoint(prepared, response, certificates)
+                    }
+                    Err(_) => Step::Failed,
+                };
+                submit(worker, &authority, Some(scope), step).await?
             }
             Progress::Push(prepared) => {
                 let scope = prepared.scope();
@@ -493,10 +604,18 @@ async fn run(
 }
 
 #[cfg(all(test, any(windows, target_os = "macos")))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum StallAt {
+    Push,
+    Pull,
+    Checkpoint,
+}
+
+#[cfg(all(test, any(windows, target_os = "macos")))]
 pub(crate) async fn verify_stalled_worker(
     state: WorkspaceState,
     owner: Arc<HostedSessionOwner>,
-    after_push: bool,
+    stall: StallAt,
 ) {
     use super::{VaultWorkerState, WorkItem, run_vault_worker};
     use context_relay_core::sync::{
@@ -505,7 +624,7 @@ pub(crate) async fn verify_stalled_worker(
     use std::sync::Mutex;
     struct Http {
         certificates: Vec<u8>,
-        after_push: bool,
+        stall: StallAt,
         entered: tokio::sync::mpsc::UnboundedSender<()>,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
@@ -518,7 +637,7 @@ pub(crate) async fn verify_stalled_worker(
             if request.url().contains("/rest/v1/device_certificates?") {
                 return Ok(SupabaseHttpResponse::new(200, self.certificates.clone()));
             }
-            if self.after_push && request.url().ends_with("/functions/v1/sync") {
+            if self.stall != StallAt::Push && request.url().ends_with("/functions/v1/sync") {
                 use base64::Engine as _;
                 let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
                 assert_eq!(body["action"], "push_operations");
@@ -541,10 +660,15 @@ pub(crate) async fn verify_stalled_worker(
                         .unwrap(),
                 ));
             }
-            assert!(request.url().contains(if self.after_push {
-                "/rest/v1/sync_operations?"
-            } else {
-                "/functions/v1/sync"
+            if self.stall == StallAt::Checkpoint
+                && request.url().contains("/rest/v1/sync_operations?")
+            {
+                return Ok(SupabaseHttpResponse::new(200, b"[]".to_vec()));
+            }
+            assert!(request.url().contains(match self.stall {
+                StallAt::Push => "/functions/v1/sync",
+                StallAt::Pull => "/rest/v1/sync_operations?",
+                StallAt::Checkpoint => "/rest/v1/sync_checkpoints?",
             }));
             self.entered.send(()).unwrap();
             self.release
@@ -579,7 +703,7 @@ pub(crate) async fn verify_stalled_worker(
         key: "public-test".to_string().into(),
         http: Some(Arc::new(Http {
             certificates: serde_json::to_vec(&certificates).unwrap(),
-            after_push,
+            stall,
             entered,
             release: Mutex::new(released),
         })),

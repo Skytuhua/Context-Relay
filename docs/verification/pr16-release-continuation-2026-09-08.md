@@ -2353,3 +2353,39 @@ a larger account currently fails safely rather than accepting partial trust.
 Core/daemon library and test Clippy with warnings denied and the normal production
 daemon library check pass. Graphify update completed. Evidence:
 `.codex/pr16-certificate-refresh-{clippy,production,graph}.log`.
+
+
+### Checkpoint network stages (2026-09-09)
+
+SyncEngine exposes owned checkpoint requests and completion stages. Its existing
+synchronous driver uses those same stages for pin lookup, bounded durable history
+scans, due checkpoint publication and append/tail confirmation. Completion rejects
+changes to scope, provider, budget, durable pin or scan. Ordinary local writes can
+continue during HTTP; final acceptance verifies the current local state again.
+
+The daemon runs these requests after operation pull, outside the sole vault
+worker. Every response returns through original-session and workspace admission,
+with a fresh certificate snapshot and current local identity/key epoch. Missing
+creator metadata leaves history retryable. Current trust is also reapplied to a
+cached chain anchor before accepting a published extension; the new regression
+reproduced acceptance through a removed issuer before that shared-verifier fix.
+
+The expanded daemon regression stalls checkpoint history HTTP, verifies local
+reads and shutdown responsiveness, then reopens the vault with the checkpoint
+request still pending and no pin accepted. This covers shutdown during history fetching
+and responsiveness. It does not prove cancellation of blocking HTTP, complete
+hosted checkpoint publication or installed cross-device acceptance. Full hosted success, remote revocation/cutoff/epoch
+propagation and the remaining release gates still require qualification.
+
+Bounded review found no remaining actionable P1/P2 after the anchor-trust fix.
+Core/daemon library and test Clippy with warnings denied passes. Graphify update
+completed with 18236 nodes. Logs: `.codex/pr16-checkpoint-stages-clippy.log` and
+`.codex/pr16-checkpoint-stages-graph.log`.
+
+Final validation passes: all 47 engine integration tests (274.37 seconds), the
+expanded authenticated-HTTP daemon regression (12.91 seconds), and the normal
+production daemon library check. The full daemon suite was not rerun for this
+checkpoint slice. Evidence:
+`.codex/pr16-checkpoint-stages-final-tests.log`,
+`.codex/pr16-checkpoint-daemon-final-tests.log`, and
+`.codex/pr16-checkpoint-stages-production.log`.
