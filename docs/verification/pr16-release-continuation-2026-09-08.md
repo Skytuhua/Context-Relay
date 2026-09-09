@@ -2778,3 +2778,22 @@ Four superseded workflows were verified terminal/canceled after preserving the
 failure: 34339932913, 34338206278, 34337253370 and 34339932921. Current-head CI,
 full native producer qualification and all remaining product-release gates remain
 required before merge.
+
+
+### Correct the archive generator material pin (2026-09-09)
+
+CI 34340949348 at 2e867b5 failed the licenses gate (job 102431337138). The
+archive retry change updated `scripts/semgrep-source-bundle.mjs` without updating
+its byte pin in the sidecar manifest. The full `node scripts/check-license-metadata.mjs`
+command reproduced the SHA-256 mismatch locally. The manifest now pins the actual
+generator SHA-256 `367f3abd61c7ff848032aa89e21d8bc66c55701332ebea5eb38d69dd36480888`.
+
+Historical bundle evidence still records its original generator hash and bundle
+bytes. Its test no longer requires a later generator revision to equal the historical
+hash; the adjacent committed-manifest test verifies current material bytes. Existing
+tamper checks and the enabled-target requirement that bundle evidence match the
+pinned generator remain intact. The full license/material command and all 28
+license/hydration tests pass. Read-only review found no P1/P2. Evidence:
+`.codex/pr16-license-retry-failure.log`, `.codex/pr16-license-pin-{check,tests}.log`.
+New CI must verify this correction. Native Semgrep remains disabled pending its
+required build evidence; the broader release checklist is unchanged.

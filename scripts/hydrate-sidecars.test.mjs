@@ -1115,10 +1115,8 @@ test('Semgrep records the V1 source bundle but remains disabled pending release 
   assert.equal(bundleEvidence.bundle.recordedLinks, 222);
   assert.equal(bundleEvidence.sourceLockSha256, '0d85427b09343615126fde5ad9bd8ad7f157908692a69fea846b4d033f6cb3c0');
   assert.equal(bundleEvidence.bundleGeneratorSha256, '092fe2855df51267ca3c8525c0b404c3ca0587470cedfc63bf1818df60e72007');
-  assert.equal(
-    sha256(await readFile(new URL('./semgrep-source-bundle.mjs', import.meta.url))),
-    '092fe2855df51267ca3c8525c0b404c3ca0587470cedfc63bf1818df60e72007',
-  );
+  // This evidence describes the recorded bundle, not later generator revisions.
+  // The committed-manifest test above verifies the current generator's byte pin.
   assert.equal(lock.researchEvidence.usableForHydration, false);
   assert.equal(lock.researchEvidence.usableForPackaging, false);
   assert.deepEqual(
