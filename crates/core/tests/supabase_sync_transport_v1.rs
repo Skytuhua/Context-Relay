@@ -766,3 +766,78 @@ fn pull_rejects_noncanonical_or_invalid_received_at_cursors() {
         );
     }
 }
+
+#[test]
+fn certificate_refresh_is_scoped_paged_and_rejects_invalid_rows() {
+    use context_relay_core::crypto::{
+        CertificateFieldsV1, DeviceCertificateV1, DeviceKeys, RecoveryKeys, RecoveryPhrase,
+    };
+    let root =
+        RecoveryKeys::derive(&RecoveryPhrase::from_entropy_for_test([71; 32]).unwrap()).unwrap();
+    let keys = DeviceKeys::generate().unwrap();
+    let row = |index: usize| {
+        let device_id = format!("018f22e2-79b0-7cc8-98c4-{index:012x}");
+        let certificate = DeviceCertificateV1::issue_genesis(
+            CertificateFieldsV1 {
+                account_id: scope().account_id,
+                workspace_id: scope().workspace_id,
+                control_epoch: 1,
+                request_nonce: context_relay_protocol::PairingRequestNonce([71; 32]),
+                device_id: device_id.parse().unwrap(),
+                signing_public_key: keys.signing_public_key(),
+                wrapping_public_key: keys.wrapping_public_key(),
+            },
+            &root,
+        )
+        .unwrap();
+        serde_json::json!({"id":device_id,"account_id":ACCOUNT_ID,"workspace_id":WORKSPACE_ID,"control_epoch":1,
+            "request_nonce":bytea(&certificate.request_nonce.0),"device_id":device_id,"issuer_kind":"recovery_root",
+            "issuer_device_id":null,"issuer_recovery_public_key":bytea(&root.signing_public_key().0),
+            "issuer_signing_public_key":bytea(&root.signing_public_key().0),"device_signing_public_key":bytea(&certificate.signing_public_key.0),
+            "device_wrapping_public_key":bytea(&certificate.wrapping_public_key.0),"signature":bytea(&certificate.signature.0)})
+    };
+    let rows = (1..=256).map(row).collect::<Vec<_>>();
+    let client = ScriptedHttpClient::new([
+        json_response(200, serde_json::json!(rows)),
+        json_response(200, serde_json::json!([row(257)])),
+    ]);
+    transport(&client)
+        .fetch_device_certificates(scope())
+        .unwrap();
+    let requests = client.requests();
+    assert_eq!(requests.len(), 2);
+    let query = query(&requests[1]);
+    assert!(query.contains(&("account_id".into(), format!("eq.{ACCOUNT_ID}"))));
+    assert!(query.contains(&("workspace_id".into(), format!("eq.{WORKSPACE_ID}"))));
+    assert!(query.contains(&(
+        "id".into(),
+        "gt.018f22e2-79b0-7cc8-98c4-000000000100".into()
+    )));
+    for (field, value) in [
+        ("account_id", serde_json::json!(WORKSPACE_ID)),
+        ("signature", serde_json::json!(bytea(&[0; 64]))),
+        ("issuer_kind", serde_json::json!("device")),
+        ("request_nonce", serde_json::json!("bad-bytea")),
+    ] {
+        let mut bad = row(1);
+        bad[field] = value;
+        let client = ScriptedHttpClient::new([json_response(200, serde_json::json!([bad]))]);
+        assert!(
+            transport(&client)
+                .fetch_device_certificates(scope())
+                .is_err()
+        );
+    }
+    for bad in [
+        vec![row(1), row(1)],
+        vec![row(2), row(1)],
+        (1..=257).map(row).collect(),
+    ] {
+        let client = ScriptedHttpClient::new([json_response(200, serde_json::json!(bad))]);
+        assert!(
+            transport(&client)
+                .fetch_device_certificates(scope())
+                .is_err()
+        );
+    }
+}

@@ -2320,3 +2320,36 @@ Final core/daemon library and test Clippy with warnings denied passes, as does t
 normal production daemon library check. Logs:
 `.codex/pr16-sync-supervisor-clippy-final.log` and
 `.codex/pr16-sync-supervisor-production.log`. Final Graphify update completed.
+
+### Hosted certificate refresh (2026-09-09)
+
+The operation supervisor fetches scoped, keyset-paged certificates before push and
+after each received operation page/range. Network parsing validates scope, field
+widths, issuer shape and signatures; the vault anchors chains in current verified
+local enrollment/pairing authority before use. Hosted records cannot replace a
+pinned certificate or resurrect locally revoked issuers and descendants. Trust
+is cycle-local and refreshed after restart; no display/platform metadata is
+invented or persisted. Requests remain bound to the original Auth session.
+
+Missing device metadata stops admission with a retryable cursor, rather than
+quarantining an operation merely because its certificate is absent. Refresh after
+the received page covers a device paired while that page was in flight. Review's
+revoked-subtree issue is fixed: descendants are excluded while independent valid
+branches continue. The bounded follow-up found no additional actionable issue.
+
+Focused transport regression passes (4.60 seconds): scoped pagination, repeated
+or out-of-order rows, oversized pages, malformed fields and invalid signatures.
+Expanded vault regression passes (6.73 seconds): reversed chains, missing issuers,
+duplicates, tampering, foreign roots/scope, pinned metadata and local revocation
+precedence. The daemon authenticated-HTTP/read/shutdown regression passes with
+certificate fetching (7.80 seconds). Logs:
+`.codex/pr16-certificate-refresh-{transport-tests,vault-tests,daemon-tests}.log`.
+
+These are component/simulated-HTTP checks. Authenticated remote revocation and
+signed cutoff/epoch propagation, checkpoint staging and full installed cross-device
+acceptance remain required. The certificate snapshot is bounded to 4096 devices;
+a larger account currently fails safely rather than accepting partial trust.
+
+Core/daemon library and test Clippy with warnings denied and the normal production
+daemon library check pass. Graphify update completed. Evidence:
+`.codex/pr16-certificate-refresh-{clippy,production,graph}.log`.

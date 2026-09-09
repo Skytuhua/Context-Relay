@@ -603,6 +603,105 @@ fn sync_material_uses_verified_enrollment_and_rejects_untrusted_devices() {
     let child =
         DeviceCertificateV1::issue_by_device(fields.clone(), id(DEVICE_ID), &fixture.device_keys)
             .unwrap();
+    let snapshot = context_relay_core::sync::DeviceCertificateSnapshot::from_certificates_for_test(
+        context_relay_core::sync::SyncScope {
+            account_id: id(ACCOUNT_ID),
+            workspace_id: id(WORKSPACE_ID),
+        },
+        vec![child.clone()],
+    );
+    assert_eq!(
+        vault
+            .trusted_sync_material(&fixture.device_keys)
+            .unwrap()
+            .trusted_device(id(ACCOUNT_ID), id(WORKSPACE_ID), id(OTHER_ID)),
+        Err(SyncError::InvalidIdentity)
+    );
+    let refreshed = vault
+        .trusted_sync_material_with_certificates(&fixture.device_keys, &snapshot)
+        .unwrap();
+    assert_eq!(
+        refreshed
+            .trusted_device(id(ACCOUNT_ID), id(WORKSPACE_ID), id(OTHER_ID))
+            .unwrap()
+            .certificate,
+        child
+    );
+    let grandchild_keys = DeviceKeys::generate().unwrap();
+    let mut grandchild_fields = fields.clone();
+    grandchild_fields.device_id = id(CERTIFICATE_ID);
+    grandchild_fields.signing_public_key = grandchild_keys.signing_public_key();
+    grandchild_fields.wrapping_public_key = grandchild_keys.wrapping_public_key();
+    let grandchild =
+        DeviceCertificateV1::issue_by_device(grandchild_fields, id(OTHER_ID), &child_keys).unwrap();
+    let independent_keys = DeviceKeys::generate().unwrap();
+    let mut independent_fields = fields.clone();
+    independent_fields.device_id = id(RECOVERY_ROOT_ID);
+    independent_fields.signing_public_key = independent_keys.signing_public_key();
+    independent_fields.wrapping_public_key = independent_keys.wrapping_public_key();
+    let independent = DeviceCertificateV1::issue_by_device(
+        independent_fields,
+        id(DEVICE_ID),
+        &fixture.device_keys,
+    )
+    .unwrap();
+    let scope = context_relay_core::sync::SyncScope {
+        account_id: id(ACCOUNT_ID),
+        workspace_id: id(WORKSPACE_ID),
+    };
+    let reversed = context_relay_core::sync::DeviceCertificateSnapshot::from_certificates_for_test(
+        scope,
+        vec![grandchild.clone(), child.clone()],
+    );
+    assert_eq!(
+        vault
+            .trusted_sync_material_with_certificates(&fixture.device_keys, &reversed)
+            .unwrap()
+            .trusted_device(id(ACCOUNT_ID), id(WORKSPACE_ID), id(CERTIFICATE_ID))
+            .unwrap()
+            .certificate,
+        grandchild
+    );
+    for certificates in [vec![grandchild.clone()], vec![child.clone(), child.clone()]] {
+        let invalid =
+            context_relay_core::sync::DeviceCertificateSnapshot::from_certificates_for_test(
+                scope,
+                certificates,
+            );
+        assert!(
+            vault
+                .trusted_sync_material_with_certificates(&fixture.device_keys, &invalid)
+                .is_err()
+        );
+    }
+    let foreign_scope =
+        context_relay_core::sync::DeviceCertificateSnapshot::from_certificates_for_test(
+            context_relay_core::sync::SyncScope {
+                workspace_id: id(OTHER_ID),
+                ..scope
+            },
+            vec![child.clone()],
+        );
+    assert!(
+        vault
+            .trusted_sync_material_with_certificates(&fixture.device_keys, &foreign_scope)
+            .is_err()
+    );
+    assert_eq!(vault.all_devices().unwrap().len(), 1);
+    let mut tampered = child.clone();
+    tampered.signature.0[0] ^= 1;
+    let invalid = context_relay_core::sync::DeviceCertificateSnapshot::from_certificates_for_test(
+        context_relay_core::sync::SyncScope {
+            account_id: id(ACCOUNT_ID),
+            workspace_id: id(WORKSPACE_ID),
+        },
+        vec![tampered],
+    );
+    assert!(
+        vault
+            .trusted_sync_material_with_certificates(&fixture.device_keys, &invalid)
+            .is_err()
+    );
     vault
         .store_device_certificate(
             id(OTHER_ID),
@@ -621,6 +720,19 @@ fn sync_material_uses_verified_enrollment_and_rejects_untrusted_devices() {
     untrusted_fields.device_id = id(ENROLLMENT_ID);
     let untrusted =
         DeviceCertificateV1::issue_genesis(untrusted_fields, &untrusted_recovery).unwrap();
+    let foreign_root =
+        context_relay_core::sync::DeviceCertificateSnapshot::from_certificates_for_test(
+            context_relay_core::sync::SyncScope {
+                account_id: id(ACCOUNT_ID),
+                workspace_id: id(WORKSPACE_ID),
+            },
+            vec![untrusted.clone()],
+        );
+    assert!(
+        vault
+            .trusted_sync_material_with_certificates(&fixture.device_keys, &foreign_root)
+            .is_err()
+    );
     vault
         .store_device_certificate(
             id(RECOVERY_ROOT_ID),
@@ -710,6 +822,36 @@ fn sync_material_uses_verified_enrollment_and_rejects_untrusted_devices() {
             .unwrap()
             .trusted_device(id(ACCOUNT_ID), id(WORKSPACE_ID), id(OTHER_ID)),
         Err(SyncError::InvalidIdentity)
+    );
+    assert_eq!(
+        vault
+            .trusted_sync_material_with_certificates(&fixture.device_keys, &snapshot)
+            .unwrap()
+            .trusted_device(id(ACCOUNT_ID), id(WORKSPACE_ID), id(OTHER_ID)),
+        Err(SyncError::InvalidIdentity)
+    );
+    let revoked_subtree =
+        context_relay_core::sync::DeviceCertificateSnapshot::from_certificates_for_test(
+            scope,
+            vec![grandchild, child, independent.clone()],
+        );
+    let refreshed = vault
+        .trusted_sync_material_with_certificates(&fixture.device_keys, &revoked_subtree)
+        .unwrap();
+    assert_eq!(
+        refreshed.trusted_device(id(ACCOUNT_ID), id(WORKSPACE_ID), id(OTHER_ID)),
+        Err(SyncError::InvalidIdentity)
+    );
+    assert_eq!(
+        refreshed.trusted_device(id(ACCOUNT_ID), id(WORKSPACE_ID), id(CERTIFICATE_ID)),
+        Err(SyncError::InvalidIdentity)
+    );
+    assert_eq!(
+        refreshed
+            .trusted_device(id(ACCOUNT_ID), id(WORKSPACE_ID), id(RECOVERY_ROOT_ID))
+            .unwrap()
+            .certificate,
+        independent
     );
 }
 

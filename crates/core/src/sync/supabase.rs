@@ -1,3 +1,6 @@
+mod certificates;
+pub use certificates::DeviceCertificateSnapshot;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,

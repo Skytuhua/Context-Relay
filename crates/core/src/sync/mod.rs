@@ -36,12 +36,12 @@ pub use operation::{
     BuiltOperation, OperationBuildRequest, OperationBuilder, OperationDecryptor, SyncError,
     TrustedOperationContext, verify_operation_envelope,
 };
+pub use supabase::{DeviceCertificateSnapshot, SupabaseTransport, SupabaseTransportConfig};
 #[cfg(feature = "test-support")]
 pub use supabase::{
     SupabaseHttpClient, SupabaseHttpError, SupabaseHttpMethod, SupabaseHttpRequest,
     SupabaseHttpResponse, SupabaseRetryRuntime,
 };
-pub use supabase::{SupabaseTransport, SupabaseTransportConfig};
 pub use transport::{
     CanonicalCheckpoint, CanonicalOperation, CheckpointCursor, CheckpointPage, CheckpointReceipt,
     PullPage, PushReceipt, ReceivedCheckpoint, ReceivedOperation, SyncScope, SyncTransport,

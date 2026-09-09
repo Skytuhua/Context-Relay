@@ -88,6 +88,7 @@ impl Drop for Supervisor {
 }
 
 struct Authority {
+    certificates: std::sync::OnceLock<context_relay_core::sync::DeviceCertificateSnapshot>,
     authentication_changed: bool,
     change_admitted: AtomicBool,
     config: Arc<Config>,
@@ -154,12 +155,18 @@ impl WorkAdmission for Admission {
 
 enum Step {
     Begin,
+    Certificates(context_relay_core::sync::DeviceCertificateSnapshot),
     Push(PreparedPush, Result<PushReceipt, TransportError>),
-    Pull(Box<PreparedPull>, PullResponse),
+    Pull(
+        Box<PreparedPull>,
+        PullResponse,
+        context_relay_core::sync::DeviceCertificateSnapshot,
+    ),
     Complete(bool),
     Failed,
 }
 enum Progress {
+    Certificates(SyncScope),
     Push(PreparedPush),
     Pull(PullProgress),
     Pushed(bool, PullProgress),
@@ -205,7 +212,17 @@ fn apply(
     status: &ServiceStatus,
 ) -> Result<Progress, ClientError> {
     authority.check()?;
-    let (keys, material) = local_sync_material(state)?.ok_or_else(scope_denied_error)?;
+    let (keys, mut material) = local_sync_material(state)?.ok_or_else(scope_denied_error)?;
+    let snapshot = match &step {
+        Step::Pull(_, _, snapshot) => Some(snapshot),
+        _ => authority.certificates.get(),
+    };
+    if let Some(snapshot) = snapshot {
+        material = state
+            .vault
+            .trusted_sync_material_with_certificates(&keys, snapshot)
+            .map_err(|_| scope_denied_error())?;
+    }
     let identity = material
         .local_identity(state.device_id, &keys)
         .map_err(|_| scope_denied_error())?;
@@ -220,6 +237,20 @@ fn apply(
     let failure = |_| service_internal_error();
     let progress = match step {
         Step::Begin => {
+            status.set_sync(SyncState::Syncing);
+            Progress::Certificates(scope)
+        }
+        Step::Certificates(snapshot) => {
+            state
+                .vault
+                .trusted_sync_material_with_certificates(&keys, &snapshot)
+                .map_err(|_| scope_denied_error())?
+                .local_identity(state.device_id, &keys)
+                .map_err(|_| scope_denied_error())?;
+            authority
+                .certificates
+                .set(snapshot)
+                .map_err(|_| scope_denied_error())?;
             if authority.authentication_changed {
                 state
                     .vault
@@ -249,18 +280,35 @@ fn apply(
                 engine.prepare_pull(&state.vault).map_err(failure)?,
             )
         }
-        Step::Pull(prepared, response) => Progress::Pull(
-            engine
-                .finish_pull(
-                    &mut state.vault,
-                    *prepared,
-                    response,
-                    &material,
-                    &sync_embedding,
-                    now_ms(),
-                )
-                .map_err(failure)?,
-        ),
+        Step::Pull(prepared, response, _) => {
+            use context_relay_core::sync::TrustedSyncMaterial as _;
+            let rows = match &response {
+                PullResponse::Operations(page) => &page.rows,
+                PullResponse::DeviceRange(rows) => rows,
+            };
+            for row in rows {
+                // Missing metadata is not proof that an operation is corrupt. Keep its cursor retryable.
+                material
+                    .trusted_device(
+                        scope.account_id,
+                        scope.workspace_id,
+                        row.operation.device_id,
+                    )
+                    .map_err(|_| scope_denied_error())?;
+            }
+            Progress::Pull(
+                engine
+                    .finish_pull(
+                        &mut state.vault,
+                        *prepared,
+                        response,
+                        &material,
+                        &sync_embedding,
+                        now_ms(),
+                    )
+                    .map_err(failure)?,
+            )
+        }
         Step::Complete(more_work) => {
             let more_work = more_work
                 || !state
@@ -308,6 +356,23 @@ async fn cycle(worker: &WorkerClient, authority: Arc<Authority>) -> Result<bool,
     let mut cycle_scope = None;
     loop {
         progress = match progress {
+            Progress::Certificates(scope) => {
+                cycle_scope = Some(scope);
+                let network_authority = authority.clone();
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    network_authority
+                        .transport()
+                        .map_err(|_| TransportError::AuthRequired)?
+                        .fetch_device_certificates(scope)
+                })
+                .await
+                .map_err(|_| service_internal_error())?;
+                let step = match snapshot {
+                    Ok(snapshot) => Step::Certificates(snapshot),
+                    Err(_) => Step::Failed,
+                };
+                submit(worker, &authority, Some(scope), step).await?
+            }
             Progress::Failed => return Ok(false),
             Progress::Complete(more_work) => return Ok(more_work),
             Progress::Pushed(pending, pull) => {
@@ -354,20 +419,25 @@ async fn cycle(worker: &WorkerClient, authority: Arc<Authority>) -> Result<bool,
                     let response = network_authority
                         .transport()
                         .map_err(|_| TransportError::AuthRequired)
-                        .and_then(|mut transport| match prepared.request() {
-                            PullRequest::Operations { cursor, limit } => transport
-                                .pull_operations(scope, cursor.as_ref(), *limit)
-                                .map(PullResponse::Operations),
-                            PullRequest::DeviceRange { device, range } => transport
-                                .pull_device_range(scope, *device, range.clone())
-                                .map(PullResponse::DeviceRange),
+                        .and_then(|mut transport| {
+                            let response = match prepared.request() {
+                                PullRequest::Operations { cursor, limit } => transport
+                                    .pull_operations(scope, cursor.as_ref(), *limit)
+                                    .map(PullResponse::Operations),
+                                PullRequest::DeviceRange { device, range } => transport
+                                    .pull_device_range(scope, *device, range.clone())
+                                    .map(PullResponse::DeviceRange),
+                            }?;
+                            // Fetch after the page: a device may have paired while its operations were in flight.
+                            let certificates = transport.fetch_device_certificates(scope)?;
+                            Ok((response, certificates))
                         });
                     (prepared, response)
                 })
                 .await
                 .map_err(|_| service_internal_error())?;
                 let step = match response {
-                    Ok(response) => Step::Pull(prepared, response),
+                    Ok((response, certificates)) => Step::Pull(prepared, response, certificates),
                     Err(_) => Step::Failed,
                 };
                 submit(worker, &authority, Some(scope), step).await?
@@ -403,6 +473,7 @@ async fn run(
             continue;
         };
         let authority = Arc::new(Authority {
+            certificates: std::sync::OnceLock::new(),
             authentication_changed: !last_session.ptr_eq(&Arc::downgrade(&session)),
             change_admitted: AtomicBool::new(false),
             config: config.clone(),
@@ -433,6 +504,7 @@ pub(crate) async fn verify_stalled_worker(
     };
     use std::sync::Mutex;
     struct Http {
+        certificates: Vec<u8>,
         after_push: bool,
         entered: tokio::sync::mpsc::UnboundedSender<()>,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
@@ -443,6 +515,9 @@ pub(crate) async fn verify_stalled_worker(
             request: SupabaseHttpRequest,
         ) -> Result<SupabaseHttpResponse, SupabaseHttpError> {
             assert!(request.header("authorization").is_some());
+            if request.url().contains("/rest/v1/device_certificates?") {
+                return Ok(SupabaseHttpResponse::new(200, self.certificates.clone()));
+            }
             if self.after_push && request.url().ends_with("/functions/v1/sync") {
                 use base64::Engine as _;
                 let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
@@ -483,6 +558,19 @@ pub(crate) async fn verify_stalled_worker(
             ))
         }
     }
+    let certificates = state.vault.all_devices().unwrap().iter().map(|row| {
+        use context_relay_core::crypto::CertificateIssuerV1;
+        let cert = &row.certificate;
+        let bytea = |bytes: &[u8]| format!("\\x{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let (kind, device, root, issuer) = match cert.issuer {
+            CertificateIssuerV1::RecoveryRoot(key) => ("recovery_root", None, Some(bytea(&key.0)), key),
+            CertificateIssuerV1::Device { device_id, signing_public_key } => ("device", Some(device_id), None, signing_public_key),
+        };
+        serde_json::json!({"id":row.certificate_id,"account_id":cert.account_id,"workspace_id":cert.workspace_id,
+            "control_epoch":cert.control_epoch,"request_nonce":bytea(&cert.request_nonce.0),"device_id":cert.device_id,
+            "issuer_kind":kind,"issuer_device_id":device,"issuer_recovery_public_key":root,"issuer_signing_public_key":bytea(&issuer.0),
+            "device_signing_public_key":bytea(&cert.signing_public_key.0),"device_wrapping_public_key":bytea(&cert.wrapping_public_key.0),"signature":bytea(&cert.signature.0)})
+    }).collect::<Vec<_>>();
     let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
     let (release, released) = std::sync::mpsc::channel();
     let config = Config {
@@ -490,6 +578,7 @@ pub(crate) async fn verify_stalled_worker(
         project: "https://example.supabase.co".into(),
         key: "public-test".to_string().into(),
         http: Some(Arc::new(Http {
+            certificates: serde_json::to_vec(&certificates).unwrap(),
             after_push,
             entered,
             release: Mutex::new(released),

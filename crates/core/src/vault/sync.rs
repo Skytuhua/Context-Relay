@@ -474,6 +474,110 @@ impl Vault {
         })
     }
 
+    /// Refresh cycle-local trust using signed certificates anchored in current local authority.
+    /// Hosted records cannot replace a pinned certificate or resurrect local revocations.
+    pub fn trusted_sync_material_with_certificates(
+        &self,
+        keys: &crate::crypto::DeviceKeys,
+        snapshot: &crate::sync::DeviceCertificateSnapshot,
+    ) -> Result<VaultSyncMaterial, VaultError> {
+        use crate::crypto::CertificateIssuerV1;
+        let mut material = self.trusted_sync_material(keys)?;
+        if snapshot.scope != material.scope {
+            return Err(VaultError::OperationConflict);
+        }
+        let stored = self.devices(material.scope)?;
+        let mut revoked = stored
+            .iter()
+            .filter(|row| row.state == super::DeviceCertificateState::Revoked)
+            .map(|row| row.certificate.device_id)
+            .collect::<BTreeSet<_>>();
+        loop {
+            let before = revoked.len();
+            for certificate in stored
+                .iter()
+                .map(|row| &row.certificate)
+                .chain(snapshot.certificates.iter())
+            {
+                if let CertificateIssuerV1::Device { device_id, .. } = certificate.issuer
+                    && revoked.contains(&device_id)
+                {
+                    revoked.insert(certificate.device_id);
+                }
+            }
+            if revoked.len() == before {
+                break;
+            }
+        }
+        let roots = material
+            .certificates
+            .values()
+            .filter_map(|certificate| match certificate.issuer {
+                CertificateIssuerV1::RecoveryRoot(root) => Some(root),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut pending = Vec::new();
+        let mut seen = BTreeSet::new();
+        for certificate in &snapshot.certificates {
+            if !seen.insert(certificate.device_id)
+                || certificate.account_id != material.scope.account_id
+                || certificate.workspace_id != material.scope.workspace_id
+                || certificate.control_epoch != material.control_epoch
+            {
+                return Err(VaultError::OperationConflict);
+            }
+            if let Some(local) = stored
+                .iter()
+                .find(|row| row.certificate.device_id == certificate.device_id)
+                && local.certificate != *certificate
+            {
+                return Err(VaultError::OperationConflict);
+            }
+            if revoked.contains(&certificate.device_id) {
+                continue;
+            }
+            if let Some(local) = material.certificates.get(&certificate.device_id) {
+                if local != certificate {
+                    return Err(VaultError::OperationConflict);
+                }
+            } else {
+                pending.push(certificate);
+            }
+        }
+        while !pending.is_empty() {
+            let before = pending.len();
+            let mut error = false;
+            pending.retain(|certificate| {
+                let trusted = match certificate.issuer {
+                    CertificateIssuerV1::RecoveryRoot(root) => roots.contains(&root),
+                    CertificateIssuerV1::Device {
+                        device_id,
+                        signing_public_key,
+                    } => material
+                        .certificates
+                        .get(&device_id)
+                        .is_some_and(|issuer| issuer.signing_public_key == signing_public_key),
+                };
+                if !trusted {
+                    return true;
+                }
+                if certificate.verify_issued_by(&certificate.issuer).is_err() {
+                    error = true;
+                    return true;
+                }
+                material
+                    .certificates
+                    .insert(certificate.device_id, (*certificate).clone());
+                false
+            });
+            if error || pending.len() == before {
+                return Err(VaultError::OperationConflict);
+            }
+        }
+        Ok(material)
+    }
+
     pub fn quarantine_sync_receipt(
         &mut self,
         write: &SyncQuarantineWrite<'_>,
