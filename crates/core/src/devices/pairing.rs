@@ -55,6 +55,21 @@ impl WorkspacePairingMaterial {
         .map_err(|_| PairingCycleError::Invalid)
     }
 
+    pub(crate) fn with_enrollment_record_sha256(
+        mut self,
+        pin: Sha256Digest,
+    ) -> Result<Self, PairingCycleError> {
+        self.bundle = self
+            .bundle
+            .with_enrollment_record_sha256(pin)
+            .map_err(|_| PairingCycleError::Invalid)?;
+        Ok(self)
+    }
+
+    pub const fn enrollment_record_sha256(&self) -> Option<Sha256Digest> {
+        self.bundle.enrollment_record_sha256()
+    }
+
     pub const fn scope(&self) -> SyncScope {
         SyncScope {
             account_id: self.bundle.account_id(),

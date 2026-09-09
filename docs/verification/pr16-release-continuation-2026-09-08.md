@@ -2694,3 +2694,34 @@ Obtain that pin through signed pairing before allowing a newly paired device to
 bootstrap control history; do not trust a digest accompanying the same untrusted
 record. Production history loading, cutoff admission, key activation/distribution,
 hosted lifecycle and the full release acceptance gates remain unfinished.
+
+
+### Enrollment pin propagation through confirmed pairing (2026-09-09)
+
+The encrypted pairing bundle now has an explicit v2 encoding carrying the nonzero
+canonical enrollment-record SHA-256. Active enrollment and recovery vault loaders
+attach their verified stored record hash. The complete approved ciphertext is bound
+to the safety number, and the joined vault preserves the confirmed pin after reopen.
+Legacy v1 bundles remain readable with no pin; they cannot bootstrap control history.
+Older applications cannot decode v2, and downgrade negotiation is not implemented.
+The pairing design records that both peers need v2 support for new enrolled approvals.
+
+The existing real enrollment-to-pairing/reopen test initially failed with the missing
+pin API, then passed in 7.93s. The codec test covers both versions, maximum epochs,
+all truncated prefixes, wrong maps/versions/field lengths, zero pins, trailing data
+and noncanonical encoding. Its initial size expectation was corrected from 123 to
+121 bytes for v1 (156 for v2); the final test passes. A ciphertext-pin mutation
+cannot reuse the original safety number or pass authenticated decryption. Legacy
+joined material remains unpinned; restored material exposes its verified record pin.
+All 58 tests across seven affected pairing, recovery and revocation integration
+suites pass. Core library and all-test Clippy with test-support and
+`-D warnings` passes in 1m03s (`.codex/pr16-pairing-pin-clippy.log`). The longest corruption suite completed in 158.92s. Evidence:
+`.codex/pr16-pairing-pin-{red,test,codec,regressions}.log`.
+
+Read-only review found no P1/P2. Graph update completed with 18,328 nodes and 51,793
+edges. Graph extraction still lacks SQL/OCaml parsers and reports a local scratch
+C++ syntax warning; it is navigation assistance, not verification of those files.
+Production initial-roster provenance/history loading, historical cutoff admission
+and key distribution, atomic activation, hosted mutation and daemon propagation
+remain unfinished, along with all broader release acceptance gates. No merge or
+full release qualification is claimed.

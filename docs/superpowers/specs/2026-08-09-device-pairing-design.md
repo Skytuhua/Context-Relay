@@ -154,6 +154,20 @@ The bundle is encoded canonically, wrapped to the request's X25519 public key wi
 XChaCha20-Poly1305 envelope, and zeroized after use. Its associated data binds the pairing ID,
 request digest, certificate digest, account, workspace, control epoch, and key epoch.
 
+The release continuation adds inner bundle version 2: a definite CBOR map of eight
+fields, preserving v1 fields 1–6 and adding field 7 as the nonzero 32-byte canonical
+enrollment-record SHA-256. Field 0 is version 2. Active enrollment and recovery
+loaders supply the verified stored record hash; a joined vault preserves it from
+the safety-confirmed encrypted transcript. The safety number binds the complete
+approved payload, including this ciphertext. Merely setting or receiving a hash
+without that trusted source does not authenticate an enrollment record.
+
+Legacy v1 map-seven bundles remain readable and explicitly have no enrollment
+pin. They cannot bootstrap revocation history. Old app versions cannot read v2
+bundles: pairing from an enrolled approver now requires both apps to support v2;
+there is no downgrade negotiation. Outer grant and approval schemas stay at v1.
+The encrypted bundle is at most 156 plaintext bytes, within existing envelope limits.
+
 ### Pairing grant
 
 `PairingGrantV1` contains only public certificate material and the encrypted key envelope:

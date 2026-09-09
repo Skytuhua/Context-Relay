@@ -798,6 +798,7 @@ fn join_confirmation_is_durable_atomic_and_reopens_sealed_material() {
         .unwrap();
     assert_eq!(trusted.scope(), confirmation_scope());
     assert_eq!(trusted.control_epoch(), 7);
+    assert_eq!(trusted.enrollment_record_sha256(), None);
     assert_eq!(trusted.key_epoch(), 11);
     let sync_material = reopened
         .trusted_sync_material(&fixture.joiner_keys)

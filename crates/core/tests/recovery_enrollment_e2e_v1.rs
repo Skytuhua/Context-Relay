@@ -1022,6 +1022,9 @@ fn recovered_vault_material_bootstraps_real_pairing_and_both_replicas_reopen() {
     let enrolled = approver_vault
         .enrolled_workspace_material(&approver_keys)
         .unwrap();
+    let expected_pin = Some(enrollment.canonical_record_sha256);
+    assert_eq!(enrolled.enrollment_record_sha256(), expected_pin);
+    assert_eq!(joined.enrollment_record_sha256(), expected_pin);
     assert_eq!(enrolled.scope(), joined.scope());
     assert_eq!(enrolled.control_epoch(), joined.control_epoch());
     assert_eq!(enrolled.key_epoch(), joined.key_epoch());
@@ -1043,6 +1046,15 @@ fn recovered_vault_material_bootstraps_real_pairing_and_both_replicas_reopen() {
         .completed_material(&joiner_vault, submission.pairing_id, &joiner_keys)
         .unwrap()
         .unwrap();
+    assert_eq!(reopened_enrolled.enrollment_record_sha256(), expected_pin);
+    assert_eq!(reopened_joined.enrollment_record_sha256(), expected_pin);
+    assert_eq!(
+        joiner_vault
+            .trusted_workspace_material(&joiner_keys)
+            .unwrap()
+            .enrollment_record_sha256(),
+        expected_pin
+    );
     assert_eq!(
         reopened_enrolled.workspace_root_key(),
         reopened_joined.workspace_root_key()

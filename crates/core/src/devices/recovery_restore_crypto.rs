@@ -18,9 +18,8 @@ use crate::{
     devices::{
         crypto::{
             PairingKeyBundle, certificate_digest, decode_certificate_v1, decode_native_platform,
-            decode_pairing_key_bundle_v1, decode_wrapped_envelope_with_limit,
-            encode_certificate_v1, encode_native_platform, encode_pairing_key_bundle_v1,
-            encode_wrapped_envelope,
+            decode_pairing_key_bundle, decode_wrapped_envelope_with_limit, encode_certificate_v1,
+            encode_native_platform, encode_pairing_key_bundle, encode_wrapped_envelope,
         },
         recovery_crypto::{
             MAX_RECOVERY_DEVICE_NAME_BYTES, RecoveryEnrollmentCryptoError,
@@ -323,7 +322,7 @@ pub(crate) fn build_recovery_device_claim_inner<R: CryptoRng + RngCore>(
     };
 
     let aad = recovered_device_material_aad(&claim)?;
-    let plaintext = encode_pairing_key_bundle_v1(&material)?;
+    let plaintext = encode_pairing_key_bundle(&material)?;
     claim.device_material_envelope = wrap_secret_with_rng(
         device_keys.wrapping_public_key(),
         plaintext.as_slice(),
@@ -475,7 +474,7 @@ pub fn open_recovered_device_material(
     }
     let aad = recovered_device_material_aad(claim)?;
     let plaintext = device_keys.unwrap_secret(&claim.device_material_envelope, &aad)?;
-    let material = decode_pairing_key_bundle_v1(plaintext.expose())?;
+    let material = decode_pairing_key_bundle(plaintext.expose())?;
     if material.account_id() != claim.account_id
         || material.workspace_id() != claim.workspace_id
         || material.control_epoch() != claim.certificate.control_epoch

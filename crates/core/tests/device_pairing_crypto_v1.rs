@@ -996,3 +996,72 @@ where
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
+
+#[test]
+fn enrollment_pin_is_bound_to_the_confirmed_pairing_transcript() {
+    let issuer = DeviceKeys::generate().unwrap();
+    let certificate = issuer_certificate(&issuer);
+    let joiner = DeviceKeys::generate().unwrap();
+    let request = signed_request(&joiner);
+    let bundle = key_bundle()
+        .with_enrollment_record_sha256(Sha256Digest([0x42; 32]))
+        .unwrap();
+    let grant = build_pairing_grant(
+        &request,
+        &approval(&request, certificate.clone()),
+        &issuer,
+        &bundle,
+    )
+    .unwrap();
+    let payload = build_pairing_approved_payload_v1(
+        &request,
+        grant,
+        id(ISSUER_CERTIFICATE_ID),
+        certificate,
+        "Desktop",
+        NativePlatform::Macos,
+    )
+    .unwrap();
+    let encoded = encode_pairing_approved_payload_v1(&payload).unwrap();
+    let inspected = inspect_pairing_approval(&encoded, &request).unwrap();
+    let confirmed = confirm_and_open_pairing_approval(
+        &inspected,
+        inspected.safety_number().as_str(),
+        &request,
+        &joiner,
+    )
+    .unwrap();
+    assert_eq!(
+        confirmed.key_bundle().enrollment_record_sha256(),
+        Some(Sha256Digest([0x42; 32]))
+    );
+    // Even a change to the encrypted pin cannot reuse the already confirmed safety number.
+    let mut altered = payload;
+    let ciphertext = &mut altered.grant.wrapped_key_bundle.ciphertext;
+    let pin_offset = ciphertext.len() - 16 - 1;
+    ciphertext[pin_offset] ^= 1;
+    let altered = inspect_pairing_approval(
+        &encode_pairing_approved_payload_v1(&altered).unwrap(),
+        &request,
+    )
+    .unwrap();
+    assert_ne!(altered.safety_number(), inspected.safety_number());
+    assert!(
+        confirm_and_open_pairing_approval(
+            &altered,
+            inspected.safety_number().as_str(),
+            &request,
+            &joiner
+        )
+        .is_err()
+    );
+    assert!(
+        confirm_and_open_pairing_approval(
+            &altered,
+            altered.safety_number().as_str(),
+            &request,
+            &joiner
+        )
+        .is_err()
+    );
+}

@@ -530,6 +530,7 @@ impl Vault {
             *material.workspace_root_key(),
             *material.active_epoch_key(),
         )
+        .and_then(|material| material.with_enrollment_record_sha256(stored.canonical_record_sha256))
         .map_err(|_| validation())
     }
 
@@ -597,6 +598,12 @@ impl Vault {
                     *material.active_epoch_key(),
                 )
                 .map_err(|_| validation())?;
+                let workspace = match material.enrollment_record_sha256() {
+                    Some(pin) => workspace
+                        .with_enrollment_record_sha256(pin)
+                        .map_err(|_| validation())?,
+                    None => workspace,
+                };
                 let approval = confirmed.approved_payload();
                 Ok((
                     workspace,

@@ -17,8 +17,8 @@ use crate::{
     },
     devices::crypto::{
         PairingKeyBundle, certificate_digest, decode_certificate_v1, decode_native_platform,
-        decode_pairing_key_bundle_v1, decode_wrapped_envelope_with_limit, encode_certificate_v1,
-        encode_native_platform, encode_pairing_key_bundle_v1, encode_wrapped_envelope,
+        decode_pairing_key_bundle, decode_wrapped_envelope_with_limit, encode_certificate_v1,
+        encode_native_platform, encode_pairing_key_bundle, encode_wrapped_envelope,
     },
 };
 
@@ -240,7 +240,7 @@ pub(crate) fn build_recovery_enrollment_artifacts_inner<R: CryptoRng + RngCore>(
     };
 
     let certificate_sha256 = certificate_digest(&record.genesis_certificate)?;
-    let plaintext = encode_pairing_key_bundle_v1(material)?;
+    let plaintext = encode_pairing_key_bundle(material)?;
     let recovery_aad = recovery_metadata_aad(&record, certificate_sha256);
     record.encrypted_recovery_metadata = wrap_secret_with_rng(
         record.recovery_wrapping_public_key,
@@ -382,7 +382,7 @@ pub fn open_recovery_metadata(
     let certificate_sha256 = certificate_digest(&record.genesis_certificate)?;
     let aad = recovery_metadata_aad(record, certificate_sha256);
     let plaintext = recovery_keys.unwrap_secret(&record.encrypted_recovery_metadata, &aad)?;
-    let material = decode_pairing_key_bundle_v1(plaintext.expose())?;
+    let material = decode_pairing_key_bundle(plaintext.expose())?;
     validate_opened_material(record, &material)?;
     Ok(material)
 }
@@ -405,7 +405,7 @@ pub fn open_device_workspace_material(
     let certificate_sha256 = certificate_digest(certificate)?;
     let aad = device_workspace_material_aad(record, certificate_sha256, device_id, device_keys);
     let plaintext = device_keys.unwrap_secret(envelope, &aad)?;
-    let material = decode_pairing_key_bundle_v1(plaintext.expose())?;
+    let material = decode_pairing_key_bundle(plaintext.expose())?;
     validate_opened_material(record, &material)?;
     Ok(material)
 }

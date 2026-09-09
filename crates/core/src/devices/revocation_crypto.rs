@@ -13,8 +13,8 @@ use crate::crypto::{CryptoError, DeviceCertificateV1, DeviceKeys, verify_signatu
 use crate::{
     crypto::{RecoveryKeys, WrappedKeyEnvelope, validate_x25519_public_key, wrap_secret},
     devices::crypto::{
-        PairingKeyBundle, certificate_digest, decode_certificate_v1, decode_pairing_key_bundle_v1,
-        encode_certificate_v1, encode_pairing_key_bundle_v1,
+        PairingKeyBundle, certificate_digest, decode_certificate_v1, decode_pairing_key_bundle,
+        encode_certificate_v1, encode_pairing_key_bundle,
     },
     sync::SyncScope,
 };
@@ -252,7 +252,7 @@ impl RevocationTransitionV1 {
             *root_key,
             *epoch_key,
         )?;
-        let plaintext = encode_pairing_key_bundle_v1(&material)?;
+        let plaintext = encode_pairing_key_bundle(&material)?;
         let commitment = Sha256Digest(Sha256::digest(&*plaintext).into());
         let mut devices = Vec::new();
         for certificate in current
@@ -359,7 +359,7 @@ impl RevocationTransitionV1 {
         if Sha256Digest(Sha256::digest(plaintext).into()) != self.key_material_sha256 {
             return Err(CryptoError::AuthenticationFailed);
         }
-        let material = decode_pairing_key_bundle_v1(plaintext)?;
+        let material = decode_pairing_key_bundle(plaintext)?;
         if material.account_id() != statement.account_id
             || material.workspace_id() != statement.workspace_id
             || material.control_epoch() != self.control_epoch
