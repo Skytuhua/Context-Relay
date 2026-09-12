@@ -47,6 +47,10 @@ async function main() {
   if (process.platform !== 'darwin' || process.arch !== 'arm64') {
     throw new Error('package:macos requires an arm64 macOS host and its native toolchain');
   }
+  const identity = process.env.CONTEXT_RELAY_MACOS_SIGNING_IDENTITY;
+  if (!identity || (identity !== '-' && !identity.startsWith('Developer ID Application:'))) {
+    throw new Error('Set CONTEXT_RELAY_MACOS_SIGNING_IDENTITY to a Developer ID Application identity or explicit internal candidate -');
+  }
   const desktop = join(workspace, 'apps', 'desktop');
   const require = createRequire(join(desktop, 'package.json'));
   const tauriCli = require.resolve('@tauri-apps/cli/tauri.js');
@@ -63,6 +67,13 @@ async function main() {
     target, modelDirectory: join(assets, 'model'), runtimeDirectory: join(assets, 'runtime'),
     stagingDirectory: join(desktop, 'src-tauri', 'resources', 'search'),
   });
+  const signingScript = join(workspace, 'scripts', 'macos_signing.py');
+  const signingMetadata = join(targetDirectory, 'macos-signing', 'runtime.json');
+  execFileSync('python3', [signingScript, 'prepare',
+    join(desktop, 'src-tauri', 'resources', 'search', 'runtime'), signingMetadata, identity,
+  ], { cwd: workspace, stdio: 'inherit' });
+  const signing = JSON.parse(await readFile(signingMetadata, 'utf8'));
+  env.CONTEXT_RELAY_MACOS_RUNTIME = JSON.stringify(signing.buildTrust);
   execFileSync('cargo', [
     'build', '--locked', '--release', '--target', target, '--target-dir', targetDirectory,
     '-p', 'context-relay-contextd', '-p', 'context-relay-context-mcp',
@@ -73,9 +84,12 @@ async function main() {
     stagingDirectory: join(desktop, 'src-tauri', 'binaries'),
   });
   execFileSync(process.execPath, [
-    tauriCli, 'build', '--target', target,
+    tauriCli, 'build', '--target', target, '--no-sign',
     '--config', 'src-tauri/tauri.macos-release.conf.json', '--', '--locked',
   ], { cwd: desktop, env, stdio: 'inherit' });
+  execFileSync('python3', [signingScript, 'finish',
+    join(targetDirectory, target, 'release', 'bundle', 'macos', 'Context Relay.app'), signingMetadata, identity,
+  ], { cwd: workspace, stdio: 'inherit' });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

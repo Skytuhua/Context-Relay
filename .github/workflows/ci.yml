@@ -357,6 +357,7 @@ jobs:
         if: ${{ runner.os == 'macOS' }}
         run: |
           cargo build --locked --release --target aarch64-apple-darwin -p context-relay-native-runner --features test-support --example macos-library-constraint-probe
+          python3 scripts/test_macos_signing.py
           python3 scripts/verify-macos-library-constraints.py target/aarch64-apple-darwin/release/examples/macos-library-constraint-probe
       - run: node --test scripts/fetch-macos-search-resources.test.mjs
       - name: Verify macOS search input acquisition
@@ -373,6 +374,7 @@ jobs:
         run: pnpm package:macos
         env:
           CONTEXT_RELAY_SEARCH_ASSETS: ${{ runner.temp }}/macos-search-resources
+          CONTEXT_RELAY_MACOS_SIGNING_IDENTITY: "-"
 
   semgrep-materials:
     runs-on: ubuntu-24.04

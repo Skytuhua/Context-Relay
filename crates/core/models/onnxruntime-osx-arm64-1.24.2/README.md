@@ -35,15 +35,29 @@ memory, verifies their size and SHA-256, and stages `model/` and `runtime/`
 only after the complete set validates. Temporary downloads are removed on
 success or failure. It does not install or execute the runtime.
 
-On an arm64 macOS host, `pnpm package:macos` stages these inputs, builds the
-four companion executables, and assembles the Tauri `.app` candidate with the
-explicit macOS resource map. It reads `target/macos-search-resources` by default;
-set `CONTEXT_RELAY_SEARCH_ASSETS` when using another acquisition directory.
-The native CI job runs this command. A successful native run is still required
-to establish packaging, and packaging alone does not activate semantic search.
+On an arm64 macOS 14+ host, select a signing identity explicitly:
 
-The macOS native loader, production resource discovery, signing and installed
-acceptance are still required. These hashes describe the upstream
-input bytes; if signing changes the dylib, release verification must bind the
-resulting signed bytes rather than reuse these input hashes. No packaged macOS
-search capability is claimed by this manifest.
+```sh
+# Internal CI candidate, not distribution signing:
+CONTEXT_RELAY_MACOS_SIGNING_IDENTITY=- pnpm package:macos
+# With the enrolled identity already available in the keychain:
+CONTEXT_RELAY_MACOS_SIGNING_IDENTITY='Developer ID Application: Your Name (TEAMID)' pnpm package:macos
+```
+
+The command reads `target/macos-search-resources` by default; set
+`CONTEXT_RELAY_SEARCH_ASSETS` for another acquisition directory. It verifies
+upstream inputs, signs the staged dylib once, and derives both its final byte
+pins and a CDHash-only library constraint. It compiles those pins into the
+consumers, builds all four companions, and assembles Tauri with `--no-sign`.
+It then signs the final companions and outer app, checks the final runtime
+bytes and executable constraints, and invokes `--verify-packaged-search` on
+the bundled daemon. This explicit mode runs real embedding inference without
+starting a vault or IPC service. A disposable copied app with a changed runtime
+must be rejected. The CI identity `-` uses an internal library-validation
+exception; Developer ID mode keeps normal validation and never falls back.
+
+The complete native signing/inference run remains pending. Production resource
+discovery, Developer ID enrollment/notarization and installed acceptance remain
+required. These manifest hashes describe upstream input bytes; the signing
+pipeline separately binds the resulting signed bytes. No distributed release
+or installed search acceptance is claimed by this manifest.

@@ -3044,3 +3044,50 @@ ORT file, compile the consumers, sign the assembled executables with the matchin
 constraint and run actual inference from the assembled app. No build metadata is
 supplied yet, so packaged macOS loading refuses initialization. Production daemon
 resource discovery remains disabled until that pipeline and native inference pass.
+
+
+### macOS signing and assembled inference gate — September 9
+
+The packaging command now requires an explicit signing identity. CI supplies `-`
+for an internal ad-hoc candidate; Developer ID mode requires its named identity
+and preserves normal library validation. A shared stdlib Python helper verifies
+upstream inputs, signs ORT once, derives a CDHash-only constraint, signs a disposable
+seed and extracts its constraint digest, then passes final-byte/constraint pins
+to Cargo. Tauri 2.11.4's installed help and pinned source confirm `--no-sign` skips
+its signing/notarization pass. Final companions are signed with the same constraint,
+then the outer app is signed last, without recursive signing of the pinned dylib.
+
+The final gate checks runtime bytes/signature and each executable's constraint,
+then invokes the actual bundled daemon's explicit `--verify-packaged-search` mode.
+That mode derives bundled resources and compares real query/passage embeddings
+before any vault or IPC startup. A disposable copied app with altered runtime
+bytes must fail. The existing native constraint canary shares the same extraction
+helper. Native execution of this whole path is still pending; production daemon
+resource discovery remains disabled until it passes.
+
+The extractor and command-mode regressions each failed before implementation and
+pass locally. Python syntax and all 27 package/native-workflow tests pass. A broader
+CI-contract invocation passed 34 tests and failed its unrelated Linux whitespace
+shell test because `/bin/bash` is absent on this Windows host; native CI must run
+that gate. Actual Developer ID signing, notarization, installed acceptance and
+full release qualification remain open.
+
+### Continuation verification — September 12
+
+PR #16 remains open at `5d748d123a4e3ab1ba9ff1e74e1774f178b9335c`.
+CI run `34364547237` completed successfully on that pushed loader revision;
+it does not cover the newer signing/inference integration described above.
+Independent qualification `34356117600` completed with failure: both macOS
+builders and macOS isolation passed, both Windows builders failed after lost
+runner communication, and Windows isolation/publication were skipped. The cause
+of the Windows failures remains unproven; failed log retrieval is not evidence
+of build success.
+
+The signing gate now requires successful real inference from the disposable
+copied app before altering its runtime, then requires rejection after alteration.
+This supplies the positive control for the exact copied-app path. Local Python
+extractor regression and all 27 packaging/native-workflow tests pass; execution
+of this signing and inference pipeline still requires native macOS CI.
+Production resource discovery, Developer ID/notarization, Windows signing,
+hosted workflows, clean-machine matrices and all remaining full-release gates
+remain open. No merge or release acceptance is claimed.

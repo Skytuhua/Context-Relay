@@ -4,16 +4,15 @@ Run on macOS 14+ arm64. This tests OS enforcement with disposable ad-hoc code,
 not Developer ID signing, notarization, or the production ONNX loader.
 """
 import os
-import hashlib
 from pathlib import Path
 import platform
 import plistlib
 import re
 import shutil
 import subprocess
-import struct
 import sys
 import tempfile
+from macos_signing import constraint_digest
 
 
 def run(args, **kwargs):
@@ -116,27 +115,7 @@ int main(int argc, char **argv) {
                 args += ["--library-constraint", str(constraint)]
             run(args + [str(output)])
             run(["/usr/bin/codesign", "--verify", "--strict", str(output)])
-        # Extract only from our freshly signed fixture. The production parser is
-        # independently tested against truncated, overlapping and altered input.
-        image = (root / "rust-constrained").read_bytes()
-        offset = 32
-        signature = None
-        for _ in range(struct.unpack_from("<I", image, 16)[0]):
-            command, size = struct.unpack_from("<II", image, offset)
-            if command == 0x1d:
-                start, length = struct.unpack_from("<II", image, offset + 8)
-                signature = image[start:start + length]
-            offset += size
-        if signature is None:
-            raise RuntimeError("fixture has no signature")
-        expected = None
-        for index in range(struct.unpack_from(">I", signature, 8)[0]):
-            slot, offset = struct.unpack_from(">II", signature, 12 + index * 8)
-            if slot == 11:
-                length = struct.unpack_from(">I", signature, offset + 4)[0]
-                expected = hashlib.sha256(signature[offset:offset + length]).hexdigest()
-        if expected is None:
-            raise RuntimeError("fixture has no library constraint blob")
+        expected = constraint_digest((root / "rust-constrained").read_bytes())
         for name, digest, code in (("rust-constrained", expected, 0),
                                   ("rust-control", expected, 20),
                                   ("rust-constrained", "00" * 32, 20)):
