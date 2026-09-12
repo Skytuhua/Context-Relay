@@ -5,6 +5,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, w
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   archiveCacheLinks,
@@ -852,6 +853,14 @@ test('complete bundle includes recursive git, opam records, pins, archives, and 
   await buildSemgrepSourceBundle({ ...options, outputPath: second });
   assert.deepEqual(await readFile(first), await readFile(second));
   const verified = await verifySemgrepSourceBundle({ bundlePath: first, sourceLockPath });
+  const supported = await buildSemgrepSourceBundle({
+    ...options,
+    outputPath: join(root, 'with-default-support.tar'),
+    supportPaths: undefined,
+    supportRoot: fileURLToPath(new URL('..', import.meta.url)),
+  });
+  const helperPath = 'third_party/sidecars/semgrep/windows-offline-firewall.ps1';
+  assert.equal(supported.digests[`support/${helperPath}`], digest('sha256', await readFile(new URL(`../${helperPath}`, import.meta.url))));
   for (const path of [
     'sources/semgrep/main.ml',
     'sources/semgrep/deps/sub/sub.ml',

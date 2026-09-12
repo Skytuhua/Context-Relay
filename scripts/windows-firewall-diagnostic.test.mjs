@@ -29,8 +29,8 @@ test('audit restoration compares every CSV field, rejecting malformed and duplic
   const output = execFileSync('pwsh', ['-NoProfile', '-Command', `
     $ErrorActionPreference = 'Stop'
     $ast = [Management.Automation.Language.Parser]::ParseFile($env:FIREWALL_DIAGNOSTIC_TEST_SCRIPT, [ref]$null, [ref]$null)
-    $functions = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in @('Read-AuditPolicyCsv', 'Compare-AuditPolicyCsv') }, $false))
-    if ($functions.Count -ne 2) { throw 'missing audit policy comparison' }
+    $functions = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in @('Read-AuditPolicyCsv', 'Compare-AuditPolicyCsv', 'Get-ConnectionAuditFlags') }, $false))
+    if ($functions.Count -ne 3) { throw 'missing audit policy comparison or target flags' }
     foreach ($fn in $functions) { Invoke-Expression $fn.Extent.Text }
     $header = 'Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclusion Setting,Setting Value'
     $system = 'PRIVATE-HOST,System,Filtering Platform Connection,{0CCE9226-69AE-11D9-BED3-505054503030},Failure,,2'
@@ -45,6 +45,12 @@ test('audit restoration compares every CSV field, rejecting malformed and duplic
     $results.target = Compare-AuditPolicyCsv $before ($before.Replace('S-1-5-21-PRIVATE', 'S-1-5-21-OTHER'))
     $results.text = Compare-AuditPolicyCsv $before ($before.Replace('Success,Failure,9', 'success,Failure,9'))
     $results.softHyphen = Compare-AuditPolicyCsv $before ($before.Replace('Disabled', ('Dis' + [char]0x00AD + 'abled')))
+    $results.flags = @(foreach ($state in @(@('No Auditing', '0'), @('Success', '1'), @('Failure', '2'), @('Success and Failure', '3'))) {
+      Get-ConnectionAuditFlags ($before.Replace('Failure,,2', ($state[0] + ',,' + $state[1])))
+    })
+    $results.ambiguous = @(foreach ($invalid in @('Not Specified,,2', 'Success,,2', 'Failure,,4', 'Failure,Failure,2')) {
+      try { $null = Get-ConnectionAuditFlags ($before.Replace('Failure,,2', $invalid)); 'accepted' } catch { 'rejected' }
+    })
     foreach ($case in @{
       header = $before.Replace('Setting Value', 'Setting Value,Unknown')
       softHyphenHeader = $before.Replace('Setting Value', ('Setting Val' + [char]0x00AD + 'ue'))
@@ -63,6 +69,11 @@ test('audit restoration compares every CSV field, rejecting malformed and duplic
   assert.equal(results.reordered.equal, true);
   assert.equal(results.reordered.beforeRows, 3);
   assert.equal(results.reordered.afterRows, 3);
+  assert.deepEqual(results.flags, [
+    { success: 'disable', failure: 'disable' }, { success: 'enable', failure: 'disable' },
+    { success: 'disable', failure: 'enable' }, { success: 'enable', failure: 'enable' },
+  ]);
+  assert.deepEqual(results.ambiguous, ['rejected', 'rejected', 'rejected', 'rejected']);
   for (const name of ['setting', 'option', 'target', 'text', 'softHyphen']) assert.equal(results[name].equal, false, name);
   for (const name of ['header', 'softHyphenHeader', 'duplicate', 'conflict', 'extra', 'quote', 'oversized']) assert.equal(results[name], 'rejected', name);
   assert.ok(!output.includes('PRIVATE'));

@@ -3221,3 +3221,34 @@ metadata, with no connection events or policy values. No network rule changed.
 The comparer and soft-hyphen regressions failed before their fixes; all 27 local
 workflow/diagnostic tests now pass. Independent review's ordinal-comparison P2
 is addressed with no new P1/P2 findings. Revised native execution remains pending.
+
+### Source-closure repair and narrow audit restoration
+
+The `b863672` license failure identified the stale Windows build-script material
+pin. Its macOS source-bundle failure had the same integration cause: the bundle
+included that changed script but omitted the extracted firewall helper. The helper
+now has an explicit required material pin and corresponding-source support entry.
+The diagnostic is separately accounted for by the license inventory, without
+entering the build tar. LF Git attributes make all PowerShell material pins stable.
+The source lock and native qualification status are unchanged.
+
+The verified prior source tar had SHA-256
+`67d52f6a45cad45f2dbf1fbea46787867348f885df4387c08a1ee5fb1532526f`.
+Resealing its changed support entries produced the verified source tar SHA-256
+`9640e920cb8dfe95660da07454489f8ffae9f21f9b24fc6f8244c542bcc1af81`,
+1,149,645,312 bytes, 39,543 entries and 222 links. Independent inventory comparison
+found only the helper addition, generator/build-script replacements and derived
+metadata changes, with nothing removed. This is source-input evidence, not a new
+native build qualification. All 73 material/bundle/finalizer tests and the license
+checker pass. The complete PR-range whitespace check now passes too.
+
+Diagnostic `34695570159` at `06daf67` confirmed baseline connectivity, denied
+shell egress and restored firewall settings, but auditing differed: both commands
+returned zero, with 64 prior rows and 66 afterward (two extra, none changed or
+missing). No connection events were exported. The two added rows and their cause
+remain unidentified. Restoration now changes only the original connection-audit
+subcategory: its unique System row, GUID, exact label/numeric mapping and empty
+exclusion are checked before mutation, and both original success/failure flags
+are restored. Full strict policy equality remains mandatory. All 27 local
+workflow/diagnostic tests pass; independent review found no P1/P2 findings.
+New native restoration, license and source-bundle execution remain pending.

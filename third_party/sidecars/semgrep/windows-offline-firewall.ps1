@@ -108,14 +108,14 @@ function Invoke-WindowsOfflineFirewall([scriptblock]$Action, [ref]$RestorationVe
         Fail 'runner control-plane firewall allow rule is not exact and active'
       }
     }
-  
+
     $DnsProgram = [IO.Path]::GetFullPath((Join-Path ([Environment]::SystemDirectory) 'svchost.exe'))
     foreach ($Protocol in @('UDP', 'TCP')) {
       $RuleName = "$FirewallPrefix-Dns-$Protocol"
       $DnsRuleNames.Add($RuleName)
       New-NetFirewallRule -Name $RuleName -DisplayName $RuleName -Direction Outbound -Program $DnsProgram -Service Dnscache -RemoteAddress $ResolverAddresses -RemotePort 53 -Protocol $Protocol -Action Allow -Profile Any -ErrorAction Stop | Out-Null
     }
-  
+
     $ExistingOutboundAllows = @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow -Enabled True |
       Where-Object { $RunnerRuleNames -notcontains $_.Name -and $DnsRuleNames -notcontains $_.Name })
     foreach ($ExistingRule in $ExistingOutboundAllows) {
@@ -128,7 +128,7 @@ function Invoke-WindowsOfflineFirewall([scriptblock]$Action, [ref]$RestorationVe
     $RemainingBroadAllows = @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow -Enabled True |
       Where-Object { $RunnerRuleNames -notcontains $_.Name -and $DnsRuleNames -notcontains $_.Name })
     if ($RemainingBroadAllows.Count -ne 0) { Fail 'outbound allow rules remain outside the runner control-plane carveout' }
-  
+
     foreach ($ProfileSnapshot in $ProfileSnapshots) {
       Set-NetFirewallProfile -Profile $ProfileSnapshot.Name -DefaultOutboundAction Block -ErrorAction Stop
     }

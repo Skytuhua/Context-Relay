@@ -48,6 +48,7 @@ const DEFAULT_SUPPORT_PATHS = [
   'third_party/sidecars/semgrep/builder-evidence.windows-x86_64.v1.schema.json',
   'third_party/sidecars/semgrep/build-public-source-macos.sh',
   'third_party/sidecars/semgrep/build-public-source-windows.ps1',
+  'third_party/sidecars/semgrep/windows-offline-firewall.ps1',
   'third_party/sidecars/semgrep/patches.v1.json',
   'third_party/sidecars/semgrep/patches.windows.v1.json',
 ];
@@ -1054,7 +1055,7 @@ export async function buildSemgrepSourceBundle({
   pinRoot,
   semgrepRoot,
   sourceLockPath,
-  supportPaths = [],
+  supportPaths = DEFAULT_SUPPORT_PATHS,
   supportRoot = process.cwd(),
 }) {
   if (![archiveCacheRoot, opamRoot, outputPath, pinRoot, semgrepRoot, sourceLockPath, supportRoot]

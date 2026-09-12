@@ -80,6 +80,29 @@ function Compare-AuditPolicyCsv([string]$BeforeCsv, [string]$AfterCsv) {
   }
 }
 
+function Get-ConnectionAuditFlags([string]$Csv) {
+  $Rows = Read-AuditPolicyCsv $Csv
+  $Selected = [Collections.Generic.List[string[]]]::new()
+  foreach ($Row in $Rows.Values) {
+    if ([string]::Equals($Row[1], 'System', [StringComparison]::Ordinal) -and
+        [string]::Equals($Row[3], '{0CCE9226-69AE-11D9-BED3-505054503030}', [StringComparison]::OrdinalIgnoreCase)) {
+      $Selected.Add($Row)
+    }
+  }
+  if ($Selected.Count -ne 1) { throw 'system connection audit row is missing or ambiguous' }
+  $Row = $Selected[0]
+  if ($Row[6] -notmatch '\A[0-3]\z' -or $Row[5].Length -ne 0) { throw 'system connection audit flags are unsupported' }
+  $Flags = [int]$Row[6]
+  $Labels = @('No Auditing', 'Success', 'Failure', 'Success and Failure')
+  if (-not [string]::Equals($Row[4], $Labels[$Flags], [StringComparison]::Ordinal)) {
+    throw 'system connection audit flags are ambiguous'
+  }
+  return [pscustomobject]@{
+    success = $(if ($Flags -band 1) { 'enable' } else { 'disable' })
+    failure = $(if ($Flags -band 2) { 'enable' } else { 'disable' })
+  }
+}
+
 # This changes host policy: only the disposable GitHub-hosted Windows 2022 job may run it.
 if (-not $IsWindows -or $env:GITHUB_ACTIONS -ne 'true' -or
     $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows' -or
@@ -92,8 +115,8 @@ if (-not $OutputRoot.StartsWith($TempRoot, [StringComparison]::OrdinalIgnoreCase
     (Test-Path -LiteralPath $OutputRoot)) { Fail 'diagnostic output must be a new runner-temp directory' }
 New-Item -ItemType Directory -Path $OutputRoot | Out-Null
 $Auditpol = Join-Path ([Environment]::SystemDirectory) 'auditpol.exe'
-# Native auditpol backup/restore preserves system, per-user and option settings.
-# https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/auditpol-restore
+# Capture all policy rows, but restore only the system subcategory this diagnostic changes.
+# https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/auditpol-set
 $AuditBackup = Join-Path $env:RUNNER_TEMP "$([Guid]::NewGuid().ToString('N')).audit.csv"
 $AuditRestored = "$AuditBackup.restored"
 # https://learn.microsoft.com/en-us/windows/win32/fwp/auditing-and-logging
@@ -118,6 +141,9 @@ try {
   $Stage = 'audit-setup'
   & $Auditpol /backup "/file:$AuditBackup" 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) { Fail 'audit backup failed' }
+  if ((Get-Item -LiteralPath $AuditBackup).Length -gt 1048576) { Fail 'audit CSV file exceeds bound' }
+  $OriginalAuditFlags = Get-ConnectionAuditFlags ([IO.File]::ReadAllText($AuditBackup, [Text.UTF8Encoding]::new($false, $true)))
+  # Unsupported initial representations fail before any audit policy mutation.
   $AuditSaved = $true
   & $Auditpol /set "/subcategory:$ConnectionAudit" /failure:enable 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) { Fail 'audit enable failed' }
@@ -135,7 +161,7 @@ try {
   $Ended = [DateTime]::UtcNow
   $Report.firewallRestored = $FirewallRestored
   if ($AuditSaved) {
-    & $Auditpol /restore "/file:$AuditBackup" 2>&1 | Out-Null
+    & $Auditpol /set "/subcategory:$ConnectionAudit" "/success:$($OriginalAuditFlags.success)" "/failure:$($OriginalAuditFlags.failure)" 2>&1 | Out-Null
     $Report.auditVerification.restoreExitCode = $LASTEXITCODE
     if ($LASTEXITCODE -ne 0) {
       $Report.failureStage = 'audit-restore-native-exit'

@@ -298,7 +298,7 @@
         {
           "role": "windows-build",
           "path": "third_party/sidecars/semgrep/build-public-source-windows.ps1",
-          "sha256": "6cbb15b8b77f6b0bf012811cd5c70bb9d8ce82123a310ac5f113d96013d08c2e"
+          "sha256": "47bd7972dd8fc99520847a6f91166b35876c8679c9de9190d9b27ce21cfe46cb"
         },
         {
           "role": "windows-builder-evidence-schema",
@@ -323,12 +323,12 @@
         {
           "role": "source-bundle-generator",
           "path": "scripts/semgrep-source-bundle.mjs",
-          "sha256": "d51cb59c41ddb0c1e090c1c9a5d465681ec898ea04b5f6fb5ba197338e0188ca"
+          "sha256": "43378c2a82dc79073b33759d53c0a50ae9f75bf3ac63b2947e1226fb43dbb3cc"
         },
         {
           "role": "source-bundle-evidence",
           "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
-          "sha256": "573b92b79d7651ca6b6c7f2430392dbf1bc7e61728c2632d43d577773648dab8"
+          "sha256": "484b7b547e6a649ae53f55b9f70b42d2b359bb8a1ef467823b6361777ff13d81"
         },
         {
           "role": "manifest-rule",
@@ -339,6 +339,16 @@
           "role": "package-policy",
           "path": "third_party/sidecars/policies/semgrep-package.yml",
           "sha256": "f3f38cae0178fd685614c0121edc9ff7eed99d8474e909ef519bffc64cb9481d"
+        },
+        {
+          "role": "windows-offline-firewall",
+          "path": "third_party/sidecars/semgrep/windows-offline-firewall.ps1",
+          "sha256": "d1fc64cb73e2243d93246ed6b461c80904692ad5ec99eb7c9d793050be4465b0"
+        },
+        {
+          "role": "windows-firewall-diagnostic",
+          "path": "third_party/sidecars/semgrep/diagnose-windows-firewall.ps1",
+          "sha256": "905db533bf1c2fb0f17cb54fc3a4c71c624b4300fa042ac9f9833a347d3aa5c0"
         }
       ],
       "commandTemplate": {
