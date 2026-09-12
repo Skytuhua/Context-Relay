@@ -3319,3 +3319,47 @@ These observations can distinguish a candidate relationship from actual current-
 ancestry, but confer no network authority. Local diagnostic/workflow checks (29),
 two material checks, independent review's four focused tests, the license checker
 and strict whitespace checks pass. Native ancestry evidence remains pending.
+
+### Ancestry and ordinary native build results
+
+Ancestry diagnostic `34697661901`, job `103563816416`, passed at `7688fa0` with
+99 untruncated blocked connections and exact audit-policy restoration. It observed
+the continuous current-job prefix `pwsh -> Runner.Worker -> Runner.Listener ->
+hosted-compute-agent` with stable PID/creation identities and HCA file hash.
+The chain explicitly ends at a missing process above HCA; it is not a complete
+historical ancestry proof. `provjobd` was a sibling, not a job ancestor.
+
+Ordinary Windows Semgrep job `103552405630` at PR head `cce0772` passed from
+12:19:01 to 13:48:24 UTC. Native isolation job `103563248384` then passed, including
+real Rulesync output/malformed-input, Gitleaks ignore-file and Semgrep clean/finding
+cases. Ordinary build mode compiles before enabling the firewall; this does not
+qualify the separate independent offline-build mode.
+
+macOS Semgrep job `103560108557` at PR head `9ba1573` passed and reconstructed the
+source tar as SHA-256 `9640e920cb8dfe95660da07454489f8ffae9f21f9b24fc6f8244c542bcc1af81`,
+1,149,645,312 bytes and 39,543 entries, matching the resealed source evidence.
+Its artifact identifies the PR merge revision
+`290d0464a2e76279949c74af36c9e4e415c58e73` and run `34696232205`; this is the older
+source-closure repair, not evidence for a subsequent policy change.
+
+### Parent-bound V2 pairing crypto component
+
+The V2 crypto module adds strict grant/payload codecs and independently confirmed
+opening bound to the exact predecessor, enrollment pin, request and admitted issuer.
+It supports a retained child using its unchanged older certificate after an actual
+revocation, and rejects relabelled stale keys against the authenticated rotation
+commitment. Existing V1 behavior and fixtures remain unchanged.
+
+Four V2 tests and all 15 existing V1 tests pass, including independent canonical
+grant/payload/AAD/safety fixtures (248-byte AAD body), mixed-version rejection,
+malicious stale/unpinned plaintext and forged rotation evidence. A missing-API
+regression and a Debug-redaction assertion failed before their fixes. Focused
+Clippy with warnings denied, formatting and graphify updates pass; independent
+review found no actionable P1/P2 issues.
+
+This is a component under caller-authenticated parent/admission inputs. Its private
+opened token does not prove a signed membership event or complete history. Genesis
+key content still relies on the independently confirmed approver's assertion.
+Membership/history verification, historical-key distribution, recovery, coordinator
+limits, atomic installation and hosted integration remain required. The proposed
+wire contract has not been ratified for production distribution.

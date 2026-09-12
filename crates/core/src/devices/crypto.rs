@@ -1,3 +1,5 @@
+pub mod control_v2;
+
 use std::{fmt, str::FromStr};
 
 use context_relay_protocol::{
