@@ -16,7 +16,7 @@ function Test-PinnedFile($Path, $Bytes, $Sha256) {
 function Get-PinnedFile($Uri, $Path, $Bytes, $Sha256) {
     if (Test-PinnedFile $Path $Bytes $Sha256) { return }
     $partial = "$Path.partial"
-    & curl.exe --fail --location --silent --show-error --max-time 180 --max-filesize $Bytes --output $partial $Uri
+    & curl.exe --fail --location --silent --show-error --max-time 180 --retry 4 --retry-delay 15 --retry-max-time 120 --max-filesize $Bytes --output $partial $Uri
     if ($LASTEXITCODE -ne 0) { throw "Download failed: $Uri" }
     if (!(Test-PinnedFile $partial $Bytes $Sha256)) { throw "Downloaded asset does not match its manifest: $Path" }
     Move-Item -LiteralPath $partial -Destination $Path -Force

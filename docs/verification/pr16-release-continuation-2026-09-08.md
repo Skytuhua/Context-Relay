@@ -3461,3 +3461,19 @@ Core library/tests Clippy passes with warnings denied. Independent reconstructio
 of the membership fixture matches its 186-byte statement body, Ed25519 signature
 and successor digest. Final source review of the staged opener and shared lifetime
 checks found no additional issue after the reproduced reuse gap was fixed.
+
+### Transient search-resource download failures
+
+Installer run `34699949159`, job `103569821566`, at `af3d145` failed before
+packaging when the pinned Hugging Face model returned HTTP429. Both platform
+downloaders now use curl's bounded transient retry support (four retries,
+15-second delay, 120-second retry window, 180 seconds per transfer). The macOS
+process timeout is 310 seconds to cover a final attempt beyond the retry window.
+Exact length and SHA-256 verification still precede staging; macOS partial stdout
+across retries would fail those checks rather than become accepted bytes.
+
+Both focused regressions failed before the change and pass afterward. The real
+Windows loopback case verifies 429 recovery, cache reuse, wrong-hash rejection
+without replacement and a permanent404 attempted once. Independent review reran
+both tests and found no P1/P2 issue. Native macOS retry behavior and the next
+hosted installer outcome remain pending.

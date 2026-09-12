@@ -35,8 +35,10 @@ export async function fetchMacSearchResources({ stagingDirectory, run = execute 
     const result = await run(process.platform === 'win32' ? 'curl.exe' : 'curl', [
       '--disable', '--fail', '--silent', '--show-error', '--location', '--max-redirs', '5',
       '--proto', '=https', '--proto-redir', '=https', '--max-time', '180',
+      '--retry', '4', '--retry-delay', '15', '--retry-max-time', '120',
       '--max-filesize', String(artifact.bytes), url,
-    ], options(artifact.bytes));
+    // A final attempt may outlive the retry window by its 180-second transfer cap.
+    ], { ...options(artifact.bytes), timeout: 310000 });
     return verify(result.stdout, artifact);
   }
   try {
