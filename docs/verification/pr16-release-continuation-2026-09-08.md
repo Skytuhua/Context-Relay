@@ -3363,3 +3363,37 @@ key content still relies on the independently confirmed approver's assertion.
 Membership/history verification, historical-key distribution, recovery, coordinator
 limits, atomic installation and hosted integration remain required. The proposed
 wire contract has not been ratified for production distribution.
+
+### Bounded HCA offline-build experiment
+
+The revised build policy discovers the exact current-job Worker, Listener and HCA
+ancestors in order, with bounded traversal, creation-time checks, regular no-link
+paths and file hashes. It allows those programs TCP443 plus a separate rule for
+only the HCA program to `169.254.169.254:80`. It admits neither sibling `provjobd`
+nor Azure-agent programs. Both destinations must accept a baseline TCP connection;
+shell TCP443 and IMDS TCP80 must then be denied inside isolation. No HTTP metadata
+or credentials are requested by these probes.
+
+Identity, hashes and exact effective firewall rules are rechecked around the
+action, then all temporary policy changes are restored and verified. Rule-name
+exclusions use ordinal comparisons; a soft-hyphen extra-rule regression failed
+before that correction. Builder and finalizer require the new explicit experiment
+mechanism and both denial probes, so old evidence cannot satisfy the revised gate.
+
+This deliberately expands the previous ancestor-based policy using the observed
+HCA traffic classes. It relies on the existing trusted-host assumption; program
+rules are not PID-bound, HCA is unsigned, and file hashes do not attest loaded
+process memory. Necessity and the earlier disconnect cause are unproven. Native
+rule normalization and sustained independent qualification must still pass before
+claiming the experiment succeeds; failures do not authorize automatic expansion.
+
+The verified source tar is SHA-256
+`91bcea54abcd7a1bacf40a41bbd98bc032e29030f21ed77decfa009dd40a3e05`,
+1,149,649,920 bytes, 39,543 entries and 222 links. Only the helper and Windows
+build support entries were resealed. Focused workflow/diagnostic tests (31),
+material/source/finalizer checks (73), the license checker and whitespace checks
+pass. Independent code review found no P1/P2 issues and separately passed 31
+workflow/diagnostic, nine finalizer and two material checks.
+Independent tar inventory comparison found no added or removed entries; only those
+two support files and their derived `MANIFEST.sha256` changed. A separate whole-tar
+SHA-256 check matched the recorded digest.

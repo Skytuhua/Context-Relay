@@ -1,7 +1,7 @@
-function Test-OutboundTcp([Net.IPAddress]$Address) {
+function Test-OutboundTcp([Net.IPAddress]$Address, [ValidateSet(80, 443)][int]$Port = 443) {
   $Client = [Net.Sockets.TcpClient]::new($Address.AddressFamily)
   try {
-    $Connect = $Client.ConnectAsync($Address, 443)
+    $Connect = $Client.ConnectAsync($Address, $Port)
     if (-not $Connect.Wait([TimeSpan]::FromSeconds(8))) { return $false }
     return $Client.Connected
   } catch {
@@ -12,34 +12,81 @@ function Test-OutboundTcp([Net.IPAddress]$Address) {
 }
 
 function Get-RunnerControlPlanePrograms {
-  $RequiredNames = @('Runner.Worker.exe', 'Runner.Listener.exe')
-  $Found = @{}
+  # Qualification experiment under the existing hosted-runner ancestor model, not vendor attestation.
+  $RequiredNames = @('Runner.Worker.exe', 'Runner.Listener.exe', 'hosted-compute-agent')
+  $Found = [Collections.Generic.List[object]]::new()
   $Visited = [Collections.Generic.HashSet[uint32]]::new()
   [uint32]$CurrentProcessId = $PID
-  while ($CurrentProcessId -ne 0 -and $Visited.Add($CurrentProcessId)) {
-    $Process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $CurrentProcessId" -ErrorAction Stop
-    if ($null -eq $Process) { break }
-    $Name = [IO.Path]::GetFileName([string]$Process.ExecutablePath)
+  $ChildCreated = $null
+  while ($CurrentProcessId -ne 0 -and $Visited.Count -lt 32) {
+    if (-not $Visited.Add($CurrentProcessId)) { Fail 'runner ancestor cycle' }
+    $Processes = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $CurrentProcessId" -Property ProcessId,ParentProcessId,CreationDate,ExecutablePath -ErrorAction Stop | Select-Object -First 2)
+    if ($Processes.Count -ne 1) { Fail 'runner ancestor is missing or ambiguous' }
+    $Process = $Processes[0]
+    if ([uint32]$Process.ProcessId -ne $CurrentProcessId -or $null -eq $Process.CreationDate) { Fail 'runner ancestor identity is unavailable' }
+    $Created = ([DateTime]$Process.CreationDate).ToUniversalTime()
+    if ($null -ne $ChildCreated -and $Created -gt $ChildCreated) { Fail 'runner parent identity was reused or creation order is invalid' }
+    $Path = [string]$Process.ExecutablePath
+    $Name = [IO.Path]::GetFileName($Path)
     if ($RequiredNames -contains $Name) {
-      if ([string]::IsNullOrWhiteSpace([string]$Process.ExecutablePath)) { Fail "runner executable path is empty: $Name" }
-      $Resolved = (Resolve-Path -LiteralPath ([string]$Process.ExecutablePath) -ErrorAction Stop).Path
-      $Item = Get-Item -LiteralPath $Resolved -Force
-      if (-not $Item.PSIsContainer -and (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) {
-        $Found[$Name] = $Resolved
-      } else {
-        Fail "runner executable path is not a regular file: $Name"
+      if (-not [string]::Equals($Name, $RequiredNames[$Found.Count], [StringComparison]::OrdinalIgnoreCase)) { Fail 'runner ancestors are duplicated or out of order' }
+      if ($Path.Length -gt 1024 -or $Path -notmatch '\A[A-Za-z]:\\' -or $Path.Substring(2).Contains(':') -or ($Path -split '\\') -contains '..') { Fail 'runner executable path is unsafe' }
+      $Path = [IO.Path]::GetFullPath($Path)
+      $Part = $Path
+      while (-not [string]::IsNullOrEmpty($Part)) {
+        $Item = Get-Item -LiteralPath $Part -Force -ErrorAction Stop
+        if (($Item.Attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Device)) -ne 0 -or
+            ($Part -eq $Path -and $Item.PSIsContainer) -or ($Part -ne $Path -and -not $Item.PSIsContainer)) { Fail 'runner executable path is not a regular no-link file' }
+        $Part = [IO.Path]::GetDirectoryName($Part)
+      }
+      $Hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash
+      if ($Hash -notmatch '\A[0-9A-Fa-f]{64}\z') { Fail 'runner executable hash is invalid' }
+      $Found.Add([pscustomobject]@{
+        Name = $RequiredNames[$Found.Count]; Path = $Path; ProcessId = $CurrentProcessId
+        ParentProcessId = [uint32]$Process.ParentProcessId; CreatedAt = $Created.ToString('o'); Sha256 = $Hash
+      })
+      if ($Found.Count -eq 3) {
+        if (-not [string]::Equals([IO.Path]::GetDirectoryName($Found[0].Path), [IO.Path]::GetDirectoryName($Found[1].Path), [StringComparison]::OrdinalIgnoreCase)) { Fail 'runner control-plane executables do not share one trusted directory' }
+        return $Found.ToArray()
       }
     }
-    [uint32]$ParentProcessId = $Process.ParentProcessId
-    if ($ParentProcessId -eq $CurrentProcessId) { break }
-    $CurrentProcessId = $ParentProcessId
+    $ChildCreated = $Created
+    $CurrentProcessId = [uint32]$Process.ParentProcessId
   }
-  foreach ($Name in $RequiredNames) {
-    if (-not $Found.ContainsKey($Name)) { Fail "runner control-plane ancestor not found: $Name" }
+  Fail 'required runner ancestors were not found within 32 processes'
+}
+
+function Assert-RunnerControlPlaneIdentity([object[]]$Expected) {
+  $Current = @(Get-RunnerControlPlanePrograms)
+  if ($Expected.Count -ne 3 -or $Current.Count -ne 3 -or
+      -not [string]::Equals(($Expected | ConvertTo-Json -Compress), ($Current | ConvertTo-Json -Compress), [StringComparison]::Ordinal)) {
+    Fail 'runner ancestor PID, creation, path or hash changed'
   }
-  $Directories = @($RequiredNames | ForEach-Object { Split-Path -Parent $Found[$_] } | Select-Object -Unique)
-  if ($Directories.Count -ne 1) { Fail 'runner control-plane executables do not share one trusted directory' }
-  return [string[]]@($RequiredNames | ForEach-Object { $Found[$_] })
+}
+
+function Assert-OfflineFirewallRules([object[]]$ExpectedRules) {
+  foreach ($Expected in $ExpectedRules) {
+    $Rules = @(Get-NetFirewallRule -Name $Expected.Name -PolicyStore ActiveStore -ErrorAction Stop)
+    if ($Rules.Count -ne 1 -or -not [string]::Equals([string]$Rules[0].Name, [string]$Expected.Name, [StringComparison]::Ordinal)) { Fail 'isolation rule is missing or ambiguous' }
+    $Rule = $Rules[0]
+    $Application = $Rule | Get-NetFirewallApplicationFilter
+    $AddressFilter = $Rule | Get-NetFirewallAddressFilter
+    $Port = $Rule | Get-NetFirewallPortFilter
+    $Service = $Rule | Get-NetFirewallServiceFilter
+    $ActualAddresses = [string[]]@($AddressFilter.RemoteAddress)
+    $ExpectedAddresses = [string[]]@($Expected.RemoteAddress)
+    [Array]::Sort($ActualAddresses, [StringComparer]::Ordinal)
+    [Array]::Sort($ExpectedAddresses, [StringComparer]::Ordinal)
+    $Protocol = [string]$Port.Protocol
+    if ($Protocol -eq '6') { $Protocol = 'TCP' }
+    if ($Protocol -eq '17') { $Protocol = 'UDP' }
+    $Actual = @([string]$Rule.Enabled, [string]$Rule.Direction, [string]$Rule.Action, [string]$Rule.Profile, [string]$Application.Program, ($ActualAddresses -join ','), [string]$Port.RemotePort, $Protocol, [string]$Service.Service)
+    $Wanted = @('True', 'Outbound', 'Allow', 'Any', $Expected.Program, ($ExpectedAddresses -join ','), $Expected.RemotePort, $Expected.Protocol, $Expected.Service)
+    if (-not [string]::Equals(($Actual | ConvertTo-Json -Compress), ($Wanted | ConvertTo-Json -Compress), [StringComparison]::Ordinal)) { Fail 'isolation rule program, service, address or port is not exact and active' }
+  }
+  $Names = [Collections.Generic.HashSet[string]]::new([string[]]@($ExpectedRules | ForEach-Object Name), [StringComparer]::Ordinal)
+  $Extra = @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow -Enabled True | Where-Object { -not $Names.Contains([string]$_.Name) })
+  if ($Extra.Count -ne 0) { Fail 'outbound allow rules remain outside the control-plane carveout' }
 }
 
 function Test-DnsResolverAddress([Net.IPAddress]$Address) {
@@ -59,11 +106,11 @@ function Invoke-WindowsOfflineFirewall([scriptblock]$Action, [ref]$RestorationVe
   if ($null -eq $ProbeAddress -or -not (Test-OutboundTcp $ProbeAddress)) {
     Fail 'outbound TCP preflight failed before enabling offline firewall policy'
   }
-  $RunnerPrograms = @(Get-RunnerControlPlanePrograms)
-  $RunnerProgramHashes = @{}
-  foreach ($Program in $RunnerPrograms) {
-    $RunnerProgramHashes[$Program] = (Get-FileHash -Algorithm SHA256 -LiteralPath $Program).Hash
-  }
+  $ImdsAddress = [Net.IPAddress]::Parse('169.254.169.254')
+  if (-not (Test-OutboundTcp $ImdsAddress 80)) { Fail 'IMDS TCP preflight failed before enabling offline firewall policy' }
+  $RunnerIdentities = @(Get-RunnerControlPlanePrograms)
+  $RunnerPrograms = @($RunnerIdentities | ForEach-Object Path)
+  $HcaProgram = $RunnerIdentities[2].Path
   $ResolverSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
   foreach ($Resolver in @(Get-DnsClientServerAddress -ErrorAction Stop | ForEach-Object ServerAddresses)) {
     [Net.IPAddress]$Address = $null
@@ -87,6 +134,7 @@ function Invoke-WindowsOfflineFirewall([scriptblock]$Action, [ref]$RestorationVe
   $RunnerRuleNames = [Collections.Generic.List[string]]::new()
   $DnsRuleNames = [Collections.Generic.List[string]]::new()
   $DisabledOutboundRuleNames = [Collections.Generic.List[string]]::new()
+  $ExpectedRules = [Collections.Generic.List[object]]::new()
   try {
     $RuleIndex = 0
     foreach ($Program in $RunnerPrograms) {
@@ -94,30 +142,23 @@ function Invoke-WindowsOfflineFirewall([scriptblock]$Action, [ref]$RestorationVe
       $RuleName = "$FirewallPrefix-Runner-$RuleIndex"
       $RunnerRuleNames.Add($RuleName)
       New-NetFirewallRule -Name $RuleName -DisplayName $RuleName -Direction Outbound -Program $Program -RemoteAddress Any -RemotePort 443 -Protocol TCP -Action Allow -Profile Any -ErrorAction Stop | Out-Null
-      $Rule = Get-NetFirewallRule -Name $RuleName -PolicyStore ActiveStore -ErrorAction Stop
-      $Application = $Rule | Get-NetFirewallApplicationFilter
-      $AddressFilter = $Rule | Get-NetFirewallAddressFilter
-      $Port = $Rule | Get-NetFirewallPortFilter
-      if ($Rule.Enabled -ne 'True' -or
-          $Rule.Direction -ne 'Outbound' -or
-          $Rule.Action -ne 'Allow' -or
-          [IO.Path]::GetFullPath($Application.Program) -ne [IO.Path]::GetFullPath($Program) -or
-          [string]$AddressFilter.RemoteAddress -cne 'Any' -or
-          [string]$Port.RemotePort -cne '443' -or
-          @('TCP', '6') -notcontains [string]$Port.Protocol) {
-        Fail 'runner control-plane firewall allow rule is not exact and active'
-      }
+      $ExpectedRules.Add([pscustomobject]@{ Name = $RuleName; Program = $Program; RemoteAddress = @('Any'); RemotePort = '443'; Protocol = 'TCP'; Service = 'Any' })
     }
+    $RuleName = "$FirewallPrefix-Hca-Imds"
+    $RunnerRuleNames.Add($RuleName)
+    New-NetFirewallRule -Name $RuleName -DisplayName $RuleName -Direction Outbound -Program $HcaProgram -RemoteAddress '169.254.169.254' -RemotePort 80 -Protocol TCP -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+    $ExpectedRules.Add([pscustomobject]@{ Name = $RuleName; Program = $HcaProgram; RemoteAddress = @('169.254.169.254'); RemotePort = '80'; Protocol = 'TCP'; Service = 'Any' })
 
     $DnsProgram = [IO.Path]::GetFullPath((Join-Path ([Environment]::SystemDirectory) 'svchost.exe'))
     foreach ($Protocol in @('UDP', 'TCP')) {
       $RuleName = "$FirewallPrefix-Dns-$Protocol"
       $DnsRuleNames.Add($RuleName)
       New-NetFirewallRule -Name $RuleName -DisplayName $RuleName -Direction Outbound -Program $DnsProgram -Service Dnscache -RemoteAddress $ResolverAddresses -RemotePort 53 -Protocol $Protocol -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+      $ExpectedRules.Add([pscustomobject]@{ Name = $RuleName; Program = $DnsProgram; RemoteAddress = $ResolverAddresses; RemotePort = '53'; Protocol = $Protocol; Service = 'Dnscache' })
     }
 
     $ExistingOutboundAllows = @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow -Enabled True |
-      Where-Object { $RunnerRuleNames -notcontains $_.Name -and $DnsRuleNames -notcontains $_.Name })
+      Where-Object { -not $RunnerRuleNames.Contains([string]$_.Name) -and -not $DnsRuleNames.Contains([string]$_.Name) })
     foreach ($ExistingRule in $ExistingOutboundAllows) {
       if ([string]$ExistingRule.PolicyStoreSourceType -ne 'Local' -or [string]::IsNullOrWhiteSpace($ExistingRule.Name)) {
         Fail "non-local outbound allow rule prevents fail-closed isolation: $($ExistingRule.DisplayName)"
@@ -126,7 +167,7 @@ function Invoke-WindowsOfflineFirewall([scriptblock]$Action, [ref]$RestorationVe
       Disable-NetFirewallRule -Name $ExistingRule.Name -ErrorAction Stop | Out-Null
     }
     $RemainingBroadAllows = @(Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow -Enabled True |
-      Where-Object { $RunnerRuleNames -notcontains $_.Name -and $DnsRuleNames -notcontains $_.Name })
+      Where-Object { -not $RunnerRuleNames.Contains([string]$_.Name) -and -not $DnsRuleNames.Contains([string]$_.Name) })
     if ($RemainingBroadAllows.Count -ne 0) { Fail 'outbound allow rules remain outside the runner control-plane carveout' }
 
     foreach ($ProfileSnapshot in $ProfileSnapshots) {
@@ -134,20 +175,21 @@ function Invoke-WindowsOfflineFirewall([scriptblock]$Action, [ref]$RestorationVe
     }
     foreach ($ProfileSnapshot in $ProfileSnapshots) {
       $Effective = Get-NetFirewallProfile -Profile $ProfileSnapshot.Name -ErrorAction Stop
-      if ([string]$Effective.DefaultOutboundAction -ne 'Block') { Fail "offline default outbound policy is not active: $($ProfileSnapshot.Name)" }
+      if ([string]$Effective.DefaultOutboundAction -ne 'Block' -or [string]$Effective.Enabled -ne 'True') { Fail "offline default outbound policy is not active: $($ProfileSnapshot.Name)" }
     }
+    Assert-RunnerControlPlaneIdentity $RunnerIdentities
+    Assert-OfflineFirewallRules $ExpectedRules.ToArray()
     if (Test-OutboundTcp $ProbeAddress) { Fail 'hostile outbound TCP probe bypassed the offline firewall policy' }
+    if (Test-OutboundTcp $ImdsAddress 80) { Fail 'hostile shell IMDS TCP probe bypassed the offline firewall policy' }
     . $Action
-    foreach ($Program in $RunnerPrograms) {
-      if ((Get-FileHash -Algorithm SHA256 -LiteralPath $Program).Hash -ne $RunnerProgramHashes[$Program]) {
-        Fail "runner control-plane executable changed during the isolated action: $Program"
-      }
-    }
+    Assert-RunnerControlPlaneIdentity $RunnerIdentities
+    Assert-OfflineFirewallRules $ExpectedRules.ToArray()
     foreach ($ProfileSnapshot in $ProfileSnapshots) {
       $Effective = Get-NetFirewallProfile -Profile $ProfileSnapshot.Name -ErrorAction Stop
-      if ([string]$Effective.DefaultOutboundAction -ne 'Block') { Fail "offline firewall policy changed during the isolated action: $($ProfileSnapshot.Name)" }
+      if ([string]$Effective.DefaultOutboundAction -ne 'Block' -or [string]$Effective.Enabled -ne 'True') { Fail "offline firewall policy changed during the isolated action: $($ProfileSnapshot.Name)" }
     }
     if (Test-OutboundTcp $ProbeAddress) { Fail 'offline firewall policy was removed during the isolated action' }
+    if (Test-OutboundTcp $ImdsAddress 80) { Fail 'shell IMDS TCP denial was removed during the isolated action' }
   } finally {
     $RestoreFailures = [Collections.Generic.List[string]]::new()
     foreach ($ProfileSnapshot in $ProfileSnapshots) {

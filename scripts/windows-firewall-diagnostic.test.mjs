@@ -207,3 +207,95 @@ test('job ancestry joins exact candidate identities and reports broken or reused
   assert.deepEqual(Object.keys(result.good.nodes[0]).sort(), ['pid','parentPid','createdAt','executablePath','candidateIndex','candidateMatch','previousIdentity'].sort());
   assert.ok(!output.includes('PRIVATE'));
 });
+
+test('firewall control-plane discovery requires bounded ordered live Worker Listener HCA identities', () => {
+  const script = fileURLToPath(new URL('../third_party/sidecars/semgrep/windows-offline-firewall.ps1', import.meta.url));
+  const output = execFileSync('pwsh', ['-NoProfile','-Command', `
+    $ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
+    . $env:FIREWALL_DIAGNOSTIC_TEST_SCRIPT
+    function Fail($Message) { throw $Message }
+    function Get-CimInstance { param($ClassName,$Filter,$Property)
+      if($Filter -notmatch '^ProcessId = ([0-9]+)$'){throw 'bad query'}
+      $script:Queries++
+      $script:Rows[[uint32]$Matches[1]]
+    }
+    function Resolve-Path { param($LiteralPath) [pscustomobject]@{Path=$LiteralPath} }
+    function Get-Item {param($LiteralPath)
+      [pscustomobject]@{PSIsContainer=($LiteralPath -notmatch 'exe$|hosted-compute-agent$'); Attributes=$(if($script:Unsafe){[IO.FileAttributes]::ReparsePoint}else{[IO.FileAttributes]::Normal}); Length=32}
+    }
+    function Get-FileHash {param($LiteralPath,$Algorithm) [pscustomobject]@{Hash=$script:Hash} }
+    function Reset-Rows {
+      $script:Queries=0; $script:Unsafe=$false; $script:Hash='A'*64; $script:Rows=@{}
+      $paths=@('C:\\pwsh.exe','C:\\runner\\Runner.Worker.exe','C:\\runner\\Runner.Listener.exe','C:\\hca\\hosted-compute-agent')
+      for($i=0;$i -lt 4;$i++) { $script:Rows[[uint32]($PID+$i)]=[pscustomobject]@{ProcessId=($PID+$i);ParentProcessId=($PID+$i+1);CreationDate=([datetime]'2026-09-12T00:00:00Z').AddSeconds(-$i);ExecutablePath=$paths[$i]} }
+    }
+    Reset-Rows
+    $first=@(Get-RunnerControlPlanePrograms)
+    if($first.Count -ne 3){throw 'HCA identity absent'}
+    Assert-RunnerControlPlaneIdentity $first
+    $result=@{names=@($first | ForEach-Object Name)}
+    foreach($case in @('ambiguous','missing','cycle','duplicate','newer','unsafe','different-directory','pid-reused','hash-changed','limit')) {
+      Reset-Rows
+      switch($case){
+        ambiguous { $script:Rows[[uint32]$PID]=@($script:Rows[[uint32]$PID],$script:Rows[[uint32]$PID]) }
+        missing { $script:Rows.Remove([uint32]($PID+3)) }
+        cycle { $script:Rows[[uint32]($PID+2)].ParentProcessId=$PID }
+        duplicate { $script:Rows[[uint32]($PID+2)].ExecutablePath='C:\\runner\\Runner.Worker.exe' }
+        newer { $script:Rows[[uint32]($PID+2)].CreationDate=[datetime]'2026-09-12T01:00:00Z' }
+        unsafe { $script:Unsafe=$true }
+        different-directory { $script:Rows[[uint32]($PID+2)].ExecutablePath='C:\\other\\Runner.Listener.exe' }
+        pid-reused { $script:Rows[[uint32]($PID+3)].CreationDate=([datetime]'2026-09-12T00:00:00Z').AddSeconds(-2) }
+        hash-changed { $script:Hash='B'*64 }
+        limit { for($i=0;$i -lt 40;$i++) { $script:Rows[[uint32]($PID+$i)]=[pscustomobject]@{ProcessId=($PID+$i);ParentProcessId=($PID+$i+1);CreationDate=[datetime]'2026-09-12T00:00:00Z';ExecutablePath='C:\\pwsh.exe'} } }
+      }
+      try { Assert-RunnerControlPlaneIdentity $first; $result[$case]='accepted' }catch{ $result[$case]='rejected' }
+      if($case -eq 'limit'){$result.limitQueries=$script:Queries}
+    }
+    $result|ConvertTo-Json -Compress
+  `], {encoding:'utf8', env:{...process.env,FIREWALL_DIAGNOSTIC_TEST_SCRIPT:script}});
+  const result=JSON.parse(output);
+  assert.equal(result.limitQueries,32);
+  assert.deepEqual(result.names,['Runner.Worker.exe','Runner.Listener.exe','hosted-compute-agent']);
+  for(const name of ['ambiguous','missing','cycle','duplicate','newer','unsafe','different-directory','pid-reused','hash-changed','limit']) assert.equal(result[name],'rejected',name);
+});
+
+test('effective offline rules reject broader IMDS address, program, port, DNS service, and added allows', () => {
+  const script=fileURLToPath(new URL('../third_party/sidecars/semgrep/windows-offline-firewall.ps1',import.meta.url));
+  const output=execFileSync('pwsh',['-NoProfile','-Command',`
+    $ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
+    . $env:FIREWALL_DIAGNOSTIC_TEST_SCRIPT
+    function Fail($Message){throw $Message}
+    if(-not(Get-Command Assert-OfflineFirewallRules -ErrorAction SilentlyContinue)){throw 'missing rule verification'}
+    $expected=@(
+      [pscustomobject]@{Name='https';Program='C:\\runner\\Runner.Worker.exe';RemoteAddress=@('Any');RemotePort='443';Protocol='TCP';Service='Any'},
+      [pscustomobject]@{Name='imds';Program='C:\\hca\\hosted-compute-agent';RemoteAddress=@('169.254.169.254');RemotePort='80';Protocol='TCP';Service='Any'},
+      [pscustomobject]@{Name='dns';Program='C:\\Windows\\System32\\svchost.exe';RemoteAddress=@('1.2.3.4');RemotePort='53';Protocol='UDP';Service='Dnscache'}
+    )
+    function Reset-Rules {
+      $script:Rules=@{}
+      foreach($entry in $expected){$script:Rules[$entry.Name]=[pscustomobject]@{Name=$entry.Name;Enabled='True';Direction='Outbound';Action='Allow';Profile='Any';Program=$entry.Program;RemoteAddress=$entry.RemoteAddress;RemotePort=$entry.RemotePort;Protocol=$entry.Protocol;Service=$entry.Service}}
+    }
+    function Get-NetFirewallRule {param($Name,$PolicyStore,$Direction,$Action,$Enabled) if($Name){$script:Rules[$Name]}else{$script:Rules.Values}}
+    function Get-NetFirewallApplicationFilter {param([Parameter(ValueFromPipeline=$true)]$Rule) process{[pscustomobject]@{Program=$Rule.Program}}}
+    function Get-NetFirewallAddressFilter {param([Parameter(ValueFromPipeline=$true)]$Rule) process{[pscustomobject]@{RemoteAddress=$Rule.RemoteAddress}}}
+    function Get-NetFirewallPortFilter {param([Parameter(ValueFromPipeline=$true)]$Rule) process{[pscustomobject]@{RemotePort=$Rule.RemotePort;Protocol=$Rule.Protocol}}}
+    function Get-NetFirewallServiceFilter {param([Parameter(ValueFromPipeline=$true)]$Rule) process{[pscustomobject]@{Service=$Rule.Service}}}
+    Reset-Rules; Assert-OfflineFirewallRules $expected
+    $result=@{}
+    foreach($case in @('address','program','port','protocol','service','extra','softHyphen')){
+      Reset-Rules
+      switch($case){
+        address{$script:Rules.imds.RemoteAddress=@('Any')}
+        program{$script:Rules.imds.Program='Any'}
+        port{$script:Rules.imds.RemotePort='Any'}
+        protocol{$script:Rules.imds.Protocol='UDP'}
+        service{$script:Rules.dns.Service='Any'}
+        extra{$script:Rules.extra=[pscustomobject]@{Name='extra'}}
+        softHyphen{$script:Rules.extra=[pscustomobject]@{Name=('im'+[char]0x00ad+'ds')}}
+      }
+      try{Assert-OfflineFirewallRules $expected;$result[$case]='accepted'}catch{$result[$case]='rejected'}
+    }
+    $result|ConvertTo-Json -Compress
+  `],{encoding:'utf8',env:{...process.env,FIREWALL_DIAGNOSTIC_TEST_SCRIPT:script}});
+  assert.deepEqual(JSON.parse(output),{address:'rejected',program:'rejected',port:'rejected',protocol:'rejected',service:'rejected',extra:'rejected',softHyphen:'rejected'});
+});

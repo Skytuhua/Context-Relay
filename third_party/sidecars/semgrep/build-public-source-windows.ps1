@@ -512,7 +512,7 @@ Invoke-WindowsOfflineFirewall {
 }
 [IO.File]::WriteAllText(
   (Join-Path $OutputRoot "$BuildLabel.offline-egress.v1.json"),
-  '{"mechanism":"' + $(if ($OfflineBuild) { 'windows-firewall-default-outbound-block-hash-pinned-runner-tcp443-allow' } else { 'windows-firewall-runtime-smoke-network-deny' }) + '","probe":"hostile-outbound-tcp-denied","schemaVersion":1}' + "`n",
+  '{"mechanism":"' + $(if ($OfflineBuild) { 'windows-firewall-default-outbound-block-ancestor-runner-hca-tcp443-hca-imds80-experiment' } else { 'windows-firewall-runtime-smoke-network-deny' }) + '","probe":"hostile-outbound-tcp443-and-imds-tcp80-denied","schemaVersion":1}' + "`n",
   [Text.UTF8Encoding]::new($false)
 )
 if ($OfflineBuild) {

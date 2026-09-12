@@ -458,7 +458,7 @@ test('native runtime builds prove OS-enforced offline execution', async () => {
   assert.match(windows, /offline-egress\.v1\.json/);
 });
 
-test('Windows offline build grants only the hash-pinned runner executables outbound TCP 443', async () => {
+test('Windows offline experiment bounds ancestor HTTPS and HCA-only IMDS rules', async () => {
   const [windows, workflow] = await Promise.all([
     Promise.all([
       readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
@@ -469,7 +469,7 @@ test('Windows offline build grants only the hash-pinned runner executables outbo
   const windowsBuilder = job(workflow, 'native-semgrep-windows-x64-builders', 'native-isolation-windows-x64');
   assert.doesNotMatch(windowsBuilder, /Capture active Actions run-service hosts|CONTEXT_RELAY_RUN_SERVICE_HOSTS/);
   assert.match(windows, /function Get-RunnerControlPlanePrograms/);
-  assert.match(windows, /Get-FileHash[^\n]+SHA256[^\n]+\$Program/);
+  assert.match(windows, /Get-FileHash[^\n]+SHA256[^\n]+\$Path/);
   assert.match(
     windows,
     /New-NetFirewallRule[^\n]+-Program\s+\$Program[^\n]+-RemoteAddress\s+Any[^\n]+-RemotePort\s+443[^\n]+-Protocol\s+TCP/,
@@ -477,10 +477,12 @@ test('Windows offline build grants only the hash-pinned runner executables outbo
   assert.match(windows, /Get-NetFirewallApplicationFilter/);
   assert.match(windows, /\$AddressFilter\s*=\s*\$Rule\s*\|\s*Get-NetFirewallAddressFilter/);
   assert.match(windows, /Get-NetFirewallPortFilter/);
-  assert.match(windows, /\$AddressFilter\.RemoteAddress[^\n]+-cne\s+['"]Any['"]/);
-  assert.doesNotMatch(windows, /\$Address\s*=\s*\$Rule\s*\|\s*Get-NetFirewallAddressFilter/);
-  assert.match(windows, /RemotePort[^\n]+-cne\s+['"]443['"]/);
-  assert.match(windows, /@\(['"]TCP['"],\s*['"]6['"]\)\s+-notcontains\s+\[string\]\$Port\.Protocol/);
+  assert.match(windows, /function Assert-OfflineFirewallRules/);
+  assert.equal((windows.match(/Assert-OfflineFirewallRules \$ExpectedRules\.ToArray\(\)/g) ?? []).length, 2);
+  assert.equal((windows.match(/Assert-RunnerControlPlaneIdentity \$RunnerIdentities/g) ?? []).length, 2);
+  assert.match(windows, /New-NetFirewallRule[^\n]+-Program \$HcaProgram[^\n]+-RemoteAddress '169\.254\.169\.254'[^\n]+-RemotePort 80[^\n]+-Protocol TCP/);
+  assert.equal((windows.match(/Test-OutboundTcp \$ImdsAddress 80/g) ?? []).length, 3);
+  assert.doesNotMatch(windows, /provjobd|WaAppAgent|WindowsAzureGuestAgent/);
   assert.doesNotMatch(windows, /New-NetFirewallDynamicKeywordAddress|Update-NetFirewallDynamicKeywordAddress/);
   assert.doesNotMatch(windows, /Start-Job|RunnerAddressRefresher|Get-NetTCPConnection/);
   assert.match(windows, /Get-DnsClientServerAddress/);

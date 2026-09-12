@@ -298,7 +298,7 @@
         {
           "role": "windows-build",
           "path": "third_party/sidecars/semgrep/build-public-source-windows.ps1",
-          "sha256": "47bd7972dd8fc99520847a6f91166b35876c8679c9de9190d9b27ce21cfe46cb"
+          "sha256": "fbb06c52646783a54b2695c8ad6f88be1942d19ff6251b4aa4bc465b0f87703a"
         },
         {
           "role": "windows-builder-evidence-schema",
@@ -328,7 +328,7 @@
         {
           "role": "source-bundle-evidence",
           "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
-          "sha256": "484b7b547e6a649ae53f55b9f70b42d2b359bb8a1ef467823b6361777ff13d81"
+          "sha256": "d776402a28416dfac7b50e867784d50e5537b0d2a5d98c9bf135eccbdd4c11ea"
         },
         {
           "role": "manifest-rule",
@@ -343,7 +343,7 @@
         {
           "role": "windows-offline-firewall",
           "path": "third_party/sidecars/semgrep/windows-offline-firewall.ps1",
-          "sha256": "d1fc64cb73e2243d93246ed6b461c80904692ad5ec99eb7c9d793050be4465b0"
+          "sha256": "7de266db35ecb475ab014a11c0d19f6219148a8d396770583ed7033cc7f588f9"
         },
         {
           "role": "windows-firewall-diagnostic",
