@@ -3397,3 +3397,67 @@ workflow/diagnostic, nine finalizer and two material checks.
 Independent tar inventory comparison found no added or removed entries; only those
 two support files and their derived `MANIFEST.sha256` changed. A separate whole-tar
 SHA-256 check matched the recorded digest.
+
+The revised-policy short diagnostic `34698764108` / job `103566700279` passed
+on PR merge revision `27467a03480fd36342d60595f1d63fa8bf810959` for head `7ad495c`.
+Its 120-second artifact contains 89 untruncated WFP blocked-connection events,
+including the shell's TCP443 and IMDS TCP80 probes. Firewall restoration,
+post-restoration connectivity and exact audit restoration passed (64 rows, no
+differences). No HCA PID 1828 drops appear in this window; sibling `provjobd`
+PID 3692 remains blocked. Absence of HCA drops proves neither necessity nor the
+earlier disconnect cause. Native effective-rule checks passed in this short run.
+
+Full independent qualification `34699122274` was dispatched at `7ad495c` after
+that diagnostic passed. Both builders per platform and sustained offline-build
+evidence remain pending; this branch dispatch cannot request publication.
+
+### Membership ancestry and Windows fixture follow-up
+
+The membership crypto component verifies the exact 186-byte admission statement
+and complete chronological additions/revocations from independently pinned,
+root-only enrollment to an independently accepted endpoint. It retains lifetime
+device/certificate admissions, rejects cross-kind operation-ID reuse and fails
+closed on caller byte/event budgets. It reuses existing signed revocation bytes.
+Twenty-two combined integration tests pass. Bypassing the exact endpoint check
+made the old-prefix/new-tip assertion fail; after restoring that check, both
+membership tests pass. Independent review found no actionable P1/P2 issues.
+This proves bounded public history, not global freshness, decryption, persistence,
+historical-key transfer, recovery or installed/hosted behavior.
+
+Ordinary CI `34693323063` at `cce0772` completed successfully, including Windows
+Rust job `103552389810`. Newer Windows Rust job `103560080853` at `9ba1573`
+failed in the process-lock fixture: the parent's ten-second readiness deadline
+expired before the child's unavailable-root panic 220 ms later. The fixture
+included encrypted vault initialization in that deadline and did not reap its
+child before deleting temporary files on panic. The test-only repair separates
+bounded initialization and durable readiness, and kills/waits on unwinding;
+real contention and crash-release assertions remain unchanged. Source review
+passes. The focused Windows test passes locally (one test, 6.29 seconds);
+confirmation under the hosted workload remains pending.
+
+Superseded runs `34696232205`, `34696950991` and `34697661902` were canceled
+and confirmed terminal after preserving their useful native results and the failed test log.
+Their pending jobs are not acceptance evidence; current-head ordinary CI and
+the independent qualification continue.
+
+Current-head macOS build job `103566701397` in CI `34698764380` at `7ad495c`
+passed. Actual output at 14:30 UTC confirms copied-app inference, assembled-app
+signing constraints and inference, then disposable-daemon search, restart,
+tamper rejection and recovery. This remains internal ad-hoc component evidence.
+
+The staged V2 joining API now confirms exact canonical request-bound transcript
+bytes before exposing their enrollment/predecessor pins. Opening then requires
+private verified history and the exact authenticated membership event, matching
+the history's successor roster and recovery authority. A reproduced regression
+showed that conditional event verification alone admitted a retired device ID;
+the opener and full replay now share lifetime device/certificate/operation-ID
+checks. Tests also reject prior addition and revocation IDs. All 23 combined
+integration tests and two V2 unit tests pass, including actual post-rotation
+retained-child pairing. Removing the exact-artifact check separately made its
+adversarial test fail. No coordinator, durable activation or hosted completion
+is implied by these pure components.
+
+Core library/tests Clippy passes with warnings denied. Independent reconstruction
+of the membership fixture matches its 186-byte statement body, Ed25519 signature
+and successor digest. Final source review of the staged opener and shared lifetime
+checks found no additional issue after the reproduced reuse gap was fixed.

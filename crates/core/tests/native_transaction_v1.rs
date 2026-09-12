@@ -5,7 +5,7 @@ use std::{
     fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     rc::Rc,
     str::FromStr,
     thread,
@@ -45,6 +45,33 @@ const ID: &str = "01890f3e-1c2b-7a4d-8e5f-123456789abc";
 const LOCK_CHILD_ROOT: &str = "CONTEXT_RELAY_NATIVE_LOCK_CHILD_ROOT";
 const LOCK_CHILD_VAULT: &str = "CONTEXT_RELAY_NATIVE_LOCK_CHILD_VAULT";
 const LOCK_CHILD_READY: &str = "CONTEXT_RELAY_NATIVE_LOCK_CHILD_READY";
+const LOCK_CHILD_INITIALIZED: &str = "CONTEXT_RELAY_NATIVE_LOCK_CHILD_INITIALIZED";
+
+struct LockChild(Child);
+
+impl Drop for LockChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn wait_for_lock_child(child: &mut Child, marker: &Path, phase: &str) {
+    // Windows encrypted fixture initialization and durable writes can take tens
+    // of seconds under parallel CI load. This bounds readiness, not lock latency.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !marker.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "lock child exited during {phase}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "lock child timed out during {phase}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
 
 struct TempLockRoot(PathBuf);
 
@@ -1563,6 +1590,11 @@ fn native_profile_lock_child_holder() {
     let ready = PathBuf::from(std::env::var_os(LOCK_CHILD_READY).unwrap());
     let keys = MemoryKeyStore::default();
     let mut vault = Vault::open(&vault_path, "native-engine-vault", &keys).unwrap();
+    fs::write(
+        std::env::var_os(LOCK_CHILD_INITIALIZED).unwrap(),
+        b"initialized",
+    )
+    .unwrap();
     let approved = plan();
     let mut journal = vault_journal(&mut vault, Path::new(&root), ID);
     journal.acquire_lock_and_begin(&approved).unwrap();
@@ -1578,27 +1610,25 @@ fn another_process_contends_and_a_crash_releases_without_deleting_siblings() {
     let lock_root = TempLockRoot::new("native-profile-lock-process");
     let canary = lock_root.path().join("unrelated-canary");
     let ready = lock_root.path().join("child-ready");
+    let initialized = lock_root.path().join("child-initialized");
     fs::write(&canary, b"preserve").unwrap();
     let child_vault = TempVault::new("native-profile-lock-child-vault");
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("native_profile_lock_child_holder")
-        .arg("--nocapture")
-        .env(LOCK_CHILD_ROOT, lock_root.path())
-        .env(LOCK_CHILD_VAULT, child_vault.path())
-        .env(LOCK_CHILD_READY, &ready)
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !ready.exists() {
-        assert!(Instant::now() < deadline, "child did not acquire the lock");
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "lock child exited early"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    // Declared after the fixtures so a panic reaps the child before deleting them.
+    let mut child = LockChild(
+        Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("native_profile_lock_child_holder")
+            .arg("--nocapture")
+            .env(LOCK_CHILD_ROOT, lock_root.path())
+            .env(LOCK_CHILD_VAULT, child_vault.path())
+            .env(LOCK_CHILD_READY, &ready)
+            .env(LOCK_CHILD_INITIALIZED, &initialized)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_lock_child(&mut child.0, &initialized, "vault initialization");
+    wait_for_lock_child(&mut child.0, &ready, "durable lock readiness");
 
     let contender_path = TempVault::new("native-profile-lock-process-contender");
     let contender_keys = MemoryKeyStore::default();
@@ -1614,8 +1644,8 @@ fn another_process_contends_and_a_crash_releases_without_deleting_siblings() {
     drop(contender);
     assert!(contender_vault.native_transaction(ID).unwrap().is_none());
 
-    child.kill().unwrap();
-    let _ = child.wait().unwrap();
+    child.0.kill().unwrap();
+    let _ = child.0.wait().unwrap();
     let retry_path = TempVault::new("native-profile-lock-process-retry");
     let retry_keys = MemoryKeyStore::default();
     let mut retry_vault =
