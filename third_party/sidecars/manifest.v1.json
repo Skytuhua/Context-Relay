@@ -348,7 +348,7 @@
         {
           "role": "windows-firewall-diagnostic",
           "path": "third_party/sidecars/semgrep/diagnose-windows-firewall.ps1",
-          "sha256": "905db533bf1c2fb0f17cb54fc3a4c71c624b4300fa042ac9f9833a347d3aa5c0"
+          "sha256": "68fad1aa2fe3e68133d1be491f871451a59168c97455055b5a48419e287ce57f"
         }
       ],
       "commandTemplate": {

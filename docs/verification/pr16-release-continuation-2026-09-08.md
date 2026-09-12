@@ -3252,3 +3252,44 @@ exclusion are checked before mutation, and both original success/failure flags
 are restored. Full strict policy equality remains mandatory. All 27 local
 workflow/diagnostic tests pass; independent review found no P1/P2 findings.
 New native restoration, license and source-bundle execution remain pending.
+
+### Verified short Windows diagnostic at `9ba1573`
+
+[Diagnostic run 34696232225](https://github.com/Skytuhua/Context-Relay/actions/runs/34696232225),
+job `103560080485`, passed baseline connectivity, shell egress denial, firewall
+restoration, full audit-policy equality and post-restoration connectivity. The
+seven-column comparison found 64 rows before and after, with no missing, extra
+or changed rows. Its 120-second observation exported 97 blocked connections
+without truncation, including GitHub hosted-compute/provisioning process paths
+and Azure VM agents. These are investigative leads, not established causes of
+the earlier hour-long runner disconnects. No new network allowance was added;
+sustained independent Windows qualification remains open.
+
+Current-head CI run `34696232205` passed licenses, whitespace and Semgrep material
+checks; native corresponding-source reconstruction remains in progress at this
+checkpoint. Actual macOS job `103560080874` at `9ba1573` reports copied
+app inference, assembled signing constraints and real packaged inference, then
+disposable daemon search, restart, tamper rejection and recovery. This extends
+internal component evidence only; production signing and installed acceptance
+remain required.
+
+The [Azure platform-IP documentation](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16)
+identifies VM-agent communication on `168.63.129.16` TCP 80/32526, and the
+[IMDS documentation](https://learn.microsoft.com/en-us/azure/virtual-machines/instance-metadata-service)
+identifies `169.254.169.254`. This supports investigation of observed destinations;
+it does not authenticate the observed process images or prove their traffic caused
+the disconnect. GitHub's official image scripts reference `hosted-compute-agent`
+on macOS, but the review found no official Windows identity/network contract for
+that executable or `provjobd`. Candidate paths and observed destination IPs alone
+cannot authorize a network exception.
+
+The next diagnostic adds before/after snapshots of at most 16 matching process
+candidates, with bounded PID, parent PID, creation time, path, file hash and
+signature status/thumbprint. It exports neither command lines nor environment
+values, ignores event-provided paths, rejects nonregular/reparse paths before
+hashing, and records fixed error codes for unavailable evidence. These are
+post-checkout observations, not vendor provenance or process-image/file binding.
+Snapshots run outside firewall isolation; signature calls share the existing job
+timeout. The firewall helper and corresponding-source tar are unchanged. Local
+diagnostic/workflow checks (28), focused material checks (2), the license checker
+and strict whitespace checks pass. Native snapshot execution remains pending.

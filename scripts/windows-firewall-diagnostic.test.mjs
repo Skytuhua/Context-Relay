@@ -78,3 +78,65 @@ test('audit restoration compares every CSV field, rejecting malformed and duplic
   for (const name of ['header', 'softHyphenHeader', 'duplicate', 'conflict', 'extra', 'quote', 'oversized']) assert.equal(results[name], 'rejected', name);
   assert.ok(!output.includes('PRIVATE'));
 });
+
+test('candidate snapshots filter names, bound metadata, and reject inaccessible or linked files', () => {
+  const script = fileURLToPath(new URL('../third_party/sidecars/semgrep/diagnose-windows-firewall.ps1', import.meta.url));
+  const output = execFileSync('pwsh', ['-NoProfile', '-Command', `
+    $ErrorActionPreference = 'Stop'
+    Set-StrictMode -Version Latest
+    $ast = [Management.Automation.Language.Parser]::ParseFile($env:FIREWALL_DIAGNOSTIC_TEST_SCRIPT, [ref]$null, [ref]$null)
+    $fn = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-CandidateProcessSnapshot'}, $false)
+    if ($null -eq $fn) { throw 'missing candidate snapshot' }
+    Invoke-Expression $fn.Extent.Text
+    $script:Processes = @(
+      [pscustomobject]@{Name='not-a-candidate.exe'; ProcessId=1; ParentProcessId=0; CreationDate=[datetime]'2026-09-12T00:00:00Z'; ExecutablePath='C:\\hidden.exe'; CommandLine='PRIVATE'},
+      [pscustomobject]@{Name='WaAppAgent.exe'; ProcessId=2; ParentProcessId=1; CreationDate=[datetime]'2026-09-12T00:00:00Z'; ExecutablePath='C:\\agents\\WaAppAgent.exe'; CommandLine='PRIVATE'},
+      [pscustomobject]@{Name='WindowsAzureGuestAgent.exe'; ProcessId=3; ParentProcessId=1; CreationDate=[datetime]'2026-09-12T00:00:00Z'; ExecutablePath='C:\\denied\\WindowsAzureGuestAgent.exe'; CommandLine='PRIVATE'},
+      [pscustomobject]@{Name='provjobd.exe123'; ProcessId=4; ParentProcessId=1; CreationDate=[datetime]'2026-09-12T00:00:00Z'; ExecutablePath='C:\\linked\\provjobd.exe123'; CommandLine='PRIVATE'},
+      [pscustomobject]@{Name='hosted-compute-agent.exe'; ProcessId=5; ParentProcessId=1; CreationDate=[datetime]'2026-09-12T00:00:00Z'; ExecutablePath=('C:\\' + ('x' * 1100) + '\\hosted-compute-agent.exe'); CommandLine='PRIVATE'},
+      [pscustomobject]@{Name='provjobd.exe-attacker'; ProcessId=6; ParentProcessId=1; CreationDate=[datetime]'2026-09-12T00:00:00Z'; ExecutablePath='C:\\hidden.exe'; CommandLine='PRIVATE'}
+    )
+    function Get-CimInstance { param($ClassName,$Filter,$Property)
+      if (($Property -join ',') -ne 'Name,ProcessId,ParentProcessId,CreationDate,ExecutablePath') { throw 'unexpected CIM fields' }
+      $script:Processes
+    }
+    function Get-Item { param($LiteralPath)
+      if ($LiteralPath -like '*denied*') { throw 'PRIVATE ACCESS ERROR' }
+      [pscustomobject]@{PSIsContainer=($LiteralPath -notmatch '\\.exe[0-9]*$'); Attributes=$(if ($LiteralPath -eq 'C:\\linked') { [IO.FileAttributes]::ReparsePoint } else { [IO.FileAttributes]::Normal }); Length=32}
+    }
+    function Get-FileHash { param($LiteralPath,$Algorithm)
+      if ($LiteralPath -ne 'C:\\agents\\WaAppAgent.exe' -or $Algorithm -ne 'SHA256') { throw 'unexpected file hashed' }
+      [pscustomobject]@{Hash=('A' * 64)}
+    }
+    function Get-AuthenticodeSignature { param($LiteralPath)
+      if ($LiteralPath -ne 'C:\\agents\\WaAppAgent.exe') { throw 'unexpected file signed' }
+      [pscustomobject]@{Status='Valid'; SignerCertificate=[pscustomobject]@{Thumbprint=('B' * 40); Subject='PRIVATE'}}
+    }
+    $first = Get-CandidateProcessSnapshot
+    $script:Processes = @()
+    $empty = Get-CandidateProcessSnapshot
+    $script:Processes = @(1..20 | ForEach-Object { [pscustomobject]@{Name='WaAppAgent.exe'; ProcessId=$_; ParentProcessId=0; CreationDate=$null; ExecutablePath=$null} })
+    $many = Get-CandidateProcessSnapshot
+    @{first=$first; empty=$empty; many=$many} | ConvertTo-Json -Depth 8 -Compress
+  `], { encoding: 'utf8', env: { ...process.env, FIREWALL_DIAGNOSTIC_TEST_SCRIPT: script } });
+  const { first, empty, many } = JSON.parse(output);
+  assert.equal(first.candidates.length, 4);
+  const good = first.candidates[0];
+  assert.deepEqual(Object.keys(good).sort(), ['candidateName','pid','parentPid','createdAt','executablePath','sha256','authenticodeStatus','signerThumbprint','error'].sort());
+  assert.equal(good.pid, 2);
+  assert.equal(good.parentPid, 1);
+  assert.match(good.createdAt, /^2026-09-12T/);
+  assert.equal(good.sha256, 'A'.repeat(64));
+  assert.equal(good.authenticodeStatus, 'Valid');
+  assert.equal(good.signerThumbprint, 'B'.repeat(40));
+  assert.equal(good.error, null);
+  assert.equal(first.candidates[1].error, 'file-unavailable');
+  assert.equal(first.candidates[2].error, 'unsafe-file');
+  assert.equal(first.candidates[2].sha256, null);
+  assert.equal(first.candidates[3].error, 'unsupported-path');
+  assert.equal(first.candidates[3].executablePath.length, 1024);
+  assert.equal(empty.candidates.length, 0);
+  assert.equal(many.candidates.length, 16);
+  assert.equal(many.truncated, true);
+  assert.ok(!output.includes('PRIVATE'));
+});

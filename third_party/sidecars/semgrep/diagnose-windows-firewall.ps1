@@ -103,6 +103,72 @@ function Get-ConnectionAuditFlags([string]$Csv) {
   }
 }
 
+function Get-CandidateProcessSnapshot {
+  # Observed names identify candidates, not authorized roles or trusted provenance. These
+  # post-checkout snapshots do not bind a running process image to the file hashed on disk.
+  # Signature calls run outside isolation; the job timeout remains their outer time bound.
+  $Snapshot = [ordered]@{
+    capturedAt = [DateTime]::UtcNow.ToString('o'); purpose = 'candidate-identities-not-authorization'
+    limit = 16; truncated = $false; queryError = $null; candidates = @()
+  }
+  $NamePattern = '\A(?:hosted-compute-agent(?:\.exe)?|provjobd\.exe[0-9]+|WaAppAgent\.exe|WindowsAzureGuestAgent\.exe)\z'
+  try {
+    $Processes = @(Get-CimInstance -ClassName Win32_Process -Property Name,ProcessId,ParentProcessId,CreationDate,ExecutablePath -Filter "Name = 'hosted-compute-agent' OR Name = 'hosted-compute-agent.exe' OR Name LIKE 'provjobd.exe%' OR Name = 'WaAppAgent.exe' OR Name = 'WindowsAzureGuestAgent.exe'" -ErrorAction Stop |
+      Where-Object { [regex]::IsMatch([string]$_.Name, $NamePattern, 'IgnoreCase,CultureInvariant') } | Select-Object -First 17)
+  } catch {
+    $Snapshot.queryError = 'process-query-unavailable'
+    return [pscustomobject]$Snapshot
+  }
+  $Snapshot.truncated = $Processes.Count -gt 16
+  $Snapshot.candidates = @(foreach ($Process in ($Processes | Select-Object -First 16)) {
+    $Name = [string]$Process.Name
+    $Path = [string]$Process.ExecutablePath
+    $Candidate = [ordered]@{
+      candidateName = $Name.Substring(0, [Math]::Min(128, $Name.Length))
+      pid = [uint32]$Process.ProcessId; parentPid = [uint32]$Process.ParentProcessId
+      createdAt = $(if ($null -ne $Process.CreationDate) { ([DateTime]$Process.CreationDate).ToUniversalTime().ToString('o') } else { $null })
+      executablePath = $Path.Substring(0, [Math]::Min(1024, $Path.Length))
+      sha256 = $null; authenticodeStatus = $null; signerThumbprint = $null; error = $null
+    }
+    if ($Path.Length -gt 1024 -or $Path -notmatch '\A[A-Za-z]:\\' -or
+        $Path.Substring(2).Contains(':') -or ($Path -split '\\') -contains '..') {
+      $Candidate.error = 'unsupported-path'
+    } else {
+      try {
+        $Part = $Path
+        while (-not [string]::IsNullOrEmpty($Part)) {
+          $Item = Get-Item -LiteralPath $Part -Force -ErrorAction Stop
+          if (($Item.Attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Device)) -ne 0 -or
+              ($Part -eq $Path -and $Item.PSIsContainer) -or ($Part -ne $Path -and -not $Item.PSIsContainer)) {
+            $Candidate.error = 'unsafe-file'; break
+          }
+          if ($Part -eq $Path -and $Item.Length -gt 268435456) { $Candidate.error = 'file-too-large'; break }
+          $Part = [IO.Path]::GetDirectoryName($Part)
+        }
+        if ($null -eq $Candidate.error) {
+          $Hash = [string](Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash
+          if ($Hash -notmatch '\A[0-9A-Fa-f]{64}\z') { throw 'invalid hash result' }
+          $Candidate.sha256 = $Hash
+          $Candidate.error = 'signature-unavailable'
+          $Signature = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+          $Status = [string]$Signature.Status
+          $Candidate.authenticodeStatus = $Status.Substring(0, [Math]::Min(64, $Status.Length))
+          if ($null -ne $Signature.SignerCertificate) {
+            $Thumbprint = [string]$Signature.SignerCertificate.Thumbprint
+            if ($Thumbprint -notmatch '\A[0-9A-Fa-f]{40,128}\z') { throw 'invalid signer thumbprint' }
+            $Candidate.signerThumbprint = $Thumbprint
+          }
+          $Candidate.error = $null
+        }
+      } catch {
+        if ($null -eq $Candidate.error) { $Candidate.error = 'file-unavailable' }
+      }
+    }
+    [pscustomobject]$Candidate
+  })
+  return [pscustomobject]$Snapshot
+}
+
 # This changes host policy: only the disposable GitHub-hosted Windows 2022 job may run it.
 if (-not $IsWindows -or $env:GITHUB_ACTIONS -ne 'true' -or
     $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows' -or
@@ -127,6 +193,7 @@ $Report = [ordered]@{
   firewallRestored = $false; auditRestored = $false; postRestoreConnected = $false
   failureStage = $null; eventLimit = 256; eventsTruncated = $false; blockedConnections = @()
   auditVerification = [ordered]@{ restoreExitCode = $null; backupExitCode = $null; comparison = $null }
+  candidateProcessesBefore = $null; candidateProcessesAfter = $null
 }
 $Stage = 'baseline'
 $AuditSaved = $false
@@ -138,6 +205,7 @@ try {
     Where-Object AddressFamily -eq ([Net.Sockets.AddressFamily]::InterNetwork) | Select-Object -First 1
   if ($null -eq $Address -or -not (Test-OutboundTcp $Address)) { Fail 'baseline connection failed' }
   $Report.baselineConnected = $true
+  $Report.candidateProcessesBefore = Get-CandidateProcessSnapshot
   $Stage = 'audit-setup'
   & $Auditpol /backup "/file:$AuditBackup" 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) { Fail 'audit backup failed' }
@@ -187,6 +255,7 @@ try {
     Remove-Item -LiteralPath $AuditBackup, $AuditRestored -Force -ErrorAction SilentlyContinue
   }
 }
+if ($Report.firewallRestored) { $Report.candidateProcessesAfter = Get-CandidateProcessSnapshot }
 if (-not $Report.firewallRestored -or -not $Report.auditRestored) {
   # Retain bounded comparison metadata even on failure; connection events remain uncollected.
   $Report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutputRoot 'firewall-diagnostic.v1.json') -Encoding utf8
