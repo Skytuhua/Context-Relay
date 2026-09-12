@@ -16,6 +16,8 @@ const releaseQualificationWorkflowUrl = new URL(
   '../.github/workflows/semgrep-release-qualification.yml',
   import.meta.url,
 );
+const firewallWorkflowUrl = new URL('../.github/workflows/windows-firewall-diagnostic.yml', import.meta.url);
+const firewallPolicyUrl = new URL('../third_party/sidecars/semgrep/windows-offline-firewall.ps1', import.meta.url);
 const publicationWorkflowUrl = new URL('../.github/workflows/publish-semgrep-native.yml', import.meta.url);
 const sourceLockUrl = new URL('../third_party/sidecars/semgrep/source-lock.v1.json', import.meta.url);
 const provenanceUrl = new URL('../third_party/sidecars/semgrep/native-ci-provenance.v1.json', import.meta.url);
@@ -426,7 +428,10 @@ test('independent builder identity validation rejects empty, zero, or reused pro
 test('native runtime builds prove OS-enforced offline execution', async () => {
   const [macos, windows] = await Promise.all([
     readFile(new URL('../third_party/sidecars/semgrep/build-public-source-macos.sh', import.meta.url), 'utf8'),
-    readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
+    Promise.all([
+      readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
+      readFile(firewallPolicyUrl, 'utf8'),
+    ]).then((parts) => parts.join('\n')),
   ]);
   assert.match(macos, /\/usr\/bin\/sandbox-exec/);
   assert.match(macos, /\(deny network\*\)/);
@@ -455,7 +460,10 @@ test('native runtime builds prove OS-enforced offline execution', async () => {
 
 test('Windows offline build grants only the hash-pinned runner executables outbound TCP 443', async () => {
   const [windows, workflow] = await Promise.all([
-    readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
+    Promise.all([
+      readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
+      readFile(firewallPolicyUrl, 'utf8'),
+    ]).then((parts) => parts.join('\n')),
     readFile(workflowUrl, 'utf8'),
   ]);
   const windowsBuilder = job(workflow, 'native-semgrep-windows-x64-builders', 'native-isolation-windows-x64');
@@ -496,12 +504,17 @@ test('Windows V1 compiles before the runtime-only firewall window', async () => 
     'utf8',
   );
   const compiled = windows.indexOf('$Build = if ($OfflineBuild) { $null } else { Build-Once $BuildLabel }');
-  const blocked = windows.lastIndexOf('Set-NetFirewallProfile -Profile $ProfileSnapshot.Name -DefaultOutboundAction Block');
-  const releaseCompile = windows.indexOf('if ($OfflineBuild) { $Build = Build-Once $BuildLabel }', blocked);
-  const smoke = windows.indexOf('Invoke-RuntimeSmoke $Build', blocked);
-  const restored = windows.lastIndexOf('} finally {');
-  assert.ok(compiled >= 0 && blocked > compiled, 'compiler must run before outbound blocking');
-  assert.ok(releaseCompile > blocked && smoke > releaseCompile && restored > smoke, 'runtime smoke must remain inside the restored firewall window');
+  const isolated = windows.indexOf('Invoke-WindowsOfflineFirewall {', compiled);
+  const releaseCompile = windows.indexOf('if ($OfflineBuild) { $Build = Build-Once $BuildLabel }', isolated);
+  const smoke = windows.indexOf('Invoke-RuntimeSmoke $Build', isolated);
+  const policy = await readFile(firewallPolicyUrl, 'utf8');
+  const blocked = policy.indexOf('Set-NetFirewallProfile -Profile $ProfileSnapshot.Name -DefaultOutboundAction Block');
+  const action = policy.indexOf('. $Action', blocked);
+  const restored = policy.lastIndexOf('} finally {');
+  assert.match(windows, /\. \(Join-Path \$PSScriptRoot 'windows-offline-firewall\.ps1'\)/);
+  assert.ok(compiled >= 0 && isolated > compiled, 'compiler must run before outbound blocking');
+  assert.ok(releaseCompile > isolated && smoke > releaseCompile, 'release compilation and smoke must share the isolated action');
+  assert.ok(blocked >= 0 && action > blocked && restored > action, 'shared policy restores after the isolated action');
   assert.match(windows, /function Invoke-RuntimeSmoke[\s\S]+& \$RuntimeExecutable --experimental --version/);
   assert.match(windows, /runtime smoke completed with network denial/i);
   assert.doesNotMatch(windows, /native build completed with .*network denial/i);
@@ -720,6 +733,7 @@ test('every workflow action remains pinned to a full commit SHA', async () => {
     readFile(workflowUrl, 'utf8'),
     readFile(publicationWorkflowUrl, 'utf8'),
     readFile(releaseQualificationWorkflowUrl, 'utf8'),
+    readFile(firewallWorkflowUrl, 'utf8'),
   ])).join('\n');
   const uses = [...source.matchAll(/^\s*- uses:\s*(\S+?)(?:\s+#.*)?\s*$/gm)].map((match) => match[1]);
   assert.ok(uses.length > 0);

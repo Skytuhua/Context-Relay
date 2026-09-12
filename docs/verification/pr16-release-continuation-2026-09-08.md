@@ -3147,3 +3147,25 @@ and native-workflow tests, the Python extractor test, formatting and whitespace
 checks passed. Scoped independent review reported no actionable P1/P2 findings.
 Native execution of this extension is still pending; the successful `cce0772`
 macOS job establishes the preceding signing/inference pipeline only.
+
+### Windows runner-disconnect diagnostic
+
+Both independent Windows builders in run `34356117600` lost runner communication.
+Their build logs remain unavailable. The source confirms that ordinary CI compiles
+before host-wide outbound blocking, while independent qualification compiles
+inside it; ordinary CI success therefore does not prove sustained runner survival.
+The policy disables other outbound allow rules, including any used by maintenance
+services. This identifies a diagnostic gap, not a proven cause of the disconnect.
+
+The diagnostic shares the existing firewall setup, checks and restoration with
+the build path, without adding network allowances. An ephemeral Windows 2022 job
+records a baseline, enables WFP failure auditing, holds the existing isolation for
+120 seconds without compiling, then verifies firewall and audit restoration.
+Only up to 256 projected event-5157 records (time, application path, PID,
+destination address/port, protocol and filter ID) enter its JSON artifact. Raw
+runner logs, command lines, environment and HTTP contents are excluded. The
+artifact is diagnostic evidence only, never release or sustained-build evidence.
+
+Local validation: the metadata projection regression failed before implementation,
+then it and the 25 native workflow contracts passed. Remote diagnostic execution
+remains pending. No firewall or audit settings were changed on the user's host.
