@@ -3293,3 +3293,29 @@ Snapshots run outside firewall isolation; signature calls share the existing job
 timeout. The firewall helper and corresponding-source tar are unchanged. Local
 diagnostic/workflow checks (28), focused material checks (2), the license checker
 and strict whitespace checks pass. Native snapshot execution remains pending.
+
+### Native snapshot and enrollment regression evidence
+
+Snapshot diagnostic run `34696950969`, job `103561952197`, passed at `787d8c7`.
+It captured 90 untruncated blocked connections and four unchanged before/after
+candidate records, including PID, creation time and file hash. HCA and `provjobd`
+reported `NotSigned`; the Azure candidates reported valid signatures. The observed
+`provjobd` parent PID matched HCA. Shell denial, firewall restoration, post-restore
+connectivity and exact 64-row audit-policy equality passed again. These observations
+do not establish trusted vendor identity, executable-image binding or the earlier
+disconnect cause. No new network exception was introduced.
+
+Actual macOS Rust job `103558347248` at `06daf67` completed successfully. Its log
+includes all 12 enrollment-vault tests passing, including
+`genesis_control_anchor_is_atomic_durable_and_never_reinitialized` and the existing
+schema-upgrade and plaintext-absence case. This extends the local genesis-anchor
+component evidence to native macOS; production current membership is still open.
+
+The diagnostic now also records a bounded chain beginning at its own PID, with
+creation times, parent links and explicit root/missing/cycle/limit/error status.
+Candidate joins require PID plus creation time; duplicate and reused identities
+receive no match. A newer parent creation time invalidates that observed link.
+These observations can distinguish a candidate relationship from actual current-job
+ancestry, but confer no network authority. Local diagnostic/workflow checks (29),
+two material checks, independent review's four focused tests, the license checker
+and strict whitespace checks pass. Native ancestry evidence remains pending.

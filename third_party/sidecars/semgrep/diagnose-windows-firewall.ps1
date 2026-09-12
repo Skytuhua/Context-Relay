@@ -169,6 +169,71 @@ function Get-CandidateProcessSnapshot {
   return [pscustomobject]$Snapshot
 }
 
+function Get-JobAncestrySnapshot([pscustomobject]$Candidates, [pscustomobject]$Previous = $null) {
+  # A bounded, contemporaneous CIM observation only; it is not vendor attestation,
+  # historical ancestry proof, process-image binding, or permission to allow network traffic.
+  $Snapshot = [ordered]@{
+    capturedAt = [DateTime]::UtcNow.ToString('o'); purpose = 'observed-job-ancestry-only'
+    limit = 32; termination = 'root'; nodes = @()
+  }
+  $Nodes = [Collections.Generic.List[object]]::new()
+  $Visited = [Collections.Generic.HashSet[uint32]]::new()
+  [uint32]$NextProcessId = $PID
+  $ChildCreated = $null
+  while ($NextProcessId -ne 0 -and $Nodes.Count -lt 32) {
+    if (-not $Visited.Add($NextProcessId)) { $Snapshot.termination = 'cycle'; break }
+    $Failure = 'query-unavailable'
+    try {
+      $Found = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $NextProcessId" -Property ProcessId,ParentProcessId,CreationDate,ExecutablePath -ErrorAction Stop | Select-Object -First 2)
+      if ($Found.Count -eq 0) { $Snapshot.termination = 'missing-process'; break }
+      if ($Found.Count -ne 1) { $Snapshot.termination = 'ambiguous-process'; break }
+      $Failure = 'invalid-process-metadata'
+      $Process = $Found[0]
+      if ([uint32]$Process.ProcessId -ne $NextProcessId) { $Snapshot.termination = 'pid-mismatch'; break }
+      if ($null -eq $Process.CreationDate) { $Snapshot.termination = 'missing-creation'; break }
+      $Created = ([DateTime]$Process.CreationDate).ToUniversalTime()
+      if ($null -ne $ChildCreated -and $Created -gt $ChildCreated) {
+        $Snapshot.termination = 'parent-created-after-child'; break
+      }
+      $Path = [string]$Process.ExecutablePath
+      $Node = [ordered]@{
+        pid = $NextProcessId; parentPid = [uint32]$Process.ParentProcessId; createdAt = $Created.ToString('o')
+        executablePath = $Path.Substring(0, [Math]::Min(1024, $Path.Length))
+        candidateIndex = $null; candidateMatch = 'unmatched'; previousIdentity = 'not-compared'
+      }
+      if ($null -ne $Previous) {
+        $PriorNodes = @($Previous.nodes | Select-Object -First 32 | Where-Object pid -eq $NextProcessId)
+        $Node.previousIdentity = 'not-observed-before'
+        if ($PriorNodes.Count -eq 1) {
+          $Node.previousIdentity = if ([string]::Equals($PriorNodes[0].createdAt, $Node.createdAt, [StringComparison]::Ordinal)) {
+            'same-pid-and-creation'
+          } else { 'pid-reused' }
+        }
+      }
+      $MatchesAt = [Collections.Generic.List[int]]::new()
+      $CandidateRows = @($Candidates.candidates | Select-Object -First 16)
+      for ($Index = 0; $Index -lt $CandidateRows.Count; $Index++) {
+        if ($CandidateRows[$Index].pid -eq $Node.pid -and
+            [string]::Equals($CandidateRows[$Index].createdAt, $Node.createdAt, [StringComparison]::Ordinal)) {
+          $MatchesAt.Add($Index)
+        }
+      }
+      if ($MatchesAt.Count -gt 1) { $Node.candidateMatch = 'duplicate-identity' }
+      elseif ($MatchesAt.Count -eq 1 -and $Node.previousIdentity -ne 'pid-reused') {
+        $Node.candidateIndex = $MatchesAt[0]; $Node.candidateMatch = 'pid-and-creation'
+      }
+      $Nodes.Add([pscustomobject]$Node)
+      $ChildCreated = $Created
+      $NextProcessId = $Node.parentPid
+    } catch {
+      $Snapshot.termination = $Failure; break
+    }
+  }
+  if ($Nodes.Count -eq 32 -and $NextProcessId -ne 0) { $Snapshot.termination = 'limit' }
+  $Snapshot.nodes = $Nodes.ToArray()
+  return [pscustomobject]$Snapshot
+}
+
 # This changes host policy: only the disposable GitHub-hosted Windows 2022 job may run it.
 if (-not $IsWindows -or $env:GITHUB_ACTIONS -ne 'true' -or
     $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows' -or
@@ -194,6 +259,7 @@ $Report = [ordered]@{
   failureStage = $null; eventLimit = 256; eventsTruncated = $false; blockedConnections = @()
   auditVerification = [ordered]@{ restoreExitCode = $null; backupExitCode = $null; comparison = $null }
   candidateProcessesBefore = $null; candidateProcessesAfter = $null
+  jobAncestryBefore = $null; jobAncestryAfter = $null
 }
 $Stage = 'baseline'
 $AuditSaved = $false
@@ -206,6 +272,7 @@ try {
   if ($null -eq $Address -or -not (Test-OutboundTcp $Address)) { Fail 'baseline connection failed' }
   $Report.baselineConnected = $true
   $Report.candidateProcessesBefore = Get-CandidateProcessSnapshot
+  $Report.jobAncestryBefore = Get-JobAncestrySnapshot $Report.candidateProcessesBefore
   $Stage = 'audit-setup'
   & $Auditpol /backup "/file:$AuditBackup" 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) { Fail 'audit backup failed' }
@@ -255,7 +322,10 @@ try {
     Remove-Item -LiteralPath $AuditBackup, $AuditRestored -Force -ErrorAction SilentlyContinue
   }
 }
-if ($Report.firewallRestored) { $Report.candidateProcessesAfter = Get-CandidateProcessSnapshot }
+if ($Report.firewallRestored) {
+  $Report.candidateProcessesAfter = Get-CandidateProcessSnapshot
+  $Report.jobAncestryAfter = Get-JobAncestrySnapshot $Report.candidateProcessesAfter $Report.jobAncestryBefore
+}
 if (-not $Report.firewallRestored -or -not $Report.auditRestored) {
   # Retain bounded comparison metadata even on failure; connection events remain uncollected.
   $Report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutputRoot 'firewall-diagnostic.v1.json') -Encoding utf8

@@ -140,3 +140,70 @@ test('candidate snapshots filter names, bound metadata, and reject inaccessible 
   assert.equal(many.truncated, true);
   assert.ok(!output.includes('PRIVATE'));
 });
+
+test('job ancestry joins exact candidate identities and reports broken or reused chains', () => {
+  const script = fileURLToPath(new URL('../third_party/sidecars/semgrep/diagnose-windows-firewall.ps1', import.meta.url));
+  const output = execFileSync('pwsh', ['-NoProfile', '-Command', `
+    $ErrorActionPreference = 'Stop'
+    Set-StrictMode -Version Latest
+    $ast = [Management.Automation.Language.Parser]::ParseFile($env:FIREWALL_DIAGNOSTIC_TEST_SCRIPT, [ref]$null, [ref]$null)
+    $fn = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-JobAncestrySnapshot'}, $false)
+    if ($null -eq $fn) { throw 'missing ancestry snapshot' }
+    Invoke-Expression $fn.Extent.Text
+    function Get-CimInstance { param($ClassName,$Filter,$Property)
+      if (($Property -join ',') -ne 'ProcessId,ParentProcessId,CreationDate,ExecutablePath' -or $Filter -notmatch '^ProcessId = ([0-9]+)$') { throw 'unexpected CIM query' }
+      $script:Queries++
+      $script:Rows[[uint32]$Matches[1]]
+    }
+    $baseTime = [datetime]'2026-09-12T00:00:00Z'
+    $script:Rows = @{}
+    $paths = @('pwsh.exe', 'Runner.Worker.exe', 'Runner.Listener.exe', 'hosted-compute-agent.exe', 'provjobd.exe123')
+    for ($i=0; $i -lt 5; $i++) {
+      $script:Rows[[uint32]($PID+$i)] = [pscustomobject]@{ProcessId=($PID+$i); ParentProcessId=$(if($i -eq 4){0}else{$PID+$i+1}); CreationDate=$baseTime.AddSeconds(-$i); ExecutablePath=('C:\\agents\\'+$paths[$i]); CommandLine='PRIVATE'}
+    }
+    $candidates = [pscustomobject]@{ candidates = @(
+      [pscustomobject]@{pid=($PID+3); createdAt=$baseTime.AddSeconds(-3).ToUniversalTime().ToString('o')},
+      [pscustomobject]@{pid=($PID+4); createdAt=$baseTime.AddSeconds(-4).ToUniversalTime().ToString('o')},
+      [pscustomobject]@{pid=999999; createdAt=$baseTime.ToUniversalTime().ToString('o')}
+    )}
+    $script:Queries=0
+    $good = Get-JobAncestrySnapshot $candidates
+    $same = Get-JobAncestrySnapshot $candidates $good
+    $script:Rows[[uint32]($PID+4)].CreationDate = $baseTime.AddSeconds(-3)
+    $reuse = Get-JobAncestrySnapshot $candidates $good
+    $script:Rows[[uint32]($PID+4)].CreationDate = $baseTime.AddSeconds(1)
+    $newParent = Get-JobAncestrySnapshot $candidates
+    $script:Rows[[uint32]($PID+4)].CreationDate = $baseTime.AddSeconds(-4)
+    $duplicateCandidates = [pscustomobject]@{candidates=@($candidates.candidates[0],$candidates.candidates[0])}
+    $duplicate = Get-JobAncestrySnapshot $duplicateCandidates
+    $script:Rows[[uint32]($PID+4)].ParentProcessId = $PID
+    $cycle = Get-JobAncestrySnapshot $candidates
+    $script:Rows.Remove([uint32]($PID+4))
+    $missing = Get-JobAncestrySnapshot $candidates
+    $script:Rows = @{}
+    for ($i=0; $i -lt 40; $i++) {
+      $script:Rows[[uint32]($PID+$i)] = [pscustomobject]@{ProcessId=($PID+$i); ParentProcessId=($PID+$i+1); CreationDate=$baseTime; ExecutablePath=('C:\\'+('x'*1100)); CommandLine='PRIVATE'}
+    }
+    $script:Queries=0
+    $long = Get-JobAncestrySnapshot $candidates
+    @{good=$good;same=$same;reuse=$reuse;newParent=$newParent;duplicate=$duplicate;cycle=$cycle;missing=$missing;long=$long;longQueries=$script:Queries} | ConvertTo-Json -Depth 8 -Compress
+  `], { encoding: 'utf8', env: { ...process.env, FIREWALL_DIAGNOSTIC_TEST_SCRIPT: script } });
+  const result = JSON.parse(output);
+  assert.equal(result.good.termination, 'root');
+  assert.equal(result.good.nodes.length, 5);
+  assert.deepEqual(result.good.nodes.map(x => x.candidateIndex), [null, null, null, 0, 1]);
+  assert.ok(result.same.nodes.every(x => x.previousIdentity === 'same-pid-and-creation'));
+  assert.equal(result.reuse.nodes.at(-1).previousIdentity, 'pid-reused');
+  assert.equal(result.reuse.nodes.at(-1).candidateIndex, null);
+  assert.equal(result.newParent.termination, 'parent-created-after-child');
+  assert.equal(result.duplicate.nodes[3].candidateMatch, 'duplicate-identity');
+  assert.equal(result.duplicate.nodes[3].candidateIndex, null);
+  assert.equal(result.cycle.termination, 'cycle');
+  assert.equal(result.missing.termination, 'missing-process');
+  assert.equal(result.long.termination, 'limit');
+  assert.equal(result.long.nodes.length, 32);
+  assert.equal(result.longQueries, 32);
+  assert.equal(result.long.nodes[0].executablePath.length, 1024);
+  assert.deepEqual(Object.keys(result.good.nodes[0]).sort(), ['pid','parentPid','createdAt','executablePath','candidateIndex','candidateMatch','previousIdentity'].sort());
+  assert.ok(!output.includes('PRIVATE'));
+});
