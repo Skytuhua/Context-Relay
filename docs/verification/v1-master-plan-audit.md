@@ -1,5 +1,20 @@
 # Context Relay v1 master-plan audit
 
+## Active scope update — 2026-09-12
+
+The user explicitly deferred all Apple-related work and anything requiring
+payment. Apple Developer enrollment, Apple signing/notarization, macOS-specific
+implementation and acceptance, paid Windows certificate enrollment, and paid
+test infrastructure are deferred. Preserve completed work and evidence.
+
+Continue Windows and shared product requirements using available resources
+without new spending. This includes local and hosted workflow implementation,
+security/reliability verification, package workflows, and available Windows
+installation checks. A mixed requirement retains its nondeferred work.
+Deferred requirements are not verified or deleted from the original plan;
+unsigned candidates cannot satisfy production-signing gates. PR16 remains open
+until the applicable acceptance audit supports merging.
+
 This records the historical audit baseline for PR #12 at
 `3c2a371aef74f4962af64d0fe71545557244f21a`, compared with base
 `367b32e15d06a7d46b6b8d04676d38dc368ae235`, with dated PR16 updates below. The v1 implementation plan remains

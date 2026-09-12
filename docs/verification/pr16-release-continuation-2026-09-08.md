@@ -1,5 +1,28 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## User deferrals and current Windows qualification — 2026-09-12
+
+The user deferred all Apple-related work and anything requiring money. Stop
+Apple enrollment/qualification and paid signing/test setup; preserve existing
+source and evidence. Continue the nondeferred Windows and shared product work.
+The [master-plan audit](v1-master-plan-audit.md#active-scope-update--2026-09-12)
+records the scope overlay without marking deferred requirements passed.
+
+At `7b827cc608114602459645a26d655e3c6daf744f`, GitHub reports successful
+[Supabase checks](https://github.com/Skytuhua/Context-Relay/actions/runs/34700303916),
+[secret scanning](https://github.com/Skytuhua/Context-Relay/actions/runs/34700303928),
+and [Windows firewall diagnostic](https://github.com/Skytuhua/Context-Relay/actions/runs/34700303977).
+These workflow outcomes are not installed hosted-lifecycle acceptance.
+
+The [Windows installer candidate](https://github.com/Skytuhua/Context-Relay/actions/runs/34700303907/job/103570759587)
+has completed verified resource fetching and package/resource tests and is
+running packaging. It has not yet produced accepted installation evidence.
+Both independent Windows builders in
+[qualification run 34699122274](https://github.com/Skytuhua/Context-Relay/actions/runs/34699122274)
+remain running at earlier commit `7ad495c`; no independent qualification pass
+is claimed. Full current-head CI is queued. These are observations, not final
+results, and must be refreshed before acceptance.
+
 ## Distinct IDs for fresh native proposals — 2026-09-09
 
 Native reconciliation still created shared candidate/proposed-memory IDs, which
