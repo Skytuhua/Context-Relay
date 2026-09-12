@@ -230,6 +230,38 @@ pub fn decode_pairing_approved_payload_v2(
     Ok(payload)
 }
 
+// These public bindings do not establish historical issuer authority. They are
+// sufficient to ensure the independently confirmed artifact answers this request.
+fn validate_request_bindings_v2(
+    p: &PairingApprovedPayloadV2,
+    request: &SignedPairingRequest,
+) -> Result<(), CryptoError> {
+    require_exact_signed_request(request)?;
+    let r = request.request();
+    let child = &p.grant.certificate;
+    let issuer = &p.issuer_certificate;
+    if p.issuer_certificate_id == p.grant.certificate_id
+        || issuer.device_id == child.device_id
+        || p.grant.pairing_id != r.pairing_id
+        || p.grant.request_digest != request.digest()
+        || child.request_nonce != r.request_nonce
+        || child.device_id != r.device_id
+        || child.signing_public_key != r.signing_public_key
+        || child.wrapping_public_key != r.wrapping_public_key
+        || issuer.account_id != child.account_id
+        || issuer.workspace_id != child.workspace_id
+        || issuer.control_epoch == 0
+        || issuer.control_epoch > child.control_epoch
+    {
+        return Err(CryptoError::AuthenticationFailed);
+    }
+    validate_x25519_public_key(issuer.wrapping_public_key)?;
+    child.verify_issued_by(&CertificateIssuerV1::Device {
+        device_id: issuer.device_id,
+        signing_public_key: issuer.signing_public_key,
+    })
+}
+
 /// Validate public admission bindings against explicitly authenticated history.
 /// This does not verify a membership event signature or prove successful opening.
 pub fn inspect_pairing_approval_v2(
@@ -237,12 +269,11 @@ pub fn inspect_pairing_approval_v2(
     request: &SignedPairingRequest,
     parent: &PairingParentV2<'_>,
 ) -> Result<PairingApprovedPayloadV2, CryptoError> {
-    require_exact_signed_request(request)?;
     let p = decode_pairing_approved_payload_v2(payload_bytes)?;
+    validate_request_bindings_v2(&p, request)?;
     let s = &parent.state;
     let issuer = &p.issuer_certificate;
     let child = &p.grant.certificate;
-    let r = request.request();
     if s.control_epoch == 0
         || s.key_epoch == 0
         || s.state_sha256.0 == [0; 32]
@@ -251,19 +282,12 @@ pub fn inspect_pairing_approval_v2(
         || p.previous_state_sha256 != s.state_sha256
         || p.enrollment_record_sha256 != parent.enrollment_record_sha256
         || p.issuer_certificate_id != parent.issuer_certificate_id
-        || p.issuer_certificate_id == p.grant.certificate_id
         || s.active_devices.get(&issuer.device_id) != Some(issuer)
         || s.active_devices.contains_key(&child.device_id)
-        || p.grant.pairing_id != r.pairing_id
-        || p.grant.request_digest != request.digest()
         || child.account_id != s.scope.account_id
         || child.workspace_id != s.scope.workspace_id
         || child.control_epoch != s.control_epoch
         || p.grant.key_epoch != s.key_epoch
-        || child.request_nonce != r.request_nonce
-        || child.device_id != r.device_id
-        || child.signing_public_key != r.signing_public_key
-        || child.wrapping_public_key != r.wrapping_public_key
     {
         return Err(CryptoError::AuthenticationFailed);
     }
@@ -279,10 +303,6 @@ pub fn inspect_pairing_approval_v2(
         crate::crypto::validate_ed25519_public_key(cert.signing_public_key)?;
         validate_x25519_public_key(cert.wrapping_public_key)?;
     }
-    child.verify_issued_by(&CertificateIssuerV1::Device {
-        device_id: issuer.device_id,
-        signing_public_key: issuer.signing_public_key,
-    })?;
     Ok(p)
 }
 
@@ -465,16 +485,37 @@ impl OpenedPairingApprovalV2 {
     }
 }
 
-/// Native joining path only. The expected number is computed privately; enter the
-/// complete number independently read on the approving device. The coordinator
-/// owns attempt/expiry limits and must verify history/event before installation.
-pub fn confirm_and_open_pairing_approval_v2(
+/// Exact independently confirmed transcript and pins, not membership authority or
+/// proof of decryption. Constructed only by confirm_pairing_transcript_v2; the
+/// joining path never exposes its computed expected safety number.
+pub struct ConfirmedV2Transcript {
+    canonical_bytes: Vec<u8>,
+    payload: PairingApprovedPayloadV2,
+}
+impl ConfirmedV2Transcript {
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+    pub fn payload(&self) -> &PairingApprovedPayloadV2 {
+        &self.payload
+    }
+    pub fn enrollment_record_sha256(&self) -> Sha256Digest {
+        self.payload.enrollment_record_sha256
+    }
+    pub fn previous_state_sha256(&self) -> Sha256Digest {
+        self.payload.previous_state_sha256
+    }
+}
+
+/// Native joining phase one. The number must be independently read on the
+/// approving device; a number delivered with provider evidence is not confirmation.
+/// The coordinator owns attempt/expiry limits. Use the confirmed pins to replay
+/// enrollment/history before passing its private proof to the staged opener.
+pub fn confirm_pairing_transcript_v2(
     canonical: &[u8],
     entered_safety_number: &str,
     request: &SignedPairingRequest,
-    keys: &DeviceKeys,
-    parent: &PairingParentV2<'_>,
-) -> Result<OpenedPairingApprovalV2, PairingConfirmationError> {
+) -> Result<ConfirmedV2Transcript, PairingConfirmationError> {
     let payload =
         decode_pairing_approved_payload_v2(canonical).map_err(PairingConfirmationError::Crypto)?;
     if !exact_safety_number_matches(
@@ -483,23 +524,91 @@ pub fn confirm_and_open_pairing_approval_v2(
     ) {
         return Err(PairingConfirmationError::SafetyNumberMismatch);
     }
-    let open = || -> Result<OpenedPairingApprovalV2, CryptoError> {
-        let payload = inspect_pairing_approval_v2(canonical, request, parent)?;
-        if keys.signing_public_key() != request.request().signing_public_key
-            || keys.wrapping_public_key() != request.request().wrapping_public_key
-        {
-            return Err(CryptoError::AuthenticationFailed);
-        }
-        let plaintext =
-            keys.unwrap_secret(&payload.grant.wrapped_key_bundle, &grant_aad_v2(&payload)?)?;
-        let key_bundle = decode_pairing_key_bundle(plaintext.expose())?;
-        check_bundle(&key_bundle, parent)?;
-        Ok(OpenedPairingApprovalV2 {
-            payload,
-            key_bundle,
-        })
-    };
-    open().map_err(PairingConfirmationError::Crypto)
+    validate_request_bindings_v2(&payload, request).map_err(PairingConfirmationError::Crypto)?;
+    Ok(ConfirmedV2Transcript {
+        canonical_bytes: canonical.to_vec(),
+        payload,
+    })
+}
+
+/// Native joining phase two. Require history ending at the independently confirmed
+/// predecessor and the exact verified membership event, then decrypt. A conditional
+/// membership proof over a different supplied roster is not accepted as this
+/// history's successor. This does not install keys or establish global freshness.
+pub fn open_confirmed_pairing_approval_v2(
+    confirmed: &ConfirmedV2Transcript,
+    request: &SignedPairingRequest,
+    keys: &DeviceKeys,
+    history: &crate::devices::membership_crypto::VerifiedMembershipHistory,
+    membership: &crate::devices::membership_crypto::VerifiedMembershipControl,
+) -> Result<OpenedPairingApprovalV2, CryptoError> {
+    let parent = history.pairing_parent(confirmed.payload.issuer_certificate.device_id)?;
+    let payload = inspect_pairing_approval_v2(confirmed.canonical_bytes(), request, &parent)?;
+    let expected = crate::devices::membership_crypto::DeviceMembershipAddStatementV1::from_approved_payload_v2(confirmed.canonical_bytes())?;
+    history.ensure_new_admission(
+        expected.membership_id,
+        payload.grant.certificate.device_id,
+        expected.certificate_id,
+    )?;
+    let next = membership.state();
+    let current = &parent.state;
+    if membership.statement() != &expected
+        || next.scope != current.scope
+        || next.control_epoch != current.control_epoch
+        || next.key_epoch != current.key_epoch
+        || next.recovery_root_id != current.recovery_root_id
+        || next.recovery_wrapping_public_key != current.recovery_wrapping_public_key
+        || next.active_devices.len() != current.active_devices.len() + 1
+        || next
+            .active_devices
+            .get(&payload.grant.certificate.device_id)
+            != Some(&payload.grant.certificate)
+        || current
+            .active_devices
+            .iter()
+            .any(|(id, cert)| next.active_devices.get(id) != Some(cert))
+    {
+        return Err(CryptoError::AuthenticationFailed);
+    }
+    open_pairing_payload_v2(payload, request, keys, &parent)
+}
+
+/// Compatibility path for callers that already independently authenticated their
+/// parent. Fresh joiners must use the staged API to obtain pins before replay.
+/// This path still does not verify a membership event or complete history itself.
+pub fn confirm_and_open_pairing_approval_v2(
+    canonical: &[u8],
+    entered_safety_number: &str,
+    request: &SignedPairingRequest,
+    keys: &DeviceKeys,
+    parent: &PairingParentV2<'_>,
+) -> Result<OpenedPairingApprovalV2, PairingConfirmationError> {
+    let confirmed = confirm_pairing_transcript_v2(canonical, entered_safety_number, request)?;
+    let payload = inspect_pairing_approval_v2(confirmed.canonical_bytes(), request, parent)
+        .map_err(PairingConfirmationError::Crypto)?;
+    open_pairing_payload_v2(payload, request, keys, parent)
+        .map_err(PairingConfirmationError::Crypto)
+}
+
+fn open_pairing_payload_v2(
+    payload: PairingApprovedPayloadV2,
+    request: &SignedPairingRequest,
+    keys: &DeviceKeys,
+    parent: &PairingParentV2<'_>,
+) -> Result<OpenedPairingApprovalV2, CryptoError> {
+    if keys.signing_public_key() != request.request().signing_public_key
+        || keys.wrapping_public_key() != request.request().wrapping_public_key
+    {
+        return Err(CryptoError::AuthenticationFailed);
+    }
+    let plaintext =
+        keys.unwrap_secret(&payload.grant.wrapped_key_bundle, &grant_aad_v2(&payload)?)?;
+    let key_bundle = decode_pairing_key_bundle(plaintext.expose())?;
+    check_bundle(&key_bundle, parent)?;
+    Ok(OpenedPairingApprovalV2 {
+        payload,
+        key_bundle,
+    })
 }
 
 impl fmt::Debug for PairingApprovedPayloadV2 {

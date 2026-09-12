@@ -4,6 +4,7 @@ pub mod identity;
 #[cfg(feature = "test-support")]
 pub mod memory_recovery_transport;
 pub mod memory_transport;
+pub mod membership_crypto;
 pub mod pairing;
 pub mod recovery;
 pub mod recovery_crypto;

@@ -428,3 +428,216 @@ fn independent_aad(p: &PairingApprovedPayloadV2) -> Vec<u8> {
     a.extend_from_slice(&Sha256::digest(cert_bytes(&payload, 7)));
     a
 }
+
+#[test]
+fn fresh_joiner_confirms_pins_then_authenticates_history_and_exact_admission_before_opening() {
+    use context_relay_core::devices::{
+        membership_crypto::*,
+        recovery_crypto::{RecoveryEnrollmentBuildRequest, build_recovery_enrollment_artifacts},
+        revocation_crypto::initial_revocation_control_state,
+    };
+    let a = DeviceKeys::from_seeds_for_test([1; 32], [2; 32]);
+    let b = DeviceKeys::from_seeds_for_test([3; 32], [4; 32]);
+    let c = DeviceKeys::from_seeds_for_test([5; 32], [6; 32]);
+    let recovery =
+        RecoveryKeys::derive(&RecoveryPhrase::from_entropy_for_test([7; 32]).unwrap()).unwrap();
+    let scope = SyncScope {
+        account_id: id(1),
+        workspace_id: id(2),
+    };
+    let cert = DeviceCertificateV1::issue_genesis(fields(&a, 3, 1), &recovery).unwrap();
+    let material = PairingKeyBundle::new(scope, 1, 1, [21; 32], [22; 32]).unwrap();
+    let enrollment = build_recovery_enrollment_artifacts(RecoveryEnrollmentBuildRequest {
+        enrollment_id: id(6),
+        recovery_root_id: id(7),
+        certificate_id: id(8),
+        certificate: cert.clone(),
+        device_name: "A".into(),
+        device_platform: NativePlatform::Windows,
+        recovery_keys: &recovery,
+        device_keys: &a,
+        material: &material,
+    })
+    .unwrap();
+    let material = material
+        .with_enrollment_record_sha256(enrollment.canonical_record_sha256)
+        .unwrap();
+    let roster = BTreeMap::from([(id(3), cert.clone())]);
+    let genesis = initial_revocation_control_state(
+        &enrollment.record,
+        enrollment.canonical_record_sha256,
+        scope,
+        &roster,
+    )
+    .unwrap();
+    let parent = PairingParentV2 {
+        state: genesis,
+        issuer_certificate_id: id(8),
+        enrollment_record_sha256: enrollment.canonical_record_sha256,
+        latest_rotation: None,
+    };
+    let request =
+        SignedPairingRequest::build(id(10), id(4), "B", NativePlatform::Windows, &b).unwrap();
+    let built = build_pairing_approval_v2(
+        &request,
+        &parent,
+        id(3),
+        &a,
+        id(11),
+        "A",
+        NativePlatform::Windows,
+        &material,
+    )
+    .unwrap();
+    let canonical = encode_pairing_approved_payload_v2(&built.payload).unwrap();
+    // No history, claimed endpoint, or provider-returned number can construct this
+    // token. Only the separately entered approving device number confirms its pins.
+    assert!(matches!(
+        confirm_pairing_transcript_v2(&canonical, "0000-0000-0000-0000-0000", &request),
+        Err(PairingConfirmationError::SafetyNumberMismatch)
+    ));
+    let confirmed =
+        confirm_pairing_transcript_v2(&canonical, built.safety_number.as_str(), &request).unwrap();
+    assert_eq!(confirmed.canonical_bytes(), canonical);
+    assert_eq!(confirmed.payload(), &built.payload);
+    assert_eq!(
+        confirmed.enrollment_record_sha256(),
+        enrollment.canonical_record_sha256
+    );
+    assert_eq!(confirmed.previous_state_sha256(), parent.state.state_sha256);
+    let expected = MembershipEndpoint {
+        state_sha256: confirmed.previous_state_sha256(),
+        control_epoch: confirmed.payload().grant.certificate.control_epoch,
+        key_epoch: confirmed.payload().grant.key_epoch,
+    };
+    let budget = MembershipHistoryBudget {
+        max_events: 10,
+        max_bytes: 1_000_000,
+    };
+    let history = verify_membership_history(
+        &enrollment.canonical_record,
+        confirmed.enrollment_record_sha256(),
+        scope,
+        &[],
+        expected,
+        budget,
+    )
+    .unwrap();
+    let statement =
+        DeviceMembershipAddStatementV1::from_approved_payload_v2(confirmed.canonical_bytes())
+            .unwrap();
+    let signature = statement.sign(&cert, &a).unwrap();
+    let event = statement
+        .verify_and_advance(
+            signature,
+            &request,
+            confirmed.canonical_bytes(),
+            &history.pairing_parent(id(3)).unwrap(),
+        )
+        .unwrap();
+    let opened =
+        open_confirmed_pairing_approval_v2(&confirmed, &request, &b, &history, &event).unwrap();
+    assert_eq!(
+        opened.key_bundle().workspace_root_key(),
+        material.workspace_root_key()
+    );
+    assert_eq!(
+        opened.key_bundle().active_epoch_key(),
+        material.active_epoch_key()
+    );
+    let different_request =
+        SignedPairingRequest::build(id(10), id(4), "B", NativePlatform::Windows, &b).unwrap();
+    assert!(
+        confirm_pairing_transcript_v2(&canonical, built.safety_number.as_str(), &different_request)
+            .is_err()
+    );
+    assert!(
+        open_confirmed_pairing_approval_v2(&confirmed, &different_request, &b, &history, &event)
+            .is_err()
+    );
+    assert!(
+        open_confirmed_pairing_approval_v2(&confirmed, &request, &c, &history, &event).is_err()
+    );
+    for mutate in [
+        |p: &mut PairingApprovedPayloadV2| p.enrollment_record_sha256.0[0] ^= 1,
+        |p: &mut PairingApprovedPayloadV2| p.previous_state_sha256.0[0] ^= 1,
+    ] {
+        let mut changed = built.payload.clone();
+        mutate(&mut changed);
+        assert!(
+            confirm_pairing_transcript_v2(
+                &encode_pairing_approved_payload_v2(&changed).unwrap(),
+                built.safety_number.as_str(),
+                &request
+            )
+            .is_err()
+        );
+    }
+    let mut changed = built.payload.clone();
+    changed.grant.certificate.request_nonce.0[0] ^= 1;
+    let bytes = encode_pairing_approved_payload_v2(&changed).unwrap();
+    assert!(matches!(
+        confirm_pairing_transcript_v2(&bytes, &independent_safety(&changed, &bytes), &request),
+        Err(PairingConfirmationError::Crypto(_))
+    ));
+    // A separately valid membership event at the same parent is not the selected artifact.
+    let alternative = build_pairing_approval_v2(
+        &request,
+        &parent,
+        id(3),
+        &a,
+        id(11),
+        "A",
+        NativePlatform::Windows,
+        &material,
+    )
+    .unwrap();
+    let alt_bytes = encode_pairing_approved_payload_v2(&alternative.payload).unwrap();
+    let alt_statement =
+        DeviceMembershipAddStatementV1::from_approved_payload_v2(&alt_bytes).unwrap();
+    let alt_event = alt_statement
+        .verify_and_advance(
+            alt_statement.sign(&cert, &a).unwrap(),
+            &request,
+            &alt_bytes,
+            &history.pairing_parent(id(3)).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        open_confirmed_pairing_approval_v2(&confirmed, &request, &b, &history, &alt_event).is_err()
+    );
+    // Conditional single-step proof over a relabelled provider roster is not the
+    // successor of authenticated history, even with the same valid statement.
+    let c_cert = DeviceCertificateV1::issue_by_device(fields(&c, 5, 1), id(3), &a).unwrap();
+    let fake_roster = BTreeMap::from([(id(3), cert.clone()), (id(5), c_cert)]);
+    let mut fake_parent = history.pairing_parent(id(3)).unwrap();
+    fake_parent.state.active_devices = &fake_roster;
+    let fake_event = statement
+        .verify_and_advance(signature, &request, &canonical, &fake_parent)
+        .unwrap();
+    assert!(
+        open_confirmed_pairing_approval_v2(&confirmed, &request, &b, &history, &fake_event)
+            .is_err()
+    );
+    // Successfully verifying another endpoint is not proof of the confirmed parent.
+    let preimage = statement.signing_preimage().unwrap();
+    let after = verify_membership_history(
+        &enrollment.canonical_record,
+        confirmed.enrollment_record_sha256(),
+        scope,
+        &[MembershipHistoryEvent::PairingAdd {
+            statement: &preimage,
+            signature,
+            request: &request,
+            approved_payload: &canonical,
+        }],
+        MembershipEndpoint {
+            state_sha256: event.state().state_sha256,
+            control_epoch: 1,
+            key_epoch: 1,
+        },
+        budget,
+    )
+    .unwrap();
+    assert!(open_confirmed_pairing_approval_v2(&confirmed, &request, &b, &after, &event).is_err());
+}
