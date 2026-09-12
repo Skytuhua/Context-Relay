@@ -3205,3 +3205,19 @@ absence. Independent source review found no actionable P1/P2 findings. Six older
 schema upgrade tests passed across lifecycle, revocation, pairing, restore and
 search fixtures; core library/tests Clippy with warnings denied, formatting and
 whitespace checks also passed. These are local component results.
+
+### Diagnostic restoration-check correction
+
+The first native diagnostic (`34694979331`, job `103556799685`, `b863672`)
+failed at audit-restoration verification and suppressed its artifact. The log
+could not distinguish a second-backup command failure from a raw-file hash
+mismatch; it does not prove the runner-disconnect cause or restored audit state.
+The correction checks native exit codes separately and strictly compares all
+seven audit CSV fields, accepting only BOM/newline/row-order representation
+changes. Input bounds, exact headers, duplicate rejection and ordinal equality
+are mandatory. A failed restoration exports only bounded status/count/field-name
+metadata, with no connection events or policy values. No network rule changed.
+
+The comparer and soft-hyphen regressions failed before their fixes; all 27 local
+workflow/diagnostic tests now pass. Independent review's ordinal-comparison P2
+is addressed with no new P1/P2 findings. Revised native execution remains pending.

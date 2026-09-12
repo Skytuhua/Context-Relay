@@ -20,6 +20,66 @@ function Convert-WfpBlockedEvent([xml]$EventXml) {
   return [pscustomobject]$Result
 }
 
+function Read-AuditPolicyCsv([string]$Csv) {
+  if ($Csv.Length -eq 0 -or $Csv.Length -gt 1048576 -or $Csv.Contains([char]0)) { throw 'invalid audit CSV size or content' }
+  if ($Csv.StartsWith([string][char]0xFEFF, [StringComparison]::Ordinal)) { $Csv = $Csv.Substring(1) }
+  # Exact seven-column Microsoft audit CSV header, including option and per-user rows:
+  # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpac/6494a0f2-8a16-40e2-b87d-328be7d732e0
+  $Header = 'Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclusion Setting,Setting Value'
+  $Parser = [Microsoft.VisualBasic.FileIO.TextFieldParser]::new([IO.StringReader]::new($Csv))
+  $Parser.SetDelimiters(',')
+  $Parser.HasFieldsEnclosedInQuotes = $true
+  $Parser.TrimWhiteSpace = $false
+  $Rows = [Collections.Generic.Dictionary[string,string[]]]::new([StringComparer]::Ordinal)
+  try {
+    $Fields = $Parser.ReadFields()
+    if ($null -eq $Fields -or $Fields.Count -ne 7 -or
+        -not [string]::Equals(($Fields -join ','), $Header, [StringComparison]::Ordinal)) { throw 'invalid audit CSV header' }
+    while (-not $Parser.EndOfData) {
+      $Fields = $Parser.ReadFields()
+      if ($Fields.Count -ne 7 -or $Rows.Count -ge 4096 -or @($Fields | Where-Object Length -gt 4096).Count) {
+        throw 'invalid audit CSV row shape or bound'
+      }
+      $Key = ConvertTo-Json -InputObject $Fields[0..3] -Compress
+      # Reject repeated identities, including identical duplicates; never silently overwrite policy.
+      if ($Rows.ContainsKey($Key)) { throw 'duplicate audit CSV identity' }
+      $Rows.Add($Key, $Fields)
+    }
+    if ($Rows.Count -eq 0) { throw 'empty audit CSV policy' }
+    return ,$Rows
+  } finally {
+    $Parser.Dispose()
+  }
+}
+
+function Compare-AuditPolicyCsv([string]$BeforeCsv, [string]$AfterCsv) {
+  $Before = Read-AuditPolicyCsv $BeforeCsv
+  $After = Read-AuditPolicyCsv $AfterCsv
+  $Missing = @($Before.Keys | Where-Object { -not $After.ContainsKey($_) }).Count
+  $Extra = @($After.Keys | Where-Object { -not $Before.ContainsKey($_) }).Count
+  $Changed = 0
+  $ChangedFields = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+  $Names = @('Machine Name', 'Policy Target', 'Subcategory', 'Subcategory GUID', 'Inclusion Setting', 'Exclusion Setting', 'Setting Value')
+  foreach ($Key in $Before.Keys) {
+    if (-not $After.ContainsKey($Key)) { continue }
+    $Different = $false
+    for ($Index = 0; $Index -lt 7; $Index++) {
+      if (-not [string]::Equals($Before[$Key][$Index], $After[$Key][$Index], [StringComparison]::Ordinal)) {
+        $Different = $true
+        [void]$ChangedFields.Add($Names[$Index])
+      }
+    }
+    if ($Different) { $Changed++ }
+  }
+  # Only counts and fixed field names leave this function; never policy targets or row values.
+  return [pscustomobject]@{
+    equal = ($Missing -eq 0 -and $Extra -eq 0 -and $Changed -eq 0)
+    beforeRows = $Before.Count; afterRows = $After.Count
+    missingRows = $Missing; extraRows = $Extra; changedRows = $Changed
+    changedFields = @($ChangedFields | Sort-Object)
+  }
+}
+
 # This changes host policy: only the disposable GitHub-hosted Windows 2022 job may run it.
 if (-not $IsWindows -or $env:GITHUB_ACTIONS -ne 'true' -or
     $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows' -or
@@ -43,6 +103,7 @@ $Report = [ordered]@{
   observationSeconds = 120; baselineConnected = $false; isolatedShellDenied = $false
   firewallRestored = $false; auditRestored = $false; postRestoreConnected = $false
   failureStage = $null; eventLimit = 256; eventsTruncated = $false; blockedConnections = @()
+  auditVerification = [ordered]@{ restoreExitCode = $null; backupExitCode = $null; comparison = $null }
 }
 $Stage = 'baseline'
 $AuditSaved = $false
@@ -55,10 +116,10 @@ try {
   if ($null -eq $Address -or -not (Test-OutboundTcp $Address)) { Fail 'baseline connection failed' }
   $Report.baselineConnected = $true
   $Stage = 'audit-setup'
-  & $Auditpol /backup "/file:$AuditBackup" | Out-Null
+  & $Auditpol /backup "/file:$AuditBackup" 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) { Fail 'audit backup failed' }
   $AuditSaved = $true
-  & $Auditpol /set "/subcategory:$ConnectionAudit" /failure:enable | Out-Null
+  & $Auditpol /set "/subcategory:$ConnectionAudit" /failure:enable 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) { Fail 'audit enable failed' }
   $Stage = 'isolated-window'
   $Started = [DateTime]::UtcNow
@@ -74,19 +135,36 @@ try {
   $Ended = [DateTime]::UtcNow
   $Report.firewallRestored = $FirewallRestored
   if ($AuditSaved) {
-    & $Auditpol /restore "/file:$AuditBackup" | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail 'audit restoration failed; diagnostic export suppressed' }
-    & $Auditpol /backup "/file:$AuditRestored" | Out-Null
-    if ($LASTEXITCODE -ne 0 -or
-        (Get-FileHash -LiteralPath $AuditBackup).Hash -ne (Get-FileHash -LiteralPath $AuditRestored).Hash) {
-      Fail 'audit restoration verification failed; diagnostic export suppressed'
+    & $Auditpol /restore "/file:$AuditBackup" 2>&1 | Out-Null
+    $Report.auditVerification.restoreExitCode = $LASTEXITCODE
+    if ($LASTEXITCODE -ne 0) {
+      $Report.failureStage = 'audit-restore-native-exit'
+    } else {
+      & $Auditpol /backup "/file:$AuditRestored" 2>&1 | Out-Null
+      $Report.auditVerification.backupExitCode = $LASTEXITCODE
+      if ($LASTEXITCODE -ne 0) {
+        $Report.failureStage = 'audit-restored-backup-native-exit'
+      } else {
+        try {
+          foreach ($Path in @($AuditBackup, $AuditRestored)) {
+            if ((Get-Item -LiteralPath $Path).Length -gt 1048576) { throw 'audit CSV file exceeds bound' }
+          }
+          $Utf8 = [Text.UTF8Encoding]::new($false, $true)
+          $Report.auditVerification.comparison = Compare-AuditPolicyCsv ([IO.File]::ReadAllText($AuditBackup, $Utf8)) ([IO.File]::ReadAllText($AuditRestored, $Utf8))
+          $Report.auditRestored = $Report.auditVerification.comparison.equal
+          if (-not $Report.auditRestored) { $Report.failureStage = 'audit-policy-mismatch' }
+        } catch {
+          $Report.failureStage = 'audit-policy-invalid-csv'
+        }
+      }
     }
-    $Report.auditRestored = $true
-    Remove-Item -LiteralPath $AuditBackup, $AuditRestored -Force
+    Remove-Item -LiteralPath $AuditBackup, $AuditRestored -Force -ErrorAction SilentlyContinue
   }
 }
 if (-not $Report.firewallRestored -or -not $Report.auditRestored) {
-  Fail 'diagnostic did not verify both restorations; diagnostic export suppressed'
+  # Retain bounded comparison metadata even on failure; connection events remain uncollected.
+  $Report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutputRoot 'firewall-diagnostic.v1.json') -Encoding utf8
+  Fail 'diagnostic did not verify both restorations; network event export suppressed'
 }
 $Report.postRestoreConnected = Test-OutboundTcp $Address
 try {

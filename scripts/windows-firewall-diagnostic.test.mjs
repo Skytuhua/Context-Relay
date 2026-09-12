@@ -23,3 +23,47 @@ test('5157 diagnostics retain only bounded connection metadata', () => {
   assert.ok(!output.includes('DO-NOT-EXPORT'));
 });
 
+
+test('audit restoration compares every CSV field, rejecting malformed and duplicate rows', () => {
+  const script = fileURLToPath(new URL('../third_party/sidecars/semgrep/diagnose-windows-firewall.ps1', import.meta.url));
+  const output = execFileSync('pwsh', ['-NoProfile', '-Command', `
+    $ErrorActionPreference = 'Stop'
+    $ast = [Management.Automation.Language.Parser]::ParseFile($env:FIREWALL_DIAGNOSTIC_TEST_SCRIPT, [ref]$null, [ref]$null)
+    $functions = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in @('Read-AuditPolicyCsv', 'Compare-AuditPolicyCsv') }, $false))
+    if ($functions.Count -ne 2) { throw 'missing audit policy comparison' }
+    foreach ($fn in $functions) { Invoke-Expression $fn.Extent.Text }
+    $header = 'Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclusion Setting,Setting Value'
+    $system = 'PRIVATE-HOST,System,Filtering Platform Connection,{0CCE9226-69AE-11D9-BED3-505054503030},Failure,,2'
+    $option = 'PRIVATE-HOST,,Option:CrashOnAuditFail,,Disabled,,0'
+    $userRow = 'PRIVATE-HOST,S-1-5-21-PRIVATE,File System,{0CCE921D-69AE-11D9-BED3-505054503030},Success,Failure,9'
+    $before = ($header, $system, $option, $userRow) -join [char]10
+    $after = [char]0xFEFF + (($header, $userRow, $option, $system) -join ([string][char]13 + [char]10)) + [char]13 + [char]10
+    $results = @{}
+    $results.reordered = Compare-AuditPolicyCsv $before $after
+    $results.setting = Compare-AuditPolicyCsv $before ($before.Replace('Failure,,2', 'Failure,,3'))
+    $results.option = Compare-AuditPolicyCsv $before ($before.Replace('Disabled,,0', 'Disabled,,1'))
+    $results.target = Compare-AuditPolicyCsv $before ($before.Replace('S-1-5-21-PRIVATE', 'S-1-5-21-OTHER'))
+    $results.text = Compare-AuditPolicyCsv $before ($before.Replace('Success,Failure,9', 'success,Failure,9'))
+    $results.softHyphen = Compare-AuditPolicyCsv $before ($before.Replace('Disabled', ('Dis' + [char]0x00AD + 'abled')))
+    foreach ($case in @{
+      header = $before.Replace('Setting Value', 'Setting Value,Unknown')
+      softHyphenHeader = $before.Replace('Setting Value', ('Setting Val' + [char]0x00AD + 'ue'))
+      duplicate = $before + [char]10 + $system
+      conflict = $before + [char]10 + $system.Replace('Failure,,2', 'Failure,,3')
+      extra = $before + ',EXTRA'
+      quote = $header + [char]10 + '"unclosed'
+      oversized = 'x' * 1048577
+    }.GetEnumerator()) {
+      try { $null = Compare-AuditPolicyCsv $before $case.Value; $results[$case.Key] = 'accepted' }
+      catch { $results[$case.Key] = 'rejected' }
+    }
+    $results | ConvertTo-Json -Depth 5 -Compress
+  `], { encoding: 'utf8', env: { ...process.env, FIREWALL_DIAGNOSTIC_TEST_SCRIPT: script } });
+  const results = JSON.parse(output);
+  assert.equal(results.reordered.equal, true);
+  assert.equal(results.reordered.beforeRows, 3);
+  assert.equal(results.reordered.afterRows, 3);
+  for (const name of ['setting', 'option', 'target', 'text', 'softHyphen']) assert.equal(results[name].equal, false, name);
+  for (const name of ['header', 'softHyphenHeader', 'duplicate', 'conflict', 'extra', 'quote', 'oversized']) assert.equal(results[name], 'rejected', name);
+  assert.ok(!output.includes('PRIVATE'));
+});
