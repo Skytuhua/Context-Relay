@@ -3091,3 +3091,59 @@ of this signing and inference pipeline still requires native macOS CI.
 Production resource discovery, Developer ID/notarization, Windows signing,
 hosted workflows, clean-machine matrices and all remaining full-release gates
 remain open. No merge or release acceptance is claimed.
+
+The integration was pushed as `cce0772f61e12275b68b029b45a862a8e9ff0bc8`.
+Fresh local verification also passes all four daemon command-mode tests,
+daemon binary Clippy with warnings denied, formatting and whitespace checks.
+CI `34693323063` is running; native macOS job `103552389709` completed successfully.
+Its downloaded log confirms all ten C/Rust constraint canaries, search-input
+acquisition, app assembly, copied-app inference, and the final signing/inference
+gate. That gate requires original-app inference, exact final runtime bytes and
+executable constraints, copied-app positive control, and altered-runtime rejection.
+Log: `.codex/pr16-macos-signing-cce0772.log`. This qualifies the internal ad-hoc
+candidate at `cce0772`, not Developer ID, notarization or installed acceptance.
+
+Read-only hosted recheck on September 12 confirms project `brvzuycnxoswdzzipgvx`
+is `ACTIVE_HEALTHY`, still has 17 migrations, and has version-one `sync`,
+`account-lifecycle` and `enrollment` functions. Pairing remains undeployed.
+Regular Chrome's authenticated provider page confirms GitHub OAuth is disabled;
+no new login is needed. The security advisor reports only informational
+RLS-without-policy findings (12 tables); no policies were loosened to remove
+these findings. This is control-plane evidence, not installed hosted acceptance.
+
+Live rulesets `19760487` and `19760490` are active for `main` and `v*` tags.
+Main requires its 22 named status checks, pull requests, resolved review threads,
+linear history and no force-push/deletion; tags reject updates and deletion.
+Both retain the existing owner bypass. No protection settings were changed.
+Dependabot alerts 37–39 affect Vitest/mocker versions below `4.1.11`, already
+pinned to `4.1.11` in this PR's manifest and lockfile. The alerts remain open on
+the default branch. Alert 23 (`glib`) remains open with its proposed disposition
+unapproved; no dependency finding is waived by this recheck.
+
+The original implementation plan was recovered from the user's Desktop and is
+preserved in `docs/context-relay-v1-implementation-plan.md`. Independent read-only
+review confirmed all 1,598 lines and the original SHA-256 recorded in the master
+audit. T01–T24 and all eight release-blocking sections remain required. Explicit
+gates include Windows 11 24H2+ x64/macOS 14+ Apple Silicon, online synchronization
+within 10 seconds P95, search below 150 ms P95 for 10,000 memories on supported
+test machines, the full matrix twice from clean machines, recovery after destroying
+the local vault, deletion through final purge, and a signed checklist in the tagged
+commit. The source does not specify a numeric fuzz duration: its phrase "release
+duration" is unresolved and must not be silently replaced by a short passing run.
+
+### Production macOS search-resource integration checkpoint
+
+The daemon now resolves the physical app executable to `Contents/Resources/search`.
+Missing resources remain configured so keyword fallback and explicit retry work.
+The packaging command compiles a separate library-test executable with the same
+runtime trust, signs it with the exact constraint, and requires the disposable
+private-IPC search/restart/tamper/recovery qualification to execute and pass.
+This extends the existing Windows test; no production service is launched.
+
+Local evidence: the new discovery regression failed before implementation, then
+all four `search_index::tests` passed. The exact missing-resource keyword fallback
+test passed; daemon library/tests Clippy with warnings denied passed; 28 package
+and native-workflow tests, the Python extractor test, formatting and whitespace
+checks passed. Scoped independent review reported no actionable P1/P2 findings.
+Native execution of this extension is still pending; the successful `cce0772`
+macOS job establishes the preceding signing/inference pipeline only.

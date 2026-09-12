@@ -698,6 +698,13 @@ impl DaemonConfig {
             vault.search_resources = Some(search_index::resources_beside_executable(&executable)?);
             vault
         };
+        #[cfg(target_os = "macos")]
+        let vault = {
+            let mut vault = vault;
+            let executable = std::env::current_exe().map_err(|_| DaemonError::Startup)?;
+            vault.search_resources = search_index::resources_in_macos_bundle(&executable)?;
+            vault
+        };
         let mut config = Self::new(
             RuntimeConfig::production(),
             vault,
@@ -6260,24 +6267,29 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     #[allow(
         clippy::assertions_on_constants,
         reason = "ignored qualification must compile for ordinary non-static test builds"
     )]
-    #[ignore = "requires explicit packaged assets and static CRT; runs only a disposable daemon"]
+    #[ignore = "requires verified packaged assets and platform signing/static CRT; runs only a disposable daemon"]
     async fn packaged_search_daemon_retries_missing_and_damaged_assets_over_private_ipc() {
         use context_relay_protocol::SearchIndexPhase;
+        #[cfg(windows)]
         use std::os::windows::process::CommandExt;
+        #[cfg(windows)]
         assert!(cfg!(target_feature = "crt-static"));
         let Some(root) = std::env::var_os("CONTEXT_RELAY_PACKAGED_DAEMON_CHILD") else {
             let root = tempfile::tempdir().unwrap();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
                 .args(["--ignored", "--exact", "tests::packaged_search_daemon_retries_missing_and_damaged_assets_over_private_ipc", "--nocapture"])
                 .env("CONTEXT_RELAY_PACKAGED_DAEMON_CHILD", root.path())
-                .env("ORT_DYLIB_PATH", root.path().join("unrelated-runtime.dll"))
-                .creation_flags(0x0800_0000).output().unwrap();
+                .env("ORT_DYLIB_PATH", root.path().join("unrelated-runtime"));
+            #[cfg(windows)]
+            command.creation_flags(0x0800_0000);
+            let output = command.output().unwrap();
             assert!(
                 output.status.success(),
                 "{}\n{}",
@@ -6340,17 +6352,19 @@ mod tests {
         wait_phase(&mut desktop, SearchIndexPhase::Failed).await;
         assert_eq!(search(&mut desktop, "uniquephonemicidentifier").await, 1);
         assert_eq!(search(&mut desktop, "unseenword").await, 0);
+        #[cfg(windows)]
+        let runtime_manifest =
+            include_str!("../../core/models/onnxruntime-win-x64-1.24.2/manifest.json");
+        #[cfg(target_os = "macos")]
+        let runtime_manifest =
+            include_str!("../../core/models/onnxruntime-osx-arm64-1.24.2/manifest.json");
         for (source_env, subdirectory, manifest) in [
             (
                 "CONTEXT_RELAY_MODEL_DIR",
                 "model",
                 include_str!("../../core/models/bge-small-en-v1.5/manifest.json"),
             ),
-            (
-                "CONTEXT_RELAY_RUNTIME_DIR",
-                "runtime",
-                include_str!("../../core/models/onnxruntime-win-x64-1.24.2/manifest.json"),
-            ),
+            ("CONTEXT_RELAY_RUNTIME_DIR", "runtime", runtime_manifest),
         ] {
             let source = PathBuf::from(std::env::var_os(source_env).unwrap());
             let destination = assets.join(subdirectory);
@@ -6361,7 +6375,10 @@ mod tests {
                 std::fs::copy(source.join(file), destination.join(file)).unwrap();
             }
         }
+        #[cfg(windows)]
         let damaged = assets.join("runtime/msvcp140_1.dll");
+        #[cfg(target_os = "macos")]
+        let damaged = assets.join("runtime/libonnxruntime.1.24.2.dylib");
         let good = std::fs::read(&damaged).unwrap();
         let mut bad = good.clone();
         *bad.last_mut().unwrap() ^= 1;

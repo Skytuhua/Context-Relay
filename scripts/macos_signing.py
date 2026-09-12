@@ -1,6 +1,7 @@
 """Sign verified macOS runtime inputs and final app executables in dependency order."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
 import plistlib
@@ -60,8 +61,8 @@ def constraint_digest(image):
     return digest
 
 
-def run(args):
-    result = subprocess.run(args, capture_output=True, timeout=120)
+def run(args, env=None):
+    result = subprocess.run(args, capture_output=True, timeout=120, env=env)
     if result.returncode:
         raise RuntimeError(f"{Path(args[0]).name} failed: {result.stderr.decode('utf-8', errors='replace')}")
     return result
@@ -115,7 +116,7 @@ def prepare(runtime, metadata, identity):
     metadata.write_text(json.dumps(value), encoding="utf-8")
 
 
-def finish(app, metadata, identity):
+def finish(app, metadata, identity, qualification):
     value = json.loads(metadata.read_text(encoding="utf-8"))
     if value["identity"] != identity:
         raise ValueError("signing identity changed after runtime preparation")
@@ -159,17 +160,33 @@ def finish(app, metadata, identity):
         if rejected.returncode == 0 or rejected.stdout:
             raise ValueError("packaged daemon accepted a changed runtime")
     print("Verified assembled macOS app signing constraints and real packaged inference", flush=True)
+    sign(qualification, identity, constraint, entitlements)
+    if constraint_digest(qualification.read_bytes()) != trust["libraryConstraintSha256"]:
+        raise ValueError("daemon qualification constraint mismatch")
+    result = run([str(qualification), "--ignored", "--exact",
+        "tests::packaged_search_daemon_retries_missing_and_damaged_assets_over_private_ipc", "--nocapture"], env={
+            **os.environ,
+            "CONTEXT_RELAY_MODEL_DIR": str(app / "Contents/Resources/search/model"),
+            "CONTEXT_RELAY_RUNTIME_DIR": str(app / "Contents/Resources/search/runtime"),
+        })
+    if b"test result: ok. 1 passed; 0 failed;" not in result.stdout:
+        raise ValueError("daemon packaged-search qualification did not execute exactly one passing test")
+    print("Verified disposable macOS daemon search, restart, tamper rejection and recovery", flush=True)
 
 
 def main():
     if platform.system() != "Darwin" or platform.machine() != "arm64" or int(platform.mac_ver()[0].split(".")[0]) < 14:
         raise RuntimeError("requires native arm64 macOS 14+")
-    if len(sys.argv) != 5 or sys.argv[1] not in ("prepare", "finish"):
-        raise ValueError("expected prepare|finish runtime-or-app metadata signing-identity")
-    mode, source, metadata, identity = sys.argv[1:]
+    if len(sys.argv) < 2 or (sys.argv[1], len(sys.argv)) not in (("prepare", 5), ("finish", 6)):
+        raise ValueError("expected prepare runtime metadata identity | finish app metadata identity qualification")
+    mode, source, metadata, identity = sys.argv[1:5]
     if identity != "-" and not identity.startswith("Developer ID Application:"):
         raise ValueError("choose explicit internal candidate '-' or Developer ID Application identity")
-    (prepare if mode == "prepare" else finish)(Path(source).resolve(strict=True), Path(metadata).resolve(), identity)
+    args = (Path(source).resolve(strict=True), Path(metadata).resolve(), identity)
+    if mode == "prepare":
+        prepare(*args)
+    else:
+        finish(*args, Path(sys.argv[5]).resolve(strict=True))
 
 
 if __name__ == "__main__":

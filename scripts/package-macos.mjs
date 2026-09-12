@@ -9,6 +9,16 @@ const target = 'aarch64-apple-darwin';
 const workspace = fileURLToPath(new URL('../', import.meta.url));
 const companions = ['context-relay-contextd', 'context-relay-context-mcp', 'context-relay-native-helper', 'context-relay-sidecar-installer'];
 
+export function daemonTestExecutable(output) {
+  const artifacts = output.split('\n').filter(line => line.trim()).map(line => JSON.parse(line))
+    .filter(value => value.reason === 'compiler-artifact' && value.profile?.test
+      && value.target?.name === 'context_relay_contextd' && value.target.kind?.includes('lib') && value.executable);
+  if (artifacts.length !== 1 || !isAbsolute(artifacts[0].executable)) {
+    throw new Error('Cargo must provide exactly one absolute daemon library test executable');
+  }
+  return artifacts[0].executable;
+}
+
 function validateExecutable(bytes, name) {
   const invalid = () => { throw new Error(`${name}: invalid thin arm64 Mach-O executable`); };
   if (bytes.length < 32 || bytes.readUInt32LE(0) !== 0xfeedfacf
@@ -87,8 +97,12 @@ async function main() {
     tauriCli, 'build', '--target', target, '--no-sign',
     '--config', 'src-tauri/tauri.macos-release.conf.json', '--', '--locked',
   ], { cwd: desktop, env, stdio: 'inherit' });
+  const qualification = daemonTestExecutable(execFileSync('cargo', [
+    'test', '--locked', '--release', '--target', target, '--target-dir', targetDirectory,
+    '-p', 'context-relay-contextd', '--features', 'test-support', '--lib', '--no-run', '--message-format=json',
+  ], { cwd: workspace, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], maxBuffer: 16 * 1024 * 1024 }));
   execFileSync('python3', [signingScript, 'finish',
-    join(targetDirectory, target, 'release', 'bundle', 'macos', 'Context Relay.app'), signingMetadata, identity,
+    join(targetDirectory, target, 'release', 'bundle', 'macos', 'Context Relay.app'), signingMetadata, identity, qualification,
   ], { cwd: workspace, stdio: 'inherit' });
 }
 

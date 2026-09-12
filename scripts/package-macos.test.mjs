@@ -3,9 +3,19 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, stat } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { stageMacCompanions } from './package-macos.mjs';
+import { daemonTestExecutable, stageMacCompanions } from './package-macos.mjs';
 
 const names = ['context-relay-contextd', 'context-relay-context-mcp', 'context-relay-native-helper', 'context-relay-sidecar-installer'];
+test('qualification selects exactly one daemon library test executable from Cargo output', () => {
+  const executable = join(tmpdir(), 'context_relay_contextd-test');
+  const artifact = { reason: 'compiler-artifact', target: { name: 'context_relay_contextd', kind: ['lib'] }, profile: { test: true }, executable };
+  const encode = values => values.map(value => JSON.stringify(value)).join('\n') + '\n';
+  const unrelated = [{ reason: 'build-finished', success: true }, { ...artifact, target: { name: 'other', kind: ['lib'] } }, { ...artifact, profile: { test: false } }];
+  assert.equal(daemonTestExecutable(encode([...unrelated, artifact])), executable);
+  for (const values of [unrelated, [artifact, artifact], [{ ...artifact, executable: 'relative' }], [{ ...artifact, target: { name: 'context_relay_contextd', kind: ['bin'] } }]]) {
+    assert.throws(() => daemonTestExecutable(encode(values)), /daemon library test/);
+  }
+});
 function executable() {
   // A thin arm64 executable header with one load command; not executable code.
   const bytes = Buffer.alloc(40);

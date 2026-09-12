@@ -18,6 +18,30 @@ pub(super) fn resources_beside_executable(
         .join("search"))
 }
 
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn resources_in_macos_bundle(
+    executable: &std::path::Path,
+) -> Result<Option<PathBuf>, crate::DaemonError> {
+    let executable = executable
+        .canonicalize()
+        .map_err(|_| crate::DaemonError::Startup)?;
+    let Some(macos) = executable.parent() else {
+        return Ok(None);
+    };
+    let Some(contents) = macos.parent() else {
+        return Ok(None);
+    };
+    let bundled = macos.file_name().is_some_and(|name| name == "MacOS")
+        && contents.file_name().is_some_and(|name| name == "Contents")
+        && contents
+            .parent()
+            .and_then(|app| app.extension())
+            .is_some_and(|ext| ext == "app");
+    // Unbundled developer binaries keep keyword search. Missing bundle resources
+    // must reach the worker so it reports Failed and supports explicit retry.
+    Ok(bundled.then(|| contents.join("Resources/search")))
+}
+
 pub(super) struct SearchIndexJob {
     pub(super) status: SearchIndexStatus,
     pending: bool,
@@ -127,6 +151,41 @@ impl SearchIndexJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_search_resources_follow_the_physical_app_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp
+            .path()
+            .join("Context Relay.app/Contents/MacOS/contextd");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, b"location fixture; never executed").unwrap();
+        let expected = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("Context Relay.app/Contents/Resources/search");
+        assert_eq!(
+            resources_in_macos_bundle(&executable).unwrap(),
+            Some(expected.clone())
+        );
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("contextd");
+            std::os::unix::fs::symlink(&executable, &link).unwrap();
+            assert_eq!(resources_in_macos_bundle(&link).unwrap(), Some(expected));
+            let outside = temp.path().join("outside");
+            std::fs::write(&outside, b"unbundled executable").unwrap();
+            std::fs::remove_file(&executable).unwrap();
+            std::os::unix::fs::symlink(&outside, &executable).unwrap();
+            assert_eq!(resources_in_macos_bundle(&executable).unwrap(), None);
+        }
+        let unrelated = temp.path().join("unrelated/Contents/MacOS/contextd");
+        std::fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        std::fs::write(&unrelated, b"unbundled executable").unwrap();
+        assert_eq!(resources_in_macos_bundle(&unrelated).unwrap(), None);
+        assert!(resources_in_macos_bundle(&temp.path().join("missing")).is_err());
+    }
 
     #[cfg(windows)]
     #[test]

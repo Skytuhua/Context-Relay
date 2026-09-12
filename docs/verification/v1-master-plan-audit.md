@@ -3,7 +3,14 @@
 This is the authoritative audit baseline for PR #12 at
 `3c2a371aef74f4962af64d0fe71545557244f21a`, compared with base
 `367b32e15d06a7d46b6b8d04676d38dc368ae235`. The v1 implementation plan remains
-the product and security authority. The development report is a claims ledger:
+the product and security authority. Its original source is now preserved as
+[Context Relay v1 Implementation Plan](../context-relay-v1-implementation-plan.md),
+recovered on September 12 from the user-provided Desktop plan (original file
+SHA-256 `cb507efa2b8d337079d5faa19d2c3c466c9e900bfd1f63e0aa14468e6ee54b56`).
+The original repository-state description is historical; reviewed changes are in
+the [contract amendments](../protocols/contract-amendments.md). The complete
+acceptance scope is Tasks T01–T24 and all eight release-blocking matrix sections.
+The development report is a claims ledger:
 counts and assertions from it are not verification unless a repository evidence
 ledger below identifies the execution plane and its limitations.
 

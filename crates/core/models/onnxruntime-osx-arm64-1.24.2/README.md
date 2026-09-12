@@ -52,12 +52,16 @@ consumers, builds all four companions, and assembles Tauri with `--no-sign`.
 It then signs the final companions and outer app, checks the final runtime
 bytes and executable constraints, and invokes `--verify-packaged-search` on
 the bundled daemon. This explicit mode runs real embedding inference without
-starting a vault or IPC service. A disposable copied app with a changed runtime
-must be rejected. The CI identity `-` uses an internal library-validation
+starting a vault or IPC service. A disposable copied app must first pass inference,
+then reject a changed runtime. The CI identity `-` uses an internal library-validation
 exception; Developer ID mode keeps normal validation and never falls back.
 
-The complete native signing/inference run remains pending. Production resource
-discovery, Developer ID enrollment/notarization and installed acceptance remain
-required. These manifest hashes describe upstream input bytes; the signing
+The internal signing/inference gate passed at `cce0772` in native macOS job
+`103552389709` on 2026-09-12. The packaging command now also signs and runs a
+disposable daemon qualification executable for missing/tampered resources,
+semantic search, restart and recovery; native evidence for this extension remains
+pending. Production resource discovery uses the physical app executable's
+`Contents/Resources/search` directory. Developer ID enrollment/notarization and
+installed acceptance remain required. These manifest hashes describe upstream input bytes; the signing
 pipeline separately binds the resulting signed bytes. No distributed release
 or installed search acceptance is claimed by this manifest.
