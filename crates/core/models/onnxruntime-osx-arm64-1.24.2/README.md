@@ -59,8 +59,8 @@ exception; Developer ID mode keeps normal validation and never falls back.
 The internal signing/inference gate passed at `cce0772` in native macOS job
 `103552389709` on 2026-09-12. The packaging command now also signs and runs a
 disposable daemon qualification executable for missing/tampered resources,
-semantic search, restart and recovery; native evidence for this extension remains
-pending. Production resource discovery uses the physical app executable's
+semantic search, restart and recovery. This extension passed native macOS job
+`103555264457` at `b59551f` on 2026-09-12. Production resource discovery uses the physical app executable's
 `Contents/Resources/search` directory. Developer ID enrollment/notarization and
 installed acceptance remain required. These manifest hashes describe upstream input bytes; the signing
 pipeline separately binds the resulting signed bytes. No distributed release

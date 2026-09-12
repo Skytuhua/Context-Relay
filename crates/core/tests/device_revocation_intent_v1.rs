@@ -219,7 +219,7 @@ fn schema_36_upgrade_does_not_invent_revocation_authority() {
         unsafe { rusqlite::ffi::sqlite3_key(raw.handle(), key.as_ptr().cast(), 32) },
         rusqlite::ffi::SQLITE_OK
     );
-    raw.execute_batch("DROP TABLE revocation_control_history; DROP TABLE device_revocation_intents; PRAGMA user_version=36;")
+    raw.execute_batch("DROP TABLE revocation_genesis_anchor; DROP TABLE revocation_control_history; DROP TABLE device_revocation_intents; PRAGMA user_version=36;")
         .unwrap();
     drop(raw);
     let vault = Vault::open(path.path(), "migration", &store).unwrap();

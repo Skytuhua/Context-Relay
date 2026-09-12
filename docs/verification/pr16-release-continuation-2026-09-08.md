@@ -3169,3 +3169,39 @@ artifact is diagnostic evidence only, never release or sustained-build evidence.
 Local validation: the metadata projection regression failed before implementation,
 then it and the 25 native workflow contracts passed. Remote diagnostic execution
 remains pending. No firewall or audit settings were changed on the user's host.
+
+### Native macOS daemon recovery gate passed
+
+At `b59551f97f858aa25a0480673812fb7fe48d821a`, native macOS job
+`103555264457` in CI `34694397897` completed successfully. The actual log records
+copied-app inference at 12:54:13 UTC, assembled-app signing/constraint/inference
+verification at 12:54:14, and disposable daemon search/restart/tamper/recovery at
+12:54:16 on September 12. Local evidence is `.codex/pr16-macos-daemon-b59551f.log`.
+This closes the pending native execution of that extension, not Developer ID,
+notarization, installed performance, clean-machine acceptance or full release.
+
+### Durable enrollment genesis evidence
+
+Schema 39 adds historical root-only enrollment anchor evidence and a separately
+stored enrollment-accepted epoch/key/hash tip. Fresh Prepared-to-Active enrollment
+creates it atomically from the authenticated record and genesis certificate only
+when the local vault has no prior device/restore/revocation state. Existing
+certificate rows preserve ordinary enrollment behavior but do not create an
+anchor. Migration and Active retries never backfill or reset this authority.
+The narrow read API authenticates active enrollment and device keys, bounds every
+new stored field, and compares independently derived root-only hashes.
+
+This is historical enrollment evidence, not current complete membership or
+production rotation authority. Hosted certificate snapshots authenticate valid
+members but may omit siblings. Pairing v2 transfers an enrollment-record pin,
+not a complete roster and accepted tip. The authenticated membership-update and
+roster/tip-transfer contract remains necessary before revocation wiring; ordinary
+sync remains unchanged.
+
+The new regression failed at the absent table before implementation. All twelve
+recovery-enrollment tests then passed, including atomic failure, restart, wrong
+keys, expanded valid hosted certificates, exact replay, corrupt tips and legacy
+absence. Independent source review found no actionable P1/P2 findings. Six older
+schema upgrade tests passed across lifecycle, revocation, pairing, restore and
+search fixtures; core library/tests Clippy with warnings denied, formatting and
+whitespace checks also passed. These are local component results.

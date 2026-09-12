@@ -264,7 +264,7 @@ fn schema_31_and_32_upgrades_create_empty_pairing_metadata() {
         let result = unsafe { rusqlite::ffi::sqlite3_key(raw.handle(), key.as_ptr().cast(), 32) };
         assert_eq!(result, rusqlite::ffi::SQLITE_OK);
         raw.execute_batch(
-            "DROP TABLE IF EXISTS revocation_control_history; DROP TABLE IF EXISTS device_revocation_intents; DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews;",
+            "DROP TABLE IF EXISTS revocation_genesis_anchor; DROP TABLE IF EXISTS revocation_control_history; DROP TABLE IF EXISTS device_revocation_intents; DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews;",
         )
         .unwrap();
         if version == 31 {

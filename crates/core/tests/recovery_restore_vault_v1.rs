@@ -565,7 +565,7 @@ fn schema_29_preserves_prepared_and_active_restore_rows() {
             "INSERT INTO recovery_restores_legacy SELECT * FROM recovery_restores;
             DROP TABLE recovery_restores;
             ALTER TABLE recovery_restores_legacy RENAME TO recovery_restores;
-            DROP TABLE IF EXISTS revocation_control_history; DROP TABLE IF EXISTS device_revocation_intents; DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews; DROP TABLE hosted_pairing_intents;
+            DROP TABLE IF EXISTS revocation_genesis_anchor; DROP TABLE IF EXISTS revocation_control_history; DROP TABLE IF EXISTS device_revocation_intents; DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews; DROP TABLE hosted_pairing_intents;
             DROP TABLE hosted_restore_intent;
             PRAGMA user_version = 29;",
         )

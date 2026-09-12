@@ -36,6 +36,218 @@ const CERTIFICATE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073986";
 const OTHER_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073987";
 
 #[test]
+fn genesis_control_anchor_is_atomic_durable_and_never_reinitialized() {
+    let fixture = fixture();
+    let path = TempVault::new("genesis-control-anchor");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    vault
+        .prepare_recovery_enrollment(&write(&fixture.artifacts, 1000))
+        .unwrap();
+    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    raw.execute_batch("CREATE TRIGGER fail_genesis_activation BEFORE UPDATE OF state ON recovery_enrollments WHEN NEW.state='active' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(
+        vault
+            .activate_recovery_enrollment(
+                &receipt(&fixture.artifacts, 2000),
+                &fixture.device_keys,
+                3000
+            )
+            .is_err()
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM revocation_genesis_anchor",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert!(
+        vault
+            .recovery_enrollment_genesis_anchor(&fixture.device_keys)
+            .unwrap()
+            .is_none()
+    );
+    raw.execute_batch("DROP TRIGGER fail_genesis_activation")
+        .unwrap();
+    vault
+        .activate_recovery_enrollment(
+            &receipt(&fixture.artifacts, 2000),
+            &fixture.device_keys,
+            3000,
+        )
+        .unwrap();
+    drop(vault);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let anchor = vault
+        .recovery_enrollment_genesis_anchor(&fixture.device_keys)
+        .unwrap()
+        .unwrap();
+    let state = anchor.genesis_state();
+    assert_eq!(state.active_devices.len(), 1);
+    assert_eq!(
+        state.active_devices.get(&id(DEVICE_ID)),
+        Some(&fixture.artifacts.record.genesis_certificate)
+    );
+    assert_eq!(anchor.enrollment_accepted_tip(), (1, 1, state.state_sha256));
+    assert!(
+        vault
+            .recovery_enrollment_genesis_anchor(&DeviceKeys::generate().unwrap())
+            .is_err()
+    );
+    let child_keys = DeviceKeys::generate().unwrap();
+    let child = DeviceCertificateV1::issue_by_device(
+        CertificateFieldsV1 {
+            account_id: id(ACCOUNT_ID),
+            workspace_id: id(WORKSPACE_ID),
+            control_epoch: 1,
+            request_nonce: PairingRequestNonce([2; 32]),
+            device_id: id(OTHER_ID),
+            signing_public_key: child_keys.signing_public_key(),
+            wrapping_public_key: child_keys.wrapping_public_key(),
+        },
+        id(DEVICE_ID),
+        &fixture.device_keys,
+    )
+    .unwrap();
+    let snapshot = context_relay_core::sync::DeviceCertificateSnapshot::from_certificates_for_test(
+        state.scope,
+        vec![child],
+    );
+    use context_relay_core::sync::TrustedSyncMaterial;
+    assert!(
+        vault
+            .trusted_sync_material_with_certificates(&fixture.device_keys, &snapshot)
+            .unwrap()
+            .trusted_device(id(ACCOUNT_ID), id(WORKSPACE_ID), id(OTHER_ID))
+            .is_ok()
+    );
+    let unchanged = vault
+        .recovery_enrollment_genesis_anchor(&fixture.device_keys)
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.genesis_state().active_devices.len(), 1);
+    assert_eq!(
+        unchanged.enrollment_accepted_tip(),
+        anchor.enrollment_accepted_tip()
+    );
+    let hashes = raw.query_row("SELECT anchor_sha256, accepted_state_sha256 FROM revocation_genesis_anchor WHERE control_epoch=1 AND key_epoch=1", [], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))).unwrap();
+    assert_eq!(hashes.0, hashes.1);
+    assert_eq!(hashes.0.len(), 32);
+    assert_eq!(
+        vault
+            .activate_recovery_enrollment(
+                &receipt(&fixture.artifacts, 2000),
+                &fixture.device_keys,
+                3000
+            )
+            .unwrap(),
+        CommitDisposition::ExactReplay
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT anchor_sha256 FROM revocation_genesis_anchor",
+            [],
+            |row| row.get::<_, Vec<u8>>(0)
+        )
+        .unwrap(),
+        hashes.0
+    );
+    raw.execute_batch("UPDATE revocation_genesis_anchor SET accepted_state_sha256=zeroblob(32)")
+        .unwrap();
+    assert!(
+        vault
+            .recovery_enrollment_genesis_anchor(&fixture.device_keys)
+            .is_err()
+    );
+    assert_eq!(
+        vault
+            .activate_recovery_enrollment(
+                &receipt(&fixture.artifacts, 2000),
+                &fixture.device_keys,
+                3000
+            )
+            .unwrap(),
+        CommitDisposition::ExactReplay
+    );
+    assert!(
+        vault
+            .recovery_enrollment_genesis_anchor(&fixture.device_keys)
+            .is_err()
+    );
+    raw.execute_batch("DELETE FROM revocation_genesis_anchor")
+        .unwrap();
+    assert!(
+        vault
+            .recovery_enrollment_genesis_anchor(&fixture.device_keys)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        vault
+            .activate_recovery_enrollment(
+                &receipt(&fixture.artifacts, 2000),
+                &fixture.device_keys,
+                3000
+            )
+            .unwrap(),
+        CommitDisposition::ExactReplay
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM revocation_genesis_anchor",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert!(
+        vault
+            .recovery_enrollment_genesis_anchor(&fixture.device_keys)
+            .unwrap()
+            .is_none()
+    );
+    let populated_path = TempVault::new("genesis-existing-device");
+    let mut populated = Vault::open(populated_path.path(), CREDENTIAL, &keys).unwrap();
+    populated
+        .store_device_certificate(
+            fixture.artifacts.record.genesis_certificate_id,
+            &fixture.artifacts.record.genesis_certificate,
+            DeviceCertificateState::Active,
+            &context_relay_core::vault::DeviceDisplayMetadata {
+                device_name: fixture.artifacts.record.device_name.clone(),
+                platform: fixture.artifacts.record.device_platform,
+            },
+            3000,
+        )
+        .unwrap();
+    populated
+        .prepare_recovery_enrollment(&write(&fixture.artifacts, 1000))
+        .unwrap();
+    populated
+        .activate_recovery_enrollment(
+            &receipt(&fixture.artifacts, 2000),
+            &fixture.device_keys,
+            3000,
+        )
+        .unwrap();
+    assert!(
+        populated
+            .enrolled_workspace_material(&fixture.device_keys)
+            .is_ok()
+    );
+    assert!(
+        populated
+            .recovery_enrollment_genesis_anchor(&fixture.device_keys)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn accepted_legacy_candidate_backfills_before_memory_in_single_record_batches() {
     let fixture = fixture();
     let path = TempVault::new("accepted-alias-backfill");
@@ -1127,7 +1339,7 @@ fn prepared_enrollment_activates_exactly_and_reopens_sealed_material() {
     raw.execute_batch(include_str!("../migrations/0022_recovery_enrollment.sql"))
         .unwrap();
     raw.execute_batch("INSERT INTO recovery_enrollments SELECT * FROM enrollment_fixture; DROP TABLE enrollment_fixture;").unwrap();
-    raw.execute_batch("DROP TABLE IF EXISTS revocation_control_history; DROP TABLE IF EXISTS device_revocation_intents; DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews; DROP TABLE hosted_pairing_intents; DROP TABLE hosted_restore_intent;")
+    raw.execute_batch("DROP TABLE IF EXISTS revocation_genesis_anchor; DROP TABLE IF EXISTS revocation_control_history; DROP TABLE IF EXISTS device_revocation_intents; DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews; DROP TABLE hosted_pairing_intents; DROP TABLE hosted_restore_intent;")
         .unwrap();
     raw.pragma_update(None, "user_version", 28).unwrap();
     drop(raw);
