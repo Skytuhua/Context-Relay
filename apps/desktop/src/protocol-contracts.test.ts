@@ -49,6 +49,25 @@ import type {
 import { PROTOCOL_VERSION } from './bindings';
 import * as protocolValidation from './protocol-validation';
 
+it('accepts only bounded hosted auth control status without credentials', () => {
+  const generation = '019924bb-5300-7000-8000-000000000001';
+  const validate = protocolValidation.validateHostedAuthStatus;
+  for (const state of [
+    ...['disabled', 'signing_in', 'restoring', 'connected', 'signing_out'].map((phase) => ({ phase })),
+    { phase: 'signed_out', remoteRevoked: null },
+    { phase: 'signed_out', remoteRevoked: false },
+    { phase: 'signed_out', remoteRevoked: true },
+    ...['unavailable', 'denied', 'expired', 'credential_store'].map((reason) => ({ phase: 'failed', reason })),
+  ]) {
+    expect(validate({ generation, state })).toEqual({ generation, state });
+    expect(() => validate({ generation, state: { ...state, accessToken: 'forbidden' } })).toThrow();
+  }
+  for (const state of [{ phase: 'signed_out' }, { phase: 'failed', reason: 'provider-secret' }, { phase: 'unknown' }, null]) {
+    expect(() => validate({ generation, state })).toThrow();
+  }
+  expect(() => validate({ generation: 'bad', state: { phase: 'disabled' } })).toThrow();
+});
+
 const { createProtocolSchemaValidator } = protocolValidation;
 type Assert<T extends true> = T;
 type OperationBrandIsPreserved = Assert<OperationId extends SyncOperationV1['operationId'] ? true : false>;
@@ -188,8 +207,8 @@ const nullAtPath = (value: unknown, path: readonly PropertyKey[]) => {
 };
 
 describe('generated protocol version', () => {
-  it('advertises the profile-bound local contract as v1.4', () => {
-    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 4 });
+  it('advertises the background search status contract as v1.11', () => {
+    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 15 });
   });
 });
 
@@ -306,7 +325,7 @@ describe('protocol schemas', () => {
     }
   });
 
-  it('accepts only the exact status protocol range for v1.4', () => {
+  it('accepts only the exact status protocol range for v1.15', () => {
     const ajv = createProtocolSchemaValidator();
     const validate = ajv.compile(load('schemas/context_relay_status-output-v1.json'));
     const fixture = load('crates/protocol/tests/fixtures/mcp-output-valid.json').context_relay_status;
@@ -314,7 +333,7 @@ describe('protocol schemas', () => {
     for (const protocol of [
       { min: { major: 2, minor: 0 }, max: { major: 2, minor: 0 } },
       { min: { major: 1, minor: 0 }, max: { major: 1, minor: 0 } },
-      { min: { major: 1, minor: 4 }, max: { major: 1, minor: 5 } },
+      { min: { major: 1, minor: 6 }, max: { major: 1, minor: 15 } },
       { min: { major: 1, minor: 1 }, max: { major: 1, minor: 0 } },
     ]) {
       expect(validate({ ...fixture, protocol }), JSON.stringify(protocol)).toBe(false);

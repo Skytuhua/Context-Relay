@@ -6,8 +6,8 @@ use context_relay_protocol::{
 fn status_output_requires_the_exact_supported_local_version() {
     let mut output = serde_json::json!({
         "protocol": {
-            "min": { "major": 1, "minor": 4 },
-            "max": { "major": 1, "minor": 4 }
+            "min": { "major": 1, "minor": 15 },
+            "max": { "major": 1, "minor": 15 }
         },
         "vault": "unlocked",
         "resolvedProject": null,
@@ -26,8 +26,8 @@ fn status_output_requires_the_exact_supported_local_version() {
             "max": { "major": 1, "minor": 0 }
         }),
         serde_json::json!({
-            "min": { "major": 1, "minor": 4 },
-            "max": { "major": 1, "minor": 5 }
+            "min": { "major": 1, "minor": 7 },
+            "max": { "major": 1, "minor": 15 }
         }),
         serde_json::json!({
             "min": { "major": 1, "minor": 1 },
@@ -45,9 +45,25 @@ fn status_output_requires_the_exact_supported_local_version() {
 
 #[test]
 fn upsert_option_pairing_and_tag_uniqueness_are_frozen() {
-    let upsert = mcp_schema("context_relay_upsert_task").unwrap().input;
-    assert!(upsert.get("anyOf").is_some());
-    assert!(upsert.get("oneOf").is_none());
+    let id = serde_json::json!("018f22e2-79b0-7cc8-98c4-dc0c0c07398f");
+    for task in [None, Some(serde_json::Value::Null), Some(id.clone())] {
+        for revision in [None, Some(serde_json::Value::Null), Some(id.clone())] {
+            let mut value = serde_json::json!({"operationId":id,"title":"Task","bodyMarkdown":"Body","status":"open"});
+            if let Some(task) = &task {
+                value["taskId"] = task.clone();
+            }
+            if let Some(revision) = &revision {
+                value["expectedRevision"] = revision.clone();
+            }
+            let paired = task.as_ref().is_some_and(|v| v.is_string())
+                == revision.as_ref().is_some_and(|v| v.is_string());
+            assert_eq!(
+                validate_mcp_fixture("context_relay_upsert_task", true, &value).is_ok(),
+                paired,
+                "{value}"
+            );
+        }
+    }
     for name in ["context_relay_remember", "context_relay_propose_memory"] {
         let schema = mcp_schema(name).unwrap().input;
         assert_eq!(schema["properties"]["tags"]["uniqueItems"], true);
@@ -60,6 +76,36 @@ fn upsert_option_pairing_and_tag_uniqueness_are_frozen() {
             value["evidenceSummary"] = "evidence".into();
         }
         assert!(validate_mcp_fixture(name, true, &value).is_err());
+    }
+}
+
+#[test]
+fn model_tool_inputs_do_not_use_unsupported_top_level_combinators() {
+    // The actual Claude client drops tools with these root keywords before
+    // sending the model request, even when type is explicitly object.
+    for name in context_relay_protocol::MCP_TOOL_NAMES {
+        let input = mcp_schema(name).unwrap().input;
+        for keyword in ["anyOf", "oneOf", "allOf"] {
+            assert!(input.get(keyword).is_none(), "{name}: {keyword}");
+        }
+    }
+}
+
+#[test]
+fn handoff_requires_at_least_one_selected_record() {
+    let id = serde_json::json!("018f22e2-79b0-7cc8-98c4-dc0c0c07398f");
+    let decision = serde_json::json!("018f22e2-79b0-7cc8-98c4-dc0c0c073990");
+    for mask in 0..8 {
+        let value = serde_json::json!({"operationId":id,"summary":"Continue",
+            "memoryIds":if mask & 1 != 0 { vec![id.clone()] } else { vec![] },
+            "decisionIds":if mask & 2 != 0 { vec![decision.clone()] } else { vec![] },
+            "taskIds":if mask & 4 != 0 { vec![id.clone()] } else { vec![] },
+        });
+        assert_eq!(
+            validate_mcp_fixture("context_relay_create_handoff", true, &value).is_ok(),
+            mask != 0,
+            "{value}"
+        );
     }
 }
 

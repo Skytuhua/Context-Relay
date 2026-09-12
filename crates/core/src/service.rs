@@ -6,8 +6,9 @@ use context_relay_protocol::{
     McpScopeSelector, MemoryArchiveParams, MemoryCandidate, MemoryCreateParams, MemoryId,
     MemoryOrigin, MemoryRecord, MemoryUpdateParams, NativeHookEvent, NativeHookEventParams,
     OperationId, ProjectId, ProjectIdentity, ProposeMemoryInput, Provenance, ReadableRecord,
-    RecordId, ScopeRef, SearchParams, Sha256Digest, TaskCompleteParams, TaskEvidence, TaskId,
-    TaskRecord, TaskStatus, TaskTransitionParams, TaskUpsertParams, WireNativeValue,
+    RecordId, RecordMutationV1, ScopeRef, SearchParams, Sha256Digest, TaskCompleteParams,
+    TaskEvidence, TaskId, TaskRecord, TaskStatus, TaskTransitionParams, TaskUpsertParams,
+    WireNativeValue,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -28,6 +29,7 @@ use crate::{
 pub struct OfflineWorkspace<'a> {
     vault: &'a mut Vault,
     device_id: DeviceId,
+    sync_identity: Option<crate::sync::SyncIdentity<'a>>,
 }
 
 struct PreparedLocalMutation<T> {
@@ -38,7 +40,166 @@ struct PreparedLocalMutation<T> {
 
 impl<'a> OfflineWorkspace<'a> {
     pub const fn new(vault: &'a mut Vault, device_id: DeviceId) -> Self {
-        Self { vault, device_id }
+        Self {
+            vault,
+            device_id,
+            sync_identity: None,
+        }
+    }
+
+    /// Configure local signing with material verified by the owning daemon.
+    /// Network authentication is separate: local writes remain available offline.
+    pub fn with_sync_identity(
+        mut self,
+        identity: crate::sync::SyncIdentity<'a>,
+    ) -> Result<Self, ClientError> {
+        if identity.device_id != self.device_id
+            || identity.control_epoch == 0
+            || identity.key_epoch == 0
+        {
+            return Err(invalid_request());
+        }
+        self.sync_identity = Some(identity);
+        Ok(self)
+    }
+
+    fn persist_memory(
+        &mut self,
+        prepared: &PreparedLocalMutation<MemoryRecord>,
+    ) -> Result<(), ClientError> {
+        let embedding = memory_embedding(&prepared.value)?;
+        if self.sync_identity.is_none() {
+            return vault(self.vault.put_local_memory_with_binding(
+                &prepared.value,
+                &embedding,
+                &prepared.binding,
+            ));
+        }
+        self.persist_signed_mutation(
+            &context_relay_protocol::RecordMutationV1::UpsertMemory(prepared.value.clone()),
+            &prepared.binding,
+            Some(&embedding),
+            prepared.value.updated_hlc,
+        )
+    }
+
+    fn persist_task(
+        &mut self,
+        prepared: &PreparedLocalMutation<TaskRecord>,
+        created_hlc: HybridLogicalClock,
+    ) -> Result<(), ClientError> {
+        if self.sync_identity.is_none() {
+            return vault(
+                self.vault
+                    .put_task_with_binding(&prepared.value, &prepared.binding),
+            );
+        }
+        self.persist_signed_mutation(
+            &context_relay_protocol::RecordMutationV1::UpsertTask(prepared.value.clone()),
+            &prepared.binding,
+            None,
+            created_hlc,
+        )
+    }
+
+    fn persist_signed_mutation(
+        &mut self,
+        mutation: &context_relay_protocol::RecordMutationV1,
+        binding: &LocalOperationBinding,
+        embedding: Option<&Embedding384>,
+        created_hlc: HybridLogicalClock,
+    ) -> Result<(), ClientError> {
+        let built =
+            self.build_signed_mutation(mutation, binding.operation_id, created_hlc, None)?;
+        let response = match mutation {
+            context_relay_protocol::RecordMutationV1::UpsertMemory(value) => {
+                serde_json::to_vec(value)
+            }
+            context_relay_protocol::RecordMutationV1::UpsertTask(value) => {
+                serde_json::to_vec(value)
+            }
+            context_relay_protocol::RecordMutationV1::UpsertMemoryCandidate(value) => {
+                serde_json::to_vec(value)
+            }
+            _ => return Err(internal()),
+        }
+        .map_err(|_| internal())?;
+        vault(self.vault.commit_outgoing_operation_with_binding(
+            mutation, &built, embedding, binding, &response,
+        ))
+        .map(|_| ())
+    }
+
+    fn build_signed_mutation(
+        &self,
+        mutation: &context_relay_protocol::RecordMutationV1,
+        operation_id: OperationId,
+        created_hlc: HybridLogicalClock,
+        preceding: Option<&crate::sync::BuiltOperation>,
+    ) -> Result<crate::sync::BuiltOperation, ClientError> {
+        use context_relay_protocol::RecordMutationV1;
+        let identity = self.sync_identity.as_ref().ok_or_else(internal)?;
+        let project_id = match mutation {
+            RecordMutationV1::UpsertMemory(memory) => memory.scope.clone(),
+            RecordMutationV1::UpsertTask(task) => ScopeRef::Project {
+                project_id: task.project_id,
+            },
+            RecordMutationV1::UpsertMemoryCandidate(candidate) => {
+                candidate.proposed_memory.scope.clone()
+            }
+            _ => return Err(internal()),
+        };
+        let project_id = match project_id {
+            ScopeRef::Global => None,
+            ScopeRef::Project { project_id } => Some(project_id),
+        };
+        use crate::sync::{
+            OperationBuildRequest, OperationBuilder, OperationChainHead, SyncIdentity, SyncScope,
+        };
+        let scope = SyncScope {
+            account_id: identity.account_id,
+            workspace_id: identity.workspace_id,
+        };
+        let mut previous = vault(
+            self.vault
+                .device_head(identity.workspace_id, self.device_id),
+        )?
+        .map(|head| OperationChainHead {
+            sequence: head.sequence,
+            canonical_hash: head.canonical_hash,
+        });
+        let mut causal_frontier = vault(self.vault.sync_checkpoint_frontier(scope))?;
+        if let Some(built) = preceding {
+            previous = Some(OperationChainHead {
+                sequence: built.operation.device_sequence,
+                canonical_hash: built.canonical_hash,
+            });
+            causal_frontier.retain(|entry| entry.device_id != self.device_id);
+            causal_frontier.push(context_relay_protocol::DeviceSequence {
+                device_id: self.device_id,
+                sequence: built.operation.device_sequence,
+            });
+            causal_frontier.sort_by_key(|entry| entry.device_id);
+        }
+        OperationBuilder::new(SyncIdentity {
+            account_id: identity.account_id,
+            workspace_id: identity.workspace_id,
+            device_id: identity.device_id,
+            control_epoch: identity.control_epoch,
+            key_epoch: identity.key_epoch,
+            device_keys: identity.device_keys,
+            content_key: identity.content_key,
+        })
+        .build(OperationBuildRequest {
+            operation_id,
+            project_id,
+            mutation,
+            causal_frontier,
+            previous,
+            blob_refs: vec![],
+            created_hlc,
+        })
+        .map_err(|_| internal())
     }
 
     pub fn handle_native_hook_event(
@@ -274,11 +435,7 @@ impl<'a> OfflineWorkspace<'a> {
     ) -> Result<MemoryRecord, ClientError> {
         let prepared = self.prepare_memory_create(&params)?;
         if prepared.should_write {
-            vault(self.vault.put_local_memory_with_binding(
-                &prepared.value,
-                &memory_embedding(&prepared.value)?,
-                &prepared.binding,
-            ))?;
+            self.persist_memory(&prepared)?;
         }
         Ok(prepared.value)
     }
@@ -379,10 +536,21 @@ impl<'a> OfflineWorkspace<'a> {
     ) -> Result<MemoryCandidate, ClientError> {
         let prepared = self.prepare_memory_proposal(&input, &scope, harness)?;
         if prepared.should_write {
-            vault(
-                self.vault
-                    .put_candidate_with_binding(&prepared.value, &prepared.binding),
-            )?;
+            if self.sync_identity.is_some() {
+                self.persist_signed_mutation(
+                    &context_relay_protocol::RecordMutationV1::UpsertMemoryCandidate(
+                        prepared.value.clone(),
+                    ),
+                    &prepared.binding,
+                    None,
+                    prepared.value.proposed_memory.updated_hlc,
+                )?;
+            } else {
+                vault(
+                    self.vault
+                        .put_candidate_with_binding(&prepared.value, &prepared.binding),
+                )?;
+            }
         }
         Ok(prepared.value)
     }
@@ -433,8 +601,7 @@ impl<'a> OfflineWorkspace<'a> {
         if vault(self.vault.candidate(&id))?.is_some() {
             return Err(operation_conflict());
         }
-        let memory_id =
-            MemoryId::new(input.operation_id.into_uuid()).map_err(|_| invalid_request())?;
+        let memory_id = proposed_memory_id(id)?;
         let clock = operation_clock(input.operation_id, self.device_id);
         let proposed_memory = MemoryRecord {
             id: memory_id,
@@ -476,11 +643,7 @@ impl<'a> OfflineWorkspace<'a> {
     ) -> Result<MemoryRecord, ClientError> {
         let prepared = self.prepare_memory_update(&params)?;
         if prepared.should_write {
-            vault(self.vault.put_local_memory_with_binding(
-                &prepared.value,
-                &memory_embedding(&prepared.value)?,
-                &prepared.binding,
-            ))?;
+            self.persist_memory(&prepared)?;
         }
         Ok(prepared.value)
     }
@@ -550,11 +713,7 @@ impl<'a> OfflineWorkspace<'a> {
     ) -> Result<MemoryRecord, ClientError> {
         let prepared = self.prepare_memory_archive(&params)?;
         if prepared.should_write {
-            vault(self.vault.put_local_memory_with_binding(
-                &prepared.value,
-                &memory_embedding(&prepared.value)?,
-                &prepared.binding,
-            ))?;
+            self.persist_memory(&prepared)?;
         }
         Ok(prepared.value)
     }
@@ -640,7 +799,9 @@ impl<'a> OfflineWorkspace<'a> {
             let Some(memory) = vault(self.vault.memory(&id))? else {
                 continue;
             };
-            if memory_embedding(&memory)?.cosine_similarity(&query_embedding) > 0.0 {
+            if self.vault.semantic_search_configured()
+                || memory_embedding(&memory)?.cosine_similarity(&query_embedding) > 0.0
+            {
                 memories.push(memory);
             }
         }
@@ -687,31 +848,108 @@ impl<'a> OfflineWorkspace<'a> {
         &mut self,
         params: CandidateReviewParams,
     ) -> Result<context_relay_protocol::MemoryCandidate, ClientError> {
-        let mut candidate =
-            vault(self.vault.candidate(&params.candidate_id))?.ok_or_else(not_found)?;
         let state = if params.accepted {
             CandidateState::Accepted
         } else {
             CandidateState::Rejected
         };
-        if candidate.state == state {
-            return Ok(candidate);
+        let binding = local_operation_binding(
+            params.operation_id,
+            LocalOperationKind::CandidateReview,
+            params.candidate_id.to_string(),
+            None,
+            &params,
+        )?;
+        match vault(self.vault.local_operation_replay(&binding))? {
+            LocalOperationReplay::Snapshot(snapshot) => {
+                let candidate: MemoryCandidate =
+                    serde_json::from_slice(&snapshot).map_err(|_| internal())?;
+                candidate.validate().map_err(|_| internal())?;
+                if (candidate.id != params.candidate_id
+                    && candidate.id
+                        != vault(self.vault.canonical_candidate_id(params.candidate_id))?)
+                    || candidate.state != state
+                {
+                    return Err(internal());
+                }
+                return Ok(candidate);
+            }
+            LocalOperationReplay::Legacy => return Err(internal()),
+            LocalOperationReplay::Fresh => {}
         }
-        if candidate.state != CandidateState::Pending {
+        let mut candidate =
+            vault(self.vault.candidate(&params.candidate_id))?.ok_or_else(not_found)?;
+        if candidate.state != CandidateState::Pending && candidate.state != state {
             return Err(conflict("The candidate was already reviewed"));
+        }
+        // Ownerless offline/native candidates retain local review until explicit sync migration.
+        if self.sync_identity.is_some()
+            && candidate.state == CandidateState::Pending
+            && vault(self.vault.has_sync_record_owner(
+                RecordId::new(candidate.id.into_uuid()).map_err(|_| internal())?,
+            ))?
+        {
+            candidate.state = state;
+            let clock = operation_clock(params.operation_id, self.device_id);
+            let decision = self.build_signed_mutation(
+                &context_relay_protocol::RecordMutationV1::UpsertMemoryCandidate(candidate.clone()),
+                params.operation_id,
+                clock,
+                None,
+            )?;
+            let accepted = if params.accepted {
+                let operation_id = OperationId::new(derived_uuid(
+                    params.operation_id.as_bytes(),
+                    b"context-relay.candidate-review-memory.v1",
+                )?)
+                .map_err(|_| internal())?;
+                Some((
+                    self.build_signed_mutation(
+                        &context_relay_protocol::RecordMutationV1::UpsertMemory(
+                            candidate.proposed_memory.clone(),
+                        ),
+                        operation_id,
+                        clock,
+                        Some(&decision),
+                    )?,
+                    memory_embedding(&candidate.proposed_memory)?,
+                ))
+            } else {
+                None
+            };
+            vault(
+                self.vault.commit_signed_candidate_review(
+                    &candidate,
+                    &decision,
+                    accepted
+                        .as_ref()
+                        .map(|(built, embedding)| (built, embedding)),
+                    &binding,
+                ),
+            )?;
+            candidate.id = params.candidate_id;
+            return Ok(candidate);
         }
         if params.accepted {
             let embedding = memory_embedding(&candidate.proposed_memory)?;
-            vault(self.vault.review_candidate(
+            vault(self.vault.review_candidate_with_binding(
                 candidate.id,
                 state,
                 Some(&candidate.proposed_memory),
                 Some(&embedding),
+                &binding,
             ))?;
         } else {
-            vault(self.vault.review_candidate(candidate.id, state, None, None))?;
+            vault(self.vault.review_candidate_with_binding(
+                candidate.id,
+                state,
+                None,
+                None,
+                &binding,
+            ))?;
         }
         candidate.state = state;
+        candidate.id = params.candidate_id;
         Ok(candidate)
     }
 
@@ -725,9 +963,9 @@ impl<'a> OfflineWorkspace<'a> {
     pub fn upsert_task(&mut self, params: TaskUpsertParams) -> Result<TaskRecord, ClientError> {
         let prepared = self.prepare_task_upsert(&params)?;
         if prepared.should_write {
-            vault(
-                self.vault
-                    .put_task_with_binding(&prepared.value, &prepared.binding),
+            self.persist_task(
+                &prepared,
+                operation_clock(prepared.binding.operation_id, self.device_id),
             )?;
         }
         Ok(prepared.value)
@@ -819,9 +1057,9 @@ impl<'a> OfflineWorkspace<'a> {
     ) -> Result<TaskRecord, ClientError> {
         let prepared = self.prepare_task_transition(&params)?;
         if prepared.should_write {
-            vault(
-                self.vault
-                    .put_task_with_binding(&prepared.value, &prepared.binding),
+            self.persist_task(
+                &prepared,
+                operation_clock(prepared.binding.operation_id, self.device_id),
             )?;
         }
         Ok(prepared.value)
@@ -894,10 +1132,7 @@ impl<'a> OfflineWorkspace<'a> {
     ) -> Result<TaskRecord, ClientError> {
         let prepared = self.prepare_task_completion(&params, recorded_hlc)?;
         if prepared.should_write {
-            vault(
-                self.vault
-                    .put_task_with_binding(&prepared.value, &prepared.binding),
-            )?;
+            self.persist_task(&prepared, recorded_hlc)?;
         }
         Ok(prepared.value)
     }
@@ -972,6 +1207,22 @@ impl<'a> OfflineWorkspace<'a> {
 
     pub fn upsert_project(&mut self, project: ProjectIdentity) -> Result<(), ClientError> {
         vault(self.vault.put_project(&project))
+    }
+
+    pub fn register_project(
+        &mut self,
+        project: ProjectIdentity,
+        path: WireNativeValue,
+    ) -> Result<(), ClientError> {
+        // Registration stores only a binding. Native setup still revalidates
+        // its reviewed filesystem targets before granting an AI app access.
+        crate::mcp::binding::canonical_directory(&path).map_err(|()| ClientError {
+            code: ErrorCode::InvalidRequest,
+            message: "Choose an existing, accessible project folder".into(),
+            field_path: Some("path".into()),
+            retryable: false,
+        })?;
+        vault(self.vault.register_project(&project, &path))
     }
 
     pub fn projects(&self) -> Result<Vec<ProjectIdentity>, ClientError> {
@@ -1113,13 +1364,26 @@ fn candidate_snapshot(
         serde_json::from_slice(canonical_response).map_err(|_| internal())?;
     candidate.validate().map_err(|_| internal())?;
     if candidate.id != expected_id
-        || candidate.proposed_memory.id.to_string() != expected_id.to_string()
+        || (candidate.proposed_memory.id.as_bytes() != expected_id.as_bytes()
+            && candidate.proposed_memory.id != proposed_memory_id(expected_id)?)
         || candidate.proposed_memory.revision != expected_revision
         || candidate.state != CandidateState::Pending
     {
         return Err(internal());
     }
     Ok(candidate)
+}
+
+fn proposed_memory_id(candidate: CandidateId) -> Result<MemoryId, ClientError> {
+    MemoryId::new(derived_uuid(
+        candidate.as_bytes(),
+        b"context-relay.proposed-memory.v1",
+    )?)
+    .map_err(|_| internal())
+}
+
+fn derived_uuid(source: &[u8; 16], domain: &[u8]) -> Result<uuid::Uuid, ClientError> {
+    crate::derived_record_uuid(source, domain).ok_or_else(internal)
 }
 
 fn task_snapshot(
@@ -1133,6 +1397,27 @@ fn task_snapshot(
         return Err(internal());
     }
     Ok(task)
+}
+
+/// Rebuilds the local lexical vector for the exact admitted sync representative.
+/// Model-derived semantic vectors remain local, resumable indexing work.
+pub fn sync_embedding(
+    _operation_id: OperationId,
+    mutation: &RecordMutationV1,
+) -> Result<Option<Embedding384>, crate::sync::SyncError> {
+    mutation
+        .validate()
+        .map_err(|_| crate::sync::SyncError::InvalidMutation)?;
+    match mutation {
+        RecordMutationV1::UpsertMemory(memory) => memory_embedding(memory).map(Some),
+        RecordMutationV1::UpsertInstruction(instruction) => text_embedding(&format!(
+            "{} {}",
+            instruction.title, instruction.body_markdown
+        ))
+        .map(Some),
+        _ => Ok(None),
+    }
+    .map_err(|_| crate::sync::SyncError::InvalidMutation)
 }
 
 fn memory_embedding(memory: &MemoryRecord) -> Result<Embedding384, ClientError> {

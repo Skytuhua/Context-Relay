@@ -4,6 +4,7 @@ use context_relay_protocol::{AccountId, DeviceId, Sha256Digest, WorkspaceId};
 
 use crate::crypto::{ContentKey, DeviceKeys};
 
+#[derive(Clone, Copy)]
 pub struct SyncIdentity<'a> {
     pub account_id: AccountId,
     pub workspace_id: WorkspaceId,

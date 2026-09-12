@@ -1,3 +1,6 @@
+mod certificates;
+pub use certificates::DeviceCertificateSnapshot;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
@@ -53,6 +56,31 @@ pub struct SupabaseHttpRequest {
     headers: Vec<(String, String)>,
     timeout: Duration,
     body: Vec<u8>,
+    max_response_bytes: usize,
+}
+
+impl SupabaseHttpRequest {
+    pub(crate) fn new(
+        method: SupabaseHttpMethod,
+        url: String,
+        headers: Vec<(String, String)>,
+        timeout: Duration,
+        body: Vec<u8>,
+    ) -> Self {
+        Self {
+            method,
+            url,
+            headers,
+            timeout,
+            body,
+            max_response_bytes: MAX_RESPONSE_BYTES,
+        }
+    }
+
+    pub(crate) fn with_response_limit(mut self, limit: usize) -> Self {
+        self.max_response_bytes = limit.min(MAX_RESPONSE_BYTES);
+        self
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -86,12 +114,29 @@ impl Drop for SupabaseHttpRequest {
         for (_, value) in &mut self.headers {
             value.zeroize();
         }
+        self.body.zeroize();
     }
 }
 
 pub struct SupabaseHttpResponse {
     status: u16,
     body: Vec<u8>,
+}
+
+impl Drop for SupabaseHttpResponse {
+    fn drop(&mut self) {
+        self.body.zeroize();
+    }
+}
+
+impl SupabaseHttpResponse {
+    pub(crate) const fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub(crate) fn body(&self) -> &[u8] {
+        &self.body
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -153,13 +198,15 @@ impl SupabaseRetryRuntime for SystemRetryRuntime {
     }
 }
 
-struct ReqwestHttpClient {
+pub(crate) struct ReqwestHttpClient {
     client: Client,
 }
 
 impl ReqwestHttpClient {
-    fn new() -> Result<Self, TransportError> {
+    pub(crate) fn new() -> Result<Self, TransportError> {
         let client = Client::builder()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .tls_backend_rustls()
@@ -198,20 +245,23 @@ impl SupabaseHttpClient for ReqwestHttpClient {
         let response = builder.send().map_err(classify_reqwest_error)?;
         if response
             .content_length()
-            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+            .is_some_and(|length| length > request.max_response_bytes as u64)
         {
             return Err(SupabaseHttpError::ResponseTooLarge);
         }
         let status = response.status().as_u16();
-        let mut body = Vec::new();
+        let mut body = Zeroizing::new(Vec::new());
         response
-            .take(MAX_RESPONSE_BYTES as u64 + 1)
+            .take(request.max_response_bytes as u64 + 1)
             .read_to_end(&mut body)
             .map_err(|_| SupabaseHttpError::Transient)?;
-        if body.len() > MAX_RESPONSE_BYTES {
+        if body.len() > request.max_response_bytes {
             return Err(SupabaseHttpError::ResponseTooLarge);
         }
-        Ok(SupabaseHttpResponse { status, body })
+        Ok(SupabaseHttpResponse {
+            status,
+            body: std::mem::take(&mut *body),
+        })
     }
 }
 
@@ -248,19 +298,7 @@ impl SupabaseTransportConfig {
         publishable_key: impl Into<String>,
         access_token: impl Into<String>,
     ) -> Result<Self, TransportError> {
-        let project_url =
-            Url::parse(project_url.as_ref()).map_err(|_| TransportError::Configuration)?;
-        let path_is_root = project_url.path().is_empty() || project_url.path() == "/";
-        if project_url.scheme() != "https"
-            || project_url.host_str().is_none()
-            || !project_url.username().is_empty()
-            || project_url.password().is_some()
-            || !path_is_root
-            || project_url.query().is_some()
-            || project_url.fragment().is_some()
-        {
-            return Err(TransportError::Configuration);
-        }
+        let project_url = validated_project_url(project_url.as_ref())?;
         let publishable_key = publishable_key.into();
         let access_token = access_token.into();
         if !valid_header_secret(&publishable_key) || !valid_header_secret(&access_token) {
@@ -272,9 +310,36 @@ impl SupabaseTransportConfig {
             access_token: Zeroizing::new(access_token),
         })
     }
+
+    pub(crate) fn project_url(&self) -> &Url {
+        &self.project_url
+    }
+
+    pub(crate) fn publishable_key(&self) -> &str {
+        &self.publishable_key
+    }
+
+    pub(crate) fn access_token(&self) -> &str {
+        &self.access_token
+    }
 }
 
-fn valid_header_secret(value: &str) -> bool {
+pub(crate) fn validated_project_url(value: &str) -> Result<Url, TransportError> {
+    let url = Url::parse(value).map_err(|_| TransportError::Configuration)?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !(url.path().is_empty() || url.path() == "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(TransportError::Configuration);
+    }
+    Ok(url)
+}
+
+pub(crate) fn valid_header_secret(value: &str) -> bool {
     !value.is_empty() && value.trim() == value && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
@@ -282,6 +347,13 @@ pub struct SupabaseTransport {
     config: SupabaseTransportConfig,
     http: Arc<dyn SupabaseHttpClient>,
     retry_runtime: Arc<dyn SupabaseRetryRuntime>,
+    hosted: Option<HostedAuthority>,
+}
+
+struct HostedAuthority {
+    owner: Arc<crate::auth::HostedSessionOwner>,
+    identity: crate::auth::HostedIdentity,
+    generation: crate::auth::LoginCancellation,
 }
 
 impl SupabaseTransport {
@@ -291,6 +363,7 @@ impl SupabaseTransport {
             config,
             http,
             retry_runtime: Arc::new(SystemRetryRuntime),
+            hosted: None,
         })
     }
 
@@ -303,6 +376,7 @@ impl SupabaseTransport {
             config,
             http,
             retry_runtime: Arc::new(SystemRetryRuntime),
+            hosted: None,
         })
     }
 
@@ -316,7 +390,39 @@ impl SupabaseTransport {
             config,
             http,
             retry_runtime,
+            hosted: None,
         })
+    }
+
+    /// Use only the current matching session token, including after refresh.
+    pub fn with_session_owner(
+        mut self,
+        owner: Arc<crate::auth::HostedSessionOwner>,
+        identity: crate::auth::HostedIdentity,
+        generation: crate::auth::LoginCancellation,
+    ) -> Self {
+        self.hosted = Some(HostedAuthority {
+            owner,
+            identity,
+            generation,
+        });
+        self
+    }
+
+    fn session(&self, now: u64) -> Result<Option<Arc<crate::auth::HostedSession>>, TransportError> {
+        self.hosted
+            .as_ref()
+            .map(|authority| {
+                let session = authority
+                    .owner
+                    .session_for(&authority.generation, authority.identity, now)
+                    .map_err(|_| TransportError::AuthRequired)?;
+                if session.project_url() != &self.config.project_url {
+                    return Err(TransportError::AuthRequired);
+                }
+                Ok(session)
+            })
+            .transpose()
     }
 
     pub fn update_access_token(
@@ -368,21 +474,35 @@ impl SupabaseTransport {
         if let Some(idempotency_key) = idempotency_key {
             headers.push(("idempotency-key".to_owned(), idempotency_key));
         }
-        SupabaseHttpRequest {
-            method,
-            url,
-            headers,
-            timeout: REQUEST_TIMEOUT,
-            body,
-        }
+        SupabaseHttpRequest::new(method, url, headers, REQUEST_TIMEOUT, body)
     }
 
     fn execute(
         &self,
         request: SupabaseHttpRequest,
     ) -> Result<SupabaseHttpResponse, SupabaseRequestError> {
+        let started = std::time::Instant::now();
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| SupabaseRequestError::Transport(TransportError::Configuration))?
+            .as_secs();
         for attempt in 0..MAX_ATTEMPTS {
-            let response = match self.http.execute(request.clone()) {
+            let session = self
+                .session(epoch.saturating_add(started.elapsed().as_secs()))
+                .map_err(SupabaseRequestError::Transport)?;
+            let mut attempt_request = request.clone();
+            if let Some(session) = session {
+                for (name, value) in &mut attempt_request.headers {
+                    if name.eq_ignore_ascii_case("authorization") {
+                        value.zeroize();
+                        *value = format!("Bearer {}", session.access_token());
+                    }
+                }
+            }
+            let response = self.http.execute(attempt_request);
+            self.session(epoch.saturating_add(started.elapsed().as_secs()))
+                .map_err(SupabaseRequestError::Transport)?;
+            let response = match response {
                 Ok(response) => response,
                 Err(SupabaseHttpError::ResponseTooLarge) => {
                     return Err(SupabaseRequestError::ResponseTooLarge);

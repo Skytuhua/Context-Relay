@@ -13,8 +13,8 @@ use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
 use super::model::{
-    ApprovedCliMutation, ApprovedInput, CanonicalCliDeclaration, NativeTransactionPlan,
-    OwnershipChange, SidecarBinding,
+    ApprovedCliMutation, ApprovedInput, CanonicalCliDeclaration, CliExecutionContext,
+    NativeTransactionPlan, OwnershipChange, SidecarBinding,
 };
 
 pub const APPROVAL_DOMAIN_V1: &[u8] = b"context-relay/native-plan/v1\0";
@@ -33,6 +33,11 @@ pub enum ApprovalError {
 }
 
 pub fn approval_hash_v1(plan: &NativeTransactionPlan) -> Result<Sha256Digest, ApprovalError> {
+    if plan.installed_runtime.is_some() {
+        return Err(ApprovalError::Invalid(
+            "approval v1 cannot bind installed runtimes".into(),
+        ));
+    }
     if !plan.cli_mutations.is_empty() {
         return Err(ApprovalError::Invalid(
             "approval v1 cannot bind cli mutations".into(),
@@ -59,6 +64,20 @@ pub fn approval_hash_v2(plan: &NativeTransactionPlan) -> Result<Sha256Digest, Ap
     validate(plan)?;
     validate_cli_mutations(plan)?;
     validate_native_memory_registrations(plan)?;
+    if let Some(super::InstalledRuntimeBinding::HermesPythonV1 { runtime }) =
+        &plan.installed_runtime
+    {
+        if plan.setup.harness != HarnessId::Hermes
+            || plan.setup.executable_path.platform != NativePlatform::Windows
+        {
+            return Err(ApprovalError::Invalid(
+                "installed runtime requires Windows Hermes".into(),
+            ));
+        }
+        runtime
+            .validate()
+            .map_err(|_| ApprovalError::Invalid("installed runtime reference is invalid".into()))?;
+    }
 
     let mut value = vec![
         Value::from(2),
@@ -68,8 +87,14 @@ pub fn approval_hash_v2(plan: &NativeTransactionPlan) -> Result<Sha256Digest, Ap
     // Preserve the already-shipped v2 preimage for legacy plans whose exact
     // registration set was empty. Any Task 10 descriptor set adds this fully
     // validated fourth member and is therefore approval-bound.
-    if !plan.native_memory_registrations.is_empty() {
+    if !plan.native_memory_registrations.is_empty() || plan.installed_runtime.is_some() {
         value.push(native_memory_approval_value(plan)?);
+    }
+    if let Some(runtime) = &plan.installed_runtime {
+        value.push(
+            serde_json::to_value(runtime)
+                .map_err(|error| ApprovalError::Serialization(error.to_string()))?,
+        );
     }
     hash_approval(APPROVAL_DOMAIN_V2, &Value::Array(value))
 }
@@ -217,6 +242,7 @@ fn validate_cli_mutations(plan: &NativeTransactionPlan) -> Result<(), ApprovalEr
 
     let mut targets = Vec::with_capacity(plan.cli_mutations.len());
     for mutation in &plan.cli_mutations {
+        validate_cli_context(plan, mutation)?;
         validate_stable_id(&mutation.stable_id)?;
         let target = validate_cli_declarations(plan, mutation)?;
         if targets.contains(&target) {
@@ -251,6 +277,59 @@ fn validate_cli_mutations(plan: &NativeTransactionPlan) -> Result<(), ApprovalEr
         return Err(ApprovalError::Invalid(
             "flattened cli forward operations do not match SetupPlan.cli_operations".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_cli_context(
+    plan: &NativeTransactionPlan,
+    mutation: &ApprovedCliMutation,
+) -> Result<(), ApprovalError> {
+    let Some(context) = &mutation.execution_context else {
+        // Preserve the hash of existing plans. Qualified executors separately
+        // refuse legacy unbound operations and require a fresh preview.
+        return Ok(());
+    };
+    let (harness, paths) = match context {
+        CliExecutionContext::CodexV1 {
+            codex_home,
+            user_home,
+            project_root,
+            working_directory,
+        } => (
+            HarnessId::Codex,
+            vec![codex_home, user_home, project_root, working_directory],
+        ),
+        CliExecutionContext::ClaudeCodeV1 {
+            config_dir,
+            state_path,
+            project_root,
+        } => (
+            HarnessId::ClaudeCode,
+            vec![config_dir, state_path, project_root],
+        ),
+        CliExecutionContext::ClaudeCodeV2 {
+            config_dir,
+            state_path,
+            project_root,
+            user_home,
+        } => (
+            HarnessId::ClaudeCode,
+            vec![config_dir, state_path, project_root, user_home],
+        ),
+    };
+    if plan.setup.harness != harness {
+        return Err(ApprovalError::Invalid(
+            "CLI context harness differs from setup plan".into(),
+        ));
+    }
+    for path in paths {
+        if path.platform != plan.setup.executable_path.platform {
+            return Err(ApprovalError::Invalid(
+                "CLI context platform differs from setup plan".into(),
+            ));
+        }
+        target_key(path)?;
     }
     Ok(())
 }
@@ -462,7 +541,7 @@ fn cli_approval_value(plan: &NativeTransactionPlan) -> Result<Value, ApprovalErr
         .cli_mutations
         .iter()
         .map(|mutation| {
-            Ok(json!({
+            let mut value = json!({
                 "stableId": mutation.stable_id,
                 "expected": declaration_value(mutation.expected.as_ref()),
                 "intended": declaration_value(mutation.intended.as_ref()),
@@ -470,7 +549,12 @@ fn cli_approval_value(plan: &NativeTransactionPlan) -> Result<Value, ApprovalErr
                     .map_err(|error| ApprovalError::Serialization(error.to_string()))?,
                 "rollback": serde_json::to_value(&mutation.rollback)
                     .map_err(|error| ApprovalError::Serialization(error.to_string()))?,
-            }))
+            });
+            if let Some(context) = &mutation.execution_context {
+                value["executionContext"] = serde_json::to_value(context)
+                    .map_err(|error| ApprovalError::Serialization(error.to_string()))?;
+            }
+            Ok(value)
         })
         .collect::<Result<Vec<_>, ApprovalError>>()?;
     Ok(Value::Array(mutations))
@@ -712,7 +796,7 @@ fn target_key(target: &WireNativeValue) -> Result<TargetKey, ApprovalError> {
     }
 }
 
-fn windows_target_key(bytes: &[u8]) -> Result<String, ApprovalError> {
+pub(crate) fn windows_target_key(bytes: &[u8]) -> Result<String, ApprovalError> {
     let units = bytes
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))

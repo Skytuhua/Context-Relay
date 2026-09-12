@@ -1,12 +1,5 @@
-#![cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the hosted pairing adapter is not configured in this build"
-    )
-)]
-
 use std::str::FromStr;
+use std::sync::Arc;
 
 use context_relay_core::{
     crypto::DeviceKeys,
@@ -33,11 +26,12 @@ use context_relay_protocol::{
 };
 use sha2::{Digest, Sha256};
 
+#[derive(Clone)]
 pub(crate) struct PairingIdentity {
     pub(crate) device_id: DeviceId,
     pub(crate) device_name: String,
     pub(crate) platform: NativePlatform,
-    pub(crate) keys: DeviceKeys,
+    pub(crate) keys: std::sync::Arc<DeviceKeys>,
 }
 
 pub(crate) trait PairingService: Send + Sync {
@@ -51,10 +45,232 @@ pub(crate) trait PairingService: Send + Sync {
     ) -> Result<LocalResult, ClientError>;
 }
 
+pub(crate) struct HostedPairingService {
+    owner: Arc<context_relay_core::auth::HostedSessionOwner>,
+    project: String,
+    publishable_key: zeroize::Zeroizing<String>,
+    identity: PairingIdentity,
+    #[cfg(test)]
+    pub(crate) http: Option<Arc<dyn context_relay_core::sync::SupabaseHttpClient>>,
+}
+
+struct HostedPairingClock;
+impl PairingClock for HostedPairingClock {
+    fn now_ms(&self) -> u64 {
+        use context_relay_core::devices::recovery::{
+            RecoveryEnrollmentClock, SystemRecoveryEnrollmentClock,
+        };
+        SystemRecoveryEnrollmentClock.now_ms()
+    }
+}
+
+impl HostedPairingService {
+    pub(crate) fn new(
+        owner: Arc<context_relay_core::auth::HostedSessionOwner>,
+        project: &str,
+        publishable_key: &str,
+        identity: PairingIdentity,
+    ) -> Self {
+        Self {
+            owner,
+            project: project.into(),
+            publishable_key: zeroize::Zeroizing::new(publishable_key.into()),
+            identity,
+            #[cfg(test)]
+            http: None,
+        }
+    }
+
+    fn client(
+        &self,
+        identity: context_relay_core::auth::HostedIdentity,
+    ) -> Result<context_relay_core::devices::supabase_pairing::HostedPairingClient, ClientError>
+    {
+        use context_relay_core::devices::supabase_pairing::HostedPairingClient;
+        let generation = self
+            .owner
+            .cancellation()
+            .map_err(|_| pairing_login_required())?;
+        #[cfg(test)]
+        if let Some(http) = &self.http {
+            return HostedPairingClient::with_http_client(
+                self.owner.clone(),
+                identity,
+                generation,
+                &self.project,
+                &self.publishable_key,
+                self.identity.keys.clone(),
+                http.clone(),
+            )
+            .map_err(|_| pairing_invalid());
+        }
+        HostedPairingClient::new(
+            self.owner.clone(),
+            identity,
+            generation,
+            &self.project,
+            &self.publishable_key,
+            self.identity.keys.clone(),
+        )
+        .map_err(|_| pairing_invalid())
+    }
+
+    fn authority(
+        &self,
+        vault: &Vault,
+    ) -> Result<Option<(SyncScope, DeviceCertificateId)>, ClientError> {
+        use context_relay_core::crypto::CertificateIssuerV1;
+        let mut roots = vault
+            .all_devices()
+            .map_err(|_| pairing_invalid())?
+            .into_iter()
+            .filter(|stored| {
+                stored.certificate.device_id == self.identity.device_id
+                    && stored.state == DeviceCertificateState::Active
+                    && matches!(
+                        stored.certificate.issuer,
+                        CertificateIssuerV1::RecoveryRoot(_)
+                    )
+            });
+        let Some(root) = roots.next() else {
+            return Ok(None);
+        };
+        if roots.next().is_some()
+            || root.certificate.signing_public_key != self.identity.keys.signing_public_key()
+            || root.certificate.wrapping_public_key != self.identity.keys.wrapping_public_key()
+        {
+            return Err(pairing_conflict());
+        }
+        let material = vault
+            .trusted_workspace_material(&self.identity.keys)
+            .map_err(|_| pairing_conflict())?;
+        let scope = material.scope();
+        if root.certificate.account_id != scope.account_id
+            || root.certificate.workspace_id != scope.workspace_id
+            || root.certificate.control_epoch != material.control_epoch()
+        {
+            return Err(pairing_conflict());
+        }
+        Ok(Some((scope, root.certificate_id)))
+    }
+}
+
+impl PairingService for HostedPairingService {
+    fn resume_prepared_decisions(&self, vault: &mut Vault) -> Result<(), ClientError> {
+        // Startup remains local while Auth restores. Explicit status/decision requests reconcile.
+        let _ = vault
+            .pending_pairing_approvals()
+            .map_err(|_| pairing_invalid())?;
+        Ok(())
+    }
+
+    fn execute(
+        &self,
+        vault: &mut Vault,
+        identity: &PairingIdentity,
+        request: LocalRequest,
+    ) -> Result<LocalResult, ClientError> {
+        use context_relay_core::{
+            auth::HostedIdentity, devices::pairing::VaultPairingMaterialSource,
+        };
+        if identity.device_id != self.identity.device_id
+            || identity.keys.signing_public_key() != self.identity.keys.signing_public_key()
+            || identity.keys.wrapping_public_key() != self.identity.keys.wrapping_public_key()
+        {
+            return Err(pairing_conflict());
+        }
+        let pairing_id = match &request {
+            LocalRequest::PairingStatus(params) | LocalRequest::PairingCancel(params) => {
+                Some(params.pairing_id)
+            }
+            LocalRequest::PairingDecision(params) => Some(params.pairing_id),
+            LocalRequest::PairingConfirm(params) => Some(params.pairing_id),
+            LocalRequest::PairingCreate(_) | LocalRequest::PairingJoin(_) => None,
+            _ => return Err(pairing_invalid()),
+        };
+        let saved = pairing_id
+            .map(|id| vault.hosted_pairing_intent(id))
+            .transpose()
+            .map_err(|_| pairing_invalid())?
+            .flatten();
+        if let Some(saved) = &saved {
+            use context_relay_core::vault::HostedPairingRole;
+            let joining = matches!(request, LocalRequest::PairingConfirm(_))
+                || (matches!(request, LocalRequest::PairingStatus(_))
+                    && vault
+                        .stored_pairing_join(pairing_id.ok_or_else(pairing_invalid)?)
+                        .map_err(|_| pairing_invalid())?
+                        .is_some());
+            let expected_role = if joining {
+                HostedPairingRole::Join
+            } else {
+                HostedPairingRole::Approve
+            };
+            if saved.role != expected_role {
+                return Err(pairing_conflict());
+            }
+        }
+        let hosted_identity = if let Some(saved) = &saved {
+            // Local terminal reads can work after logout; the client still requires this exact
+            // identity and current generation for every provider operation.
+            HostedIdentity {
+                user_id: saved.user_id,
+                session_id: saved.session_id,
+            }
+        } else {
+            *self
+                .owner
+                .current_session(HostedPairingClock.now_ms() / 1000)
+                .map_err(|_| pairing_login_required())?
+                .ok_or_else(pairing_login_required)?
+                .identity()
+        };
+        let client = self.client(hosted_identity)?;
+        if let Some(saved) = &saved
+            && client.original_intent(saved.role) != *saved
+        {
+            return Err(pairing_conflict());
+        }
+        let authority = self.authority(vault)?;
+        let approval =
+            authority.map(|(scope, _)| client.approval_client(scope, identity.device_id));
+        let coordinator = PairingCoordinator::new(
+            HostedPairingClock,
+            VaultPairingMaterialSource,
+            client,
+            approval,
+        );
+        if let LocalRequest::PairingStatus(params) = &request
+            && authority.is_some()
+        {
+            coordinator
+                .resume_prepared_decision(vault, params.pairing_id)
+                .map_err(pairing_error)?;
+        }
+        match authority {
+            Some((scope, certificate)) => {
+                CoordinatorPairingService::new(coordinator, scope, certificate)
+                    .execute(vault, identity, request)
+            }
+            None => {
+                CoordinatorPairingService::new_joiner(coordinator).execute(vault, identity, request)
+            }
+        }
+    }
+}
+
+fn pairing_login_required() -> ClientError {
+    ClientError {
+        code: ErrorCode::ScopeDenied,
+        message: "Sign in to continue hosted pairing".into(),
+        field_path: None,
+        retryable: false,
+    }
+}
+
 pub(crate) struct CoordinatorPairingService<C, M, J, A> {
     coordinator: PairingCoordinator<C, M, J, A>,
-    scope: SyncScope,
-    issuer_certificate_id: DeviceCertificateId,
+    authority: Option<(SyncScope, DeviceCertificateId)>,
 }
 
 impl<C, M, J, A> CoordinatorPairingService<C, M, J, A> {
@@ -65,9 +281,19 @@ impl<C, M, J, A> CoordinatorPairingService<C, M, J, A> {
     ) -> Self {
         Self {
             coordinator,
-            scope,
-            issuer_certificate_id,
+            authority: Some((scope, issuer_certificate_id)),
         }
+    }
+
+    pub(crate) fn new_joiner(coordinator: PairingCoordinator<C, M, J, A>) -> Self {
+        Self {
+            coordinator,
+            authority: None,
+        }
+    }
+
+    fn approval_authority(&self) -> Result<(SyncScope, DeviceCertificateId), ClientError> {
+        self.authority.ok_or_else(pairing_invalid)
     }
 }
 
@@ -79,6 +305,14 @@ impl<
 > PairingService for CoordinatorPairingService<C, M, J, A>
 {
     fn resume_prepared_decisions(&self, vault: &mut Vault) -> Result<(), ClientError> {
+        if self.authority.is_none()
+            && !vault
+                .pending_pairing_approvals()
+                .map_err(|_| pairing_invalid())?
+                .is_empty()
+        {
+            return Err(pairing_invalid());
+        }
         self.coordinator
             .resume_prepared_decisions(vault)
             .map(|_| ())
@@ -93,6 +327,7 @@ impl<
     ) -> Result<LocalResult, ClientError> {
         match request {
             LocalRequest::PairingCreate(_) => {
+                self.approval_authority()?;
                 let invite = self.coordinator.create_invite().map_err(pairing_error)?;
                 Ok(invite_result(&invite, PairingState::Pending))
             }
@@ -116,18 +351,15 @@ impl<
             }
             LocalRequest::PairingStatus(params) => self.status(vault, identity, params.pairing_id),
             LocalRequest::PairingDecision(params) => {
-                let review = self
-                    .coordinator
-                    .request_status(params.pairing_id)
-                    .map_err(pairing_error)?
-                    .ok_or_else(pairing_not_found)?;
+                let (scope, issuer_certificate_id) = self.approval_authority()?;
+                let review = self.decision_review(vault, params.pairing_id)?;
                 if review.request_digest != params.request_digest {
                     return Err(pairing_conflict());
                 }
                 let decision = if params.approve {
                     PairingDecisionInput::Approve(PairingApprovalAuthority {
-                        certificate_id: child_certificate_id(params.pairing_id, self.scope),
-                        issuer_certificate_id: self.issuer_certificate_id,
+                        certificate_id: child_certificate_id(params.pairing_id, scope),
+                        issuer_certificate_id,
                         issuer_keys: &identity.keys,
                     })
                 } else {
@@ -172,6 +404,7 @@ impl<
                 )
             }
             LocalRequest::PairingCancel(params) => {
+                self.approval_authority()?;
                 self.coordinator
                     .cancel(params.pairing_id)
                     .map_err(pairing_error)?;
@@ -189,6 +422,24 @@ impl<
     A: PairingApprovalTransport,
 > CoordinatorPairingService<C, M, J, A>
 {
+    fn decision_review(
+        &self,
+        vault: &Vault,
+        pairing_id: PairingId,
+    ) -> Result<PairingRequestReview, ClientError> {
+        if let Some(review) = self
+            .coordinator
+            .saved_request_review(vault, pairing_id)
+            .map_err(pairing_error)?
+        {
+            return Ok(review);
+        }
+        self.coordinator
+            .request_status(pairing_id)
+            .map_err(pairing_error)?
+            .ok_or_else(pairing_not_found)
+    }
+
     fn status(
         &self,
         vault: &mut Vault,
@@ -231,16 +482,13 @@ impl<
             };
         }
 
+        self.approval_authority()?;
         if let Some(accepted) = self
             .coordinator
             .accepted_decision_status(vault, pairing_id)
             .map_err(pairing_error)?
         {
-            let review = self
-                .coordinator
-                .request_status(pairing_id)
-                .map_err(pairing_error)?
-                .ok_or_else(pairing_not_found)?;
+            let review = self.decision_review(vault, pairing_id)?;
             if review.request_digest != accepted.request_digest {
                 return Err(pairing_conflict());
             }

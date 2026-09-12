@@ -12,9 +12,9 @@ use crate::{
     ExportId, HandoffPayload, HarnessAccessPolicy, HarnessId, InstallationTokenProof,
     MAX_MARKDOWN_BYTES, MAX_TAG_BYTES, MAX_TAGS, MAX_TITLE_BYTES, MemoryCandidate, MemoryId,
     MemoryKind, MemoryRecord, NativePlatform, OperationId, PairingId, PlanId, ProbeReport,
-    ProjectId, ProjectIdentity, ProtocolVersion, RecordId, RecoveryEnrollmentId, ScopeRef,
-    SetupPlan, Sha256Digest, StatusOutput, TaskId, TaskRecord, TaskStatus, ValidationError,
-    WireNativeValue, decimal_u64, required_text,
+    ProjectId, ProjectIdentity, ProtocolVersion, RecordId, RecoveryEnrollmentId, RecoveryRestoreId,
+    ScopeRef, SetupPlan, Sha256Digest, StatusOutput, TaskId, TaskRecord, TaskStatus,
+    ValidationError, WireNativeValue, decimal_u64, required_text,
 };
 
 pub const RECOVERY_ENROLLMENT_SESSION_MS: u64 = 600_000;
@@ -58,11 +58,114 @@ macro_rules! params { ($name:ident { $($(#[$field_attr:meta])* $field:ident : $t
     pub struct $name { $($(#[$field_attr])* pub $field:$ty),* }
 }; }
 params!(EmptyParams {});
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchIndexPhase {
+    Disabled,
+    Preparing,
+    Ready,
+    Failed,
+}
+
+/// Owner-only status across saved context. Contains no record or project counts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchIndexStatus {
+    pub phase: SearchIndexPhase,
+    #[serde(with = "decimal_u64")]
+    #[ts(type = "DecimalU64")]
+    pub revision: u64,
+}
+params!(HarnessLaunchInfo {
+    selection: HarnessParams,
+    executable: WireNativeValue,
+    project_root: WireNativeValue
+});
+params!(ConnectionCheckStartParams {
+    selection: HarnessParams,
+    memory_id: MemoryId,
+    expected_revision: OperationId
+});
+params!(ConnectionCheckIdParams {
+    check_id: OperationId
+});
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionCheckPhase {
+    Waiting,
+    Verified,
+    Expired,
+    Canceled,
+    Invalidated,
+}
+params!(ConnectionCheckStatus {
+    check_id: OperationId,
+    selection: HarnessParams,
+    memory_id: MemoryId,
+    expected_revision: OperationId,
+    phase: ConnectionCheckPhase,
+    expires_in_seconds: u32,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    verified_at: Option<DecimalTimestamp>
+});
+params!(HarnessPrepareParams {
+    operation_id: OperationId,
+    selection: HarnessParams
+});
+params!(HarnessPreparationIdParams {
+    operation_id: OperationId
+});
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessPreparationPhase {
+    Inspecting,
+    Copying,
+    CheckingSource,
+    CheckingCopy,
+    Retaining,
+    Cancelling,
+    Ready,
+    Canceled,
+    Failed,
+}
+
+params!(HarnessPreparationStatus {
+    operation_id: OperationId,
+    selection: HarnessParams,
+    phase: HarnessPreparationPhase,
+    completed_files: u32,
+    completed_bytes: u32,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    error: Option<ClientError>
+});
+
+impl HarnessPreparationStatus {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_harness_profile(&self.selection)?;
+        if self.selection.harness != HarnessId::Hermes
+            || self.completed_files > 32768
+            || self.completed_bytes > 1_073_741_824
+            || (self.phase == HarnessPreparationPhase::Failed) != self.error.is_some()
+        {
+            return Err(ValidationError::Invalid("harnessPreparation"));
+        }
+        if let Some(error) = &self.error {
+            required_text(&error.message, "harnessPreparation.error", MAX_TITLE_BYTES)?;
+        }
+        Ok(())
+    }
+}
 params!(ProjectParams {
     project_id: ProjectId
 });
 params!(ProjectUpsertParams {
     project: ProjectIdentity
+});
+params!(ProjectRegisterParams {
+    project: ProjectIdentity,
+    path: WireNativeValue
 });
 params!(ProjectPathParams {
     project_id: ProjectId,
@@ -227,12 +330,37 @@ params!(AccessSetParams {
     policy: HarnessAccessPolicy
 });
 params!(AccountDeletionParams {
+    operation_id: OperationId,
     confirmation: String
 });
 
 #[derive(Clone, Eq, PartialEq, TS)]
 #[ts(type = "Array<string>")]
 pub struct RecoveryPhraseWords(Vec<String>);
+params!(RecoveryRestoreParams {
+    recovery_phrase_words: RecoveryPhraseWords
+});
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "state",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RecoveryRestoreStatus {
+    Idle {},
+    Submitting {
+        restore_id: RecoveryRestoreId,
+    },
+    Complete {
+        restore_id: RecoveryRestoreId,
+        device: DeviceSummary,
+    },
+    Conflict {
+        restore_id: RecoveryRestoreId,
+    },
+}
 impl fmt::Debug for RecoveryPhraseWords {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RecoveryPhraseWords([REDACTED])")
@@ -531,6 +659,14 @@ pub enum ClientRole {
 )]
 #[ts(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum LocalRequest {
+    HostedAuthStatus(EmptyParams),
+    HostedAuthStart(crate::HostedAuthStartParams),
+    HostedAuthCancel(crate::HostedAuthGenerationParams),
+    HostedAuthLogout(crate::HostedAuthGenerationParams),
+    DesktopWritePrepare(DesktopWritePrepareParams),
+    DesktopWritesList(DesktopWritesListParams),
+    DesktopWriteGet(DesktopWriteIdParams),
+    DesktopWriteForget(DesktopWriteIdParams),
     Hello(HelloParams),
     Cancel(CancelParams),
     Shutdown(EmptyParams),
@@ -540,10 +676,13 @@ pub enum LocalRequest {
     Unlock(EmptyParams),
     ProjectsList(EmptyParams),
     ProjectUpsert(ProjectUpsertParams),
+    ProjectRegister(ProjectRegisterParams),
     ProjectPathSet(ProjectPathParams),
     MemoryGet(MemoryParams),
     MemoryList(MemoryListParams),
     MemorySearch(SearchParams),
+    SearchIndexStatus(EmptyParams),
+    SearchIndexRetry(EmptyParams),
     MemoryCreate(MemoryCreateParams),
     MemoryUpdate(MemoryUpdateParams),
     MemoryArchive(MemoryArchiveParams),
@@ -557,6 +696,19 @@ pub enum LocalRequest {
     AccessGet(HarnessParams),
     AccessSet(AccessSetParams),
     HarnessProbe(HarnessParams),
+    HarnessLaunchInfo(HarnessParams),
+    ConnectionCheckStart(ConnectionCheckStartParams),
+    ConnectionCheckStatus(ConnectionCheckIdParams),
+    ConnectionCheckCancel(ConnectionCheckIdParams),
+    HarnessPrepare(HarnessPrepareParams),
+    HarnessPreparedPreview(HarnessPrepareParams),
+    HarnessPreparationStatus(HarnessPreparationIdParams),
+    HarnessPreparationCancel(HarnessPreparationIdParams),
+    HarnessExecutionStart(crate::HarnessExecutionParams),
+    HarnessExecutionStatus(crate::HarnessExecutionParams),
+    HarnessExecutionCurrent(EmptyParams),
+    HarnessSetupsList(crate::HarnessSetupsParams),
+    HarnessSetupGet(PlanParams),
     HarnessPreview(HarnessParams),
     HarnessApply(PlanParams),
     HarnessRepair(HarnessParams),
@@ -575,6 +727,10 @@ pub enum LocalRequest {
     PairingConfirm(PairingConfirmParams),
     PairingCancel(PairingIdParams),
     RecoveryEnrollmentBegin(EmptyParams),
+    RecoveryRestoreBegin(RecoveryRestoreParams),
+    RecoveryRestoreOverview(EmptyParams),
+    RecoveryRestoreResume(EmptyParams),
+    RecoveryRestoreCancel(EmptyParams),
     RecoveryEnrollmentOverview(EmptyParams),
     RecoveryEnrollmentConfirm(RecoveryEnrollmentConfirmParams),
     RecoveryEnrollmentStatus(RecoveryEnrollmentIdParams),
@@ -583,7 +739,8 @@ pub enum LocalRequest {
     ExportChunk(ExportChunkParams),
     AccountDeletionBegin(AccountDeletionParams),
     AccountDeletionStatus(EmptyParams),
-    AccountDeletionCancel(EmptyParams),
+    AccountDeletionIntents(AccountDeletionIntentsParams),
+    AccountDeletionCancel(RetryParams),
 }
 
 fn validate_tags(tags: &[String]) -> Result<(), ValidationError> {
@@ -605,7 +762,26 @@ fn validate_tags(tags: &[String]) -> Result<(), ValidationError> {
 impl LocalRequest {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::HarnessLaunchInfo(p) => {
+                validate_harness_profile(p)?;
+                if p.project_id.is_none() {
+                    return Err(ValidationError::Invalid("harnessLaunch.projectId"));
+                }
+                Ok(())
+            }
+            Self::ConnectionCheckStart(p) => {
+                validate_harness_profile(&p.selection)?;
+                if p.selection.project_id.is_none() {
+                    return Err(ValidationError::Invalid("connectionCheck.projectId"));
+                }
+                Ok(())
+            }
+            Self::DesktopWritePrepare(p) => p.write.validate(),
             Self::ProjectUpsert(p) => p.project.validate(),
+            Self::ProjectRegister(p) => {
+                p.project.validate()?;
+                p.path.validate()
+            }
             Self::ProjectPathSet(p) => p.path.validate(),
             Self::McpCall(p) => {
                 p.binding.working_directory.validate()?;
@@ -666,6 +842,13 @@ impl LocalRequest {
             .validate(),
             Self::HarnessProbe(p) | Self::HarnessPreview(p) | Self::HarnessRepair(p) => {
                 validate_harness_profile(p)
+            }
+            Self::HarnessPrepare(p) | Self::HarnessPreparedPreview(p) => {
+                validate_harness_profile(&p.selection)?;
+                if p.selection.harness != HarnessId::Hermes {
+                    return Err(ValidationError::Invalid("harnessPrepare.selection"));
+                }
+                Ok(())
             }
             Self::AccessGet(p) if p.hermes_profile.is_some() => {
                 Err(ValidationError::Invalid("accessGet.hermesProfile"))
@@ -988,6 +1171,20 @@ pub enum AccountDeletionState {
     PendingDelete,
     Purged,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum AccountLifecycleIntentAction {
+    BeginDeletion,
+    CancelDeletion,
+}
+params!(AccountDeletionIntentSummary {
+    operation_id: OperationId,
+    action: AccountLifecycleIntentAction
+});
+params!(AccountDeletionIntentsParams {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    after: Option<OperationId>
+});
 #[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(
     tag = "kind",
@@ -996,6 +1193,42 @@ pub enum AccountDeletionState {
     rename_all_fields = "camelCase"
 )]
 pub enum LocalResult {
+    RecoveryRestoreStatus {
+        status: RecoveryRestoreStatus,
+    },
+    HostedAuth {
+        status: crate::HostedAuthStatus,
+    },
+    SearchIndex {
+        status: SearchIndexStatus,
+    },
+    HarnessExecutionCurrent {
+        status: Option<crate::HarnessExecutionStatus>,
+    },
+    HarnessExecution {
+        status: crate::HarnessExecutionStatus,
+    },
+    HarnessSetup {
+        setup: Box<crate::HarnessSetupRecord>,
+    },
+    HarnessSetups {
+        page: crate::HarnessSetupsPage,
+    },
+    HarnessLaunchInfo {
+        info: HarnessLaunchInfo,
+    },
+    ConnectionCheck {
+        status: ConnectionCheckStatus,
+    },
+    HarnessPreparation {
+        status: HarnessPreparationStatus,
+    },
+    DesktopWrite {
+        write: Option<crate::DesktopWrite>,
+    },
+    DesktopWrites {
+        page: crate::DesktopWritesPage,
+    },
     Empty,
     Health {
         protocol: ProtocolVersion,
@@ -1067,6 +1300,9 @@ pub enum LocalResult {
     Export {
         payload: ExportPayload,
     },
+    AccountDeletionIntents {
+        intents: Vec<AccountDeletionIntentSummary>,
+    },
     AccountDeletion {
         state: AccountDeletionState,
         purge_deadline: Option<DecimalTimestamp>,
@@ -1087,6 +1323,44 @@ pub enum LocalResult {
     deny_unknown_fields
 )]
 enum LocalResultSerde {
+    RecoveryRestoreStatus {
+        status: RecoveryRestoreStatus,
+    },
+    HostedAuth {
+        status: crate::HostedAuthStatus,
+    },
+    SearchIndex {
+        status: SearchIndexStatus,
+    },
+    HarnessExecutionCurrent {
+        #[serde(deserialize_with = "crate::required_nullable")]
+        status: Option<crate::HarnessExecutionStatus>,
+    },
+    HarnessExecution {
+        status: crate::HarnessExecutionStatus,
+    },
+    HarnessSetup {
+        setup: Box<crate::HarnessSetupRecord>,
+    },
+    HarnessSetups {
+        page: crate::HarnessSetupsPage,
+    },
+    HarnessLaunchInfo {
+        info: HarnessLaunchInfo,
+    },
+    ConnectionCheck {
+        status: ConnectionCheckStatus,
+    },
+    HarnessPreparation {
+        status: HarnessPreparationStatus,
+    },
+    DesktopWrite {
+        #[serde(deserialize_with = "crate::required_nullable")]
+        write: Option<crate::DesktopWrite>,
+    },
+    DesktopWrites {
+        page: crate::DesktopWritesPage,
+    },
     Empty,
     Health {
         protocol: ProtocolVersion,
@@ -1158,6 +1432,9 @@ enum LocalResultSerde {
     Export {
         payload: ExportPayload,
     },
+    AccountDeletionIntents {
+        intents: Vec<AccountDeletionIntentSummary>,
+    },
     AccountDeletion {
         state: AccountDeletionState,
         #[serde(deserialize_with = "crate::required_nullable")]
@@ -1172,7 +1449,51 @@ enum LocalResultSerde {
 impl LocalResult {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
-            Self::Empty | Self::AccountDeletion { .. } | Self::Access { .. } => Ok(()),
+            Self::HarnessExecutionCurrent { status } => status
+                .as_ref()
+                .map_or(Ok(()), crate::HarnessExecutionStatus::validate),
+            Self::HarnessExecution { status } => status.validate(),
+            Self::HarnessSetup { setup } => setup.validate(),
+            Self::HarnessSetups { page } => page.validate(),
+            Self::HarnessLaunchInfo { info } => {
+                validate_harness_profile(&info.selection)?;
+                if info.selection.project_id.is_none() {
+                    return Err(ValidationError::Invalid("harnessLaunch.projectId"));
+                }
+                info.executable.validate()?;
+                info.project_root.validate()
+            }
+            Self::ConnectionCheck { status } => {
+                validate_harness_profile(&status.selection)?;
+                if status.selection.project_id.is_none()
+                    || status.expires_in_seconds > 300
+                    || (status.phase == ConnectionCheckPhase::Verified)
+                        != status.verified_at.is_some()
+                {
+                    return Err(ValidationError::Invalid("connectionCheck"));
+                }
+                Ok(())
+            }
+            Self::HarnessPreparation { status } => status.validate(),
+            Self::DesktopWrite { write } => {
+                write.as_ref().map_or(Ok(()), crate::DesktopWrite::validate)
+            }
+            Self::DesktopWrites { page } => page.validate(),
+            Self::AccountDeletionIntents { intents } => {
+                if intents.len() > 50
+                    || intents
+                        .windows(2)
+                        .any(|pair| pair[0].operation_id >= pair[1].operation_id)
+                {
+                    return Err(ValidationError::Invalid("accountDeletionIntents"));
+                }
+                Ok(())
+            }
+            Self::Empty
+            | Self::HostedAuth { .. }
+            | Self::AccountDeletion { .. }
+            | Self::Access { .. }
+            | Self::SearchIndex { .. } => Ok(()),
             Self::Health { protocol, .. } => {
                 if protocol.major != crate::PROTOCOL_MAJOR {
                     return Err(ValidationError::Invalid("health.protocol"));
@@ -1225,6 +1546,15 @@ impl LocalResult {
             Self::PairingApproval { approval } => approval.request.validate(),
             Self::PairingCompletion { completion } => completion.device.validate(),
             Self::RecoveryEnrollmentPhrase { phrase } => phrase.validate(),
+            Self::RecoveryRestoreStatus {
+                status:
+                    RecoveryRestoreStatus::Idle {}
+                    | RecoveryRestoreStatus::Submitting { .. }
+                    | RecoveryRestoreStatus::Conflict { .. },
+            } => Ok(()),
+            Self::RecoveryRestoreStatus {
+                status: RecoveryRestoreStatus::Complete { device, .. },
+            } => device.validate(),
             Self::RecoveryEnrollmentStatus { status } => status.validate(),
             Self::RecoveryEnrollmentComplete { completion } => completion.device.validate(),
             Self::Export { payload } => payload.validate(),
@@ -1269,6 +1599,16 @@ params!(JsonRpcErrorV1 {
     #[serde(deserialize_with = "crate::required_nullable")]
     id: Option<RecordId>,
     error: JsonRpcErrorObject
+});
+params!(DesktopWritePrepareParams {
+    write: crate::DesktopWrite
+});
+params!(DesktopWriteIdParams {
+    operation_id: OperationId
+});
+params!(DesktopWritesListParams {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    after: Option<OperationId>
 });
 pub const JSON_RPC_PARSE_ERROR: i32 = -32700;
 pub const JSON_RPC_INVALID_REQUEST: i32 = -32600;

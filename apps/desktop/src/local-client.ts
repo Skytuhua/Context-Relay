@@ -6,12 +6,22 @@ import type {
   RecoveryEnrollmentConfirmParams,
   RecoveryEnrollmentHostBeginResult,
   RecoveryEnrollmentHostConfirmResult,
+  RecoveryRestoreStatus,
 } from './bindings';
 
 export class LocalClient {
+  recoveryRestoreBegin(): Promise<RecoveryRestoreStatus | null> {
+    return invoke<RecoveryRestoreStatus | null>('recovery_restore_begin');
+  }
+
+  chooseProjectFolder(): Promise<string | null> {
+    return invoke<string | null>('choose_project_folder');
+  }
+
   async call(request: LocalRequest): Promise<LocalResult> {
     if (
       request.method === 'recovery_enrollment_begin' ||
+      request.method === 'recovery_restore_begin' ||
       request.method === 'recovery_enrollment_confirm'
     ) {
       throw new Error('Recovery approval requires the dedicated native recovery command.');

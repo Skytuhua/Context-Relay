@@ -59,3 +59,11 @@ For every local wire-version amendment, change control must explicitly check off
 and the [exact handshake vectors/tests](../../crates/local-ipc/src/handshake_tests.rs), including
 any frozen proof vectors owned by those tests. This closes the A-001 checklist gap: DTOs or
 bindings alone are never sufficient compatibility evidence.
+
+
+## A-006 — Local protocol 1.5 atomic project registration
+
+- **Trigger:** the desktop created the project identity and folder in separate IPC writes, leaving a partial project when the folder write failed.
+- **Amendment:** add strict Desktop-only `project_register { project, path }` and advance the exact local boundary from 1.4 to 1.5. Directory validation precedes one vault transaction for both records. Exact same-ID replay is accepted; conflicting existing content is rejected. The desktop reuses its most recent uncertain registration ID on explicit identical retry and does not send the two legacy writes as a fallback.
+- **Compatibility and migration impact:** ordinary 1.4 and 1.5 clients do not interoperate. Generated TypeScript, schema/version fixtures, role/routing matrices and independently derived HMAC vectors advance together. Windows preinstall always extracts the new helper. Its private shutdown-only path accepts authenticated protocol 1.4, validates the acknowledgment and waits for the exact connected process; it never exposes a reusable legacy client or launches an older executable. Absent services require no credentials or startup. Existing vault tables and sync/checkpoint schemas are unchanged.
+- **Verification:** strict decoder, role matrices, exact-version ordinary handshake rejection, injected second-write failure with no orphan after reopening, exact replay and conflict rejection, authenticated daemon registration/restart, and single-request/manual-retry desktop tests. Isolated Windows process fixtures verify current/legacy shutdown, exact process-exit waiting, unsupported-version and invalid-server-proof rejection, response validation, and absence without startup. Installed 1.4-to-1.5 update acceptance remains pending while desktop control is paused.

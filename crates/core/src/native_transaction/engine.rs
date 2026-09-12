@@ -106,6 +106,12 @@ impl CompensationOutcome {
 }
 
 pub trait NativeAdapter {
+    /// A retained runtime must be owned and consumed by this adapter, not merely
+    /// present in approval. Existing native-launcher adapters have no binding.
+    fn installed_runtime(&self) -> Option<&super::InstalledRuntimeBinding> {
+        None
+    }
+
     fn reprobe_live_state(&mut self, plan: &NativeTransactionPlan) -> Result<(), BoundaryError>;
     fn compare_approved_digests(
         &mut self,
@@ -387,6 +393,11 @@ where
     ) -> Result<NativeApplyReceipt, TransactionError> {
         self.cli_applied.clear();
         self.active_cli_mutations.clone_from(&plan.cli_mutations);
+        if self.adapter.installed_runtime() != plan.installed_runtime.as_ref() {
+            return Err(
+                BoundaryError::new("adapter does not own the approved installed runtime").into(),
+            );
+        }
         let mut begun = false;
         let transaction_nonce = *plan.setup.plan_id.as_bytes();
 

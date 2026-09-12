@@ -441,9 +441,18 @@ impl BridgeLocator for NeverBridgeLocator {
     }
 }
 
-struct NeverBridgeExecutor;
+struct WatchOnlyCodexVerifier<'a>(&'a CodexAdapter);
 
-impl BridgePlanExecutor for NeverBridgeExecutor {
+impl BridgePlanExecutor for WatchOnlyCodexVerifier<'_> {
+    fn verify_watch_only_registration(
+        &mut self,
+        plan: &NativeTransactionPlan,
+        now_ms: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        context_relay_core::setup::verify_watch_only_registration(self.0, plan, now_ms)
+            .map_err(|error| BridgeExecutionError::restored(error.message))
+    }
+
     fn execute(
         &mut self,
         _: &mut Vault,
@@ -509,7 +518,7 @@ impl BridgeInstallEngine for WatchOnlyCodexSetupEngine {
         BridgeInstallService::persisted(vault).apply(
             &params.plan_id,
             1_900_000_000_001,
-            &mut NeverBridgeExecutor,
+            &mut WatchOnlyCodexVerifier(&self.adapter.lock().unwrap()),
         )
     }
 
@@ -523,7 +532,7 @@ impl BridgeInstallEngine for WatchOnlyCodexSetupEngine {
         BridgeInstallService::persisted(vault).rollback(
             &params.plan_id,
             1_900_000_000_002,
-            &mut NeverBridgeExecutor,
+            &mut WatchOnlyCodexVerifier(&self.adapter.lock().unwrap()),
         )
     }
 }
@@ -758,10 +767,14 @@ impl MaterializedCodex {
         let home = root.join("home");
         let project_root = root.join("project");
         let working_directory = project_root.join("service");
+        #[cfg(windows)]
+        let project_key = dunce::simplified(&project_root);
+        #[cfg(not(windows))]
+        let project_key = project_root.as_path();
         materialize_substituting(
             &codex_home,
             fixture["codexHome"].as_object().unwrap(),
-            &project_root,
+            project_key,
         );
         materialize(
             &home.join(".agents/skills"),
@@ -784,6 +797,7 @@ impl MaterializedCodex {
                 version: version.into(),
                 installation_method: InstallationMethod::PackageManager,
                 codex_home: codex_home.clone(),
+                user_home: home.clone(),
                 user_skills_dir: home.join(".agents/skills"),
                 project_root: project_root.clone(),
                 working_directory,

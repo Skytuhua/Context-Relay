@@ -1,5 +1,103 @@
 use std::fmt;
 
+/// Original hosted identity for recovery. Contains no credentials or recovery phrase.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostedRestoreIntent {
+    pub project_url: String,
+    pub user_id: uuid::Uuid,
+    pub session_id: uuid::Uuid,
+}
+
+impl HostedRestoreIntent {
+    pub(crate) fn validate(&self) -> Result<(), VaultError> {
+        if self.project_url.len() > 2048
+            || crate::sync::supabase::validated_project_url(&self.project_url).is_err()
+            || [self.user_id, self.session_id].iter().any(|id| {
+                id.get_variant() != uuid::Variant::RFC4122
+                    || !(1..=8).contains(&id.get_version_num())
+            })
+        {
+            return Err(validation());
+        }
+        Ok(())
+    }
+}
+
+fn load_hosted_restore_intent(
+    connection: &Connection,
+) -> Result<Option<HostedRestoreIntent>, VaultError> {
+    let payload: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT payload FROM hosted_restore_intent WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    payload
+        .map(|bytes| {
+            if bytes.len() > 8192 {
+                return Err(validation());
+            }
+            let intent: HostedRestoreIntent =
+                serde_json::from_slice(&bytes).map_err(|_| validation())?;
+            intent.validate()?;
+            Ok(intent)
+        })
+        .transpose()
+}
+
+impl Vault {
+    pub fn hosted_restore_intent(&self) -> Result<Option<HostedRestoreIntent>, VaultError> {
+        load_hosted_restore_intent(&self.connection)
+    }
+
+    /// Bind the original login before any claim is prepared or submitted.
+    pub fn store_hosted_restore_intent(
+        &mut self,
+        intent: &HostedRestoreIntent,
+    ) -> Result<(), VaultError> {
+        intent.validate()?;
+        let payload = serde_json::to_vec(intent).map_err(|_| validation())?;
+        if payload.len() > 8192 {
+            return Err(validation());
+        }
+        let transaction = self.connection.transaction()?;
+        if let Some(existing) = load_hosted_restore_intent(&transaction)? {
+            if existing != *intent {
+                return Err(VaultError::OperationConflict);
+            }
+        } else {
+            require_pristine_vault(&transaction)?;
+            if load_recovery_restore(&transaction)?.is_some() {
+                return Err(VaultError::OperationConflict);
+            }
+            transaction.execute(
+                "INSERT INTO hosted_restore_intent(singleton,payload) VALUES(1,?1)",
+                params![payload],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Only an exact, unprepared attempt can be abandoned for another login.
+    pub fn discard_unprepared_hosted_restore_intent(
+        &mut self,
+        expected: &HostedRestoreIntent,
+    ) -> Result<(), VaultError> {
+        let transaction = self.connection.transaction()?;
+        if load_recovery_restore(&transaction)?.is_some()
+            || load_hosted_restore_intent(&transaction)?.as_ref() != Some(expected)
+        {
+            return Err(VaultError::OperationConflict);
+        }
+        transaction.execute("DELETE FROM hosted_restore_intent WHERE singleton=1", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
 use context_relay_protocol::{
     AccountId, DeviceCertificateId, DeviceId, Ed25519PublicKeyBytes, RecoveryEnrollmentId,
     RecoveryRestoreId, RecoveryRootId, Sha256Digest, WorkspaceId, X25519PublicKeyBytes,
@@ -308,10 +406,10 @@ impl Vault {
     ) -> Result<CommitDisposition, VaultError> {
         let transaction = self.connection.transaction()?;
         let stored = load_recovery_restore(&transaction)?.ok_or_else(validation)?;
+        // Provider acceptance and local preparation/completion use independent clocks.
         if projection.canonical_claim != stored.canonical_claim
             || &projection.receipt != receipt
-            || receipt.accepted_at_ms < stored.prepared_at_ms
-            || completed_at_ms < receipt.accepted_at_ms
+            || completed_at_ms < stored.prepared_at_ms
         {
             transaction.rollback()?;
             return Err(validation());
@@ -432,6 +530,7 @@ impl Vault {
             *material.workspace_root_key(),
             *material.active_epoch_key(),
         )
+        .and_then(|material| material.with_enrollment_record_sha256(stored.canonical_record_sha256))
         .map_err(|_| validation())
     }
 
@@ -439,16 +538,80 @@ impl Vault {
         &self,
         device_keys: &DeviceKeys,
     ) -> Result<WorkspacePairingMaterial, VaultError> {
+        self.trusted_workspace_material_and_certificates(device_keys)
+            .map(|(material, _)| material)
+    }
+
+    pub(super) fn trusted_workspace_material_and_certificates(
+        &self,
+        device_keys: &DeviceKeys,
+    ) -> Result<
+        (
+            WorkspacePairingMaterial,
+            Vec<crate::crypto::DeviceCertificateV1>,
+        ),
+        VaultError,
+    > {
         let enrollment = self.recovery_enrollment()?;
         let restore = self.recovery_restore()?;
         match (enrollment, restore) {
             (Some(enrollment), None)
                 if enrollment.state == RecoveryEnrollmentPersistenceState::Active =>
             {
-                self.enrolled_workspace_material(device_keys)
+                Ok((
+                    self.enrolled_workspace_material(device_keys)?,
+                    vec![enrollment.record.genesis_certificate],
+                ))
             }
             (None, Some(restore)) if restore.state == RecoveryRestorePersistenceState::Active => {
-                self.recovered_workspace_material(device_keys)
+                Ok((
+                    self.recovered_workspace_material(device_keys)?,
+                    vec![
+                        restore.record.genesis_certificate,
+                        restore.claim.certificate,
+                    ],
+                ))
+            }
+            (None, None) => {
+                let mut statement = self.connection.prepare(
+                    "SELECT pairing_id FROM pairing_approval_transcripts
+                     WHERE role = 'joiner' AND state = 'completed' LIMIT 2",
+                )?;
+                let ids = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let [pairing_id] = ids.as_slice() else {
+                    return Err(validation());
+                };
+                let confirmed = self
+                    .completed_pairing_approval(parse_id(pairing_id)?, device_keys)?
+                    .ok_or_else(validation)?;
+                let material = confirmed.key_bundle();
+                let workspace = WorkspacePairingMaterial::new(
+                    SyncScope {
+                        account_id: material.account_id(),
+                        workspace_id: material.workspace_id(),
+                    },
+                    material.control_epoch(),
+                    material.key_epoch(),
+                    *material.workspace_root_key(),
+                    *material.active_epoch_key(),
+                )
+                .map_err(|_| validation())?;
+                let workspace = match material.enrollment_record_sha256() {
+                    Some(pin) => workspace
+                        .with_enrollment_record_sha256(pin)
+                        .map_err(|_| validation())?,
+                    None => workspace,
+                };
+                let approval = confirmed.approved_payload();
+                Ok((
+                    workspace,
+                    vec![
+                        approval.issuer_certificate.clone(),
+                        approval.grant.certificate.clone(),
+                    ],
+                ))
             }
             _ => Err(validation()),
         }
@@ -491,6 +654,11 @@ fn require_pristine_vault(transaction: &Transaction<'_>) -> Result<(), VaultErro
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
     for table in tables {
+        if table == "hosted_restore_intent" {
+            // The original hosted identity is durable before claim preparation.
+            load_hosted_restore_intent(transaction)?;
+            continue;
+        }
         if table == "recovery_restores"
             || table.starts_with("search_documents_")
             || table.starts_with("search_fts_")
@@ -679,10 +847,8 @@ fn validate_stored_row(raw: RawRecoveryRestore) -> Result<StoredRecoveryRestore,
             activated_genesis_certificate_id == Some(record.genesis_certificate_id)
                 && activated_recovered_certificate_id == Some(claim.certificate_id)
                 && accepted_generation == expected_generation.checked_add(1)
-                && provider_accepted_at_ms.is_some_and(|value| value >= prepared_at_ms)
-                && completed_at_ms
-                    .zip(provider_accepted_at_ms)
-                    .is_some_and(|(completed, provider)| completed >= provider)
+                && provider_accepted_at_ms.is_some()
+                && completed_at_ms.is_some_and(|value| value >= prepared_at_ms)
                 && conflict_at_ms.is_none()
         }
         RecoveryRestorePersistenceState::Conflict => {

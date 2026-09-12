@@ -15,6 +15,7 @@ import type {
   RecoveryEnrollmentStatus,
 } from './bindings';
 import type { DeviceGateway, PairingStatusResult } from './workspace';
+import { RecoveryRestorePanel } from './recovery-restore';
 
 const PAIRING_CODE_PATTERN = /^[0-9A-HJKMNP-TV-Z]{5}-[0-9A-HJKMNP-TV-Z]{5}$/;
 const SAFETY_NUMBER_PATTERN = /^[0-9A-F]{4}(?:-[0-9A-F]{4}){4}$/;
@@ -380,6 +381,7 @@ export function DevicesScreen({
         onComplete={loadDevices}
         pollIntervalMs={pollIntervalMs}
       />
+      <RecoveryRestorePanel gateway={gateway} onComplete={loadDevices} />
 
       <section className="pairing-workspace" aria-labelledby="pair-device-title">
         <div>
@@ -618,6 +620,7 @@ function RecoveryEnrollmentPanel({
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [working, setWorking] = useState(false);
   const [unavailable, setUnavailable] = useState(false);
+  const [statusRetryNeeded, setStatusRetryNeeded] = useState(false);
   const [lostChallengeCleanupFailed, setLostChallengeCleanupFailed] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -634,6 +637,7 @@ function RecoveryEnrollmentPanel({
   const applyRecoveryStatus = useCallback(
     async (nextStatus: RecoveryEnrollmentStatus) => {
       if (!mountedRef.current) return;
+      setStatusRetryNeeded(false);
       setStatus(nextStatus);
       switch (nextStatus.state) {
         case 'idle':
@@ -702,23 +706,29 @@ function RecoveryEnrollmentPanel({
     [clearChallenge, gateway, onComplete],
   );
 
+  const refreshRecoveryStatus = useCallback(async () => {
+    try {
+      const nextStatus = await gateway.recoveryEnrollmentOverview();
+      if (!mountedRef.current) return null;
+      await applyRecoveryStatus(nextStatus);
+      return nextStatus;
+    } catch (cause) {
+      if (!mountedRef.current) return null;
+      if (isClientError(cause, 'harness_unsupported')) {
+        setUnavailable(true);
+        setStatus(null);
+        setError(null);
+      } else {
+        setStatusRetryNeeded(true);
+        setError('Recovery status could not be loaded. Retry to check the saved setup.');
+      }
+      return null;
+    }
+  }, [applyRecoveryStatus, gateway]);
+
   useEffect(() => {
     mountedRef.current = true;
-    void gateway
-      .recoveryEnrollmentOverview()
-      .then((nextStatus) => {
-        if (mountedRef.current) void applyRecoveryStatus(nextStatus);
-      })
-      .catch((cause) => {
-        if (!mountedRef.current) return;
-        if (isClientError(cause, 'harness_unsupported')) {
-          setUnavailable(true);
-          setStatus(null);
-          setError(null);
-        } else {
-          setError('Recovery status could not be loaded.');
-        }
-      });
+    void refreshRecoveryStatus();
 
     return () => {
       mountedRef.current = false;
@@ -728,7 +738,7 @@ function RecoveryEnrollmentPanel({
         void gateway.recoveryEnrollmentCancel(activeChallenge.enrollmentId).catch(() => undefined);
       }
     };
-  }, [applyRecoveryStatus, gateway]);
+  }, [refreshRecoveryStatus, gateway]);
 
   useEffect(() => {
     if (!challenge) return;
@@ -757,7 +767,10 @@ function RecoveryEnrollmentPanel({
           if (!stopped) void applyRecoveryStatus(nextStatus);
         })
         .catch(() => {
-          if (!stopped) setError('Recovery status could not be refreshed.');
+          if (!stopped) {
+            setStatusRetryNeeded(true);
+            setError('Recovery status could not be refreshed.');
+          }
         });
     }, pollIntervalMs);
     return () => {
@@ -805,6 +818,15 @@ function RecoveryEnrollmentPanel({
         return;
       }
       setError(safeRecoveryError(cause, 'Recovery setup could not begin.'));
+    } finally {
+      if (mountedRef.current) setWorking(false);
+    }
+  }
+
+  async function retryRecoveryStatus() {
+    setWorking(true);
+    try {
+      await refreshRecoveryStatus();
     } finally {
       if (mountedRef.current) setWorking(false);
     }
@@ -858,9 +880,12 @@ function RecoveryEnrollmentPanel({
     } catch (cause) {
       if (!mountedRef.current) return;
       clearChallenge();
-      setStatus(idleRecoveryStatus());
+      setStatus(null);
       setMessage(null);
-      setError(safeRecoveryError(cause, 'Recovery confirmation failed. Start setup again.'));
+      const refreshed = await refreshRecoveryStatus();
+      if (mountedRef.current && refreshed?.state === 'idle') {
+        setError(safeRecoveryError(cause, 'Recovery confirmation failed. Start setup again.'));
+      }
     } finally {
       if (mountedRef.current) setWorking(false);
     }
@@ -902,6 +927,17 @@ function RecoveryEnrollmentPanel({
           type="button"
         >
           Set up recovery
+        </button>
+      )}
+
+      {!unavailable && statusRetryNeeded && (
+        <button
+          className="secondary-action"
+          disabled={working}
+          onClick={() => void retryRecoveryStatus()}
+          type="button"
+        >
+          Retry recovery status
         </button>
       )}
 

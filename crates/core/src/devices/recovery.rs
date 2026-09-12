@@ -362,6 +362,9 @@ where
             .ok_or(RecoveryEnrollmentCycleError::Conflict)?;
         let receipt = match self.transport.register(&stored.canonical_record, now_ms) {
             Ok(receipt) => receipt,
+            Err(RecoveryTransportError::Expired) => {
+                return Err(RecoveryEnrollmentCycleError::Expired);
+            }
             Err(RecoveryTransportError::Transient) => {
                 return Ok(RecoveryEnrollmentConfirmOutcome::Status(
                     status_from_stored(&stored),
@@ -383,6 +386,7 @@ where
                 ));
             }
         };
+        let now_ms = self.clock.now_ms().max(stored.prepared_at_ms);
         match self.activate(vault, &stored, &receipt, device_keys, now_ms) {
             Ok(completion) => Ok(RecoveryEnrollmentConfirmOutcome::Complete(completion)),
             Err(RecoveryEnrollmentCycleError::Conflict) => self
@@ -480,6 +484,9 @@ where
                         }
                         None => match self.transport.register(&stored.canonical_record, now_ms) {
                             Ok(receipt) => receipt,
+                            Err(RecoveryTransportError::Expired) => {
+                                return Err(RecoveryEnrollmentCycleError::Expired);
+                            }
                             Err(RecoveryTransportError::Transient) => {
                                 return Ok(status_from_stored(&stored));
                             }
@@ -491,6 +498,7 @@ where
                             ) => return self.mark_conflict(vault, &stored, now_ms),
                         },
                     };
+                    let now_ms = self.clock.now_ms().max(stored.prepared_at_ms);
                     match self.activate(vault, &stored, &receipt, device_keys, now_ms) {
                         Ok(completion) => Ok(RecoveryEnrollmentStatus {
                             enrollment_id: Some(completion.enrollment_id),
@@ -757,6 +765,7 @@ fn map_transport_error(error: RecoveryTransportError) -> RecoveryEnrollmentCycle
             RecoveryEnrollmentCycleError::Conflict
         }
         RecoveryTransportError::Unauthorized => RecoveryEnrollmentCycleError::Unauthorized,
+        RecoveryTransportError::Expired => RecoveryEnrollmentCycleError::Expired,
         RecoveryTransportError::Transient => RecoveryEnrollmentCycleError::Transient,
     }
 }

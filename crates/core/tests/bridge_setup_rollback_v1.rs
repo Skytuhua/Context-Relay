@@ -124,6 +124,7 @@ fn operation(arguments: &[&str]) -> CliOperation {
 
 fn plan() -> NativeTransactionPlan {
     let cli = ApprovedCliMutation {
+        execution_context: None,
         stable_id: "b5be495e-d4ee-7a2e-a29e-b589ebc5d7fd".to_owned(),
         expected: Some(declaration("/opt/context-relay-old")),
         intended: Some(declaration("/opt/context-relay")),
@@ -195,6 +196,7 @@ fn plan() -> NativeTransactionPlan {
         scanner_result_hash: Sha256Digest([12; 32]),
         mutations: vec![],
         cli_mutations: vec![cli],
+        installed_runtime: None,
         native_memory_registrations: vec![],
         ownership_changes: vec![],
     }
@@ -329,6 +331,29 @@ fn rollback_persists_and_applies_a_linked_exact_inverse_then_replays() {
         rollback_executor.calls.len(),
         1,
         "rollback replay must not execute the inverse twice"
+    );
+    drop(vault);
+    let vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
+    let history = context_relay_core::setup::harness_setups(&vault, None).unwrap();
+    assert_eq!(
+        history.setups.len(),
+        1,
+        "the inverse must not appear as another saved setup"
+    );
+    assert_eq!(history.setups[0].plan_id, original.setup.plan_id);
+    assert_eq!(
+        history.setups[0].state,
+        context_relay_protocol::HarnessSetupState::RolledBack
+    );
+    let saved = context_relay_core::setup::harness_setup(&vault, &original.setup.plan_id).unwrap();
+    assert_eq!(saved.plan, original.setup);
+    assert_eq!(
+        saved.state,
+        context_relay_protocol::HarnessSetupState::RolledBack
+    );
+    assert!(
+        context_relay_core::setup::harness_setup(&vault, &rollback_executor.calls[0].setup.plan_id)
+            .is_err()
     );
 }
 
@@ -637,49 +662,61 @@ fn rollback_reconciles_the_inverse_native_terminal_without_reexecuting() {
 
 #[test]
 fn rollback_does_not_reexecute_a_pending_inverse_native_outcome() {
-    let keys = MemoryKeyStore::default();
-    let path = TempVault::new("bridge-setup-rollback-pending-inverse");
-    let mut vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
-    let original = persist(&mut vault, plan());
-    BridgeInstallService::persisted(&mut vault)
-        .apply(
-            &original.setup.plan_id,
-            NOW_MS + 1,
-            &mut RecordingExecutor::default(),
-        )
-        .unwrap();
-    let inverse_id = Rc::new(RefCell::new(None));
-    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let _ = BridgeInstallService::persisted(&mut vault).rollback(
-            &original.setup.plan_id,
-            NOW_MS + 2,
-            &mut CrashRollback {
-                status: Some(NativeTransactionStatus::Pending),
-                inverse_id: inverse_id.clone(),
-            },
-        );
-    }));
-    let inverse_id = inverse_id.borrow().unwrap();
-    let mut executor = RecordingExecutor::default();
-
-    assert!(
+    for native_status in [
+        NativeTransactionStatus::Pending,
+        NativeTransactionStatus::Restoring,
+    ] {
+        let keys = MemoryKeyStore::default();
+        let path = TempVault::new("bridge-setup-rollback-pending-inverse");
+        let mut vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
+        let original = persist(&mut vault, plan());
         BridgeInstallService::persisted(&mut vault)
-            .rollback(&original.setup.plan_id, NOW_MS + 3, &mut executor)
-            .is_err()
-    );
-    assert!(executor.calls.is_empty());
-    assert_eq!(
-        vault
-            .setup_plan(&original.setup.plan_id)
-            .unwrap()
-            .unwrap()
-            .lifecycle,
-        SetupPlanLifecycle::RollingBack
-    );
-    assert_eq!(
-        vault.setup_plan(&inverse_id).unwrap().unwrap().lifecycle,
-        SetupPlanLifecycle::Applying
-    );
+            .apply(
+                &original.setup.plan_id,
+                NOW_MS + 1,
+                &mut RecordingExecutor::default(),
+            )
+            .unwrap();
+        let inverse_id = Rc::new(RefCell::new(None));
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = BridgeInstallService::persisted(&mut vault).rollback(
+                &original.setup.plan_id,
+                NOW_MS + 2,
+                &mut CrashRollback {
+                    status: Some(native_status),
+                    inverse_id: inverse_id.clone(),
+                },
+            );
+        }));
+        let inverse_id = inverse_id.borrow().unwrap();
+        let mut executor = RecordingExecutor::default();
+
+        drop(vault);
+        let mut vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
+        assert!(
+            BridgeInstallService::persisted(&mut vault)
+                .reconcile_after_native_recovery()
+                .is_err()
+        );
+        assert!(
+            BridgeInstallService::persisted(&mut vault)
+                .rollback(&original.setup.plan_id, NOW_MS + 3, &mut executor)
+                .is_err()
+        );
+        assert!(executor.calls.is_empty());
+        assert_eq!(
+            vault
+                .setup_plan(&original.setup.plan_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            SetupPlanLifecycle::RollingBack
+        );
+        assert_eq!(
+            vault.setup_plan(&inverse_id).unwrap().unwrap().lifecycle,
+            SetupPlanLifecycle::Applying
+        );
+    }
 }
 
 #[test]
@@ -708,6 +745,25 @@ fn rollback_resumes_a_claimed_inverse_when_its_native_transaction_is_missing() {
     }));
     let inverse_id = inverse_id.borrow().unwrap();
     let mut executor = RecordingExecutor::default();
+
+    drop(vault);
+    let mut vault = Vault::open(path.path(), "bridge-setup-rollback-v1", &keys).unwrap();
+    BridgeInstallService::persisted(&mut vault)
+        .reconcile_after_native_recovery()
+        .expect("an Undo interrupted before native execution must allow startup");
+    assert_eq!(
+        vault
+            .setup_plan(&original.setup.plan_id)
+            .unwrap()
+            .unwrap()
+            .lifecycle,
+        SetupPlanLifecycle::RollingBack,
+    );
+    assert_eq!(
+        vault.setup_plan(&inverse_id).unwrap().unwrap().lifecycle,
+        SetupPlanLifecycle::Applying
+    );
+    assert!(executor.calls.is_empty());
 
     BridgeInstallService::persisted(&mut vault)
         .rollback(&original.setup.plan_id, NOW_MS + 3, &mut executor)

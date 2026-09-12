@@ -18,9 +18,8 @@ use crate::{
     devices::{
         crypto::{
             PairingKeyBundle, certificate_digest, decode_certificate_v1, decode_native_platform,
-            decode_pairing_key_bundle_v1, decode_wrapped_envelope_with_limit,
-            encode_certificate_v1, encode_native_platform, encode_pairing_key_bundle_v1,
-            encode_wrapped_envelope,
+            decode_pairing_key_bundle, decode_wrapped_envelope_with_limit, encode_certificate_v1,
+            encode_native_platform, encode_pairing_key_bundle, encode_wrapped_envelope,
         },
         recovery_crypto::{
             MAX_RECOVERY_DEVICE_NAME_BYTES, RecoveryEnrollmentCryptoError,
@@ -139,6 +138,44 @@ impl fmt::Debug for RecoveryDeviceClaimArtifacts {
             .field("canonical_claim", &"[REDACTED]")
             .finish()
     }
+}
+
+/// Device possession proof bound to the verified hosted user/session and exact claim.
+/// The server must also enforce live ownership and atomic restore-generation checks.
+pub fn hosted_recovery_proof_preimage(
+    auth_user_id: uuid::Uuid,
+    session_id: uuid::Uuid,
+    claim: &RecoveryDeviceClaimV1,
+) -> Result<Vec<u8>, RecoveryRestoreCryptoError> {
+    if auth_user_id.is_nil() || session_id.is_nil() {
+        return Err(RecoveryRestoreCryptoError::InvalidRecovery);
+    }
+    let canonical = encode_recovery_device_claim_v1(claim)?;
+    let mut preimage = b"context-relay/hosted-recovery-device-proof/v1\0".to_vec();
+    preimage.extend_from_slice(auth_user_id.as_bytes());
+    preimage.extend_from_slice(session_id.as_bytes());
+    preimage.extend_from_slice(&Sha256::digest(canonical));
+    Ok(preimage)
+}
+
+pub fn sign_hosted_recovery_proof(
+    device: &DeviceKeys,
+    auth_user_id: uuid::Uuid,
+    session_id: uuid::Uuid,
+    claim: &RecoveryDeviceClaimV1,
+) -> Result<Ed25519SignatureBytes, RecoveryRestoreCryptoError> {
+    if device.signing_public_key() != claim.certificate.signing_public_key
+        || device.wrapping_public_key() != claim.certificate.wrapping_public_key
+    {
+        return Err(RecoveryRestoreCryptoError::InvalidRecovery);
+    }
+    Ok(
+        device.sign_hosted_device_proof(&hosted_recovery_proof_preimage(
+            auth_user_id,
+            session_id,
+            claim,
+        )?),
+    )
 }
 
 pub fn authenticate_recovery_root(
@@ -285,7 +322,7 @@ pub(crate) fn build_recovery_device_claim_inner<R: CryptoRng + RngCore>(
     };
 
     let aad = recovered_device_material_aad(&claim)?;
-    let plaintext = encode_pairing_key_bundle_v1(&material)?;
+    let plaintext = encode_pairing_key_bundle(&material)?;
     claim.device_material_envelope = wrap_secret_with_rng(
         device_keys.wrapping_public_key(),
         plaintext.as_slice(),
@@ -437,7 +474,7 @@ pub fn open_recovered_device_material(
     }
     let aad = recovered_device_material_aad(claim)?;
     let plaintext = device_keys.unwrap_secret(&claim.device_material_envelope, &aad)?;
-    let material = decode_pairing_key_bundle_v1(plaintext.expose())?;
+    let material = decode_pairing_key_bundle(plaintext.expose())?;
     if material.account_id() != claim.account_id
         || material.workspace_id() != claim.workspace_id
         || material.control_epoch() != claim.certificate.control_epoch

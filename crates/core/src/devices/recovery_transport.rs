@@ -15,6 +15,7 @@ pub enum RecoveryTransportError {
     Invalid,
     Conflict,
     Unauthorized,
+    Expired,
     Transient,
 }
 
@@ -24,6 +25,7 @@ impl RecoveryTransportError {
             Self::Invalid => "recovery_invalid",
             Self::Conflict => "recovery_conflict",
             Self::Unauthorized => "recovery_unauthorized",
+            Self::Expired => "recovery_expired",
             Self::Transient => "transient",
         }
     }

@@ -34,6 +34,51 @@ const DEVICE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07398b";
 const CERTIFICATE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07398a";
 const OTHER_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073989";
 
+#[test]
+fn hosted_enrollment_proof_binds_the_session_challenge_and_record() {
+    use context_relay_core::crypto::verify_signature;
+    use context_relay_core::devices::recovery_crypto::{
+        HostedEnrollmentChallenge, hosted_enrollment_proof_preimage, sign_hosted_enrollment_proof,
+    };
+    let fixture = fixture();
+    let challenge = HostedEnrollmentChallenge {
+        reservation_id: id(ENROLLMENT_ID),
+        auth_user_id: id(ACCOUNT_ID),
+        session_id: id(WORKSPACE_ID),
+        nonce: [7; 32],
+    };
+    let record = &fixture.artifacts.record;
+    let signature = sign_hosted_enrollment_proof(&fixture.device_keys, &challenge, record).unwrap();
+    let preimage = hosted_enrollment_proof_preimage(&challenge, record).unwrap();
+    let vector: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/hosted-enrollment-proof-v1.json")).unwrap();
+    assert_eq!(encode_hex(&preimage), vector["preimage"]);
+    assert_eq!(encode_hex(&signature.0), vector["signature"]);
+    verify_signature(
+        fixture.device_keys.signing_public_key(),
+        &preimage,
+        signature,
+    )
+    .unwrap();
+    for offset in [0, 49, 65, 81, 97, preimage.len() - 1] {
+        let mut changed = preimage.clone();
+        changed[offset] ^= 1;
+        assert!(
+            verify_signature(
+                fixture.device_keys.signing_public_key(),
+                &changed,
+                signature
+            )
+            .is_err()
+        );
+    }
+    let other = DeviceKeys::generate().unwrap();
+    assert!(sign_hosted_enrollment_proof(&other, &challenge, record).is_err());
+    let mut invalid = challenge;
+    invalid.session_id = uuid::Uuid::nil();
+    assert!(hosted_enrollment_proof_preimage(&invalid, record).is_err());
+}
+
 struct SequenceRng(u8);
 
 impl RngCore for SequenceRng {

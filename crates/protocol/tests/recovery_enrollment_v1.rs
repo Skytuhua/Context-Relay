@@ -15,11 +15,53 @@ use serde_json::{Value, json};
 const ENROLLMENT_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
 const DEVICE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073990";
 
+#[test]
+fn restore_request_redacts_phrase_and_status_has_closed_wire_shape() {
+    let parsed: JsonRpcRequestV1 = serde_json::from_value(request(
+        "recovery_restore_begin",
+        json!({"recoveryPhraseWords":vec!["abandon";24]}),
+    ))
+    .unwrap();
+    assert!(!format!("{parsed:?}").contains("abandon"));
+    assert!(
+        serde_json::from_value::<JsonRpcRequestV1>(request(
+            "recovery_restore_begin",
+            json!({"recoveryPhraseWords":vec!["abandon";23]})
+        ))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<JsonRpcRequestV1>(request(
+            "recovery_restore_begin",
+            json!({"recoveryPhraseWords":vec!["abandon";24],"sessionId":"unexpected"})
+        ))
+        .is_err()
+    );
+    let status = context_relay_protocol::RecoveryRestoreStatus::Submitting {
+        restore_id: ENROLLMENT_ID.parse().unwrap(),
+    };
+    let wire = serde_json::to_value(&status).unwrap();
+    assert_eq!(
+        wire,
+        json!({"state":"submitting","restoreId":ENROLLMENT_ID})
+    );
+    assert_eq!(
+        serde_json::from_value::<context_relay_protocol::RecoveryRestoreStatus>(wire).unwrap(),
+        status
+    );
+    assert!(
+        serde_json::from_value::<context_relay_protocol::RecoveryRestoreStatus>(
+            json!({"state":"idle","restoreId":ENROLLMENT_ID})
+        )
+        .is_err()
+    );
+}
+
 fn request(method: &str, params: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": support::ID,
-        "protocol": {"major": 1, "minor": 4},
+        "protocol": {"major": 1, "minor": 15},
         "daemonInstanceNonce": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
         "method": method,
         "params": params,

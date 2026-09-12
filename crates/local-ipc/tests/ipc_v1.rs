@@ -243,6 +243,15 @@ fn verify_server_proof(
 
 #[test]
 fn challenged_hmac_matches_frozen_vector() {
+    // The protocol bytes are part of the authenticated transcript. These 1.15
+    // client/server vectors were independently checked with Python stdlib HMAC-SHA256.
+    assert_eq!(
+        PROTOCOL_VERSION,
+        ProtocolVersion {
+            major: 1,
+            minor: 15
+        }
+    );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
     let proof = create_proof(
         &token,
@@ -255,7 +264,7 @@ fn challenged_hmac_matches_frozen_vector() {
 
     assert_eq!(
         serde_json::to_string(&proof).unwrap(),
-        r#""vIjLF221NRLHOpwHDx9ZmjSsNW7Xx7keDPG46cCNS7M""#
+        r#""ulh4Ld9oAi1UkHJsSNxkYoAizyyRxYTmeocJZjmaVtM""#
     );
     assert!(
         verify_proof(
@@ -439,6 +448,13 @@ fn auth_server_hello_is_strict_and_requires_a_32_byte_challenge() {
 
 #[test]
 fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
+    assert_eq!(
+        PROTOCOL_VERSION,
+        ProtocolVersion {
+            major: 1,
+            minor: 15
+        }
+    );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
     let client_proof = create_proof(
         &token,
@@ -460,7 +476,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
 
     assert_eq!(
         serde_json::to_string(&server_proof).unwrap(),
-        r#""5waUUOCuxRderadzSuNDDkVDFB1kLnOdSZahgcMbtxA""#
+        r#""PzkXMpOhpyFTGswqMihkhRda73CAxSyWCcFGtUfnSU0""#
     );
     assert!(
         verify_server_proof(
@@ -673,6 +689,28 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
 
     vec![
         (
+            "DesktopWritesList",
+            request_fixture("desktop_writes_list", serde_json::json!({"after": null})),
+        ),
+        (
+            "DesktopWriteGet",
+            request_fixture("desktop_write_get", serde_json::json!({"operationId": ID})),
+        ),
+        (
+            "DesktopWriteForget",
+            request_fixture(
+                "desktop_write_forget",
+                serde_json::json!({"operationId": ID}),
+            ),
+        ),
+        (
+            "DesktopWritePrepare",
+            request_fixture(
+                "desktop_write_prepare",
+                serde_json::json!({"write": {"method":"memory_archive","params":{"operationId": ID,"memoryId": ID,"expectedRevision": ID}}}),
+            ),
+        ),
+        (
             "Hello",
             request_fixture(
                 "hello",
@@ -732,6 +770,13 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
             request_fixture(
                 "project_upsert",
                 serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}}),
+            ),
+        ),
+        (
+            "ProjectRegister",
+            request_fixture(
+                "project_register",
+                serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}, "path": {"platform": "windows", "bytes": "", "display": null}}),
             ),
         ),
         (
@@ -882,6 +927,32 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         ),
         ("HarnessProbe", request_fixture("harness_probe", harness())),
         (
+            "HarnessExecutionStart",
+            request_fixture(
+                "harness_execution_start",
+                serde_json::json!({"planId": ID, "action": "apply"}),
+            ),
+        ),
+        (
+            "HarnessExecutionStatus",
+            request_fixture(
+                "harness_execution_status",
+                serde_json::json!({"planId": ID, "action": "rollback"}),
+            ),
+        ),
+        (
+            "HarnessExecutionCurrent",
+            request_fixture("harness_execution_current", empty()),
+        ),
+        (
+            "HarnessSetupsList",
+            request_fixture("harness_setups_list", serde_json::json!({"after": null})),
+        ),
+        (
+            "HarnessSetupGet",
+            request_fixture("harness_setup_get", serde_json::json!({"planId": ID})),
+        ),
+        (
             "HarnessPreview",
             request_fixture("harness_preview", harness()),
         ),
@@ -969,6 +1040,25 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
             request_fixture("pairing_cancel", serde_json::json!({"pairingId": ID})),
         ),
         (
+            "RecoveryRestoreBegin",
+            request_fixture(
+                "recovery_restore_begin",
+                serde_json::json!({"recoveryPhraseWords":vec!["abandon";24]}),
+            ),
+        ),
+        (
+            "RecoveryRestoreOverview",
+            request_fixture("recovery_restore_overview", empty()),
+        ),
+        (
+            "RecoveryRestoreCancel",
+            request_fixture("recovery_restore_cancel", empty()),
+        ),
+        (
+            "RecoveryRestoreResume",
+            request_fixture("recovery_restore_resume", empty()),
+        ),
+        (
             "RecoveryEnrollmentBegin",
             request_fixture("recovery_enrollment_begin", empty()),
         ),
@@ -1023,7 +1113,14 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
             "AccountDeletionBegin",
             request_fixture(
                 "account_deletion_begin",
-                serde_json::json!({"confirmation": "delete"}),
+                serde_json::json!({"operationId": ID, "confirmation": "delete"}),
+            ),
+        ),
+        (
+            "AccountDeletionIntents",
+            request_fixture(
+                "account_deletion_intents",
+                serde_json::json!({"after":null}),
             ),
         ),
         (
@@ -1032,15 +1129,18 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         ),
         (
             "AccountDeletionCancel",
-            request_fixture("account_deletion_cancel", empty()),
+            request_fixture(
+                "account_deletion_cancel",
+                serde_json::json!({"operationId": ID}),
+            ),
         ),
     ]
 }
 
 #[test]
-fn role_allowlist_covers_all_53_requests() {
+fn role_allowlist_covers_core_and_tracked_setup_requests() {
     let fixtures = all_request_fixtures();
-    assert_eq!(fixtures.len(), 53);
+    assert_eq!(fixtures.len(), 68);
 
     for (name, request) in &fixtures {
         let common = matches!(*name, "Cancel" | "Health");
@@ -1062,7 +1162,10 @@ fn role_allowlist_covers_all_53_requests() {
             role_allows(ClientRole::Desktop, request),
             !matches!(
                 *name,
-                "Hello" | "RecoveryEnrollmentBegin" | "RecoveryEnrollmentConfirm"
+                "Hello"
+                    | "RecoveryEnrollmentBegin"
+                    | "RecoveryEnrollmentConfirm"
+                    | "RecoveryRestoreBegin"
             ),
             "Desktop matrix mismatch for {name}"
         );
@@ -1071,6 +1174,10 @@ fn role_allowlist_covers_all_53_requests() {
             matches!(
                 *name,
                 "Cancel"
+                    | "RecoveryRestoreBegin"
+                    | "RecoveryRestoreOverview"
+                    | "RecoveryRestoreResume"
+                    | "RecoveryRestoreCancel"
                     | "RecoveryEnrollmentBegin"
                     | "RecoveryEnrollmentConfirm"
                     | "RecoveryEnrollmentCancel"
@@ -1094,14 +1201,14 @@ fn role_allowlist_covers_all_53_requests() {
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::Desktop, request))
             .count(),
-        50
+        64
     );
     assert_eq!(
         fixtures
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::DesktopRecoveryHost, request))
             .count(),
-        4
+        8
     );
     assert_eq!(
         fixtures
@@ -1773,5 +1880,31 @@ mod macos_transport_tests {
             runtime.endpoint_name(),
             Err(IpcError::InvalidRuntime)
         ));
+    }
+}
+
+#[test]
+fn guided_connection_and_launch_interfaces_are_desktop_only() {
+    let id = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
+    let selection = serde_json::json!({"harness":"codex","projectId":id,"hermesProfile":null});
+    for (method, params) in [
+        ("harness_launch_info", selection.clone()),
+        (
+            "connection_check_start",
+            serde_json::json!({"selection":selection,"memoryId":id,"expectedRevision":id}),
+        ),
+        ("connection_check_status", serde_json::json!({"checkId":id})),
+        ("connection_check_cancel", serde_json::json!({"checkId":id})),
+    ] {
+        let request: LocalRequest =
+            serde_json::from_value(serde_json::json!({"method":method,"params":params})).unwrap();
+        assert!(role_allows(ClientRole::Desktop, &request));
+        for role in [
+            ClientRole::McpBridge,
+            ClientRole::Installer,
+            ClientRole::DesktopRecoveryHost,
+        ] {
+            assert!(!role_allows(role, &request), "{method}: {role:?}");
+        }
     }
 }

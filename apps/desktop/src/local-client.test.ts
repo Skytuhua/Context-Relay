@@ -14,7 +14,64 @@ import { LocalClient } from './local-client';
 import { LocalWorkspaceGateway } from './workspace';
 
 beforeEach(() => {
-  invoke.mockReset();
+    invoke.mockReset();
+});
+
+it('opens native recovery input without passing phrase data through invoke', async () => {
+  invoke.mockResolvedValueOnce(null);
+  await expect(new LocalClient().recoveryRestoreBegin()).resolves.toBeNull();
+  expect(invoke).toHaveBeenCalledExactlyOnceWith('recovery_restore_begin');
+});
+
+it('routes restore actions and rejects malformed or secret-bearing public status', async () => {
+  const gateway = new LocalWorkspaceGateway();
+  const idle = { state: 'idle' };
+  invoke.mockResolvedValue({ kind: 'recovery_restore_status', data: { status: idle } });
+  await expect(gateway.recoveryRestoreOverview()).resolves.toEqual(idle);
+  await expect(gateway.recoveryRestoreCancel()).resolves.toEqual(idle);
+  const pending = { state: 'submitting', restoreId: '018f22e2-79b0-7cc8-98c4-dc0c0c075602' };
+  invoke.mockResolvedValue({ kind: 'recovery_restore_status', data: { status: pending } });
+  await expect(gateway.recoveryRestoreResume()).resolves.toEqual(pending);
+  await expect(gateway.recoveryRestoreCancel()).rejects.toThrow();
+  invoke.mockResolvedValue(pending);
+  await expect(gateway.recoveryRestoreBegin()).resolves.toEqual(pending);
+  expect(invoke.mock.calls.slice(0, 3).map((call) => call[1].request.method)).toEqual([
+    'recovery_restore_overview', 'recovery_restore_cancel', 'recovery_restore_resume',
+  ]);
+  for (const invalid of [
+    { state: 'idle', phrase: ['secret'] }, { state: 'submitting', restoreId: 'bad-id' },
+    { state: 'complete', restoreId: pending.restoreId, device: null }, { state: 'unknown' },
+  ]) {
+    invoke.mockResolvedValue(invalid);
+    await expect(gateway.recoveryRestoreBegin()).rejects.toThrow();
+    invoke.mockResolvedValue({ kind: 'recovery_restore_status', data: { status: invalid } });
+    await expect(gateway.recoveryRestoreOverview()).rejects.toThrow();
+  }
+});
+
+it('reads and retries search preparation through the typed protocol and rejects malformed progress', async () => {
+  const gateway = new LocalWorkspaceGateway();
+  const status = { phase: 'preparing', revision: '4' };
+  invoke.mockResolvedValue({ kind: 'search_index', data: { status } });
+  await expect(gateway.searchIndexStatus()).resolves.toEqual(status);
+  await expect(gateway.searchIndexRetry()).resolves.toEqual(status);
+  expect(invoke.mock.calls.map((call) => call[1].request.method)).toEqual(['search_index_status', 'search_index_retry']);
+  for (const invalid of [
+    { phase: 'ready', revision: 4 }, { phase: 'ready', revision: '18446744073709551616' },
+    { phase: 'unknown', revision: '4' }, { phase: 'ready' },
+    { phase: 'ready', revision: '4', recordCount: 3 },
+  ]) {
+    invoke.mockResolvedValue({ kind: 'search_index', data: { status: invalid } });
+    await expect(gateway.searchIndexStatus()).rejects.toThrow();
+  }
+});
+
+it('opens the native folder picker without sending workspace mutations, including cancellation', async () => {
+  invoke.mockResolvedValueOnce('C:\\Work\\專案 🚀').mockResolvedValueOnce(null);
+  const gateway = new LocalWorkspaceGateway();
+  await expect(gateway.chooseProjectFolder()).resolves.toBe('C:\\Work\\專案 🚀');
+  await expect(gateway.chooseProjectFolder()).resolves.toBeNull();
+  expect(invoke.mock.calls).toEqual([['choose_project_folder'], ['choose_project_folder']]);
 });
 
 it('forwards only the typed request through the local_request command', async () => {
@@ -62,6 +119,16 @@ it('rejects phrase-bearing recovery methods on the generic renderer bridge', asy
   ).rejects.toThrow('dedicated native recovery command');
   await expect(
     client.call({ method: 'recovery_enrollment_confirm', params }),
+  ).rejects.toThrow('dedicated native recovery command');
+  expect(invoke).not.toHaveBeenCalled();
+});
+
+it('rejects restore phrase submission through the generic renderer bridge', async () => {
+  await expect(
+    new LocalClient().call({
+      method: 'recovery_restore_begin',
+      params: { recoveryPhraseWords: Array<string>(24).fill('abandon') },
+    }),
   ).rejects.toThrow('dedicated native recovery command');
   expect(invoke).not.toHaveBeenCalled();
 });

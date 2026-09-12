@@ -130,6 +130,7 @@ pub struct PairingDecisionEnvelope {
     pub pairing_id: PairingId,
     pub request_digest: Sha256Digest,
     decision: PairingDecision,
+    canonical_request: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -150,7 +151,25 @@ impl PairingDecisionEnvelope {
             decision: PairingDecision::Approve {
                 canonical_approved_payload,
             },
+            canonical_request: None,
         }
+    }
+
+    pub fn approve_request(
+        request: &super::crypto::SignedPairingRequest,
+        canonical_approved_payload: Vec<u8>,
+    ) -> Self {
+        let mut envelope = Self::approve(
+            request.request().pairing_id,
+            request.digest(),
+            canonical_approved_payload,
+        );
+        envelope.canonical_request = Some(request.canonical_bytes().to_vec());
+        envelope
+    }
+
+    pub(crate) fn canonical_request(&self) -> Option<&[u8]> {
+        self.canonical_request.as_deref()
     }
 
     pub const fn reject(pairing_id: PairingId, request_digest: Sha256Digest) -> Self {
@@ -158,6 +177,7 @@ impl PairingDecisionEnvelope {
             pairing_id,
             request_digest,
             decision: PairingDecision::Reject,
+            canonical_request: None,
         }
     }
 
@@ -257,6 +277,9 @@ impl fmt::Debug for PairingResult {
 }
 
 pub trait PairingJoinTransport: Send + Sync {
+    fn hosted_intent(&self) -> Option<crate::vault::HostedPairingIntent> {
+        None
+    }
     fn resolve_code(
         &self,
         code: &PairingCode,
@@ -279,6 +302,9 @@ pub trait PairingJoinTransport: Send + Sync {
 }
 
 pub trait PairingApprovalTransport: Send + Sync {
+    fn hosted_intent(&self) -> Option<crate::vault::HostedPairingIntent> {
+        None
+    }
     fn create_invite(&self, now_ms: u64) -> Result<PairingInvite, PairingTransportError>;
 
     fn invite_status(
@@ -300,6 +326,51 @@ pub trait PairingApprovalTransport: Send + Sync {
     ) -> Result<PairingDecisionReceipt, PairingTransportError>;
 
     fn cancel(&self, pairing_id: PairingId, now_ms: u64) -> Result<(), PairingTransportError>;
+}
+
+/// Fresh joining devices have no approval authority or scoped approval client.
+impl<T: PairingApprovalTransport> PairingApprovalTransport for Option<T> {
+    fn hosted_intent(&self) -> Option<crate::vault::HostedPairingIntent> {
+        self.as_ref()
+            .and_then(PairingApprovalTransport::hosted_intent)
+    }
+    fn create_invite(&self, now_ms: u64) -> Result<PairingInvite, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .create_invite(now_ms)
+    }
+    fn invite_status(
+        &self,
+        id: PairingId,
+        now_ms: u64,
+    ) -> Result<PairingInviteStatus, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .invite_status(id, now_ms)
+    }
+    fn request(
+        &self,
+        id: PairingId,
+        now_ms: u64,
+    ) -> Result<Option<StoredPairingRequest>, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .request(id, now_ms)
+    }
+    fn decide(
+        &self,
+        envelope: PairingDecisionEnvelope,
+        now_ms: u64,
+    ) -> Result<PairingDecisionReceipt, PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .decide(envelope, now_ms)
+    }
+    fn cancel(&self, id: PairingId, now_ms: u64) -> Result<(), PairingTransportError> {
+        self.as_ref()
+            .ok_or(PairingTransportError::Unauthorized)?
+            .cancel(id, now_ms)
+    }
 }
 
 pub trait PairingTransport: Send + Sync {

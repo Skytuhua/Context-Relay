@@ -51,7 +51,7 @@ pub fn seal_plan(
         return Err(PlanSealError::ApprovalHash);
     }
 
-    let native_plan = json!({
+    let mut native_plan = json!({
         "setup": plan.setup,
         "approvalVersion": plan.approval_version,
         "helperPolicyVersion": plan.helper_policy_version,
@@ -86,13 +86,19 @@ pub fn seal_plan(
             "expectedFingerprint": digest(mutation.expected.0),
             "intendedFingerprint": digest(mutation.intended.0),
         })).collect::<Vec<_>>(),
-        "cliMutations": plan.cli_mutations.iter().map(|mutation| json!({
+        "cliMutations": plan.cli_mutations.iter().map(|mutation| {
+            let mut value = json!({
             "stableId": mutation.stable_id,
             "expected": mutation.expected.as_ref().map(cli_declaration),
             "intended": mutation.intended.as_ref().map(cli_declaration),
             "forward": mutation.forward,
             "rollback": mutation.rollback,
-        })).collect::<Vec<_>>(),
+            });
+            if let Some(context) = &mutation.execution_context {
+                value["executionContext"] = json!(context);
+            }
+            value
+        }).collect::<Vec<_>>(),
         "nativeMemoryRegistrations": plan.native_memory_registrations,
         "ownershipChanges": plan.ownership_changes.iter().map(|change| json!({
             "stableId": change.stable_id,
@@ -101,6 +107,9 @@ pub fn seal_plan(
             "nativeDigest": digest(change.native_digest),
         })).collect::<Vec<_>>(),
     });
+    if let Some(runtime) = &plan.installed_runtime {
+        native_plan["installedRuntime"] = json!(runtime);
+    }
     serde_json::to_vec(&json!({
         "schemaVersion": SEALED_PLAN_SCHEMA_VERSION,
         "approvalVersion": 2,
@@ -411,6 +420,8 @@ struct SealedNativePlan {
     cli_mutations: Vec<SealedCliMutation>,
     #[serde(default)]
     native_memory_registrations: Vec<crate::native_memory::NativeMemoryRegistration>,
+    #[serde(default)]
+    installed_runtime: Option<super::InstalledRuntimeBinding>,
     ownership_changes: Vec<SealedOwnershipChange>,
 }
 
@@ -447,6 +458,7 @@ impl SealedNativePlan {
                 .map(SealedCliMutation::open)
                 .collect::<Result<_, _>>()?,
             native_memory_registrations: self.native_memory_registrations,
+            installed_runtime: self.installed_runtime,
             ownership_changes: self
                 .ownership_changes
                 .into_iter()
@@ -617,6 +629,8 @@ impl SealedMutation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SealedCliMutation {
     stable_id: String,
+    #[serde(default)]
+    execution_context: Option<super::CliExecutionContext>,
     expected: Option<SealedCliDeclaration>,
     intended: Option<SealedCliDeclaration>,
     forward: Vec<CliOperation>,
@@ -626,6 +640,7 @@ struct SealedCliMutation {
 impl SealedCliMutation {
     fn open(self) -> Result<super::ApprovedCliMutation, PlanSealError> {
         Ok(super::ApprovedCliMutation {
+            execution_context: self.execution_context,
             stable_id: self.stable_id,
             expected: self.expected.map(SealedCliDeclaration::open).transpose()?,
             intended: self.intended.map(SealedCliDeclaration::open).transpose()?,

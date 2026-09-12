@@ -24,6 +24,32 @@ pub struct TrustedDevice {
     pub active_key_epoch: u32,
 }
 
+impl TrustedDevice {
+    pub(crate) fn validate_identity(
+        &self,
+        account: AccountId,
+        workspace: WorkspaceId,
+        device: DeviceId,
+        key_epoch: u32,
+    ) -> Result<(), SyncError> {
+        let certificate = &self.certificate;
+        if certificate.account_id != account
+            || certificate.workspace_id != workspace
+            || certificate.device_id != device
+            || certificate.control_epoch == 0
+            || certificate.control_epoch > self.active_control_epoch
+            || self.active_key_epoch == 0
+            || key_epoch != self.active_key_epoch
+        {
+            return Err(SyncError::InvalidIdentity);
+        }
+        Ok(())
+    }
+}
+
+/// Supplies certificates authorized by the authenticated current control roster,
+/// not merely certificates with valid historical signatures. Issuance epochs may
+/// precede the current epoch when that roster explicitly retains the device.
 pub trait TrustedSyncMaterial {
     fn trusted_device(
         &self,
@@ -190,14 +216,13 @@ fn validate_active_identity(
     operation: &SyncOperationV1,
     trusted: &TrustedDevice,
 ) -> Result<(), SyncError> {
-    let certificate = &trusted.certificate;
-    if certificate.account_id != operation.account_id
-        || certificate.workspace_id != operation.workspace_id
-        || certificate.device_id != operation.device_id
-        || certificate.control_epoch != trusted.active_control_epoch
-        || operation.control_epoch != trusted.active_control_epoch
-        || operation.key_epoch != trusted.active_key_epoch
-    {
+    trusted.validate_identity(
+        operation.account_id,
+        operation.workspace_id,
+        operation.device_id,
+        operation.key_epoch,
+    )?;
+    if operation.control_epoch != trusted.active_control_epoch {
         return Err(SyncError::InvalidIdentity);
     }
     Ok(())
@@ -209,7 +234,8 @@ fn trusted_context<'a>(
     existing_scope: Option<context_relay_protocol::ScopeRef>,
 ) -> TrustedOperationContext<'a> {
     let context =
-        TrustedOperationContext::new(&trusted.certificate, trusted.active_key_epoch, previous);
+        TrustedOperationContext::new(&trusted.certificate, trusted.active_key_epoch, previous)
+            .with_current_control_epoch(trusted.active_control_epoch);
     match existing_scope {
         Some(scope) => context.with_existing_record_scope(scope),
         None => context,

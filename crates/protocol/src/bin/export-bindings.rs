@@ -34,6 +34,7 @@ export type OperationId = UuidV7 & {{ readonly __operationId: unique symbol }};\
 export type RecordId = UuidV7 & {{ readonly __recordId: unique symbol }};\n\
 export type PairingId = UuidV7 & {{ readonly __pairingId: unique symbol }};\n\
 export type RecoveryEnrollmentId = UuidV7 & {{ readonly __recoveryEnrollmentId: unique symbol }};\n\
+export type RecoveryRestoreId = UuidV7 & {{ readonly __recoveryRestoreId: unique symbol }};\n\
 export type RecoveryRootId = UuidV7 & {{ readonly __recoveryRootId: unique symbol }};\n\
 export type DeviceCertificateId = UuidV7 & {{ readonly __deviceCertificateId: unique symbol }};\n\
 export type DeviceId = UuidV7 & {{ readonly __deviceId: unique symbol }};\n\
@@ -42,6 +43,12 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
     );
     macro_rules! push { ($($ty:ty),+ $(,)?) => { $(bindings.push_str(&declaration::<$ty>());)+ }; }
     push!(
+        DesktopWrite,
+        DesktopWriteSummary,
+        DesktopWritesPage,
+        DesktopWritePrepareParams,
+        DesktopWriteIdParams,
+        DesktopWritesListParams,
         ProtocolVersion,
         ProtocolVersionRange,
         ProtocolInfo,
@@ -89,6 +96,8 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         InstallationMethod,
         ProbeContext,
         ProbeReport,
+        SavedHookApproval,
+        SavedMemoryHookApproval,
         NativeScope,
         ImportRequest,
         ImportedState,
@@ -111,6 +120,31 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         JsonRpcVersion,
         DaemonInstanceNonce,
         EmptyParams,
+        SearchIndexPhase,
+        SearchIndexStatus,
+        HostedAuthStartParams,
+        HostedAuthGenerationParams,
+        HostedAuthFailure,
+        HostedAuthState,
+        HostedAuthStatus,
+        HarnessPrepareParams,
+        HarnessLaunchInfo,
+        ConnectionCheckStartParams,
+        ConnectionCheckIdParams,
+        ConnectionCheckPhase,
+        ConnectionCheckStatus,
+        HarnessPreparationIdParams,
+        HarnessPreparationPhase,
+        HarnessPreparationStatus,
+        HarnessExecutionAction,
+        HarnessExecutionParams,
+        HarnessExecutionPhase,
+        HarnessExecutionStatus,
+        HarnessSetupState,
+        HarnessSetupRecord,
+        HarnessSetupSummary,
+        HarnessSetupsParams,
+        HarnessSetupsPage,
         ProjectParams,
         ProjectPathParams,
         MemoryParams,
@@ -120,6 +154,7 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         CandidateListParams,
         SearchParams,
         ProjectUpsertParams,
+        ProjectRegisterParams,
         MemoryListParams,
         CandidateReviewParams,
         TaskParams,
@@ -137,6 +172,8 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         RetryParams,
         ExportParams,
         RecoveryEnrollmentIdParams,
+        RecoveryRestoreParams,
+        RecoveryRestoreStatus,
         RecoveryWordConfirmation,
         RecoveryEnrollmentConfirmParams,
         DeviceRevokeParams,
@@ -172,6 +209,9 @@ export type PackageId = UuidV7 & {{ readonly __packageId: unique symbol }};\nexp
         DeviceState,
         RecoveryEnrollmentState,
         AccountDeletionState,
+        AccountLifecycleIntentAction,
+        AccountDeletionIntentSummary,
+        AccountDeletionIntentsParams,
         LocalRequest,
         JsonRpcRequestV1,
         LocalResult,

@@ -1,3 +1,10 @@
+mod checkpoints;
+pub use checkpoints::{
+    CheckpointProgress, CheckpointRequest, CheckpointResponse, PreparedCheckpoint,
+};
+mod pull;
+pub use pull::{PreparedPull, PullProgress, PullRequest, PullResponse};
+
 use std::{collections::BTreeSet, error::Error, fmt};
 
 use context_relay_protocol::{
@@ -34,25 +41,6 @@ enum GapRepairOutcome {
     BlockedByQuarantine,
 }
 
-struct CheckpointPullResult {
-    accepted: usize,
-    more_work: bool,
-    chain_anchor: Option<CheckpointChainAnchor>,
-    append_anchor: Option<CheckpointAppendAnchor>,
-}
-
-struct CheckpointChainAnchor {
-    verified: VerifiedCheckpointChainAnchor,
-}
-
-enum CheckpointAppendAnchor {
-    Empty,
-    Endpoint {
-        cursor: CheckpointCursor,
-        canonical_hash: Sha256Digest,
-    },
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SyncCycleReport {
     pub pushed: usize,
@@ -79,6 +67,25 @@ impl SyncCycleReport {
             checkpointed: false,
             more_work: false,
         }
+    }
+}
+
+/// Immutable push work prepared on the vault owner, movable across network waits.
+/// Hosts must revalidate the original session before finishing on that same owner.
+pub struct PreparedPush {
+    scope: SyncScope,
+    provider: SyncProvider,
+    due: Vec<DueOutboxOperation>,
+    operations: Vec<CanonicalOperation>,
+    more_work: bool,
+}
+
+impl PreparedPush {
+    pub const fn scope(&self) -> SyncScope {
+        self.scope
+    }
+    pub fn operations(&self) -> &[CanonicalOperation] {
+        &self.operations
     }
 }
 
@@ -210,214 +217,41 @@ impl<G> SyncEngine<G> {
         E: RepresentativeEmbeddingResolver,
         G: RetryRandomSource,
     {
-        let mut report = SyncCycleReport::empty();
-        self.push_due(vault, transport, now_ms, &mut report)?;
-
-        let mut processed = 0usize;
-        let mut processed_bytes = 0usize;
-        while processed < self.max_operations {
-            let cursor = vault
-                .sync_cursor(self.scope.workspace_id, self.provider.as_str())
-                .map_err(local_error)?;
-            let page_limit = (self.max_operations - processed).min(MAX_BATCH);
-            let mut page = transport
-                .pull_operations(self.scope, cursor.as_ref(), page_limit)
-                .map_err(transport_error)?;
-            validate_page(
-                cursor.as_ref(),
-                &page.rows,
-                page.next_cursor.as_ref(),
-                page_limit,
-            )?;
-            if page.rows.is_empty() {
-                break;
-            }
-            page.rows.sort_by(compare_received);
-            report.pulled = report.pulled.saturating_add(page.rows.len());
-
-            for row in page.rows {
-                validate_receipt_binding(&row)?;
-                if processed == self.max_operations {
-                    report.more_work = true;
+        let mut pushed = SyncCycleReport::empty();
+        self.push_due(vault, transport, now_ms, &mut pushed)?;
+        let mut progress = self.prepare_pull(vault)?;
+        loop {
+            progress = match progress {
+                PullProgress::Complete(mut report) => {
+                    report.pushed += pushed.pushed;
+                    report.duplicates += pushed.duplicates;
+                    report.more_work |= pushed.more_work;
                     return Ok(report);
                 }
-                if let Some(stored) = self.existing_quarantine(vault, &row)? {
-                    validate_existing_quarantine(&stored, &row)?;
-                    self.persist_quarantine(vault, &row, &stored.safe_error_code, now_ms, true)?;
-                    report.quarantined += 1;
-                    processed += 1;
-                    continue;
+                PullProgress::Request(prepared) => {
+                    let response = match prepared.request() {
+                        PullRequest::Operations { cursor, limit } => PullResponse::Operations(
+                            transport
+                                .pull_operations(prepared.scope(), cursor.as_ref(), *limit)
+                                .map_err(transport_error)?,
+                        ),
+                        PullRequest::DeviceRange { device, range } => PullResponse::DeviceRange(
+                            transport
+                                .pull_device_range(prepared.scope(), *device, range.clone())
+                                .map_err(transport_error)?,
+                        ),
+                    };
+                    self.finish_pull(
+                        vault,
+                        *prepared,
+                        response,
+                        trusted_material,
+                        embedding_resolver,
+                        now_ms,
+                    )?
                 }
-                if let Some(stored) = self.existing_rejection(vault, &row)? {
-                    validate_existing_rejection(&stored, &row)?;
-                    self.persist_rejection(vault, &row, now_ms, true)?;
-                    report.quarantined += 1;
-                    processed += 1;
-                    continue;
-                }
-                if row.operation.bytes.len() > MAX_CBOR_OPERATION_BYTES {
-                    self.persist_rejection(vault, &row, now_ms, true)?;
-                    report.quarantined += 1;
-                    processed += 1;
-                    continue;
-                }
-                if !reserve_bytes(
-                    &mut processed_bytes,
-                    row.operation.bytes.len(),
-                    self.max_bytes,
-                ) {
-                    report.more_work = true;
-                    return Ok(report);
-                }
-                if validate_received(self.scope, &row).is_err() {
-                    self.persist_quarantine(vault, &row, "integrity_quarantined", now_ms, true)?;
-                    report.quarantined += 1;
-                    processed += 1;
-                    continue;
-                }
-                match admit_operation(vault, &row.operation.bytes, trusted_material) {
-                    Ok(AdmissionDecision::ExactReplay(operation_id)) => {
-                        if operation_id != row.operation.operation_id {
-                            return Err(SyncCycleError::new("integrity_quarantined"));
-                        }
-                        vault
-                            .advance_replay_cursor(
-                                self.scope.workspace_id,
-                                self.provider.as_str(),
-                                &row.cursor.received_at,
-                                operation_id,
-                            )
-                            .map_err(local_error)?;
-                        processed += 1;
-                    }
-                    Ok(AdmissionDecision::Admitted(admitted)) => {
-                        let decision = vault
-                            .apply_admitted_operation_at(
-                                &admitted,
-                                trusted_material,
-                                self.provider.as_str(),
-                                &row.cursor.received_at,
-                                embedding_resolver,
-                                now_ms,
-                            )
-                            .map_err(local_error)?;
-                        record_apply(&mut report, decision);
-                        processed += 1;
-                    }
-                    Ok(AdmissionDecision::Gap(range)) => {
-                        processed_bytes -= row.operation.bytes.len();
-                        match self.repair_gap(
-                            vault,
-                            transport,
-                            trusted_material,
-                            embedding_resolver,
-                            row.operation.device_id,
-                            range,
-                            &mut processed,
-                            &mut processed_bytes,
-                            &mut report,
-                            now_ms,
-                        )? {
-                            GapRepairOutcome::Complete => {}
-                            GapRepairOutcome::Pending => {
-                                report.more_work = true;
-                                return Ok(report);
-                            }
-                            GapRepairOutcome::BlockedByQuarantine => {
-                                if processed == self.max_operations
-                                    || !reserve_bytes(
-                                        &mut processed_bytes,
-                                        row.operation.bytes.len(),
-                                        self.max_bytes,
-                                    )
-                                {
-                                    report.more_work = true;
-                                    return Ok(report);
-                                }
-                                self.persist_quarantine(vault, &row, "gap_pending", now_ms, true)?;
-                                report.quarantined += 1;
-                                processed += 1;
-                                continue;
-                            }
-                        }
-                        if processed == self.max_operations {
-                            report.more_work = true;
-                            return Ok(report);
-                        }
-                        if !reserve_bytes(
-                            &mut processed_bytes,
-                            row.operation.bytes.len(),
-                            self.max_bytes,
-                        ) {
-                            report.more_work = true;
-                            return Ok(report);
-                        }
-                        match admit_operation(vault, &row.operation.bytes, trusted_material) {
-                            Ok(AdmissionDecision::Admitted(admitted)) => {
-                                let decision = vault
-                                    .apply_admitted_operation_at(
-                                        &admitted,
-                                        trusted_material,
-                                        self.provider.as_str(),
-                                        &row.cursor.received_at,
-                                        embedding_resolver,
-                                        now_ms,
-                                    )
-                                    .map_err(local_error)?;
-                                record_apply(&mut report, decision);
-                                processed += 1;
-                            }
-                            Ok(AdmissionDecision::ExactReplay(operation_id)) => {
-                                if operation_id != row.operation.operation_id {
-                                    return Err(SyncCycleError::new("integrity_quarantined"));
-                                }
-                                vault
-                                    .advance_replay_cursor(
-                                        self.scope.workspace_id,
-                                        self.provider.as_str(),
-                                        &row.cursor.received_at,
-                                        operation_id,
-                                    )
-                                    .map_err(local_error)?;
-                                processed += 1;
-                            }
-                            Ok(AdmissionDecision::Gap(_)) => {
-                                report.more_work = true;
-                                return Ok(report);
-                            }
-                            Err(error) => {
-                                require_quarantinable(error)?;
-                                self.persist_quarantine(
-                                    vault,
-                                    &row,
-                                    "integrity_quarantined",
-                                    now_ms,
-                                    true,
-                                )?;
-                                report.quarantined += 1;
-                                processed += 1;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        require_quarantinable(error)?;
-                        self.persist_quarantine(
-                            vault,
-                            &row,
-                            "integrity_quarantined",
-                            now_ms,
-                            true,
-                        )?;
-                        report.quarantined += 1;
-                        processed += 1;
-                    }
-                }
-            }
+            };
         }
-        if processed == self.max_operations {
-            report.more_work = true;
-        }
-        Ok(report)
     }
 
     pub fn sync_once_with_checkpoint<T, M, E>(
@@ -445,266 +279,49 @@ impl<G> SyncEngine<G> {
             embedding_resolver,
             now_ms,
         )?;
-        let checkpoint_pull =
-            self.pull_checkpoint_chain(vault, transport, trusted_material, now_ms)?;
-        if checkpoint_pull.accepted > 0 {
-            report.checkpointed = true;
-        }
-        report.more_work |= checkpoint_pull.more_work;
-        if checkpoint_pull.more_work {
-            return Ok(report);
-        }
-        let schedule = vault
-            .sync_checkpoint_schedule(self.scope)
-            .map_err(checkpoint_vault_error)?;
-        if !schedule.is_due(now_ms) {
-            return Ok(report);
-        }
-        let checkpoint = if let Some(anchor) = checkpoint_pull.chain_anchor.as_ref() {
-            build_checkpoint_after_chain(
-                vault,
-                checkpoint_context,
-                trusted_material,
-                &anchor.verified,
-            )
-            .map_err(sync_error)?
-        } else {
-            build_checkpoint(vault, checkpoint_context, trusted_material).map_err(sync_error)?
-        };
-        let receipt = transport
-            .push_checkpoint(self.scope, CHECKPOINT_SCHEMA_VERSION, &checkpoint)
-            .map_err(transport_error)?;
-        if receipt.canonical_hash != checkpoint.canonical_hash {
-            return Err(SyncCycleError::new("integrity_quarantined"));
-        }
-        let append_anchor = checkpoint_pull
-            .append_anchor
-            .as_ref()
-            .ok_or_else(|| SyncCycleError::new("integrity_quarantined"))?;
-        self.confirm_checkpoint_append(transport, append_anchor, &checkpoint, trusted_material)?;
-        if let Some(anchor) = checkpoint_pull.chain_anchor.as_ref() {
-            let verified = verify_checkpoint_chain_extension(
-                vault,
-                self.scope,
-                &checkpoint,
-                &anchor.verified,
-                trusted_material,
-            )
-            .map_err(sync_error)?;
-            vault
-                .accept_sync_checkpoint_chain_extension(
-                    &verified,
-                    now_ms,
-                    self.provider.as_str(),
-                    anchor.verified.checkpoint.canonical_hash,
-                )
-                .map_err(checkpoint_vault_error)?;
-        } else {
-            let verified = verify_checkpoint(vault, self.scope, &checkpoint, trusted_material)
-                .map_err(sync_error)?;
-            vault
-                .accept_sync_checkpoint(&verified, now_ms)
-                .map_err(checkpoint_vault_error)?;
-        }
-        report.checkpointed = true;
-        Ok(report)
-    }
-
-    fn pull_checkpoint_chain<T, M>(
-        &self,
-        vault: &mut Vault,
-        transport: &mut T,
-        trusted_material: &M,
-        now_ms: u64,
-    ) -> Result<CheckpointPullResult, SyncCycleError>
-    where
-        T: SyncTransport,
-        M: TrustedSyncMaterial,
-    {
-        let initial_pin = vault
-            .sync_checkpoint_pin(self.scope)
-            .map_err(checkpoint_vault_error)?;
-        if let Some(pin) = initial_pin.as_ref() {
-            let remote_pin = transport
-                .checkpoint_by_hash(self.scope, CHECKPOINT_SCHEMA_VERSION, pin.canonical_hash)
-                .map_err(transport_error)?
-                .ok_or_else(|| SyncCycleError::new("integrity_quarantined"))?;
-            if remote_pin.bytes != pin.canonical_bytes || remote_pin.state_hash != pin.state_hash {
-                return Err(SyncCycleError::new("integrity_quarantined"));
-            }
-        }
-        let scan = vault
-            .sync_checkpoint_scan(self.scope, self.provider.as_str())
-            .map_err(checkpoint_vault_error)?;
-        let base_pin_hash = initial_pin.as_ref().map(|pin| pin.canonical_hash);
-        if scan
-            .as_ref()
-            .is_some_and(|scan| scan.base_pin_hash != base_pin_hash)
-        {
-            return Err(SyncCycleError::new("integrity_quarantined"));
-        }
-        let mut found_pin = scan
-            .as_ref()
-            .map_or(initial_pin.is_none(), |scan| scan.pin_seen);
-        let mut after = scan.as_ref().map(|scan| scan.cursor.clone());
-        let mut expected_previous = scan
-            .as_ref()
-            .map_or(Sha256Digest([0; 32]), |scan| scan.checkpoint.canonical_hash);
-        let mut scanned = 0usize;
+        let mut progress = self.prepare_checkpoint(vault)?;
         loop {
-            let remaining = self.max_operations.saturating_sub(scanned);
-            if remaining == 0 {
-                return Ok(CheckpointPullResult {
-                    accepted: 0,
-                    more_work: true,
-                    chain_anchor: None,
-                    append_anchor: None,
-                });
-            }
-            let limit = remaining.min(MAX_BATCH);
-            let page = transport
-                .pull_checkpoints(self.scope, CHECKPOINT_SCHEMA_VERSION, after.as_ref(), limit)
-                .map_err(transport_error)?;
-            validate_checkpoint_page(after.as_ref(), &page.rows, page.next_cursor.as_ref(), limit)?;
-            if page.rows.is_empty() {
-                if !found_pin {
-                    return Err(SyncCycleError::new("integrity_quarantined"));
+            progress = match progress {
+                CheckpointProgress::Complete(checkpoints) => {
+                    report.checkpointed |= checkpoints.checkpointed;
+                    report.more_work |= checkpoints.more_work;
+                    return Ok(report);
                 }
-                let Some(scan) = vault
-                    .sync_checkpoint_scan(self.scope, self.provider.as_str())
-                    .map_err(checkpoint_vault_error)?
-                else {
-                    return Ok(CheckpointPullResult {
-                        accepted: 0,
-                        more_work: false,
-                        chain_anchor: None,
-                        append_anchor: Some(CheckpointAppendAnchor::Empty),
-                    });
-                };
-                let (chain_anchor, verified) = verify_checkpoint_after_chain(
-                    vault,
-                    self.scope,
-                    &scan.checkpoint,
-                    scan.base_pin_hash,
-                    trusted_material,
-                )
-                .map_err(sync_error)?;
-                if let Some(verified) = verified {
-                    vault
-                        .accept_sync_checkpoint_endpoint(&verified, now_ms, self.provider.as_str())
-                        .map_err(checkpoint_vault_error)?;
-                    return Ok(CheckpointPullResult {
-                        accepted: 1,
-                        more_work: false,
-                        chain_anchor: None,
-                        append_anchor: Some(CheckpointAppendAnchor::Endpoint {
-                            cursor: scan.cursor,
-                            canonical_hash: chain_anchor.checkpoint.canonical_hash,
-                        }),
-                    });
+                CheckpointProgress::Request(prepared) => {
+                    let response = match prepared.request() {
+                        CheckpointRequest::ByHash(hash) => CheckpointResponse::ByHash(
+                            transport
+                                .checkpoint_by_hash(self.scope, CHECKPOINT_SCHEMA_VERSION, *hash)
+                                .map_err(transport_error)?
+                                .map(Box::new),
+                        ),
+                        CheckpointRequest::Page { after, limit } => CheckpointResponse::Page(
+                            transport
+                                .pull_checkpoints(
+                                    self.scope,
+                                    CHECKPOINT_SCHEMA_VERSION,
+                                    after.as_ref(),
+                                    *limit,
+                                )
+                                .map_err(transport_error)?,
+                        ),
+                        CheckpointRequest::Push(checkpoint) => CheckpointResponse::Push(
+                            transport
+                                .push_checkpoint(self.scope, CHECKPOINT_SCHEMA_VERSION, checkpoint)
+                                .map_err(transport_error)?,
+                        ),
+                    };
+                    self.finish_checkpoint(
+                        vault,
+                        *prepared,
+                        response,
+                        trusted_material,
+                        now_ms,
+                        checkpoint_context,
+                    )?
                 }
-                let append_cursor = scan.cursor.clone();
-                let append_hash = chain_anchor.checkpoint.canonical_hash;
-                return Ok(CheckpointPullResult {
-                    accepted: 0,
-                    more_work: false,
-                    chain_anchor: Some(CheckpointChainAnchor {
-                        verified: chain_anchor,
-                    }),
-                    append_anchor: Some(CheckpointAppendAnchor::Endpoint {
-                        cursor: append_cursor,
-                        canonical_hash: append_hash,
-                    }),
-                });
-            }
-            for row in page.rows {
-                scanned = scanned.saturating_add(1);
-                validate_received_checkpoint(&row)?;
-                let authenticated = verify_checkpoint_link(
-                    self.scope,
-                    &row.checkpoint,
-                    expected_previous,
-                    trusted_material,
-                )
-                .map_err(sync_error)?;
-                if let Some(pin) = initial_pin.as_ref()
-                    && row.checkpoint.canonical_hash == pin.canonical_hash
-                {
-                    if row.checkpoint.bytes != pin.canonical_bytes
-                        || row.checkpoint.state_hash != pin.state_hash
-                    {
-                        return Err(SyncCycleError::new("integrity_quarantined"));
-                    }
-                    found_pin = true;
-                }
-                vault
-                    .save_sync_checkpoint_scan(
-                        self.scope,
-                        self.provider.as_str(),
-                        &row.cursor,
-                        &authenticated,
-                        base_pin_hash,
-                        found_pin,
-                    )
-                    .map_err(checkpoint_vault_error)?;
-                expected_previous = row.checkpoint.canonical_hash;
-                after = Some(row.cursor);
-            }
-            if scanned == self.max_operations {
-                return Ok(CheckpointPullResult {
-                    accepted: 0,
-                    more_work: true,
-                    chain_anchor: None,
-                    append_anchor: None,
-                });
-            }
+            };
         }
-    }
-
-    fn confirm_checkpoint_append<T, M>(
-        &self,
-        transport: &mut T,
-        anchor: &CheckpointAppendAnchor,
-        checkpoint: &super::CanonicalCheckpoint,
-        trusted_material: &M,
-    ) -> Result<(), SyncCycleError>
-    where
-        T: SyncTransport,
-        M: TrustedSyncMaterial,
-    {
-        let (after, expected_previous) = match anchor {
-            CheckpointAppendAnchor::Empty => (None, Sha256Digest([0; 32])),
-            CheckpointAppendAnchor::Endpoint {
-                cursor,
-                canonical_hash,
-            } => (Some(cursor), *canonical_hash),
-        };
-        let page = transport
-            .pull_checkpoints(self.scope, CHECKPOINT_SCHEMA_VERSION, after, 2)
-            .map_err(transport_error)?;
-        validate_checkpoint_page(after, &page.rows, page.next_cursor.as_ref(), 2)?;
-        let [row] = page.rows.as_slice() else {
-            return Err(SyncCycleError::new("integrity_quarantined"));
-        };
-        validate_received_checkpoint(row)?;
-        let authenticated = verify_checkpoint_link(
-            self.scope,
-            &row.checkpoint,
-            expected_previous,
-            trusted_material,
-        )
-        .map_err(sync_error)?;
-        if authenticated.checkpoint != *checkpoint {
-            return Err(SyncCycleError::new("integrity_quarantined"));
-        }
-        let tail = transport
-            .pull_checkpoints(self.scope, CHECKPOINT_SCHEMA_VERSION, Some(&row.cursor), 1)
-            .map_err(transport_error)?;
-        validate_checkpoint_page(Some(&row.cursor), &tail.rows, tail.next_cursor.as_ref(), 1)?;
-        if !tail.rows.is_empty() {
-            return Err(SyncCycleError::new("integrity_quarantined"));
-        }
-        Ok(())
     }
 
     fn existing_quarantine(
@@ -802,13 +419,29 @@ impl<G> SyncEngine<G> {
     where
         G: RetryRandomSource,
     {
-        let due = vault.due_outbox(now_ms, MAX_BATCH).map_err(local_error)?;
-        if due.is_empty() {
+        let Some(prepared) = self.prepare_push(vault, now_ms)? else {
             return Ok(());
+        };
+        let response = transport.push_operations(prepared.scope(), prepared.operations());
+        let finished = self.finish_push(vault, prepared, response, now_ms)?;
+        report.more_work |= finished.more_work;
+        report.pushed += finished.pushed;
+        report.duplicates += finished.duplicates;
+        Ok(())
+    }
+
+    /// Select and validate a bounded push without performing network I/O.
+    pub fn prepare_push(
+        &self,
+        vault: &mut Vault,
+        now_ms: u64,
+    ) -> Result<Option<PreparedPush>, SyncCycleError> {
+        let mut due = vault.due_outbox(now_ms, MAX_BATCH).map_err(local_error)?;
+        if due.is_empty() {
+            return Ok(None);
         }
-        report.more_work |= due.len() == MAX_BATCH;
+        let mut more_work = due.len() == MAX_BATCH;
         let mut batch = Vec::with_capacity(due.len());
-        let mut ids = Vec::with_capacity(due.len());
         let mut total_bytes = 0usize;
         for row in &due {
             let Some(next_total) = total_bytes.checked_add(row.canonical_bytes.len()) else {
@@ -821,7 +454,7 @@ impl<G> SyncEngine<G> {
                     )?;
                     return Err(SyncCycleError::new("configuration_error"));
                 }
-                report.more_work = true;
+                more_work = true;
                 break;
             };
             if next_total > self.max_bytes || next_total > MAX_REQUEST_BYTES {
@@ -834,7 +467,7 @@ impl<G> SyncEngine<G> {
                     )?;
                     return Err(SyncCycleError::new("configuration_error"));
                 }
-                report.more_work = true;
+                more_work = true;
                 break;
             }
             let operation = match decode_sync_operation_v1(&row.canonical_bytes) {
@@ -849,7 +482,7 @@ impl<G> SyncEngine<G> {
                         )?;
                         return Err(SyncCycleError::new("integrity_quarantined"));
                     }
-                    report.more_work = true;
+                    more_work = true;
                     break;
                 }
             };
@@ -865,7 +498,7 @@ impl<G> SyncEngine<G> {
                         )?;
                         return Err(SyncCycleError::new("integrity_quarantined"));
                     }
-                    report.more_work = true;
+                    more_work = true;
                     break;
                 }
             };
@@ -883,11 +516,10 @@ impl<G> SyncEngine<G> {
                     )?;
                     return Err(SyncCycleError::new("integrity_quarantined"));
                 }
-                report.more_work = true;
+                more_work = true;
                 break;
             }
             total_bytes = next_total;
-            ids.push(row.operation_id);
             batch.push(CanonicalOperation {
                 operation_id: operation.operation_id,
                 device_id: operation.device_id,
@@ -896,10 +528,51 @@ impl<G> SyncEngine<G> {
             });
         }
 
-        let receipt = match transport.push_operations(self.scope, &batch) {
+        due.truncate(batch.len());
+        Ok(Some(PreparedPush {
+            scope: self.scope,
+            provider: self.provider,
+            due,
+            operations: batch,
+            more_work,
+        }))
+    }
+
+    /// Apply a response only to the immutable operations selected before HTTP.
+    pub fn finish_push(
+        &self,
+        vault: &mut Vault,
+        prepared: PreparedPush,
+        response: Result<super::PushReceipt, TransportError>,
+        now_ms: u64,
+    ) -> Result<SyncCycleReport, SyncCycleError>
+    where
+        G: RetryRandomSource,
+    {
+        if prepared.scope != self.scope || prepared.provider != self.provider {
+            return Err(SyncCycleError::new("integrity_quarantined"));
+        }
+        for operation in &prepared.operations {
+            if vault
+                .stored_sync_operation(operation.operation_id)
+                .map_err(local_error)?
+                .as_ref()
+                != Some(&operation.bytes)
+            {
+                return Err(SyncCycleError::new("integrity_quarantined"));
+            }
+        }
+        let ids = prepared
+            .operations
+            .iter()
+            .map(|operation| operation.operation_id)
+            .collect::<Vec<_>>();
+        let mut report = SyncCycleReport::empty();
+        report.more_work = prepared.more_work;
+        let receipt = match response {
             Ok(receipt) => receipt,
             Err(error) => {
-                self.defer_transport_failure(vault, &due[..ids.len()], now_ms, error)?;
+                self.defer_transport_failure(vault, &prepared.due, now_ms, error)?;
                 return Err(transport_error(error));
             }
         };
@@ -915,7 +588,8 @@ impl<G> SyncEngine<G> {
             .map_err(local_error)?;
         report.pushed += receipt.accepted.len();
         report.duplicates += receipt.duplicates.len();
-        Ok(())
+        report.more_work |= !vault.due_outbox(now_ms, 1).map_err(local_error)?.is_empty();
+        Ok(report)
     }
 
     fn defer_transport_failure(
@@ -953,115 +627,6 @@ impl<G> SyncEngine<G> {
         vault
             .defer_outbox_individual(&retries, error.safe_code())
             .map_err(local_error)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn repair_gap<T, M, R>(
-        &self,
-        vault: &mut Vault,
-        transport: &mut T,
-        trusted_material: &M,
-        embedding_resolver: &R,
-        device: context_relay_protocol::DeviceId,
-        range: std::ops::RangeInclusive<u64>,
-        processed: &mut usize,
-        processed_bytes: &mut usize,
-        report: &mut SyncCycleReport,
-        now_ms: u64,
-    ) -> Result<GapRepairOutcome, SyncCycleError>
-    where
-        T: SyncTransport,
-        M: TrustedSyncMaterial,
-        R: RepresentativeEmbeddingResolver,
-    {
-        let mut next = *range.start();
-        let end = *range.end();
-        while next <= end {
-            if *processed == self.max_operations {
-                return Ok(GapRepairOutcome::Pending);
-            }
-            let capacity = (self.max_operations - *processed).min(MAX_BATCH) as u64;
-            let chunk_end = next.saturating_add(capacity.saturating_sub(1)).min(end);
-            let mut rows = transport
-                .pull_device_range(self.scope, device, next..=chunk_end)
-                .map_err(transport_error)?;
-            rows.sort_by_key(|row| row.operation.device_sequence);
-            let expected_count = usize::try_from(chunk_end - next + 1)
-                .map_err(|_| SyncCycleError::new("configuration_error"))?;
-            if rows.len() != expected_count {
-                return Ok(GapRepairOutcome::Pending);
-            }
-            for (offset, row) in rows.iter().enumerate() {
-                let expected = next + offset as u64;
-                if row.operation.device_id != device || row.operation.device_sequence != expected {
-                    return Err(SyncCycleError::new("integrity_quarantined"));
-                }
-                validate_receipt_binding(row)?;
-            }
-            for row in rows {
-                if let Some(stored) = self.existing_quarantine(vault, &row)? {
-                    validate_existing_quarantine(&stored, &row)?;
-                    report.quarantined += 1;
-                    return Ok(GapRepairOutcome::BlockedByQuarantine);
-                }
-                if let Some(stored) = self.existing_rejection(vault, &row)? {
-                    validate_existing_rejection(&stored, &row)?;
-                    report.quarantined += 1;
-                    return Ok(GapRepairOutcome::BlockedByQuarantine);
-                }
-                if row.operation.bytes.len() > MAX_CBOR_OPERATION_BYTES {
-                    self.persist_rejection(vault, &row, now_ms, false)?;
-                    report.quarantined += 1;
-                    return Ok(GapRepairOutcome::BlockedByQuarantine);
-                }
-                if !reserve_bytes(processed_bytes, row.operation.bytes.len(), self.max_bytes) {
-                    return Ok(GapRepairOutcome::Pending);
-                }
-                if validate_received(self.scope, &row).is_err() {
-                    self.persist_quarantine(vault, &row, "integrity_quarantined", now_ms, false)?;
-                    report.quarantined += 1;
-                    return Ok(GapRepairOutcome::BlockedByQuarantine);
-                }
-                match admit_operation(vault, &row.operation.bytes, trusted_material) {
-                    Ok(AdmissionDecision::Admitted(admitted)) => {
-                        let decision = vault
-                            .apply_repaired_operation_at(
-                                &admitted,
-                                trusted_material,
-                                &row.cursor.received_at,
-                                embedding_resolver,
-                                now_ms,
-                            )
-                            .map_err(local_error)?;
-                        record_apply(report, decision);
-                    }
-                    Ok(AdmissionDecision::ExactReplay(operation_id))
-                        if operation_id == row.operation.operation_id => {}
-                    Ok(AdmissionDecision::ExactReplay(_)) | Ok(AdmissionDecision::Gap(_)) => {
-                        return Err(SyncCycleError::new("integrity_quarantined"));
-                    }
-                    Err(error) => {
-                        require_quarantinable(error)?;
-                        self.persist_quarantine(
-                            vault,
-                            &row,
-                            "integrity_quarantined",
-                            now_ms,
-                            false,
-                        )?;
-                        report.quarantined += 1;
-                        return Ok(GapRepairOutcome::BlockedByQuarantine);
-                    }
-                }
-                *processed += 1;
-                report.gaps_repaired += 1;
-            }
-            next = match chunk_end.checked_add(1) {
-                Some(value) => value,
-                None => break,
-            };
-        }
-        Ok(GapRepairOutcome::Complete)
     }
 }
 

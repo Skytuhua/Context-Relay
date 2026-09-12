@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    path::Path,
+    time::Duration,
+};
 
 use context_relay_protocol::{
     ApplyReceipt, CandidateId, CandidateState, CheckpointV1, HarnessAccessPolicy, HarnessId,
@@ -20,21 +25,32 @@ use crate::native_memory::{
     native_memory_title,
 };
 use crate::search::{
-    AllowedSearchScope, Embedding384, SearchHit, quote_fts_query, reciprocal_rank_fusion,
+    AllowedSearchScope, Embedding384, ModelError, PinnedModelEmbedder, SearchHit, SemanticSearch,
+    quote_fts_query, reciprocal_rank_fusion, semantic_input_digest, semantic_model_fingerprint,
 };
 
+mod desktop_writes;
 mod native_transactions;
 pub use native_transactions::*;
 mod devices;
 pub use devices::*;
+mod account_lifecycle_intent;
+pub use account_lifecycle_intent::*;
+mod hosted_pairing;
+pub use hosted_pairing::*;
+mod pairing_review;
 mod recovery;
 pub use recovery::*;
 mod recovery_restore;
 pub use recovery_restore::*;
+mod revocation;
+pub use revocation::*;
 mod sync;
 pub use sync::*;
+mod semantic_index;
+pub use semantic_index::{SemanticIndexBatch, SemanticIndexProgress};
 
-pub const LATEST_SCHEMA_VERSION: u32 = 25;
+pub const LATEST_SCHEMA_VERSION: u32 = 39;
 pub const MAX_NATIVE_HOOK_SESSIONS: usize = 256;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
@@ -52,7 +68,7 @@ pub enum VaultError {
     FutureSchema { found: u32 },
     #[error("vault migration failed: {0}")]
     Migration(String),
-    #[error("the before-image budget is exhausted")]
+    #[error("the local storage quota is exhausted")]
     BudgetExceeded,
     #[error("credential store failure: {0}")]
     Credential(String),
@@ -66,6 +82,8 @@ pub enum VaultError {
     Serialization(String),
     #[error("vault database failure: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error("the local search model failed")]
+    SearchModel(#[from] ModelError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +95,7 @@ pub(crate) enum LocalOperationKind {
     TaskUpsert,
     TaskComplete,
     TaskTransition,
+    CandidateReview,
 }
 
 impl LocalOperationKind {
@@ -89,6 +108,7 @@ impl LocalOperationKind {
             Self::TaskUpsert => "task_upsert",
             Self::TaskComplete => "task_complete",
             Self::TaskTransition => "task_transition",
+            Self::CandidateReview => "candidate_review",
         }
     }
 }
@@ -204,6 +224,9 @@ pub struct NativeHookSession {
 pub struct Vault {
     connection: Connection,
     embedding_cache: BTreeMap<String, CachedEmbedding>,
+    semantic_search: Option<Box<RefCell<SemanticSearch>>>,
+    semantic_search_configured: bool,
+    semantic_search_failed: Cell<bool>,
 }
 
 #[cfg(feature = "test-support")]
@@ -370,7 +393,44 @@ impl Vault {
         Ok(Self {
             connection,
             embedding_cache,
+            semantic_search: None,
+            semantic_search_configured: false,
+            semantic_search_failed: Cell::new(false),
         })
+    }
+
+    pub fn enable_semantic_search(&mut self, model: PinnedModelEmbedder) {
+        self.semantic_search_configured = true;
+        self.semantic_search_failed.set(false);
+        self.semantic_search = Some(Box::new(RefCell::new(SemanticSearch::new(model))));
+    }
+
+    /// Select keyword fallback while the packaged model is loading or unavailable.
+    pub fn prepare_semantic_search(&mut self) {
+        self.semantic_search_configured = true;
+    }
+
+    pub(crate) fn semantic_search_configured(&self) -> bool {
+        self.semantic_search_configured
+    }
+
+    pub fn semantic_search_enabled(&self) -> bool {
+        self.semantic_search.is_some() && !self.semantic_search_failed.get()
+    }
+
+    pub fn take_semantic_search_failure(&mut self) -> bool {
+        if !self.semantic_search_failed.get() {
+            return false;
+        }
+        self.reset_semantic_search();
+        true
+    }
+
+    /// Drop a failed session while preserving keyword search and persisted vectors.
+    pub fn reset_semantic_search(&mut self) {
+        self.semantic_search = None;
+        self.semantic_search_configured = true;
+        self.semantic_search_failed.set(false);
     }
 
     pub fn runtime_info(&self) -> Result<VaultRuntimeInfo, VaultError> {
@@ -702,6 +762,9 @@ impl Vault {
     }
 
     pub fn put_candidate(&mut self, candidate: &MemoryCandidate) -> Result<(), VaultError> {
+        if self.canonical_candidate_id(candidate.id)? != candidate.id {
+            return Err(VaultError::OperationConflict);
+        }
         candidate
             .validate()
             .map_err(|error| VaultError::Validation(error.to_string()))?;
@@ -723,6 +786,9 @@ impl Vault {
         candidate: &MemoryCandidate,
         binding: &LocalOperationBinding,
     ) -> Result<(), VaultError> {
+        if self.canonical_candidate_id(candidate.id)? != candidate.id {
+            return Err(VaultError::OperationConflict);
+        }
         candidate
             .validate()
             .map_err(|error| VaultError::Validation(error.to_string()))?;
@@ -749,8 +815,17 @@ impl Vault {
         load_json(
             &self.connection,
             "SELECT payload_json FROM candidates WHERE id = ?1",
-            &id.to_string(),
+            &resolve_candidate_id(&self.connection, &id.to_string())?,
         )
+    }
+
+    pub(crate) fn canonical_candidate_id(
+        &self,
+        id: CandidateId,
+    ) -> Result<CandidateId, VaultError> {
+        resolve_candidate_id(&self.connection, &id.to_string())?
+            .parse()
+            .map_err(|_| VaultError::OperationConflict)
     }
 
     pub fn candidates(
@@ -908,10 +983,11 @@ impl Vault {
                 NativeMemoryChangeKind::InitialPreview
             };
             let canonical_candidate = to_json(candidate)?;
+            let canonical_id = resolve_candidate_id(&transaction, &candidate.id.to_string())?;
             let existing = transaction
                 .query_row(
                     "SELECT payload_json FROM candidates WHERE id = ?1",
-                    [candidate.id.to_string()],
+                    [&canonical_id],
                     |row| row.get::<_, Vec<u8>>(0),
                 )
                 .optional()?;
@@ -930,6 +1006,7 @@ impl Vault {
                         ledger,
                         candidate,
                         replay_change_kind,
+                        true,
                     )?;
                 } else {
                     let existing_candidate: MemoryCandidate = from_json(&existing)?;
@@ -937,18 +1014,42 @@ impl Vault {
                         .validate()
                         .map_err(|error| VaultError::Validation(error.to_string()))?;
                     native_memory_change_kind(&existing_candidate)?;
-                    if !same_native_candidate_identity(&existing_candidate, candidate) {
+                    let mut comparison = existing_candidate.clone();
+                    if comparison.id.to_string() != canonical_id {
                         return Err(VaultError::OperationConflict);
                     }
+                    comparison.id = candidate.id;
+                    if !same_native_candidate_identity(&comparison, candidate) {
+                        return Err(VaultError::OperationConflict);
+                    }
+                    let expected_change_kind = if prior_ledger
+                        .as_ref()
+                        .is_some_and(|(_, payload)| payload == &canonical_ledger)
+                        && existing_candidate.evidence_summary == candidate.evidence_summary
+                    {
+                        native_memory_change_kind(candidate)?
+                    } else {
+                        expected_change_kind
+                    };
                     validate_native_memory_candidate(
                         source,
                         ledger,
                         candidate,
                         expected_change_kind,
+                        true,
                     )?;
                 }
             } else {
-                validate_native_memory_candidate(source, ledger, candidate, expected_change_kind)?;
+                if canonical_id != candidate.id.to_string() {
+                    return Err(VaultError::OperationConflict);
+                }
+                validate_native_memory_candidate(
+                    source,
+                    ledger,
+                    candidate,
+                    expected_change_kind,
+                    false,
+                )?;
                 transaction.execute(
                     "INSERT INTO candidates(id, state, payload_json) VALUES (?1, 'pending', ?2)",
                     params![candidate.id.to_string(), canonical_candidate],
@@ -967,11 +1068,34 @@ impl Vault {
         memory: Option<&MemoryRecord>,
         embedding: Option<&Embedding384>,
     ) -> Result<(), VaultError> {
+        self.review_candidate_inner(id, state, memory, embedding, None)
+    }
+
+    pub(crate) fn review_candidate_with_binding(
+        &mut self,
+        id: CandidateId,
+        state: CandidateState,
+        memory: Option<&MemoryRecord>,
+        embedding: Option<&Embedding384>,
+        binding: &LocalOperationBinding,
+    ) -> Result<(), VaultError> {
+        self.review_candidate_inner(id, state, memory, embedding, Some(binding))
+    }
+
+    fn review_candidate_inner(
+        &mut self,
+        id: CandidateId,
+        state: CandidateState,
+        memory: Option<&MemoryRecord>,
+        embedding: Option<&Embedding384>,
+        binding: Option<&LocalOperationBinding>,
+    ) -> Result<(), VaultError> {
         if state == CandidateState::Pending {
             return Err(VaultError::Validation(
                 "candidate review must accept or reject".to_owned(),
             ));
         }
+        let id = self.canonical_candidate_id(id)?;
         let transaction = self.connection.transaction()?;
         let payload = transaction
             .query_row(
@@ -982,6 +1106,24 @@ impl Vault {
             .optional()?
             .ok_or_else(|| VaultError::Validation("candidate does not exist".to_owned()))?;
         let mut candidate: MemoryCandidate = from_json(&payload)?;
+        let already_reviewed = binding.is_some() && candidate.state == state;
+        if let Some(binding) = binding {
+            if binding.operation_kind != LocalOperationKind::CandidateReview
+                || resolve_candidate_id(&transaction, &binding.target_id)? != id.to_string()
+                || (candidate.state != CandidateState::Pending && candidate.state != state)
+            {
+                return Err(VaultError::OperationConflict);
+            }
+            let mut response = candidate.clone();
+            response.state = state;
+            response.id = binding
+                .target_id
+                .parse()
+                .map_err(|_| VaultError::OperationConflict)?;
+            if !insert_local_operation_binding(&transaction, binding, &to_json(&response)?)? {
+                return Err(VaultError::OperationConflict);
+            }
+        }
         match (state, memory, embedding) {
             (CandidateState::Accepted, Some(memory), Some(embedding))
                 if memory == &candidate.proposed_memory =>
@@ -989,18 +1131,20 @@ impl Vault {
                 memory
                     .validate()
                     .map_err(|error| VaultError::Validation(error.to_string()))?;
-                upsert_searchable_record(
-                    &transaction,
-                    &memory.id.to_string(),
-                    "memory",
-                    &memory.scope,
-                    memory.archived,
-                    &memory.title,
-                    &memory.body_markdown,
-                    &to_json(memory)?,
-                    &memory.provenance,
-                    embedding,
-                )?;
+                if !already_reviewed {
+                    upsert_searchable_record(
+                        &transaction,
+                        &memory.id.to_string(),
+                        "memory",
+                        &memory.scope,
+                        memory.archived,
+                        &memory.title,
+                        &memory.body_markdown,
+                        &to_json(memory)?,
+                        &memory.provenance,
+                        embedding,
+                    )?;
+                }
             }
             (CandidateState::Rejected, None, None) => {}
             _ => {
@@ -1015,7 +1159,7 @@ impl Vault {
             params![id.to_string(), candidate_state(state), to_json(&candidate)?],
         )?;
         transaction.commit()?;
-        if let (Some(memory), Some(embedding)) = (memory, embedding) {
+        if !already_reviewed && let (Some(memory), Some(embedding)) = (memory, embedding) {
             self.embedding_cache.insert(
                 memory.id.to_string(),
                 cached_embedding(&memory.scope, memory.archived, embedding),
@@ -1288,6 +1432,50 @@ impl Vault {
              ON CONFLICT(id) DO UPDATE SET payload_json = excluded.payload_json",
             params![project.project_id.to_string(), to_json(project)?],
         )?;
+        Ok(())
+    }
+
+    pub fn register_project(
+        &mut self,
+        project: &ProjectIdentity,
+        path: &WireNativeValue,
+    ) -> Result<(), VaultError> {
+        project
+            .validate()
+            .and_then(|()| path.validate())
+            .map_err(|error| VaultError::Validation(error.to_string()))?;
+        let id = project.project_id.to_string();
+        let transaction = self.connection.transaction()?;
+        let existing_project: Option<ProjectIdentity> = load_json(
+            &transaction,
+            "SELECT payload_json FROM projects WHERE id = ?1",
+            &id,
+        )?;
+        let existing_path: Option<WireNativeValue> = load_json(
+            &transaction,
+            "SELECT payload_json FROM paths WHERE id = ?1",
+            &id,
+        )?;
+        // Repeating an uncertain registration may complete an older partial
+        // entry, but must never rename or redirect an already bound project.
+        if existing_project
+            .as_ref()
+            .is_some_and(|value| value != project)
+            || existing_path.as_ref().is_some_and(|value| value != path)
+        {
+            return Err(VaultError::Validation(
+                "project registration conflicts with an existing record".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO projects(id, payload_json) VALUES (?1, ?2) ON CONFLICT(id) DO NOTHING",
+            params![id, to_json(project)?],
+        )?;
+        transaction.execute(
+            "INSERT INTO paths(id, payload_json) VALUES (?1, ?2) ON CONFLICT(id) DO NOTHING",
+            params![id, to_json(path)?],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1570,14 +1758,69 @@ impl Vault {
         };
 
         let mut semantic = Vec::with_capacity(self.embedding_cache.len());
-        for (record_id, cached) in &self.embedding_cache {
-            if !cached.approved || cached.archived || !cached.scope.allowed_by(scope) {
-                continue;
+        if self.semantic_search_failed.get() {
+            return Ok(reciprocal_rank_fusion(&lexical, &[], limit));
+        }
+        if let Some(engine) = &self.semantic_search {
+            let mut engine = engine.borrow_mut();
+            let query_embedding = match engine.query(query) {
+                Ok(embedding) => embedding,
+                Err(_) => {
+                    self.semantic_search_failed.set(true);
+                    return Ok(reciprocal_rank_fusion(&lexical, &[], limit));
+                }
+            };
+            // total_changes observes our own writes; data_version observes commits
+            // through another connection. Either invalidates the scope snapshot.
+            let database_revision = (
+                self.connection.total_changes(),
+                self.connection
+                    .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?,
+            );
+            if let Some(scores) = engine.cached_scores(scope, database_revision, &query_embedding) {
+                semantic = scores;
+            } else {
+                // Search only ready vectors. Passage inference belongs to resumable
+                // indexing batches, never to an interactive search request.
+                let mut statement = self.connection.prepare(
+                    "SELECT d.record_id, d.input_digest, e.vector
+                     FROM search_documents AS d JOIN semantic_embeddings AS e
+                       ON e.record_id = d.record_id AND e.input_digest = d.input_digest
+                       AND e.model_fingerprint = ?3
+                     WHERE d.approved = 1 AND d.archived = 0 AND (
+                       (d.scope_kind = 'global' AND ?1 = 1)
+                       OR (d.scope_kind = 'project' AND d.project_id = ?2)
+                     ) ORDER BY d.record_id",
+                )?;
+                let fingerprint = semantic_model_fingerprint();
+                let mut rows = statement.query(params![
+                    allows_global,
+                    project_id.as_deref(),
+                    fingerprint.as_slice()
+                ])?;
+                while let Some(row) = rows.next()? {
+                    let record_id: String = row.get(0)?;
+                    let digest: [u8; 32] = row.get::<_, Vec<u8>>(1)?.try_into().map_err(|_| {
+                        VaultError::Validation("invalid semantic input digest".into())
+                    })?;
+                    let embedding = Embedding384::from_le_bytes(&row.get::<_, Vec<u8>>(2)?)
+                        .map_err(|_| VaultError::Validation("invalid semantic vector".into()))?;
+                    let score = embedding.cosine_similarity(&query_embedding);
+                    engine.cache_passage(&record_id, digest, embedding);
+                    semantic.push((record_id, score));
+                }
+                engine.remember_scope(scope, database_revision, &semantic);
             }
-            semantic.push((
-                record_id.clone(),
-                cached.embedding.cosine_similarity(query_embedding),
-            ));
+        } else if !self.semantic_search_configured {
+            for (record_id, cached) in &self.embedding_cache {
+                if !cached.approved || cached.archived || !cached.scope.allowed_by(scope) {
+                    continue;
+                }
+                semantic.push((
+                    record_id.clone(),
+                    cached.embedding.cosine_similarity(query_embedding),
+                ));
+            }
         }
         semantic.sort_by(|left, right| {
             right
@@ -1609,6 +1852,7 @@ fn validate_native_memory_candidate(
     ledger: &NativeMemoryLedger,
     candidate: &MemoryCandidate,
     expected_change_kind: NativeMemoryChangeKind,
+    existing_candidate: bool,
 ) -> Result<(), VaultError> {
     let unmanaged_digest = ledger.last_imported_digest.ok_or_else(|| {
         VaultError::Validation("native memory candidate requires an imported digest".to_owned())
@@ -1622,7 +1866,8 @@ fn validate_native_memory_candidate(
     if extracted.managed_body.is_some()
         || extracted.unmanaged_digest != unmanaged_digest
         || candidate.id != expected_candidate_id
-        || memory.id != expected_memory_id
+        || (memory.id != expected_memory_id
+            && !(existing_candidate && memory.id.as_bytes() == expected_candidate_id.as_bytes()))
         || memory.revision != expected_operation_id
         || candidate.state != CandidateState::Pending
         || candidate.source_harness != source.harness
@@ -1661,6 +1906,10 @@ fn native_memory_change_kind(
 
 fn same_native_candidate_identity(existing: &MemoryCandidate, incoming: &MemoryCandidate) -> bool {
     let mut normalized = existing.clone();
+    // Old imports shared IDs. Re-observation must retain their saved memory/receipt identity.
+    if normalized.proposed_memory.id.as_bytes() == normalized.id.as_bytes() {
+        normalized.proposed_memory.id = incoming.proposed_memory.id;
+    }
     normalized
         .evidence_summary
         .clone_from(&incoming.evidence_summary);
@@ -2064,7 +2313,180 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }
+    if found < 26 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0026_desktop_writes.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 26))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 27 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0027_semantic_index.sql"))
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        semantic_index::backfill_search_metadata(&transaction)
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .pragma_update(None, "user_version", 27)
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 28 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0028_hosted_enrollment_intent.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 28))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 29 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0029_enrollment_clock_domains.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 29))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 30 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0030_restore_clock_domains.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 30))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 31 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0031_hosted_restore_intent.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 31))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 32 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0032_hosted_pairing_intents.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 32))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 33 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0033_pairing_request_reviews.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 33))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 34 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0034_account_lifecycle_intents.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 34))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 35 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0035_candidate_review_bindings.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 35))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 36 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0036_candidate_aliases.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 36))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 37 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0037_device_revocation_intents.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 37))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 38 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0038_revocation_control_history.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 38))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 39 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0039_revocation_genesis_anchor.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 39))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
     Ok(())
+}
+
+fn resolve_candidate_id(connection: &Connection, id: &str) -> Result<String, VaultError> {
+    Ok(connection
+        .query_row(
+            "SELECT canonical_id FROM candidate_aliases WHERE legacy_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| id.to_owned()))
 }
 
 const fn task_status(status: TaskStatus) -> &'static str {
@@ -2346,12 +2768,13 @@ fn upsert_searchable_record(
     )?;
     transaction.execute(
         "INSERT INTO search_documents(
-            record_id, record_kind, scope_kind, project_id, archived, approved, title, body
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7)
+            record_id, record_kind, scope_kind, project_id, archived, approved, title, body, tags, input_digest
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9)
          ON CONFLICT(record_id) DO UPDATE SET record_kind = excluded.record_kind,
             scope_kind = excluded.scope_kind, project_id = excluded.project_id,
             archived = excluded.archived, approved = 1,
-            title = excluded.title, body = excluded.body",
+            title = excluded.title, body = excluded.body,
+            tags = excluded.tags, input_digest = excluded.input_digest",
         params![
             id,
             kind,
@@ -2360,6 +2783,8 @@ fn upsert_searchable_record(
             i64::from(archived),
             title,
             body,
+            handoff_projection.tags,
+            semantic_input_digest(title, &handoff_projection.tags, body).as_slice(),
         ],
     )?;
     transaction.execute(
@@ -2370,12 +2795,13 @@ fn upsert_searchable_record(
     transaction.execute("DELETE FROM search_fts WHERE record_id = ?1", [id])?;
     transaction.execute(
         "INSERT INTO search_fts(record_id, title, body) VALUES (?1, ?2, ?3)",
-        params![id, title, body],
+        params![id, title, format!("{}\n{body}", handoff_projection.tags)],
     )?;
     Ok(())
 }
 
 struct HandoffProjection {
+    tags: String,
     memory_kind: Option<&'static str>,
     updated_physical_sort: Option<String>,
     updated_logical: Option<i64>,
@@ -2385,6 +2811,7 @@ struct HandoffProjection {
 fn handoff_projection(record_kind: &str, payload: &[u8]) -> Result<HandoffProjection, VaultError> {
     if record_kind != "memory" {
         return Ok(HandoffProjection {
+            tags: String::new(),
             memory_kind: None,
             updated_physical_sort: None,
             updated_logical: None,
@@ -2393,6 +2820,7 @@ fn handoff_projection(record_kind: &str, payload: &[u8]) -> Result<HandoffProjec
     }
     let memory: MemoryRecord = from_json(payload)?;
     Ok(HandoffProjection {
+        tags: memory.tags.join(" "),
         memory_kind: Some(memory_kind(memory.kind)),
         updated_physical_sort: Some(format!("{:020}", memory.updated_hlc.physical_ms)),
         updated_logical: Some(i64::from(memory.updated_hlc.logical)),

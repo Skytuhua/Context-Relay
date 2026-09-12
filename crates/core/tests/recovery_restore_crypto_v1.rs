@@ -147,6 +147,38 @@ fn assert_material_eq(actual: &PairingKeyBundle, expected: &PairingKeyBundle) {
 }
 
 #[test]
+fn hosted_recovery_proof_matches_the_session_bound_edge_vector() {
+    use context_relay_core::devices::recovery_restore_crypto::{
+        hosted_recovery_proof_preimage, sign_hosted_recovery_proof,
+    };
+    let vector: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/hosted-recovery-proof-v1.json")).unwrap();
+    let user = uuid::Uuid::parse_str(vector["authUserId"].as_str().unwrap()).unwrap();
+    let session = uuid::Uuid::parse_str(vector["sessionId"].as_str().unwrap()).unwrap();
+    let claim = fixture_claim();
+    let device = recovered_device_keys();
+    let preimage = hosted_recovery_proof_preimage(user, session, &claim).unwrap();
+    let signature = sign_hosted_recovery_proof(&device, user, session, &claim).unwrap();
+    assert_eq!(encode_hex(&preimage), vector["preimage"].as_str().unwrap());
+    assert_eq!(
+        encode_hex(&signature.0),
+        vector["signature"].as_str().unwrap()
+    );
+    context_relay_core::crypto::verify_signature(device.signing_public_key(), &preimage, signature)
+        .unwrap();
+    assert_ne!(
+        preimage,
+        hosted_recovery_proof_preimage(session, user, &claim).unwrap()
+    );
+    assert!(hosted_recovery_proof_preimage(uuid::Uuid::nil(), session, &claim).is_err());
+    let wrong = DeviceKeys::from_seeds_for_test([0x66; 32], [0x78; 32]);
+    assert!(sign_hosted_recovery_proof(&wrong, user, session, &claim).is_err());
+    let mut forged = claim;
+    forged.recovery_root_signature.0[0] ^= 1;
+    assert!(sign_hosted_recovery_proof(&device, user, session, &forged).is_err());
+}
+
+#[test]
 fn frozen_recovery_device_claim_round_trips_and_opens_for_the_target_device() {
     let canonical_enrollment = enrollment_bytes();
     let enrollment_sha256 = Sha256Digest(Sha256::digest(&canonical_enrollment).into());

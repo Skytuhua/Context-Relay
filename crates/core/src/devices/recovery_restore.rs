@@ -237,7 +237,7 @@ where
             .submit_restore(&stored.canonical_claim, now_ms)
         {
             Ok(receipt) => receipt,
-            Err(RecoveryTransportError::Transient) => {
+            Err(RecoveryTransportError::Transient | RecoveryTransportError::Expired) => {
                 return Ok(RecoveryRestoreOutcome::Submitting { restore_id });
             }
             Err(RecoveryTransportError::Unauthorized) => {
@@ -267,7 +267,7 @@ where
             Err(RecoveryTransportError::Unauthorized) => {
                 return Err(RecoveryRestoreCycleError::Unauthorized);
             }
-            Err(RecoveryTransportError::Transient) => {
+            Err(RecoveryTransportError::Transient | RecoveryTransportError::Expired) => {
                 return Ok(RecoveryRestoreOutcome::Submitting { restore_id });
             }
         };
@@ -281,7 +281,9 @@ where
         {
             return self.mark_conflict(vault, &stored);
         }
-        match vault.activate_recovery_restore(&receipt, &projection, identity.keys, now_ms) {
+        let completed_at_ms = self.clock.now_ms().max(stored.prepared_at_ms);
+        match vault.activate_recovery_restore(&receipt, &projection, identity.keys, completed_at_ms)
+        {
             Ok(_) => {
                 let active = vault
                     .recovery_restore()
@@ -433,7 +435,9 @@ fn map_initial_transport_error(error: RecoveryTransportError) -> RecoveryRestore
             RecoveryRestoreCycleError::Conflict
         }
         RecoveryTransportError::Unauthorized => RecoveryRestoreCycleError::Unauthorized,
-        RecoveryTransportError::Transient => RecoveryRestoreCycleError::Transient,
+        RecoveryTransportError::Transient | RecoveryTransportError::Expired => {
+            RecoveryRestoreCycleError::Transient
+        }
     }
 }
 

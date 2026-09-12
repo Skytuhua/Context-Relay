@@ -1,4 +1,212 @@
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
+
+use crate::devices::revocation_crypto::{RevocationControlState, initial_revocation_control_state};
+
+/// Historical root-only enrollment evidence, authenticated on each vault read.
+/// The accepted tip is the tip at enrollment, NOT proof of current membership or
+/// freshness after pairing/recovery/rotation. No production rotation authority
+/// is available until authenticated complete-roster and tip transfer exists.
+pub struct RecoveryEnrollmentGenesisAnchor {
+    record: RecoveryEnrollmentRecordV1,
+    active_devices: BTreeMap<DeviceId, crate::crypto::DeviceCertificateV1>,
+    state_sha256: Sha256Digest,
+    accepted_tip: (u32, u32, Sha256Digest),
+}
+
+impl RecoveryEnrollmentGenesisAnchor {
+    pub fn genesis_state(&self) -> RevocationControlState<'_> {
+        RevocationControlState {
+            scope: scope(&self.record),
+            control_epoch: 1,
+            key_epoch: 1,
+            state_sha256: self.state_sha256,
+            active_devices: &self.active_devices,
+            recovery_root_id: self.record.recovery_root_id,
+            recovery_wrapping_public_key: self.record.recovery_wrapping_public_key,
+        }
+    }
+
+    /// Separately persisted acceptance at enrollment, never the current tip.
+    pub const fn enrollment_accepted_tip(&self) -> (u32, u32, Sha256Digest) {
+        self.accepted_tip
+    }
+}
+
+fn genesis_anchor(
+    stored: &StoredRecoveryEnrollment,
+) -> Result<RecoveryEnrollmentGenesisAnchor, VaultError> {
+    let active_devices = BTreeMap::from([(
+        stored.record.genesis_certificate.device_id,
+        stored.record.genesis_certificate.clone(),
+    )]);
+    let state_sha256 = initial_revocation_control_state(
+        &stored.record,
+        stored.canonical_record_sha256,
+        scope(&stored.record),
+        &active_devices,
+    )
+    .map_err(|_| validation())?
+    .state_sha256;
+    Ok(RecoveryEnrollmentGenesisAnchor {
+        record: stored.record.clone(),
+        active_devices,
+        state_sha256,
+        accepted_tip: (1, 1, state_sha256),
+    })
+}
+
+/// Public enrollment intent stored inside the encrypted vault before networking.
+/// Never contains login tokens, the recovery phrase, or private keys.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostedEnrollmentIntent {
+    pub project_url: String,
+    pub user_id: uuid::Uuid,
+    pub session_id: uuid::Uuid,
+    pub operation_id: context_relay_protocol::OperationId,
+    pub reservation: Option<crate::devices::supabase_enrollment::HostedEnrollmentReservation>,
+}
+
+impl HostedEnrollmentIntent {
+    pub(crate) fn validate(&self) -> Result<(), VaultError> {
+        if self.project_url.len() > 2048
+            || crate::sync::supabase::validated_project_url(&self.project_url).is_err()
+            || [self.user_id, self.session_id].iter().any(|id| {
+                id.get_variant() != uuid::Variant::RFC4122
+                    || !(1..=8).contains(&id.get_version_num())
+            })
+            || self.reservation.as_ref().is_some_and(|reservation| {
+                reservation.reservation_id != self.operation_id
+                    || reservation.expires_at.0 == 0
+                    || reservation.expires_at.0 > i64::MAX as u64
+            })
+        {
+            return Err(VaultError::Validation(
+                "invalid hosted enrollment intent".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn load_hosted_intent(
+    connection: &Connection,
+) -> Result<Option<HostedEnrollmentIntent>, VaultError> {
+    let payload: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT payload FROM hosted_enrollment_intent WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    payload
+        .map(|bytes| {
+            if bytes.len() > 8192 {
+                return Err(VaultError::Validation(
+                    "invalid hosted enrollment intent".into(),
+                ));
+            }
+            let intent: HostedEnrollmentIntent = serde_json::from_slice(&bytes)
+                .map_err(|_| VaultError::Validation("invalid hosted enrollment intent".into()))?;
+            intent.validate()?;
+            Ok(intent)
+        })
+        .transpose()
+}
+
+impl Vault {
+    /// Persist a server-renewed challenge without replacing the prepared record.
+    pub fn renew_hosted_enrollment_intent(
+        &mut self,
+        expected: &HostedEnrollmentIntent,
+        reservation: crate::devices::supabase_enrollment::HostedEnrollmentReservation,
+    ) -> Result<HostedEnrollmentIntent, VaultError> {
+        reservation
+            .validate_renewal(
+                expected
+                    .reservation
+                    .as_ref()
+                    .ok_or(VaultError::OperationConflict)?,
+            )
+            .map_err(|_| VaultError::OperationConflict)?;
+        let mut renewed = expected.clone();
+        renewed.reservation = Some(reservation);
+        renewed.validate()?;
+        let payload = serde_json::to_vec(&renewed).map_err(|_| validation())?;
+        if payload.len() > 8192 {
+            return Err(validation());
+        }
+        let transaction = self.connection.transaction()?;
+        if load_hosted_intent(&transaction)?.as_ref() != Some(expected) {
+            return Err(VaultError::OperationConflict);
+        }
+        transaction.execute(
+            "UPDATE hosted_enrollment_intent SET payload=?1 WHERE singleton=1",
+            params![payload],
+        )?;
+        transaction.commit()?;
+        Ok(renewed)
+    }
+    /// Discard only the exact unprepared intent. Prepared/accepted enrollment
+    /// records must be reconciled, never retargeted to a new hosted identity.
+    pub fn discard_unprepared_hosted_enrollment_intent(
+        &mut self,
+        expected: &HostedEnrollmentIntent,
+    ) -> Result<(), VaultError> {
+        let transaction = self.connection.transaction()?;
+        if load_recovery_enrollment(&transaction)?.is_some()
+            || load_hosted_intent(&transaction)?.as_ref() != Some(expected)
+        {
+            return Err(VaultError::OperationConflict);
+        }
+        transaction.execute("DELETE FROM hosted_enrollment_intent WHERE singleton=1", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
+    pub fn hosted_enrollment_intent(&self) -> Result<Option<HostedEnrollmentIntent>, VaultError> {
+        load_hosted_intent(&self.connection)
+    }
+    /// Only the exact initial intent may acquire its reservation. Once present,
+    /// the challenge cannot be replaced by a retry or a different hosted login.
+    pub fn store_hosted_enrollment_intent(
+        &mut self,
+        intent: &HostedEnrollmentIntent,
+    ) -> Result<(), VaultError> {
+        intent.validate()?;
+        let payload = serde_json::to_vec(intent)
+            .map_err(|_| VaultError::Validation("invalid hosted enrollment intent".into()))?;
+        if payload.len() > 8192 {
+            return Err(VaultError::Validation(
+                "invalid hosted enrollment intent".into(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        if let Some(mut existing) = load_hosted_intent(&transaction)? {
+            if existing.reservation.is_none() {
+                existing.reservation = intent.reservation.clone();
+            }
+            if existing != *intent {
+                return Err(VaultError::OperationConflict);
+            }
+        } else if load_recovery_enrollment(&transaction)?.is_some()
+            || transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hosted_restore_intent)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            // An already prepared enrollment cannot acquire a different hosted owner.
+            return Err(VaultError::OperationConflict);
+        }
+        transaction.execute(
+            "INSERT INTO hosted_enrollment_intent(singleton,payload) VALUES(1,?1)
+            ON CONFLICT(singleton) DO UPDATE SET payload=excluded.payload",
+            params![payload],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
 
 use context_relay_protocol::{
     AccountId, DeviceCertificateId, DeviceId, Ed25519PublicKeyBytes, RecoveryEnrollmentId,
@@ -133,6 +341,21 @@ impl Vault {
     ) -> Result<CommitDisposition, VaultError> {
         let candidate = validate_write(write)?;
         let transaction = self.connection.transaction()?;
+        if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hosted_restore_intent)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )? {
+            return Err(VaultError::OperationConflict);
+        }
+        if let Some(intent) = load_hosted_intent(&transaction)? {
+            let reservation = intent.reservation.ok_or(VaultError::OperationConflict)?;
+            if candidate.record.account_id != reservation.account_id
+                || candidate.record.workspace_id != reservation.workspace_id
+            {
+                return Err(VaultError::OperationConflict);
+            }
+        }
         if let Some(existing) = load_recovery_enrollment(&transaction)? {
             let exact = exact_prepared_write(&existing, write)?;
             if exact {
@@ -246,9 +469,9 @@ impl Vault {
                 receipt.registered_at_ms,
             )
             .map_err(|_| validation())?;
-        if receipt.registered_at_ms < stored.prepared_at_ms
-            || completed_at_ms < receipt.registered_at_ms
-        {
+        // Provider acceptance uses the server clock; preparation/completion use
+        // the local clock. Only timestamps within the same domain are ordered.
+        if completed_at_ms < stored.prepared_at_ms {
             transaction.rollback()?;
             return Err(validation());
         }
@@ -262,6 +485,33 @@ impl Vault {
 
         match stored.state {
             RecoveryEnrollmentPersistenceState::Prepared => {
+                // Only this locally authenticated Prepared -> Active transition
+                // can establish a fresh root-only roster. Existing certificates,
+                // restores or control artifacts leave genesis authority unavailable.
+                // Never reconstruct it from hosted certificate snapshots/history.
+                let fresh: bool = transaction.query_row(
+                    "SELECT NOT (EXISTS(SELECT 1 FROM device_certificates)
+                        OR EXISTS(SELECT 1 FROM recovery_restores)
+                        OR EXISTS(SELECT 1 FROM revocation_control_history)
+                        OR EXISTS(SELECT 1 FROM device_revocation_intents))",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM revocation_genesis_anchor)",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )? {
+                    return Err(VaultError::OperationConflict);
+                }
+                if fresh {
+                    let anchor = genesis_anchor(&stored)?;
+                    transaction.execute(
+                        "INSERT INTO revocation_genesis_anchor(singleton,account_id,workspace_id,enrollment_sha256,anchor_sha256,control_epoch,key_epoch,accepted_state_sha256)
+                         VALUES(1,?1,?2,?3,?4,1,1,?4)",
+                        params![stored.record.account_id.to_string(), stored.record.workspace_id.to_string(), stored.canonical_record_sha256.0.as_slice(), anchor.state_sha256.0.as_slice()],
+                    )?;
+                }
                 ensure_active_certificate_tx(
                     &transaction,
                     stored.record.genesis_certificate_id,
@@ -323,6 +573,66 @@ impl Vault {
         }
     }
 
+    /// Return historical genesis evidence only; old/paired/recovered vaults are
+    /// not implicitly initialized. This does not certify today's complete roster.
+    pub fn recovery_enrollment_genesis_anchor(
+        &self,
+        device_keys: &DeviceKeys,
+    ) -> Result<Option<RecoveryEnrollmentGenesisAnchor>, VaultError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut query = transaction.prepare(
+            "SELECT CASE WHEN typeof(account_id)='text' AND length(CAST(account_id AS BLOB))=36 THEN account_id END,
+                    CASE WHEN typeof(workspace_id)='text' AND length(CAST(workspace_id AS BLOB))=36 THEN workspace_id END,
+                    CASE WHEN typeof(enrollment_sha256)='blob' AND length(enrollment_sha256)=32 THEN enrollment_sha256 END,
+                    CASE WHEN typeof(anchor_sha256)='blob' AND length(anchor_sha256)=32 THEN anchor_sha256 END,
+                    CASE WHEN typeof(control_epoch)='integer' AND control_epoch=1 THEN control_epoch END,
+                    CASE WHEN typeof(key_epoch)='integer' AND key_epoch=1 THEN key_epoch END,
+                    CASE WHEN typeof(accepted_state_sha256)='blob' AND length(accepted_state_sha256)=32 THEN accepted_state_sha256 END,
+                    singleton
+             FROM revocation_genesis_anchor LIMIT 2",
+        )?;
+        let mut rows = query.query([])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let account: String = row.get(0)?;
+        let workspace: String = row.get(1)?;
+        let pin: Vec<u8> = row.get(2)?;
+        let hash: Vec<u8> = row.get(3)?;
+        let control_epoch: u32 = row.get(4)?;
+        let key_epoch: u32 = row.get(5)?;
+        let tip: Vec<u8> = row.get(6)?;
+        let singleton: i64 = row.get(7)?;
+        if singleton != 1 || rows.next()?.is_some() {
+            return Err(validation());
+        }
+        let stored = self.recovery_enrollment()?.ok_or_else(validation)?;
+        if stored.state != RecoveryEnrollmentPersistenceState::Active {
+            return Err(validation());
+        }
+        open_device_workspace_material(
+            &stored.record,
+            &stored.device_material_envelope,
+            stored.record.genesis_certificate.device_id,
+            device_keys,
+        )
+        .map_err(|_| validation())?;
+        let mut anchor = genesis_anchor(&stored)?;
+        if account != stored.record.account_id.to_string()
+            || workspace != stored.record.workspace_id.to_string()
+            || pin != stored.canonical_record_sha256.0
+            || hash != anchor.state_sha256.0
+            || tip != anchor.state_sha256.0
+        {
+            return Err(validation());
+        }
+        anchor.accepted_tip = (control_epoch, key_epoch, digest_from_db(tip)?);
+        drop(rows);
+        drop(query);
+        transaction.commit()?;
+        Ok(Some(anchor))
+    }
+
     pub fn enrolled_workspace_material(
         &self,
         device_keys: &DeviceKeys,
@@ -348,6 +658,7 @@ impl Vault {
             *material.workspace_root_key(),
             *material.active_epoch_key(),
         )
+        .and_then(|material| material.with_enrollment_record_sha256(stored.canonical_record_sha256))
         .map_err(|_| validation())
     }
 }
@@ -508,10 +819,8 @@ fn validate_stored_row(raw: RawRecoveryEnrollment) -> Result<StoredRecoveryEnrol
         }
         RecoveryEnrollmentPersistenceState::Active => {
             activated_certificate_id == Some(record.genesis_certificate_id)
-                && provider_accepted_at_ms.is_some_and(|value| value >= prepared_at_ms)
-                && completed_at_ms
-                    .zip(provider_accepted_at_ms)
-                    .is_some_and(|(completed, provider)| completed >= provider)
+                && provider_accepted_at_ms.is_some()
+                && completed_at_ms.is_some_and(|completed| completed >= prepared_at_ms)
                 && conflict_at_ms.is_none()
         }
         RecoveryEnrollmentPersistenceState::Conflict => {

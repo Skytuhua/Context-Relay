@@ -16,6 +16,7 @@ pub use model::{
     cleanup_profile_after_durable_outcome, create_fresh_profile, recover_profile,
 };
 pub(crate) use native::copy_locked_file;
+pub(crate) use native::{ProcThreadAttributes, create_verified_kill_job};
 pub use native::{
     Win32LaunchAudit, Win32LaunchBackend, Win32SandboxOutput, seal_protocol_handles_before_sidecar,
 };

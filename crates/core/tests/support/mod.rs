@@ -124,7 +124,18 @@ impl Drop for TempVault {
 pub fn remove_native_memory_migrations_after_schema_23(connection: &Connection) {
     connection
         .execute_batch(
-            "DROP TABLE native_memory_source_supersessions;
+            "DROP TABLE IF EXISTS revocation_genesis_anchor; DROP TABLE IF EXISTS revocation_control_history; DROP TABLE IF EXISTS device_revocation_intents; DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews; DROP TABLE hosted_pairing_intents;
+             DROP TABLE hosted_restore_intent;
+             DROP TABLE hosted_enrollment_intent;
+             DROP TRIGGER semantic_document_insert;
+             DROP TRIGGER semantic_document_update;
+             DROP TABLE semantic_embeddings;
+             DROP TABLE semantic_index_queue;
+             DROP TABLE semantic_index_model;
+             ALTER TABLE search_documents DROP COLUMN input_digest;
+             ALTER TABLE search_documents DROP COLUMN tags;
+             DROP TABLE desktop_writes;
+             DROP TABLE native_memory_source_supersessions;
              ALTER TABLE native_memory_sources DROP COLUMN last_applied_managed_digest;",
         )
         .unwrap();
@@ -236,7 +247,10 @@ pub fn persist_native_terminal(
                 )
                 .unwrap();
         }
-        NativeTransactionStatus::Restoring => unreachable!(),
+        NativeTransactionStatus::Restoring => {
+            vault.begin_native_recovery(&transaction_id).unwrap();
+            return;
+        }
     }
     vault.finish_native_cleanup(&transaction_id).unwrap();
 }

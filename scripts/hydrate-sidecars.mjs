@@ -237,6 +237,12 @@ export function parseSidecarManifest(json) {
       hash(material.sha256, `${materialPath}.sha256`);
     }
     uniquePaths(tool.materials, `${path}.materials`);
+    if (tool.id === 'semgrep' && tool.materials.some((material) => material.role === 'windows-build')) {
+      const helpers = tool.materials.filter((material) => material.role === 'windows-offline-firewall');
+      if (helpers.length !== 1 || helpers[0].path !== 'third_party/sidecars/semgrep/windows-offline-firewall.ps1') {
+        throw new Error('semgrep Windows build requires its hashed shared firewall helper');
+      }
+    }
 
     exactKeys(tool.commandTemplate, ['id', 'argv', 'sha256'], ['id', 'argv', 'sha256'], `${path}.commandTemplate`);
     if (!ID.test(tool.commandTemplate.id)) throw new Error(`${path}.commandTemplate.id is invalid`);

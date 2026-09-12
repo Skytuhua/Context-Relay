@@ -1,0 +1,11 @@
+# Recover unconfirmed desktop saves
+
+Submitted context, task and suggestion changes must survive a desktop restart once the local service has durably prepared the request. Store the exact typed request and original operation ID in the existing encrypted vault, then send the ordinary mutation. A usable acknowledgment permits removal of the pending request. Losing either acknowledgment must not cause a new operation identity or silently replay a write.
+
+Home offers an Unconfirmed changes panel: load bounded summaries, review an individual request, explicitly retry its original operation, or dismiss its recovery copy. Dismissal does not undo a change that might already have committed. Startup only reads. Unsubmitted keystrokes are outside this journal's guarantee.
+
+Only authenticated Desktop clients may prepare, list, read or forget these requests. The stored enum accepts the seven existing record mutation methods (task_upsert covers create and edit), validates their ordinary input limits, and does not admit harness setup, credential, export or account operations. The ordinary service retains mutation authorization, revision checks and replay binding. Preparation is idempotent only for an identical request; reuse of an ID with different content fails.
+
+List pages contain at most 50 operation IDs and short action/title summaries, with a cursor. Read returns one full request. Retain at most 256 requests and 64 MiB of serialized payload; reject preparation before sending the mutation if capacity is exhausted. Never silently evict. Existing 1 MiB text limits remain. All journal data uses SQLCipher and stays outside synced records. Existing complete encrypted-vault backups include recovery copies, while their record counts count only saved records. Restoring a backup must not apply pending requests automatically.
+
+Protocol 1.7 adds these contracts. Preserve authenticated installer shutdown compatibility with 1.4, 1.5 and 1.6; ordinary IPC clients still require the exact version. Verify generated schemas/bindings, roles, authentication vectors, encrypted reopen/replay behavior and frontend lost acknowledgment/restart recovery. Native UI remains paused; test with isolated vaults and browser fixtures.

@@ -105,6 +105,79 @@ fn open_keyed(path: &Path, key: &[u8; 32]) -> Connection {
 }
 
 #[test]
+fn hosted_restore_intent_survives_restart_and_cannot_retarget_prepared_claims() {
+    use context_relay_core::vault::HostedRestoreIntent;
+    let path = TempVault::new("hosted-restore-intent");
+    let keys = MemoryKeyStore::default();
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let intent = HostedRestoreIntent {
+        project_url: "https://example.supabase.co".into(),
+        user_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+        session_id: "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+    };
+    vault.store_hosted_restore_intent(&intent).unwrap();
+    vault.store_hosted_restore_intent(&intent).unwrap();
+    let enrollment = context_relay_core::vault::HostedEnrollmentIntent {
+        project_url: intent.project_url.clone(),
+        user_id: intent.user_id,
+        session_id: intent.session_id,
+        operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c073901".parse().unwrap(),
+        reservation: None,
+    };
+    assert!(vault.store_hosted_enrollment_intent(&enrollment).is_err());
+    let mut changed = intent.clone();
+    changed.session_id = intent.user_id;
+    assert!(vault.store_hosted_restore_intent(&changed).is_err());
+    assert!(
+        vault
+            .discard_unprepared_hosted_restore_intent(&changed)
+            .is_err()
+    );
+    vault
+        .discard_unprepared_hosted_restore_intent(&intent)
+        .unwrap();
+    assert!(vault.hosted_restore_intent().unwrap().is_none());
+    vault.store_hosted_enrollment_intent(&enrollment).unwrap();
+    assert!(vault.store_hosted_restore_intent(&intent).is_err());
+    vault
+        .discard_unprepared_hosted_enrollment_intent(&enrollment)
+        .unwrap();
+    for invalid in [
+        HostedRestoreIntent {
+            project_url: "http://example.supabase.co".into(),
+            ..intent.clone()
+        },
+        HostedRestoreIntent {
+            user_id: uuid::Uuid::nil(),
+            ..intent.clone()
+        },
+    ] {
+        assert!(vault.store_hosted_restore_intent(&invalid).is_err());
+    }
+    vault.store_hosted_restore_intent(&intent).unwrap();
+    let (_, write) = provider_and_write(3_000);
+    vault.prepare_recovery_restore(&write).unwrap();
+    drop(vault);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert_eq!(vault.hosted_restore_intent().unwrap(), Some(intent.clone()));
+    vault.store_hosted_restore_intent(&intent).unwrap();
+    assert!(
+        vault
+            .discard_unprepared_hosted_restore_intent(&intent)
+            .is_err()
+    );
+    assert!(vault.store_hosted_restore_intent(&changed).is_err());
+    let stored = vault.recovery_restore().unwrap().unwrap();
+    assert_eq!(stored.canonical_claim, write.canonical_claim);
+    assert_eq!(stored.state, RecoveryRestorePersistenceState::Prepared);
+    // Existing claims without hosted provenance must not acquire an arbitrary owner.
+    let other_path = TempVault::new("unbound-restore-intent");
+    let mut other = Vault::open(other_path.path(), CREDENTIAL, &keys).unwrap();
+    other.prepare_recovery_restore(&write).unwrap();
+    assert!(other.store_hosted_restore_intent(&intent).is_err());
+}
+
+#[test]
 fn prepared_restore_is_exact_without_installing_either_certificate() {
     let provider = InMemoryRecoveryEnrollmentProvider::new();
     provider
@@ -233,6 +306,26 @@ fn exact_provider_proof_activates_both_certificates_and_reopens_material() {
 
     let reopened = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
     let material = reopened.recovered_workspace_material(&device_keys).unwrap();
+    assert_eq!(
+        material.enrollment_record_sha256(),
+        Some(stored.canonical_record_sha256)
+    );
+    let sync_material = reopened.trusted_sync_material(&device_keys).unwrap();
+    use context_relay_core::sync::TrustedSyncMaterial;
+    assert!(sync_material.content_key(scope().workspace_id, 1).is_ok());
+    for row in reopened.devices(scope()).unwrap() {
+        assert_eq!(
+            sync_material
+                .trusted_device(
+                    scope().account_id,
+                    scope().workspace_id,
+                    row.certificate.device_id
+                )
+                .unwrap()
+                .certificate,
+            row.certificate
+        );
+    }
     assert_eq!(material.scope(), scope());
     assert_eq!(material.control_epoch(), 1);
     assert_eq!(material.key_epoch(), 1);
@@ -432,6 +525,60 @@ fn wrong_keys_forged_proof_and_terminal_conflict_install_no_trust() {
         stored.claim.certificate_id,
     ] {
         assert!(vault.device_certificate(certificate_id).unwrap().is_none());
+    }
+}
+
+#[test]
+fn schema_29_preserves_prepared_and_active_restore_rows() {
+    for active in [false, true] {
+        let (provider, write) = provider_and_write(3_000);
+        let path = TempVault::new("restore-schema-29");
+        let keys = MemoryKeyStore::default();
+        let key = [0x92; 32];
+        keys.insert(CREDENTIAL, key);
+        let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+        vault.prepare_recovery_restore(&write).unwrap();
+        if active {
+            let transport = provider.restore_transport(scope());
+            let receipt = transport
+                .submit_restore(&write.canonical_claim, 3_500)
+                .unwrap();
+            let projection = transport
+                .restore_claim(receipt.restore_id)
+                .unwrap()
+                .unwrap();
+            vault
+                .activate_recovery_restore(&receipt, &projection, &recovered_device_keys(), 4_000)
+                .unwrap();
+        }
+        let before = vault.recovery_restore().unwrap().unwrap();
+        drop(vault);
+        let raw = open_keyed(path.path(), &key);
+        raw.execute_batch(
+            &include_str!("../migrations/0023_recovery_restore.sql").replace(
+                "CREATE TABLE recovery_restores (",
+                "CREATE TABLE recovery_restores_legacy (",
+            ),
+        )
+        .unwrap();
+        raw.execute_batch(
+            "INSERT INTO recovery_restores_legacy SELECT * FROM recovery_restores;
+            DROP TABLE recovery_restores;
+            ALTER TABLE recovery_restores_legacy RENAME TO recovery_restores;
+            DROP TABLE IF EXISTS revocation_genesis_anchor; DROP TABLE IF EXISTS revocation_control_history; DROP TABLE IF EXISTS device_revocation_intents; DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews; DROP TABLE hosted_pairing_intents;
+            DROP TABLE hosted_restore_intent;
+            PRAGMA user_version = 29;",
+        )
+        .unwrap();
+        drop(raw);
+        let vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+        assert_eq!(vault.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        assert_eq!(vault.recovery_restore().unwrap().unwrap(), before);
+        if active {
+            vault
+                .recovered_workspace_material(&recovered_device_keys())
+                .unwrap();
+        }
     }
 }
 

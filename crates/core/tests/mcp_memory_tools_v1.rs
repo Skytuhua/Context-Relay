@@ -22,6 +22,54 @@ use support::{
 
 const CREDENTIAL: &str = "mcp-memory-tools-v1";
 
+#[test]
+fn configured_mcp_writes_queue_signed_operations_and_replay_original_bytes() {
+    use context_relay_core::{
+        crypto::{ContentKey, DeviceKeys},
+        sync::SyncIdentity,
+    };
+    let mut fixture = Fixture::new("mcp-signed-writes", HarnessAccessPolicy::Default);
+    let keys = DeviceKeys::generate().unwrap();
+    let content = ContentKey::from_bytes([0x76; 32]);
+    let identity = SyncIdentity {
+        account_id: ID_6.parse().unwrap(),
+        workspace_id: ID_8.parse().unwrap(),
+        device_id: fixture.device_id,
+        control_epoch: 1,
+        key_epoch: 1,
+        device_keys: &keys,
+        content_key: &content,
+    };
+    let request = McpCallParams {
+        binding: McpBinding {
+            harness: HarnessId::Codex,
+            working_directory: wire_path(fixture.root.path()),
+        },
+        name: "context_relay_remember".into(),
+        arguments: json!({"operationId":ID_1,"kind":"fact","title":"Signed MCP","markdown":"Persisted through MCP","tags":[],"scope":{"scope":"active_project"}}),
+    };
+    let output = McpWorkspace::new(&mut fixture.vault, fixture.device_id)
+        .with_sync_identity(identity)
+        .unwrap()
+        .call(request.clone())
+        .unwrap();
+    let before = fixture.vault.due_outbox(u64::MAX, 10).unwrap();
+    assert_eq!(before.len(), 1);
+    fixture.reopen();
+    assert_eq!(
+        McpWorkspace::new(&mut fixture.vault, fixture.device_id)
+            .with_sync_identity(identity)
+            .unwrap()
+            .call(request)
+            .unwrap(),
+        output
+    );
+    assert_eq!(
+        fixture.vault.due_outbox(u64::MAX, 10).unwrap()[0].canonical_bytes,
+        before[0].canonical_bytes
+    );
+}
+
 struct Fixture {
     _database: TempVault,
     _keys: MemoryKeyStore,
@@ -158,8 +206,8 @@ fn status_reports_the_resolved_project_and_actual_policy() {
 
     let output = fixture.call("context_relay_status", json!({})).unwrap();
 
-    assert_eq!(output["protocol"]["min"], json!({"major": 1, "minor": 4}));
-    assert_eq!(output["protocol"]["max"], json!({"major": 1, "minor": 4}));
+    assert_eq!(output["protocol"]["min"], json!({"major": 1, "minor": 15}));
+    assert_eq!(output["protocol"]["max"], json!({"major": 1, "minor": 15}));
     assert_eq!(output["vault"], "unlocked");
     assert_eq!(output["resolvedProject"], fixture.project_id.to_string());
     assert_eq!(output["sync"], "offline");

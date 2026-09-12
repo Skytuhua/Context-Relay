@@ -5,6 +5,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, w
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   archiveCacheLinks,
@@ -686,6 +687,37 @@ test('archive fetch verifies before atomic persistence and reuses a valid cache'
   await assert.rejects(() => readFile(join(root, 'sha256', sha256)), /ENOENT/i);
 });
 
+test('archive fetch retries transient HTTP failures within a bounded attempt count', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'context-relay-semgrep-fetch-retry-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const bytes = Buffer.from('pinned retry archive');
+  const sha256 = digest('sha256', bytes);
+  const source = { url: 'https://example.invalid/archive', mirrors: [], supplementalChecksums: [], checksums: [{ algorithm: 'sha256', digest: sha256 }] };
+  const lock = { opam: { resolvedSourceArchives: [{ package: 'a', version: '1', targets: ['windows-x86_64'], opamPath: 'packages/a/a.1/opam', opamSha256: 'a'.repeat(64), licenses: ['MIT'], source, extraSources: [] }] } };
+  let calls = 0;
+  const failedBody = new Response('temporary failure', { status: 500 });
+  await fetchArchiveCache(lock, join(root, 'success'), {
+    fetchImpl: async () => ++calls === 1 ? failedBody : new Response(bytes),
+  });
+  assert.equal(calls, 2);
+  assert.deepEqual(await readFile(join(root, 'success', 'sha256', sha256)), bytes);
+  assert.equal((await failedBody.body.getReader().read()).done, true);
+  for (const [label, status, expectedCalls] of [['unavailable', 503, 3], ['missing', 404, 1]]) {
+    calls = 0;
+    await assert.rejects(() => fetchArchiveCache(lock, join(root, label), {
+      fetchImpl: async () => { calls += 1; return new Response('error', { status }); },
+    }), /HTTP/);
+    assert.equal(calls, expectedCalls);
+    await assert.rejects(() => readFile(join(root, label, 'sha256', sha256)), /ENOENT/);
+  }
+  calls = 0;
+  await assert.rejects(() => fetchArchiveCache(lock, join(root, 'drift'), {
+    fetchImpl: async () => ++calls === 1 ? new Response('retry', { status: 500 }) : new Response('drift'),
+  }), /checksum mismatch/);
+  assert.equal(calls, 2);
+  await assert.rejects(() => readFile(join(root, 'drift', 'sha256', sha256)), /ENOENT/);
+});
+
 test('archive fetch enforces one aggregate cache budget across downloads', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'context-relay-semgrep-fetch-cap-'));
   t.after(() => rm(root, { force: true, recursive: true }));
@@ -821,6 +853,14 @@ test('complete bundle includes recursive git, opam records, pins, archives, and 
   await buildSemgrepSourceBundle({ ...options, outputPath: second });
   assert.deepEqual(await readFile(first), await readFile(second));
   const verified = await verifySemgrepSourceBundle({ bundlePath: first, sourceLockPath });
+  const supported = await buildSemgrepSourceBundle({
+    ...options,
+    outputPath: join(root, 'with-default-support.tar'),
+    supportPaths: undefined,
+    supportRoot: fileURLToPath(new URL('..', import.meta.url)),
+  });
+  const helperPath = 'third_party/sidecars/semgrep/windows-offline-firewall.ps1';
+  assert.equal(supported.digests[`support/${helperPath}`], digest('sha256', await readFile(new URL(`../${helperPath}`, import.meta.url))));
   for (const path of [
     'sources/semgrep/main.ml',
     'sources/semgrep/deps/sub/sub.ml',

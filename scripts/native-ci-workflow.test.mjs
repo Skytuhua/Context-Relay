@@ -16,6 +16,8 @@ const releaseQualificationWorkflowUrl = new URL(
   '../.github/workflows/semgrep-release-qualification.yml',
   import.meta.url,
 );
+const firewallWorkflowUrl = new URL('../.github/workflows/windows-firewall-diagnostic.yml', import.meta.url);
+const firewallPolicyUrl = new URL('../third_party/sidecars/semgrep/windows-offline-firewall.ps1', import.meta.url);
 const publicationWorkflowUrl = new URL('../.github/workflows/publish-semgrep-native.yml', import.meta.url);
 const sourceLockUrl = new URL('../third_party/sidecars/semgrep/source-lock.v1.json', import.meta.url);
 const provenanceUrl = new URL('../third_party/sidecars/semgrep/native-ci-provenance.v1.json', import.meta.url);
@@ -113,6 +115,9 @@ test('normal CI uses one native builder per platform and defers A/B qualificatio
   assert.match(qualification, /workflow_dispatch:/);
   assert.match(qualification, /uses:\s*\.\/\.github\/workflows\/ci\.yml/);
   assert.match(qualification, /semgrep_release_qualification:\s*true/);
+  const caller = job(qualification, 'qualification');
+  assert.match(caller, /permissions:\s*\n\s+actions: read\s*\n\s+contents: write/);
+  assert.match(source, /github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' && github\.ref_protected == true/);
 });
 
 test('normal V1 retries reuse successful native artifacts across workflow attempts', async () => {
@@ -231,6 +236,7 @@ test('Windows native CI pins and records its exact AMD64 toolchain', async () =>
   assert.match(windows, /v24\.14\.0/);
   assert.match(windows, /cygcheck\.exe -cd/);
   assert.match(windows, /assert-cygwin-release\.mjs/);
+  assert.match(windows, /'cygwin=3\.6\.10-1'/);
   assert.match(windows, /--windows-evidence/);
   assert.match(windows, /--windows-stable-toolchain/);
   for (const block of windows.split(/(?=      - name:|      - uses:)/)) {
@@ -422,7 +428,10 @@ test('independent builder identity validation rejects empty, zero, or reused pro
 test('native runtime builds prove OS-enforced offline execution', async () => {
   const [macos, windows] = await Promise.all([
     readFile(new URL('../third_party/sidecars/semgrep/build-public-source-macos.sh', import.meta.url), 'utf8'),
-    readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
+    Promise.all([
+      readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
+      readFile(firewallPolicyUrl, 'utf8'),
+    ]).then((parts) => parts.join('\n')),
   ]);
   assert.match(macos, /\/usr\/bin\/sandbox-exec/);
   assert.match(macos, /\(deny network\*\)/);
@@ -449,15 +458,18 @@ test('native runtime builds prove OS-enforced offline execution', async () => {
   assert.match(windows, /offline-egress\.v1\.json/);
 });
 
-test('Windows offline build grants only the hash-pinned runner executables outbound TCP 443', async () => {
+test('Windows offline experiment bounds ancestor HTTPS and HCA-only IMDS rules', async () => {
   const [windows, workflow] = await Promise.all([
-    readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
+    Promise.all([
+      readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8'),
+      readFile(firewallPolicyUrl, 'utf8'),
+    ]).then((parts) => parts.join('\n')),
     readFile(workflowUrl, 'utf8'),
   ]);
   const windowsBuilder = job(workflow, 'native-semgrep-windows-x64-builders', 'native-isolation-windows-x64');
   assert.doesNotMatch(windowsBuilder, /Capture active Actions run-service hosts|CONTEXT_RELAY_RUN_SERVICE_HOSTS/);
   assert.match(windows, /function Get-RunnerControlPlanePrograms/);
-  assert.match(windows, /Get-FileHash[^\n]+SHA256[^\n]+\$Program/);
+  assert.match(windows, /Get-FileHash[^\n]+SHA256[^\n]+\$Path/);
   assert.match(
     windows,
     /New-NetFirewallRule[^\n]+-Program\s+\$Program[^\n]+-RemoteAddress\s+Any[^\n]+-RemotePort\s+443[^\n]+-Protocol\s+TCP/,
@@ -465,10 +477,12 @@ test('Windows offline build grants only the hash-pinned runner executables outbo
   assert.match(windows, /Get-NetFirewallApplicationFilter/);
   assert.match(windows, /\$AddressFilter\s*=\s*\$Rule\s*\|\s*Get-NetFirewallAddressFilter/);
   assert.match(windows, /Get-NetFirewallPortFilter/);
-  assert.match(windows, /\$AddressFilter\.RemoteAddress[^\n]+-cne\s+['"]Any['"]/);
-  assert.doesNotMatch(windows, /\$Address\s*=\s*\$Rule\s*\|\s*Get-NetFirewallAddressFilter/);
-  assert.match(windows, /RemotePort[^\n]+-cne\s+['"]443['"]/);
-  assert.match(windows, /@\(['"]TCP['"],\s*['"]6['"]\)\s+-notcontains\s+\[string\]\$Port\.Protocol/);
+  assert.match(windows, /function Assert-OfflineFirewallRules/);
+  assert.equal((windows.match(/Assert-OfflineFirewallRules \$ExpectedRules\.ToArray\(\)/g) ?? []).length, 2);
+  assert.equal((windows.match(/Assert-RunnerControlPlaneIdentity \$RunnerIdentities/g) ?? []).length, 2);
+  assert.match(windows, /New-NetFirewallRule[^\n]+-Program \$HcaProgram[^\n]+-RemoteAddress '169\.254\.169\.254'[^\n]+-RemotePort 80[^\n]+-Protocol TCP/);
+  assert.equal((windows.match(/Test-OutboundTcp \$ImdsAddress 80/g) ?? []).length, 3);
+  assert.doesNotMatch(windows, /provjobd|WaAppAgent|WindowsAzureGuestAgent/);
   assert.doesNotMatch(windows, /New-NetFirewallDynamicKeywordAddress|Update-NetFirewallDynamicKeywordAddress/);
   assert.doesNotMatch(windows, /Start-Job|RunnerAddressRefresher|Get-NetTCPConnection/);
   assert.match(windows, /Get-DnsClientServerAddress/);
@@ -492,12 +506,17 @@ test('Windows V1 compiles before the runtime-only firewall window', async () => 
     'utf8',
   );
   const compiled = windows.indexOf('$Build = if ($OfflineBuild) { $null } else { Build-Once $BuildLabel }');
-  const blocked = windows.lastIndexOf('Set-NetFirewallProfile -Profile $ProfileSnapshot.Name -DefaultOutboundAction Block');
-  const releaseCompile = windows.indexOf('if ($OfflineBuild) { $Build = Build-Once $BuildLabel }', blocked);
-  const smoke = windows.indexOf('Invoke-RuntimeSmoke $Build', blocked);
-  const restored = windows.lastIndexOf('} finally {');
-  assert.ok(compiled >= 0 && blocked > compiled, 'compiler must run before outbound blocking');
-  assert.ok(releaseCompile > blocked && smoke > releaseCompile && restored > smoke, 'runtime smoke must remain inside the restored firewall window');
+  const isolated = windows.indexOf('Invoke-WindowsOfflineFirewall {', compiled);
+  const releaseCompile = windows.indexOf('if ($OfflineBuild) { $Build = Build-Once $BuildLabel }', isolated);
+  const smoke = windows.indexOf('Invoke-RuntimeSmoke $Build', isolated);
+  const policy = await readFile(firewallPolicyUrl, 'utf8');
+  const blocked = policy.indexOf('Set-NetFirewallProfile -Profile $ProfileSnapshot.Name -DefaultOutboundAction Block');
+  const action = policy.indexOf('. $Action', blocked);
+  const restored = policy.lastIndexOf('} finally {');
+  assert.match(windows, /\. \(Join-Path \$PSScriptRoot 'windows-offline-firewall\.ps1'\)/);
+  assert.ok(compiled >= 0 && isolated > compiled, 'compiler must run before outbound blocking');
+  assert.ok(releaseCompile > isolated && smoke > releaseCompile, 'release compilation and smoke must share the isolated action');
+  assert.ok(blocked >= 0 && action > blocked && restored > action, 'shared policy restores after the isolated action');
   assert.match(windows, /function Invoke-RuntimeSmoke[\s\S]+& \$RuntimeExecutable --experimental --version/);
   assert.match(windows, /runtime smoke completed with network denial/i);
   assert.doesNotMatch(windows, /native build completed with .*network denial/i);
@@ -716,6 +735,7 @@ test('every workflow action remains pinned to a full commit SHA', async () => {
     readFile(workflowUrl, 'utf8'),
     readFile(publicationWorkflowUrl, 'utf8'),
     readFile(releaseQualificationWorkflowUrl, 'utf8'),
+    readFile(firewallWorkflowUrl, 'utf8'),
   ])).join('\n');
   const uses = [...source.matchAll(/^\s*- uses:\s*(\S+?)(?:\s+#.*)?\s*$/gm)].map((match) => match[1]);
   assert.ok(uses.length > 0);

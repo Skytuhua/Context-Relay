@@ -1,6 +1,7 @@
 import Ajv2020 from 'ajv/dist/2020.js';
+import type { AccountDeletionIntentSummary, LocalResult, OperationId, HostedAuthStatus, RecoveryRestoreStatus } from './bindings';
 
-import type { MemoryRecord, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
+import type { ConnectionCheckStatus, HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SearchIndexStatus, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
 
 const utf8 = new TextEncoder();
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -57,6 +58,42 @@ const id = (value: unknown, field: string) => {
 const u64 = (value: unknown, field: string) => {
   if (typeof value !== 'string' || value.length > 20 || !decimal.test(value) || BigInt(value) > u64Max) fail(field);
 };
+
+export function validateSearchIndexStatus(value: unknown): SearchIndexStatus {
+  const status = object(value, ['phase', 'revision'], 'search status');
+  choice(status.phase, ['disabled', 'preparing', 'ready', 'failed'], 'search phase');
+  u64(status.revision, 'search revision');
+  return value as SearchIndexStatus;
+}
+
+export function validateRecoveryRestoreStatus(value: unknown): RecoveryRestoreStatus {
+  if (!value || typeof value !== 'object' || !('state' in value)) fail('recovery status');
+  const state = (value as { state: unknown }).state;
+  choice(state, ['idle', 'submitting', 'complete', 'conflict'], 'recovery state');
+  const status = object(value, state === 'idle' ? ['state'] : state === 'complete'
+    ? ['state', 'restoreId', 'device'] : ['state', 'restoreId'], 'recovery status');
+  if (state !== 'idle') id(status.restoreId, 'restore id');
+  if (state === 'complete') {
+    const device = object(status.device, ['deviceId', 'name', 'platform', 'state', 'isCurrent'], 'recovered device');
+    id(device.deviceId, 'device id');
+    text(device.name, 512, 'device name');
+    choice(device.platform, ['windows', 'macos'], 'device platform');
+    choice(device.state, ['active'], 'device state');
+    choice(device.isCurrent, [true], 'current device');
+  }
+  return value as RecoveryRestoreStatus;
+}
+export function validateHostedAuthStatus(value: unknown): HostedAuthStatus {
+  const status = object(value, ['generation', 'state'], 'hosted auth status');
+  id(status.generation, 'hosted auth generation');
+  const phase = status.state && (status.state as Record<string, unknown>).phase;
+  choice(phase, ['disabled', 'signed_out', 'signing_in', 'restoring', 'connected', 'signing_out', 'failed'], 'hosted auth phase');
+  const keys = phase === 'signed_out' ? ['phase', 'remoteRevoked'] : phase === 'failed' ? ['phase', 'reason'] : ['phase'];
+  const state = object(status.state, keys, 'hosted auth state');
+  if (phase === 'signed_out') choice(state.remoteRevoked, [null, true, false], 'remote revocation');
+  if (phase === 'failed') choice(state.reason, ['unavailable', 'denied', 'expired', 'credential_store'], 'hosted auth failure');
+  return value as HostedAuthStatus;
+}
 const sha = (value: unknown, field: string) => {
   if (typeof value !== 'string' || !digest.test(value)) fail(field);
 };
@@ -137,6 +174,23 @@ const nativeScope = (value: unknown, field: string) => {
   choice(item.scope, ['global', 'project'], `${field}.scope`);
   if (project) { id(item.projectId, `${field}.projectId`); native(item.root, `${field}.root`); }
 };
+
+export const assertProbeReport = (value: unknown): asserts value is ProbeReport => {
+  const item = object(value, ['executable', 'executableSha256', 'harnessVersion', 'installationMethod', 'configRoots', 'activeProfile', 'policyConflicts', 'capability', 'codexSavedHookApproval'], 'probeReport');
+  if (item.codexSavedHookApproval !== null) {
+    const approval = object(item.codexSavedHookApproval, ['sessionStart', 'stop'], 'probeReport.codexSavedHookApproval');
+    for (const key of ['sessionStart', 'stop']) choice(approval[key], ['missing', 'needs_approval', 'approved', 'changed', 'disabled'], 'probeReport.codexSavedHookApproval');
+  }
+  if (item.executable !== null) native(item.executable, 'probeReport.executable');
+  if (item.executableSha256 !== null) sha(item.executableSha256, 'probeReport.executableSha256');
+  if (item.harnessVersion !== null) text(item.harnessVersion, adapterTextLimit, 'probeReport.harnessVersion');
+  if (item.activeProfile !== null) text(item.activeProfile, adapterTextLimit, 'probeReport.activeProfile');
+  choice(item.installationMethod, ['bundled', 'package_manager', 'manual', 'unknown'], 'probeReport.installationMethod');
+  choice(item.capability, ['full', 'import_only', 'blocked', 'missing'], 'probeReport.capability');
+  for (const value of list(item.configRoots, adapterCollectionLimit, 'probeReport.configRoots')) native(value, 'probeReport.configRoots');
+  for (const value of list(item.policyConflicts, adapterCollectionLimit, 'probeReport.policyConflicts')) text(value, adapterTextLimit, 'probeReport.policyConflicts');
+};
+
 const dependency = (value: unknown, field: string) => {
   const item = object(value, ['name', 'version', 'digest', 'immutableSourceRef'], field);
   text(item.name, 512, `${field}.name`); text(item.version, 512, `${field}.version`); sha(item.digest, `${field}.digest`); text(item.immutableSourceRef, 1024 * 1024, `${field}.immutableSourceRef`);
@@ -200,3 +254,115 @@ export const createProtocolSchemaValidator = () => {
 };
 export const assertSha256Hex = (value: string) => sha(value, 'SHA-256 hex');
 export const assertBase64UrlBytes = (value: string, size: number) => fixed(value, size, 'fixed-size base64url');
+
+const setupStates = ['previewed', 'applying', 'applied', 'apply_restored', 'rolling_back', 'rolled_back', 'rollback_restored', 'conflict', 'expired'];
+function clientError(value: unknown, field: string) {
+  const error = object(value, ['code', 'message', 'fieldPath', 'retryable'], field);
+  choice(error.code, ['protocol_version_unsupported', 'invalid_request', 'frame_too_large', 'vault_locked', 'not_found', 'revision_conflict', 'scope_denied', 'approval_required', 'plan_changed', 'plan_expired', 'harness_unsupported', 'conflict', 'quota_exceeded', 'canceled', 'timeout', 'busy', 'internal'], `${field}.code`);
+  text(error.message, 512, `${field}.message`);
+  if (error.fieldPath !== null) string(error.fieldPath, `${field}.fieldPath`);
+  choice(error.retryable, [true, false], `${field}.retryable`);
+}
+
+export function validateHarnessPreparation(value: unknown): HarnessPreparationStatus {
+  const item = object(value, ['operationId', 'selection', 'phase', 'completedFiles', 'completedBytes', 'error'], 'harnessPreparation');
+  id(item.operationId, 'harnessPreparation.operationId');
+  const selection = object(item.selection, ['harness', 'projectId', 'hermesProfile'], 'harnessPreparation.selection');
+  if (selection.harness !== 'hermes') fail('harnessPreparation.harness');
+  if (selection.projectId !== null) id(selection.projectId, 'harnessPreparation.projectId');
+  const profile = text(selection.hermesProfile, 64, 'harnessPreparation.profile');
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(profile)) fail('harnessPreparation.profile');
+  choice(item.phase, ['inspecting', 'copying', 'checking_source', 'checking_copy', 'retaining', 'cancelling', 'ready', 'canceled', 'failed'], 'harnessPreparation.phase');
+  uint(item.completedFiles, 32768, 'harnessPreparation.completedFiles');
+  uint(item.completedBytes, 1_073_741_824, 'harnessPreparation.completedBytes');
+  if ((item.phase === 'failed') !== (item.error !== null)) fail('harnessPreparation.error');
+  if (item.error !== null) clientError(item.error, 'harnessPreparation.error');
+  return value as HarnessPreparationStatus;
+}
+
+export function validateHarnessExecution(value: unknown): HarnessExecutionStatus {
+  const item = object(value, ['planId', 'action', 'phase', 'error'], 'harnessExecution');
+  id(item.planId, 'harnessExecution.planId');
+  choice(item.action, ['apply', 'rollback'], 'harnessExecution.action');
+  choice(item.phase, ['queued', 'running', 'finished', 'unknown'], 'harnessExecution.phase');
+  if (item.error !== null) {
+    if (item.phase !== 'finished') fail('harnessExecution.error');
+    clientError(item.error, 'harnessExecution.error');
+  }
+  return value as HarnessExecutionStatus;
+}
+
+export function validateHarnessSetupRecord(value: unknown): HarnessSetupRecord {
+  const item = object(value, ['plan', 'state', 'createdAt'], 'harnessSetup');
+  const assertPlan: (value: unknown) => asserts value is SetupPlan = assertSetupPlan;
+  assertPlan(item.plan);
+  if (item.plan.rulesyncVersion !== 'bridge-preview-v1') fail('harnessSetup.plan');
+  choice(item.state, setupStates, 'harnessSetup.state');
+  u64(item.createdAt, 'harnessSetup.createdAt');
+  return value as HarnessSetupRecord;
+}
+
+export function validateHarnessSetupsPage(value: unknown): HarnessSetupsPage {
+  const page = object(value, ['setups', 'nextAfter'], 'harnessSetups');
+  let previous: string | null = null;
+  for (const value of list(page.setups, 50, 'harnessSetups.setups')) {
+    const item = object(value, ['planId', 'harness', 'harnessProfile', 'targetScopes', 'state', 'createdAt', 'expiresAt'], 'harnessSetups.setup');
+    id(item.planId, 'harnessSetups.planId');
+    if (previous !== null && (item.planId as string) >= previous) fail('harnessSetups.order');
+    previous = item.planId as string;
+    choice(item.harness, ['codex', 'claude_code', 'hermes'], 'harnessSetups.harness');
+    if (item.harness === 'hermes') text(item.harnessProfile, 512, 'harnessSetups.profile');
+    else if (item.harnessProfile !== null) fail('harnessSetups.profile');
+    const scopes = list(item.targetScopes, adapterCollectionLimit, 'harnessSetups.scopes');
+    if (!scopes.length) fail('harnessSetups.scopes');
+    scopes.forEach(value => scope(value, 'harnessSetups.scope'));
+    choice(item.state, setupStates, 'harnessSetups.state');
+    u64(item.createdAt, 'harnessSetups.createdAt'); u64(item.expiresAt, 'harnessSetups.expiresAt');
+  }
+  if (page.nextAfter !== null) {
+    id(page.nextAfter, 'harnessSetups.nextAfter');
+    if (previous !== null && (page.nextAfter as string) > previous) fail('harnessSetups.nextAfter');
+  }
+  return value as HarnessSetupsPage;
+}
+
+export function validateConnectionCheckStatus(value: unknown): ConnectionCheckStatus {
+  const item = object(value, ['checkId', 'selection', 'memoryId', 'expectedRevision', 'phase', 'expiresInSeconds', 'verifiedAt'], 'connectionCheck');
+  id(item.checkId, 'connectionCheck.checkId');
+  id(item.memoryId, 'connectionCheck.memoryId');
+  id(item.expectedRevision, 'connectionCheck.expectedRevision');
+  const selection = object(item.selection, ['harness', 'projectId', 'hermesProfile'], 'connectionCheck.selection');
+  choice(selection.harness, ['codex', 'claude_code', 'hermes'], 'connectionCheck.harness');
+  id(selection.projectId, 'connectionCheck.projectId');
+  if (selection.harness === 'hermes') text(selection.hermesProfile, 512, 'connectionCheck.hermesProfile');
+  else if (selection.hermesProfile !== null) fail('connectionCheck.hermesProfile');
+  choice(item.phase, ['waiting', 'verified', 'expired', 'canceled', 'invalidated'], 'connectionCheck.phase');
+  uint(item.expiresInSeconds, 300, 'connectionCheck.expiresInSeconds');
+  if ((item.phase === 'verified') !== (item.verifiedAt !== null)) fail('connectionCheck.verifiedAt');
+  if (item.verifiedAt !== null) u64(item.verifiedAt, 'connectionCheck.verifiedAt');
+  return value as ConnectionCheckStatus;
+}
+
+export function validateAccountDeletion(value: unknown): Extract<LocalResult, { kind: 'account_deletion' }>['data'] {
+  const envelope = object(value, ['kind', 'data'], 'account lifecycle reply');
+  choice(envelope.kind, ['account_deletion'], 'account lifecycle reply');
+  const status = object(envelope.data, ['state', 'purgeDeadline', 'exportAvailable'], 'account lifecycle status');
+  choice(status.state, ['active', 'pending_delete', 'purged'], 'account lifecycle state');
+  const pending = status.state === 'pending_delete';
+  if (status.exportAvailable !== pending) fail('account lifecycle export');
+  if (pending) u64(status.purgeDeadline, 'account lifecycle deadline');
+  else if (status.purgeDeadline !== null) fail('account lifecycle deadline');
+  return envelope.data as Extract<LocalResult, { kind: 'account_deletion' }>['data'];
+}
+
+export function validateAccountDeletionIntents(value: unknown, after: OperationId | null): AccountDeletionIntentSummary[] {
+  let previous = after ?? '';
+  for (const item of list(value, 50, 'account lifecycle requests')) {
+    const intent = object(item, ['operationId', 'action'], 'account lifecycle request');
+    id(intent.operationId, 'account lifecycle operation');
+    choice(intent.action, ['beginDeletion', 'cancelDeletion'], 'account lifecycle action');
+    if ((intent.operationId as string) <= previous) fail('account lifecycle cursor');
+    previous = intent.operationId as string;
+  }
+  return value as AccountDeletionIntentSummary[];
+}

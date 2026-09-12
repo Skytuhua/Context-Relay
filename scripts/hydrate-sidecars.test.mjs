@@ -1082,6 +1082,19 @@ test('the committed manifest and all referenced material validate', async () => 
   await validateManifestMaterials(manifest, workspace);
 });
 
+test('Windows build materials reject a missing or tampered shared firewall helper', async () => {
+  const workspace = new URL('..', import.meta.url);
+  const manifest = JSON.parse(await readFile(new URL('../third_party/sidecars/manifest.v1.json', import.meta.url)));
+  const semgrep = manifest.tools.find(({ id }) => id === 'semgrep');
+  const missing = structuredClone(manifest);
+  missing.tools.find(({ id }) => id === 'semgrep').materials = semgrep.materials.filter(({ role }) => role !== 'windows-offline-firewall');
+  assert.throws(() => parseSidecarManifest(JSON.stringify(missing)), /shared firewall helper/i);
+  const helper = semgrep.materials.find(({ role }) => role === 'windows-offline-firewall');
+  assert.equal(helper.path, 'third_party/sidecars/semgrep/windows-offline-firewall.ps1');
+  helper.sha256 = fullHex('a');
+  await assert.rejects(() => validateManifestMaterials(manifest, workspace), /windows-offline-firewall SHA-256 mismatch/i);
+});
+
 test('Semgrep records the V1 source bundle but remains disabled pending release qualification', async () => {
   const lockBytes = await readFile(new URL('../third_party/sidecars/semgrep/source-lock.v1.json', import.meta.url));
   const lock = JSON.parse(lockBytes);
@@ -1109,16 +1122,15 @@ test('Semgrep records the V1 source bundle but remains disabled pending release 
   );
   assert.equal('sourceAssetUrl' in lock, false);
   assert.equal('sourceBundleSha256' in lock, false);
-  assert.equal(bundleEvidence.bundle.sha256, 'a7367b50b602540384f2879bf31b55c15fc95c5b0ec739517795c46004bac626');
-  assert.equal(bundleEvidence.bundle.size, 1149642752);
-  assert.equal(bundleEvidence.bundle.payloadEntries, 39542);
+  assert.equal(bundleEvidence.bundle.sha256, '91bcea54abcd7a1bacf40a41bbd98bc032e29030f21ed77decfa009dd40a3e05');
+  assert.equal(bundleEvidence.bundle.size, 1149649920);
+  assert.equal(bundleEvidence.bundle.payloadEntries, 39543);
   assert.equal(bundleEvidence.bundle.recordedLinks, 222);
   assert.equal(bundleEvidence.sourceLockSha256, '0d85427b09343615126fde5ad9bd8ad7f157908692a69fea846b4d033f6cb3c0');
-  assert.equal(bundleEvidence.bundleGeneratorSha256, '092fe2855df51267ca3c8525c0b404c3ca0587470cedfc63bf1818df60e72007');
-  assert.equal(
-    sha256(await readFile(new URL('./semgrep-source-bundle.mjs', import.meta.url))),
-    '092fe2855df51267ca3c8525c0b404c3ca0587470cedfc63bf1818df60e72007',
-  );
+  assert.equal(bundleEvidence.bundleGeneratorSha256, '43378c2a82dc79073b33759d53c0a50ae9f75bf3ac63b2947e1226fb43dbb3cc');
+  assert.equal(bundleEvidence.bundleGeneratorSha256, sha256(await readFile(
+    new URL('./semgrep-source-bundle.mjs', import.meta.url),
+  )));
   assert.equal(lock.researchEvidence.usableForHydration, false);
   assert.equal(lock.researchEvidence.usableForPackaging, false);
   assert.deepEqual(

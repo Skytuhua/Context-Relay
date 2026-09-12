@@ -7,7 +7,7 @@ mod identity;
 mod memory;
 mod merge;
 mod operation;
-mod supabase;
+pub(crate) mod supabase;
 mod transport;
 
 pub use admission::{
@@ -25,7 +25,9 @@ pub use checkpoint::{
     verify_checkpoint,
 };
 pub use engine::{
-    RetryRandomSource, SyncCycleError, SyncCycleReport, SyncEngine, SyncProvider, SystemRetryRandom,
+    CheckpointProgress, CheckpointRequest, CheckpointResponse, PreparedCheckpoint, PreparedPull,
+    PreparedPush, PullProgress, PullRequest, PullResponse, RetryRandomSource, SyncCycleError,
+    SyncCycleReport, SyncEngine, SyncProvider, SystemRetryRandom,
 };
 pub use identity::{OperationChainHead, SyncIdentity};
 pub use memory::{FaultSchedule, InMemoryTransport};
@@ -35,12 +37,12 @@ pub use operation::{
     BuiltOperation, OperationBuildRequest, OperationBuilder, OperationDecryptor, SyncError,
     TrustedOperationContext, verify_operation_envelope,
 };
+pub use supabase::{DeviceCertificateSnapshot, SupabaseTransport, SupabaseTransportConfig};
 #[cfg(feature = "test-support")]
 pub use supabase::{
     SupabaseHttpClient, SupabaseHttpError, SupabaseHttpMethod, SupabaseHttpRequest,
     SupabaseHttpResponse, SupabaseRetryRuntime,
 };
-pub use supabase::{SupabaseTransport, SupabaseTransportConfig};
 pub use transport::{
     CanonicalCheckpoint, CanonicalOperation, CheckpointCursor, CheckpointPage, CheckpointReceipt,
     PullPage, PushReceipt, ReceivedCheckpoint, ReceivedOperation, SyncScope, SyncTransport,

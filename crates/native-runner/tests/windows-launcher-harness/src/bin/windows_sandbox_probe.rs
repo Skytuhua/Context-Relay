@@ -1,5 +1,6 @@
 #![cfg(windows)]
 
+use context_relay_native_runner::read_helper_request;
 use std::{
     env,
     ffi::OsString,
@@ -9,7 +10,6 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
-use context_relay_native_runner::read_helper_request;
 use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
 
 fn main() {
@@ -21,6 +21,12 @@ fn main() {
     let helper_request = read_helper_request(&mut std::io::stdin().lock()).unwrap();
     assert_eq!(helper_request.request().inputs().len(), 1);
     let request = std::str::from_utf8(helper_request.request().inputs()[0].bytes()).unwrap();
+    if request == "PATH-RESOLUTION\n" {
+        let home = PathBuf::from(env::var_os("HOME").unwrap());
+        let result = context_relay_windows_launcher_harness::path_probe::inspect(&home);
+        writeln!(stdout, "PATH-RESOLUTION={result}").unwrap();
+        return;
+    }
     let mut lines = request.lines();
     if lines.next() == Some("RUNTIME-SEAL") {
         assert_eq!(lines.next(), None);

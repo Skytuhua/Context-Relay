@@ -339,6 +339,9 @@ test('supported native builds are build-only and independent from host tests', a
   assert.match(native, /target:\s*aarch64-apple-darwin/);
   assert.equal((native.match(/^\s+target:/gm) ?? []).length, 2);
   assert.match(native, /pnpm --filter @context-relay\/desktop tauri build --target \$\{\{ matrix\.target \}\}/);
+  assert.match(native, /run: pnpm package:macos/);
+  assert.match(native, /CONTEXT_RELAY_SEARCH_ASSETS: \$\{\{ runner\.temp \}\}\/macos-search-resources/);
+  assert.match(native, /node --test scripts\/package-macos\.test\.mjs/);
   assert.doesNotMatch(native, /cargo test|cargo clippy/);
 });
 

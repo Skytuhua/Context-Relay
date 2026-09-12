@@ -1,3 +1,5 @@
+pub mod control_v2;
+
 use std::{fmt, str::FromStr};
 
 use context_relay_protocol::{
@@ -31,6 +33,7 @@ const X25519_KEY_TAG: &[u8] = b"x25519\0";
 const PAIRING_GRANT_AAD_DOMAIN: &[u8] = b"context-relay/pairing-grant-aad/v1\0";
 const PAIRING_SAFETY_DOMAIN: &[u8] = b"context-relay/pairing-safety/v1\0";
 const KEY_BUNDLE_SCHEMA_VERSION: u16 = 1;
+const PINNED_KEY_BUNDLE_SCHEMA_VERSION: u16 = 2;
 const MIN_WRAPPED_CIPHERTEXT_BYTES: usize = 16;
 
 #[derive(Clone, Eq, PartialEq)]
@@ -122,6 +125,70 @@ pub fn pairing_request_fingerprint(request: &PairingRequestV1) -> Sha256Digest {
     Sha256Digest(hash.finalize().into())
 }
 
+/// Hosted possession proofs bind the original Auth identity and exact payload.
+/// The provider still enforces live session, authority and atomic state checks.
+pub fn sign_hosted_pairing_request_proof(
+    device: &DeviceKeys,
+    user: uuid::Uuid,
+    session: uuid::Uuid,
+    request: &SignedPairingRequest,
+) -> Result<context_relay_protocol::Ed25519SignatureBytes, CryptoError> {
+    require_exact_signed_request(request)?;
+    if device.signing_public_key() != request.request().signing_public_key
+        || device.wrapping_public_key() != request.request().wrapping_public_key
+    {
+        return Err(CryptoError::InvalidKey);
+    }
+    hosted_pairing_proof(
+        device,
+        user,
+        session,
+        b"context-relay/hosted-pairing-request-proof/v1\0",
+        request.canonical_bytes(),
+    )
+}
+
+pub fn sign_hosted_pairing_approval_proof(
+    device: &DeviceKeys,
+    user: uuid::Uuid,
+    session: uuid::Uuid,
+    request: &SignedPairingRequest,
+    payload: &PairingApprovedPayloadV1,
+) -> Result<context_relay_protocol::Ed25519SignatureBytes, CryptoError> {
+    validate_approved_payload_bindings(payload, request)?;
+    if device.signing_public_key() != payload.issuer_certificate.signing_public_key
+        || device.wrapping_public_key() != payload.issuer_certificate.wrapping_public_key
+    {
+        return Err(CryptoError::InvalidKey);
+    }
+    hosted_pairing_proof(
+        device,
+        user,
+        session,
+        b"context-relay/hosted-pairing-approval-proof/v1\0",
+        &encode_pairing_approved_payload_v1(payload)?,
+    )
+}
+
+fn hosted_pairing_proof(
+    device: &DeviceKeys,
+    user: uuid::Uuid,
+    session: uuid::Uuid,
+    domain: &[u8],
+    canonical: &[u8],
+) -> Result<context_relay_protocol::Ed25519SignatureBytes, CryptoError> {
+    for id in [user, session] {
+        if id.get_variant() != uuid::Variant::RFC4122 || !(1..=8).contains(&id.get_version_num()) {
+            return Err(CryptoError::InvalidProtocolValue);
+        }
+    }
+    let mut preimage = domain.to_vec();
+    preimage.extend_from_slice(user.as_bytes());
+    preimage.extend_from_slice(session.as_bytes());
+    preimage.extend_from_slice(&Sha256::digest(canonical));
+    Ok(device.sign_hosted_device_proof(&preimage))
+}
+
 pub struct PairingKeyBundle {
     account_id: AccountId,
     workspace_id: WorkspaceId,
@@ -129,6 +196,7 @@ pub struct PairingKeyBundle {
     key_epoch: u32,
     workspace_root_key: Zeroizing<[u8; 32]>,
     active_epoch_key: Zeroizing<[u8; 32]>,
+    enrollment_record_sha256: Option<Sha256Digest>,
 }
 
 impl PairingKeyBundle {
@@ -149,7 +217,23 @@ impl PairingKeyBundle {
             key_epoch,
             workspace_root_key: Zeroizing::new(workspace_root_key),
             active_epoch_key: Zeroizing::new(active_epoch_key),
+            enrollment_record_sha256: None,
         })
+    }
+
+    /// Attach an independently authenticated enrollment record hash before pairing.
+    /// This setter does not authenticate the hash; the confirmed pairing transcript binds it.
+    pub fn with_enrollment_record_sha256(mut self, pin: Sha256Digest) -> Result<Self, CryptoError> {
+        if pin.0 == [0; 32] {
+            return Err(CryptoError::InvalidProtocolValue);
+        }
+        self.enrollment_record_sha256 = Some(pin);
+        Ok(self)
+    }
+
+    /// Legacy bundles have no enrollment anchor and cannot bootstrap revocation history.
+    pub const fn enrollment_record_sha256(&self) -> Option<Sha256Digest> {
+        self.enrollment_record_sha256
     }
 
     pub const fn account_id(&self) -> AccountId {
@@ -472,7 +556,7 @@ pub fn build_pairing_grant(
         approval.control_epoch,
         bundle.key_epoch,
     );
-    let mut plaintext = encode_pairing_key_bundle_v1(bundle)?;
+    let mut plaintext = encode_pairing_key_bundle(bundle)?;
     let wrapped = wrap_secret(request.wrapping_public_key, &plaintext, &aad);
     plaintext.zeroize();
     let wrapped_key_bundle = wrapped?;
@@ -657,7 +741,7 @@ fn verify_and_open_pairing_grant(
         grant.key_epoch,
     );
     let plaintext = joiner_keys.unwrap_secret(&grant.wrapped_key_bundle, &aad)?;
-    let bundle = decode_pairing_key_bundle_v1(plaintext.expose())?;
+    let bundle = decode_pairing_key_bundle(plaintext.expose())?;
     if bundle.account_id != scope.account_id
         || bundle.workspace_id != scope.workspace_id
         || bundle.control_epoch != certificate.control_epoch
@@ -991,15 +1075,22 @@ fn grant_aad(
     aad
 }
 
-pub(crate) fn encode_pairing_key_bundle_v1(
+pub(crate) fn encode_pairing_key_bundle(
     bundle: &PairingKeyBundle,
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
-    // The fixed v1 bundle is at most 123 bytes. Preallocating its complete buffer prevents a
-    // reallocation from leaving a stale plaintext copy before the returned allocation is zeroized.
-    let mut encoder = Encoder::new(Vec::with_capacity(128));
-    encoder.map(7).map_err(enc)?;
+    // v1 is at most 121 bytes; v2 adds the 35-byte enrollment pin field. Preallocate
+    // the complete buffer to avoid leaving stale plaintext in a reallocated buffer.
+    let mut encoder = Encoder::new(Vec::with_capacity(160));
+    let pinned = bundle.enrollment_record_sha256.is_some();
+    encoder.map(if pinned { 8 } else { 7 }).map_err(enc)?;
     key(&mut encoder, 0)?;
-    encoder.u16(KEY_BUNDLE_SCHEMA_VERSION).map_err(enc)?;
+    encoder
+        .u16(if pinned {
+            PINNED_KEY_BUNDLE_SCHEMA_VERSION
+        } else {
+            KEY_BUNDLE_SCHEMA_VERSION
+        })
+        .map_err(enc)?;
     key(&mut encoder, 1)?;
     bytes(&mut encoder, bundle.account_id.as_bytes())?;
     key(&mut encoder, 2)?;
@@ -1012,14 +1103,22 @@ pub(crate) fn encode_pairing_key_bundle_v1(
     bytes(&mut encoder, &bundle.workspace_root_key[..])?;
     key(&mut encoder, 6)?;
     bytes(&mut encoder, &bundle.active_epoch_key[..])?;
+    if let Some(pin) = bundle.enrollment_record_sha256 {
+        key(&mut encoder, 7)?;
+        bytes(&mut encoder, &pin.0)?;
+    }
     Ok(Zeroizing::new(encoder.into_writer()))
 }
 
-pub(crate) fn decode_pairing_key_bundle_v1(input: &[u8]) -> Result<PairingKeyBundle, CryptoError> {
+pub(crate) fn decode_pairing_key_bundle(input: &[u8]) -> Result<PairingKeyBundle, CryptoError> {
     let mut decoder = Decoder::new(input);
-    require_map(&mut decoder, 7)?;
+    let fields = decoder.map().map_err(dec)?;
     expect_key(&mut decoder, 0)?;
-    if decoder.u16().map_err(dec)? != KEY_BUNDLE_SCHEMA_VERSION {
+    let version = decoder.u16().map_err(dec)?;
+    if !matches!(
+        (fields, version),
+        (Some(7), KEY_BUNDLE_SCHEMA_VERSION) | (Some(8), PINNED_KEY_BUNDLE_SCHEMA_VERSION)
+    ) {
         return Err(CryptoError::InvalidProtocolValue);
     }
     expect_key(&mut decoder, 1)?;
@@ -1034,6 +1133,12 @@ pub(crate) fn decode_pairing_key_bundle_v1(input: &[u8]) -> Result<PairingKeyBun
     let workspace_root_key = read_fixed::<32>(&mut decoder)?;
     expect_key(&mut decoder, 6)?;
     let active_epoch_key = read_fixed::<32>(&mut decoder)?;
+    let pin = if version == PINNED_KEY_BUNDLE_SCHEMA_VERSION {
+        expect_key(&mut decoder, 7)?;
+        Some(Sha256Digest(read_fixed::<32>(&mut decoder)?))
+    } else {
+        None
+    };
     if decoder.position() != input.len() {
         return Err(CryptoError::InvalidProtocolValue);
     }
@@ -1047,7 +1152,11 @@ pub(crate) fn decode_pairing_key_bundle_v1(input: &[u8]) -> Result<PairingKeyBun
         workspace_root_key,
         active_epoch_key,
     )?;
-    let canonical = encode_pairing_key_bundle_v1(&bundle)?;
+    let bundle = match pin {
+        Some(pin) => bundle.with_enrollment_record_sha256(pin)?,
+        None => bundle,
+    };
+    let canonical = encode_pairing_key_bundle(&bundle)?;
     if canonical.as_slice() != input {
         return Err(CryptoError::InvalidProtocolValue);
     }
@@ -1266,4 +1375,75 @@ fn enc(_: minicbor::encode::Error<std::convert::Infallible>) -> CryptoError {
 
 fn dec(_: minicbor::decode::Error) -> CryptoError {
     CryptoError::InvalidProtocolValue
+}
+
+#[cfg(test)]
+mod key_bundle_tests {
+    use super::*;
+
+    #[test]
+    fn enrollment_pin_codec_preserves_legacy_and_rejects_malformed_versions() {
+        let scope = SyncScope {
+            account_id: "018f22e2-79b0-7cc8-98c4-dc0c0c07398f".parse().unwrap(),
+            workspace_id: "018f22e2-79b0-7cc8-98c4-dc0c0c07398e".parse().unwrap(),
+        };
+        let bundle = PairingKeyBundle::new(scope, u32::MAX, u32::MAX, [1; 32], [2; 32]).unwrap();
+        let legacy = encode_pairing_key_bundle(&bundle).unwrap();
+        assert_eq!(legacy.len(), 121);
+        assert_eq!(&legacy[..3], &[0xa7, 0, 1]);
+        assert_eq!(
+            decode_pairing_key_bundle(&legacy)
+                .unwrap()
+                .enrollment_record_sha256(),
+            None
+        );
+        let bundle = bundle
+            .with_enrollment_record_sha256(Sha256Digest([3; 32]))
+            .unwrap();
+        let encoded = encode_pairing_key_bundle(&bundle).unwrap();
+        assert_eq!(encoded.len(), 156);
+        assert_eq!(&encoded[..3], &[0xa8, 0, 2]);
+        assert_eq!(&encoded[3..121], &legacy[3..]);
+        assert_eq!(&encoded[121..124], &[7, 0x58, 32]);
+        let opened = decode_pairing_key_bundle(&encoded).unwrap();
+        assert_eq!(
+            opened.enrollment_record_sha256(),
+            Some(Sha256Digest([3; 32]))
+        );
+        assert_eq!(opened.workspace_root_key(), &[1; 32]);
+        assert_eq!(opened.active_epoch_key(), &[2; 32]);
+        assert!(
+            bundle
+                .with_enrollment_record_sha256(Sha256Digest([0; 32]))
+                .is_err()
+        );
+        for end in 0..encoded.len() {
+            assert!(decode_pairing_key_bundle(&encoded[..end]).is_err());
+        }
+        for (offset, value) in [
+            (0, 0xa7),
+            (0, 0xbf),
+            (2, 1),
+            (2, 3),
+            (121, 8),
+            (123, 31),
+            (123, 33),
+        ] {
+            let mut invalid = encoded.to_vec();
+            invalid[offset] = value;
+            assert!(decode_pairing_key_bundle(&invalid).is_err());
+        }
+        let mut invalid = encoded.to_vec();
+        invalid[124..].fill(0);
+        assert!(decode_pairing_key_bundle(&invalid).is_err());
+        let mut invalid = encoded.to_vec();
+        invalid.push(0);
+        assert!(decode_pairing_key_bundle(&invalid).is_err());
+        let mut invalid = encoded.to_vec();
+        invalid.splice(2..3, [0x18, 2]);
+        assert!(decode_pairing_key_bundle(&invalid).is_err());
+        let mut invalid = legacy.to_vec();
+        invalid[2] = 2;
+        assert!(decode_pairing_key_bundle(&invalid).is_err());
+    }
 }

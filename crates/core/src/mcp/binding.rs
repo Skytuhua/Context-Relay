@@ -203,7 +203,7 @@ fn registered_match(
         .map(|specificity| (specificity, project))
 }
 
-fn canonical_directory(value: &WireNativeValue) -> Result<PathBuf, ()> {
+pub(crate) fn canonical_directory(value: &WireNativeValue) -> Result<PathBuf, ()> {
     let path = decode_native_path(value)?;
     if !path.is_absolute() {
         return Err(());

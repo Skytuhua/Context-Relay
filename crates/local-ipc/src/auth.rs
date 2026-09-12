@@ -188,6 +188,18 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
     use ClientRole::{Desktop, DesktopRecoveryHost, Installer, McpBridge};
 
     match request {
+        LocalRequest::HostedAuthStatus(_)
+        | LocalRequest::HostedAuthStart(_)
+        | LocalRequest::HostedAuthCancel(_)
+        | LocalRequest::HostedAuthLogout(_) => matches!(role, Desktop),
+        LocalRequest::HarnessLaunchInfo(_)
+        | LocalRequest::ConnectionCheckStart(_)
+        | LocalRequest::ConnectionCheckStatus(_)
+        | LocalRequest::ConnectionCheckCancel(_) => matches!(role, Desktop),
+        LocalRequest::DesktopWritePrepare(_)
+        | LocalRequest::DesktopWritesList(_)
+        | LocalRequest::DesktopWriteGet(_)
+        | LocalRequest::DesktopWriteForget(_) => matches!(role, Desktop),
         LocalRequest::Hello(_) => false,
         LocalRequest::Cancel(_) => true,
         LocalRequest::Shutdown(_) => matches!(role, Desktop),
@@ -197,10 +209,14 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::Unlock(_) => matches!(role, Desktop),
         LocalRequest::ProjectsList(_) => matches!(role, Desktop),
         LocalRequest::ProjectUpsert(_) => matches!(role, Desktop),
+        LocalRequest::ProjectRegister(_) => matches!(role, Desktop),
         LocalRequest::ProjectPathSet(_) => matches!(role, Desktop),
         LocalRequest::MemoryGet(_) => matches!(role, Desktop),
         LocalRequest::MemoryList(_) => matches!(role, Desktop),
         LocalRequest::MemorySearch(_) => matches!(role, Desktop),
+        LocalRequest::SearchIndexStatus(_) | LocalRequest::SearchIndexRetry(_) => {
+            matches!(role, Desktop)
+        }
         LocalRequest::MemoryCreate(_) => matches!(role, Desktop),
         LocalRequest::MemoryUpdate(_) => matches!(role, Desktop),
         LocalRequest::MemoryArchive(_) => matches!(role, Desktop),
@@ -214,6 +230,15 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::AccessGet(_) => matches!(role, Desktop | Installer),
         LocalRequest::AccessSet(_) => matches!(role, Desktop | Installer),
         LocalRequest::HarnessProbe(_) => matches!(role, Desktop | Installer),
+        LocalRequest::HarnessPrepare(_)
+        | LocalRequest::HarnessPreparedPreview(_)
+        | LocalRequest::HarnessPreparationStatus(_)
+        | LocalRequest::HarnessPreparationCancel(_)
+        | LocalRequest::HarnessExecutionStart(_)
+        | LocalRequest::HarnessExecutionStatus(_)
+        | LocalRequest::HarnessExecutionCurrent(_)
+        | LocalRequest::HarnessSetupsList(_)
+        | LocalRequest::HarnessSetupGet(_) => matches!(role, Desktop),
         LocalRequest::HarnessPreview(_) => matches!(role, Desktop | Installer),
         LocalRequest::HarnessApply(_) => matches!(role, Desktop | Installer),
         LocalRequest::HarnessRepair(_) => matches!(role, Desktop | Installer),
@@ -232,6 +257,12 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::PairingConfirm(_) => matches!(role, Desktop),
         LocalRequest::PairingCancel(_) => matches!(role, Desktop),
         LocalRequest::RecoveryEnrollmentBegin(_) => matches!(role, DesktopRecoveryHost),
+        LocalRequest::RecoveryRestoreBegin(_) => matches!(role, DesktopRecoveryHost),
+        LocalRequest::RecoveryRestoreOverview(_)
+        | LocalRequest::RecoveryRestoreResume(_)
+        | LocalRequest::RecoveryRestoreCancel(_) => {
+            matches!(role, Desktop | DesktopRecoveryHost)
+        }
         LocalRequest::RecoveryEnrollmentOverview(_) => matches!(role, Desktop),
         LocalRequest::RecoveryEnrollmentConfirm(_) => matches!(role, DesktopRecoveryHost),
         LocalRequest::RecoveryEnrollmentStatus(_) => matches!(role, Desktop),
@@ -241,7 +272,9 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::ExportRecords(_) => matches!(role, Desktop),
         LocalRequest::ExportChunk(_) => matches!(role, Desktop),
         LocalRequest::AccountDeletionBegin(_) => matches!(role, Desktop),
-        LocalRequest::AccountDeletionStatus(_) => matches!(role, Desktop),
+        LocalRequest::AccountDeletionStatus(_) | LocalRequest::AccountDeletionIntents(_) => {
+            matches!(role, Desktop)
+        }
         LocalRequest::AccountDeletionCancel(_) => matches!(role, Desktop),
     }
 }

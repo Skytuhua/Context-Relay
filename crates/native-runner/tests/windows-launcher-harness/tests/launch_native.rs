@@ -128,11 +128,7 @@ fn closure_runtime_acl_denies_writes_allows_execution_and_host_cleanup() {
     let pinned = nested.join("pinned.dll");
     fs::write(&pinned, b"pinned\n").unwrap();
     let executable = nested.join("pinned.exe");
-    fs::copy(
-        env!("CARGO_BIN_EXE_windows_sandbox_probe"),
-        &executable,
-    )
-    .unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_windows_sandbox_probe"), &executable).unwrap();
     let digest: [u8; 32] = Sha256::digest(fs::read(layout.helper_path()).unwrap()).into();
 
     let backend = Win32LaunchBackend::prepare(&identity, layout, digest).unwrap();
@@ -172,6 +168,76 @@ fn closure_runtime_acl_denies_writes_allows_execution_and_host_cleanup() {
 }
 
 struct FileCleanup(std::path::PathBuf);
+
+#[test]
+fn native_path_queries_distinguish_file_access_from_volume_name_resolution() {
+    let mut profiles = Win32ProfileApi::new();
+    let identity = profiles.derive_identity(&unique_moniker()).unwrap();
+    assert_eq!(
+        profiles.create_profile(&identity).unwrap(),
+        CreateProfileOutcome::Created
+    );
+    let profile_guard = ProfileCleanup(identity.clone());
+    let profile_folder = profiles.profile_folder(&identity).unwrap();
+    let layout = Win32ProfileLayout::initialize(profile_folder.clone()).unwrap();
+    fs::copy(
+        env!("CARGO_BIN_EXE_windows_sandbox_probe"),
+        layout.helper_path(),
+    )
+    .unwrap();
+    let digest: [u8; 32] = Sha256::digest(fs::read(layout.helper_path()).unwrap()).into();
+    let backend = Win32LaunchBackend::prepare(&identity, layout, digest).unwrap();
+    let mut running = LaunchSequence::for_identity(backend, &identity)
+        .create_suspended()
+        .unwrap()
+        .bind_kill_on_close_job()
+        .unwrap()
+        .attest_zero_capability_token()
+        .unwrap()
+        .resume_once()
+        .unwrap();
+    let output = running
+        .exchange(&helper_request(b"PATH-RESOLUTION\n"))
+        .unwrap();
+    assert_eq!(
+        output.exit_code(),
+        0,
+        "{}",
+        String::from_utf8_lossy(output.stderr())
+    );
+    assert!(output.stderr().is_empty());
+    let text = std::str::from_utf8(output.stdout()).unwrap();
+    let report: serde_json::Value = serde_json::from_str(
+        text.lines()
+            .find_map(|line| line.strip_prefix("PATH-RESOLUTION="))
+            .unwrap(),
+    )
+    .unwrap();
+    let host_path = profile_folder.join("stage/home");
+    let host = context_relay_windows_launcher_harness::path_probe::inspect(&host_path);
+    println!("Restricted path queries: {report}");
+    println!("Host path queries: {host}");
+    assert_eq!(report["enumeration"], true);
+    assert!(report.get("openError").is_none());
+    assert!(host["canonical"]["path"].is_string());
+    assert!(report["queries"]["nt-normalized"]["path"].is_string());
+    assert_eq!(
+        report["queries"]["nt-normalized"],
+        host["queries"]["nt-normalized"]
+    );
+    assert_eq!(report["ntInput"]["enumeration"], true);
+    // Record the observed compatibility result rather than requiring future
+    // Windows versions to retain their current DOS-name restriction.
+    assert!(report["canonical"]["path"].is_string() || report["canonical"]["error"] == 5);
+    let audit = running.audit();
+    assert!(audit.token_is_appcontainer());
+    assert_eq!(audit.token_capability_count(), 0);
+    assert!(audit.job_kill_on_close_verified());
+    drop(running);
+    profiles.delete_profile(&identity).unwrap();
+    assert!(!profile_folder.exists());
+    drop(profile_guard);
+}
 
 impl Drop for FileCleanup {
     fn drop(&mut self) {

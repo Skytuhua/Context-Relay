@@ -734,6 +734,8 @@ fn approval_transcript_prepares_resumes_and_recovers_safety_number() {
 fn join_confirmation_is_durable_atomic_and_reopens_sealed_material() {
     let path = TempVault::new("pairing-join-confirmation");
     let keys = MemoryKeyStore::default();
+    let key = [49; 32];
+    keys.insert(CREDENTIAL, key);
     let fixture = confirmation_fixture();
     let pairing_id = id(CONFIRM_PAIRING_ID);
 
@@ -761,6 +763,10 @@ fn join_confirmation_is_durable_atomic_and_reopens_sealed_material() {
         fixture.approval.safety_number()
     );
     assert!(vault.devices(confirmation_scope()).unwrap().is_empty());
+    assert!(matches!(
+        vault.trusted_workspace_material(&fixture.joiner_keys),
+        Err(VaultError::Validation(_))
+    ));
     drop(vault);
 
     let mut reopened = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
@@ -785,6 +791,37 @@ fn join_confirmation_is_durable_atomic_and_reopens_sealed_material() {
             .unwrap(),
         CommitDisposition::ExactReplay
     );
+    drop(reopened);
+    let reopened = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    let trusted = reopened
+        .trusted_workspace_material(&fixture.joiner_keys)
+        .unwrap();
+    assert_eq!(trusted.scope(), confirmation_scope());
+    assert_eq!(trusted.control_epoch(), 7);
+    assert_eq!(trusted.enrollment_record_sha256(), None);
+    assert_eq!(trusted.key_epoch(), 11);
+    let sync_material = reopened
+        .trusted_sync_material(&fixture.joiner_keys)
+        .unwrap();
+    use context_relay_core::sync::TrustedSyncMaterial;
+    assert!(
+        sync_material
+            .content_key(confirmation_scope().workspace_id, 11)
+            .is_ok()
+    );
+    for row in reopened.devices(confirmation_scope()).unwrap() {
+        assert_eq!(
+            sync_material
+                .trusted_device(
+                    confirmation_scope().account_id,
+                    confirmation_scope().workspace_id,
+                    row.certificate.device_id
+                )
+                .unwrap()
+                .certificate,
+            row.certificate
+        );
+    }
     let reopened_material = reopened
         .completed_pairing_approval(pairing_id, &fixture.joiner_keys)
         .unwrap()
@@ -799,6 +836,18 @@ fn join_confirmation_is_durable_atomic_and_reopens_sealed_material() {
     );
     assert_eq!(reopened_material.key_bundle().control_epoch(), 7);
     assert_eq!(reopened_material.key_bundle().key_epoch(), 11);
+    assert_eq!(
+        trusted.workspace_root_key(),
+        reopened_material.key_bundle().workspace_root_key()
+    );
+    assert_eq!(
+        trusted.active_epoch_key(),
+        reopened_material.key_bundle().active_epoch_key()
+    );
+    assert!(matches!(
+        reopened.trusted_workspace_material(&DeviceKeys::generate().unwrap()),
+        Err(VaultError::Validation(_))
+    ));
     let mut recovered_canary = Vec::from(reopened_material.key_bundle().workspace_root_key());
     recovered_canary.extend_from_slice(
         &reopened_material.key_bundle().active_epoch_key()[..KEY_CANARY.len() - 32],
@@ -814,6 +863,16 @@ fn join_confirmation_is_durable_atomic_and_reopens_sealed_material() {
     let wrong_keys = DeviceKeys::generate().unwrap();
     assert!(matches!(
         reopened.completed_pairing_approval(pairing_id, &wrong_keys),
+        Err(VaultError::Validation(_))
+    ));
+    drop(reopened);
+    let raw = open_keyed(path.path(), &key);
+    raw.execute("UPDATE device_certificates SET state = 'revoked'", [])
+        .unwrap();
+    drop(raw);
+    let reopened = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+    assert!(matches!(
+        reopened.trusted_workspace_material(&fixture.joiner_keys),
         Err(VaultError::Validation(_))
     ));
 }

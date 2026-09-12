@@ -1,34 +1,24 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "anyOf": [
-    {
-      "properties": {
-        "expectedRevision": {
-          "type": "null"
-        },
-        "taskId": {
-          "type": "null"
-        }
+  "else": {
+    "properties": {
+      "expectedRevision": {
+        "type": "null"
+      }
+    }
+  },
+  "if": {
+    "properties": {
+      "taskId": {
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        "type": "string"
       }
     },
-    {
-      "properties": {
-        "expectedRevision": {
-          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-          "type": "string"
-        },
-        "taskId": {
-          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-          "type": "string"
-        }
-      },
-      "required": [
-        "taskId",
-        "expectedRevision"
-      ]
-    }
-  ],
+    "required": [
+      "taskId"
+    ]
+  },
   "properties": {
     "bodyMarkdown": {
       "maxLength": 1048576,
@@ -85,5 +75,16 @@
     "bodyMarkdown",
     "status"
   ],
+  "then": {
+    "properties": {
+      "expectedRevision": {
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "expectedRevision"
+    ]
+  },
   "type": "object"
 }

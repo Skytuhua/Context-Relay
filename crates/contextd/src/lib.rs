@@ -1,3 +1,7 @@
+mod connection_check;
+#[cfg(test)]
+#[path = "../build.rs"]
+mod hosted_build_config;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -46,10 +50,18 @@ use tokio::{
     time::timeout,
 };
 
+mod account_lifecycle;
 pub mod bridge_install;
+pub mod harness_preparation;
+pub mod hosted_auth;
+pub mod hosted_login;
+mod hosted_sync;
 mod native_memory;
 mod pairing;
+#[cfg(all(test, any(windows, target_os = "macos")))]
+mod pairing_test_provider;
 mod recovery_enrollment;
+mod search_index;
 
 #[cfg(test)]
 pub(crate) mod unit_test_support {
@@ -105,7 +117,12 @@ pub(crate) mod unit_test_support {
     }
 }
 
+use account_lifecycle::{
+    AccountLifecycleService, TransportAccountLifecycleService, UnavailableAccountLifecycleTransport,
+};
 use bridge_install::{BridgeInstallEngine, ProductionBridgeInstallEngine};
+use harness_preparation::{PreparationClient, PreparationSupervisor};
+mod harness_execution;
 use native_memory::{
     NativeMemorySupervisor, NativeMemoryUpdateSender, NoopLifecycleProbe,
     native_memory_update_channel,
@@ -175,6 +192,12 @@ trait WorkerHook: Send + Sync {
     fn before_execute(&self);
 
     fn after_enqueue(&self) {}
+
+    #[cfg(test)]
+    fn before_index(&self) {}
+
+    #[cfg(test)]
+    fn before_index_admission(&self) {}
 }
 
 #[cfg(test)]
@@ -204,6 +227,8 @@ impl InstallationTokenProvider for PlatformInstallationTokenProvider {
 }
 
 struct VaultConfig {
+    search_resources: Option<PathBuf>,
+    preparation: Option<PreparationClient>,
     path: PathBuf,
     credential_id: String,
     key_store: Arc<dyn DatabaseKeyStore>,
@@ -214,7 +239,8 @@ struct VaultConfig {
     native_memory_updates: Option<NativeMemoryUpdateSender>,
     pairing_service: Option<Arc<dyn PairingService>>,
     recovery_enrollment_service: Option<Arc<dyn RecoveryEnrollmentService>>,
-    device_keys: Option<DeviceKeys>,
+    account_lifecycle_service: Arc<dyn AccountLifecycleService>,
+    device_keys: Option<Arc<DeviceKeys>>,
     device_identity_credential_id: String,
     device_identity_store: Arc<dyn DeviceIdentityStore>,
     device_name: String,
@@ -230,6 +256,8 @@ impl VaultConfig {
         key_store: Arc<dyn DatabaseKeyStore>,
     ) -> Self {
         Self {
+            preparation: None,
+            search_resources: None,
             path,
             credential_id: credential_id.into(),
             key_store,
@@ -243,6 +271,9 @@ impl VaultConfig {
             native_memory_updates: None,
             pairing_service: None,
             recovery_enrollment_service: None,
+            account_lifecycle_service: Arc::new(TransportAccountLifecycleService::new(
+                UnavailableAccountLifecycleTransport,
+            )),
             device_keys: None,
             device_identity_credential_id: DEVICE_IDENTITY_CREDENTIAL_ID.into(),
             device_identity_store: Arc::new(PlatformDeviceIdentityStore),
@@ -313,6 +344,12 @@ impl VaultConfig {
     }
 
     #[cfg(test)]
+    fn with_account_lifecycle_service(mut self, service: Arc<dyn AccountLifecycleService>) -> Self {
+        self.account_lifecycle_service = service;
+        self
+    }
+
+    #[cfg(test)]
     fn with_startup_recovery(mut self, startup_recovery: StartupRecovery) -> Self {
         self.startup_recovery = Some(startup_recovery);
         self
@@ -322,13 +359,13 @@ impl VaultConfig {
         if self.device_keys.is_none()
             && (self.pairing_service.is_some() || self.recovery_enrollment_service.is_some())
         {
-            self.device_keys = Some(
+            self.device_keys = Some(Arc::new(
                 load_or_create_device_keys(
                     self.device_identity_store.as_ref(),
                     &self.device_identity_credential_id,
                 )
                 .map_err(|_| DaemonError::Startup)?,
-            );
+            ));
         }
         Ok(self)
     }
@@ -368,6 +405,23 @@ struct ProductionBridgeCliRecoveryIo {
 }
 
 impl ProductionBridgeCliRecoveryIo {
+    fn project_binding(
+        &self,
+        bound: &BoundCliRecoveryPlan,
+    ) -> Result<(PathBuf, context_relay_protocol::ProjectId), BoundaryError> {
+        if bound
+            .plan
+            .setup
+            .target_scopes
+            .iter()
+            .any(|scope| matches!(scope, context_relay_protocol::NativeScope::Project { .. }))
+        {
+            return bridge_install::sealed_project_binding(&bound.plan)
+                .map_err(|error| BoundaryError::new(error.message));
+        }
+        Ok((self.root.clone(), self.project_id))
+    }
+
     fn with_executor<R>(
         &self,
         bound: &BoundCliRecoveryPlan,
@@ -376,11 +430,12 @@ impl ProductionBridgeCliRecoveryIo {
             &[context_relay_core::native_transaction::ApprovedCliMutation],
         ) -> Result<R, BoundaryError>,
     ) -> Result<R, BoundaryError> {
+        let (root, project_id) = self.project_binding(bound)?;
         match bound.plan.setup.harness {
             HarnessId::ClaudeCode => {
                 let mut adapter = context_relay_core::claude_code::ClaudeCodeAdapter::discover(
-                    &self.root,
-                    self.project_id,
+                    &root,
+                    project_id,
                     self.device_id,
                     self.observed_hlc,
                 )
@@ -391,9 +446,9 @@ impl ProductionBridgeCliRecoveryIo {
             }
             HarnessId::Codex => {
                 let mut adapter = context_relay_core::codex::CodexAdapter::discover(
-                    &self.root,
-                    &self.root,
-                    self.project_id,
+                    &root,
+                    &root,
+                    project_id,
                     self.device_id,
                     self.observed_hlc,
                 )
@@ -606,6 +661,8 @@ fn is_nonlaunching_recovery_identity(identity: &RecoverySandboxIdentity) -> bool
 }
 
 pub struct DaemonConfig {
+    // None selects build configuration after the instance guard is acquired.
+    hosted_auth: Option<hosted_auth::HostedAuthService>,
     runtime: RuntimeConfig,
     vault: VaultConfig,
     token_provider: Arc<dyn InstallationTokenProvider>,
@@ -618,6 +675,7 @@ impl DaemonConfig {
         token_provider: Arc<dyn InstallationTokenProvider>,
     ) -> Self {
         Self {
+            hosted_auth: Some(hosted_auth::HostedAuthService::disabled()),
             runtime,
             vault,
             token_provider,
@@ -628,15 +686,37 @@ impl DaemonConfig {
         let root = dirs::data_local_dir()
             .ok_or(DaemonError::Startup)?
             .join("Context Relay");
-        Ok(Self::new(
+        let vault = VaultConfig::new(
+            root.join("vault-v1.db"),
+            VAULT_CREDENTIAL_ID,
+            Arc::new(PlatformKeyStore::default()),
+        );
+        #[cfg(windows)]
+        let vault = {
+            let mut vault = vault;
+            let executable = std::env::current_exe().map_err(|_| DaemonError::Startup)?;
+            vault.search_resources = Some(search_index::resources_beside_executable(&executable)?);
+            vault
+        };
+        #[cfg(target_os = "macos")]
+        let vault = {
+            let mut vault = vault;
+            let executable = std::env::current_exe().map_err(|_| DaemonError::Startup)?;
+            vault.search_resources = search_index::resources_in_macos_bundle(&executable)?;
+            vault
+        };
+        let mut config = Self::new(
             RuntimeConfig::production(),
-            VaultConfig::new(
-                root.join("vault-v1.db"),
-                VAULT_CREDENTIAL_ID,
-                Arc::new(PlatformKeyStore::default()),
-            ),
+            vault,
             Arc::new(PlatformInstallationTokenProvider),
-        ))
+        );
+        config.hosted_auth = None;
+        Ok(config)
+    }
+
+    pub fn with_hosted_auth(mut self, service: hosted_auth::HostedAuthService) -> Self {
+        self.hosted_auth = Some(service);
+        self
     }
 
     #[cfg(test)]
@@ -653,6 +733,9 @@ impl DaemonConfig {
 }
 
 pub struct Daemon {
+    sync: hosted_sync::Supervisor,
+    hosted_auth: hosted_auth::HostedAuthService,
+    preparation: PreparationSupervisor,
     instance: Option<InstanceGuard>,
     listener: Option<Listener>,
     worker: VaultWorker,
@@ -668,9 +751,76 @@ pub struct Daemon {
 impl Daemon {
     pub async fn start(config: DaemonConfig) -> Result<Self, DaemonError> {
         let mut instance = InstanceGuard::acquire(&config.runtime).map_err(map_guard_error)?;
-        let vault_config = config.vault.load_device_identity()?;
-        let native_memory_probe = vault_config.native_memory_probe.clone();
+        let production_hosted = config.hosted_auth.is_none();
+        let hosted_auth = match config.hosted_auth {
+            Some(service) => service,
+            None => hosted_auth::HostedAuthService::production()
+                .await
+                .map_err(|_| DaemonError::Startup)?,
+        };
         let token = Arc::new(config.token_provider.load_or_create()?);
+        let mut vault_config = config
+            .vault
+            .with_device_id(stable_device_id(token.as_bytes()));
+        if production_hosted
+            && let (Some(owner), Some(project), Some(key)) = (
+                hosted_auth.session_owner(),
+                option_env!("CONTEXT_RELAY_HOSTED_URL"),
+                option_env!("CONTEXT_RELAY_HOSTED_PUBLISHABLE_KEY"),
+            )
+        {
+            let keys = Arc::new(
+                load_or_create_device_keys(
+                    vault_config.device_identity_store.as_ref(),
+                    &vault_config.device_identity_credential_id,
+                )
+                .map_err(|_| DaemonError::Startup)?,
+            );
+            vault_config.device_keys = Some(keys.clone());
+            let identity = PairingIdentity {
+                device_id: vault_config.device_id,
+                device_name: vault_config.device_name.clone(),
+                platform: vault_config.platform,
+                keys,
+            };
+            vault_config.pairing_service = Some(Arc::new(pairing::HostedPairingService::new(
+                owner.clone(),
+                project,
+                key,
+                identity.clone(),
+            )));
+            vault_config.account_lifecycle_service =
+                Arc::new(account_lifecycle::HostedAccountLifecycleService::new(
+                    owner.clone(),
+                    project,
+                    key,
+                    identity.clone(),
+                ));
+            vault_config.recovery_enrollment_service = Some(Arc::new(
+                recovery_enrollment::HostedRecoveryEnrollmentService::new(
+                    owner, project, key, identity,
+                ),
+            ));
+        }
+        let sync_config = if production_hosted {
+            hosted_auth.session_owner().and_then(|owner| {
+                Some(hosted_sync::Config {
+                    owner,
+                    project: option_env!("CONTEXT_RELAY_HOSTED_URL")?.into(),
+                    key: option_env!("CONTEXT_RELAY_HOSTED_PUBLISHABLE_KEY")?
+                        .to_string()
+                        .into(),
+                    #[cfg(test)]
+                    http: None,
+                })
+            })
+        } else {
+            None
+        };
+        let mut vault_config = vault_config.load_device_identity()?;
+        let preparation = PreparationSupervisor::spawn().map_err(|_| DaemonError::Startup)?;
+        vault_config.preparation = Some(preparation.client());
+        let native_memory_probe = vault_config.native_memory_probe.clone();
         let instance_nonce = generate_instance_nonce().map_err(|_| DaemonError::Startup)?;
         let (native_memory_updates, native_memory_update_receiver) = native_memory_update_channel();
         let mut worker = VaultWorker::spawn(
@@ -679,6 +829,7 @@ impl Daemon {
                 .with_device_id(stable_device_id(token.as_bytes())),
         )
         .await?;
+        let sync = hosted_sync::Supervisor::spawn(worker.client(), sync_config);
         let native_memory_ledgers = worker.take_native_memory_ledgers();
         let listener =
             Listener::bind(&config.runtime, &mut instance).map_err(map_transport_error)?;
@@ -692,7 +843,10 @@ impl Daemon {
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
         let (state_sender, state_receiver) = watch::channel(DaemonState::Running);
         Ok(Self {
+            sync,
+            hosted_auth,
             instance: Some(instance),
+            preparation,
             listener: Some(listener),
             worker,
             native_memory,
@@ -720,6 +874,10 @@ impl Daemon {
             .ok_or(DaemonError::Transport)?;
         let mut worker_exit = self.worker.take_exit();
         let service = ConnectionService {
+            sync: self.sync.client(),
+            hosted_auth: self.hosted_auth.clone(),
+            execution: harness_execution::ExecutionClient::default(),
+            preparation: self.preparation.client(),
             token: self.token.clone(),
             instance_nonce: self.instance_nonce,
             registry: RequestRegistry::default(),
@@ -758,11 +916,15 @@ impl Daemon {
         }
 
         self.worker.close_admission();
+        self.sync.shutdown().await;
+        self.hosted_auth.shutdown().await;
+        self.preparation.client().close();
         self.state_sender.send_replace(DaemonState::Draining);
         self.shutdown_sender.send_replace(true);
         while connections.join_next().await.is_some() {}
         self.native_memory.shutdown_and_join_async().await;
         self.worker.shutdown_and_join_async().await;
+        self.preparation.shutdown_and_join_async().await;
         drop(listener);
         self.instance.take();
         self.state_sender.send_replace(DaemonState::Stopped);
@@ -776,6 +938,10 @@ impl Daemon {
 
 #[derive(Clone)]
 struct ConnectionService {
+    sync: hosted_sync::Client,
+    hosted_auth: hosted_auth::HostedAuthService,
+    execution: harness_execution::ExecutionClient,
+    preparation: PreparationClient,
     token: Arc<InstallationToken>,
     instance_nonce: DaemonInstanceNonce,
     registry: RequestRegistry,
@@ -837,13 +1003,71 @@ async fn serve_request(
         registration,
     } = request;
     if *service.shutdown.borrow() {
+        drop(registration);
         connection.respond(id, Err(busy_error())).await?;
         return Ok(false);
     }
 
     match route_request(role, request) {
+        RoutedRequest::SyncRetry => {
+            let result = begin_immediate(&registration).and_then(|()| service.sync.retry());
+            drop(registration);
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
+        RoutedRequest::HostedAuth(request) => {
+            let result = match begin_immediate(&registration) {
+                Ok(()) => service.hosted_auth.handle(request).await,
+                Err(error) => Err(error),
+            };
+            drop(registration);
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
+        RoutedRequest::ExecutionCurrent => {
+            let result =
+                begin_immediate(&registration).map(|()| LocalResult::HarnessExecutionCurrent {
+                    status: service.execution.current(),
+                });
+            drop(registration);
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
+        RoutedRequest::ExecutionStart(params) => {
+            let result = begin_immediate(&registration)
+                .and_then(|()| service.execution.start(&service.worker, params))
+                .map(|status| LocalResult::HarnessExecution { status });
+            drop(registration);
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
+        RoutedRequest::ExecutionStatus(params) => {
+            let result = begin_immediate(&registration).map(|()| LocalResult::HarnessExecution {
+                status: service.execution.status(&params),
+            });
+            drop(registration);
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
+        RoutedRequest::PreparationStatus(params) => {
+            let result = begin_immediate(&registration)
+                .and_then(|()| service.preparation.status(params.operation_id))
+                .map(|status| LocalResult::HarnessPreparation { status });
+            drop(registration);
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
+        RoutedRequest::PreparationCancel(params) => {
+            let result = begin_immediate(&registration)
+                .and_then(|()| service.preparation.cancel(params.operation_id))
+                .map(|status| LocalResult::HarnessPreparation { status });
+            drop(registration);
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
         RoutedRequest::Immediate(result) => {
             let result = begin_immediate(&registration).and(result);
+            drop(registration);
             connection.respond(id, result).await?;
             Ok(true)
         }
@@ -859,12 +1083,31 @@ async fn serve_request(
                     Err(service_internal_error())
                 }
             });
+            drop(registration);
+            connection.respond(id, result).await?;
+            Ok(true)
+        }
+        RoutedRequest::SearchIndexStatus => {
+            let result = begin_immediate(&registration).and_then(|()| {
+                if !service.worker.is_alive() {
+                    return Err(service_internal_error());
+                }
+                let snapshot = service.worker.status();
+                if snapshot.vault == VaultState::Locked {
+                    return Err(ClientError::vault_locked());
+                }
+                Ok(LocalResult::SearchIndex {
+                    status: snapshot.search,
+                })
+            });
+            drop(registration);
             connection.respond(id, result).await?;
             Ok(true)
         }
         RoutedRequest::Shutdown => {
             let result = begin_immediate(&registration).map(|()| LocalResult::Empty);
             let accepted = result.is_ok();
+            drop(registration);
             connection.respond(id, result).await?;
             if accepted {
                 service.shutdown.send_replace(true);
@@ -898,9 +1141,13 @@ fn begin_immediate(registration: &RequestRegistration) -> Result<(), ClientError
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        self.sync.close();
+        self.hosted_auth.close();
         self.listener.take();
+        self.preparation.client().close();
         self.native_memory.shutdown_and_join();
         self.worker.shutdown_and_join();
+        self.preparation.shutdown_and_join();
         self.instance.take();
         self.state_sender.send_replace(DaemonState::Stopped);
     }
@@ -908,6 +1155,14 @@ impl Drop for Daemon {
 
 #[derive(Debug)]
 enum RoutedRequest {
+    SyncRetry,
+    HostedAuth(LocalRequest),
+    SearchIndexStatus,
+    ExecutionCurrent,
+    ExecutionStart(context_relay_protocol::HarnessExecutionParams),
+    ExecutionStatus(context_relay_protocol::HarnessExecutionParams),
+    PreparationStatus(context_relay_protocol::HarnessPreparationIdParams),
+    PreparationCancel(context_relay_protocol::HarnessPreparationIdParams),
     Immediate(Result<LocalResult, ClientError>),
     Health,
     Shutdown,
@@ -916,10 +1171,13 @@ enum RoutedRequest {
 
 #[derive(Debug)]
 enum VaultCommand {
+    Sync(Box<hosted_sync::Work>),
+    SearchIndexRetry,
     Unlock,
     ProjectPathSet(ProjectPathParams),
     MemoryGet(MemoryParams),
     Workspace(LocalRequest),
+    DesktopMcp(context_relay_protocol::McpCallParams),
     Pairing(LocalRequest),
     Recovery(LocalRequest),
     HarnessSetup(LocalRequest),
@@ -934,7 +1192,36 @@ enum VaultCommand {
 fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
     if matches!(
         &request,
+        LocalRequest::HostedAuthStatus(_)
+            | LocalRequest::HostedAuthStart(_)
+            | LocalRequest::HostedAuthCancel(_)
+            | LocalRequest::HostedAuthLogout(_)
+            | LocalRequest::HarnessLaunchInfo(_)
+            | LocalRequest::ConnectionCheckStart(_)
+            | LocalRequest::ConnectionCheckStatus(_)
+            | LocalRequest::ConnectionCheckCancel(_)
+            | LocalRequest::HarnessPrepare(_)
+            | LocalRequest::SearchIndexStatus(_)
+            | LocalRequest::SearchIndexRetry(_)
+            | LocalRequest::HarnessExecutionStart(_)
+            | LocalRequest::HarnessExecutionStatus(_)
+            | LocalRequest::HarnessExecutionCurrent(_)
+            | LocalRequest::HarnessSetupGet(_)
+            | LocalRequest::HarnessSetupsList(_)
+            | LocalRequest::HarnessPreparedPreview(_)
+            | LocalRequest::HarnessPreparationStatus(_)
+            | LocalRequest::HarnessPreparationCancel(_)
+    ) && !role_allows(role, &request)
+    {
+        return RoutedRequest::Immediate(Err(scope_denied_error()));
+    }
+    if matches!(
+        &request,
         LocalRequest::RecoveryEnrollmentBegin(_)
+            | LocalRequest::RecoveryRestoreBegin(_)
+            | LocalRequest::RecoveryRestoreOverview(_)
+            | LocalRequest::RecoveryRestoreResume(_)
+            | LocalRequest::RecoveryRestoreCancel(_)
             | LocalRequest::RecoveryEnrollmentOverview(_)
             | LocalRequest::RecoveryEnrollmentConfirm(_)
             | LocalRequest::RecoveryEnrollmentStatus(_)
@@ -944,6 +1231,20 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         return RoutedRequest::Immediate(Err(scope_denied_error()));
     }
     match request {
+        request @ (LocalRequest::HostedAuthStatus(_)
+        | LocalRequest::HostedAuthStart(_)
+        | LocalRequest::HostedAuthCancel(_)
+        | LocalRequest::HostedAuthLogout(_)) => RoutedRequest::HostedAuth(request),
+        LocalRequest::McpCall(params) if role != ClientRole::McpBridge => {
+            RoutedRequest::Work(VaultCommand::DesktopMcp(params))
+        }
+        LocalRequest::SearchIndexStatus(_) => RoutedRequest::SearchIndexStatus,
+        LocalRequest::SearchIndexRetry(_) => RoutedRequest::Work(VaultCommand::SearchIndexRetry),
+        LocalRequest::HarnessExecutionCurrent(_) => RoutedRequest::ExecutionCurrent,
+        LocalRequest::HarnessExecutionStart(params) => RoutedRequest::ExecutionStart(params),
+        LocalRequest::HarnessExecutionStatus(params) => RoutedRequest::ExecutionStatus(params),
+        LocalRequest::HarnessPreparationStatus(params) => RoutedRequest::PreparationStatus(params),
+        LocalRequest::HarnessPreparationCancel(params) => RoutedRequest::PreparationCancel(params),
         LocalRequest::Hello(_) => RoutedRequest::Immediate(Err(invalid_request_error())),
         LocalRequest::Cancel(_) => RoutedRequest::Immediate(Err(invalid_request_error())),
         LocalRequest::Shutdown(_) => RoutedRequest::Shutdown,
@@ -952,11 +1253,23 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         LocalRequest::ProjectPathSet(params) => {
             RoutedRequest::Work(VaultCommand::ProjectPathSet(params))
         }
+        request @ (LocalRequest::HarnessLaunchInfo(_)
+        | LocalRequest::ConnectionCheckStart(_)
+        | LocalRequest::ConnectionCheckStatus(_)
+        | LocalRequest::ConnectionCheckCancel(_)) => {
+            RoutedRequest::Work(VaultCommand::Workspace(request))
+        }
         LocalRequest::MemoryGet(params) => RoutedRequest::Work(VaultCommand::MemoryGet(params)),
         request @ (LocalRequest::McpCall(_)
         | LocalRequest::NativeHookEvent(_)
+        | LocalRequest::DesktopWritePrepare(_)
+        | LocalRequest::AccountDeletionIntents(_)
+        | LocalRequest::DesktopWritesList(_)
+        | LocalRequest::DesktopWriteGet(_)
+        | LocalRequest::DesktopWriteForget(_)
         | LocalRequest::ProjectsList(_)
         | LocalRequest::ProjectUpsert(_)
+        | LocalRequest::ProjectRegister(_)
         | LocalRequest::MemoryList(_)
         | LocalRequest::MemorySearch(_)
         | LocalRequest::MemoryCreate(_)
@@ -980,13 +1293,17 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         | LocalRequest::AccountDeletionCancel(_)) => {
             RoutedRequest::Work(VaultCommand::Workspace(request))
         }
-        request @ (LocalRequest::HarnessPreview(_)
+        request @ (LocalRequest::HarnessProbe(_)
+        | LocalRequest::HarnessSetupGet(_)
+        | LocalRequest::HarnessSetupsList(_)
+        | LocalRequest::HarnessPrepare(_)
+        | LocalRequest::HarnessPreparedPreview(_)
+        | LocalRequest::HarnessPreview(_)
         | LocalRequest::HarnessApply(_)
         | LocalRequest::HarnessRollback(_)) => {
             RoutedRequest::Work(VaultCommand::HarnessSetup(request))
         }
-        LocalRequest::HarnessProbe(_)
-        | LocalRequest::HarnessRepair(_)
+        LocalRequest::HarnessRepair(_)
         | LocalRequest::PackageImport(_)
         | LocalRequest::PackageExport(_) => RoutedRequest::Immediate(Err(unsupported_error(
             "The requested local adapter operation is not supported",
@@ -998,17 +1315,22 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         | LocalRequest::PairingConfirm(_)
         | LocalRequest::PairingCancel(_)) => RoutedRequest::Work(VaultCommand::Pairing(request)),
         request @ (LocalRequest::RecoveryEnrollmentBegin(_)
+        | LocalRequest::RecoveryRestoreBegin(_)
+        | LocalRequest::RecoveryRestoreOverview(_)
+        | LocalRequest::RecoveryRestoreResume(_)
+        | LocalRequest::RecoveryRestoreCancel(_)
         | LocalRequest::RecoveryEnrollmentOverview(_)
         | LocalRequest::RecoveryEnrollmentConfirm(_)
         | LocalRequest::RecoveryEnrollmentStatus(_)
         | LocalRequest::RecoveryEnrollmentCancel(_)) => {
             RoutedRequest::Work(VaultCommand::Recovery(request))
         }
-        LocalRequest::SyncRetry(_)
-        | LocalRequest::DeviceRename(_)
-        | LocalRequest::DeviceRevoke(_) => RoutedRequest::Immediate(Err(unsupported_error(
-            "Hosted workspace configuration is not available",
-        ))),
+        LocalRequest::SyncRetry(_) => RoutedRequest::SyncRetry,
+        LocalRequest::DeviceRename(_) | LocalRequest::DeviceRevoke(_) => {
+            RoutedRequest::Immediate(Err(unsupported_error(
+                "Hosted workspace configuration is not available",
+            )))
+        }
     }
 }
 
@@ -1087,6 +1409,7 @@ fn work_timeout_error() -> ClientError {
 
 trait WorkAdmission: Send {
     fn begin(&self) -> bool;
+    fn finished(&self, _result: &Result<LocalResult, ClientError>) {}
 }
 
 impl WorkAdmission for RequestRegistration {
@@ -1129,12 +1452,15 @@ impl WorkerClient {
             .admission
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if !*admission_gate {
-            return Err(busy_error());
-        }
         let Some(sender) = self.sender.upgrade() else {
             return Err(service_internal_error());
         };
+        if sender.is_closed() {
+            return Err(service_internal_error());
+        }
+        if !*admission_gate {
+            return Err(busy_error());
+        }
         let (response, receiver) = oneshot::channel();
         let item = WorkItem {
             command,
@@ -1170,6 +1496,7 @@ struct VaultWorker {
 struct ServiceStatusSnapshot {
     vault: VaultState,
     sync: SyncState,
+    search: context_relay_protocol::SearchIndexStatus,
 }
 
 struct ServiceStatus(Mutex<ServiceStatusSnapshot>);
@@ -1179,6 +1506,7 @@ impl ServiceStatus {
         Self(Mutex::new(ServiceStatusSnapshot {
             vault: VaultState::Unlocked,
             sync: SyncState::Offline,
+            search: search_index::SearchIndexJob::new(false).status,
         }))
     }
 
@@ -1192,6 +1520,20 @@ impl ServiceStatus {
             .unwrap_or_else(|error| error.into_inner())
             .vault = vault;
     }
+
+    fn set_search(&self, search: context_relay_protocol::SearchIndexStatus) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .search = search;
+    }
+
+    fn set_sync(&self, sync: SyncState) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .sync = sync;
+    }
 }
 
 struct StoredExport {
@@ -1201,6 +1543,10 @@ struct StoredExport {
 }
 
 struct WorkspaceState {
+    connection_check: Option<connection_check::ConnectionCheck>,
+    search_index: search_index::SearchIndexJob,
+    sync_backfill: SyncBackfill,
+    preparation: Option<PreparationClient>,
     vault: Vault,
     vault_path: PathBuf,
     device_id: DeviceId,
@@ -1209,7 +1555,48 @@ struct WorkspaceState {
     native_memory_updates: Option<NativeMemoryUpdateSender>,
     pairing_service: Option<Arc<dyn PairingService>>,
     recovery_enrollment_service: Option<Arc<dyn RecoveryEnrollmentService>>,
+    account_lifecycle_service: Arc<dyn AccountLifecycleService>,
     pairing_identity: Option<PairingIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncBackfill {
+    Pending,
+    Idle,
+    Failed,
+}
+
+impl WorkspaceState {
+    fn wake_sync_backfill(&mut self) {
+        if self.sync_backfill != SyncBackfill::Failed {
+            self.sync_backfill = SyncBackfill::Pending;
+        }
+    }
+
+    fn tick_sync_backfill(&mut self, status: &ServiceStatus) {
+        if self.sync_backfill != SyncBackfill::Pending {
+            return;
+        }
+        let result = (|| {
+            if !self.vault.has_sync_authority()? {
+                return Ok(0);
+            }
+            let identity = self
+                .pairing_identity
+                .as_ref()
+                .ok_or(VaultError::OperationConflict)?;
+            self.vault
+                .backfill_sync_records(self.device_id, &identity.keys, 1)
+        })();
+        self.sync_backfill = match result {
+            Ok(0) => SyncBackfill::Idle,
+            Ok(_) => SyncBackfill::Pending,
+            Err(_) => {
+                status.set_sync(SyncState::Error);
+                SyncBackfill::Failed
+            }
+        };
+    }
 }
 
 enum VaultWorkerState {
@@ -1294,8 +1681,16 @@ fn open_workspace(
         } else {
             None
         };
+    if config.search_resources.is_some() {
+        vault.prepare_semantic_search();
+    }
     Ok((
         WorkspaceState {
+            connection_check: None,
+            sync_backfill: SyncBackfill::Pending,
+            search_index: search_index::SearchIndexJob::new(vault.semantic_search_enabled())
+                .with_resources(config.search_resources.clone()),
+            preparation: config.preparation.clone(),
             vault,
             vault_path: config.path.clone(),
             device_id: config.device_id,
@@ -1304,6 +1699,7 @@ fn open_workspace(
             native_memory_updates: config.native_memory_updates.clone(),
             pairing_service: config.pairing_service.clone(),
             recovery_enrollment_service: config.recovery_enrollment_service.clone(),
+            account_lifecycle_service: config.account_lifecycle_service.clone(),
             pairing_identity,
         },
         ledgers,
@@ -1317,6 +1713,7 @@ impl VaultWorker {
         let (ready_sender, ready_receiver) = oneshot::channel();
         let (exit_sender, exit_receiver) = oneshot::channel();
         let admission = Arc::new(Mutex::new(true));
+        let thread_admission = admission.clone();
         let worker_hook = config.worker_hook.clone();
         let thread_worker_hook = worker_hook.clone();
         let status = Arc::new(ServiceStatus::new());
@@ -1327,6 +1724,7 @@ impl VaultWorker {
                 let (state, ledgers) = match open_workspace(&mut config) {
                     Ok((workspace, ledgers)) => {
                         worker_status.set_vault(VaultState::Unlocked);
+                        worker_status.set_search(workspace.search_index.status);
                         (VaultWorkerState::Open(workspace), ledgers)
                     }
                     Err(WorkspaceOpenError::Locked) => {
@@ -1347,6 +1745,7 @@ impl VaultWorker {
                     &mut receiver,
                     thread_worker_hook.as_deref(),
                     &worker_status,
+                    &thread_admission,
                 );
                 let _ = exit_sender.send(());
             })
@@ -1409,6 +1808,7 @@ impl VaultWorker {
     }
 
     fn shutdown_and_join(&mut self) {
+        self.close_admission();
         self.sender.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -1416,6 +1816,7 @@ impl VaultWorker {
     }
 
     async fn shutdown_and_join_async(&mut self) {
+        self.close_admission();
         self.sender.take();
         if let Some(thread) = self.thread.take() {
             let _ = tokio::task::spawn_blocking(move || thread.join()).await;
@@ -1429,8 +1830,55 @@ fn run_vault_worker(
     receiver: &mut mpsc::Receiver<WorkItem>,
     worker_hook: Option<&dyn WorkerHook>,
     status: &ServiceStatus,
+    admission_gate: &Mutex<bool>,
 ) {
-    while let Some(item) = receiver.blocking_recv() {
+    loop {
+        let item = match receiver.try_recv() {
+            Ok(item) => item,
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                #[cfg(test)]
+                if let Some(worker_hook) = worker_hook {
+                    worker_hook.before_index_admission();
+                }
+                // Admit one record at a time. Never hold the admission/status lock
+                // during inference; control requests and shutdown remain available.
+                let gate = admission_gate
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                // try_submit uses this same gate. Recheck while holding it so a
+                // request that arrived after the first check wins this turn.
+                match receiver.try_recv() {
+                    Ok(item) => {
+                        drop(gate);
+                        item
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        let admitted = *gate
+                            && matches!(&state, VaultWorkerState::Open(workspace) if workspace.search_index.pending() || workspace.sync_backfill == SyncBackfill::Pending);
+                        drop(gate);
+                        if admitted && let VaultWorkerState::Open(workspace) = &mut state {
+                            if !workspace.search_index.pending() {
+                                workspace.tick_sync_backfill(status);
+                                continue;
+                            }
+                            #[cfg(test)]
+                            if let Some(worker_hook) = worker_hook {
+                                worker_hook.before_index();
+                            }
+                            workspace.search_index.tick(&mut workspace.vault);
+                            status.set_search(workspace.search_index.status);
+                            continue;
+                        }
+                        let Some(item) = receiver.blocking_recv() else {
+                            break;
+                        };
+                        item
+                    }
+                }
+            }
+        };
         let WorkItem {
             command,
             admission,
@@ -1444,8 +1892,21 @@ fn run_vault_worker(
         } else {
             Err(canceled_error())
         };
-        let _ = response.send(result);
+        admission.finished(&result);
+        // Release the request ID before a client can observe completion and replay it.
         drop(admission);
+        let _ = response.send(result);
+        // Writes from desktop, harnesses, and native reconciliation all maintain
+        // the durable queue. Recheck it after requests without rescanning records.
+        if let VaultWorkerState::Open(workspace) = &mut state {
+            workspace.wake_sync_backfill();
+            if workspace.vault.take_semantic_search_failure() {
+                workspace.search_index.fail();
+                status.set_search(workspace.search_index.status);
+            } else {
+                workspace.search_index.wake();
+            }
+        }
     }
 }
 
@@ -1466,6 +1927,7 @@ fn execute_vault_command(
         if let Some(updates) = &workspace.native_memory_updates {
             updates.send_replace(ledgers);
         }
+        status.set_search(workspace.search_index.status);
         *state = VaultWorkerState::Open(workspace);
         status.set_vault(VaultState::Unlocked);
         return Ok(LocalResult::Empty);
@@ -1475,6 +1937,14 @@ fn execute_vault_command(
         return Err(ClientError::vault_locked());
     };
     match command {
+        VaultCommand::Sync(work) => work.execute(state, status),
+        VaultCommand::SearchIndexRetry => {
+            state.search_index.retry();
+            status.set_search(state.search_index.status);
+            Ok(LocalResult::SearchIndex {
+                status: state.search_index.status,
+            })
+        }
         VaultCommand::Unlock => unreachable!("unlock is handled before open-state dispatch"),
         VaultCommand::ProjectPathSet(params) => state
             .vault
@@ -1486,6 +1956,7 @@ fn execute_vault_command(
             .memory(&params.memory_id)
             .map(|memory| LocalResult::Memory { memory })
             .map_err(client_error_from_vault),
+        VaultCommand::DesktopMcp(params) => execute_mcp_request(state, params, status, false),
         VaultCommand::Workspace(request) => execute_workspace_request(state, request, status),
         VaultCommand::Pairing(request) => execute_pairing_request(state, request),
         VaultCommand::Recovery(request) => execute_recovery_enrollment_request(state, request),
@@ -1540,6 +2011,65 @@ fn execute_harness_setup(
     request: LocalRequest,
 ) -> Result<LocalResult, ClientError> {
     match request {
+        LocalRequest::HarnessSetupGet(params) => {
+            context_relay_core::setup::harness_setup(&state.vault, &params.plan_id).map(|setup| {
+                LocalResult::HarnessSetup {
+                    setup: Box::new(setup),
+                }
+            })
+        }
+        LocalRequest::HarnessSetupsList(params) => {
+            context_relay_core::setup::harness_setups(&state.vault, params.after.as_ref())
+                .map(|page| LocalResult::HarnessSetups { page })
+        }
+        LocalRequest::HarnessPrepare(params) => {
+            let client = state
+                .preparation
+                .as_ref()
+                .ok_or_else(service_internal_error)?;
+            if let Some(status) = client.replay(&params)? {
+                return Ok(LocalResult::HarnessPreparation { status });
+            }
+            // A rejected factory is still a resolved attempt. Publish its exact
+            // identity through the owned worker so reconnecting clients can
+            // distinguish terminal failure from a start awaiting admission.
+            // The preparation worker redacts the error and replay retains it.
+            let task = state
+                .bridge_install
+                .prepare(
+                    &state.vault,
+                    &state.vault_path,
+                    state.device_id,
+                    params.selection.clone(),
+                )
+                .unwrap_or_else(|error| Box::new(move |_, _| Err(error)));
+            client
+                .start(params, task)
+                .map(|status| LocalResult::HarnessPreparation { status })
+        }
+        LocalRequest::HarnessPreparedPreview(params) => {
+            let client = state
+                .preparation
+                .as_ref()
+                .ok_or_else(service_internal_error)?;
+            client
+                .preview(&params, |artifact| {
+                    state.bridge_install.preview_prepared(
+                        &mut state.vault,
+                        &state.vault_path,
+                        state.device_id,
+                        params.selection.clone(),
+                        artifact,
+                    )
+                })
+                .map(|plan| LocalResult::Plan {
+                    plan: Box::new(plan),
+                })
+        }
+        LocalRequest::HarnessProbe(params) => state
+            .bridge_install
+            .probe(&state.vault, state.device_id, params)
+            .map(|report| LocalResult::Probe { report }),
         LocalRequest::HarnessPreview(params) => state
             .bridge_install
             .preview(&mut state.vault, &state.vault_path, state.device_id, params)
@@ -1582,24 +2112,171 @@ fn execute_harness_setup(
     }
 }
 
+fn connection_check_status(
+    state: &mut WorkspaceState,
+    id: context_relay_protocol::OperationId,
+) -> Result<LocalResult, ClientError> {
+    let check = state
+        .connection_check
+        .as_mut()
+        .filter(|check| check.status.check_id == id)
+        .ok_or_else(record_not_found_error)?;
+    let memory = state
+        .vault
+        .memory(&check.status.memory_id)
+        .map_err(client_error_from_vault)?;
+    check.refresh(memory.as_ref());
+    Ok(LocalResult::ConnectionCheck {
+        status: check.status.clone(),
+    })
+}
+
+fn local_sync_material(
+    state: &WorkspaceState,
+) -> Result<
+    Option<(
+        Arc<DeviceKeys>,
+        context_relay_core::vault::VaultSyncMaterial,
+    )>,
+    ClientError,
+> {
+    if !state
+        .vault
+        .has_sync_authority()
+        .map_err(client_error_from_vault)?
+    {
+        return Ok(None);
+    }
+    let identity = state
+        .pairing_identity
+        .as_ref()
+        .ok_or_else(service_internal_error)?;
+    let material = state
+        .vault
+        .trusted_sync_material(&identity.keys)
+        .map_err(client_error_from_vault)?;
+    Ok(Some((identity.keys.clone(), material)))
+}
+
+fn with_local_workspace<R>(
+    state: &mut WorkspaceState,
+    action: impl FnOnce(OfflineWorkspace<'_>) -> Result<R, ClientError>,
+) -> Result<R, ClientError> {
+    let material = local_sync_material(state)?;
+    let mut workspace = OfflineWorkspace::new(&mut state.vault, state.device_id);
+    if let Some((keys, material)) = &material {
+        workspace = workspace.with_sync_identity(
+            material
+                .local_identity(state.device_id, keys)
+                .map_err(|_| service_internal_error())?,
+        )?;
+    }
+    action(workspace)
+}
+
+fn execute_mcp_request(
+    state: &mut WorkspaceState,
+    params: context_relay_protocol::McpCallParams,
+    service_status: &ServiceStatus,
+    authenticated_bridge: bool,
+) -> Result<LocalResult, ClientError> {
+    let name = params.name.clone();
+    let binding = params.binding.clone();
+    let status = service_status.snapshot();
+    let material = if matches!(
+        name.as_str(),
+        "context_relay_remember"
+            | "context_relay_update_memory"
+            | "context_relay_archive_memory"
+            | "context_relay_propose_memory"
+            | "context_relay_upsert_task"
+            | "context_relay_complete_task"
+    ) {
+        local_sync_material(state)?
+    } else {
+        None
+    };
+    let mut workspace = McpWorkspace::with_service_status(
+        &mut state.vault,
+        state.device_id,
+        status.vault,
+        status.sync,
+    );
+    if let Some((keys, material)) = &material {
+        workspace = workspace.with_sync_identity(
+            material
+                .local_identity(state.device_id, keys)
+                .map_err(|_| service_internal_error())?,
+        )?;
+    }
+    let output = workspace.call(params)?;
+    // Only the authenticated bridge route can reach this receipt boundary. All normal
+    // MCP resolution, policy, record-scope, output validation and admission checks passed.
+    if authenticated_bridge && name == "context_relay_get" && state.connection_check.is_some() {
+        let resolved = context_relay_core::mcp::binding::resolve_binding(&state.vault, &binding)?;
+        if let Ok(context_relay_protocol::GetOutput {
+            record: Some(context_relay_protocol::ReadableRecord::Memory(memory)),
+        }) = serde_json::from_value(output.clone())
+            && let Some(check) = &mut state.connection_check
+        {
+            check.observe(
+                resolved.harness,
+                resolved.active_project.map(|project| project.project_id),
+                &memory,
+            );
+        }
+    }
+    Ok(LocalResult::McpOutput { name, output })
+}
 fn execute_workspace_request(
     state: &mut WorkspaceState,
     request: LocalRequest,
     service_status: &ServiceStatus,
 ) -> Result<LocalResult, ClientError> {
     match request {
-        LocalRequest::McpCall(params) => {
-            let name = params.name.clone();
-            let status = service_status.snapshot();
-            McpWorkspace::with_service_status(
-                &mut state.vault,
-                state.device_id,
-                status.vault,
-                status.sync,
-            )
-            .call(params)
-            .map(|output| LocalResult::McpOutput { name, output })
+        LocalRequest::HarnessLaunchInfo(selection) => bridge_install::launch_info(
+            state.bridge_install.as_ref(),
+            &state.vault,
+            state.device_id,
+            selection,
+        )
+        .map(|info| LocalResult::HarnessLaunchInfo { info }),
+        LocalRequest::ConnectionCheckStart(params) => {
+            LocalRequest::ConnectionCheckStart(params.clone())
+                .validate()
+                .map_err(|_| invalid_request_error())?;
+            let note = state
+                .vault
+                .memory(&params.memory_id)
+                .map_err(client_error_from_vault)?
+                .ok_or_else(record_not_found_error)?;
+            if note.revision != params.expected_revision
+                || note.archived
+                || note.kind != MemoryKind::Note
+                || !matches!(note.scope, context_relay_protocol::ScopeRef::Project {project_id} if Some(project_id) == params.selection.project_id)
+            {
+                return Err(invalid_request_error());
+            }
+            let check = connection_check::ConnectionCheck::start(params);
+            let status = check.status.clone();
+            state.connection_check = Some(check);
+            Ok(LocalResult::ConnectionCheck { status })
         }
+        LocalRequest::ConnectionCheckCancel(params) => {
+            let check = state
+                .connection_check
+                .as_mut()
+                .filter(|check| check.status.check_id == params.check_id)
+                .ok_or_else(record_not_found_error)?;
+            check.cancel();
+            Ok(LocalResult::ConnectionCheck {
+                status: check.status.clone(),
+            })
+        }
+        LocalRequest::ConnectionCheckStatus(params) => {
+            connection_check_status(state, params.check_id)
+        }
+        LocalRequest::McpCall(params) => execute_mcp_request(state, params, service_status, true),
         LocalRequest::NativeHookEvent(params) => {
             let resolved = context_relay_core::mcp::binding::resolve_hook_binding(
                 &state.vault,
@@ -1613,16 +2290,57 @@ fn execute_workspace_request(
                 context_relay_protocol::NativeHookEvent::TaskEvidence { .. }
             );
             let project_id = resolved.access.require_tasks(task_write)?;
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .handle_native_hook_event(project_id, params)
-                .map(|()| LocalResult::Empty)
+            with_local_workspace(state, |mut workspace| {
+                workspace.handle_native_hook_event(project_id, params)
+            })
+            .map(|()| LocalResult::Empty)
         }
+        LocalRequest::DesktopWritePrepare(params) => state
+            .vault
+            .prepare_desktop_write(&params.write)
+            .map(|()| LocalResult::Empty)
+            .map_err(client_error_from_vault),
+        LocalRequest::AccountDeletionIntents(params) => state
+            .vault
+            .account_lifecycle_intents(params.after)
+            .map(|intents| LocalResult::AccountDeletionIntents {
+                intents: intents
+                    .into_iter()
+                    .map(
+                        |intent| context_relay_protocol::AccountDeletionIntentSummary {
+                            operation_id: intent.operation_id,
+                            action: intent.action,
+                        },
+                    )
+                    .collect(),
+            })
+            .map_err(client_error_from_vault),
+        LocalRequest::DesktopWritesList(params) => state
+            .vault
+            .desktop_writes(params.after)
+            .map(|page| LocalResult::DesktopWrites { page })
+            .map_err(client_error_from_vault),
+        LocalRequest::DesktopWriteGet(params) => state
+            .vault
+            .desktop_write(params.operation_id)
+            .map(|write| LocalResult::DesktopWrite { write })
+            .map_err(client_error_from_vault),
+        LocalRequest::DesktopWriteForget(params) => state
+            .vault
+            .forget_desktop_write(params.operation_id)
+            .map(|()| LocalResult::Empty)
+            .map_err(client_error_from_vault),
         LocalRequest::ProjectsList(_) => OfflineWorkspace::new(&mut state.vault, state.device_id)
             .projects()
             .map(|projects| LocalResult::Projects { projects }),
         LocalRequest::ProjectUpsert(params) => {
             OfflineWorkspace::new(&mut state.vault, state.device_id)
                 .upsert_project(params.project)
+                .map(|()| LocalResult::Empty)
+        }
+        LocalRequest::ProjectRegister(params) => {
+            OfflineWorkspace::new(&mut state.vault, state.device_id)
+                .register_project(params.project, params.path)
                 .map(|()| LocalResult::Empty)
         }
         LocalRequest::MemorySearch(params) => {
@@ -1636,25 +2354,25 @@ fn execute_workspace_request(
             .map_err(client_error_from_vault)
             .map(|memories| LocalResult::Memories { memories }),
         LocalRequest::MemoryCreate(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .create_memory(params)
-                .map(|memory| LocalResult::Memory {
+            with_local_workspace(state, |mut workspace| workspace.create_memory(params)).map(
+                |memory| LocalResult::Memory {
                     memory: Some(memory),
-                })
+                },
+            )
         }
         LocalRequest::MemoryUpdate(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .update_memory(params)
-                .map(|memory| LocalResult::Memory {
+            with_local_workspace(state, |mut workspace| workspace.update_memory(params)).map(
+                |memory| LocalResult::Memory {
                     memory: Some(memory),
-                })
+                },
+            )
         }
         LocalRequest::MemoryArchive(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .archive_memory(params)
-                .map(|memory| LocalResult::Memory {
+            with_local_workspace(state, |mut workspace| workspace.archive_memory(params)).map(
+                |memory| LocalResult::Memory {
                     memory: Some(memory),
-                })
+                },
+            )
         }
         LocalRequest::CandidatesList(params) => {
             OfflineWorkspace::new(&mut state.vault, state.device_id)
@@ -1662,28 +2380,25 @@ fn execute_workspace_request(
                 .map(|candidates| LocalResult::Candidates { candidates })
         }
         LocalRequest::CandidateReview(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .review_candidate(params)
-                .map(|candidate| LocalResult::Candidates {
+            with_local_workspace(state, |mut workspace| workspace.review_candidate(params)).map(
+                |candidate| LocalResult::Candidates {
                     candidates: vec![candidate],
-                })
+                },
+            )
         }
         LocalRequest::TasksList(params) => OfflineWorkspace::new(&mut state.vault, state.device_id)
             .tasks(params.project_id)
             .map(|tasks| LocalResult::Tasks { tasks }),
         LocalRequest::TaskUpsert(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .upsert_task(params)
+            with_local_workspace(state, |mut workspace| workspace.upsert_task(params))
                 .map(|task| LocalResult::Tasks { tasks: vec![task] })
         }
         LocalRequest::TaskComplete(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .complete_task(params)
+            with_local_workspace(state, |mut workspace| workspace.complete_task(params))
                 .map(|task| LocalResult::Tasks { tasks: vec![task] })
         }
         LocalRequest::TaskTransition(params) => {
-            OfflineWorkspace::new(&mut state.vault, state.device_id)
-                .transition_task(params)
+            with_local_workspace(state, |mut workspace| workspace.transition_task(params))
                 .map(|task| LocalResult::Tasks { tasks: vec![task] })
         }
         LocalRequest::HandoffCreate(params) => create_handoff(state, params),
@@ -1722,9 +2437,11 @@ fn execute_workspace_request(
         LocalRequest::ExportChunk(params) => {
             export_chunk(state, params.export_id, params.chunk_index)
         }
-        LocalRequest::AccountDeletionBegin(_)
+        request @ (LocalRequest::AccountDeletionBegin(_)
         | LocalRequest::AccountDeletionStatus(_)
-        | LocalRequest::AccountDeletionCancel(_) => Err(account_lifecycle_unavailable_error()),
+        | LocalRequest::AccountDeletionCancel(_)) => {
+            execute_account_lifecycle_request(state, request)
+        }
         _ => Err(invalid_request_error()),
     }
 }
@@ -1894,15 +2611,19 @@ fn export_record_count(vault: &Vault) -> Result<u32, ClientError> {
     u32::try_from(count).map_err(|_| service_internal_error())
 }
 
-fn account_lifecycle_unavailable_error() -> ClientError {
-    ClientError {
-        code: ErrorCode::HarnessUnsupported,
-        message:
-            "Account lifecycle needs the hosted workspace service and is not available in this build."
-                .into(),
-        field_path: None,
-        retryable: false,
+fn execute_account_lifecycle_request(
+    state: &mut WorkspaceState,
+    request: LocalRequest,
+) -> Result<LocalResult, ClientError> {
+    if matches!(
+        &request,
+        LocalRequest::AccountDeletionBegin(params)
+            if !params.confirmation.eq_ignore_ascii_case("delete")
+    ) {
+        return Err(invalid_request_error());
     }
+    let service = state.account_lifecycle_service.clone();
+    service.execute(&mut state.vault, request)
 }
 
 fn stable_device_id(seed: &[u8]) -> DeviceId {
@@ -1999,6 +2720,7 @@ pub fn client_error_from_vault(error: VaultError) -> ClientError {
         | VaultError::Migration(_)
         | VaultError::Credential(_)
         | VaultError::Security(_)
+        | VaultError::SearchModel(_)
         | VaultError::Serialization(_)
         | VaultError::Database(_) => ClientError {
             code: ErrorCode::Internal,
@@ -2024,12 +2746,10 @@ pub mod test_support {
     use context_relay_core::vault::TestVaultCell;
     use context_relay_core::{
         codex::CodexAdapter,
-        mcp::install::{BRIDGE_SERVER_NAME, BridgeExecutable},
+        mcp::install::BridgeExecutable,
         native_memory::{NativeMemoryLedger, NativeMemorySource, NativeMemorySourceId},
         native_transaction::{
-            ApprovedCliMutation, ApprovedInput, CanonicalCliDeclaration, NativeTransactionPlan,
-            SidecarBinding,
-            cli::{CliMutationOutcome, CliRestoreOutcome, NativeCliExecutor},
+            ApprovedInput, NativeTransactionPlan, SidecarBinding,
             engine::{
                 BoundaryError, FrozenOutput, NativeAdapter, NoFault, RestrictedExecutor,
                 RestrictedRun,
@@ -2039,7 +2759,8 @@ pub mod test_support {
         },
         setup::{
             BridgeInstallService, BridgeLocator, BridgeMutationPlan, BridgePreviewHarness,
-            NativeEngineBridgePlanExecutor, PrimaryMemoryMutationPlan, RegisteredProject,
+            NativeEngineBridgePlanExecutor, NoBridgeCliExecutor, PrimaryMemoryMutationPlan,
+            RegisteredProject,
         },
         vault::{BeforeImagePolicy, DatabaseKeyStore, NativeSandboxIdentity, Vault, VaultError},
     };
@@ -2094,6 +2815,14 @@ pub mod test_support {
         created_hlc: HybridLogicalClock,
     ) -> Result<ComponentRecord, ClientError> {
         primary_memory_instruction_component(harness, project_id, origin_device, created_hlc)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn test_managed_memory_hooks(
+        harness: HarnessId,
+        bridge_executable: &WireNativeValue,
+    ) -> Result<Vec<ComponentRecord>, ClientError> {
+        context_relay_core::native_memory::managed_memory_hooks(harness, bridge_executable)
     }
 
     #[derive(Clone)]
@@ -2513,6 +3242,7 @@ pub mod test_support {
         pub version: String,
         pub installation_method: InstallationMethod,
         pub codex_home: PathBuf,
+        pub user_home: PathBuf,
         pub user_skills_dir: PathBuf,
         pub project_root: PathBuf,
         pub working_directory: PathBuf,
@@ -2556,6 +3286,7 @@ pub mod test_support {
                     version: request.version,
                     installation_method: request.installation_method,
                     codex_home: request.codex_home,
+                    user_home: request.user_home,
                     user_skills_dir: request.user_skills_dir,
                     project_root: request.project_root.clone(),
                     working_directory: request.working_directory,
@@ -2595,10 +3326,7 @@ pub mod test_support {
             lock_root: PathBuf,
         ) -> Self {
             Self {
-                harness: Mutex::new(TestCodexHarness {
-                    adapter,
-                    live_cli: Arc::new(Mutex::new(None)),
-                }),
+                harness: Mutex::new(TestCodexHarness { adapter }),
                 bridge,
                 project_id,
                 project_root: std::fs::canonicalize(project_root)
@@ -2631,9 +3359,7 @@ pub mod test_support {
             };
             let mut filesystem = OsNativeTransactionFileSystem::new(*plan_id.as_bytes());
             let mut hook = NoFault;
-            let mut cli = TestCodexCli {
-                live: harness.live_cli.clone(),
-            };
+            let mut cli = NoBridgeCliExecutor;
             let mut executor = NativeEngineBridgePlanExecutor::new(
                 &mut *harness,
                 &mut restricted,
@@ -2725,7 +3451,6 @@ pub mod test_support {
     #[derive(Clone)]
     struct TestCodexHarness {
         adapter: CodexAdapter,
-        live_cli: Arc<Mutex<Option<CanonicalCliDeclaration>>>,
     }
 
     impl HarnessAdapter for TestCodexHarness {
@@ -2762,6 +3487,10 @@ pub mod test_support {
     }
 
     impl BridgePreviewHarness for TestCodexHarness {
+        fn bridge_adapter_version(&self) -> u32 {
+            self.adapter.bridge_adapter_version()
+        }
+
         fn bridge_harness(&self) -> HarnessId {
             HarnessId::Codex
         }
@@ -2780,19 +3509,10 @@ pub mod test_support {
 
         fn bridge_mutations(
             &self,
-            _: &DesiredState,
+            desired: &DesiredState,
             intended: &ComponentRecord,
         ) -> Result<BridgeMutationPlan, ClientError> {
-            let live = self.live_cli.clone();
-            Ok(BridgeMutationPlan {
-                cli: Some(self.adapter.plan_bridge_cli_mutation_with_runner(
-                    intended,
-                    move |arguments: &[String]| {
-                        test_codex_cli_output(arguments, live.lock().unwrap().as_ref())
-                    },
-                )?),
-                native: vec![],
-            })
+            self.adapter.bridge_mutations(desired, intended)
         }
 
         fn primary_memory_mutations(
@@ -2825,6 +3545,13 @@ pub mod test_support {
             plan: &NativeTransactionPlan,
         ) -> Result<(), BoundaryError> {
             NativeAdapter::compare_approved_digests(&mut self.adapter, plan)
+        }
+
+        fn verify_live_state_reservation(
+            &mut self,
+            plan: &NativeTransactionPlan,
+        ) -> Result<(), BoundaryError> {
+            NativeAdapter::verify_live_state_reservation(&mut self.adapter, plan)
         }
 
         fn validate_staged_output(
@@ -2889,163 +3616,6 @@ pub mod test_support {
         fn reject_unsafe_topology(&mut self) -> Result<(), BoundaryError> {
             Ok(())
         }
-    }
-
-    struct TestCodexCli {
-        live: Arc<Mutex<Option<CanonicalCliDeclaration>>>,
-    }
-
-    impl NativeCliExecutor for TestCodexCli {
-        fn probe_cli_mutation(
-            &mut self,
-            _: &ApprovedCliMutation,
-        ) -> Result<Option<Sha256Digest>, BoundaryError> {
-            Ok(self
-                .live
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|value| value.fingerprint))
-        }
-
-        fn compare_cli_targets(
-            &mut self,
-            mutations: &[ApprovedCliMutation],
-        ) -> Result<(), BoundaryError> {
-            for mutation in mutations {
-                if self
-                    .live
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|value| value.fingerprint)
-                    != mutation.expected.as_ref().map(|value| value.fingerprint)
-                {
-                    return Err(BoundaryError::new("Test Codex CLI state changed"));
-                }
-            }
-            Ok(())
-        }
-
-        fn apply_cli_mutation(
-            &mut self,
-            mutation: &ApprovedCliMutation,
-        ) -> Result<CliMutationOutcome, BoundaryError> {
-            let current = self
-                .live
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|value| value.fingerprint);
-            if current == mutation.expected.as_ref().map(|value| value.fingerprint) {
-                self.live.lock().unwrap().clone_from(&mutation.intended);
-            }
-            Ok(CliMutationOutcome {
-                resulting_fingerprint: self
-                    .live
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|value| value.fingerprint),
-                command_error: None,
-            })
-        }
-
-        fn restore_cli_mutation_if_matches(
-            &mut self,
-            mutation: &ApprovedCliMutation,
-        ) -> Result<CliRestoreOutcome, BoundaryError> {
-            let intended = mutation.intended.as_ref().map(|value| value.fingerprint);
-            let mut live = self.live.lock().unwrap();
-            if live.as_ref().map(|value| value.fingerprint) != intended {
-                return Ok(CliRestoreOutcome {
-                    restored: false,
-                    resulting_fingerprint: live.as_ref().map(|value| value.fingerprint),
-                });
-            }
-            live.clone_from(&mutation.expected);
-            Ok(CliRestoreOutcome {
-                restored: true,
-                resulting_fingerprint: live.as_ref().map(|value| value.fingerprint),
-            })
-        }
-
-        fn finish_committed_cli_mutations(
-            &mut self,
-            mutations: &[ApprovedCliMutation],
-        ) -> Result<(), BoundaryError> {
-            for mutation in mutations {
-                if self
-                    .live
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|value| value.fingerprint)
-                    != mutation.intended.as_ref().map(|value| value.fingerprint)
-                {
-                    return Err(BoundaryError::new("Test Codex committed CLI state changed"));
-                }
-            }
-            Ok(())
-        }
-    }
-
-    fn test_codex_cli_output(
-        arguments: &[String],
-        live: Option<&CanonicalCliDeclaration>,
-    ) -> Result<Vec<u8>, BoundaryError> {
-        match arguments {
-            [plugin, list, format]
-                if (plugin.as_str(), list.as_str(), format.as_str())
-                    == ("plugin", "list", "--json") =>
-            {
-                Ok(br#"{"installed":[],"available":[]}"#.to_vec())
-            }
-            [mcp, list, format]
-                if (mcp.as_str(), list.as_str(), format.as_str()) == ("mcp", "list", "--json") =>
-            {
-                Ok(match live {
-                    Some(declaration) => test_codex_mcp_list(&declaration.canonical_body)?,
-                    None => b"[]".to_vec(),
-                })
-            }
-            [mcp, get, name, format]
-                if (mcp.as_str(), get.as_str(), name.as_str(), format.as_str())
-                    == ("mcp", "get", BRIDGE_SERVER_NAME, "--json") =>
-            {
-                test_codex_mcp_get(
-                    &live
-                        .ok_or_else(|| BoundaryError::new("missing test Codex declaration"))?
-                        .canonical_body,
-                )
-            }
-            _ => Err(BoundaryError::new("unexpected test Codex CLI inspection")),
-        }
-    }
-
-    fn test_codex_transport(body: &str) -> Result<String, BoundaryError> {
-        let prefix = body
-            .strip_suffix('}')
-            .ok_or_else(|| BoundaryError::new("test Codex declaration is invalid"))?;
-        Ok(format!(
-            "{prefix},\"env\":{{}},\"env_vars\":[],\"cwd\":null}}"
-        ))
-    }
-
-    fn test_codex_mcp_list(body: &str) -> Result<Vec<u8>, BoundaryError> {
-        Ok(format!(
-            "[{{\"name\":\"{BRIDGE_SERVER_NAME}\",\"enabled\":true,\"disabled_reason\":null,\"transport\":{},\"startup_timeout_sec\":null,\"tool_timeout_sec\":null,\"auth_status\":\"unsupported\"}}]",
-            test_codex_transport(body)?
-        )
-        .into_bytes())
-    }
-
-    fn test_codex_mcp_get(body: &str) -> Result<Vec<u8>, BoundaryError> {
-        Ok(format!(
-            "{{\"name\":\"{BRIDGE_SERVER_NAME}\",\"enabled\":true,\"disabled_reason\":null,\"transport\":{},\"enabled_tools\":null,\"disabled_tools\":null,\"startup_timeout_sec\":null,\"tool_timeout_sec\":null}}",
-            test_codex_transport(body)?
-        )
-        .into_bytes())
     }
 
     fn test_native_identity() -> NativeSandboxIdentity {
@@ -3175,6 +3745,10 @@ mod tests {
             CertificateFieldsV1, DeviceCertificateV1, DeviceKeys, RecoveryKeys, RecoveryPhrase,
         },
         devices::{
+            account_lifecycle::{
+                ACCOUNT_DELETION_GRACE_MS, AccountDeletionProjection, AccountLifecycleTransport,
+                AccountLifecycleTransportError,
+            },
             identity::{DeviceIdentityError, StoreIfAbsent},
             memory_transport::InMemoryPairingProvider,
             pairing::{
@@ -3210,11 +3784,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     use context_relay_protocol::ApplyReceipt;
     use context_relay_protocol::{
-        AccountId, CancelParams, ClientRole, DeviceCertificateId, EmptyParams, HelloParams,
-        JsonRpcErrorV1, JsonRpcRequestV1, JsonRpcSuccessV1, JsonRpcVersion, LocalRequest,
-        NativePlatform, PROTOCOL_VERSION, PairingConfirmParams, PairingDecisionParams,
-        PairingIdParams, PairingJoinParams, PairingRequestNonce, PairingState, PlanId, RecordId,
-        RecoveryPhraseWords, Sha256Digest, WorkspaceId,
+        AccountDeletionState, AccountId, CancelParams, ClientRole, DecimalTimestamp,
+        DeviceCertificateId, EmptyParams, HelloParams, JsonRpcErrorV1, JsonRpcRequestV1,
+        JsonRpcSuccessV1, JsonRpcVersion, LocalRequest, NativePlatform, PROTOCOL_VERSION,
+        PairingConfirmParams, PairingDecisionParams, PairingIdParams, PairingJoinParams,
+        PairingRequestNonce, PairingState, PlanId, RecordId, RecoveryPhraseWords, Sha256Digest,
+        WorkspaceId,
     };
     #[cfg(any(windows, target_os = "macos"))]
     use context_relay_protocol::{
@@ -3223,6 +3798,69 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
+
+    const LIFECYCLE_BEGIN_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07a102";
+    const LIFECYCLE_CANCEL_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07a103";
+
+    #[derive(Clone)]
+    struct TestAccountLifecycleTransport {
+        state: Arc<Mutex<AccountDeletionState>>,
+        calls: Arc<AtomicUsize>,
+        operations: Arc<Mutex<Vec<context_relay_protocol::OperationId>>>,
+    }
+
+    impl TestAccountLifecycleTransport {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(AccountDeletionState::Active)),
+                calls: Arc::new(AtomicUsize::new(0)),
+                operations: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn projection(&self) -> AccountDeletionProjection {
+            let state = *self.state.lock().unwrap();
+            AccountDeletionProjection {
+                state,
+                requested_at_ms: (state == AccountDeletionState::PendingDelete).then_some(1_000),
+                purge_deadline_ms: (state == AccountDeletionState::PendingDelete)
+                    .then_some(1_000 + ACCOUNT_DELETION_GRACE_MS),
+            }
+        }
+    }
+
+    impl AccountLifecycleTransport for TestAccountLifecycleTransport {
+        fn deletion_status(
+            &self,
+        ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.projection())
+        }
+
+        fn begin_deletion(
+            &self,
+            operation_id: context_relay_protocol::OperationId,
+        ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+            self.operations.lock().unwrap().push(operation_id);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut state = self.state.lock().unwrap();
+            *state = AccountDeletionState::PendingDelete;
+            drop(state);
+            Ok(self.projection())
+        }
+
+        fn cancel_deletion(
+            &self,
+            operation_id: context_relay_protocol::OperationId,
+        ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+            self.operations.lock().unwrap().push(operation_id);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut state = self.state.lock().unwrap();
+            *state = AccountDeletionState::Active;
+            drop(state);
+            Ok(self.projection())
+        }
+    }
 
     #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
@@ -3423,19 +4061,20 @@ mod tests {
             let bin = root.join("bin");
             let home = root.join("home");
             let config_root = root.join("claude-config");
-            let state_path = root.join("live-state");
-            let get_path = root.join("mcp-get.json");
+            let project = root.join("project");
+            let state_path = config_root.join(".claude.json");
             std::fs::create_dir_all(&bin).unwrap();
             std::fs::create_dir_all(&home).unwrap();
             std::fs::create_dir_all(&config_root).unwrap();
-            std::fs::write(&state_path, initial).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            let home = std::fs::canonicalize(home).unwrap();
+            let config_root = std::fs::canonicalize(config_root).unwrap();
+            let project = std::fs::canonicalize(project).unwrap();
             let executable = bin.join("claude");
             std::fs::write(
                 &executable,
                 format!(
-                    "#!/bin/sh\ncase \"$*\" in\n  --version) printf '2.1.214\\n' ;;\n  doctor) printf 'Claude Code diagnostics: OK\\n' ;;\n  'mcp list') if [ \"$(/bin/cat '{}')\" = present ]; then printf 'context-relay: local (stdio)\\n'; fi ;;\n  'mcp get context-relay') /bin/cat '{}' ;;\n  'mcp remove context-relay --scope user') printf absent > '{}' ;;\n  *) exit 9 ;;\nesac\n",
-                    state_path.display(),
-                    get_path.display(),
+                    "#!/bin/sh\ncase \"$*\" in\n  --version) printf '2.1.214 (Claude Code)\\n' ;;\n  'mcp remove context-relay --scope user') printf '{{}}' > '{}' ;;\n  *) exit 9 ;;\nesac\n",
                     state_path.display(),
                 ),
             )
@@ -3456,15 +4095,21 @@ mod tests {
             std::fs::set_permissions(&bridge_executable, std::fs::Permissions::from_mode(0o700))
                 .unwrap();
             let bridge_executable = std::fs::canonicalize(bridge_executable).unwrap();
-            std::fs::write(
-                &get_path,
-                serde_json::to_vec(&serde_json::json!({
-                    "name": "context-relay",
-                    "scope": "user",
+            let present_state = serde_json::json!({
+                "mcpServers": { "context-relay": {
                     "type": "stdio",
                     "command": bridge_executable.to_str().unwrap(),
                     "args": ["--harness", "claude-code"],
-                }))
+                }}
+            });
+            let absent_state = serde_json::json!({});
+            std::fs::write(
+                &state_path,
+                serde_json::to_vec(if initial == "present" {
+                    &present_state
+                } else {
+                    &absent_state
+                })
                 .unwrap(),
             )
             .unwrap();
@@ -3481,6 +4126,14 @@ mod tests {
                 keys.as_ref(),
                 &executable,
                 &bridge_executable,
+                context_relay_core::native_transaction::CliExecutionContext::ClaudeCodeV2 {
+                    config_dir: unit_test_support::wire_native_path(&config_root),
+                    state_path: unit_test_support::wire_native_path(
+                        &config_root.join(".claude.json"),
+                    ),
+                    project_root: unit_test_support::wire_native_path(&project),
+                    user_home: unit_test_support::wire_native_path(&home),
+                },
                 committed,
             );
 
@@ -3509,8 +4162,13 @@ mod tests {
                 "{label}",
             );
             assert_eq!(
-                std::fs::read_to_string(&state_path).unwrap(),
-                final_state,
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&state_path).unwrap())
+                    .unwrap(),
+                if final_state == "present" {
+                    present_state
+                } else {
+                    serde_json::json!({})
+                },
                 "{label}",
             );
             assert!(!bridge_canary.exists(), "{label}");
@@ -3689,7 +4347,7 @@ mod tests {
     #[test]
     fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 53);
+        assert_eq!(fixtures.len(), 68);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -3699,12 +4357,36 @@ mod tests {
                 "Health" => assert!(matches!(routed, RoutedRequest::Health)),
                 "McpCall" => assert!(matches!(
                     routed,
-                    RoutedRequest::Work(VaultCommand::Workspace(LocalRequest::McpCall(_)))
+                    RoutedRequest::Work(VaultCommand::DesktopMcp(_))
                 )),
                 _ => assert!(!matches!(
                     routed,
                     RoutedRequest::Immediate(Err(error)) if error == unavailable_error()
                 )),
+            }
+        }
+    }
+
+    #[test]
+    fn hosted_auth_controls_are_desktop_only_and_bypass_the_vault_worker() {
+        let requests = all_request_fixtures()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("HostedAuth"))
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 4);
+        for (_, request) in requests {
+            assert!(matches!(
+                route_request(ClientRole::Desktop, request.clone()),
+                RoutedRequest::HostedAuth(_)
+            ));
+            for role in [
+                ClientRole::McpBridge,
+                ClientRole::Installer,
+                ClientRole::DesktopRecoveryHost,
+            ] {
+                assert!(
+                    matches!(route_request(role, request.clone()), RoutedRequest::Immediate(Err(error)) if error == scope_denied_error())
+                );
             }
         }
     }
@@ -3729,9 +4411,9 @@ mod tests {
     fn recovery_enrollment_commands_are_role_checked_before_the_ordered_vault_worker() {
         let recovery = all_request_fixtures()
             .into_iter()
-            .filter(|(name, _)| name.starts_with("RecoveryEnrollment"))
+            .filter(|(name, _)| name.starts_with("Recovery"))
             .collect::<Vec<_>>();
-        assert_eq!(recovery.len(), 5);
+        assert_eq!(recovery.len(), 9);
 
         for (name, request) in recovery {
             for role in [
@@ -3744,12 +4426,19 @@ mod tests {
                     ClientRole::Desktop => matches!(
                         name,
                         "RecoveryEnrollmentOverview"
+                            | "RecoveryRestoreOverview"
+                            | "RecoveryRestoreResume"
+                            | "RecoveryRestoreCancel"
                             | "RecoveryEnrollmentStatus"
                             | "RecoveryEnrollmentCancel"
                     ),
                     ClientRole::DesktopRecoveryHost => matches!(
                         name,
                         "RecoveryEnrollmentBegin"
+                            | "RecoveryRestoreBegin"
+                            | "RecoveryRestoreOverview"
+                            | "RecoveryRestoreResume"
+                            | "RecoveryRestoreCancel"
                             | "RecoveryEnrollmentConfirm"
                             | "RecoveryEnrollmentCancel"
                     ),
@@ -3825,6 +4514,306 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, unavailable_error());
         worker.shutdown_and_join();
+    }
+
+    #[test]
+    fn hosted_pairing_starts_offline_and_requires_login_before_joining() {
+        use context_relay_core::auth::{
+            HostedSessionOwner, LoginError, LoginStore, StoredLogin, SupabaseAuthClient,
+        };
+        struct NoLogin;
+        impl LoginStore for NoLogin {
+            fn load(&self) -> Result<Option<StoredLogin>, LoginError> {
+                Ok(None)
+            }
+            fn save(&self, _: &StoredLogin) -> Result<(), LoginError> {
+                Err(LoginError::CredentialStore)
+            }
+            fn clear(&self) -> Result<(), LoginError> {
+                Ok(())
+            }
+        }
+        let owner = Arc::new(HostedSessionOwner::new(
+            Arc::new(
+                SupabaseAuthClient::new("https://example.supabase.co", "public-test").unwrap(),
+            ),
+            Arc::new(NoLogin),
+        ));
+        let identity = PairingIdentity {
+            device_id: stable_device_id(b"hosted-pairing-offline"),
+            device_name: "Fresh desktop".into(),
+            platform: NativePlatform::Windows,
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
+        };
+        let service = pairing::HostedPairingService::new(
+            owner,
+            "https://example.supabase.co",
+            "public-test",
+            identity.clone(),
+        );
+        let path = unique_temp_path("hosted-pairing-offline").join("vault.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut vault = Vault::open(&path, "test-vault-key", &MemoryKeyStore::default()).unwrap();
+        service.resume_prepared_decisions(&mut vault).unwrap();
+        assert_eq!(
+            service
+                .execute(
+                    &mut vault,
+                    &identity,
+                    LocalRequest::PairingJoin(PairingJoinParams {
+                        code: context_relay_protocol::PairingCode::new("ABCDE-FGHJK".into())
+                            .unwrap(),
+                        device_name: identity.device_name.clone(),
+                    })
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::ScopeDenied
+        );
+        assert!(vault.all_devices().unwrap().is_empty());
+        assert!(vault.pending_pairing_approvals().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hosted_pairing_restarts_exact_join_and_rejects_replaced_login() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use context_relay_core::{
+            auth::{
+                HostedSessionOwner, LoginError, LoginStore, PendingLogin, StoredLogin,
+                SupabaseAuthClient,
+            },
+            devices::recovery::{RecoveryEnrollmentClock, SystemRecoveryEnrollmentClock},
+            sync::{
+                SupabaseHttpClient, SupabaseHttpError, SupabaseHttpRequest, SupabaseHttpResponse,
+            },
+        };
+        use serde_json::{Value, json};
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        const PROJECT: &str = "https://example.supabase.co";
+        const USER: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const PAIRING: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c074091";
+        struct Login;
+        impl LoginStore for Login {
+            fn load(&self) -> Result<Option<StoredLogin>, LoginError> {
+                Ok(None)
+            }
+            fn save(&self, _: &StoredLogin) -> Result<(), LoginError> {
+                Ok(())
+            }
+            fn clear(&self) -> Result<(), LoginError> {
+                Ok(())
+            }
+        }
+        struct Http {
+            now: u64,
+            replaced: AtomicBool,
+            lost: AtomicBool,
+            calls: AtomicUsize,
+            submitted: Mutex<Vec<String>>,
+        }
+        impl SupabaseHttpClient for Http {
+            fn execute(
+                &self,
+                request: SupabaseHttpRequest,
+            ) -> Result<SupabaseHttpResponse, SupabaseHttpError> {
+                let reply = |body: Value| {
+                    Ok(SupabaseHttpResponse::new(
+                        200,
+                        serde_json::to_vec(&body).unwrap(),
+                    ))
+                };
+                if request.url().ends_with("/user") {
+                    return reply(json!({"id":USER}));
+                }
+                if request.url().contains("/auth/v1/token") {
+                    let session = if self.replaced.load(Ordering::SeqCst) {
+                        "550e8400-e29b-41d4-a716-446655440002"
+                    } else {
+                        "550e8400-e29b-41d4-a716-446655440001"
+                    };
+                    let claims = json!({"iss":format!("{PROJECT}/auth/v1"),"aud":"authenticated","sub":USER,"session_id":session,"exp":self.now+3600});
+                    return reply(
+                        json!({"token_type":"bearer","access_token":format!("e30.{}.signature",URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())),"refresh_token":"synthetic-refresh"}),
+                    );
+                }
+                assert!(request.url().ends_with("/functions/v1/pairing"));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let body: Value = serde_json::from_slice(request.body()).unwrap();
+                match body["action"].as_str().unwrap() {
+                    "resolve" => {
+                        reply(json!({"v":1,"result":{"status":"located","pairingId":PAIRING}}))
+                    }
+                    "submit" => {
+                        let canonical = body["canonicalRequest"].as_str().unwrap();
+                        self.submitted.lock().unwrap().push(canonical.into());
+                        if self.lost.swap(false, Ordering::SeqCst) {
+                            return Err(SupabaseHttpError::Transient);
+                        }
+                        let bytes: Vec<u8> = canonical
+                            .as_bytes()
+                            .chunks_exact(2)
+                            .map(|pair| {
+                                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()
+                            })
+                            .collect();
+                        reply(
+                            json!({"v":1,"receipt":{"pairingId":PAIRING,"requestDigest":format!("{:x}",Sha256::digest(bytes)),"requestedAt":(self.now*1000).to_string()}}),
+                        )
+                    }
+                    "result" => reply(json!({"v":1,"result":{"status":"pending"}})),
+                    other => panic!("unexpected pairing action {other}"),
+                }
+            }
+        }
+        let now = SystemRecoveryEnrollmentClock.now_ms() / 1000;
+        let http = Arc::new(Http {
+            now,
+            replaced: AtomicBool::new(false),
+            lost: AtomicBool::new(true),
+            calls: AtomicUsize::new(0),
+            submitted: Mutex::new(Vec::new()),
+        });
+        let owner = Arc::new(HostedSessionOwner::new(
+            Arc::new(
+                SupabaseAuthClient::with_http_client(PROJECT, "public-test", http.clone()).unwrap(),
+            ),
+            Arc::new(Login),
+        ));
+        let login = || {
+            let instant = std::time::Instant::now();
+            let mut pending =
+                PendingLogin::new(PROJECT, "127.0.0.1:41783".parse().unwrap(), instant).unwrap();
+            let url = pending.authorization_url();
+            let redirect = url
+                .query_pairs()
+                .find(|(key, _)| key == "redirect_to")
+                .unwrap()
+                .1
+                .into_owned();
+            let mut callback = url.join(&redirect).unwrap();
+            callback
+                .query_pairs_mut()
+                .append_pair("code", "synthetic-code");
+            owner
+                .complete_login(
+                    owner.begin_login().unwrap(),
+                    pending.take_callback(&callback, instant).unwrap(),
+                    now,
+                )
+                .unwrap();
+        };
+        login();
+        let identity = PairingIdentity {
+            device_id: stable_device_id(b"hosted-pairing-restart"),
+            device_name: "Fresh desktop".into(),
+            platform: NativePlatform::Windows,
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
+        };
+        let make = || {
+            let mut service = pairing::HostedPairingService::new(
+                owner.clone(),
+                PROJECT,
+                "public-test",
+                identity.clone(),
+            );
+            service.http = Some(http.clone());
+            service
+        };
+        let path = unique_temp_path("hosted-pairing-restart").join("vault.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(&path, "test-vault-key", &keys).unwrap();
+        let service = make();
+        assert!(
+            service
+                .execute(
+                    &mut vault,
+                    &identity,
+                    LocalRequest::PairingCreate(EmptyParams {})
+                )
+                .is_err()
+        );
+        assert_eq!(http.calls.load(Ordering::SeqCst), 0);
+        let join = || {
+            LocalRequest::PairingJoin(PairingJoinParams {
+                code: context_relay_protocol::PairingCode::new("ABCDE-FGHJK".into()).unwrap(),
+                device_name: identity.device_name.clone(),
+            })
+        };
+        assert!(service.execute(&mut vault, &identity, join()).is_err());
+        let saved = vault
+            .hosted_pairing_intent(PAIRING.parse().unwrap())
+            .unwrap()
+            .unwrap();
+        drop(vault);
+        let mut vault = Vault::open(&path, "test-vault-key", &keys).unwrap();
+        let service = make();
+        service.resume_prepared_decisions(&mut vault).unwrap();
+        assert!(matches!(
+            service.execute(&mut vault, &identity, join()).unwrap(),
+            LocalResult::PairingRequest {
+                status: PairingState::Pending,
+                ..
+            }
+        ));
+        let requests = http.submitted.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        drop(requests);
+        let status = || {
+            LocalRequest::PairingStatus(PairingIdParams {
+                pairing_id: PAIRING.parse().unwrap(),
+            })
+        };
+        assert!(service.execute(&mut vault, &identity, status()).is_ok());
+        let calls = http.calls.load(Ordering::SeqCst);
+        let stored = vault
+            .stored_pairing_join(PAIRING.parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            service
+                .execute(
+                    &mut vault,
+                    &identity,
+                    LocalRequest::PairingDecision(PairingDecisionParams {
+                        pairing_id: PAIRING.parse().unwrap(),
+                        request_digest: stored.request_sha256,
+                        approve: true,
+                    })
+                )
+                .is_err()
+        );
+        let mut wrong_keys = identity.clone();
+        wrong_keys.keys = Arc::new(DeviceKeys::generate().unwrap());
+        assert!(service.execute(&mut vault, &wrong_keys, status()).is_err());
+        let mut other_project = pairing::HostedPairingService::new(
+            owner.clone(),
+            "https://other.supabase.co",
+            "public-test",
+            identity.clone(),
+        );
+        other_project.http = Some(http.clone());
+        assert!(
+            other_project
+                .execute(&mut vault, &identity, status())
+                .is_err()
+        );
+        assert_eq!(http.calls.load(Ordering::SeqCst), calls);
+        owner.begin_login().unwrap();
+        assert!(service.execute(&mut vault, &identity, status()).is_err());
+        http.replaced.store(true, Ordering::SeqCst);
+        login();
+        assert!(service.execute(&mut vault, &identity, status()).is_err());
+        assert_eq!(http.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(
+            vault
+                .hosted_pairing_intent(PAIRING.parse().unwrap())
+                .unwrap(),
+            Some(saved)
+        );
+        assert!(vault.all_devices().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4150,7 +5139,7 @@ mod tests {
             device_id,
             device_name: "Restarted Approver".into(),
             platform: NativePlatform::Macos,
-            keys: DeviceKeys::generate().unwrap(),
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
         };
         let path = unique_temp_path("pairing-invite-restart").join("vault.db");
         let vault_keys = MemoryKeyStore::default();
@@ -4279,7 +5268,7 @@ mod tests {
             device_id: approver_device_id,
             device_name: "Approver".into(),
             platform: NativePlatform::Macos,
-            keys: DeviceKeys::generate().unwrap(),
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
         };
         let joiner_keys = DeviceKeys::generate().unwrap();
         let approver_path = unique_temp_path("pairing-rejected-approver").join("vault.db");
@@ -4390,6 +5379,17 @@ mod tests {
     #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn device_pairing_crosses_two_authenticated_daemons_without_exposing_joiner_safety() {
+        run_two_daemon_pairing(false).await;
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn hosted_pairing_crosses_two_daemons_and_resumes_lost_approval() {
+        run_two_daemon_pairing(true).await;
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    async fn run_two_daemon_pairing(hosted: bool) {
         let account_id = "018f22e2-79b0-7cc8-98c4-dc0c0c074101"
             .parse::<AccountId>()
             .unwrap();
@@ -4517,57 +5517,100 @@ mod tests {
                 scope,
                 issuer_certificate_id,
             ));
-        let joiner_service: Arc<dyn PairingService> =
-            Arc::new(pairing::CoordinatorPairingService::new(
-                PairingCoordinator::new(
-                    clock.clone(),
-                    VaultPairingMaterialSource,
-                    provider
-                        .join_session_client("contextd-joining-device")
-                        .unwrap(),
-                    UnavailablePairingApproval,
+        let joiner_service: Arc<dyn PairingService> = Arc::new(
+            pairing::CoordinatorPairingService::new_joiner(PairingCoordinator::new(
+                clock.clone(),
+                VaultPairingMaterialSource,
+                provider
+                    .join_session_client("contextd-joining-device")
+                    .unwrap(),
+                UnavailablePairingApproval,
+            )),
+        );
+        let backend =
+            pairing_test_provider::Backend::new(provider.clone(), Arc::new(clock.clone()), scope);
+        let hosted_fixtures = hosted.then(|| {
+            let identity = |device_id,
+                            name: &str,
+                            store: &MemoryDeviceIdentityStore,
+                            credential| PairingIdentity {
+                device_id,
+                device_name: name.into(),
+                platform: NativePlatform::Macos,
+                keys: Arc::new(load_or_create_device_keys(store, credential).unwrap()),
+            };
+            (
+                pairing_test_provider::Fixture::new(
+                    backend.clone(),
+                    identity(
+                        approver_device_id,
+                        "Approving Mac",
+                        approver_identity_store.as_ref(),
+                        "pairing-approver-identity",
+                    ),
+                    "550e8400-e29b-41d4-a716-446655440001",
+                    true,
                 ),
-                scope,
-                issuer_certificate_id,
-            ));
-        let approver_config = DaemonConfig::new(
-            approver_runtime.clone(),
-            VaultConfig::new(
-                approver_path.clone(),
-                "test-vault-key",
-                approver_vault_keys.clone(),
+                pairing_test_provider::Fixture::new(
+                    backend.clone(),
+                    identity(
+                        joiner_device_id,
+                        "Joining Mac",
+                        joiner_identity_store.as_ref(),
+                        "pairing-joiner-identity",
+                    ),
+                    "550e8400-e29b-41d4-a716-446655440002",
+                    false,
+                ),
             )
-            .with_pairing_service(
-                approver_service,
-                approver_identity_store.clone(),
-                "pairing-approver-identity",
-                "Approving Mac",
-                NativePlatform::Macos,
-            ),
-            Arc::new(PairingTokenProvider(approver_token)),
-        );
-        let joiner_config = DaemonConfig::new(
-            joiner_runtime.clone(),
-            VaultConfig::new(
-                joiner_path.clone(),
-                "test-vault-key",
-                joiner_vault_keys.clone(),
+        });
+        let approver_config = || {
+            DaemonConfig::new(
+                approver_runtime.clone(),
+                VaultConfig::new(
+                    approver_path.clone(),
+                    "test-vault-key",
+                    approver_vault_keys.clone(),
+                )
+                .with_pairing_service(
+                    hosted_fixtures.as_ref().map_or_else(
+                        || approver_service.clone(),
+                        |(approver, _)| approver.service(),
+                    ),
+                    approver_identity_store.clone(),
+                    "pairing-approver-identity",
+                    "Approving Mac",
+                    NativePlatform::Macos,
+                ),
+                Arc::new(PairingTokenProvider(approver_token)),
             )
-            .with_pairing_service(
-                joiner_service,
-                joiner_identity_store.clone(),
-                "pairing-joiner-identity",
-                "Joining Mac",
-                NativePlatform::Macos,
-            ),
-            Arc::new(PairingTokenProvider(joiner_token)),
-        );
-        let approver_daemon = Daemon::start(approver_config).await.unwrap();
-        let approver_handle = approver_daemon.handle();
-        let approver_owner = tokio::spawn(approver_daemon.run());
-        let joiner_daemon = Daemon::start(joiner_config).await.unwrap();
-        let joiner_handle = joiner_daemon.handle();
-        let joiner_owner = tokio::spawn(joiner_daemon.run());
+        };
+        let joiner_config = || {
+            DaemonConfig::new(
+                joiner_runtime.clone(),
+                VaultConfig::new(
+                    joiner_path.clone(),
+                    "test-vault-key",
+                    joiner_vault_keys.clone(),
+                )
+                .with_pairing_service(
+                    hosted_fixtures
+                        .as_ref()
+                        .map_or_else(|| joiner_service.clone(), |(_, joiner)| joiner.service()),
+                    joiner_identity_store.clone(),
+                    "pairing-joiner-identity",
+                    "Joining Mac",
+                    NativePlatform::Macos,
+                ),
+                Arc::new(PairingTokenProvider(joiner_token)),
+            )
+        };
+        let approver_daemon = Daemon::start(approver_config()).await.unwrap();
+        let mut approver_handle = approver_daemon.handle();
+        let mut approver_owner = tokio::spawn(approver_daemon.run());
+        let joiner_daemon = Daemon::start(joiner_config()).await.unwrap();
+        let mut joiner_handle = joiner_daemon.handle();
+        let mut joiner_owner = tokio::spawn(joiner_daemon.run());
         let mut approver =
             RawClient::connect_with_token(&approver_runtime, ClientRole::Desktop, approver_token)
                 .await;
@@ -4583,6 +5626,20 @@ mod tests {
         };
         assert_eq!(status, PairingState::Pending);
         clock.set(1_001);
+        for request in [
+            LocalRequest::PairingCreate(EmptyParams {}),
+            LocalRequest::PairingCancel(PairingIdParams {
+                pairing_id: invite.pairing_id,
+            }),
+            LocalRequest::PairingStatus(PairingIdParams {
+                pairing_id: invite.pairing_id,
+            }),
+        ] {
+            assert_eq!(
+                joiner.call(request).await.unwrap_err().code,
+                ErrorCode::InvalidRequest
+            );
+        }
         let LocalResult::PairingRequest {
             request: submitted,
             status,
@@ -4599,6 +5656,22 @@ mod tests {
         assert_eq!(status, PairingState::Pending);
         assert_eq!(submitted.pairing_id, invite.pairing_id);
         assert_eq!(submitted.platform, NativePlatform::Macos);
+        assert_eq!(
+            joiner
+                .call(LocalRequest::PairingDecision(PairingDecisionParams {
+                    pairing_id: invite.pairing_id,
+                    request_digest: submitted.request_digest,
+                    approve: true,
+                }))
+                .await
+                .unwrap_err()
+                .code,
+            if hosted {
+                ErrorCode::Conflict
+            } else {
+                ErrorCode::InvalidRequest
+            }
+        );
 
         clock.set(1_002);
         let LocalResult::PairingRequest {
@@ -4616,15 +5689,40 @@ mod tests {
         assert_eq!(status, PairingState::Pending);
         assert_eq!(review.request_digest, submitted.request_digest);
         clock.set(1_003);
-        let LocalResult::PairingApproval { approval } = approver
+        backend
+            .lose_approval_response
+            .store(hosted, std::sync::atomic::Ordering::SeqCst);
+        let decision = approver
             .call(LocalRequest::PairingDecision(PairingDecisionParams {
                 pairing_id: invite.pairing_id,
                 request_digest: review.request_digest,
                 approve: true,
             }))
-            .await
-            .unwrap()
-        else {
+            .await;
+        let approval_result = if hosted {
+            assert_eq!(decision.unwrap_err().code, ErrorCode::Internal);
+            drop(approver);
+            assert_eq!(approver_handle.shutdown().await, DaemonState::Stopped);
+            assert_eq!(approver_owner.await.unwrap(), Ok(()));
+            let daemon = Daemon::start(approver_config()).await.unwrap();
+            approver_handle = daemon.handle();
+            approver_owner = tokio::spawn(daemon.run());
+            approver = RawClient::connect_with_token(
+                &approver_runtime,
+                ClientRole::Desktop,
+                approver_token,
+            )
+            .await;
+            approver
+                .call(LocalRequest::PairingStatus(PairingIdParams {
+                    pairing_id: invite.pairing_id,
+                }))
+                .await
+                .unwrap()
+        } else {
+            decision.unwrap()
+        };
+        let LocalResult::PairingApproval { approval } = approval_result else {
             panic!("expected approver safety number")
         };
 
@@ -4648,6 +5746,63 @@ mod tests {
                 .contains(approval.safety_number.as_str())
         );
 
+        if let Some((approver, joiner)) = &hosted_fixtures {
+            for fixture in [approver, joiner] {
+                let outcome = fixture.owner.logout().unwrap();
+                outcome.local.unwrap();
+                outcome.remote.unwrap().unwrap();
+            }
+        }
+        let calls_before_local_confirmation =
+            backend.calls.load(std::sync::atomic::Ordering::SeqCst);
+        // A well-formed but different number must never install trust, even offline.
+        let mut wrong_number = approval.safety_number.as_str().to_owned();
+        wrong_number.replace_range(
+            ..1,
+            if wrong_number.starts_with('0') {
+                "1"
+            } else {
+                "0"
+            },
+        );
+        assert_eq!(
+            joiner
+                .call(LocalRequest::PairingConfirm(PairingConfirmParams {
+                    pairing_id: invite.pairing_id,
+                    safety_number: context_relay_protocol::PairingSafetyNumber::new(wrong_number)
+                        .unwrap(),
+                }))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        drop(joiner);
+        assert_eq!(joiner_handle.shutdown().await, DaemonState::Stopped);
+        assert_eq!(joiner_owner.await.unwrap(), Ok(()));
+        {
+            let vault =
+                Vault::open(&joiner_path, "test-vault-key", joiner_vault_keys.as_ref()).unwrap();
+            assert!(vault.devices(scope).unwrap().is_empty());
+            assert!(
+                vault
+                    .awaiting_pairing_confirmation(invite.pairing_id)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let daemon = Daemon::start(joiner_config()).await.unwrap();
+        joiner_handle = daemon.handle();
+        joiner_owner = tokio::spawn(daemon.run());
+        joiner =
+            RawClient::connect_with_token(&joiner_runtime, ClientRole::Desktop, joiner_token).await;
+        let resumed = joiner
+            .call(LocalRequest::PairingStatus(PairingIdParams {
+                pairing_id: invite.pairing_id,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resumed, joiner_status);
         clock.set(1_005);
         let LocalResult::PairingCompletion { completion } = joiner
             .call(LocalRequest::PairingConfirm(PairingConfirmParams {
@@ -4661,6 +5816,10 @@ mod tests {
         };
         assert_eq!(completion.device.device_id, joiner_device_id);
         assert!(completion.device.is_current);
+        assert_eq!(
+            backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_before_local_confirmation
+        );
 
         let mut bridge =
             RawClient::connect_with_token(&approver_runtime, ClientRole::McpBridge, approver_token)
@@ -4683,7 +5842,7 @@ mod tests {
         let joiner_keys =
             load_or_create_device_keys(joiner_identity_store.as_ref(), "pairing-joiner-identity")
                 .unwrap();
-        let approver_vault = Vault::open(
+        let mut approver_vault = Vault::open(
             &approver_path,
             "test-vault-key",
             approver_vault_keys.as_ref(),
@@ -4696,6 +5855,50 @@ mod tests {
         let enrolled = approver_vault
             .enrolled_workspace_material(&approver_keys)
             .unwrap();
+        let offline_service: Arc<dyn PairingService> =
+            Arc::new(pairing::CoordinatorPairingService::new(
+                PairingCoordinator::new(
+                    clock.clone(),
+                    VaultPairingMaterialSource,
+                    UnavailablePairingJoin,
+                    UnavailablePairingApproval,
+                ),
+                scope,
+                issuer_certificate_id,
+            ));
+        let offline_service = hosted_fixtures
+            .as_ref()
+            .map_or(offline_service, |(approver, _)| approver.service());
+        let offline_identity = PairingIdentity {
+            device_id: approver_device_id,
+            device_name: "Approving Mac".into(),
+            platform: NativePlatform::Macos,
+            keys: Arc::new(approver_keys),
+        };
+        for request in [
+            LocalRequest::PairingStatus(PairingIdParams {
+                pairing_id: invite.pairing_id,
+            }),
+            LocalRequest::PairingDecision(PairingDecisionParams {
+                pairing_id: invite.pairing_id,
+                request_digest: review.request_digest,
+                approve: true,
+            }),
+        ] {
+            let LocalResult::PairingApproval {
+                approval: offline_approval,
+            } = offline_service
+                .execute(&mut approver_vault, &offline_identity, request)
+                .unwrap()
+            else {
+                panic!("expected local accepted approval")
+            };
+            assert_eq!(offline_approval.request, review);
+        }
+        assert_eq!(
+            backend.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_before_local_confirmation
+        );
         let reopened = PairingCoordinator::new(
             clock,
             VaultPairingMaterialSource,
@@ -4712,6 +5915,137 @@ mod tests {
         assert_eq!(enrolled.key_epoch(), reopened.key_epoch());
         assert_eq!(enrolled.workspace_root_key(), reopened.workspace_root_key());
         assert_eq!(enrolled.active_epoch_key(), reopened.active_epoch_key());
+        drop((approver_vault, joiner_vault));
+        if let Some((_, fixture)) = &hosted_fixtures {
+            fixture.login();
+            let config = || {
+                let mut config = joiner_config();
+                config.vault.account_lifecycle_service = fixture.lifecycle_service();
+                config
+            };
+            let daemon = Daemon::start(config()).await.unwrap();
+            let handle = daemon.handle();
+            let owner = tokio::spawn(daemon.run());
+            let mut desktop =
+                RawClient::connect_with_token(&joiner_runtime, ClientRole::Desktop, joiner_token)
+                    .await;
+            let begin = || {
+                LocalRequest::AccountDeletionBegin(context_relay_protocol::AccountDeletionParams {
+                    operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
+                    confirmation: "delete".into(),
+                })
+            };
+            let mut bridge =
+                RawClient::connect_with_token(&joiner_runtime, ClientRole::McpBridge, joiner_token)
+                    .await;
+            assert_eq!(
+                bridge.call(begin()).await.unwrap_err().code,
+                ErrorCode::ScopeDenied
+            );
+            assert_eq!(
+                desktop
+                    .call(LocalRequest::AccountDeletionBegin(
+                        context_relay_protocol::AccountDeletionParams {
+                            operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
+                            confirmation: "wrong".into(),
+                        }
+                    ))
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidRequest
+            );
+            assert!(backend.lifecycle.lock().unwrap().calls.is_empty());
+            backend
+                .lose_lifecycle_response
+                .store(true, Ordering::SeqCst);
+            assert_eq!(
+                desktop.call(begin()).await.unwrap_err().code,
+                ErrorCode::Internal
+            );
+            let submitted = backend.lifecycle.lock().unwrap().calls[0].clone();
+            assert_eq!(backend.lifecycle.lock().unwrap().mutations, 1);
+            drop((desktop, bridge));
+            assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+            assert_eq!(owner.await.unwrap(), Ok(()));
+            backend
+                .lose_lifecycle_response
+                .store(false, Ordering::SeqCst);
+            let calls = backend.lifecycle.lock().unwrap().calls.len();
+            let daemon = Daemon::start(config()).await.unwrap();
+            let handle = daemon.handle();
+            let owner = tokio::spawn(daemon.run());
+            let mut desktop =
+                RawClient::connect_with_token(&joiner_runtime, ClientRole::Desktop, joiner_token)
+                    .await;
+            let LocalResult::AccountDeletionIntents { intents } = desktop
+                .call(LocalRequest::AccountDeletionIntents(
+                    context_relay_protocol::AccountDeletionIntentsParams { after: None },
+                ))
+                .await
+                .unwrap()
+            else {
+                panic!("expected intents")
+            };
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].operation_id, LIFECYCLE_BEGIN_ID.parse().unwrap());
+            assert_eq!(
+                intents[0].action,
+                context_relay_protocol::AccountLifecycleIntentAction::BeginDeletion
+            );
+            assert_eq!(backend.lifecycle.lock().unwrap().calls.len(), calls);
+            let pending = desktop
+                .call(LocalRequest::AccountDeletionStatus(EmptyParams {}))
+                .await
+                .unwrap();
+            assert!(matches!(
+                pending,
+                LocalResult::AccountDeletion {
+                    state: AccountDeletionState::PendingDelete,
+                    export_available: true,
+                    ..
+                }
+            ));
+            assert_eq!(desktop.call(begin()).await.unwrap(), pending);
+            assert_eq!(
+                backend.lifecycle.lock().unwrap().calls.last().unwrap(),
+                &submitted
+            );
+            assert_eq!(backend.lifecycle.lock().unwrap().mutations, 1);
+            let active = desktop
+                .call(LocalRequest::AccountDeletionCancel(
+                    context_relay_protocol::RetryParams {
+                        operation_id: LIFECYCLE_CANCEL_ID.parse().unwrap(),
+                    },
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                active,
+                LocalResult::AccountDeletion {
+                    state: AccountDeletionState::Active,
+                    purge_deadline: None,
+                    export_available: false
+                }
+            ));
+            // An old exact retry returns current state without restarting deletion.
+            assert_eq!(desktop.call(begin()).await.unwrap(), active);
+            assert_eq!(backend.lifecycle.lock().unwrap().mutations, 2);
+            fixture.owner.logout().unwrap().local.unwrap();
+            let calls = backend.lifecycle.lock().unwrap().calls.len();
+            assert_eq!(
+                desktop
+                    .call(LocalRequest::AccountDeletionStatus(EmptyParams {}))
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::ScopeDenied
+            );
+            assert_eq!(backend.lifecycle.lock().unwrap().calls.len(), calls);
+            drop(desktop);
+            assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+            assert_eq!(owner.await.unwrap(), Ok(()));
+        }
     }
 
     #[test]
@@ -4810,6 +6144,463 @@ mod tests {
         worker.shutdown_and_join();
     }
 
+    #[tokio::test]
+    async fn packaged_search_startup_keeps_keywords_when_resources_are_missing() {
+        use context_relay_protocol::SearchIndexPhase;
+        let path = unit_test_support::TempVault::new("missing-packaged-search");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut config = VaultConfig::new(path.path().to_owned(), "test-vault-key", keys);
+        config.search_resources = Some(path.path().with_file_name("absent-search-assets"));
+        config.startup_recovery = Some(Arc::new(|vault| {
+            let params = serde_json::from_value(serde_json::json!({
+                "operationId": "018f22e2-79b0-7cc8-98c4-dc0c0c073991",
+                "scope": {"scope": "global"}, "kind": "note", "title": "Vehicle",
+                "bodyMarkdown": "Keep the car engine serviced.", "tags": ["uniquephonemicidentifier"]
+            })).unwrap();
+            OfflineWorkspace::new(vault, stable_device_id(b"packaged-search-fixture"))
+                .create_memory(params)
+                .unwrap();
+            Ok(())
+        }));
+        let (mut workspace, _) =
+            open_workspace(&mut config).unwrap_or_else(|_| panic!("fixture workspace"));
+        assert_eq!(
+            workspace.search_index.status.phase,
+            SearchIndexPhase::Preparing
+        );
+        workspace.search_index.tick(&mut workspace.vault);
+        assert_eq!(
+            workspace.search_index.status.phase,
+            SearchIndexPhase::Failed
+        );
+        assert!(!workspace.search_index.pending());
+        let results = OfflineWorkspace::new(
+            &mut workspace.vault,
+            stable_device_id(b"packaged-search-fixture"),
+        )
+        .search_memories(context_relay_protocol::SearchParams {
+            query: "uniquephonemicidentifier".into(),
+            project_id: None,
+        })
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        workspace.search_index.retry();
+        assert!(workspace.search_index.pending());
+        workspace.search_index.tick(&mut workspace.vault);
+        assert_eq!(
+            workspace.search_index.status.phase,
+            SearchIndexPhase::Failed
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packaged_search_production_uses_resources_beside_the_executable() {
+        // Construct configuration only; do not start a normal daemon or open a vault.
+        let config = DaemonConfig::production().unwrap();
+        assert_eq!(
+            config.vault.search_resources,
+            Some(
+                std::env::current_exe()
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("search")
+            )
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires verified BGE assets and ONNX Runtime"]
+    async fn real_search_worker_prepares_semantic_results_in_the_background() {
+        let path = unit_test_support::TempVault::new("background-semantic-search");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let model_directory = PathBuf::from(
+            std::env::var_os("CONTEXT_RELAY_MODEL_DIR").expect("verified model directory"),
+        );
+        let mut config = VaultConfig::new(path.path().to_owned(), "test-vault-key", keys);
+        config.startup_recovery = Some(Arc::new(move |vault| {
+            let params = serde_json::from_value(serde_json::json!({
+                "operationId": "018f22e2-79b0-7cc8-98c4-dc0c0c073990",
+                "scope": {"scope": "global"}, "kind": "note", "title": "Vehicle",
+                "bodyMarkdown": "Keep the car engine serviced and replace its oil regularly.", "tags": []
+            })).unwrap();
+            OfflineWorkspace::new(vault, stable_device_id(b"search-worker-fixture"))
+                .create_memory(params)
+                .unwrap();
+            vault.enable_semantic_search(
+                context_relay_core::search::PinnedModelEmbedder::load(&model_directory).unwrap(),
+            );
+            Ok(())
+        }));
+        let mut worker = VaultWorker::spawn(config).await.unwrap();
+        let client = worker.client();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        while tokio::time::Instant::now() < deadline {
+            let response = client
+                .try_submit(
+                    VaultCommand::Workspace(LocalRequest::MemorySearch(
+                        context_relay_protocol::SearchParams {
+                            query: "automobile maintenance".into(),
+                            project_id: None,
+                        },
+                    )),
+                    TestAdmission(true),
+                )
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(response, LocalResult::Memories { memories } if !memories.is_empty()) {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        worker.shutdown_and_join_async().await;
+        assert!(
+            found,
+            "the worker never prepared the queued semantic record"
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "ignored qualification must compile for ordinary non-static test builds"
+    )]
+    #[ignore = "requires verified packaged assets and platform signing/static CRT; runs only a disposable daemon"]
+    async fn packaged_search_daemon_retries_missing_and_damaged_assets_over_private_ipc() {
+        use context_relay_protocol::SearchIndexPhase;
+        #[cfg(windows)]
+        use std::os::windows::process::CommandExt;
+        #[cfg(windows)]
+        assert!(cfg!(target_feature = "crt-static"));
+        let Some(root) = std::env::var_os("CONTEXT_RELAY_PACKAGED_DAEMON_CHILD") else {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--ignored", "--exact", "tests::packaged_search_daemon_retries_missing_and_damaged_assets_over_private_ipc", "--nocapture"])
+                .env("CONTEXT_RELAY_PACKAGED_DAEMON_CHILD", root.path())
+                .env("ORT_DYLIB_PATH", root.path().join("unrelated-runtime"));
+            #[cfg(windows)]
+            command.creation_flags(0x0800_0000);
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            root.close().unwrap();
+            return;
+        };
+        async fn wait_phase(client: &mut RawClient, expected: SearchIndexPhase) {
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    let response = client.call(LocalRequest::SearchIndexStatus(EmptyParams {})).await.unwrap();
+                    if matches!(response, LocalResult::SearchIndex { status } if status.phase == expected) { break; }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.expect("search phase deadline");
+        }
+        async fn search(client: &mut RawClient, query: &str) -> usize {
+            let response = client
+                .call(LocalRequest::MemorySearch(
+                    context_relay_protocol::SearchParams {
+                        query: query.into(),
+                        project_id: None,
+                    },
+                ))
+                .await
+                .unwrap();
+            let LocalResult::Memories { memories } = response else {
+                panic!("search result");
+            };
+            memories.len()
+        }
+        let root = PathBuf::from(root);
+        let assets = root.join("search");
+        let runtime = test_runtime("packaged-search-daemon");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut config = test_config(
+            runtime.clone(),
+            root.join("vault.db"),
+            keys.clone(),
+            Arc::new(FixedTokenProvider::default()),
+        );
+        config.vault.search_resources = Some(assets.clone());
+        config.vault.startup_recovery = Some(Arc::new(|vault| {
+            let params = serde_json::from_value(serde_json::json!({
+                "operationId": "018f22e2-79b0-7cc8-98c4-dc0c0c073992",
+                "scope": {"scope": "global"}, "kind": "note", "title": "Vehicle",
+                "bodyMarkdown": "Keep the car engine serviced and replace its oil regularly.", "tags": ["uniquephonemicidentifier"]
+            })).unwrap();
+            OfflineWorkspace::new(vault, stable_device_id(b"packaged-daemon-fixture"))
+                .create_memory(params)
+                .unwrap();
+            Ok(())
+        }));
+        let daemon = Daemon::start(config).await.unwrap();
+        let handle = daemon.handle();
+        let owner = tokio::spawn(daemon.run());
+        let mut desktop = RawClient::connect(&runtime, ClientRole::Desktop).await;
+        wait_phase(&mut desktop, SearchIndexPhase::Failed).await;
+        assert_eq!(search(&mut desktop, "uniquephonemicidentifier").await, 1);
+        assert_eq!(search(&mut desktop, "unseenword").await, 0);
+        #[cfg(windows)]
+        let runtime_manifest =
+            include_str!("../../core/models/onnxruntime-win-x64-1.24.2/manifest.json");
+        #[cfg(target_os = "macos")]
+        let runtime_manifest =
+            include_str!("../../core/models/onnxruntime-osx-arm64-1.24.2/manifest.json");
+        for (source_env, subdirectory, manifest) in [
+            (
+                "CONTEXT_RELAY_MODEL_DIR",
+                "model",
+                include_str!("../../core/models/bge-small-en-v1.5/manifest.json"),
+            ),
+            ("CONTEXT_RELAY_RUNTIME_DIR", "runtime", runtime_manifest),
+        ] {
+            let source = PathBuf::from(std::env::var_os(source_env).unwrap());
+            let destination = assets.join(subdirectory);
+            std::fs::create_dir_all(&destination).unwrap();
+            let manifest: serde_json::Value = serde_json::from_str(manifest).unwrap();
+            for artifact in manifest["artifacts"].as_array().unwrap() {
+                let file = artifact["file"].as_str().unwrap();
+                std::fs::copy(source.join(file), destination.join(file)).unwrap();
+            }
+        }
+        #[cfg(windows)]
+        let damaged = assets.join("runtime/msvcp140_1.dll");
+        #[cfg(target_os = "macos")]
+        let damaged = assets.join("runtime/libonnxruntime.1.24.2.dylib");
+        let good = std::fs::read(&damaged).unwrap();
+        let mut bad = good.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        std::fs::write(&damaged, bad).unwrap();
+        desktop
+            .call(LocalRequest::SearchIndexRetry(EmptyParams {}))
+            .await
+            .unwrap();
+        wait_phase(&mut desktop, SearchIndexPhase::Failed).await;
+        assert_eq!(search(&mut desktop, "uniquephonemicidentifier").await, 1);
+        std::fs::write(&damaged, good).unwrap();
+        desktop
+            .call(LocalRequest::SearchIndexRetry(EmptyParams {}))
+            .await
+            .unwrap();
+        wait_phase(&mut desktop, SearchIndexPhase::Ready).await;
+        assert_eq!(search(&mut desktop, "automobile maintenance").await, 1);
+        assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+        owner.await.unwrap().unwrap();
+        #[cfg(feature = "test-support")]
+        {
+            // Restart the same disposable vault with a fresh session that fails
+            // its next inference. Existing vectors require no passage inference,
+            // so the first interactive query exercises the worker failure path.
+            let mut config = test_config(
+                runtime.clone(),
+                root.join("vault.db"),
+                keys,
+                Arc::new(FixedTokenProvider::default()),
+            );
+            config.vault.search_resources = Some(assets.clone());
+            config.vault.startup_recovery = Some(Arc::new(move |vault| {
+                let mut model =
+                    context_relay_core::search::PinnedModelEmbedder::load_packaged(&assets)
+                        .unwrap();
+                model.fail_next_inference_for_test();
+                vault.enable_semantic_search(model);
+                Ok(())
+            }));
+            let daemon = Daemon::start(config).await.unwrap();
+            let handle = daemon.handle();
+            let owner = tokio::spawn(daemon.run());
+            let mut desktop = RawClient::connect(&runtime, ClientRole::Desktop).await;
+            wait_phase(&mut desktop, SearchIndexPhase::Ready).await;
+            assert_eq!(search(&mut desktop, "engine").await, 1);
+            wait_phase(&mut desktop, SearchIndexPhase::Failed).await;
+            assert_eq!(search(&mut desktop, "unseenword").await, 0);
+            desktop
+                .call(LocalRequest::SearchIndexRetry(EmptyParams {}))
+                .await
+                .unwrap();
+            wait_phase(&mut desktop, SearchIndexPhase::Ready).await;
+            assert_eq!(search(&mut desktop, "automobile maintenance").await, 1);
+            assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+            owner.await.unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn search_progress_and_retry_are_owner_only_even_when_routed_directly() {
+        for request in [
+            LocalRequest::SearchIndexStatus(EmptyParams {}),
+            LocalRequest::SearchIndexRetry(EmptyParams {}),
+        ] {
+            assert!(role_allows(ClientRole::Desktop, &request));
+            for role in [
+                ClientRole::McpBridge,
+                ClientRole::Installer,
+                ClientRole::DesktopRecoveryHost,
+            ] {
+                assert!(!role_allows(role, &request));
+                assert!(
+                    matches!(route_request(role, request.clone()), RoutedRequest::Immediate(Err(error)) if error == scope_denied_error())
+                );
+            }
+        }
+        assert!(matches!(
+            route_request(
+                ClientRole::Desktop,
+                LocalRequest::SearchIndexStatus(EmptyParams {})
+            ),
+            RoutedRequest::SearchIndexStatus
+        ));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    #[ignore = "requires verified BGE assets and ONNX Runtime"]
+    async fn real_search_progress_stays_responsive_and_indexing_yields_then_stops_on_shutdown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct IndexGate {
+            events: std::sync::mpsc::Sender<&'static str>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            batches: AtomicUsize,
+            admission_checks: AtomicUsize,
+        }
+        impl WorkerHook for IndexGate {
+            fn before_index_admission(&self) {
+                if self.admission_checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.events.send("admission").unwrap();
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(20))
+                        .unwrap();
+                }
+            }
+            fn before_execute(&self) {
+                self.events.send("request").unwrap();
+            }
+            fn before_index(&self) {
+                self.batches.fetch_add(1, Ordering::SeqCst);
+                self.events.send("index").unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(20))
+                    .unwrap();
+            }
+        }
+        let path = unit_test_support::TempVault::new("search-index-admission");
+        let runtime = test_runtime("search-index-admission");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut config = test_config(
+            runtime.clone(),
+            path.path().to_owned(),
+            keys.clone(),
+            Arc::new(FixedTokenProvider::default()),
+        );
+        let model_directory = PathBuf::from(
+            std::env::var_os("CONTEXT_RELAY_MODEL_DIR").expect("verified model directory"),
+        );
+        config.vault.startup_recovery = Some(Arc::new(move |vault| {
+            for index in 0..4 {
+                let params = serde_json::from_value(serde_json::json!({
+                    "operationId": format!("018f22e2-79b0-7cc8-98c4-dc0c0c07399{index}"),
+                    "scope": {"scope": "global"}, "kind": "note", "title": "Vehicle",
+                    "bodyMarkdown": "Keep the car engine serviced and replace its oil regularly.", "tags": []
+                })).unwrap();
+                OfflineWorkspace::new(vault, stable_device_id(b"search-admission-fixture"))
+                    .create_memory(params)
+                    .unwrap();
+            }
+            vault.enable_semantic_search(
+                context_relay_core::search::PinnedModelEmbedder::load(&model_directory).unwrap(),
+            );
+            Ok(())
+        }));
+        let (events, received) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let gate = Arc::new(IndexGate {
+            events,
+            release: Mutex::new(released),
+            batches: AtomicUsize::new(0),
+            admission_checks: AtomicUsize::new(0),
+        });
+        config.vault.worker_hook = Some(gate.clone());
+        let daemon = Daemon::start(config).await.unwrap();
+        let client = daemon.worker.client();
+        let handle = daemon.handle();
+        let owner = tokio::spawn(daemon.run());
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "admission"
+        );
+        let raced_request = client
+            .try_submit(
+                VaultCommand::Workspace(LocalRequest::ProjectsList(EmptyParams {})),
+                TestAdmission(true),
+            )
+            .unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "request",
+            "a request enqueued before indexing admission must win"
+        );
+        raced_request.await.unwrap().unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "index"
+        );
+        let mut desktop = RawClient::connect(&runtime, ClientRole::Desktop).await;
+        let progress = timeout(
+            Duration::from_secs(1),
+            desktop.call(LocalRequest::SearchIndexStatus(EmptyParams {})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(progress, LocalResult::SearchIndex { status } if status.phase == context_relay_protocol::SearchIndexPhase::Preparing)
+        );
+        let request = client
+            .try_submit(
+                VaultCommand::Workspace(LocalRequest::ProjectsList(EmptyParams {})),
+                TestAdmission(true),
+            )
+            .unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "request",
+            "queued work must precede a second inference"
+        );
+        assert!(matches!(
+            request.await.unwrap().unwrap(),
+            LocalResult::Projects { .. }
+        ));
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "index"
+        );
+        // The second slice is already admitted; shutdown may finish it, but must
+        // not admit either of the two remaining records.
+        *client.admission.lock().unwrap() = false;
+        release.send(()).unwrap();
+        assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+        owner.await.unwrap().unwrap();
+        assert_eq!(gate.batches.load(Ordering::SeqCst), 2);
+    }
+
     #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn unconfigured_account_lifecycle_never_simulates_remote_deletion() {
@@ -4821,10 +6612,13 @@ mod tests {
         let client = worker.client();
         let requests = [
             LocalRequest::AccountDeletionBegin(context_relay_protocol::AccountDeletionParams {
+                operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
                 confirmation: "delete".into(),
             }),
             LocalRequest::AccountDeletionStatus(EmptyParams {}),
-            LocalRequest::AccountDeletionCancel(EmptyParams {}),
+            LocalRequest::AccountDeletionCancel(context_relay_protocol::RetryParams {
+                operation_id: LIFECYCLE_CANCEL_ID.parse().unwrap(),
+            }),
         ];
 
         for request in requests {
@@ -4841,6 +6635,652 @@ mod tests {
                 "Account lifecycle needs the hosted workspace service and is not available in this build."
             );
         }
+        worker.shutdown_and_join();
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn connection_check_only_fresh_authenticated_bridge_note_read_verifies() {
+        let runtime = test_runtime("connection-check");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let path = unique_temp_path("connection-check").join("vault.db");
+        let root = canonical_test_directory("connection-check-project");
+        let project = seed_mcp_project(&path, keys.as_ref(), &root, HarnessAccessPolicy::Default);
+        let daemon = Daemon::start(test_config(
+            runtime.clone(),
+            path,
+            keys,
+            Arc::new(FixedTokenProvider::default()),
+        ))
+        .await
+        .unwrap();
+        let handle = daemon.handle();
+        let owner = tokio::spawn(daemon.run());
+        let mut desktop = RawClient::connect(&runtime, ClientRole::Desktop).await;
+        let mut bridge = RawClient::connect(&runtime, ClientRole::McpBridge).await;
+        let revision = uuid::Uuid::now_v7().to_string();
+        let note = desktop.call(request_fixture("memory_create", serde_json::json!({"operationId":revision,"scope":{"scope":"project","projectId":project},"kind":"note","title":"Connection check","bodyMarkdown":"Use clear language","tags":[]}))).await.unwrap();
+        let LocalResult::Memory { memory: Some(note) } = note else {
+            panic!("note")
+        };
+        let start = request_fixture(
+            "connection_check_start",
+            serde_json::json!({"selection":{"harness":"codex","projectId":project,"hermesProfile":null},"memoryId":note.id,"expectedRevision":note.revision}),
+        );
+        let read = mcp_request(
+            &root,
+            "context_relay_get",
+            serde_json::json!({"recordId":note.id}),
+        );
+        bridge.call(read.clone()).await.unwrap(); // An old read cannot be reused.
+        let started = desktop.call(start.clone()).await;
+        assert!(
+            started.is_ok(),
+            "saved-note connection check must start: {started:?}"
+        );
+        let LocalResult::ConnectionCheck { status } = started.unwrap() else {
+            panic!("check")
+        };
+        let status_request = request_fixture(
+            "connection_check_status",
+            serde_json::json!({"checkId":status.check_id}),
+        );
+        desktop.call(read.clone()).await.unwrap(); // Desktop MCP calls do not attest a harness.
+        desktop
+            .call(request_fixture(
+                "memory_get",
+                serde_json::json!({"memoryId":note.id}),
+            ))
+            .await
+            .unwrap();
+        bridge
+            .call(mcp_request(
+                &root,
+                "context_relay_status",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let LocalResult::ConnectionCheck { status } =
+            desktop.call(status_request.clone()).await.unwrap()
+        else {
+            panic!("check")
+        };
+        assert_eq!(
+            status.phase,
+            context_relay_protocol::ConnectionCheckPhase::Waiting
+        );
+        let outside = canonical_test_directory("connection-check-wrong-project");
+        assert!(
+            bridge
+                .call(mcp_request(
+                    &outside,
+                    "context_relay_get",
+                    serde_json::json!({"recordId":note.id})
+                ))
+                .await
+                .is_err()
+        );
+        let mut wrong_harness = read.clone();
+        if let LocalRequest::McpCall(params) = &mut wrong_harness {
+            params.binding.harness = HarnessId::ClaudeCode;
+        }
+        let _ = bridge.call(wrong_harness).await;
+        let LocalResult::ConnectionCheck { status } =
+            desktop.call(status_request.clone()).await.unwrap()
+        else {
+            panic!("check")
+        };
+        assert_eq!(
+            status.phase,
+            context_relay_protocol::ConnectionCheckPhase::Waiting
+        );
+        assert!(bridge.call(start.clone()).await.is_err());
+        bridge.call(read.clone()).await.unwrap();
+        let LocalResult::ConnectionCheck { status } =
+            desktop.call(status_request.clone()).await.unwrap()
+        else {
+            panic!("check")
+        };
+        assert_eq!(
+            status.phase,
+            context_relay_protocol::ConnectionCheckPhase::Verified
+        );
+        assert!(status.verified_at.is_some());
+        let LocalResult::ConnectionCheck { status: new } = desktop.call(start).await.unwrap()
+        else {
+            panic!("check")
+        };
+        assert_ne!(new.check_id, status.check_id);
+        assert_eq!(
+            new.phase,
+            context_relay_protocol::ConnectionCheckPhase::Waiting
+        );
+        assert!(desktop.call(status_request).await.is_err());
+        desktop
+            .call(request_fixture(
+                "connection_check_cancel",
+                serde_json::json!({"checkId":new.check_id}),
+            ))
+            .await
+            .unwrap();
+        bridge.call(read).await.unwrap();
+        let LocalResult::ConnectionCheck { status } = desktop
+            .call(request_fixture(
+                "connection_check_status",
+                serde_json::json!({"checkId":new.check_id}),
+            ))
+            .await
+            .unwrap()
+        else {
+            panic!("check")
+        };
+        assert_eq!(
+            status.phase,
+            context_relay_protocol::ConnectionCheckPhase::Canceled
+        );
+        assert_eq!(handle.shutdown().await, DaemonState::Stopped);
+        assert_eq!(owner.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_discovery_reads_original_actions_after_worker_restart() {
+        use context_relay_core::vault::{AccountLifecycleIntent, AccountLifecycleIntentAction};
+        let path = unit_test_support::TempVault::new("lifecycle-discovery-worker");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let intent = AccountLifecycleIntent {
+            operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
+            action: AccountLifecycleIntentAction::BeginDeletion,
+            project_url: "https://example.supabase.co/".into(),
+            user_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+            session_id: "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+            account_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074002".parse().unwrap(),
+            workspace_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074003".parse().unwrap(),
+        };
+        let mut vault = Vault::open(path.path(), "discovery-worker", keys.as_ref()).unwrap();
+        vault.store_account_lifecycle_intent(&intent).unwrap();
+        drop(vault);
+        for _ in 0..2 {
+            let mut worker = VaultWorker::spawn(VaultConfig::new(
+                path.path().into(),
+                "discovery-worker",
+                keys.clone(),
+            ))
+            .await
+            .unwrap();
+            for after in [None, Some(intent.operation_id)] {
+                let result = worker
+                    .client()
+                    .try_submit(
+                        VaultCommand::Workspace(request_fixture(
+                            "account_deletion_intents",
+                            serde_json::json!({"after":after}),
+                        )),
+                        TestAdmission(true),
+                    )
+                    .unwrap()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let expected = if after.is_none() {
+                    vec![
+                        serde_json::json!({"operationId":intent.operation_id,"action":"beginDeletion"}),
+                    ]
+                } else {
+                    vec![]
+                };
+                assert_eq!(
+                    serde_json::to_value(result).unwrap(),
+                    serde_json::json!({"kind":"account_deletion_intents","data":{"intents":expected}})
+                );
+            }
+            worker.shutdown_and_join();
+        }
+        let vault = Vault::open(path.path(), "discovery-worker", keys.as_ref()).unwrap();
+        assert_eq!(
+            vault.account_lifecycle_intent(intent.operation_id).unwrap(),
+            Some(intent)
+        );
+    }
+
+    #[test]
+    fn native_lifecycle_uses_verified_scope_and_rejects_replacement_login() {
+        use context_relay_core::sync::{
+            SupabaseHttpClient, SupabaseHttpError, SupabaseHttpRequest, SupabaseHttpResponse,
+        };
+        use std::sync::atomic::AtomicBool;
+        struct Http {
+            lost: AtomicBool,
+            requests: Mutex<Vec<Vec<u8>>>,
+        }
+        impl SupabaseHttpClient for Http {
+            fn execute(
+                &self,
+                request: SupabaseHttpRequest,
+            ) -> Result<SupabaseHttpResponse, SupabaseHttpError> {
+                assert!(request.url().ends_with("/functions/v1/account-lifecycle"));
+                let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+                assert_eq!(body["workspaceId"], "018f22e2-79b0-7cc8-98c4-dc0c0c074102");
+                self.requests.lock().unwrap().push(request.body().to_vec());
+                if self.lost.load(Ordering::SeqCst) {
+                    return Err(SupabaseHttpError::Transient);
+                }
+                Ok(SupabaseHttpResponse::new(
+                    200,
+                    br#"{"v":1,"state":"active","requestedAtMs":null,"purgeDeadlineMs":null}"#
+                        .to_vec(),
+                ))
+            }
+        }
+        let scope = SyncScope {
+            account_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074101".parse().unwrap(),
+            workspace_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074102".parse().unwrap(),
+        };
+        let identity = PairingIdentity {
+            device_id: stable_device_id(b"native-lifecycle"),
+            device_name: "Desktop".into(),
+            platform: NativePlatform::Windows,
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
+        };
+        let clock = PairingTestClock::default();
+        clock.set(900);
+        let backend = pairing_test_provider::Backend::new(
+            InMemoryPairingProvider::new().unwrap(),
+            Arc::new(clock.clone()),
+            scope,
+        );
+        let fixture = |session| {
+            pairing_test_provider::Fixture::new(backend.clone(), identity.clone(), session, true)
+        };
+        let original = fixture("550e8400-e29b-41d4-a716-446655440001");
+        let http = Arc::new(Http {
+            lost: AtomicBool::new(false),
+            requests: Mutex::new(Vec::new()),
+        });
+        let make = |owner, identity| {
+            let mut service = account_lifecycle::HostedAccountLifecycleService::new(
+                owner,
+                "https://example.supabase.co",
+                "public-test",
+                identity,
+            );
+            service.http = Some(http.clone());
+            service
+        };
+        let path = unit_test_support::TempVault::new("native-lifecycle");
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(path.path(), "lifecycle", &keys).unwrap();
+        let status = || LocalRequest::AccountDeletionStatus(EmptyParams {});
+        assert!(
+            make(original.owner.clone(), identity.clone())
+                .execute(&mut vault, status())
+                .is_err()
+        );
+        assert!(http.requests.lock().unwrap().is_empty());
+        let recovery = recovery_enrollment::CoordinatorRecoveryEnrollmentService::new(
+            RecoveryEnrollmentCoordinator::new(clock.clone(), RecoveryTestTransport::new(scope)),
+            identity.device_id,
+            &identity.device_name,
+            identity.platform,
+        );
+        let LocalResult::RecoveryEnrollmentPhrase { phrase } = recovery
+            .execute(
+                &mut vault,
+                &identity.keys,
+                LocalRequest::RecoveryEnrollmentBegin(EmptyParams {}),
+            )
+            .unwrap()
+        else {
+            panic!("expected phrase")
+        };
+        clock.set(950);
+        let confirmations = phrase
+            .confirmation_positions
+            .iter()
+            .map(
+                |position| context_relay_protocol::RecoveryWordConfirmation {
+                    position: *position,
+                    word: phrase.recovery_phrase_words.as_words()[usize::from(*position) - 1]
+                        .clone(),
+                },
+            )
+            .collect();
+        recovery
+            .execute(
+                &mut vault,
+                &identity.keys,
+                LocalRequest::RecoveryEnrollmentConfirm(
+                    context_relay_protocol::RecoveryEnrollmentConfirmParams {
+                        enrollment_id: phrase.enrollment_id,
+                        confirmations,
+                    },
+                ),
+            )
+            .unwrap();
+        let begin = || {
+            LocalRequest::AccountDeletionBegin(context_relay_protocol::AccountDeletionParams {
+                operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
+                confirmation: "delete".into(),
+            })
+        };
+        http.lost.store(true, Ordering::SeqCst);
+        assert_eq!(
+            make(original.owner.clone(), identity.clone())
+                .execute(&mut vault, begin())
+                .unwrap_err()
+                .code,
+            ErrorCode::Internal
+        );
+        let intent = vault
+            .account_lifecycle_intent(LIFECYCLE_BEGIN_ID.parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.account_id, scope.account_id);
+        assert_eq!(intent.workspace_id, scope.workspace_id);
+        let first = http.requests.lock().unwrap()[0].clone();
+        drop(vault);
+        let mut vault = Vault::open(path.path(), "lifecycle", &keys).unwrap();
+        http.lost.store(false, Ordering::SeqCst);
+        make(original.owner.clone(), identity.clone())
+            .execute(&mut vault, begin())
+            .unwrap();
+        assert!(
+            http.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|body| *body == first)
+        );
+        let before = http.requests.lock().unwrap().len();
+        let replacement = fixture("550e8400-e29b-41d4-a716-446655440002");
+        assert_eq!(
+            make(replacement.owner.clone(), identity.clone())
+                .execute(&mut vault, begin())
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            make(original.owner.clone(), identity.clone())
+                .execute(
+                    &mut vault,
+                    LocalRequest::AccountDeletionCancel(context_relay_protocol::RetryParams {
+                        operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
+                    })
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict,
+        );
+        let mut wrong_project = account_lifecycle::HostedAccountLifecycleService::new(
+            original.owner.clone(),
+            "https://other.supabase.co",
+            "public-test",
+            identity.clone(),
+        );
+        wrong_project.http = Some(http.clone());
+        assert!(wrong_project.execute(&mut vault, status()).is_err());
+        let mut wrong = identity.clone();
+        wrong.device_id = stable_device_id(b"other-device");
+        assert!(
+            make(original.owner.clone(), wrong)
+                .execute(&mut vault, status())
+                .is_err()
+        );
+        assert_eq!(http.requests.lock().unwrap().len(), before);
+        make(original.owner.clone(), identity.clone())
+            .execute(&mut vault, status())
+            .unwrap();
+        assert_eq!(http.requests.lock().unwrap().len(), before + 1);
+        original.owner.logout().unwrap();
+        assert!(
+            make(original.owner.clone(), identity.clone())
+                .execute(&mut vault, status())
+                .is_err()
+        );
+        assert_eq!(http.requests.lock().unwrap().len(), before + 1);
+        assert_eq!(
+            vault.account_lifecycle_intent(intent.operation_id).unwrap(),
+            Some(intent)
+        );
+    }
+
+    #[test]
+    fn hosted_lifecycle_intent_is_durable_before_dispatch_and_status_never_replays() {
+        use context_relay_core::vault::{AccountLifecycleIntent, AccountLifecycleIntentAction};
+        use context_relay_protocol::OperationId;
+        struct Transport {
+            intent: AccountLifecycleIntent,
+            path: std::path::PathBuf,
+            keys: Arc<MemoryKeyStore>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl AccountLifecycleTransport for Transport {
+            fn hosted_intent(
+                &self,
+                id: OperationId,
+                action: AccountLifecycleIntentAction,
+            ) -> Result<Option<AccountLifecycleIntent>, AccountLifecycleTransportError>
+            {
+                let mut intent = self.intent.clone();
+                intent.operation_id = id;
+                intent.action = action;
+                Ok(Some(intent))
+            }
+            fn deletion_status(
+                &self,
+            ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+                Ok(AccountDeletionProjection {
+                    state: AccountDeletionState::Active,
+                    requested_at_ms: None,
+                    purge_deadline_ms: None,
+                })
+            }
+            fn begin_deletion(
+                &self,
+                id: OperationId,
+            ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+                let vault = Vault::open(&self.path, "intent-dispatch", self.keys.as_ref()).unwrap();
+                assert_eq!(
+                    vault.account_lifecycle_intent(id).unwrap(),
+                    Some(self.intent.clone())
+                );
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(AccountLifecycleTransportError::Transient)
+            }
+            fn cancel_deletion(
+                &self,
+                _: OperationId,
+            ) -> Result<AccountDeletionProjection, AccountLifecycleTransportError> {
+                panic!("changed action must not reach provider")
+            }
+        }
+        let path = unit_test_support::TempVault::new("lifecycle-dispatch");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let intent = AccountLifecycleIntent {
+            operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
+            action: AccountLifecycleIntentAction::BeginDeletion,
+            project_url: "https://example.supabase.co/".into(),
+            user_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+            session_id: "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+            account_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074002".parse().unwrap(),
+            workspace_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074003".parse().unwrap(),
+        };
+        let service = |intent| {
+            TransportAccountLifecycleService::new(Transport {
+                intent,
+                path: path.path().into(),
+                keys: keys.clone(),
+                calls: calls.clone(),
+            })
+        };
+        let request = || {
+            LocalRequest::AccountDeletionBegin(context_relay_protocol::AccountDeletionParams {
+                operation_id: intent.operation_id,
+                confirmation: "delete".into(),
+            })
+        };
+        for _ in 0..2 {
+            let mut vault = Vault::open(path.path(), "intent-dispatch", keys.as_ref()).unwrap();
+            assert_eq!(
+                service(intent.clone())
+                    .execute(&mut vault, request())
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Internal
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let mut vault = Vault::open(path.path(), "intent-dispatch", keys.as_ref()).unwrap();
+        service(intent.clone())
+            .execute(
+                &mut vault,
+                LocalRequest::AccountDeletionStatus(EmptyParams {}),
+            )
+            .unwrap();
+        let mut changed = intent.clone();
+        changed.session_id = intent.user_id;
+        assert_eq!(
+            service(changed)
+                .execute(&mut vault, request())
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            service(intent.clone())
+                .execute(
+                    &mut vault,
+                    LocalRequest::AccountDeletionCancel(context_relay_protocol::RetryParams {
+                        operation_id: intent.operation_id
+                    })
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        let unbound = TestAccountLifecycleTransport::new();
+        assert_eq!(
+            TransportAccountLifecycleService::new(unbound.clone())
+                .execute(&mut vault, request())
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(unbound.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            vault.account_lifecycle_intent(intent.operation_id).unwrap(),
+            Some(intent)
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn configured_account_lifecycle_runs_only_through_the_ordered_vault_worker() {
+        let path = unique_temp_path("account-lifecycle-configured").join("vault.db");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let lifecycle = TestAccountLifecycleTransport::new();
+        let config = VaultConfig::new(path, "test-vault-key", keys).with_account_lifecycle_service(
+            Arc::new(TransportAccountLifecycleService::new(lifecycle.clone())),
+        );
+        let mut worker = VaultWorker::spawn(config).await.unwrap();
+        let client = worker.client();
+
+        let invalid = client
+            .try_submit(
+                VaultCommand::Workspace(LocalRequest::AccountDeletionBegin(
+                    context_relay_protocol::AccountDeletionParams {
+                        operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
+                        confirmation: "not-delete".into(),
+                    },
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(invalid.code, ErrorCode::InvalidRequest);
+        assert_eq!(lifecycle.calls.load(Ordering::SeqCst), 0);
+
+        let pending = client
+            .try_submit(
+                VaultCommand::Workspace(LocalRequest::AccountDeletionBegin(
+                    context_relay_protocol::AccountDeletionParams {
+                        operation_id: LIFECYCLE_BEGIN_ID.parse().unwrap(),
+                        confirmation: "delete".into(),
+                    },
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let LocalResult::AccountDeletion {
+            state,
+            purge_deadline,
+            export_available,
+        } = pending
+        else {
+            panic!("expected hosted account deletion projection")
+        };
+        assert_eq!(state, AccountDeletionState::PendingDelete);
+        assert_eq!(
+            purge_deadline,
+            Some(DecimalTimestamp(1_000 + ACCOUNT_DELETION_GRACE_MS))
+        );
+        assert!(export_available);
+
+        let status = client
+            .try_submit(
+                VaultCommand::Workspace(LocalRequest::AccountDeletionStatus(EmptyParams {})),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            status,
+            LocalResult::AccountDeletion {
+                state,
+                purge_deadline,
+                export_available,
+            }
+        );
+
+        let active = client
+            .try_submit(
+                VaultCommand::Workspace(LocalRequest::AccountDeletionCancel(
+                    context_relay_protocol::RetryParams {
+                        operation_id: LIFECYCLE_CANCEL_ID.parse().unwrap(),
+                    },
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            active,
+            LocalResult::AccountDeletion {
+                state: AccountDeletionState::Active,
+                purge_deadline: None,
+                export_available: false,
+            }
+        ));
+        assert_eq!(lifecycle.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            *lifecycle.operations.lock().unwrap(),
+            vec![
+                LIFECYCLE_BEGIN_ID.parse().unwrap(),
+                LIFECYCLE_CANCEL_ID.parse().unwrap(),
+            ]
+        );
         worker.shutdown_and_join();
     }
 
@@ -5170,6 +7610,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vault_worker_recovers_prepared_writes_after_restart_without_applying_them() {
+        let path = unique_temp_path("worker-desktop-recovery").join("vault.db");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let id = "018f22e2-79b0-7cc8-98c4-dc0c0c073981";
+        let write = serde_json::json!({"method":"memory_create","params":{
+            "operationId":id,"scope":{"scope":"global"},"kind":"note",
+            "title":"Retained decision","bodyMarkdown":"Original content","tags":[]
+        }});
+        let mut worker = VaultWorker::spawn(VaultConfig::new(
+            path.clone(),
+            "worker-desktop-recovery",
+            keys.clone(),
+        ))
+        .await
+        .unwrap();
+        let prepared = worker
+            .client()
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "desktop_write_prepare",
+                    serde_json::json!({"write":write}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared, LocalResult::Empty);
+        let exported = worker
+            .client()
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "export_records",
+                    serde_json::json!({"projectId":null,"includeArchived":true}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let LocalResult::Export { payload } = exported else {
+            panic!("expected full encrypted backup")
+        };
+        assert_eq!(payload.record_count, 0);
+        assert_eq!(payload.chunk_count, 1);
+        assert!(
+            !payload
+                .chunk
+                .as_slice()
+                .windows(b"Original content".len())
+                .any(|bytes| bytes == b"Original content")
+        );
+        let restored_path = path.parent().unwrap().join("restored-backup.db");
+        std::fs::write(&restored_path, payload.chunk.as_slice()).unwrap();
+        let restored_vault =
+            Vault::open(&restored_path, "worker-desktop-recovery", keys.as_ref()).unwrap();
+        assert!(restored_vault.memories(None, true).unwrap().is_empty());
+        let pending = restored_vault
+            .desktop_write(id.parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(pending).unwrap(), write);
+        drop(restored_vault);
+        worker.shutdown_and_join();
+        let mut worker = VaultWorker::spawn(VaultConfig::new(
+            path.clone(),
+            "worker-desktop-recovery",
+            keys.clone(),
+        ))
+        .await
+        .unwrap();
+        let client = worker.client();
+        let list = client
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "desktop_writes_list",
+                    serde_json::json!({"after":null}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let LocalResult::DesktopWrites { page } = list else {
+            panic!("expected pending writes")
+        };
+        assert_eq!(page.writes.len(), 1);
+        let restored = client
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "desktop_write_get",
+                    serde_json::json!({"operationId":id}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        let LocalResult::DesktopWrite {
+            write: Some(restored),
+        } = restored
+        else {
+            panic!("expected recovery copy")
+        };
+        assert_eq!(serde_json::to_value(&restored).unwrap(), write);
+        // Startup/list/get did not apply the prepared write.
+        let memories = client
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "memory_list",
+                    serde_json::json!({"projectId":null,"includeArchived":true}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(memories, LocalResult::Memories { memories } if memories.is_empty()));
+        let first = client
+            .try_submit(
+                VaultCommand::Workspace(restored.clone().into_request()),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        worker.shutdown_and_join();
+        let mut worker =
+            VaultWorker::spawn(VaultConfig::new(path, "worker-desktop-recovery", keys))
+                .await
+                .unwrap();
+        let client = worker.client();
+        let replay = client
+            .try_submit(
+                VaultCommand::Workspace(restored.into_request()),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, replay);
+        let forgotten = client
+            .try_submit(
+                VaultCommand::Workspace(request_fixture(
+                    "desktop_write_forget",
+                    serde_json::json!({"operationId":id}),
+                )),
+                TestAdmission(true),
+            )
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forgotten, LocalResult::Empty);
+        worker.shutdown_and_join();
+    }
+
+    #[tokio::test]
     async fn vault_worker_runs_the_offline_workspace_and_encrypted_export() {
         let path = unique_temp_path("worker-offline-workspace").join("vault.db");
         let keys = Arc::new(MemoryKeyStore::default());
@@ -5389,6 +7994,24 @@ mod tests {
                 vault_locked: true,
             }
         );
+        // A completed immediate request can be reused on another connection.
+        let mut other = RawClient::connect(&runtime, ClientRole::Desktop).await;
+        let health_id = next_record_id();
+        for _ in 0..32 {
+            for client in [&mut desktop, &mut other] {
+                assert_eq!(
+                    client
+                        .call_with_id(health_id, LocalRequest::Health(EmptyParams {}))
+                        .await
+                        .unwrap(),
+                    LocalResult::Health {
+                        protocol: PROTOCOL_VERSION,
+                        vault_locked: true
+                    },
+                );
+            }
+        }
+        drop(other);
         let locked = mcp
             .call(mcp_request(
                 &root,
@@ -5871,6 +8494,67 @@ mod tests {
         RecordId::new(uuid::Uuid::now_v7()).unwrap()
     }
 
+    #[test]
+    fn worker_releases_admission_before_publishing_response() {
+        struct ObservedAdmission {
+            accepted: bool,
+            received: Mutex<oneshot::Receiver<Result<LocalResult, ClientError>>>,
+            released_before_response: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl WorkAdmission for ObservedAdmission {
+            fn begin(&self) -> bool {
+                self.accepted
+            }
+        }
+        impl Drop for ObservedAdmission {
+            fn drop(&mut self) {
+                self.released_before_response.store(
+                    matches!(
+                        self.received.get_mut().unwrap().try_recv(),
+                        Err(oneshot::error::TryRecvError::Empty)
+                    ),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+        }
+        for accepted in [true, false] {
+            let path = tempfile::tempdir().unwrap();
+            let config = VaultConfig::new(
+                path.path().join("unused.db"),
+                "test-vault-key",
+                Arc::new(MemoryKeyStore::default()),
+            );
+            let (sender, mut receiver) = mpsc::channel(1);
+            let (response, received) = oneshot::channel();
+            let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            sender
+                .try_send(WorkItem {
+                    command: VaultCommand::MemoryGet(MemoryParams {
+                        memory_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074208".parse().unwrap(),
+                    }),
+                    admission: Box::new(ObservedAdmission {
+                        accepted,
+                        received: Mutex::new(received),
+                        released_before_response: released.clone(),
+                    }),
+                    response,
+                })
+                .unwrap();
+            drop(sender);
+            run_vault_worker(
+                VaultWorkerState::Locked(config),
+                &mut receiver,
+                None,
+                &ServiceStatus::new(),
+                &Mutex::new(true),
+            );
+            assert!(
+                released.load(std::sync::atomic::Ordering::SeqCst),
+                "response became visible before admission was released (accepted={accepted})"
+            );
+        }
+    }
+
     struct TestAdmission(bool);
 
     impl WorkAdmission for TestAdmission {
@@ -5993,6 +8677,47 @@ mod tests {
 
         vec![
             (
+                "HostedAuthStatus",
+                request_fixture("hosted_auth_status", empty()),
+            ),
+            (
+                "HostedAuthStart",
+                request_fixture(
+                    "hosted_auth_start",
+                    serde_json::json!({"operationId": ID, "expectedGeneration": ID}),
+                ),
+            ),
+            (
+                "HostedAuthCancel",
+                request_fixture("hosted_auth_cancel", serde_json::json!({"generation": ID})),
+            ),
+            (
+                "HostedAuthLogout",
+                request_fixture("hosted_auth_logout", serde_json::json!({"generation": ID})),
+            ),
+            (
+                "DesktopWritesList",
+                request_fixture("desktop_writes_list", serde_json::json!({"after": null})),
+            ),
+            (
+                "DesktopWriteGet",
+                request_fixture("desktop_write_get", serde_json::json!({"operationId": ID})),
+            ),
+            (
+                "DesktopWriteForget",
+                request_fixture(
+                    "desktop_write_forget",
+                    serde_json::json!({"operationId": ID}),
+                ),
+            ),
+            (
+                "DesktopWritePrepare",
+                request_fixture(
+                    "desktop_write_prepare",
+                    serde_json::json!({"write": {"method":"memory_archive","params":{"operationId": ID,"memoryId": ID,"expectedRevision": ID}}}),
+                ),
+            ),
+            (
                 "Hello",
                 request_fixture(
                     "hello",
@@ -6048,6 +8773,13 @@ mod tests {
                 request_fixture(
                     "project_upsert",
                     serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}}),
+                ),
+            ),
+            (
+                "ProjectRegister",
+                request_fixture(
+                    "project_register",
+                    serde_json::json!({"project": {"projectId": ID, "githubRepositoryId": null, "gitRemoteFingerprint": null, "monorepoSubdirectory": null, "name": "Context Relay"}, "path": {"platform": "windows", "bytes": "", "display": null}}),
                 ),
             ),
             (
@@ -6149,6 +8881,16 @@ mod tests {
             ),
             ("HarnessProbe", request_fixture("harness_probe", harness())),
             (
+                "HarnessPreparedPreview",
+                request_fixture(
+                    "harness_prepared_preview",
+                    serde_json::json!({
+                        "operationId": ID,
+                        "selection": {"harness": "hermes", "projectId": null, "hermesProfile": "default"}
+                    }),
+                ),
+            ),
+            (
                 "HarnessPreview",
                 request_fixture("harness_preview", harness()),
             ),
@@ -6229,6 +8971,25 @@ mod tests {
                 request_fixture("pairing_cancel", serde_json::json!({"pairingId": ID})),
             ),
             (
+                "RecoveryRestoreBegin",
+                request_fixture(
+                    "recovery_restore_begin",
+                    serde_json::json!({"recoveryPhraseWords":vec!["abandon";24]}),
+                ),
+            ),
+            (
+                "RecoveryRestoreOverview",
+                request_fixture("recovery_restore_overview", empty()),
+            ),
+            (
+                "RecoveryRestoreCancel",
+                request_fixture("recovery_restore_cancel", empty()),
+            ),
+            (
+                "RecoveryRestoreResume",
+                request_fixture("recovery_restore_resume", empty()),
+            ),
+            (
                 "RecoveryEnrollmentBegin",
                 request_fixture("recovery_enrollment_begin", empty()),
             ),
@@ -6283,7 +9044,14 @@ mod tests {
                 "AccountDeletionBegin",
                 request_fixture(
                     "account_deletion_begin",
-                    serde_json::json!({"confirmation": "delete"}),
+                    serde_json::json!({"operationId": ID, "confirmation": "delete"}),
+                ),
+            ),
+            (
+                "AccountDeletionIntents",
+                request_fixture(
+                    "account_deletion_intents",
+                    serde_json::json!({"after":null}),
                 ),
             ),
             (
@@ -6292,7 +9060,10 @@ mod tests {
             ),
             (
                 "AccountDeletionCancel",
-                request_fixture("account_deletion_cancel", empty()),
+                request_fixture(
+                    "account_deletion_cancel",
+                    serde_json::json!({"operationId": ID}),
+                ),
             ),
         ]
     }
@@ -6323,6 +9094,496 @@ mod tests {
             "context-relay-contextd-{label}-{}",
             uuid::Uuid::now_v7()
         ))
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn enroll_sync_test_workspace(state: &mut WorkspaceState) -> (PairingIdentity, SyncScope) {
+        let identity = PairingIdentity {
+            device_id: state.device_id,
+            device_name: "Local signing".into(),
+            platform: NativePlatform::Windows,
+            keys: Arc::new(DeviceKeys::generate().unwrap()),
+        };
+        let scope = SyncScope {
+            account_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074201".parse().unwrap(),
+            workspace_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074202".parse().unwrap(),
+        };
+        let clock = PairingTestClock(Arc::new(AtomicU64::new(900)));
+        let recovery = recovery_enrollment::CoordinatorRecoveryEnrollmentService::new(
+            RecoveryEnrollmentCoordinator::new(clock.clone(), RecoveryTestTransport::new(scope)),
+            identity.device_id,
+            &identity.device_name,
+            identity.platform,
+        );
+        let LocalResult::RecoveryEnrollmentPhrase { phrase } = recovery
+            .execute(
+                &mut state.vault,
+                &identity.keys,
+                LocalRequest::RecoveryEnrollmentBegin(EmptyParams {}),
+            )
+            .unwrap()
+        else {
+            panic!("phrase")
+        };
+        state.pairing_identity = Some(identity.clone());
+        assert!(local_sync_material(state).unwrap().is_none());
+        clock.set(950);
+        let confirmations = phrase
+            .confirmation_positions
+            .iter()
+            .map(
+                |position| context_relay_protocol::RecoveryWordConfirmation {
+                    position: *position,
+                    word: phrase.recovery_phrase_words.as_words()[usize::from(*position) - 1]
+                        .clone(),
+                },
+            )
+            .collect();
+        recovery
+            .execute(
+                &mut state.vault,
+                &identity.keys,
+                LocalRequest::RecoveryEnrollmentConfirm(
+                    context_relay_protocol::RecoveryEnrollmentConfirmParams {
+                        enrollment_id: phrase.enrollment_id,
+                        confirmations,
+                    },
+                ),
+            )
+            .unwrap();
+        (identity, scope)
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "macos"))]
+    fn enrolled_daemon_signs_desktop_and_mcp_writes_without_network_auth() {
+        let path = unit_test_support::TempVault::new("daemon-local-signing");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut config = VaultConfig::new(path.path().to_owned(), "test-vault-key", keys);
+        let (mut state, _) =
+            open_workspace(&mut config).unwrap_or_else(|_| panic!("open workspace"));
+        let status = ServiceStatus::new();
+        assert!(local_sync_material(&state).unwrap().is_none());
+        state.tick_sync_backfill(&status);
+        assert_eq!(state.sync_backfill, SyncBackfill::Idle);
+        assert_eq!(status.snapshot().sync, SyncState::Offline);
+        let untouched = OfflineWorkspace::new(&mut state.vault, state.device_id)
+            .create_memory(context_relay_protocol::MemoryCreateParams {
+                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074207".parse().unwrap(),
+                scope: ScopeRef::Global,
+                kind: context_relay_protocol::MemoryKind::Fact,
+                title: "Untouched offline note".into(),
+                body_markdown: "Preserve on enrollment".into(),
+                tags: vec![],
+            })
+            .unwrap();
+        execute_workspace_request(
+            &mut state,
+            LocalRequest::MemoryCreate(context_relay_protocol::MemoryCreateParams {
+                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074205".parse().unwrap(),
+                scope: ScopeRef::Global,
+                kind: context_relay_protocol::MemoryKind::Fact,
+                title: "Before enrollment".into(),
+                body_markdown: "Offline record".into(),
+                tags: vec![],
+            }),
+            &status,
+        )
+        .unwrap();
+        assert!(state.vault.due_outbox(u64::MAX, 10).unwrap().is_empty());
+        let (identity, _) = enroll_sync_test_workspace(&mut state);
+        execute_workspace_request(
+            &mut state,
+            LocalRequest::MemoryUpdate(context_relay_protocol::MemoryUpdateParams {
+                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074206".parse().unwrap(),
+                memory_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074205".parse().unwrap(),
+                expected_revision: "018f22e2-79b0-7cc8-98c4-dc0c0c074205".parse().unwrap(),
+                title: Some("After enrollment".into()),
+                body_markdown: None,
+                tags: None,
+            }),
+            &status,
+        )
+        .unwrap();
+        let create = LocalRequest::MemoryCreate(context_relay_protocol::MemoryCreateParams {
+            operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074203".parse().unwrap(),
+            scope: ScopeRef::Global,
+            kind: context_relay_protocol::MemoryKind::Fact,
+            title: "Desktop".into(),
+            body_markdown: "Signed local write".into(),
+            tags: vec![],
+        });
+        let output = execute_workspace_request(&mut state, create.clone(), &status).unwrap();
+        let mcp = mcp_request(
+            path.path().parent().unwrap(),
+            "context_relay_remember",
+            serde_json::json!({
+                "operationId":"018f22e2-79b0-7cc8-98c4-dc0c0c074204", "kind":"fact", "title":"MCP", "markdown":"Signed MCP write", "tags":[], "scope":{"scope":"global"}
+            }),
+        );
+        execute_workspace_request(&mut state, mcp, &status).unwrap();
+        state.wake_sync_backfill();
+        state.tick_sync_backfill(&status);
+        assert_eq!(state.sync_backfill, SyncBackfill::Pending);
+        assert_eq!(state.vault.memory(&untouched.id).unwrap(), Some(untouched));
+        state.tick_sync_backfill(&status);
+        assert_eq!(state.sync_backfill, SyncBackfill::Idle);
+        assert_eq!(status.snapshot().sync, SyncState::Offline);
+        let before = state.vault.due_outbox(u64::MAX, 10).unwrap();
+        assert_eq!(before.len(), 4);
+        assert_eq!(
+            execute_workspace_request(&mut state, create.clone(), &status).unwrap(),
+            output
+        );
+        assert_eq!(
+            state.vault.due_outbox(u64::MAX, 10).unwrap()[0].canonical_bytes,
+            before[0].canonical_bytes
+        );
+        state.pairing_identity.as_mut().unwrap().keys = Arc::new(DeviceKeys::generate().unwrap());
+        state.wake_sync_backfill();
+        state.tick_sync_backfill(&status);
+        assert_eq!(state.sync_backfill, SyncBackfill::Failed);
+        assert_eq!(status.snapshot().sync, SyncState::Error);
+        state.wake_sync_backfill();
+        assert_eq!(state.sync_backfill, SyncBackfill::Failed);
+        assert!(execute_workspace_request(&mut state, create, &status).is_err());
+        execute_workspace_request(
+            &mut state,
+            LocalRequest::MemoryList(context_relay_protocol::MemoryListParams {
+                project_id: None,
+                include_archived: false,
+            }),
+            &status,
+        )
+        .unwrap();
+        state.pairing_identity = None;
+        assert!(local_sync_material(&state).is_err());
+
+        // Exercise the real worker admission loop with a request racing background work.
+        state.pairing_identity = Some(identity);
+        state.sync_backfill = SyncBackfill::Pending;
+        let pending = OfflineWorkspace::new(&mut state.vault, state.device_id)
+            .create_memory(context_relay_protocol::MemoryCreateParams {
+                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074208".parse().unwrap(),
+                scope: ScopeRef::Global,
+                kind: context_relay_protocol::MemoryKind::Fact,
+                title: "Worker backfill".into(),
+                body_markdown: "Preserve queued read".into(),
+                tags: vec![],
+            })
+            .unwrap();
+        struct BackfillGate {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl WorkerHook for BackfillGate {
+            fn before_execute(&self) {}
+
+            fn before_index_admission(&self) {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(20))
+                    .unwrap();
+            }
+        }
+        let (entered, entries) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let gate = BackfillGate {
+            entered,
+            release: Mutex::new(released),
+        };
+        let (sender, mut receiver) = mpsc::channel(2);
+        let admission = Arc::new(Mutex::new(true));
+        let worker_admission = admission.clone();
+        let worker = std::thread::spawn(move || {
+            run_vault_worker(
+                VaultWorkerState::Open(state),
+                &mut receiver,
+                Some(&gate),
+                &ServiceStatus::new(),
+                &worker_admission,
+            );
+        });
+        entries.recv_timeout(Duration::from_secs(20)).unwrap();
+        let (response, received) = oneshot::channel();
+        sender
+            .try_send(WorkItem {
+                command: VaultCommand::MemoryGet(MemoryParams {
+                    memory_id: pending.id,
+                }),
+                admission: Box::new(TestAdmission(true)),
+                response,
+            })
+            .unwrap();
+        release.send(()).unwrap();
+        assert!(
+            matches!(received.blocking_recv().unwrap().unwrap(), LocalResult::Memory { memory: Some(memory) } if memory == pending)
+        );
+        entries.recv_timeout(Duration::from_secs(20)).unwrap();
+        release.send(()).unwrap();
+        entries.recv_timeout(Duration::from_secs(20)).unwrap();
+        *admission.lock().unwrap() = false;
+        drop(sender);
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        let vault = Vault::open(path.path(), "test-vault-key", config.key_store.as_ref()).unwrap();
+        assert_eq!(vault.due_outbox(u64::MAX, 10).unwrap().len(), 5);
+        assert_eq!(vault.memory(&pending.id).unwrap(), Some(pending));
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "macos"))]
+    fn hosted_sync_keeps_reads_and_shutdown_responsive_during_http() {
+        let path = unit_test_support::TempVault::new("sync-supervisor");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut config = VaultConfig::new(path.path().to_owned(), "test-vault-key", keys);
+        let (mut state, _) = open_workspace(&mut config).unwrap_or_else(|_| panic!("open"));
+        let (identity, scope) = enroll_sync_test_workspace(&mut state);
+        let status = ServiceStatus::new();
+        execute_workspace_request(
+            &mut state,
+            LocalRequest::MemoryCreate(context_relay_protocol::MemoryCreateParams {
+                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074301".parse().unwrap(),
+                scope: ScopeRef::Global,
+                kind: context_relay_protocol::MemoryKind::Fact,
+                title: "Sync worker".into(),
+                body_markdown: "Readable while HTTP stalls".into(),
+                tags: vec![],
+            }),
+            &status,
+        )
+        .unwrap();
+        let before = state.vault.due_outbox(u64::MAX, 10).unwrap();
+        let backend = pairing_test_provider::Backend::new(
+            InMemoryPairingProvider::new().unwrap(),
+            Arc::new(PairingTestClock(Arc::new(AtomicU64::new(1000)))),
+            scope,
+        );
+        let fixture = pairing_test_provider::Fixture::new(
+            backend,
+            identity.clone(),
+            "550e8400-e29b-41d4-a716-446655440001",
+            true,
+        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(hosted_sync::verify_stalled_worker(
+                state,
+                fixture.owner.clone(),
+                hosted_sync::StallAt::Push,
+            ));
+        let vault = Vault::open(path.path(), "test-vault-key", config.key_store.as_ref()).unwrap();
+        let after = vault.due_outbox(u64::MAX, 10).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before[0].canonical_bytes, after[0].canonical_bytes);
+        assert_eq!(before[0].attempt_count, after[0].attempt_count);
+        drop(vault);
+        fixture.login();
+        let (mut state, _) = open_workspace(&mut config).unwrap_or_else(|_| panic!("reopen"));
+        state.pairing_identity = Some(identity.clone());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(hosted_sync::verify_stalled_worker(
+                state,
+                fixture.owner.clone(),
+                hosted_sync::StallAt::Pull,
+            ));
+        let vault = Vault::open(path.path(), "test-vault-key", config.key_store.as_ref()).unwrap();
+        assert!(vault.due_outbox(u64::MAX, 10).unwrap().is_empty());
+        drop(vault);
+        fixture.login();
+        let (mut state, _) = open_workspace(&mut config).unwrap_or_else(|_| panic!("reopen"));
+        state.pairing_identity = Some(identity);
+        state.vault.request_sync_checkpoint(scope).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(hosted_sync::verify_stalled_worker(
+                state,
+                fixture.owner,
+                hosted_sync::StallAt::Checkpoint,
+            ));
+        let vault = Vault::open(path.path(), "test-vault-key", config.key_store.as_ref()).unwrap();
+        assert!(vault.sync_checkpoint_pin(scope).unwrap().is_none());
+        assert!(vault.sync_checkpoint_schedule(scope).unwrap().requested);
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "macos"))]
+    fn hosted_sync_receives_searchable_remote_memory_and_recovers_checkpoint_after_restart() {
+        let path = unit_test_support::TempVault::new("sync-checkpoint-completion");
+        let keys = Arc::new(MemoryKeyStore::default());
+        let mut config = VaultConfig::new(path.path().to_owned(), "test-vault-key", keys);
+        let (mut state, _) = open_workspace(&mut config).unwrap_or_else(|_| panic!("open"));
+        let (identity, scope) = enroll_sync_test_workspace(&mut state);
+        execute_workspace_request(
+            &mut state,
+            LocalRequest::MemoryCreate(context_relay_protocol::MemoryCreateParams {
+                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074302".parse().unwrap(),
+                scope: ScopeRef::Global,
+                kind: context_relay_protocol::MemoryKind::Fact,
+                title: "Checkpoint receipt".into(),
+                body_markdown: "Retained after a complete sync and restart".into(),
+                tags: vec![],
+            }),
+            &ServiceStatus::new(),
+        )
+        .unwrap();
+        state.vault.request_sync_checkpoint(scope).unwrap();
+        let (incoming, remote_memory) = {
+            use context_relay_core::{
+                crypto::{CertificateFieldsV1, DeviceCertificateV1},
+                sync::{CanonicalOperation, SyncIdentity},
+            };
+            let (local_keys, material) = local_sync_material(&state).unwrap().unwrap();
+            let local = material
+                .local_identity(state.device_id, &local_keys)
+                .unwrap();
+            let remote_device = "018f22e2-79b0-7cc8-98c4-dc0c0c074303".parse().unwrap();
+            let remote_keys = DeviceKeys::generate().unwrap();
+            let certificate = DeviceCertificateV1::issue_by_device(
+                CertificateFieldsV1 {
+                    account_id: scope.account_id,
+                    workspace_id: scope.workspace_id,
+                    control_epoch: local.control_epoch,
+                    request_nonce: context_relay_protocol::PairingRequestNonce([0x84; 32]),
+                    device_id: remote_device,
+                    signing_public_key: remote_keys.signing_public_key(),
+                    wrapping_public_key: remote_keys.wrapping_public_key(),
+                },
+                state.device_id,
+                &local_keys,
+            )
+            .unwrap();
+            let source_path = unit_test_support::TempVault::new("sync-remote-source");
+            let source_keys = MemoryKeyStore::default();
+            let mut source = Vault::open(source_path.path(), "source-key", &source_keys).unwrap();
+            let memory = OfflineWorkspace::new(&mut source, remote_device)
+                .with_sync_identity(SyncIdentity {
+                    device_id: remote_device,
+                    device_keys: &remote_keys,
+                    ..local
+                })
+                .unwrap()
+                .create_memory(context_relay_protocol::MemoryCreateParams {
+                    operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074305".parse().unwrap(),
+                    scope: ScopeRef::Global,
+                    kind: context_relay_protocol::MemoryKind::Fact,
+                    title: "Remote hummingbird".into(),
+                    body_markdown:
+                        "remotehummingbird received from a newly certified second device".into(),
+                    tags: vec![],
+                })
+                .unwrap();
+            let queued = source.due_outbox(u64::MAX, 1).unwrap().remove(0);
+            let decoded =
+                context_relay_protocol::decode_sync_operation_v1(&queued.canonical_bytes).unwrap();
+            (
+                hosted_sync::IncomingOperation {
+                    certificate_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074304".parse().unwrap(),
+                    certificate,
+                    operation: CanonicalOperation {
+                        operation_id: decoded.operation_id,
+                        device_id: decoded.device_id,
+                        device_sequence: decoded.device_sequence,
+                        bytes: queued.canonical_bytes,
+                    },
+                },
+                memory,
+            )
+        };
+        let backend = pairing_test_provider::Backend::new(
+            InMemoryPairingProvider::new().unwrap(),
+            Arc::new(PairingTestClock(Arc::new(AtomicU64::new(1000)))),
+            scope,
+        );
+        let fixture = pairing_test_provider::Fixture::new(
+            backend,
+            identity.clone(),
+            "550e8400-e29b-41d4-a716-446655440001",
+            true,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let checkpoint = runtime.block_on(hosted_sync::verify_checkpoint_worker(
+            state,
+            fixture.owner.clone(),
+            None,
+            &incoming,
+        ));
+        assert_eq!(checkpoint.checkpoint.causal_frontier.len(), 2);
+        assert!(
+            checkpoint
+                .checkpoint
+                .causal_frontier
+                .iter()
+                .any(|entry| entry.device_id == incoming.operation.device_id)
+        );
+        let (mut state, _) = open_workspace(&mut config).unwrap_or_else(|_| panic!("reopen"));
+        state.pairing_identity = Some(identity);
+        assert_eq!(
+            state.vault.memory(&remote_memory.id).unwrap(),
+            Some(remote_memory.clone())
+        );
+        let LocalResult::Memories { memories } = execute_workspace_request(
+            &mut state,
+            LocalRequest::MemorySearch(context_relay_protocol::SearchParams {
+                query: "remotehummingbird".into(),
+                project_id: None,
+            }),
+            &ServiceStatus::new(),
+        )
+        .unwrap() else {
+            panic!("memory search result");
+        };
+        assert!(memories.iter().any(|memory| memory.id == remote_memory.id));
+        let pin = state.vault.sync_checkpoint_pin(scope).unwrap().unwrap();
+        assert_eq!(pin.canonical_bytes, checkpoint.bytes);
+        assert!(
+            !state
+                .vault
+                .sync_checkpoint_schedule(scope)
+                .unwrap()
+                .requested
+        );
+        assert!(state.vault.due_outbox(u64::MAX, 10).unwrap().is_empty());
+        let repeated = runtime.block_on(hosted_sync::verify_checkpoint_worker(
+            state,
+            fixture.owner,
+            Some(checkpoint.clone()),
+            &incoming,
+        ));
+        assert_eq!(repeated, checkpoint);
+        let vault = Vault::open(path.path(), "test-vault-key", config.key_store.as_ref()).unwrap();
+        assert_eq!(
+            vault
+                .sync_checkpoint_pin(scope)
+                .unwrap()
+                .unwrap()
+                .canonical_bytes,
+            checkpoint.bytes
+        );
+        assert!(!vault.sync_checkpoint_schedule(scope).unwrap().requested);
+        assert_eq!(
+            vault.memory(&remote_memory.id).unwrap(),
+            Some(remote_memory)
+        );
+        assert!(
+            vault
+                .all_devices()
+                .unwrap()
+                .iter()
+                .all(|row| row.certificate.device_id != incoming.operation.device_id)
+        );
     }
 
     fn test_config(
@@ -6410,6 +9671,7 @@ mod tests {
         keys: &dyn DatabaseKeyStore,
         executable: &Path,
         bridge_executable: &Path,
+        execution_context: context_relay_core::native_transaction::CliExecutionContext,
         committed: bool,
     ) -> (PlanId, String) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -6418,6 +9680,7 @@ mod tests {
             &mut vault,
             executable,
             bridge_executable,
+            execution_context,
         );
         let plan_id = plan.setup.plan_id;
         vault

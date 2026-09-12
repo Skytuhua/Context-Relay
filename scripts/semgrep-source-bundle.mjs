@@ -16,6 +16,7 @@ import {
 import { dirname, basename, join, posix, resolve } from 'node:path';
 import { isIP } from 'node:net';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
 import { verifyResolvedSourceInventory } from './semgrep-source-inventory.mjs';
@@ -47,6 +48,7 @@ const DEFAULT_SUPPORT_PATHS = [
   'third_party/sidecars/semgrep/builder-evidence.windows-x86_64.v1.schema.json',
   'third_party/sidecars/semgrep/build-public-source-macos.sh',
   'third_party/sidecars/semgrep/build-public-source-windows.ps1',
+  'third_party/sidecars/semgrep/windows-offline-firewall.ps1',
   'third_party/sidecars/semgrep/patches.v1.json',
   'third_party/sidecars/semgrep/patches.windows.v1.json',
 ];
@@ -702,11 +704,22 @@ async function fetchWithRedirects(start, sha256, fetchImpl, requestTimeoutMs) {
   let current = safeFetchUrl(start, sha256);
   const signal = AbortSignal.timeout(requestTimeoutMs);
   for (let redirects = 0; redirects <= 5; redirects += 1) {
-    const response = await fetchImpl(current, {
-      headers: { 'accept-encoding': 'identity', 'user-agent': 'Context-Relay-Semgrep-Source/1' },
-      redirect: 'manual',
-      signal,
-    });
+    let response;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      response = await fetchImpl(current, {
+        headers: { 'accept-encoding': 'identity', 'user-agent': 'Context-Relay-Semgrep-Source/1' },
+        redirect: 'manual',
+        signal,
+      });
+      if (response.status !== 200) {
+        // Release both native Node and fetch response streams before retry/redirect.
+        response.body?.destroy?.();
+        await response.body?.cancel?.();
+      }
+      if (![408, 429, 500, 502, 503, 504].includes(response.status) || attempt === 2) break;
+      // All retries and redirects share the original request deadline.
+      await delay(250 * (attempt + 1), undefined, { signal });
+    }
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get('location');
       if (location === null || redirects === 5) fail('archive redirect chain is invalid or too long');
@@ -1042,7 +1055,7 @@ export async function buildSemgrepSourceBundle({
   pinRoot,
   semgrepRoot,
   sourceLockPath,
-  supportPaths = [],
+  supportPaths = DEFAULT_SUPPORT_PATHS,
   supportRoot = process.cwd(),
 }) {
   if (![archiveCacheRoot, opamRoot, outputPath, pinRoot, semgrepRoot, sourceLockPath, supportRoot]

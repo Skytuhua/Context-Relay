@@ -65,17 +65,23 @@ fn version_negotiation_uses_greatest_shared_minor() {
 }
 
 #[test]
-fn exact_local_wire_versions_do_not_negotiate_across_the_hermes_profile_break() {
+fn exact_local_wire_versions_do_not_negotiate_across_saved_hook_approval() {
     let legacy = ProtocolVersionRange {
-        min: ProtocolVersion { major: 1, minor: 3 },
-        max: ProtocolVersion { major: 1, minor: 3 },
+        min: ProtocolVersion { major: 1, minor: 5 },
+        max: ProtocolVersion { major: 1, minor: 5 },
     };
     let current = ProtocolVersionRange {
         min: PROTOCOL_VERSION,
         max: PROTOCOL_VERSION,
     };
 
-    assert_eq!(PROTOCOL_VERSION, ProtocolVersion { major: 1, minor: 4 });
+    assert_eq!(
+        PROTOCOL_VERSION,
+        ProtocolVersion {
+            major: 1,
+            minor: 15
+        }
+    );
     assert!(negotiate_version(legacy, current).is_err());
     assert_eq!(negotiate_version(current, current), Ok(PROTOCOL_VERSION));
 }
@@ -92,4 +98,42 @@ fn v1_request_rejects_an_unsupported_protocol_major() {
     });
 
     assert!(serde_json::from_value::<JsonRpcRequestV1>(request).is_err());
+}
+
+#[test]
+fn lifecycle_discovery_contract_is_bounded_and_contains_only_original_action_ids() {
+    let request = serde_json::json!({"method":"account_deletion_intents","params":{"after":null}});
+    let decoded: context_relay_protocol::LocalRequest =
+        serde_json::from_value(request.clone()).unwrap();
+    decoded.validate().unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), request);
+    assert!(
+        serde_json::from_value::<context_relay_protocol::LocalRequest>(
+            serde_json::json!({"method":"account_deletion_intents","params":{}})
+        )
+        .is_err()
+    );
+    let item = serde_json::json!({"operationId":"018f22e2-79b0-7cc8-98c4-dc0c0c074001","action":"beginDeletion"});
+    let reply =
+        |intents| serde_json::json!({"kind":"account_deletion_intents","data":{"intents":intents}});
+    let valid = reply(vec![item.clone()]);
+    let decoded: context_relay_protocol::LocalResult =
+        serde_json::from_value(valid.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), valid);
+    assert!(
+        serde_json::from_value::<context_relay_protocol::LocalResult>(reply(vec![
+            item.clone();
+            51
+        ]))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<context_relay_protocol::LocalResult>(reply(vec![item.clone(); 2]))
+            .is_err()
+    );
+    let mut extra = item;
+    extra["sessionId"] = serde_json::json!("not part of the public contract");
+    assert!(
+        serde_json::from_value::<context_relay_protocol::LocalResult>(reply(vec![extra])).is_err()
+    );
 }
