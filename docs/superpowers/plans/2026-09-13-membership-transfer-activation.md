@@ -74,6 +74,36 @@ Files: `sync/admission.rs`, existing checkpoint/chain verification, vault sync i
 - [ ] Test accepting a revocation, interrupting before activation, restarting and attempting sync/pairing through old material readers and stale owned capabilities; no stale authority may resume.
 - [ ] Verify offline joining across rotations, retained children, restart during reconstruction, forks, withheld history, replacement exporter, known revocation and interruption before/after activation.
 
+### Task4 implementation decisions — 2026-09-14
+
+Historical installation must coexist with newer/current work. Reconstruct the
+exact target in bounded isolated memory using the existing merge/materialization
+and state-summary primitives; then merge verified operation/head evidence into
+live state under the final joint transaction. Do not overwrite live records with
+a scratch snapshot or forbid installation merely because current state exceeds
+the target. Preserve newer heads, concurrent conflicts, outbox/cursor semantics
+and post-commit cache behavior. Tests must prove target-hash isolation, newer-work
+preservation and rollback. A wrong implementation risks data loss or false
+checkpoint acceptance.
+
+Activation may survive verified same-control/key-epoch ADD descendants when its
+source endpoint lies on the accepted lineage, independent current material is
+still valid and the same recipient remains authorized. Rebuild current reader
+authority at fresh exact D; stale owned D capabilities remain invalid. A rotation
+invalidates old activation immediately. Scalar epoch equality alone is never
+authority. Test same-epoch branches/additions, old capabilities, corruption and
+revocation; otherwise stale or forked authority could survive.
+
+Existing SyncOperationV1 signs control/key epochs but contains no membership-event
+hash. Historical admission proves exact certificate authorization in a replayed
+accepted state at those epochs, verified chain/causal inclusion and the applicable
+exact signed cutoff. It cannot prove before/after ordering relative to a same-epoch
+ADD using a nonexistent wire field. Provider certificates, HLC timestamps and
+unrelated branches cannot supply missing authorization. Preserve repairable missing
+proof, accepted retained children and current-write restrictions; test absent ADD,
+wrong certificate/branch/epoch and cutoff substitution. Do not implicitly introduce
+a wire migration or overstate temporal authority.
+
 ## Task 5: Connect hosted transport and installed workflows
 
 - [ ] Extend the existing bounded transport and durable retry coordinator for addressed header/page/public-history retrieval and publication. Enforce current server-side identity/recipient authorization independently of cryptographic verification.

@@ -1,5 +1,30 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Pushed-head Windows native isolation passed; overall CI failed — 2026-09-14
+
+Run `34765079727` is terminal failure because daemon integration tests failed
+as detailed below. Its Windows native builder `103744831697` and native
+isolation job `103754449705` nevertheless completed successfully. Both tested
+PR merge revision `0697186709f6aaac8f41e91b48a30ea077d43dfa` for pushed head
+`30589c0`; this evidence does not cover later local Task3/4 source.
+
+Actual isolation log `.codex/pr16-windows-native-isolation-30589c0.log` confirms
+one passing execution each of real RuleSync output containment (20.55 seconds),
+RuleSync malformed-frontmatter rejection/cleanup (18.54 seconds), Gitleaks
+clean/findings with attacker ignore-file rejection (8.73 seconds), and Semgrep
+clean/findings under the closed policy (89.74 seconds). Ordinary ignored or
+zero-match summaries are not used as evidence for these gates.
+
+The final candidate artifact is `10320484594`, 1,462,093,965 bytes, with
+uploader-reported ZIP SHA-256
+`9f1c400ab35bf79bdfe4a389e9ffab0d79473cee2a19d56e274d905e66de0fa4`.
+The ordinary single-builder artifact is `10320109828`, 1,405,068,494 bytes,
+uploader ZIP SHA-256
+`5cfe3384eaff3ee7c7fbbcc76a0de8463279d175ecfcb89a100358fd9bac66b0`;
+its actual log is `.codex/pr16-windows-native-builder-30589c0.log`.
+No local whole-ZIP/payload rehash, independent two-builder qualification,
+installed acceptance, publication or merge is claimed by these observations.
+
 ## Durable key storage reviewed and verified — 2026-09-14
 
 Local commit `dcce7a12c9ce730bff9d2833991a22b7615943c6` adds migration 41 and
