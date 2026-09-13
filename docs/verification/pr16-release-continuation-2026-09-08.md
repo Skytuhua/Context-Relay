@@ -1,5 +1,50 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Windows-only qualification completed — 2026-09-13
+
+Run `34760841409` is now terminal **success** at exact revision
+`a22dfab775e7b7d7642b5742c8c87bee677f7644`. All selected Windows/shared jobs
+passed, including both independent builders, source validation and native
+isolation. Apple jobs and publication were skipped. Actual workspace Rust log
+summaries total 1,728 passed, zero failed and 54 ignored across 154 summaries;
+ignored tests are not counted as passed. The selected real-sidecar executions
+are separately evidenced below. The actual log is
+`.codex/pr16-windows-rust-a22dfab.log`.
+
+Windows installer run `34765079720` also completed successfully for PR head
+`30589c0`, testing GitHub merge revision
+`0697186709f6aaac8f41e91b48a30ea077d43dfa`. The actual log records candidate
+artifact `10321050413`, 77,437,265 bytes, uploader ZIP SHA-256
+`1286028663605292e5f0cd9fc7dd111b5463ed74df80fb2c14d46b853ce8c4a7`.
+Evidence is `.codex/pr16-installer-30589c0.log`. This is unsigned packaging,
+not installation or clean-machine acceptance.
+
+The completed qualification predates the later device-history and in-progress
+key-storage changes. No current-head full acceptance, public release or merge
+is claimed. The full remaining product checklist and Apple/payment deferrals
+continue to apply.
+## Windows native isolation passed — 2026-09-13
+
+Windows-only qualification run `34760841409` at exact source
+`a22dfab775e7b7d7642b5742c8c87bee677f7644` completed native isolation job
+`103744328039` successfully. Actual downloaded job logs confirm both source
+archives passed verification: 39,543 payload entries, 222 links,
+1,149,649,920 bytes and SHA-256
+`91bcea54abcd7a1bacf40a41bbd98bc032e29030f21ed77decfa009dd40a3e05`.
+The independent identity/source/toolchain checks and strict candidate preparation
+passed. Native tests and the exact registered real-sidecar gates passed:
+RuleSync output containment, malformed-frontmatter rejection/cleanup, Gitleaks
+clean/findings with attacker ignore-file rejection, and Semgrep clean/findings
+under the closed policy. The individual real-sidecar runs executed one test each
+with zero failures, rather than relying on ordinary ignored-test summaries.
+
+The job uploaded candidate artifact `10320023865`, 2,611,747,606 bytes, with
+uploader-reported ZIP SHA-256
+`20c24e7119ae5ae8510066944adc985808f8d86234db704f0d59e21772f78c95`.
+The retained actual log is `.codex/pr16-native-isolation-a22dfab.log`. No local
+whole-ZIP rehash is claimed. The workspace Rust job was still running at this
+observation. This qualification does not cover later membership changes, prove
+installed product acceptance, or authorize publication or merge.
 ## Independent Windows builder identities — 2026-09-13
 
 Both builders in Windows-only qualification run `34760841409` at `a22dfab`
