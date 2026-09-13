@@ -197,3 +197,18 @@ bridge, verifies exact receipt retries, status and public-event bytes, and
 rejects an invalid proof before committing. Auth claims and SDK transport are
 stubbed; the rotated parent is still seeded. This closes the local integration
 gap above, not deployed Supabase Auth/PostgREST acceptance.
+
+## Fresh replay including recovery SQL
+
+All 18 migrations applied to the separately bootstrapped
+`task5_recovery_replay` database (`task-5-recovery-clean-applied.log`). The
+complete database test command passed all 20 tests in 8205.5712ms
+(`task-5-recovery-clean-green.log`), including pairing and recovery integrations.
+The enrollment/recovery Edge covering command passed all 28 tests in 344.0145ms
+(`task-5-recovery-edge-covering.log`). The implementer confirms all three
+commands completed successfully, as did the earlier integrated recovery test.
+
+These results qualify the current local SQL replay with minimal provider
+fixtures. Auth/SDK stubs and seeded revocation limitations above still apply.
+At this checkpoint the native recovery coordinator uses V1; integrating V2 and complete
+history reconstruction remains necessary before full recovery acceptance.
