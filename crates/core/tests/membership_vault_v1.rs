@@ -731,6 +731,96 @@ fn retained_root_stages_rotation_without_pairing_c_and_preserves_epoch_one() {
             |r| r.get(0),
         )
         .unwrap();
+    // Skip staging epoch two, add another device, then rotate again while root survives.
+    let next_device = id("018f22e2-79b0-7cc8-98c4-dc0c0c073991");
+    let next_keys = DeviceKeys::generate().unwrap();
+    let request = SignedPairingRequest::build(
+        id("018f22e2-79b0-7cc8-98c4-dc0c0c073992"),
+        next_device,
+        "C",
+        NativePlatform::Windows,
+        &next_keys,
+    )
+    .unwrap();
+    let history = v.accepted_membership_history(BUDGET).unwrap().unwrap();
+    let pinned = t
+        .open_device_material(
+            &s,
+            sig,
+            &history.latest_rotation_predecessor().unwrap(),
+            id(DEVICE_ID),
+            &f.device_keys,
+        )
+        .unwrap()
+        .with_enrollment_record_sha256(f.artifacts.canonical_record_sha256)
+        .unwrap();
+    let built = build_pairing_approval_v2(
+        &request,
+        &history.pairing_parent(id(DEVICE_ID)).unwrap(),
+        id(DEVICE_ID),
+        &f.device_keys,
+        id("018f22e2-79b0-7cc8-98c4-dc0c0c073993"),
+        "A",
+        NativePlatform::Windows,
+        &pinned,
+    )
+    .unwrap();
+    let payload = encode_pairing_approved_payload_v2(&built.payload).unwrap();
+    let add = DeviceMembershipAddStatementV1::from_approved_payload_v2(&payload).unwrap();
+    let signature = add
+        .sign(
+            &history.state().active_devices[&id(DEVICE_ID)],
+            &f.device_keys,
+        )
+        .unwrap();
+    let added = MembershipEndpoint {
+        state_sha256: add.control_state_sha256(signature).unwrap(),
+        ..d
+    };
+    v.accept_membership_extension(
+        d,
+        added,
+        &[MembershipHistoryEvent::PairingAdd {
+            statement: &add.signing_preimage().unwrap(),
+            signature,
+            request: &request,
+            approved_payload: &payload,
+        }],
+        BUDGET,
+    )
+    .unwrap();
+    let history = v.accepted_membership_history(BUDGET).unwrap().unwrap();
+    let (s3, t3, sig3) = RevocationTransitionV1::build(
+        DeviceRevocationStatementV1 {
+            revocation_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073994"),
+            target_device_id: next_device,
+            control_epoch: 2,
+            key_epoch: 2,
+            ..s
+        },
+        &f.device_keys,
+        &history.state(),
+    )
+    .unwrap();
+    let original3 = t3
+        .open_device_material(&s3, sig3, &history.state(), id(DEVICE_ID), &f.device_keys)
+        .unwrap();
+    let d = MembershipEndpoint {
+        state_sha256: s3.control_state_sha256(sig3).unwrap(),
+        control_epoch: 3,
+        key_epoch: 3,
+    };
+    v.accept_membership_extension(
+        added,
+        d,
+        &[MembershipHistoryEvent::Revocation {
+            statement: &s3.signing_preimage().unwrap(),
+            signature: sig3,
+            transition: &t3.canonical_bytes().unwrap(),
+        }],
+        BUDGET,
+    )
+    .unwrap();
     assert!(
         v.stage_current_membership_material(c, id(DEVICE_ID), &f.device_keys, BUDGET)
             .is_err()
@@ -739,12 +829,58 @@ fn retained_root_stages_rotation_without_pairing_c_and_preserves_epoch_one() {
         v.stage_current_membership_material(d, id(DEVICE_ID), &b, BUDGET)
             .is_err()
     );
+    raw.execute_batch("CREATE TRIGGER fail_third_epoch BEFORE INSERT ON membership_epoch_secrets WHEN NEW.key_epoch=3 BEGIN SELECT RAISE(ABORT,'injected');END").unwrap();
+    assert!(
+        v.stage_current_membership_material(d, id(DEVICE_ID), &f.device_keys, BUDGET)
+            .is_err()
+    );
+    drop(v);
+    let mut v = Vault::open(path.path(), CREDENTIAL, &ks).unwrap();
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM membership_epoch_secrets WHERE key_epoch>1",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+        "late bundle failure must roll back epoch two too"
+    );
+    raw.execute_batch("DROP TRIGGER fail_third_epoch").unwrap();
     v.stage_current_membership_material(d, id(DEVICE_ID), &f.device_keys, BUDGET)
+        .unwrap();
+    let seals: Vec<(u32, Vec<u8>, Vec<u8>)> = raw
+        .prepare(
+            "SELECT key_epoch,envelope,signature FROM membership_epoch_secrets ORDER BY key_epoch",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
         .unwrap();
     drop(v);
     let mut v = Vault::open(path.path(), CREDENTIAL, &ks).unwrap();
+    assert!(
+        v.staged_membership_epoch(d, id(DEVICE_ID), 2, true, &f.device_keys, BUDGET)
+            .unwrap()
+            .is_some(),
+        "skipped intermediate rotation must be durably staged"
+    );
     v.stage_current_membership_material(d, id(DEVICE_ID), &f.device_keys, BUDGET)
         .unwrap();
+    let retry_seals: Vec<(u32, Vec<u8>, Vec<u8>)> = raw
+        .prepare(
+            "SELECT key_epoch,envelope,signature FROM membership_epoch_secrets ORDER BY key_epoch",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        seals, retry_seals,
+        "multi-bundle exact retry preserves every seal and signature"
+    );
     assert_eq!(
         v.staged_membership_epoch(d, id(DEVICE_ID), 1, true, &f.device_keys, BUDGET)
             .unwrap()
@@ -758,6 +894,17 @@ fn retained_root_stages_rotation_without_pairing_c_and_preserves_epoch_one() {
         .unwrap();
     assert_eq!(staged.workspace_root_key(), original.workspace_root_key());
     assert_eq!(staged.active_epoch_key(), original.active_epoch_key());
+    let epoch1 = v
+        .staged_membership_epoch(d, id(DEVICE_ID), 1, true, &f.device_keys, BUDGET)
+        .unwrap()
+        .unwrap();
+    assert_eq!(epoch1.active_epoch_key(), material.active_epoch_key());
+    let epoch3 = v
+        .staged_membership_epoch(d, id(DEVICE_ID), 3, true, &f.device_keys, BUDGET)
+        .unwrap()
+        .unwrap();
+    assert_eq!(epoch3.workspace_root_key(), original3.workspace_root_key());
+    assert_eq!(epoch3.active_epoch_key(), original3.active_epoch_key());
     assert_eq!(
         staged.enrollment_record_sha256(),
         Some(f.artifacts.canonical_record_sha256)

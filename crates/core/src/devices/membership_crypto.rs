@@ -409,15 +409,17 @@ pub fn verify_membership_lineage(
         events,
         independent_endpoint,
         budget,
-        |endpoint, rotation| {
-            anchor_seen |= endpoint == independent_anchor;
-            if let Some(rotation) = rotation {
+        |history, event| {
+            anchor_seen |= history.endpoint() == independent_anchor;
+            if matches!(event, Some(MembershipHistoryEvent::Revocation { .. })) {
+                let (_, rotation, _) = history.latest_rotation.as_ref().unwrap();
                 rotated_key_commitments.push(VerifiedRotatedKeyCommitment {
                     control_epoch: rotation.control_epoch,
                     key_epoch: rotation.key_epoch,
                     key_material_sha256: rotation.key_material_sha256,
                 });
             }
+            Ok(())
         },
     )?;
     if !anchor_seen {
@@ -448,18 +450,23 @@ pub fn verify_membership_history(
         events,
         independent_endpoint,
         budget,
-        |_, _| {},
+        |_, _| Ok(()),
     )
 }
 
-fn replay_membership_history(
+/// Visitor state is authenticated only through its current prefix. Callers must
+/// not publish effects until replay succeeds at the independently accepted endpoint.
+pub(crate) fn replay_membership_history(
     canonical_enrollment: &[u8],
     independent_enrollment_pin: Sha256Digest,
     scope: SyncScope,
     events: &[MembershipHistoryEvent<'_>],
     independent_endpoint: MembershipEndpoint,
     budget: MembershipHistoryBudget,
-    mut on_verified_state: impl FnMut(MembershipEndpoint, Option<&RevocationTransitionV1>),
+    mut on_verified_state: impl FnMut(
+        &VerifiedMembershipHistory,
+        Option<&MembershipHistoryEvent<'_>>,
+    ) -> Result<(), CryptoError>,
 ) -> Result<VerifiedMembershipHistory, CryptoError> {
     let invalid = CryptoError::AuthenticationFailed;
     if events.len() > budget.max_events {
@@ -519,7 +526,7 @@ fn replay_membership_history(
         operations: BTreeSet::new(),
         latest_rotation: None,
     };
-    on_verified_state(history.endpoint(), None);
+    on_verified_state(&history, None)?;
     for event in events {
         match event {
             MembershipHistoryEvent::PairingAdd {
@@ -543,7 +550,7 @@ fn replay_membership_history(
                     .admissions
                     .insert(p.grant.certificate.device_id, s.certificate_id);
                 history.state = next.state;
-                on_verified_state(history.endpoint(), None);
+                on_verified_state(&history, Some(event))?;
             }
             MembershipHistoryEvent::Revocation {
                 statement,
@@ -558,8 +565,8 @@ fn replay_membership_history(
                 let next = t.verify_and_advance(&s, *signature, &history.state())?;
                 let previous =
                     std::mem::replace(&mut history.state, OwnedControl::from_state(&next.state()));
-                on_verified_state(history.endpoint(), Some(&t));
                 history.latest_rotation = Some((next, t, previous));
+                on_verified_state(&history, Some(event))?;
             }
         }
     }

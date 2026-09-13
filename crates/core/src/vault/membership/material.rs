@@ -7,7 +7,9 @@ use crate::{
         historical_crypto::{
             EpochOneTrust, HistoricalTransferAuthority, HistoricalTransferHeader, MAX_PAGE_BYTES,
         },
-        membership_crypto::{VerifiedMembershipLineage, verify_membership_lineage},
+        membership_crypto::{
+            VerifiedMembershipLineage, replay_membership_history, verify_membership_lineage,
+        },
         recovery_crypto::{
             decode_recovery_device_envelope_v1, encode_recovery_device_envelope_v1,
             open_device_workspace_material,
@@ -452,7 +454,7 @@ impl Vault {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stored = load(&tx, budget)?.ok_or_else(invalid)?;
-        let history = endpoint_check(&stored, expected, device, keys, budget)?;
+        endpoint_check(&stored, expected, device, keys, budget)?;
         // Prefer signed staging. A known seed can never be repaired from the legacy envelope.
         if load_secret(&tx, &stored, device, 1, true, keys, budget)?.is_none() {
             let seeded: bool = tx.query_row(
@@ -479,46 +481,80 @@ impl Vault {
                 retain_enrollment(&tx, &stored, device, &original, keys, budget)?;
             }
         }
-        if load_secret(&tx, &stored, device, expected.key_epoch, true, keys, budget)?.is_none() {
-            let predecessor = history.latest_rotation_predecessor().ok_or_else(invalid)?;
-            let e = stored
+        // Full D and local authorization were checked above. Replay once more to
+        // recover each rotation's actual predecessor, never the latest state.
+        let mut pending = Vec::new();
+        crypto(replay_membership_history(
+            &stored.enrollment,
+            stored.pin,
+            stored.scope,
+            &stored
                 .events
                 .iter()
-                .rev()
-                .find(|e| e.request.is_none())
-                .ok_or_else(invalid)?;
-            let statement = crypto(DeviceRevocationStatementV1::from_signing_preimage(
-                &e.statement,
-            ))?;
-            let transition = crypto(RevocationTransitionV1::from_canonical_bytes(&e.artifact))?;
-            // The opener authenticates the ORIGINAL plaintext commitment, before pin association.
-            let original = crypto(transition.open_device_material(
-                &statement,
-                e.signature,
-                &predecessor,
-                device,
-                keys,
-            ))?;
-            if original
-                .enrollment_record_sha256()
-                .is_some_and(|pin| pin != stored.pin)
-            {
-                return Err(invalid());
-            }
-            let bundle = crypto(original.with_enrollment_record_sha256(stored.pin))?;
-            if bundle.key_epoch() != expected.key_epoch {
-                return Err(invalid());
-            }
+                .map(Event::evidence)
+                .collect::<Vec<_>>(),
+            expected,
+            budget,
+            |history, event| {
+                let Some(MembershipHistoryEvent::Revocation {
+                    statement,
+                    signature,
+                    transition,
+                }) = event
+                else {
+                    return Ok(());
+                };
+                // Rotations before this device's admission have no envelope for it.
+                if !history.state().active_devices.contains_key(&device)
+                    || load_secret(
+                        &tx,
+                        &stored,
+                        device,
+                        history.endpoint().key_epoch,
+                        true,
+                        keys,
+                        budget,
+                    )
+                    .map_err(|_| crate::crypto::CryptoError::AuthenticationFailed)?
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                let statement = DeviceRevocationStatementV1::from_signing_preimage(statement)?;
+                let transition = RevocationTransitionV1::from_canonical_bytes(transition)?;
+                let predecessor = history
+                    .latest_rotation_predecessor()
+                    .ok_or(crate::crypto::CryptoError::AuthenticationFailed)?;
+                // Authenticate ORIGINAL plaintext commitment before associating the pin.
+                let original = transition.open_device_material(
+                    &statement,
+                    *signature,
+                    &predecessor,
+                    device,
+                    keys,
+                )?;
+                if original
+                    .enrollment_record_sha256()
+                    .is_some_and(|pin| pin != stored.pin)
+                {
+                    return Err(crate::crypto::CryptoError::AuthenticationFailed);
+                }
+                pending.push((
+                    original.with_enrollment_record_sha256(stored.pin)?,
+                    transition.key_material_sha256,
+                ));
+                Ok(())
+            },
+        ))?;
+        // All opened bundles remain private until the complete replay succeeds.
+        // Their count is bounded by the same preflight event/byte budget.
+        for (bundle, provenance) in pending {
             retain(
-                &tx,
-                &stored,
-                device,
-                &bundle,
-                true,
-                transition.key_material_sha256,
-                keys,
-                budget,
+                &tx, &stored, device, &bundle, true, provenance, keys, budget,
             )?;
+        }
+        if load_secret(&tx, &stored, device, expected.key_epoch, true, keys, budget)?.is_none() {
+            return Err(invalid());
         }
         tx.commit()?;
         Ok(())
