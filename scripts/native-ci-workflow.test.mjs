@@ -425,6 +425,49 @@ test('independent builder identity validation rejects empty, zero, or reused pro
   assert.throws(() => validateIndependentBuilderIdentities(a, reused, expected));
 });
 
+test('Windows offline evidence uses the same strict policy in CI and release finalization', async () => {
+  const { validateWindowsOfflineEvidence } = await import('./verify-native-builder-identities.mjs');
+  const workflow = await readFile(workflowUrl, 'utf8');
+  const windows = job(workflow, 'native-isolation-windows-x64', 'native-semgrep-macos-arm64-builders');
+  const producer = await readFile(new URL('../third_party/sidecars/semgrep/build-public-source-windows.ps1', import.meta.url), 'utf8');
+  const finalizer = await readFile(new URL('./finalize-semgrep-native-release.mjs', import.meta.url), 'utf8');
+  assert.match(windows, /--windows-offline-evidence qualification/);
+  assert.match(windows, /--windows-offline-evidence runtime-smoke/);
+  assert.match(finalizer, /validateWindowsOfflineEvidence\(bytes, 'qualification'\)/);
+  const root = await mkdtemp(join(tmpdir(), 'windows-offline-evidence-'));
+  try {
+    for (const [mode, mechanism] of [
+      ['qualification', 'windows-firewall-default-outbound-block-ancestor-runner-hca-tcp443-hca-imds80-experiment'],
+      ['runtime-smoke', 'windows-firewall-runtime-smoke-network-deny'],
+    ]) {
+      const value = { mechanism, probe: 'hostile-outbound-tcp443-and-imds-tcp80-denied', schemaVersion: 1 };
+      const bytes = Buffer.from(`${JSON.stringify(value)}\n`);
+      assert.ok(producer.includes(mechanism));
+      assert.ok(producer.includes(value.probe));
+      assert.equal(validateWindowsOfflineEvidence(bytes, mode), true);
+      for (const changed of [
+        { ...value, mechanism: 'windows-firewall-default-outbound-block-hash-pinned-runner-tcp443-allow' },
+        { ...value, probe: 'hostile-outbound-tcp-denied' },
+        { ...value, mechanism: 'arbitrary-network-allow' },
+        { ...value, schemaVersion: 2 },
+        { mechanism, schemaVersion: 1 },
+        { ...value, unreviewed: true },
+      ]) assert.throws(() => validateWindowsOfflineEvidence(Buffer.from(`${JSON.stringify(changed)}\n`), mode));
+      assert.throws(() => validateWindowsOfflineEvidence(bytes, mode === 'qualification' ? 'runtime-smoke' : 'qualification'));
+      assert.throws(() => validateWindowsOfflineEvidence(bytes.subarray(0, -1), mode));
+      assert.throws(() => validateWindowsOfflineEvidence(bytes, 'unknown'));
+      const path = join(root, 'offline.json');
+      const args = [fileURLToPath(new URL('./verify-native-builder-identities.mjs', import.meta.url)), '--windows-offline-evidence', mode, path];
+      await writeFile(path, bytes);
+      await execFileAsync(process.execPath, args);
+      await writeFile(path, '{}\n');
+      await assert.rejects(execFileAsync(process.execPath, args), /invalid Windows offline evidence/);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('native runtime builds prove OS-enforced offline execution', async () => {
   const [macos, windows] = await Promise.all([
     readFile(new URL('../third_party/sidecars/semgrep/build-public-source-macos.sh', import.meta.url), 'utf8'),
@@ -482,6 +525,7 @@ test('Windows offline experiment bounds ancestor HTTPS and HCA-only IMDS rules',
   assert.equal((windows.match(/Assert-RunnerControlPlaneIdentity \$RunnerIdentities/g) ?? []).length, 2);
   assert.match(windows, /New-NetFirewallRule[^\n]+-Program \$HcaProgram[^\n]+-RemoteAddress '169\.254\.169\.254'[^\n]+-RemotePort 80[^\n]+-Protocol TCP/);
   assert.equal((windows.match(/Test-OutboundTcp \$ImdsAddress 80/g) ?? []).length, 3);
+  assert.equal((windows.match(/Test-OutboundTcp \$ProbeAddress/g) ?? []).length, 3);
   assert.doesNotMatch(windows, /provjobd|WaAppAgent|WindowsAzureGuestAgent/);
   assert.doesNotMatch(windows, /New-NetFirewallDynamicKeywordAddress|Update-NetFirewallDynamicKeywordAddress/);
   assert.doesNotMatch(windows, /Start-Job|RunnerAddressRefresher|Get-NetTCPConnection/);
@@ -513,6 +557,8 @@ test('Windows V1 compiles before the runtime-only firewall window', async () => 
   const blocked = policy.indexOf('Set-NetFirewallProfile -Profile $ProfileSnapshot.Name -DefaultOutboundAction Block');
   const action = policy.indexOf('. $Action', blocked);
   const restored = policy.lastIndexOf('} finally {');
+  assert.match(policy, /if \(\$RestoreFailures.Count -ne 0\) \{ Fail/);
+  assert.match(windows, /Invoke-WindowsOfflineFirewall \{[\s\S]+Invoke-RuntimeSmoke \$Build\s*\}\s*\[IO.File\]::WriteAllText\(/);
   assert.match(windows, /\. \(Join-Path \$PSScriptRoot 'windows-offline-firewall\.ps1'\)/);
   assert.ok(compiled >= 0 && isolated > compiled, 'compiler must run before outbound blocking');
   assert.ok(releaseCompile > isolated && smoke > releaseCompile, 'release compilation and smoke must share the isolated action');

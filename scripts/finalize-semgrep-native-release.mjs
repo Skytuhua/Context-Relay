@@ -21,7 +21,7 @@ import { parseNativeSmokeEvidence } from './native-smoke-evidence.mjs';
 import { createWindowsStableToolchainEvidence } from './prepare-semgrep-runtime.mjs';
 import { resealSemgrepSourceBundle } from './reseal-semgrep-source-bundle.mjs';
 import { verifyBundleEvidence } from './semgrep-source-bundle.mjs';
-import { validateIndependentBuilderIdentities } from './verify-native-builder-identities.mjs';
+import { validateIndependentBuilderIdentities, validateWindowsOfflineEvidence } from './verify-native-builder-identities.mjs';
 
 const VERSION = '1.170.0';
 const SEMGREP_REVISION = 'bd614accba811b407ae5c9ec6f1eecd3bdc29911';
@@ -70,7 +70,6 @@ const TARGETS = new Map([
     smokeJob: 'native-isolation-windows-x64',
     sourceTarget: 'windows-x86_64',
     pendingReason: 'pending_two_matching_public_source_builds_and_no_python_smoke',
-    offline: '{"mechanism":"windows-firewall-default-outbound-block-ancestor-runner-hca-tcp443-hca-imds80-experiment","probe":"hostile-outbound-tcp443-and-imds-tcp80-denied","schemaVersion":1}\n',
   }],
   ['macos-aarch64', {
     executable: 'osemgrep',
@@ -554,7 +553,8 @@ async function readArtifact(root, target, expected, pendingBundleBytes, sourceLo
   const offline = [];
   for (const slot of ['a', 'b']) {
     const bytes = await readFile(join(tree.root, `build-${slot}.offline-egress.v1.json`));
-    if (!bytes.equals(Buffer.from(policy.offline))) fail(`${target} build-${slot} offline evidence is invalid`);
+    if (target === 'windows-x86_64') validateWindowsOfflineEvidence(bytes, 'qualification');
+    else if (!bytes.equals(Buffer.from(policy.offline))) fail(`${target} build-${slot} offline evidence is invalid`);
     offline.push({ build: `build-${slot}`, sha256: sha256(bytes), size: bytes.length });
   }
   const artifactBundleBytes = await readFile(join(tree.root, 'bundle-evidence.v1.json'));

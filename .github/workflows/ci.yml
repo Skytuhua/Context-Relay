@@ -19,6 +19,9 @@ on:
       semgrep_release_qualification:
         type: boolean
         default: false
+      semgrep_windows_only:
+        type: boolean
+        default: false
       semgrep_artifact_run_id:
         type: string
         default: ''
@@ -53,11 +56,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - host: windows-x64
-            os: windows-2025
-          - host: macos-arm64
-            os: macos-15
+        include: ${{ fromJSON(inputs.semgrep_release_qualification && inputs.semgrep_windows_only && '[{"host":"windows-x64","os":"windows-2025"}]' || '[{"host":"windows-x64","os":"windows-2025"},{"host":"macos-arm64","os":"macos-15"}]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -79,11 +78,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - host: windows-x64
-            os: windows-2025
-          - host: macos-arm64
-            os: macos-15
+        include: ${{ fromJSON(inputs.semgrep_release_qualification && inputs.semgrep_windows_only && '[{"host":"windows-x64","os":"windows-2025"}]' || '[{"host":"windows-x64","os":"windows-2025"},{"host":"macos-arm64","os":"macos-15"}]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -331,13 +326,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - host: windows-x64
-            os: windows-2025
-            target: x86_64-pc-windows-msvc
-          - host: macos-arm64
-            os: macos-15
-            target: aarch64-apple-darwin
+        include: ${{ fromJSON(inputs.semgrep_release_qualification && inputs.semgrep_windows_only && '[{"host":"windows-x64","os":"windows-2025","target":"x86_64-pc-windows-msvc"}]' || '[{"host":"windows-x64","os":"windows-2025","target":"x86_64-pc-windows-msvc"},{"host":"macos-arm64","os":"macos-15","target":"aarch64-apple-darwin"}]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -653,8 +642,7 @@ jobs:
           node scripts/semgrep-source-bundle.mjs --verify-evidence (Resolve-Path third_party/sidecars/semgrep/source-lock.v1.json).Path (Join-Path $root 'source-a.tar') (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path
           node scripts/semgrep-source-bundle.mjs --verify-evidence (Resolve-Path third_party/sidecars/semgrep/source-lock.v1.json).Path (Join-Path $root 'source-b.tar') (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path
           foreach ($slot in @('a', 'b')) {
-            $offline = Get-Content -Raw (Join-Path $root "build-$slot.offline-egress.v1.json") | ConvertFrom-Json
-            if ($offline.schemaVersion -ne 1 -or $offline.mechanism -ne 'windows-firewall-default-outbound-block-hash-pinned-runner-tcp443-allow' -or $offline.probe -ne 'hostile-outbound-tcp-denied') { throw 'invalid Windows offline evidence' }
+            node scripts/verify-native-builder-identities.mjs --windows-offline-evidence qualification (Join-Path $root "build-$slot.offline-egress.v1.json")
           }
           if ((Get-FileHash -Algorithm SHA256 (Join-Path $root 'build-a.builder-toolchain.windows-x86_64.v1.json')).Hash -ne (Get-FileHash -Algorithm SHA256 (Join-Path $root 'build-b.builder-toolchain.windows-x86_64.v1.json')).Hash) { throw 'independent Windows toolchains differ' }
       - name: Verify single-build Windows V1 source and runtime-smoke evidence
@@ -665,8 +653,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $root = Join-Path $env:RUNNER_TEMP 'context-relay-semgrep-output-windows'
           node scripts/semgrep-source-bundle.mjs --verify-evidence (Resolve-Path third_party/sidecars/semgrep/source-lock.v1.json).Path (Join-Path $root 'source-a.tar') (Resolve-Path third_party/sidecars/semgrep/bundle-evidence.v1.json).Path
-          $offline = Get-Content -Raw (Join-Path $root 'build-a.offline-egress.v1.json') | ConvertFrom-Json
-          if ($offline.schemaVersion -ne 1 -or $offline.mechanism -ne 'windows-firewall-runtime-smoke-network-deny' -or $offline.probe -ne 'hostile-outbound-tcp-denied') { throw 'invalid Windows V1 runtime-smoke network evidence' }
+          node scripts/verify-native-builder-identities.mjs --windows-offline-evidence runtime-smoke (Join-Path $root 'build-a.offline-egress.v1.json')
       - name: Prepare strict Windows candidate
         id: prepare
         shell: pwsh
@@ -728,7 +715,7 @@ jobs:
 
   native-semgrep-macos-arm64-builders:
     needs: semgrep-materials
-    if: ${{ needs.semgrep-materials.outputs.changed == 'true' }}
+    if: ${{ !(inputs.semgrep_release_qualification && inputs.semgrep_windows_only) && needs.semgrep-materials.outputs.changed == 'true' }}
     name: Native Semgrep macOS arm64 build-${{ matrix.build }}
     strategy:
       fail-fast: false
@@ -835,7 +822,7 @@ jobs:
     needs:
       - semgrep-materials
       - native-semgrep-macos-arm64-builders
-    if: ${{ always() && !cancelled() && (needs.native-semgrep-macos-arm64-builders.result == 'success' || inputs.semgrep_artifact_run_id != '') }}
+    if: ${{ always() && !cancelled() && !(inputs.semgrep_release_qualification && inputs.semgrep_windows_only) && (needs.native-semgrep-macos-arm64-builders.result == 'success' || inputs.semgrep_artifact_run_id != '') }}
     outputs:
       hydration_mode: ${{ steps.prepare.outputs.mode }}
     runs-on: macos-15
@@ -989,7 +976,7 @@ jobs:
     needs:
       - native-isolation-windows-x64
       - native-isolation-macos-arm64
-    if: ${{ inputs.semgrep_release_qualification && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref_protected == true && needs.native-isolation-windows-x64.outputs.hydration_mode == 'candidate' && needs.native-isolation-macos-arm64.outputs.hydration_mode == 'candidate' }}
+    if: ${{ inputs.semgrep_release_qualification && !inputs.semgrep_windows_only && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref_protected == true && needs.native-isolation-windows-x64.outputs.hydration_mode == 'candidate' && needs.native-isolation-macos-arm64.outputs.hydration_mode == 'candidate' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write

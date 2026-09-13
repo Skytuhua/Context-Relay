@@ -4,6 +4,10 @@ import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:f
 import test from 'node:test';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createRequire } from 'node:module';
+
+const desktopRequire = createRequire(new URL('../apps/desktop/package.json', import.meta.url));
+const { load: parseYaml } = createRequire(desktopRequire.resolve('eslint'))('js-yaml');
 
 const workflowDirectoryUrl = new URL('../.github/workflows/', import.meta.url);
 const ciWorkflowUrl = new URL('../.github/workflows/ci.yml', import.meta.url);
@@ -16,6 +20,16 @@ const ordinaryFeatures = [
 ].join(',');
 const checkoutNode24 = 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1';
 const setupNode24 = 'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020';
+
+// These checked-in conditions use the common JS/Actions boolean and JSON subset.
+function evaluate(expression, { inputs = {}, needs = {}, github = {}, cancelled = false } = {}) {
+  if (typeof expression !== 'string') return expression;
+  assert.match(expression, /^\$\{\{[\s\S]+\}\}$/);
+  const body = expression.slice(3, -2).replace(/needs\.([a-z][a-z0-9-]*)/g, 'needs["$1"]');
+  return Function('inputs', 'needs', 'github', 'fromJSON', 'always', 'cancelled', `return (${body})`)(
+    inputs, needs, github, JSON.parse, () => true, () => cancelled,
+  );
+}
 
 function job(source, name) {
   const jobsStart = source.indexOf('\njobs:\n');
@@ -36,9 +50,11 @@ function assertIndependent(source, names) {
 
 function assertSupportedHostMatrix(body) {
   assert.match(body, /fail-fast:\s*false/);
-  assert.match(body, /include:\s*\n\s+- host:\s*windows-x64\s*\n\s+os:\s*windows-2025/);
-  assert.match(body, /- host:\s*macos-arm64\s*\n\s+os:\s*macos-15/);
-  assert.equal((body.match(/^\s+- host:/gm) ?? []).length, 2);
+  const rows = evaluate(Object.values(parseYaml(body))[0].strategy.matrix.include);
+  assert.deepEqual(rows.map(({ host, os }) => ({ host, os })), [
+    { host: 'windows-x64', os: 'windows-2025' },
+    { host: 'macos-arm64', os: 'macos-15' },
+  ]);
   assert.match(body, /RUNNER_ARCH[^\n]+X64/);
   assert.match(body, /uname -m[^\n]+arm64/);
 }
@@ -90,6 +106,58 @@ async function initializedRepository(prefix) {
   git(workspace, 'config', 'user.name', 'CI Contract');
   return workspace;
 }
+
+test('Windows-only manual qualification expands only Windows hosts and retains strict dependency gates', async () => {
+  const ci = parseYaml(await readFile(ciWorkflowUrl, 'utf8'));
+  const caller = parseYaml(await readFile(new URL('semgrep-release-qualification.yml', workflowDirectoryUrl), 'utf8'));
+  assert.equal(caller.on.workflow_dispatch.inputs.windows_only.type, 'boolean');
+  assert.equal(caller.on.workflow_dispatch.inputs.windows_only.default, false);
+  assert.equal(ci.on.workflow_call.inputs.semgrep_windows_only.type, 'boolean');
+  assert.equal(ci.on.workflow_call.inputs.semgrep_windows_only.default, false);
+  assert.equal(caller.jobs.qualification.with.semgrep_release_qualification, true);
+  for (const windowsOnly of [false, true]) {
+    assert.equal(evaluate(caller.jobs.qualification.with.semgrep_windows_only, { inputs: { windows_only: windowsOnly } }), windowsOnly);
+  }
+  const windowsHost = { host: 'windows-x64', os: 'windows-2025' };
+  const macosHost = { host: 'macos-arm64', os: 'macos-15' };
+  const windowsBuilder = ci.jobs['native-semgrep-windows-x64-builders'];
+  const windowsIsolation = ci.jobs['native-isolation-windows-x64'];
+  assert.equal(windowsBuilder.needs, 'semgrep-materials');
+  assert.deepEqual(windowsIsolation.needs, ['semgrep-materials', 'native-semgrep-windows-x64-builders']);
+  assert.deepEqual(ci.jobs['request-native-sidecar-publication'].needs, ['native-isolation-windows-x64', 'native-isolation-macos-arm64']);
+  for (const qualification of [false, true]) {
+    for (const windowsOnly of [false, true]) {
+      const inputs = { semgrep_release_qualification: qualification, semgrep_windows_only: windowsOnly, semgrep_artifact_run_id: '' };
+      const restricted = qualification && windowsOnly;
+      for (const name of ['rust-lint', 'rust-tests', 'native']) {
+        const rows = evaluate(ci.jobs[name].strategy.matrix.include, { inputs });
+        const expected = restricted ? [windowsHost] : [windowsHost, macosHost];
+        assert.deepEqual(rows, name === 'native'
+          ? expected.map((row) => ({ ...row, target: row.host === 'windows-x64' ? 'x86_64-pc-windows-msvc' : 'aarch64-apple-darwin' }))
+          : expected, `${name}: qualification=${qualification}, windowsOnly=${windowsOnly}`);
+        assert.equal(ci.jobs[name]['runs-on'], '${{ matrix.os }}');
+      }
+      const needs = Object.fromEntries(Object.keys(ci.jobs).map((name) => [name, { result: 'success', outputs: { changed: 'true', hydration_mode: 'candidate' } }]));
+      const context = { inputs, needs, github: { event_name: 'workflow_dispatch', ref: 'refs/heads/main', ref_protected: true } };
+      assert.equal(evaluate(windowsBuilder.if, context), true);
+      assert.deepEqual(evaluate(windowsBuilder.strategy.matrix.build, context), qualification ? ['a', 'b'] : ['a']);
+      assert.equal(evaluate(windowsIsolation.if, context), true);
+      for (const name of ['native-semgrep-macos-arm64-builders', 'native-isolation-macos-arm64']) {
+        assert.equal(evaluate(ci.jobs[name].if, context), !restricted, name);
+      }
+      const publication = ci.jobs['request-native-sidecar-publication'].if;
+      assert.equal(evaluate(publication, context), false, 'manual dispatch cannot publish');
+      assert.equal(evaluate(publication, { ...context, github: { ...context.github, event_name: 'push' } }), qualification && !windowsOnly);
+      needs['native-semgrep-macos-arm64-builders'].result = 'skipped';
+      assert.equal(evaluate(windowsIsolation.if, context), true, 'Apple skip cannot suppress Windows isolation');
+      needs['native-semgrep-windows-x64-builders'].result = 'failure';
+      assert.equal(evaluate(windowsIsolation.if, context), false, 'failed Windows builds cannot qualify');
+      assert.equal(evaluate(windowsIsolation.if, { ...context, cancelled: true }), false);
+      needs['semgrep-materials'].outputs.changed = 'false';
+      assert.equal(evaluate(windowsBuilder.if, context), false);
+    }
+  }
+});
 
 test('required CI gates are independently visible and cannot be masked by Rust lint', async () => {
   const source = await readFile(ciWorkflowUrl, 'utf8');
@@ -335,9 +403,9 @@ test('supported native builds are build-only and independent from host tests', a
   const source = await readFile(ciWorkflowUrl, 'utf8');
   const native = job(source, 'native');
   assertSupportedHostMatrix(native);
-  assert.match(native, /target:\s*x86_64-pc-windows-msvc/);
-  assert.match(native, /target:\s*aarch64-apple-darwin/);
-  assert.equal((native.match(/^\s+target:/gm) ?? []).length, 2);
+  assert.deepEqual(evaluate(parseYaml(native).native.strategy.matrix.include).map(({ target }) => target), [
+    'x86_64-pc-windows-msvc', 'aarch64-apple-darwin',
+  ]);
   assert.match(native, /pnpm --filter @context-relay\/desktop tauri build --target \$\{\{ matrix\.target \}\}/);
   assert.match(native, /run: pnpm package:macos/);
   assert.match(native, /CONTEXT_RELAY_SEARCH_ASSETS: \$\{\{ runner\.temp \}\}\/macos-search-resources/);

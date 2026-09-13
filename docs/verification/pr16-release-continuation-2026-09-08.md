@@ -1,5 +1,53 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Membership lineage and Windows qualification repairs — 2026-09-13
+
+`verify_membership_lineage` reuses the complete membership replay to prove an
+exact independently accepted anchor lies on the genesis-to-endpoint path.
+It retains each authenticated rotation's control/key epochs and plaintext
+commitment, including earlier rotations. Genesis has no invented key digest.
+Private proof construction, exact endpoint comparison, lifetime identity checks
+and event/byte budgets remain enforced. This is a prerequisite for historical
+key transfer; it neither confirms recipient admission nor installs secrets.
+
+Eight membership/pairing-V2/revocation integration tests pass. Actual mutations
+that accepted an epoch-only anchor or dropped an earlier commitment fail their
+assertions; the restored suite passes. Core library/tests Clippy with warnings
+denied passes, and independent source review found no actionable P1/P2 issue.
+Logs: `.codex/lineage-{mutation-anchor,mutation-commitment,final-tests,clippy}.log`.
+The previously unsorted module declaration is corrected; whole-workspace
+format checking passes.
+
+The [af3 Windows Rust job](https://github.com/Skytuhua/Context-Relay/actions/runs/34699949136/job/103569821697)
+failed when a test edited a watched file during the protected reader's lease.
+The three live-watcher fixture writers now retry only Windows sharing error 32
+for at most ten seconds. Other errors propagate; production read protection is
+unchanged. A real held-file regression fails before this repair. All five
+authoritative-memory tests and target Clippy pass afterward; independent review
+found no actionable issue. Logs: `.codex/pr16-watched-write-{red,green,clippy}.log`.
+
+Both Windows builders in [independent run 34699122274](https://github.com/Skytuhua/Context-Relay/actions/runs/34699122274)
+completed at `7ad495c`. Its [isolation preflight](https://github.com/Skytuhua/Context-Relay/actions/runs/34699122274/job/103579099608)
+then rejected an obsolete evidence-format expectation. CI and finalization now
+share byte-exact validation of the current qualification/runtime-smoke evidence.
+Wrong mode, old probes, altered/extra fields and noncanonical bytes fail; source,
+toolchain, independent identity and restoration requirements are preserved.
+The relevant evidence/finalizer tests pass (35 checks).
+
+Manual qualification now accepts `windows_only: true`, preserving two Windows
+builders and isolation while skipping Apple jobs and preventing cross-platform
+publication. Ordinary/full defaults are unchanged. Parsed workflow matrix and
+condition checks pass (43 checks in the focused combined invocation); the
+separate pre-existing `/bin/bash` whitespace fixture is unavailable on this
+Windows host and remains required in its supported environment. Logs:
+`.codex/pr16-windows-only-qualification-{red,green,full-windows}.log`.
+
+The [0c9 Windows installer](https://github.com/Skytuhua/Context-Relay/actions/runs/34701091591)
+also completed. These results do not establish signed distribution, installed
+acceptance or a complete independent qualification. A fresh Windows-only run
+must verify the repaired gate at its own exact revision/run identity; old A/B
+artifacts cannot be relabelled as new qualification evidence.
+
 ## User deferrals and current Windows qualification — 2026-09-12
 
 The user deferred all Apple-related work and anything requiring money. Stop
