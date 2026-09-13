@@ -1,6 +1,31 @@
 # PR 16 full-release continuation — 2026-09-08
 
-## Historical reconstruction component progress — 2026-09-14
+## Membership activation and historical reconstruction reviewed — 2026-09-14
+
+The membership-transfer plan's Task4 is complete through source commit
+`d43aced5381d681bc79cb8f451d8e5d0b1fe1d4d`, after independent review and two
+fix rounds. The [component evidence map](membership-transfer-activation-2026-09-14.md)
+records all seven requirements, exact test commands and their limits. Current
+coverage includes 21 historical tests, four membership integration tests, five
+documentation tests, formatting and clean all-target Clippy. The review closed
+unauthenticated representative reads, incomplete replay reporting success,
+dependency-cache poisoning and a superseding-head chain-inclusion gap.
+
+This supersedes the implementation-status statements in the earlier checkpoint
+below; those earlier logs remain historical evidence. It does not complete T17,
+RB-CRYPTO, RB-SYNC or the full release. Hosted V2 pairing/public-history transport,
+installed login/sync/recovery and clean-Windows acceptance are the next active
+work. The three known Windows daemon integration failures below remain open.
+Schema40 legacy-root provenance, bounded live-read performance and actual
+OpenSSL symbol placement remain broader obligations.
+
+GitHub sign-in was later inspected in regular Chrome on September 14 and remained
+disabled. OAuth registration is prepared but unsubmitted, pending explicit
+approval for new authentication access. No credentials or provider settings
+were changed. The prior hosted pepper-deployment policy rejection still applies.
+Apple work and anything requiring payment remain deferred; PR16 is unmerged.
+
+## Earlier historical reconstruction checkpoint — 2026-09-14
 
 Task4 is still local, uncommitted and unreviewed. Actual focused Windows logs
 under `.superpowers/sdd/2026-09-13-membership-transfer-activation/` now record:
