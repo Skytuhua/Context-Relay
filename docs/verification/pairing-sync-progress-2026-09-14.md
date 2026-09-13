@@ -129,3 +129,31 @@ rollback retaining rows and user_version42. This uses direct in-memory table DDL
 not a full schema42 vault upgrade through the production migration driver.
 Durable recovery integration, complete reconstruction/transfer, deployed behavior,
 installed upgrades and final independent review remain open.
+
+## Durable recovery fault checks and server verifier
+
+The expanded recovery test now passes after restart, signature/session
+substitution checks and forced SQLCipher insertion rollback
+(`task-5-recovery-durable-green2.log`: 1 passed in 21.87s). This verifies local
+prepared recovery storage; it does not authorize membership or establish
+complete history installation.
+
+The subsequent covering command stopped with 3 passed and 1 failed because the
+simulated schema40 fixture retained a newer SQLite44 table. After correcting
+that fixture, its targeted rerun passed in 5.79s
+(`task-5-recovery-schema40-green.log`). The failed covering command remains
+recorded in `task-5-recovery-durable-covering1.log`; the targeted fix is not a
+replacement for final broad regression coverage.
+
+The server recovery verifier passed all 8 tests in 256.994ms
+(`task-5-recovery-edge-green2.log`), including the native recovery vector,
+malformed encodings, changed signatures, exact record/session bindings and
+invalid embedded certificates. Server recovery transactions, native/UI
+integration and deployed/installed acceptance remain incomplete.
+The first local server recovery transaction test passed in 273.6249ms
+(`task-5-recovery-postgres-green1.log`, total 439.4802ms), following a
+missing-RPC failure in `task-5-recovery-postgres-red.log`. The test covers
+recovery publication at the exact parent/generation and an exact retry. Its
+rotated parent is seeded from a Rust-verified vector; this is not a live
+revocation-publication test. Failure-case coverage and fresh full migration
+replay after this SQL change remain required.
