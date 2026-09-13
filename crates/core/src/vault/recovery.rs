@@ -478,7 +478,7 @@ impl Vault {
             transaction.rollback()?;
             return Err(validation());
         }
-        open_device_workspace_material(
+        let opened_material = open_device_workspace_material(
             &stored.record,
             &stored.device_material_envelope,
             stored.record.genesis_certificate.device_id,
@@ -521,6 +521,12 @@ impl Vault {
                             control_epoch: 1,
                             key_epoch: 1,
                         },
+                    )?;
+                    super::membership::retain_enrollment_material(
+                        &transaction,
+                        stored.record.genesis_certificate.device_id,
+                        &opened_material,
+                        device_keys,
                     )?;
                     transaction.execute(
                         "INSERT INTO revocation_genesis_anchor(singleton,account_id,workspace_id,enrollment_sha256,anchor_sha256,control_epoch,key_epoch,accepted_state_sha256)

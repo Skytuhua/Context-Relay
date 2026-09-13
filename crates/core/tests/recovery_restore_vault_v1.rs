@@ -561,6 +561,7 @@ fn schema_29_preserves_prepared_and_active_restore_rows() {
             ),
         )
         .unwrap();
+        support::remove_membership_material_migration(&raw);
         raw.execute_batch(
             "INSERT INTO recovery_restores_legacy SELECT * FROM recovery_restores;
             DROP TABLE recovery_restores;

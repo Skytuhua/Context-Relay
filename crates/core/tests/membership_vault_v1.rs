@@ -482,6 +482,17 @@ fn complete_add_revoke_history_cas_restart_corruption_and_staged_admission() {
     );
     // Public acceptance alone deliberately does not install the privately opened current secrets.
     assert!(j.trusted_sync_material(&b).is_err());
+    let joined_raw = open_raw(joined.path(), &ks.key(CREDENTIAL));
+    assert_eq!(joined_raw.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='membership_epoch_secrets'", [], |r| r.get::<_,i64>(0)).unwrap(), 1, "confirmed admission must durably retain its privately opened keys");
+    assert_eq!(
+        joined_raw
+            .query_row("SELECT count(*) FROM membership_epoch_secrets", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        1
+    );
     let current = v.accepted_membership_history(BUDGET).unwrap().unwrap();
     let rotation = DeviceRevocationStatementV1 {
         schema_version: 1,
@@ -586,6 +597,268 @@ fn complete_add_revoke_history_cas_restart_corruption_and_staged_admission() {
     assert!(v.trusted_workspace_material(&f.device_keys).is_err());
 }
 struct NoEmbedding;
+
+#[test]
+fn retained_root_stages_rotation_without_pairing_c_and_preserves_epoch_one() {
+    let f = fixture();
+    let path = TempVault::new("membership-root-staging");
+    let ks = MemoryKeyStore::default();
+    let mut v = Vault::open(path.path(), CREDENTIAL, &ks).unwrap();
+    v.prepare_recovery_enrollment(&write(&f.artifacts, 1000))
+        .unwrap();
+    let raw = open_raw(path.path(), &ks.key(CREDENTIAL));
+    raw.execute_batch("CREATE TRIGGER fail_root_seed BEFORE INSERT ON membership_root_material_seed BEGIN SELECT RAISE(ABORT,'injected');END").unwrap();
+    assert!(
+        v.activate_recovery_enrollment(&receipt(&f.artifacts, 2000), &f.device_keys, 3000)
+            .is_err()
+    );
+    drop(v);
+    let mut v = Vault::open(path.path(), CREDENTIAL, &ks).unwrap();
+    assert!(v.accepted_membership_history(BUDGET).unwrap().is_none());
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM membership_epoch_secrets", [], |r| r
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    raw.execute_batch("DROP TRIGGER fail_root_seed").unwrap();
+    v.activate_recovery_enrollment(&receipt(&f.artifacts, 2000), &f.device_keys, 3000)
+        .unwrap();
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM membership_epoch_secrets", [], |r| r
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM membership_root_material_seed",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    let root = v.accepted_membership_history(BUDGET).unwrap().unwrap();
+    let g = root.endpoint();
+    v.stage_current_membership_material(g, id(DEVICE_ID), &f.device_keys, BUDGET)
+        .unwrap();
+    let b = DeviceKeys::generate().unwrap();
+    let request =
+        SignedPairingRequest::build(id(OTHER_ID), id(OTHER_ID), "B", NativePlatform::Windows, &b)
+            .unwrap();
+    let material = f
+        .material
+        .with_enrollment_record_sha256(f.artifacts.canonical_record_sha256)
+        .unwrap();
+    let built = build_pairing_approval_v2(
+        &request,
+        &root.pairing_parent(id(DEVICE_ID)).unwrap(),
+        id(DEVICE_ID),
+        &f.device_keys,
+        id(OTHER_ID),
+        "A",
+        NativePlatform::Windows,
+        &material,
+    )
+    .unwrap();
+    let payload = encode_pairing_approved_payload_v2(&built.payload).unwrap();
+    let statement = DeviceMembershipAddStatementV1::from_approved_payload_v2(&payload).unwrap();
+    let sig = statement
+        .sign(&f.artifacts.record.genesis_certificate, &f.device_keys)
+        .unwrap();
+    let c = MembershipEndpoint {
+        state_sha256: statement.control_state_sha256(sig).unwrap(),
+        ..g
+    };
+    v.accept_membership_extension(
+        g,
+        c,
+        &[MembershipHistoryEvent::PairingAdd {
+            statement: &statement.signing_preimage().unwrap(),
+            signature: sig,
+            request: &request,
+            approved_payload: &payload,
+        }],
+        BUDGET,
+    )
+    .unwrap();
+    v.stage_current_membership_material(c, id(DEVICE_ID), &f.device_keys, BUDGET)
+        .unwrap();
+    let history = v.accepted_membership_history(BUDGET).unwrap().unwrap();
+    let s = DeviceRevocationStatementV1 {
+        schema_version: 1,
+        revocation_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073990"),
+        account_id: id(ACCOUNT_ID),
+        workspace_id: id(WORKSPACE_ID),
+        issuer_device_id: id(DEVICE_ID),
+        target_device_id: id(OTHER_ID),
+        control_epoch: 1,
+        key_epoch: 1,
+        cutoff_sequence: 0,
+        cutoff_hash: Sha256Digest([0; 32]),
+        transition_sha256: Sha256Digest([1; 32]),
+    };
+    let (s, t, sig) = RevocationTransitionV1::build(s, &f.device_keys, &history.state()).unwrap();
+    let original = t
+        .open_device_material(&s, sig, &history.state(), id(DEVICE_ID), &f.device_keys)
+        .unwrap();
+    assert!(original.enrollment_record_sha256().is_none());
+    let d = MembershipEndpoint {
+        state_sha256: s.control_state_sha256(sig).unwrap(),
+        control_epoch: 2,
+        key_epoch: 2,
+    };
+    v.accept_membership_extension(
+        c,
+        d,
+        &[MembershipHistoryEvent::Revocation {
+            statement: &s.signing_preimage().unwrap(),
+            signature: sig,
+            transition: &t.canonical_bytes().unwrap(),
+        }],
+        BUDGET,
+    )
+    .unwrap();
+    let original_seal: Vec<u8> = raw
+        .query_row(
+            "SELECT envelope FROM membership_epoch_secrets WHERE key_epoch=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        v.stage_current_membership_material(c, id(DEVICE_ID), &f.device_keys, BUDGET)
+            .is_err()
+    );
+    assert!(
+        v.stage_current_membership_material(d, id(DEVICE_ID), &b, BUDGET)
+            .is_err()
+    );
+    v.stage_current_membership_material(d, id(DEVICE_ID), &f.device_keys, BUDGET)
+        .unwrap();
+    drop(v);
+    let mut v = Vault::open(path.path(), CREDENTIAL, &ks).unwrap();
+    v.stage_current_membership_material(d, id(DEVICE_ID), &f.device_keys, BUDGET)
+        .unwrap();
+    assert_eq!(
+        v.staged_membership_epoch(d, id(DEVICE_ID), 1, true, &f.device_keys, BUDGET)
+            .unwrap()
+            .unwrap()
+            .workspace_root_key(),
+        material.workspace_root_key()
+    );
+    let staged = v
+        .staged_membership_epoch(d, id(DEVICE_ID), 2, true, &f.device_keys, BUDGET)
+        .unwrap()
+        .unwrap();
+    assert_eq!(staged.workspace_root_key(), original.workspace_root_key());
+    assert_eq!(staged.active_epoch_key(), original.active_epoch_key());
+    assert_eq!(
+        staged.enrollment_record_sha256(),
+        Some(f.artifacts.canonical_record_sha256)
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT envelope FROM membership_epoch_secrets WHERE key_epoch=1",
+            [],
+            |r| r.get::<_, Vec<u8>>(0)
+        )
+        .unwrap(),
+        original_seal
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM membership_confirmed_admission",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert!(v.trusted_sync_material(&f.device_keys).is_err());
+    // Once signed, the obsolete enrollment envelope is no longer a recurring source.
+    raw.execute_batch("UPDATE recovery_enrollments SET device_envelope_sha256=zeroblob(32)")
+        .unwrap();
+    v.stage_current_membership_material(d, id(DEVICE_ID), &f.device_keys, BUDGET)
+        .unwrap();
+    raw.execute(
+        "UPDATE recovery_enrollments SET device_envelope_sha256=?1",
+        [f.artifacts.device_material_envelope_sha256.0.as_slice()],
+    )
+    .unwrap();
+    raw.execute_batch("CREATE TEMP TABLE saved_root AS SELECT * FROM membership_epoch_secrets WHERE key_epoch=1; DELETE FROM membership_epoch_secrets WHERE key_epoch=1").unwrap();
+    assert!(
+        v.stage_current_membership_material(d, id(DEVICE_ID), &f.device_keys, BUDGET)
+            .is_err()
+    );
+    raw.execute_batch("INSERT INTO membership_epoch_secrets SELECT * FROM saved_root; UPDATE membership_epoch_secrets SET signature=zeroblob(64) WHERE key_epoch=1").unwrap();
+    assert!(
+        v.stage_current_membership_material(d, id(DEVICE_ID), &f.device_keys, BUDGET)
+            .is_err()
+    );
+}
+
+#[test]
+fn schema40_root_seeding_preserves_explicit_legacy_enrollment_trust_boundary() {
+    let f = fixture();
+    let path = TempVault::new("membership-legacy-root");
+    let ks = MemoryKeyStore::default();
+    let mut v = Vault::open(path.path(), CREDENTIAL, &ks).unwrap();
+    v.prepare_recovery_enrollment(&write(&f.artifacts, 1000))
+        .unwrap();
+    v.activate_recovery_enrollment(&receipt(&f.artifacts, 2000), &f.device_keys, 3000)
+        .unwrap();
+    let g = v
+        .accepted_membership_history(BUDGET)
+        .unwrap()
+        .unwrap()
+        .endpoint();
+    drop(v);
+    let raw = open_raw(path.path(), &ks.key(CREDENTIAL));
+    raw.execute_batch("DROP TABLE historical_transfer_selection; DROP TABLE historical_transfer_pages; DROP TABLE historical_transfers; DROP TABLE membership_confirmed_admission; DROP TABLE membership_root_material_seed; DROP TABLE membership_epoch_secrets; PRAGMA user_version=40").unwrap();
+    let mut v = Vault::open(path.path(), CREDENTIAL, &ks).unwrap();
+    assert_eq!(v.schema_version().unwrap(), 41);
+    assert!(
+        v.staged_membership_epoch(g, id(DEVICE_ID), 1, true, &f.device_keys, BUDGET)
+            .unwrap()
+            .is_none()
+    );
+    raw.execute_batch("CREATE TRIGGER fail_legacy_seed BEFORE INSERT ON membership_root_material_seed BEGIN SELECT RAISE(ABORT,'injected');END").unwrap();
+    assert!(
+        v.stage_current_membership_material(g, id(DEVICE_ID), &f.device_keys, BUDGET)
+            .is_err()
+    );
+    drop(v);
+    let mut v = Vault::open(path.path(), CREDENTIAL, &ks).unwrap();
+    assert!(
+        v.staged_membership_epoch(g, id(DEVICE_ID), 1, true, &f.device_keys, BUDGET)
+            .unwrap()
+            .is_none()
+    );
+    raw.execute_batch("DROP TRIGGER fail_legacy_seed").unwrap();
+    v.stage_current_membership_material(g, id(DEVICE_ID), &f.device_keys, BUDGET)
+        .unwrap();
+    let bundle = v
+        .staged_membership_epoch(g, id(DEVICE_ID), 1, true, &f.device_keys, BUDGET)
+        .unwrap()
+        .unwrap();
+    assert_eq!(bundle.workspace_root_key(), f.material.workspace_root_key());
+    assert_eq!(bundle.active_epoch_key(), f.material.active_epoch_key());
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM membership_root_material_seed",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
 impl context_relay_core::sync::RepresentativeEmbeddingResolver for NoEmbedding {
     fn resolve_representative_embedding(
         &self,

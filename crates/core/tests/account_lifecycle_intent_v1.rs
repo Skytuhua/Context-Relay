@@ -116,6 +116,7 @@ fn schema_33_upgrade_never_invents_lifecycle_authority() {
         unsafe { rusqlite::ffi::sqlite3_key(raw.handle(), key.as_ptr().cast(), 32) },
         rusqlite::ffi::SQLITE_OK
     );
+    support::remove_membership_material_migration(&raw);
     raw.execute_batch("DROP TABLE IF EXISTS membership_events; DROP TABLE IF EXISTS accepted_membership; DROP TABLE IF EXISTS revocation_genesis_anchor; DROP TABLE IF EXISTS revocation_control_history; DROP TABLE IF EXISTS device_revocation_intents; DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; PRAGMA user_version=33;")
         .unwrap();
     drop(raw);

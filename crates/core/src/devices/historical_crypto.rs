@@ -580,6 +580,785 @@ mod tests {
         PairingRequestNonce, encode_checkpoint_v1,
     };
     use std::collections::BTreeMap;
+    struct KeyStore;
+    impl crate::vault::DatabaseKeyStore for KeyStore {
+        fn load_key(
+            &self,
+            _: &str,
+        ) -> Result<Option<Zeroizing<Vec<u8>>>, crate::vault::VaultError> {
+            Ok(Some(Zeroizing::new(vec![77; 32])))
+        }
+        fn store_key(&self, _: &str, _: &[u8]) -> Result<(), crate::vault::VaultError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn historical_missing_confirmed_genesis_never_becomes_an_exporter_assertion() {
+        use crate::vault::{HistoricalTransferBudget, Vault};
+        let f = fixture(1);
+        let budget = HistoricalTransferBudget {
+            history: MembershipHistoryBudget {
+                max_events: 10,
+                max_bytes: 100_000,
+            },
+            max_pages: 1,
+            max_bytes: 100_000,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "historical-missing-genesis-{}.db",
+            uuid::Uuid::now_v7()
+        ));
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        let Event::Add(_, _, request, _) = &f.events[0] else {
+            panic!()
+        };
+        v.accept_confirmed_membership_admission(
+            &f.enrollment,
+            &[],
+            &f.confirmed,
+            request,
+            f.signature,
+            &f.keys,
+            budget.history,
+        )
+        .unwrap();
+        let d = f.lineage.history().endpoint();
+        v.accept_membership_extension(
+            f.lineage.anchor(),
+            d,
+            &f.events[1..]
+                .iter()
+                .map(Event::borrowed)
+                .collect::<Vec<_>>(),
+            budget.history,
+        )
+        .unwrap();
+        let authority = f.authority();
+        let page = authority
+            .build_page(
+                0,
+                ZERO,
+                &f.bundles[..1],
+                EpochOneTrust::PreviouslyTrusted(&f.bundles[0]),
+            )
+            .unwrap();
+        let header = authority
+            .sign_header(digest(&page), &f.exporter_keys)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        let selected = v
+            .select_historical_transfer(
+                d,
+                None,
+                &f.confirmed,
+                f.signature,
+                &header,
+                &f.checkpoint,
+                &f.keys,
+                budget,
+            )
+            .unwrap();
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        unsafe {
+            assert_eq!(
+                rusqlite::ffi::sqlite3_key(raw.handle(), [77u8; 32].as_ptr().cast(), 32),
+                0
+            );
+        }
+        raw.execute("DELETE FROM membership_epoch_secrets WHERE key_epoch=1", [])
+            .unwrap();
+        assert!(
+            v.commit_historical_transfer_page(
+                selected,
+                &f.confirmed,
+                f.signature,
+                (0, digest(&page)),
+                &page,
+                &f.keys,
+                budget
+            )
+            .is_err(),
+            "missing independently confirmed epoch one must not fall back to exporter assertion"
+        );
+        assert_eq!(
+            raw.query_row("SELECT count(*) FROM historical_transfer_pages", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            raw.query_row("SELECT count(*) FROM membership_epoch_secrets", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        drop(v);
+        drop(raw);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn historical_durable_pages_restart_conflicts_cas_and_supersession() {
+        use crate::vault::{CommitDisposition, HistoricalTransferBudget, Vault};
+        let f = fixture(33);
+        let budget = HistoricalTransferBudget {
+            history: MembershipHistoryBudget {
+                max_events: 200,
+                max_bytes: 2_000_000,
+            },
+            max_pages: 4,
+            max_bytes: 100_000,
+        };
+        let path =
+            std::env::temp_dir().join(format!("historical-durable-{}.db", uuid::Uuid::now_v7()));
+        // Initialize through the real Vault path and use the test key store for reopen.
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        unsafe {
+            assert_eq!(
+                rusqlite::ffi::sqlite3_key(raw.handle(), [77u8; 32].as_ptr().cast(), 32),
+                0
+            );
+        }
+        let Event::Add(_, _, request, _) = &f.events[0] else {
+            panic!()
+        };
+        raw.execute_batch("CREATE TRIGGER fail_admission BEFORE INSERT ON membership_epoch_secrets BEGIN SELECT RAISE(ABORT,'injected');END").unwrap();
+        assert!(
+            v.accept_confirmed_membership_admission(
+                &f.enrollment,
+                &[],
+                &f.confirmed,
+                request,
+                f.signature,
+                &f.keys,
+                budget.history
+            )
+            .is_err()
+        );
+        assert!(
+            v.accepted_membership_history(budget.history)
+                .unwrap()
+                .is_none()
+        );
+        raw.execute_batch("DROP TRIGGER fail_admission").unwrap();
+        drop(v);
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        assert!(
+            v.accepted_membership_history(budget.history)
+                .unwrap()
+                .is_none()
+        );
+        v.accept_confirmed_membership_admission(
+            &f.enrollment,
+            &[],
+            &f.confirmed,
+            request,
+            f.signature,
+            &f.keys,
+            budget.history,
+        )
+        .unwrap();
+        let c = f.lineage.anchor();
+        let d = f.lineage.history().endpoint();
+        v.accept_membership_extension(
+            c,
+            d,
+            &f.events[1..]
+                .iter()
+                .map(Event::borrowed)
+                .collect::<Vec<_>>(),
+            budget.history,
+        )
+        .unwrap();
+        assert!(
+            v.staged_membership_epoch(d, id(4), d.key_epoch, true, &f.keys, budget.history)
+                .unwrap()
+                .is_none()
+        );
+        assert!(v.trusted_sync_material(&f.keys).is_err());
+        let authority = f.authority();
+        let last = authority
+            .build_page(
+                1,
+                ZERO,
+                &f.bundles[32..33],
+                EpochOneTrust::PreviouslyTrusted(&f.bundles[0]),
+            )
+            .unwrap();
+        let first = authority
+            .build_page(
+                0,
+                digest(&last),
+                &f.bundles[..32],
+                EpochOneTrust::PreviouslyTrusted(&f.bundles[0]),
+            )
+            .unwrap();
+        let header = authority
+            .sign_header(digest(&first), &f.exporter_keys)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        raw.execute_batch("CREATE TRIGGER fail_selection BEFORE INSERT ON historical_transfer_selection BEGIN SELECT RAISE(ABORT,'injected');END").unwrap();
+        assert!(
+            v.select_historical_transfer(
+                d,
+                None,
+                &f.confirmed,
+                f.signature,
+                &header,
+                &f.checkpoint,
+                &f.keys,
+                budget
+            )
+            .is_err()
+        );
+        assert_eq!(
+            raw.query_row("SELECT count(*) FROM historical_transfers", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        raw.execute_batch("DROP TRIGGER fail_selection").unwrap();
+        drop(v);
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        assert!(
+            v.historical_transfer_selection(id(4), budget)
+                .unwrap()
+                .is_none()
+        );
+        let selected = v
+            .select_historical_transfer(
+                d,
+                None,
+                &f.confirmed,
+                f.signature,
+                &header,
+                &f.checkpoint,
+                &f.keys,
+                budget,
+            )
+            .unwrap();
+        assert_eq!(
+            v.select_historical_transfer(
+                d,
+                None,
+                &f.confirmed,
+                f.signature,
+                &header,
+                &f.checkpoint,
+                &f.keys,
+                budget
+            )
+            .unwrap(),
+            selected
+        );
+        assert!(
+            v.commit_historical_transfer_page(
+                selected,
+                &f.confirmed,
+                f.signature,
+                (1, digest(&last)),
+                &last,
+                &f.keys,
+                budget
+            )
+            .is_err()
+        );
+        assert!(
+            v.commit_historical_transfer_page(
+                selected,
+                &f.confirmed,
+                f.signature,
+                (0, digest(&first)),
+                &first,
+                &f.exporter_keys,
+                budget
+            )
+            .is_err()
+        );
+        raw.execute_batch("CREATE TRIGGER fail_progress BEFORE UPDATE ON historical_transfers BEGIN SELECT RAISE(ABORT,'injected');END").unwrap();
+        assert!(
+            v.commit_historical_transfer_page(
+                selected,
+                &f.confirmed,
+                f.signature,
+                (0, digest(&first)),
+                &first,
+                &f.keys,
+                budget
+            )
+            .is_err()
+        );
+        assert_eq!(
+            raw.query_row("SELECT count(*) FROM membership_epoch_secrets", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            raw.query_row("SELECT count(*) FROM historical_transfer_pages", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        raw.execute_batch("DROP TRIGGER fail_progress").unwrap();
+        drop(v);
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        assert_eq!(
+            v.historical_transfer_progress(selected, &f.confirmed, f.signature, &f.keys, budget)
+                .unwrap()
+                .next_page,
+            Some((0, digest(&first)))
+        );
+        v.commit_historical_transfer_page(
+            selected,
+            &f.confirmed,
+            f.signature,
+            (0, digest(&first)),
+            &first,
+            &f.keys,
+            budget,
+        )
+        .unwrap();
+        let sealed: Vec<u8> = raw
+            .query_row(
+                "SELECT envelope FROM membership_epoch_secrets WHERE key_epoch=2",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(v);
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        raw.execute_batch(
+            "CREATE TEMP TABLE saved_secrets AS SELECT * FROM membership_epoch_secrets",
+        )
+        .unwrap();
+        for corruption in [
+            "UPDATE membership_epoch_secrets SET provenance=zeroblob(32) WHERE key_epoch=1",
+            "UPDATE membership_epoch_secrets SET signature=zeroblob(64) WHERE key_epoch=1",
+        ] {
+            raw.execute_batch(corruption).unwrap();
+            assert!(
+                v.staged_membership_epoch(d, id(4), 1, true, &f.keys, budget.history)
+                    .is_err()
+            );
+            raw.execute_batch("DELETE FROM membership_epoch_secrets; INSERT INTO membership_epoch_secrets SELECT * FROM saved_secrets").unwrap();
+        }
+        raw.execute_batch(
+            "UPDATE membership_epoch_secrets SET independent_current=1 WHERE key_epoch=2",
+        )
+        .unwrap();
+        assert!(
+            v.staged_membership_epoch(d, id(4), 2, true, &f.keys, budget.history)
+                .is_err()
+        );
+        raw.execute_batch("DELETE FROM membership_epoch_secrets; INSERT INTO membership_epoch_secrets SELECT * FROM saved_secrets").unwrap();
+        // Anyone knows the wrapping public key. Re-encryption cannot forge local staging provenance.
+        let attacker =
+            PairingKeyBundle::new(f.lineage.history().state().scope, 1, 1, [88; 32], [89; 32])
+                .unwrap()
+                .with_enrollment_record_sha256(f.confirmed.enrollment_record_sha256())
+                .unwrap();
+        let mut aad = b"context-relay/staged-membership-secret/v1\0".to_vec();
+        aad.extend(id::<AccountId>(1).as_bytes());
+        aad.extend(id::<WorkspaceId>(2).as_bytes());
+        aad.extend(f.confirmed.enrollment_record_sha256().0);
+        aad.extend(id::<DeviceId>(4).as_bytes());
+        aad.extend(1u32.to_be_bytes());
+        aad.push(1);
+        aad.extend(c.state_sha256.0);
+        aad.extend(1u32.to_be_bytes());
+        aad.extend(1u32.to_be_bytes());
+        aad.extend(digest(f.confirmed.canonical_bytes()).0);
+        let forged = wrap_secret(
+            f.keys.wrapping_public_key(),
+            &encode_pairing_key_bundle(&attacker).unwrap(),
+            &aad,
+        )
+        .unwrap();
+        let forged =
+            crate::devices::recovery_crypto::encode_recovery_device_envelope_v1(&forged).unwrap();
+        raw.execute(
+            "UPDATE membership_epoch_secrets SET envelope=?1 WHERE key_epoch=1",
+            [forged],
+        )
+        .unwrap();
+        assert!(
+            v.staged_membership_epoch(d, id(4), 1, true, &f.keys, budget.history)
+                .is_err()
+        );
+        raw.execute_batch("DELETE FROM membership_epoch_secrets; INSERT INTO membership_epoch_secrets SELECT * FROM saved_secrets").unwrap();
+        assert_eq!(
+            v.historical_transfer_progress(selected, &f.confirmed, f.signature, &f.keys, budget)
+                .unwrap()
+                .next_page,
+            Some((1, digest(&last)))
+        );
+        assert_eq!(
+            v.commit_historical_transfer_page(
+                selected,
+                &f.confirmed,
+                f.signature,
+                (0, digest(&first)),
+                &first,
+                &f.keys,
+                budget
+            )
+            .unwrap(),
+            CommitDisposition::ExactReplay
+        );
+        assert_eq!(
+            raw.query_row(
+                "SELECT envelope FROM membership_epoch_secrets WHERE key_epoch=2",
+                [],
+                |r| r.get::<_, Vec<u8>>(0)
+            )
+            .unwrap(),
+            sealed
+        );
+        let conflict = authority
+            .build_page(
+                0,
+                digest(&last),
+                &f.bundles[..32],
+                EpochOneTrust::ActiveExporterAssertion,
+            )
+            .unwrap();
+        assert!(
+            v.commit_historical_transfer_page(
+                selected,
+                &f.confirmed,
+                f.signature,
+                (0, digest(&first)),
+                &conflict,
+                &f.keys,
+                budget
+            )
+            .is_err()
+        );
+        let mut tiny = budget;
+        tiny.max_bytes = 1;
+        assert!(
+            v.historical_transfer_progress(selected, &f.confirmed, f.signature, &f.keys, tiny)
+                .is_err()
+        );
+        raw.execute_batch("CREATE TEMP TABLE saved_page AS SELECT * FROM historical_transfer_pages; DELETE FROM historical_transfer_pages").unwrap();
+        assert!(
+            v.historical_transfer_progress(selected, &f.confirmed, f.signature, &f.keys, budget)
+                .is_err()
+        );
+        raw.execute_batch("INSERT INTO historical_transfer_pages SELECT * FROM saved_page")
+            .unwrap();
+        v.commit_historical_transfer_page(
+            selected,
+            &f.confirmed,
+            f.signature,
+            (1, digest(&last)),
+            &last,
+            &f.keys,
+            budget,
+        )
+        .unwrap();
+        assert!(
+            v.historical_transfer_progress(selected, &f.confirmed, f.signature, &f.keys, budget)
+                .unwrap()
+                .inventory_verified
+        );
+        assert!(
+            v.staged_membership_epoch(d, id(4), d.key_epoch, true, &f.keys, budget.history)
+                .unwrap()
+                .is_none()
+        );
+        raw.execute_batch("CREATE TRIGGER fail_current BEFORE INSERT ON membership_epoch_secrets WHEN NEW.independent_current=1 BEGIN SELECT RAISE(ABORT,'injected');END").unwrap();
+        assert!(
+            v.stage_current_membership_material(d, id(4), &f.keys, budget.history)
+                .is_err()
+        );
+        assert!(
+            v.staged_membership_epoch(d, id(4), d.key_epoch, true, &f.keys, budget.history)
+                .unwrap()
+                .is_none()
+        );
+        raw.execute_batch("DROP TRIGGER fail_current").unwrap();
+        drop(v);
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        assert!(
+            v.staged_membership_epoch(d, id(4), d.key_epoch, true, &f.keys, budget.history)
+                .unwrap()
+                .is_none()
+        );
+        v.stage_current_membership_material(d, id(4), &f.keys, budget.history)
+            .unwrap();
+        drop(v);
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        assert_eq!(
+            v.staged_membership_epoch(d, id(4), 34, true, &f.keys, budget.history)
+                .unwrap()
+                .unwrap()
+                .active_epoch_key(),
+            f.bundles[33].active_epoch_key()
+        );
+        assert!(v.trusted_sync_material(&f.keys).is_err());
+        // Two writers observed the same D and prior target. Only one replacement wins.
+        let mut v2 = Vault::open(&path, "historical", &KeyStore).unwrap();
+        let mut checkpoint2 = decode_checkpoint_v1(&f.checkpoint).unwrap();
+        checkpoint2.previous_checkpoint_hash = digest(&f.checkpoint);
+        checkpoint2.created_hlc.physical_ms += 1;
+        f.exporter_keys.sign_checkpoint(&mut checkpoint2).unwrap();
+        let checkpoint2 = encode_checkpoint_v1(&checkpoint2).unwrap();
+        let replacement = HistoricalTransferAuthority::new(
+            &f.lineage,
+            &f.confirmed,
+            f.signature,
+            id(201),
+            id(181),
+            &checkpoint2,
+        )
+        .unwrap();
+        let h2 = replacement
+            .sign_header(Sha256Digest([91; 32]), &f.exporter_keys)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        let s2 = v
+            .select_historical_transfer(
+                d,
+                Some(selected),
+                &f.confirmed,
+                f.signature,
+                &h2,
+                &checkpoint2,
+                &f.keys,
+                budget,
+            )
+            .unwrap();
+        let loser = HistoricalTransferAuthority::new(
+            &f.lineage,
+            &f.confirmed,
+            f.signature,
+            id(202),
+            id(181),
+            &f.checkpoint,
+        )
+        .unwrap();
+        let h3 = loser
+            .sign_header(Sha256Digest([92; 32]), &f.exporter_keys)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        assert!(
+            v2.select_historical_transfer(
+                d,
+                Some(selected),
+                &f.confirmed,
+                f.signature,
+                &h3,
+                &f.checkpoint,
+                &f.keys,
+                budget
+            )
+            .is_err()
+        );
+        assert!(
+            v.commit_historical_transfer_page(
+                selected,
+                &f.confirmed,
+                f.signature,
+                (1, digest(&last)),
+                &last,
+                &f.keys,
+                budget
+            )
+            .is_err()
+        );
+        assert_eq!(
+            v.historical_transfer_selection(id(4), budget).unwrap(),
+            Some(s2)
+        );
+        assert_eq!(
+            raw.query_row("SELECT count(*) FROM historical_transfer_pages", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            2
+        );
+        // Addition-only D advance keeps verified installs but requires a fresh transfer identity.
+        let extra = SignedPairingRequest::build(
+            id(210),
+            id(211),
+            "later",
+            NativePlatform::Windows,
+            &f.exporter_keys,
+        )
+        .unwrap();
+        let added = build_pairing_approval_v2(
+            &extra,
+            &f.lineage.history().pairing_parent(id(4)).unwrap(),
+            id(4),
+            &f.keys,
+            id(212),
+            "B",
+            NativePlatform::Windows,
+            &f.bundles[33],
+        )
+        .unwrap();
+        let payload = encode_pairing_approved_payload_v2(&added.payload).unwrap();
+        let add = DeviceMembershipAddStatementV1::from_approved_payload_v2(&payload).unwrap();
+        let add_sig = add
+            .sign(&f.confirmed.payload().grant.certificate, &f.keys)
+            .unwrap();
+        let add_bytes = add.signing_preimage().unwrap();
+        let next_d = MembershipEndpoint {
+            state_sha256: add.control_state_sha256(add_sig).unwrap(),
+            ..d
+        };
+        let event = MembershipHistoryEvent::PairingAdd {
+            statement: &add_bytes,
+            signature: add_sig,
+            request: &extra,
+            approved_payload: &payload,
+        };
+        v.accept_membership_extension(d, next_d, &[event], budget.history)
+            .unwrap();
+        assert!(
+            v.historical_transfer_progress(s2, &f.confirmed, f.signature, &f.keys, budget)
+                .is_err()
+        );
+        v.stage_current_membership_material(next_d, id(4), &f.keys, budget.history)
+            .unwrap();
+        let mut events = f.events.iter().map(Event::borrowed).collect::<Vec<_>>();
+        events.push(MembershipHistoryEvent::PairingAdd {
+            statement: &add_bytes,
+            signature: add_sig,
+            request: &extra,
+            approved_payload: &payload,
+        });
+        let lineage = verify_membership_lineage(
+            &f.enrollment,
+            f.confirmed.enrollment_record_sha256(),
+            f.lineage.history().state().scope,
+            &events,
+            c,
+            next_d,
+            budget.history,
+        )
+        .unwrap();
+        let renewed = HistoricalTransferAuthority::new(
+            &lineage,
+            &f.confirmed,
+            f.signature,
+            id(204),
+            id(181),
+            &checkpoint2,
+        )
+        .unwrap();
+        let renewed_header = renewed
+            .sign_header(Sha256Digest([93; 32]), &f.exporter_keys)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        assert!(
+            v.select_historical_transfer(
+                next_d,
+                Some(s2),
+                &f.confirmed,
+                f.signature,
+                &h2,
+                &checkpoint2,
+                &f.keys,
+                budget
+            )
+            .is_err()
+        );
+        let s3 = v
+            .select_historical_transfer(
+                next_d,
+                Some(s2),
+                &f.confirmed,
+                f.signature,
+                &renewed_header,
+                &checkpoint2,
+                &f.keys,
+                budget,
+            )
+            .unwrap();
+        assert_eq!(s3.authorizing_endpoint, next_d);
+        assert!(
+            v.staged_membership_epoch(next_d, id(4), 33, false, &f.keys, budget.history)
+                .unwrap()
+                .is_some()
+        );
+        // A locally accepted revocation supersedes partial work before commit.
+        let statement = DeviceRevocationStatementV1 {
+            schema_version: 1,
+            revocation_id: id(203),
+            account_id: id(1),
+            workspace_id: id(2),
+            issuer_device_id: id(181),
+            target_device_id: id(4),
+            control_epoch: d.control_epoch,
+            key_epoch: d.key_epoch,
+            cutoff_sequence: 0,
+            cutoff_hash: ZERO,
+            transition_sha256: Sha256Digest([1; 32]),
+        };
+        let (statement, transition, sig) =
+            RevocationTransitionV1::build(statement, &f.exporter_keys, &lineage.history().state())
+                .unwrap();
+        let next = MembershipEndpoint {
+            state_sha256: statement.control_state_sha256(sig).unwrap(),
+            control_epoch: 35,
+            key_epoch: 35,
+        };
+        v.accept_membership_extension(
+            next_d,
+            next,
+            &[MembershipHistoryEvent::Revocation {
+                statement: &statement.signing_preimage().unwrap(),
+                signature: sig,
+                transition: &transition.canonical_bytes().unwrap(),
+            }],
+            budget.history,
+        )
+        .unwrap();
+        assert!(
+            v.commit_historical_transfer_page(
+                s3,
+                &f.confirmed,
+                f.signature,
+                (0, Sha256Digest([93; 32])),
+                &first,
+                &f.keys,
+                budget
+            )
+            .is_err()
+        );
+        assert!(
+            v.stage_current_membership_material(next, id(4), &f.keys, budget.history)
+                .is_err()
+        );
+        assert_eq!(
+            raw.query_row("SELECT count(*) FROM membership_epoch_secrets", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            34
+        );
+        drop(v2);
+        drop(v);
+        drop(raw);
+        std::fs::remove_file(path).unwrap();
+    }
 
     struct Fixture {
         lineage: VerifiedMembershipLineage,

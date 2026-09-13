@@ -1459,6 +1459,7 @@ fn prepared_enrollment_activates_exactly_and_reopens_sealed_material() {
     raw.execute_batch(include_str!("../migrations/0022_recovery_enrollment.sql"))
         .unwrap();
     raw.execute_batch("INSERT INTO recovery_enrollments SELECT * FROM enrollment_fixture; DROP TABLE enrollment_fixture;").unwrap();
+    support::remove_membership_material_migration(&raw);
     raw.execute_batch("DROP TABLE IF EXISTS membership_events; DROP TABLE IF EXISTS accepted_membership; DROP TABLE IF EXISTS revocation_genesis_anchor; DROP TABLE IF EXISTS revocation_control_history; DROP TABLE IF EXISTS device_revocation_intents; DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews; DROP TABLE hosted_pairing_intents; DROP TABLE hosted_restore_intent;")
         .unwrap();
     raw.pragma_update(None, "user_version", 28).unwrap();

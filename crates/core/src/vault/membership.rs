@@ -1,4 +1,5 @@
 //! Durable public acceptance. Canonical replay, never certificate rows, supplies authority.
+mod material;
 use super::{CommitDisposition, Vault, VaultError};
 use crate::{
     crypto::DeviceKeys,
@@ -17,6 +18,9 @@ use crate::{
     sync::SyncScope,
 };
 use context_relay_protocol::{Ed25519SignatureBytes, Sha256Digest, decode_pairing_request_v1};
+pub use material::{
+    HistoricalTransferBudget, HistoricalTransferProgress, HistoricalTransferSelection,
+};
 use rusqlite::{Connection, TransactionBehavior, params};
 
 pub(super) const CURRENT_BUDGET: MembershipHistoryBudget = MembershipHistoryBudget {
@@ -317,6 +321,16 @@ pub(super) fn bootstrap(
     c.execute("INSERT INTO accepted_membership(singleton,account_id,workspace_id,enrollment_pin,enrollment,state_hash,control_epoch,key_epoch) VALUES(1,?1,?2,?3,?4,?5,?6,?7)",params![scope.account_id.to_string(),scope.workspace_id.to_string(),pin.0.as_slice(),enrollment,endpoint.state_sha256.0.as_slice(),endpoint.control_epoch,endpoint.key_epoch])?;
     Ok(())
 }
+pub(super) fn retain_enrollment_material(
+    c: &Connection,
+    device: context_relay_protocol::DeviceId,
+    bundle: &crate::devices::crypto::PairingKeyBundle,
+    keys: &DeviceKeys,
+) -> Result<(), VaultError> {
+    let stored = load(c, CURRENT_BUDGET)?.ok_or_else(invalid)?;
+    stored.verify(CURRENT_BUDGET)?;
+    material::retain_enrollment(c, &stored, device, bundle, keys, CURRENT_BUDGET)
+}
 impl Vault {
     pub(crate) fn require_current_device(
         &self,
@@ -505,7 +519,7 @@ impl Vault {
             confirmed.canonical_bytes(),
             &crypto(proof.pairing_parent(p.issuer_certificate.device_id))?,
         ))?;
-        crypto(open_confirmed_pairing_approval_v2(
+        let opened = crypto(open_confirmed_pairing_approval_v2(
             confirmed,
             request,
             keys,
@@ -550,6 +564,14 @@ impl Vault {
                     .zip(&stored.events)
                     .all(|(a, b)| a.same(b))
             {
+                material::retain_admission(
+                    &tx,
+                    &stored,
+                    confirmed,
+                    opened.key_bundle(),
+                    keys,
+                    budget,
+                )?;
                 tx.commit()?;
                 return Ok(CommitDisposition::ExactReplay);
             }
@@ -561,6 +583,7 @@ impl Vault {
         super::recovery_restore::require_pristine_vault(&tx)?;
         bootstrap(&tx, enrollment, stored.pin, scope, endpoint)?;
         insert_events(&tx, &stored.events, 0)?;
+        material::retain_admission(&tx, &stored, confirmed, opened.key_bundle(), keys, budget)?;
         tx.commit()?;
         Ok(CommitDisposition::Inserted)
     }

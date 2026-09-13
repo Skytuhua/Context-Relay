@@ -219,6 +219,7 @@ fn schema_36_upgrade_does_not_invent_revocation_authority() {
         unsafe { rusqlite::ffi::sqlite3_key(raw.handle(), key.as_ptr().cast(), 32) },
         rusqlite::ffi::SQLITE_OK
     );
+    support::remove_membership_material_migration(&raw);
     raw.execute_batch("DROP TABLE IF EXISTS membership_events; DROP TABLE IF EXISTS accepted_membership; DROP TABLE revocation_genesis_anchor; DROP TABLE revocation_control_history; DROP TABLE device_revocation_intents; PRAGMA user_version=36;")
         .unwrap();
     drop(raw);

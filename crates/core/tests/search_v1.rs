@@ -47,6 +47,7 @@ fn open_keyed(path: &std::path::Path, key: &[u8; 32]) -> rusqlite::Connection {
 
 fn downgrade_fixture_to_schema_26(path: &TempVault, keys: &MemoryKeyStore) {
     let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    support::remove_membership_material_migration(&raw);
     raw.execute_batch(
         "DROP TABLE IF EXISTS membership_events; DROP TABLE IF EXISTS accepted_membership; DROP TABLE IF EXISTS revocation_genesis_anchor; DROP TABLE IF EXISTS revocation_control_history; DROP TABLE IF EXISTS device_revocation_intents; DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews; DROP TABLE hosted_pairing_intents;
          DROP TABLE hosted_restore_intent;
