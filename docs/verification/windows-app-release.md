@@ -1,5 +1,10 @@
 # Windows app release acceptance
 
+Current installed-file identity was rechecked on September 14: all 18 files match
+build 1468327. See [the verified installed baseline](windows-installed-baseline-2026-09-14.md).
+Earlier installed runtime results below retain their original revisions and dates;
+this read-only check does not establish current-source or clean-machine acceptance.
+
 Current user feedback (2026-09-05): connecting harnesses and creating projects,
 context or tasks failed during their own EXE test, and the interface was too
 hard to understand. Usability and successful ordinary-user workflows are release
