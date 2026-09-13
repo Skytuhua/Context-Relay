@@ -309,3 +309,16 @@ and its callback path/state query. The Site URL remains `http://localhost:3000`.
 No credential value is included in this evidence. This clears configuration
 handoffs only: actual installed sign-in, token exchange, refresh, restart and
 hosted workflow acceptance remain unverified.
+## Nonempty recovery requalification
+
+The original reselection run lost its process handle and had no terminal log;
+its outcome remains unknown. After the owner confirmed the handle unavailable
+and no matching process, one fresh run produced `task-5-recovery-reselection-requalify1.log`:
+one expanded native recovery test passed in 370.97s. It covers nonempty history,
+explicit target replacement, rejection of a false checkpoint state, missing-data
+retry, installation rollback, durable-history regression rejection and damaged
+receipt fields. This is local core evidence, not daemon or installed acceptance.
+
+The passing binary predates the additional aggregate storage check after writing
+the installed signature. That guard and its exact-cap rollback/reopen/retry test
+are now in source and require the next run together with relevant Task4 checks.
