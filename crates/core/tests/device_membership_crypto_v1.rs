@@ -318,6 +318,179 @@ fn complete_root_only_history_retained_issuer_and_adversarial_evidence() {
     };
     assert!(replay(&[event_b(), event_r(), fork_event], fork_tip).is_ok());
     assert!(replay(&[event_b(), event_r(), event_c()], fork_tip).is_err());
+    // Lineage authenticates the one independently accepted anchor on this exact branch.
+    let lineage = |events: &[MembershipHistoryEvent<'_>], anchor, end, budget| {
+        verify_membership_lineage(
+            &enrollment.canonical_record,
+            pin,
+            scope,
+            events,
+            anchor,
+            end,
+            budget,
+        )
+    };
+    let empty = lineage(&[], endpoint(&genesis), endpoint(&genesis), generous).unwrap();
+    assert!(empty.rotated_key_commitments().is_empty()); // genesis has no public key digest
+    let second_rotation = DeviceRevocationStatementV1 {
+        revocation_id: id(17),
+        target_device_id: id(5),
+        control_epoch: 2,
+        key_epoch: 2,
+        ..rotation.clone()
+    };
+    let (second_rotation, second_transition, second_sig) =
+        RevocationTransitionV1::build(second_rotation, &b, &proof.state()).unwrap();
+    let second_bytes = second_rotation.signing_preimage().unwrap();
+    let second_transition_bytes = second_transition.canonical_bytes().unwrap();
+    let second_tip = endpoint(
+        &second_transition
+            .verify_and_advance(&second_rotation, second_sig, &proof.state())
+            .unwrap()
+            .state(),
+    );
+    let second_event = || MembershipHistoryEvent::Revocation {
+        statement: &second_bytes,
+        signature: second_sig,
+        transition: &second_transition_bytes,
+    };
+    let events = [event_b(), event_r(), event_c(), second_event()];
+    for anchor in [
+        endpoint(&genesis),
+        endpoint(&after_b.state()),
+        rotated_tip,
+        tip,
+        second_tip,
+    ] {
+        let verified = lineage(&events, anchor, second_tip, generous).unwrap();
+        assert_eq!(verified.anchor(), anchor);
+        assert_eq!(verified.history().endpoint(), second_tip);
+        assert_eq!(verified.history().admissions(), proof.admissions());
+        let commitments = verified.rotated_key_commitments();
+        assert_eq!(commitments.len(), 2);
+        assert_eq!(
+            commitments
+                .iter()
+                .map(|c| (c.control_epoch(), c.key_epoch()))
+                .collect::<Vec<_>>(),
+            vec![(2, 2), (3, 3)]
+        );
+        for (commitment, transition) in commitments.iter().zip([&transition, &second_transition]) {
+            assert_eq!(commitment.control_epoch(), transition.control_epoch);
+            assert_eq!(commitment.key_epoch(), transition.key_epoch);
+            assert_eq!(
+                commitment.key_material_sha256(),
+                transition.key_material_sha256
+            );
+        }
+        // Preserve existing latest transition/verified successor evidence; opening still needs its verified predecessor.
+        let parent = verified.history().pairing_parent(id(4)).unwrap();
+        assert_eq!(parent.latest_rotation.unwrap().1, &second_transition);
+    }
+    let after_add = lineage(&events[..3], tip, tip, generous).unwrap();
+    assert_eq!(after_add.rotated_key_commitments().len(), 1);
+    assert_eq!(
+        after_add.rotated_key_commitments()[0].key_material_sha256(),
+        transition.key_material_sha256
+    );
+    // A valid same-epoch fork endpoint is not an ancestor of this independently accepted tip.
+    assert_eq!(
+        (fork_tip.control_epoch, fork_tip.key_epoch),
+        (tip.control_epoch, tip.key_epoch)
+    );
+    for anchor in [
+        fork_tip,
+        MembershipEndpoint {
+            control_epoch: tip.control_epoch + 1,
+            ..tip
+        },
+        MembershipEndpoint {
+            key_epoch: tip.key_epoch + 1,
+            ..tip
+        },
+        MembershipEndpoint {
+            state_sha256: Sha256Digest([99; 32]),
+            ..tip
+        },
+    ] {
+        assert!(lineage(&events, anchor, second_tip, generous).is_err());
+    }
+    // Finding the anchor does not accept a truncated prefix or invalid later evidence.
+    assert!(lineage(&events[..3], tip, second_tip, generous).is_err());
+    assert!(lineage(&events, tip, tip, generous).is_err());
+    let mut bad_rotation_sig = second_sig;
+    bad_rotation_sig.0[0] ^= 1;
+    assert!(
+        lineage(
+            &[
+                event_b(),
+                event_r(),
+                event_c(),
+                MembershipHistoryEvent::Revocation {
+                    statement: &second_bytes,
+                    signature: bad_rotation_sig,
+                    transition: &second_transition_bytes,
+                }
+            ],
+            tip,
+            second_tip,
+            generous
+        )
+        .is_err()
+    );
+    let mut bad_add_sig = sig_c;
+    bad_add_sig.0[0] ^= 1;
+    assert!(
+        lineage(
+            &[
+                event_b(),
+                event_r(),
+                MembershipHistoryEvent::PairingAdd {
+                    statement: &bytes_c,
+                    signature: bad_add_sig,
+                    request: &req_c,
+                    approved_payload: &payload_c,
+                },
+                second_event()
+            ],
+            tip,
+            second_tip,
+            generous
+        )
+        .is_err()
+    );
+    let exact_bytes = enrollment.canonical_record.len()
+        + bytes_b.len()
+        + 64
+        + req_b.canonical_bytes().len()
+        + payload_b.len()
+        + r_bytes.len()
+        + 64
+        + t_bytes.len()
+        + bytes_c.len()
+        + 64
+        + req_c.canonical_bytes().len()
+        + payload_c.len()
+        + second_bytes.len()
+        + 64
+        + second_transition_bytes.len();
+    let exact_budget = MembershipHistoryBudget {
+        max_events: events.len(),
+        max_bytes: exact_bytes,
+    };
+    assert!(lineage(&events, tip, second_tip, exact_budget).is_ok());
+    for budget in [
+        MembershipHistoryBudget {
+            max_events: events.len() - 1,
+            ..exact_budget
+        },
+        MembershipHistoryBudget {
+            max_bytes: exact_bytes - 1,
+            ..exact_budget
+        },
+    ] {
+        assert!(lineage(&events, tip, second_tip, budget).is_err());
+    }
     // This explicitly cannot discover a withheld newer tail beyond an independently old pin.
     assert!(replay(&[event_b()], endpoint(&after_b.state())).is_ok());
     assert!(

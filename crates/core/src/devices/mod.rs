@@ -1,10 +1,10 @@
 pub mod account_lifecycle;
 pub mod crypto;
 pub mod identity;
+pub mod membership_crypto;
 #[cfg(feature = "test-support")]
 pub mod memory_recovery_transport;
 pub mod memory_transport;
-pub mod membership_crypto;
 pub mod pairing;
 pub mod recovery;
 pub mod recovery_crypto;

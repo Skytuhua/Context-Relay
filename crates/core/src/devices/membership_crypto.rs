@@ -333,6 +333,91 @@ impl VerifiedMembershipHistory {
     }
 }
 
+/// Authenticated public plaintext commitment from one verified rotation.
+/// This does not prove that any supplied secret opens to this commitment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedRotatedKeyCommitment {
+    control_epoch: u32,
+    key_epoch: u32,
+    key_material_sha256: Sha256Digest,
+}
+impl VerifiedRotatedKeyCommitment {
+    pub fn control_epoch(&self) -> u32 {
+        self.control_epoch
+    }
+    pub fn key_epoch(&self) -> u32 {
+        self.key_epoch
+    }
+    pub fn key_material_sha256(&self) -> Sha256Digest {
+        self.key_material_sha256
+    }
+}
+
+/// One exact anchor on the verified genesis-to-endpoint path. This is neither
+/// recipient admission/human confirmation nor authority to install keys.
+pub struct VerifiedMembershipLineage {
+    history: VerifiedMembershipHistory,
+    anchor: MembershipEndpoint,
+    rotated_key_commitments: Vec<VerifiedRotatedKeyCommitment>,
+}
+impl VerifiedMembershipLineage {
+    pub fn history(&self) -> &VerifiedMembershipHistory {
+        &self.history
+    }
+    pub fn anchor(&self) -> MembershipEndpoint {
+        self.anchor
+    }
+    /// Chronological rotations, including the current epoch. Genesis has no
+    /// public plaintext digest, so there is deliberately no epoch-one entry.
+    pub fn rotated_key_commitments(&self) -> &[VerifiedRotatedKeyCommitment] {
+        &self.rotated_key_commitments
+    }
+}
+
+/// Prove an independently accepted anchor occurs on the complete path to an
+/// independently accepted endpoint, under the same enrollment pin and scope.
+/// Genesis and the endpoint itself are valid anchors. Provider-supplied hashes
+/// alone are not authority; this proves neither global freshness nor secret validity.
+/// The same event/byte budgets and failure rules as history replay apply.
+pub fn verify_membership_lineage(
+    canonical_enrollment: &[u8],
+    independent_enrollment_pin: Sha256Digest,
+    scope: SyncScope,
+    events: &[MembershipHistoryEvent<'_>],
+    independent_anchor: MembershipEndpoint,
+    independent_endpoint: MembershipEndpoint,
+    budget: MembershipHistoryBudget,
+) -> Result<VerifiedMembershipLineage, CryptoError> {
+    let mut anchor_seen = false;
+    let mut rotated_key_commitments = Vec::new();
+    let history = replay_membership_history(
+        canonical_enrollment,
+        independent_enrollment_pin,
+        scope,
+        events,
+        independent_endpoint,
+        budget,
+        |endpoint, rotation| {
+            anchor_seen |= endpoint == independent_anchor;
+            if let Some(rotation) = rotation {
+                rotated_key_commitments.push(VerifiedRotatedKeyCommitment {
+                    control_epoch: rotation.control_epoch,
+                    key_epoch: rotation.key_epoch,
+                    key_material_sha256: rotation.key_material_sha256,
+                });
+            }
+        },
+    )?;
+    if !anchor_seen {
+        return Err(CryptoError::AuthenticationFailed);
+    }
+    Ok(VerifiedMembershipLineage {
+        history,
+        anchor: independent_anchor,
+        rotated_key_commitments,
+    })
+}
+
 /// Verify every parent edge from root-only enrollment genesis. Never pass a pin
 /// or endpoint selected solely by the same provider supplying this evidence.
 /// Budget exhaustion is an error, never success with an accepted prefix.
@@ -343,6 +428,26 @@ pub fn verify_membership_history(
     events: &[MembershipHistoryEvent<'_>],
     independent_endpoint: MembershipEndpoint,
     budget: MembershipHistoryBudget,
+) -> Result<VerifiedMembershipHistory, CryptoError> {
+    replay_membership_history(
+        canonical_enrollment,
+        independent_enrollment_pin,
+        scope,
+        events,
+        independent_endpoint,
+        budget,
+        |_, _| {},
+    )
+}
+
+fn replay_membership_history(
+    canonical_enrollment: &[u8],
+    independent_enrollment_pin: Sha256Digest,
+    scope: SyncScope,
+    events: &[MembershipHistoryEvent<'_>],
+    independent_endpoint: MembershipEndpoint,
+    budget: MembershipHistoryBudget,
+    mut on_verified_state: impl FnMut(MembershipEndpoint, Option<&RevocationTransitionV1>),
 ) -> Result<VerifiedMembershipHistory, CryptoError> {
     let invalid = CryptoError::AuthenticationFailed;
     if events.len() > budget.max_events {
@@ -402,6 +507,7 @@ pub fn verify_membership_history(
         operations: BTreeSet::new(),
         latest_rotation: None,
     };
+    on_verified_state(history.endpoint(), None);
     for event in events {
         match event {
             MembershipHistoryEvent::PairingAdd {
@@ -425,6 +531,7 @@ pub fn verify_membership_history(
                     .admissions
                     .insert(p.grant.certificate.device_id, s.certificate_id);
                 history.state = next.state;
+                on_verified_state(history.endpoint(), None);
             }
             MembershipHistoryEvent::Revocation {
                 statement,
@@ -438,6 +545,7 @@ pub fn verify_membership_history(
                 let t = RevocationTransitionV1::from_canonical_bytes(transition)?;
                 let next = t.verify_and_advance(&s, *signature, &history.state())?;
                 history.state = OwnedControl::from_state(&next.state());
+                on_verified_state(history.endpoint(), Some(&t));
                 history.latest_rotation = Some((next, t));
             }
         }
