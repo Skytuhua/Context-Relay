@@ -13,3 +13,43 @@ Task 3 must apply and verify available settings after CI exists and GitHub authe
 - Set the GitHub Actions token to read-only.
 - Require squash-only merges.
 - After CI exists, configure rulesets for `main` and `v*`.
+
+## Live verification — 2026-09-14
+
+Read-only GitHub REST checks against `Skytuhua/Context-Relay` verified:
+
+- Public repository, default branch `main`, and GitHub license detection `Apache-2.0`.
+- Secret scanning, provider-pattern push protection, Dependabot security updates,
+  and private vulnerability reporting enabled. Non-provider patterns and validity
+  checks remain disabled; the required `Secret Scan` check remains the recorded
+  compensating gate, not evidence that those GitHub features are enabled.
+- Actions default token permissions are `read`, and Actions cannot approve pull
+  request reviews. Squash merging is enabled; merge commits and rebase merging
+  are disabled.
+- [Protect main](https://github.com/Skytuhua/Context-Relay/rules/19760487)
+  is active for exactly `refs/heads/main`: deletion and force updates are blocked,
+  linear history and a pull request are required, review threads must be resolved,
+  and 22 strict status checks are required. Required approving review count is zero.
+- [Protect release tags](https://github.com/Skytuhua/Context-Relay/rules/19760490)
+  is active for `refs/tags/v*`, blocking update and deletion. It does not restrict
+  tag creation. Both rulesets retain an explicit user bypass actor with `always`
+  mode; this audit neither used nor removed that bypass.
+
+The main ruleset still includes macOS checks. The user's Apple deferral has not
+changed remote protection configuration or authorized bypassing a failed check.
+Reconcile applicable merge requirements before the final merge audit. No remote
+settings were changed during this verification.
+
+The live open Dependabot set is #23 (`glib`), #37–39 (`@vitest/mocker`/`vitest`),
+and #40 (`js-yaml`). The latter four advisories report patched versions 4.1.11
+and 4.3.2 respectively, already present in PR16's manifest/lockfile at pushed
+head `30589c010af29b1bd0caf543eaab539baedd044c`; those files match the current
+worktree. This does not close the default-branch alerts. Alert #23 remains open
+without an approved disposition. No alert was dismissed.
+
+Evidence was retrieved using `gh api` for the repository, both ruleset IDs,
+`actions/permissions/workflow`, `private-vulnerability-reporting`, and the open
+Dependabot alerts. The local response snapshot is
+`.codex/pr16-repository-settings-2026-09-14.json`. These are configuration and
+advisory observations, not fork-secret attack tests, name clearance, license
+closure, protected-tag publication, or full T01/T02/RB-REP acceptance.
