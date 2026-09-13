@@ -1,5 +1,27 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Independent Windows builder identities — 2026-09-13
+
+Both builders in Windows-only qualification run `34760841409` at `a22dfab`
+completed successfully. Actual artifact `10320870012` (A) and `10320420116` (B)
+identity records were retrieved using bounded ZIP ranges with CRC checks. The
+shared identity validator passes for the exact commit, workflow, run/attempt,
+job definition, separate check-run IDs and slots. A's runner is GitHub Actions
+1000009054; B's is GitHub Actions 1000009051. Both actual offline-evidence files
+pass the qualification validator. These are metadata/evidence checks, not a new
+runtime payload comparison or complete qualification.
+
+The actual A job log records a 1,405,068,586-byte upload, artifact `10320870012`,
+and uploaded ZIP SHA-256
+`744993d1d56d87744faef9fdd462d9ff491c0fdb1ccf072ce5792f65540d4744`.
+This digest is reported by the uploader; a whole-ZIP download was not rehashed.
+Logs and retrieved metadata remain under `.codex/`. Rust tests and Windows
+isolation were still running at observation. No rerun was started.
+
+The separately pushed device-history change `30589c0` has passing Secret Scan
+`34765079725` and Supabase checks `34765079722`; CI was queued and Windows
+installer/firewall checks were running. Earlier qualification does not cover
+this revision. Full release and installed acceptance remain incomplete.
 ## Durable accepted membership — 2026-09-13
 
 Schema 40 stores complete canonical signed additions and revocations, pinned
