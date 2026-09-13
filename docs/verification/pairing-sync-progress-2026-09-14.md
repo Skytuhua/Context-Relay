@@ -157,3 +157,43 @@ recovery publication at the exact parent/generation and an exact retry. Its
 rotated parent is seeded from a Rust-verified vector; this is not a live
 revocation-publication test. Failure-case coverage and fresh full migration
 replay after this SQL change remain required.
+
+## Recovery server failure cases and history access
+
+All four recovery database tests passed in 1165.6965ms
+(`task-5-recovery-postgres-covering1.log`, implementer confirms terminal0).
+They cover stale parent/generation rejection, rollback after public-event
+insertion failure, and retries requiring the current recipient and original
+live session. The rotated parent remains a seeded component fixture.
+
+The adapter covering run passed 9 tests in 265.613ms
+(`task-5-recovery-adapter-green.log`). The expanded HTTP handler run passed
+10 in 274.8299ms (`task-5-recovery-http-green1.log`). The adapter test uses a
+fake RPC and the handler test uses simulated authentication/history dependencies;
+these results do not establish an integrated handler-to-database or deployed test.
+
+`task-5-recovery-history-green1.log` passed one database test in 321.7299ms
+(total). It proves addressed history access from a new unbound owner session,
+missing-object handling and dead-session endpoint rejection. Existing device
+rows remain active in this fixture. Explicit all-devices-inactive and wrong
+owner/workspace/enrollment checks were requested before claiming that broader
+coverage. Complete native recovery, real revocation/recovery concurrency, fresh
+migration replay and hosted/installed acceptance remain open.
+
+The expanded history test subsequently passed in 714.5419ms total
+(`task-5-recovery-history-green2.log`). Its fixture explicitly makes every prior
+member inactive and binding revoked, asserts zero active rows, then retrieves
+history from the new owner session. It rejects wrong owners on both reads,
+wrong enrollment pin on the endpoint, wrong workspace on the event, and dead
+sessions on both reads. Direct private-helper execution remains denied to anon,
+authenticated and service_role. Revocation state is seeded by the fixture;
+this does not qualify actual signed revocation publication or its concurrent
+interaction with recovery.
+
+The subsequent integrated local recovery test passed in 1867.4192ms total
+(`task-5-recovery-http-postgres1.log`). It connects the real handler and
+production adapter to service-role PostgreSQL transactions through a psql
+bridge, verifies exact receipt retries, status and public-event bytes, and
+rejects an invalid proof before committing. Auth claims and SDK transport are
+stubbed; the rotated parent is still seeded. This closes the local integration
+gap above, not deployed Supabase Auth/PostgREST acceptance.
