@@ -4014,7 +4014,7 @@ fn parse_record_id(value: &str) -> Result<RecordId, VaultError> {
         .map_err(|_| VaultError::Validation("invalid stored record ID".to_owned()))
 }
 
-const fn record_kind_name(value: RecordKind) -> &'static str {
+pub(in crate::vault) const fn record_kind_name(value: RecordKind) -> &'static str {
     match value {
         RecordKind::Memory => "memory",
         RecordKind::MemoryCandidate => "memory_candidate",
@@ -4039,7 +4039,7 @@ fn parse_record_kind(value: &str) -> Result<RecordKind, VaultError> {
     }
 }
 
-const fn mutation_kind_name(value: MutationKind) -> &'static str {
+pub(in crate::vault) const fn mutation_kind_name(value: MutationKind) -> &'static str {
     match value {
         MutationKind::Upsert => "upsert",
         MutationKind::Tombstone => "tombstone",

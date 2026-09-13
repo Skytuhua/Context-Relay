@@ -15,6 +15,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Copy)]
 /// Explicit aggregate limits for durable candidates, verified chains and isolated replay.
+/// Installation and completion additionally authenticate live provenance under the private
+/// reader's fixed limits: 100,000 rows, 64 MiB and 1,000,000 dependencies. These separate
+/// bounded reads may reject larger live vaults and are repeated for affected operations.
 pub struct HistoricalReconstructionBudget {
     pub transfer: HistoricalTransferBudget,
     pub max_operations: usize,
@@ -95,14 +98,13 @@ impl Vault {
         for head in &checkpoint.causal_frontier {
             for seq in 1..=head.sequence {
                 let entry = &evidence.entries[&(head.device_id, seq)];
-                let row=tx.query_row("SELECT CASE WHEN length(operations.payload_json)<=?2 THEN operations.payload_json END,CASE WHEN length(meta.canonical_sha256)=32 THEN meta.canonical_sha256 END FROM operations JOIN sync_operation_meta meta ON meta.operation_id=operations.id WHERE operations.id=?1",params![entry.operation.operation_id.to_string(),budget.max_operation_bytes.saturating_mul(16).min(i64::MAX as usize) as i64],|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,Vec<u8>>(1)?))).optional()?;
-                let Some((payload, hash)) = row else {
-                    return Ok(false);
-                };
-                let op: SyncOperationV1 = super::super::from_json(&payload)?;
-                if checked(encode_sync_operation_v1(&op))? != entry.bytes || hash != entry.hash.0 {
-                    return Err(invalid());
-                }
+                representative::authenticate_local_operation(
+                    &tx,
+                    &stored,
+                    device,
+                    &entry.operation,
+                    false,
+                )?;
             }
         }
         tx.commit()?;
@@ -132,19 +134,49 @@ impl Vault {
             return Ok(false);
         };
         let mut updates = Vec::new();
+        let stored = load(&tx, budget.transfer.history)?.ok_or_else(invalid)?;
+        let device = confirmed.payload().grant.certificate.device_id;
+        if !reconstructed.operations.is_empty() {
+            representative::ensure_live_bounds(&tx)?;
+        }
         for operation in &reconstructed.operations {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1)",
+                [operation.operation().operation_id.to_string()],
+                |r| r.get(0),
+            )?;
+            if exists {
+                representative::authenticate_local_operation(
+                    &tx,
+                    &stored,
+                    device,
+                    operation.operation(),
+                    false,
+                )?;
+            }
             let (_, update) = Self::apply_verified_in_transaction(
                 &tx,
                 operation,
                 None,
-                &|op| decrypt(op, &reconstructed.keys),
+                &|op| {
+                    representative::authenticate_local_operation(&tx, &stored, device, op, true)?;
+                    decrypt(op, &reconstructed.keys)
+                },
                 embeddings,
                 0,
                 "1970-01-01T00:00:00Z",
             )?;
+            if !exists {
+                representative::authenticate_local_operation(
+                    &tx,
+                    &stored,
+                    device,
+                    operation.operation(),
+                    false,
+                )?;
+            }
             updates.push(update);
         }
-        let stored = load(&tx, budget.transfer.history)?.ok_or_else(invalid)?;
         let t = material::load_transfer(&tx, selected.transfer_id, budget.transfer)?
             .ok_or_else(invalid)?;
         let mut preimage = receipt_preimage(&stored, &t, &reconstructed.prefixes);
@@ -234,36 +266,55 @@ impl Vault {
             // A full untrusted candidate cache must never block a correct bounded repair.
             tx.execute("DELETE FROM historical_operation_evidence", [])?;
         }
-        let mut chosen = BTreeMap::new();
-        let mut ids = BTreeMap::new();
-        for raw in operations {
-            let entry = decode_entry(raw)?;
-            let index = (entry.operation.device_id, entry.operation.device_sequence);
-            if chosen.insert(index, raw).is_some_and(|old| old != raw) {
-                return Err(VaultError::OperationConflict);
-            }
-            if ids
-                .insert(entry.operation.operation_id, raw)
-                .is_some_and(|old| old != raw)
-            {
-                return Err(VaultError::OperationConflict);
-            }
-            let pinned:Option<Vec<u8>>=tx.query_row("SELECT CASE WHEN length(canonical)<=?4 THEN canonical END FROM historical_verified_operations WHERE operation_id=?1 OR (device_id=?2 AND device_sequence=?3) LIMIT 1",params![entry.operation.operation_id.to_string(),index.0.to_string(),index.1.to_string(),budget.max_operation_bytes.min(i64::MAX as usize) as i64],|r|r.get(0)).optional()?;
-            if let Some(pinned) = pinned {
-                if pinned != *raw {
-                    return Err(VaultError::OperationConflict);
-                }
-                continue;
-            }
-            tx.execute("DELETE FROM historical_operation_evidence WHERE operation_id=?1 OR (device_id=?2 AND device_sequence=?3)",params![entry.operation.operation_id.to_string(),index.0.to_string(),index.1.to_string()])?;
-            tx.execute("INSERT INTO historical_operation_evidence(operation_id,device_id,device_sequence,canonical) VALUES(?1,?2,?3,?4)",params![entry.operation.operation_id.to_string(),index.0.to_string(),index.1.to_string(),raw])?;
-        }
+        stage_candidates(&tx, operations, budget)?;
         // Recheck aggregate limits before allocating/replaying newly collected evidence.
-        let evidence = load_evidence(&tx, budget)?;
+        let evidence = match load_evidence(&tx, budget) {
+            Ok(evidence) => evidence,
+            Err(VaultError::BudgetExceeded) => {
+                // Dependency pressure is also cache pressure. Retry only the explicitly
+                // supplied branch with immutable verified pins; never evict trusted proof.
+                tx.execute("DELETE FROM historical_operation_evidence", [])?;
+                stage_candidates(&tx, operations, budget)?;
+                load_evidence(&tx, budget)?
+            }
+            Err(error) => return Err(error),
+        };
         authenticate(&stored, evidence, budget)?;
         tx.commit()?;
         Ok(())
     }
+}
+
+fn stage_candidates(
+    tx: &Transaction<'_>,
+    operations: &[Vec<u8>],
+    budget: HistoricalReconstructionBudget,
+) -> Result<(), VaultError> {
+    let mut chosen = BTreeMap::new();
+    let mut ids = BTreeMap::new();
+    for raw in operations {
+        let entry = decode_entry(raw)?;
+        let index = (entry.operation.device_id, entry.operation.device_sequence);
+        if chosen.insert(index, raw).is_some_and(|old| old != raw) {
+            return Err(VaultError::OperationConflict);
+        }
+        if ids
+            .insert(entry.operation.operation_id, raw)
+            .is_some_and(|old| old != raw)
+        {
+            return Err(VaultError::OperationConflict);
+        }
+        let pinned:Option<Vec<u8>>=tx.query_row("SELECT CASE WHEN length(canonical)<=?4 THEN canonical END FROM historical_verified_operations WHERE operation_id=?1 OR (device_id=?2 AND device_sequence=?3) LIMIT 1",params![entry.operation.operation_id.to_string(),index.0.to_string(),index.1.to_string(),budget.max_operation_bytes.min(i64::MAX as usize) as i64],|r|r.get(0)).optional()?;
+        if let Some(pinned) = pinned {
+            if pinned != *raw {
+                return Err(VaultError::OperationConflict);
+            }
+            continue;
+        }
+        tx.execute("DELETE FROM historical_operation_evidence WHERE operation_id=?1 OR (device_id=?2 AND device_sequence=?3)",params![entry.operation.operation_id.to_string(),index.0.to_string(),index.1.to_string()])?;
+        tx.execute("INSERT INTO historical_operation_evidence(operation_id,device_id,device_sequence,canonical) VALUES(?1,?2,?3,?4)",params![entry.operation.operation_id.to_string(),index.0.to_string(),index.1.to_string(),raw])?;
+    }
+    Ok(())
 }
 
 struct Entry {

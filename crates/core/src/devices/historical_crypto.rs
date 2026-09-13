@@ -702,6 +702,659 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[derive(Clone, Copy)]
+    enum InstallReviewCase {
+        LiveBudget,
+        LiveCap,
+        CompletionHeads,
+        RepresentativeMetadata,
+        RepresentativeBranch,
+        ReplayMetadata,
+        ReplayHeads,
+        DependencyStage,
+        DependencyReconstruct,
+    }
+    #[test]
+    fn historical_review_install_requires_representative_metadata() {
+        exercise_install_review(InstallReviewCase::RepresentativeMetadata);
+    }
+    #[test]
+    fn historical_review_install_requires_representative_cutoff_branch() {
+        exercise_install_review(InstallReviewCase::RepresentativeBranch);
+    }
+    #[test]
+    fn historical_review_replay_requires_applied_metadata() {
+        exercise_install_review(InstallReviewCase::ReplayMetadata);
+    }
+    #[test]
+    fn historical_review_replay_requires_record_frontier() {
+        exercise_install_review(InstallReviewCase::ReplayHeads);
+    }
+    #[test]
+    fn historical_review_dependency_pressure_repairs_through_stage() {
+        exercise_install_review(InstallReviewCase::DependencyStage);
+    }
+    #[test]
+    fn historical_review_dependency_pressure_repairs_through_reconstruct() {
+        exercise_install_review(InstallReviewCase::DependencyReconstruct);
+    }
+    #[test]
+    fn historical_review_target_budget_is_separate_from_live_reads() {
+        exercise_install_review(InstallReviewCase::LiveBudget);
+    }
+    #[test]
+    fn historical_review_live_read_cap_is_enforced() {
+        exercise_install_review(InstallReviewCase::LiveCap);
+    }
+    #[test]
+    fn historical_review_completion_authenticates_record_frontier() {
+        exercise_install_review(InstallReviewCase::CompletionHeads);
+    }
+    fn exercise_install_review(case: InstallReviewCase) {
+        use crate::{sync::*, vault::*};
+        use context_relay_protocol::{
+            DeviceSequence, ProjectIdentity, RecordKind, RecordMutationV1,
+        };
+        let root_keys = DeviceKeys::from_seeds([1; 32], [2; 32]);
+        let key = crate::crypto::ContentKey::from_bytes([22; 32]);
+        let mutation = |name: &str| {
+            RecordMutationV1::UpsertProject(ProjectIdentity {
+                project_id: id(91),
+                github_repository_id: None,
+                git_remote_fingerprint: None,
+                monorepo_subdirectory: None,
+                name: name.into(),
+            })
+        };
+        let old = mutation("existing representative");
+        let make_old = || {
+            OperationBuilder::new(SyncIdentity {
+                membership_endpoint: None,
+                account_id: id(1),
+                workspace_id: id(2),
+                device_id: id(3),
+                control_epoch: 1,
+                key_epoch: 1,
+                device_keys: &root_keys,
+                content_key: &key,
+            })
+            .build(OperationBuildRequest {
+                operation_id: id(90),
+                project_id: Some(id(91)),
+                mutation: &old,
+                causal_frontier: vec![],
+                previous: None,
+                blob_refs: vec![],
+                created_hlc: HybridLogicalClock::new(1000, 0, id(3)),
+            })
+            .unwrap()
+        };
+        let old_op = make_old();
+        let alternate = make_old();
+        assert_ne!(old_op.canonical_hash, alternate.canonical_hash);
+        let mut f = fixture_with_first_cutoff(1, Some((1, old_op.canonical_hash)));
+        let target_mutation = mutation("incoming historical target");
+        let target = OperationBuilder::new(SyncIdentity {
+            membership_endpoint: Some(f.lineage.anchor()),
+            account_id: id(1),
+            workspace_id: id(2),
+            device_id: id(4),
+            control_epoch: 1,
+            key_epoch: 1,
+            device_keys: &f.keys,
+            content_key: &key,
+        })
+        .build(OperationBuildRequest {
+            operation_id: id(95),
+            project_id: Some(id(91)),
+            mutation: &target_mutation,
+            causal_frontier: vec![],
+            previous: None,
+            blob_refs: vec![],
+            created_hlc: HybridLogicalClock::new(1001, 0, id(4)),
+        })
+        .unwrap();
+        let mut checkpoint = context_relay_protocol::decode_checkpoint_v1(&f.checkpoint).unwrap();
+        checkpoint.causal_frontier = vec![DeviceSequence {
+            device_id: id(4),
+            sequence: 1,
+        }];
+        checkpoint.state_hash = StateSummaryV1 {
+            entries: vec![StateSummaryEntryV1 {
+                record_id: target_mutation.record_id(),
+                record_kind: RecordKind::Project,
+                head_hashes: vec![target.canonical_hash],
+                tombstoned: false,
+                conflicted: false,
+            }],
+        }
+        .state_hash()
+        .unwrap();
+        f.exporter_keys.sign_checkpoint(&mut checkpoint).unwrap();
+        f.checkpoint = encode_checkpoint_v1(&checkpoint).unwrap();
+        let budget = HistoricalReconstructionBudget {
+            transfer: HistoricalTransferBudget {
+                history: MembershipHistoryBudget {
+                    max_events: 200,
+                    max_bytes: 2_000_000,
+                },
+                max_pages: 4,
+                max_bytes: 100_000,
+            },
+            max_operations: 20,
+            max_operation_bytes: 1_000_000,
+            max_dependencies: 100,
+        };
+        let path =
+            std::env::temp_dir().join(format!("historical-review-{}.db", uuid::Uuid::now_v7()));
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        let Event::Add(_, _, request, _) = &f.events[0] else {
+            panic!()
+        };
+        v.accept_confirmed_membership_admission(
+            &f.enrollment,
+            &[],
+            &f.confirmed,
+            request,
+            f.signature,
+            &f.keys,
+            budget.transfer.history,
+        )
+        .unwrap();
+        v.activate_current_membership_material(
+            f.lineage.anchor(),
+            id(4),
+            &f.keys,
+            budget.transfer.history,
+        )
+        .unwrap();
+        let current = v.trusted_sync_material(&f.keys).unwrap();
+        let embeddings = |_, _: &RecordMutationV1| Ok(None);
+        let AdmissionDecision::Admitted(old_admitted) =
+            admit_operation(&v, &old_op.canonical_bytes, &current).unwrap()
+        else {
+            panic!()
+        };
+        v.apply_admitted_operation(
+            &old_admitted,
+            &current,
+            "memory",
+            "2026-09-14T00:00:00Z",
+            &embeddings,
+        )
+        .unwrap();
+        if matches!(
+            case,
+            InstallReviewCase::ReplayMetadata | InstallReviewCase::ReplayHeads
+        ) {
+            let AdmissionDecision::Admitted(admitted) =
+                admit_operation(&v, &target.canonical_bytes, &current).unwrap()
+            else {
+                panic!()
+            };
+            v.apply_admitted_operation(
+                &admitted,
+                &current,
+                "memory",
+                "2026-09-14T00:00:00Z",
+                &embeddings,
+            )
+            .unwrap();
+        }
+        let d = f.lineage.history().endpoint();
+        v.accept_membership_extension(
+            f.lineage.anchor(),
+            d,
+            &f.events[1..]
+                .iter()
+                .map(Event::borrowed)
+                .collect::<Vec<_>>(),
+            budget.transfer.history,
+        )
+        .unwrap();
+        v.stage_current_membership_material(d, id(4), &f.keys, budget.transfer.history)
+            .unwrap();
+        assert!(v.trusted_sync_material(&f.keys).is_err());
+        let authority = f.authority();
+        let page = authority
+            .build_page(
+                0,
+                ZERO,
+                &f.bundles[..1],
+                EpochOneTrust::PreviouslyTrusted(&f.bundles[0]),
+            )
+            .unwrap();
+        let header = authority
+            .sign_header(digest(&page), &f.exporter_keys)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        let selected = v
+            .select_historical_transfer(
+                d,
+                None,
+                &f.confirmed,
+                f.signature,
+                &header,
+                &f.checkpoint,
+                &f.keys,
+                budget.transfer,
+            )
+            .unwrap();
+        v.commit_historical_transfer_page(
+            selected,
+            &f.confirmed,
+            f.signature,
+            (0, digest(&page)),
+            &page,
+            &f.keys,
+            budget.transfer,
+        )
+        .unwrap();
+        let proof = v
+            .reconstruct_historical_transfer(
+                selected,
+                &f.confirmed,
+                f.signature,
+                std::slice::from_ref(&target.canonical_bytes),
+                &f.keys,
+                budget,
+                &embeddings,
+            )
+            .unwrap()
+            .unwrap();
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        unsafe {
+            assert_eq!(
+                rusqlite::ffi::sqlite3_key(raw.handle(), [77u8; 32].as_ptr().cast(), 32),
+                0
+            );
+        }
+        if matches!(
+            case,
+            InstallReviewCase::DependencyStage | InstallReviewCase::DependencyReconstruct
+        ) {
+            let poison = OperationBuilder::new(SyncIdentity {
+                membership_endpoint: Some(f.lineage.anchor()),
+                account_id: id(1),
+                workspace_id: id(2),
+                device_id: id(4),
+                control_epoch: 1,
+                key_epoch: 1,
+                device_keys: &f.keys,
+                content_key: &key,
+            })
+            .build(OperationBuildRequest {
+                operation_id: id(96),
+                project_id: Some(id(91)),
+                mutation: &target_mutation,
+                causal_frontier: vec![DeviceSequence {
+                    device_id: id(4),
+                    sequence: 1,
+                }],
+                previous: Some(OperationChainHead {
+                    sequence: 1,
+                    canonical_hash: target.canonical_hash,
+                }),
+                blob_refs: vec![],
+                created_hlc: HybridLogicalClock::new(1002, 0, id(4)),
+            })
+            .unwrap();
+            let current_key =
+                crate::crypto::ContentKey::from_bytes(*f.bundles[1].active_epoch_key());
+            let correct = OperationBuilder::new(SyncIdentity {
+                membership_endpoint: Some(d),
+                account_id: id(1),
+                workspace_id: id(2),
+                device_id: id(181),
+                control_epoch: 2,
+                key_epoch: 2,
+                device_keys: &f.exporter_keys,
+                content_key: &current_key,
+            })
+            .build(OperationBuildRequest {
+                operation_id: id(97),
+                project_id: Some(id(91)),
+                mutation: &target_mutation,
+                causal_frontier: vec![DeviceSequence {
+                    device_id: id(4),
+                    sequence: 1,
+                }],
+                previous: None,
+                blob_refs: vec![],
+                created_hlc: HybridLogicalClock::new(1003, 0, id(181)),
+            })
+            .unwrap();
+            v.stage_historical_operations(
+                d,
+                id(4),
+                std::slice::from_ref(&poison.canonical_bytes),
+                &f.keys,
+                budget,
+            )
+            .unwrap();
+            drop(v);
+            let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+            let limited = HistoricalReconstructionBudget {
+                max_dependencies: 1,
+                ..budget
+            };
+            if matches!(case, InstallReviewCase::DependencyStage) {
+                v.stage_historical_operations(d,id(4),std::slice::from_ref(&correct.canonical_bytes),&f.keys,limited).expect("dependency pressure must evict provisional poison for a correct bounded stage retry");
+            } else {
+                assert!(
+                    v.reconstruct_historical_transfer(
+                        selected,
+                        &f.confirmed,
+                        f.signature,
+                        std::slice::from_ref(&correct.canonical_bytes),
+                        &f.keys,
+                        limited,
+                        &embeddings
+                    )
+                    .expect(
+                        "dependency pressure must permit a correct bounded reconstruction retry"
+                    )
+                    .is_some()
+                );
+            }
+            assert_eq!(
+                raw.query_row(
+                    "SELECT canonical FROM historical_verified_operations WHERE operation_id=?1",
+                    [target.operation.operation_id.to_string()],
+                    |r| r.get::<_, Vec<u8>>(0)
+                )
+                .unwrap(),
+                target.canonical_bytes
+            );
+            assert_eq!(
+                raw.query_row(
+                    "SELECT count(*) FROM historical_operation_evidence WHERE operation_id=?1",
+                    [poison.operation.operation_id.to_string()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            drop(raw);
+            drop(v);
+            std::fs::remove_file(&path).unwrap();
+            return;
+        }
+        if matches!(
+            case,
+            InstallReviewCase::LiveBudget | InstallReviewCase::CompletionHeads
+        ) {
+            if matches!(case, InstallReviewCase::LiveBudget) {
+                v.activate_current_membership_material(d, id(4), &f.keys, budget.transfer.history)
+                    .unwrap();
+                let newer_mutation = mutation("newer live work beyond the target budget");
+                let newer_key =
+                    crate::crypto::ContentKey::from_bytes(*f.bundles[1].active_epoch_key());
+                let newer = OperationBuilder::new(SyncIdentity {
+                    membership_endpoint: Some(d),
+                    account_id: id(1),
+                    workspace_id: id(2),
+                    device_id: id(181),
+                    control_epoch: d.control_epoch,
+                    key_epoch: d.key_epoch,
+                    device_keys: &f.exporter_keys,
+                    content_key: &newer_key,
+                })
+                .build(OperationBuildRequest {
+                    operation_id: id(98),
+                    project_id: Some(id(91)),
+                    mutation: &newer_mutation,
+                    causal_frontier: vec![DeviceSequence {
+                        device_id: id(3),
+                        sequence: 1,
+                    }],
+                    previous: None,
+                    blob_refs: vec![],
+                    created_hlc: HybridLogicalClock::new(1002, 0, id(181)),
+                })
+                .unwrap();
+                let current = v.trusted_sync_material(&f.keys).unwrap();
+                let AdmissionDecision::Admitted(admitted) =
+                    admit_operation(&v, &newer.canonical_bytes, &current).unwrap()
+                else {
+                    panic!()
+                };
+                v.apply_admitted_operation(
+                    &admitted,
+                    &current,
+                    "supabase",
+                    "2026-09-14T00:00:00Z",
+                    &embeddings,
+                )
+                .unwrap();
+            }
+            let limited = HistoricalReconstructionBudget {
+                max_operations: 1,
+                ..budget
+            };
+            let install_budget = if matches!(case, InstallReviewCase::LiveBudget) {
+                limited
+            } else {
+                budget
+            };
+            assert!(
+                v.install_historical_transfer(
+                    &proof,
+                    &f.confirmed,
+                    f.signature,
+                    &f.keys,
+                    install_budget,
+                    &embeddings
+                )
+                .is_ok_and(|ok| ok),
+                "bounded target must install beside a larger authenticated live state"
+            );
+            assert!(
+                v.historical_transfer_is_installed(
+                    selected,
+                    &f.confirmed,
+                    f.signature,
+                    &f.keys,
+                    install_budget
+                )
+                .unwrap()
+            );
+            if matches!(case, InstallReviewCase::LiveBudget) {
+                assert_eq!(
+                    raw.query_row(
+                        "SELECT count(*) FROM operations WHERE id=?1",
+                        [id::<context_relay_protocol::OperationId>(98).to_string()],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    1,
+                    "newer live operation remains stored"
+                );
+                assert_eq!(
+                    raw.query_row(
+                        "SELECT count(*) FROM sync_record_heads WHERE record_id=?1",
+                        [id::<context_relay_protocol::RecordId>(91).to_string()],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    2,
+                    "target and concurrent newer live heads both survive installation"
+                );
+            }
+            if matches!(case, InstallReviewCase::CompletionHeads) {
+                raw.execute(
+                    "DELETE FROM sync_record_heads WHERE operation_id=?1",
+                    [target.operation.operation_id.to_string()],
+                )
+                .unwrap();
+                assert!(
+                    !v.historical_transfer_is_installed(
+                        selected,
+                        &f.confirmed,
+                        f.signature,
+                        &f.keys,
+                        budget
+                    )
+                    .is_ok_and(|ok| ok),
+                    "completion must reject missing live provenance after installation"
+                );
+            }
+            drop(raw);
+            drop(v);
+            std::fs::remove_file(&path).unwrap();
+            return;
+        }
+        raw.execute_batch("CREATE TEMP TABLE saved_meta AS SELECT * FROM sync_operation_meta; CREATE TEMP TABLE saved_heads AS SELECT * FROM sync_record_heads;").unwrap();
+        match case {
+            InstallReviewCase::LiveCap => {
+                raw.execute(
+                    "UPDATE operations SET payload_json=zeroblob(?1) WHERE id=?2",
+                    rusqlite::params![
+                        64 * 1024 * 1024 + 1,
+                        old_op.operation.operation_id.to_string()
+                    ],
+                )
+                .unwrap();
+            }
+            InstallReviewCase::RepresentativeMetadata => {
+                raw.execute(
+                    "DELETE FROM sync_operation_meta WHERE operation_id=?1",
+                    [old_op.operation.operation_id.to_string()],
+                )
+                .unwrap();
+            }
+            InstallReviewCase::RepresentativeBranch => {
+                raw.execute(
+                    "UPDATE operations SET payload_json=?1 WHERE id=?2",
+                    rusqlite::params![
+                        serde_json::to_vec(&alternate.operation).unwrap(),
+                        old_op.operation.operation_id.to_string()
+                    ],
+                )
+                .unwrap();
+                raw.execute(
+                    "UPDATE sync_operation_meta SET canonical_sha256=?1 WHERE operation_id=?2",
+                    rusqlite::params![
+                        alternate.canonical_hash.0.as_slice(),
+                        old_op.operation.operation_id.to_string()
+                    ],
+                )
+                .unwrap();
+                raw.execute(
+                    "UPDATE sync_record_heads SET canonical_sha256=?1 WHERE operation_id=?2",
+                    rusqlite::params![
+                        alternate.canonical_hash.0.as_slice(),
+                        old_op.operation.operation_id.to_string()
+                    ],
+                )
+                .unwrap();
+                raw.execute(
+                    "UPDATE sync_device_heads SET canonical_sha256=?1 WHERE device_id=?2",
+                    rusqlite::params![
+                        alternate.canonical_hash.0.as_slice(),
+                        old_op.operation.device_id.to_string()
+                    ],
+                )
+                .unwrap();
+            }
+            InstallReviewCase::ReplayMetadata => {
+                raw.execute(
+                    "DELETE FROM sync_operation_meta WHERE operation_id=?1",
+                    [target.operation.operation_id.to_string()],
+                )
+                .unwrap();
+            }
+            InstallReviewCase::ReplayHeads => {
+                raw.execute(
+                    "DELETE FROM sync_record_heads WHERE operation_id=?1",
+                    [target.operation.operation_id.to_string()],
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let live_counts = || {
+            raw.query_row("SELECT (SELECT count(*) FROM operations),(SELECT count(*) FROM sync_operation_meta),(SELECT count(*) FROM sync_record_heads),(SELECT count(*) FROM sync_device_heads)", [], |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?))).unwrap()
+        };
+        let before_counts = live_counts();
+        let before_projects = v.projects().unwrap();
+        let before = v
+            .sync_state_summary(f.lineage.history().state().scope)
+            .map_err(|error| error.to_string());
+        let install = v.install_historical_transfer(
+            &proof,
+            &f.confirmed,
+            f.signature,
+            &f.keys,
+            budget,
+            &embeddings,
+        );
+        if matches!(case, InstallReviewCase::LiveCap) {
+            assert!(
+                matches!(install, Err(VaultError::BudgetExceeded)),
+                "live byte cap must reject before allocating payload JSON"
+            );
+        } else {
+            assert!(
+                !install.is_ok_and(|ok| ok),
+                "installation must reject incomplete replay or unauthenticated existing representative"
+            );
+        }
+        assert_eq!(v.projects().unwrap(), before_projects);
+        assert_eq!(live_counts(), before_counts);
+        assert_eq!(
+            v.sync_state_summary(f.lineage.history().state().scope)
+                .map_err(|error| error.to_string()),
+            before
+        );
+        assert!(
+            v.trusted_sync_material(&f.keys).is_err(),
+            "failed installation must not activate current material"
+        );
+        assert_eq!(raw.query_row("SELECT count(*) FROM historical_reconstructions WHERE installed_signature IS NOT NULL",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        raw.execute_batch("DELETE FROM sync_operation_meta; INSERT INTO sync_operation_meta SELECT * FROM saved_meta; DELETE FROM sync_record_heads; INSERT INTO sync_record_heads SELECT * FROM saved_heads;").unwrap();
+        raw.execute(
+            "UPDATE operations SET payload_json=?1 WHERE id=?2",
+            rusqlite::params![
+                serde_json::to_vec(&old_op.operation).unwrap(),
+                old_op.operation.operation_id.to_string()
+            ],
+        )
+        .unwrap();
+        raw.execute(
+            "UPDATE sync_device_heads SET canonical_sha256=?1 WHERE device_id=?2",
+            rusqlite::params![
+                old_op.canonical_hash.0.as_slice(),
+                old_op.operation.device_id.to_string()
+            ],
+        )
+        .unwrap();
+        assert!(
+            v.install_historical_transfer(
+                &proof,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget,
+                &embeddings
+            )
+            .unwrap()
+        );
+        assert!(
+            v.historical_transfer_is_installed(
+                selected,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget
+            )
+            .unwrap()
+        );
+        drop(raw);
+        drop(v);
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn historical_reconstructs_real_operation_after_inventory_and_restart() {
         use crate::{sync::*, vault::*};
