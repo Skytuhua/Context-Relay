@@ -40,6 +40,10 @@ Status meanings:
 Local evidence never implies hosted, credentialed, physical-device, signing, or
 deployment evidence. A task is not release-complete while its next gate remains.
 
+The [September14 hosted configuration and permission snapshot](hosted-permissions-2026-09-14.md)
+records live project/function/migration metadata and bounded privilege checks.
+It does not complete hosted login, pairing, sync/recovery or RB-SYNC acceptance.
+
 ## Graph navigation baseline
 
 The 2026-08-10 Graphify snapshot covers 453 supported files, 12,456 nodes,
