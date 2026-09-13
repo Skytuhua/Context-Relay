@@ -1,5 +1,65 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Durable key storage implemented; independent review pending — 2026-09-14
+
+Local commit `dcce7a12c9ce730bff9d2833991a22b7615943c6` adds migration 41 and
+recipient-specific, signed and encrypted key staging. It preserves prior epoch
+keys, immutable transfer bytes and atomic page progress; current material is
+authenticated separately. Fresh enrollment stores signed root material in its
+activation transaction. Neither staged inventory nor a signed checkpoint target
+constitutes reconstructed history or current-write activation.
+
+Focused evidence: four membership tests passed; the seven historical-transfer
+tests passed in 270.97 seconds; seven migration tests and the exact prepared
+enrollment lifecycle test passed. A later focused regression demonstrated that
+deleting independently confirmed epoch-one material incorrectly permitted an
+exporter assertion, then passed after a fail-closed guard (RED 6.14 seconds,
+GREEN 6.08 seconds). The seven-case suite preceded that narrow guard; its
+covering regression, enrollment test and final scoped Clippy followed it.
+Final core-library/membership-target Clippy with warnings denied and workspace
+format checking passed. Test linking still emitted dependency missing-PDB
+warnings. These are component results, not an all-workspace pass.
+
+Existing schema40 root upgrades retain the existing active-enrollment opener's
+trust boundary; this change does not newly prove legacy envelope plaintext
+provenance or detect whole-database rollback. Signed root material is preferred
+once present, and missing/corrupt known material cannot be repaired by fallback
+to the old envelope. This inherited limitation remains for the full security
+and upgrade audit.
+
+Independent Task3 review is pending against the complete `30589c0..dcce7a1`
+change. Activation, historical reconstruction, V2 hosted orchestration and
+installed acceptance remain open, as do the Windows failures below.
+
+## Current Windows pairing/sync integration failures — 2026-09-14
+
+Windows Rust job `103744496873` in run `34765079727`, at pushed revision
+`30589c010af29b1bd0caf543eaab539baedd044c`, completed with failure. The actual
+job log, retrieved through GitHub's jobs/logs endpoint, is
+`.codex/pr16-windows-rust-30589c0.log`. Contextd library results were 103 passed,
+three failed and four ignored in 226.32 seconds. The failed tests are:
+
+- `device_pairing_crosses_two_authenticated_daemons_without_exposing_joiner_safety`:
+  pairing approval returned `InvalidRequest`.
+- `hosted_pairing_crosses_two_daemons_and_resumes_lost_approval`:
+  approval returned `InvalidRequest` before the expected lost-response error.
+- `hosted_sync_receives_searchable_remote_memory_and_recovers_checkpoint_after_restart`:
+  the sync cycle returned `ScopeDenied`.
+
+Source inspection identifies unfinished authority integration: fresh enrollment
+now establishes accepted membership, while the pairing coordinator still builds
+V1 approval and reaches the guard that rejects legacy pairing for that scope.
+The sync fixture supplies a directly issued remote certificate through a hosted
+snapshot without an authenticated accepted membership ADD. Complete V2 pairing
+orchestration and public-history propagation remain required. Do not weaken the
+guards, promote provider certificate rows into authority, or convert these
+current-product checks into legacy-only fixtures merely to make CI pass.
+
+These failures supersede any inference of current-head test success from the
+earlier Windows qualification below. Task3 key-storage tests do not clear these
+daemon integration failures. Apple work and paid requirements remain deferred;
+the full release is incomplete and PR16 must not be merged yet.
+
 ## Windows-only qualification completed — 2026-09-13
 
 Run `34760841409` is now terminal **success** at exact revision
