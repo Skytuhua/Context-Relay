@@ -180,3 +180,13 @@ security purpose; it is not a general allowlist.
 - Classification: `synthetic-negative-test`
 - Non-credential basis: The exact historical JSON object was inspected. The matched recovery-root signing key is public Ed25519 verification material in a synthetic pairing vector, not a private seed, bearer token or provider-issued credential. The canonical certificate embeds this public key; companion Rust and Edge tests verify the signatures and reject substituted authority. No credential exists to revoke.
 - Security purpose: Frozen cross-language pairing fixtures test canonical approval verification and rejection of altered requests, issuer keys and session-bound proofs. Only this immutable historical fingerprint is admitted; full-history scanning and all detector rules remain enabled.
+
+### `f4ab27c7edb4d5402d96ea21d62cf51a4c25f46e:docs/protocols/historical-key-transfer-v1.md:generic-api-key:128`
+
+- Historical commit: `f4ab27c7edb4d5402d96ea21d62cf51a4c25f46e`
+- Historical path: `docs/protocols/historical-key-transfer-v1.md`
+- Rule: `generic-api-key`
+- Line: `128`
+- Classification: `synthetic-negative-test`
+- Non-credential basis: The exact historical Git blob was inspected. The matched label introduces an X25519 public value independently reproduced from fixed synthetic test input. It is public verification data, not a private key, bearer token or provider-issued credential. The adjacent envelope contains dummy ciphertext, not usable encrypted material. Independent read-only review confirmed the derivation; no credential exists to revoke.
+- Security purpose: The frozen page and authenticated-data vectors support canonical encoding verification and hostile-input rejection in historical key transfer. This exception admits only the inspected historical fingerprint; all detector rules, redaction and full-history scanning remain enabled.

@@ -35,9 +35,10 @@ const reviewedExceptionFingerprints = [
   '5bd19cfc2125ddaa1e101ef4bd80d8923a114955:crates/core/tests/fixtures/hosted-pairing-approval-v1.json:generic-api-key:14',
   '1d1ee66c443e50d824ea10224e9f1e517582592d:crates/core/tests/fixtures/hosted-pairing-approval-v1.json:generic-api-key:8',
   '1d1ee66c443e50d824ea10224e9f1e517582592d:crates/core/tests/fixtures/hosted-pairing-approval-v1.json:generic-api-key:10',
+  'f4ab27c7edb4d5402d96ea21d62cf51a4c25f46e:docs/protocols/historical-key-transfer-v1.md:generic-api-key:128',
 ].join('\n') + '\n';
-const reviewedIgnoreByteLength = 1665;
-const reviewedIgnoreSha256 = '93727a02280384fd9577b0cf24231851bff3b4a4f62a122390b6f06b8bae5a31';
+const reviewedIgnoreByteLength = 1771;
+const reviewedIgnoreSha256 = '0e5a52fe0a9756cefa7b66a54541d5b146071897ffd3ff3b25e258fd95fed2fd';
 const allowedExceptionClassifications = new Set([
   'detector-literal',
   'synthetic-negative-test',
@@ -87,7 +88,7 @@ test('repository secret scan verifies pinned Gitleaks and scans every Git ref', 
   assert.match(source, /17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c/);
   assert.match(source, /\.github\/repository\.gitleaksignore/);
   assert.doesNotMatch(source, /third_party\/sidecars\/policies\/repository\.gitleaksignore/);
-  assert.match(source, /\(Get-Item -LiteralPath \$ignore\)\.Length -ne 1665/);
+  assert.match(source, /\(Get-Item -LiteralPath \$ignore\)\.Length -ne 1771/);
   assert.match(source, new RegExp(reviewedIgnoreSha256));
   assert.match(source, /--gitleaks-ignore-path/);
   assert.match(source, /--ignore-gitleaks-allow/);
