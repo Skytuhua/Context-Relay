@@ -57,6 +57,7 @@ fn first_signed_task_transition_binds_offline_task_atomically() {
     let keys = DeviceKeys::generate().unwrap();
     let content = ContentKey::from_bytes([0x7a; 32]);
     let identity = SyncIdentity {
+        membership_endpoint: None,
         account_id: ID_6.parse().unwrap(),
         workspace_id: ID_8.parse().unwrap(),
         device_id: ID_9.parse().unwrap(),
@@ -134,6 +135,7 @@ fn first_signed_update_binds_offline_record_atomically_and_preserves_original_re
     let keys = DeviceKeys::generate().unwrap();
     let content = ContentKey::from_bytes([0x78; 32]);
     let identity = SyncIdentity {
+        membership_endpoint: None,
         account_id: ID_6.parse().unwrap(),
         workspace_id: ID_8.parse().unwrap(),
         device_id: ID_9.parse().unwrap(),
@@ -207,6 +209,7 @@ fn configured_approval_commits_all_signed_operations_or_none() {
         let keys = DeviceKeys::generate().unwrap();
         let content = ContentKey::from_bytes([0x75; 32]);
         let identity = || SyncIdentity {
+            membership_endpoint: None,
             account_id: ID_6.parse().unwrap(),
             workspace_id: ID_8.parse().unwrap(),
             device_id: ID_9.parse().unwrap(),
@@ -436,6 +439,7 @@ fn configured_proposal_sync_rolls_back_and_replays_without_materializing_memory(
     let keys = DeviceKeys::generate().unwrap();
     let content = ContentKey::from_bytes([0x72; 32]);
     let identity = || SyncIdentity {
+        membership_endpoint: None,
         account_id: ID_6.parse().unwrap(),
         workspace_id: ID_8.parse().unwrap(),
         device_id: ID_9.parse().unwrap(),
@@ -559,6 +563,7 @@ fn legacy_proposal_identity_replays_and_accepts_without_rewriting_saved_ids() {
     let content = ContentKey::from_bytes([0x62; 32]);
     let mut service = OfflineWorkspace::new(&mut vault, ID_9.parse().unwrap())
         .with_sync_identity(SyncIdentity {
+            membership_endpoint: None,
             account_id: ID_6.parse().unwrap(),
             workspace_id: ID_8.parse().unwrap(),
             device_id: ID_9.parse().unwrap(),
@@ -610,6 +615,7 @@ fn configured_task_sync_covers_transitions_completion_hooks_and_rollback() {
         let keys = DeviceKeys::generate().unwrap();
         let content = ContentKey::from_bytes([0x52; 32]);
         let identity = || SyncIdentity {
+            membership_endpoint: None,
             account_id: ID_6.parse().unwrap(),
             workspace_id: ID_8.parse().unwrap(),
             device_id: ID_9.parse().unwrap(),
@@ -754,6 +760,7 @@ fn configured_memory_sync_is_atomic_and_replays_original_bytes_after_restart() {
     let keys = DeviceKeys::generate().unwrap();
     let content = ContentKey::from_bytes([0x43; 32]);
     let identity = || SyncIdentity {
+        membership_endpoint: None,
         account_id: ID_7.parse().unwrap(),
         workspace_id: ID_8.parse().unwrap(),
         device_id: ID_9.parse().unwrap(),

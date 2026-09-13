@@ -3926,6 +3926,7 @@ fn chain(
             required_on_device: true,
         });
         let built = OperationBuilder::new(SyncIdentity {
+            membership_endpoint: None,
             account_id: id(ID_1),
             workspace_id: id(ID_2),
             device_id: device.certificate.device_id,
@@ -3980,6 +3981,7 @@ fn large_chain(
             required_on_device: true,
         });
         let built = OperationBuilder::new(SyncIdentity {
+            membership_endpoint: None,
             account_id: id(ID_1),
             workspace_id: id(ID_2),
             device_id: device.certificate.device_id,

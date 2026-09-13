@@ -32,6 +32,7 @@ fn configured_mcp_writes_queue_signed_operations_and_replay_original_bytes() {
     let keys = DeviceKeys::generate().unwrap();
     let content = ContentKey::from_bytes([0x76; 32]);
     let identity = SyncIdentity {
+        membership_endpoint: None,
         account_id: ID_6.parse().unwrap(),
         workspace_id: ID_8.parse().unwrap(),
         device_id: fixture.device_id,

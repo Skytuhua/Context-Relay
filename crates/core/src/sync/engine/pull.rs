@@ -283,6 +283,7 @@ impl<G> SyncEngine<G> {
                             self.provider.as_str(),
                             &row.cursor.received_at,
                             operation_id,
+                            trusted_material.membership_endpoint(),
                         )
                         .map_err(local_error)?;
                     state.processed += 1;

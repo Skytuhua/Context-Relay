@@ -9467,6 +9467,7 @@ mod tests {
             let mut source = Vault::open(source_path.path(), "source-key", &source_keys).unwrap();
             let memory = OfflineWorkspace::new(&mut source, remote_device)
                 .with_sync_identity(SyncIdentity {
+                    membership_endpoint: None,
                     device_id: remote_device,
                     device_keys: &remote_keys,
                     ..local

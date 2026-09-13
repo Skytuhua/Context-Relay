@@ -514,6 +514,16 @@ impl Vault {
         &self,
         device_keys: &DeviceKeys,
     ) -> Result<WorkspacePairingMaterial, VaultError> {
+        if self.recovery_restore()?.is_none() {
+            return Err(validation());
+        }
+        self.trusted_workspace_material(device_keys)
+    }
+
+    fn original_recovered_workspace_material(
+        &self,
+        device_keys: &DeviceKeys,
+    ) -> Result<WorkspacePairingMaterial, VaultError> {
         let stored = self.recovery_restore()?.ok_or_else(validation)?;
         if stored.state != RecoveryRestorePersistenceState::Active {
             return Err(validation());
@@ -552,6 +562,51 @@ impl Vault {
         ),
         VaultError,
     > {
+        let history = self.accepted_membership_history(super::membership::CURRENT_BUDGET)?;
+        let (material, legacy_certificates) =
+            self.original_workspace_material_and_certificates(device_keys)?;
+        let Some(history) = history else {
+            if self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM revocation_genesis_anchor)",
+                [],
+                |r| r.get::<_, bool>(0),
+            )? {
+                return Err(validation());
+            }
+            return Ok((material, legacy_certificates));
+        };
+        let state = history.state();
+        let local = state
+            .active_devices
+            .values()
+            .find(|c| {
+                c.signing_public_key == device_keys.signing_public_key()
+                    && c.wrapping_public_key == device_keys.wrapping_public_key()
+            })
+            .ok_or_else(validation)?;
+        let parent = history
+            .pairing_parent(local.device_id)
+            .map_err(|_| validation())?;
+        if material.scope() != state.scope
+            || material.control_epoch() != state.control_epoch
+            || material.key_epoch() != state.key_epoch
+            || material.enrollment_record_sha256() != Some(parent.enrollment_record_sha256)
+        {
+            return Err(validation());
+        }
+        Ok((material, state.active_devices.values().cloned().collect()))
+    }
+
+    fn original_workspace_material_and_certificates(
+        &self,
+        device_keys: &DeviceKeys,
+    ) -> Result<
+        (
+            WorkspacePairingMaterial,
+            Vec<crate::crypto::DeviceCertificateV1>,
+        ),
+        VaultError,
+    > {
         let enrollment = self.recovery_enrollment()?;
         let restore = self.recovery_restore()?;
         match (enrollment, restore) {
@@ -559,13 +614,13 @@ impl Vault {
                 if enrollment.state == RecoveryEnrollmentPersistenceState::Active =>
             {
                 Ok((
-                    self.enrolled_workspace_material(device_keys)?,
+                    self.original_enrolled_workspace_material(device_keys)?,
                     vec![enrollment.record.genesis_certificate],
                 ))
             }
             (None, Some(restore)) if restore.state == RecoveryRestorePersistenceState::Active => {
                 Ok((
-                    self.recovered_workspace_material(device_keys)?,
+                    self.original_recovered_workspace_material(device_keys)?,
                     vec![
                         restore.record.genesis_certificate,
                         restore.claim.certificate,
@@ -643,7 +698,7 @@ fn exact_prepared_write(stored: &StoredRecoveryRestore, write: &RecoveryRestoreW
         && stored.prepared_at_ms == write.prepared_at_ms
 }
 
-fn require_pristine_vault(transaction: &Transaction<'_>) -> Result<(), VaultError> {
+pub(super) fn require_pristine_vault(transaction: &Transaction<'_>) -> Result<(), VaultError> {
     let mut statement = transaction.prepare(
         "SELECT name FROM sqlite_master
          WHERE type = 'table' AND name NOT LIKE 'sqlite_%'

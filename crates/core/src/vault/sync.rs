@@ -202,6 +202,7 @@ enum CacheChange<'a> {
 
 /// Verified, cycle-local device authority and decrypted active content key.
 pub struct VaultSyncMaterial {
+    membership_endpoint: Option<crate::devices::membership_crypto::MembershipEndpoint>,
     scope: SyncScope,
     control_epoch: u32,
     key_epoch: u32,
@@ -225,6 +226,7 @@ impl VaultSyncMaterial {
             return Err(crate::sync::SyncError::InvalidIdentity);
         }
         Ok(crate::sync::SyncIdentity {
+            membership_endpoint: self.membership_endpoint,
             account_id: self.scope.account_id,
             workspace_id: self.scope.workspace_id,
             device_id,
@@ -237,6 +239,9 @@ impl VaultSyncMaterial {
 }
 
 impl TrustedSyncMaterial for VaultSyncMaterial {
+    fn membership_endpoint(&self) -> Option<crate::devices::membership_crypto::MembershipEndpoint> {
+        self.membership_endpoint
+    }
     fn trusted_device(
         &self,
         account: AccountId,
@@ -423,6 +428,31 @@ impl Vault {
         use crate::crypto::CertificateIssuerV1;
         let (material, anchors) = self.trusted_workspace_material_and_certificates(device_keys)?;
         let scope = material.scope();
+        if let Some(history) =
+            self.accepted_membership_history(super::membership::CURRENT_BUDGET)?
+        {
+            if history.state().scope != scope
+                || history.state().control_epoch != material.control_epoch()
+                || history.state().key_epoch != material.key_epoch()
+                || history
+                    .state()
+                    .active_devices
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    != anchors
+            {
+                return Err(VaultError::OperationConflict);
+            }
+            return Ok(VaultSyncMaterial {
+                membership_endpoint: Some(history.endpoint()),
+                scope,
+                control_epoch: material.control_epoch(),
+                key_epoch: material.key_epoch(),
+                content_key: crate::crypto::ContentKey::from_bytes(*material.active_epoch_key()),
+                certificates: anchors.into_iter().map(|c| (c.device_id, c)).collect(),
+            });
+        }
         let stored = self.devices(scope)?;
         let mut certificates = std::collections::BTreeMap::new();
         for anchor in &anchors {
@@ -466,6 +496,7 @@ impl Vault {
             }
         }
         Ok(VaultSyncMaterial {
+            membership_endpoint: None,
             scope,
             control_epoch: material.control_epoch(),
             key_epoch: material.key_epoch(),
@@ -485,6 +516,19 @@ impl Vault {
         let mut material = self.trusted_sync_material(keys)?;
         if snapshot.scope != material.scope {
             return Err(VaultError::OperationConflict);
+        }
+        if self
+            .accepted_membership_history(super::membership::CURRENT_BUDGET)?
+            .is_some()
+        {
+            if snapshot
+                .certificates
+                .iter()
+                .any(|c| material.certificates.get(&c.device_id) != Some(c))
+            {
+                return Err(VaultError::OperationConflict);
+            }
+            return Ok(material);
         }
         let stored = self.devices(material.scope)?;
         let mut revoked = stored
@@ -770,24 +814,27 @@ impl Vault {
         provider: &str,
         received_at: &str,
         operation_id: OperationId,
+        expected_membership: Option<crate::devices::membership_crypto::MembershipEndpoint>,
     ) -> Result<(), VaultError> {
         validate_sync_provider_v1(provider)?;
         validate_received_at(received_at)?;
         let transaction = self.connection.transaction()?;
-        let exists = transaction
+        let payload:Option<Vec<u8>> = transaction
             .query_row(
-                "SELECT 1 FROM sync_operation_meta
+                "SELECT operations.payload_json FROM sync_operation_meta JOIN operations ON operations.id=sync_operation_meta.operation_id
                  WHERE operation_id = ?1 AND workspace_id = ?2",
                 params![operation_id.to_string(), workspace.to_string()],
-                |_| Ok(()),
+                |row| row.get(0),
             )
-            .optional()?
-            .is_some();
-        if !exists {
-            return Err(VaultError::Validation(
-                "replay cursor requires an existing operation".to_owned(),
-            ));
+            .optional()?;
+        let payload = payload.ok_or_else(|| {
+            VaultError::Validation("replay cursor requires an existing operation".to_owned())
+        })?;
+        let operation: SyncOperationV1 = from_json(&payload)?;
+        if operation.operation_id != operation_id || operation.workspace_id != workspace {
+            return Err(VaultError::OperationConflict);
         }
+        super::membership::require_operation(&transaction, &operation, expected_membership)?;
         upsert_cursor(&transaction, workspace, provider, received_at, operation_id)?;
         transaction.commit()?;
         Ok(())
@@ -867,6 +914,16 @@ impl Vault {
     ) -> Result<MergeDecision, VaultError> {
         validate_admitted(admitted)?;
         let transaction = self.connection.transaction()?;
+        super::membership::require_operation(
+            &transaction,
+            admitted.operation(),
+            trusted_material.membership_endpoint(),
+        )?;
+        super::membership::require_operation(
+            &transaction,
+            admitted.operation(),
+            admitted.membership_endpoint,
+        )?;
         if exact_incoming_replay(&transaction, admitted)? {
             if let Some(provider) = cursor_provider {
                 upsert_cursor(
@@ -1225,11 +1282,15 @@ impl Vault {
         let limit = i64::try_from(limit)
             .map_err(|_| VaultError::Validation("outbox limit exceeds i64".to_owned()))?;
         let now_ms = i64::try_from(now_ms).unwrap_or(i64::MAX);
-        let mut statement = self.connection.prepare(
+        let transaction = self.connection.unchecked_transaction()?;
+        let endpoint = super::membership::history(&transaction, super::membership::CURRENT_BUDGET)?
+            .map(|h| h.endpoint());
+        let mut statement = transaction.prepare(
             "SELECT outbox.operation_id, operations.payload_json, outbox.attempt_count
              FROM outbox
              JOIN operations ON operations.id = outbox.operation_id
              WHERE outbox.next_attempt_ms <= ?1
+               AND (?3=0 OR EXISTS(SELECT 1 FROM sync_operation_meta WHERE operation_id=operations.id))
                AND (
                    outbox.safe_error_code IS NULL
                    OR outbox.safe_error_code IN ('offline', 'transient')
@@ -1237,7 +1298,7 @@ impl Vault {
              ORDER BY outbox.next_attempt_ms, outbox.queued_at, outbox.operation_id
              LIMIT ?2",
         )?;
-        let rows = statement.query_map(params![now_ms, limit], |row| {
+        let rows = statement.query_map(params![now_ms, limit, endpoint.is_some()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -1247,6 +1308,7 @@ impl Vault {
         rows.map(|row| {
             let (operation_id, payload, attempt_count) = row?;
             let operation: SyncOperationV1 = from_json(&payload)?;
+            super::membership::require_operation(&transaction, &operation, endpoint)?;
             let parsed_id = parse_operation_id(&operation_id)?;
             if operation.operation_id != parsed_id {
                 return Err(VaultError::Validation(
@@ -1619,10 +1681,35 @@ impl Vault {
         verified: &VerifiedCheckpoint,
         accepted_at_ms: u64,
     ) -> Result<CheckpointDisposition, VaultError> {
+        let membership = super::membership::require_current(
+            transaction,
+            verified.scope,
+            verified.membership_endpoint,
+        )?;
         let accepted_at_sql = i64::try_from(accepted_at_ms).map_err(|_| {
             VaultError::Validation("checkpoint acceptance time exceeds SQLite range".to_owned())
         })?;
         let checkpoint = &verified.checkpoint;
+        if let Some(history) = membership {
+            let state = history.state();
+            let cert = state
+                .active_devices
+                .get(&checkpoint.checkpoint.creator_device)
+                .ok_or(VaultError::OperationConflict)?;
+            if checkpoint.checkpoint.key_epoch != state.key_epoch {
+                return Err(VaultError::OperationConflict);
+            }
+            let preimage = context_relay_protocol::encode_checkpoint_signing_preimage_v1(
+                &checkpoint.checkpoint,
+            )
+            .map_err(|_| VaultError::OperationConflict)?;
+            crate::crypto::verify_signature(
+                cert.signing_public_key,
+                &preimage,
+                checkpoint.checkpoint.signature,
+            )
+            .map_err(|_| VaultError::OperationConflict)?;
+        }
         let decoded = decode_checkpoint_v1(&checkpoint.bytes)
             .map_err(|_| VaultError::Validation("invalid signed checkpoint".to_owned()))?;
         let canonical = encode_checkpoint_v1(&decoded)
@@ -2973,6 +3060,7 @@ fn persist_outgoing<'a>(
     materialize: bool,
 ) -> Result<(CommitDisposition, CacheChange<'a>), VaultError> {
     validate_commit(mutation, built)?;
+    super::membership::require_operation(transaction, &built.operation, built.membership_endpoint)?;
     if exact_replay(transaction, built)? {
         return Ok((CommitDisposition::ExactReplay, CacheChange::None));
     }

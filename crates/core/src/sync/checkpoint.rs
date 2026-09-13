@@ -121,6 +121,7 @@ pub struct CheckpointBuildContext<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedCheckpoint {
+    pub(crate) membership_endpoint: Option<crate::devices::membership_crypto::MembershipEndpoint>,
     pub(crate) scope: SyncScope,
     pub(crate) checkpoint: CanonicalCheckpoint,
     pub(crate) expected_pin_hash: Option<Sha256Digest>,
@@ -204,6 +205,13 @@ fn build_checkpoint_with_previous(
         context.scope.workspace_id,
         context.creator_device,
     )?;
+    vault
+        .require_current_device(
+            context.scope,
+            trusted_material.membership_endpoint(),
+            &trusted,
+        )
+        .map_err(checkpoint_vault_error)?;
     trusted.validate_identity(
         context.scope.account_id,
         context.scope.workspace_id,
@@ -271,6 +279,7 @@ pub fn verify_checkpoint(
     }
 
     Ok(VerifiedCheckpoint {
+        membership_endpoint: trusted_material.membership_endpoint(),
         scope,
         checkpoint: authenticated.checkpoint,
         expected_pin_hash,
@@ -316,6 +325,7 @@ pub(crate) fn verify_checkpoint_after_chain(
     Ok((
         anchor,
         Some(VerifiedCheckpoint {
+            membership_endpoint: trusted_material.membership_endpoint(),
             scope,
             checkpoint: authenticated.checkpoint,
             expected_pin_hash: base_pin_hash,
@@ -347,6 +357,7 @@ pub(crate) fn verify_checkpoint_chain_extension(
         return Err(SyncError::InvalidChain);
     }
     Ok(VerifiedCheckpoint {
+        membership_endpoint: trusted_material.membership_endpoint(),
         scope,
         checkpoint: authenticated.checkpoint,
         expected_pin_hash: anchor.base_pin_hash,

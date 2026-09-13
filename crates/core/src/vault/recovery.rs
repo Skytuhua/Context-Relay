@@ -366,6 +366,7 @@ impl Vault {
             return Err(VaultError::OperationConflict);
         }
 
+        if transaction.query_row("SELECT EXISTS(SELECT 1 FROM accepted_membership) OR EXISTS(SELECT 1 FROM membership_events)",[],|r|r.get::<_,bool>(0))? {return Err(VaultError::OperationConflict);}
         let record = &candidate.record;
         transaction.execute(
             "INSERT INTO recovery_enrollments(
@@ -459,7 +460,9 @@ impl Vault {
         device_keys: &DeviceKeys,
         completed_at_ms: u64,
     ) -> Result<CommitDisposition, VaultError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let stored = load_recovery_enrollment(&transaction)?.ok_or_else(validation)?;
         receipt
             .validate_for(
@@ -493,6 +496,8 @@ impl Vault {
                     "SELECT NOT (EXISTS(SELECT 1 FROM device_certificates)
                         OR EXISTS(SELECT 1 FROM recovery_restores)
                         OR EXISTS(SELECT 1 FROM revocation_control_history)
+                        OR EXISTS(SELECT 1 FROM accepted_membership)
+                        OR EXISTS(SELECT 1 FROM membership_events)
                         OR EXISTS(SELECT 1 FROM device_revocation_intents))",
                     [],
                     |row| row.get(0),
@@ -506,6 +511,17 @@ impl Vault {
                 }
                 if fresh {
                     let anchor = genesis_anchor(&stored)?;
+                    super::membership::bootstrap(
+                        &transaction,
+                        &stored.canonical_record,
+                        stored.canonical_record_sha256,
+                        scope(&stored.record),
+                        crate::devices::membership_crypto::MembershipEndpoint {
+                            state_sha256: anchor.state_sha256,
+                            control_epoch: 1,
+                            key_epoch: 1,
+                        },
+                    )?;
                     transaction.execute(
                         "INSERT INTO revocation_genesis_anchor(singleton,account_id,workspace_id,enrollment_sha256,anchor_sha256,control_epoch,key_epoch,accepted_state_sha256)
                          VALUES(1,?1,?2,?3,?4,1,1,?4)",
@@ -637,6 +653,16 @@ impl Vault {
         &self,
         device_keys: &DeviceKeys,
     ) -> Result<WorkspacePairingMaterial, VaultError> {
+        if self.recovery_enrollment()?.is_none() {
+            return Err(validation());
+        }
+        self.trusted_workspace_material(device_keys)
+    }
+
+    pub(super) fn original_enrolled_workspace_material(
+        &self,
+        device_keys: &DeviceKeys,
+    ) -> Result<WorkspacePairingMaterial, VaultError> {
         let stored = self.recovery_enrollment()?.ok_or_else(validation)?;
         if stored.state != RecoveryEnrollmentPersistenceState::Active {
             return Err(validation());
@@ -701,7 +727,7 @@ fn exact_prepared_write(
         && stored.prepared_at_ms == write.prepared_at_ms)
 }
 
-fn load_recovery_enrollment(
+pub(super) fn load_recovery_enrollment(
     connection: &Connection,
 ) -> Result<Option<StoredRecoveryEnrollment>, VaultError> {
     let row_count: i64 =

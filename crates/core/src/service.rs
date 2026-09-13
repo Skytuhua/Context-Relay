@@ -182,6 +182,7 @@ impl<'a> OfflineWorkspace<'a> {
             causal_frontier.sort_by_key(|entry| entry.device_id);
         }
         OperationBuilder::new(SyncIdentity {
+            membership_endpoint: identity.membership_endpoint,
             account_id: identity.account_id,
             workspace_id: identity.workspace_id,
             device_id: identity.device_id,

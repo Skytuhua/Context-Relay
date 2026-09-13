@@ -51,6 +51,10 @@ impl TrustedDevice {
 /// not merely certificates with valid historical signatures. Issuance epochs may
 /// precede the current epoch when that roster explicitly retains the device.
 pub trait TrustedSyncMaterial {
+    /// Continuity only, never a substitute for replaying local accepted authority.
+    fn membership_endpoint(&self) -> Option<crate::devices::membership_crypto::MembershipEndpoint> {
+        None
+    }
     fn trusted_device(
         &self,
         account: AccountId,
@@ -77,6 +81,7 @@ pub trait TrustedSyncMaterial {
 /// };
 /// ```
 pub struct AdmittedOperation {
+    pub(crate) membership_endpoint: Option<crate::devices::membership_crypto::MembershipEndpoint>,
     operation: SyncOperationV1,
     mutation: RecordMutationV1,
     canonical_bytes: Vec<u8>,
@@ -115,6 +120,9 @@ pub fn admit_operation(
 ) -> Result<AdmissionDecision, SyncError> {
     let operation =
         decode_sync_operation_v1(received_bytes).map_err(|_| SyncError::InvalidEnvelope)?;
+    vault
+        .require_current_operation(&operation, trusted_material.membership_endpoint())
+        .map_err(|_| SyncError::InvalidIdentity)?;
     operation
         .validate()
         .map_err(|_| SyncError::InvalidEnvelope)?;
@@ -205,6 +213,7 @@ pub fn admit_operation(
     let context = trusted_context(&trusted, previous_chain, existing_scope);
     let mutation = verify_operation_envelope(&operation, &context, key)?;
     Ok(AdmissionDecision::Admitted(Box::new(AdmittedOperation {
+        membership_endpoint: trusted_material.membership_endpoint(),
         operation,
         mutation,
         canonical_bytes,

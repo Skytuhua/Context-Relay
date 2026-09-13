@@ -442,6 +442,7 @@ fn build(
     previous: Option<OperationChainHead>,
 ) -> context_relay_core::sync::BuiltOperation {
     OperationBuilder::new(SyncIdentity {
+        membership_endpoint: None,
         account_id: id(ID_1),
         workspace_id: id(ID_2),
         device_id: device.certificate.device_id,

@@ -76,6 +76,7 @@ impl SyncError {
 impl Error for SyncError {}
 
 pub struct BuiltOperation {
+    pub(crate) membership_endpoint: Option<crate::devices::membership_crypto::MembershipEndpoint>,
     pub operation: SyncOperationV1,
     pub canonical_bytes: Vec<u8>,
     pub canonical_hash: Sha256Digest,
@@ -230,6 +231,7 @@ impl<'a> OperationBuilder<'a> {
         let canonical_hash = digest(&canonical_bytes);
 
         Ok(BuiltOperation {
+            membership_endpoint: self.identity.membership_endpoint,
             operation,
             sealed_mutation_hash: mutation_hash,
             sealed_operation_hash: canonical_hash,
@@ -502,6 +504,7 @@ mod tests {
         let keys = DeviceKeys::from_seeds([7; 32], [9; 32]);
         let content_key = ContentKey::from_bytes([11; 32]);
         let identity = SyncIdentity {
+            membership_endpoint: None,
             account_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073981"),
             workspace_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073982"),
             device_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073983"),
@@ -559,6 +562,7 @@ mod tests {
         let debug = format!(
             "{:#?}",
             OperationBuilder::new(SyncIdentity {
+                membership_endpoint: None,
                 account_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073981"),
                 workspace_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073982"),
                 device_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073983"),

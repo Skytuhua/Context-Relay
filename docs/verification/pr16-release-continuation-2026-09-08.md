@@ -1,5 +1,44 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Durable accepted membership — 2026-09-13
+
+Schema 40 stores complete canonical signed additions and revocations, pinned
+enrollment, and a separate accepted endpoint. Schema 39 remains immutable
+historical enrollment evidence. Immediate transactions compare exact parent
+endpoints, preserve exact retry bytes and roll back failed extensions. Restart
+reads replay bounded evidence; scope, pin, linkage or signature corruption makes
+authority unavailable. SQL lengths and types bound BLOB loading before allocation.
+
+Fresh enrollment and independently confirmed, privately opened V2 admission
+provide the two bootstrap paths. Pending recovery blocks V2 bootstrap. Current
+sync readers rebuild the roster from accepted history; provider certificate
+snapshots cannot add authority. Owned outgoing and admitted operations carry
+continuity stamps that are checked again with current signed authority inside
+mutation transactions, including exact replay. Checkpoint creation and acceptance,
+replay cursor changes and due-outbox reads also check current authority.
+Unsigned local migration rows remain stored but are excluded from the signed
+outbox until backfill converts them.
+
+This is public-history persistence and immediate authority gating. Current keys
+after rotation, V2 key storage, historical reconstruction and hosted integration
+remain unfinished. Accepted-history vaults cannot use standalone V1 pairing;
+genuinely legacy vaults retain that path. Missing accepted history is not backfilled
+from certificate rows or a historical genesis marker. Upgrades and installed
+recovery still require the later integration and acceptance work in the plan.
+
+Verification: membership 2, merge 11, enrollment 12, legacy pairing 13 and
+recovery restore 11 tests pass. Three focused storage checks pass for migration
+rollback/future-version rejection, version-one upgrade and bundled tables. Core
+library/tests Clippy passes with `test-support` and warnings denied. Tests cover real
+ADD/REVOKE, competing same-epoch histories, stale capabilities, rollback, restart,
+corruption and pending recovery. Real regressions reproduced the pending-restore,
+stale checkpoint and replay-cursor gaps before their fixes. Independent source
+review found those fixes sufficient. Logs are retained at
+`.codex/pr16-membership-cursor-green.log`, `.codex/pr16-membership-final-tests.log`,
+`.codex/pr16-membership-clippy.log` and the three
+`.codex/pr16-membership-migration-*.log` files. This is component verification,
+not current-head CI, installed recovery or release qualification.
+
 ## Public test vector scan and Windows runtime comparison — 2026-09-13
 
 Commit `23141ec388827c0077028b9a20e09c306a91c31d` documents one exact

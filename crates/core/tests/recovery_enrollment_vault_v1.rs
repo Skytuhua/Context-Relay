@@ -120,9 +120,17 @@ fn genesis_control_anchor_is_atomic_durable_and_never_reinitialized() {
     assert!(
         vault
             .trusted_sync_material_with_certificates(&fixture.device_keys, &snapshot)
+            .is_err()
+    );
+    let admitted = accept_test_member(&mut vault, &fixture, &child_keys);
+    assert_eq!(
+        vault
+            .trusted_sync_material(&fixture.device_keys)
             .unwrap()
             .trusted_device(id(ACCOUNT_ID), id(WORKSPACE_ID), id(OTHER_ID))
-            .is_ok()
+            .unwrap()
+            .certificate,
+        admitted
     );
     let unchanged = vault
         .recovery_enrollment_genesis_anchor(&fixture.device_keys)
@@ -471,7 +479,14 @@ fn backfill_queues_unchanged_offline_records_atomically_and_resumes_after_reopen
             .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 32)
             .is_err()
     );
-    assert_eq!(vault.due_outbox(u64::MAX, 32).unwrap().len(), 3);
+    // Pending legacy rows remain intact for migration, but cannot be sent as signed sync.
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM outbox", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(vault.due_outbox(u64::MAX, 32).unwrap().len(), 2);
     assert_eq!(
         raw.query_row(
             "SELECT count(*) FROM sync_record_owners WHERE record_id = ?1",
@@ -781,7 +796,7 @@ fn backfill_queues_unchanged_offline_records_atomically_and_resumes_after_reopen
 }
 
 #[test]
-fn sync_material_uses_verified_enrollment_and_rejects_untrusted_devices() {
+fn legacy_sync_material_uses_verified_enrollment_and_rejects_untrusted_devices() {
     use context_relay_core::{
         sync::{SyncError, TrustedSyncMaterial},
         vault::DeviceDisplayMetadata,
@@ -791,6 +806,20 @@ fn sync_material_uses_verified_enrollment_and_rejects_untrusted_devices() {
     let keys = MemoryKeyStore::default();
     let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
     assert!(vault.trusted_sync_material(&fixture.device_keys).is_err());
+    // A previously installed certificate keeps this fixture on the legacy path.
+    // Accepted-history authority is exercised by the signed ADD test above.
+    vault
+        .store_device_certificate(
+            id(CERTIFICATE_ID),
+            &fixture.artifacts.record.genesis_certificate,
+            DeviceCertificateState::Active,
+            &DeviceDisplayMetadata {
+                device_name: fixture.artifacts.record.device_name.clone(),
+                platform: fixture.artifacts.record.device_platform,
+            },
+            3000,
+        )
+        .unwrap();
     vault
         .prepare_recovery_enrollment(&write(&fixture.artifacts, 1000))
         .unwrap();
@@ -802,6 +831,12 @@ fn sync_material_uses_verified_enrollment_and_rejects_untrusted_devices() {
             3000,
         )
         .unwrap();
+    assert!(
+        vault
+            .accepted_membership_history(membership_budget())
+            .unwrap()
+            .is_none()
+    );
     let child_keys = DeviceKeys::generate().unwrap();
     let fields = CertificateFieldsV1 {
         account_id: id(ACCOUNT_ID),
@@ -988,6 +1023,7 @@ fn sync_material_uses_verified_enrollment_and_rejects_untrusted_devices() {
         "Verified child",
     ));
     let operation = OperationBuilder::new(SyncIdentity {
+        membership_endpoint: None,
         account_id: id(ACCOUNT_ID),
         workspace_id: id(WORKSPACE_ID),
         device_id: id(OTHER_ID),
@@ -1065,6 +1101,90 @@ fn sync_material_uses_verified_enrollment_and_rejects_untrusted_devices() {
             .certificate,
         independent
     );
+}
+
+fn membership_budget() -> context_relay_core::devices::membership_crypto::MembershipHistoryBudget {
+    context_relay_core::devices::membership_crypto::MembershipHistoryBudget {
+        max_events: 16,
+        max_bytes: 1_000_000,
+    }
+}
+
+fn accept_test_member(
+    vault: &mut Vault,
+    fixture: &Fixture,
+    child_keys: &DeviceKeys,
+) -> DeviceCertificateV1 {
+    use context_relay_core::devices::{
+        crypto::control_v2::{build_pairing_approval_v2, encode_pairing_approved_payload_v2},
+        membership_crypto::{
+            DeviceMembershipAddStatementV1, MembershipEndpoint, MembershipHistoryEvent,
+        },
+    };
+    let history = vault
+        .accepted_membership_history(membership_budget())
+        .unwrap()
+        .unwrap();
+    let parent = history.pairing_parent(id(DEVICE_ID)).unwrap();
+    let request = SignedPairingRequest::build(
+        id(OTHER_ID),
+        id(OTHER_ID),
+        "Child",
+        NativePlatform::Windows,
+        child_keys,
+    )
+    .unwrap();
+    let material = PairingKeyBundle::new(
+        history.state().scope,
+        1,
+        1,
+        *fixture.material.workspace_root_key(),
+        *fixture.material.active_epoch_key(),
+    )
+    .unwrap()
+    .with_enrollment_record_sha256(fixture.artifacts.canonical_record_sha256)
+    .unwrap();
+    let approval = build_pairing_approval_v2(
+        &request,
+        &parent,
+        id(DEVICE_ID),
+        &fixture.device_keys,
+        id(OTHER_ID),
+        "Root",
+        NativePlatform::Windows,
+        &material,
+    )
+    .unwrap();
+    let payload = encode_pairing_approved_payload_v2(&approval.payload).unwrap();
+    let statement = DeviceMembershipAddStatementV1::from_approved_payload_v2(&payload).unwrap();
+    let signature = statement
+        .sign(
+            &fixture.artifacts.record.genesis_certificate,
+            &fixture.device_keys,
+        )
+        .unwrap();
+    let bytes = statement.signing_preimage().unwrap();
+    let successor = MembershipEndpoint {
+        state_sha256: statement.control_state_sha256(signature).unwrap(),
+        ..history.endpoint()
+    };
+    assert_eq!(
+        vault
+            .accept_membership_extension(
+                history.endpoint(),
+                successor,
+                &[MembershipHistoryEvent::PairingAdd {
+                    statement: &bytes,
+                    signature,
+                    request: &request,
+                    approved_payload: &payload
+                }],
+                membership_budget()
+            )
+            .unwrap(),
+        CommitDisposition::Inserted
+    );
+    approval.payload.grant.certificate
 }
 
 fn id<T: FromStr>(value: &str) -> T
@@ -1339,7 +1459,7 @@ fn prepared_enrollment_activates_exactly_and_reopens_sealed_material() {
     raw.execute_batch(include_str!("../migrations/0022_recovery_enrollment.sql"))
         .unwrap();
     raw.execute_batch("INSERT INTO recovery_enrollments SELECT * FROM enrollment_fixture; DROP TABLE enrollment_fixture;").unwrap();
-    raw.execute_batch("DROP TABLE IF EXISTS revocation_genesis_anchor; DROP TABLE IF EXISTS revocation_control_history; DROP TABLE IF EXISTS device_revocation_intents; DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews; DROP TABLE hosted_pairing_intents; DROP TABLE hosted_restore_intent;")
+    raw.execute_batch("DROP TABLE IF EXISTS membership_events; DROP TABLE IF EXISTS accepted_membership; DROP TABLE IF EXISTS revocation_genesis_anchor; DROP TABLE IF EXISTS revocation_control_history; DROP TABLE IF EXISTS device_revocation_intents; DROP TABLE IF EXISTS candidate_aliases; DROP TABLE account_lifecycle_intents; DROP TABLE pairing_request_reviews; DROP TABLE hosted_pairing_intents; DROP TABLE hosted_restore_intent;")
         .unwrap();
     raw.pragma_update(None, "user_version", 28).unwrap();
     drop(raw);

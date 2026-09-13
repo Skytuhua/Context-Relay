@@ -6,6 +6,8 @@ use crate::crypto::{ContentKey, DeviceKeys};
 
 #[derive(Clone, Copy)]
 pub struct SyncIdentity<'a> {
+    /// Continuity stamp only; persistence reauthenticates the accepted history.
+    pub membership_endpoint: Option<crate::devices::membership_crypto::MembershipEndpoint>,
     pub account_id: AccountId,
     pub workspace_id: WorkspaceId,
     pub device_id: DeviceId,
