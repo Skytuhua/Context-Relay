@@ -106,3 +106,26 @@ single test does not establish complete recovery acceptance.
 A separate `task5_replay` database was prepared with only the minimal provider
 bootstrap for a fresh migration replay; preparation alone is not successful
 replay evidence.
+
+## Subsequent recovery storage and preservation evidence
+
+The expanded server migration subsequently replayed all 18 migrations into
+`task5_replay`; all 14 database tests passed in 5156.3808ms. Evidence is in
+`task-5-postgres-expanded-replay-applied.log` and
+`task-5-postgres-expanded-replay-green.log`. The provider-fixture limitations
+above still apply, and later SQL changes require renewed verification.
+
+Recovery event decoding/replay passed in 1.94s, followed by vault storage/restart
+in 7.50s and root-opened key retention checks in 8.72s. These are successively
+expanded versions of the same test, not three independent full recovery suites.
+Their logs are `task-5-recovery-event-green1.log`,
+`task-5-recovery-vault-green1.log` and `task-5-recovery-retention-green1.log`.
+
+The covering command in `task-5-recovery-covering1.log` finished successfully
+(handle57972, terminal0): 2 membership crypto tests, 4 membership vault tests,
+7 existing recovery-format tests and 1 expanded recovery test passed. The latter
+includes exact eight-column preservation of ADD/revocation rows and failed-copy
+rollback retaining rows and user_version42. This uses direct in-memory table DDL,
+not a full schema42 vault upgrade through the production migration driver.
+Durable recovery integration, complete reconstruction/transfer, deployed behavior,
+installed upgrades and final independent review remain open.
