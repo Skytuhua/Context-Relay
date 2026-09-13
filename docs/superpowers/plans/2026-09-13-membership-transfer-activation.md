@@ -113,6 +113,18 @@ increase or signed checkpoint link is insufficient. Preserve prior required
 ranges/verified hashes and installed history; test unchanged selection during
 missing proof, higher-sequence forks, and successful alternate-exporter repair.
 
+Ruling: unverified operation candidates cannot irrevocably occupy a device sequence
+or operation ID before exact target reconstruction. Keep bounded replaceable
+candidate storage separate from verified prefix authority; an explicit candidate
+branch per attempt avoids automatic combinatorial fork search. Preserve partial
+candidate restart/retry, exact cutoff checks, prior verified pins and installed
+history. Correct bounded retries may replace untrusted cache entries. Complete
+chain/cutoff-only staging is insufficient for active-device wrong-target forks.
+Test wrong-then-correct branches across restart, operation-ID collisions, cache
+bounds/replacement, and alternate-exporter repair. Cost if wrong: permanent
+recovery poisoning or accidental loss of trusted prefix obligations. Full details
+and source reasoning are recorded in the Task4 controller rulings.
+
 ## Task 5: Connect hosted transport and installed workflows
 
 - [ ] Extend the existing bounded transport and durable retry coordinator for addressed header/page/public-history retrieval and publication. Enforce current server-side identity/recipient authorization independently of cryptographic verification.
