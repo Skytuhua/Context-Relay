@@ -192,6 +192,7 @@ fn complete_root_only_history_retained_issuer_and_adversarial_evidence() {
         approved_payload: &payload_b,
     };
     let proof_b = replay(&[event_b()], endpoint(&after_b.state())).unwrap();
+    assert!(proof_b.latest_rotation_predecessor().is_none());
     let rotation = DeviceRevocationStatementV1 {
         schema_version: 1,
         revocation_id: id(12),
@@ -383,11 +384,39 @@ fn complete_root_only_history_retained_issuer_and_adversarial_evidence() {
                 transition.key_material_sha256
             );
         }
-        // Preserve existing latest transition/verified successor evidence; opening still needs its verified predecessor.
+        // The latest envelope opens against its authenticated predecessor, not its successor.
         let parent = verified.history().pairing_parent(id(4)).unwrap();
         assert_eq!(parent.latest_rotation.unwrap().1, &second_transition);
+        let predecessor = verified.history().latest_rotation_predecessor().unwrap();
+        assert_eq!(endpoint(&predecessor), tip);
+        let material = second_transition
+            .open_device_material(&second_rotation, second_sig, &predecessor, id(4), &b)
+            .unwrap();
+        assert_eq!(material.key_epoch(), 3);
+        assert!(
+            second_transition
+                .open_device_material(
+                    &second_rotation,
+                    second_sig,
+                    &verified.history().state(),
+                    id(4),
+                    &b
+                )
+                .is_err()
+        );
+        assert!(
+            second_transition
+                .open_device_material(&second_rotation, second_sig, &predecessor, id(5), &c)
+                .is_err()
+        );
     }
     let after_add = lineage(&events[..3], tip, tip, generous).unwrap();
+    let predecessor = after_add.history().latest_rotation_predecessor().unwrap();
+    assert_eq!(endpoint(&predecessor), endpoint(&proof_b.state()));
+    let retained = transition
+        .open_device_material(&rotation, sig_r, &predecessor, id(4), &b)
+        .unwrap();
+    assert_eq!(retained.active_epoch_key(), current.active_epoch_key());
     assert_eq!(after_add.rotated_key_commitments().len(), 1);
     assert_eq!(
         after_add.rotated_key_commitments()[0].key_material_sha256(),

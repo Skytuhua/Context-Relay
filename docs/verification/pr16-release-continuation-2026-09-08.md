@@ -1,5 +1,26 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Verified rotation predecessor — 2026-09-13
+
+Membership history now retains the authenticated state immediately preceding
+its latest rotation. It moves the existing state without another roster clone,
+preserves it through additions and replaces it on the next verified rotation.
+The existing envelope opener can use this predecessor; current authorization
+continues to use the final history state. No wire format or activation changes.
+
+All eight membership/pairing-V2/revocation integration tests pass, including
+actual latest-envelope decryption, retention after an addition, replacement on
+a second rotation, and rejection of the successor state or revoked recipient.
+The test first failed to compile against the missing accessor. Core library and
+membership-test Clippy with warnings denied passes; independent bounded source
+review found no actionable issue. Logs: `.codex/pr16-rotation-predecessor-{red,green,clippy}.log`.
+Historical transfer, durable key retention and atomic activation remain open.
+
+Windows-only qualification [34760841409](https://github.com/Skytuhua/Context-Relay/actions/runs/34760841409)
+at `a22dfab` is still running. Shared/frontend checks passed at this observation;
+Windows Rust, native build and both independent builders remain live. Apple
+jobs are skipped. This run does not cover the subsequent predecessor change.
+
 ## Membership lineage and Windows qualification repairs — 2026-09-13
 
 `verify_membership_lineage` reuses the complete membership replay to prove an

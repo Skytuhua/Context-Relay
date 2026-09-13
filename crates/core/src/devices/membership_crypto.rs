@@ -286,7 +286,11 @@ pub struct VerifiedMembershipHistory {
     admissions: BTreeMap<DeviceId, DeviceCertificateId>,
     certificates: BTreeSet<DeviceCertificateId>,
     operations: BTreeSet<OperationId>,
-    latest_rotation: Option<(VerifiedRevocationControl, RevocationTransitionV1)>,
+    latest_rotation: Option<(
+        VerifiedRevocationControl,
+        RevocationTransitionV1,
+        OwnedControl,
+    )>,
 }
 impl VerifiedMembershipHistory {
     pub fn state(&self) -> RevocationControlState<'_> {
@@ -297,6 +301,14 @@ impl VerifiedMembershipHistory {
     }
     pub fn admissions(&self) -> &BTreeMap<DeviceId, DeviceCertificateId> {
         &self.admissions
+    }
+    /// Authenticated state immediately before the latest rotation, retained through
+    /// later additions. Use only to verify/open that rotation's envelopes; current
+    /// authorization still comes from `state()`. No rotation means no predecessor.
+    pub fn latest_rotation_predecessor(&self) -> Option<RevocationControlState<'_>> {
+        self.latest_rotation
+            .as_ref()
+            .map(|(_, _, previous)| previous.state())
     }
     /// The staged opener and full replay enforce the same lifetime first-admission
     /// rules, including the shared addition/revocation operation-ID namespace.
@@ -328,7 +340,7 @@ impl VerifiedMembershipHistory {
                 .get(&issuer)
                 .ok_or(CryptoError::AuthenticationFailed)?,
             enrollment_record_sha256: self.enrollment_record_sha256,
-            latest_rotation: self.latest_rotation.as_ref().map(|(v, t)| (v, t)),
+            latest_rotation: self.latest_rotation.as_ref().map(|(v, t, _)| (v, t)),
         })
     }
 }
@@ -544,9 +556,10 @@ fn replay_membership_history(
                 }
                 let t = RevocationTransitionV1::from_canonical_bytes(transition)?;
                 let next = t.verify_and_advance(&s, *signature, &history.state())?;
-                history.state = OwnedControl::from_state(&next.state());
+                let previous =
+                    std::mem::replace(&mut history.state, OwnedControl::from_state(&next.state()));
                 on_verified_state(history.endpoint(), Some(&t));
-                history.latest_rotation = Some((next, t));
+                history.latest_rotation = Some((next, t, previous));
             }
         }
     }
