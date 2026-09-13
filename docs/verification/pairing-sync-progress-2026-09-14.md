@@ -212,3 +212,39 @@ These results qualify the current local SQL replay with minimal provider
 fixtures. Auth/SDK stubs and seeded revocation limitations above still apply.
 At this checkpoint the native recovery coordinator uses V1; integrating V2 and complete
 history reconstruction remains necessary before full recovery acceptance.
+
+## Native recovery preparation and admission
+
+The native coordinator initially submitted V1 instead of V2
+(`task-5-recovery-coordinator-red2.log`: 1 failed in 3.94s). After integration,
+the V2 rotated-claim preparation/restart/retry test passed in 12.24s
+(`task-5-recovery-coordinator-green1.log`, handle63824 terminal0).
+
+Its expanded admission test passed in 46.42s
+(`task-5-recovery-coordinator-green3.log`, handle14291 terminal0). It requires
+the exact published event as well as the receipt/projection, preserves admission
+across restart and exact replay, rejects wrong recipient keys, and keeps
+`trusted_sync_material` unavailable after admission alone. The preceding run
+failed on an unsuitable test assertion: `has_sync_authority` reports membership
+presence, not activation. The correction exercises the actual material gate;
+no production guard was relaxed.
+
+Current-key activation remains an explicit independent operation under the
+existing verified-current-state guards. History installation is separate;
+these tests do not establish complete history restoration or hosted acceptance.
+The next hosted transport test fails with `recovery_unauthorized` at the existing
+fail-closed history method (`task-5-recovery-hosted-transport-red.log`, 0.41s).
+
+The hosted transport subsequently passed in 1.76s
+(`task-5-recovery-hosted-transport-green1.log`, handle67641 terminal0), covering
+addressed reads, explicit-null versus omitted objects, original-session proof,
+receipt/status agreement and cancellation without further requests. HTTP
+responses are simulated.
+
+The broader `task-5-recovery-native-covering1.log` records 25 hosted transport
+tests passing in 23.65s and the expanded native recovery test passing in 56.68s.
+The latter injects a final admission INSERT failure, verifies zero rows across
+accepted membership, events, retained secrets, admission and activation tables,
+retains prepared recovery, then reopens and retries successfully. Successful
+admission still leaves trusted sync material unavailable without explicit
+activation. Complete reconstruction and deployed/installed acceptance remain open.
