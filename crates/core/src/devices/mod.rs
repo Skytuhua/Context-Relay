@@ -1,5 +1,6 @@
 pub mod account_lifecycle;
 pub mod crypto;
+pub mod historical_crypto;
 pub mod identity;
 pub mod membership_crypto;
 #[cfg(feature = "test-support")]

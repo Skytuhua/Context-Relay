@@ -1,5 +1,55 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Historical transfer codec candidate — 2026-09-13
+
+The isolated historical-key codec binds the exact independently confirmed V2
+admission C to an authenticated C-to-D lineage, active recipient and exporter,
+and exporter-signed checkpoint target. It encrypts all prior epochs in bounded
+32-entry pages with exact ciphertext hashes, canonical pinned bundles and
+authenticated rotation commitments. Epoch-one exporter trust is explicit;
+an existing trusted value must match. Rejected pages leave progress unchanged.
+
+Six focused tests pass, including 33 actual rotations across two pages, a
+distinct exporter admitted after C, revoked recipients, wrong anchors, signed
+context substitutions and validly encrypted invalid plaintext. Independent
+Python reconstruction matches the fixed header signature and page/AAD vectors.
+Source review found no actionable issue; core library and tests Clippy passes
+with `test-support` and warnings denied. Tests and evidence are in
+`.codex/historical-codec-test-final.log` and the two
+`.codex/historical-*-independent-vector.json` files. Self-export is permitted;
+distinct exporter/recipient coverage is a test requirement, not a new protocol
+restriction.
+
+The [wire candidate](../protocols/historical-key-transfer-v1.md) and
+[integration plan](../superpowers/plans/2026-09-13-membership-transfer-activation.md)
+preserve the remaining acceptance boundaries. Review corrected the plan to keep
+ordinary current-key activation independent of historical reconstruction and to
+gate existing readers/stale sync capabilities immediately on accepted control
+advancement. Durable history, staged keys, activation, historical admission and
+hosted transport are not implemented by this codec.
+
+Bounded range reads recovered the original Windows A/B artifact metadata from
+run `34699122274`, artifacts `10301610530` and `10301660573`. Actual identity and
+offline-evidence bytes pass the repaired shared validators against their
+original `7ad495c`/run/attempt identities. Both manifests list the same 17 runtime
+hashes. Build A's 17 actual runtime payloads (255,387,207 bytes) also match their
+SHA-256 entries and ZIP checksums. Build B payload hashing is still running;
+matching manifests alone do not establish byte reproducibility or current-head
+qualification.
+
+Actual [Windows native build output](https://github.com/Skytuhua/Context-Relay/actions/runs/34760841409/job/103733282900)
+confirms a release Tauri EXE built at `a22dfab` in 5m02s. This is compilation,
+not installed acceptance. The Windows-only run still has Rust tests and both
+independent runtime builders running. No clean-machine gate is cleared: the
+local Windows 11 Home host has no discoverable Windows Sandbox, Hyper-V,
+VirtualBox, QEMU or VMware command. No paid resource was provisioned.
+
+The [Windows installer candidate at 3d92013](https://github.com/Skytuhua/Context-Relay/actions/runs/34761276468)
+also completed. Its actual job output confirms the bundle and artifact
+`10319945742`, archive SHA-256
+`6f2c0b9b03b9da7e901728b64367dd7b7bc77ab1a27505501a25ece52cc14d67`.
+This is an unsigned candidate, not clean-machine installation evidence.
+
 ## Verified rotation predecessor — 2026-09-13
 
 Membership history now retains the authenticated state immediately preceding
