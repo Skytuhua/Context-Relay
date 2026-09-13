@@ -60,3 +60,23 @@ PostgreSQL transaction behavior, not live Supabase Auth, Storage or Realtime.
 Authorized history-access RPCs remain under implementation; later changes to the
 same migration require new covering verification. Task5 and release acceptance
 remain incomplete.
+
+## Subsequent local authorization and history-object checkpoint
+
+`task-5-postgres-objects-green1.log` records 10 passed, 0 failed in
+2065.4087ms. It adds live-session and exact active-device checks, explicit
+enrollment initialization without reactivation, atomic V2 approval/public ADD
+publication, and addressed history/result binding to the original recipient,
+request, enrollment pin and live membership. The preceding objects test run
+had 9 passed and 1 failed because the retrieval RPC was absent.
+
+This remains evolving local SQL with minimal provider fixtures. Complete
+history/key transfer, recovery, final clean migration replay, independent review
+and deployed/installed acceptance remain open.
+
+A fresh read of Windows CI job `103744496873` in run `34765079727` at pushed
+head `30589c010af29b1bd0caf543eaab539baedd044c` confirmed 103 daemon tests
+passed, 3 failed and 4 ignored. Its three failures are the original pairing,
+hosted pairing and hosted sync regressions listed above. Their later local
+results do not clear that remote failure or qualify the evolving full diff.
+PR16 remains open and blocked; no new CI run, deployment or merge was initiated.
