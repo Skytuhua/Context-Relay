@@ -248,3 +248,34 @@ accepted membership, events, retained secrets, admission and activation tables,
 retains prepared recovery, then reopens and retries successfully. Successful
 admission still leaves trusted sync material unavailable without explicit
 activation. Complete reconstruction and deployed/installed acceptance remain open.
+
+## Recovery target selection
+
+The expanded native test passed in 84.43s after a 53.16s compile
+(`task-5-recovery-target-green2.log`, handle33560 terminal0). It adds the exact
+307-byte recovery target, recipient-signed selection bound to the original
+intent, historical checkpoint-author validation, negative input checks,
+transaction rollback, exact retry and restart. The earlier target runs stopped
+at compile errors; they are not behavioral failure evidence.
+
+Selecting a target does not reconstruct or install history. The next test
+currently fails to compile because the reconstruction, installation and
+installation-status methods are absent
+(`task-5-recovery-reconstruction-red.log`). Sharing the existing private
+reconstruction algorithm is in progress; its previous pairing regressions must
+be verified again after the shared changes. Reselection remains incomplete.
+
+## Initial recovery reconstruction
+
+The subsequent `task-5-recovery-reconstruction-green1.log` records one expanded
+native recovery test passing in 130.86s after compilation in 52.11s. This first
+case reconstructs an empty historical checkpoint, installs it and checks restart.
+It does not yet establish nonempty-history, missing-range, cutoff, receipt-tamper
+or shared Task4 regression acceptance. The earlier compile-only status above
+is superseded for these APIs, not for the remaining coverage.
+
+Explicit replacement of an unreconstructed candidate must preserve every existing
+verified reconstruction baseline. Selecting an incomplete intermediate candidate
+must not let a later selection bypass an earlier reconstructed or installed
+history. The implementer is adding this bounded reselection rule and its tests;
+it is not yet accepted implementation evidence.
