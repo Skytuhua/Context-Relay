@@ -44,6 +44,11 @@ The [September14 hosted configuration and permission snapshot](hosted-permission
 records live project/function/migration metadata and bounded privilege checks.
 It does not complete hosted login, pairing, sync/recovery or RB-SYNC acceptance.
 
+The [September14 GitHub/package preflight](package-preflight-2026-09-14.md)
+maps existing protocol/native approval facilities to the still-missing T18/T19
+workflow and records the published installation-metadata column that must be
+reconciled with memory-only GitHub tokens. It does not close RB-PACKAGE.
+
 ## Graph navigation baseline
 
 The 2026-08-10 Graphify snapshot covers 453 supported files, 12,456 nodes,
