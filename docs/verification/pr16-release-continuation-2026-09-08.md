@@ -1,5 +1,41 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Historical reconstruction component progress — 2026-09-14
+
+Task4 is still local, uncommitted and unreviewed. Actual focused Windows logs
+under `.superpowers/sdd/2026-09-13-membership-transfer-activation/` now record:
+
+- `task-4-cutoff-conflict.log`: one passed in 31.87 seconds. A historical
+  operation absent from the live vault is restored alongside a current concurrent
+  edit. An injected installation failure rolls back operation insertion and
+  materialization. The successful retry preserves both conflict heads and the
+  current cursor; target sequence1 requires proof through the exact signed
+  revocation cutoff at sequence2. A same-sequence fork fails and a correct retry
+  after restart succeeds. Dropping a prior range fails; another active exporter
+  can supply a consistent dominating target.
+- `task-4-reconstruction-selection-green.log`: two passed in 27.92 seconds,
+  covering exact older-target reconstruction with newer live state, repair of a
+  rejected candidate using the same operation ID/sequence, immutable verified
+  prefix obligations, and rejection of replacement before prior reconstruction.
+- `task-4-durable-final.log`: the full 33-rotation SQLCipher storage fixture
+  passed in 330.23 seconds after being updated to reconstruct valid targets and
+  commit actual replacement pages before subsequent selection.
+
+These runs precede the remaining current-read integration fix: a new current
+incoming edit may need to decrypt an old conflict representative after history
+installation or ordinary no-pairing rotation. Keep current admission/key-epoch
+guards strict while adding a private, authenticated stored-history read path.
+That path, remaining boundary regressions, final lint and independent review are
+not yet covered by the results above. Dependency missing-PDB linker warnings
+remain visible. No full Task4, hosted workflow or release completion is claimed.
+
+Fresh read-only Supabase checks still show project `brvzuycnxoswdzzipgvx` healthy,
+17 migrations, and only version1 sync/enrollment/account-lifecycle functions;
+pairing is absent. Security advisors return 12 informational RLS-without-policy
+notices. No hosted changes or user-workflow tests occurred; OAuth configuration
+was not rechecked. [Repository protection and alert observations](../repository-settings.md#live-verification--2026-09-14)
+are separately recorded. All Apple-related work and paid steps remain deferred.
+
 ## Pushed-head Windows native isolation passed; overall CI failed — 2026-09-14
 
 Run `34765079727` is terminal failure because daemon integration tests failed
