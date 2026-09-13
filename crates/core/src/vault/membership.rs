@@ -1,5 +1,7 @@
 //! Durable public acceptance. Canonical replay, never certificate rows, supplies authority.
+mod activation;
 mod material;
+mod reconstruction;
 use super::{CommitDisposition, Vault, VaultError};
 use crate::{
     crypto::DeviceKeys,
@@ -17,9 +19,14 @@ use crate::{
     },
     sync::SyncScope,
 };
+pub(super) use activation::current_material;
 use context_relay_protocol::{Ed25519SignatureBytes, Sha256Digest, decode_pairing_request_v1};
 pub use material::{
     HistoricalTransferBudget, HistoricalTransferProgress, HistoricalTransferSelection,
+};
+pub(super) use reconstruction::read_material;
+pub use reconstruction::{
+    HistoricalReadMaterial, HistoricalReconstruction, HistoricalReconstructionBudget,
 };
 use rusqlite::{Connection, TransactionBehavior, params};
 
@@ -248,7 +255,7 @@ pub(super) fn require_current(
     scope: SyncScope,
     stamp: Option<MembershipEndpoint>,
 ) -> Result<Option<VerifiedMembershipHistory>, VaultError> {
-    let Some(history) = history(c, CURRENT_BUDGET)? else {
+    let Some(stored) = load(c, CURRENT_BUDGET)? else {
         if c.query_row(
             "SELECT EXISTS(SELECT 1 FROM revocation_genesis_anchor)",
             [],
@@ -258,11 +265,14 @@ pub(super) fn require_current(
         }
         return Ok(None);
     };
+    let history = stored.verify(CURRENT_BUDGET)?;
     if history.state().scope != scope || stamp != Some(history.endpoint()) {
         return Err(VaultError::OperationConflict);
     }
-    // Until current-rotation activation is installed, only the authenticated enrollment
-    // material can be current. Public acceptance must never activate downloaded keys.
+    if activation::active_device(c, &stored, &history)?.is_some() {
+        return Ok(Some(history));
+    }
+    // Preserve existing enrolled epoch-one compatibility; public staging never activates.
     if history.endpoint().control_epoch != 1 || history.endpoint().key_epoch != 1 {
         return Err(invalid());
     }

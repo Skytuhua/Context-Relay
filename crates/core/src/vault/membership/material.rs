@@ -27,7 +27,7 @@ fn digest(bytes: &[u8]) -> Sha256Digest {
 fn crypto<T, E>(result: Result<T, E>) -> Result<T, VaultError> {
     result.map_err(|_| invalid())
 }
-fn endpoint_check(
+pub(super) fn endpoint_check(
     stored: &Stored,
     expected: MembershipEndpoint,
     device: DeviceId,
@@ -45,7 +45,7 @@ fn endpoint_check(
     }
     Ok(history)
 }
-fn lineage(
+pub(super) fn lineage(
     stored: &Stored,
     anchor: MembershipEndpoint,
     budget: MembershipHistoryBudget,
@@ -85,7 +85,7 @@ fn secret_aad(
     aad.extend(provenance.0);
     aad
 }
-fn load_secret(
+pub(super) fn load_secret(
     c: &Connection,
     stored: &Stored,
     device: DeviceId,
@@ -338,14 +338,14 @@ pub struct HistoricalTransferProgress {
     pub next_page: Option<(u32, Sha256Digest)>,
     pub inventory_verified: bool,
 }
-struct Transfer {
-    header: HistoricalTransferHeader,
-    raw: Vec<u8>,
-    checkpoint: Vec<u8>,
+pub(super) struct Transfer {
+    pub(super) header: HistoricalTransferHeader,
+    pub(super) raw: Vec<u8>,
+    pub(super) checkpoint: Vec<u8>,
     index: u32,
     hash: Sha256Digest,
 }
-fn load_transfer(
+pub(super) fn load_transfer(
     c: &Connection,
     id: OperationId,
     budget: HistoricalTransferBudget,
@@ -375,7 +375,7 @@ fn load_transfer(
         hash: Sha256Digest(hash.try_into().map_err(|_| invalid())?),
     }))
 }
-fn selection(
+pub(super) fn selection(
     c: &Connection,
     device: DeviceId,
     budget: HistoricalTransferBudget,
@@ -411,7 +411,7 @@ fn selection(
         revision,
     }))
 }
-fn admission_lineage(
+pub(super) fn admission_lineage(
     c: &Connection,
     stored: &Stored,
     confirmed: &ConfirmedV2Transcript,
@@ -649,6 +649,11 @@ impl Vault {
         if !same && selected != previous {
             return Err(VaultError::OperationConflict);
         }
+        if !same && let Some(prior) = selected {
+            super::reconstruction::require_target_extension(
+                &tx, &stored, prior, checkpoint, keys, budget,
+            )?;
+        }
         if let Some(existing) = load_transfer(&tx, h.context.transfer_id, budget)? {
             if existing.raw != header || existing.checkpoint != checkpoint {
                 return Err(VaultError::OperationConflict);
@@ -719,8 +724,24 @@ impl Vault {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = Self::replay_historical_transfer_tx(
+            &tx, selected, confirmed, signature, page, keys, budget,
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn replay_historical_transfer_tx(
+        tx: &rusqlite::Transaction<'_>,
+        selected: HistoricalTransferSelection,
+        confirmed: &ConfirmedV2Transcript,
+        signature: Ed25519SignatureBytes,
+        page: Option<((u32, Sha256Digest), &[u8])>,
+        keys: &DeviceKeys,
+        budget: HistoricalTransferBudget,
+    ) -> Result<(HistoricalTransferProgress, CommitDisposition), VaultError> {
         let device = confirmed.payload().grant.certificate.device_id;
-        let stored = load(&tx, budget.history)?.ok_or_else(invalid)?;
+        let stored = load(tx, budget.history)?.ok_or_else(invalid)?;
         endpoint_check(
             &stored,
             selected.authorizing_endpoint,
@@ -728,11 +749,11 @@ impl Vault {
             keys,
             budget.history,
         )?;
-        if selection(&tx, device, budget)? != Some(selected) {
+        if selection(tx, device, budget)? != Some(selected) {
             return Err(VaultError::OperationConflict);
         }
-        let t = load_transfer(&tx, selected.transfer_id, budget)?.ok_or_else(invalid)?;
-        let proof = admission_lineage(&tx, &stored, confirmed, signature, budget.history)?;
+        let t = load_transfer(tx, selected.transfer_id, budget)?.ok_or_else(invalid)?;
+        let proof = admission_lineage(tx, &stored, confirmed, signature, budget.history)?;
         let authority = crypto(HistoricalTransferAuthority::new(
             &proof,
             confirmed,
@@ -742,7 +763,7 @@ impl Vault {
             &t.checkpoint,
         ))?;
         let mut verified = crypto(authority.verify_header(&t.raw))?;
-        let genesis = load_secret(&tx, &stored, device, 1, false, keys, budget.history)?;
+        let genesis = load_secret(tx, &stored, device, 1, false, keys, budget.history)?;
         // Confirmed epoch-one admission proves this value was previously trusted.
         // Deletion is not authority to replace it with an exporter assertion.
         if genesis.is_none()
@@ -783,7 +804,7 @@ impl Vault {
             let bundles = crypto(verified.open_next_page(&raw, keys, trust))?;
             for bundle in bundles {
                 let retained = load_secret(
-                    &tx,
+                    tx,
                     &stored,
                     device,
                     bundle.key_epoch(),
@@ -818,7 +839,7 @@ impl Vault {
             let bundles = crypto(verified.open_next_page(raw, keys, trust))?;
             for bundle in bundles {
                 retain(
-                    &tx,
+                    tx,
                     &stored,
                     device,
                     &bundle,
@@ -842,7 +863,6 @@ impl Vault {
             next_page: verified.next_page(),
             inventory_verified: verified.inventory_verified(),
         };
-        tx.commit()?;
         Ok((progress, disposition))
     }
 }

@@ -51,6 +51,10 @@ impl TrustedDevice {
 /// not merely certificates with valid historical signatures. Issuance epochs may
 /// precede the current epoch when that roster explicitly retains the device.
 pub trait TrustedSyncMaterial {
+    /// Opaque stored-representative read capability; never used for incoming admission.
+    fn historical_read_material(&self) -> Option<&crate::vault::HistoricalReadMaterial> {
+        None
+    }
     /// Continuity only, never a substitute for replaying local accepted authority.
     fn membership_endpoint(&self) -> Option<crate::devices::membership_crypto::MembershipEndpoint> {
         None
@@ -89,6 +93,51 @@ pub struct AdmittedOperation {
 }
 
 impl AdmittedOperation {
+    /// Crate-private historical admission; it never bypasses current write entry gates.
+    pub(crate) fn from_historical(
+        vault: &Vault,
+        bytes: &[u8],
+        certificate: &DeviceCertificateV1,
+        key: &ContentKey,
+        endpoint: crate::devices::membership_crypto::MembershipEndpoint,
+    ) -> Result<Self, SyncError> {
+        let operation = decode_sync_operation_v1(bytes).map_err(|_| SyncError::InvalidEnvelope)?;
+        let canonical_bytes =
+            encode_sync_operation_v1(&operation).map_err(|_| SyncError::InvalidEnvelope)?;
+        if canonical_bytes != bytes {
+            return Err(SyncError::InvalidEnvelope);
+        }
+        let previous = vault
+            .device_head(operation.workspace_id, operation.device_id)
+            .map_err(|_| SyncError::PersistenceFailed)?
+            .map(|h| OperationChainHead {
+                sequence: h.sequence,
+                canonical_hash: h.canonical_hash,
+            });
+        let mut context = TrustedOperationContext::new(certificate, operation.key_epoch, previous)
+            .with_current_control_epoch(operation.control_epoch);
+        if operation.mutation_kind == context_relay_protocol::MutationKind::Tombstone {
+            let scope = vault
+                .materialized_record_scope(
+                    operation.workspace_id,
+                    operation.record_id,
+                    operation.record_kind,
+                )
+                .map_err(|_| SyncError::PersistenceFailed)?
+                .ok_or(SyncError::InvalidScope)?;
+            context = context.with_existing_record_scope(scope);
+        }
+        validate_frontier_against_vault(vault, &operation)?;
+        let mutation = verify_operation_envelope(&operation, &context, key)?;
+        let canonical_hash = digest(&canonical_bytes);
+        Ok(Self {
+            membership_endpoint: Some(endpoint),
+            operation,
+            mutation,
+            canonical_bytes,
+            canonical_hash,
+        })
+    }
     pub const fn operation(&self) -> &SyncOperationV1 {
         &self.operation
     }

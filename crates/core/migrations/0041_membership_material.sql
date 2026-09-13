@@ -39,3 +39,33 @@ CREATE TABLE historical_transfer_selection (
  transfer_id TEXT NOT NULL REFERENCES historical_transfers(transfer_id),
  revision INTEGER NOT NULL CHECK(revision>0)
 );
+CREATE TABLE membership_current_activation (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ device_id TEXT NOT NULL CHECK(length(device_id)=36),
+ source_hash BLOB NOT NULL CHECK(length(source_hash)=32),
+ control_epoch INTEGER NOT NULL CHECK(control_epoch BETWEEN 1 AND 4294967295),
+ key_epoch INTEGER NOT NULL CHECK(key_epoch BETWEEN 1 AND 4294967295),
+ signature BLOB NOT NULL CHECK(length(signature)=64)
+);
+-- Repair evidence has no selected-target or completion authority.
+CREATE TABLE historical_operation_evidence (
+ operation_id TEXT PRIMARY KEY CHECK(length(operation_id)=36),
+ device_id TEXT NOT NULL CHECK(length(device_id)=36),
+ device_sequence TEXT NOT NULL,
+ canonical BLOB NOT NULL CHECK(length(canonical) BETWEEN 1 AND 8388608),
+ UNIQUE(device_id,device_sequence)
+);
+-- Only exact reconstruction/cutoff verification pins a branch here.
+CREATE TABLE historical_verified_operations (
+ operation_id TEXT PRIMARY KEY CHECK(length(operation_id)=36),
+ device_id TEXT NOT NULL CHECK(length(device_id)=36),
+ device_sequence TEXT NOT NULL,
+ canonical BLOB NOT NULL CHECK(length(canonical) BETWEEN 1 AND 8388608),
+ UNIQUE(device_id,device_sequence)
+);
+CREATE TABLE historical_reconstructions (
+ transfer_id TEXT PRIMARY KEY REFERENCES historical_transfers(transfer_id),
+ prefixes BLOB NOT NULL,
+ signature BLOB NOT NULL CHECK(length(signature)=64),
+ installed_signature BLOB CHECK(installed_signature IS NULL OR length(installed_signature)=64)
+);

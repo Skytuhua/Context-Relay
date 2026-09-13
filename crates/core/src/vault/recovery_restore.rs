@@ -562,6 +562,12 @@ impl Vault {
         ),
         VaultError,
     > {
+        let tx = self.connection.unchecked_transaction()?;
+        if let Some(material) = super::membership::current_material(&tx, device_keys)? {
+            tx.commit()?;
+            return Ok(material);
+        }
+        tx.commit()?;
         let history = self.accepted_membership_history(super::membership::CURRENT_BUDGET)?;
         let (material, legacy_certificates) =
             self.original_workspace_material_and_certificates(device_keys)?;

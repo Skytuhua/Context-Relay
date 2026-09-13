@@ -202,6 +202,7 @@ enum CacheChange<'a> {
 
 /// Verified, cycle-local device authority and decrypted active content key.
 pub struct VaultSyncMaterial {
+    historical_read: Option<super::HistoricalReadMaterial>,
     membership_endpoint: Option<crate::devices::membership_crypto::MembershipEndpoint>,
     scope: SyncScope,
     control_epoch: u32,
@@ -209,6 +210,9 @@ pub struct VaultSyncMaterial {
     content_key: crate::crypto::ContentKey,
     certificates: std::collections::BTreeMap<DeviceId, crate::crypto::DeviceCertificateV1>,
 }
+
+// Owned effects can outlive rehydrated representative plaintext until the joint commit.
+pub(in crate::vault) type SyncCacheUpdate = Option<(String, Option<super::CachedEmbedding>)>;
 
 impl VaultSyncMaterial {
     pub fn local_identity<'a>(
@@ -239,6 +243,9 @@ impl VaultSyncMaterial {
 }
 
 impl TrustedSyncMaterial for VaultSyncMaterial {
+    fn historical_read_material(&self) -> Option<&super::HistoricalReadMaterial> {
+        self.historical_read.as_ref()
+    }
     fn membership_endpoint(&self) -> Option<crate::devices::membership_crypto::MembershipEndpoint> {
         self.membership_endpoint
     }
@@ -413,7 +420,8 @@ impl Vault {
     /// Presence is not authority: callers must still load and verify the complete proof.
     pub fn has_sync_authority(&self) -> Result<bool, VaultError> {
         Ok(self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM recovery_enrollments WHERE state = 'active')
+            "SELECT EXISTS(SELECT 1 FROM accepted_membership)
+                 OR EXISTS(SELECT 1 FROM recovery_enrollments WHERE state = 'active')
                  OR EXISTS(SELECT 1 FROM recovery_restores WHERE state = 'active')
                  OR EXISTS(SELECT 1 FROM pairing_approval_transcripts WHERE role = 'joiner' AND state = 'completed')
                  OR EXISTS(SELECT 1 FROM sync_record_owners)", [], |row| row.get(0),
@@ -445,6 +453,11 @@ impl Vault {
                 return Err(VaultError::OperationConflict);
             }
             return Ok(VaultSyncMaterial {
+                historical_read: Some(super::membership::read_material(
+                    &self.connection,
+                    history.endpoint(),
+                    device_keys,
+                )?),
                 membership_endpoint: Some(history.endpoint()),
                 scope,
                 control_epoch: material.control_epoch(),
@@ -496,6 +509,7 @@ impl Vault {
             }
         }
         Ok(VaultSyncMaterial {
+            historical_read: None,
             membership_endpoint: None,
             scope,
             control_epoch: material.control_epoch(),
@@ -924,22 +938,59 @@ impl Vault {
             admitted.operation(),
             admitted.membership_endpoint,
         )?;
-        if exact_incoming_replay(&transaction, admitted)? {
-            if let Some(provider) = cursor_provider {
-                upsert_cursor(
-                    &transaction,
-                    admitted.operation().workspace_id,
-                    provider,
-                    received_at,
-                    admitted.operation().operation_id,
-                )?;
+        let (decision, update) = Self::apply_verified_in_transaction(
+            &transaction,
+            admitted,
+            Some(trusted_material),
+            &|operation| rehydrate_stored_mutation(&transaction, trusted_material, operation),
+            embedding_resolver,
+            applied_at_ms,
+            received_at,
+        )?;
+        if let Some(provider) = cursor_provider {
+            upsert_cursor(
+                &transaction,
+                admitted.operation().workspace_id,
+                provider,
+                received_at,
+                admitted.operation().operation_id,
+            )?;
+        }
+        transaction.commit()?;
+        self.apply_sync_cache_update(update);
+        Ok(decision)
+    }
+
+    pub(in crate::vault) fn apply_sync_cache_update(&mut self, update: SyncCacheUpdate) {
+        if let Some((id, value)) = update {
+            match value {
+                Some(value) => {
+                    self.embedding_cache.insert(id, value);
+                }
+                None => {
+                    self.embedding_cache.remove(&id);
+                }
             }
-            transaction.commit()?;
-            return Ok(MergeDecision::NoLiveChange);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::vault) fn apply_verified_in_transaction(
+        transaction: &Transaction<'_>,
+        admitted: &AdmittedOperation,
+        trusted_material: Option<&dyn TrustedSyncMaterial>,
+        rehydrate: &impl Fn(&SyncOperationV1) -> Result<RecordMutationV1, VaultError>,
+        embedding_resolver: &impl RepresentativeEmbeddingResolver,
+        applied_at_ms: u64,
+        received_at: &str,
+    ) -> Result<(MergeDecision, SyncCacheUpdate), VaultError> {
+        validate_admitted(admitted)?;
+        if exact_incoming_replay(transaction, admitted)? {
+            return Ok((MergeDecision::NoLiveChange, None));
         }
         ensure_sync_record_owner(
-            &transaction,
-            Some(trusted_material),
+            transaction,
+            trusted_material,
             admitted.operation().account_id,
             admitted.operation().workspace_id,
             admitted.operation().record_id,
@@ -947,20 +998,20 @@ impl Vault {
         )?;
         if let RecordMutationV1::UpsertMemoryCandidate(candidate) = admitted.mutation() {
             restore_received_candidate_alias(
-                &transaction,
+                transaction,
                 candidate,
                 admitted.operation().account_id,
                 admitted.operation().workspace_id,
             )?;
         }
         let current = load_record_heads(
-            &transaction,
+            transaction,
             admitted.operation().workspace_id,
             admitted.operation().record_id,
         )?;
         let decision = decide_merge(admitted, &current)
             .map_err(|error| VaultError::Validation(error.to_string()))?;
-        validate_device_chain(&transaction, admitted.operation())?;
+        validate_device_chain(transaction, admitted.operation())?;
 
         let conflict_heads = match &decision {
             MergeDecision::AddConflictHead { remove } => {
@@ -977,7 +1028,7 @@ impl Vault {
         };
         let rehydrated_mutation = match conflict_heads.as_ref() {
             Some(heads) if heads[0].operation_id != admitted.operation().operation_id => {
-                Some(rehydrate_stored_mutation(trusted_material, &heads[0])?)
+                Some(rehydrate(&heads[0])?)
             }
             _ => None,
         };
@@ -1020,14 +1071,14 @@ impl Vault {
         };
         let cache_change = match representative {
             Some((_, mutation)) => {
-                materialize_mutation(&transaction, mutation, resolved_embedding.as_ref())?
+                materialize_mutation(transaction, mutation, resolved_embedding.as_ref())?
             }
             None => CacheChange::None,
         };
 
-        insert_incoming_operation(&transaction, admitted, received_at)?;
+        insert_incoming_operation(transaction, admitted, received_at)?;
         note_checkpoint_operation(
-            &transaction,
+            transaction,
             admitted.operation().account_id,
             admitted.operation().workspace_id,
             applied_at_ms,
@@ -1069,7 +1120,7 @@ impl Vault {
                         ],
                     )?;
                 }
-                insert_record_head(&transaction, admitted)?;
+                insert_record_head(transaction, admitted)?;
                 transaction.execute(
                     "DELETE FROM conflicts WHERE record_id = ?1",
                     [admitted.operation().record_id.to_string()],
@@ -1087,7 +1138,7 @@ impl Vault {
                         ],
                     )?;
                 }
-                insert_record_head(&transaction, admitted)?;
+                insert_record_head(transaction, admitted)?;
                 let heads = conflict_heads.as_ref().ok_or_else(|| {
                     VaultError::Validation("conflict head set is unavailable".to_owned())
                 })?;
@@ -1110,20 +1161,20 @@ impl Vault {
                 )?;
             }
         }
-        if let Some(provider) = cursor_provider {
-            upsert_cursor(
-                &transaction,
-                admitted.operation().workspace_id,
-                provider,
-                received_at,
-                admitted.operation().operation_id,
-            )?;
-        }
-        transaction.commit()?;
-        apply_cache_change(&mut self.embedding_cache, cache_change);
-        Ok(decision)
+        let update = match cache_change {
+            CacheChange::PutMemory(record, embedding) => Some((
+                record.id.to_string(),
+                Some(cached_embedding(&record.scope, record.archived, embedding)),
+            )),
+            CacheChange::PutInstruction(record, embedding) => Some((
+                record.id.to_string(),
+                Some(cached_embedding(&record.scope, record.archived, embedding)),
+            )),
+            CacheChange::Remove(id) => Some((id, None)),
+            CacheChange::None => None,
+        };
+        Ok((decision, update))
     }
-
     pub fn commit_outgoing_operation(
         &mut self,
         mutation: &RecordMutationV1,
@@ -2255,14 +2306,25 @@ fn validate_admitted(admitted: &AdmittedOperation) -> Result<(), VaultError> {
 }
 
 fn rehydrate_stored_mutation(
+    connection: &Connection,
     trusted_material: &(impl TrustedSyncMaterial + ?Sized),
     operation: &SyncOperationV1,
 ) -> Result<RecordMutationV1, VaultError> {
-    let key = trusted_material
-        .content_key(operation.workspace_id, operation.key_epoch)
-        .map_err(|_| {
-            VaultError::Validation("stored representative key is unavailable".to_owned())
-        })?;
+    match trusted_material.content_key(operation.workspace_id, operation.key_epoch) {
+        Ok(key) => rehydrate_mutation_with_key(operation, key),
+        Err(_) => trusted_material
+            .historical_read_material()
+            .ok_or_else(|| {
+                VaultError::Validation("stored representative key is unavailable".into())
+            })?
+            .rehydrate(connection, operation),
+    }
+}
+
+pub(in crate::vault) fn rehydrate_mutation_with_key(
+    operation: &SyncOperationV1,
+    key: &crate::crypto::ContentKey,
+) -> Result<RecordMutationV1, VaultError> {
     let aad = encode_sync_operation_aad_v1(operation).map_err(|_| {
         VaultError::Validation("stored representative envelope is invalid".to_owned())
     })?;
@@ -3493,7 +3555,7 @@ fn legacy_owner_matches_materialization(
     }
 
     let representative_mutation =
-        rehydrate_stored_mutation(trusted_material, &representative.operation)?;
+        rehydrate_stored_mutation(connection, trusted_material, &representative.operation)?;
     let materialized_kinds = materialized_record_kinds(connection, record_id)?;
     if matches!(representative_mutation, RecordMutationV1::Tombstone { .. }) {
         return Ok(materialized_kinds.is_empty());

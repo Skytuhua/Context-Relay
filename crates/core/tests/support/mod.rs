@@ -122,7 +122,7 @@ impl Drop for TempVault {
 }
 
 pub fn remove_membership_material_migration(connection: &Connection) {
-    connection.execute_batch("DROP TABLE IF EXISTS historical_transfer_selection; DROP TABLE IF EXISTS historical_transfer_pages; DROP TABLE IF EXISTS historical_transfers; DROP TABLE IF EXISTS membership_confirmed_admission; DROP TABLE IF EXISTS membership_root_material_seed; DROP TABLE IF EXISTS membership_epoch_secrets;").unwrap();
+    connection.execute_batch("DROP TABLE IF EXISTS historical_verified_operations; DROP TABLE IF EXISTS historical_reconstructions; DROP TABLE IF EXISTS historical_operation_evidence; DROP TABLE IF EXISTS membership_current_activation; DROP TABLE IF EXISTS historical_transfer_selection; DROP TABLE IF EXISTS historical_transfer_pages; DROP TABLE IF EXISTS historical_transfers; DROP TABLE IF EXISTS membership_confirmed_admission; DROP TABLE IF EXISTS membership_root_material_seed; DROP TABLE IF EXISTS membership_epoch_secrets;").unwrap();
 }
 
 pub fn remove_native_memory_migrations_after_schema_23(connection: &Connection) {

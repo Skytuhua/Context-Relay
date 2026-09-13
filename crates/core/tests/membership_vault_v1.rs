@@ -647,6 +647,33 @@ fn retained_root_stages_rotation_without_pairing_c_and_preserves_epoch_one() {
     let g = root.endpoint();
     v.stage_current_membership_material(g, id(DEVICE_ID), &f.device_keys, BUDGET)
         .unwrap();
+    v.activate_current_membership_material(g, id(DEVICE_ID), &f.device_keys, BUDGET)
+        .unwrap();
+    let stale = v.trusted_sync_material(&f.device_keys).unwrap();
+    let stale_mutation = context_relay_protocol::RecordMutationV1::UpsertProject(
+        context_relay_protocol::ProjectIdentity {
+            project_id: id(OTHER_ID),
+            github_repository_id: None,
+            git_remote_fingerprint: None,
+            monorepo_subdirectory: None,
+            name: "stale operation".into(),
+        },
+    );
+    let stale_operation = context_relay_core::sync::OperationBuilder::new(
+        stale.local_identity(id(DEVICE_ID), &f.device_keys).unwrap(),
+    )
+    .build(context_relay_core::sync::OperationBuildRequest {
+        operation_id: id(ENROLLMENT_ID),
+        project_id: Some(id(OTHER_ID)),
+        mutation: &stale_mutation,
+        causal_frontier: vec![],
+        previous: None,
+        blob_refs: vec![],
+        created_hlc: context_relay_protocol::HybridLogicalClock::new(4000, 0, id(DEVICE_ID)),
+    })
+    .unwrap();
+    v.commit_outgoing_operation_at(&stale_mutation, &stale_operation, None, 4000)
+        .unwrap();
     let b = DeviceKeys::generate().unwrap();
     let request =
         SignedPairingRequest::build(id(OTHER_ID), id(OTHER_ID), "B", NativePlatform::Windows, &b)
@@ -689,6 +716,37 @@ fn retained_root_stages_rotation_without_pairing_c_and_preserves_epoch_one() {
     .unwrap();
     v.stage_current_membership_material(c, id(DEVICE_ID), &f.device_keys, BUDGET)
         .unwrap();
+    assert_eq!(
+        v.trusted_sync_material(&f.device_keys)
+            .unwrap()
+            .local_identity(id(DEVICE_ID), &f.device_keys)
+            .unwrap()
+            .membership_endpoint,
+        Some(c),
+        "authenticated activation survives accepted same-epoch ADD with freshly rebuilt authority"
+    );
+    assert!(
+        context_relay_core::sync::admit_operation(&v, &stale_operation.canonical_bytes, &stale)
+            .is_err(),
+        "old owned endpoint fails even though same-epoch keys remain active"
+    );
+    assert!(
+        v.commit_outgoing_operation_at(&stale_mutation, &stale_operation, None, 4001)
+            .is_err()
+    );
+    assert!(
+        v.activate_current_membership_material(
+            MembershipEndpoint {
+                state_sha256: Sha256Digest([55; 32]),
+                ..c
+            },
+            id(DEVICE_ID),
+            &f.device_keys,
+            BUDGET
+        )
+        .is_err(),
+        "unrelated same-epoch branch is not activation authority"
+    );
     let history = v.accepted_membership_history(BUDGET).unwrap().unwrap();
     let s = DeviceRevocationStatementV1 {
         schema_version: 1,
@@ -929,6 +987,172 @@ fn retained_root_stages_rotation_without_pairing_c_and_preserves_epoch_one() {
     );
     assert!(v.trusted_sync_material(&f.device_keys).is_err());
     // Once signed, the obsolete enrollment envelope is no longer a recurring source.
+    assert!(
+        v.activate_current_membership_material(c, id(DEVICE_ID), &f.device_keys, BUDGET)
+            .is_err()
+    );
+    assert!(
+        v.activate_current_membership_material(d, id(DEVICE_ID), &b, BUDGET)
+            .is_err()
+    );
+    raw.execute_batch("CREATE TRIGGER fail_activation BEFORE INSERT ON membership_current_activation BEGIN SELECT RAISE(ABORT,'injected');END").unwrap();
+    assert!(
+        v.activate_current_membership_material(d, id(DEVICE_ID), &f.device_keys, BUDGET)
+            .is_err()
+    );
+    drop(v);
+    let mut v = Vault::open(path.path(), CREDENTIAL, &ks).unwrap();
+    assert!(v.trusted_sync_material(&f.device_keys).is_err());
+    assert!(v.enrolled_workspace_material(&f.device_keys).is_err());
+    use context_relay_core::devices::pairing::PairingMaterialSource;
+    assert!(
+        context_relay_core::devices::pairing::VaultPairingMaterialSource
+            .current_material(&mut v, &f.device_keys, root.state().scope)
+            .is_err()
+    );
+    assert!(
+        context_relay_core::sync::admit_operation(&v, &stale_operation.canonical_bytes, &stale)
+            .is_err()
+    );
+    assert!(
+        v.commit_outgoing_operation_at(&stale_mutation, &stale_operation, None, 5000)
+            .is_err()
+    );
+    raw.execute_batch("DROP TRIGGER fail_activation").unwrap();
+    v.activate_current_membership_material(d, id(DEVICE_ID), &f.device_keys, BUDGET)
+        .expect("independent retained rotation must activate without a transfer or pairing C");
+    let active = v.trusted_sync_material(&f.device_keys).unwrap();
+    let identity = active
+        .local_identity(id(DEVICE_ID), &f.device_keys)
+        .unwrap();
+    assert_eq!(identity.key_epoch, 3);
+    assert_eq!(identity.membership_endpoint, Some(d));
+    drop(v);
+    let mut v = Vault::open(path.path(), CREDENTIAL, &ks).unwrap();
+    assert_eq!(
+        v.trusted_workspace_material(&f.device_keys)
+            .unwrap()
+            .key_epoch(),
+        3
+    );
+    assert!(
+        context_relay_core::sync::admit_operation(&v, &stale_operation.canonical_bytes, &stale)
+            .is_err()
+    );
+    assert!(
+        v.commit_outgoing_operation_at(&stale_mutation, &stale_operation, None, 5000)
+            .is_err()
+    );
+    raw.execute_batch("CREATE TEMP TABLE saved_activation AS SELECT * FROM membership_current_activation; UPDATE membership_current_activation SET signature=zeroblob(64)").unwrap();
+    assert!(v.trusted_sync_material(&f.device_keys).is_err());
+    raw.execute_batch("DELETE FROM membership_current_activation; INSERT INTO membership_current_activation SELECT * FROM saved_activation").unwrap();
+    // A retained root's pre-rotation operation needs no historical transfer or pairing C.
+    let newcomer = DeviceKeys::generate().unwrap();
+    let newcomer_id = id("018f22e2-79b0-7cc8-98c4-dc0c0c073996");
+    let newcomer_request = SignedPairingRequest::build(
+        id("018f22e2-79b0-7cc8-98c4-dc0c0c073996"),
+        newcomer_id,
+        "D",
+        NativePlatform::Windows,
+        &newcomer,
+    )
+    .unwrap();
+    let history = v.accepted_membership_history(BUDGET).unwrap().unwrap();
+    let material = v
+        .staged_membership_epoch(d, id(DEVICE_ID), 3, true, &f.device_keys, BUDGET)
+        .unwrap()
+        .unwrap();
+    let built = build_pairing_approval_v2(
+        &newcomer_request,
+        &history.pairing_parent(id(DEVICE_ID)).unwrap(),
+        id(DEVICE_ID),
+        &f.device_keys,
+        id("018f22e2-79b0-7cc8-98c4-dc0c0c073996"),
+        "A",
+        NativePlatform::Windows,
+        &material,
+    )
+    .unwrap();
+    let payload = encode_pairing_approved_payload_v2(&built.payload).unwrap();
+    let add = DeviceMembershipAddStatementV1::from_approved_payload_v2(&payload).unwrap();
+    let sig = add
+        .sign(
+            &history.state().active_devices[&id(DEVICE_ID)],
+            &f.device_keys,
+        )
+        .unwrap();
+    let added = MembershipEndpoint {
+        state_sha256: add.control_state_sha256(sig).unwrap(),
+        ..d
+    };
+    v.accept_membership_extension(
+        d,
+        added,
+        &[MembershipHistoryEvent::PairingAdd {
+            statement: &add.signing_preimage().unwrap(),
+            signature: sig,
+            request: &newcomer_request,
+            approved_payload: &payload,
+        }],
+        BUDGET,
+    )
+    .unwrap();
+    let fresh = v.trusted_sync_material(&f.device_keys).unwrap();
+    let incoming = context_relay_core::sync::OperationBuilder::new(
+        fresh.local_identity(newcomer_id, &newcomer).unwrap(),
+    )
+    .build(context_relay_core::sync::OperationBuildRequest {
+        operation_id: id("ffffffff-ffff-7fff-8fff-ffffffffffff"),
+        project_id: Some(id(OTHER_ID)),
+        mutation: &stale_mutation,
+        causal_frontier: vec![],
+        previous: None,
+        blob_refs: vec![],
+        created_hlc: context_relay_protocol::HybridLogicalClock::new(6000, 0, newcomer_id),
+    })
+    .unwrap();
+    let context_relay_core::sync::AdmissionDecision::Admitted(admitted) =
+        context_relay_core::sync::admit_operation(&v, &incoming.canonical_bytes, &fresh).unwrap()
+    else {
+        panic!()
+    };
+    raw.execute_batch("CREATE TEMP TABLE saved_operation_meta AS SELECT * FROM sync_operation_meta; DELETE FROM sync_operation_meta").unwrap();
+    assert!(
+        v.apply_admitted_operation(
+            &admitted,
+            &fresh,
+            "memory",
+            "2026-09-14T00:00:00Z",
+            &NoEmbedding
+        )
+        .is_err(),
+        "raw signed operation rows alone do not prove ordinary local admission"
+    );
+    raw.execute_batch("INSERT INTO sync_operation_meta SELECT * FROM saved_operation_meta")
+        .unwrap();
+    v.apply_admitted_operation(
+        &admitted,
+        &fresh,
+        "memory",
+        "2026-09-14T00:00:00Z",
+        &NoEmbedding,
+    )
+    .expect(
+        "ordinary current merge must rehydrate retained root history without C or any transfer",
+    );
+    assert_eq!(
+        v.record_heads(id(WORKSPACE_ID), stale_mutation.record_id())
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM historical_transfers", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let d = added;
     raw.execute_batch("UPDATE recovery_enrollments SET device_envelope_sha256=zeroblob(32)")
         .unwrap();
     v.stage_current_membership_material(d, id(DEVICE_ID), &f.device_keys, BUDGET)
@@ -946,6 +1170,60 @@ fn retained_root_stages_rotation_without_pairing_c_and_preserves_epoch_one() {
     raw.execute_batch("INSERT INTO membership_epoch_secrets SELECT * FROM saved_root; UPDATE membership_epoch_secrets SET signature=zeroblob(64) WHERE key_epoch=1").unwrap();
     assert!(
         v.stage_current_membership_material(d, id(DEVICE_ID), &f.device_keys, BUDGET)
+            .is_err()
+    );
+    let history = v.accepted_membership_history(BUDGET).unwrap().unwrap();
+    let (revoked, transition, signature) = RevocationTransitionV1::build(
+        DeviceRevocationStatementV1 {
+            schema_version: 1,
+            revocation_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073997"),
+            account_id: id(ACCOUNT_ID),
+            workspace_id: id(WORKSPACE_ID),
+            issuer_device_id: newcomer_id,
+            target_device_id: id(DEVICE_ID),
+            control_epoch: 3,
+            key_epoch: 3,
+            cutoff_sequence: 1,
+            cutoff_hash: stale_operation.canonical_hash,
+            transition_sha256: Sha256Digest([1; 32]),
+        },
+        &newcomer,
+        &history.state(),
+    )
+    .unwrap();
+    let revoked_endpoint = MembershipEndpoint {
+        state_sha256: revoked.control_state_sha256(signature).unwrap(),
+        control_epoch: 4,
+        key_epoch: 4,
+    };
+    v.accept_membership_extension(
+        d,
+        revoked_endpoint,
+        &[MembershipHistoryEvent::Revocation {
+            statement: &revoked.signing_preimage().unwrap(),
+            signature,
+            transition: &transition.canonical_bytes().unwrap(),
+        }],
+        BUDGET,
+    )
+    .unwrap();
+    drop(v);
+    let mut v = Vault::open(path.path(), CREDENTIAL, &ks).unwrap();
+    assert!(v.trusted_sync_material(&f.device_keys).is_err());
+    assert!(
+        v.apply_admitted_operation(
+            &admitted,
+            &fresh,
+            "memory",
+            "2026-09-14T00:00:02Z",
+            &NoEmbedding
+        )
+        .is_err(),
+        "old owned reader cannot resume after accepted local revocation and restart"
+    );
+    assert!(
+        context_relay_core::devices::pairing::VaultPairingMaterialSource
+            .current_material(&mut v, &f.device_keys, root.state().scope)
             .is_err()
     );
 }
@@ -967,7 +1245,7 @@ fn schema40_root_seeding_preserves_explicit_legacy_enrollment_trust_boundary() {
         .endpoint();
     drop(v);
     let raw = open_raw(path.path(), &ks.key(CREDENTIAL));
-    raw.execute_batch("DROP TABLE historical_transfer_selection; DROP TABLE historical_transfer_pages; DROP TABLE historical_transfers; DROP TABLE membership_confirmed_admission; DROP TABLE membership_root_material_seed; DROP TABLE membership_epoch_secrets; PRAGMA user_version=40").unwrap();
+    raw.execute_batch("DROP TABLE historical_verified_operations; DROP TABLE historical_reconstructions; DROP TABLE historical_operation_evidence; DROP TABLE membership_current_activation; DROP TABLE historical_transfer_selection; DROP TABLE historical_transfer_pages; DROP TABLE historical_transfers; DROP TABLE membership_confirmed_admission; DROP TABLE membership_root_material_seed; DROP TABLE membership_epoch_secrets; PRAGMA user_version=40").unwrap();
     let mut v = Vault::open(path.path(), CREDENTIAL, &ks).unwrap();
     assert_eq!(v.schema_version().unwrap(), 41);
     assert!(

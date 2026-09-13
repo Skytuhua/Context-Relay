@@ -703,6 +703,1437 @@ mod tests {
     }
 
     #[test]
+    fn historical_reconstructs_real_operation_after_inventory_and_restart() {
+        use crate::{sync::*, vault::*};
+        use context_relay_protocol::{
+            DeviceSequence, ProjectIdentity, RecordKind, RecordMutationV1,
+        };
+        let mut f = fixture(1);
+        let d = f.lineage.history().endpoint();
+        let budget = HistoricalReconstructionBudget {
+            transfer: HistoricalTransferBudget {
+                history: MembershipHistoryBudget {
+                    max_events: 200,
+                    max_bytes: 2_000_000,
+                },
+                max_pages: 4,
+                max_bytes: 100_000,
+            },
+            max_operations: 20,
+            max_operation_bytes: 1_000_000,
+            max_dependencies: 100,
+        };
+        let mutation = RecordMutationV1::UpsertProject(ProjectIdentity {
+            project_id: id(91),
+            github_repository_id: None,
+            git_remote_fingerprint: None,
+            monorepo_subdirectory: None,
+            name: "historical project".into(),
+        });
+        let key = crate::crypto::ContentKey::from_bytes(*f.bundles[0].active_epoch_key());
+        let built = OperationBuilder::new(SyncIdentity {
+            membership_endpoint: Some(f.lineage.anchor()),
+            account_id: id(1),
+            workspace_id: id(2),
+            device_id: id(4),
+            control_epoch: 1,
+            key_epoch: 1,
+            device_keys: &f.keys,
+            content_key: &key,
+        })
+        .build(OperationBuildRequest {
+            operation_id: id(92),
+            project_id: Some(id(91)),
+            mutation: &mutation,
+            causal_frontier: vec![],
+            previous: None,
+            blob_refs: vec![],
+            created_hlc: HybridLogicalClock::new(1000, 0, id(4)),
+        })
+        .unwrap();
+        let summary = StateSummaryV1 {
+            entries: vec![StateSummaryEntryV1 {
+                record_id: mutation.record_id(),
+                record_kind: RecordKind::Project,
+                head_hashes: vec![built.canonical_hash],
+                tombstoned: false,
+                conflicted: false,
+            }],
+        };
+        let mut checkpoint = context_relay_protocol::decode_checkpoint_v1(&f.checkpoint).unwrap();
+        checkpoint.causal_frontier = vec![DeviceSequence {
+            device_id: id(4),
+            sequence: 1,
+        }];
+        checkpoint.state_hash = summary.state_hash().unwrap();
+        f.exporter_keys.sign_checkpoint(&mut checkpoint).unwrap();
+        f.checkpoint = encode_checkpoint_v1(&checkpoint).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "historical-reconstruction-{}.db",
+            uuid::Uuid::now_v7()
+        ));
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        let Event::Add(_, _, request, _) = &f.events[0] else {
+            panic!()
+        };
+        v.accept_confirmed_membership_admission(
+            &f.enrollment,
+            &[],
+            &f.confirmed,
+            request,
+            f.signature,
+            &f.keys,
+            budget.transfer.history,
+        )
+        .unwrap();
+        v.activate_current_membership_material(
+            f.lineage.anchor(),
+            id(4),
+            &f.keys,
+            budget.transfer.history,
+        )
+        .unwrap();
+        assert!(
+            v.has_sync_authority().unwrap(),
+            "activated V2-only admission must be discoverable by production sync readiness"
+        );
+        v.commit_outgoing_operation_at(&mutation, &built, None, 1000)
+            .unwrap();
+        v.accept_membership_extension(
+            f.lineage.anchor(),
+            d,
+            &f.events[1..]
+                .iter()
+                .map(Event::borrowed)
+                .collect::<Vec<_>>(),
+            budget.transfer.history,
+        )
+        .unwrap();
+        assert!(
+            v.trusted_sync_material(&f.keys).is_err(),
+            "accepted rotation immediately invalidates old activation"
+        );
+        v.stage_current_membership_material(d, id(4), &f.keys, budget.transfer.history)
+            .unwrap();
+        v.activate_current_membership_material(d, id(4), &f.keys, budget.transfer.history)
+            .unwrap();
+        let current = v.trusted_sync_material(&f.keys).unwrap();
+        let mut newer = mutation.clone();
+        if let RecordMutationV1::UpsertProject(project) = &mut newer {
+            project.name = "newer current project".into();
+        }
+        let newer = OperationBuilder::new(current.local_identity(id(4), &f.keys).unwrap())
+            .build(OperationBuildRequest {
+                operation_id: id(93),
+                project_id: Some(id(91)),
+                mutation: &newer,
+                causal_frontier: vec![DeviceSequence {
+                    device_id: id(4),
+                    sequence: 1,
+                }],
+                previous: Some(OperationChainHead {
+                    sequence: 1,
+                    canonical_hash: built.canonical_hash,
+                }),
+                blob_refs: vec![],
+                created_hlc: HybridLogicalClock::new(2000, 0, id(4)),
+            })
+            .unwrap();
+        let RecordMutationV1::UpsertProject(mut project) = mutation.clone() else {
+            panic!()
+        };
+        project.name = "newer current project".into();
+        v.commit_outgoing_operation_at(
+            &RecordMutationV1::UpsertProject(project),
+            &newer,
+            None,
+            2000,
+        )
+        .unwrap();
+        let live_summary = v
+            .sync_state_summary(f.lineage.history().state().scope)
+            .unwrap();
+        let outbox_snapshot = || {
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            unsafe {
+                assert_eq!(
+                    rusqlite::ffi::sqlite3_key(raw.handle(), [77u8; 32].as_ptr().cast(), 32),
+                    0
+                );
+            }
+            raw.query_row("SELECT json_group_array(json_object('id',operation_id,'queued',queued_at,'attempts',attempt_count,'next',next_attempt_ms,'error',safe_error_code)) FROM (SELECT * FROM outbox ORDER BY operation_id)",[],|r|r.get::<_,String>(0)).unwrap()
+        };
+        let live_outbox = outbox_snapshot();
+        assert!(
+            v.due_outbox(10_000, 20).is_err(),
+            "old queued epoch remains denied by current sending gates"
+        );
+        assert_ne!(live_summary, summary);
+        let authority = f.authority();
+        let page = authority
+            .build_page(
+                0,
+                ZERO,
+                &f.bundles[..1],
+                EpochOneTrust::PreviouslyTrusted(&f.bundles[0]),
+            )
+            .unwrap();
+        let header = authority
+            .sign_header(digest(&page), &f.exporter_keys)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        let selected = v
+            .select_historical_transfer(
+                d,
+                None,
+                &f.confirmed,
+                f.signature,
+                &header,
+                &f.checkpoint,
+                &f.keys,
+                budget.transfer,
+            )
+            .unwrap();
+        let embeddings = |_, _: &RecordMutationV1| Ok(None);
+        assert!(
+            v.reconstruct_historical_transfer(
+                selected,
+                &f.confirmed,
+                f.signature,
+                &[],
+                &f.keys,
+                budget,
+                &embeddings
+            )
+            .unwrap()
+            .is_none()
+        );
+        v.commit_historical_transfer_page(
+            selected,
+            &f.confirmed,
+            f.signature,
+            (0, digest(&page)),
+            &page,
+            &f.keys,
+            budget.transfer,
+        )
+        .unwrap();
+        assert!(
+            v.historical_transfer_progress(
+                selected,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget.transfer
+            )
+            .unwrap()
+            .inventory_verified
+        );
+        assert!(
+            v.reconstruct_historical_transfer(
+                selected,
+                &f.confirmed,
+                f.signature,
+                &[],
+                &f.keys,
+                budget,
+                &embeddings
+            )
+            .unwrap()
+            .is_none(),
+            "inventory alone cannot reconstruct an unavailable prefix"
+        );
+        drop(v);
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        let mut wrong = mutation.clone();
+        if let RecordMutationV1::UpsertProject(project) = &mut wrong {
+            project.name = "wrong signed branch".into();
+        }
+        let fork = OperationBuilder::new(SyncIdentity {
+            membership_endpoint: Some(f.lineage.anchor()),
+            account_id: id(1),
+            workspace_id: id(2),
+            device_id: id(4),
+            control_epoch: 1,
+            key_epoch: 1,
+            device_keys: &f.keys,
+            content_key: &key,
+        })
+        .build(OperationBuildRequest {
+            operation_id: id(92),
+            project_id: Some(id(91)),
+            mutation: &wrong,
+            causal_frontier: vec![],
+            previous: None,
+            blob_refs: vec![],
+            created_hlc: HybridLogicalClock::new(1000, 0, id(4)),
+        })
+        .unwrap();
+        for (device, epoch, signer) in [
+            (id(77), 1, &f.keys),
+            (id(4), 9, &f.keys),
+            (id(4), 1, &f.exporter_keys),
+        ] {
+            let mut unauthorized = built.operation.clone();
+            unauthorized.device_id = device;
+            unauthorized.created_hlc.node = device;
+            unauthorized.control_epoch = epoch;
+            unauthorized.key_epoch = epoch;
+            signer.sign_sync_operation(&mut unauthorized).unwrap();
+            let bytes = context_relay_protocol::encode_sync_operation_v1(&unauthorized).unwrap();
+            assert!(
+                v.stage_historical_operations(d, id(4), &[bytes], &f.keys, budget)
+                    .is_err(),
+                "absent accepted ADD, wrong historical epochs and substituted signing certificate must fail"
+            );
+        }
+        assert!(
+            v.reconstruct_historical_transfer(
+                selected,
+                &f.confirmed,
+                f.signature,
+                std::slice::from_ref(&fork.canonical_bytes),
+                &f.keys,
+                budget,
+                &embeddings
+            )
+            .is_err(),
+            "wrong signed target branch must fail exact state reconstruction"
+        );
+        drop(v);
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        let bounded = HistoricalReconstructionBudget {
+            max_operations: 1,
+            ..budget
+        };
+        v.stage_historical_operations(
+            d,
+            id(4),
+            std::slice::from_ref(&newer.canonical_bytes),
+            &f.keys,
+            bounded,
+        )
+        .expect("a bounded incoming branch evicts a saturated untrusted cache");
+        let proof = v
+            .reconstruct_historical_transfer(
+                selected,
+                &f.confirmed,
+                f.signature,
+                std::slice::from_ref(&built.canonical_bytes),
+                &f.keys,
+                bounded,
+                &embeddings,
+            )
+            .unwrap()
+            .expect(
+                "correct bounded retry must replace rejected candidates after cache saturation",
+            );
+        assert!(
+            v.stage_historical_operations(
+                d,
+                id(4),
+                std::slice::from_ref(&newer.canonical_bytes),
+                &f.keys,
+                bounded
+            )
+            .is_err(),
+            "cache eviction must never erase a verified prefix to fit another operation"
+        );
+        assert!(
+            v.stage_historical_operations(d, id(4), &[fork.canonical_bytes], &f.keys, budget)
+                .is_err(),
+            "verified target prefix cannot be overwritten by a later candidate"
+        );
+        assert_eq!(proof.selection(), selected);
+        let mut higher_fork = newer.operation.clone();
+        higher_fork.previous_device_hash = Sha256Digest([88; 32]);
+        f.keys.sign_sync_operation(&mut higher_fork).unwrap();
+        v.stage_historical_operations(
+            d,
+            id(4),
+            &[context_relay_protocol::encode_sync_operation_v1(&higher_fork).unwrap()],
+            &f.keys,
+            budget,
+        )
+        .unwrap();
+        let mut fork_checkpoint = checkpoint.clone();
+        fork_checkpoint.causal_frontier[0].sequence = 2;
+        fork_checkpoint.previous_checkpoint_hash = digest(&f.checkpoint);
+        f.exporter_keys
+            .sign_checkpoint(&mut fork_checkpoint)
+            .unwrap();
+        let fork_checkpoint = encode_checkpoint_v1(&fork_checkpoint).unwrap();
+        let fork_authority = HistoricalTransferAuthority::new(
+            &f.lineage,
+            &f.confirmed,
+            f.signature,
+            id(203),
+            id(181),
+            &fork_checkpoint,
+        )
+        .unwrap();
+        let fork_header = fork_authority
+            .sign_header(Sha256Digest([89; 32]), &f.exporter_keys)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        assert!(
+            v.select_historical_transfer(
+                d,
+                Some(selected),
+                &f.confirmed,
+                f.signature,
+                &fork_header,
+                &fork_checkpoint,
+                &f.keys,
+                budget.transfer
+            )
+            .is_err(),
+            "higher scalar and predecessor checkpoint link cannot replace a selected verified prefix with a fork"
+        );
+        assert_eq!(
+            v.historical_transfer_selection(id(4), budget.transfer)
+                .unwrap(),
+            Some(selected)
+        );
+        assert!(
+            !v.historical_transfer_is_installed(
+                selected,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget
+            )
+            .unwrap()
+        );
+        v.install_historical_transfer(
+            &proof,
+            &f.confirmed,
+            f.signature,
+            &f.keys,
+            budget,
+            &embeddings,
+        )
+        .expect("reconstructed history must install through live merge");
+        assert!(
+            v.historical_transfer_is_installed(
+                selected,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            v.sync_state_summary(f.lineage.history().state().scope)
+                .unwrap(),
+            live_summary,
+            "install preserves causally newer live work despite exact older target reconstruction"
+        );
+        assert_eq!(v.device_head(id(2), id(4)).unwrap().unwrap().sequence, 2);
+        assert!(v.sync_cursor(id(2), "supabase").unwrap().is_none());
+        drop(v);
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        assert!(
+            v.historical_transfer_is_installed(
+                selected,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget
+            )
+            .unwrap()
+        );
+        assert!(
+            v.install_historical_transfer(
+                &proof,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget,
+                &embeddings
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            v.sync_state_summary(f.lineage.history().state().scope)
+                .unwrap(),
+            live_summary
+        );
+        assert_eq!(outbox_snapshot(), live_outbox);
+        {
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            unsafe {
+                assert_eq!(
+                    rusqlite::ffi::sqlite3_key(raw.handle(), [77u8; 32].as_ptr().cast(), 32),
+                    0
+                );
+            }
+            raw.execute_batch("CREATE TEMP TABLE saved_pages AS SELECT * FROM historical_transfer_pages; UPDATE historical_transfer_pages SET ciphertext=zeroblob(length(ciphertext))").unwrap();
+            assert!(
+                v.historical_transfer_is_installed(
+                    selected,
+                    &f.confirmed,
+                    f.signature,
+                    &f.keys,
+                    budget
+                )
+                .is_err(),
+                "completion must reauthenticate inventory after restart"
+            );
+            assert!(
+                v.trusted_sync_material(&f.keys).is_ok(),
+                "a damaged historical transfer cannot revoke independent current activation"
+            );
+            raw.execute_batch("DELETE FROM historical_transfer_pages; INSERT INTO historical_transfer_pages SELECT * FROM saved_pages; CREATE TEMP TABLE saved_installation AS SELECT * FROM historical_reconstructions; UPDATE historical_reconstructions SET installed_signature=zeroblob(64)").unwrap();
+            assert!(
+                v.historical_transfer_is_installed(
+                    selected,
+                    &f.confirmed,
+                    f.signature,
+                    &f.keys,
+                    budget
+                )
+                .is_err()
+            );
+            raw.execute_batch("DELETE FROM historical_reconstructions; INSERT INTO historical_reconstructions SELECT * FROM saved_installation").unwrap();
+            assert!(
+                v.historical_transfer_is_installed(
+                    selected,
+                    &f.confirmed,
+                    f.signature,
+                    &f.keys,
+                    budget
+                )
+                .unwrap()
+            );
+        }
+        drop(v);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn historical_replacement_needs_reconstructed_prefix_even_same_frontier() {
+        use crate::{sync::StateSummaryV1, vault::*};
+        let mut f = fixture(0);
+        let mut checkpoint = decode_checkpoint_v1(&f.checkpoint).unwrap();
+        checkpoint.state_hash = StateSummaryV1 { entries: vec![] }.state_hash().unwrap();
+        f.exporter_keys.sign_checkpoint(&mut checkpoint).unwrap();
+        f.checkpoint = encode_checkpoint_v1(&checkpoint).unwrap();
+        let budget = HistoricalTransferBudget {
+            history: MembershipHistoryBudget {
+                max_events: 200,
+                max_bytes: 2_000_000,
+            },
+            max_pages: 4,
+            max_bytes: 100_000,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "historical-replacement-{}.db",
+            uuid::Uuid::now_v7()
+        ));
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        let Event::Add(_, _, request, _) = &f.events[0] else {
+            panic!()
+        };
+        v.accept_confirmed_membership_admission(
+            &f.enrollment,
+            &[],
+            &f.confirmed,
+            request,
+            f.signature,
+            &f.keys,
+            budget.history,
+        )
+        .unwrap();
+        let d = f.lineage.history().endpoint();
+        v.accept_membership_extension(
+            f.lineage.anchor(),
+            d,
+            &f.events[1..]
+                .iter()
+                .map(Event::borrowed)
+                .collect::<Vec<_>>(),
+            budget.history,
+        )
+        .unwrap();
+        let header = f
+            .authority()
+            .sign_header(ZERO, &f.exporter_keys)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        let selected = v
+            .select_historical_transfer(
+                d,
+                None,
+                &f.confirmed,
+                f.signature,
+                &header,
+                &f.checkpoint,
+                &f.keys,
+                budget,
+            )
+            .unwrap();
+        let candidate = HistoricalTransferAuthority::new(
+            &f.lineage,
+            &f.confirmed,
+            f.signature,
+            id(201),
+            id(181),
+            &f.checkpoint,
+        )
+        .unwrap();
+        let header2 = candidate
+            .sign_header(ZERO, &f.exporter_keys)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        assert!(
+            v.select_historical_transfer(
+                d,
+                Some(selected),
+                &f.confirmed,
+                f.signature,
+                &header2,
+                &f.checkpoint,
+                &f.keys,
+                budget
+            )
+            .is_err(),
+            "scalar-equal candidate cannot replace an unreconstructed target"
+        );
+        assert_eq!(
+            v.historical_transfer_selection(id(4), budget).unwrap(),
+            Some(selected)
+        );
+        let rb = HistoricalReconstructionBudget {
+            transfer: budget,
+            max_operations: 10,
+            max_operation_bytes: 10_000,
+            max_dependencies: 100,
+        };
+        let embeddings = |_, _: &context_relay_protocol::RecordMutationV1| Ok(None);
+        let proof = v
+            .reconstruct_historical_transfer(
+                selected,
+                &f.confirmed,
+                f.signature,
+                &[],
+                &f.keys,
+                rb,
+                &embeddings,
+            )
+            .unwrap()
+            .unwrap();
+        let replacement = v
+            .select_historical_transfer(
+                d,
+                Some(selected),
+                &f.confirmed,
+                f.signature,
+                &header2,
+                &f.checkpoint,
+                &f.keys,
+                budget,
+            )
+            .unwrap();
+        assert_ne!(replacement, selected);
+        assert!(
+            v.install_historical_transfer(
+                &proof,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                rb,
+                &embeddings
+            )
+            .is_err(),
+            "owned reconstruction cannot install after same-D target CAS changes"
+        );
+        drop(v);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn historical_exact_cutoff_repair_merges_missing_history_and_rolls_back_conflicts() {
+        use crate::{sync::*, vault::*};
+        use context_relay_protocol::{
+            DeviceSequence, MemoryKind, MemoryOrigin, MemoryRecord, Provenance, RecordKind,
+            RecordMutationV1, ScopeRef,
+        };
+        let root_keys = DeviceKeys::from_seeds([1; 32], [2; 32]);
+        let root_key = crate::crypto::ContentKey::from_bytes([22; 32]);
+        let project = |name: &str| {
+            RecordMutationV1::UpsertMemory(MemoryRecord {
+                id: id(91),
+                scope: ScopeRef::Project { project_id: id(91) },
+                kind: MemoryKind::Fact,
+                title: name.into(),
+                body_markdown: name.into(),
+                tags: vec![],
+                origin: MemoryOrigin::Explicit,
+                provenance: Provenance {
+                    origin_device: id(3),
+                    harness: None,
+                    source: None,
+                    created_hlc: HybridLogicalClock::new(900, 0, id(3)),
+                },
+                revision: id(90),
+                created_hlc: HybridLogicalClock::new(900, 0, id(3)),
+                updated_hlc: HybridLogicalClock::new(1000, 0, id(3)),
+                archived: name == "historical representative",
+            })
+        };
+        let old = project("historical representative");
+        let first = OperationBuilder::new(SyncIdentity {
+            membership_endpoint: None,
+            account_id: id(1),
+            workspace_id: id(2),
+            device_id: id(3),
+            control_epoch: 1,
+            key_epoch: 1,
+            device_keys: &root_keys,
+            content_key: &root_key,
+        })
+        .build(OperationBuildRequest {
+            operation_id: id(90),
+            project_id: Some(id(91)),
+            mutation: &old,
+            causal_frontier: vec![],
+            previous: None,
+            blob_refs: vec![],
+            created_hlc: HybridLogicalClock::new(1000, 0, id(3)),
+        })
+        .unwrap();
+        let second_mutation = project("at signed cutoff");
+        let child_keys = DeviceKeys::from_seeds([3; 32], [4; 32]);
+        let make_dependency = || {
+            OperationBuilder::new(SyncIdentity {
+                membership_endpoint: None,
+                account_id: id(1),
+                workspace_id: id(2),
+                device_id: id(4),
+                control_epoch: 1,
+                key_epoch: 1,
+                device_keys: &child_keys,
+                content_key: &root_key,
+            })
+            .build(OperationBuildRequest {
+                operation_id: id(98),
+                project_id: Some(id(91)),
+                mutation: &project("causal prerequisite"),
+                causal_frontier: vec![],
+                previous: None,
+                blob_refs: vec![],
+                created_hlc: HybridLogicalClock::new(900, 0, id(4)),
+            })
+            .unwrap()
+        };
+        let dependency = make_dependency();
+        let alternate_dependency = make_dependency();
+        assert_ne!(
+            dependency.canonical_hash,
+            alternate_dependency.canonical_hash
+        );
+        let make_second = |mutation: &RecordMutationV1| {
+            OperationBuilder::new(SyncIdentity {
+                membership_endpoint: None,
+                account_id: id(1),
+                workspace_id: id(2),
+                device_id: id(3),
+                control_epoch: 1,
+                key_epoch: 1,
+                device_keys: &root_keys,
+                content_key: &root_key,
+            })
+            .build(OperationBuildRequest {
+                operation_id: id(95),
+                project_id: Some(id(91)),
+                mutation,
+                causal_frontier: vec![
+                    DeviceSequence {
+                        device_id: id(3),
+                        sequence: 1,
+                    },
+                    DeviceSequence {
+                        device_id: id(4),
+                        sequence: 1,
+                    },
+                ],
+                previous: Some(OperationChainHead {
+                    sequence: 1,
+                    canonical_hash: first.canonical_hash,
+                }),
+                blob_refs: vec![],
+                created_hlc: HybridLogicalClock::new(1001, 0, id(3)),
+            })
+            .unwrap()
+        };
+        let second = make_second(&second_mutation);
+        let wrong_second = make_second(&project("signed fork at same cutoff sequence"));
+        let mut f = fixture_with_first_cutoff(1, Some((2, second.canonical_hash)));
+        let d = f.lineage.history().endpoint();
+        let scope = f.lineage.history().state().scope;
+        let budget = HistoricalReconstructionBudget {
+            transfer: HistoricalTransferBudget {
+                history: MembershipHistoryBudget {
+                    max_events: 200,
+                    max_bytes: 2_000_000,
+                },
+                max_pages: 4,
+                max_bytes: 100_000,
+            },
+            max_operations: 20,
+            max_operation_bytes: 100_000,
+            max_dependencies: 100,
+        };
+        let summary = StateSummaryV1 {
+            entries: vec![StateSummaryEntryV1 {
+                record_id: old.record_id(),
+                record_kind: RecordKind::Memory,
+                head_hashes: vec![first.canonical_hash],
+                tombstoned: false,
+                conflicted: false,
+            }],
+        };
+        let mut checkpoint = decode_checkpoint_v1(&f.checkpoint).unwrap();
+        checkpoint.causal_frontier = vec![DeviceSequence {
+            device_id: id(3),
+            sequence: 1,
+        }];
+        checkpoint.state_hash = summary.state_hash().unwrap();
+        f.exporter_keys.sign_checkpoint(&mut checkpoint).unwrap();
+        f.checkpoint = encode_checkpoint_v1(&checkpoint).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("historical-cutoff-{}.db", uuid::Uuid::now_v7()));
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        let Event::Add(_, _, request, _) = &f.events[0] else {
+            panic!()
+        };
+        v.accept_confirmed_membership_admission(
+            &f.enrollment,
+            &[],
+            &f.confirmed,
+            request,
+            f.signature,
+            &f.keys,
+            budget.transfer.history,
+        )
+        .unwrap();
+        v.accept_membership_extension(
+            f.lineage.anchor(),
+            d,
+            &f.events[1..]
+                .iter()
+                .map(Event::borrowed)
+                .collect::<Vec<_>>(),
+            budget.transfer.history,
+        )
+        .unwrap();
+        v.stage_current_membership_material(d, id(4), &f.keys, budget.transfer.history)
+            .unwrap();
+        v.activate_current_membership_material(d, id(4), &f.keys, budget.transfer.history)
+            .unwrap();
+        let current = v.trusted_sync_material(&f.keys).unwrap();
+        assert!(
+            v.trusted_sync_material(&root_keys).is_err(),
+            "retained child is active while its revoked issuer is denied"
+        );
+        let live = project("current concurrent representative");
+        let current_op =
+            OperationBuilder::new(current.local_identity(id(181), &f.exporter_keys).unwrap())
+                .build(OperationBuildRequest {
+                    operation_id: id(94),
+                    project_id: Some(id(91)),
+                    mutation: &live,
+                    causal_frontier: vec![],
+                    previous: None,
+                    blob_refs: vec![],
+                    created_hlc: HybridLogicalClock::new(2000, 0, id(181)),
+                })
+                .unwrap();
+        let AdmissionDecision::Admitted(admitted) =
+            admit_operation(&v, &current_op.canonical_bytes, &current).unwrap()
+        else {
+            panic!()
+        };
+        let vector = crate::search::Embedding384::try_from(vec![1.0; 384]).unwrap();
+        let embeddings = |_, _: &RecordMutationV1| Ok(Some(vector.clone()));
+        let search_scope = crate::search::AllowedSearchScope::resolve(
+            None,
+            &context_relay_protocol::HarnessAccessPolicy::Default,
+            Some(id(91)),
+        )
+        .unwrap();
+        v.apply_admitted_operation(
+            &admitted,
+            &current,
+            "memory",
+            "2026-09-14T00:00:00Z",
+            &embeddings,
+        )
+        .unwrap();
+        let live_summary = v.sync_state_summary(scope).unwrap();
+        assert_eq!(v.search("", &search_scope, &vector, 10).unwrap().len(), 1);
+        let cursor = v.sync_cursor(id(2), "memory").unwrap();
+        assert!(
+            v.stored_sync_operation(first.operation.operation_id)
+                .unwrap()
+                .is_none()
+        );
+        let authority = f.authority();
+        let page = authority
+            .build_page(
+                0,
+                ZERO,
+                &f.bundles[..1],
+                EpochOneTrust::PreviouslyTrusted(&f.bundles[0]),
+            )
+            .unwrap();
+        let header = authority
+            .sign_header(digest(&page), &f.exporter_keys)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        let selected = v
+            .select_historical_transfer(
+                d,
+                None,
+                &f.confirmed,
+                f.signature,
+                &header,
+                &f.checkpoint,
+                &f.keys,
+                budget.transfer,
+            )
+            .unwrap();
+        v.commit_historical_transfer_page(
+            selected,
+            &f.confirmed,
+            f.signature,
+            (0, digest(&page)),
+            &page,
+            &f.keys,
+            budget.transfer,
+        )
+        .unwrap();
+        assert!(
+            v.reconstruct_historical_transfer(
+                selected,
+                &f.confirmed,
+                f.signature,
+                std::slice::from_ref(&first.canonical_bytes),
+                &f.keys,
+                budget,
+                &embeddings
+            )
+            .unwrap()
+            .is_none(),
+            "target prefix is insufficient without exact signed cutoff evidence"
+        );
+        drop(v);
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        assert!(
+            v.reconstruct_historical_transfer(
+                selected,
+                &f.confirmed,
+                f.signature,
+                &[wrong_second.canonical_bytes],
+                &f.keys,
+                budget,
+                &embeddings
+            )
+            .is_err(),
+            "larger/equal cutoff sequence cannot replace the signed cutoff hash"
+        );
+        assert!(
+            v.reconstruct_historical_transfer(
+                selected,
+                &f.confirmed,
+                f.signature,
+                std::slice::from_ref(&second.canonical_bytes),
+                &f.keys,
+                budget,
+                &embeddings
+            )
+            .unwrap()
+            .is_none(),
+            "valid cutoff chain still requires its withheld causal dependency"
+        );
+        let proof = v
+            .reconstruct_historical_transfer(
+                selected,
+                &f.confirmed,
+                f.signature,
+                std::slice::from_ref(&dependency.canonical_bytes),
+                &f.keys,
+                budget,
+                &embeddings,
+            )
+            .unwrap()
+            .expect("correct cutoff branch repairs the durable partial candidate after restart");
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        unsafe {
+            assert_eq!(
+                rusqlite::ffi::sqlite3_key(raw.handle(), [77u8; 32].as_ptr().cast(), 32),
+                0
+            );
+        }
+        raw.execute_batch("CREATE TRIGGER fail_history_install BEFORE UPDATE OF installed_signature ON historical_reconstructions BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
+        assert_eq!(
+            raw.query_row(
+                "SELECT count(*) FROM historical_verified_operations WHERE device_id=?1",
+                [id::<context_relay_protocol::DeviceId>(4).to_string()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1,
+            "successful reconstruction must preserve the verified cutoff dependency, outside the installed target, against candidate-cache eviction"
+        );
+        assert!(
+            v.install_historical_transfer(
+                &proof,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget,
+                &embeddings
+            )
+            .is_err()
+        );
+        assert_eq!(v.sync_state_summary(scope).unwrap(), live_summary);
+        assert!(
+            v.stored_sync_operation(first.operation.operation_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            v.memory(&id(91)).unwrap().unwrap().title,
+            "current concurrent representative"
+        );
+        assert_eq!(
+            v.search("", &search_scope, &vector, 10).unwrap().len(),
+            1,
+            "rolled-back historical merge must preserve live embedding cache"
+        );
+        assert!(
+            !v.historical_transfer_is_installed(
+                selected,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget
+            )
+            .unwrap()
+        );
+        raw.execute_batch("DROP TRIGGER fail_history_install")
+            .unwrap();
+        assert!(
+            v.install_historical_transfer(
+                &proof,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget,
+                &embeddings
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            v.stored_sync_operation(first.operation.operation_id)
+                .unwrap(),
+            Some(first.canonical_bytes)
+        );
+        assert_eq!(v.record_heads(id(2), old.record_id()).unwrap().len(), 2);
+        assert_eq!(
+            v.memory(&id(91)).unwrap().unwrap().title,
+            "historical representative"
+        );
+        assert!(
+            v.search("", &search_scope, &vector, 10).unwrap().is_empty(),
+            "committed archived representative must update the live embedding cache"
+        );
+        assert_eq!(v.sync_cursor(id(2), "memory").unwrap(), cursor);
+        assert_eq!(v.device_head(id(2), id(181)).unwrap().unwrap().sequence, 1);
+        assert_eq!(v.device_head(id(2), id(3)).unwrap().unwrap().sequence, 1);
+        assert!(
+            v.historical_transfer_is_installed(
+                selected,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget
+            )
+            .unwrap()
+        );
+        raw.execute(
+            "UPDATE historical_verified_operations SET canonical=?1 WHERE operation_id=?2",
+            rusqlite::params![
+                &alternate_dependency.canonical_bytes,
+                dependency.operation.operation_id.to_string()
+            ],
+        )
+        .unwrap();
+        assert!(
+            !v.historical_transfer_is_installed(
+                selected,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget
+            )
+            .is_ok_and(|installed| installed),
+            "recipient receipt must detect a valid sender-signed alternate beyond-target causal prerequisite"
+        );
+        assert!(
+            !v.install_historical_transfer(
+                &proof,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget,
+                &embeddings
+            )
+            .is_ok_and(|installed| installed)
+        );
+        raw.execute(
+            "UPDATE historical_verified_operations SET canonical=?1 WHERE operation_id=?2",
+            rusqlite::params![
+                &dependency.canonical_bytes,
+                dependency.operation.operation_id.to_string()
+            ],
+        )
+        .unwrap();
+        // A predecessor link does not authorize dropping the old required range.
+        drop(v);
+        let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        let refreshed = v.trusted_sync_material(&f.keys).unwrap();
+        let after_mutation = project("current after installed history");
+        let after =
+            OperationBuilder::new(refreshed.local_identity(id(181), &f.exporter_keys).unwrap())
+                .build(OperationBuildRequest {
+                    operation_id: id(96),
+                    project_id: Some(id(91)),
+                    mutation: &after_mutation,
+                    causal_frontier: vec![DeviceSequence {
+                        device_id: id(181),
+                        sequence: 1,
+                    }],
+                    previous: Some(OperationChainHead {
+                        sequence: 1,
+                        canonical_hash: current_op.canonical_hash,
+                    }),
+                    blob_refs: vec![],
+                    created_hlc: HybridLogicalClock::new(3000, 0, id(181)),
+                })
+                .unwrap();
+        let AdmissionDecision::Admitted(after_admitted) =
+            admit_operation(&v, &after.canonical_bytes, &refreshed).unwrap()
+        else {
+            panic!()
+        };
+        assert!(
+            refreshed.content_key(id(2), 1).is_err(),
+            "ordinary key lookup stays exact-current"
+        );
+        raw.execute(
+            "UPDATE historical_verified_operations SET canonical=?1 WHERE operation_id=?2",
+            rusqlite::params![
+                &alternate_dependency.canonical_bytes,
+                dependency.operation.operation_id.to_string()
+            ],
+        )
+        .unwrap();
+        assert!(
+            v.apply_admitted_operation(
+                &after_admitted,
+                &refreshed,
+                "memory",
+                "2026-09-14T00:00:01Z",
+                &embeddings
+            )
+            .is_err(),
+            "stored representative reads must authenticate saved cutoff/causal prefix pins"
+        );
+        raw.execute(
+            "UPDATE historical_verified_operations SET canonical=?1 WHERE operation_id=?2",
+            rusqlite::params![
+                &dependency.canonical_bytes,
+                dependency.operation.operation_id.to_string()
+            ],
+        )
+        .unwrap();
+        v.apply_admitted_operation(&after_admitted,&refreshed,"memory","2026-09-14T00:00:01Z",&embeddings).expect("current incoming merge after history installation must rehydrate its verified old representative");
+        assert_eq!(
+            v.memory(&id(91)).unwrap().unwrap().title,
+            "historical representative"
+        );
+        assert_eq!(v.record_heads(id(2), old.record_id()).unwrap().len(), 2);
+        assert!(v.search("", &search_scope, &vector, 10).unwrap().is_empty());
+        assert!(
+            admit_operation(&v, &second.canonical_bytes, &refreshed).is_err(),
+            "historical resolver cannot admit an incoming stale epoch"
+        );
+        let mut dropped = checkpoint.clone();
+        dropped.previous_checkpoint_hash = digest(&f.checkpoint);
+        dropped.causal_frontier.clear();
+        dropped.state_hash = StateSummaryV1 { entries: vec![] }.state_hash().unwrap();
+        f.exporter_keys.sign_checkpoint(&mut dropped).unwrap();
+        let dropped = encode_checkpoint_v1(&dropped).unwrap();
+        let candidate = HistoricalTransferAuthority::new(
+            &f.lineage,
+            &f.confirmed,
+            f.signature,
+            id(202),
+            id(181),
+            &dropped,
+        )
+        .unwrap();
+        let h = candidate
+            .sign_header(Sha256Digest([91; 32]), &f.exporter_keys)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        assert!(
+            v.select_historical_transfer(
+                d,
+                Some(selected),
+                &f.confirmed,
+                f.signature,
+                &h,
+                &dropped,
+                &f.keys,
+                budget.transfer
+            )
+            .is_err()
+        );
+        assert_eq!(
+            v.historical_transfer_selection(id(4), budget.transfer)
+                .unwrap(),
+            Some(selected)
+        );
+        // A replacement may retain the actual target while its signed proof closure is larger.
+        let mut same = checkpoint.clone();
+        same.creator_device = id(4);
+        same.created_hlc.node = id(4);
+        same.previous_checkpoint_hash = digest(&f.checkpoint);
+        f.keys.sign_checkpoint(&mut same).unwrap();
+        let same = encode_checkpoint_v1(&same).unwrap();
+        let same_authority = HistoricalTransferAuthority::new(
+            &f.lineage,
+            &f.confirmed,
+            f.signature,
+            id(203),
+            id(4),
+            &same,
+        )
+        .unwrap();
+        let same_page = same_authority
+            .build_page(
+                0,
+                ZERO,
+                &f.bundles[..1],
+                EpochOneTrust::PreviouslyTrusted(&f.bundles[0]),
+            )
+            .unwrap();
+        let same_header = same_authority
+            .sign_header(digest(&same_page), &f.keys)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        let selected = v
+            .select_historical_transfer(
+                d,
+                Some(selected),
+                &f.confirmed,
+                f.signature,
+                &same_header,
+                &same,
+                &f.keys,
+                budget.transfer,
+            )
+            .expect("proof closure must not be confused with the materialized target frontier");
+        v.commit_historical_transfer_page(
+            selected,
+            &f.confirmed,
+            f.signature,
+            (0, digest(&same_page)),
+            &same_page,
+            &f.keys,
+            budget.transfer,
+        )
+        .unwrap();
+        let proof = v
+            .reconstruct_historical_transfer(
+                selected,
+                &f.confirmed,
+                f.signature,
+                &[],
+                &f.keys,
+                budget,
+                &embeddings,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            v.install_historical_transfer(
+                &proof,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget,
+                &embeddings
+            )
+            .unwrap()
+        );
+        // Another active exporter supplies a dominating target on the exact proven prefix.
+        let mut next = checkpoint;
+        next.previous_checkpoint_hash = digest(&same);
+        next.causal_frontier[0].sequence = 2;
+        next.causal_frontier.push(DeviceSequence {
+            device_id: id(4),
+            sequence: 1,
+        });
+        next.creator_device = id(4);
+        next.created_hlc.node = id(4);
+        next.state_hash = StateSummaryV1 {
+            entries: vec![StateSummaryEntryV1 {
+                record_id: old.record_id(),
+                record_kind: RecordKind::Memory,
+                head_hashes: vec![second.canonical_hash],
+                tombstoned: false,
+                conflicted: false,
+            }],
+        }
+        .state_hash()
+        .unwrap();
+        f.keys.sign_checkpoint(&mut next).unwrap();
+        let next = encode_checkpoint_v1(&next).unwrap();
+        let candidate = HistoricalTransferAuthority::new(
+            &f.lineage,
+            &f.confirmed,
+            f.signature,
+            id(201),
+            id(4),
+            &next,
+        )
+        .unwrap();
+        let page = candidate
+            .build_page(
+                0,
+                ZERO,
+                &f.bundles[..1],
+                EpochOneTrust::PreviouslyTrusted(&f.bundles[0]),
+            )
+            .unwrap();
+        let h = candidate
+            .sign_header(digest(&page), &f.keys)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        raw.execute(
+            "UPDATE historical_verified_operations SET canonical=?1 WHERE operation_id=?2",
+            rusqlite::params![
+                &alternate_dependency.canonical_bytes,
+                dependency.operation.operation_id.to_string()
+            ],
+        )
+        .unwrap();
+        assert!(
+            v.select_historical_transfer(
+                d,
+                Some(selected),
+                &f.confirmed,
+                f.signature,
+                &h,
+                &next,
+                &f.keys,
+                budget.transfer
+            )
+            .is_err(),
+            "replacement must preserve every authenticated proof prefix"
+        );
+        assert_eq!(
+            v.historical_transfer_selection(id(4), budget.transfer)
+                .unwrap(),
+            Some(selected)
+        );
+        raw.execute(
+            "UPDATE historical_verified_operations SET canonical=?1 WHERE operation_id=?2",
+            rusqlite::params![
+                &dependency.canonical_bytes,
+                dependency.operation.operation_id.to_string()
+            ],
+        )
+        .unwrap();
+        let replacement = v
+            .select_historical_transfer(
+                d,
+                Some(selected),
+                &f.confirmed,
+                f.signature,
+                &h,
+                &next,
+                &f.keys,
+                budget.transfer,
+            )
+            .unwrap();
+        assert!(
+            v.install_historical_transfer(
+                &proof,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget,
+                &embeddings
+            )
+            .is_err()
+        );
+        assert!(v.trusted_sync_material(&f.keys).is_ok());
+        v.commit_historical_transfer_page(
+            replacement,
+            &f.confirmed,
+            f.signature,
+            (0, digest(&page)),
+            &page,
+            &f.keys,
+            budget.transfer,
+        )
+        .unwrap();
+        let proof = v
+            .reconstruct_historical_transfer(
+                replacement,
+                &f.confirmed,
+                f.signature,
+                &[],
+                &f.keys,
+                budget,
+                &embeddings,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            v.install_historical_transfer(
+                &proof,
+                &f.confirmed,
+                f.signature,
+                &f.keys,
+                budget,
+                &embeddings
+            )
+            .unwrap()
+        );
+        assert_eq!(v.record_heads(id(2), old.record_id()).unwrap().len(), 2);
+        assert_eq!(v.device_head(id(2), id(3)).unwrap().unwrap().sequence, 2);
+        drop(v);
+        drop(raw);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn historical_durable_pages_restart_conflicts_cas_and_supersession() {
         use crate::vault::{CommitDisposition, HistoricalTransferBudget, Vault};
         let f = fixture(33);
@@ -1158,7 +2589,27 @@ mod tests {
             f.bundles[33].active_epoch_key()
         );
         assert!(v.trusted_sync_material(&f.keys).is_err());
-        // Two writers observed the same D and prior target. Only one replacement wins.
+        let reconstruction_budget = crate::vault::HistoricalReconstructionBudget {
+            transfer: budget,
+            max_operations: 100,
+            max_operation_bytes: 100_000,
+            max_dependencies: 100,
+        };
+        let embeddings = |_, _: &context_relay_protocol::RecordMutationV1| Ok(None);
+        assert!(
+            v.reconstruct_historical_transfer(
+                selected,
+                &f.confirmed,
+                f.signature,
+                &[],
+                &f.keys,
+                reconstruction_budget,
+                &embeddings
+            )
+            .unwrap()
+            .is_some()
+        );
+        // Two writers observed the same D and reconstructed prior target. Only one replacement wins.
         let mut v2 = Vault::open(&path, "historical", &KeyStore).unwrap();
         let mut checkpoint2 = decode_checkpoint_v1(&f.checkpoint).unwrap();
         checkpoint2.previous_checkpoint_hash = digest(&f.checkpoint);
@@ -1174,8 +2625,24 @@ mod tests {
             &checkpoint2,
         )
         .unwrap();
+        let replacement_last = replacement
+            .build_page(
+                1,
+                ZERO,
+                &f.bundles[32..33],
+                EpochOneTrust::PreviouslyTrusted(&f.bundles[0]),
+            )
+            .unwrap();
+        let replacement_first = replacement
+            .build_page(
+                0,
+                digest(&replacement_last),
+                &f.bundles[..32],
+                EpochOneTrust::PreviouslyTrusted(&f.bundles[0]),
+            )
+            .unwrap();
         let h2 = replacement
-            .sign_header(Sha256Digest([91; 32]), &f.exporter_keys)
+            .sign_header(digest(&replacement_first), &f.exporter_keys)
             .unwrap()
             .canonical_bytes()
             .unwrap();
@@ -1240,6 +2707,39 @@ mod tests {
             })
             .unwrap(),
             2
+        );
+        v.commit_historical_transfer_page(
+            s2,
+            &f.confirmed,
+            f.signature,
+            (0, digest(&replacement_first)),
+            &replacement_first,
+            &f.keys,
+            budget,
+        )
+        .unwrap();
+        v.commit_historical_transfer_page(
+            s2,
+            &f.confirmed,
+            f.signature,
+            (1, digest(&replacement_last)),
+            &replacement_last,
+            &f.keys,
+            budget,
+        )
+        .unwrap();
+        assert!(
+            v.reconstruct_historical_transfer(
+                s2,
+                &f.confirmed,
+                f.signature,
+                &[],
+                &f.keys,
+                reconstruction_budget,
+                &embeddings
+            )
+            .unwrap()
+            .is_some()
         );
         // Addition-only D advance keeps verified installs but requires a fresh transfer identity.
         let extra = SignedPairingRequest::build(
@@ -1450,6 +2950,9 @@ mod tests {
         }
     }
     fn fixture(rotations: u8) -> Fixture {
+        fixture_with_first_cutoff(rotations, None)
+    }
+    fn fixture_with_first_cutoff(rotations: u8, cutoff: Option<(u64, Sha256Digest)>) -> Fixture {
         let a = DeviceKeys::from_seeds([1; 32], [2; 32]);
         let b = DeviceKeys::from_seeds([3; 32], [4; 32]);
         let recovery =
@@ -1589,8 +3092,12 @@ mod tests {
                 target_device_id: target,
                 control_epoch: endpoint.control_epoch,
                 key_epoch: endpoint.key_epoch,
-                cutoff_sequence: 0,
-                cutoff_hash: ZERO,
+                cutoff_sequence: if i == 0 { cutoff.map_or(0, |v| v.0) } else { 0 },
+                cutoff_hash: if i == 0 {
+                    cutoff.map_or(ZERO, |v| v.1)
+                } else {
+                    ZERO
+                },
                 transition_sha256: Sha256Digest([1; 32]),
             };
             let (statement, transition, sig) =
@@ -1663,7 +3170,9 @@ mod tests {
             workspace_id: id(2),
             previous_checkpoint_hash: ZERO,
             causal_frontier: vec![],
-            state_hash: Sha256Digest([9; 32]),
+            state_hash: crate::sync::StateSummaryV1 { entries: vec![] }
+                .state_hash()
+                .unwrap(),
             key_epoch: endpoint.key_epoch,
             creator_device: id(181),
             created_hlc: HybridLogicalClock {

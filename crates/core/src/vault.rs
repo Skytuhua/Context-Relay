@@ -47,6 +47,7 @@ mod revocation;
 pub use revocation::*;
 mod membership;
 pub use membership::{
+    HistoricalReadMaterial, HistoricalReconstruction, HistoricalReconstructionBudget,
     HistoricalTransferBudget, HistoricalTransferProgress, HistoricalTransferSelection,
 };
 mod sync;
@@ -273,6 +274,20 @@ impl CachedScope {
 }
 
 impl Vault {
+    /// Isolated replay workspace. Never opens a plaintext temporary file.
+    pub(crate) fn reconstruction_workspace() -> Result<Self, VaultError> {
+        let mut connection = Connection::open_in_memory()?;
+        configure_connection(&connection)?;
+        verify_runtime(&connection)?;
+        migrate(&mut connection)?;
+        Ok(Self {
+            connection,
+            embedding_cache: BTreeMap::new(),
+            semantic_search: None,
+            semantic_search_configured: false,
+            semantic_search_failed: Cell::new(false),
+        })
+    }
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn test_plaintext_cells(&self) -> Result<Vec<TestVaultCell>, VaultError> {
