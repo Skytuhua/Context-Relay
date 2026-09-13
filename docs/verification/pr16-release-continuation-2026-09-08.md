@@ -1,6 +1,6 @@
 # PR 16 full-release continuation — 2026-09-08
 
-## Durable key storage implemented; independent review pending — 2026-09-14
+## Durable key storage reviewed and verified — 2026-09-14
 
 Local commit `dcce7a12c9ce730bff9d2833991a22b7615943c6` adds migration 41 and
 recipient-specific, signed and encrypted key staging. It preserves prior epoch
@@ -27,9 +27,27 @@ once present, and missing/corrupt known material cannot be repaired by fallback
 to the old envelope. This inherited limitation remains for the full security
 and upgrade audit.
 
-Independent Task3 review is pending against the complete `30589c0..dcce7a1`
-change. Activation, historical reconstruction, V2 hosted orchestration and
-installed acceptance remain open, as do the Windows failures below.
+Independent Task3 review of the complete `30589c0..dcce7a1` change found one
+important gap: a retained/root device accepting multiple rotations before staging
+retained only the original and latest keys. Fix commit `b402134` uses the existing
+bounded replay to open missing recipient rotations with their authenticated
+predecessors, verify original commitments and retain results atomically after
+exact-D verification. Four membership tests, five membership/revocation crypto
+tests and seven historical cases passed. The expanded root test covers two
+missed rotations, all epoch-one/two/three keys after reopen, late-insert rollback
+and unchanged seals/signatures on retry without a pairing anchor.
+
+Scoped re-review accepted that production fix but found the excluded durable
+test's old row-count expectation invalid: independently verified keys coexist
+with preserved historical assertions. The test now checks exact per-role epoch
+inventories and all-column preservation instead of only a scalar total. Its full
+33-rotation SQLCipher run passed in 287.58 seconds, including restart, retry,
+addition-only advancement and rejection after revocation. Test correction
+`b69dcab` passed final scoped review with no new findings; Task3 is complete at
+that revision. This is a storage milestone, not full release acceptance. The review also records
+dependency missing-PDB warnings for later triage. Activation, historical
+reconstruction, V2 hosted orchestration and installed acceptance remain open,
+as do the Windows failures below.
 
 ## Current Windows pairing/sync integration failures — 2026-09-14
 

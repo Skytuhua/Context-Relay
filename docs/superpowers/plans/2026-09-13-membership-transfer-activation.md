@@ -53,12 +53,14 @@ Files: a new migration after the actual latest schema, `vault.rs`, a focused vau
 
 Files: extend the same vault module/migration while unpublished, or add the next migration if already published; focused vault integration tests.
 
-- [ ] Retain per-epoch root and content keys inside the encrypted vault with authenticated provenance. Preserve prior keys before rotating; do not derive them from the latest random keys or overwrite earlier epochs.
-- [ ] Store immutable transfer header/ciphertext identity and selected checkpoint target. Selection CAS must compare both D and the previously selected target hash/revision; same-D concurrent replacements cannot regress the target.
-- [ ] Commit a verified page's sealed secrets and progress together, comparing transfer identity, D, expected page index and expected hash. Exact retries preserve the original ciphertext and keys.
-- [ ] Authenticate current material independently: reuse confirmed current material for addition-only descendants or open the latest verified rotation using its retained predecessor. Verify the original plaintext commitment before associating the enrollment pin.
-- [ ] A known D advance supersedes partial transfer work. Retain verified staging; start a new transfer identity under the new accepted endpoint if the recipient remains active. Never relabel ciphertext or discard previously completed historical installations.
-- [ ] Test crash/restart at each transaction boundary, conflicting page retries, missing pages, wrong keys/commitments, current-material absence, same-D replacement races and recipient revocation before commit.
+- [x] Retain per-epoch root and content keys inside the encrypted vault with authenticated provenance. Preserve prior keys before rotating; do not derive them from the latest random keys or overwrite earlier epochs.
+- [x] Store immutable transfer header/ciphertext identity and selected checkpoint target. Selection CAS must compare both D and the previously selected target hash/revision; same-D concurrent replacements cannot regress the target.
+- [x] Commit a verified page's sealed secrets and progress together, comparing transfer identity, D, expected page index and expected hash. Exact retries preserve the original ciphertext and keys.
+- [x] Authenticate current material independently: reuse confirmed current material for addition-only descendants or open the latest verified rotation using its retained predecessor. Verify the original plaintext commitment before associating the enrollment pin.
+- [x] A known D advance supersedes partial transfer work. Retain verified staging; start a new transfer identity under the new accepted endpoint if the recipient remains active. Never relabel ciphertext or discard previously completed historical installations.
+- [x] Test crash/restart at each transaction boundary, conflicting page retries, missing pages, wrong keys/commitments, current-material absence, same-D replacement races and recipient revocation before commit.
+
+Task3 reviewed through `b69dcab`: retained-device intermediate rotations and role-aware durable preservation corrected in two review rounds. Task4 still owns semantic checkpoint frontier domination, reconstruction and activation; Task3 completion covers storage and selection CAS. Legacy-root provenance and dependency warning limits remain recorded in the continuation ledger.
 
 ## Task 4: Activate current material and install reconstructed history
 
