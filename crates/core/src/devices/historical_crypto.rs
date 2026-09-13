@@ -704,6 +704,8 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum InstallReviewCase {
+        ReplayOffPrefix,
+        CompletionOffPrefix,
         LiveBudget,
         LiveCap,
         CompletionHeads,
@@ -749,6 +751,14 @@ mod tests {
     #[test]
     fn historical_review_completion_authenticates_record_frontier() {
         exercise_install_review(InstallReviewCase::CompletionHeads);
+    }
+    #[test]
+    fn historical_review_off_prefix_head_cannot_complete_installation() {
+        exercise_install_review(InstallReviewCase::ReplayOffPrefix);
+    }
+    #[test]
+    fn historical_review_off_prefix_head_invalidates_completion() {
+        exercise_install_review(InstallReviewCase::CompletionOffPrefix);
     }
     fn exercise_install_review(case: InstallReviewCase) {
         use crate::{sync::*, vault::*};
@@ -885,7 +895,10 @@ mod tests {
         .unwrap();
         if matches!(
             case,
-            InstallReviewCase::ReplayMetadata | InstallReviewCase::ReplayHeads
+            InstallReviewCase::ReplayMetadata
+                | InstallReviewCase::ReplayHeads
+                | InstallReviewCase::ReplayOffPrefix
+                | InstallReviewCase::CompletionOffPrefix
         ) {
             let AdmissionDecision::Admitted(admitted) =
                 admit_operation(&v, &target.canonical_bytes, &current).unwrap()
@@ -969,6 +982,164 @@ mod tests {
                 rusqlite::ffi::sqlite3_key(raw.handle(), [77u8; 32].as_ptr().cast(), 32),
                 0
             );
+        }
+        if matches!(
+            case,
+            InstallReviewCase::ReplayOffPrefix | InstallReviewCase::CompletionOffPrefix
+        ) {
+            let completed = matches!(case, InstallReviewCase::CompletionOffPrefix);
+            if completed {
+                assert!(
+                    v.install_historical_transfer(
+                        &proof,
+                        &f.confirmed,
+                        f.signature,
+                        &f.keys,
+                        budget,
+                        &embeddings
+                    )
+                    .unwrap()
+                );
+                assert!(
+                    v.historical_transfer_is_installed(
+                        selected,
+                        &f.confirmed,
+                        f.signature,
+                        &f.keys,
+                        budget
+                    )
+                    .unwrap()
+                );
+            }
+            let bad = OperationBuilder::new(SyncIdentity {
+                membership_endpoint: Some(f.lineage.anchor()),
+                account_id: id(1),
+                workspace_id: id(2),
+                device_id: id(4),
+                control_epoch: 1,
+                key_epoch: 1,
+                device_keys: &f.keys,
+                content_key: &key,
+            })
+            .build(OperationBuildRequest {
+                operation_id: id(96),
+                project_id: Some(id(91)),
+                mutation: &target_mutation,
+                causal_frontier: vec![DeviceSequence {
+                    device_id: id(4),
+                    sequence: 1,
+                }],
+                previous: Some(OperationChainHead {
+                    sequence: 1,
+                    canonical_hash: Sha256Digest([99; 32]),
+                }),
+                blob_refs: vec![],
+                created_hlc: HybridLogicalClock::new(1002, 0, id(4)),
+            })
+            .unwrap();
+            assert_ne!(bad.operation.previous_device_hash, target.canonical_hash);
+            raw.execute_batch("CREATE TEMP TABLE saved_heads AS SELECT * FROM sync_record_heads;")
+                .unwrap();
+            raw.execute(
+                "INSERT INTO operations(id,record_id,payload_json) VALUES(?1,?2,?3)",
+                rusqlite::params![
+                    bad.operation.operation_id.to_string(),
+                    bad.operation.record_id.to_string(),
+                    serde_json::to_vec(&bad.operation).unwrap()
+                ],
+            )
+            .unwrap();
+            raw.execute("INSERT INTO sync_operation_meta(operation_id,account_id,workspace_id,device_id,device_sequence,canonical_sha256,direction,state) VALUES(?1,?2,?3,?4,'2',?5,'incoming','applied')",rusqlite::params![bad.operation.operation_id.to_string(),bad.operation.account_id.to_string(),bad.operation.workspace_id.to_string(),bad.operation.device_id.to_string(),bad.canonical_hash.0.as_slice()]).unwrap();
+            raw.execute("UPDATE sync_record_heads SET operation_id=?1,canonical_sha256=?2 WHERE operation_id=?3",rusqlite::params![bad.operation.operation_id.to_string(),bad.canonical_hash.0.as_slice(),target.operation.operation_id.to_string()]).unwrap();
+            let device_head: (String,Vec<u8>) = raw.query_row("SELECT device_sequence,canonical_sha256 FROM sync_device_heads WHERE device_id=?1",[target.operation.device_id.to_string()],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(device_head, ("1".into(), target.canonical_hash.0.to_vec()));
+            let before = v
+                .sync_state_summary(f.lineage.history().state().scope)
+                .unwrap();
+            let projects = v.projects().unwrap();
+            if completed {
+                assert!(
+                    !v.historical_transfer_is_installed(
+                        selected,
+                        &f.confirmed,
+                        f.signature,
+                        &f.keys,
+                        budget
+                    )
+                    .is_ok_and(|ok| ok),
+                    "off-prefix signed superseding head must invalidate completion"
+                );
+            } else {
+                assert!(
+                    !v.install_historical_transfer(
+                        &proof,
+                        &f.confirmed,
+                        f.signature,
+                        &f.keys,
+                        budget,
+                        &embeddings
+                    )
+                    .is_ok_and(|ok| ok),
+                    "off-prefix signed superseding head must not authorize replay installation"
+                );
+                assert!(
+                    v.trusted_sync_material(&f.keys).is_err(),
+                    "rejected replay must not activate D"
+                );
+                assert_eq!(raw.query_row("SELECT count(*) FROM historical_reconstructions WHERE installed_signature IS NOT NULL",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+                assert!(
+                    !v.historical_transfer_is_installed(
+                        selected,
+                        &f.confirmed,
+                        f.signature,
+                        &f.keys,
+                        budget
+                    )
+                    .is_ok_and(|ok| ok)
+                );
+            }
+            assert_eq!(v.projects().unwrap(), projects);
+            assert_eq!(
+                v.sync_state_summary(f.lineage.history().state().scope)
+                    .unwrap(),
+                before
+            );
+            raw.execute_batch("DELETE FROM sync_record_heads; INSERT INTO sync_record_heads SELECT * FROM saved_heads;").unwrap();
+            raw.execute(
+                "DELETE FROM sync_operation_meta WHERE operation_id=?1",
+                [bad.operation.operation_id.to_string()],
+            )
+            .unwrap();
+            raw.execute(
+                "DELETE FROM operations WHERE id=?1",
+                [bad.operation.operation_id.to_string()],
+            )
+            .unwrap();
+            assert!(
+                v.install_historical_transfer(
+                    &proof,
+                    &f.confirmed,
+                    f.signature,
+                    &f.keys,
+                    budget,
+                    &embeddings
+                )
+                .unwrap()
+            );
+            assert!(
+                v.historical_transfer_is_installed(
+                    selected,
+                    &f.confirmed,
+                    f.signature,
+                    &f.keys,
+                    budget
+                )
+                .unwrap()
+            );
+            drop(raw);
+            drop(v);
+            std::fs::remove_file(&path).unwrap();
+            return;
         }
         if matches!(
             case,
