@@ -39,3 +39,24 @@ desktop progress and error handling, actual hosted login/pair/sync/recovery, and
 clean Windows installed acceptance remain open. Existing OpenSSL debug-symbol
 warnings remain unresolved. No merge, deployment, final source approval, or
 full-release completion is established by this checkpoint.
+
+## Subsequent local PostgreSQL checkpoint
+
+All18 migrations, including the evolving
+`20260913210523_membership_public_history_v2.sql`, applied transactionally in a
+fresh `task5_clean` database on isolated PostgreSQL17.11 at127.0.0.1:55439.
+The six enrollment-anchor tests passed (terminal0,1443.5847ms), recorded in
+`task-5-postgres-clean-applied.log` and `task-5-postgres-anchor-clean-green.log`.
+
+These cases verify the exact canonical genesis anchor, unsupported-version
+rejection, rollback of enrollment writes when initialization fails, preservation
+of a descendant head and inactive genesis member, conflicting pin/receipt
+rejection, and denied direct access to the private initializer. An earlier
+5-pass/1-fail run differed only by a Windows carriage return in the test output;
+the fix normalized line endings and retained the exact value assertions.
+
+The database uses minimal existing provider-schema fixtures. This proves local
+PostgreSQL transaction behavior, not live Supabase Auth, Storage or Realtime.
+Authorized history-access RPCs remain under implementation; later changes to the
+same migration require new covering verification. Task5 and release acceptance
+remain incomplete.
