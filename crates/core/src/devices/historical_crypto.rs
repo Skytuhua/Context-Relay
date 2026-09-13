@@ -1078,6 +1078,30 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let inventory = || {
+            raw.prepare("SELECT independent_current,key_epoch FROM membership_epoch_secrets ORDER BY independent_current,key_epoch")
+                .unwrap()
+                .query_map([], |r| Ok((r.get::<_, bool>(0)?, r.get::<_, u32>(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let historical_epochs = (2..=33).map(|epoch| (false, epoch)).collect::<Vec<_>>();
+        let before_staging = historical_epochs
+            .iter()
+            .copied()
+            .chain([(true, 1)])
+            .collect::<Vec<_>>();
+        assert_eq!(inventory(), before_staging);
+        // Preserve every historical column, including ciphertext, signature,
+        // provenance, role and exact source endpoint; epoch one was independently admitted.
+        raw.execute_batch("CREATE TEMP TABLE historical_before_staging AS SELECT * FROM membership_epoch_secrets WHERE independent_current=0").unwrap();
+        let historical_unchanged = || {
+            assert!(raw.query_row(
+                "SELECT NOT EXISTS(SELECT * FROM historical_before_staging EXCEPT SELECT * FROM membership_epoch_secrets WHERE independent_current=0) AND NOT EXISTS(SELECT * FROM membership_epoch_secrets WHERE independent_current=0 EXCEPT SELECT * FROM historical_before_staging)",
+                [], |r| r.get::<_, bool>(0),
+            ).unwrap());
+        };
         raw.execute_batch("CREATE TRIGGER fail_current BEFORE INSERT ON membership_epoch_secrets WHEN NEW.independent_current=1 BEGIN SELECT RAISE(ABORT,'injected');END").unwrap();
         assert!(
             v.stage_current_membership_material(d, id(4), &f.keys, budget.history)
@@ -1096,10 +1120,36 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(inventory(), before_staging);
+        historical_unchanged();
         v.stage_current_membership_material(d, id(4), &f.keys, budget.history)
             .unwrap();
         drop(v);
         let mut v = Vault::open(&path, "historical", &KeyStore).unwrap();
+        // Independent opening adds a separate role for every retained rotation;
+        // it does not relabel historical assertions or activate ordinary writes.
+        let after_staging = historical_epochs
+            .iter()
+            .copied()
+            .chain((1..=34).map(|epoch| (true, epoch)))
+            .collect::<Vec<_>>();
+        assert_eq!(inventory(), after_staging);
+        historical_unchanged();
+        raw.execute_batch(
+            "CREATE TEMP TABLE all_after_staging AS SELECT * FROM membership_epoch_secrets",
+        )
+        .unwrap();
+        let all_unchanged = || {
+            assert!(raw.query_row(
+                "SELECT NOT EXISTS(SELECT * FROM all_after_staging EXCEPT SELECT * FROM membership_epoch_secrets) AND NOT EXISTS(SELECT * FROM membership_epoch_secrets EXCEPT SELECT * FROM all_after_staging)",
+                [], |r| r.get::<_, bool>(0),
+            ).unwrap());
+        };
+        v.stage_current_membership_material(d, id(4), &f.keys, budget.history)
+            .unwrap();
+        assert_eq!(inventory(), after_staging);
+        historical_unchanged();
+        all_unchanged();
         assert_eq!(
             v.staged_membership_epoch(d, id(4), 34, true, &f.keys, budget.history)
                 .unwrap()
@@ -1235,6 +1285,8 @@ mod tests {
         );
         v.stage_current_membership_material(next_d, id(4), &f.keys, budget.history)
             .unwrap();
+        historical_unchanged();
+        all_unchanged();
         let mut events = f.events.iter().map(Event::borrowed).collect::<Vec<_>>();
         events.push(MembershipHistoryEvent::PairingAdd {
             statement: &add_bytes,
@@ -1346,14 +1398,9 @@ mod tests {
             v.stage_current_membership_material(next, id(4), &f.keys, budget.history)
                 .is_err()
         );
-        assert_eq!(
-            raw.query_row("SELECT count(*) FROM membership_epoch_secrets", [], |r| r
-                .get::<_, i64>(
-                0
-            ))
-            .unwrap(),
-            34
-        );
+        assert_eq!(inventory(), after_staging);
+        historical_unchanged();
+        all_unchanged();
         drop(v2);
         drop(v);
         drop(raw);
