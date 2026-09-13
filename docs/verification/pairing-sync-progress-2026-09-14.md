@@ -80,3 +80,29 @@ passed, 3 failed and 4 ignored. Its three failures are the original pairing,
 hosted pairing and hosted sync regressions listed above. Their later local
 results do not clear that remote failure or qualify the evolving full diff.
 PR16 remains open and blocked; no new CI run, deployment or merge was initiated.
+
+## Integrated server coverage and recovery boundary
+
+The subsequent server covering run passed all 21 tests in 309.6586ms
+(`task-5-server-covering2.log`); the PostgreSQL covering run passed all 14 in
+4720.5407ms (`task-5-postgres-covering3.log`). Coverage includes the actual
+request handler and production adapter calling database RPCs through a local
+psql test bridge. External Auth claims are stubbed; this does not exercise
+deployed Supabase Auth or PostgREST.
+
+The account-deletion regression is covered in both directions: deleting a
+referenced certificate alone fails at commit and preserves that certificate;
+deleting the account succeeds and removes its account/head/member records.
+
+`task-5-recovery-rotated-red.log` records the compiled
+destroyed-device recovery case failing in 1.24s: existing recovery returns
+control/key epochs `(1,1)` instead of the verified rotated parent `(2,2)`.
+The subsequent exact test passed in 1.72s after a 51.51s compile
+(`task-5-recovery-rotated-green1.log`, handle71752, terminal0). The implementer
+reports exact epoch2 key recovery and canonical V2 roundtrip coverage. Recovery
+history replay, durable key retention and hosted integration remain open; this
+single test does not establish complete recovery acceptance.
+
+A separate `task5_replay` database was prepared with only the minimal provider
+bootstrap for a fresh migration replay; preparation alone is not successful
+replay evidence.
