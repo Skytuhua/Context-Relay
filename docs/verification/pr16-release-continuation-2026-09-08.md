@@ -1,5 +1,27 @@
 # PR 16 full-release continuation — 2026-09-08
 
+## Public test vector scan and Windows runtime comparison — 2026-09-13
+
+Commit `23141ec388827c0077028b9a20e09c306a91c31d` documents one exact
+historical non-credential fingerprint. Pinned Gitleaks 8.30.1 reproduced the
+failure at the historical transfer specification's public-key vector. Root and
+independent review derived that exact X25519 public value from its fixed test
+input. The reviewed exception changes no detector or all-ref coverage. All five
+scan-policy tests and local all-ref scanning pass; GitHub Secret Scan
+`34763262851` passed at that commit. See the
+[exact rationale](../security/secret-scan-exceptions.md).
+
+Actual payload verification of both original Windows artifacts `10301610530`
+and `10301660573` is complete: all 17 runtime entries match their manifests and
+each other, totaling 255,387,207 bytes per build. SHA-256 and ZIP CRC checks were
+performed over the streamed payloads, not inferred from matching manifests.
+The evidence is retained in each `.codex/pr16-artifact-metadata-<ID>/verified-runtime.json`.
+This establishes runtime byte equality for `7ad495c` / run `34699122274` only.
+Source archives and full ZIP digests were not revalidated by these partial reads;
+that run's failed isolation preflight remains failed. The newer Windows-only
+qualification `34760841409` at `a22dfab` is still running. Neither result clears
+current-head release acceptance.
+
 ## Historical transfer codec candidate — 2026-09-13
 
 The isolated historical-key codec binds the exact independently confirmed V2
