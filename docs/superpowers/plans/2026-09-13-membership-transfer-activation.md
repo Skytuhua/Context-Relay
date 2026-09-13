@@ -66,13 +66,15 @@ Task3 reviewed through `b69dcab`: retained-device intermediate rotations and rol
 
 Files: `sync/admission.rs`, existing checkpoint/chain verification, vault sync integration, and focused cross-epoch tests.
 
-- [ ] Add a deliberate historical-read admission path using the certificate authorized at the operation's historical state, verified device-chain prefixes, exact signed revocation cutoff hash, and causal dependencies. Preserve all current-write epoch checks.
-- [ ] Require every replacement target to dominate previously required frontiers with consistent verified chain prefixes. A signed checkpoint predecessor link or larger scalar sequence is insufficient.
-- [ ] Reconstruct the selected target and reproduce its exact state hash. Missing chain/cutoff evidence remains repairable; do not mark historical reads complete merely because keys arrived.
-- [ ] Implement ordinary current-rotation activation independently of historical transfer: require the exact accepted endpoint, verified predecessor/transition, privately opened current material and recipient authority in one transaction. Enrolled/root and retained devices need no pairing anchor C or historical-transfer checkpoint for this path. Rebuild sync authority from accepted history, not a mutable active-certificate snapshot.
-- [ ] Commit historical transfer installation/completion only when accepted D, target identity, complete historical inventory, reconstructed target and privately authenticated current material still agree in one transaction. This joint gate must not prevent independently valid ordinary current-rotation activation while earlier history is unavailable.
-- [ ] Test accepting a revocation, interrupting before activation, restarting and attempting sync/pairing through old material readers and stale owned capabilities; no stale authority may resume.
-- [ ] Verify offline joining across rotations, retained children, restart during reconstruction, forks, withheld history, replacement exporter, known revocation and interruption before/after activation.
+- [x] Add a deliberate historical-read admission path using the certificate authorized at the operation's historical state, verified device-chain prefixes, exact signed revocation cutoff hash, and causal dependencies. Preserve all current-write epoch checks.
+- [x] Require every replacement target to dominate previously required frontiers with consistent verified chain prefixes. A signed checkpoint predecessor link or larger scalar sequence is insufficient.
+- [x] Reconstruct the selected target and reproduce its exact state hash. Missing chain/cutoff evidence remains repairable; do not mark historical reads complete merely because keys arrived.
+- [x] Implement ordinary current-rotation activation independently of historical transfer: require the exact accepted endpoint, verified predecessor/transition, privately opened current material and recipient authority in one transaction. Enrolled/root and retained devices need no pairing anchor C or historical-transfer checkpoint for this path. Rebuild sync authority from accepted history, not a mutable active-certificate snapshot.
+- [x] Commit historical transfer installation/completion only when accepted D, target identity, complete historical inventory, reconstructed target and privately authenticated current material still agree in one transaction. This joint gate must not prevent independently valid ordinary current-rotation activation while earlier history is unavailable.
+- [x] Test accepting a revocation, interrupting before activation, restarting and attempting sync/pairing through old material readers and stale owned capabilities; no stale authority may resume.
+- [x] Verify offline joining across rotations, retained children, restart during reconstruction, forks, withheld history, replacement exporter, known revocation and interruption before/after activation.
+
+Task4 is complete through `d43aced5381d681bc79cb8f451d8e5d0b1fe1d4d` after two scoped fix rounds. Independent review verified all findings addressed with no new Critical/Important breakage. Component evidence and remaining release boundaries are recorded in `docs/verification/membership-transfer-activation-2026-09-14.md`. Task5 and full-release acceptance remain incomplete.
 
 ### Task4 implementation decisions — 2026-09-14
 
