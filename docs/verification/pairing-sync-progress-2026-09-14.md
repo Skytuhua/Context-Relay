@@ -279,3 +279,18 @@ verified reconstruction baseline. Selecting an incomplete intermediate candidate
 must not let a later selection bypass an earlier reconstructed or installed
 history. The implementer is adding this bounded reselection rule and its tests;
 it is not yet accepted implementation evidence.
+## Reselection and application integration remain open
+
+`task-5-recovery-reselection-red.log` records the expanded native test failing
+in 142.50s on a replacement target rejected with `OperationConflict`. Later
+nonempty-history, missing-range and installation-rollback assertions were not
+reached in that run. The replacement implementation is undergoing verification.
+Its storage limit must include the final installed receipt before committing.
+
+The current application integration also needs V2 durable-state handling:
+`HostedRecoveryEnrollmentService::execute_restore` reads only the V1 restore row,
+so overview can report Idle and Resume can reject an existing V2 attempt. The
+backend has a RestoringHistory outcome, but the desktop generated binding,
+status validator and recovery panel do not yet handle it. Core recovery tests
+alone cannot establish daemon restart/resume or desktop acceptance. These gaps
+remain required implementation and regression work before Task5 acceptance.
