@@ -294,3 +294,18 @@ backend has a RestoringHistory outcome, but the desktop generated binding,
 status validator and recovery panel do not yet handle it. Core recovery tests
 alone cannot establish daemon restart/resume or desktop acceptance. These gaps
 remain required implementation and regression work before Task5 acceptance.
+## Hosted GitHub sign-in configuration
+
+The user created the Context Relay GitHub OAuth app (application 3856220), then
+configured and enabled the GitHub provider in Supabase project
+`brvzuycnxoswdzzipgvx`. Live regular-Chrome inspection verified the saved public
+client ID matches the app and the OAuth callback is exactly
+`https://brvzuycnxoswdzzipgvx.supabase.co/auth/v1/callback`.
+
+The user also saved the single application redirect allowlist entry
+`http://127.0.0.1:*/auth/callback?state=*`; the live configuration lists exactly
+one URL. This matches the daemon's IPv4 loopback listener on a temporary port
+and its callback path/state query. The Site URL remains `http://localhost:3000`.
+No credential value is included in this evidence. This clears configuration
+handoffs only: actual installed sign-in, token exchange, refresh, restart and
+hosted workflow acceptance remain unverified.
