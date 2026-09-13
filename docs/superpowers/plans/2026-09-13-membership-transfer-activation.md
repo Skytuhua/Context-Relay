@@ -104,6 +104,15 @@ proof, accepted retained children and current-write restrictions; test absent AD
 wrong certificate/branch/epoch and cutoff substitution. Do not implicitly introduce
 a wire migration or overstate temporal authority.
 
+Keep the prior selected target and report incomplete/conflict while its required
+reconstruction/chain evidence is unavailable, as the referenced contract review
+requires. Alternative exporters may supply bounded candidate repair evidence,
+but even provisional replacement of the selected target requires verified
+shared-prefix consistency and frontier domination before D/target CAS. A scalar
+increase or signed checkpoint link is insufficient. Preserve prior required
+ranges/verified hashes and installed history; test unchanged selection during
+missing proof, higher-sequence forks, and successful alternate-exporter repair.
+
 ## Task 5: Connect hosted transport and installed workflows
 
 - [ ] Extend the existing bounded transport and durable retry coordinator for addressed header/page/public-history retrieval and publication. Enforce current server-side identity/recipient authorization independently of cryptographic verification.
