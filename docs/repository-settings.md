@@ -16,6 +16,37 @@ Task 3 must apply and verify available settings after CI exists and GitHub authe
 
 ## Live verification — 2026-09-14
 
+### Canonical remote and preserved history
+
+The active release checkout is `E:\Context Relay Releases\workspaces\pr16-release`
+on `codex/windows-app-release`. Fetch and push remotes both resolve to
+`https://github.com/Skytuhua/Context-Relay.git`. Its existing upstream tracks
+`origin/codex/windows-app-release`; this single-branch clone had no `origin/main`
+ref. A non-forced `git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main`
+created that tracking ref without changing the checkout or working files.
+
+GitHub PR16 and `git ls-remote` agreed on:
+
+| Reference | Commit |
+| --- | --- |
+| Public `main` | `b3d487e0965a87f69a0d7acf07066daa6a29f132` |
+| Pushed release branch / PR head | `30589c010af29b1bd0caf543eaab539baedd044c` |
+| Local head at this check | `c56c173ce3ff63902bf8fb9e4af54cac282394a1` |
+
+All five explicit `git merge-base --is-ancestor` checks exited zero: original
+root `ab914cc4be6776c3f0d844fd9a19928bc58119e8` to public main and local head;
+bootstrap `3fdb5489506398019a7f4fe0fbacd184d80e1795` to public main;
+public main to local head; and pushed release head to local head.
+`git rev-list --left-right --count origin/codex/windows-app-release...HEAD`
+reported `0 15`: local commits extend the pushed branch without divergence.
+This verifies current canonical alignment and preservation of the original
+history. It does not reconstruct every historical push event. PR16 remained
+open and unmerged, with membership source changes still uncommitted; no push,
+reset, checkout switch or force update was performed. Recheck exact refs before
+the final authorized merge.
+
+### Hosted protection settings
+
 Read-only GitHub REST checks against `Skytuhua/Context-Relay` verified:
 
 - Public repository, default branch `main`, and GitHub license detection `Apache-2.0`.
