@@ -6,6 +6,7 @@ import { createSupabasePairingDependencies } from './adapter.mjs';
 import { verifyPairingRequest } from './crypto.mjs';
 
 const fixture = JSON.parse(await readFile(new URL('../../../crates/core/tests/fixtures/hosted-pairing-approval-v1.json',import.meta.url),'utf8'));
+const revocation = JSON.parse(await readFile(new URL('../../../crates/core/tests/fixtures/device-revocation-v1.json',import.meta.url),'utf8'));
 const canonicalRequest = (await readFile(new URL('../../../crates/core/tests/fixtures/hosted-pairing-request-v1.hex',import.meta.url),'utf8')).trim();
 const request = await verifyPairingRequest(Uint8Array.from(Buffer.from(canonicalRequest,'hex')));
 const digest = Buffer.from(request.requestDigest).toString('hex');
@@ -28,6 +29,12 @@ function harness() {
     create:async ()=>({pairingId:scope.pairingId,createdAt:'1000',expiresAt:'601000',code:'01234-56789'}),
     control:async (_identity,_scope,_id,action)=>({pairingId:scope.pairingId,createdAt:'1000',expiresAt:'601000',state:action==='cancel'?'canceled':'pending'}),
     resolve:async ()=>({status:'located',pairingId:scope.pairingId}),
+    membershipEndpoint:async ()=>({...revocation.trusted.endpoint}),
+    acceptedMembershipObject:async ()=>'01',
+    revocationContext:async (_identity,_scope,targetDeviceId)=>({endpoint:{...revocation.trusted.endpoint},targetDeviceId,head:{sequence:'0',canonicalSha256:'00'.repeat(32)}}),
+    revocationVerificationContext:async ()=>structuredClone(revocation.trusted),
+    revocationResult:async ()=>structuredClone(revocation.receipt),
+    publishRevocation:async (_identity,_scope,parsed)=>{calls.push({action:'publish_revocation',parsed});return structuredClone(revocation.receipt);},
   };
   const handler = createPairingEdgeHandler(dependencies);
   const call = body => handler(new Request('https://example.test/pairing',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer token'},body:JSON.stringify({v:1,...body})}));
@@ -78,6 +85,23 @@ test('HTTP pairing rejects unauthenticated, oversized and unknown requests befor
   assert.equal((await h.call({action:'submit',canonicalRequest:'00'.repeat(70000),proof:fixture.proofs.request})).status,413);
   assert.equal((await h.call({action:'__proto__'})).status,400);
   assert.equal(h.calls.length,0);
+});
+
+test('existing devices read accepted objects and publish only an exact verified revocation',async()=>{
+  const h=harness(),targetDeviceId=revocation.trusted.targetDeviceId;
+  assert.equal((await h.call({action:'membership_object',workspaceId:scope.workspaceId,deviceId:scope.deviceId,kind:'event',address:'05'.repeat(32)})).status,200);
+  assert.equal((await h.call({action:'revocation_context',workspaceId:scope.workspaceId,deviceId:scope.deviceId,targetDeviceId})).status,200);
+  assert.equal((await h.call({action:'revocation_result',workspaceId:scope.workspaceId,deviceId:scope.deviceId,operationId:revocation.operationId,objectSha256:revocation.objectSha256})).status,200);
+  const publication=body=>h.handler(new Request('https://example.test/pairing/revocation-publish',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer token'},body:JSON.stringify({v:1,...body})}));
+  const body={action:'publish_revocation',workspaceId:revocation.trusted.workspaceId,deviceId:revocation.trusted.issuerDeviceId,object:revocation.object};
+  assert.equal((await h.call(body)).status,400,'large action is unavailable on the ordinary route');
+  assert.equal((await publication(body)).status,200);
+  assert.equal(h.calls.at(-1).parsed.operationId,revocation.operationId);
+  const changed={...body,object:revocation.object.slice(0,-2)+'00'};
+  assert.equal((await publication(changed)).status,400);
+  assert.equal(h.calls.filter(call=>call.action==='publish_revocation').length,1);
+  h.dependencies.publishRevocation=async()=>null;
+  assert.equal((await publication(body)).status,409);
 });
 
 test('composed HTTP and Supabase adapter pass only verified approval fields to the commit RPC', async () => {

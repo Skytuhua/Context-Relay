@@ -23,7 +23,7 @@ export function createSupabasePairingDependencies({createClient,env}) {
     try { result = await serviceClient.rpc(name,args); } catch { throw failure(); }
     if (result?.error) throw failure(safeCodes.has(result.error.message) ? result.error.message : 'transient');
     if (result?.error !== null || result.data === undefined
-      || (result.data === null && !['service_pairing_request_for_approver','service_pairing_membership_object'].includes(name))) throw failure();
+      || (result.data === null && !['service_pairing_request_for_approver','service_pairing_membership_object','service_membership_object','service_revocation_result'].includes(name))) throw failure();
     return result.data;
   }
   async function initialize(identity,scope) {
@@ -67,6 +67,28 @@ export function createSupabasePairingDependencies({createClient,env}) {
       if(!['membership_enrollment','membership_event'].includes(kind)) throw failure('invalid_pairing_request');
       return rpc('service_pairing_membership_object',identity,{p_pairing_id:uuid(pairingId,'7'),
         p_request_digest:bytea(hexBytes(requestDigest,32)),p_address:bytea(hexBytes(address,32)),p_kind:kind});
+    },
+    async acceptedMembershipObject(identity,scope,kind,address) {
+      return rpc('service_membership_object',identity,{...authority(scope),p_kind:kind,
+        p_address:bytea(hexBytes(address,32))});
+    },
+    async revocationContext(identity,scope,targetDeviceId) {
+      return rpc('service_revocation_context',identity,{...authority(scope),p_target_device_id:uuid(targetDeviceId,'7')});
+    },
+    async revocationVerificationContext(identity,scope) {
+      return rpc('service_revocation_verification_context',identity,authority(scope));
+    },
+    async revocationResult(identity,scope,operationId,objectSha256) {
+      return rpc('service_revocation_result',identity,{...authority(scope),p_operation_id:uuid(operationId,'7'),
+        p_object_sha256:bytea(hexBytes(objectSha256,32))});
+    },
+    async publishRevocation(identity,scope,verified) {
+      return rpc('service_publish_revocation',identity,{...authority(scope),p_operation_id:uuid(verified.operationId,'7'),
+        p_target_device_id:uuid(verified.targetDeviceId,'7'),p_control_epoch:verified.controlEpoch,p_key_epoch:verified.keyEpoch,
+        p_cutoff_sequence:verified.cutoffSequence,p_cutoff_sha256:bytea(verified.cutoffSha256),
+        p_parent_sha256:bytea(verified.previousStateSha256),p_successor_sha256:bytea(verified.successorSha256),
+        p_object_sha256:bytea(verified.objectSha256),p_signature:bytea(verified.signature),
+        p_canonical_object:bytea(verified.canonicalObject)});
     },
     async submit(identity,request) {
       return rpc('service_submit_pairing_request',identity,{p_pairing_id:uuid(request.pairingId,'7'),

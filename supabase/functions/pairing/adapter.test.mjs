@@ -98,4 +98,19 @@ test('pairing adapter forwards exact membership addresses and verified V2 CAS in
   assert.equal(f.calls.at(-1).name,'service_decide_pairing_request_v2');
   assert.equal(f.calls.at(-1).args.p_previous_state_sha256,'\\x'+'05'.repeat(32));
   assert.equal(f.calls.at(-1).args.p_canonical_certificate,'\\x'+'08'.repeat(32));
+  await f.dependencies.acceptedMembershipObject(identity,scope,'event','09'.repeat(32));
+  assert.equal(f.calls.at(-1).name,'service_membership_object');
+  assert.equal(f.calls.at(-1).args.p_address,'\\x'+'09'.repeat(32));
+  await f.dependencies.revocationContext(identity,scope,pairingId);
+  assert.equal(f.calls.at(-1).args.p_target_device_id,pairingId);
+  await f.dependencies.revocationVerificationContext(identity,scope);
+  assert.equal(f.calls.at(-1).name,'service_revocation_verification_context');
+  await f.dependencies.revocationResult(identity,scope,pairingId,'0a'.repeat(32));
+  assert.equal(f.calls.at(-1).args.p_object_sha256,'\\x'+'0a'.repeat(32));
+  await f.dependencies.publishRevocation(identity,scope,{operationId:pairingId,targetDeviceId:pairingId,controlEpoch:1,keyEpoch:1,
+    cutoffSequence:'0',cutoffSha256:bytes(0),previousStateSha256:bytes(1),successorSha256:bytes(2),objectSha256:bytes(3),
+    signature:new Uint8Array(64),canonicalObject:new Uint8Array([4,5])});
+  assert.equal(f.calls.at(-1).name,'service_publish_revocation');
+  assert.equal(f.calls.at(-1).args.p_canonical_object,'\\x0405');
+  assert.equal(f.calls.at(-1).args.p_signature,'\\x'+'00'.repeat(64));
 });

@@ -5,10 +5,15 @@ use context_relay_core::{
     devices::revocation_crypto::{
         DeviceRevocationStatementV1, RevocationControlState, RevocationTransitionV1,
     },
+    devices::{
+        membership_crypto::{MembershipEndpoint, MembershipHistoryEvent},
+        membership_transport::MembershipEventObject,
+    },
     sync::SyncScope,
-    vault::{DeviceRevocationIntent, Vault},
+    vault::{DeviceRevocationDisposition, DeviceRevocationIntent, DeviceRevocationReceipt, Vault},
 };
 use context_relay_protocol::{PairingRequestNonce, Sha256Digest};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use support::{MemoryKeyStore, TempVault};
 
@@ -82,8 +87,91 @@ fn revocation_intent_preserves_exact_keys_and_authority_across_restart() {
     vault
         .store_device_revocation_intent(&intent, &current)
         .unwrap();
+    let operation_id = intent.statement.revocation_id;
+    assert_eq!(
+        vault
+            .device_revocation_coordination(operation_id)
+            .unwrap()
+            .unwrap()
+            .disposition,
+        DeviceRevocationDisposition::Prepared
+    );
+    assert_eq!(
+        vault
+            .begin_device_revocation_submission(operation_id)
+            .unwrap(),
+        DeviceRevocationDisposition::Submitting
+    );
     drop(vault);
     let mut vault = Vault::open(path.path(), "revocation", &store).unwrap();
+    vault.recover_device_revocation_submissions().unwrap();
+    assert_eq!(
+        vault
+            .device_revocation_coordination(operation_id)
+            .unwrap()
+            .unwrap()
+            .disposition,
+        DeviceRevocationDisposition::Unconfirmed
+    );
+    let canceled = vault
+        .cancel_device_revocation_submission(operation_id)
+        .unwrap();
+    assert!(canceled.send_canceled);
+    assert_eq!(
+        canceled.disposition,
+        DeviceRevocationDisposition::Unconfirmed
+    );
+
+    let statement_bytes = intent.statement.signing_preimage().unwrap();
+    let transition_bytes = intent.transition.canonical_bytes().unwrap();
+    let object = MembershipEventObject::from_evidence(&MembershipHistoryEvent::Revocation {
+        statement: &statement_bytes,
+        signature: intent.signature,
+        transition: &transition_bytes,
+    })
+    .unwrap();
+    let receipt = DeviceRevocationReceipt {
+        operation_id,
+        object_sha256: Sha256Digest(Sha256::digest(object.canonical_bytes()).into()),
+        parent: MembershipEndpoint {
+            state_sha256: intent.transition.previous_state_sha256,
+            control_epoch: intent.statement.control_epoch,
+            key_epoch: intent.statement.key_epoch,
+        },
+        successor: MembershipEndpoint {
+            state_sha256: intent
+                .statement
+                .control_state_sha256(intent.signature)
+                .unwrap(),
+            control_epoch: intent.statement.control_epoch + 1,
+            key_epoch: intent.statement.key_epoch + 1,
+        },
+    };
+    let mut wrong = receipt.clone();
+    wrong.object_sha256.0[0] ^= 1;
+    assert!(
+        vault
+            .accept_device_revocation_receipt(operation_id, &wrong)
+            .is_err()
+    );
+    let accepted = vault
+        .accept_device_revocation_receipt(operation_id, &receipt)
+        .unwrap();
+    assert!(accepted.send_canceled);
+    assert_eq!(
+        accepted.disposition,
+        DeviceRevocationDisposition::Accepted(receipt.clone())
+    );
+    drop(vault);
+    let mut vault = Vault::open(path.path(), "revocation", &store).unwrap();
+    assert_eq!(
+        vault
+            .device_revocation_coordination(operation_id)
+            .unwrap()
+            .unwrap()
+            .disposition,
+        DeviceRevocationDisposition::Accepted(receipt)
+    );
     assert_eq!(
         vault.device_revocation_intent_ids(None).unwrap(),
         vec![intent.statement.revocation_id]
@@ -152,7 +240,7 @@ fn revocation_intent_preserves_exact_keys_and_authority_across_restart() {
     );
     raw.pragma_update(None, "ignore_check_constraints", true)
         .unwrap();
-    let vault = Vault::open(path.path(), "revocation", &store).unwrap();
+    let mut vault = Vault::open(path.path(), "revocation", &store).unwrap();
     for (column, original) in [
         ("project_url", intent.project_url.clone()),
         ("user_id", intent.user_id.to_string()),
@@ -190,6 +278,36 @@ fn revocation_intent_preserves_exact_keys_and_authority_across_restart() {
     raw.execute(
         "UPDATE device_revocation_intents SET operation_id=?1",
         [intent.statement.revocation_id.to_string()],
+    )
+    .unwrap();
+    raw.execute(
+        "UPDATE device_revocation_intents SET receipt=zeroblob(148)",
+        [],
+    )
+    .unwrap();
+    assert!(
+        vault
+            .device_revocation_coordination(intent.statement.revocation_id)
+            .is_err()
+    );
+    let mut next_statement = intent.statement.clone();
+    next_statement.revocation_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073999".parse().unwrap();
+    let (statement, transition, signature) =
+        RevocationTransitionV1::build(next_statement, &keys, &current).unwrap();
+    let next_intent = DeviceRevocationIntent {
+        statement,
+        transition,
+        signature,
+        ..intent.clone()
+    };
+    assert!(
+        vault
+            .store_device_revocation_intent(&next_intent, &current)
+            .is_err()
+    );
+    raw.execute(
+        "UPDATE device_revocation_intents SET receipt=NULL,outcome=0",
+        [],
     )
     .unwrap();
     drop(vault);

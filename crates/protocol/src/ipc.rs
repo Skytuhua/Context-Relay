@@ -293,12 +293,17 @@ params!(RecoveryEnrollmentIdParams {
     enrollment_id: RecoveryEnrollmentId
 });
 params!(DeviceRevokeParams {
+    operation_id: OperationId,
     device_id: DeviceId
 });
 params!(DeviceRenameParams {
     operation_id: OperationId,
     device_id: DeviceId,
     name: String
+});
+params!(DeviceRevocationIntentsParams {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    after: Option<OperationId>
 });
 params!(CancelParams {
     request_id: RecordId
@@ -345,6 +350,59 @@ params!(RecoveryHistoryEndpoint {
     control_epoch: u32,
     key_epoch: u32
 });
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceRevocationAccess {
+    Ready,
+    OriginalAuthRequired,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "state",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum DeviceRevocationOutcome {
+    Prepared {},
+    Submitting {},
+    Unconfirmed {},
+    Accepted {
+        accepted_endpoint: RecoveryHistoryEndpoint,
+    },
+    Conflict {},
+    CanceledBeforeSend {},
+}
+params!(DeviceRevocationStatus {
+    operation_id: OperationId,
+    device_id: DeviceId,
+    send_canceled: bool,
+    access: DeviceRevocationAccess,
+    outcome: DeviceRevocationOutcome
+});
+params!(DeviceRevocationSummary {
+    operation_id: OperationId,
+    device_id: DeviceId,
+    send_canceled: bool,
+    access: DeviceRevocationAccess,
+    outcome: DeviceRevocationOutcome
+});
+impl DeviceRevocationStatus {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        match &self.outcome {
+            DeviceRevocationOutcome::Accepted { accepted_endpoint } => accepted_endpoint.validate(),
+            _ => Ok(()),
+        }
+    }
+}
+impl DeviceRevocationSummary {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        match &self.outcome {
+            DeviceRevocationOutcome::Accepted { accepted_endpoint } => accepted_endpoint.validate(),
+            _ => Ok(()),
+        }
+    }
+}
 params!(RecoveryHistoryCursor {
     restore_id: RecoveryRestoreId,
     accepted_endpoint_sha256: Sha256Digest,
@@ -893,6 +951,9 @@ pub enum LocalRequest {
     DevicesList(EmptyParams),
     DeviceRename(DeviceRenameParams),
     DeviceRevoke(DeviceRevokeParams),
+    DeviceRevocationStatus(RetryParams),
+    DeviceRevocationCancel(RetryParams),
+    DeviceRevocationIntents(DeviceRevocationIntentsParams),
     PairingCreate(EmptyParams),
     PairingJoin(PairingJoinParams),
     PairingStatus(PairingIdParams),
@@ -1475,6 +1536,12 @@ pub enum LocalResult {
     Devices {
         devices: Vec<DeviceSummary>,
     },
+    DeviceRevocation {
+        status: DeviceRevocationStatus,
+    },
+    DeviceRevocationIntents {
+        intents: Vec<DeviceRevocationSummary>,
+    },
     PairingInvite {
         invite: PairingInviteInfo,
         status: PairingState,
@@ -1610,6 +1677,12 @@ enum LocalResultSerde {
     Devices {
         devices: Vec<DeviceSummary>,
     },
+    DeviceRevocation {
+        status: DeviceRevocationStatus,
+    },
+    DeviceRevocationIntents {
+        intents: Vec<DeviceRevocationSummary>,
+    },
     PairingInvite {
         invite: PairingInviteInfo,
         status: PairingState,
@@ -1728,6 +1801,20 @@ impl LocalResult {
                         .any(|pair| pair[0].operation_id >= pair[1].operation_id)
                 {
                     return Err(ValidationError::Invalid("accountDeletionIntents"));
+                }
+                Ok(())
+            }
+            Self::DeviceRevocation { status } => status.validate(),
+            Self::DeviceRevocationIntents { intents } => {
+                if intents.len() > 50
+                    || intents
+                        .windows(2)
+                        .any(|pair| pair[0].operation_id >= pair[1].operation_id)
+                {
+                    return Err(ValidationError::Invalid("deviceRevocationIntents"));
+                }
+                for intent in intents {
+                    intent.validate()?;
                 }
                 Ok(())
             }

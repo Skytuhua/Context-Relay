@@ -1316,7 +1316,13 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         | LocalRequest::PairingStatus(_)
         | LocalRequest::PairingDecision(_)
         | LocalRequest::PairingConfirm(_)
-        | LocalRequest::PairingCancel(_)) => RoutedRequest::Work(VaultCommand::Pairing(request)),
+        | LocalRequest::PairingCancel(_)
+        | LocalRequest::DeviceRevoke(_)
+        | LocalRequest::DeviceRevocationStatus(_)
+        | LocalRequest::DeviceRevocationCancel(_)
+        | LocalRequest::DeviceRevocationIntents(_)) => {
+            RoutedRequest::Work(VaultCommand::Pairing(request))
+        }
         request @ (LocalRequest::RecoveryEnrollmentBegin(_)
         | LocalRequest::RecoveryRestoreBegin(_)
         | LocalRequest::RecoveryRestoreOverview(_)
@@ -1332,11 +1338,9 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
             RoutedRequest::Work(VaultCommand::Recovery(request))
         }
         LocalRequest::SyncRetry(_) => RoutedRequest::SyncRetry,
-        LocalRequest::DeviceRename(_) | LocalRequest::DeviceRevoke(_) => {
-            RoutedRequest::Immediate(Err(unsupported_error(
-                "Hosted workspace configuration is not available",
-            )))
-        }
+        LocalRequest::DeviceRename(_) => RoutedRequest::Immediate(Err(unsupported_error(
+            "Hosted workspace configuration is not available",
+        ))),
     }
 }
 
@@ -4372,7 +4376,7 @@ mod tests {
     #[test]
     fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 71);
+        assert_eq!(fixtures.len(), 74);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -4421,6 +4425,22 @@ mod tests {
         for (name, request) in all_request_fixtures()
             .into_iter()
             .filter(|(name, _)| name.starts_with("Pairing"))
+        {
+            assert!(
+                matches!(
+                    route_request(ClientRole::Desktop, request),
+                    RoutedRequest::Work(VaultCommand::Pairing(_))
+                ),
+                "{name} bypassed the ordered Vault worker"
+            );
+        }
+    }
+
+    #[test]
+    fn device_revocation_commands_route_through_the_ordered_vault_worker() {
+        for (name, request) in all_request_fixtures()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("DeviceRevocation") || *name == "DeviceRevoke")
         {
             assert!(
                 matches!(
@@ -4842,6 +4862,296 @@ mod tests {
             Some(saved)
         );
         assert!(vault.all_devices().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hosted_revocation_restarts_exact_self_revocation_after_lost_response() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use context_relay_core::{
+            auth::{
+                HostedSessionOwner, LoginError, LoginStore, PendingLogin, StoredLogin,
+                SupabaseAuthClient,
+            },
+            devices::{
+                crypto::PairingKeyBundle,
+                membership_crypto::MembershipHistoryBudget,
+                membership_transport::MembershipEventObject,
+                recovery::{RecoveryEnrollmentClock, SystemRecoveryEnrollmentClock},
+                recovery_crypto::{
+                    RecoveryEnrollmentBuildRequest, build_recovery_enrollment_artifacts,
+                },
+            },
+            sync::{
+                SupabaseHttpClient, SupabaseHttpError, SupabaseHttpRequest, SupabaseHttpResponse,
+            },
+            vault::RecoveryEnrollmentWrite,
+        };
+        use context_relay_protocol::{
+            DeviceRevocationAccess, DeviceRevocationOutcome, DeviceRevokeParams, OperationId,
+            RecoveryEnrollmentId, RecoveryRootId, RetryParams,
+        };
+        use serde_json::{Value, json};
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::AtomicBool;
+
+        const PROJECT: &str = "https://example.supabase.co";
+        const USER: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const SESSION: &str = "550e8400-e29b-41d4-a716-446655440001";
+        const ACCOUNT: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c075101";
+        const WORKSPACE: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c075102";
+        const ENROLLMENT: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c075103";
+        const ROOT: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c075104";
+        const DEVICE: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c075105";
+        const CERTIFICATE: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c075106";
+        const OPERATION: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c075107";
+        const BUDGET: MembershipHistoryBudget = MembershipHistoryBudget {
+            max_events: 20,
+            max_bytes: 1_000_000,
+        };
+
+        struct Login;
+        impl LoginStore for Login {
+            fn load(&self) -> Result<Option<StoredLogin>, LoginError> {
+                Ok(None)
+            }
+            fn save(&self, _: &StoredLogin) -> Result<(), LoginError> {
+                Ok(())
+            }
+            fn clear(&self) -> Result<(), LoginError> {
+                Ok(())
+            }
+        }
+        struct Http {
+            now: u64,
+            endpoint:
+                Mutex<Option<context_relay_core::devices::membership_crypto::MembershipEndpoint>>,
+            lose_first_publish: AtomicBool,
+            submitted: Mutex<Vec<Vec<u8>>>,
+        }
+        impl SupabaseHttpClient for Http {
+            fn execute(
+                &self,
+                request: SupabaseHttpRequest,
+            ) -> Result<SupabaseHttpResponse, SupabaseHttpError> {
+                let reply = |body: Value| {
+                    Ok(SupabaseHttpResponse::new(
+                        200,
+                        serde_json::to_vec(&body).unwrap(),
+                    ))
+                };
+                if request.url().ends_with("/user") {
+                    return reply(json!({"id":USER}));
+                }
+                if request.url().contains("/auth/v1/token") {
+                    let claims = json!({"iss":format!("{PROJECT}/auth/v1"),"aud":"authenticated","sub":USER,"session_id":SESSION,"exp":self.now+3600});
+                    return reply(
+                        json!({"token_type":"bearer","access_token":format!("e30.{}.signature",URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())),"refresh_token":"synthetic-refresh"}),
+                    );
+                }
+                let body: Value = serde_json::from_slice(request.body()).unwrap();
+                if body["action"] == "revocation_context" {
+                    let endpoint = self.endpoint.lock().unwrap().unwrap();
+                    return reply(
+                        json!({"v":1,"endpoint":{"stateSha256":endpoint.state_sha256,"controlEpoch":endpoint.control_epoch,"keyEpoch":endpoint.key_epoch},"targetDeviceId":DEVICE,"head":{"sequence":"0","canonicalSha256":Sha256Digest([0;32])}}),
+                    );
+                }
+                assert!(
+                    request
+                        .url()
+                        .ends_with("/functions/v1/pairing/revocation-publish")
+                );
+                assert_eq!(body["action"], "publish_revocation");
+                let object_hex = body["object"].as_str().unwrap();
+                let canonical = object_hex
+                    .as_bytes()
+                    .chunks_exact(2)
+                    .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                    .collect::<Vec<_>>();
+                let object = MembershipEventObject::from_canonical_bytes(&canonical).unwrap();
+                let (parent_hash, successor_hash) = object.endpoints().unwrap();
+                let parent = self.endpoint.lock().unwrap().unwrap();
+                assert_eq!(parent.state_sha256, parent_hash);
+                self.submitted.lock().unwrap().push(canonical.clone());
+                if self.lose_first_publish.swap(false, Ordering::SeqCst) {
+                    return Err(SupabaseHttpError::Transient);
+                }
+                reply(
+                    json!({"v":1,"receipt":{"operationId":OPERATION,"objectSha256":Sha256Digest(Sha256::digest(&canonical).into()),"parent":{"stateSha256":parent_hash,"controlEpoch":parent.control_epoch,"keyEpoch":parent.key_epoch},"successor":{"stateSha256":successor_hash,"controlEpoch":parent.control_epoch+1,"keyEpoch":parent.key_epoch+1}}}),
+                )
+            }
+        }
+
+        let now = SystemRecoveryEnrollmentClock.now_ms() / 1000;
+        let http = Arc::new(Http {
+            now,
+            endpoint: Mutex::new(None),
+            lose_first_publish: AtomicBool::new(true),
+            submitted: Mutex::new(Vec::new()),
+        });
+        let owner = Arc::new(HostedSessionOwner::new(
+            Arc::new(
+                SupabaseAuthClient::with_http_client(PROJECT, "public-test", http.clone()).unwrap(),
+            ),
+            Arc::new(Login),
+        ));
+        let instant = std::time::Instant::now();
+        let mut pending =
+            PendingLogin::new(PROJECT, "127.0.0.1:41783".parse().unwrap(), instant).unwrap();
+        let url = pending.authorization_url();
+        let redirect = url
+            .query_pairs()
+            .find(|(key, _)| key == "redirect_to")
+            .unwrap()
+            .1
+            .into_owned();
+        let mut callback = url.join(&redirect).unwrap();
+        callback
+            .query_pairs_mut()
+            .append_pair("code", "synthetic-code");
+        owner
+            .complete_login(
+                owner.begin_login().unwrap(),
+                pending.take_callback(&callback, instant).unwrap(),
+                now,
+            )
+            .unwrap();
+
+        let scope = SyncScope {
+            account_id: ACCOUNT.parse().unwrap(),
+            workspace_id: WORKSPACE.parse().unwrap(),
+        };
+        let identity = PairingIdentity {
+            device_id: DEVICE.parse().unwrap(),
+            device_name: "Only device".into(),
+            platform: NativePlatform::Windows,
+            keys: Arc::new(DeviceKeys::from_seeds_for_test([0x41; 32], [0x51; 32])),
+        };
+        let recovery =
+            RecoveryKeys::derive(&RecoveryPhrase::from_entropy_for_test([0x31; 32]).unwrap())
+                .unwrap();
+        let certificate = DeviceCertificateV1::issue_genesis(
+            CertificateFieldsV1 {
+                account_id: scope.account_id,
+                workspace_id: scope.workspace_id,
+                control_epoch: 1,
+                request_nonce: PairingRequestNonce([0x81; 32]),
+                device_id: identity.device_id,
+                signing_public_key: identity.keys.signing_public_key(),
+                wrapping_public_key: identity.keys.wrapping_public_key(),
+            },
+            &recovery,
+        )
+        .unwrap();
+        let material = PairingKeyBundle::new(scope, 1, 1, [0x61; 32], [0x71; 32]).unwrap();
+        let artifacts = build_recovery_enrollment_artifacts(RecoveryEnrollmentBuildRequest {
+            enrollment_id: ENROLLMENT.parse::<RecoveryEnrollmentId>().unwrap(),
+            recovery_root_id: ROOT.parse::<RecoveryRootId>().unwrap(),
+            certificate_id: CERTIFICATE.parse().unwrap(),
+            certificate,
+            device_name: identity.device_name.clone(),
+            device_platform: identity.platform,
+            recovery_keys: &recovery,
+            device_keys: &identity.keys,
+            material: &material,
+        })
+        .unwrap();
+        let path = unique_temp_path("hosted-revocation-restart").join("vault.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let keys = MemoryKeyStore::default();
+        let mut vault = Vault::open(&path, "test-vault-key", &keys).unwrap();
+        vault
+            .prepare_recovery_enrollment(&RecoveryEnrollmentWrite {
+                canonical_record: artifacts.canonical_record.clone(),
+                canonical_record_sha256: artifacts.canonical_record_sha256,
+                device_material_envelope: artifacts.device_material_envelope.clone(),
+                device_material_envelope_sha256: artifacts.device_material_envelope_sha256,
+                prepared_at_ms: now * 1000,
+            })
+            .unwrap();
+        vault
+            .activate_recovery_enrollment(
+                &RecoveryEnrollmentReceipt {
+                    enrollment_id: artifacts.record.enrollment_id,
+                    recovery_root_id: artifacts.record.recovery_root_id,
+                    account_id: scope.account_id,
+                    workspace_id: scope.workspace_id,
+                    genesis_certificate_id: artifacts.record.genesis_certificate_id,
+                    canonical_record_sha256: artifacts.canonical_record_sha256,
+                    registered_at_ms: now * 1000,
+                },
+                &identity.keys,
+                now * 1000,
+            )
+            .unwrap();
+        *http.endpoint.lock().unwrap() = Some(
+            vault
+                .accepted_membership_history(BUDGET)
+                .unwrap()
+                .unwrap()
+                .endpoint(),
+        );
+        let make = || {
+            let mut service = pairing::HostedPairingService::new(
+                owner.clone(),
+                PROJECT,
+                "public-test",
+                identity.clone(),
+            );
+            service.http = Some(http.clone());
+            service
+        };
+        let operation = OPERATION.parse::<OperationId>().unwrap();
+        let request = || {
+            LocalRequest::DeviceRevoke(DeviceRevokeParams {
+                operation_id: operation,
+                device_id: identity.device_id,
+            })
+        };
+        let LocalResult::DeviceRevocation { status } =
+            make().execute(&mut vault, &identity, request()).unwrap()
+        else {
+            panic!("expected device revocation status")
+        };
+        assert!(matches!(
+            status.outcome,
+            DeviceRevocationOutcome::Unconfirmed {}
+        ));
+        drop(vault);
+
+        let mut vault = Vault::open(&path, "test-vault-key", &keys).unwrap();
+        let service = make();
+        service.resume_prepared_decisions(&mut vault).unwrap();
+        let LocalResult::DeviceRevocation { status } =
+            service.execute(&mut vault, &identity, request()).unwrap()
+        else {
+            panic!("expected accepted device revocation status")
+        };
+        assert!(matches!(
+            status.outcome,
+            DeviceRevocationOutcome::Accepted { .. }
+        ));
+        assert_eq!(status.access, DeviceRevocationAccess::OriginalAuthRequired);
+        let submitted = http.submitted.lock().unwrap();
+        assert_eq!(submitted.len(), 2);
+        assert_eq!(submitted[0], submitted[1]);
+        drop(submitted);
+        let LocalResult::DeviceRevocation { status } = service
+            .execute(
+                &mut vault,
+                &identity,
+                LocalRequest::DeviceRevocationStatus(RetryParams {
+                    operation_id: operation,
+                }),
+            )
+            .unwrap()
+        else {
+            panic!("expected durable device revocation status")
+        };
+        assert!(matches!(
+            status.outcome,
+            DeviceRevocationOutcome::Accepted { .. }
+        ));
+        assert!(vault.trusted_workspace_material(&identity.keys).is_err());
     }
 
     #[tokio::test]
@@ -8965,7 +9275,31 @@ mod tests {
             ),
             (
                 "DeviceRevoke",
-                request_fixture("device_revoke", serde_json::json!({"deviceId": ID})),
+                request_fixture(
+                    "device_revoke",
+                    serde_json::json!({"operationId": ID, "deviceId": ID}),
+                ),
+            ),
+            (
+                "DeviceRevocationStatus",
+                request_fixture(
+                    "device_revocation_status",
+                    serde_json::json!({"operationId": ID}),
+                ),
+            ),
+            (
+                "DeviceRevocationCancel",
+                request_fixture(
+                    "device_revocation_cancel",
+                    serde_json::json!({"operationId": ID}),
+                ),
+            ),
+            (
+                "DeviceRevocationIntents",
+                request_fixture(
+                    "device_revocation_intents",
+                    serde_json::json!({"after": null}),
+                ),
             ),
             ("PairingCreate", request_fixture("pairing_create", empty())),
             (
@@ -9293,6 +9627,21 @@ mod tests {
         state.pairing_identity.as_mut().unwrap().keys = Arc::new(DeviceKeys::generate().unwrap());
         state.wake_sync_backfill();
         state.tick_sync_backfill(&status);
+        assert_eq!(state.sync_backfill, SyncBackfill::Idle);
+        assert_eq!(status.snapshot().sync, SyncState::Offline);
+        assert_eq!(state.vault.due_outbox(u64::MAX, 10).unwrap(), before);
+        let pending = OfflineWorkspace::new(&mut state.vault, state.device_id)
+            .create_memory(context_relay_protocol::MemoryCreateParams {
+                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074208".parse().unwrap(),
+                scope: ScopeRef::Global,
+                kind: context_relay_protocol::MemoryKind::Fact,
+                title: "Worker backfill".into(),
+                body_markdown: "Preserve queued read".into(),
+                tags: vec![],
+            })
+            .unwrap();
+        state.wake_sync_backfill();
+        state.tick_sync_backfill(&status);
         assert_eq!(state.sync_backfill, SyncBackfill::Failed);
         assert_eq!(status.snapshot().sync, SyncState::Error);
         state.wake_sync_backfill();
@@ -9313,16 +9662,6 @@ mod tests {
         // Exercise the real worker admission loop with a request racing background work.
         state.pairing_identity = Some(identity);
         state.sync_backfill = SyncBackfill::Pending;
-        let pending = OfflineWorkspace::new(&mut state.vault, state.device_id)
-            .create_memory(context_relay_protocol::MemoryCreateParams {
-                operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074208".parse().unwrap(),
-                scope: ScopeRef::Global,
-                kind: context_relay_protocol::MemoryKind::Fact,
-                title: "Worker backfill".into(),
-                body_markdown: "Preserve queued read".into(),
-                tags: vec![],
-            })
-            .unwrap();
         struct BackfillGate {
             entered: std::sync::mpsc::Sender<()>,
             release: Mutex<std::sync::mpsc::Receiver<()>>,

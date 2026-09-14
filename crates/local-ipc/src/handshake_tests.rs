@@ -117,7 +117,7 @@ async fn authenticated_pair(
 async fn exact_local_handshake_rejects_legacy_minor_in_both_directions() {
     const LEGACY_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
         major: 1,
-        minor: 15,
+        minor: 16,
     };
 
     let (client_io, server_io) = duplex(64 * 1024);

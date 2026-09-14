@@ -1,17 +1,203 @@
-use context_relay_protocol::{Ed25519SignatureBytes, OperationId};
+use context_relay_protocol::{Ed25519SignatureBytes, OperationId, Sha256Digest};
 use minicbor::{Decoder, Encoder};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 
 use super::{HostedRestoreIntent, Vault, VaultError};
 use crate::{
     crypto::DeviceCertificateV1,
     devices::{
         crypto::{decode_certificate_v1, encode_certificate_v1},
+        membership_crypto::{MembershipEndpoint, MembershipHistoryEvent},
+        membership_transport::MembershipEventObject,
         revocation_crypto::{
             DeviceRevocationStatementV1, RevocationControlState, RevocationTransitionV1,
         },
     },
 };
+
+const MAX_REVOCATION_INTENTS: i64 = 4096;
+const MAX_REVOCATION_INTENT_BYTES: i64 = 64 * 1024 * 1024;
+const RECEIPT_BYTES: usize = 149;
+const RESERVED_COORDINATION_BYTES: i64 = 1 + 1 + RECEIPT_BYTES as i64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceRevocationReceipt {
+    pub operation_id: OperationId,
+    pub object_sha256: Sha256Digest,
+    pub parent: MembershipEndpoint,
+    pub successor: MembershipEndpoint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeviceRevocationDisposition {
+    Prepared,
+    Submitting,
+    Unconfirmed,
+    Accepted(DeviceRevocationReceipt),
+    Conflict,
+    CanceledBeforeSend,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceRevocationCoordination {
+    pub intent: DeviceRevocationIntent,
+    pub send_canceled: bool,
+    pub disposition: DeviceRevocationDisposition,
+}
+
+fn encode_receipt(receipt: &DeviceRevocationReceipt) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(RECEIPT_BYTES);
+    bytes.push(1);
+    bytes.extend(receipt.operation_id.to_string().as_bytes());
+    bytes.extend(receipt.object_sha256.0);
+    for endpoint in [&receipt.parent, &receipt.successor] {
+        bytes.extend(endpoint.state_sha256.0);
+        bytes.extend(endpoint.control_epoch.to_be_bytes());
+        bytes.extend(endpoint.key_epoch.to_be_bytes());
+    }
+    debug_assert_eq!(bytes.len(), RECEIPT_BYTES);
+    bytes
+}
+
+fn coordination(
+    connection: &Connection,
+    id: OperationId,
+) -> Result<Option<DeviceRevocationCoordination>, VaultError> {
+    let Some(intent) = load(connection, id)? else {
+        return Ok(None);
+    };
+    let (outcome, send_canceled, receipt, receipt_valid): (i64, i64, Option<Vec<u8>>, i64) = connection.query_row(
+        "SELECT CASE WHEN typeof(outcome)='integer' AND outcome BETWEEN 0 AND 5 THEN outcome END,
+                CASE WHEN typeof(send_canceled)='integer' AND send_canceled IN (0,1) THEN send_canceled END,
+                CASE WHEN receipt IS NULL OR (typeof(receipt)='blob' AND length(receipt)=149) THEN receipt END,
+                CASE WHEN receipt IS NULL OR (typeof(receipt)='blob' AND length(receipt)=149) THEN 1 ELSE 0 END
+         FROM device_revocation_intents WHERE operation_id=?1",
+        [id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if receipt_valid != 1 {
+        return Err(VaultError::OperationConflict);
+    }
+    let disposition = match (outcome, receipt) {
+        (0, None) => DeviceRevocationDisposition::Prepared,
+        (1, None) => DeviceRevocationDisposition::Submitting,
+        (2, None) => DeviceRevocationDisposition::Unconfirmed,
+        (3, Some(bytes)) => {
+            let receipt = decode_receipt(&bytes)?;
+            if receipt != expected_receipt(&intent)? {
+                return Err(VaultError::OperationConflict);
+            }
+            DeviceRevocationDisposition::Accepted(receipt)
+        }
+        (4, None) => DeviceRevocationDisposition::Conflict,
+        (5, None) => DeviceRevocationDisposition::CanceledBeforeSend,
+        _ => return Err(VaultError::OperationConflict),
+    };
+    Ok(Some(DeviceRevocationCoordination {
+        intent,
+        send_canceled: send_canceled == 1,
+        disposition,
+    }))
+}
+
+fn charged_bytes(lengths: [&usize; 8]) -> Result<i64, VaultError> {
+    lengths
+        .into_iter()
+        .try_fold(RESERVED_COORDINATION_BYTES, |total, bytes| {
+            total
+                .checked_add(i64::try_from(*bytes).map_err(|_| VaultError::BudgetExceeded)?)
+                .ok_or(VaultError::BudgetExceeded)
+        })
+}
+
+fn decode_receipt(bytes: &[u8]) -> Result<DeviceRevocationReceipt, VaultError> {
+    fn take<'a>(input: &mut &'a [u8], n: usize) -> Result<&'a [u8], VaultError> {
+        let (head, tail) = input
+            .split_at_checked(n)
+            .ok_or(VaultError::OperationConflict)?;
+        *input = tail;
+        Ok(head)
+    }
+    fn endpoint(input: &mut &[u8]) -> Result<MembershipEndpoint, VaultError> {
+        Ok(MembershipEndpoint {
+            state_sha256: Sha256Digest(take(input, 32)?.try_into().unwrap()),
+            control_epoch: u32::from_be_bytes(take(input, 4)?.try_into().unwrap()),
+            key_epoch: u32::from_be_bytes(take(input, 4)?.try_into().unwrap()),
+        })
+    }
+    if bytes.len() != RECEIPT_BYTES {
+        return Err(VaultError::OperationConflict);
+    }
+    let mut input = bytes;
+    if take(&mut input, 1)? != [1] {
+        return Err(VaultError::OperationConflict);
+    }
+    let operation_text =
+        std::str::from_utf8(take(&mut input, 36)?).map_err(|_| VaultError::OperationConflict)?;
+    let operation_id: OperationId = operation_text
+        .parse()
+        .map_err(|_| VaultError::OperationConflict)?;
+    if operation_id.to_string() != operation_text {
+        return Err(VaultError::OperationConflict);
+    }
+    let object_sha256 = Sha256Digest(take(&mut input, 32)?.try_into().unwrap());
+    let parent = endpoint(&mut input)?;
+    let successor = endpoint(&mut input)?;
+    if !input.is_empty() {
+        return Err(VaultError::OperationConflict);
+    }
+    Ok(DeviceRevocationReceipt {
+        operation_id,
+        object_sha256,
+        parent,
+        successor,
+    })
+}
+
+fn expected_receipt(
+    intent: &DeviceRevocationIntent,
+) -> Result<DeviceRevocationReceipt, VaultError> {
+    let statement = intent
+        .statement
+        .signing_preimage()
+        .map_err(|_| VaultError::OperationConflict)?;
+    let transition = intent
+        .transition
+        .canonical_bytes()
+        .map_err(|_| VaultError::OperationConflict)?;
+    let object = MembershipEventObject::from_evidence(&MembershipHistoryEvent::Revocation {
+        statement: &statement,
+        signature: intent.signature,
+        transition: &transition,
+    })
+    .map_err(|_| VaultError::OperationConflict)?;
+    Ok(DeviceRevocationReceipt {
+        operation_id: intent.statement.revocation_id,
+        object_sha256: Sha256Digest(Sha256::digest(object.canonical_bytes()).into()),
+        parent: MembershipEndpoint {
+            state_sha256: intent.transition.previous_state_sha256,
+            control_epoch: intent.statement.control_epoch,
+            key_epoch: intent.statement.key_epoch,
+        },
+        successor: MembershipEndpoint {
+            state_sha256: intent
+                .statement
+                .control_state_sha256(intent.signature)
+                .map_err(|_| VaultError::OperationConflict)?,
+            control_epoch: intent
+                .statement
+                .control_epoch
+                .checked_add(1)
+                .ok_or(VaultError::OperationConflict)?,
+            key_epoch: intent
+                .statement
+                .key_epoch
+                .checked_add(1)
+                .ok_or(VaultError::OperationConflict)?,
+        },
+    })
+}
 
 /// Exact prepared artifacts and original hosted identity, inside SQLCipher.
 /// Contains no tokens or plaintext keys. Presence is neither hosted acceptance
@@ -148,6 +334,13 @@ impl Vault {
         load(&self.connection, id)
     }
 
+    pub fn device_revocation_coordination(
+        &self,
+        id: OperationId,
+    ) -> Result<Option<DeviceRevocationCoordination>, VaultError> {
+        coordination(&self.connection, id)
+    }
+
     /// Persist before the first hosted mutation. Identical retries preserve the
     /// original identity, keys and ciphertexts; changed operation payloads conflict.
     pub fn store_device_revocation_intent(
@@ -156,12 +349,60 @@ impl Vault {
         current: &RevocationControlState<'_>,
     ) -> Result<(), VaultError> {
         intent.validate()?;
-        let transaction = self.connection.transaction()?;
-        if let Some(existing) = load(&transaction, intent.statement.revocation_id)? {
-            if existing != *intent {
+        let certificate = certificate_bytes(&intent.issuer_certificate)?;
+        let statement = intent
+            .statement
+            .signing_preimage()
+            .map_err(|_| VaultError::OperationConflict)?;
+        let transition = intent
+            .transition
+            .canonical_bytes()
+            .map_err(|_| VaultError::OperationConflict)?;
+        let operation_id = intent.statement.revocation_id.to_string();
+        let user_id = intent.user_id.to_string();
+        let session_id = intent.session_id.to_string();
+        let charge = charged_bytes([
+            &operation_id.len(),
+            &intent.project_url.len(),
+            &user_id.len(),
+            &session_id.len(),
+            &certificate.len(),
+            &statement.len(),
+            &transition.len(),
+            &intent.signature.0.len(),
+        ])?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = coordination(&transaction, intent.statement.revocation_id)? {
+            if existing.intent != *intent {
                 return Err(VaultError::OperationConflict);
             }
         } else {
+            let (count, bytes, valid): (i64, i64, i64) = transaction.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(
+                    length(CAST(operation_id AS BLOB)) + length(CAST(project_url AS BLOB)) +
+                    length(CAST(user_id AS BLOB)) + length(CAST(session_id AS BLOB)) +
+                    length(issuer_certificate) + length(statement) + length(transition) +
+                    length(signature) + 151), 0), COALESCE(MIN(CASE
+                      WHEN typeof(outcome)='integer' AND outcome BETWEEN 0 AND 5
+                       AND typeof(send_canceled)='integer' AND send_canceled IN (0,1)
+                       AND (receipt IS NULL OR (typeof(receipt)='blob' AND length(receipt)=149))
+                      THEN 1 ELSE 0 END),1)
+                 FROM device_revocation_intents",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if valid != 1 {
+                return Err(VaultError::OperationConflict);
+            }
+            if count >= MAX_REVOCATION_INTENTS
+                || bytes
+                    .checked_add(charge)
+                    .is_none_or(|total| total > MAX_REVOCATION_INTENT_BYTES)
+            {
+                return Err(VaultError::BudgetExceeded);
+            }
             if current
                 .active_devices
                 .get(&intent.statement.issuer_device_id)
@@ -176,14 +417,143 @@ impl Vault {
             transaction.execute(
                 "INSERT INTO device_revocation_intents(operation_id,project_url,user_id,session_id,
                     issuer_certificate,statement,transition,signature) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![intent.statement.revocation_id.to_string(), intent.project_url,
-                    intent.user_id.to_string(), intent.session_id.to_string(), certificate_bytes(&intent.issuer_certificate)?,
-                    intent.statement.signing_preimage().map_err(|_| VaultError::OperationConflict)?,
-                    intent.transition.canonical_bytes().map_err(|_| VaultError::OperationConflict)?, &intent.signature.0[..]],
+                params![operation_id, intent.project_url, user_id, session_id, certificate,
+                    statement, transition, &intent.signature.0[..]],
             )?;
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn begin_device_revocation_submission(
+        &mut self,
+        id: OperationId,
+    ) -> Result<DeviceRevocationDisposition, VaultError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = coordination(&transaction, id)?.ok_or(VaultError::OperationConflict)?;
+        if !current.send_canceled
+            && matches!(
+                current.disposition,
+                DeviceRevocationDisposition::Prepared | DeviceRevocationDisposition::Unconfirmed
+            )
+        {
+            transaction.execute(
+                "UPDATE device_revocation_intents SET outcome=1 WHERE operation_id=?1",
+                [id.to_string()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(coordination(&self.connection, id)?
+            .ok_or(VaultError::OperationConflict)?
+            .disposition)
+    }
+
+    pub fn mark_device_revocation_unconfirmed(
+        &mut self,
+        id: OperationId,
+    ) -> Result<DeviceRevocationCoordination, VaultError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = coordination(&transaction, id)?.ok_or(VaultError::OperationConflict)?;
+        if matches!(current.disposition, DeviceRevocationDisposition::Submitting) {
+            transaction.execute(
+                "UPDATE device_revocation_intents SET outcome=2 WHERE operation_id=?1",
+                [id.to_string()],
+            )?;
+        }
+        transaction.commit()?;
+        coordination(&self.connection, id)?.ok_or(VaultError::OperationConflict)
+    }
+
+    pub fn recover_device_revocation_submissions(&mut self) -> Result<(), VaultError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE device_revocation_intents SET outcome=2 WHERE outcome=1",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn cancel_device_revocation_submission(
+        &mut self,
+        id: OperationId,
+    ) -> Result<DeviceRevocationCoordination, VaultError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = coordination(&transaction, id)?.ok_or(VaultError::OperationConflict)?;
+        let outcome = match current.disposition {
+            DeviceRevocationDisposition::Prepared => 5,
+            DeviceRevocationDisposition::Submitting | DeviceRevocationDisposition::Unconfirmed => 2,
+            _ => transaction.query_row(
+                "SELECT outcome FROM device_revocation_intents WHERE operation_id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )?,
+        };
+        transaction.execute(
+            "UPDATE device_revocation_intents SET outcome=?1,send_canceled=1 WHERE operation_id=?2",
+            params![outcome, id.to_string()],
+        )?;
+        transaction.commit()?;
+        coordination(&self.connection, id)?.ok_or(VaultError::OperationConflict)
+    }
+
+    pub fn accept_device_revocation_receipt(
+        &mut self,
+        id: OperationId,
+        receipt: &DeviceRevocationReceipt,
+    ) -> Result<DeviceRevocationCoordination, VaultError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = coordination(&transaction, id)?.ok_or(VaultError::OperationConflict)?;
+        if *receipt != expected_receipt(&current.intent)? {
+            return Err(VaultError::OperationConflict);
+        }
+        if let DeviceRevocationDisposition::Accepted(existing) = current.disposition {
+            if existing != *receipt {
+                return Err(VaultError::OperationConflict);
+            }
+        } else if matches!(current.disposition, DeviceRevocationDisposition::Conflict) {
+            return Err(VaultError::OperationConflict);
+        } else {
+            transaction.execute(
+                "UPDATE device_revocation_intents SET outcome=3,receipt=?1 WHERE operation_id=?2",
+                params![encode_receipt(receipt), id.to_string()],
+            )?;
+        }
+        transaction.commit()?;
+        coordination(&self.connection, id)?.ok_or(VaultError::OperationConflict)
+    }
+
+    pub fn mark_device_revocation_conflict(
+        &mut self,
+        id: OperationId,
+    ) -> Result<DeviceRevocationCoordination, VaultError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = coordination(&transaction, id)?.ok_or(VaultError::OperationConflict)?;
+        if matches!(
+            current.disposition,
+            DeviceRevocationDisposition::Prepared
+                | DeviceRevocationDisposition::Submitting
+                | DeviceRevocationDisposition::Unconfirmed
+        ) {
+            transaction.execute(
+                "UPDATE device_revocation_intents SET outcome=4 WHERE operation_id=?1",
+                [id.to_string()],
+            )?;
+        }
+        transaction.commit()?;
+        coordination(&self.connection, id)?.ok_or(VaultError::OperationConflict)
     }
 }
 

@@ -9,6 +9,7 @@ use super::{
     membership_crypto::MembershipEndpoint,
     membership_transport::{MAX_MEMBERSHIP_OBJECT_BYTES, MembershipEventObject},
     transport::{
+        DeviceOperationHead, DeviceRevocationContext, MembershipObjectKind,
         PairingApprovalTransport, PairingApprovedResult, PairingDecision, PairingDecisionEnvelope,
         PairingDecisionKind, PairingDecisionReceipt, PairingInvite, PairingInviteState,
         PairingInviteStatus, PairingJoinTransport, PairingRequestReceipt, PairingResult,
@@ -23,11 +24,11 @@ use crate::{
         ReqwestHttpClient, SupabaseHttpClient, SupabaseHttpMethod, SupabaseHttpRequest,
         valid_header_secret, validated_project_url,
     },
-    vault::{HostedPairingIntent, HostedPairingRole},
+    vault::{DeviceRevocationReceipt, HostedPairingIntent, HostedPairingRole},
 };
 use context_relay_protocol::{
-    AccountId, DecimalTimestamp, DeviceId, Ed25519SignatureBytes, PairingCode, PairingId,
-    Sha256Digest, WorkspaceId, decode_pairing_request_v1,
+    AccountId, DecimalTimestamp, DeviceId, Ed25519SignatureBytes, OperationId, PairingCode,
+    PairingId, Sha256Digest, WorkspaceId, decode_pairing_request_v1,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -38,6 +39,8 @@ use std::{
 use zeroize::Zeroizing;
 
 const RESPONSE_LIMIT: usize = 68 * 1024;
+const REVOCATION_OBJECT_LIMIT: usize = 8_388_927;
+const REVOCATION_PUBLISH_BODY_LIMIT: usize = 16_778_878;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +60,64 @@ struct WireEndpoint {
 struct ObjectResponse {
     v: u8,
     object: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RevocationHead {
+    sequence: DecimalTimestamp,
+    canonical_sha256: Sha256Digest,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RevocationContextResponse {
+    v: u8,
+    endpoint: WireEndpoint,
+    target_device_id: DeviceId,
+    head: RevocationHead,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireRevocationReceipt {
+    operation_id: OperationId,
+    object_sha256: Sha256Digest,
+    parent: WireEndpoint,
+    successor: WireEndpoint,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevocationReceiptResponse {
+    v: u8,
+    receipt: Option<WireRevocationReceipt>,
+}
+
+fn endpoint(wire: WireEndpoint) -> Result<MembershipEndpoint, Error> {
+    if wire.state_sha256.0 == [0; 32] || wire.control_epoch == 0 || wire.key_epoch == 0 {
+        return Err(Error::Conflict);
+    }
+    Ok(MembershipEndpoint {
+        state_sha256: wire.state_sha256,
+        control_epoch: wire.control_epoch,
+        key_epoch: wire.key_epoch,
+    })
+}
+
+fn receipt(wire: WireRevocationReceipt) -> Result<DeviceRevocationReceipt, Error> {
+    Ok(DeviceRevocationReceipt {
+        operation_id: wire.operation_id,
+        object_sha256: wire.object_sha256,
+        parent: endpoint(wire.parent)?,
+        successor: endpoint(wire.successor)?,
+    })
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 /// Native-only client bound to one verified login generation and device key pair.
@@ -180,6 +241,22 @@ impl HostedPairingClient {
         now_ms: u64,
         response_limit: usize,
     ) -> Result<T, Error> {
+        self.call_at_path_with_limits(
+            "/functions/v1/pairing",
+            body,
+            now_ms,
+            RESPONSE_LIMIT,
+            response_limit,
+        )
+    }
+    fn call_at_path_with_limits<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+        now_ms: u64,
+        body_limit: usize,
+        response_limit: usize,
+    ) -> Result<T, Error> {
         let started = Instant::now();
         let session = self
             .owner
@@ -189,15 +266,12 @@ impl HostedPairingClient {
             return Err(Error::Unauthorized);
         }
         let body = serde_json::to_vec(&body).map_err(|_| Error::Invalid)?;
-        if body.len() > RESPONSE_LIMIT {
+        if body.len() > body_limit {
             return Err(Error::Invalid);
         }
         let request = SupabaseHttpRequest::new(
             SupabaseHttpMethod::Post,
-            self.project
-                .join("/functions/v1/pairing")
-                .map_err(|_| Error::Invalid)?
-                .into(),
+            self.project.join(path).map_err(|_| Error::Invalid)?.into(),
             vec![
                 ("content-type".into(), "application/json".into()),
                 ("apikey".into(), self.publishable_key.to_string()),
@@ -280,18 +354,117 @@ impl HostedPairingApprovalClient {
 impl PairingApprovalTransport for HostedPairingApprovalClient {
     fn membership_endpoint(&self, now_ms: u64) -> Result<MembershipEndpoint, Error> {
         let r:EndpointResponse=self.client.call(serde_json::json!({"v":1,"action":"membership_endpoint","workspaceId":self.scope.workspace_id,"deviceId":self.device_id}),now_ms)?;
-        if r.v != 1
-            || r.endpoint.state_sha256 == Sha256Digest([0; 32])
-            || r.endpoint.control_epoch == 0
-            || r.endpoint.key_epoch == 0
+        if r.v != 1 {
+            return Err(Error::Conflict);
+        }
+        endpoint(r.endpoint)
+    }
+    fn membership_object(
+        &self,
+        kind: MembershipObjectKind,
+        address: Sha256Digest,
+        now_ms: u64,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let kind = match kind {
+            MembershipObjectKind::Enrollment => "enrollment",
+            MembershipObjectKind::Event => "event",
+        };
+        let response: ObjectResponse = self.client.call_with_response_limit(
+            serde_json::json!({"v":1,"action":"membership_object","workspaceId":self.scope.workspace_id,"deviceId":self.device_id,"kind":kind,"address":address}),
+            now_ms,
+            MAX_MEMBERSHIP_OBJECT_BYTES * 2 + 1024,
+        )?;
+        if response.v != 1 {
+            return Err(Error::Conflict);
+        }
+        response
+            .object
+            .map(|value| decode_hex_bounded(&value, MAX_MEMBERSHIP_OBJECT_BYTES))
+            .transpose()
+    }
+    fn revocation_context(
+        &self,
+        target: DeviceId,
+        now_ms: u64,
+    ) -> Result<DeviceRevocationContext, Error> {
+        let response: RevocationContextResponse = self.client.call(
+            serde_json::json!({"v":1,"action":"revocation_context","workspaceId":self.scope.workspace_id,"deviceId":self.device_id,"targetDeviceId":target}),
+            now_ms,
+        )?;
+        if response.v != 1
+            || response.target_device_id != target
+            || (response.head.sequence.0 == 0)
+                != (response.head.canonical_sha256 == Sha256Digest([0; 32]))
         {
             return Err(Error::Conflict);
         }
-        Ok(MembershipEndpoint {
-            state_sha256: r.endpoint.state_sha256,
-            control_epoch: r.endpoint.control_epoch,
-            key_epoch: r.endpoint.key_epoch,
+        Ok(DeviceRevocationContext {
+            endpoint: endpoint(response.endpoint)?,
+            target_device_id: target,
+            head: DeviceOperationHead {
+                sequence: response.head.sequence.0,
+                canonical_sha256: response.head.canonical_sha256,
+            },
         })
+    }
+    fn revocation_result(
+        &self,
+        operation_id: OperationId,
+        object_sha256: Sha256Digest,
+        now_ms: u64,
+    ) -> Result<Option<DeviceRevocationReceipt>, Error> {
+        let response: RevocationReceiptResponse = self.client.call(
+            serde_json::json!({"v":1,"action":"revocation_result","workspaceId":self.scope.workspace_id,"deviceId":self.device_id,"operationId":operation_id,"objectSha256":object_sha256}),
+            now_ms,
+        )?;
+        if response.v != 1 {
+            return Err(Error::Conflict);
+        }
+        response.receipt.map(receipt).transpose().and_then(|value| {
+            if value.as_ref().is_some_and(|receipt| {
+                receipt.operation_id != operation_id || receipt.object_sha256 != object_sha256
+            }) {
+                Err(Error::Conflict)
+            } else {
+                Ok(value)
+            }
+        })
+    }
+    fn publish_revocation(
+        &self,
+        object: &MembershipEventObject,
+        now_ms: u64,
+    ) -> Result<DeviceRevocationReceipt, Error> {
+        let canonical = object.canonical_bytes();
+        let operation_id = match object.evidence() {
+            super::membership_crypto::MembershipHistoryEvent::Revocation { statement, .. } => {
+                super::revocation_crypto::DeviceRevocationStatementV1::from_signing_preimage(
+                    statement,
+                )
+                .map_err(|_| Error::Invalid)?
+                .revocation_id
+            }
+            _ => return Err(Error::Invalid),
+        };
+        if canonical.len() > REVOCATION_OBJECT_LIMIT {
+            return Err(Error::Invalid);
+        }
+        let object_sha256 = Sha256Digest(Sha256::digest(&canonical).into());
+        let response: RevocationReceiptResponse = self.client.call_at_path_with_limits(
+            "/functions/v1/pairing/revocation-publish",
+            serde_json::json!({"v":1,"action":"publish_revocation","workspaceId":self.scope.workspace_id,"deviceId":self.device_id,"object":encode_hex(&canonical)}),
+            now_ms,
+            REVOCATION_PUBLISH_BODY_LIMIT,
+            RESPONSE_LIMIT,
+        )?;
+        let receipt = response.receipt.ok_or(Error::Conflict).and_then(receipt)?;
+        if response.v != 1
+            || receipt.operation_id != operation_id
+            || receipt.object_sha256 != object_sha256
+        {
+            return Err(Error::Conflict);
+        }
+        Ok(receipt)
     }
     fn hosted_intent(&self) -> Option<HostedPairingIntent> {
         Some(self.client.original_intent(HostedPairingRole::Approve))

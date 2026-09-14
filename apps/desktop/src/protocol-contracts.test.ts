@@ -209,7 +209,7 @@ const nullAtPath = (value: unknown, path: readonly PropertyKey[]) => {
 
 describe('generated protocol version', () => {
   it('advertises the background search status contract as v1.11', () => {
-    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 16 });
+    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 17 });
   });
 });
 
@@ -326,7 +326,7 @@ describe('protocol schemas', () => {
     }
   });
 
-  it('accepts only the exact status protocol range for v1.16', () => {
+  it('accepts only the exact status protocol range for v1.17', () => {
     const ajv = createProtocolSchemaValidator();
     const validate = ajv.compile(load('schemas/context_relay_status-output-v1.json'));
     const fixture = load('crates/protocol/tests/fixtures/mcp-output-valid.json').context_relay_status;
@@ -334,7 +334,7 @@ describe('protocol schemas', () => {
     for (const protocol of [
       { min: { major: 2, minor: 0 }, max: { major: 2, minor: 0 } },
       { min: { major: 1, minor: 0 }, max: { major: 1, minor: 0 } },
-      { min: { major: 1, minor: 6 }, max: { major: 1, minor: 16 } },
+      { min: { major: 1, minor: 6 }, max: { major: 1, minor: 17 } },
       { min: { major: 1, minor: 1 }, max: { major: 1, minor: 0 } },
     ]) {
       expect(validate({ ...fixture, protocol }), JSON.stringify(protocol)).toBe(false);

@@ -216,6 +216,176 @@ $$;
 revoke all on function public.service_membership_endpoint(uuid,uuid,uuid,uuid) from public,anon,authenticated,service_role;
 grant execute on function public.service_membership_endpoint(uuid,uuid,uuid,uuid) to service_role;
 
+create table context_relay_private.device_revocation_receipts (
+  operation_id uuid primary key,
+  workspace_id uuid not null references context_relay_private.membership_heads(workspace_id) on delete cascade,
+  auth_user_id uuid not null,
+  session_id uuid not null,
+  issuer_device_id uuid not null,
+  target_device_id uuid not null,
+  object_sha256 bytea not null check(octet_length(object_sha256)=32),
+  parent_sha256 bytea not null check(octet_length(parent_sha256)=32),
+  successor_sha256 bytea not null check(octet_length(successor_sha256)=32),
+  cutoff_sequence bigint not null check(cutoff_sequence>=0),
+  cutoff_sha256 bytea not null check(octet_length(cutoff_sha256)=32),
+  control_epoch bigint not null check(control_epoch between 1 and 4294967294),
+  key_epoch bigint not null check(key_epoch between 1 and 4294967294),
+  unique(workspace_id,successor_sha256),
+  foreign key(operation_id) references context_relay_private.membership_events(event_id) deferrable initially deferred
+);
+alter table context_relay_private.device_revocation_receipts enable row level security;
+revoke all on table context_relay_private.device_revocation_receipts from public,anon,authenticated,service_role;
+
+create function public.service_membership_object(
+  p_auth_user_id uuid,p_session_id uuid,p_workspace_id uuid,p_device_id uuid,p_kind text,p_address bytea
+) returns text language plpgsql volatile security definer set search_path=''
+as $$
+declare h context_relay_private.membership_heads%rowtype; object bytea;
+begin
+  perform context_relay_private.lock_current_membership_member(p_auth_user_id,p_session_id,p_workspace_id,p_device_id);
+  if p_address is null or octet_length(p_address)<>32 or p_kind not in ('enrollment','event')
+  then raise exception using errcode='22023',message='invalid_pairing_request';end if;
+  select * into strict h from context_relay_private.membership_heads where workspace_id=p_workspace_id;
+  if p_kind='enrollment' then
+    if p_address<>h.enrollment_sha256 then return null;end if;
+    select ec.canonical_record into object from context_relay_private.enrollment_commits ec
+      where ec.account_id=h.account_id and sha256(ec.canonical_record)=h.enrollment_sha256;
+  else
+    select e.canonical_object into object from context_relay_private.membership_events e
+      where e.workspace_id=p_workspace_id and e.successor_sha256=p_address;
+  end if;
+  return case when object is null then null else encode(object,'hex') end;
+end;
+$$;
+revoke all on function public.service_membership_object(uuid,uuid,uuid,uuid,text,bytea) from public,anon,authenticated,service_role;
+grant execute on function public.service_membership_object(uuid,uuid,uuid,uuid,text,bytea) to service_role;
+
+create function public.service_revocation_context(
+  p_auth_user_id uuid,p_session_id uuid,p_workspace_id uuid,p_device_id uuid,p_target_device_id uuid
+) returns jsonb language plpgsql volatile security definer set search_path=''
+as $$
+declare h context_relay_private.membership_heads%rowtype; sequence numeric; digest bytea;
+begin
+  perform context_relay_private.lock_current_membership_member(p_auth_user_id,p_session_id,p_workspace_id,p_device_id);
+  select * into strict h from context_relay_private.membership_heads where workspace_id=p_workspace_id;
+  if not exists(select 1 from context_relay_private.membership_members where workspace_id=p_workspace_id and device_id=p_target_device_id and active)
+  then raise exception using errcode='40001',message='pairing_conflict';end if;
+  select o.device_sequence,o.canonical_sha256 into sequence,digest from public.sync_operations o
+    where o.account_id=h.account_id and o.workspace_id=p_workspace_id and o.device_id=p_target_device_id
+    order by o.device_sequence desc limit 1;
+  if not found then sequence:=0;digest:=decode(repeat('00',32),'hex');end if;
+  if sequence>9223372036854775807 then raise exception using errcode='40001',message='pairing_conflict';end if;
+  return jsonb_build_object('endpoint',jsonb_build_object('stateSha256',encode(h.state_sha256,'hex'),'controlEpoch',h.control_epoch,'keyEpoch',h.key_epoch),
+    'targetDeviceId',p_target_device_id,'head',jsonb_build_object('sequence',sequence::text,'canonicalSha256',encode(digest,'hex')));
+end;
+$$;
+revoke all on function public.service_revocation_context(uuid,uuid,uuid,uuid,uuid) from public,anon,authenticated,service_role;
+grant execute on function public.service_revocation_context(uuid,uuid,uuid,uuid,uuid) to service_role;
+
+create or replace function public.service_revocation_verification_context(
+  p_auth_user_id uuid,p_session_id uuid,p_workspace_id uuid,p_device_id uuid
+) returns jsonb language plpgsql volatile security definer set search_path=''
+as $$
+declare h context_relay_private.membership_heads%rowtype;m context_relay_private.membership_members%rowtype;
+  root public.recovery_roots%rowtype; enrollment context_relay_private.enrollment_commits%rowtype;
+  issuer public.device_certificates%rowtype;
+begin
+  m:=context_relay_private.lock_current_membership_member(p_auth_user_id,p_session_id,p_workspace_id,p_device_id);
+  select * into strict h from context_relay_private.membership_heads where workspace_id=p_workspace_id;
+  select * into strict enrollment from context_relay_private.enrollment_commits where account_id=h.account_id and sha256(canonical_record)=h.enrollment_sha256;
+  select * into strict root from public.recovery_roots where account_id=h.account_id and id=(enrollment.receipt->>'recoveryRootId')::uuid;
+  select * into strict issuer from public.device_certificates where id=m.certificate_id and account_id=h.account_id
+    and workspace_id=h.workspace_id and device_id=m.device_id;
+  return jsonb_build_object('accountId',h.account_id,'workspaceId',h.workspace_id,'issuerDeviceId',p_device_id,
+    'issuerSigningKey',encode(issuer.device_signing_public_key,'hex'),
+    'targetDeviceId',null,
+    'endpoint',jsonb_build_object('stateSha256',encode(h.state_sha256,'hex'),'controlEpoch',h.control_epoch,'keyEpoch',h.key_epoch),
+    'recoveryRootId',root.id,'recoveryWrappingKey',encode(root.wrapping_public_key,'hex'),
+    'activeMembers',(select jsonb_agg(jsonb_build_object('deviceId',mm.device_id,'canonicalCertificate',encode(mm.canonical_certificate,'hex')) order by mm.device_id)
+      from context_relay_private.membership_members mm where mm.workspace_id=p_workspace_id and mm.active));
+end;
+$$;
+revoke all on function public.service_revocation_verification_context(uuid,uuid,uuid,uuid) from public,anon,authenticated,service_role;
+grant execute on function public.service_revocation_verification_context(uuid,uuid,uuid,uuid) to service_role;
+
+create or replace function context_relay_private.revocation_receipt_json(r context_relay_private.device_revocation_receipts)
+returns jsonb language sql immutable security definer set search_path=''
+as $$ select jsonb_build_object('operationId',r.operation_id,'objectSha256',encode(r.object_sha256,'hex'),
+  'parent',jsonb_build_object('stateSha256',encode(r.parent_sha256,'hex'),'controlEpoch',r.control_epoch,'keyEpoch',r.key_epoch),
+  'successor',jsonb_build_object('stateSha256',encode(r.successor_sha256,'hex'),'controlEpoch',r.control_epoch+1,'keyEpoch',r.key_epoch+1)) $$;
+revoke all on function context_relay_private.revocation_receipt_json(context_relay_private.device_revocation_receipts) from public,anon,authenticated,service_role;
+
+create or replace function public.service_revocation_result(
+  p_auth_user_id uuid,p_session_id uuid,p_workspace_id uuid,p_device_id uuid,p_operation_id uuid,p_object_sha256 bytea
+) returns jsonb language plpgsql volatile security definer set search_path=''
+as $$
+declare r context_relay_private.device_revocation_receipts%rowtype;
+begin
+  perform context_relay_private.lock_current_membership_member(p_auth_user_id,p_session_id,p_workspace_id,p_device_id);
+  select * into r from context_relay_private.device_revocation_receipts where operation_id=p_operation_id;
+  if not found then return null;end if;
+  if r.workspace_id<>p_workspace_id or r.object_sha256<>p_object_sha256
+  then raise exception using errcode='40001',message='pairing_conflict';end if;
+  return context_relay_private.revocation_receipt_json(r);
+end;
+$$;
+revoke all on function public.service_revocation_result(uuid,uuid,uuid,uuid,uuid,bytea) from public,anon,authenticated,service_role;
+grant execute on function public.service_revocation_result(uuid,uuid,uuid,uuid,uuid,bytea) to service_role;
+
+create or replace function public.service_publish_revocation(
+  p_auth_user_id uuid,p_session_id uuid,p_workspace_id uuid,p_device_id uuid,p_operation_id uuid,p_target_device_id uuid,
+  p_control_epoch bigint,p_key_epoch bigint,p_cutoff_sequence bigint,p_cutoff_sha256 bytea,p_parent_sha256 bytea,
+  p_successor_sha256 bytea,p_object_sha256 bytea,p_signature bytea,p_canonical_object bytea
+) returns jsonb language plpgsql volatile security definer set search_path=''
+as $$
+declare h context_relay_private.membership_heads%rowtype; issuer context_relay_private.membership_members%rowtype;
+  target context_relay_private.membership_members%rowtype;r context_relay_private.device_revocation_receipts%rowtype;
+  sequence numeric;digest bytea;
+begin
+  if p_control_epoch not between 1 and 4294967294 or p_key_epoch not between 1 and 4294967294
+    or p_cutoff_sequence<0 or p_canonical_object is null or octet_length(p_canonical_object) not between 319 and 8388927
+    or p_signature is null or octet_length(p_signature)<>64
+    or p_object_sha256<>sha256(p_canonical_object)
+    or exists(select 1 from unnest(array[p_cutoff_sha256,p_parent_sha256,p_successor_sha256,p_object_sha256]) x where x is null or octet_length(x)<>32)
+    or (p_cutoff_sequence=0)<>(p_cutoff_sha256=decode(repeat('00',32),'hex'))
+  then raise exception using errcode='22023',message='invalid_pairing_request';end if;
+  issuer:=context_relay_private.lock_current_membership_member(p_auth_user_id,p_session_id,p_workspace_id,p_device_id);
+  select * into h from context_relay_private.membership_heads where workspace_id=p_workspace_id;
+  select * into r from context_relay_private.device_revocation_receipts where operation_id=p_operation_id;
+  if found then
+    if r.workspace_id<>p_workspace_id or r.auth_user_id<>p_auth_user_id or r.session_id<>p_session_id
+      or r.issuer_device_id<>p_device_id or r.target_device_id<>p_target_device_id or r.object_sha256<>p_object_sha256
+      or r.parent_sha256<>p_parent_sha256 or r.successor_sha256<>p_successor_sha256 or r.control_epoch<>p_control_epoch
+      or r.key_epoch<>p_key_epoch or r.cutoff_sequence<>p_cutoff_sequence or r.cutoff_sha256<>p_cutoff_sha256
+      or not exists(select 1 from context_relay_private.membership_events e where e.event_id=p_operation_id and e.canonical_object=p_canonical_object)
+    then raise exception using errcode='40001',message='pairing_conflict';end if;
+    return context_relay_private.revocation_receipt_json(r);
+  end if;
+  if h.state_sha256<>p_parent_sha256 or h.control_epoch<>p_control_epoch or h.key_epoch<>p_key_epoch
+  then raise exception using errcode='40001',message='pairing_conflict';end if;
+  select * into target from context_relay_private.membership_members where workspace_id=p_workspace_id and device_id=p_target_device_id for update;
+  if not found or not target.active then raise exception using errcode='40001',message='pairing_conflict';end if;
+  select o.device_sequence,o.canonical_sha256 into sequence,digest from public.sync_operations o
+    where o.account_id=h.account_id and o.workspace_id=p_workspace_id and o.device_id=p_target_device_id order by o.device_sequence desc limit 1;
+  if not found then sequence:=0;digest:=decode(repeat('00',32),'hex');end if;
+  if sequence<>p_cutoff_sequence or digest<>p_cutoff_sha256 then raise exception using errcode='40001',message='pairing_conflict';end if;
+  insert into context_relay_private.membership_events values(p_operation_id,p_workspace_id,p_parent_sha256,p_successor_sha256,p_canonical_object);
+  update context_relay_private.membership_members set active=false where workspace_id=p_workspace_id and device_id=p_target_device_id;
+  update context_relay_private.membership_heads set state_sha256=p_successor_sha256,control_epoch=p_control_epoch+1,key_epoch=p_key_epoch+1 where workspace_id=p_workspace_id;
+  update public.accounts set control_epoch=p_control_epoch+1,key_epoch=p_key_epoch+1,updated_at=clock_timestamp() where id=h.account_id;
+  update public.device_bindings set state='revoked',revoked_at=coalesce(revoked_at,clock_timestamp()),
+    cutoff_device_sequence=p_cutoff_sequence,cutoff_hash=p_cutoff_sha256,cutoff_signature=p_signature,
+    updated_at=clock_timestamp()
+    where account_id=h.account_id and device_id=p_target_device_id and state='active' and revoked_at is null;
+  insert into context_relay_private.device_revocation_receipts values(p_operation_id,p_workspace_id,p_auth_user_id,p_session_id,
+    p_device_id,p_target_device_id,p_object_sha256,p_parent_sha256,p_successor_sha256,p_cutoff_sequence,p_cutoff_sha256,p_control_epoch,p_key_epoch)
+    returning * into r;
+  return context_relay_private.revocation_receipt_json(r);
+end;
+$$;
+revoke all on function public.service_publish_revocation(uuid,uuid,uuid,uuid,uuid,uuid,bigint,bigint,bigint,bytea,bytea,bytea,bytea,bytea,bytea) from public,anon,authenticated,service_role;
+grant execute on function public.service_publish_revocation(uuid,uuid,uuid,uuid,uuid,uuid,bigint,bigint,bigint,bytea,bytea,bytea,bytea,bytea,bytea) to service_role;
+
 -- Pairing now authorizes the current canonical membership, including admitted issuers.
 create or replace function public.service_create_pairing_invite(
   p_auth_user_id uuid,p_session_id uuid,p_workspace_id uuid,p_device_id uuid,

@@ -3,8 +3,10 @@ import { exact, uuid, hex, timestamp } from '../enrollment/core.mjs';
 import { verifyPairingRequest } from './crypto.mjs';
 import { verifyPairingApproval } from './approval.mjs';
 import { verifyPairingDeviceProof } from './proof.mjs';
+import { verifyRevocationObject } from './revocation.mjs';
 
 const MAX_BYTES = 68 * 1024;
+const REVOCATION_BYTES = 16_778_878;
 const codes = {auth_required:401,invalid_request:400,invalid_pairing_request:400,request_too_large:413,
   method_not_allowed:405,pairing_denied:403,pairing_conflict:409,pairing_expired:410,
   pairing_canceled:409,pairing_rejected:409,pairing_rate_limited:429};
@@ -17,6 +19,10 @@ const fields = {create:['workspaceId','deviceId'],resolve:['code'],status:scoped
   submit:['canonicalRequest','proof'],approve:[...scoped,'canonicalApprovedPayload','proof'],
   reject:[...scoped,'requestDigest'],result:['pairingId','requestDigest'],
   membership_endpoint:['workspaceId','deviceId'],
+  membership_object:['workspaceId','deviceId','kind','address'],
+  revocation_context:['workspaceId','deviceId','targetDeviceId'],
+  revocation_result:['workspaceId','deviceId','operationId','objectSha256'],
+  publish_revocation:['workspaceId','deviceId','object'],
   membership_enrollment:['pairingId','requestDigest','address'],
   membership_event:['pairingId','requestDigest','address']};
 const locator = value => {
@@ -64,16 +70,19 @@ export function createPairingEdgeHandler(dependencies) {
     try {
       if (request.method!=='POST') fail('method_not_allowed');
       if (request.headers.get('content-type')?.split(';',1)[0].trim()!=='application/json') fail('invalid_request');
+      const publication=new URL(request.url).pathname.endsWith('/revocation-publish');
+      const requestLimit=publication?REVOCATION_BYTES:MAX_BYTES;
       const length=request.headers.get('content-length');
       if (length!==null) {
         if (!/^(0|[1-9][0-9]*)$/.test(length)) fail('invalid_request');
-        if (BigInt(length)>BigInt(MAX_BYTES)) fail('request_too_large');
+        if (BigInt(length)>BigInt(requestLimit)) fail('request_too_large');
       }
       let body;
-      try { body=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(await readBoundedBody(request,MAX_BYTES))); }
+      try { body=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(await readBoundedBody(request,requestLimit))); }
       catch (error) { fail(error?.code==='request_too_large' ? error.code : 'invalid_request'); }
       if (!body || body.v!==1 || typeof body.action!=='string' || !Object.hasOwn(fields,body.action)
         || !exact(body,['v','action',...fields[body.action],...(body.action==='approve' && Object.hasOwn(body,'membershipSignature')?['membershipSignature']:[])])) fail('invalid_request');
+      if(publication!==(body.action==='publish_revocation')) fail('invalid_request');
       const scope=Object.hasOwn(body,'workspaceId') ? {workspaceId:uuid(body.workspaceId),deviceId:uuid(body.deviceId)} : null;
       const pairingId=Object.hasOwn(body,'pairingId') ? uuid(body.pairingId) : null;
       const requestDigest=Object.hasOwn(body,'requestDigest') ? toHex(hex(body.requestDigest,32)) : null;
@@ -94,6 +103,37 @@ export function createPairingEdgeHandler(dependencies) {
         if (endpoint.stateSha256==='00'.repeat(32)) fail('invalid_request');
         for(const key of ['controlEpoch','keyEpoch']) if(!Number.isInteger(endpoint[key]) || endpoint[key]<1 || endpoint[key]>0xffffffff) fail('invalid_request');
         return response(200,{v:1,endpoint:{...endpoint}});
+      }
+      if(body.action==='membership_object') {
+        if(!['enrollment','event'].includes(body.kind)) fail('invalid_request');
+        const address=toHex(hex(body.address,32));
+        const object=await dependencies.acceptedMembershipObject(identity,scope,body.kind,address);
+        if(object!==null) hex(object,1,16*1024*1024);
+        return response(200,{v:1,object});
+      }
+      if(body.action==='revocation_context') {
+        const targetDeviceId=uuid(body.targetDeviceId);
+        const value=await dependencies.revocationContext(identity,scope,targetDeviceId);
+        if(!exact(value,['endpoint','targetDeviceId','head'])||value.targetDeviceId!==targetDeviceId
+          ||!exact(value.head,['sequence','canonicalSha256'])) fail('invalid_request');
+        hex(value.endpoint.stateSha256,32);hex(value.head.canonicalSha256,32);timestamp(value.head.sequence);
+        if(value.endpoint.stateSha256==='00'.repeat(32)) fail('invalid_request');
+        for(const key of ['controlEpoch','keyEpoch']) if(!Number.isInteger(value.endpoint[key])||value.endpoint[key]<1||value.endpoint[key]>0xffffffff) fail('invalid_request');
+        if((value.head.sequence==='0')!==(value.head.canonicalSha256==='00'.repeat(32))) fail('invalid_request');
+        return response(200,{v:1,...value});
+      }
+      if(body.action==='revocation_result') {
+        const operationId=uuid(body.operationId),objectSha256=toHex(hex(body.objectSha256,32));
+        const value=await dependencies.revocationResult(identity,scope,operationId,objectSha256);
+        return response(200,{v:1,receipt:revocationReceipt(value,operationId,objectSha256)});
+      }
+      if(body.action==='publish_revocation') {
+        const object=hex(body.object,319,8388927);
+        const trusted=await dependencies.revocationVerificationContext(identity,scope);
+        const parsed=await verified(()=>verifyRevocationObject(object,trusted));
+        const value=await dependencies.publishRevocation(identity,scope,parsed);
+        if(value===null) fail('pairing_conflict');
+        return response(200,{v:1,receipt:revocationReceipt(value,parsed.operationId,toHex(parsed.objectSha256))});
       }
       if (body.action==='membership_enrollment' || body.action==='membership_event') {
         const address=toHex(hex(body.address,32));
@@ -159,4 +199,16 @@ export function createPairingEdgeHandler(dependencies) {
       return response(codes[code]??503,{v:1,error:code});
     }
   };
+}
+
+function revocationReceipt(value,operationId,objectSha256) {
+  if(value===null) return null;
+  if(!exact(value,['operationId','objectSha256','parent','successor'])||value.operationId!==operationId||value.objectSha256!==objectSha256) fail('pairing_conflict');
+  for(const endpoint of [value.parent,value.successor]) {
+    if(!exact(endpoint,['stateSha256','controlEpoch','keyEpoch'])) fail('invalid_request');
+    hex(endpoint.stateSha256,32);
+    if(endpoint.stateSha256==='00'.repeat(32)) fail('invalid_request');
+    for(const key of ['controlEpoch','keyEpoch']) if(!Number.isInteger(endpoint[key])||endpoint[key]<1||endpoint[key]>0xffffffff) fail('invalid_request');
+  }
+  return {...value,parent:{...value.parent},successor:{...value.successor}};
 }

@@ -123,7 +123,7 @@ impl Drop for TempVault {
 
 pub fn remove_membership_material_migration(connection: &Connection) {
     // Downgrade fixtures must also remove all tables introduced after schema41.
-    connection.execute_batch("DROP TABLE IF EXISTS recovery_v2_conflict; DROP TABLE IF EXISTS recovery_history_selection; DROP TABLE IF EXISTS recovery_history_targets; DROP TABLE IF EXISTS recovery_v2_admission; DROP TABLE IF EXISTS recovery_v2_history_keys; DROP TABLE IF EXISTS recovery_v2_parent_objects; DROP TABLE IF EXISTS recovery_v2_prepared;").unwrap();
+    connection.execute_batch("DROP TABLE IF EXISTS recovery_v2_supplemental_history_keys; DROP TABLE IF EXISTS recovery_v2_conflict; DROP TABLE IF EXISTS recovery_history_selection; DROP TABLE IF EXISTS recovery_history_targets; DROP TABLE IF EXISTS recovery_v2_admission; DROP TABLE IF EXISTS recovery_v2_history_keys; DROP TABLE IF EXISTS recovery_v2_parent_objects; DROP TABLE IF EXISTS recovery_v2_prepared;").unwrap();
     connection.execute_batch("DROP TABLE IF EXISTS pairing_v2_public_objects; DROP TABLE IF EXISTS pairing_v2_transcripts;").unwrap();
     connection.execute_batch("DROP TABLE IF EXISTS historical_verified_operations; DROP TABLE IF EXISTS historical_reconstructions; DROP TABLE IF EXISTS historical_operation_evidence; DROP TABLE IF EXISTS membership_current_activation; DROP TABLE IF EXISTS historical_transfer_selection; DROP TABLE IF EXISTS historical_transfer_pages; DROP TABLE IF EXISTS historical_transfers; DROP TABLE IF EXISTS membership_confirmed_admission; DROP TABLE IF EXISTS membership_root_material_seed; DROP TABLE IF EXISTS membership_epoch_secrets;").unwrap();
 }

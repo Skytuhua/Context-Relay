@@ -249,7 +249,10 @@ pub fn role_allows(role: ClientRole, request: &LocalRequest) -> bool {
         LocalRequest::SyncRetry(_) => matches!(role, Desktop),
         LocalRequest::DevicesList(_) => matches!(role, Desktop),
         LocalRequest::DeviceRename(_) => matches!(role, Desktop),
-        LocalRequest::DeviceRevoke(_) => matches!(role, Desktop),
+        LocalRequest::DeviceRevoke(_)
+        | LocalRequest::DeviceRevocationStatus(_)
+        | LocalRequest::DeviceRevocationCancel(_)
+        | LocalRequest::DeviceRevocationIntents(_) => matches!(role, Desktop),
         LocalRequest::PairingCreate(_) => matches!(role, Desktop),
         LocalRequest::PairingJoin(_) => matches!(role, Desktop),
         LocalRequest::PairingStatus(_) => matches!(role, Desktop),

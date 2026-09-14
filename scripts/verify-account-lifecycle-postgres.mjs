@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import test, { before, after } from 'node:test';
+import { readFileSync } from 'node:fs';
 
 // Run only against an explicitly selected disposable, loopback PostgreSQL instance.
 assert.equal(process.env.CONTEXT_RELAY_DISPOSABLE_POSTGRES, '1');
@@ -22,6 +23,8 @@ async function sql(query, application = 'context-relay-lifecycle-test') {
   return result.stdout.trim();
 }
 const id = () => randomUUID().replace(/^(.{14})./, (_, prefix) => `${prefix}7`);
+const enrollmentTemplate = Buffer.from(JSON.parse(readFileSync(new URL('../crates/core/tests/fixtures/hosted-pairing-approval-v2.json', import.meta.url),'utf8')).canonicalEnrollment,'hex');
+const uuidBytes = value => Buffer.from(value.replaceAll('-',''),'hex');
 
 // Supabase's postgres role is not a superuser. Fixture administration needs
 // temporary owner membership; RPC assertions still explicitly SET ROLE service_role.
@@ -119,19 +122,34 @@ async function enrollmentFixture() {
 }
 
 // Synthetic decoded fields exercise the SQL transaction, not Edge cryptography.
-function enrollmentCommit(f, reservation, certificate = id()) {
+function enrollmentRecord(reservation, enrollment, root, certificate, device, changedRecord = false) {
+  const canonical=Buffer.from(enrollmentTemplate);
+  for (const [offset,value] of [[5,enrollment],[23,root],[41,reservation.accountId],[59,reservation.workspaceId],[147,certificate],
+    [206,reservation.accountId],[224,reservation.workspaceId],[279,device]]) uuidBytes(value).copy(canonical,offset);
+  for (const [offset,value] of [[78,0x44],[113,0x45],[172,0x44],[245,0x43],[298,0x46],[333,0x47]]) canonical.fill(value,offset,offset+32);
+  canonical.fill(0x48,368,432);
+  if (changedRecord) canonical[canonical.length - 1] ^= 1;
+  return canonical;
+}
+
+function enrollmentCommit(f, reservation, certificate = id(), changedRecord = false) {
+  const enrollment=id(),root=id(),device=id();
+  const canonical=enrollmentRecord(reservation,enrollment,root,certificate,device,changedRecord);
   return `set role service_role; select public.service_commit_enrollment_for_session(
     '${f.user}','${f.session}','${reservation.reservationId}',decode('${reservation.nonce}','hex'),
-    '${reservation.accountId}','${reservation.workspaceId}','${id()}','${id()}','${certificate}','${id()}',
+    '${reservation.accountId}','${reservation.workspaceId}','${enrollment}','${root}','${certificate}','${device}',
     decode(repeat('43',32),'hex'),decode(repeat('44',32),'hex'),decode(repeat('45',32),'hex'),
     decode(repeat('46',32),'hex'),decode(repeat('47',32),'hex'),decode(repeat('48',64),'hex'),
-    decode(repeat('49',80),'hex'),decode('010203','hex'));`;
+    decode(repeat('49',80),'hex'),decode('${canonical.toString('hex')}','hex'));`;
 }
 
 async function pairingDecisionFixture(code = '42') {
   const f = await enrollmentFixture(), joining = randomUUID(), pairing = id(), child = id(), certificate = id();
   const reservation = JSON.parse(await sql(f.request()));
   await sql(enrollmentCommit(f, reservation));
+  const membership = JSON.parse(await sql(`select json_build_object(
+    'state',encode(state_sha256,'hex'),'enrollment',encode(enrollment_sha256,'hex'))
+    from context_relay_private.membership_heads where workspace_id='${reservation.workspaceId}'`));
   const device = await sql(`select device_id from public.device_bindings where session_id='${f.session}'`);
   await sql(`set role service_role; select public.service_create_pairing_invite('${f.user}','${f.session}',
     '${reservation.workspaceId}','${device}','${pairing}',decode(repeat('${code}',32),'hex'));`);
@@ -139,9 +157,11 @@ async function pairingDecisionFixture(code = '42') {
   await sql(`set role service_role; select public.service_resolve_pairing_code('${f.user}','${joining}',decode(repeat('${code}',32),'hex'));`);
   const receipt = JSON.parse(await sql(`set role service_role; select public.service_submit_pairing_request('${f.user}','${joining}','${pairing}',
     decode('010203','hex'),decode(repeat('51',32),'hex'),decode(repeat('52',32),'hex'));`));
-  const decide = (action = 'approve', payload = '040506') => `set role service_role; select public.service_decide_pairing_request(
+  const decide = (action = 'approve', payload = '040506') => `set role service_role; select public.service_decide_pairing_request_v2(
     '${f.user}','${f.session}','${reservation.workspaceId}','${device}','${pairing}',decode('${receipt.requestDigest}','hex'),
-    '${action}',1,1,${action === 'approve' ? `decode('${payload}','hex'),'${certificate}','${child}',decode(repeat('53',32),'hex'),decode(repeat('54',64),'hex')` : 'null,null,null,null,null'});`;
+    '${action}',1,1,${action === 'approve' ? `decode('${payload}','hex'),'${certificate}','${child}',decode(repeat('53',32),'hex'),decode(repeat('54',64),'hex')` : 'null,null,null,null,null'},
+    decode('${membership.state}','hex'),decode('${membership.enrollment}','hex'),
+    ${action === 'approve' ? "decode(repeat('55',64),'hex'),decode('040506','hex')" : 'null,null'});`;
   return { ...f, joining, pairing, child, certificate, reservation, decide,
     result: `set role service_role; select public.service_pairing_result_for_session('${f.user}','${joining}','${pairing}',decode('${receipt.requestDigest}','hex'));`,
     cleanup: async () => { await sql(`delete from auth.sessions where id='${joining}'`); await f.cleanup(); } };
@@ -194,11 +214,11 @@ test('pairing verification context selects original server authority and retains
     assert.equal(projection.trusted.controlEpoch, 1);
     assert.equal(projection.trusted.keyEpoch, 1);
     assert.equal(projection.trusted.issuerSigningKey, '46'.repeat(32));
-    assert.equal(projection.trusted.recoverySigningKey, '44'.repeat(32));
+    assert.equal(projection.trusted.issuerCertificate.length > 0, true);
     await assert.rejects(sql(context.replace(f.session,f.joining)), /pairing_denied/);
     await assert.rejects(sql(context.replace(f.reservation.workspaceId,id())), /pairing_denied/);
     await sql(`update public.recovery_roots set revoked_at=clock_timestamp() where account_id='${f.reservation.accountId}'`);
-    await assert.rejects(sql(context), /pairing_denied/);
+    assert.deepEqual(JSON.parse(await sql(context)), projection);
     await sql(`update public.recovery_roots set revoked_at=null where account_id='${f.reservation.accountId}'`);
     const receipt = JSON.parse(await sql(f.decide()));
     await sql(`update public.recovery_roots set revoked_at=clock_timestamp() where account_id='${f.reservation.accountId}'`);
@@ -396,7 +416,7 @@ test('pairing cancellation is final, owner-session-bound and survives its origin
       assert.equal(JSON.parse(await sql(control('status'))).state, state);
     }
     await sql(`update public.recovery_roots set revoked_at=clock_timestamp() where account_id='${reservation.accountId}'`);
-    await assert.rejects(sql(control('status')), /pairing_denied/);
+    assert.equal(JSON.parse(await sql(control('status'))).state, 'rejected');
   } finally {
     await sql(`delete from auth.sessions where id='${joining}'`);
     await f.cleanup();
@@ -558,9 +578,12 @@ test('recovery snapshot allows a fresh owner session without granting device tru
     const receipt = JSON.parse(await sql(enrollmentCommit(f, reservation)));
     await sql(`insert into auth.sessions(id,user_id) values ('${fresh}','${f.user}');`);
     const value = JSON.parse(await sql(snapshot()));
-    assert.deepEqual(value, { accountId: reservation.accountId, workspaceId: reservation.workspaceId,
-      canonicalRecord: '010203', canonicalRecordSha256: receipt.canonicalRecordSha256,
-      registeredAtMs: receipt.registeredAtMs, recoveryGeneration: '0' });
+    assert.equal(createHash('sha256').update(Buffer.from(value.canonicalRecord, 'hex')).digest('hex'), receipt.canonicalRecordSha256);
+    assert.equal(value.accountId, reservation.accountId);
+    assert.equal(value.workspaceId, reservation.workspaceId);
+    assert.equal(value.canonicalRecordSha256, receipt.canonicalRecordSha256);
+    assert.equal(value.registeredAtMs, receipt.registeredAtMs);
+    assert.equal(value.recoveryGeneration, '0');
     assert.equal(await sql(`select count(*) from public.device_bindings where session_id='${fresh}'`), '0');
     assert.equal(JSON.parse(await sql(snapshot(other.user, other.session))), null);
     await assert.rejects(sql(snapshot(f.user, other.session)), /enrollment_session_denied/);
@@ -766,7 +789,7 @@ test('enrollment commit is atomic, exact on retry, and rejects changed records',
     assert.deepEqual(JSON.parse(await sql(statusRequest)).receipt, receipt);
     await assert.rejects(sql(statusRequest.replace(first.session, second.session)), /enrollment_reservation_denied/);
     await assert.rejects(sql(statusRequest.replace('set role service_role', 'set role authenticated')), /permission denied/);
-    await assert.rejects(sql(request.replace("decode('010203'", "decode('010204'")), /enrollment_conflict/);
+    await assert.rejects(sql(enrollmentCommit(first, reservation, certificate, true)), /enrollment_conflict/);
     assert.equal(await sql(`select count(*) from public.device_bindings
       where auth_user_id='${first.user}' and state='active'`), '1');
     assert.equal(await sql(`select control_epoch||':'||key_epoch from public.accounts

@@ -7,6 +7,9 @@ import type {
   DecimalTimestamp,
   DeviceId,
   DeviceSummary,
+  DeviceRevocationStatus,
+  DeviceRevocationSummary,
+  OperationId,
   PairingCode,
   PairingId,
   PairingSafetyNumber,
@@ -37,6 +40,7 @@ const safety = '0123-4567-89AB-CDEF-0123' as PairingSafetyNumber;
 const createdAt = '1000' as DecimalTimestamp;
 const expiresAt = '601000' as DecimalTimestamp;
 const enrollmentId = '018f22e2-79b0-7cc8-98c4-dc0c0c076001' as RecoveryEnrollmentId;
+const revocationId = '018f22e2-79b0-7cc8-98c4-dc0c0c077001' as OperationId;
 const recoveryCreatedAt = '1000' as DecimalTimestamp;
 const recoveryExpiresAt = '601000' as DecimalTimestamp;
 const recoveryCanaries = ['abandon', 'ability', 'able', 'about'];
@@ -125,6 +129,38 @@ class FakeDeviceGateway implements DeviceGateway {
   recoveryCancelCalls: RecoveryEnrollmentId[] = [];
   recoveryCancelError: unknown = null;
   recoveryOverviewCalls = 0;
+  revocationStatusValue: DeviceRevocationStatus = {
+    operationId: revocationId,
+    deviceId: joinerId,
+    sendCanceled: false,
+    access: 'ready',
+    outcome: { state: 'unconfirmed' },
+  };
+  revocationCalls: Array<{ operationId: OperationId; deviceId: DeviceId }> = [];
+  revocationStatusCalls: OperationId[] = [];
+  revocationCancelCalls: OperationId[] = [];
+  revocationIntentsValue: DeviceRevocationSummary[] = [];
+  revocationIntentCalls: Array<OperationId | null> = [];
+
+  async revokeDevice(operationId: OperationId, deviceId: DeviceId) {
+    this.revocationCalls.push({ operationId, deviceId });
+    return { ...this.revocationStatusValue, operationId, deviceId };
+  }
+
+  async deviceRevocationStatus(operationId: OperationId) {
+    this.revocationStatusCalls.push(operationId);
+    return { ...this.revocationStatusValue, operationId };
+  }
+
+  async cancelDeviceRevocation(operationId: OperationId) {
+    this.revocationCancelCalls.push(operationId);
+    return { ...this.revocationStatusValue, operationId, sendCanceled: true };
+  }
+
+  async deviceRevocationIntents(after: OperationId | null) {
+    this.revocationIntentCalls.push(after);
+    return after === null ? this.revocationIntentsValue : [];
+  }
 
   async devices() {
     this.devicesCalls += 1;
@@ -235,6 +271,65 @@ afterEach(() => {
 });
 
 describe('DevicesScreen', () => {
+  it('requires explicit revocation confirmation and keeps an uncertain operation for status', async () => {
+    const gateway = new FakeDeviceGateway();
+    gateway.devicesValue = [currentDevice, { ...joiningDevice, isCurrent: false }];
+    render(<DevicesScreen gateway={gateway} pollIntervalMs={60_000} />);
+
+    await screen.findByText('Travel Mac');
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke Travel Mac' }));
+    const dialog = screen.getByRole('dialog', { name: 'Revoke device' });
+    expect(within(dialog).getByText(/Travel Mac will lose access/)).toBeVisible();
+    expect(gateway.revocationCalls).toHaveLength(0);
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Revoke device' }));
+    await within(dialog).findByText('The revocation outcome is not confirmed.');
+    expect(gateway.revocationCalls).toHaveLength(1);
+    expect(gateway.devicesCalls).toBe(1);
+
+    gateway.revocationStatusValue = {
+      ...gateway.revocationStatusValue,
+      outcome: {
+        state: 'accepted',
+        acceptedEndpoint: { stateSha256: '11'.repeat(32) as Sha256Digest, controlEpoch: 2, keyEpoch: 2 },
+      },
+    };
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Check revocation status' }));
+    await within(dialog).findByText('Revocation accepted.');
+    expect(gateway.revocationStatusCalls).toEqual([gateway.revocationCalls[0].operationId]);
+    await waitFor(() => expect(gateway.devicesCalls).toBe(2));
+  });
+
+  it('shows current and final-device consequences before revocation', async () => {
+    const gateway = new FakeDeviceGateway();
+    render(<DevicesScreen gateway={gateway} pollIntervalMs={60_000} />);
+    await screen.findByText('Current Mac');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke Current Mac' }));
+    const dialog = screen.getByRole('dialog', { name: 'Revoke device' });
+    expect(within(dialog).getByText(/current device will immediately lose access/i)).toBeVisible();
+    expect(within(dialog).getByText(/last trusted device/i)).toBeVisible();
+    expect(gateway.revocationCalls).toHaveLength(0);
+  });
+
+  it('discovers retained revocation attempts after restart and refreshes the same operation', async () => {
+    const gateway = new FakeDeviceGateway();
+    gateway.devicesValue = [currentDevice, { ...joiningDevice, isCurrent: false }];
+    gateway.revocationIntentsValue = [gateway.revocationStatusValue];
+    render(<DevicesScreen gateway={gateway} pollIntervalMs={60_000} />);
+
+    const review = await screen.findByRole('button', {
+      name: 'Review saved revocation for Travel Mac',
+    });
+    await waitFor(() => expect(gateway.revocationIntentCalls).toEqual([null, revocationId]));
+
+    fireEvent.click(review);
+    const dialog = screen.getByRole('dialog', { name: 'Revoke device' });
+    expect(within(dialog).getByText('The revocation outcome is not confirmed.')).toBeVisible();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Check revocation status' }));
+    await waitFor(() => expect(gateway.revocationStatusCalls).toEqual([revocationId]));
+  });
+
   it('shows only the four challenged recovery words and confirms the exact projection', async () => {
     const gateway = new FakeDeviceGateway();
     render(<DevicesScreen gateway={gateway} pollIntervalMs={60_000} />);

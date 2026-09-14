@@ -6,6 +6,9 @@ import type {
   CandidateId,
   DesktopWrite,
   DesktopWritesPage,
+  DeviceId,
+  DeviceRevocationStatus,
+  DeviceRevocationSummary,
   HarnessParams,
   HarnessPrepareParams,
   HarnessExecutionParams,
@@ -40,7 +43,7 @@ import type {
   TaskStatus,
 } from './bindings';
 import { LocalClient } from './local-client';
-import { validateAccountDeletion, validateAccountDeletionIntents, validateHostedAuthStatus, validateRecoveryRestoreStatus, validateRecoveryHistoryCandidates } from './protocol-validation';
+import { validateAccountDeletion, validateAccountDeletionIntents, validateDeviceRevocationIntents, validateDeviceRevocationStatus, validateHostedAuthStatus, validateRecoveryRestoreStatus, validateRecoveryHistoryCandidates } from './protocol-validation';
 import { uuidV7 } from './uuid';
 import { type HarnessGateway, requireHarnessAcknowledgment, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
 import { validateConnectionCheckStatus, validateHarnessPreparation, validateHarnessExecution, validateHarnessSetupRecord, validateHarnessSetupsPage, validateSearchIndexStatus } from './protocol-validation';
@@ -83,6 +86,10 @@ export interface DeviceGateway {
   recoveryRestoreResume(): Promise<RecoveryRestoreStatus>;
   recoveryRestoreCancel(): Promise<RecoveryRestoreStatus>;
   devices(): Promise<Extract<LocalResult, { kind: 'devices' }>['data']['devices']>;
+  revokeDevice(operationId: OperationId, deviceId: DeviceId): Promise<DeviceRevocationStatus>;
+  deviceRevocationStatus(operationId: OperationId): Promise<DeviceRevocationStatus>;
+  cancelDeviceRevocation(operationId: OperationId): Promise<DeviceRevocationStatus>;
+  deviceRevocationIntents(after: OperationId | null): Promise<DeviceRevocationSummary[]>;
   createPairingInvite(): Promise<PairingInviteResult>;
   joinPairing(code: PairingCode, deviceName: string): Promise<PairingRequestResult>;
   pairingStatus(pairingId: PairingId): Promise<PairingStatusResult>;
@@ -449,6 +456,35 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
   async recoveryRestoreBegin() {
     const status = await this.client.recoveryRestoreBegin();
     return status === null ? null : validateRecoveryRestoreStatus(status);
+  }
+
+  private async revocation(request: Extract<LocalRequest, { method: 'device_revoke' | 'device_revocation_status' | 'device_revocation_cancel' }>) {
+    const result = await this.call(request);
+    const status = validateDeviceRevocationStatus(controlResult(result, 'device_revocation', 'status'));
+    if (status.operationId !== request.params.operationId) {
+      throw new Error('The revocation attempt identity changed.');
+    }
+    if (request.method === 'device_revoke' && status.deviceId !== request.params.deviceId) {
+      throw new Error('The revocation target changed.');
+    }
+    return status;
+  }
+
+  revokeDevice(operationId: OperationId, deviceId: DeviceId) {
+    return this.revocation({ method: 'device_revoke', params: { operationId, deviceId } });
+  }
+
+  deviceRevocationStatus(operationId: OperationId) {
+    return this.revocation({ method: 'device_revocation_status', params: { operationId } });
+  }
+
+  cancelDeviceRevocation(operationId: OperationId) {
+    return this.revocation({ method: 'device_revocation_cancel', params: { operationId } });
+  }
+
+  async deviceRevocationIntents(after: OperationId | null) {
+    const result = await this.call({ method: 'device_revocation_intents', params: { after } });
+    return validateDeviceRevocationIntents(controlResult(result, 'device_revocation_intents', 'intents'), after);
   }
   async recoveryHistoryCandidates(params: RecoveryHistoryCandidatesParams) {
     const page = validateRecoveryHistoryCandidates(controlResult(await this.call({ method: 'recovery_history_candidates', params }), 'recovery_history_candidates', 'page'));

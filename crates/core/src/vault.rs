@@ -59,7 +59,7 @@ pub use sync::*;
 mod semantic_index;
 pub use semantic_index::{SemanticIndexBatch, SemanticIndexProgress};
 
-pub const LATEST_SCHEMA_VERSION: u32 = 47;
+pub const LATEST_SCHEMA_VERSION: u32 = 48;
 pub const MAX_NATIVE_HOOK_SESSIONS: usize = 256;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
@@ -2579,6 +2579,18 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
                 "../migrations/0047_recovery_history_key_repair.sql"
             ))
             .and_then(|_| transaction.pragma_update(None, "user_version", 47))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 48 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0048_device_revocation_coordination.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 48))
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }

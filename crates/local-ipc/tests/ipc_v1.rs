@@ -243,13 +243,13 @@ fn verify_server_proof(
 
 #[test]
 fn challenged_hmac_matches_frozen_vector() {
-    // The protocol bytes are part of the authenticated transcript. These 1.16
+    // The protocol bytes are part of the authenticated transcript. These 1.17
     // client/server vectors were independently checked with Python stdlib HMAC-SHA256.
     assert_eq!(
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 16
+            minor: 17
         }
     );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
@@ -264,7 +264,7 @@ fn challenged_hmac_matches_frozen_vector() {
 
     assert_eq!(
         serde_json::to_string(&proof).unwrap(),
-        r#""KqDtkeB5xlfQCGpuFKYWQJPwsbl7oTMetegDhgcgGco""#
+        r#""1qXKEY6LA-7UsGcapNvVRKClen4p-XfxBd6BjBqRrR4""#
     );
     assert!(
         verify_proof(
@@ -452,7 +452,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 16
+            minor: 17
         }
     );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
@@ -476,7 +476,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
 
     assert_eq!(
         serde_json::to_string(&server_proof).unwrap(),
-        r#""MgwxHs2zCEKw5hZ6qH6WM5KGseRxd58AWtP9915DZTg""#
+        r#""QrC7s-X8532Ul_P4D3WOZz4HjVMbBJkcJBW23gzTrGY""#
     );
     assert!(
         verify_server_proof(
@@ -997,7 +997,31 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
         ),
         (
             "DeviceRevoke",
-            request_fixture("device_revoke", serde_json::json!({"deviceId": ID})),
+            request_fixture(
+                "device_revoke",
+                serde_json::json!({"operationId": ID, "deviceId": ID}),
+            ),
+        ),
+        (
+            "DeviceRevocationStatus",
+            request_fixture(
+                "device_revocation_status",
+                serde_json::json!({"operationId": ID}),
+            ),
+        ),
+        (
+            "DeviceRevocationCancel",
+            request_fixture(
+                "device_revocation_cancel",
+                serde_json::json!({"operationId": ID}),
+            ),
+        ),
+        (
+            "DeviceRevocationIntents",
+            request_fixture(
+                "device_revocation_intents",
+                serde_json::json!({"after": null}),
+            ),
         ),
         ("PairingCreate", request_fixture("pairing_create", empty())),
         (
@@ -1161,7 +1185,7 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
 #[test]
 fn role_allowlist_covers_core_and_tracked_setup_requests() {
     let fixtures = all_request_fixtures();
-    assert_eq!(fixtures.len(), 71);
+    assert_eq!(fixtures.len(), 74);
 
     for (name, request) in &fixtures {
         let common = matches!(*name, "Cancel" | "Health");
@@ -1224,7 +1248,7 @@ fn role_allowlist_covers_core_and_tracked_setup_requests() {
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::Desktop, request))
             .count(),
-        66
+        69
     );
     assert_eq!(
         fixtures

@@ -1,5 +1,5 @@
 import Ajv2020 from 'ajv/dist/2020.js';
-import type { AccountDeletionIntentSummary, LocalResult, OperationId, HostedAuthStatus, RecoveryRestoreStatus, RecoveryHistoryCandidatesPage } from './bindings';
+import type { AccountDeletionIntentSummary, DeviceRevocationStatus, DeviceRevocationSummary, LocalResult, OperationId, HostedAuthStatus, RecoveryRestoreStatus, RecoveryHistoryCandidatesPage } from './bindings';
 
 import type { ConnectionCheckStatus, HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SearchIndexStatus, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
 
@@ -102,6 +102,31 @@ function recoveryEndpoint(value: unknown) {
   nonzeroSha(endpoint.stateSha256); uint(endpoint.controlEpoch, 0xffff_ffff, 'control epoch'); uint(endpoint.keyEpoch, 0xffff_ffff, 'key epoch');
   if (!endpoint.controlEpoch || !endpoint.keyEpoch) fail('recovery epoch');
   return endpoint;
+}
+function revocationStatus(value: unknown, field: string) {
+  const status = object(value, ['operationId', 'deviceId', 'sendCanceled', 'access', 'outcome'], field);
+  id(status.operationId, `${field}.operationId`);
+  id(status.deviceId, `${field}.deviceId`);
+  choice(status.sendCanceled, [true, false], `${field}.sendCanceled`);
+  choice(status.access, ['ready', 'original_auth_required'], `${field}.access`);
+  const state = status.outcome && (status.outcome as Record<string, unknown>).state;
+  choice(state, ['prepared', 'submitting', 'unconfirmed', 'accepted', 'conflict', 'canceled_before_send'], `${field}.outcome`);
+  const outcome = object(status.outcome, state === 'accepted' ? ['state', 'acceptedEndpoint'] : ['state'], `${field}.outcome`);
+  if (state === 'accepted') recoveryEndpoint(outcome.acceptedEndpoint);
+  return status;
+}
+export function validateDeviceRevocationStatus(value: unknown): DeviceRevocationStatus {
+  revocationStatus(value, 'device revocation');
+  return value as DeviceRevocationStatus;
+}
+export function validateDeviceRevocationIntents(value: unknown, after: OperationId | null): DeviceRevocationSummary[] {
+  let previous = after ?? '';
+  for (const item of list(value, 50, 'device revocations')) {
+    const summary = revocationStatus(item, 'device revocation');
+    if ((summary.operationId as string) <= previous) fail('device revocation cursor');
+    previous = summary.operationId as string;
+  }
+  return value as DeviceRevocationSummary[];
 }
 export function validateRecoveryHistoryCandidates(value: unknown): RecoveryHistoryCandidatesPage {
   const page = object(value, ['restoreId', 'acceptedEndpoint', 'candidates', 'nextCursor'], 'recovery page');
