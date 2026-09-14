@@ -15,3 +15,7 @@ b357b29ad4379fae191a288fb653dd55e69f340c:crates/core/src/hermes/yaml.rs:private-
 1d1ee66c443e50d824ea10224e9f1e517582592d:crates/core/tests/fixtures/hosted-pairing-approval-v1.json:generic-api-key:8
 1d1ee66c443e50d824ea10224e9f1e517582592d:crates/core/tests/fixtures/hosted-pairing-approval-v1.json:generic-api-key:10
 f4ab27c7edb4d5402d96ea21d62cf51a4c25f46e:docs/protocols/historical-key-transfer-v1.md:generic-api-key:128
+924348a36900e89df6bc8b41fa6162127c24b8b3:crates/core/tests/fixtures/hosted-recovery-claim-v2.json:generic-api-key:2
+924348a36900e89df6bc8b41fa6162127c24b8b3:crates/core/tests/fixtures/hosted-pairing-approval-v2.json:generic-api-key:19
+7d736642caeec1e4d71cc3d0421df6a471247486:crates/core/src/vault/membership/activation.rs:generic-api-key:92
+6c3bd9807dce57eecf8335da9730048c8f156942:docs/verification/pr16-windows-shared-acceptance.csv:generic-api-key:322
