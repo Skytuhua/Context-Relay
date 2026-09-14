@@ -1,0 +1,43 @@
+# Physical-PC acceptance procedure — September 14, 2026
+
+This replaces the VM/ISO procedure at the user's request. It is a preparation record, not a test pass. Use only this physical Windows PC. The approved source work, hosted security checks, four-hour fuzz durations and protected merge gates remain required.
+
+## Isolation and two passes
+
+Use dedicated standard Windows test accounts, separate from `User` and from the existing Codex sandbox accounts. Suggested names: `CRPr16A1` and `CRPr16B1` for pass1; `CRPr16A2` and `CRPr16B2` for pass2. Create them through supported Windows account administration with passwords entered directly by the user. Initialize each actual profile by signing in; do not treat an environment-variable HOME override as another OS identity.
+
+Each account gets its own per-user Context Relay installation, SQLCipher vault, native credential entries, IPC token/pipe, browser Auth session, enrolled device keys and disposable harness configuration. Do not copy an enrolled profile, normal-user vault, credentials or harness settings. Keep both test sessions signed in when measuring device-to-device propagation. Test under standard-user permissions; an administrator reading both profiles does not prove cross-user access denial.
+
+Use disposable project folders and canary records with no personal content. Record account/device identifiers without tokens or phrases. Use an additional disposable profile or independently empty app state when a scenario requires destroyed-vault recovery or another account; a reset must not reuse the original enrolled device identity accidentally. Preserve failed-state evidence before any scoped reset. Never clear a whole host credential store or terminate an unscoped daemon.
+
+Pass2 starts from fresh Windows test profiles and new enrollment/device state, not pass1's modified vaults. Repeat the complete applicable matrix, not only prior failures. Record exact final candidate hashes, hosted deployment identity and per-case results in the requirement ledger.
+
+## Before requesting native user actions
+
+- Produce and verify candidate0.1.1, its source/installer/resource hashes, updater signature and artifact bundle. Identify exact N-1 installer1468327 and its preserved manifest.
+- Confirm normal-user installation hashes and service identity without stopping it. Record the Windows build and machine-wide dependencies, including runtimes and policies that fresh profiles inherit.
+- Prepare the exact per-user installer path, account creation/sign-in steps, disposable project paths, evidence paths and scoped rollback procedure. Do not run the new installer as the normal user.
+- Test installer/startup behavior in the dedicated account, including missing service, normal restart and update. Never issue production `--shutdown` as a test shortcut.
+- Prepare real test GitHub/Supabase sign-ins and the reviewed hosted deployment; the user handles native credential/phrase/consent dialogs directly. Credentials and phrases never enter chat, screenshots, logs or the acceptance CSV.
+
+Pinned source review at `924348a36900e89df6bc8b41fa6162127c24b8b3` supports distinct Windows-user vault/key/pipe/lock boundaries. It does not qualify either built installer. Before running N-1 or the candidate, retain their exact generated NSIS scripts, template/plugin identities, execution-level manifests, per-user registry/destination scope and adjacent shutdown-helper hashes. Verify the destination belongs to the signed-in test profile. An unexpected elevation prompt, shared destination or machine-wide predecessor migration must be resolved before proceeding. Preserve inherited WebView2 and other host runtimes; do not remove them to simulate a clean OS.
+
+The default installation directory also contains `vault-v1.db`. Never recursively delete that directory to roll back executable versions. Removing listed payload files or choosing generic app-data deletion does not prove removal of this vault or its native credential entries. Fresh-device cases require independently initialized profiles; explicit account/data deletion uses its separately verified product workflow. Close the target profile's desktop and reconnecting clients during upgrade unless the specific case requires a running daemon, and record the actual daemon path/version after startup. Another executable folder under the same Windows account still shares that account's service and credentials.
+
+At the reviewed checkpoint, installer shutdown exists but the signed updater and transactional rollback remain unimplemented release work. Re-running NSIS cannot establish updater-signature verification, previous-executable retention through startup, or encrypted rollback. Those rows require the completed candidate implementation and their own observations. Whole-PC clock changes, runtime removal, network/firewall changes and reboot or power-loss injection also affect the normal user; they require a separately prepared procedure or remain unqualified.
+
+## Execution groups
+
+1. Install N-1 into the dedicated profile, record version and file hashes, create disposable encrypted data, then perform the verified N-1→0.1.1 migration. Separately exercise a fresh0.1.1 per-user installation. Check tamper rejection, interrupted update, exact encrypted rollback and retention of the previous executable through successful startup.
+2. Exercise actual onboarding, login callback/refresh/logout/cancel, enrollment, pairing, recovery, explicit history selection, reassociation, revocation, rotation, offline convergence, quota and deletion through purge against the exact deployed hosted revision.
+3. Run local cross-user IPC denial, wrong/missing keys, locked vault, competing daemons, malformed/oversized frames, transaction interruptions and canary scans with scoped test identities. Preserve unrelated user services and data.
+4. Use actual supported current/previous Claude Code, Codex and Hermes installations inside the test profiles. Verify setup approvals, validation, memory/task/handoff behavior, offline writes, conflicts, export/import, exact rollback and zero-write reapply. Unknown versions and unsupported wrappers stay import-only.
+5. Run package public/private authorization, immutable closure, quarantine/scanning, exact approval, disabled install/validation/enablement and removal cases. Test account sign-ins do not substitute for repository-access authorization.
+6. Perform physical keyboard, screen-reader, contrast/reduced-motion and native dialog checks. Record the actual user's observation separately from automated DOM/component checks.
+7. Measure installed production search P95 below150ms with10000 memories and the packaged production model/runtime; report cold initialization separately. Measure online sync P95 at most10s from committed write to readability in the other test account. Preserve raw samples, concurrency, power mode, application/runtime versions and shared-host limitations.
+
+## Limits that remain explicit
+
+Fresh user profiles share the same Windows installation, hardware, clock, machine-wide runtimes, network and policies. They cannot prove that the installer works on a clean OS without developer prerequisites, that devices tolerate independent hardware/clock behavior, or that another Windows build behaves identically. Do not mark these original requirements passed, call the runs clean-OS qualification, or treat the user's no-VM decision as an implicit security/release waiver. Continue every applicable test that this computer can demonstrate; unresolved original requirements remain visible for final scope reconciliation.
+
+The normal installed application remains source1468327 until separately authorized. The candidate is internal while paid Authenticode and dependent public-beta publication remain deferred.
