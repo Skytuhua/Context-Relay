@@ -452,6 +452,9 @@ impl<
             .is_some()
         {
             let review = stored_join_review(vault, pairing_id)?;
+            self.coordinator
+                .resume_confirmed_join(vault, pairing_id, &identity.keys)
+                .map_err(pairing_error)?;
             return match self
                 .coordinator
                 .join_status(vault, pairing_id)
@@ -691,6 +694,11 @@ fn pairing_error(error: PairingCycleError) -> ClientError {
             false,
         ),
         PairingCycleError::Conflict => (ErrorCode::Conflict, "The pairing request changed", false),
+        PairingCycleError::Incomplete => (
+            ErrorCode::Conflict,
+            "Confirmation saved; waiting for verified membership history",
+            true,
+        ),
         PairingCycleError::Transient => (
             ErrorCode::Internal,
             "The pairing service is temporarily unavailable",

@@ -31,7 +31,7 @@ impl HostedPairingIntent {
     }
 }
 
-fn load(
+pub(super) fn load(
     connection: &rusqlite::Connection,
     id: PairingId,
 ) -> Result<Option<HostedPairingIntent>, VaultError> {
@@ -81,6 +81,7 @@ impl Vault {
                 "SELECT EXISTS(SELECT 1 FROM pairing_joins WHERE pairing_id=?1)
                     OR EXISTS(SELECT 1 FROM pairing_decisions WHERE pairing_id=?1)
                     OR EXISTS(SELECT 1 FROM pairing_approval_transcripts WHERE pairing_id=?1)
+                    OR EXISTS(SELECT 1 FROM pairing_v2_transcripts WHERE pairing_id=?1)
                     OR EXISTS(SELECT 1 FROM pairing_request_reviews WHERE pairing_id=?1)",
                 [id.to_string()],
                 |row| row.get(0),

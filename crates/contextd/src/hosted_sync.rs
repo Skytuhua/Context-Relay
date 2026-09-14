@@ -1,6 +1,8 @@
+#[cfg(test)]
+use super::local_sync_material;
 use super::{
     ServiceStatus, VaultCommand, WorkAdmission, WorkerClient, WorkspaceState, canceled_error,
-    local_sync_material, scope_denied_error, service_internal_error,
+    local_sync_material_with_certificates, scope_denied_error, service_internal_error,
 };
 use context_relay_core::{
     auth::{HostedIdentity, HostedSessionOwner, LoginCancellation},
@@ -220,17 +222,16 @@ fn apply(
     status: &ServiceStatus,
 ) -> Result<Progress, ClientError> {
     authority.check()?;
-    let (keys, mut material) = local_sync_material(state)?.ok_or_else(scope_denied_error)?;
     let snapshot = match &step {
-        Step::Pull(_, _, snapshot) | Step::Checkpoint(_, _, snapshot) => Some(snapshot),
+        Step::Certificates(snapshot)
+        | Step::Pull(_, _, snapshot)
+        | Step::Checkpoint(_, _, snapshot) => Some(snapshot),
         _ => authority.certificates.get(),
     };
-    if let Some(snapshot) = snapshot {
-        material = state
-            .vault
-            .trusted_sync_material_with_certificates(&keys, snapshot)
-            .map_err(|_| scope_denied_error())?;
-    }
+    // Rebuild current authority once for this actor step. Provider metadata is
+    // checked by that same build; no material survives into another step.
+    let (keys, material) =
+        local_sync_material_with_certificates(state, snapshot)?.ok_or_else(scope_denied_error)?;
     let identity = material
         .local_identity(state.device_id, &keys)
         .map_err(|_| scope_denied_error())?;
@@ -249,12 +250,6 @@ fn apply(
             Progress::Certificates(scope)
         }
         Step::Certificates(snapshot) => {
-            state
-                .vault
-                .trusted_sync_material_with_certificates(&keys, &snapshot)
-                .map_err(|_| scope_denied_error())?
-                .local_identity(state.device_id, &keys)
-                .map_err(|_| scope_denied_error())?;
             authority
                 .certificates
                 .set(snapshot)
@@ -987,6 +982,15 @@ pub(crate) async fn verify_checkpoint_worker(
     };
     let expected_pushes = usize::from(previous.is_none());
     let mut certificates = certificate_rows(&state.vault);
+    assert!(
+        certificates
+            .iter()
+            .any(|row| row == &certificate_row(incoming.certificate_id, &incoming.certificate))
+    );
+    // The first provider snapshot may lag an already locally accepted ADD. It
+    // cannot grant membership; the sender was admitted by the pairing workflow.
+    certificates
+        .retain(|row| row["device_id"] != serde_json::json!(incoming.certificate.device_id));
     let initial_certificates = serde_json::to_vec(&certificates).unwrap();
     assert!(
         !certificates

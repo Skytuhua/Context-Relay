@@ -1,4 +1,5 @@
 use std::fmt;
+mod v2;
 
 use context_relay_protocol::{
     DeviceCertificateId, DeviceId, NativePlatform, PairingCode, PairingId, Sha256Digest,
@@ -114,6 +115,7 @@ pub enum PairingCycleError {
     Rejected,
     Conflict,
     Transient,
+    Incomplete,
 }
 
 impl PairingCycleError {
@@ -125,6 +127,7 @@ impl PairingCycleError {
             Self::Rejected => "pairing_rejected",
             Self::Conflict => "pairing_conflict",
             Self::Transient => "transient",
+            Self::Incomplete => "pairing_history_incomplete",
         }
     }
 }
@@ -493,6 +496,13 @@ impl<
                     .device_certificate(authority.issuer_certificate_id)
                     .map_err(map_vault_error)?
                     .ok_or(PairingCycleError::Conflict)?;
+                if vault
+                    .accepted_membership_history(crate::vault::pairing_v2::BUDGET)
+                    .map_err(map_vault_error)?
+                    .is_some()
+                {
+                    return self.decide_v2(vault, &signed_request, &authority, &material, &issuer);
+                }
                 if issuer.state != DeviceCertificateState::Active
                     || authority.issuer_keys.signing_public_key()
                         != issuer.certificate.signing_public_key
@@ -630,6 +640,19 @@ impl<
             HostedPairingRole::Join,
             false,
         )?;
+        if let Some(stored) = vault.pairing_v2(pairing_id).map_err(map_vault_error)? {
+            if stored.role != "joiner" {
+                return Err(PairingCycleError::Conflict);
+            }
+            return match stored.state.as_str() {
+                "awaiting_confirmation" => {
+                    Ok(PairingJoinStatus::AwaitingConfirmation { pairing_id })
+                }
+                "confirmed" => Err(PairingCycleError::Incomplete),
+                "completed" => Ok(PairingJoinStatus::Completed { pairing_id }),
+                _ => Err(PairingCycleError::Conflict),
+            };
+        }
         if vault
             .pairing_approval_transcript(pairing_id)
             .map_err(map_vault_error)?
@@ -639,9 +662,8 @@ impl<
             return Ok(PairingJoinStatus::Completed { pairing_id });
         }
         if vault
-            .awaiting_pairing_confirmation(pairing_id)
+            .pairing_confirmation_pending(pairing_id)
             .map_err(map_vault_error)?
-            .is_some()
         {
             return Ok(PairingJoinStatus::AwaitingConfirmation { pairing_id });
         }
@@ -681,6 +703,23 @@ impl<
                     .map_err(|_| PairingCycleError::Invalid)?;
                 let signed_request =
                     verify_pairing_request(&request).map_err(|_| PairingCycleError::Invalid)?;
+                if let Some(signature) = approved.membership_signature() {
+                    vault
+                        .store_pairing_v2(
+                            &signed_request,
+                            canonical_approved_payload,
+                            signature,
+                            "joiner",
+                            self.clock.now_ms(),
+                        )
+                        .map_err(map_vault_error)?;
+                    let transcript = vault
+                        .pairing_v2(pairing_id)
+                        .map_err(map_vault_error)?
+                        .ok_or(PairingCycleError::Conflict)?;
+                    self.cache_v2_parent_proof(vault, &transcript)?;
+                    return Ok(PairingJoinStatus::AwaitingConfirmation { pairing_id });
+                }
                 let approval =
                     inspect_pairing_approval(canonical_approved_payload, &signed_request)
                         .map_err(|_| PairingCycleError::Invalid)?;
@@ -710,6 +749,18 @@ impl<
             HostedPairingRole::Join,
             false,
         )?;
+        if vault
+            .pairing_v2(pairing_id)
+            .map_err(map_vault_error)?
+            .is_some()
+        {
+            vault
+                .confirm_pairing_v2(pairing_id, entered_safety_number, joiner_keys)
+                .map_err(map_vault_error)?;
+            return self
+                .resume_confirmed_join(vault, pairing_id, joiner_keys)?
+                .ok_or(PairingCycleError::Incomplete);
+        }
         if let Some(stored) = vault
             .completed_pairing_transcript(pairing_id)
             .map_err(map_vault_error)?
@@ -753,6 +804,19 @@ impl<
         pairing_id: PairingId,
         joiner_keys: &DeviceKeys,
     ) -> Result<Option<WorkspacePairingMaterial>, PairingCycleError> {
+        if let Some(stored) = vault.pairing_v2(pairing_id).map_err(map_vault_error)? {
+            if stored.role != "joiner" || stored.state != "completed" {
+                return Ok(None);
+            }
+            vault
+                .confirmed_pairing_v2(pairing_id, joiner_keys)
+                .map_err(map_vault_error)?
+                .ok_or(PairingCycleError::Conflict)?;
+            return vault
+                .trusted_workspace_material(joiner_keys)
+                .map(Some)
+                .map_err(map_vault_error);
+        }
         vault
             .completed_pairing_approval(pairing_id, joiner_keys)
             .map(|value| {
@@ -770,6 +834,20 @@ impl<
         vault: &Vault,
         pairing_id: PairingId,
     ) -> Result<Option<AcceptedPairingDecisionStatus>, PairingCycleError> {
+        if let Some(stored) = vault.pairing_v2(pairing_id).map_err(map_vault_error)? {
+            if stored.role != "approver" || stored.state != "accepted" {
+                return Ok(None);
+            }
+            self.require_v2_issuer(vault, &stored)?;
+            return Ok(Some(AcceptedPairingDecisionStatus {
+                request_digest: stored.request.digest(),
+                safety_number: crate::devices::crypto::control_v2::approver_safety_number_v2(
+                    &stored.canonical,
+                    &stored.request,
+                )
+                .map_err(|_| PairingCycleError::Invalid)?,
+            }));
+        }
         vault
             .accepted_pairing_approval(pairing_id)
             .map(|stored| {
@@ -787,6 +865,13 @@ impl<
         vault: &mut Vault,
         pairing_id: PairingId,
     ) -> Result<bool, PairingCycleError> {
+        if let Some(stored) = vault.pairing_v2(pairing_id).map_err(map_vault_error)? {
+            if stored.role == "approver" && stored.state == "prepared" {
+                self.resume_v2_approval(vault, stored)?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         let pending = vault.pending_pairing_approvals().map_err(map_vault_error)?;
         let Some(stored) = pending
             .into_iter()
@@ -799,12 +884,17 @@ impl<
     }
 
     pub fn resume_prepared_decisions(&self, vault: &mut Vault) -> Result<usize, PairingCycleError> {
+        let v2 = vault.pending_pairing_v2().map_err(map_vault_error)?;
+        let v2_count = v2.len();
+        for id in v2 {
+            self.resume_prepared_decision(vault, id)?;
+        }
         let pending = vault.pending_pairing_approvals().map_err(map_vault_error)?;
         let count = pending.len();
         for stored in pending {
             self.resume_approval(vault, stored)?;
         }
-        Ok(count)
+        Ok(count + v2_count)
     }
 
     fn resume_approval(

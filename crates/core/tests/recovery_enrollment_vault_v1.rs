@@ -327,6 +327,27 @@ fn accepted_legacy_candidate_backfills_before_memory_in_single_record_batches() 
         vault.candidate(&legacy.id).unwrap().unwrap().state,
         legacy.state
     );
+
+    // An already-owned same-ID candidate is corrupt, not an empty backfill queue.
+    let mut corrupt = support::candidate();
+    corrupt.id = id(support::ID_9);
+    corrupt.proposed_memory.id = id(support::ID_9);
+    vault.put_candidate(&corrupt).unwrap();
+    let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+    raw.execute(
+        "INSERT INTO sync_record_owners(record_id, account_id, workspace_id, binding_state, record_kind)
+         VALUES (?1, ?2, ?3, 'verified', 'memory_candidate')",
+        rusqlite::params![corrupt.id.to_string(), ACCOUNT_ID, WORKSPACE_ID],
+    )
+    .unwrap();
+    let before_outbox = vault.due_outbox(u64::MAX, 10).unwrap();
+    assert!(
+        vault
+            .backfill_sync_records(id(DEVICE_ID), &fixture.device_keys, 1)
+            .is_err()
+    );
+    assert_eq!(vault.candidate(&corrupt.id).unwrap(), Some(corrupt));
+    assert_eq!(vault.due_outbox(u64::MAX, 10).unwrap(), before_outbox);
 }
 
 #[test]

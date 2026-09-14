@@ -373,7 +373,11 @@ where
             Err(RecoveryTransportError::Unauthorized) => {
                 return Err(RecoveryEnrollmentCycleError::Unauthorized);
             }
-            Err(RecoveryTransportError::Invalid | RecoveryTransportError::Conflict) => {
+            Err(
+                RecoveryTransportError::Invalid
+                | RecoveryTransportError::Conflict
+                | RecoveryTransportError::PublicationRejected,
+            ) => {
                 vault
                     .mark_recovery_enrollment_conflict(now_ms)
                     .map_err(map_vault_error)?;
@@ -494,7 +498,9 @@ where
                                 return Err(RecoveryEnrollmentCycleError::Unauthorized);
                             }
                             Err(
-                                RecoveryTransportError::Invalid | RecoveryTransportError::Conflict,
+                                RecoveryTransportError::Invalid
+                                | RecoveryTransportError::Conflict
+                                | RecoveryTransportError::PublicationRejected,
                             ) => return self.mark_conflict(vault, &stored, now_ms),
                         },
                     };
@@ -761,9 +767,9 @@ fn conflict_status(
 
 fn map_transport_error(error: RecoveryTransportError) -> RecoveryEnrollmentCycleError {
     match error {
-        RecoveryTransportError::Invalid | RecoveryTransportError::Conflict => {
-            RecoveryEnrollmentCycleError::Conflict
-        }
+        RecoveryTransportError::Invalid
+        | RecoveryTransportError::Conflict
+        | RecoveryTransportError::PublicationRejected => RecoveryEnrollmentCycleError::Conflict,
         RecoveryTransportError::Unauthorized => RecoveryEnrollmentCycleError::Unauthorized,
         RecoveryTransportError::Expired => RecoveryEnrollmentCycleError::Expired,
         RecoveryTransportError::Transient => RecoveryEnrollmentCycleError::Transient,

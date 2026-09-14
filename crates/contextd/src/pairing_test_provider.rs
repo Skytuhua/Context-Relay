@@ -266,11 +266,23 @@ impl SupabaseHttpClient for Endpoint {
         let action = body["action"].as_str().unwrap();
         if matches!(
             action,
-            "create" | "status" | "request" | "approve" | "reject" | "cancel"
+            "create"
+                | "status"
+                | "request"
+                | "approve"
+                | "reject"
+                | "cancel"
+                | "membership_endpoint"
         ) {
             assert!(self.can_approve);
             assert_eq!(body["workspaceId"], json!(self.backend.scope.workspace_id));
             assert_eq!(body["deviceId"], json!(self.identity.device_id));
+        }
+        if action == "membership_endpoint" {
+            let endpoint = approver.membership_endpoint(now).unwrap();
+            return reply(
+                json!({"v":1,"endpoint":{"stateSha256":endpoint.state_sha256,"controlEpoch":endpoint.control_epoch,"keyEpoch":endpoint.key_epoch}}),
+            );
         }
         if action == "create" {
             let invite = approver.create_invite(now).unwrap();
@@ -326,17 +338,26 @@ impl SupabaseHttpClient for Endpoint {
                 .unwrap();
                 let decision = if action == "approve" {
                     let canonical = unhex(&body["canonicalApprovedPayload"]);
-                    let payload = decode_pairing_approved_payload_v1(&canonical).unwrap();
-                    let proof = sign_hosted_pairing_approval_proof(
-                        &self.identity.keys,
-                        USER.parse().unwrap(),
-                        self.session.parse().unwrap(),
-                        &signed,
-                        &payload,
-                    )
-                    .unwrap();
-                    assert_eq!(body["proof"], json!(hex(&proof.0)));
-                    PairingDecisionEnvelope::approve_request(&signed, canonical)
+                    if let Some(signature) = body.get("membershipSignature") {
+                        let signature = context_relay_protocol::Ed25519SignatureBytes(
+                            unhex(signature).try_into().unwrap(),
+                        );
+                        let proof=context_relay_core::devices::crypto::control_v2::sign_hosted_pairing_approval_proof_v2(&self.identity.keys,USER.parse().unwrap(),self.session.parse().unwrap(),&signed,&canonical,signature).unwrap();
+                        assert_eq!(body["proof"], json!(hex(&proof.0)));
+                        PairingDecisionEnvelope::approve_request_v2(&signed, canonical, signature)
+                    } else {
+                        let payload = decode_pairing_approved_payload_v1(&canonical).unwrap();
+                        let proof = sign_hosted_pairing_approval_proof(
+                            &self.identity.keys,
+                            USER.parse().unwrap(),
+                            self.session.parse().unwrap(),
+                            &signed,
+                            &payload,
+                        )
+                        .unwrap();
+                        assert_eq!(body["proof"], json!(hex(&proof.0)));
+                        PairingDecisionEnvelope::approve_request(&signed, canonical)
+                    }
                 } else {
                     PairingDecisionEnvelope::reject(
                         id,
@@ -345,7 +366,10 @@ impl SupabaseHttpClient for Endpoint {
                 };
                 let decided = approver.decide(decision, now).unwrap();
                 if action == "approve" {
-                    let result = json!({"v":1,"result":{"status":"approved","canonicalApprovedPayload":body["canonicalApprovedPayload"],"receipt":receipt(&decided)}});
+                    let mut result = json!({"v":1,"result":{"status":"approved","canonicalApprovedPayload":body["canonicalApprovedPayload"],"receipt":receipt(&decided)}});
+                    if let Some(signature) = body.get("membershipSignature") {
+                        result["result"]["membershipSignature"] = signature.clone();
+                    }
                     let mut approved = self.backend.approved.lock().unwrap();
                     if let Some(old) = approved.get(&id) {
                         assert_eq!(old, &result);
@@ -373,6 +397,19 @@ impl SupabaseHttpClient for Endpoint {
                         reply(self.backend.approved.lock().unwrap()[&id].clone())
                     }
                 }
+            }
+            "membership_enrollment" | "membership_event" => {
+                let digest = serde_json::from_value(body["requestDigest"].clone()).unwrap();
+                let address = serde_json::from_value(body["address"].clone()).unwrap();
+                let bytes = if action == "membership_enrollment" {
+                    joiner.enrollment(id, digest, address, now).unwrap()
+                } else {
+                    joiner
+                        .membership_event(id, digest, address, now)
+                        .unwrap()
+                        .map(|e| e.canonical_bytes())
+                };
+                reply(json!({"v":1,"object":bytes.map(|b|hex(&b))}))
             }
             other => panic!("unexpected pairing action {other}"),
         }

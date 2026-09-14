@@ -2140,6 +2140,19 @@ fn local_sync_material(
     )>,
     ClientError,
 > {
+    local_sync_material_with_certificates(state, None)
+}
+
+fn local_sync_material_with_certificates(
+    state: &WorkspaceState,
+    snapshot: Option<&context_relay_core::sync::DeviceCertificateSnapshot>,
+) -> Result<
+    Option<(
+        Arc<DeviceKeys>,
+        context_relay_core::vault::VaultSyncMaterial,
+    )>,
+    ClientError,
+> {
     if !state
         .vault
         .has_sync_authority()
@@ -2151,10 +2164,16 @@ fn local_sync_material(
         .pairing_identity
         .as_ref()
         .ok_or_else(service_internal_error)?;
-    let material = state
-        .vault
-        .trusted_sync_material(&identity.keys)
-        .map_err(client_error_from_vault)?;
+    let material = match snapshot {
+        Some(snapshot) => state
+            .vault
+            .trusted_sync_material_with_certificates(&identity.keys, snapshot)
+            .map_err(|_| scope_denied_error())?,
+        None => state
+            .vault
+            .trusted_sync_material(&identity.keys)
+            .map_err(client_error_from_vault)?,
+    };
     Ok(Some((identity.keys.clone(), material)))
 }
 
@@ -5504,6 +5523,9 @@ mod tests {
         .unwrap();
 
         let provider = InMemoryPairingProvider::new().unwrap();
+        provider
+            .register_committed_enrollment(scope, &enrollment.canonical_record)
+            .unwrap();
         let clock = PairingTestClock::default();
         clock.set(1_000);
         let approver_service: Arc<dyn PairingService> =
@@ -5786,9 +5808,8 @@ mod tests {
             assert!(vault.devices(scope).unwrap().is_empty());
             assert!(
                 vault
-                    .awaiting_pairing_confirmation(invite.pairing_id)
+                    .pairing_confirmation_pending(invite.pairing_id)
                     .unwrap()
-                    .is_some()
             );
         }
         let daemon = Daemon::start(joiner_config()).await.unwrap();
@@ -9439,39 +9460,81 @@ mod tests {
         state.vault.request_sync_checkpoint(scope).unwrap();
         let (incoming, remote_memory) = {
             use context_relay_core::{
-                crypto::{CertificateFieldsV1, DeviceCertificateV1},
-                sync::{CanonicalOperation, SyncIdentity},
-            };
-            let (local_keys, material) = local_sync_material(&state).unwrap().unwrap();
-            let local = material
-                .local_identity(state.device_id, &local_keys)
-                .unwrap();
-            let remote_device = "018f22e2-79b0-7cc8-98c4-dc0c0c074303".parse().unwrap();
-            let remote_keys = DeviceKeys::generate().unwrap();
-            let certificate = DeviceCertificateV1::issue_by_device(
-                CertificateFieldsV1 {
-                    account_id: scope.account_id,
-                    workspace_id: scope.workspace_id,
-                    control_epoch: local.control_epoch,
-                    request_nonce: context_relay_protocol::PairingRequestNonce([0x84; 32]),
-                    device_id: remote_device,
-                    signing_public_key: remote_keys.signing_public_key(),
-                    wrapping_public_key: remote_keys.wrapping_public_key(),
+                devices::pairing::{
+                    PairingApprovalAuthority, PairingCoordinator, PairingDecisionInput,
+                    PairingDecisionStatus, VaultPairingMaterialSource,
                 },
-                state.device_id,
-                &local_keys,
-            )
-            .unwrap();
+                sync::CanonicalOperation,
+            };
+            let (local_keys, _) = local_sync_material(&state).unwrap().unwrap();
+            let remote_device = "018f22e2-79b0-7cc8-98c4-dc0c0c074303".parse().unwrap();
+            let remote_certificate_id = "018f22e2-79b0-7cc8-98c4-dc0c0c074304".parse().unwrap();
+            let remote_keys = DeviceKeys::generate().unwrap();
             let source_path = unit_test_support::TempVault::new("sync-remote-source");
             let source_keys = MemoryKeyStore::default();
             let mut source = Vault::open(source_path.path(), "source-key", &source_keys).unwrap();
+            let enrollment = state.vault.recovery_enrollment().unwrap().unwrap();
+            let provider = InMemoryPairingProvider::new().unwrap();
+            provider
+                .register_committed_enrollment(scope, &enrollment.canonical_record)
+                .unwrap();
+            let coordinator = PairingCoordinator::new(
+                PairingTestClock(Arc::new(AtomicU64::new(1000))),
+                VaultPairingMaterialSource,
+                provider.join_session_client("sync-remote").unwrap(),
+                provider.existing_device_client(scope, state.device_id),
+            );
+            let invite = coordinator.create_invite().unwrap();
+            let joined = coordinator
+                .join(
+                    &mut source,
+                    &invite.code,
+                    remote_device,
+                    "Sync peer",
+                    NativePlatform::Windows,
+                    &remote_keys,
+                )
+                .unwrap();
+            let decision = coordinator
+                .decide(
+                    &mut state.vault,
+                    invite.pairing_id,
+                    joined.request_digest,
+                    PairingDecisionInput::Approve(PairingApprovalAuthority {
+                        certificate_id: remote_certificate_id,
+                        issuer_certificate_id: enrollment.record.genesis_certificate_id,
+                        issuer_keys: &local_keys,
+                    }),
+                )
+                .unwrap();
+            let PairingDecisionStatus::Approved { safety_number } = decision else {
+                panic!("approved")
+            };
+            coordinator
+                .join_status(&mut source, invite.pairing_id)
+                .unwrap();
+            coordinator
+                .confirm_join(
+                    &mut source,
+                    invite.pairing_id,
+                    safety_number.as_str(),
+                    &remote_keys,
+                )
+                .unwrap();
+            let certificate = source
+                .all_devices()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.certificate.device_id == remote_device)
+                .unwrap()
+                .certificate;
+            let remote_material = source.trusted_sync_material(&remote_keys).unwrap();
             let memory = OfflineWorkspace::new(&mut source, remote_device)
-                .with_sync_identity(SyncIdentity {
-                    membership_endpoint: None,
-                    device_id: remote_device,
-                    device_keys: &remote_keys,
-                    ..local
-                })
+                .with_sync_identity(
+                    remote_material
+                        .local_identity(remote_device, &remote_keys)
+                        .unwrap(),
+                )
                 .unwrap()
                 .create_memory(context_relay_protocol::MemoryCreateParams {
                     operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074305".parse().unwrap(),
@@ -9488,7 +9551,7 @@ mod tests {
                 context_relay_protocol::decode_sync_operation_v1(&queued.canonical_bytes).unwrap();
             (
                 hosted_sync::IncomingOperation {
-                    certificate_id: "018f22e2-79b0-7cc8-98c4-dc0c0c074304".parse().unwrap(),
+                    certificate_id: remote_certificate_id,
                     certificate,
                     operation: CanonicalOperation {
                         operation_id: decoded.operation_id,
@@ -9583,7 +9646,8 @@ mod tests {
                 .all_devices()
                 .unwrap()
                 .iter()
-                .all(|row| row.certificate.device_id != incoming.operation.device_id)
+                .any(|row| row.certificate == incoming.certificate
+                    && row.certificate_id == incoming.certificate_id)
         );
     }
 

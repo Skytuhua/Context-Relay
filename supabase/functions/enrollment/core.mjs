@@ -7,7 +7,7 @@ const headers = { "content-type": "application/json", "cache-control": "no-store
 const codes = { auth_required: 401, invalid_request: 400, request_too_large: 413,
   method_not_allowed: 405, enrollment_session_denied: 403, enrollment_reservation_denied: 403,
   enrollment_reservation_expired: 403, enrollment_requires_pairing: 409,
-  recovery_denied: 403, recovery_conflict: 409, enrollment_conflict: 409, enrollment_in_progress: 409, enrollment_rate_limited: 429 };
+  recovery_denied: 403, recovery_conflict: 409, recovery_publication_rejected: 409, enrollment_conflict: 409, enrollment_in_progress: 409, enrollment_rate_limited: 429 };
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 const response = (status, body) => new Response(JSON.stringify(body), { status, headers });
 const exact = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value)
@@ -82,6 +82,8 @@ const actionFields = {
   reserve:["v","action","reservationId"], renew:["v","action","reservationId"],
   status:["v","action","reservationId"], commit:["v","action","reservationId","record","proof"],
   snapshot:["v","action"], restore:["v","action","claim","proof"], restore_status:["v","action","restoreId"],
+  recovery_membership_endpoint:["v","action","workspaceId","enrollmentSha256"],
+  recovery_membership_event:["v","action","workspaceId","enrollmentSha256","successorSha256"],
 };
 
 export function createEnrollmentEdgeHandler(dependencies) {
@@ -108,6 +110,20 @@ export function createEnrollmentEdgeHandler(dependencies) {
       if (authorization === null || !/^Bearer [^\s]+$/.test(authorization)) fail("auth_required");
       const authenticated = await dependencies.authenticate(authorization.slice(7));
       const identity = { userId: uuid(authenticated.userId, "[1-8]"), sessionId: uuid(authenticated.sessionId, "[1-8]") };
+      if(body.action==="recovery_membership_endpoint" || body.action==="recovery_membership_event") {
+        const scope={workspaceId:uuid(body.workspaceId),enrollmentSha256:hex(body.enrollmentSha256,32)};
+        if(body.action==="recovery_membership_endpoint") {
+          const endpoint=await dependencies.recoveryMembershipEndpoint(identity,scope);
+          if(!exact(endpoint,["stateSha256","controlEpoch","keyEpoch"]))fail("invalid_request");
+          hex(endpoint.stateSha256,32);
+          for(const epoch of [endpoint.controlEpoch,endpoint.keyEpoch])if(!Number.isInteger(epoch)||epoch<1||epoch>4294967295)fail("invalid_request");
+          return response(200,{v:1,endpoint:{...endpoint}});
+        }
+        scope.successorSha256=hex(body.successorSha256,32);
+        const object=await dependencies.recoveryMembershipEvent(identity,scope);
+        if(object!==null)hex(object,1,16*1024*1024);
+        return response(200,{v:1,object});
+      }
       if (body.action === "snapshot") {
         return response(200, { v: 1, snapshot: await snapshot(await dependencies.snapshot(identity)) });
       }

@@ -4,7 +4,6 @@ import { readUuid7, verifyRecoveryCertificate, verifyRecoveryRecord } from "./re
 
 import { verifyRecoveryDeviceProof } from "./proof.mjs";
 
-const DOMAIN = new TextEncoder().encode("context-relay/recovery-device-claim/v1\0");
 const equal = (a, b) => a.length === b.length && a.every((byte, index) => byte === b[index]);
 const invalid = () => new Error("invalid_recovery_claim");
 
@@ -22,11 +21,13 @@ export async function verifyRecoveryClaim(input, rootInput, context, proof) {
       || !equal(claim.canonicalRecordSha256, digest)
       || !equal(claim.recoverySigningKey, root.recoverySigningKey)
       || claim.deviceId === root.deviceId || claim.certificateId === root.certificateId) throw invalid();
-    await verifyRecoveryCertificate(claim);
+    if(claim.version===2 && new Set([claim.restoreId,claim.enrollmentId,claim.recoveryRootId,
+      claim.certificateId,claim.deviceId,root.certificateId,root.deviceId]).size!==7)throw invalid();
+    await verifyRecoveryCertificate(claim, claim.controlEpoch);
     await verifyEd25519Strict(root.recoverySigningKey, claim.rootSignature, claim.signingPreimage);
     await validateWrappingKey(claim.deviceWrappingKey);
     await validateWrappingKey(claim.ephemeralKey);
-    await verifyRecoveryDeviceProof(context, claim.canonicalClaim, claim.deviceSigningKey, proof);
+    await verifyRecoveryDeviceProof(context, claim.canonicalClaim, claim.deviceSigningKey, proof, claim.version);
     return claim;
   } catch { throw invalid(); }
 }
@@ -36,8 +37,9 @@ export function decodeRecoveryClaim(input) {
     if (!(input instanceof Uint8Array) || input.length === 0 || input.length > 32768) throw invalid();
     const canonicalClaim = Uint8Array.from(input);
     const reader = new CanonicalReader(canonicalClaim);
-    reader.expectMap(15);
-    reader.expectUnsigned(0); reader.expectUnsigned(1);
+    const version=canonicalClaim[0]===0xb0 ? 2 : 1;
+    reader.expectMap(version===2 ? 16 : 15);
+    reader.expectUnsigned(0); reader.expectUnsigned(version);
     reader.expectUnsigned(1); const restoreId = readUuid7(reader);
     reader.expectUnsigned(2); const enrollmentId = readUuid7(reader);
     reader.expectUnsigned(3); const recoveryRootId = readUuid7(reader);
@@ -46,36 +48,45 @@ export function decodeRecoveryClaim(input) {
     reader.expectUnsigned(6); const canonicalRecordSha256 = reader.fixedBytes(32);
     reader.expectUnsigned(7); const expectedRecoveryGeneration = reader.unsigned(9223372036854775806n).toString();
     reader.expectUnsigned(8); const certificateId = readUuid7(reader);
-    reader.expectUnsigned(9); reader.expectMap(9);
+    reader.expectUnsigned(9); const certificateOffset=reader.position; reader.expectMap(9);
     reader.expectUnsigned(0); reader.expectMap(2);
     reader.expectUnsigned(0); reader.expectUnsigned(0);
     reader.expectUnsigned(1); const recoverySigningKey = reader.fixedBytes(32);
     reader.expectUnsigned(1); const certificateAccount = readUuid7(reader);
     reader.expectUnsigned(2); const certificateWorkspace = readUuid7(reader);
-    reader.expectUnsigned(3); reader.expectUnsigned(1);
+    reader.expectUnsigned(3); const controlEpoch=Number(reader.unsigned(4294967295n));
     reader.expectUnsigned(4); const requestNonce = reader.fixedBytes(32);
     reader.expectUnsigned(5); const deviceId = readUuid7(reader);
     reader.expectUnsigned(6); const deviceSigningKey = reader.fixedBytes(32);
     reader.expectUnsigned(7); const deviceWrappingKey = reader.fixedBytes(32);
     reader.expectUnsigned(8); const certificateSignature = reader.fixedBytes(64);
+    const canonicalCertificate=canonicalClaim.subarray(certificateOffset,reader.position);
     reader.expectUnsigned(10); const deviceName = reader.text(256);
     reader.expectUnsigned(11); const platform = Number(reader.unsigned(1n));
-    reader.expectUnsigned(12); reader.expectUnsigned(1);
+    reader.expectUnsigned(12); const keyEpoch=Number(reader.unsigned(4294967295n));
     reader.expectUnsigned(13); const envelopeOffset = reader.position; reader.expectMap(3);
     reader.expectUnsigned(0); const ephemeralKey = reader.fixedBytes(32);
     reader.expectUnsigned(1); const nonce = reader.fixedBytes(24);
     reader.expectUnsigned(2); const ciphertext = reader.byteString(32768);
     const deviceMaterialEnvelope = canonicalClaim.subarray(envelopeOffset, reader.position);
+    let previousStateSha256=null;
+    if(version===2){reader.expectUnsigned(14);previousStateSha256=reader.fixedBytes(32);}
     const signatureOffset = reader.position;
-    reader.expectUnsigned(14); const rootSignature = reader.fixedBytes(64);
+    reader.expectUnsigned(version===2 ? 15 : 14); const rootSignature = reader.fixedBytes(64);
     if (reader.position !== canonicalClaim.length || ciphertext.length < 16
+      || controlEpoch===0 || keyEpoch===0 || (version===1 && (controlEpoch!==1 || keyEpoch!==1))
+      || (version===2 && (previousStateSha256.every(byte=>byte===0) || canonicalRecordSha256.every(byte=>byte===0)))
       || certificateAccount !== accountId || certificateWorkspace !== workspaceId
       || equal(deviceSigningKey, deviceWrappingKey)) throw invalid();
+    const ids=[restoreId,enrollmentId,recoveryRootId,certificateId,deviceId];
+    if(version===2 && new Set(ids).size!==ids.length)throw invalid();
+    const DOMAIN = new TextEncoder().encode(`context-relay/recovery-device-claim/v${version}\0`);
     const signingPreimage = new Uint8Array(DOMAIN.length + signatureOffset);
     signingPreimage.set(DOMAIN);
     signingPreimage.set(canonicalClaim.subarray(0, signatureOffset), DOMAIN.length);
-    signingPreimage[DOMAIN.length] = 0xae; // The 14 unsigned fields.
-    return { canonicalClaim, signingPreimage, restoreId, enrollmentId, recoveryRootId,
+    signingPreimage[DOMAIN.length] = version===2 ? 0xaf : 0xae;
+    return { version,controlEpoch,keyEpoch,previousStateSha256,canonicalCertificate,
+      canonicalClaim, signingPreimage, restoreId, enrollmentId, recoveryRootId,
       accountId, workspaceId, canonicalRecordSha256, expectedRecoveryGeneration, certificateId,
       recoverySigningKey, requestNonce, deviceId, deviceSigningKey, deviceWrappingKey,
       certificateSignature, deviceName, platform, ephemeralKey, nonce, ciphertext,

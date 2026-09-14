@@ -1,4 +1,5 @@
 use super::*;
+mod recovery;
 mod representative;
 use crate::{
     crypto::{ContentKey, DeviceCertificateV1},
@@ -8,6 +9,7 @@ use context_relay_protocol::{
     DeviceId, DeviceSequence, RecordMutationV1, SyncOperationV1, decode_checkpoint_v1,
     decode_sync_operation_v1, encode_sync_operation_v1,
 };
+pub use recovery::{RecoveryHistoricalReconstruction, RecoveryTargetV1};
 pub use representative::HistoricalReadMaterial;
 pub(in crate::vault) use representative::read_material;
 use rusqlite::{OptionalExtension, Transaction};
@@ -133,50 +135,9 @@ impl Vault {
         else {
             return Ok(false);
         };
-        let mut updates = Vec::new();
         let stored = load(&tx, budget.transfer.history)?.ok_or_else(invalid)?;
         let device = confirmed.payload().grant.certificate.device_id;
-        if !reconstructed.operations.is_empty() {
-            representative::ensure_live_bounds(&tx)?;
-        }
-        for operation in &reconstructed.operations {
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1)",
-                [operation.operation().operation_id.to_string()],
-                |r| r.get(0),
-            )?;
-            if exists {
-                representative::authenticate_local_operation(
-                    &tx,
-                    &stored,
-                    device,
-                    operation.operation(),
-                    false,
-                )?;
-            }
-            let (_, update) = Self::apply_verified_in_transaction(
-                &tx,
-                operation,
-                None,
-                &|op| {
-                    representative::authenticate_local_operation(&tx, &stored, device, op, true)?;
-                    decrypt(op, &reconstructed.keys)
-                },
-                embeddings,
-                0,
-                "1970-01-01T00:00:00Z",
-            )?;
-            if !exists {
-                representative::authenticate_local_operation(
-                    &tx,
-                    &stored,
-                    device,
-                    operation.operation(),
-                    false,
-                )?;
-            }
-            updates.push(update);
-        }
+        let updates = install_reconstructed(&tx, &stored, device, &reconstructed, embeddings)?;
         let t = material::load_transfer(&tx, selected.transfer_id, budget.transfer)?
             .ok_or_else(invalid)?;
         let mut preimage = receipt_preimage(&stored, &t, &reconstructed.prefixes);
@@ -676,6 +637,9 @@ fn saved_prefixes(
             return Err(invalid());
         }
     }
+    if !recovery::cover_saved_prefixes(c, stored, evidence, device, budget, &mut covered)? {
+        return Ok(false);
+    }
     let frontier = covered
         .iter()
         .map(|(device, sequence)| DeviceSequence {
@@ -754,14 +718,9 @@ fn reconstruct(
     let t =
         material::load_transfer(tx, selected.transfer_id, budget.transfer)?.ok_or_else(invalid)?;
     let checkpoint = checked(decode_checkpoint_v1(&t.checkpoint))?;
-    let evidence = authenticate(&stored, load_evidence(tx, budget)?, budget)?;
-    if !saved_prefixes(tx, &stored, &evidence, device, budget)? {
-        return Ok(None);
-    }
-    let Some(required) = verified_ranges(&evidence, &checkpoint.causal_frontier, budget)? else {
+    let Some(proof) = authenticate_target(tx, &stored, &checkpoint, device, budget)? else {
         return Ok(None);
     };
-    let prefixes = prefix_bytes(&evidence, &required);
     let mut content_keys = BTreeMap::new();
     // Inventory is bounded by authenticated transfer pages, independent current separately.
     for epoch in 1..=stored.endpoint.key_epoch {
@@ -779,6 +738,60 @@ fn reconstruct(
         };
         content_keys.insert(epoch, ContentKey::from_bytes(*bundle.active_epoch_key()));
     }
+    let Some(reconstructed) =
+        reconstruct_verified_target(tx, &stored, &checkpoint, proof, content_keys, embeddings)?
+    else {
+        return Ok(None);
+    };
+    let signature =
+        keys.sign_hosted_device_proof(&receipt_preimage(&stored, &t, &reconstructed.prefixes));
+    tx.execute("INSERT INTO historical_reconstructions(transfer_id,prefixes,signature) VALUES(?1,?2,?3) ON CONFLICT(transfer_id) DO UPDATE SET prefixes=excluded.prefixes,signature=excluded.signature",params![selected.transfer_id.to_string(),&reconstructed.prefixes,signature.0.as_slice()])?;
+    Ok(Some(reconstructed))
+}
+
+// Only pairing/recovery private gates supply canonical authorized targets and opened keys.
+// Signature/chain/cutoff/dependency/scratch-state verification remains shared here.
+#[allow(clippy::too_many_arguments)]
+struct VerifiedTargetEvidence {
+    evidence: AuthenticatedEvidence,
+    required: BTreeMap<DeviceId, u64>,
+    prefixes: Vec<u8>,
+}
+fn authenticate_target(
+    tx: &Transaction<'_>,
+    stored: &Stored,
+    checkpoint: &context_relay_protocol::CheckpointV1,
+    device: DeviceId,
+    budget: HistoricalReconstructionBudget,
+) -> Result<Option<VerifiedTargetEvidence>, VaultError> {
+    let evidence = authenticate(stored, load_evidence(tx, budget)?, budget)?;
+    if !saved_prefixes(tx, stored, &evidence, device, budget)? {
+        return Ok(None);
+    }
+    let Some(required) = verified_ranges(&evidence, &checkpoint.causal_frontier, budget)? else {
+        return Ok(None);
+    };
+    let prefixes = prefix_bytes(&evidence, &required);
+    Ok(Some(VerifiedTargetEvidence {
+        evidence,
+        required,
+        prefixes,
+    }))
+}
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_verified_target(
+    tx: &Transaction<'_>,
+    stored: &Stored,
+    checkpoint: &context_relay_protocol::CheckpointV1,
+    proof: VerifiedTargetEvidence,
+    content_keys: BTreeMap<u32, ContentKey>,
+    embeddings: &impl RepresentativeEmbeddingResolver,
+) -> Result<Option<Reconstructed>, VaultError> {
+    let VerifiedTargetEvidence {
+        evidence,
+        required,
+        prefixes,
+    } = proof;
     let target = checkpoint
         .causal_frontier
         .iter()
@@ -858,14 +871,65 @@ fn reconstruct(
             [entry.operation.operation_id.to_string()],
         )?;
     }
-    let signature = keys.sign_hosted_device_proof(&receipt_preimage(&stored, &t, &prefixes));
-    tx.execute("INSERT INTO historical_reconstructions(transfer_id,prefixes,signature) VALUES(?1,?2,?3) ON CONFLICT(transfer_id) DO UPDATE SET prefixes=excluded.prefixes,signature=excluded.signature",params![selected.transfer_id.to_string(),&prefixes,signature.0.as_slice()])?;
     Ok(Some(Reconstructed {
         operations,
         keys: content_keys,
         prefixes,
     }))
 }
+
+fn install_reconstructed(
+    tx: &Transaction<'_>,
+    stored: &Stored,
+    device: DeviceId,
+    reconstructed: &Reconstructed,
+    embeddings: &impl RepresentativeEmbeddingResolver,
+) -> Result<Vec<super::super::sync::SyncCacheUpdate>, VaultError> {
+    let mut updates = Vec::new();
+    if !reconstructed.operations.is_empty() {
+        representative::ensure_live_bounds(tx)?;
+    }
+    for operation in &reconstructed.operations {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1)",
+            [operation.operation().operation_id.to_string()],
+            |r| r.get(0),
+        )?;
+        if exists {
+            representative::authenticate_local_operation(
+                tx,
+                stored,
+                device,
+                operation.operation(),
+                false,
+            )?;
+        }
+        let (_, update) = Vault::apply_verified_in_transaction(
+            tx,
+            operation,
+            None,
+            &|op| {
+                representative::authenticate_local_operation(tx, stored, device, op, true)?;
+                decrypt(op, &reconstructed.keys)
+            },
+            embeddings,
+            0,
+            "1970-01-01T00:00:00Z",
+        )?;
+        if !exists {
+            representative::authenticate_local_operation(
+                tx,
+                stored,
+                device,
+                operation.operation(),
+                false,
+            )?;
+        }
+        updates.push(update);
+    }
+    Ok(updates)
+}
+
 fn decrypt(
     op: &SyncOperationV1,
     keys: &BTreeMap<u32, ContentKey>,

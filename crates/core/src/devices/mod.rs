@@ -3,6 +3,7 @@ pub mod crypto;
 pub mod historical_crypto;
 pub mod identity;
 pub mod membership_crypto;
+pub mod membership_transport;
 #[cfg(feature = "test-support")]
 pub mod memory_recovery_transport;
 pub mod memory_transport;

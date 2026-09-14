@@ -257,6 +257,9 @@ impl OwnedControl {
 /// Canonical evidence, chronologically ordered. Repeated entries are invalid,
 /// including retries; retry lookup belongs outside the ancestry stream.
 pub enum MembershipHistoryEvent<'a> {
+    RecoveryAdd {
+        canonical_claim: &'a [u8],
+    },
     PairingAdd {
         statement: &'a [u8],
         signature: Ed25519SignatureBytes,
@@ -293,6 +296,14 @@ pub struct VerifiedMembershipHistory {
     )>,
 }
 impl VerifiedMembershipHistory {
+    pub(crate) fn enrollment_record_sha256(&self) -> Sha256Digest {
+        self.enrollment_record_sha256
+    }
+    pub(crate) fn current_rotated_key_commitment(&self) -> Option<Sha256Digest> {
+        self.latest_rotation
+            .as_ref()
+            .map(|(_, rotation, _)| rotation.key_material_sha256)
+    }
     pub fn state(&self) -> RevocationControlState<'_> {
         self.state.state()
     }
@@ -479,6 +490,9 @@ pub(crate) fn replay_membership_history(
     // Account all input before decoding/cloning any variable-sized event.
     for event in events {
         let sizes = match event {
+            MembershipHistoryEvent::RecoveryAdd { canonical_claim } => {
+                [canonical_claim.len(), 0, 0, 0]
+            }
             MembershipHistoryEvent::PairingAdd {
                 statement,
                 request,
@@ -529,6 +543,29 @@ pub(crate) fn replay_membership_history(
     on_verified_state(&history, None)?;
     for event in events {
         match event {
+            MembershipHistoryEvent::RecoveryAdd { canonical_claim } => {
+                use super::recovery_restore_crypto::v2::{
+                    decode_recovery_device_claim_v2, recovery_membership_successor,
+                    verify_recovery_device_claim_v2,
+                };
+                let claim =
+                    decode_recovery_device_claim_v2(canonical_claim).map_err(|_| invalid)?;
+                verify_recovery_device_claim_v2(&record, &claim, &history).map_err(|_| invalid)?;
+                history
+                    .operations
+                    .insert(claim.restore_id.to_string().parse().map_err(|_| invalid)?);
+                history.certificates.insert(claim.certificate_id);
+                history
+                    .admissions
+                    .insert(claim.certificate.device_id, claim.certificate_id);
+                history
+                    .state
+                    .active_devices
+                    .insert(claim.certificate.device_id, claim.certificate.clone());
+                history.state.endpoint.state_sha256 =
+                    recovery_membership_successor(&claim).map_err(|_| invalid)?;
+                on_verified_state(&history, Some(event))?;
+            }
             MembershipHistoryEvent::PairingAdd {
                 statement,
                 signature,

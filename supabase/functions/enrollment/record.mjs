@@ -27,12 +27,14 @@ export async function verifyEnrollmentRecord(input, context, proof) {
   } catch { throw invalid(); }
 }
 
-export async function verifyRecoveryCertificate(record) {
+export async function verifyRecoveryCertificate(record, controlEpoch = 1) {
+  if(!Number.isInteger(controlEpoch)||controlEpoch<1||controlEpoch>4294967295)throw invalid();
+  const epoch=new Uint8Array(4);new DataView(epoch.buffer).setUint32(0,controlEpoch);
   const uuidBytes = value => Uint8Array.from(value.replaceAll("-", "").match(/../g), byte => Number.parseInt(byte, 16));
   const certificatePreimage = Uint8Array.from([
     ...new TextEncoder().encode("context-relay/device-certificate/v1\0"), 0,
     ...record.recoverySigningKey, ...uuidBytes(record.accountId), ...uuidBytes(record.workspaceId),
-    0, 0, 0, 1, ...record.requestNonce, ...uuidBytes(record.deviceId),
+    ...epoch, ...record.requestNonce, ...uuidBytes(record.deviceId),
     ...record.deviceSigningKey, ...record.deviceWrappingKey,
   ]);
   await verifyEd25519Strict(record.recoverySigningKey, record.certificateSignature, certificatePreimage);

@@ -548,6 +548,35 @@ fn complete_add_revoke_history_cas_restart_corruption_and_staged_admission() {
         r
     );
     assert!(v.trusted_workspace_material(&f.device_keys).is_err());
+    // Historical canonical adds provide metadata, but current accepted removals
+    // determine issuer/discovery state even when legacy rows still say active.
+    let revoked = v.device_certificate(id(CERTIFICATE_ID)).unwrap().unwrap();
+    assert_eq!(
+        revoked.state,
+        context_relay_core::vault::DeviceCertificateState::Revoked
+    );
+    let all = v.all_devices().unwrap();
+    assert_eq!(
+        all.iter()
+            .find(|row| row.certificate_id == id(CERTIFICATE_ID))
+            .unwrap()
+            .state,
+        context_relay_core::vault::DeviceCertificateState::Revoked
+    );
+    assert_eq!(
+        all.iter()
+            .find(|row| row.certificate_id == id(OTHER_ID))
+            .unwrap()
+            .state,
+        context_relay_core::vault::DeviceCertificateState::Active
+    );
+    assert!(
+        v.accepted_membership_history(BUDGET)
+            .unwrap()
+            .unwrap()
+            .pairing_parent(id(DEVICE_ID))
+            .is_err()
+    );
     let pin: Vec<u8> = raw
         .query_row("SELECT enrollment_pin FROM accepted_membership", [], |r| {
             r.get(0)
@@ -1245,9 +1274,13 @@ fn schema40_root_seeding_preserves_explicit_legacy_enrollment_trust_boundary() {
         .endpoint();
     drop(v);
     let raw = open_raw(path.path(), &ks.key(CREDENTIAL));
-    raw.execute_batch("DROP TABLE historical_verified_operations; DROP TABLE historical_reconstructions; DROP TABLE historical_operation_evidence; DROP TABLE membership_current_activation; DROP TABLE historical_transfer_selection; DROP TABLE historical_transfer_pages; DROP TABLE historical_transfers; DROP TABLE membership_confirmed_admission; DROP TABLE membership_root_material_seed; DROP TABLE membership_epoch_secrets; PRAGMA user_version=40").unwrap();
+    support::remove_membership_material_migration(&raw);
+    raw.execute_batch("PRAGMA user_version=40").unwrap();
     let mut v = Vault::open(path.path(), CREDENTIAL, &ks).unwrap();
-    assert_eq!(v.schema_version().unwrap(), 41);
+    assert_eq!(
+        v.schema_version().unwrap(),
+        context_relay_core::vault::LATEST_SCHEMA_VERSION
+    );
     assert!(
         v.staged_membership_epoch(g, id(DEVICE_ID), 1, true, &f.device_keys, BUDGET)
             .unwrap()

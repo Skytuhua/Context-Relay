@@ -1,5 +1,7 @@
 use std::{fmt, str::FromStr};
 
+pub mod v2;
+
 use context_relay_protocol::{
     AccountId, DeviceCertificateId, DeviceId, Ed25519SignatureBytes, NativePlatform,
     PairingRequestNonce, RecoveryEnrollmentId, RecoveryRestoreId, RecoveryRootId, Sha256Digest,

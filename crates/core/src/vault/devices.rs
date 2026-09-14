@@ -1009,6 +1009,11 @@ impl Vault {
         &self,
         certificate_id: DeviceCertificateId,
     ) -> Result<Option<StoredDeviceCertificate>, VaultError> {
+        if let Some(devices) = self.accepted_device_views()? {
+            return Ok(devices
+                .into_iter()
+                .find(|row| row.certificate_id == certificate_id));
+        }
         self.connection
             .query_row(
                 "SELECT account_id, workspace_id, device_id, canonical_bytes, canonical_sha256, state, device_name, platform, stored_at_ms
@@ -1048,6 +1053,15 @@ impl Vault {
     }
 
     pub fn devices(&self, scope: SyncScope) -> Result<Vec<StoredDeviceCertificate>, VaultError> {
+        if let Some(devices) = self.accepted_device_views()? {
+            return Ok(devices
+                .into_iter()
+                .filter(|row| {
+                    row.certificate.account_id == scope.account_id
+                        && row.certificate.workspace_id == scope.workspace_id
+                })
+                .collect());
+        }
         let mut statement = self.connection.prepare(
             "SELECT certificate_id FROM device_certificates
              WHERE account_id = ?1 AND workspace_id = ?2 ORDER BY device_id",
@@ -1069,6 +1083,9 @@ impl Vault {
     }
 
     pub fn all_devices(&self) -> Result<Vec<StoredDeviceCertificate>, VaultError> {
+        if let Some(devices) = self.accepted_device_views()? {
+            return Ok(devices);
+        }
         let mut statement = self.connection.prepare(
             "SELECT certificate_id FROM device_certificates
              ORDER BY account_id, workspace_id, device_id, certificate_id",

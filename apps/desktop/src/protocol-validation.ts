@@ -69,7 +69,7 @@ export function validateSearchIndexStatus(value: unknown): SearchIndexStatus {
 export function validateRecoveryRestoreStatus(value: unknown): RecoveryRestoreStatus {
   if (!value || typeof value !== 'object' || !('state' in value)) fail('recovery status');
   const state = (value as { state: unknown }).state;
-  choice(state, ['idle', 'submitting', 'complete', 'conflict'], 'recovery state');
+  choice(state, ['idle', 'submitting', 'restoring_history', 'complete', 'conflict'], 'recovery state');
   const status = object(value, state === 'idle' ? ['state'] : state === 'complete'
     ? ['state', 'restoreId', 'device'] : ['state', 'restoreId'], 'recovery status');
   if (state !== 'idle') id(status.restoreId, 'restore id');

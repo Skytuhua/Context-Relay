@@ -252,8 +252,17 @@ impl HostedRecoveryEnrollmentService {
         };
         use context_relay_protocol::RecoveryRestoreStatus as Status;
         let stored = vault.recovery_restore().map_err(|_| transient_error())?;
+        let stored_v2 = vault
+            .prepared_recovery_v2(&self.identity.keys)
+            .map_err(|_| transient_error())?;
+        if stored.is_some() && stored_v2.is_some() {
+            return Err(restore_error(
+                context_relay_core::devices::recovery_restore::RecoveryRestoreCycleError::Conflict,
+            ));
+        }
+        let has_prepared = stored.is_some() || stored_v2.is_some();
         if matches!(request, LocalRequest::RecoveryRestoreCancel(_)) {
-            if stored.is_some() {
+            if has_prepared {
                 return Err(restore_error(context_relay_core::devices::recovery_restore::RecoveryRestoreCycleError::Conflict));
             }
             if let Some(intent) = vault
@@ -267,6 +276,31 @@ impl HostedRecoveryEnrollmentService {
             return Ok(LocalResult::RecoveryRestoreStatus {
                 status: Status::Idle {},
             });
+        }
+        if let Some(saved) = &stored_v2 {
+            if saved.claim.certificate.device_id != self.identity.device_id
+                || saved.claim.device_name != self.identity.device_name
+                || saved.claim.device_platform != self.identity.platform
+            {
+                return Err(restore_error(context_relay_core::devices::recovery_restore::RecoveryRestoreCycleError::Conflict));
+            }
+            if matches!(request, LocalRequest::RecoveryRestoreOverview(_))
+                || saved.publication_conflict
+            {
+                let restore_id = saved.claim.restore_id;
+                let status = if saved.publication_conflict {
+                    Status::Conflict { restore_id }
+                } else if vault
+                    .recovery_membership_admission(&self.identity.keys)
+                    .map_err(|_| transient_error())?
+                    .is_some()
+                {
+                    Status::RestoringHistory { restore_id }
+                } else {
+                    Status::Submitting { restore_id }
+                };
+                return Ok(LocalResult::RecoveryRestoreStatus { status });
+            }
         }
         if let Some(stored) = &stored {
             if stored.claim.certificate.device_id != self.identity.device_id
@@ -314,7 +348,7 @@ impl HostedRecoveryEnrollmentService {
             return Ok(LocalResult::RecoveryRestoreStatus { status });
         }
         let begin = matches!(request, LocalRequest::RecoveryRestoreBegin(_));
-        if !begin && stored.is_none() {
+        if !begin && !has_prepared {
             return Err(invalid_error());
         }
         let now = SystemRecoveryEnrollmentClock.now_ms() / 1000;
@@ -332,7 +366,7 @@ impl HostedRecoveryEnrollmentService {
             .hosted_restore_intent()
             .map_err(|_| transient_error())?;
         if begin
-            && stored.is_none()
+            && !has_prepared
             && let Some(saved) = &intent
             && *saved != current
         {
@@ -342,6 +376,9 @@ impl HostedRecoveryEnrollmentService {
             intent = None;
         }
         if intent.is_none() {
+            if stored_v2.is_some() {
+                return Err(restore_error(context_relay_core::devices::recovery_restore::RecoveryRestoreCycleError::Conflict));
+            }
             vault.store_hosted_restore_intent(&current).map_err(|_| restore_error(context_relay_core::devices::recovery_restore::RecoveryRestoreCycleError::Conflict))?;
             intent = Some(current);
         }
@@ -358,6 +395,9 @@ impl HostedRecoveryEnrollmentService {
         if stored.as_ref().is_some_and(|s| {
             s.canonical_record != snapshot.canonical_record
                 || s.canonical_record_sha256 != snapshot.canonical_record_sha256
+        }) || stored_v2.as_ref().is_some_and(|s| {
+            s.canonical_record != snapshot.canonical_record
+                || s.claim.canonical_record_sha256 != snapshot.canonical_record_sha256
         }) {
             return Err(restore_error(
                 context_relay_core::devices::recovery_restore::RecoveryRestoreCycleError::Conflict,
@@ -379,7 +419,7 @@ impl HostedRecoveryEnrollmentService {
             keys: &self.identity.keys,
         };
         let result = match request {
-            LocalRequest::RecoveryRestoreBegin(params) if stored.is_none() => {
+            LocalRequest::RecoveryRestoreBegin(params) if !has_prepared => {
                 coordinator.recover(vault, params.recovery_phrase_words, &device)
             }
             LocalRequest::RecoveryRestoreBegin(_) | LocalRequest::RecoveryRestoreResume(_) => {
@@ -392,6 +432,9 @@ impl HostedRecoveryEnrollmentService {
             status: match result {
                 RecoveryRestoreOutcome::Submitting { restore_id } => {
                     Status::Submitting { restore_id }
+                }
+                RecoveryRestoreOutcome::RestoringHistory { restore_id } => {
+                    Status::RestoringHistory { restore_id }
                 }
                 RecoveryRestoreOutcome::Conflict { restore_id } => Status::Conflict { restore_id },
                 RecoveryRestoreOutcome::Complete { restore_id, device } => {
@@ -460,6 +503,9 @@ impl RecoveryEnrollmentService for HostedRecoveryEnrollmentService {
             .hosted_enrollment_intent()
             .map_err(|_| transient_error())?;
         vault.recovery_restore().map_err(|_| transient_error())?;
+        vault
+            .prepared_recovery_v2(&self.identity.keys)
+            .map_err(|_| transient_error())?;
         vault
             .hosted_restore_intent()
             .map_err(|_| transient_error())?;
@@ -662,7 +708,7 @@ fn hosted_transport_error(
     use context_relay_core::devices::recovery_transport::RecoveryTransportError as T;
     recovery_error(match error {
         T::Invalid => RecoveryEnrollmentCycleError::Invalid,
-        T::Conflict => RecoveryEnrollmentCycleError::Conflict,
+        T::Conflict | T::PublicationRejected => RecoveryEnrollmentCycleError::Conflict,
         T::Unauthorized => RecoveryEnrollmentCycleError::Unauthorized,
         T::Expired => RecoveryEnrollmentCycleError::Expired,
         T::Transient => RecoveryEnrollmentCycleError::Transient,
@@ -1058,6 +1104,7 @@ mod hosted_expiry_tests {
         lose_reserve: bool,
         expire_commit: bool,
         lose_restore: bool,
+        reject_restore: bool,
     }
     struct Http {
         state: Mutex<Remote>,
@@ -1092,7 +1139,13 @@ mod hosted_expiry_tests {
             let vault = Vault::open(&self.path, "expiry-test", self.keys.as_ref()).unwrap();
             if matches!(
                 body["action"].as_str(),
-                Some("snapshot" | "restore" | "restore_status")
+                Some(
+                    "snapshot"
+                        | "restore"
+                        | "restore_status"
+                        | "recovery_membership_endpoint"
+                        | "recovery_membership_event"
+                )
             ) {
                 let intent = vault.hosted_restore_intent().unwrap().unwrap();
                 assert_eq!(intent.project_url, "https://example.supabase.co/");
@@ -1106,6 +1159,40 @@ mod hosted_expiry_tests {
                     .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
                     .collect();
                 let root = context_relay_core::devices::recovery_crypto::decode_recovery_enrollment_record_v1(&canonical).unwrap();
+                let pin = context_relay_protocol::Sha256Digest(Sha256::digest(&canonical).into());
+                if body["action"] == "recovery_membership_endpoint" {
+                    let endpoint =
+                        context_relay_core::devices::membership_transport::enrollment_endpoint(
+                            &canonical,
+                            pin,
+                            context_relay_core::sync::SyncScope {
+                                account_id: root.account_id,
+                                workspace_id: root.workspace_id,
+                            },
+                        )
+                        .unwrap();
+                    return reply(
+                        200,
+                        json!({"v":1,"endpoint":{"stateSha256":endpoint.state_sha256,"controlEpoch":endpoint.control_epoch,"keyEpoch":endpoint.key_epoch}}),
+                    );
+                }
+                if body["action"] == "recovery_membership_event" {
+                    let claim = state.records.last().unwrap().as_str().unwrap();
+                    let bytes: Vec<u8> = claim
+                        .as_bytes()
+                        .chunks_exact(2)
+                        .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+                        .collect();
+                    let object = context_relay_core::devices::membership_transport::MembershipEventObject::from_evidence(&context_relay_core::devices::membership_crypto::MembershipHistoryEvent::RecoveryAdd { canonical_claim: &bytes }).unwrap();
+                    assert_eq!(
+                        body["successorSha256"],
+                        json!(object.endpoints().unwrap().1)
+                    );
+                    return reply(
+                        200,
+                        json!({"v":1,"object":object.canonical_bytes().iter().map(|b|format!("{b:02x}")).collect::<String>()}),
+                    );
+                }
                 if body["action"] == "snapshot" {
                     return reply(
                         200,
@@ -1120,23 +1207,42 @@ mod hosted_expiry_tests {
                         json!({"v":1,"projection":{"canonicalClaim":state.records.last().unwrap(),"receipt":state.receipt}}),
                     );
                 }
-                let stored = vault.recovery_restore().unwrap().unwrap();
-                assert_eq!(
-                    stored.state,
-                    context_relay_core::vault::RecoveryRestorePersistenceState::Prepared
-                );
-                let exact: String = stored
-                    .canonical_claim
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
+                let claim_bytes: Vec<u8> = body["claim"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes()
+                    .chunks_exact(2)
+                    .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
                     .collect();
-                assert_eq!(body["claim"], exact);
+                let claim = context_relay_core::devices::recovery_restore_crypto::v2::decode_recovery_device_claim_v2(&claim_bytes).unwrap();
+                assert!(vault.recovery_restore().unwrap().is_none());
                 assert_eq!(body["proof"].as_str().unwrap().len(), 128);
+                let mut proof_input = b"context-relay/hosted-recovery-device-proof/v2\0".to_vec();
+                proof_input.extend_from_slice(intent.user_id.as_bytes());
+                proof_input.extend_from_slice(intent.session_id.as_bytes());
+                proof_input.extend_from_slice(&Sha256::digest(&claim_bytes));
+                let signature: Vec<u8> = body["proof"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes()
+                    .chunks_exact(2)
+                    .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+                    .collect();
+                context_relay_core::crypto::verify_signature(
+                    claim.certificate.signing_public_key,
+                    &proof_input,
+                    context_relay_protocol::Ed25519SignatureBytes(signature.try_into().unwrap()),
+                )
+                .unwrap();
                 state.records.push(body["claim"].clone());
-                state.receipt = json!({"restoreId":stored.claim.restore_id,"enrollmentId":root.enrollment_id,"recoveryRootId":root.recovery_root_id,
-                    "accountId":root.account_id,"workspaceId":root.workspace_id,"certificateId":stored.claim.certificate_id,
-                    "canonicalRecordSha256":stored.canonical_record_sha256,"canonicalClaimSha256":stored.canonical_claim_sha256,
-                    "acceptedGeneration":(stored.claim.expected_recovery_generation+1).to_string(),"acceptedAtMs":(self.now*1000).to_string()});
+                if state.reject_restore {
+                    return reply(409, json!({"v":1,"error":"recovery_publication_rejected"}));
+                }
+
+                state.receipt = json!({"restoreId":claim.restore_id,"enrollmentId":root.enrollment_id,"recoveryRootId":root.recovery_root_id,
+                    "accountId":root.account_id,"workspaceId":root.workspace_id,"certificateId":claim.certificate_id,
+                    "canonicalRecordSha256":pin,"canonicalClaimSha256":format!("{:x}",Sha256::digest(&claim_bytes)),
+                    "acceptedGeneration":(claim.expected_recovery_generation+1).to_string(),"acceptedAtMs":(self.now*1000).to_string()});
                 if std::mem::take(&mut state.lose_restore) {
                     return reply(503, json!({"v":1,"error":"transient"}));
                 }
@@ -1198,6 +1304,13 @@ mod hosted_expiry_tests {
     }
     #[test]
     fn hosted_restore_resumes_exact_claim_after_restart_without_reentering_phrase() {
+        hosted_restore_restart(false);
+    }
+    #[test]
+    fn hosted_restore_terminal_conflict_reopens_and_resumes_offline() {
+        hosted_restore_restart(true);
+    }
+    fn hosted_restore_restart(terminal_conflict: bool) {
         use context_relay_protocol::{RecoveryRestoreParams, RecoveryRestoreStatus as Status};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("restore.db");
@@ -1357,39 +1470,11 @@ mod hosted_expiry_tests {
                 status: Status::Submitting { .. }
             }
         ));
-        let claim = vault.recovery_restore().unwrap().unwrap().canonical_claim;
-        assert!(
-            service
-                .execute(
-                    &mut vault,
-                    &device,
-                    LocalRequest::RecoveryRestoreCancel(EmptyParams {})
-                )
-                .is_err()
-        );
-        drop(service);
-        drop(vault);
-        let mut vault = Vault::open(&path, "expiry-test", keys.as_ref()).unwrap();
-        let service = make_service();
-        service.resume_prepared(&mut vault, &device).unwrap();
-        assert!(matches!(
-            service
-                .execute(
-                    &mut vault,
-                    &device,
-                    LocalRequest::RecoveryRestoreResume(EmptyParams {})
-                )
-                .unwrap(),
-            LocalResult::RecoveryRestoreStatus {
-                status: Status::Complete { .. }
-            }
-        ));
-        assert_eq!(
-            vault.recovery_restore().unwrap().unwrap().canonical_claim,
-            claim
-        );
-        assert_eq!(http.state.lock().unwrap().records.len(), 2);
-        owner.begin_login().unwrap();
+        let claim = vault
+            .prepared_recovery_v2(&device)
+            .unwrap()
+            .unwrap()
+            .canonical_claim;
         assert!(matches!(
             service
                 .execute(
@@ -1399,7 +1484,146 @@ mod hosted_expiry_tests {
                 )
                 .unwrap(),
             LocalResult::RecoveryRestoreStatus {
-                status: Status::Complete { .. }
+                status: Status::Submitting { .. }
+            }
+        ));
+        assert_eq!(
+            service
+                .execute(
+                    &mut vault,
+                    &device,
+                    LocalRequest::RecoveryRestoreCancel(EmptyParams {})
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        drop(service);
+        drop(vault);
+        let mut vault = Vault::open(&path, "expiry-test", keys.as_ref()).unwrap();
+        let service = make_service();
+        assert_eq!(
+            vault
+                .prepared_recovery_v2(&device)
+                .unwrap()
+                .unwrap()
+                .canonical_claim,
+            claim
+        );
+        assert!(matches!(
+            service
+                .execute(
+                    &mut vault,
+                    &device,
+                    LocalRequest::RecoveryRestoreOverview(EmptyParams {})
+                )
+                .unwrap(),
+            LocalResult::RecoveryRestoreStatus {
+                status: Status::Submitting { .. }
+            }
+        ));
+        service.resume_prepared(&mut vault, &device).unwrap();
+        if terminal_conflict {
+            http.state.lock().unwrap().reject_restore = true;
+            assert!(matches!(
+                service
+                    .execute(
+                        &mut vault,
+                        &device,
+                        LocalRequest::RecoveryRestoreResume(EmptyParams {})
+                    )
+                    .unwrap(),
+                LocalResult::RecoveryRestoreStatus {
+                    status: Status::Conflict { .. }
+                }
+            ));
+            drop(vault);
+            let mut vault = Vault::open(&path, "expiry-test", keys.as_ref()).unwrap();
+            let service = make_service();
+            owner.begin_login().unwrap();
+            let requests = http.state.lock().unwrap().records.len();
+            for request in [
+                LocalRequest::RecoveryRestoreOverview(EmptyParams {}),
+                LocalRequest::RecoveryRestoreResume(EmptyParams {}),
+            ] {
+                assert!(matches!(
+                    service.execute(&mut vault, &device, request).unwrap(),
+                    LocalResult::RecoveryRestoreStatus {
+                        status: Status::Conflict { .. }
+                    }
+                ));
+            }
+            assert_eq!(http.state.lock().unwrap().records.len(), requests);
+            assert_eq!(
+                vault
+                    .prepared_recovery_v2(&device)
+                    .unwrap()
+                    .unwrap()
+                    .canonical_claim,
+                claim
+            );
+            assert!(
+                service
+                    .execute(
+                        &mut vault,
+                        &device,
+                        LocalRequest::RecoveryRestoreCancel(EmptyParams {})
+                    )
+                    .is_err()
+            );
+            assert!(vault.trusted_sync_material(&device).is_err());
+            return;
+        }
+        assert!(matches!(
+            service
+                .execute(
+                    &mut vault,
+                    &device,
+                    LocalRequest::RecoveryRestoreResume(EmptyParams {})
+                )
+                .unwrap(),
+            LocalResult::RecoveryRestoreStatus {
+                status: Status::RestoringHistory { .. }
+            }
+        ));
+        assert_eq!(
+            vault
+                .prepared_recovery_v2(&device)
+                .unwrap()
+                .unwrap()
+                .canonical_claim,
+            claim
+        );
+        assert_eq!(http.state.lock().unwrap().records.len(), 2);
+        owner.begin_login().unwrap();
+        assert!(
+            service
+                .execute(
+                    &mut vault,
+                    &device,
+                    LocalRequest::RecoveryRestoreResume(EmptyParams {})
+                )
+                .is_err()
+        );
+        assert_eq!(
+            vault
+                .prepared_recovery_v2(&device)
+                .unwrap()
+                .unwrap()
+                .canonical_claim,
+            claim
+        );
+        assert!(vault.trusted_sync_material(&device).is_err());
+        assert!(matches!(
+            service
+                .execute(
+                    &mut vault,
+                    &device,
+                    LocalRequest::RecoveryRestoreOverview(EmptyParams {})
+                )
+                .unwrap(),
+            LocalResult::RecoveryRestoreStatus {
+                status: Status::RestoringHistory { .. }
             }
         ));
     }

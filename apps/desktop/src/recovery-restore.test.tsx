@@ -3,9 +3,26 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { StrictMode } from 'react';
 import { RecoveryRestorePanel } from './recovery-restore';
 import type { RecoveryRestoreStatus } from './bindings';
+import { validateRecoveryRestoreStatus } from './protocol-validation';
+import { LocalWorkspaceGateway } from './workspace';
+import type { LocalClient } from './local-client';
 
 const idle: RecoveryRestoreStatus = { state: 'idle' };
 afterEach(cleanup);
+it('resumes admitted recovery history without treating admission as completion', async () => {
+  const history = validateRecoveryRestoreStatus({ state: 'restoring_history', restoreId: '018f22e2-79b0-7cc8-98c4-dc0c0c075602' });
+  const call = vi.fn(async () => ({ kind: 'recovery_restore_status', data: { status: history } }));
+  const api = new LocalWorkspaceGateway({ call } as unknown as LocalClient);
+  const onComplete = vi.fn();
+  render(<RecoveryRestorePanel gateway={api} onComplete={onComplete} />);
+  expect(await screen.findByText('Your recovery is saved. Your history is still being restored.')).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Resume recovery' }));
+  await waitFor(() => expect(call).toHaveBeenLastCalledWith({ method: 'recovery_restore_resume', params: {} }));
+  expect(onComplete).not.toHaveBeenCalled();
+  expect(screen.queryByRole('button', { name: 'Enter recovery phrase' })).toBeNull();
+  expect(() => validateRecoveryRestoreStatus({ state: 'restoring_history' })).toThrow();
+  expect(() => validateRecoveryRestoreStatus({ ...history, device: {} })).toThrow();
+});
 const pending: RecoveryRestoreStatus = { state: 'submitting', restoreId: '018f22e2-79b0-7cc8-98c4-dc0c0c075602' as never };
 const gateway = () => ({
   recoveryRestoreOverview: vi.fn(async (): Promise<RecoveryRestoreStatus> => idle),

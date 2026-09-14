@@ -116,6 +116,13 @@ pub(super) fn load_secret(
                     &event.statement,
                 ))?;
                 (s.control_epoch, s.key_epoch)
+            } else if event.statement.is_empty() {
+                let claim = crypto(
+                    crate::devices::recovery_restore_crypto::v2::decode_recovery_device_claim_v2(
+                        &event.artifact,
+                    ),
+                )?;
+                (claim.certificate.control_epoch, claim.key_epoch)
             } else {
                 let t = crypto(RevocationTransitionV1::from_canonical_bytes(
                     &event.artifact,
@@ -162,7 +169,11 @@ pub(super) fn load_secret(
         }
     } else {
         let mut commitment = None;
-        for e in stored.events.iter().filter(|e| e.request.is_none()) {
+        for e in stored
+            .events
+            .iter()
+            .filter(|e| e.request.is_none() && !e.statement.is_empty())
+        {
             let transition = crypto(RevocationTransitionV1::from_canonical_bytes(&e.artifact))?;
             if transition.key_epoch == epoch {
                 commitment = Some(transition);
@@ -189,7 +200,7 @@ pub(super) fn load_secret(
     Ok(Some(bundle))
 }
 #[allow(clippy::too_many_arguments)]
-fn retain(
+pub(super) fn retain(
     c: &Connection,
     stored: &Stored,
     device: DeviceId,

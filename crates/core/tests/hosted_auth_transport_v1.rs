@@ -20,6 +20,194 @@ const SESSION: &str = "550e8400-e29b-41d4-a716-446655440001";
 const NOW: u64 = 1_800_000_000;
 
 #[test]
+fn native_recovery_v2_transport_reads_addressed_history_and_preserves_session_proof() {
+    use context_relay_core::{
+        crypto::DeviceKeys,
+        devices::{
+            recovery::RecoveryEnrollmentClock, recovery_restore_crypto::v2::*,
+            recovery_restore_transport::RecoveryRestoreTransport,
+            supabase_enrollment::HostedEnrollmentClient,
+        },
+    };
+    use sha2::{Digest, Sha256};
+    struct Clock;
+    impl RecoveryEnrollmentClock for Clock {
+        fn now_ms(&self) -> u64 {
+            NOW * 1000
+        }
+    }
+    let decode = |value: &str| -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
+            .collect()
+    };
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/hosted-recovery-claim-v2.json")).unwrap();
+    let canonical = decode(fixture["canonicalClaim"].as_str().unwrap());
+    let claim = decode_recovery_device_claim_v2(&canonical).unwrap();
+    let snapshot = json!({"accountId":claim.account_id,"workspaceId":claim.workspace_id,"canonicalRecord":fixture["canonicalRecord"],"canonicalRecordSha256":claim.canonical_record_sha256,"registeredAtMs":"1","recoveryGeneration":"0"});
+    let receipt = json!({"restoreId":claim.restore_id,"enrollmentId":claim.enrollment_id,"recoveryRootId":claim.recovery_root_id,"accountId":claim.account_id,"workspaceId":claim.workspace_id,"certificateId":claim.certificate_id,"canonicalRecordSha256":claim.canonical_record_sha256,"canonicalClaimSha256":format!("{:x}",Sha256::digest(&canonical)),"acceptedGeneration":"1","acceptedAtMs":"2"});
+    let (auth, http) = client(
+        PROJECT,
+        vec![
+            tokens(&token(NOW + 900)),
+            response(200, json!({"id":USER})),
+            response(200, json!({"v":1,"snapshot":snapshot})),
+            response(
+                200,
+                json!({"v":1,"endpoint":{"stateSha256":claim.previous_state_sha256,"controlEpoch":2,"keyEpoch":2}}),
+            ),
+            response(200, json!({"v":1,"object":fixture["parentObjects"][1]})),
+            response(200, json!({"v":1,"object":null})),
+            response(200, json!({"v":1})),
+            response(200, json!({"v":1,"receipt":receipt})),
+            response(
+                200,
+                json!({"v":1,"projection":{"canonicalClaim":fixture["canonicalClaim"],"receipt":receipt}}),
+            ),
+        ],
+    );
+    let owner = Arc::new(HostedSessionOwner::new(
+        Arc::new(auth),
+        Arc::new(Store::default()),
+    ));
+    let attempt = owner.begin_login().unwrap();
+    let cancel = attempt.cancellation();
+    let identity = owner.complete_login(attempt, exchange(), NOW).unwrap();
+    let client = HostedEnrollmentClient::with_http_client(
+        owner.clone(),
+        identity,
+        cancel,
+        PROJECT,
+        "public-test",
+        http.clone(),
+    )
+    .unwrap();
+    let initial = client.snapshot(NOW).unwrap().unwrap();
+    let keys = Arc::new(DeviceKeys::from_seeds_for_test([31; 32], [32; 32]));
+    let expected =
+        sign_hosted_recovery_proof_v2(&keys, identity.user_id, identity.session_id, &claim)
+            .unwrap();
+    let transport = client
+        .into_restore_transport(
+            &context_relay_core::vault::HostedRestoreIntent {
+                project_url: PROJECT.into(),
+                user_id: identity.user_id,
+                session_id: identity.session_id,
+            },
+            initial,
+            keys,
+            Clock,
+        )
+        .unwrap();
+    assert_eq!(
+        transport.membership_endpoint().unwrap().state_sha256,
+        claim.previous_state_sha256
+    );
+    assert_eq!(
+        transport
+            .membership_event(claim.previous_state_sha256)
+            .unwrap()
+            .unwrap()
+            .endpoints()
+            .unwrap()
+            .1,
+        claim.previous_state_sha256
+    );
+    assert!(
+        transport
+            .membership_event(claim.previous_state_sha256)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        transport
+            .membership_event(claim.previous_state_sha256)
+            .is_err(),
+        "omitted object is not an explicit missing object"
+    );
+    let accepted = transport.submit_restore(&canonical, NOW * 1000).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_slice(http.requests.lock().unwrap().last().unwrap().body()).unwrap();
+    assert_eq!(
+        body["proof"],
+        expected
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    assert_eq!(
+        transport
+            .restore_claim(claim.restore_id)
+            .unwrap()
+            .unwrap()
+            .receipt,
+        accepted
+    );
+    use context_relay_core::devices::recovery_transport::RecoveryTransportError;
+    for (status, body, expected_error) in [
+        (
+            409,
+            json!({"v":1,"error":"recovery_publication_rejected"}),
+            RecoveryTransportError::PublicationRejected,
+        ),
+        (
+            409,
+            json!({"v":1,"error":"recovery_conflict"}),
+            RecoveryTransportError::Conflict,
+        ),
+        (
+            409,
+            json!({"v":1,"error":"recovery_publication_rejected","extra":true}),
+            RecoveryTransportError::Conflict,
+        ),
+        (
+            200,
+            json!({"v":1,"error":"recovery_publication_rejected"}),
+            RecoveryTransportError::Conflict,
+        ),
+        (
+            403,
+            json!({"v":1,"error":"recovery_publication_rejected"}),
+            RecoveryTransportError::Unauthorized,
+        ),
+        (
+            503,
+            json!({"v":1,"error":"recovery_publication_rejected"}),
+            RecoveryTransportError::Transient,
+        ),
+    ] {
+        http.responses
+            .lock()
+            .unwrap()
+            .push_back(response(status, body));
+        assert_eq!(
+            transport
+                .submit_restore(&canonical, NOW * 1000)
+                .unwrap_err(),
+            expected_error
+        );
+    }
+    owner.begin_login().unwrap();
+    let calls = http.requests.lock().unwrap().len();
+    assert!(transport.membership_endpoint().is_err());
+    assert!(
+        transport
+            .membership_event(claim.previous_state_sha256)
+            .is_err()
+    );
+    assert!(transport.submit_restore(&canonical, NOW * 1000).is_err());
+    assert_eq!(
+        http.requests.lock().unwrap().len(),
+        calls,
+        "canceled original session must not send"
+    );
+}
+
+#[test]
 fn hosted_pairing_approval_checks_scope_proofs_receipts_and_cancel() {
     use context_relay_core::{
         crypto::DeviceKeys,

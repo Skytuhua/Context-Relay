@@ -1,7 +1,9 @@
 //! Durable public acceptance. Canonical replay, never certificate rows, supplies authority.
 mod activation;
+mod device_views;
 mod material;
 mod reconstruction;
+mod recovery;
 use super::{CommitDisposition, Vault, VaultError};
 use crate::{
     crypto::DeviceKeys,
@@ -28,7 +30,14 @@ pub(super) use reconstruction::read_material;
 pub use reconstruction::{
     HistoricalReadMaterial, HistoricalReconstruction, HistoricalReconstructionBudget,
 };
+pub use reconstruction::{RecoveryHistoricalReconstruction, RecoveryTargetV1};
 use rusqlite::{Connection, TransactionBehavior, params};
+
+pub type AcceptedMembershipObjects = (
+    Vec<u8>,
+    Vec<crate::devices::membership_transport::MembershipEventObject>,
+    MembershipEndpoint,
+);
 
 pub(super) const CURRENT_BUDGET: MembershipHistoryBudget = MembershipHistoryBudget {
     max_events: 4096,
@@ -45,6 +54,7 @@ fn crypto<T>(result: Result<T, crate::crypto::CryptoError>) -> Result<T, VaultEr
     result.map_err(|_| invalid())
 }
 
+#[derive(Clone)]
 struct Event {
     parent: Sha256Digest,
     successor: Sha256Digest,
@@ -55,6 +65,11 @@ struct Event {
 }
 impl Event {
     fn evidence(&self) -> MembershipHistoryEvent<'_> {
+        if self.statement.is_empty() && self.request.is_none() {
+            return MembershipHistoryEvent::RecoveryAdd {
+                canonical_claim: &self.artifact,
+            };
+        }
         match &self.request {
             Some(request) => MembershipHistoryEvent::PairingAdd {
                 statement: &self.statement,
@@ -71,6 +86,21 @@ impl Event {
     }
     fn from_evidence(e: &MembershipHistoryEvent<'_>) -> Result<Self, VaultError> {
         let (statement, signature, request, artifact, parent, successor) = match e {
+            MembershipHistoryEvent::RecoveryAdd { canonical_claim } => {
+                use crate::devices::recovery_restore_crypto::v2::{
+                    decode_recovery_device_claim_v2, recovery_membership_successor,
+                };
+                let claim =
+                    decode_recovery_device_claim_v2(canonical_claim).map_err(|_| invalid())?;
+                (
+                    &[][..],
+                    claim.recovery_root_signature,
+                    None,
+                    *canonical_claim,
+                    claim.previous_state_sha256,
+                    recovery_membership_successor(&claim).map_err(|_| invalid())?,
+                )
+            }
             MembershipHistoryEvent::PairingAdd {
                 statement,
                 signature,
@@ -197,7 +227,7 @@ fn load(c: &Connection, budget: MembershipHistoryBudget) -> Result<Option<Stored
     let mut query=c.prepare("SELECT ordinal,kind,
         CASE WHEN typeof(parent)='blob' AND length(parent)=32 THEN parent END,
         CASE WHEN typeof(successor)='blob' AND length(successor)=32 THEN successor END,
-        CASE WHEN typeof(statement)='blob' AND length(statement) BETWEEN 1 AND 512 THEN statement END,
+        CASE WHEN typeof(statement)='blob' AND ((kind IN (1,2) AND length(statement) BETWEEN 1 AND 512) OR (kind=3 AND length(statement)=0)) THEN statement END,
         CASE WHEN typeof(signature)='blob' AND length(signature)=64 THEN signature END,
         CASE WHEN typeof(request)='blob' AND length(request)<=?1 THEN request END,
         CASE WHEN typeof(artifact)='blob' AND length(artifact) BETWEEN 1 AND ?1 THEN artifact END
@@ -218,7 +248,7 @@ fn load(c: &Connection, budget: MembershipHistoryBudget) -> Result<Option<Stored
                 }
                 Some(parsed)
             }
-            2 if request.is_empty() => None,
+            2 | 3 if request.is_empty() => None,
             _ => return Err(invalid()),
         };
         let event = Event {
@@ -317,7 +347,7 @@ pub(super) fn require_operation(
 }
 fn insert_events(c: &Connection, events: &[Event], offset: usize) -> Result<(), VaultError> {
     for (i, e) in events.iter().enumerate() {
-        c.execute("INSERT INTO membership_events(successor,parent,ordinal,kind,statement,signature,request,artifact) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![e.successor.0.as_slice(),e.parent.0.as_slice(),(offset+i) as i64,if e.request.is_some(){1}else{2},&e.statement,e.signature.0.as_slice(),e.request.as_ref().map(|r|r.canonical_bytes()).unwrap_or(&[]),&e.artifact])?;
+        c.execute("INSERT INTO membership_events(successor,parent,ordinal,kind,statement,signature,request,artifact) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![e.successor.0.as_slice(),e.parent.0.as_slice(),(offset+i) as i64,if e.request.is_some(){1}else if e.statement.is_empty(){3}else{2},&e.statement,e.signature.0.as_slice(),e.request.as_ref().map(|r|r.canonical_bytes()).unwrap_or(&[]),&e.artifact])?;
     }
     Ok(())
 }
@@ -342,6 +372,20 @@ pub(super) fn retain_enrollment_material(
     material::retain_enrollment(c, &stored, device, bundle, keys, CURRENT_BUDGET)
 }
 impl Vault {
+    /// Export only a reauthenticated accepted public snapshot, under explicit bounds.
+    pub fn accepted_membership_objects(
+        &self,
+        budget: MembershipHistoryBudget,
+    ) -> Result<Option<AcceptedMembershipObjects>, VaultError> {
+        let tx = self.connection.unchecked_transaction()?;
+        let result = load(&tx, budget)?.map(|stored| {
+            stored.verify(budget)?;
+            let events = stored.events.iter().map(|event| crypto(crate::devices::membership_transport::MembershipEventObject::from_evidence(&event.evidence()))).collect::<Result<Vec<_>, _>>()?;
+            Ok((stored.enrollment, events, stored.endpoint))
+        }).transpose();
+        tx.commit()?;
+        result
+    }
     pub(crate) fn require_current_device(
         &self,
         scope: SyncScope,
@@ -399,6 +443,9 @@ impl Vault {
             .iter()
             .try_fold(0usize, |n, e| {
                 let sizes = match e {
+                    MembershipHistoryEvent::RecoveryAdd { canonical_claim } => {
+                        [canonical_claim.len(), 0, 0, 0]
+                    }
                     MembershipHistoryEvent::PairingAdd {
                         statement,
                         request,
@@ -558,6 +605,21 @@ impl Vault {
             events,
         };
         stored.verify(budget)?;
+        let v2_receipt = self
+            .pairing_v2(request.request().pairing_id)?
+            .map(|transcript| {
+                let saved = self
+                    .confirmed_pairing_v2(request.request().pairing_id, keys)?
+                    .ok_or_else(invalid)?;
+                if saved.canonical_bytes() != confirmed.canonical_bytes()
+                    || transcript.signature != signature
+                    || transcript.request != *request
+                {
+                    return Err(invalid());
+                }
+                transcript.receipt.ok_or_else(invalid)
+            })
+            .transpose()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -590,7 +652,18 @@ impl Vault {
         // Restore resumption has its own pristine-vault exceptions. They are not
         // authority to initialize a different pairing identity in this vault.
         if tx.query_row("SELECT EXISTS(SELECT 1 FROM recovery_restores) OR EXISTS(SELECT 1 FROM hosted_restore_intent)",[],|r|r.get::<_,bool>(0))? {return Err(VaultError::OperationConflict);}
-        super::recovery_restore::require_pristine_vault(&tx)?;
+        if let Some(receipt) = v2_receipt {
+            super::pairing_v2::require_pristine_join(
+                &tx,
+                request,
+                confirmed.canonical_bytes(),
+                signature,
+                receipt,
+                keys,
+            )?;
+        } else {
+            super::recovery_restore::require_pristine_vault(&tx)?;
+        }
         bootstrap(&tx, enrollment, stored.pin, scope, endpoint)?;
         insert_events(&tx, &stored.events, 0)?;
         material::retain_admission(&tx, &stored, confirmed, opened.key_bundle(), keys, budget)?;

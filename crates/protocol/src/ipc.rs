@@ -353,6 +353,9 @@ pub enum RecoveryRestoreStatus {
     Submitting {
         restore_id: RecoveryRestoreId,
     },
+    RestoringHistory {
+        restore_id: RecoveryRestoreId,
+    },
     Complete {
         restore_id: RecoveryRestoreId,
         device: DeviceSummary,
@@ -1550,6 +1553,7 @@ impl LocalResult {
                 status:
                     RecoveryRestoreStatus::Idle {}
                     | RecoveryRestoreStatus::Submitting { .. }
+                    | RecoveryRestoreStatus::RestoringHistory { .. }
                     | RecoveryRestoreStatus::Conflict { .. },
             } => Ok(()),
             Self::RecoveryRestoreStatus {

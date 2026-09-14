@@ -14,6 +14,8 @@ use crate::{
 pub enum RecoveryTransportError {
     Invalid,
     Conflict,
+    /// Only a validated restore publication rejected by the bound service.
+    PublicationRejected,
     Unauthorized,
     Expired,
     Transient,
@@ -23,6 +25,7 @@ impl RecoveryTransportError {
     pub const fn safe_code(self) -> &'static str {
         match self {
             Self::Invalid => "recovery_invalid",
+            Self::PublicationRejected => "recovery_publication_rejected",
             Self::Conflict => "recovery_conflict",
             Self::Unauthorized => "recovery_unauthorized",
             Self::Expired => "recovery_expired",

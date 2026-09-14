@@ -15,7 +15,10 @@ const digest = async bytes => toHex(new Uint8Array(await crypto.subtle.digest('S
 const scoped = ['workspaceId','deviceId','pairingId'];
 const fields = {create:['workspaceId','deviceId'],resolve:['code'],status:scoped,cancel:scoped,request:scoped,
   submit:['canonicalRequest','proof'],approve:[...scoped,'canonicalApprovedPayload','proof'],
-  reject:[...scoped,'requestDigest'],result:['pairingId','requestDigest']};
+  reject:[...scoped,'requestDigest'],result:['pairingId','requestDigest'],
+  membership_endpoint:['workspaceId','deviceId'],
+  membership_enrollment:['pairingId','requestDigest','address'],
+  membership_event:['pairingId','requestDigest','address']};
 const locator = value => {
   if (typeof value !== 'string' || !/^[0-9A-HJKMNP-TV-Z]{5}-[0-9A-HJKMNP-TV-Z]{5}$/.test(value)) fail('invalid_request');
   return value;
@@ -41,12 +44,15 @@ function receipt(value,pairingId,requestDigest,decision) {
   return {...value};
 }
 async function context(value,scope,pairingId) {
+  const v2=Object.hasOwn(value?.trusted??{},'stateSha256');
   if (!exact(value,['canonicalRequest','trusted']) || !exact(value.trusted,
-    ['accountId','workspaceId','controlEpoch','keyEpoch','issuerDeviceId','issuerCertificateId','issuerSigningKey','recoverySigningKey'])) fail('invalid_request');
+    ['accountId','workspaceId','controlEpoch','keyEpoch','issuerDeviceId','issuerCertificateId','issuerSigningKey',...(v2?['issuerCertificate','stateSha256','enrollmentSha256']:['recoverySigningKey'])])) fail('invalid_request');
   const trusted = {...value.trusted};
   for (const key of ['accountId','workspaceId','issuerDeviceId','issuerCertificateId']) uuid(trusted[key]);
   for (const key of ['controlEpoch','keyEpoch']) if (!Number.isInteger(trusted[key]) || trusted[key]<1 || trusted[key]>0xffffffff) fail('invalid_request');
-  hex(trusted.issuerSigningKey,32); hex(trusted.recoverySigningKey,32);
+  hex(trusted.issuerSigningKey,32);
+  if(v2) {hex(trusted.issuerCertificate,1,16384);hex(trusted.stateSha256,32);hex(trusted.enrollmentSha256,32);}
+  else hex(trusted.recoverySigningKey,32);
   if (trusted.workspaceId!==scope.workspaceId || trusted.issuerDeviceId!==scope.deviceId) fail('pairing_conflict');
   const request = await verified(()=>verifyPairingRequest(hex(value.canonicalRequest,1,8192)));
   if (request.pairingId!==pairingId) fail('pairing_conflict');
@@ -67,19 +73,34 @@ export function createPairingEdgeHandler(dependencies) {
       try { body=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(await readBoundedBody(request,MAX_BYTES))); }
       catch (error) { fail(error?.code==='request_too_large' ? error.code : 'invalid_request'); }
       if (!body || body.v!==1 || typeof body.action!=='string' || !Object.hasOwn(fields,body.action)
-        || !exact(body,['v','action',...fields[body.action]])) fail('invalid_request');
+        || !exact(body,['v','action',...fields[body.action],...(body.action==='approve' && Object.hasOwn(body,'membershipSignature')?['membershipSignature']:[])])) fail('invalid_request');
       const scope=Object.hasOwn(body,'workspaceId') ? {workspaceId:uuid(body.workspaceId),deviceId:uuid(body.deviceId)} : null;
       const pairingId=Object.hasOwn(body,'pairingId') ? uuid(body.pairingId) : null;
       const requestDigest=Object.hasOwn(body,'requestDigest') ? toHex(hex(body.requestDigest,32)) : null;
       const canonical=body.action==='submit' ? hex(body.canonicalRequest,1,8192)
         : body.action==='approve' ? hex(body.canonicalApprovedPayload,1,32768) : null;
       const proof=canonical ? hex(body.proof,64) : null;
+      const membershipSignature=Object.hasOwn(body,'membershipSignature')?hex(body.membershipSignature,64):undefined;
       if (body.action==='resolve') locator(body.code);
       const authorization=request.headers.get('authorization');
       if (authorization===null || !/^Bearer [^\s]+$/.test(authorization)) fail('auth_required');
       const authenticated=await dependencies.authenticate(authorization.slice(7));
       const identity={userId:uuid(authenticated.userId,'[1-8]'),sessionId:uuid(authenticated.sessionId,'[1-8]')};
       const proofContext={authUserId:identity.userId,sessionId:identity.sessionId};
+      if (body.action==='membership_endpoint') {
+        const endpoint=await dependencies.membershipEndpoint(identity,scope);
+        if (!exact(endpoint,['stateSha256','controlEpoch','keyEpoch'])) fail('invalid_request');
+        hex(endpoint.stateSha256,32);
+        if (endpoint.stateSha256==='00'.repeat(32)) fail('invalid_request');
+        for(const key of ['controlEpoch','keyEpoch']) if(!Number.isInteger(endpoint[key]) || endpoint[key]<1 || endpoint[key]>0xffffffff) fail('invalid_request');
+        return response(200,{v:1,endpoint:{...endpoint}});
+      }
+      if (body.action==='membership_enrollment' || body.action==='membership_event') {
+        const address=toHex(hex(body.address,32));
+        const object=await dependencies.membershipObject(identity,pairingId,requestDigest,address,body.action);
+        if(object!==null) hex(object,1,16*1024*1024);
+        return response(200,{v:1,object});
+      }
       if (body.action==='create') return response(200,{v:1,invite:invite(await dependencies.create(identity,scope),null,true)});
       if (body.action==='status' || body.action==='cancel') {
         const value=invite(await dependencies.control(identity,scope,pairingId,body.action),pairingId);
@@ -102,8 +123,9 @@ export function createPairingEdgeHandler(dependencies) {
         const {trusted,request:stored}=await context(await dependencies.verificationContext(identity,scope,pairingId),scope,pairingId);
         let approval=null;
         if (body.action==='approve') {
-          approval=await verified(()=>verifyPairingApproval(canonical,stored.canonicalRequest,trusted));
-          await verified(()=>verifyPairingDeviceProof(proofContext,'approval',canonical,hex(trusted.issuerSigningKey,32),proof));
+          if(Object.hasOwn(trusted,'stateSha256') !== (membershipSignature!==undefined)) fail('pairing_conflict');
+          approval=await verified(()=>verifyPairingApproval(canonical,stored.canonicalRequest,trusted,membershipSignature));
+          await verified(()=>verifyPairingDeviceProof(proofContext,'approval',canonical,hex(trusted.issuerSigningKey,32),proof,membershipSignature===undefined?undefined:{membershipSignature,requestDigest:stored.requestDigest}));
         } else if (requestDigest!==toHex(stored.requestDigest)) fail('pairing_conflict');
         const decision=approval ? 'approved' : 'rejected';
         const value=receipt(await dependencies.decide(identity,scope,stored,trusted,approval),pairingId,toHex(stored.requestDigest),decision);
@@ -126,7 +148,8 @@ export function createPairingEdgeHandler(dependencies) {
       if (state==='pending' || state==='canceled') {
         if (!exact(value,['status'])) fail('invalid_request');
       } else if (state==='approved' || state==='rejected') {
-        if (!exact(value,state==='approved'?['status','canonicalApprovedPayload','receipt']:['status','receipt'])) fail('invalid_request');
+        if (!exact(value,state==='approved'?['status','canonicalApprovedPayload','receipt',...(Object.hasOwn(value,'membershipSignature')?['membershipSignature']:[])]:['status','receipt'])) fail('invalid_request');
+        if(Object.hasOwn(value,'membershipSignature')) hex(value.membershipSignature,64);
         receipt(value.receipt,pairingId,requestDigest,state);
         if (state==='approved' && await digest(hex(value.canonicalApprovedPayload,1,32768))!==value.receipt.approvedPayloadDigest) fail('pairing_conflict');
       } else fail('invalid_request');

@@ -76,6 +76,10 @@ export function RecoveryRestorePanel({ gateway, onComplete }: { gateway: Gateway
         <button className="primary-action" type="button" disabled={busy} onClick={() => void run('resume')}>Resume recovery</button>
       </>}
       {status?.state === 'complete' && <p role="status">This device has been recovered.</p>}
+      {status?.state === 'restoring_history' && <>
+        <p role="status">Your recovery is saved. Your history is still being restored.</p>
+        <button className="primary-action" type="button" disabled={busy} onClick={() => void run('resume')}>Resume recovery</button>
+      </>}
       {status?.state === 'conflict' && <p role="alert">Recovery could not be completed because the workspace changed. Pair this installation from a trusted device or contact support.</p>}
     </section>
   );

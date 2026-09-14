@@ -4,6 +4,33 @@ use crate::devices::revocation_crypto::{
     RevocationControlState, RevocationTransitionV1, VerifiedRevocationControl,
 };
 
+/// Live-session possession proof for the exact V2 payload and detached ADD signature.
+pub fn sign_hosted_pairing_approval_proof_v2(
+    keys: &DeviceKeys,
+    user: uuid::Uuid,
+    session: uuid::Uuid,
+    request: &SignedPairingRequest,
+    canonical: &[u8],
+    membership_signature: Ed25519SignatureBytes,
+) -> Result<Ed25519SignatureBytes, CryptoError> {
+    let payload = decode_pairing_approved_payload_v2(canonical)?;
+    approver_safety_number_v2(canonical, request)?;
+    if user.is_nil()
+        || session.is_nil()
+        || keys.signing_public_key() != payload.issuer_certificate.signing_public_key
+        || keys.wrapping_public_key() != payload.issuer_certificate.wrapping_public_key
+    {
+        return Err(CryptoError::AuthenticationFailed);
+    }
+    let mut preimage = b"context-relay/hosted-pairing-approval-proof/v2\0".to_vec();
+    preimage.extend(user.as_bytes());
+    preimage.extend(session.as_bytes());
+    preimage.extend(request.digest().0);
+    preimage.extend(Sha256::digest(canonical));
+    preimage.extend(membership_signature.0);
+    Ok(keys.sign_hosted_device_proof(&preimage))
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct PairingGrantV2 {
     pub schema_version: u16,
@@ -332,6 +359,58 @@ fn safety_number_v2(p: &PairingApprovedPayloadV2, canonical: &[u8]) -> PairingSa
     h.update(p.grant.request_digest.0);
     h.update(Sha256::digest(canonical));
     PairingSafetyNumber(format_safety_number(Sha256Digest(h.finalize().into())))
+}
+
+pub(crate) fn approver_safety_number_v2(
+    canonical: &[u8],
+    request: &SignedPairingRequest,
+) -> Result<PairingSafetyNumber, CryptoError> {
+    let payload = decode_pairing_approved_payload_v2(canonical)?;
+    validate_request_bindings_v2(&payload, request)?;
+    Ok(safety_number_v2(&payload, canonical))
+}
+
+pub(crate) fn confirmation_preimage_v2(
+    canonical: &[u8],
+    request: &SignedPairingRequest,
+    signature: context_relay_protocol::Ed25519SignatureBytes,
+    hosted_binding: &[u8],
+) -> Vec<u8> {
+    let mut bytes = b"context-relay/persisted-pairing-confirmation/v2\0".to_vec();
+    bytes.extend(request.request().device_id.as_bytes());
+    bytes.extend(request.request().signing_public_key.0);
+    bytes.extend(request.request().wrapping_public_key.0);
+    bytes.extend(request.digest().0);
+    bytes.extend(Sha256::digest(canonical));
+    bytes.extend(signature.0);
+    bytes.extend(Sha256::digest(hosted_binding));
+    bytes
+}
+
+pub(crate) fn restore_confirmed_pairing_transcript_v2(
+    canonical: &[u8],
+    request: &SignedPairingRequest,
+    membership_signature: context_relay_protocol::Ed25519SignatureBytes,
+    hosted_binding: &[u8],
+    receipt: context_relay_protocol::Ed25519SignatureBytes,
+    keys: &DeviceKeys,
+) -> Result<ConfirmedV2Transcript, CryptoError> {
+    if keys.signing_public_key() != request.request().signing_public_key
+        || keys.wrapping_public_key() != request.request().wrapping_public_key
+    {
+        return Err(CryptoError::AuthenticationFailed);
+    }
+    crate::crypto::verify_signature(
+        keys.signing_public_key(),
+        &confirmation_preimage_v2(canonical, request, membership_signature, hosted_binding),
+        receipt,
+    )?;
+    let payload = decode_pairing_approved_payload_v2(canonical)?;
+    validate_request_bindings_v2(&payload, request)?;
+    Ok(ConfirmedV2Transcript {
+        canonical_bytes: canonical.to_vec(),
+        payload,
+    })
 }
 
 fn check_bundle(

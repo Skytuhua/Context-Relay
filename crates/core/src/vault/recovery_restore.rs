@@ -88,6 +88,11 @@ impl Vault {
     ) -> Result<(), VaultError> {
         let transaction = self.connection.transaction()?;
         if load_recovery_restore(&transaction)?.is_some()
+            || transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM recovery_v2_prepared)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?
             || load_hosted_restore_intent(&transaction)?.as_ref() != Some(expected)
         {
             return Err(VaultError::OperationConflict);
@@ -705,6 +710,13 @@ fn exact_prepared_write(stored: &StoredRecoveryRestore, write: &RecoveryRestoreW
 }
 
 pub(super) fn require_pristine_vault(transaction: &Transaction<'_>) -> Result<(), VaultError> {
+    require_pristine_except(transaction, &[])
+}
+
+pub(super) fn require_pristine_except(
+    transaction: &Transaction<'_>,
+    allowed: &[&str],
+) -> Result<(), VaultError> {
     let mut statement = transaction.prepare(
         "SELECT name FROM sqlite_master
          WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
@@ -715,6 +727,9 @@ pub(super) fn require_pristine_vault(transaction: &Transaction<'_>) -> Result<()
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
     for table in tables {
+        if allowed.contains(&table.as_str()) {
+            continue;
+        }
         if table == "hosted_restore_intent" {
             // The original hosted identity is durable before claim preparation.
             load_hosted_restore_intent(transaction)?;

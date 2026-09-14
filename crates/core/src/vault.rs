@@ -39,10 +39,13 @@ pub use account_lifecycle_intent::*;
 mod hosted_pairing;
 pub use hosted_pairing::*;
 mod pairing_review;
+pub(crate) mod pairing_v2;
 mod recovery;
 pub use recovery::*;
 mod recovery_restore;
 pub use recovery_restore::*;
+mod recovery_v2;
+pub use recovery_v2::PreparedRecoveryV2;
 mod revocation;
 pub use revocation::*;
 mod membership;
@@ -50,12 +53,13 @@ pub use membership::{
     HistoricalReadMaterial, HistoricalReconstruction, HistoricalReconstructionBudget,
     HistoricalTransferBudget, HistoricalTransferProgress, HistoricalTransferSelection,
 };
+pub use membership::{RecoveryHistoricalReconstruction, RecoveryTargetV1};
 mod sync;
 pub use sync::*;
 mod semantic_index;
 pub use semantic_index::{SemanticIndexBatch, SemanticIndexProgress};
 
-pub const LATEST_SCHEMA_VERSION: u32 = 41;
+pub const LATEST_SCHEMA_VERSION: u32 = 46;
 pub const MAX_NATIVE_HOOK_SESSIONS: usize = 256;
 const DATABASE_KEY_BYTES: usize = 32;
 const DEFAULT_BEFORE_IMAGE_BYTES: u64 = 200 * 1024 * 1024;
@@ -2511,6 +2515,58 @@ fn migrate(connection: &mut Connection) -> Result<(), VaultError> {
         transaction
             .execute_batch(include_str!("../migrations/0041_membership_material.sql"))
             .and_then(|_| transaction.pragma_update(None, "user_version", 41))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 42 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0042_pairing_v2.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 42))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 43 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0043_recovery_membership.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 43))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 44 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!(
+                "../migrations/0044_recovery_v2_preparation.sql"
+            ))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 44))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 45 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0045_recovery_history.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 45))
+            .and_then(|_| transaction.commit())
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+    }
+    if found < 46 {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| VaultError::Migration(error.to_string()))?;
+        transaction
+            .execute_batch(include_str!("../migrations/0046_recovery_conflict.sql"))
+            .and_then(|_| transaction.pragma_update(None, "user_version", 46))
             .and_then(|_| transaction.commit())
             .map_err(|error| VaultError::Migration(error.to_string()))?;
     }

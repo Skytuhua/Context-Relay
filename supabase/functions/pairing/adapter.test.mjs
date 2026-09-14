@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createSupabasePairingDependencies } from './adapter.mjs';
+import {readFileSync} from 'node:fs';
+const publicFixture=JSON.parse(readFileSync(new URL('../../../crates/core/tests/fixtures/hosted-pairing-approval-v2.json',import.meta.url),'utf8'));
 
 const identity = { userId:'01900000-0000-7000-8000-000000000001', sessionId:'01900000-0000-7000-8000-000000000002' };
-const scope = { workspaceId:'01900000-0000-7000-8000-000000000003', deviceId:'01900000-0000-7000-8000-000000000004' };
+const scope = {workspaceId:publicFixture.trusted.workspaceId,deviceId:publicFixture.trusted.issuerDeviceId};
 const pairingId = '01900000-0000-7000-8000-000000000005';
 const bytes = value => new Uint8Array(32).fill(value);
 function fixture() {
@@ -13,7 +15,10 @@ function fixture() {
     CONTEXT_RELAY_SUPABASE_SECRET_KEY:'sb_secret_test', CONTEXT_RELAY_PAIRING_PEPPER:'42'.repeat(32) };
   const createClient = () => ({ auth:{ getClaims:async token => {
     assert.equal(token, 'test-token'); return {data:{claims:{sub:identity.userId,session_id:identity.sessionId}},error:null};
-  } }, rpc:async (name,args) => { calls.push({name,args}); return result; } });
+  } }, rpc:async (name,args) => { calls.push({name,args});
+    if(name==='service_recovery_snapshot_for_session') return {data:{accountId:publicFixture.trusted.accountId,workspaceId:scope.workspaceId,
+      canonicalRecord:publicFixture.canonicalEnrollment,canonicalRecordSha256:publicFixture.trusted.enrollmentSha256},error:null};
+    return result; } });
   return { calls, env, createClient, dependencies:createSupabasePairingDependencies({createClient,env}),
     result: value => { result = value; } };
 }
@@ -23,7 +28,7 @@ test('pairing adapter uses verified identity and stores only keyed locator diges
   assert.deepEqual(await f.dependencies.authenticate('test-token'), identity);
   const invite = await f.dependencies.create(identity,scope);
   assert.match(invite.code,/^[0-9A-HJKMNP-TV-Z]{5}-[0-9A-HJKMNP-TV-Z]{5}$/);
-  const creation = f.calls[0];
+  const creation = f.calls.find(call=>call.name==='service_create_pairing_invite');
   assert.equal(creation.name,'service_create_pairing_invite');
   assert.equal(creation.args.p_auth_user_id,identity.userId);
   assert.equal(creation.args.p_session_id,identity.sessionId);
@@ -33,10 +38,17 @@ test('pairing adapter uses verified identity and stores only keyed locator diges
   assert.match(creation.args.p_code_digest,/^\\x[0-9a-f]{64}$/);
   assert.equal(JSON.stringify(creation).includes(invite.code),false);
   await f.dependencies.resolve(identity,invite.code);
-  assert.equal(f.calls[1].args.p_code_digest,creation.args.p_code_digest);
+  assert.equal(f.calls.at(-1).args.p_code_digest,creation.args.p_code_digest);
   await assert.rejects(f.dependencies.resolve(identity,'bad-code'));
-  assert.equal(f.calls.length,2);
+  assert.equal(f.calls.filter(call=>call.name==='service_resolve_pairing_code').length,1);
   assert.throws(()=>createSupabasePairingDependencies({createClient:f.createClient,env:{...f.env,CONTEXT_RELAY_PAIRING_PEPPER:''}}),/configuration_error/);
+});
+
+test('creation re-verifies the exact committed enrollment before idempotent initialization',async()=>{
+  const f=fixture();await f.dependencies.create(identity,scope);
+  assert.deepEqual(f.calls.map(call=>call.name),['service_recovery_snapshot_for_session','service_initialize_committed_membership','service_create_pairing_invite']);
+  assert.equal(f.calls[1].args.p_enrollment_sha256,'\\x'+publicFixture.trusted.enrollmentSha256);
+  assert.equal(f.calls[1].args.p_workspace_id,scope.workspaceId);
 });
 
 test('pairing adapter maps verified request and approval fields to bounded service operations', async () => {
@@ -68,4 +80,22 @@ test('pairing adapter maps verified request and approval fields to bounded servi
   await assert.rejects(f.dependencies.request(identity,scope,pairingId),/pairing_expired/);
   f.result({data:null,error:{message:'private-provider-detail'}});
   await assert.rejects(f.dependencies.request(identity,scope,pairingId), error=>error.code==='transient'&&!error.message.includes('private-provider-detail'));
+});
+
+test('pairing adapter forwards exact membership addresses and verified V2 CAS inputs',async()=>{
+  const f=fixture();
+  await f.dependencies.membershipObject(identity,pairingId,'03'.repeat(32),'04'.repeat(32),'membership_event');
+  assert.equal(f.calls.at(-1).name,'service_pairing_membership_object');
+  assert.equal(f.calls.at(-1).args.p_request_digest,'\\x'+'03'.repeat(32));
+  assert.equal(f.calls.at(-1).args.p_address,'\\x'+'04'.repeat(32));
+  f.result({data:null,error:null});
+  assert.equal(await f.dependencies.membershipObject(identity,pairingId,'03'.repeat(32),'04'.repeat(32),'membership_event'),null);
+  f.result({data:{},error:null});
+  const request={pairingId,requestDigest:bytes(3)};
+  const approval={version:2,canonicalApprovedPayload:bytes(4),certificateId:pairingId,previousStateSha256:bytes(5),enrollmentSha256:bytes(6),membershipSignature:new Uint8Array(64),
+    child:{deviceId:pairingId,requestNonce:bytes(7),signature:new Uint8Array(64),canonical:bytes(8)}};
+  await f.dependencies.decide(identity,scope,request,{controlEpoch:1,keyEpoch:1,stateSha256:'05'.repeat(32),enrollmentSha256:'06'.repeat(32)},approval);
+  assert.equal(f.calls.at(-1).name,'service_decide_pairing_request_v2');
+  assert.equal(f.calls.at(-1).args.p_previous_state_sha256,'\\x'+'05'.repeat(32));
+  assert.equal(f.calls.at(-1).args.p_canonical_certificate,'\\x'+'08'.repeat(32));
 });

@@ -294,6 +294,34 @@ impl Vault {
         if limit == 0 {
             return Ok(0);
         }
+        // Empty scans need no signing identity. Check every obligation conservatively
+        // across scopes; any work still takes the full authority and transaction path.
+        let has_work: bool = self.connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM (
+                     SELECT id, kind FROM records
+                     UNION ALL SELECT id, 'task' FROM tasks
+                     UNION ALL SELECT id, 'memory_candidate' FROM candidates
+                     UNION ALL SELECT id, 'secret_ref' FROM secret_refs
+                     UNION ALL SELECT id, 'component' FROM components
+                     UNION ALL SELECT id, 'project' FROM projects
+                 ) AS local_record
+                 WHERE NOT EXISTS(SELECT 1 FROM sync_record_owners owner WHERE owner.record_id = local_record.id AND owner.record_kind = local_record.kind)
+             ) OR EXISTS(
+                 SELECT 1 FROM candidates
+                 WHERE id = json_extract(CAST(payload_json AS TEXT), '$.proposedMemory.id')
+             ) OR EXISTS(
+                 SELECT 1 FROM sync_record_owners owner JOIN operations ON operations.record_id = owner.record_id
+                 JOIN outbox ON outbox.operation_id = operations.id
+                 WHERE owner.binding_state = 'verified'
+                 AND NOT EXISTS(SELECT 1 FROM sync_operation_meta WHERE operation_id = operations.id)
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_work {
+            return Ok(0);
+        }
         let material = self.trusted_sync_material(keys)?;
         let identity = material
             .local_identity(device_id, keys)

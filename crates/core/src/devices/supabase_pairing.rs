@@ -1,8 +1,13 @@
 use super::{
+    crypto::control_v2::{
+        decode_pairing_approved_payload_v2, sign_hosted_pairing_approval_proof_v2,
+    },
     crypto::{
         decode_pairing_approved_payload_v1, sign_hosted_pairing_approval_proof,
         sign_hosted_pairing_request_proof, verify_pairing_request,
     },
+    membership_crypto::MembershipEndpoint,
+    membership_transport::{MAX_MEMBERSHIP_OBJECT_BYTES, MembershipEventObject},
     transport::{
         PairingApprovalTransport, PairingApprovedResult, PairingDecision, PairingDecisionEnvelope,
         PairingDecisionKind, PairingDecisionReceipt, PairingInvite, PairingInviteState,
@@ -21,8 +26,8 @@ use crate::{
     vault::{HostedPairingIntent, HostedPairingRole},
 };
 use context_relay_protocol::{
-    AccountId, DecimalTimestamp, DeviceId, PairingCode, PairingId, Sha256Digest, WorkspaceId,
-    decode_pairing_request_v1,
+    AccountId, DecimalTimestamp, DeviceId, Ed25519SignatureBytes, PairingCode, PairingId,
+    Sha256Digest, WorkspaceId, decode_pairing_request_v1,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -33,6 +38,26 @@ use std::{
 use zeroize::Zeroizing;
 
 const RESPONSE_LIMIT: usize = 68 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EndpointResponse {
+    v: u8,
+    endpoint: WireEndpoint,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireEndpoint {
+    state_sha256: Sha256Digest,
+    control_epoch: u32,
+    key_epoch: u32,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObjectResponse {
+    v: u8,
+    object: Option<String>,
+}
 
 /// Native-only client bound to one verified login generation and device key pair.
 #[derive(Clone)]
@@ -47,6 +72,22 @@ pub struct HostedPairingClient {
 }
 
 impl HostedPairingClient {
+    fn public_object(
+        &self,
+        action: &str,
+        id: PairingId,
+        digest: Sha256Digest,
+        address: Sha256Digest,
+        now: u64,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let r:ObjectResponse=self.call_with_response_limit(serde_json::json!({"v":1,"action":action,"pairingId":id,"requestDigest":digest,"address":address}),now,MAX_MEMBERSHIP_OBJECT_BYTES*2+1024)?;
+        if r.v != 1 {
+            return Err(Error::Conflict);
+        }
+        r.object
+            .map(|s| decode_hex_bounded(&s, MAX_MEMBERSHIP_OBJECT_BYTES))
+            .transpose()
+    }
     pub fn approval_client(
         &self,
         scope: SyncScope,
@@ -131,6 +172,14 @@ impl HostedPairingClient {
         body: serde_json::Value,
         now_ms: u64,
     ) -> Result<T, Error> {
+        self.call_with_response_limit(body, now_ms, RESPONSE_LIMIT)
+    }
+    fn call_with_response_limit<T: serde::de::DeserializeOwned>(
+        &self,
+        body: serde_json::Value,
+        now_ms: u64,
+        response_limit: usize,
+    ) -> Result<T, Error> {
         let started = Instant::now();
         let session = self
             .owner
@@ -160,7 +209,7 @@ impl HostedPairingClient {
             Duration::from_secs(15),
             body,
         )
-        .with_response_limit(RESPONSE_LIMIT);
+        .with_response_limit(response_limit);
         let response = self.http.execute(request).map_err(|_| Error::Transient)?;
         let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.owner
@@ -170,7 +219,7 @@ impl HostedPairingClient {
                 now_ms.saturating_add(elapsed) / 1000,
             )
             .map_err(|_| Error::Unauthorized)?;
-        if response.body().len() > RESPONSE_LIMIT {
+        if response.body().len() > response_limit {
             return Err(Error::Conflict);
         }
         match response.status() {
@@ -229,6 +278,21 @@ impl HostedPairingApprovalClient {
     }
 }
 impl PairingApprovalTransport for HostedPairingApprovalClient {
+    fn membership_endpoint(&self, now_ms: u64) -> Result<MembershipEndpoint, Error> {
+        let r:EndpointResponse=self.client.call(serde_json::json!({"v":1,"action":"membership_endpoint","workspaceId":self.scope.workspace_id,"deviceId":self.device_id}),now_ms)?;
+        if r.v != 1
+            || r.endpoint.state_sha256 == Sha256Digest([0; 32])
+            || r.endpoint.control_epoch == 0
+            || r.endpoint.key_epoch == 0
+        {
+            return Err(Error::Conflict);
+        }
+        Ok(MembershipEndpoint {
+            state_sha256: r.endpoint.state_sha256,
+            control_epoch: r.endpoint.control_epoch,
+            key_epoch: r.endpoint.key_epoch,
+        })
+    }
     fn hosted_intent(&self) -> Option<HostedPairingIntent> {
         Some(self.client.original_intent(HostedPairingRole::Approve))
     }
@@ -308,28 +372,50 @@ impl PairingApprovalTransport for HostedPairingApprovalClient {
                 }
                 let request = decode_pairing_request_v1(canonical).map_err(|_| Error::Invalid)?;
                 let signed = verify_pairing_request(&request).map_err(|_| Error::Invalid)?;
-                let payload = decode_pairing_approved_payload_v1(canonical_approved_payload)
-                    .map_err(|_| Error::Invalid)?;
+                let issuer = if envelope.membership_signature().is_some() {
+                    decode_pairing_approved_payload_v2(canonical_approved_payload)
+                        .map_err(|_| Error::Invalid)?
+                        .issuer_certificate
+                } else {
+                    decode_pairing_approved_payload_v1(canonical_approved_payload)
+                        .map_err(|_| Error::Invalid)?
+                        .issuer_certificate
+                };
                 if request.pairing_id != envelope.pairing_id
                     || signed.digest() != envelope.request_digest
-                    || payload.issuer_certificate.account_id != self.scope.account_id
-                    || payload.issuer_certificate.workspace_id != self.scope.workspace_id
-                    || payload.issuer_certificate.device_id != self.device_id
+                    || issuer.account_id != self.scope.account_id
+                    || issuer.workspace_id != self.scope.workspace_id
+                    || issuer.device_id != self.device_id
                 {
                     return Err(Error::Conflict);
                 }
-                let proof = sign_hosted_pairing_approval_proof(
-                    &self.client.keys,
-                    self.client.identity.user_id,
-                    self.client.identity.session_id,
-                    &signed,
-                    &payload,
-                )
+                let proof = if let Some(signature) = envelope.membership_signature() {
+                    sign_hosted_pairing_approval_proof_v2(
+                        &self.client.keys,
+                        self.client.identity.user_id,
+                        self.client.identity.session_id,
+                        &signed,
+                        canonical_approved_payload,
+                        signature,
+                    )
+                } else {
+                    sign_hosted_pairing_approval_proof(
+                        &self.client.keys,
+                        self.client.identity.user_id,
+                        self.client.identity.session_id,
+                        &signed,
+                        &decode_pairing_approved_payload_v1(canonical_approved_payload)
+                            .map_err(|_| Error::Invalid)?,
+                    )
+                }
                 .map_err(|_| Error::Invalid)?;
                 let mut body = self.body("approve", envelope.pairing_id);
                 body["canonicalApprovedPayload"] =
                     serde_json::json!(hex(canonical_approved_payload));
                 body["proof"] = serde_json::json!(hex(&proof.0));
+                if let Some(signature) = envelope.membership_signature() {
+                    body["membershipSignature"] = serde_json::json!(hex(&signature.0));
+                }
                 (
                     body,
                     PairingDecisionKind::Approved,
@@ -408,6 +494,28 @@ fn required_request<'de, D: serde::Deserializer<'de>>(
 }
 
 impl PairingJoinTransport for HostedPairingClient {
+    fn enrollment(
+        &self,
+        id: PairingId,
+        digest: Sha256Digest,
+        pin: Sha256Digest,
+        now: u64,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        self.public_object("membership_enrollment", id, digest, pin, now)
+    }
+    fn membership_event(
+        &self,
+        id: PairingId,
+        digest: Sha256Digest,
+        address: Sha256Digest,
+        now: u64,
+    ) -> Result<Option<MembershipEventObject>, Error> {
+        self.public_object("membership_event", id, digest, address, now)?
+            .map(|bytes| {
+                MembershipEventObject::from_canonical_bytes(&bytes).map_err(|_| Error::Conflict)
+            })
+            .transpose()
+    }
     fn hosted_intent(&self) -> Option<HostedPairingIntent> {
         Some(self.original_intent(HostedPairingRole::Join))
     }
@@ -487,6 +595,7 @@ impl PairingJoinTransport for HostedPairingClient {
             }),
             JoinResult::Approved {
                 canonical_approved_payload,
+                membership_signature,
                 receipt,
             } => {
                 let canonical = decode_hex(&canonical_approved_payload)?;
@@ -495,9 +604,21 @@ impl PairingJoinTransport for HostedPairingClient {
                     receipt.validate(id, digest, PairingDecisionKind::Approved, Some(hash))?;
                 // The coordinator still verifies the complete signed approval and
                 // requires human safety-number confirmation before installing trust.
-                Ok(PairingResult::Approved(PairingApprovedResult::new(
-                    canonical, receipt,
-                )))
+                Ok(PairingResult::Approved(
+                    if let Some(signature) = membership_signature {
+                        PairingApprovedResult::new_v2(
+                            canonical,
+                            receipt,
+                            Ed25519SignatureBytes(
+                                decode_hex(&signature)?
+                                    .try_into()
+                                    .map_err(|_| Error::Conflict)?,
+                            ),
+                        )
+                    } else {
+                        PairingApprovedResult::new(canonical, receipt)
+                    },
+                ))
             }
         }
     }
@@ -514,8 +635,11 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 fn decode_hex(value: &str) -> Result<Vec<u8>, Error> {
+    decode_hex_bounded(value, 32768)
+}
+fn decode_hex_bounded(value: &str, limit: usize) -> Result<Vec<u8>, Error> {
     if value.is_empty()
-        || value.len() > 65536
+        || value.len() > limit * 2
         || !value.len().is_multiple_of(2)
         || !value
             .bytes()
@@ -620,6 +744,8 @@ enum JoinResult {
     Approved {
         #[serde(rename = "canonicalApprovedPayload")]
         canonical_approved_payload: String,
+        #[serde(rename = "membershipSignature", default)]
+        membership_signature: Option<String>,
         receipt: DecisionReceipt,
     },
 }

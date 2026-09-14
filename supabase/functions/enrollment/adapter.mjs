@@ -1,8 +1,9 @@
 import { createSupabaseSessionClients } from "../account-lifecycle/adapter.mjs";
+import {verifyRecoveryRecord} from "./record.mjs";
 
 const safeCodes = new Set(["enrollment_session_denied", "enrollment_reservation_denied",
   "enrollment_reservation_expired", "enrollment_requires_pairing", "enrollment_conflict",
-  "enrollment_in_progress", "enrollment_rate_limited", "recovery_denied", "recovery_conflict"]);
+  "enrollment_in_progress", "enrollment_rate_limited", "recovery_denied", "recovery_conflict", "recovery_publication_rejected"]);
 function failure(code = "transient") { return Object.assign(new Error(code), { code }); }
 export function uuid(value, version = "[1-8]") {
   if (typeof value !== "string" || !new RegExp(`^[0-9a-f]{8}-[0-9a-f]{4}-${version}[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).test(value)) throw failure("invalid_request");
@@ -36,24 +37,45 @@ export function createSupabaseEnrollmentDependencies({ createClient, env }) {
     let result;
     try { result = await serviceClient.rpc(name, args); } catch { throw failure(); }
     if (result?.error) throw failure(safeCodes.has(result.error.message) ? result.error.message : "transient");
-    const nullable = name === "service_recovery_snapshot_for_session" || name === "service_recovery_claim_for_session";
+    const nullable = name === "service_recovery_snapshot_for_session" || name === "service_recovery_claim_for_session" || name === "service_recovery_membership_event";
     if (result?.error !== null || (result.data === null && !nullable) || result.data === undefined) throw failure();
     return result.data;
+  }
+  async function initializeRecoveryMembership(identity,scope){
+    const snapshot=await rpc("service_recovery_snapshot_for_session",identity);
+    if(!snapshot || typeof snapshot.canonicalRecord!=="string" || !/^[0-9a-f]+$/.test(snapshot.canonicalRecord)
+      || snapshot.canonicalRecord.length%2 || snapshot.canonicalRecord.length>65536)throw failure("recovery_conflict");
+    const bytes=Uint8Array.from(snapshot.canonicalRecord.match(/../g),byte=>Number.parseInt(byte,16));
+    let record;try{record=await verifyRecoveryRecord(bytes);}catch{throw failure("recovery_conflict");}
+    const digest=new Uint8Array(await crypto.subtle.digest("SHA-256",bytes));
+    if(record.workspaceId!==scope.workspaceId || record.accountId!==snapshot.accountId || record.workspaceId!==snapshot.workspaceId
+      || hex(digest)!==snapshot.canonicalRecordSha256 || hex(digest)!==hex(scope.enrollmentSha256))throw failure("recovery_conflict");
+    await rpc("service_initialize_committed_membership",identity,undefined,{p_workspace_id:scope.workspaceId,p_enrollment_sha256:bytea(digest)});
   }
   return {
     authenticate(token) { return authenticateSupabaseSession(authClient, token); },
     snapshot(identity) { return rpc("service_recovery_snapshot_for_session", identity); },
+    async recoveryMembershipEndpoint(identity,scope){
+      await initializeRecoveryMembership(identity,scope);
+      return rpc("service_recovery_membership_endpoint",identity,undefined,{p_workspace_id:uuid(scope.workspaceId,"7"),p_record_sha256:bytea(scope.enrollmentSha256)});
+    },
+    recoveryMembershipEvent(identity,scope){
+      return rpc("service_recovery_membership_event",identity,undefined,{p_workspace_id:uuid(scope.workspaceId,"7"),p_record_sha256:bytea(scope.enrollmentSha256),p_successor_sha256:bytea(scope.successorSha256)});
+    },
     restoreStatus(identity, restoreId) {
       return rpc("service_recovery_claim_for_session",identity,undefined,{p_restore_id:uuid(restoreId,"7")});
     },
     restore(identity, claim) {
-      return rpc("service_commit_recovery_for_session",identity,undefined,{
+      return rpc(claim.version===2 ? "service_commit_recovery_v2_for_session" : "service_commit_recovery_for_session",identity,undefined,{
         p_restore_id:claim.restoreId,p_enrollment_id:claim.enrollmentId,p_root_id:claim.recoveryRootId,
         p_account_id:claim.accountId,p_workspace_id:claim.workspaceId,p_certificate_id:claim.certificateId,
         p_device_id:claim.deviceId,p_expected_generation:claim.expectedRecoveryGeneration,
         p_record_sha256:bytea(claim.canonicalRecordSha256),p_canonical_claim:bytea(claim.canonicalClaim),
         p_request_nonce:bytea(claim.requestNonce),p_device_signing_key:bytea(claim.deviceSigningKey),
         p_device_wrapping_key:bytea(claim.deviceWrappingKey),p_certificate_signature:bytea(claim.certificateSignature),
+        ...(claim.version===2 ? {p_control_epoch:claim.controlEpoch,p_key_epoch:claim.keyEpoch,
+          p_parent_sha256:bytea(claim.previousStateSha256),p_canonical_certificate:bytea(claim.canonicalCertificate),
+          p_root_signature:bytea(claim.rootSignature)} : {}),
       });
     },
     reserve(identity, operation) {

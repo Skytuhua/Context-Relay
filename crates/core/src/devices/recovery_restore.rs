@@ -13,18 +13,15 @@ use crate::{
             OsRecoveryEnrollmentEntropy, RecoveryEnrollmentClock, RecoveryEnrollmentEntropy,
             SystemRecoveryEnrollmentClock,
         },
-        recovery_restore_crypto::{
-            build_recovery_device_claim_inner, open_recovered_device_material,
-        },
+        recovery_restore_crypto::open_recovered_device_material,
         recovery_restore_transport::RecoveryRestoreTransport,
         recovery_transport::RecoveryTransportError,
     },
     sync::SyncScope,
-    vault::{
-        RecoveryRestorePersistenceState, RecoveryRestoreWrite, StoredRecoveryRestore, Vault,
-        VaultError,
-    },
+    vault::{RecoveryRestorePersistenceState, StoredRecoveryRestore, Vault, VaultError},
 };
+
+mod v2;
 
 pub struct RecoveryRestoreIdentity<'a> {
     pub device_id: DeviceId,
@@ -83,6 +80,9 @@ impl Error for RecoveryRestoreCycleError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecoveryRestoreOutcome {
     Submitting {
+        restore_id: RecoveryRestoreId,
+    },
+    RestoringHistory {
         restore_id: RecoveryRestoreId,
     },
     Complete {
@@ -148,57 +148,7 @@ where
         phrase_words: RecoveryPhraseWords,
         identity: &RecoveryRestoreIdentity<'_>,
     ) -> Result<RecoveryRestoreOutcome, RecoveryRestoreCycleError> {
-        validate_identity(identity)?;
-        if vault.recovery_restore().map_err(map_vault_error)?.is_some() {
-            return Err(RecoveryRestoreCycleError::Conflict);
-        }
-        let scope = self.transport.scope();
-        let snapshot = self
-            .transport
-            .root_snapshot()
-            .map_err(map_initial_transport_error)?
-            .ok_or(RecoveryRestoreCycleError::Unavailable)?;
-        snapshot
-            .validate_for(scope)
-            .map_err(|_| RecoveryRestoreCycleError::Conflict)?;
-        let phrase = RecoveryPhrase::from_words(phrase_words)
-            .map_err(|_| RecoveryRestoreCycleError::Invalid)?;
-        let authority = crate::devices::recovery_restore_crypto::authenticate_recovery_root(
-            &snapshot.canonical_record,
-            snapshot.canonical_record_sha256,
-            phrase,
-        )
-        .map_err(|_| RecoveryRestoreCycleError::Invalid)?;
-        let restore_id = self.entropy_uuid_v7::<RecoveryRestoreId>()?;
-        let certificate_id = self.entropy_uuid_v7::<DeviceCertificateId>()?;
-        let request_nonce = PairingRequestNonce(self.entropy_array()?);
-        let mut rng = RestoreEntropyRng {
-            source: &self.entropy,
-            failed: false,
-        };
-        let artifacts = build_recovery_device_claim_inner(
-            authority,
-            restore_id,
-            snapshot.recovery_generation,
-            certificate_id,
-            request_nonce,
-            identity.device_id,
-            identity.device_name.clone(),
-            identity.platform,
-            identity.keys,
-            &mut rng,
-        );
-        let artifacts = match artifacts {
-            Ok(artifacts) => artifacts,
-            Err(_) if rng.failed => return Err(RecoveryRestoreCycleError::Transient),
-            Err(_) => return Err(RecoveryRestoreCycleError::Invalid),
-        };
-        let write = RecoveryRestoreWrite::new(snapshot, artifacts, self.clock.now_ms())
-            .map_err(map_vault_error)?;
-        vault
-            .prepare_recovery_restore(&write)
-            .map_err(map_vault_error)?;
-        self.resume_prepared(vault, identity)
+        self.recover_v2(vault, phrase_words, identity)
     }
 
     pub fn resume_prepared(
@@ -207,6 +157,13 @@ where
         identity: &RecoveryRestoreIdentity<'_>,
     ) -> Result<RecoveryRestoreOutcome, RecoveryRestoreCycleError> {
         validate_identity(identity)?;
+        if vault
+            .prepared_recovery_v2(identity.keys)
+            .map_err(map_vault_error)?
+            .is_some()
+        {
+            return self.resume_v2(vault, identity);
+        }
         let stored = vault
             .recovery_restore()
             .map_err(map_vault_error)?
@@ -243,7 +200,11 @@ where
             Err(RecoveryTransportError::Unauthorized) => {
                 return Err(RecoveryRestoreCycleError::Unauthorized);
             }
-            Err(RecoveryTransportError::Invalid | RecoveryTransportError::Conflict) => {
+            Err(
+                RecoveryTransportError::Invalid
+                | RecoveryTransportError::Conflict
+                | RecoveryTransportError::PublicationRejected,
+            ) => {
                 return self.mark_conflict(vault, &stored);
             }
         };
@@ -261,7 +222,12 @@ where
         }
         let projection = match self.transport.restore_claim(restore_id) {
             Ok(Some(projection)) => projection,
-            Ok(None) | Err(RecoveryTransportError::Invalid | RecoveryTransportError::Conflict) => {
+            Ok(None)
+            | Err(
+                RecoveryTransportError::Invalid
+                | RecoveryTransportError::Conflict
+                | RecoveryTransportError::PublicationRejected,
+            ) => {
                 return self.mark_conflict(vault, &stored);
             }
             Err(RecoveryTransportError::Unauthorized) => {
@@ -431,9 +397,9 @@ fn complete(stored: &StoredRecoveryRestore) -> RecoveryRestoreOutcome {
 
 fn map_initial_transport_error(error: RecoveryTransportError) -> RecoveryRestoreCycleError {
     match error {
-        RecoveryTransportError::Invalid | RecoveryTransportError::Conflict => {
-            RecoveryRestoreCycleError::Conflict
-        }
+        RecoveryTransportError::Invalid
+        | RecoveryTransportError::Conflict
+        | RecoveryTransportError::PublicationRejected => RecoveryRestoreCycleError::Conflict,
         RecoveryTransportError::Unauthorized => RecoveryRestoreCycleError::Unauthorized,
         RecoveryTransportError::Transient | RecoveryTransportError::Expired => {
             RecoveryRestoreCycleError::Transient
