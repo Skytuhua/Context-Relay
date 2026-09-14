@@ -3,6 +3,9 @@
 ## Capability and policy states
 
 Native Codex `0.144.0` and `0.144.1` installations are eligible for full setup.
+The Windows x64 adapter also explicitly permits native `0.144.6` under the
+same executable, requirements and project-trust checks. This separate version
+eligibility does not replace installed acceptance of the fixed supported pair.
 Unknown versions, wrapper scripts, and unknown executable formats are
 import-only. A supported native installation is reported as blocked for setup
 when an administrator requirements file is active or the selected project is
@@ -15,10 +18,11 @@ their exact targets. It binds the physical native release executable beneath
 the expected releases directory and verifies that the release directory and
 held executable report the same version. Arbitrary PATH junctions and nested
 reparse points remain rejected. Later launches retain executable identity,
-digest and topology checks. Finding standalone `0.144.6` does not qualify it
-for full setup. Isolated lifecycle, memory, MCP and native-transaction evidence
-is recorded in the verification documents; installed acceptance and remaining
-profile/platform qualification still gate production enablement.
+digest and topology checks. Discovery alone does not establish effective setup
+permission: the exact supported version/format and current requirements/trust
+checks must also pass. Isolated lifecycle, memory, MCP and native-transaction
+evidence is recorded in the verification documents; remaining installed and
+profile/platform qualification is a separate release gate.
 
 The MCP parser accepts `transport.env: null` as no environment overrides,
 matching the standalone `0.144.6` CLI output. Nonempty environment overrides
