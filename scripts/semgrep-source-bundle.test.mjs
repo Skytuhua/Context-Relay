@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import * as sourceBundle from './semgrep-source-bundle.mjs';
 
 import {
   archiveCacheLinks,
@@ -926,4 +927,114 @@ test('complete bundle includes recursive git, opam records, pins, archives, and 
     () => verifyBundleEvidence({ bundlePath: first, evidencePath, sourceLockPath }),
     /evidence.*bundle|bundle.*evidence|size/i,
   );
+
+  await t.test('internal Windows source evidence binds completed bundled delivery without public promotion', async () => {
+    Object.assign(lock, {
+      completeCorrespondingSource: true,
+      missingMaterial: [],
+      targetStatus: [
+        { distributionTarget: 'windows-x86_64', enabled: true, reason: null },
+        { distributionTarget: 'aarch64-apple-darwin', enabled: false, reason: 'deferred_apple_native_qualification' },
+      ],
+    });
+    lock.opam.resolvedSourceArchivesComplete = true;
+    await writeFile(sourceLockPath, `${JSON.stringify(lock, null, 2)}\n`);
+    const bundlePath = join(root, 'internal.tar');
+    const built = await buildSemgrepSourceBundle({ ...options, outputPath: bundlePath });
+    const internal = {
+      schemaVersion: 2,
+      format: 'context-relay-semgrep-source-v1',
+      sourceLockSha256: digest('sha256', await readFile(sourceLockPath)),
+      bundleGeneratorSha256: digest('sha256', await readFile(new URL('./semgrep-source-bundle.mjs', import.meta.url))),
+      independentBuilds: 2,
+      byteIdentical: true,
+      status: 'complete_corresponding_source',
+      sourceDelivery: { kind: 'bundled', path: 'compliance/semgrep/semgrep-1.170.0-corresponding-source.tar' },
+      bundle: { sha256: built.sha256, size: built.size, payloadEntries: built.payloadEntries, recordedLinks: built.links },
+    };
+    const internalEvidencePath = join(root, 'bundle-evidence.internal-windows.v2.json');
+    const checkOptions = { bundlePath, evidencePath: internalEvidencePath, sourceLockPath };
+    const save = (value) => writeFile(internalEvidencePath, `${JSON.stringify(value, null, 2)}\n`);
+    await save(internal);
+    assert.equal(typeof sourceBundle.verifyInternalBundleEvidenceV2, 'function', 'completed internal bundled-source verification is required');
+    const actual = await sourceBundle.verifyInternalBundleEvidenceV2(checkOptions);
+    assert.equal(actual.sha256, digest('sha256', await readFile(bundlePath)));
+    await assert.rejects(() => verifyBundleEvidence(checkOptions), /fields|schema|asset/i);
+    await assert.rejects(
+      () => sourceBundle.verifyInternalBundleEvidenceV2({ ...checkOptions, evidencePath }),
+      /fields|schema|delivery/i,
+    );
+
+    for (const [label, change] of [
+      ['public delivery', (value) => { value.sourceAssetUrl = evidence.sourceAssetUrl; }],
+      ['alternate companion', (value) => { value.sourceDelivery.path = '../source.tar'; }],
+      ['missing delivery', (value) => { delete value.sourceDelivery; }],
+      ['unknown delivery field', (value) => { value.sourceDelivery.url = 'https://example.invalid/source.tar'; }],
+      ['wrong delivery kind', (value) => { value.sourceDelivery.kind = 'download'; }],
+      ['single build', (value) => { value.independentBuilds = 1; }],
+      ['pending source', (value) => { value.status = 'source_bundle_reproducible_native_builds_pending'; }],
+      ['unequal builds', (value) => { value.byteIdentical = false; }],
+      ['wrong schema', (value) => { value.schemaVersion = 1; }],
+      ['empty generator hash', (value) => { value.bundleGeneratorSha256 = '0'.repeat(64); }],
+      ['uppercase digest', (value) => { value.bundle.sha256 = 'A'.repeat(64); }],
+      ['oversized bundle', (value) => { value.bundle.size = 2147483649; }],
+      ['excessive entries', (value) => { value.bundle.payloadEntries = 1000001; }],
+      ['excessive links', (value) => { value.bundle.recordedLinks = 1000001; }],
+      ['wrong count', (value) => { value.bundle.payloadEntries += 1; }],
+      ['stale lock', (value) => { value.sourceLockSha256 = '1'.repeat(64); }],
+    ]) {
+      const invalid = structuredClone(internal);
+      change(invalid);
+      await save(invalid);
+      await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /bundle evidence|source delivery/i, label);
+    }
+    await writeFile(internalEvidencePath, `${JSON.stringify(internal, null, 2).slice(0, -1)},"schemaVersion":2}\n`);
+    await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /canonical|fields|JSON/i);
+    await writeFile(internalEvidencePath, `${JSON.stringify(internal, null, 2)}${' '.repeat(65536)}\n`);
+    await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /bounded|size/i);
+
+    for (const [label, change] of [
+      ['incomplete source', (value) => { value.completeCorrespondingSource = false; }],
+      ['pending material', (value) => { value.missingMaterial = ['native build']; }],
+      ['incomplete archive inventory', (value) => { value.opam.resolvedSourceArchivesComplete = false; }],
+      ['unqualified Windows', (value) => { value.targetStatus[0].enabled = false; }],
+      ['promoted Apple', (value) => { value.targetStatus[1].enabled = true; }],
+      ['missing deferral', (value) => { value.targetStatus[1].reason = null; }],
+      ['duplicate target', (value) => { value.targetStatus.push(value.targetStatus[0]); }],
+    ]) {
+      const invalidLock = structuredClone(lock);
+      change(invalidLock);
+      await writeFile(sourceLockPath, `${JSON.stringify(invalidLock, null, 2)}\n`);
+      await save({ ...internal, sourceLockSha256: digest('sha256', await readFile(sourceLockPath)) });
+      await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /source lock|target|incomplete/i, label);
+    }
+    await writeFile(sourceLockPath, `${JSON.stringify(lock, null, 2)}\n`);
+    await save(internal);
+    const changedLicensePath = join(root, 'changed-license.tar');
+    const changedLicense = await buildDeterministicTar({
+      outputPath: changedLicensePath,
+      entries: [
+        { path: 'metadata/source-lock.v1.json', bytes: await readFile(sourceLockPath), executable: false },
+        { path: `opam-repository/cache/sha256/${archiveSha256.slice(0, 2)}/${archiveSha256}`, bytes: archive, executable: false },
+        ...lock.licenseMaterials.map((material) => ({
+          path: material.path,
+          bytes: material.source === 'semgrep' ? Buffer.from('substituted license\n') : license,
+          executable: false,
+        })),
+      ],
+    });
+    await save({ ...internal, bundle: {
+      sha256: changedLicense.sha256,
+      size: changedLicense.size,
+      payloadEntries: changedLicense.payloadEntries,
+      recordedLinks: changedLicense.links,
+    } });
+    await assert.rejects(
+      () => sourceBundle.verifyInternalBundleEvidenceV2({ ...checkOptions, bundlePath: changedLicensePath }),
+      /license material/i,
+    );
+    await save(internal);
+    await writeFile(bundlePath, Buffer.from('substituted source'));
+    await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /bundle|tar/i);
+  });
 });

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import {
   chmod,
   copyFile,
+  cp,
   link,
   mkdir,
   mkdtemp,
@@ -30,6 +31,9 @@ import {
   verifyDeterministicTar,
 } from './semgrep-source-bundle.mjs';
 import { finalizeSemgrepNativeRelease } from './finalize-semgrep-native-release.mjs';
+import * as nativeFinalizer from './finalize-semgrep-native-release.mjs';
+import * as runtimePreparer from './prepare-semgrep-runtime.mjs';
+import * as sidecarHydration from './hydrate-sidecars.mjs';
 
 const COMMIT = '1'.repeat(40);
 const SEMGREP_REVISION = 'bd614accba811b407ae5c9ec6f1eecd3bdc29911';
@@ -60,7 +64,7 @@ async function put(root, relative, bytes, mode = 0o644) {
   return path;
 }
 
-function identity(target, build, checkRunId) {
+function identity(target, build, checkRunId, workflow) {
   const windows = target === 'windows-x86_64';
   const letter = build.slice(-1);
   return {
@@ -78,8 +82,7 @@ function identity(target, build, checkRunId) {
     runnerName: `hosted-${target}-${letter}`,
     runnerOs: windows ? 'Windows' : 'macOS',
     runnerArch: windows ? 'X64' : 'ARM64',
-    workflowRef: WORKFLOW_REF,
-    workflowSha: COMMIT,
+    ...workflow,
   };
 }
 
@@ -185,7 +188,7 @@ async function makeMacArtifact(root) {
   return artifact;
 }
 
-async function addNativeEvidence(artifact, target, bootstrap, bundleEvidence) {
+async function addNativeEvidence(artifact, target, bootstrap, bundleEvidence, workflow) {
   for (const slot of ['a', 'b']) {
     await copyFile(bootstrap, join(artifact, `source-${slot}.tar`));
     await writeFile(
@@ -194,6 +197,7 @@ async function addNativeEvidence(artifact, target, bootstrap, bundleEvidence) {
         target,
         `build-${slot}`,
         (target === 'windows-x86_64' ? 11 : 13) + (slot === 'b' ? 1 : 0),
+        workflow,
       ))}\n`,
     );
     await writeFile(
@@ -218,15 +222,18 @@ async function addNativeEvidence(artifact, target, bootstrap, bundleEvidence) {
   );
 }
 
-async function fixture() {
+async function fixture(workflow = { workflowRef: WORKFLOW_REF, workflowSha: COMMIT }) {
   const root = await mkdtemp(join(tmpdir(), 'context-relay-finalize-'));
   const workspace = join(root, 'workspace');
   await mkdir(workspace);
   const schema = Buffer.from('{"schemaVersion":1}\n');
   const generator = await readFile(new URL('./semgrep-source-bundle.mjs', import.meta.url));
-  const compilerRevision = '5'.repeat(40);
-  const compilerLicense = Buffer.from('compiler license\n');
-  const semgrepLicense = Buffer.from('semgrep source license\n');
+  const catalog = JSON.parse(await readFile(new URL('../third_party/sidecars/semgrep/source-lock.v1.json', import.meta.url)));
+  const licenseEntries = catalog.licenseMaterials.map((material) => ({
+    path: material.path, executable: false, bytes: Buffer.from(`${material.source} ${material.kind} fixture\n`),
+  }));
+  const archiveFixture = Buffer.from('tree-sitter source archive fixture\n');
+  const archiveHash = sha256(archiveFixture);
   const sourceLock = {
     schemaVersion: 1,
     project: 'Semgrep',
@@ -237,28 +244,21 @@ async function fixture() {
     sourceRevision: SEMGREP_REVISION,
     sourceTree: TREE,
     license: 'LGPL-2.1-or-later',
-    licenseMaterials: [
-      {
-        source: 'compiler', kind: 'license', spdx: 'LGPL-2.1-or-later',
-        path: `pins/${compilerRevision}/LICENSE`, sha256: sha256(compilerLicense),
+    licenseMaterials: catalog.licenseMaterials.map((material, index) => ({ ...material, sha256: sha256(licenseEntries[index].bytes) })),
+    additionalArchives: [{
+      ...catalog.additionalArchives[0],
+      source: {
+        url: 'https://example.invalid/tree-sitter.tar', mirrors: [], supplementalChecksums: [],
+        checksums: [{ algorithm: 'sha256', digest: archiveHash }],
       },
-      {
-        source: 'semgrep', kind: 'license', spdx: 'LGPL-2.1-or-later',
-        path: 'sources/semgrep/LICENSE', sha256: sha256(semgrepLicense),
-      },
-    ],
-    additionalArchives: [],
+    }],
     completeCorrespondingSource: false,
     recursiveInventoryComplete: true,
     rootGitlinks: [],
     opam: {
       repository: { revision: '6'.repeat(40) },
-      compiler: {
-        url: 'https://github.com/ocaml/ocaml',
-        revision: compilerRevision,
-        licenseSource: 'compiler',
-      },
-      pinDepends: [],
+      compiler: structuredClone(catalog.opam.compiler),
+      pinDepends: structuredClone(catalog.opam.pinDepends),
       resolvedSourceArchivesComplete: true,
       resolvedSourceArchives: [{
         package: 'fixture', version: '1', targets: ['aarch64-apple-darwin', 'windows-x86_64'],
@@ -360,6 +360,8 @@ async function fixture() {
     entries: [
       { bytes: sourceLockBytes, executable: false, path: 'metadata/source-lock.v1.json' },
       { bytes: Buffer.from('source\n'), executable: false, path: 'sources/semgrep/main.ml' },
+      ...licenseEntries,
+      { bytes: archiveFixture, executable: false, path: `opam-repository/cache/sha256/${archiveHash.slice(0, 2)}/${archiveHash}` },
     ],
     outputPath: bootstrap,
   });
@@ -430,10 +432,10 @@ async function fixture() {
       version: '1.170.0',
     });
     artifacts[target] = prepared.artifactRoot;
-    await addNativeEvidence(prepared.artifactRoot, target, bootstrap, bundleEvidence);
+    await addNativeEvidence(prepared.artifactRoot, target, bootstrap, bundleEvidence, workflow);
   }
   artifacts['macos-aarch64'] = await makeMacArtifact(join(root, 'prepared-macos-aarch64'));
-  await addNativeEvidence(artifacts['macos-aarch64'], 'macos-aarch64', bootstrap, bundleEvidence);
+  await addNativeEvidence(artifacts['macos-aarch64'], 'macos-aarch64', bootstrap, bundleEvidence, workflow);
   const facts = {
     commit: COMMIT,
     cygwinRelease: '3.6.10(0.349/5/3)',
@@ -470,8 +472,7 @@ async function fixture() {
         commit: COMMIT,
         runId: RUN_ID,
         runAttempt: 1,
-        workflowRef: WORKFLOW_REF,
-        workflowSha: COMMIT,
+        ...workflow,
       },
     },
     root,
@@ -521,7 +522,150 @@ test('finalizer verifies native evidence and emits only a complete reviewable pa
   }
 });
 
+test('internal finalizer preserves PR workflow identity, qualifies Windows only and bundles source', async () => {
+  const value = await fixture({
+    workflowRef: 'Skytuhua/Context-Relay/.github/workflows/ci.yml@refs/pull/16/merge',
+    workflowSha: 'e'.repeat(40),
+  });
+  try {
+    const { macosArtifactRoot, ...args } = value.args;
+    assert.equal(typeof nativeFinalizer.finalizeInternalWindowsSemgrepRelease, 'function');
+    const finalize = nativeFinalizer.finalizeInternalWindowsSemgrepRelease;
+    await assert.rejects(finalize(value.args), /macOS|Windows.only/i);
+    await assert.rejects(finalizeSemgrepNativeRelease(args), /CI identity|macOS/i);
+    const result = await finalize(args);
+    const materialRoot = join(result.patchRoot, 'third_party/sidecars/semgrep');
+    const lock = JSON.parse(await readFile(join(materialRoot, 'source-lock.v1.json')));
+    const evidence = JSON.parse(await readFile(join(materialRoot, 'native-build-evidence.v1.json')));
+    const bundle = JSON.parse(await readFile(join(materialRoot, 'bundle-evidence.internal-windows.v2.json')));
+    const manifest = JSON.parse(await readFile(join(result.patchRoot, 'third_party/sidecars/manifest.v1.json')));
+    assert.equal(result.publishable, false);
+    assert.equal(result.purpose, 'internal-windows-package-qualification');
+    assert.deepEqual(evidence.ci, args.expected);
+    assert.equal(evidence.builders.length, 2);
+    assert.deepEqual(evidence.smokes.map(({ target }) => target), ['windows-x86_64']);
+    assert.deepEqual(lock.targetStatus, [
+      { distributionTarget: 'windows-x86_64', enabled: true, reason: null },
+      { distributionTarget: 'aarch64-apple-darwin', enabled: false, reason: 'deferred_apple_native_qualification' },
+    ]);
+    assert.equal(lock.toolchains.length, 2);
+    assert.deepEqual(manifest.tools[0].targets.map(({ enabled }) => enabled), [true, false, false]);
+    assert.equal(manifest.tools[0].targets[1].disabledReason, 'deferred_apple_native_qualification');
+    assert.equal(manifest.tools[0].materials.find(({ role }) => role === 'source-bundle-evidence').path,
+      'third_party/sidecars/semgrep/bundle-evidence.internal-windows.v2.json');
+    assert.equal(bundle.schemaVersion, 2);
+    assert.equal(Object.hasOwn(bundle, 'sourceAssetUrl'), false);
+    assert.deepEqual(bundle.sourceDelivery, {
+      kind: 'bundled', path: 'compliance/semgrep/semgrep-1.170.0-corresponding-source.tar',
+    });
+    assert.equal(bundle.bundle.sha256, result.sourceBundle.sha256);
+    assert.equal(sha256(await readFile(result.sourceBundle.path)), bundle.bundle.sha256);
+    await assert.rejects(readFile(join(materialRoot, 'bundle-evidence.v1.json')), { code: 'ENOENT' });
+    assert.equal(typeof runtimePreparer.createInternalWindowsDocuments, 'function');
+    const inputs = {
+      applicationSourceCommit: '4'.repeat(40),
+      qualification: args.expected,
+      manifestBytes: await readFile(join(result.patchRoot, 'third_party/sidecars/manifest.v1.json')),
+      sourceLockBytes: await readFile(join(materialRoot, 'source-lock.v1.json')),
+      nativeBuildEvidenceBytes: await readFile(join(materialRoot, 'native-build-evidence.v1.json')),
+      bundleEvidenceBytes: await readFile(join(materialRoot, 'bundle-evidence.internal-windows.v2.json')),
+      complianceManifestBytes: json({ schemaVersion: 1, fixtureOnly: true }),
+    };
+    const document = runtimePreparer.createInternalWindowsDocuments(inputs);
+    const descriptor = JSON.parse(document.descriptorBytes);
+    assert.equal(descriptor.applicationSourceCommit, inputs.applicationSourceCommit);
+    assert.deepEqual(descriptor.qualification, args.expected);
+    assert.equal(descriptor.sourceLock.sha256, bundle.sourceLockSha256);
+    assert.equal(descriptor.complianceManifest.sha256, sha256(inputs.complianceManifestBytes));
+    assert.equal(descriptor.sourceCompanion.sha256, result.sourceBundle.sha256);
+    assert.equal(document.descriptorDigest, sha256(Buffer.concat([
+      Buffer.from('context-relay/internal-windows-package-qualification/v2\0'), document.descriptorBytes,
+    ])));
+    assert.deepEqual(runtimePreparer.createInternalWindowsDocuments(inputs).descriptorBytes, document.descriptorBytes);
+    for (const key of ['manifestBytes', 'sourceLockBytes', 'nativeBuildEvidenceBytes', 'bundleEvidenceBytes']) {
+      assert.throws(() => runtimePreparer.createInternalWindowsDocuments({ ...inputs, [key]: json({}) }), undefined, key);
+    }
+    const verify = sidecarHydration.verifyInternalWindowsPackageInputs;
+    assert.equal(typeof verify, 'function');
+    const resources = join(value.root, 'resources');
+    const verification = join(resources, 'sidecars/semgrep/verification');
+    await cp(args.workspace, verification, { recursive: true });
+    await cp(result.patchRoot, verification, { recursive: true });
+    await put(resources, descriptor.sourceCompanion.path, await readFile(result.sourceBundle.path));
+    await put(resources, descriptor.complianceManifest.path, inputs.complianceManifestBytes);
+    const descriptorPath = 'sidecars/semgrep/internal-windows-package-qualification.v2.json';
+    await put(resources, descriptorPath, document.descriptorBytes);
+    const archiveBytes = await readFile(join(args.windowsArtifactRoot, 'semgrep-1.170.0-windows-x86_64.tar.gz'));
+    const options = { resourceRoot: resources, expectedDescriptorBytes: document.descriptorBytes, archiveBytes };
+    const verified = await verify(options);
+    assert.equal(verified.descriptorDigest, document.descriptorDigest);
+    assert.equal(verified.complianceVerified, false);
+    assert.deepEqual(verified.complianceManifestBytes, inputs.complianceManifestBytes);
+    assert.deepEqual(verified.files.map(({ entry }) => entry.path), descriptor.closure.map(({ path }) => path));
+    for (const [relative, mutate, error] of [
+      [descriptorPath, (bytes) => Buffer.concat([bytes, Buffer.from(' ')]), /descriptor|size/i],
+      [descriptorPath, (bytes) => Buffer.from(bytes.toString().replace('4'.repeat(40), '5'.repeat(40))), /descriptor.*producer/i],
+      [descriptor.sourceCompanion.path, (bytes) => Buffer.concat([bytes, Buffer.from('changed')]), /source|bundle/i],
+      [descriptor.complianceManifest.path, (bytes) => Buffer.alloc(bytes.length, 0x20), /SHA-256/i],
+      [descriptor.nativeBuildEvidence.path, (bytes) => Buffer.alloc(bytes.length, 0x20), /SHA-256/i],
+    ]) {
+      const path = join(resources, relative);
+      const original = await readFile(path);
+      await writeFile(path, mutate(original));
+      await assert.rejects(verify(options), error);
+      await writeFile(path, original);
+    }
+    await assert.rejects(verify({ ...options, archiveBytes: Buffer.alloc(archiveBytes.length) }), /archive.*SHA-256/i);
+    const licensePath = join(verification, manifest.tools[0].license.path);
+    const alias = join(value.root, 'license-hardlink');
+    await link(licensePath, alias);
+    await assert.rejects(verify(options), /license.*regular no-link/i);
+    await rm(alias);
+    const inconsistentManifest = structuredClone(manifest);
+    inconsistentManifest.tools[0].targets[0].download.entries.push({ path: 'extra.txt', type: 'file', size: 1 });
+    const inconsistentBytes = json(inconsistentManifest);
+    const inconsistentDescriptor = structuredClone(descriptor);
+    inconsistentDescriptor.sidecarManifest.size = inconsistentBytes.length;
+    inconsistentDescriptor.sidecarManifest.sha256 = sha256(inconsistentBytes);
+    const inconsistentDescriptorBytes = json(inconsistentDescriptor);
+    await put(resources, descriptor.sidecarManifest.path, inconsistentBytes);
+    await put(resources, descriptorPath, inconsistentDescriptorBytes);
+    await assert.rejects(verify({ ...options, expectedDescriptorBytes: inconsistentDescriptorBytes }), /descriptor.*archive inventory/i);
+  } finally {
+    await rm(value.root, { force: true, recursive: true });
+  }
+});
+
 test('finalizer refuses drift, topology tricks, and a pre-existing output without deleting it', async (t) => {
+  await t.test('internal Windows rejects changed builder, smoke and source identities before output', async () => {
+    const value = await fixture();
+    try {
+      const { macosArtifactRoot, ...args } = value.args;
+      const finalize = nativeFinalizer.finalizeInternalWindowsSemgrepRelease;
+      for (const [relative, change] of [
+        ['build-b.identity.v1.json', (bytes) => {
+          const changed = JSON.parse(bytes);
+          changed.workflowSha = 'e'.repeat(40);
+          return Buffer.from(`${JSON.stringify(changed)}\n`);
+        }],
+        ['native-smoke.windows-x86_64.v1.json', () => createNativeSmokeEvidence({
+          target: 'windows-x86_64', commit: COMMIT, runId: '9999', runAttempt: 1,
+          checkRunId: 21, jobDefinition: 'native-isolation-windows-x64',
+        })],
+        ['source-b.tar', (bytes) => Buffer.concat([bytes, Buffer.from('changed')])],
+      ]) {
+        const path = join(args.windowsArtifactRoot, relative);
+        const original = await readFile(path);
+        await writeFile(path, change(original));
+        await assert.rejects(finalize(args), /identity|workflow|smoke|source bundles/i, relative);
+        await assert.rejects(readFile(join(args.outputRoot, 'patch/third_party/sidecars/manifest.v1.json')), { code: 'ENOENT' });
+        await writeFile(path, original);
+      }
+    } finally {
+      await rm(value.root, { force: true, recursive: true });
+    }
+  });
+
   await t.test('unknown pending source-lock key', async () => {
     const value = await fixture();
     try {

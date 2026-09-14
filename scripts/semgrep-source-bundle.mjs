@@ -1011,9 +1011,9 @@ function validateBundleLock(lock) {
   return lock;
 }
 
-async function readJsonFile(path, label) {
+async function readJsonFile(path, label, maximum = 16 * 1024 * 1024) {
   const info = await lstat(resolve(path));
-  if (!info.isFile() || info.isSymbolicLink() || info.size === 0 || info.size > 16 * 1024 * 1024) {
+  if (!info.isFile() || info.isSymbolicLink() || info.size === 0 || info.size > maximum) {
     fail(`${label} is not a bounded no-link regular file`);
   }
   const bytes = await readFile(path);
@@ -1145,12 +1145,20 @@ function exactEvidenceKeys(value, expected, label) {
   }
 }
 
-export async function verifyBundleEvidence({ bundlePath, evidencePath, sourceLockPath }) {
+export async function verifyBundleEvidence(options) {
+  return verifyBundleEvidenceForDelivery(options, false);
+}
+
+export async function verifyInternalBundleEvidenceV2(options) {
+  return verifyBundleEvidenceForDelivery(options, true);
+}
+
+async function verifyBundleEvidenceForDelivery({ bundlePath, evidencePath, sourceLockPath }, internal) {
   if (![bundlePath, evidencePath, sourceLockPath].every((value) => typeof value === 'string')) {
     fail('bundle evidence arguments are invalid');
   }
   const [evidenceFile, sourceLockFile] = await Promise.all([
-    readJsonFile(evidencePath, 'bundle evidence'),
+    readJsonFile(evidencePath, 'bundle evidence', internal ? 65536 : undefined),
     readJsonFile(sourceLockPath, 'source lock'),
   ]);
   const evidence = evidenceFile.value;
@@ -1161,7 +1169,7 @@ export async function verifyBundleEvidence({ bundlePath, evidencePath, sourceLoc
     'format',
     'independentBuilds',
     'schemaVersion',
-    'sourceAssetUrl',
+    internal ? 'sourceDelivery' : 'sourceAssetUrl',
     'sourceLockSha256',
     'status',
   ], 'bundle evidence');
@@ -1172,10 +1180,16 @@ export async function verifyBundleEvidence({ bundlePath, evidencePath, sourceLoc
     'size',
   ], 'bundle evidence bundle');
   const sha256Pattern = /^[0-9a-f]{64}$/;
-  if (evidence.sourceAssetUrl !== SOURCE_ASSET_URL) {
+  if (internal) {
+    exactEvidenceKeys(evidence.sourceDelivery, ['kind', 'path'], 'bundle evidence source delivery');
+    if (evidence.sourceDelivery.kind !== 'bundled'
+        || evidence.sourceDelivery.path !== 'compliance/semgrep/semgrep-1.170.0-corresponding-source.tar') {
+      fail('bundle evidence source delivery is invalid');
+    }
+  } else if (evidence.sourceAssetUrl !== SOURCE_ASSET_URL) {
     fail('bundle evidence source asset URL is invalid');
   }
-  if (evidence.schemaVersion !== 1
+  if (evidence.schemaVersion !== (internal ? 2 : 1)
       || evidence.format !== 'context-relay-semgrep-source-v1'
       || !Number.isSafeInteger(evidence.independentBuilds)
       || typeof evidence.byteIdentical !== 'boolean'
@@ -1191,6 +1205,51 @@ export async function verifyBundleEvidence({ bundlePath, evidencePath, sourceLoc
   const v1 = evidence.status === 'source_bundle_v1_native_builds_pending';
   if (evidence.independentBuilds !== (v1 ? 1 : 2)
       || evidence.byteIdentical !== !v1) fail('bundle evidence qualification claim is invalid');
+  if (internal) {
+    if (evidence.status !== 'complete_corresponding_source'
+        || [evidence.sourceLockSha256, evidence.bundleGeneratorSha256, evidence.bundle.sha256]
+          .some((value) => typeof value !== 'string' || /^0+$/.test(value))
+        || evidence.bundle.size > 2147483648
+        || evidence.bundle.payloadEntries > 1000000 || evidence.bundle.recordedLinks > 1000000) {
+      fail('internal bundle evidence is incomplete or exceeds its bounds');
+    }
+    const canonical = {
+      schemaVersion: evidence.schemaVersion,
+      format: evidence.format,
+      sourceLockSha256: evidence.sourceLockSha256,
+      bundleGeneratorSha256: evidence.bundleGeneratorSha256,
+      independentBuilds: evidence.independentBuilds,
+      byteIdentical: evidence.byteIdentical,
+      status: evidence.status,
+      sourceDelivery: { kind: evidence.sourceDelivery.kind, path: evidence.sourceDelivery.path },
+      bundle: {
+        sha256: evidence.bundle.sha256,
+        size: evidence.bundle.size,
+        payloadEntries: evidence.bundle.payloadEntries,
+        recordedLinks: evidence.bundle.recordedLinks,
+      },
+    };
+    if (!evidenceFile.bytes.equals(Buffer.from(`${JSON.stringify(canonical, null, 2)}\n`))) {
+      fail('internal bundle evidence is not canonical JSON');
+    }
+    const lock = sourceLockFile.value;
+    if (lock?.completeCorrespondingSource !== true || lock.recursiveInventoryComplete !== true
+        || lock.opam?.resolvedSourceArchivesComplete !== true
+        || !Array.isArray(lock.missingMaterial) || lock.missingMaterial.length !== 0
+        || !Array.isArray(lock.targetStatus) || lock.targetStatus.length !== 2) {
+      fail('internal source lock is incomplete');
+    }
+    for (const status of lock.targetStatus) {
+      exactEvidenceKeys(status, ['distributionTarget', 'enabled', 'reason'], 'internal source lock target');
+    }
+    const windows = lock.targetStatus.filter((status) => status.distributionTarget === 'windows-x86_64');
+    const apple = lock.targetStatus.filter((status) => status.distributionTarget === 'aarch64-apple-darwin');
+    if (windows.length !== 1 || windows[0].enabled !== true || windows[0].reason !== null
+        || apple.length !== 1 || apple[0].enabled !== false
+        || apple[0].reason !== 'deferred_apple_native_qualification') {
+      fail('internal source lock target qualification is invalid');
+    }
+  }
   if (evidence.sourceLockSha256 !== hash('sha256', sourceLockFile.bytes)) {
     fail('bundle evidence source lock hash mismatch');
   }
@@ -1204,6 +1263,13 @@ export async function verifyBundleEvidence({ bundlePath, evidencePath, sourceLoc
     fail('bundle evidence generator hash mismatch');
   }
   const verified = await verifySemgrepSourceBundle({ bundlePath, sourceLockPath });
+  if (internal) {
+    for (const material of sourceLockFile.value.licenseMaterials) {
+      if (verified.digests[material.path] !== material.sha256) {
+        fail('internal source lock license material does not match the bundle');
+      }
+    }
+  }
   if (evidence.bundle.sha256 !== verified.sha256
       || evidence.bundle.size !== verified.size
       || evidence.bundle.payloadEntries !== verified.payloadEntries

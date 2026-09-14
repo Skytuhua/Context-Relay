@@ -16,11 +16,12 @@ import {
   parseSidecarManifest,
   validateManifestMaterials,
   validateSemgrepNativeBuildEvidence,
+  validateInternalWindowsNativeBuildEvidence,
 } from './hydrate-sidecars.mjs';
 import { parseNativeSmokeEvidence } from './native-smoke-evidence.mjs';
 import { createWindowsStableToolchainEvidence } from './prepare-semgrep-runtime.mjs';
 import { resealSemgrepSourceBundle } from './reseal-semgrep-source-bundle.mjs';
-import { verifyBundleEvidence } from './semgrep-source-bundle.mjs';
+import { verifyBundleEvidence, verifyInternalBundleEvidenceV2 } from './semgrep-source-bundle.mjs';
 import { validateIndependentBuilderIdentities, validateWindowsOfflineEvidence } from './verify-native-builder-identities.mjs';
 
 const VERSION = '1.170.0';
@@ -320,13 +321,15 @@ function verifyRuntimeArchive(bytes, inventory, label) {
   }
 }
 
-function validateExpected(expected) {
+function validateExpected(expected, internal) {
   exact(expected, ['commit', 'runId', 'runAttempt', 'workflowRef', 'workflowSha'], 'expected CI identity');
   if (!COMMIT.test(expected.commit) || !COMMIT.test(expected.workflowSha)
-      || expected.workflowSha !== expected.commit || !/^[1-9][0-9]*$/u.test(expected.runId)
+      || (!internal && expected.workflowSha !== expected.commit) || !/^[1-9][0-9]*$/u.test(expected.runId)
       || expected.runId.length > 32 || positive(expected.runAttempt, 'run attempt') !== expected.runAttempt
       || typeof expected.workflowRef !== 'string'
-      || !/^[^\r\n\0]+\/\.github\/workflows\/ci\.yml@[^\r\n\0]+$/u.test(expected.workflowRef)) {
+      || (internal
+        ? !/^[\x21-\x7e]{1,1024}$/u.test(expected.workflowRef) || expected.workflowRef.includes('\\')
+        : !/^[^\r\n\0]+\/\.github\/workflows\/ci\.yml@[^\r\n\0]+$/u.test(expected.workflowRef))) {
     fail('expected CI identity is invalid');
   }
 }
@@ -625,11 +628,15 @@ async function readArtifact(root, target, expected, pendingBundleBytes, sourceLo
   };
 }
 
-function finalSourceLock(pending, nativeEvidenceSha256, support, windowsBuilderSha256) {
+function finalSourceLock(pending, nativeEvidenceSha256, support, windowsBuilderSha256, internal) {
   const lock = structuredClone(pending);
   lock.completeCorrespondingSource = true;
   lock.missingMaterial = [];
-  lock.targetStatus = lock.targetStatus.map((status) => ({ ...status, enabled: true, reason: null }));
+  lock.targetStatus = lock.targetStatus.map((status) => (
+    internal && status.distributionTarget === 'aarch64-apple-darwin'
+      ? { ...status, enabled: false, reason: 'deferred_apple_native_qualification' }
+      : { ...status, enabled: true, reason: null }
+  ));
   const windows = lock.toolchains.find(({ distributionTarget }) => distributionTarget === 'windows-x86_64');
   windows.status = 'native_builds_verified';
   windows.builderEvidence.sha256 = windowsBuilderSha256;
@@ -643,13 +650,17 @@ function finalSourceLock(pending, nativeEvidenceSha256, support, windowsBuilderS
   return lock;
 }
 
-function finalManifest(pending, sourceLockSha256, bundleEvidenceSha256, nativeEvidenceSha256, support, artifacts) {
+function finalManifest(pending, sourceLockSha256, bundleEvidenceSha256, nativeEvidenceSha256, support, artifacts, internal) {
   const manifest = structuredClone(pending);
   const semgrep = manifest.tools.find(({ id }) => id === 'semgrep');
   semgrep.source.materialSha256 = sourceLockSha256;
   const evidence = semgrep.materials.filter(({ role }) => role === 'source-bundle-evidence');
   if (evidence.length !== 1) fail('pending manifest must have one source-bundle-evidence material');
   evidence[0].sha256 = bundleEvidenceSha256;
+  if (internal) {
+    evidence[0].path = 'third_party/sidecars/semgrep/bundle-evidence.internal-windows.v2.json';
+    semgrep.targets.find(({ target }) => target === 'macos-aarch64').disabledReason = 'deferred_apple_native_qualification';
+  }
   semgrep.materials.push({
     role: 'native-build-evidence',
     path: 'third_party/sidecars/semgrep/native-build-evidence.v1.json',
@@ -687,26 +698,36 @@ function finalManifest(pending, sourceLockSha256, bundleEvidenceSha256, nativeEv
   return manifest;
 }
 
-export async function finalizeSemgrepNativeRelease({
+export async function finalizeSemgrepNativeRelease(options) {
+  return finalizeNativeRelease(options, false);
+}
+
+export async function finalizeInternalWindowsSemgrepRelease(options) {
+  return finalizeNativeRelease(options, true);
+}
+
+async function finalizeNativeRelease({
   bootstrapSourcePath,
   expected,
   macosArtifactRoot,
   outputRoot,
   windowsArtifactRoot,
   workspace,
-}) {
-  validateExpected(expected);
+}, internal) {
+  if (internal && macosArtifactRoot !== undefined) fail('internal Windows-only qualification does not accept a macOS artifact');
+  validateExpected(expected, internal);
   for (const [value, label] of [
     [workspace, 'workspace'], [windowsArtifactRoot, 'Windows artifact root'],
-    [macosArtifactRoot, 'macOS artifact root'], [bootstrapSourcePath, 'bootstrap source'],
+    ...(!internal ? [[macosArtifactRoot, 'macOS artifact root']] : []), [bootstrapSourcePath, 'bootstrap source'],
     [outputRoot, 'output root'],
   ]) if (typeof value !== 'string' || value.length === 0) fail(`${label} path is invalid`);
   workspace = resolve(workspace);
   windowsArtifactRoot = resolve(windowsArtifactRoot);
-  macosArtifactRoot = resolve(macosArtifactRoot);
+  if (!internal) macosArtifactRoot = resolve(macosArtifactRoot);
   bootstrapSourcePath = resolve(bootstrapSourcePath);
   outputRoot = resolve(outputRoot);
-  if (outputRoot === parse(outputRoot).root || [workspace, windowsArtifactRoot, macosArtifactRoot]
+  const inputRoots = [workspace, windowsArtifactRoot, ...(!internal ? [macosArtifactRoot] : [])];
+  if (outputRoot === parse(outputRoot).root || inputRoots
     .some((root) => outputRoot === root || outputRoot.startsWith(`${root}${process.platform === 'win32' ? '\\' : '/'}`))) {
     fail('output root is unsafe');
   }
@@ -789,17 +810,17 @@ export async function finalizeSemgrepNativeRelease({
 
   const artifacts = await Promise.all([
     readArtifact(windowsArtifactRoot, 'windows-x86_64', expected, bundleEvidenceBytes, pendingToolchains.windows),
-    readArtifact(macosArtifactRoot, 'macos-aarch64', expected, bundleEvidenceBytes, pendingToolchains.macos),
+    ...(!internal ? [readArtifact(macosArtifactRoot, 'macos-aarch64', expected, bundleEvidenceBytes, pendingToolchains.macos)] : []),
   ]);
   const sourceCopies = artifacts.flatMap(({ sources }) => sources);
-  if (sourceCopies.length !== 4 || sourceCopies.some(({ sha256: digest, size }) => (
+  if (sourceCopies.length !== artifacts.length * 2 || sourceCopies.some(({ sha256: digest, size }) => (
     digest !== bootstrapIdentity.sha256 || size !== bootstrapIdentity.size
-  ))) fail('four pending source bundles differ from the verified bootstrap source');
+  ))) fail('pending source bundles differ from the verified bootstrap source');
   const checkRunIds = [
     ...artifacts.flatMap(({ identities }) => identities.map(({ value }) => value.checkRunId)),
     ...artifacts.map(({ smoke }) => smoke.checkRunId),
   ];
-  if (new Set(checkRunIds).size !== 6) fail('native builder/smoke check-run identities are not distinct');
+  if (new Set(checkRunIds).size !== artifacts.length * 3) fail('native builder/smoke check-run identities are not distinct');
 
   const builders = artifacts.flatMap(({ identities, target }) => identities.map(({ sha256: digest, size, value }) => ({
     target,
@@ -852,6 +873,7 @@ export async function finalizeSemgrepNativeRelease({
     nativeEvidenceSha256,
     support,
     artifacts[0].windowsBuilder.evidence.sha256,
+    internal,
   );
   const finalLockBytes = jsonBytes(finalLockValue);
   const finalLockSha256 = sha256(finalLockBytes);
@@ -892,7 +914,22 @@ export async function finalizeSemgrepNativeRelease({
       fail('final source bundle does not bind its release metadata');
     }
     await rm(comparisonPath);
-    const finalBundleEvidenceValue = {
+    const finalBundleEvidenceValue = internal ? {
+      schemaVersion: 2,
+      format: 'context-relay-semgrep-source-v1',
+      sourceLockSha256: finalLockSha256,
+      bundleGeneratorSha256: bundleEvidence.bundleGeneratorSha256,
+      independentBuilds: 2,
+      byteIdentical: true,
+      status: 'complete_corresponding_source',
+      sourceDelivery: { kind: 'bundled', path: `compliance/semgrep/${SOURCE_ASSET}` },
+      bundle: {
+        sha256: first.sha256,
+        size: first.size,
+        payloadEntries: first.payloadEntries,
+        recordedLinks: first.links,
+      },
+    } : {
       bundle: {
         payloadEntries: first.payloadEntries,
         recordedLinks: first.links,
@@ -916,30 +953,36 @@ export async function finalizeSemgrepNativeRelease({
       nativeEvidenceSha256,
       support,
       artifacts,
+      internal,
     );
     const finalManifestBytes = jsonBytes(finalManifestValue);
     parseSidecarManifest(finalManifestBytes.toString('utf8'));
     const finalSemgrep = finalManifestValue.tools.find(({ id }) => id === 'semgrep');
     const nativeMaterial = finalSemgrep.materials.find(({ role }) => role === 'native-build-evidence');
-    validateSemgrepNativeBuildEvidence(
+    const validateNative = internal ? validateInternalWindowsNativeBuildEvidence : validateSemgrepNativeBuildEvidence;
+    validateNative(
       nativeEvidenceValue,
       finalLockValue,
       nativeMaterial,
       finalSemgrep.materials,
       finalSemgrep.targets.filter(({ enabled }) => enabled),
+      ...(internal ? [expected] : []),
     );
     await writeFile(join(semgrepPatch, 'native-build-evidence.v1.json'), nativeEvidenceBytes, { flag: 'wx' });
     await writeFile(join(semgrepPatch, 'source-lock.v1.json'), finalLockBytes, { flag: 'wx' });
-    await writeFile(join(semgrepPatch, 'bundle-evidence.v1.json'), finalBundleEvidenceBytes, { flag: 'wx' });
+    const bundleEvidenceName = internal ? 'bundle-evidence.internal-windows.v2.json' : 'bundle-evidence.v1.json';
+    await writeFile(join(semgrepPatch, bundleEvidenceName), finalBundleEvidenceBytes, { flag: 'wx' });
     const manifestPath = join(patchRoot, 'third_party', 'sidecars', 'manifest.v1.json');
     await mkdir(dirname(manifestPath), { recursive: true });
     await writeFile(manifestPath, finalManifestBytes, { flag: 'wx' });
-    await verify({
+    const verifyFinal = internal ? verifyInternalBundleEvidenceV2 : verify;
+    await verifyFinal({
       bundlePath: finalSourcePath,
-      evidencePath: join(semgrepPatch, 'bundle-evidence.v1.json'),
+      evidencePath: join(semgrepPatch, bundleEvidenceName),
       sourceLockPath: join(semgrepPatch, 'source-lock.v1.json'),
     });
     return {
+      ...(internal ? { purpose: 'internal-windows-package-qualification', publishable: false } : {}),
       outputRoot,
       patchRoot,
       releaseRoot,
@@ -960,13 +1003,16 @@ export async function finalizeSemgrepNativeRelease({
 }
 
 async function main(argv) {
-  if (argv.length !== 20) fail('usage: --workspace PATH --windows-artifact PATH --macos-artifact PATH --bootstrap-source PATH --output PATH --commit SHA --run-id ID --run-attempt N --workflow-ref REF --workflow-sha SHA');
-  const values = Object.fromEntries(Array.from({ length: 10 }, (_, index) => [argv[index * 2], argv[index * 2 + 1]]));
+  const internal = argv[0] === '--internal-windows';
+  if (internal) argv = argv.slice(1);
+  if (argv.length !== (internal ? 18 : 20)) fail('usage: [--internal-windows] --workspace PATH --windows-artifact PATH [--macos-artifact PATH (public only)] --bootstrap-source PATH --output PATH --commit SHA --run-id ID --run-attempt N --workflow-ref REF --workflow-sha SHA');
+  const values = Object.fromEntries(Array.from({ length: argv.length / 2 }, (_, index) => [argv[index * 2], argv[index * 2 + 1]]));
   if (JSON.stringify(Object.keys(values).sort()) !== JSON.stringify([
-    '--bootstrap-source', '--commit', '--macos-artifact', '--output', '--run-attempt',
+    '--bootstrap-source', '--commit', ...(!internal ? ['--macos-artifact'] : []), '--output', '--run-attempt',
     '--run-id', '--windows-artifact', '--workflow-ref', '--workflow-sha', '--workspace',
   ])) fail('arguments are invalid');
-  const result = await finalizeSemgrepNativeRelease({
+  const finalize = internal ? finalizeInternalWindowsSemgrepRelease : finalizeSemgrepNativeRelease;
+  const result = await finalize({
     workspace: values['--workspace'],
     windowsArtifactRoot: values['--windows-artifact'],
     macosArtifactRoot: values['--macos-artifact'],

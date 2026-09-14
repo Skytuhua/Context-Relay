@@ -272,7 +272,7 @@
       },
       "relinking": {
         "path": "third_party/sidecars/semgrep/RELINKING.md",
-        "sha256": "aac857bc70fac3e3775dde65dddddbd472540107818ca1d4b3846e655443f170"
+        "sha256": "9727aed08662d29c779b1d43fe206e3f2e3950b507b9b3a3bb1fe50aaa37c308"
       },
       "materials": [
         {
@@ -323,12 +323,12 @@
         {
           "role": "source-bundle-generator",
           "path": "scripts/semgrep-source-bundle.mjs",
-          "sha256": "43378c2a82dc79073b33759d53c0a50ae9f75bf3ac63b2947e1226fb43dbb3cc"
+          "sha256": "199b18ff2bac412ded23b036cdef86ba1ea0402f55152b2743250be39d8ab9af"
         },
         {
           "role": "source-bundle-evidence",
           "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
-          "sha256": "d776402a28416dfac7b50e867784d50e5537b0d2a5d98c9bf135eccbdd4c11ea"
+          "sha256": "c0683dcb75c31fa4084c8a8e16a4b340d8031907404835cba05354fe7e087474"
         },
         {
           "role": "manifest-rule",
