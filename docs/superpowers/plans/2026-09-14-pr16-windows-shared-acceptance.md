@@ -126,8 +126,8 @@ Use actual client sessions for hosted acceptance. Stubbed Auth and local Postgre
 
 - [ ] Create the separate App with only Metadata read and Contents read.
 - [ ] Bind installation access to verified GitHub identity plus live Context Relay account/device authorization. A callback-supplied installation ID is insufficient.
-- [ ] Verify current user access to each requested repository before issuing a narrowly scoped installation token. GitHub provides user-accessible installation/repository endpoints for this check. [GitHub installation APIs](https://docs.github.com/en/rest/apps/installations)
-- [ ] Keep repository-access tokens in native memory, clear them on logout/disconnect/expiry and never return them to React.
+- [ ] Use expiring GitHub App user access tokens for user-initiated repository inspection/download, as explicitly approved on September 14, 2026. Verify the GitHub identity and current user-accessible installation/repository set, and fail closed if requested-repository narrowing is not established. This supersedes the original installation-token choice. [GitHub user access tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app)
+- [ ] Keep repository access and refresh tokens only in native memory; clear them on logout/disconnect/expiry/restart and never return them to React. Keep the authorization-code/refresh client secret in hosted secret storage. Distinguish local discard from provider token revocation and verify disconnect behavior.
 - [ ] Persist installation IDs, repository IDs and metadata only. Reconcile `encrypted_token_reference` through an additive migration without storing access tokens.
 - [ ] Resolve branches/tags to immutable commits and download archives directly from GitHub.
 
