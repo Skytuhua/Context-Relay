@@ -53,7 +53,6 @@ function assertSupportedHostMatrix(body) {
   const rows = evaluate(Object.values(parseYaml(body))[0].strategy.matrix.include);
   assert.deepEqual(rows.map(({ host, os }) => ({ host, os })), [
     { host: 'windows-x64', os: 'windows-2025' },
-    { host: 'macos-arm64', os: 'macos-15' },
   ]);
   assert.match(body, /RUNNER_ARCH[^\n]+X64/);
   assert.match(body, /uname -m[^\n]+arm64/);
@@ -107,7 +106,7 @@ async function initializedRepository(prefix) {
   return workspace;
 }
 
-test('Windows-only manual qualification expands only Windows hosts and retains strict dependency gates', async () => {
+test('Windows/shared qualification defers Apple hosts and retains strict dependency gates', async () => {
   const ci = parseYaml(await readFile(ciWorkflowUrl, 'utf8'));
   const caller = parseYaml(await readFile(new URL('semgrep-release-qualification.yml', workflowDirectoryUrl), 'utf8'));
   assert.equal(caller.on.workflow_dispatch.inputs.windows_only.type, 'boolean');
@@ -119,7 +118,6 @@ test('Windows-only manual qualification expands only Windows hosts and retains s
     assert.equal(evaluate(caller.jobs.qualification.with.semgrep_windows_only, { inputs: { windows_only: windowsOnly } }), windowsOnly);
   }
   const windowsHost = { host: 'windows-x64', os: 'windows-2025' };
-  const macosHost = { host: 'macos-arm64', os: 'macos-15' };
   const windowsBuilder = ci.jobs['native-semgrep-windows-x64-builders'];
   const windowsIsolation = ci.jobs['native-isolation-windows-x64'];
   assert.equal(windowsBuilder.needs, 'semgrep-materials');
@@ -128,10 +126,9 @@ test('Windows-only manual qualification expands only Windows hosts and retains s
   for (const qualification of [false, true]) {
     for (const windowsOnly of [false, true]) {
       const inputs = { semgrep_release_qualification: qualification, semgrep_windows_only: windowsOnly, semgrep_artifact_run_id: '' };
-      const restricted = qualification && windowsOnly;
       for (const name of ['rust-lint', 'rust-tests', 'native']) {
         const rows = evaluate(ci.jobs[name].strategy.matrix.include, { inputs });
-        const expected = restricted ? [windowsHost] : [windowsHost, macosHost];
+        const expected = [windowsHost];
         assert.deepEqual(rows, name === 'native'
           ? expected.map((row) => ({ ...row, target: row.host === 'windows-x64' ? 'x86_64-pc-windows-msvc' : 'aarch64-apple-darwin' }))
           : expected, `${name}: qualification=${qualification}, windowsOnly=${windowsOnly}`);
@@ -143,12 +140,14 @@ test('Windows-only manual qualification expands only Windows hosts and retains s
       assert.deepEqual(evaluate(windowsBuilder.strategy.matrix.build, context), qualification ? ['a', 'b'] : ['a']);
       assert.equal(evaluate(windowsIsolation.if, context), true);
       for (const name of ['native-semgrep-macos-arm64-builders', 'native-isolation-macos-arm64']) {
-        assert.equal(evaluate(ci.jobs[name].if, context), !restricted, name);
+        assert.equal(evaluate(ci.jobs[name].if, context), false, `${name} remains deferred`);
       }
       const publication = ci.jobs['request-native-sidecar-publication'].if;
       assert.equal(evaluate(publication, context), false, 'manual dispatch cannot publish');
-      assert.equal(evaluate(publication, { ...context, github: { ...context.github, event_name: 'push' } }), qualification && !windowsOnly);
+      assert.equal(evaluate(publication, { ...context, github: { ...context.github, event_name: 'push' } }), qualification && !windowsOnly, 'policy predicate with artificial successful Apple outputs; unreachable while deferred');
       needs['native-semgrep-macos-arm64-builders'].result = 'skipped';
+      needs['native-isolation-macos-arm64'] = { result: 'skipped', outputs: {} };
+      assert.equal(evaluate(publication, { ...context, github: { ...context.github, event_name: 'push' } }), false, 'deferred Apple jobs cannot qualify public publication');
       assert.equal(evaluate(windowsIsolation.if, context), true, 'Apple skip cannot suppress Windows isolation');
       needs['native-semgrep-windows-x64-builders'].result = 'failure';
       assert.equal(evaluate(windowsIsolation.if, context), false, 'failed Windows builds cannot qualify');
@@ -404,7 +403,7 @@ test('supported native builds are build-only and independent from host tests', a
   const native = job(source, 'native');
   assertSupportedHostMatrix(native);
   assert.deepEqual(evaluate(parseYaml(native).native.strategy.matrix.include).map(({ target }) => target), [
-    'x86_64-pc-windows-msvc', 'aarch64-apple-darwin',
+    'x86_64-pc-windows-msvc',
   ]);
   assert.match(native, /pnpm --filter @context-relay\/desktop tauri build --target \$\{\{ matrix\.target \}\}/);
   assert.match(native, /run: pnpm package:macos/);

@@ -162,7 +162,11 @@ test('normal CI skips native Semgrep for non-material evidence-only changes', as
         : 'native-isolation-macos-arm64',
     );
     assert.match(body, /needs:\s*semgrep-materials/);
-    assert.match(body, /needs\.semgrep-materials\.outputs\.changed == 'true'/);
+    if (name === 'native-semgrep-windows-x64-builders') {
+      assert.match(body, /needs\.semgrep-materials\.outputs\.changed == 'true'/);
+    } else {
+      assert.match(body, /^    if: \$\{\{ false \}\}$/m);
+    }
   }
 });
 
