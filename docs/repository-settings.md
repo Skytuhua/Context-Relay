@@ -16,6 +16,10 @@ Task 3 must apply and verify available settings after CI exists and GitHub authe
 
 ## Live verification — 2026-09-14
 
+This section records the earlier, pre-deferral observations. Its 22-check count
+and statements that macOS remained required and no remote settings changed are
+historical; the later same-day amendment below supersedes those settings facts.
+
 ### Canonical remote and preserved history
 
 The active release checkout is `E:\Context Relay Releases\workspaces\pr16-release`
@@ -84,3 +88,22 @@ Dependabot alerts. The local response snapshot is
 `.codex/pr16-repository-settings-2026-09-14.json`. These are configuration and
 advisory observations, not fork-secret attack tests, name clearance, license
 closure, protected-tag publication, or full T01/T02/RB-REP acceptance.
+
+## Follow-on Apple CI deferral — 2026-09-14
+
+The later authorized main-ruleset update removed exactly four required contexts:
+`Rust lint (macos-arm64)`, `Rust tests (macos-arm64)`,
+`Native build (macos-arm64)` and `native-isolation-macos-arm64`. The captured
+fresh baseline, exact PUT response and subsequent readback were independently
+compared: all 18 remaining contexts retained their integration IDs and order,
+strict status enforcement and every other main protection/bypass field were
+preserved, and release-tag ruleset19760490 remained byte-identical. No bypass
+was used. These are captured readback results, not a guarantee of future state.
+
+The corresponding Windows-only CI change is local commit
+`a96e441456f5369c43ce805aaa615e933a252916`. Apple job code remains preserved and
+qualification is deferred, not passed. Local semantic and 34 selected workflow
+tests passed; Linux whitespace integration and hosted/installed acceptance remain
+open. No source push, merge or publication was performed by this amendment.
+See [the complete deferral evidence](verification/pr16-apple-ci-deferral-2026-09-14.md)
+for exact identities, preserved checks, readbacks and validation limits.
