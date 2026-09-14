@@ -7,6 +7,7 @@
 )]
 
 use std::sync::Mutex;
+mod history;
 
 use context_relay_core::{
     crypto::DeviceKeys,
@@ -231,6 +232,7 @@ pub(crate) struct HostedRecoveryEnrollmentService {
     publishable_key: zeroize::Zeroizing<String>,
     identity: crate::pairing::PairingIdentity,
     coordinator: Mutex<Option<HostedCoordinator>>,
+    history_pages: Mutex<Option<history::CandidateTraversal>>,
     #[cfg(test)]
     http: Option<std::sync::Arc<dyn context_relay_core::sync::SupabaseHttpClient>>,
 }
@@ -295,7 +297,9 @@ impl HostedRecoveryEnrollmentService {
                     .map_err(|_| transient_error())?
                     .is_some()
                 {
-                    Status::RestoringHistory { restore_id }
+                    vault
+                        .recovery_history_status(&self.identity.keys, history::budget())
+                        .map_err(history::vault_error)?
                 } else {
                     Status::Submitting { restore_id }
                 };
@@ -389,7 +393,7 @@ impl HostedRecoveryEnrollmentService {
         {
             return Err(restore_error(context_relay_core::devices::recovery_restore::RecoveryRestoreCycleError::Unauthorized));
         }
-        let client = self.client(identity, generation)?;
+        let client = self.client(identity, generation.clone())?;
         let snapshot = client.snapshot(now).map_err(hosted_transport_error)?
             .ok_or_else(|| restore_error(context_relay_core::devices::recovery_restore::RecoveryRestoreCycleError::Unavailable))?;
         if stored.as_ref().is_some_and(|s| {
@@ -402,6 +406,14 @@ impl HostedRecoveryEnrollmentService {
             return Err(restore_error(
                 context_relay_core::devices::recovery_restore::RecoveryRestoreCycleError::Conflict,
             ));
+        }
+        if stored_v2.is_some()
+            && vault
+                .recovery_membership_admission(&self.identity.keys)
+                .map_err(history::vault_error)?
+                .is_some()
+        {
+            return self.execute_history(vault, request, identity, generation);
         }
         let transport = client
             .into_restore_transport(
@@ -434,7 +446,10 @@ impl HostedRecoveryEnrollmentService {
                     Status::Submitting { restore_id }
                 }
                 RecoveryRestoreOutcome::RestoringHistory { restore_id } => {
-                    Status::RestoringHistory { restore_id }
+                    let _ = restore_id;
+                    vault
+                        .recovery_history_status(&self.identity.keys, history::budget())
+                        .map_err(history::vault_error)?
                 }
                 RecoveryRestoreOutcome::Conflict { restore_id } => Status::Conflict { restore_id },
                 RecoveryRestoreOutcome::Complete { restore_id, device } => {
@@ -456,6 +471,7 @@ impl HostedRecoveryEnrollmentService {
             publishable_key: zeroize::Zeroizing::new(publishable_key.into()),
             identity,
             coordinator: Mutex::new(None),
+            history_pages: Mutex::new(None),
             #[cfg(test)]
             http: None,
         }
@@ -509,6 +525,15 @@ impl RecoveryEnrollmentService for HostedRecoveryEnrollmentService {
         vault
             .hosted_restore_intent()
             .map_err(|_| transient_error())?;
+        if vault
+            .recovery_membership_admission(&self.identity.keys)
+            .map_err(history::vault_error)?
+            .is_some()
+        {
+            vault
+                .recovery_history_status(&self.identity.keys, history::budget())
+                .map_err(history::vault_error)?;
+        }
         Ok(())
     }
 
@@ -532,6 +557,9 @@ impl RecoveryEnrollmentService for HostedRecoveryEnrollmentService {
                 | LocalRequest::RecoveryRestoreOverview(_)
                 | LocalRequest::RecoveryRestoreResume(_)
                 | LocalRequest::RecoveryRestoreCancel(_)
+                | LocalRequest::RecoveryHistoryCandidates(_)
+                | LocalRequest::RecoveryHistorySelect(_)
+                | LocalRequest::RecoveryHistoryUnlock(_)
         ) {
             return self.execute_restore(vault, request);
         }
@@ -1105,6 +1133,10 @@ mod hosted_expiry_tests {
         expire_commit: bool,
         lose_restore: bool,
         reject_restore: bool,
+        history_checkpoints: Vec<Value>,
+        history_operations: Vec<Value>,
+        history_offline: bool,
+        history_repeat_page: bool,
     }
     struct Http {
         state: Mutex<Remote>,
@@ -1134,6 +1166,41 @@ mod hosted_expiry_tests {
                     200,
                     json!({"token_type":"bearer","access_token":format!("e30.{}.signature",URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())),"refresh_token":"synthetic-refresh"}),
                 );
+            }
+            if request.url().contains("/rest/v1/sync_") {
+                let url = reqwest::Url::parse(request.url()).unwrap();
+                let state = self.state.lock().unwrap();
+                if state.history_offline {
+                    return reply(503, json!({"error":"synthetic offline"}));
+                }
+                if url.path().ends_with("sync_checkpoints") {
+                    if let Some((_, hash)) =
+                        url.query_pairs().find(|(k, _)| k == "canonical_sha256")
+                    {
+                        return reply(
+                            200,
+                            json!(
+                                state
+                                    .history_checkpoints
+                                    .iter()
+                                    .filter(|row| hash
+                                        == format!(
+                                            "eq.{}",
+                                            row["canonical_sha256"].as_str().unwrap()
+                                        ))
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            ),
+                        );
+                    }
+                    assert!(url.query_pairs().any(|(k, v)| k == "limit" && v == "8"));
+                    if url.query_pairs().any(|(k, _)| k == "or") && !state.history_repeat_page {
+                        return reply(200, json!([]));
+                    }
+                    return reply(200, json!(state.history_checkpoints));
+                }
+                assert!(url.path().ends_with("sync_operations"));
+                return reply(200, json!(state.history_operations));
             }
             let body: Value = serde_json::from_slice(request.body()).unwrap();
             let vault = Vault::open(&self.path, "expiry-test", self.keys.as_ref()).unwrap();
@@ -1304,13 +1371,25 @@ mod hosted_expiry_tests {
     }
     #[test]
     fn hosted_restore_resumes_exact_claim_after_restart_without_reentering_phrase() {
-        hosted_restore_restart(false);
+        hosted_restore_restart(false, false, false);
     }
     #[test]
     fn hosted_restore_terminal_conflict_reopens_and_resumes_offline() {
-        hosted_restore_restart(true);
+        hosted_restore_restart(true, false, false);
     }
-    fn hosted_restore_restart(terminal_conflict: bool) {
+    #[test]
+    fn original_history_session_cancellation_guards_commit_and_final_status() {
+        hosted_restore_restart(false, true, false);
+    }
+    #[test]
+    fn hosted_history_resume_restores_searchable_memory_and_instruction() {
+        hosted_restore_restart(false, false, true);
+    }
+    fn hosted_restore_restart(
+        terminal_conflict: bool,
+        check_authorization: bool,
+        searchable_history: bool,
+    ) {
         use context_relay_protocol::{RecoveryRestoreParams, RecoveryRestoreStatus as Status};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("restore.db");
@@ -1626,6 +1705,876 @@ mod hosted_expiry_tests {
                 status: Status::RestoringHistory { .. }
             }
         ));
+        // A fresh authenticated session resumes the same durable restore identity.
+        let instant = std::time::Instant::now();
+        let mut pending =
+            PendingLogin::new(project, "127.0.0.1:41783".parse().unwrap(), instant).unwrap();
+        let auth = pending.authorization_url();
+        let redirect = auth
+            .query_pairs()
+            .find(|(k, _)| k == "redirect_to")
+            .unwrap()
+            .1
+            .into_owned();
+        let mut callback = auth.join(&redirect).unwrap();
+        callback
+            .query_pairs_mut()
+            .append_pair("code", "synthetic-code");
+        owner
+            .complete_login(
+                owner.begin_login().unwrap(),
+                pending.take_callback(&callback, instant).unwrap(),
+                now,
+            )
+            .unwrap();
+        if searchable_history {
+            exercise_searchable_history(&service, &mut vault, &device, &http);
+            return;
+        }
+        exercise_history_selection(&service, &mut vault, &device, &http, check_authorization);
+        if check_authorization {
+            return;
+        }
+        drop(vault);
+        let mut vault = Vault::open(&path, "expiry-test", keys.as_ref()).unwrap();
+        let service = make_service();
+        service.resume_prepared(&mut vault, &device).unwrap();
+        assert!(matches!(
+            service
+                .execute(
+                    &mut vault,
+                    &device,
+                    LocalRequest::RecoveryRestoreOverview(EmptyParams {})
+                )
+                .unwrap(),
+            LocalResult::RecoveryRestoreStatus {
+                status: Status::Complete { .. }
+            }
+        ));
+    }
+
+    fn exercise_searchable_history(
+        service: &HostedRecoveryEnrollmentService,
+        vault: &mut Vault,
+        device: &DeviceKeys,
+        http: &Http,
+    ) {
+        use context_relay_core::{
+            search::AllowedSearchScope,
+            service::sync_embedding,
+            sync::{
+                CanonicalCheckpoint, CanonicalOperation, OperationBuildRequest, OperationBuilder,
+                OperationChainHead, StateSummaryEntryV1, StateSummaryV1, SyncIdentity,
+            },
+        };
+        use context_relay_protocol::{
+            CheckpointV1, DeviceSequence, Ed25519SignatureBytes, HarnessAccessPolicy,
+            HybridLogicalClock, InstructionRecord, MemoryKind, MemoryOrigin, MemoryRecord,
+            Provenance, RecordMutationV1, RecoveryHistoryCandidatesParams, RecoveryHistoryExtent,
+            RecoveryHistoryProgress, RecoveryHistorySelectParams, RecoveryRestoreStatus as Status,
+            ScopeRef, Sha256Digest,
+        };
+        let prepared = vault.prepared_recovery_v2(device).unwrap().unwrap();
+        let endpoint = vault
+            .recovery_membership_admission(device)
+            .unwrap()
+            .unwrap();
+        let root =
+            context_relay_core::devices::recovery_crypto::decode_recovery_enrollment_record_v1(
+                &prepared.canonical_record,
+            )
+            .unwrap();
+        let author = DeviceKeys::from_seeds_for_test([0x11; 32], [0x22; 32]);
+        let author_id = root.genesis_certificate.device_id;
+        let project_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073950".parse().unwrap();
+        let memory_operation = "018f22e2-79b0-7cc8-98c4-dc0c0c073952".parse().unwrap();
+        let instruction_operation = "018f22e2-79b0-7cc8-98c4-dc0c0c073955".parse().unwrap();
+        let clock = HybridLogicalClock::new(1001, 0, author_id);
+        let provenance = Provenance {
+            origin_device: author_id,
+            harness: None,
+            source: None,
+            created_hlc: clock,
+        };
+        let memory = MemoryRecord {
+            id: "018f22e2-79b0-7cc8-98c4-dc0c0c073951".parse().unwrap(),
+            scope: ScopeRef::Project { project_id },
+            kind: MemoryKind::Fact,
+            title: "Restored memory".into(),
+            body_markdown: "Authenticated historical memory content".into(),
+            tags: vec!["recovery".into()],
+            origin: MemoryOrigin::Explicit,
+            provenance: provenance.clone(),
+            revision: memory_operation,
+            created_hlc: clock,
+            updated_hlc: clock,
+            archived: false,
+        };
+        let instruction = InstructionRecord {
+            id: "018f22e2-79b0-7cc8-98c4-dc0c0c073954".parse().unwrap(),
+            scope: ScopeRef::Project { project_id },
+            title: "Restored instruction".into(),
+            body_markdown: "Authenticated historical instruction content".into(),
+            provenance,
+            archived: false,
+        };
+        let content = context_relay_core::crypto::ContentKey::from_bytes([0x55; 32]);
+        let builder = OperationBuilder::new(SyncIdentity {
+            membership_endpoint: Some(prepared.parent.endpoint()),
+            account_id: root.account_id,
+            workspace_id: root.workspace_id,
+            device_id: author_id,
+            control_epoch: 1,
+            key_epoch: 1,
+            device_keys: &author,
+            content_key: &content,
+        });
+        let mutations = [
+            (
+                memory_operation,
+                RecordMutationV1::UpsertMemory(memory.clone()),
+            ),
+            (
+                instruction_operation,
+                RecordMutationV1::UpsertInstruction(instruction.clone()),
+            ),
+        ];
+        let mut operations = Vec::new();
+        let mut summaries = Vec::new();
+        let mut previous = None;
+        for (index, (operation_id, mutation)) in mutations.iter().enumerate() {
+            let sequence = index as u64 + 1;
+            let built = builder
+                .build(OperationBuildRequest {
+                    operation_id: *operation_id,
+                    project_id: Some(project_id),
+                    mutation,
+                    causal_frontier: if index == 0 {
+                        vec![]
+                    } else {
+                        vec![DeviceSequence {
+                            device_id: author_id,
+                            sequence: sequence - 1,
+                        }]
+                    },
+                    previous,
+                    blob_refs: vec![],
+                    created_hlc: HybridLogicalClock::new(1001 + index as u64, 0, author_id),
+                })
+                .unwrap();
+            previous = Some(OperationChainHead {
+                sequence,
+                canonical_hash: built.canonical_hash,
+            });
+            summaries.push(StateSummaryEntryV1 {
+                record_id: mutation.record_id(),
+                record_kind: mutation.record_kind(),
+                head_hashes: vec![built.canonical_hash],
+                tombstoned: false,
+                conflicted: false,
+            });
+            operations.push(CanonicalOperation {
+                operation_id: *operation_id,
+                device_id: author_id,
+                device_sequence: sequence,
+                bytes: built.canonical_bytes,
+            });
+        }
+        let mut checkpoint = CheckpointV1 {
+            schema_version: 2,
+            account_id: root.account_id,
+            workspace_id: root.workspace_id,
+            previous_checkpoint_hash: Sha256Digest([0; 32]),
+            causal_frontier: vec![DeviceSequence {
+                device_id: author_id,
+                sequence: 2,
+            }],
+            state_hash: StateSummaryV1 { entries: summaries }.state_hash().unwrap(),
+            key_epoch: 1,
+            creator_device: author_id,
+            created_hlc: HybridLogicalClock::new(1003, 0, author_id),
+            signature: Ed25519SignatureBytes([0; 64]),
+        };
+        author.sign_checkpoint(&mut checkpoint).unwrap();
+        let checkpoint = CanonicalCheckpoint::from_checkpoint(checkpoint).unwrap();
+        {
+            let mut remote = http.state.lock().unwrap();
+            remote.history_checkpoints = vec![history_checkpoint_row(&checkpoint)];
+            remote.history_operations = operations.iter().map(history_operation_row).collect();
+        }
+        let LocalResult::RecoveryHistoryCandidates { page } = service
+            .execute(
+                vault,
+                device,
+                LocalRequest::RecoveryHistoryCandidates(RecoveryHistoryCandidatesParams {
+                    restore_id: prepared.claim.restore_id,
+                    accepted_endpoint_sha256: endpoint.state_sha256,
+                    cursor: None,
+                }),
+            )
+            .unwrap()
+        else {
+            panic!("authenticated candidate page")
+        };
+        assert_eq!(page.candidates.len(), 1);
+        assert_eq!(
+            page.candidates[0].checkpoint_sha256,
+            checkpoint.canonical_hash
+        );
+        assert_eq!(
+            page.candidates[0].extent,
+            RecoveryHistoryExtent::Supported { operation_count: 2 }
+        );
+        assert!(
+            vault
+                .recovery_history_selection(device, history::budget())
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            service
+                .execute(
+                    vault,
+                    device,
+                    LocalRequest::RecoveryHistorySelect(RecoveryHistorySelectParams {
+                        restore_id: prepared.claim.restore_id,
+                        accepted_endpoint_sha256: endpoint.state_sha256,
+                        checkpoint_sha256: checkpoint.canonical_hash,
+                    })
+                )
+                .unwrap(),
+            LocalResult::RecoveryRestoreStatus {
+                status: Status::RestoringHistory {
+                    history: RecoveryHistoryProgress::Incomplete { .. },
+                    ..
+                }
+            }
+        ));
+        assert!(
+            matches!(
+                service
+                    .execute(
+                        vault,
+                        device,
+                        LocalRequest::RecoveryRestoreResume(EmptyParams {})
+                    )
+                    .unwrap(),
+                LocalResult::RecoveryRestoreStatus {
+                    status: Status::Complete { .. }
+                }
+            ),
+            "actual Resume must restore searchable signed records without an injected resolver"
+        );
+        for reopened in [false, true] {
+            if reopened {
+                *vault = Vault::open(&http.path, "expiry-test", http.keys.as_ref()).unwrap();
+            }
+            assert_eq!(vault.memory(&memory.id).unwrap(), Some(memory.clone()));
+            assert_eq!(
+                vault.instruction(&instruction.id).unwrap(),
+                Some(instruction.clone())
+            );
+            let scope =
+                AllowedSearchScope::resolve(None, &HarnessAccessPolicy::Default, Some(project_id))
+                    .unwrap();
+            let vector = sync_embedding(memory_operation, &mutations[0].1)
+                .unwrap()
+                .unwrap();
+            let hits = vault.search("Restored", &scope, &vector, 10).unwrap();
+            for (_, mutation) in &mutations {
+                assert_eq!(
+                    vault
+                        .record_heads(root.workspace_id, mutation.record_id())
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert!(
+                    vault
+                        .embedding_storage_bytes(&mutation.record_id().to_string())
+                        .unwrap()
+                        > 0
+                );
+                assert!(
+                    hits.iter()
+                        .any(|hit| hit.record_id() == mutation.record_id().to_string()),
+                    "restored lexical representation is searchable after reopen"
+                );
+            }
+            assert!(matches!(
+                service
+                    .execute(
+                        vault,
+                        device,
+                        LocalRequest::RecoveryRestoreOverview(EmptyParams {})
+                    )
+                    .unwrap(),
+                LocalResult::RecoveryRestoreStatus {
+                    status: Status::Complete { .. }
+                }
+            ));
+            assert_eq!(
+                vault
+                    .prepared_recovery_v2(device)
+                    .unwrap()
+                    .unwrap()
+                    .canonical_claim,
+                prepared.canonical_claim
+            );
+        }
+    }
+
+    fn exercise_history_selection(
+        service: &HostedRecoveryEnrollmentService,
+        vault: &mut Vault,
+        device: &DeviceKeys,
+        http: &Http,
+        check_authorization: bool,
+    ) {
+        use context_relay_core::sync::{
+            CanonicalCheckpoint, CanonicalOperation, OperationBuildRequest, OperationBuilder,
+            StateSummaryEntryV1, StateSummaryV1, SyncIdentity,
+        };
+        use context_relay_protocol::{
+            CheckpointV1, DeviceSequence, Ed25519SignatureBytes, HybridLogicalClock,
+            ProjectIdentity, RecordMutationV1, RecoveryHistoryCandidatesParams,
+            RecoveryHistoryExtent, RecoveryHistoryProgress, RecoveryHistorySelectParams,
+            RecoveryRestoreStatus as Status, Sha256Digest,
+        };
+        let prepared = vault.prepared_recovery_v2(device).unwrap().unwrap();
+        let endpoint = vault
+            .recovery_membership_admission(device)
+            .unwrap()
+            .unwrap();
+        let root =
+            context_relay_core::devices::recovery_crypto::decode_recovery_enrollment_record_v1(
+                &prepared.canonical_record,
+            )
+            .unwrap();
+        let author = DeviceKeys::from_seeds_for_test([0x11; 32], [0x22; 32]);
+        let author_id = root.genesis_certificate.device_id;
+        let project_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073951".parse().unwrap();
+        let mutation = RecordMutationV1::UpsertProject(ProjectIdentity {
+            project_id,
+            name: "Explicitly recovered project".into(),
+            github_repository_id: None,
+            git_remote_fingerprint: None,
+            monorepo_subdirectory: None,
+        });
+        let mutation = if check_authorization {
+            RecordMutationV1::UpsertMemory(context_relay_protocol::MemoryRecord {
+                id: project_id.to_string().parse().unwrap(),
+                scope: context_relay_protocol::ScopeRef::Project { project_id },
+                kind: context_relay_protocol::MemoryKind::Fact,
+                title: "Canceled history".into(),
+                body_markdown: "History resolver cancellation".into(),
+                tags: vec![],
+                origin: context_relay_protocol::MemoryOrigin::Explicit,
+                provenance: context_relay_protocol::Provenance {
+                    origin_device: author_id,
+                    harness: None,
+                    source: None,
+                    created_hlc: HybridLogicalClock::new(1001, 0, author_id),
+                },
+                revision: "018f22e2-79b0-7cc8-98c4-dc0c0c073952".parse().unwrap(),
+                created_hlc: HybridLogicalClock::new(1001, 0, author_id),
+                updated_hlc: HybridLogicalClock::new(1001, 0, author_id),
+                archived: false,
+            })
+        } else {
+            mutation
+        };
+        let content = context_relay_core::crypto::ContentKey::from_bytes([0x55; 32]);
+        let operation = OperationBuilder::new(SyncIdentity {
+            membership_endpoint: Some(prepared.parent.endpoint()),
+            account_id: root.account_id,
+            workspace_id: root.workspace_id,
+            device_id: author_id,
+            control_epoch: 1,
+            key_epoch: 1,
+            device_keys: &author,
+            content_key: &content,
+        })
+        .build(OperationBuildRequest {
+            operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c073952".parse().unwrap(),
+            project_id: Some(project_id),
+            mutation: &mutation,
+            causal_frontier: vec![],
+            previous: None,
+            blob_refs: vec![],
+            created_hlc: HybridLogicalClock::new(1001, 0, author_id),
+        })
+        .unwrap();
+        let mut checkpoint = CheckpointV1 {
+            schema_version: 2,
+            account_id: root.account_id,
+            workspace_id: root.workspace_id,
+            previous_checkpoint_hash: Sha256Digest([0; 32]),
+            causal_frontier: vec![DeviceSequence {
+                device_id: author_id,
+                sequence: 1,
+            }],
+            state_hash: StateSummaryV1 {
+                entries: vec![StateSummaryEntryV1 {
+                    record_id: mutation.record_id(),
+                    record_kind: mutation.record_kind(),
+                    head_hashes: vec![operation.canonical_hash],
+                    tombstoned: false,
+                    conflicted: false,
+                }],
+            }
+            .state_hash()
+            .unwrap(),
+            key_epoch: 1,
+            creator_device: author_id,
+            created_hlc: HybridLogicalClock::new(1002, 0, author_id),
+            signature: Ed25519SignatureBytes([0; 64]),
+        };
+        author.sign_checkpoint(&mut checkpoint).unwrap();
+        let checkpoint = CanonicalCheckpoint::from_checkpoint(checkpoint).unwrap();
+        let operation = CanonicalOperation {
+            operation_id: operation.operation.operation_id,
+            device_id: author_id,
+            device_sequence: 1,
+            bytes: operation.canonical_bytes,
+        };
+        if check_authorization {
+            let login = || {
+                let instant = std::time::Instant::now();
+                let mut pending = PendingLogin::new(
+                    &service.project,
+                    "127.0.0.1:41783".parse().unwrap(),
+                    instant,
+                )
+                .unwrap();
+                let auth = pending.authorization_url();
+                let redirect = auth
+                    .query_pairs()
+                    .find(|(k, _)| k == "redirect_to")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                let mut callback = auth.join(&redirect).unwrap();
+                callback
+                    .query_pairs_mut()
+                    .append_pair("code", "synthetic-code");
+                service
+                    .owner
+                    .complete_login(
+                        service.owner.begin_login().unwrap(),
+                        pending.take_callback(&callback, instant).unwrap(),
+                        http.now,
+                    )
+                    .unwrap();
+            };
+            let original_identity = *service
+                .owner
+                .current_session(http.now)
+                .unwrap()
+                .unwrap()
+                .identity();
+            let generation = service.owner.cancellation().unwrap();
+            let selected = service
+                .authorized_history_action(original_identity, &generation, |authorize| {
+                    vault
+                        .select_recovery_history_authorized(
+                            endpoint,
+                            &checkpoint.bytes,
+                            device,
+                            history::budget(),
+                            authorize,
+                        )
+                        .map_err(history::vault_error)
+                })
+                .unwrap();
+            let embeddings =
+                |_: context_relay_protocol::OperationId,
+                 _: &context_relay_protocol::RecordMutationV1| {
+                    Ok(Some(
+                        context_relay_core::search::Embedding384::try_from(vec![1.0; 384]).unwrap(),
+                    ))
+                };
+            let proof = vault
+                .reconstruct_recovery_history(
+                    selected,
+                    std::slice::from_ref(&operation.bytes),
+                    device,
+                    history::budget(),
+                    &embeddings,
+                )
+                .unwrap()
+                .unwrap();
+            let before = vault.test_plaintext_cells().unwrap();
+            let resolved = std::cell::Cell::new(0);
+            let cancel_embeddings =
+                |_: context_relay_protocol::OperationId,
+                 _: &context_relay_protocol::RecordMutationV1| {
+                    resolved.set(resolved.get() + 1);
+                    generation.cancel();
+                    Ok(Some(
+                        context_relay_core::search::Embedding384::try_from(vec![1.0; 384]).unwrap(),
+                    ))
+                };
+            let result =
+                service.authorized_history_action(original_identity, &generation, |authorize| {
+                    vault
+                        .install_recovery_history_authorized(
+                            &proof,
+                            device,
+                            history::budget(),
+                            &cancel_embeddings,
+                            authorize,
+                        )
+                        .map_err(history::vault_error)
+                });
+            assert!(resolved.get() > 0);
+            assert_eq!(result.unwrap_err().code, ErrorCode::ScopeDenied);
+            assert_eq!(vault.test_plaintext_cells().unwrap(), before);
+            assert!(vault.trusted_sync_material(device).is_err());
+            *vault = Vault::open(&http.path, "expiry-test", http.keys.as_ref()).unwrap();
+            assert_eq!(
+                vault.test_plaintext_cells().unwrap(),
+                before,
+                "canceled original generation cannot commit records, heads, installed receipt or activation"
+            );
+            login();
+            let generation = service.owner.cancellation().unwrap();
+            let result =
+                service.authorized_history_action(original_identity, &generation, |authorize| {
+                    assert!(
+                        vault
+                            .install_recovery_history_authorized(
+                                &proof,
+                                device,
+                                history::budget(),
+                                &embeddings,
+                                authorize
+                            )
+                            .map_err(history::vault_error)?
+                    );
+                    let status = vault
+                        .recovery_history_status(device, history::budget())
+                        .map_err(history::vault_error)?;
+                    assert!(matches!(status, Status::Complete { .. }));
+                    generation.cancel();
+                    Ok(LocalResult::RecoveryRestoreStatus { status })
+                });
+            assert_eq!(
+                result.unwrap_err().code,
+                ErrorCode::ScopeDenied,
+                "cancellation during expensive final status construction must suppress active-action success"
+            );
+            let committed = vault.test_plaintext_cells().unwrap();
+            *vault = Vault::open(&http.path, "expiry-test", http.keys.as_ref()).unwrap();
+            assert_eq!(vault.test_plaintext_cells().unwrap(), committed);
+            assert!(
+                matches!(
+                    service
+                        .execute(
+                            vault,
+                            device,
+                            LocalRequest::RecoveryRestoreOverview(EmptyParams {})
+                        )
+                        .unwrap(),
+                    LocalResult::RecoveryRestoreStatus {
+                        status: Status::Complete { .. }
+                    }
+                ),
+                "durable read-only overview survives cancellation after commit"
+            );
+            login();
+            let generation = service.owner.cancellation().unwrap();
+            let result: Result<(), ClientError> =
+                service.authorized_history_action(original_identity, &generation, |_| {
+                    Err(history::vault_error(
+                        context_relay_core::vault::VaultError::OperationConflict,
+                    ))
+                });
+            assert_eq!(
+                result.unwrap_err().code,
+                ErrorCode::Conflict,
+                "unrelated integrity/selection conflict stays distinct from Auth denial"
+            );
+            return;
+        }
+        http.state.lock().unwrap().history_checkpoints = vec![history_checkpoint_row(&checkpoint)];
+        let candidates = || {
+            LocalRequest::RecoveryHistoryCandidates(RecoveryHistoryCandidatesParams {
+                restore_id: prepared.claim.restore_id,
+                accepted_endpoint_sha256: endpoint.state_sha256,
+                cursor: None,
+            })
+        };
+        assert!(matches!(
+            service
+                .execute(
+                    vault,
+                    device,
+                    LocalRequest::RecoveryRestoreResume(EmptyParams {})
+                )
+                .unwrap(),
+            LocalResult::RecoveryRestoreStatus {
+                status: Status::RestoringHistory {
+                    history: RecoveryHistoryProgress::Unselected {},
+                    ..
+                }
+            }
+        ));
+        let LocalResult::RecoveryHistoryCandidates { page } =
+            service.execute(vault, device, candidates()).unwrap()
+        else {
+            panic!("candidate page")
+        };
+        assert_eq!(page.candidates.len(), 1);
+        assert_eq!(
+            page.candidates[0].extent,
+            RecoveryHistoryExtent::Supported { operation_count: 1 }
+        );
+        assert!(
+            vault
+                .recovery_history_selection(device, history::budget())
+                .unwrap()
+                .is_none()
+        );
+        let next = || {
+            LocalRequest::RecoveryHistoryCandidates(RecoveryHistoryCandidatesParams {
+                restore_id: prepared.claim.restore_id,
+                accepted_endpoint_sha256: endpoint.state_sha256,
+                cursor: page.next_cursor.clone(),
+            })
+        };
+        http.state.lock().unwrap().history_repeat_page = true;
+        assert!(
+            service.execute(vault, device, next()).is_err(),
+            "non-advancing authenticated page denied"
+        );
+        http.state.lock().unwrap().history_repeat_page = false;
+        assert!(
+            matches!(service.execute(vault,device,next()).unwrap(),LocalResult::RecoveryHistoryCandidates {page} if page.candidates.is_empty() && page.next_cursor.is_none())
+        );
+        let selected = RecoveryHistorySelectParams {
+            restore_id: prepared.claim.restore_id,
+            accepted_endpoint_sha256: endpoint.state_sha256,
+            checkpoint_sha256: checkpoint.canonical_hash,
+        };
+        let mut substituted = selected.clone();
+        substituted.checkpoint_sha256 = Sha256Digest([9; 32]);
+        assert!(
+            service
+                .execute(
+                    vault,
+                    device,
+                    LocalRequest::RecoveryHistorySelect(substituted)
+                )
+                .is_err()
+        );
+        assert!(
+            vault
+                .recovery_history_selection(device, history::budget())
+                .unwrap()
+                .is_none()
+        );
+        let mut stale = selected.clone();
+        stale.accepted_endpoint_sha256 = Sha256Digest([8; 32]);
+        assert!(
+            service
+                .execute(vault, device, LocalRequest::RecoveryHistorySelect(stale))
+                .is_err()
+        );
+        assert!(matches!(
+            service
+                .execute(
+                    vault,
+                    device,
+                    LocalRequest::RecoveryHistorySelect(selected.clone())
+                )
+                .unwrap(),
+            LocalResult::RecoveryRestoreStatus {
+                status: Status::RestoringHistory {
+                    history: RecoveryHistoryProgress::Incomplete { .. },
+                    ..
+                }
+            }
+        ));
+        http.state.lock().unwrap().history_offline = true;
+        assert!(
+            service
+                .execute(
+                    vault,
+                    device,
+                    LocalRequest::RecoveryRestoreResume(EmptyParams {})
+                )
+                .is_err()
+        );
+        http.state.lock().unwrap().history_offline = false;
+        assert!(
+            matches!(
+                service
+                    .execute(
+                        vault,
+                        device,
+                        LocalRequest::RecoveryRestoreResume(EmptyParams {})
+                    )
+                    .unwrap(),
+                LocalResult::RecoveryRestoreStatus {
+                    status: Status::RestoringHistory {
+                        history: RecoveryHistoryProgress::Incomplete { .. },
+                        ..
+                    }
+                }
+            ),
+            "missing operations do not become completion or phrase entry"
+        );
+        assert_eq!(
+            vault
+                .recovery_history_selection(device, history::budget())
+                .unwrap()
+                .unwrap()
+                .checkpoint_sha256(),
+            selected.checkpoint_sha256
+        );
+        http.state.lock().unwrap().history_operations = vec![history_operation_row(&operation)];
+        assert!(matches!(
+            service
+                .execute(
+                    vault,
+                    device,
+                    LocalRequest::RecoveryRestoreResume(EmptyParams {})
+                )
+                .unwrap(),
+            LocalResult::RecoveryRestoreStatus {
+                status: Status::Complete { .. }
+            }
+        ));
+        assert_eq!(
+            vault
+                .record_heads(root.workspace_id, mutation.record_id())
+                .unwrap()
+                .len(),
+            1
+        );
+        // A later authenticated cutoff may mention operations beyond the installed history.
+        let later = OperationBuilder::new(SyncIdentity {
+            membership_endpoint: Some(endpoint),
+            account_id: root.account_id,
+            workspace_id: root.workspace_id,
+            device_id: author_id,
+            control_epoch: 1,
+            key_epoch: 1,
+            device_keys: &author,
+            content_key: &content,
+        })
+        .build(OperationBuildRequest {
+            operation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c073953".parse().unwrap(),
+            project_id: Some(project_id),
+            mutation: &mutation,
+            causal_frontier: vec![DeviceSequence {
+                device_id: author_id,
+                sequence: 1,
+            }],
+            previous: Some(context_relay_core::sync::OperationChainHead {
+                sequence: 1,
+                canonical_hash: Sha256Digest(Sha256::digest(&operation.bytes).into()),
+            }),
+            blob_refs: vec![],
+            created_hlc: HybridLogicalClock::new(1003, 0, author_id),
+        })
+        .unwrap();
+        let history = vault
+            .accepted_membership_history(history::budget().transfer.history)
+            .unwrap()
+            .unwrap();
+        let (statement, transition, signature) =
+            context_relay_core::devices::revocation_crypto::RevocationTransitionV1::build(
+                context_relay_core::devices::revocation_crypto::DeviceRevocationStatementV1 {
+                    schema_version: 1,
+                    revocation_id: "018f22e2-79b0-7cc8-98c4-dc0c0c073954".parse().unwrap(),
+                    account_id: root.account_id,
+                    workspace_id: root.workspace_id,
+                    issuer_device_id: prepared.claim.certificate.device_id,
+                    target_device_id: author_id,
+                    control_epoch: endpoint.control_epoch,
+                    key_epoch: endpoint.key_epoch,
+                    cutoff_sequence: 2,
+                    cutoff_hash: later.canonical_hash,
+                    transition_sha256: Sha256Digest([1; 32]),
+                },
+                device,
+                &history.state(),
+            )
+            .unwrap();
+        let descendant = context_relay_core::devices::membership_crypto::MembershipEndpoint {
+            state_sha256: statement.control_state_sha256(signature).unwrap(),
+            control_epoch: 2,
+            key_epoch: 2,
+        };
+        vault.accept_membership_extension(endpoint,descendant,&[context_relay_core::devices::membership_crypto::MembershipHistoryEvent::Revocation {statement:&statement.signing_preimage().unwrap(),signature,transition:&transition.canonical_bytes().unwrap()}],history::budget().transfer.history).unwrap();
+        assert!(
+            matches!(
+                vault.recovery_history_status(device, history::budget()),
+                Ok(Status::Complete { .. })
+            ),
+            "an installed historical prefix remains complete while a later accepted cutoff operation has not downloaded"
+        );
+        assert!(
+            vault.trusted_sync_material(device).is_err(),
+            "historical completion never activates descendant write authority"
+        );
+    }
+    fn history_bytea(bytes: &[u8]) -> String {
+        format!(
+            "\\x{}",
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        )
+    }
+    fn history_operation_row(
+        operation: &context_relay_core::sync::CanonicalOperation,
+    ) -> serde_json::Value {
+        let decoded = context_relay_protocol::decode_sync_operation_v1(&operation.bytes).unwrap();
+        serde_json::json!({
+            "id": decoded.operation_id,
+            "account_id": decoded.account_id,
+            "workspace_id": decoded.workspace_id,
+            "project_id": decoded.project_id,
+            "record_id": decoded.record_id,
+            "record_kind": decoded.record_kind,
+            "mutation_kind": decoded.mutation_kind,
+            "device_id": decoded.device_id,
+            "schema_version": decoded.schema_version,
+            "device_sequence": decoded.device_sequence,
+            "causal_frontier": decoded.causal_frontier,
+            "control_epoch": decoded.control_epoch,
+            "key_epoch": decoded.key_epoch,
+            "previous_device_hash": history_bytea(&decoded.previous_device_hash.0),
+            "nonce": history_bytea(&decoded.nonce.0),
+            "ciphertext": history_bytea(decoded.ciphertext.as_slice()),
+            "ciphertext_hash": history_bytea(&decoded.ciphertext_hash.0),
+            "blob_refs": decoded.blob_refs,
+            "created_hlc": decoded.created_hlc,
+            "signature": history_bytea(&decoded.signature.0),
+            "canonical_sha256": history_bytea(&Sha256::digest(&operation.bytes)),
+            "received_at": "2026-09-14T00:00:00Z",
+        })
+    }
+
+    fn history_checkpoint_row(
+        checkpoint: &context_relay_core::sync::CanonicalCheckpoint,
+    ) -> serde_json::Value {
+        let decoded = &checkpoint.checkpoint;
+        serde_json::json!({
+            "account_id": decoded.account_id,
+            "workspace_id": decoded.workspace_id,
+            "schema_version": decoded.schema_version,
+            "previous_checkpoint_hash": history_bytea(&decoded.previous_checkpoint_hash.0),
+            "causal_frontier": decoded.causal_frontier,
+            "state_hash": history_bytea(&decoded.state_hash.0),
+            "key_epoch": decoded.key_epoch,
+            "creator_device_id": decoded.creator_device,
+            "created_hlc": decoded.created_hlc,
+            "signature": history_bytea(&decoded.signature.0),
+            "canonical_sha256": history_bytea(&checkpoint.canonical_hash.0),
+            "received_at": "2026-09-14T00:00:00Z",
+        })
     }
 
     #[test]

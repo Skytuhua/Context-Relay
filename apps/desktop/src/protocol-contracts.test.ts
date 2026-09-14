@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -208,7 +209,7 @@ const nullAtPath = (value: unknown, path: readonly PropertyKey[]) => {
 
 describe('generated protocol version', () => {
   it('advertises the background search status contract as v1.11', () => {
-    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 15 });
+    expect(PROTOCOL_VERSION).toEqual({ major: 1, minor: 16 });
   });
 });
 
@@ -325,7 +326,7 @@ describe('protocol schemas', () => {
     }
   });
 
-  it('accepts only the exact status protocol range for v1.15', () => {
+  it('accepts only the exact status protocol range for v1.16', () => {
     const ajv = createProtocolSchemaValidator();
     const validate = ajv.compile(load('schemas/context_relay_status-output-v1.json'));
     const fixture = load('crates/protocol/tests/fixtures/mcp-output-valid.json').context_relay_status;
@@ -333,7 +334,7 @@ describe('protocol schemas', () => {
     for (const protocol of [
       { min: { major: 2, minor: 0 }, max: { major: 2, minor: 0 } },
       { min: { major: 1, minor: 0 }, max: { major: 1, minor: 0 } },
-      { min: { major: 1, minor: 6 }, max: { major: 1, minor: 15 } },
+      { min: { major: 1, minor: 6 }, max: { major: 1, minor: 16 } },
       { min: { major: 1, minor: 1 }, max: { major: 1, minor: 0 } },
     ]) {
       expect(validate({ ...fixture, protocol }), JSON.stringify(protocol)).toBe(false);
@@ -521,4 +522,11 @@ describe('protocol schemas', () => {
       expect(validateExport(omitted), `omitted export provenance ${field}`).toBe(false);
     }
   });
+});
+
+it('validates the frozen recovery history page, exact status and canonical fixture digest', () => {
+  const fixture = load('crates/protocol/tests/fixtures/runtime-contracts-v1.json');
+  expect(protocolValidation.validateRecoveryHistoryCandidates(fixture.recoveryHistoryCandidatesPage)).toEqual(fixture.recoveryHistoryCandidatesPage);
+  expect(protocolValidation.validateRecoveryRestoreStatus(fixture.recoveryHistoryStatus)).toEqual(fixture.recoveryHistoryStatus);
+  expect(createHash('sha256').update(JSON.stringify(fixture.recoveryHistoryCandidatesPage)).digest('hex')).toBe(fixture.recoveryHistoryCandidatesPageSha256);
 });

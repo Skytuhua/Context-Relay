@@ -340,6 +340,174 @@ pub struct RecoveryPhraseWords(Vec<String>);
 params!(RecoveryRestoreParams {
     recovery_phrase_words: RecoveryPhraseWords
 });
+params!(RecoveryHistoryEndpoint {
+    state_sha256: Sha256Digest,
+    control_epoch: u32,
+    key_epoch: u32
+});
+params!(RecoveryHistoryCursor {
+    restore_id: RecoveryRestoreId,
+    accepted_endpoint_sha256: Sha256Digest,
+    received_at: String,
+    canonical_hash: Sha256Digest
+});
+params!(RecoveryHistoryCandidatesParams {
+    restore_id: RecoveryRestoreId,
+    accepted_endpoint_sha256: Sha256Digest,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    cursor: Option<RecoveryHistoryCursor>
+});
+params!(RecoveryHistorySelectParams {
+    restore_id: RecoveryRestoreId,
+    accepted_endpoint_sha256: Sha256Digest,
+    checkpoint_sha256: Sha256Digest
+});
+params!(RecoveryHistoryUnlockParams {
+    restore_id: RecoveryRestoreId,
+    accepted_endpoint_sha256: Sha256Digest,
+    checkpoint_sha256: Sha256Digest,
+    recovery_phrase_words: RecoveryPhraseWords
+});
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "state",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RecoveryHistoryExtent {
+    Supported { operation_count: u32 },
+    Unsupported {},
+}
+params!(RecoveryHistoryCandidate {
+    checkpoint_sha256: Sha256Digest,
+    author_device_id: DeviceId,
+    created_hlc: crate::HybridLogicalClock,
+    key_epoch: u32,
+    frontier_device_count: u32,
+    extent: RecoveryHistoryExtent
+});
+params!(RecoveryHistoryCandidatesPage {
+    restore_id: RecoveryRestoreId,
+    accepted_endpoint: RecoveryHistoryEndpoint,
+    candidates: Vec<RecoveryHistoryCandidate>,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    next_cursor: Option<RecoveryHistoryCursor>
+});
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "state",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RecoveryHistoryProgress {
+    Unselected {},
+    Incomplete {
+        selected_endpoint: RecoveryHistoryEndpoint,
+        checkpoint_sha256: Sha256Digest,
+    },
+    HistoricalKeysNeeded {
+        selected_endpoint: RecoveryHistoryEndpoint,
+        checkpoint_sha256: Sha256Digest,
+    },
+    CurrentMaterialUnavailable {
+        selected_endpoint: RecoveryHistoryEndpoint,
+        checkpoint_sha256: Sha256Digest,
+    },
+    StaleEndpoint {
+        selected_endpoint: RecoveryHistoryEndpoint,
+        checkpoint_sha256: Sha256Digest,
+    },
+}
+impl RecoveryHistoryEndpoint {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.state_sha256.0 == [0; 32] || self.control_epoch == 0 || self.key_epoch == 0 {
+            return Err(ValidationError::Invalid("recovery endpoint"));
+        }
+        Ok(())
+    }
+}
+impl RecoveryHistoryCursor {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.accepted_endpoint_sha256.0 == [0; 32]
+            || self.canonical_hash.0 == [0; 32]
+            || self.received_at.is_empty()
+            || self.received_at.len() > 64
+            || !self
+                .received_at
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b"-:+.TZ".contains(&b))
+        {
+            return Err(ValidationError::Invalid("recovery cursor"));
+        }
+        Ok(())
+    }
+}
+impl RecoveryHistoryProgress {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let (endpoint, hash) = match self {
+            Self::Unselected {} => return Ok(()),
+            Self::Incomplete {
+                selected_endpoint,
+                checkpoint_sha256,
+            }
+            | Self::HistoricalKeysNeeded {
+                selected_endpoint,
+                checkpoint_sha256,
+            }
+            | Self::CurrentMaterialUnavailable {
+                selected_endpoint,
+                checkpoint_sha256,
+            }
+            | Self::StaleEndpoint {
+                selected_endpoint,
+                checkpoint_sha256,
+            } => (selected_endpoint, checkpoint_sha256),
+        };
+        endpoint.validate()?;
+        if hash.0 == [0; 32] {
+            return Err(ValidationError::Invalid("recovery checkpoint"));
+        }
+        Ok(())
+    }
+}
+impl RecoveryHistoryCandidatesPage {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        self.accepted_endpoint.validate()?;
+        if self.candidates.len() > 8 {
+            return Err(ValidationError::Invalid("recovery candidates"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for candidate in &self.candidates {
+            if candidate.checkpoint_sha256.0 == [0; 32]
+                || !seen.insert(candidate.checkpoint_sha256)
+                || candidate.created_hlc.node != candidate.author_device_id
+                || candidate.key_epoch == 0
+                || candidate.key_epoch > self.accepted_endpoint.key_epoch
+                || candidate.frontier_device_count as usize > crate::MAX_BATCH_OPERATIONS
+                || matches!(candidate.extent, RecoveryHistoryExtent::Supported { operation_count } if operation_count > 100000 || operation_count < candidate.frontier_device_count)
+            {
+                return Err(ValidationError::Invalid("recovery candidate"));
+            }
+        }
+        if let Some(cursor) = &self.next_cursor {
+            cursor.validate()?;
+            if cursor.restore_id != self.restore_id
+                || cursor.accepted_endpoint_sha256 != self.accepted_endpoint.state_sha256
+                || self
+                    .candidates
+                    .last()
+                    .is_none_or(|last| last.checkpoint_sha256 != cursor.canonical_hash)
+            {
+                return Err(ValidationError::Invalid("recovery cursor"));
+            }
+        } else if !self.candidates.is_empty() {
+            return Err(ValidationError::Invalid("recovery cursor"));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(
@@ -355,6 +523,8 @@ pub enum RecoveryRestoreStatus {
     },
     RestoringHistory {
         restore_id: RecoveryRestoreId,
+        accepted_endpoint: RecoveryHistoryEndpoint,
+        history: RecoveryHistoryProgress,
     },
     Complete {
         restore_id: RecoveryRestoreId,
@@ -734,6 +904,9 @@ pub enum LocalRequest {
     RecoveryRestoreOverview(EmptyParams),
     RecoveryRestoreResume(EmptyParams),
     RecoveryRestoreCancel(EmptyParams),
+    RecoveryHistoryCandidates(RecoveryHistoryCandidatesParams),
+    RecoveryHistorySelect(RecoveryHistorySelectParams),
+    RecoveryHistoryUnlock(RecoveryHistoryUnlockParams),
     RecoveryEnrollmentOverview(EmptyParams),
     RecoveryEnrollmentConfirm(RecoveryEnrollmentConfirmParams),
     RecoveryEnrollmentStatus(RecoveryEnrollmentIdParams),
@@ -765,6 +938,32 @@ fn validate_tags(tags: &[String]) -> Result<(), ValidationError> {
 impl LocalRequest {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::RecoveryHistoryCandidates(p) => {
+                if p.accepted_endpoint_sha256.0 == [0; 32] {
+                    return Err(ValidationError::Invalid("recovery endpoint"));
+                }
+                if let Some(cursor) = &p.cursor {
+                    cursor.validate()?;
+                    if cursor.restore_id != p.restore_id
+                        || cursor.accepted_endpoint_sha256 != p.accepted_endpoint_sha256
+                    {
+                        return Err(ValidationError::Invalid("recovery cursor"));
+                    }
+                }
+                Ok(())
+            }
+            Self::RecoveryHistorySelect(p) => {
+                if p.accepted_endpoint_sha256.0 == [0; 32] || p.checkpoint_sha256.0 == [0; 32] {
+                    return Err(ValidationError::Invalid("recovery target"));
+                }
+                Ok(())
+            }
+            Self::RecoveryHistoryUnlock(p) => {
+                if p.accepted_endpoint_sha256.0 == [0; 32] || p.checkpoint_sha256.0 == [0; 32] {
+                    return Err(ValidationError::Invalid("recovery target"));
+                }
+                Ok(())
+            }
             Self::HarnessLaunchInfo(p) => {
                 validate_harness_profile(p)?;
                 if p.project_id.is_none() {
@@ -1196,6 +1395,9 @@ params!(AccountDeletionIntentsParams {
     rename_all_fields = "camelCase"
 )]
 pub enum LocalResult {
+    RecoveryHistoryCandidates {
+        page: RecoveryHistoryCandidatesPage,
+    },
     RecoveryRestoreStatus {
         status: RecoveryRestoreStatus,
     },
@@ -1326,6 +1528,9 @@ pub enum LocalResult {
     deny_unknown_fields
 )]
 enum LocalResultSerde {
+    RecoveryHistoryCandidates {
+        page: RecoveryHistoryCandidatesPage,
+    },
     RecoveryRestoreStatus {
         status: RecoveryRestoreStatus,
     },
@@ -1452,6 +1657,40 @@ enum LocalResultSerde {
 impl LocalResult {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::RecoveryHistoryCandidates { page } => page.validate(),
+            Self::RecoveryRestoreStatus {
+                status:
+                    RecoveryRestoreStatus::RestoringHistory {
+                        accepted_endpoint,
+                        history,
+                        ..
+                    },
+            } => {
+                accepted_endpoint.validate()?;
+                history.validate()?;
+                let selected = match history {
+                    RecoveryHistoryProgress::Unselected {} => return Ok(()),
+                    RecoveryHistoryProgress::Incomplete {
+                        selected_endpoint, ..
+                    }
+                    | RecoveryHistoryProgress::HistoricalKeysNeeded {
+                        selected_endpoint, ..
+                    }
+                    | RecoveryHistoryProgress::CurrentMaterialUnavailable {
+                        selected_endpoint,
+                        ..
+                    }
+                    | RecoveryHistoryProgress::StaleEndpoint {
+                        selected_endpoint, ..
+                    } => selected_endpoint,
+                };
+                if matches!(history, RecoveryHistoryProgress::StaleEndpoint { .. })
+                    == (selected == accepted_endpoint)
+                {
+                    return Err(ValidationError::Invalid("recovery endpoint"));
+                }
+                Ok(())
+            }
             Self::HarnessExecutionCurrent { status } => status
                 .as_ref()
                 .map_or(Ok(()), crate::HarnessExecutionStatus::validate),
@@ -1553,7 +1792,6 @@ impl LocalResult {
                 status:
                     RecoveryRestoreStatus::Idle {}
                     | RecoveryRestoreStatus::Submitting { .. }
-                    | RecoveryRestoreStatus::RestoringHistory { .. }
                     | RecoveryRestoreStatus::Conflict { .. },
             } => Ok(()),
             Self::RecoveryRestoreStatus {

@@ -115,6 +115,47 @@ pub(super) fn authenticate_local_operation(
     operation: &SyncOperationV1,
     representative: bool,
 ) -> Result<(), VaultError> {
+    authenticate_local_operations(
+        c,
+        stored,
+        device,
+        &[operation],
+        representative,
+        CutoffClosure::Current,
+    )
+}
+
+/// Called only after recovery verifies its original installed target, receipt and prefix closure.
+/// One snapshot per status call; this does not confer current read or write authority.
+pub(super) fn authenticate_installed_operations(
+    c: &Connection,
+    stored: &Stored,
+    device: DeviceId,
+    operations: &[&SyncOperationV1],
+) -> Result<(), VaultError> {
+    authenticate_local_operations(
+        c,
+        stored,
+        device,
+        operations,
+        false,
+        CutoffClosure::RetainedLocal,
+    )
+}
+
+struct LocalSnapshot {
+    evidence: AuthenticatedEvidence,
+    local: BTreeSet<(DeviceId, u64)>,
+    heads: BTreeMap<DeviceId, u64>,
+    verified: BTreeMap<DeviceId, u64>,
+}
+
+fn local_snapshot(
+    c: &Connection,
+    stored: &Stored,
+    device: DeviceId,
+    closure: CutoffClosure,
+) -> Result<LocalSnapshot, VaultError> {
     let budget = LIVE_READ_BUDGET;
     ensure_live_bounds(c)?;
     let mut entries = Evidence::new();
@@ -161,16 +202,7 @@ pub(super) fn authenticate_local_operation(
         insert(&mut entries, &mut ids, &mut dependencies, entry, budget)?;
     }
     let evidence = authenticate(stored, entries, budget)?;
-    if !saved_prefixes(c, stored, &evidence, device, budget)? {
-        return Err(invalid());
-    }
-    let entry = evidence
-        .entries
-        .get(&(operation.device_id, operation.device_sequence))
-        .ok_or_else(invalid)?;
-    if !local.contains(&(operation.device_id, operation.device_sequence))
-        || entry.bytes != checked(encode_sync_operation_v1(operation))?
-    {
+    if !saved_prefixes_with_cutoff(c, stored, &evidence, device, budget, closure)? {
         return Err(invalid());
     }
     let mut frontier = Vec::new();
@@ -193,61 +225,138 @@ pub(super) fn authenticate_local_operation(
             sequence: seq,
         });
     }
-    if frontier
+    if matches!(closure, CutoffClosure::RetainedLocal) {
+        // Even an unreferenced retained row must respect an authenticated revocation.
+        for ((author, sequence), entry) in &evidence.entries {
+            if let Some((cutoff, hash)) = evidence.cutoffs.get(author)
+                && (sequence > cutoff || (sequence == cutoff && entry.hash != *hash))
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    let heads = frontier
         .iter()
-        .find(|h| h.device_id == operation.device_id)
-        .is_none_or(|h| h.sequence < operation.device_sequence)
+        .map(|h| (h.device_id, h.sequence))
+        .collect::<BTreeMap<_, _>>();
+    let verified =
+        verified_ranges_with_cutoff(&evidence, &frontier, budget, closure)?.ok_or_else(invalid)?;
+    if matches!(closure, CutoffClosure::RetainedLocal)
+        && local
+            .iter()
+            .any(|(author, sequence)| heads.get(author).is_none_or(|end| sequence > end))
     {
         return Err(invalid());
     }
-    let verified = verified_ranges(&evidence, &frontier, budget)?.ok_or_else(invalid)?;
-    let mut represented = false;
-    let mut q = c.prepare("SELECT CASE WHEN length(h.operation_id)=36 THEN h.operation_id END,CASE WHEN length(h.canonical_sha256)=32 THEN h.canonical_sha256 END,CASE WHEN length(h.record_kind)<=32 THEN h.record_kind END,CASE WHEN length(h.mutation_kind)<=32 THEN h.mutation_kind END,CASE WHEN length(m.device_id)=36 THEN m.device_id END,CASE WHEN length(m.device_sequence) BETWEEN 1 AND 20 THEN m.device_sequence END FROM sync_record_heads h JOIN sync_record_owners o ON o.record_id=h.record_id LEFT JOIN sync_operation_meta m ON m.operation_id=h.operation_id WHERE h.workspace_id=?1 AND h.record_id=?2 AND o.account_id=?3 AND o.workspace_id=?1 AND o.binding_state='verified'")?;
+    Ok(LocalSnapshot {
+        evidence,
+        local,
+        heads,
+        verified,
+    })
+}
+
+fn authenticate_local_operations(
+    c: &Connection,
+    stored: &Stored,
+    device: DeviceId,
+    operations: &[&SyncOperationV1],
+    representative: bool,
+    closure: CutoffClosure,
+) -> Result<(), VaultError> {
+    if operations.len() > LIVE_READ_BUDGET.max_operations {
+        return Err(VaultError::BudgetExceeded);
+    }
+    let snapshot = local_snapshot(c, stored, device, closure)?;
+    let mut records = BTreeMap::new();
+    for operation in operations {
+        let index = (operation.device_id, operation.device_sequence);
+        let entry = snapshot.evidence.entries.get(&index).ok_or_else(invalid)?;
+        if !snapshot.local.contains(&index)
+            || entry.bytes != checked(encode_sync_operation_v1(operation))?
+            || snapshot
+                .heads
+                .get(&operation.device_id)
+                .is_none_or(|end| *end < operation.device_sequence)
+            || records
+                .insert(operation.record_id, operation.record_kind)
+                .is_some_and(|kind| kind != operation.record_kind)
+        {
+            return Err(invalid());
+        }
+    }
+    let mut covered = BTreeMap::<_, BTreeMap<DeviceId, u64>>::new();
+    let mut exact_heads = BTreeSet::new();
+    // One bounded scan for the batch. A single-operation caller keeps its scoped SQL read.
+    let one_record = (records.len() == 1).then(|| records.keys().next().unwrap().to_string());
+    let mut q = c.prepare("SELECT CASE WHEN length(h.record_id)=36 THEN h.record_id END,CASE WHEN length(h.operation_id)=36 THEN h.operation_id END,CASE WHEN length(h.canonical_sha256)=32 THEN h.canonical_sha256 END,CASE WHEN length(h.record_kind)<=32 THEN h.record_kind END,CASE WHEN length(h.mutation_kind)<=32 THEN h.mutation_kind END,CASE WHEN length(m.device_id)=36 THEN m.device_id END,CASE WHEN length(m.device_sequence) BETWEEN 1 AND 20 THEN m.device_sequence END FROM sync_record_heads h JOIN sync_record_owners o ON o.record_id=h.record_id LEFT JOIN sync_operation_meta m ON m.operation_id=h.operation_id WHERE h.workspace_id=?1 AND o.account_id=?2 AND o.workspace_id=?1 AND o.binding_state='verified' AND (?3 IS NULL OR h.record_id=?3)")?;
     let mut rows = q.query(params![
         stored.scope.workspace_id.to_string(),
-        operation.record_id.to_string(),
-        stored.scope.account_id.to_string()
+        stored.scope.account_id.to_string(),
+        one_record
     ])?;
     let mut head_count = 0usize;
     while let Some(row) = rows.next()? {
         head_count += 1;
-        if head_count > budget.max_operations {
+        if head_count > LIVE_READ_BUDGET.max_operations {
             return Err(VaultError::BudgetExceeded);
         }
-        let head_device: DeviceId = row.get::<_, String>(4)?.parse().map_err(|_| invalid())?;
-        let head_sequence: u64 = row.get::<_, String>(5)?.parse().map_err(|_| invalid())?;
-        let head = evidence
+        let record = row.get::<_, String>(0)?.parse().map_err(|_| invalid())?;
+        let Some(kind) = records.get(&record) else {
+            continue;
+        };
+        let author: DeviceId = row.get::<_, String>(5)?.parse().map_err(|_| invalid())?;
+        let sequence: u64 = row.get::<_, String>(6)?.parse().map_err(|_| invalid())?;
+        let head = snapshot
+            .evidence
             .entries
-            .get(&(head_device, head_sequence))
+            .get(&(author, sequence))
             .ok_or_else(invalid)?;
-        // A signature and higher sequence alone do not prove a stored head's chain.
-        // Representation may use only the already verified local device/causal closure.
-        if verified
-            .get(&head_device)
-            .is_none_or(|end| head_sequence > *end)
-            || !local.contains(&(head_device, head_sequence))
-            || head.operation.operation_id.to_string() != row.get::<_, String>(0)?
-            || head.hash.0 != row.get::<_, Vec<u8>>(1)?.as_slice()
-            || head.operation.record_id != operation.record_id
-            || head.operation.record_kind != operation.record_kind
+        if snapshot
+            .verified
+            .get(&author)
+            .is_none_or(|end| sequence > *end)
+            || !snapshot.local.contains(&(author, sequence))
+            || head.operation.operation_id.to_string() != row.get::<_, String>(1)?
+            || head.hash.0 != row.get::<_, Vec<u8>>(2)?.as_slice()
+            || head.operation.record_id != record
+            || head.operation.record_kind != *kind
             || crate::vault::sync::record_kind_name(head.operation.record_kind)
-                != row.get::<_, String>(2)?
-            || crate::vault::sync::mutation_kind_name(head.operation.mutation_kind)
                 != row.get::<_, String>(3)?
+            || crate::vault::sync::mutation_kind_name(head.operation.mutation_kind)
+                != row.get::<_, String>(4)?
         {
             return Err(invalid());
         }
-        represented |= if representative {
-            head.bytes == entry.bytes
-        } else {
-            matches!(
-                crate::sync::compare_operations(&head.operation, operation),
-                crate::sync::CausalOrder::After | crate::sync::CausalOrder::Equal
-            )
-        };
+        exact_heads.insert((author, sequence));
+        // For the same author, After|Equal is sequence coverage. For another author it
+        // is precisely left_knows_right in compare_operations. Aggregate once, rather
+        // than comparing every installed operation with every current record head.
+        let coverage = covered.entry(record).or_default();
+        for (author, sequence) in std::iter::once((author, sequence)).chain(
+            head.operation
+                .causal_frontier
+                .iter()
+                .map(|d| (d.device_id, d.sequence)),
+        ) {
+            coverage
+                .entry(author)
+                .and_modify(|end| *end = (*end).max(sequence))
+                .or_insert(sequence);
+        }
     }
-    if !represented {
-        return Err(invalid());
+    for operation in operations {
+        let represented = if representative {
+            exact_heads.contains(&(operation.device_id, operation.device_sequence))
+        } else {
+            covered
+                .get(&operation.record_id)
+                .and_then(|c| c.get(&operation.device_id))
+                .is_some_and(|end| *end >= operation.device_sequence)
+        };
+        if !represented {
+            return Err(invalid());
+        }
     }
     Ok(())
 }

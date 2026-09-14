@@ -1,5 +1,5 @@
 import Ajv2020 from 'ajv/dist/2020.js';
-import type { AccountDeletionIntentSummary, LocalResult, OperationId, HostedAuthStatus, RecoveryRestoreStatus } from './bindings';
+import type { AccountDeletionIntentSummary, LocalResult, OperationId, HostedAuthStatus, RecoveryRestoreStatus, RecoveryHistoryCandidatesPage } from './bindings';
 
 import type { ConnectionCheckStatus, HarnessPreparationStatus, HarnessExecutionStatus, HarnessSetupRecord, HarnessSetupsPage, MemoryRecord, ProbeReport, SearchIndexStatus, SetupPlan, SyncOperationV1, TaskRecord } from './bindings';
 
@@ -71,8 +71,21 @@ export function validateRecoveryRestoreStatus(value: unknown): RecoveryRestoreSt
   const state = (value as { state: unknown }).state;
   choice(state, ['idle', 'submitting', 'restoring_history', 'complete', 'conflict'], 'recovery state');
   const status = object(value, state === 'idle' ? ['state'] : state === 'complete'
-    ? ['state', 'restoreId', 'device'] : ['state', 'restoreId'], 'recovery status');
+    ? ['state', 'restoreId', 'device'] : state === 'restoring_history' ? ['state', 'restoreId', 'acceptedEndpoint', 'history'] : ['state', 'restoreId'], 'recovery status');
   if (state !== 'idle') id(status.restoreId, 'restore id');
+  if (state === 'restoring_history') {
+    recoveryEndpoint(status.acceptedEndpoint);
+    const state = status.history && (status.history as Record<string, unknown>).state;
+    choice(state, ['unselected', 'incomplete', 'historical_keys_needed', 'current_material_unavailable', 'stale_endpoint'], 'history progress');
+    const history = object(status.history, state === 'unselected' ? ['state'] : ['state', 'selectedEndpoint', 'checkpointSha256'], 'history progress');
+    if (state !== 'unselected') {
+      const selected = recoveryEndpoint(history.selectedEndpoint);
+      const accepted = recoveryEndpoint(status.acceptedEndpoint);
+      const same = selected.stateSha256 === accepted.stateSha256 && selected.controlEpoch === accepted.controlEpoch && selected.keyEpoch === accepted.keyEpoch;
+      if ((state === 'stale_endpoint') === same) fail('history endpoint');
+      nonzeroSha(history.checkpointSha256);
+    }
+  }
   if (state === 'complete') {
     const device = object(status.device, ['deviceId', 'name', 'platform', 'state', 'isCurrent'], 'recovered device');
     id(device.deviceId, 'device id');
@@ -82,6 +95,38 @@ export function validateRecoveryRestoreStatus(value: unknown): RecoveryRestoreSt
     choice(device.isCurrent, [true], 'current device');
   }
   return value as RecoveryRestoreStatus;
+}
+function nonzeroSha(value: unknown) { sha(value, 'recovery hash'); if (value === '0'.repeat(64)) fail('recovery hash'); }
+function recoveryEndpoint(value: unknown) {
+  const endpoint = object(value, ['stateSha256', 'controlEpoch', 'keyEpoch'], 'recovery endpoint');
+  nonzeroSha(endpoint.stateSha256); uint(endpoint.controlEpoch, 0xffff_ffff, 'control epoch'); uint(endpoint.keyEpoch, 0xffff_ffff, 'key epoch');
+  if (!endpoint.controlEpoch || !endpoint.keyEpoch) fail('recovery epoch');
+  return endpoint;
+}
+export function validateRecoveryHistoryCandidates(value: unknown): RecoveryHistoryCandidatesPage {
+  const page = object(value, ['restoreId', 'acceptedEndpoint', 'candidates', 'nextCursor'], 'recovery page');
+  id(page.restoreId, 'restore id');
+  const endpoint = recoveryEndpoint(page.acceptedEndpoint);
+  const candidates = list(page.candidates, 8, 'recovery candidates');
+  const seen = new Set();
+  for (const value of candidates) {
+    const candidate = object(value, ['checkpointSha256', 'authorDeviceId', 'createdHlc', 'keyEpoch', 'frontierDeviceCount', 'extent'], 'recovery candidate');
+    nonzeroSha(candidate.checkpointSha256); id(candidate.authorDeviceId, 'history author'); hlc(candidate.createdHlc, 'history clock');
+    if ((candidate.createdHlc as Record<string, unknown>).node !== candidate.authorDeviceId || seen.has(candidate.checkpointSha256)) fail('history author');
+    seen.add(candidate.checkpointSha256);
+    uint(candidate.keyEpoch, endpoint.keyEpoch as number, 'history epoch'); if (!candidate.keyEpoch) fail('history epoch');
+    uint(candidate.frontierDeviceCount, 10000, 'history frontier');
+    const state = candidate.extent && (candidate.extent as Record<string, unknown>).state;
+    choice(state, ['supported', 'unsupported'], 'history extent');
+    const extent = object(candidate.extent, state === 'supported' ? ['state', 'operationCount'] : ['state'], 'history extent');
+    if (state === 'supported') { uint(extent.operationCount, 100000, 'history extent'); if ((extent.operationCount as number) < (candidate.frontierDeviceCount as number)) fail('history extent'); }
+  }
+  if (page.nextCursor !== null) {
+    const cursor = object(page.nextCursor, ['restoreId', 'acceptedEndpointSha256', 'receivedAt', 'canonicalHash'], 'history cursor');
+    const receivedAt = text(cursor.receivedAt, 64, 'cursor timestamp');
+    if (!/^[0-9T:.Z+-]+$/.test(receivedAt) || cursor.restoreId !== page.restoreId || cursor.acceptedEndpointSha256 !== endpoint.stateSha256 || !candidates.length || cursor.canonicalHash !== (candidates.at(-1) as Record<string, unknown>).checkpointSha256) fail('history cursor');
+  } else if (candidates.length) fail('history cursor');
+  return value as RecoveryHistoryCandidatesPage;
 }
 export function validateHostedAuthStatus(value: unknown): HostedAuthStatus {
   const status = object(value, ['generation', 'state'], 'hosted auth status');

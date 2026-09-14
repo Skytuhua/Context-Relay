@@ -184,3 +184,14 @@ function recoveryStatus(state: 'idle') {
     transitionedAtMs: null,
   } as const;
 }
+
+it('keeps history unlock on the native host and rejects its phrase-bearing generic route', async () => {
+  const params = { restoreId: '018f22e2-79b0-7cc8-98c4-dc0c0c073914' as never, acceptedEndpointSha256: '11'.repeat(32) as never, checkpointSha256: '22'.repeat(32) as never };
+  invoke.mockResolvedValueOnce(null);
+  const client = new LocalClient();
+  await expect(client.recoveryHistoryUnlock(params)).resolves.toBeNull();
+  expect(invoke).toHaveBeenCalledExactlyOnceWith('recovery_history_unlock', { params });
+  invoke.mockClear();
+  await expect(client.call({ method: 'recovery_history_unlock', params: { ...params, recoveryPhraseWords: Array<string>(24).fill('abandon') } })).rejects.toThrow('dedicated native recovery command');
+  expect(invoke).not.toHaveBeenCalled();
+});

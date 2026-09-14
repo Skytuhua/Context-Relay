@@ -1,10 +1,10 @@
 # Context Relay protocol version 1
 
-Context Relay protocol version 1.6 is identified by `PROTOCOL_MAJOR = 1` and `PROTOCOL_MINOR = 6`. Sync operations use schema version 1; scope-bound signed checkpoints use the independent checkpoint schema version 2. Local IPC frames are limited to 8 MiB.
+Context Relay protocol version 1.16 is identified by `PROTOCOL_MAJOR = 1` and `PROTOCOL_MINOR = 16`. Sync operations use schema version 1; scope-bound signed checkpoints use the independent checkpoint schema version 2. Local IPC frames are limited to 8 MiB.
 
 Harness discovery includes nullable `codexSavedHookApproval` with `sessionStart` and `stop` states. These describe saved user hook definitions and approvals, not effective runtime enablement or a verified connection. `null` means the check is unavailable, including unsupported versions or unreadable settings.
 
-Version negotiation requires matching major versions and selects the greatest minor version present in both advertised ranges. A major mismatch or disjoint minor range returns `protocol_version_unsupported`. No caller may fall back to an unknown major.
+Ordinary clients and servers require exact protocol1.16. Incompatible major or minor versions return `protocol_version_unsupported` before dispatch. The installer-only authenticated shutdown path separately recognizes explicit legacy versions, including the qualified1.12 and prior1.15 versions; it provides no reusable legacy application client.
 
 All product identifiers are UUIDv7 values. JSON uses lowercase hyphenated text. Canonical CBOR uses exactly 16 bytes. JSON encodes wire `u64` values as canonical decimal strings. CBOR encodes them as unsigned integers.
 
@@ -103,14 +103,25 @@ automatically or falls back to the legacy two-request creation sequence.
 `project_upsert` and `project_path_set` remain available for their existing
 independent operations. Their presence is not an atomic creation contract.
 
-Ordinary local clients require exactly 1.6 and reject 1.5 before application
+Ordinary local clients require exactly 1.16 and reject 1.15 before application
 dispatch. The Windows updater always extracts its new authenticated shutdown
 helper before replacing companions; it never runs an old daemon executable
 that might ignore `--shutdown` and start a service. The helper has one private
-compatibility path for protocols 1.4 and 1.5: verify both installation-token proofs,
+compatibility path for explicitly listed protocols 1.4 through 1.15, including
+the qualified 1.12 predecessor: verify both installation-token proofs,
 send only the fixed shutdown request, require its matching empty acknowledgment,
 and wait for the exact connected process to exit. It cannot return a reusable
 client or dispatch other legacy requests. Other legacy versions are rejected.
 An absent service succeeds without starting a daemon or reading credentials.
 No vault schema migration is needed for project registration, and sync/checkpoint
 schema versions are unchanged.
+
+## Explicit recovery history, protocol 1.16
+
+A root-authorized recovery admission remains `restoring_history` until the user explicitly chooses a canonical checkpoint and the daemon verifies its durable installation. `RecoveryRestoreOverview` returns original `restoreId`, full current accepted endpoint (`stateSha256`, `controlEpoch`, `keyEpoch`), and a strict progress union: `unselected`, `incomplete`, `historical_keys_needed`, `current_material_unavailable`, or `stale_endpoint`. Every selected state includes its selected endpoint and checkpoint hash. A stale endpoint requires explicit reselection; integrity failures remain errors. A verified installed receipt remains a historical completion fact after accepted descendant membership progress and grants no current write authority.
+
+Desktop-only `recovery_history_candidates` takes `restoreId`, exact `acceptedEndpointSha256`, and a required-nullable cursor. It returns at most eight authenticated summaries: canonical checkpoint hash, author device ID, signed created HLC, key epoch, frontier device count, and checked total frontier extent (supported up to100000 operations, otherwise explicitly unsupported). Provider received time only positions the cursor; it is not signed checkpoint time or proof of globally newest history. The cursor binds original restore ID and accepted endpoint to receivedAt/canonicalHash. Nonempty pages, including short pages, return a cursor; only an empty page ends traversal. The daemon retains one bounded traversal with at most4096 pages and64MiB of canonical checkpoint bytes. Individual checkpoints remain bounded to1MiB. Listing is read-only and cannot select a target.
+
+Desktop-only `recovery_history_select` takes the three exact nonsecret identifiers: restore ID, accepted endpoint hash, and checkpoint hash. The daemon downloads and authenticates those exact bytes before the existing durable selection transaction. `recovery_restore_resume` acts only on that durable choice and reuses signed operation download, reconstruction and installation. It never chooses a checkpoint implicitly or treats missing operations as missing keys. Event/page4096, operation100000, dependency1000000, checkpoint1MiB and category64MiB limits remain unchanged.
+
+`recovery_history_unlock` is confined to DesktopRecoveryHost. React invokes the native Tauri command with only the three nonsecret identifiers. The native host rereads exact positive `historical_keys_needed` status before opening the existing phrase dialog. Only native IPC adds `RecoveryPhraseWords`. The daemon rechecks original hosted intent/session, original preparation/claim/pin/recipient, accepted lineage, exact selected endpoint/checkpoint and cancellation before transactional retention. Cancel and stale state preserve the durable target. Initial and supplemental key receipts reuse `recovery-history-key/v1` AAD and recipient signatures; supplemental retention is additive only for genuinely absent historical epochs below current D. It never replaces original preparation, repairs corrupt receipts, supplies independent current-D material, activates writes, or publishes another recovery claim. Exact retry preserves ciphertext and signatures. Migration47 adds only the four bounded supplemental receipt columns from the original representation.

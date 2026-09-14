@@ -61,7 +61,7 @@ fn request(method: &str, params: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": support::ID,
-        "protocol": {"major": 1, "minor": 15},
+        "protocol": {"major": 1, "minor": 16},
         "daemonInstanceNonce": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
         "method": method,
         "params": params,
@@ -479,4 +479,56 @@ fn phrase_and_challenge_require_the_exact_ten_minute_window() {
 #[test]
 fn recovery_host_is_a_distinct_role() {
     assert_ne!(ClientRole::Desktop, ClientRole::DesktopRecoveryHost);
+}
+
+#[test]
+fn explicit_history_fixture_and_endpoint_semantics_are_strict() {
+    use context_relay_protocol::{LocalResult, RecoveryHistoryCandidatesPage};
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/runtime-contracts-v1.json")).unwrap();
+    let page: RecoveryHistoryCandidatesPage =
+        serde_json::from_value(fixture["recoveryHistoryCandidatesPage"].clone()).unwrap();
+    page.validate().unwrap();
+    assert_eq!(
+        serde_json::to_value(page.clone()).unwrap(),
+        fixture["recoveryHistoryCandidatesPage"]
+    );
+    let mut invalid = page.clone();
+    invalid.candidates = vec![page.candidates[0].clone(); 9];
+    assert!(invalid.validate().is_err());
+    let mut invalid = page.clone();
+    invalid.candidates[0].frontier_device_count =
+        (context_relay_protocol::MAX_BATCH_OPERATIONS + 1) as u32;
+    invalid.candidates[0].extent = context_relay_protocol::RecoveryHistoryExtent::Supported {
+        operation_count: invalid.candidates[0].frontier_device_count,
+    };
+    assert!(invalid.validate().is_err());
+    let mut invalid = page.clone();
+    invalid.next_cursor = None;
+    assert!(invalid.validate().is_err());
+    let mut invalid = page;
+    invalid
+        .next_cursor
+        .as_mut()
+        .unwrap()
+        .accepted_endpoint_sha256 = context_relay_protocol::Sha256Digest([9; 32]);
+    assert!(invalid.validate().is_err());
+    for state in [
+        "incomplete",
+        "historical_keys_needed",
+        "current_material_unavailable",
+        "stale_endpoint",
+    ] {
+        let mut status = fixture["recoveryHistoryStatus"].clone();
+        status["history"]["state"] = state.into();
+        if state != "stale_endpoint" {
+            status["history"]["selectedEndpoint"]["stateSha256"] = "33".repeat(32).into();
+        }
+        assert!(
+            serde_json::from_value::<LocalResult>(
+                serde_json::json!({"kind":"recovery_restore_status","data":{"status":status}})
+            )
+            .is_err()
+        );
+    }
 }

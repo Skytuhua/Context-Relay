@@ -41,31 +41,71 @@ impl AuthenticatedRecoveryHistory {
         self.material
             .iter()
             .filter(|(epoch, _)| **epoch < claim.key_epoch)
-            .map(|(&epoch, material)| {
-                // Decoders required exact canonical roundtrip; retain that original
-                // representation, before adding a native enrollment pin to the bundle.
-                let plain = encode_pairing_key_bundle(material)?;
-                let commitment = digest(&plain);
-                let aad = history_key_aad(claim_hash, epoch, commitment);
-                let envelope = wrap_secret_with_rng(
-                    recipient.wrapping_public_key(),
-                    &plain,
-                    &aad,
-                    &mut OsRng,
+            .map(|(&epoch, material)| seal_history_key(claim_hash, epoch, material, recipient))
+            .collect()
+    }
+
+    /// Additive native phrase repair preserves the original claim's parent and recipient.
+    pub(crate) fn seal_missing_historical_keys(
+        &self,
+        claim: &RecoveryDeviceClaimV2,
+        original_parent: &VerifiedMembershipHistory,
+        lineage: &crate::devices::membership_crypto::VerifiedMembershipLineage,
+        missing: &std::collections::BTreeSet<u32>,
+        recipient: &DeviceKeys,
+    ) -> Result<Vec<RecoveryHistoryKeyV1>, RecoveryRestoreCryptoError> {
+        verify_recovery_device_claim_v2(&self.root.record, claim, original_parent)?;
+        require_recipient(claim, recipient)?;
+        if self.history.endpoint() != lineage.history().endpoint()
+            || self.history.enrollment_record_sha256() != claim.canonical_record_sha256
+        {
+            return Err(RecoveryRestoreCryptoError::InvalidRecovery);
+        }
+        let claim_hash = digest(&encode_recovery_device_claim_v2(claim)?);
+        missing
+            .iter()
+            .map(|&epoch| {
+                if epoch == 0 || epoch >= self.history.endpoint().key_epoch {
+                    return Err(RecoveryRestoreCryptoError::InvalidRecovery);
+                }
+                let bundle = self
+                    .material
+                    .get(&epoch)
+                    .ok_or(RecoveryRestoreCryptoError::InvalidRecovery)?;
+                let retained = seal_history_key(claim_hash, epoch, bundle, recipient)?;
+                open_recovery_history_key(
+                    &self.root.record,
+                    claim,
+                    original_parent,
+                    lineage,
+                    &retained,
+                    recipient,
                 )?;
-                let mut signed = aad;
-                signed.extend(
-                    super::super::recovery_crypto::encode_recovery_device_envelope_v1(&envelope)?,
-                );
-                Ok(RecoveryHistoryKeyV1 {
-                    key_epoch: epoch,
-                    original_bundle_sha256: commitment,
-                    envelope,
-                    signature: recipient.sign_hosted_device_proof(&signed),
-                })
+                Ok(retained)
             })
             .collect()
     }
+}
+
+fn seal_history_key(
+    claim_hash: Sha256Digest,
+    epoch: u32,
+    material: &PairingKeyBundle,
+    recipient: &DeviceKeys,
+) -> Result<RecoveryHistoryKeyV1, RecoveryRestoreCryptoError> {
+    // Keep the original canonical representation before adding a native enrollment pin.
+    let plain = encode_pairing_key_bundle(material)?;
+    let commitment = digest(&plain);
+    let aad = history_key_aad(claim_hash, epoch, commitment);
+    let envelope = wrap_secret_with_rng(recipient.wrapping_public_key(), &plain, &aad, &mut OsRng)?;
+    let mut signed = aad;
+    signed.extend(super::super::recovery_crypto::encode_recovery_device_envelope_v1(&envelope)?);
+    Ok(RecoveryHistoryKeyV1 {
+        key_epoch: epoch,
+        original_bundle_sha256: commitment,
+        envelope,
+        signature: recipient.sign_hosted_device_proof(&signed),
+    })
 }
 
 #[derive(Clone)]

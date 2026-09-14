@@ -243,13 +243,13 @@ fn verify_server_proof(
 
 #[test]
 fn challenged_hmac_matches_frozen_vector() {
-    // The protocol bytes are part of the authenticated transcript. These 1.15
+    // The protocol bytes are part of the authenticated transcript. These 1.16
     // client/server vectors were independently checked with Python stdlib HMAC-SHA256.
     assert_eq!(
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 15
+            minor: 16
         }
     );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
@@ -264,7 +264,7 @@ fn challenged_hmac_matches_frozen_vector() {
 
     assert_eq!(
         serde_json::to_string(&proof).unwrap(),
-        r#""ulh4Ld9oAi1UkHJsSNxkYoAizyyRxYTmeocJZjmaVtM""#
+        r#""KqDtkeB5xlfQCGpuFKYWQJPwsbl7oTMetegDhgcgGco""#
     );
     assert!(
         verify_proof(
@@ -452,7 +452,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
         PROTOCOL_VERSION,
         ProtocolVersion {
             major: 1,
-            minor: 15
+            minor: 16
         }
     );
     let (token, client_nonce, daemon_nonce, challenge) = auth_fixture();
@@ -476,7 +476,7 @@ fn server_auth_requires_the_installation_token_and_binds_the_client_proof() {
 
     assert_eq!(
         serde_json::to_string(&server_proof).unwrap(),
-        r#""PzkXMpOhpyFTGswqMihkhRda73CAxSyWCcFGtUfnSU0""#
+        r#""MgwxHs2zCEKw5hZ6qH6WM5KGseRxd58AWtP9915DZTg""#
     );
     assert!(
         verify_server_proof(
@@ -1040,6 +1040,27 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
             request_fixture("pairing_cancel", serde_json::json!({"pairingId": ID})),
         ),
         (
+            "RecoveryHistoryCandidates",
+            request_fixture(
+                "recovery_history_candidates",
+                serde_json::json!({"restoreId":ID,"acceptedEndpointSha256":"11".repeat(32),"cursor":null}),
+            ),
+        ),
+        (
+            "RecoveryHistorySelect",
+            request_fixture(
+                "recovery_history_select",
+                serde_json::json!({"restoreId":ID,"acceptedEndpointSha256":"11".repeat(32),"checkpointSha256":"22".repeat(32)}),
+            ),
+        ),
+        (
+            "RecoveryHistoryUnlock",
+            request_fixture(
+                "recovery_history_unlock",
+                serde_json::json!({"restoreId":ID,"acceptedEndpointSha256":"11".repeat(32),"checkpointSha256":"22".repeat(32),"recoveryPhraseWords":vec!["abandon";24]}),
+            ),
+        ),
+        (
             "RecoveryRestoreBegin",
             request_fixture(
                 "recovery_restore_begin",
@@ -1140,7 +1161,7 @@ fn all_request_fixtures() -> Vec<(&'static str, LocalRequest)> {
 #[test]
 fn role_allowlist_covers_core_and_tracked_setup_requests() {
     let fixtures = all_request_fixtures();
-    assert_eq!(fixtures.len(), 68);
+    assert_eq!(fixtures.len(), 71);
 
     for (name, request) in &fixtures {
         let common = matches!(*name, "Cancel" | "Health");
@@ -1166,6 +1187,7 @@ fn role_allowlist_covers_core_and_tracked_setup_requests() {
                     | "RecoveryEnrollmentBegin"
                     | "RecoveryEnrollmentConfirm"
                     | "RecoveryRestoreBegin"
+                    | "RecoveryHistoryUnlock"
             ),
             "Desktop matrix mismatch for {name}"
         );
@@ -1175,6 +1197,7 @@ fn role_allowlist_covers_core_and_tracked_setup_requests() {
                 *name,
                 "Cancel"
                     | "RecoveryRestoreBegin"
+                    | "RecoveryHistoryUnlock"
                     | "RecoveryRestoreOverview"
                     | "RecoveryRestoreResume"
                     | "RecoveryRestoreCancel"
@@ -1201,14 +1224,14 @@ fn role_allowlist_covers_core_and_tracked_setup_requests() {
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::Desktop, request))
             .count(),
-        64
+        66
     );
     assert_eq!(
         fixtures
             .iter()
             .filter(|(_, request)| role_allows(ClientRole::DesktopRecoveryHost, request))
             .count(),
-        8
+        9
     );
     assert_eq!(
         fixtures

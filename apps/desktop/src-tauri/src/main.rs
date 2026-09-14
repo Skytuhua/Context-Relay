@@ -232,6 +232,7 @@ where
         LocalRequest::RecoveryEnrollmentBegin(_)
             | LocalRequest::RecoveryEnrollmentConfirm(_)
             | LocalRequest::RecoveryRestoreBegin(_)
+            | LocalRequest::RecoveryHistoryUnlock(_)
     ) {
         return Err(ClientError {
             code: ErrorCode::ScopeDenied,
@@ -415,6 +416,83 @@ async fn recovery_restore_begin(
     recovery_restore_begin_with(|| recovery_input::prompt(&app), &mut delegate).await
 }
 
+async fn recovery_history_unlock_with<P, F, D>(
+    params: context_relay_protocol::RecoveryHistorySelectParams,
+    prompt: P,
+    delegate: &mut D,
+) -> Result<Option<context_relay_protocol::RecoveryRestoreStatus>, ClientError>
+where
+    P: FnOnce() -> F,
+    F: Future<Output = Result<Option<context_relay_protocol::RecoveryPhraseWords>, &'static str>>,
+    D: RecoveryHostDelegate,
+{
+    use context_relay_protocol::{
+        EmptyParams, RecoveryHistoryProgress, RecoveryHistoryUnlockParams, RecoveryRestoreStatus,
+    };
+    let overview = delegate
+        .call(
+            ClientRole::DesktopRecoveryHost,
+            new_request_id(),
+            LocalRequest::RecoveryRestoreOverview(EmptyParams {}),
+        )
+        .await?;
+    match overview {
+        LocalResult::RecoveryRestoreStatus {
+            status:
+                RecoveryRestoreStatus::RestoringHistory {
+                    restore_id,
+                    accepted_endpoint,
+                    history:
+                        RecoveryHistoryProgress::HistoricalKeysNeeded {
+                            selected_endpoint,
+                            checkpoint_sha256,
+                        },
+                },
+        } if restore_id == params.restore_id
+            && accepted_endpoint.state_sha256 == params.accepted_endpoint_sha256
+            && selected_endpoint == accepted_endpoint
+            && checkpoint_sha256 == params.checkpoint_sha256 => {}
+        _ => return Err(invalid_result_error()),
+    }
+    let Some(words) = prompt().await.map_err(|message| ClientError {
+        code: ErrorCode::Internal,
+        message: message.into(),
+        field_path: None,
+        retryable: true,
+    })?
+    else {
+        return Ok(None);
+    };
+    match delegate
+        .call(
+            ClientRole::DesktopRecoveryHost,
+            new_request_id(),
+            LocalRequest::RecoveryHistoryUnlock(RecoveryHistoryUnlockParams {
+                restore_id: params.restore_id,
+                accepted_endpoint_sha256: params.accepted_endpoint_sha256,
+                checkpoint_sha256: params.checkpoint_sha256,
+                recovery_phrase_words: words,
+            }),
+        )
+        .await?
+    {
+        LocalResult::RecoveryRestoreStatus { status } => Ok(Some(status)),
+        _ => Err(invalid_result_error()),
+    }
+}
+#[tauri::command]
+async fn recovery_history_unlock(
+    app: AppHandle,
+    state: State<'_, DesktopRecoveryHostState>,
+    params: context_relay_protocol::RecoveryHistorySelectParams,
+) -> Result<Option<context_relay_protocol::RecoveryRestoreStatus>, ClientError> {
+    let mut client = state.client.lock().await;
+    let mut delegate = CachedRecoveryHostDelegate {
+        client: &mut client,
+    };
+    recovery_history_unlock_with(params, || recovery_input::prompt(&app), &mut delegate).await
+}
+
 fn invalid_result_error() -> ClientError {
     ClientError {
         code: ErrorCode::InvalidRequest,
@@ -461,7 +539,8 @@ fn main() {
             local_request,
             recovery_enrollment_begin,
             recovery_enrollment_confirm,
-            recovery_restore_begin
+            recovery_restore_begin,
+            recovery_history_unlock
         ])
         .run(tauri::generate_context!())
         .expect("Context Relay desktop shell should run");
@@ -492,7 +571,8 @@ mod tests {
     use super::{
         RecoveryApprovalPrompt, RecoveryHostDelegate, RecoveryPhrasePrompt, evict_on_call_error,
         local_request_with, recovery_confirmation_message, recovery_enrollment_begin_with,
-        recovery_enrollment_confirm_with, recovery_phrase_message, safe_ipc_error,
+        recovery_enrollment_confirm_with, recovery_history_unlock_with, recovery_phrase_message,
+        safe_ipc_error,
     };
 
     fn enrollment_id() -> RecoveryEnrollmentId {
@@ -669,6 +749,15 @@ mod tests {
                 recovery_phrase_words: RecoveryPhraseWords::new(vec!["abandon".into(); 24])
                     .unwrap(),
             }),
+            LocalRequest::RecoveryHistoryUnlock(
+                context_relay_protocol::RecoveryHistoryUnlockParams {
+                    restore_id: "018f22e2-79b0-7cc8-98c4-dc0c0c073914".parse().unwrap(),
+                    accepted_endpoint_sha256: context_relay_protocol::Sha256Digest([1; 32]),
+                    checkpoint_sha256: context_relay_protocol::Sha256Digest([2; 32]),
+                    recovery_phrase_words: RecoveryPhraseWords::new(vec!["abandon".into(); 24])
+                        .unwrap(),
+                },
+            ),
             LocalRequest::RecoveryEnrollmentConfirm(RecoveryEnrollmentConfirmParams {
                 enrollment_id: enrollment_id(),
                 confirmations: vec![
@@ -879,6 +968,108 @@ mod tests {
                 ClientRole::DesktopRecoveryHost,
                 LocalRequest::RecoveryEnrollmentConfirm(params),
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn history_unlock_requires_exact_missing_key_state_and_keeps_words_native() {
+        use context_relay_protocol::{
+            RecoveryHistoryEndpoint, RecoveryHistoryProgress, RecoveryHistorySelectParams,
+            RecoveryRestoreStatus, Sha256Digest,
+        };
+        let restore_id = "018f22e2-79b0-7cc8-98c4-dc0c0c073914".parse().unwrap();
+        let endpoint = RecoveryHistoryEndpoint {
+            state_sha256: Sha256Digest([1; 32]),
+            control_epoch: 2,
+            key_epoch: 2,
+        };
+        let params = RecoveryHistorySelectParams {
+            restore_id,
+            accepted_endpoint_sha256: endpoint.state_sha256,
+            checkpoint_sha256: Sha256Digest([2; 32]),
+        };
+        let status = |history| LocalResult::RecoveryRestoreStatus {
+            status: RecoveryRestoreStatus::RestoringHistory {
+                restore_id,
+                accepted_endpoint: endpoint.clone(),
+                history,
+            },
+        };
+        let missing = RecoveryHistoryProgress::HistoricalKeysNeeded {
+            selected_endpoint: endpoint.clone(),
+            checkpoint_sha256: params.checkpoint_sha256,
+        };
+        for history in [
+            RecoveryHistoryProgress::Unselected {},
+            RecoveryHistoryProgress::HistoricalKeysNeeded {
+                selected_endpoint: RecoveryHistoryEndpoint {
+                    state_sha256: Sha256Digest([3; 32]),
+                    ..endpoint.clone()
+                },
+                checkpoint_sha256: params.checkpoint_sha256,
+            },
+            RecoveryHistoryProgress::CurrentMaterialUnavailable {
+                selected_endpoint: endpoint.clone(),
+                checkpoint_sha256: params.checkpoint_sha256,
+            },
+            RecoveryHistoryProgress::HistoricalKeysNeeded {
+                selected_endpoint: endpoint.clone(),
+                checkpoint_sha256: Sha256Digest([3; 32]),
+            },
+        ] {
+            let mut delegate = RecordingDelegate {
+                calls: vec![],
+                results: [Ok(status(history))].into_iter().collect(),
+            };
+            assert!(
+                recovery_history_unlock_with(
+                    params.clone(),
+                    || async { panic!("phrase prompt must not open") },
+                    &mut delegate
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(delegate.calls.len(), 1);
+        }
+        let mut canceled = RecordingDelegate {
+            calls: vec![],
+            results: [Ok(status(missing.clone()))].into_iter().collect(),
+        };
+        assert!(
+            recovery_history_unlock_with(params.clone(), || async { Ok(None) }, &mut canceled)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(canceled.calls.len(), 1);
+        let result = status(RecoveryHistoryProgress::Incomplete {
+            selected_endpoint: endpoint.clone(),
+            checkpoint_sha256: params.checkpoint_sha256,
+        });
+        let mut accepted = RecordingDelegate {
+            calls: vec![],
+            results: [Ok(status(missing)), Ok(result)].into_iter().collect(),
+        };
+        assert!(
+            recovery_history_unlock_with(
+                params.clone(),
+                || async { Ok(Some(phrase().recovery_phrase_words)) },
+                &mut accepted
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(accepted.calls.len(), 2);
+        assert!(
+            accepted
+                .calls
+                .iter()
+                .all(|(role, _)| *role == ClientRole::DesktopRecoveryHost)
+        );
+        assert!(
+            matches!(&accepted.calls[1].1,LocalRequest::RecoveryHistoryUnlock(p) if p.restore_id==params.restore_id && p.checkpoint_sha256==params.checkpoint_sha256)
         );
     }
 

@@ -53,6 +53,9 @@ pub struct RecoveryTargetV1 {
     checkpoint_sha256: Sha256Digest,
 }
 impl RecoveryTargetV1 {
+    pub fn restore_id(&self) -> RecoveryRestoreId {
+        self.restore_id
+    }
     pub fn authorizing_endpoint(&self) -> MembershipEndpoint {
         self.endpoint
     }
@@ -290,7 +293,485 @@ fn load_target(
     Ok((target, row.1))
 }
 
+fn endpoint_dto(endpoint: MembershipEndpoint) -> context_relay_protocol::RecoveryHistoryEndpoint {
+    context_relay_protocol::RecoveryHistoryEndpoint {
+        state_sha256: endpoint.state_sha256,
+        control_epoch: endpoint.control_epoch,
+        key_epoch: endpoint.key_epoch,
+    }
+}
+fn selected_hash(c: &Connection) -> Result<Option<Sha256Digest>, VaultError> {
+    let hash = c.query_row("SELECT CASE WHEN length(target_sha256)=32 THEN target_sha256 END FROM recovery_history_selection WHERE singleton=1", [], |r| r.get::<_,Vec<u8>>(0)).optional()?;
+    hash.map(|hash| Ok(Sha256Digest(hash.try_into().map_err(|_| invalid())?)))
+        .transpose()
+}
+fn recovery_context(
+    c: &Connection,
+    keys: &DeviceKeys,
+    budget: HistoricalReconstructionBudget,
+) -> Result<(crate::vault::PreparedRecoveryV2, Stored), VaultError> {
+    let prepared = super::super::super::recovery_v2::load(c, keys)?.ok_or_else(invalid)?;
+    super::super::recovery::receipt(c, &prepared, keys)?.ok_or_else(invalid)?;
+    if prepared.publication_conflict {
+        return Err(invalid());
+    }
+    let stored = load(c, budget.transfer.history)?.ok_or_else(invalid)?;
+    material::endpoint_check(
+        &stored,
+        stored.endpoint,
+        prepared.claim.certificate.device_id,
+        keys,
+        budget.transfer.history,
+    )?;
+    material::lineage(
+        &stored,
+        MembershipEndpoint {
+            state_sha256: checked(recovery_membership_successor(&prepared.claim))?,
+            control_epoch: prepared.claim.certificate.control_epoch,
+            key_epoch: prepared.claim.key_epoch,
+        },
+        budget.transfer.history,
+    )?;
+    supplemental_keys(c, &stored, &prepared, keys, budget)?;
+    let evidence = authenticate(&stored, load_evidence(c, budget)?, budget)?;
+    // Missing operations remain repairable; receipt corruption never means unselected.
+    saved_prefixes(
+        c,
+        &stored,
+        &evidence,
+        prepared.claim.certificate.device_id,
+        budget,
+    )?;
+    Ok((prepared, stored))
+}
+
+enum KeyAvailability {
+    Ready,
+    HistoricalMissing,
+    CurrentMissing,
+}
+fn key_availability(
+    c: &Connection,
+    stored: &Stored,
+    target: RecoveryTargetV1,
+    keys: &DeviceKeys,
+    budget: HistoricalReconstructionBudget,
+) -> Result<KeyAvailability, VaultError> {
+    let prepared = super::super::super::recovery_v2::load(c, keys)?.ok_or_else(invalid)?;
+    let root = checked(
+        crate::devices::recovery_crypto::decode_recovery_enrollment_record_v1(
+            &prepared.canonical_record,
+        ),
+    )?;
+    let lineage = material::lineage(
+        stored,
+        MembershipEndpoint {
+            state_sha256: target.admission,
+            control_epoch: prepared.claim.certificate.control_epoch,
+            key_epoch: prepared.claim.key_epoch,
+        },
+        budget.transfer.history,
+    )?;
+    let mut retained = BTreeSet::new();
+    let supplemental = supplemental_keys(c, stored, &prepared, keys, budget)?;
+    for key in prepared.history_keys.iter().chain(&supplemental) {
+        checked(
+            crate::devices::recovery_restore_crypto::v2::open_recovery_history_key(
+                &root,
+                &prepared.claim,
+                &prepared.parent,
+                &lineage,
+                key,
+                keys,
+            ),
+        )?;
+        retained.insert(key.key_epoch);
+    }
+    // Independent current authority is never supplied by root-only history repair.
+    if material::load_secret(
+        c,
+        stored,
+        target.recipient,
+        stored.endpoint.key_epoch,
+        true,
+        keys,
+        budget.transfer.history,
+    )?
+    .is_none()
+    {
+        return Ok(KeyAvailability::CurrentMissing);
+    }
+    if stored.endpoint.key_epoch as usize > budget.transfer.history.max_events.saturating_add(1) {
+        return Err(VaultError::BudgetExceeded);
+    }
+    for epoch in 1..stored.endpoint.key_epoch {
+        if material::load_secret(
+            c,
+            stored,
+            target.recipient,
+            epoch,
+            false,
+            keys,
+            budget.transfer.history,
+        )?
+        .is_none()
+            && !retained.contains(&epoch)
+        {
+            return Ok(KeyAvailability::HistoricalMissing);
+        }
+    }
+    Ok(KeyAvailability::Ready)
+}
+
+fn supplemental_keys(
+    c: &Connection,
+    stored: &Stored,
+    prepared: &crate::vault::PreparedRecoveryV2,
+    keys: &DeviceKeys,
+    budget: HistoricalReconstructionBudget,
+) -> Result<Vec<crate::devices::recovery_restore_crypto::v2::RecoveryHistoryKeyV1>, VaultError> {
+    use crate::devices::{
+        recovery_crypto::{
+            decode_recovery_device_envelope_v1, decode_recovery_enrollment_record_v1,
+        },
+        recovery_restore_crypto::v2::{RecoveryHistoryKeyV1, open_recovery_history_key},
+    };
+    let (count,bytes):(i64,i64)=c.query_row("SELECT count(*),COALESCE(sum(length(original_bundle_sha256)+length(canonical_envelope)+length(signature)+4),0) FROM (SELECT * FROM recovery_v2_history_keys UNION ALL SELECT * FROM recovery_v2_supplemental_history_keys)",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    if !(0..=4096).contains(&count) || bytes < 0 || bytes as usize > budget.transfer.max_bytes {
+        return Err(VaultError::BudgetExceeded);
+    }
+    let root = checked(decode_recovery_enrollment_record_v1(
+        &prepared.canonical_record,
+    ))?;
+    let lineage = material::lineage(
+        stored,
+        MembershipEndpoint {
+            state_sha256: checked(recovery_membership_successor(&prepared.claim))?,
+            control_epoch: prepared.claim.certificate.control_epoch,
+            key_epoch: prepared.claim.key_epoch,
+        },
+        budget.transfer.history,
+    )?;
+    let mut epochs = prepared
+        .history_keys
+        .iter()
+        .map(|k| k.key_epoch)
+        .collect::<BTreeSet<_>>();
+    let mut query=c.prepare("SELECT key_epoch,CASE WHEN length(original_bundle_sha256)=32 THEN original_bundle_sha256 END,CASE WHEN length(canonical_envelope) BETWEEN 1 AND 1024 THEN canonical_envelope END,CASE WHEN length(signature)=64 THEN signature END FROM recovery_v2_supplemental_history_keys ORDER BY key_epoch")?;
+    let mut rows = query.query([])?;
+    let mut result = Vec::new();
+    while let Some(row) = rows.next()? {
+        let key_epoch = row.get(0)?;
+        if !epochs.insert(key_epoch) {
+            return Err(invalid());
+        }
+        let retained = RecoveryHistoryKeyV1 {
+            key_epoch,
+            original_bundle_sha256: Sha256Digest(
+                row.get::<_, Vec<u8>>(1)?
+                    .try_into()
+                    .map_err(|_| invalid())?,
+            ),
+            envelope: checked(decode_recovery_device_envelope_v1(
+                &row.get::<_, Vec<u8>>(2)?,
+            ))?,
+            signature: Ed25519SignatureBytes(
+                row.get::<_, Vec<u8>>(3)?
+                    .try_into()
+                    .map_err(|_| invalid())?,
+            ),
+        };
+        checked(open_recovery_history_key(
+            &root,
+            &prepared.claim,
+            &prepared.parent,
+            &lineage,
+            &retained,
+            keys,
+        ))?;
+        result.push(retained);
+    }
+    Ok(result)
+}
+
 impl Vault {
+    /// Native phrase reentry repairs only absent historical receipts, never current authority.
+    pub fn unlock_recovery_history(
+        &mut self,
+        target: RecoveryTargetV1,
+        words: context_relay_protocol::RecoveryPhraseWords,
+        keys: &DeviceKeys,
+        budget: HistoricalReconstructionBudget,
+        authorize: impl Fn() -> Result<(), VaultError>,
+    ) -> Result<(), VaultError> {
+        use crate::devices::{
+            recovery_crypto::encode_recovery_device_envelope_v1,
+            recovery_restore_crypto::{
+                authenticate_recovery_root, v2::authenticate_recovery_history,
+            },
+        };
+        let budget = cap_budget(budget);
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (prepared, stored) = recovery_context(&tx, keys, budget)?;
+        exact_selected(&tx, &stored, target, keys, budget)?;
+        if prepared.claim.restore_id != target.restore_id {
+            return Err(invalid());
+        }
+        let availability = key_availability(&tx, &stored, target, keys, budget)?;
+        if matches!(availability, KeyAvailability::CurrentMissing) {
+            return Err(invalid());
+        }
+        if matches!(availability, KeyAvailability::Ready) {
+            authorize()?;
+            return Ok(());
+        }
+        let supplemental = supplemental_keys(&tx, &stored, &prepared, keys, budget)?;
+        let retained = prepared
+            .history_keys
+            .iter()
+            .chain(&supplemental)
+            .map(|key| key.key_epoch)
+            .collect::<BTreeSet<_>>();
+        let mut missing = BTreeSet::new();
+        for epoch in 1..stored.endpoint.key_epoch {
+            if !retained.contains(&epoch)
+                && material::load_secret(
+                    &tx,
+                    &stored,
+                    target.recipient,
+                    epoch,
+                    false,
+                    keys,
+                    budget.transfer.history,
+                )?
+                .is_none()
+            {
+                missing.insert(epoch);
+            }
+        }
+        let phrase = checked(crate::crypto::RecoveryPhrase::from_words(words))?;
+        let root = checked(authenticate_recovery_root(
+            &prepared.canonical_record,
+            prepared.claim.canonical_record_sha256,
+            phrase,
+        ))?;
+        let events = stored
+            .events
+            .iter()
+            .map(Event::evidence)
+            .collect::<Vec<_>>();
+        let authority = checked(authenticate_recovery_history(
+            root,
+            &events,
+            stored.endpoint,
+            budget.transfer.history,
+        ))?;
+        let lineage = material::lineage(
+            &stored,
+            MembershipEndpoint {
+                state_sha256: target.admission,
+                control_epoch: prepared.claim.certificate.control_epoch,
+                key_epoch: prepared.claim.key_epoch,
+            },
+            budget.transfer.history,
+        )?;
+        let repaired = checked(authority.seal_missing_historical_keys(
+            &prepared.claim,
+            &prepared.parent,
+            &lineage,
+            &missing,
+            keys,
+        ))?;
+        drop(authority);
+        authorize()?;
+        for key in repaired {
+            tx.execute(
+                "INSERT INTO recovery_v2_supplemental_history_keys VALUES(?1,?2,?3,?4)",
+                params![
+                    key.key_epoch,
+                    key.original_bundle_sha256.0.as_slice(),
+                    checked(encode_recovery_device_envelope_v1(&key.envelope))?,
+                    key.signature.0.as_slice()
+                ],
+            )?;
+        }
+        supplemental_keys(&tx, &stored, &prepared, keys, budget)?;
+        authorize()?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Download planning only. Final closure, cutoff hashes and state replay stay shared.
+    pub fn recovery_history_missing_operations(
+        &self,
+        target: RecoveryTargetV1,
+        keys: &DeviceKeys,
+        budget: HistoricalReconstructionBudget,
+    ) -> Result<Option<(DeviceId, std::ops::RangeInclusive<u64>)>, VaultError> {
+        let budget = cap_budget(budget);
+        let tx = self.connection.unchecked_transaction()?;
+        let (_, stored) = recovery_context(&tx, keys, budget)?;
+        let bytes = exact_selected(&tx, &stored, target, keys, budget)?;
+        let checkpoint = checkpoint(&stored, &bytes, target.checkpoint_sha256, budget)?;
+        let evidence = authenticate(&stored, load_evidence(&tx, budget)?, budget)?;
+        let mut required = checkpoint
+            .causal_frontier
+            .iter()
+            .map(|head| (head.device_id, head.sequence))
+            .collect::<BTreeMap<_, _>>();
+        loop {
+            let before = required.clone();
+            for (device, end) in &before {
+                if let Some((cutoff, _)) = evidence.cutoffs.get(device) {
+                    if end > cutoff {
+                        return Err(invalid());
+                    }
+                    required.insert(*device, *cutoff);
+                }
+                for (_, entry) in evidence.entries.range((*device, 1)..=(*device, *end)) {
+                    for dep in &entry.operation.causal_frontier {
+                        required
+                            .entry(dep.device_id)
+                            .and_modify(|n| *n = (*n).max(dep.sequence))
+                            .or_insert(dep.sequence);
+                    }
+                }
+            }
+            let total = required
+                .values()
+                .try_fold(0u64, |n, end| n.checked_add(*end))
+                .ok_or(VaultError::BudgetExceeded)?;
+            if total > budget.max_operations as u64 {
+                return Err(VaultError::BudgetExceeded);
+            }
+            if before == required {
+                break;
+            }
+        }
+        for (device, end) in required {
+            for sequence in 1..=end {
+                if !evidence.entries.contains_key(&(device, sequence)) {
+                    return Ok(Some((
+                        device,
+                        sequence..=end.min(sequence.saturating_add(255)),
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Authenticate provider bytes without creating or replacing any target receipt.
+    pub fn recovery_history_candidate(
+        &self,
+        restore_id: RecoveryRestoreId,
+        expected: Sha256Digest,
+        bytes: &[u8],
+        hash: Sha256Digest,
+        keys: &DeviceKeys,
+        budget: HistoricalReconstructionBudget,
+    ) -> Result<context_relay_protocol::RecoveryHistoryCandidate, VaultError> {
+        let budget = cap_budget(budget);
+        let tx = self.connection.unchecked_transaction()?;
+        let (prepared, stored) = recovery_context(&tx, keys, budget)?;
+        if prepared.claim.restore_id != restore_id || stored.endpoint.state_sha256 != expected {
+            return Err(VaultError::OperationConflict);
+        }
+        let value = checkpoint(&stored, bytes, hash, budget)?;
+        let extent = value
+            .causal_frontier
+            .iter()
+            .try_fold(0u64, |n, head| n.checked_add(head.sequence));
+        let extent = match extent {
+            Some(n) if n <= budget.max_operations as u64 => {
+                context_relay_protocol::RecoveryHistoryExtent::Supported {
+                    operation_count: n as u32,
+                }
+            }
+            _ => context_relay_protocol::RecoveryHistoryExtent::Unsupported {},
+        };
+        Ok(context_relay_protocol::RecoveryHistoryCandidate {
+            checkpoint_sha256: hash,
+            author_device_id: value.creator_device,
+            created_hlc: value.created_hlc,
+            key_epoch: value.key_epoch,
+            frontier_device_count: value
+                .causal_frontier
+                .len()
+                .try_into()
+                .map_err(|_| VaultError::BudgetExceeded)?,
+            extent,
+        })
+    }
+
+    /// Exact reauthentication shared by overview and explicit history actions.
+    pub fn recovery_history_status(
+        &self,
+        keys: &DeviceKeys,
+        budget: HistoricalReconstructionBudget,
+    ) -> Result<context_relay_protocol::RecoveryRestoreStatus, VaultError> {
+        use context_relay_protocol::{
+            RecoveryHistoryProgress as Progress, RecoveryRestoreStatus as Status,
+        };
+        let budget = cap_budget(budget);
+        let tx = self.connection.unchecked_transaction()?;
+        let (prepared, stored) = recovery_context(&tx, keys, budget)?;
+        let hash = selected_hash(&tx)?;
+        let history = if let Some(hash) = hash {
+            let (target, bytes) = load_target(&tx, &stored, hash, budget)?;
+            if target.restore_id != prepared.claim.restore_id
+                || target.recipient != prepared.claim.certificate.device_id
+            {
+                return Err(invalid());
+            }
+            if installed_receipt(&tx, &stored, target, &bytes, keys, budget)? {
+                return Ok(Status::Complete {
+                    restore_id: prepared.claim.restore_id,
+                    device: context_relay_protocol::DeviceSummary {
+                        device_id: target.recipient,
+                        name: prepared.claim.device_name,
+                        platform: prepared.claim.device_platform,
+                        state: context_relay_protocol::DeviceState::Active,
+                        is_current: true,
+                    },
+                });
+            }
+            let selected_endpoint = endpoint_dto(target.endpoint);
+            let checkpoint_sha256 = target.checkpoint_sha256;
+            if target.endpoint != stored.endpoint {
+                Progress::StaleEndpoint {
+                    selected_endpoint,
+                    checkpoint_sha256,
+                }
+            } else {
+                match key_availability(&tx, &stored, target, keys, budget)? {
+                    KeyAvailability::HistoricalMissing => Progress::HistoricalKeysNeeded {
+                        selected_endpoint,
+                        checkpoint_sha256,
+                    },
+                    KeyAvailability::CurrentMissing => Progress::CurrentMaterialUnavailable {
+                        selected_endpoint,
+                        checkpoint_sha256,
+                    },
+                    KeyAvailability::Ready => Progress::Incomplete {
+                        selected_endpoint,
+                        checkpoint_sha256,
+                    },
+                }
+            }
+        } else {
+            Progress::Unselected {}
+        };
+        tx.commit()?;
+        Ok(Status::RestoringHistory {
+            restore_id: prepared.claim.restore_id,
+            accepted_endpoint: endpoint_dto(stored.endpoint),
+            history,
+        })
+    }
+
     pub fn recovery_history_selection(
         &self,
         keys: &DeviceKeys,
@@ -318,12 +799,16 @@ impl Vault {
         Ok(Some(target))
     }
 
-    pub fn select_recovery_history(
+    /// Recheck caller authority immediately before either selection commit.
+    /// A later cancellation does not retroactively undo an authorized commit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn select_recovery_history_authorized(
         &mut self,
         expected: MembershipEndpoint,
         bytes: &[u8],
         keys: &DeviceKeys,
         budget: HistoricalReconstructionBudget,
+        authorize: impl Fn() -> Result<(), VaultError>,
     ) -> Result<RecoveryTargetV1, VaultError> {
         let budget = cap_budget(budget);
         let tx = self
@@ -372,6 +857,7 @@ impl Vault {
                 budget,
             )?;
             if old == target {
+                authorize()?;
                 tx.commit()?;
                 return Ok(target);
             }
@@ -426,8 +912,19 @@ impl Vault {
         }
         target_storage(&tx, budget)?;
         tx.execute("INSERT INTO recovery_history_selection VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET target_sha256=excluded.target_sha256",[hash.0.as_slice()])?;
+        authorize()?;
         tx.commit()?;
         Ok(target)
+    }
+
+    pub fn select_recovery_history(
+        &mut self,
+        expected: MembershipEndpoint,
+        bytes: &[u8],
+        keys: &DeviceKeys,
+        budget: HistoricalReconstructionBudget,
+    ) -> Result<RecoveryTargetV1, VaultError> {
+        self.select_recovery_history_authorized(expected, bytes, keys, budget, || Ok(()))
     }
 }
 
@@ -574,7 +1071,8 @@ fn inventory(
             &prepared.canonical_record,
         ),
     )?;
-    for retained in &prepared.history_keys {
+    let supplemental = supplemental_keys(c, stored, &prepared, keys, budget)?;
+    for retained in prepared.history_keys.iter().chain(&supplemental) {
         let bundle = checked(open_recovery_history_key(
             &root,
             &prepared.claim,
@@ -651,13 +1149,16 @@ fn reconstruct_recovery(
 }
 
 impl Vault {
-    pub fn reconstruct_recovery_history(
+    /// Authenticated staged pages remain repairable if final authorization denies the receipt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct_recovery_history_authorized(
         &mut self,
         target: RecoveryTargetV1,
         operations: &[Vec<u8>],
         keys: &DeviceKeys,
         budget: HistoricalReconstructionBudget,
         embeddings: &impl RepresentativeEmbeddingResolver,
+        authorize: impl Fn() -> Result<(), VaultError>,
     ) -> Result<Option<RecoveryHistoricalReconstruction>, VaultError> {
         let budget = cap_budget(budget);
         self.stage_historical_operations(
@@ -671,16 +1172,38 @@ impl Vault {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = reconstruct_recovery(&tx, target, keys, budget, embeddings)?;
+        authorize()?;
         tx.commit()?;
         Ok(result.map(|_| RecoveryHistoricalReconstruction { target }))
     }
 
-    pub fn install_recovery_history(
+    pub fn reconstruct_recovery_history(
+        &mut self,
+        target: RecoveryTargetV1,
+        operations: &[Vec<u8>],
+        keys: &DeviceKeys,
+        budget: HistoricalReconstructionBudget,
+        embeddings: &impl RepresentativeEmbeddingResolver,
+    ) -> Result<Option<RecoveryHistoricalReconstruction>, VaultError> {
+        self.reconstruct_recovery_history_authorized(
+            target,
+            operations,
+            keys,
+            budget,
+            embeddings,
+            || Ok(()),
+        )
+    }
+
+    /// Authorize after all transactional writes; publish cache updates only after commit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_recovery_history_authorized(
         &mut self,
         proof: &RecoveryHistoricalReconstruction,
         keys: &DeviceKeys,
         budget: HistoricalReconstructionBudget,
         embeddings: &impl RepresentativeEmbeddingResolver,
+        authorize: impl Fn() -> Result<(), VaultError>,
     ) -> Result<bool, VaultError> {
         let budget = cap_budget(budget);
         let target = proof.target;
@@ -714,11 +1237,22 @@ impl Vault {
             keys,
             budget.transfer.history,
         )?;
+        authorize()?;
         tx.commit()?;
         for update in updates {
             self.apply_sync_cache_update(update);
         }
         Ok(true)
+    }
+
+    pub fn install_recovery_history(
+        &mut self,
+        proof: &RecoveryHistoricalReconstruction,
+        keys: &DeviceKeys,
+        budget: HistoricalReconstructionBudget,
+        embeddings: &impl RepresentativeEmbeddingResolver,
+    ) -> Result<bool, VaultError> {
+        self.install_recovery_history_authorized(proof, keys, budget, embeddings, || Ok(()))
     }
 
     pub fn recovery_history_is_installed(
@@ -731,38 +1265,87 @@ impl Vault {
         let tx = self.connection.unchecked_transaction()?;
         let stored = load(&tx, budget.transfer.history)?.ok_or_else(invalid)?;
         let bytes = exact_selected(&tx, &stored, target, keys, budget)?;
-        let row=tx.query_row("SELECT CASE WHEN length(prefixes)<=?2 THEN prefixes END,CASE WHEN length(installed_signature)=64 THEN installed_signature END FROM recovery_history_targets WHERE target_sha256=?1",params![digest(&target.canonical_bytes()).0.as_slice(),budget.max_operation_bytes.min(64*1024*1024) as i64],|r|Ok((r.get::<_,Option<Vec<u8>>>(0)?,r.get::<_,Option<Vec<u8>>>(1)?)))?;
-        let (Some(saved), Some(signature)) = row else {
+        let installed = installed_receipt(&tx, &stored, target, &bytes, keys, budget)?;
+        if !installed {
             return Ok(false);
-        };
-        checked(crate::crypto::verify_signature(
-            keys.signing_public_key(),
-            &reconstruction_preimage(target, &saved, true),
-            Ed25519SignatureBytes(signature.try_into().map_err(|_| invalid())?),
-        ))?;
+        }
         if inventory(&tx, &stored, target, keys, budget, false)?.is_none() {
             return Ok(false);
         }
         activation::current_material(&tx, keys)?.ok_or_else(invalid)?;
-        let checkpoint = checkpoint(&stored, &bytes, target.checkpoint_sha256, budget)?;
-        let evidence = authenticate(&stored, load_evidence(&tx, budget)?, budget)?;
-        if !saved_prefixes(&tx, &stored, &evidence, target.recipient, budget)?
-            || prefixes(&evidence, &checkpoint.causal_frontier, budget)?.as_ref() != Some(&saved)
+        tx.commit()?;
+        Ok(installed)
+    }
+}
+
+// Historical completion is a read-only fact. Installation retains exact_selected/CAS.
+fn installed_receipt(
+    c: &Connection,
+    stored: &Stored,
+    target: RecoveryTargetV1,
+    bytes: &[u8],
+    keys: &DeviceKeys,
+    budget: HistoricalReconstructionBudget,
+) -> Result<bool, VaultError> {
+    let row=c.query_row("SELECT installed_signature IS NOT NULL,CASE WHEN length(prefixes)<=?2 THEN prefixes END,CASE WHEN length(installed_signature)=64 THEN installed_signature END,CASE WHEN length(reconstructed_signature)=64 THEN reconstructed_signature END FROM recovery_history_targets WHERE target_sha256=?1",params![digest(&target.canonical_bytes()).0.as_slice(),budget.max_operation_bytes.min(64*1024*1024) as i64],|r|Ok((r.get::<_,bool>(0)?,r.get::<_,Option<Vec<u8>>>(1)?,r.get::<_,Option<Vec<u8>>>(2)?,r.get::<_,Option<Vec<u8>>>(3)?)))?;
+    if !row.0 {
+        return Ok(false);
+    }
+    let saved = row.1.ok_or_else(invalid)?;
+    for (signature, installed) in [(row.2, true), (row.3, false)] {
+        checked(crate::crypto::verify_signature(
+            keys.signing_public_key(),
+            &reconstruction_preimage(target, &saved, installed),
+            Ed25519SignatureBytes(
+                signature
+                    .ok_or_else(invalid)?
+                    .try_into()
+                    .map_err(|_| invalid())?,
+            ),
+        ))?;
+    }
+    for epoch in 1..=target.endpoint.key_epoch {
+        if material::load_secret(
+            c,
+            stored,
+            target.recipient,
+            epoch,
+            epoch == target.endpoint.key_epoch,
+            keys,
+            budget.transfer.history,
+        )?
+        .is_none()
         {
             return Ok(false);
         }
-        for head in &checkpoint.causal_frontier {
-            for sequence in 1..=head.sequence {
-                representative::authenticate_local_operation(
-                    &tx,
-                    &stored,
-                    target.recipient,
-                    &evidence.entries[&(head.device_id, sequence)].operation,
-                    false,
-                )?;
-            }
-        }
-        tx.commit()?;
-        Ok(true)
     }
+    let selected_index = stored
+        .events
+        .iter()
+        .position(|e| e.successor == target.endpoint.state_sha256)
+        .ok_or_else(invalid)?;
+    let selected = Stored {
+        scope: stored.scope,
+        pin: stored.pin,
+        enrollment: stored.enrollment.clone(),
+        endpoint: target.endpoint,
+        events: stored.events[..=selected_index].to_vec(),
+    };
+    let checkpoint = checkpoint(&selected, bytes, target.checkpoint_sha256, budget)?;
+    let mut evidence = authenticate(stored, load_evidence(c, budget)?, budget)?;
+    // Later revocations cannot manufacture a different receipt for an already installed target.
+    evidence.cutoffs = authenticate(&selected, BTreeMap::new(), budget)?.cutoffs;
+    if prefixes(&evidence, &checkpoint.causal_frontier, budget)?.as_ref() != Some(&saved) {
+        return Ok(false);
+    }
+    let operations = checkpoint
+        .causal_frontier
+        .iter()
+        .flat_map(|head| {
+            (1..=head.sequence)
+                .map(|sequence| &evidence.entries[&(head.device_id, sequence)].operation)
+        })
+        .collect::<Vec<_>>();
+    representative::authenticate_installed_operations(c, stored, target.recipient, &operations)?;
+    Ok(true)
 }

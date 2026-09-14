@@ -16,6 +16,9 @@ import type { WorkspaceGateway } from './workspace';
 const id = (suffix: string) => `018f22e2-79b0-7cc8-98c4-dc0c0c0739${suffix}`;
 
 class FakeWorkspaceGateway implements WorkspaceGateway {
+  async recoveryHistoryCandidates(): Promise<never> { throw new Error('not configured'); }
+  async recoveryHistorySelect(): Promise<never> { throw new Error('not configured'); }
+  async recoveryHistoryUnlock(): Promise<never> { throw new Error('not configured'); }
   async accountDeletionStatus(): Promise<never> { throw Object.assign(new Error('Unavailable'), { code: 'harness_unsupported' }); }
   async accountDeletionIntents() { return []; }
   async accountDeletionBegin(): Promise<never> { throw new Error('Unexpected hosted mutation'); }

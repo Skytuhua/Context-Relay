@@ -150,12 +150,26 @@ pub(super) fn load(
 ) -> Result<Option<PreparedRecoveryV2>, VaultError> {
     let row=c.query_row("SELECT CASE WHEN length(canonical_record) BETWEEN 1 AND 32768 THEN canonical_record END,CASE WHEN length(canonical_claim) BETWEEN 1 AND 32768 THEN canonical_claim END,CASE WHEN length(hosted_intent)<=8192 THEN hosted_intent END,CASE WHEN length(preparation_signature)=64 THEN preparation_signature END FROM recovery_v2_prepared WHERE singleton=1",[],|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,Vec<u8>>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,Vec<u8>>(3)?))).optional()?;
     let marker = c.query_row("SELECT reason, CASE WHEN length(signature)=64 THEN signature END FROM recovery_v2_conflict WHERE singleton=1", [], |r| Ok((r.get::<_,u8>(0)?,r.get::<_,Vec<u8>>(1)?))).optional()?;
+    let supplemental: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM recovery_v2_supplemental_history_keys)",
+        [],
+        |r| r.get(0),
+    )?;
     let Some((record, claim, intent, signature)) = row else {
-        if marker.is_some() {
+        if marker.is_some() || supplemental {
             return Err(invalid());
         }
         return Ok(None);
     };
+    if supplemental
+        && !c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM recovery_v2_admission)",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        return Err(invalid());
+    }
     if c.query_row("SELECT EXISTS(SELECT 1 FROM recovery_restores)", [], |r| {
         r.get::<_, bool>(0)
     })? {

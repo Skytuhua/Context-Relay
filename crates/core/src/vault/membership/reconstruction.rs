@@ -430,10 +430,27 @@ fn prefixes(
     Ok(verified_ranges(evidence, frontier, budget)?.map(|ranges| prefix_bytes(evidence, &ranges)))
 }
 
+// Historical completion checks existing obligations; ordinary reconstruction still requires
+// the full current cutoff. This policy is private to the authenticated local read boundary.
+#[derive(Clone, Copy)]
+enum CutoffClosure {
+    Current,
+    RetainedLocal,
+}
+
 fn verified_ranges(
     evidence: &AuthenticatedEvidence,
     frontier: &[DeviceSequence],
     budget: HistoricalReconstructionBudget,
+) -> Result<Option<BTreeMap<DeviceId, u64>>, VaultError> {
+    verified_ranges_with_cutoff(evidence, frontier, budget, CutoffClosure::Current)
+}
+
+fn verified_ranges_with_cutoff(
+    evidence: &AuthenticatedEvidence,
+    frontier: &[DeviceSequence],
+    budget: HistoricalReconstructionBudget,
+    closure: CutoffClosure,
 ) -> Result<Option<BTreeMap<DeviceId, u64>>, VaultError> {
     if frontier
         .windows(2)
@@ -453,7 +470,9 @@ fn verified_ranges(
                 if sequence > cutoff {
                     return Err(invalid());
                 }
-                required.insert(*device, *cutoff);
+                if matches!(closure, CutoffClosure::Current) {
+                    required.insert(*device, *cutoff);
+                }
             }
         }
         let total = required
@@ -552,6 +571,17 @@ fn saved_prefixes(
     device: DeviceId,
     budget: HistoricalReconstructionBudget,
 ) -> Result<bool, VaultError> {
+    saved_prefixes_with_cutoff(c, stored, evidence, device, budget, CutoffClosure::Current)
+}
+
+fn saved_prefixes_with_cutoff(
+    c: &Connection,
+    stored: &Stored,
+    evidence: &AuthenticatedEvidence,
+    device: DeviceId,
+    budget: HistoricalReconstructionBudget,
+    closure: CutoffClosure,
+) -> Result<bool, VaultError> {
     let (count, bytes): (i64, i64) = c.query_row(
         "SELECT count(*),COALESCE(sum(length(r.transfer_id)+length(r.prefixes)+length(r.signature)+COALESCE(length(t.header),0)+COALESCE(length(t.checkpoint),0)),0) FROM historical_reconstructions r LEFT JOIN historical_transfers t ON t.transfer_id=r.transfer_id",
         [], |r| Ok((r.get(0)?, r.get(1)?)),
@@ -647,7 +677,7 @@ fn saved_prefixes(
             sequence: *sequence,
         })
         .collect::<Vec<_>>();
-    if verified_ranges(evidence, &frontier, budget)?.is_none() {
+    if verified_ranges_with_cutoff(evidence, &frontier, budget, closure)?.is_none() {
         return Ok(false);
     }
     // A row marked verified must be inside an authenticated receipt's prefix. With no

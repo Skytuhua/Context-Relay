@@ -1222,6 +1222,9 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
             | LocalRequest::RecoveryRestoreOverview(_)
             | LocalRequest::RecoveryRestoreResume(_)
             | LocalRequest::RecoveryRestoreCancel(_)
+            | LocalRequest::RecoveryHistoryCandidates(_)
+            | LocalRequest::RecoveryHistorySelect(_)
+            | LocalRequest::RecoveryHistoryUnlock(_)
             | LocalRequest::RecoveryEnrollmentOverview(_)
             | LocalRequest::RecoveryEnrollmentConfirm(_)
             | LocalRequest::RecoveryEnrollmentStatus(_)
@@ -1319,6 +1322,9 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         | LocalRequest::RecoveryRestoreOverview(_)
         | LocalRequest::RecoveryRestoreResume(_)
         | LocalRequest::RecoveryRestoreCancel(_)
+        | LocalRequest::RecoveryHistoryCandidates(_)
+        | LocalRequest::RecoveryHistorySelect(_)
+        | LocalRequest::RecoveryHistoryUnlock(_)
         | LocalRequest::RecoveryEnrollmentOverview(_)
         | LocalRequest::RecoveryEnrollmentConfirm(_)
         | LocalRequest::RecoveryEnrollmentStatus(_)
@@ -4366,7 +4372,7 @@ mod tests {
     #[test]
     fn required_task_7_methods_never_use_the_generic_unavailable_error() {
         let fixtures = all_request_fixtures();
-        assert_eq!(fixtures.len(), 68);
+        assert_eq!(fixtures.len(), 71);
 
         for (name, request) in fixtures {
             let routed = route_request(ClientRole::Desktop, request);
@@ -4432,7 +4438,7 @@ mod tests {
             .into_iter()
             .filter(|(name, _)| name.starts_with("Recovery"))
             .collect::<Vec<_>>();
-        assert_eq!(recovery.len(), 9);
+        assert_eq!(recovery.len(), 12);
 
         for (name, request) in recovery {
             for role in [
@@ -4445,6 +4451,8 @@ mod tests {
                     ClientRole::Desktop => matches!(
                         name,
                         "RecoveryEnrollmentOverview"
+                            | "RecoveryHistoryCandidates"
+                            | "RecoveryHistorySelect"
                             | "RecoveryRestoreOverview"
                             | "RecoveryRestoreResume"
                             | "RecoveryRestoreCancel"
@@ -4455,6 +4463,7 @@ mod tests {
                         name,
                         "RecoveryEnrollmentBegin"
                             | "RecoveryRestoreBegin"
+                            | "RecoveryHistoryUnlock"
                             | "RecoveryRestoreOverview"
                             | "RecoveryRestoreResume"
                             | "RecoveryRestoreCancel"
@@ -8990,6 +8999,27 @@ mod tests {
             (
                 "PairingCancel",
                 request_fixture("pairing_cancel", serde_json::json!({"pairingId": ID})),
+            ),
+            (
+                "RecoveryHistoryCandidates",
+                request_fixture(
+                    "recovery_history_candidates",
+                    serde_json::json!({"restoreId":ID,"acceptedEndpointSha256":"11".repeat(32),"cursor":null}),
+                ),
+            ),
+            (
+                "RecoveryHistorySelect",
+                request_fixture(
+                    "recovery_history_select",
+                    serde_json::json!({"restoreId":ID,"acceptedEndpointSha256":"11".repeat(32),"checkpointSha256":"22".repeat(32)}),
+                ),
+            ),
+            (
+                "RecoveryHistoryUnlock",
+                request_fixture(
+                    "recovery_history_unlock",
+                    serde_json::json!({"restoreId":ID,"acceptedEndpointSha256":"11".repeat(32),"checkpointSha256":"22".repeat(32),"recoveryPhraseWords":vec!["abandon";24]}),
+                ),
             ),
             (
                 "RecoveryRestoreBegin",

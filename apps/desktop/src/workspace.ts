@@ -29,6 +29,9 @@ import type {
   RecoveryEnrollmentId,
   RecoveryEnrollmentStatus,
   RecoveryRestoreStatus,
+  RecoveryHistoryCandidatesParams,
+  RecoveryHistoryCandidatesPage,
+  RecoveryHistorySelectParams,
   Sha256Digest,
   StatusOutput,
   SearchIndexStatus,
@@ -37,7 +40,7 @@ import type {
   TaskStatus,
 } from './bindings';
 import { LocalClient } from './local-client';
-import { validateAccountDeletion, validateAccountDeletionIntents, validateHostedAuthStatus, validateRecoveryRestoreStatus } from './protocol-validation';
+import { validateAccountDeletion, validateAccountDeletionIntents, validateHostedAuthStatus, validateRecoveryRestoreStatus, validateRecoveryHistoryCandidates } from './protocol-validation';
 import { uuidV7 } from './uuid';
 import { type HarnessGateway, requireHarnessAcknowledgment, validateHarnessPlan, validateHarnessProbe } from './harness-gateway';
 import { validateConnectionCheckStatus, validateHarnessPreparation, validateHarnessExecution, validateHarnessSetupRecord, validateHarnessSetupsPage, validateSearchIndexStatus } from './protocol-validation';
@@ -72,6 +75,9 @@ export class RecoveryStorageFullError extends Error {
 }
 
 export interface DeviceGateway {
+  recoveryHistoryCandidates(params: RecoveryHistoryCandidatesParams): Promise<RecoveryHistoryCandidatesPage>;
+  recoveryHistorySelect(params: RecoveryHistorySelectParams): Promise<RecoveryRestoreStatus>;
+  recoveryHistoryUnlock(params: RecoveryHistorySelectParams): Promise<RecoveryRestoreStatus | null>;
   recoveryRestoreBegin(): Promise<RecoveryRestoreStatus | null>;
   recoveryRestoreOverview(): Promise<RecoveryRestoreStatus>;
   recoveryRestoreResume(): Promise<RecoveryRestoreStatus>;
@@ -442,6 +448,18 @@ export class LocalWorkspaceGateway implements WorkspaceGateway {
 
   async recoveryRestoreBegin() {
     const status = await this.client.recoveryRestoreBegin();
+    return status === null ? null : validateRecoveryRestoreStatus(status);
+  }
+  async recoveryHistoryCandidates(params: RecoveryHistoryCandidatesParams) {
+    const page = validateRecoveryHistoryCandidates(controlResult(await this.call({ method: 'recovery_history_candidates', params }), 'recovery_history_candidates', 'page'));
+    if (page.restoreId !== params.restoreId || page.acceptedEndpoint.stateSha256 !== params.acceptedEndpointSha256) throw new Error('Recovery history changed.');
+    return page;
+  }
+  async recoveryHistorySelect(params: RecoveryHistorySelectParams) {
+    return validateRecoveryRestoreStatus(controlResult(await this.call({ method: 'recovery_history_select', params }), 'recovery_restore_status', 'status'));
+  }
+  async recoveryHistoryUnlock(params: RecoveryHistorySelectParams) {
+    const status = await this.client.recoveryHistoryUnlock(params);
     return status === null ? null : validateRecoveryRestoreStatus(status);
   }
 

@@ -85,6 +85,9 @@ const request = (digest = requestDigest): PairingRequestResult => ({
 });
 
 class FakeDeviceGateway implements DeviceGateway {
+  async recoveryHistoryCandidates(): Promise<never> { throw new Error('not configured'); }
+  async recoveryHistorySelect(): Promise<never> { throw new Error('not configured'); }
+  async recoveryHistoryUnlock(): Promise<never> { throw new Error('not configured'); }
   async recoveryRestoreOverview() { return { state: 'idle' } as const; }
   async recoveryRestoreBegin() { return null; }
   async recoveryRestoreResume(): Promise<never> { throw new Error('No restore is prepared'); }
