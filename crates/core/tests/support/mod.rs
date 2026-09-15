@@ -125,6 +125,20 @@ pub fn remove_membership_material_migration(connection: &Connection) {
     // Downgrade fixtures must also remove all tables introduced after schema41.
     connection.execute_batch("DROP TABLE IF EXISTS recovery_v2_supplemental_history_keys; DROP TABLE IF EXISTS recovery_v2_conflict; DROP TABLE IF EXISTS recovery_history_selection; DROP TABLE IF EXISTS recovery_history_targets; DROP TABLE IF EXISTS recovery_v2_admission; DROP TABLE IF EXISTS recovery_v2_history_keys; DROP TABLE IF EXISTS recovery_v2_parent_objects; DROP TABLE IF EXISTS recovery_v2_prepared;").unwrap();
     connection.execute_batch("DROP TABLE IF EXISTS pairing_v2_public_objects; DROP TABLE IF EXISTS pairing_v2_transcripts;").unwrap();
+    // Migration 0048 only adds columns to the schema-37 intents table; the replay
+    // below user_version 40 reruns 0037, so the table itself must be dropped to
+    // reach the pre-0048 column set.
+    // Migration 0048 only adds columns to the schema-37 intents table. Drop it and
+    // recreate the exact pre-0048 shape so the downgrade post-condition holds for
+    // fixtures that replay from any version >= 37 (where 0037 is not rerun).
+    connection
+        .execute_batch("DROP TABLE IF EXISTS device_revocation_intents;")
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE device_revocation_intents (             operation_id TEXT PRIMARY KEY NOT NULL CHECK (typeof(operation_id) = 'text' AND length(CAST(operation_id AS BLOB)) = 36),             project_url TEXT NOT NULL CHECK (typeof(project_url) = 'text' AND length(CAST(project_url AS BLOB)) BETWEEN 1 AND 2048),             user_id TEXT NOT NULL CHECK (typeof(user_id) = 'text' AND length(CAST(user_id AS BLOB)) = 36),             session_id TEXT NOT NULL CHECK (typeof(session_id) = 'text' AND length(CAST(session_id AS BLOB)) = 36),             issuer_certificate BLOB NOT NULL CHECK (length(issuer_certificate) BETWEEN 1 AND 512),             statement BLOB NOT NULL CHECK (length(statement) = 197),             transition BLOB NOT NULL CHECK (length(transition) BETWEEN 1 AND 8388608),             signature BLOB NOT NULL CHECK (length(signature) = 64));",
+        )
+        .unwrap();
     connection.execute_batch("DROP TABLE IF EXISTS historical_verified_operations; DROP TABLE IF EXISTS historical_reconstructions; DROP TABLE IF EXISTS historical_operation_evidence; DROP TABLE IF EXISTS membership_current_activation; DROP TABLE IF EXISTS historical_transfer_selection; DROP TABLE IF EXISTS historical_transfer_pages; DROP TABLE IF EXISTS historical_transfers; DROP TABLE IF EXISTS membership_confirmed_admission; DROP TABLE IF EXISTS membership_root_material_seed; DROP TABLE IF EXISTS membership_epoch_secrets;").unwrap();
 }
 

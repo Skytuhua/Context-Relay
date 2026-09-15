@@ -1281,11 +1281,10 @@ fn schema40_root_seeding_preserves_explicit_legacy_enrollment_trust_boundary() {
         v.schema_version().unwrap(),
         context_relay_core::vault::LATEST_SCHEMA_VERSION
     );
-    assert!(
-        v.staged_membership_epoch(g, id(DEVICE_ID), 1, true, &f.device_keys, BUDGET)
-            .unwrap()
-            .is_none()
-    );
+    assert!(v
+        .staged_membership_epoch(g, id(DEVICE_ID), 1, true, &f.device_keys, BUDGET)
+        .unwrap()
+        .is_none());
     raw.execute_batch("CREATE TRIGGER fail_legacy_seed BEFORE INSERT ON membership_root_material_seed BEGIN SELECT RAISE(ABORT,'injected');END").unwrap();
     assert!(
         v.stage_current_membership_material(g, id(DEVICE_ID), &f.device_keys, BUDGET)
