@@ -65,7 +65,8 @@ impl fmt::Debug for RecoveryRootSnapshot {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryRestoreReceipt {
     pub restore_id: RecoveryRestoreId,
     pub enrollment_id: RecoveryEnrollmentId,
@@ -80,6 +81,30 @@ pub struct RecoveryRestoreReceipt {
 }
 
 impl RecoveryRestoreReceipt {
+    pub fn validate_v2(
+        &self,
+        claim: &super::recovery_restore_crypto::v2::RecoveryDeviceClaimV2,
+    ) -> Result<(), RecoveryTransportError> {
+        let canonical = super::recovery_restore_crypto::v2::encode_recovery_device_claim_v2(claim)
+            .map_err(|_| RecoveryTransportError::Conflict)?;
+        if self.restore_id != claim.restore_id
+            || self.enrollment_id != claim.enrollment_id
+            || self.recovery_root_id != claim.recovery_root_id
+            || self.account_id != claim.account_id
+            || self.workspace_id != claim.workspace_id
+            || self.certificate_id != claim.certificate_id
+            || self.canonical_record_sha256 != claim.canonical_record_sha256
+            || self.canonical_claim_sha256 != digest(&canonical)
+            || self.accepted_generation
+                != claim
+                    .expected_recovery_generation
+                    .checked_add(1)
+                    .ok_or(RecoveryTransportError::Conflict)?
+        {
+            return Err(RecoveryTransportError::Conflict);
+        }
+        Ok(())
+    }
     pub fn validate_for(
         &self,
         scope: SyncScope,
@@ -148,6 +173,19 @@ pub trait RecoveryRestoreTransport: Send + Sync {
     fn scope(&self) -> SyncScope;
 
     fn root_snapshot(&self) -> Result<Option<RecoveryRootSnapshot>, RecoveryTransportError>;
+
+    fn membership_endpoint(
+        &self,
+    ) -> Result<super::membership_crypto::MembershipEndpoint, RecoveryTransportError> {
+        Err(RecoveryTransportError::Unauthorized)
+    }
+    fn membership_event(
+        &self,
+        _successor: Sha256Digest,
+    ) -> Result<Option<super::membership_transport::MembershipEventObject>, RecoveryTransportError>
+    {
+        Err(RecoveryTransportError::Unauthorized)
+    }
 
     fn submit_restore(
         &self,

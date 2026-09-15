@@ -34,7 +34,7 @@ pub const MAX_IN_FLIGHT_TOOL_CALLS: usize = 64;
 pub const TOOL_CALL_RATE_BURST: usize = 64;
 pub const TOOL_CALL_RATE_REFILL_PER_SECOND: usize = 16;
 const WRITER_QUEUE_CAPACITY: usize = MAX_IN_FLIGHT_TOOL_CALLS + 16;
-const TOOLS_PAGE_SIZE: usize = 8;
+const LEGACY_TOOLS_SECOND_PAGE_START: usize = 8;
 const TOOLS_SECOND_PAGE_CURSOR: &str = "context-relay-tools-v1:8";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -375,14 +375,17 @@ impl<D: Daemon> Server<D> {
         if !valid_request_meta(params.meta.as_ref()) {
             return Some(error(Some(id), INVALID_PARAMS, "Invalid tools/list params"));
         }
-        let (start, next_cursor) = match params.cursor.as_deref() {
-            None => (0, Some(TOOLS_SECOND_PAGE_CURSOR)),
-            Some(TOOLS_SECOND_PAGE_CURSOR) => (TOOLS_PAGE_SIZE, None),
+        // All eleven tools fit in one bounded response. Native Codex currently
+        // exposes only the first page, so paging hid completion, handoff and
+        // status. Retain the old opaque cursor for clients already holding it.
+        let start = match params.cursor.as_deref() {
+            None => 0,
+            Some(TOOLS_SECOND_PAGE_CURSOR) => LEGACY_TOOLS_SECOND_PAGE_START,
             Some(_) => {
                 return Some(error(Some(id), INVALID_PARAMS, "Invalid tools/list cursor"));
             }
         };
-        let tools = MCP_TOOL_NAMES[start..MCP_TOOL_NAMES.len().min(start + TOOLS_PAGE_SIZE)]
+        let tools = MCP_TOOL_NAMES[start..]
             .iter()
             .map(|name| {
                 let schema = mcp_schema(name).expect("frozen tool has schema");
@@ -393,11 +396,7 @@ impl<D: Daemon> Server<D> {
                 })
             })
             .collect::<Vec<_>>();
-        let mut result = json!({"tools": tools});
-        if let Some(next_cursor) = next_cursor {
-            result["nextCursor"] = Value::String(next_cursor.to_owned());
-        }
-        Some(success(id, result))
+        Some(success(id, json!({"tools": tools})))
     }
 
     fn call_tool(

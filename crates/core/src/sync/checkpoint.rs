@@ -121,6 +121,7 @@ pub struct CheckpointBuildContext<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedCheckpoint {
+    pub(crate) membership_endpoint: Option<crate::devices::membership_crypto::MembershipEndpoint>,
     pub(crate) scope: SyncScope,
     pub(crate) checkpoint: CanonicalCheckpoint,
     pub(crate) expected_pin_hash: Option<Sha256Digest>,
@@ -204,14 +205,21 @@ fn build_checkpoint_with_previous(
         context.scope.workspace_id,
         context.creator_device,
     )?;
+    vault
+        .require_current_device(
+            context.scope,
+            trusted_material.membership_endpoint(),
+            &trusted,
+        )
+        .map_err(checkpoint_vault_error)?;
+    trusted.validate_identity(
+        context.scope.account_id,
+        context.scope.workspace_id,
+        context.creator_device,
+        context.active_key_epoch,
+    )?;
     let certificate = &trusted.certificate;
-    if certificate.account_id != context.scope.account_id
-        || certificate.workspace_id != context.scope.workspace_id
-        || certificate.device_id != context.creator_device
-        || certificate.control_epoch != trusted.active_control_epoch
-        || trusted.active_key_epoch != context.active_key_epoch
-        || certificate.signing_public_key != context.device_keys.signing_public_key()
-    {
+    if certificate.signing_public_key != context.device_keys.signing_public_key() {
         return Err(SyncError::InvalidIdentity);
     }
     let frontier = vault
@@ -271,6 +279,7 @@ pub fn verify_checkpoint(
     }
 
     Ok(VerifiedCheckpoint {
+        membership_endpoint: trusted_material.membership_endpoint(),
         scope,
         checkpoint: authenticated.checkpoint,
         expected_pin_hash,
@@ -316,6 +325,7 @@ pub(crate) fn verify_checkpoint_after_chain(
     Ok((
         anchor,
         Some(VerifiedCheckpoint {
+            membership_endpoint: trusted_material.membership_endpoint(),
             scope,
             checkpoint: authenticated.checkpoint,
             expected_pin_hash: base_pin_hash,
@@ -335,6 +345,8 @@ pub(crate) fn verify_checkpoint_chain_extension(
     {
         return Err(SyncError::InvalidChain);
     }
+    // An owned continuation can outlive the trust used to authenticate its anchor.
+    authenticate_checkpoint(scope, &anchor.checkpoint, trusted_material)?;
     let authenticated = authenticate_checkpoint(scope, received, trusted_material)?;
     verify_local_checkpoint_state(vault, scope, &authenticated.checkpoint)?;
     let current_pin_hash = vault
@@ -345,6 +357,7 @@ pub(crate) fn verify_checkpoint_chain_extension(
         return Err(SyncError::InvalidChain);
     }
     Ok(VerifiedCheckpoint {
+        membership_endpoint: trusted_material.membership_endpoint(),
         scope,
         checkpoint: authenticated.checkpoint,
         expected_pin_hash: anchor.base_pin_hash,
@@ -378,15 +391,13 @@ fn authenticate_checkpoint(
         scope.workspace_id,
         checkpoint.creator_device,
     )?;
+    trusted.validate_identity(
+        scope.account_id,
+        scope.workspace_id,
+        checkpoint.creator_device,
+        checkpoint.key_epoch,
+    )?;
     let certificate = &trusted.certificate;
-    if certificate.account_id != scope.account_id
-        || certificate.workspace_id != scope.workspace_id
-        || certificate.device_id != checkpoint.creator_device
-        || certificate.control_epoch != trusted.active_control_epoch
-        || checkpoint.key_epoch != trusted.active_key_epoch
-    {
-        return Err(SyncError::InvalidIdentity);
-    }
     let preimage = encode_checkpoint_signing_preimage_v1(&checkpoint)
         .map_err(|_| SyncError::InvalidEnvelope)?;
     verify_signature(

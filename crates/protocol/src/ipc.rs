@@ -12,9 +12,9 @@ use crate::{
     ExportId, HandoffPayload, HarnessAccessPolicy, HarnessId, InstallationTokenProof,
     MAX_MARKDOWN_BYTES, MAX_TAG_BYTES, MAX_TAGS, MAX_TITLE_BYTES, MemoryCandidate, MemoryId,
     MemoryKind, MemoryRecord, NativePlatform, OperationId, PairingId, PlanId, ProbeReport,
-    ProjectId, ProjectIdentity, ProtocolVersion, RecordId, RecoveryEnrollmentId, ScopeRef,
-    SetupPlan, Sha256Digest, StatusOutput, TaskId, TaskRecord, TaskStatus, ValidationError,
-    WireNativeValue, decimal_u64, required_text,
+    ProjectId, ProjectIdentity, ProtocolVersion, RecordId, RecoveryEnrollmentId, RecoveryRestoreId,
+    ScopeRef, SetupPlan, Sha256Digest, StatusOutput, TaskId, TaskRecord, TaskStatus,
+    ValidationError, WireNativeValue, decimal_u64, required_text,
 };
 
 pub const RECOVERY_ENROLLMENT_SESSION_MS: u64 = 600_000;
@@ -58,11 +58,114 @@ macro_rules! params { ($name:ident { $($(#[$field_attr:meta])* $field:ident : $t
     pub struct $name { $($(#[$field_attr])* pub $field:$ty),* }
 }; }
 params!(EmptyParams {});
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchIndexPhase {
+    Disabled,
+    Preparing,
+    Ready,
+    Failed,
+}
+
+/// Owner-only status across saved context. Contains no record or project counts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchIndexStatus {
+    pub phase: SearchIndexPhase,
+    #[serde(with = "decimal_u64")]
+    #[ts(type = "DecimalU64")]
+    pub revision: u64,
+}
+params!(HarnessLaunchInfo {
+    selection: HarnessParams,
+    executable: WireNativeValue,
+    project_root: WireNativeValue
+});
+params!(ConnectionCheckStartParams {
+    selection: HarnessParams,
+    memory_id: MemoryId,
+    expected_revision: OperationId
+});
+params!(ConnectionCheckIdParams {
+    check_id: OperationId
+});
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionCheckPhase {
+    Waiting,
+    Verified,
+    Expired,
+    Canceled,
+    Invalidated,
+}
+params!(ConnectionCheckStatus {
+    check_id: OperationId,
+    selection: HarnessParams,
+    memory_id: MemoryId,
+    expected_revision: OperationId,
+    phase: ConnectionCheckPhase,
+    expires_in_seconds: u32,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    verified_at: Option<DecimalTimestamp>
+});
+params!(HarnessPrepareParams {
+    operation_id: OperationId,
+    selection: HarnessParams
+});
+params!(HarnessPreparationIdParams {
+    operation_id: OperationId
+});
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessPreparationPhase {
+    Inspecting,
+    Copying,
+    CheckingSource,
+    CheckingCopy,
+    Retaining,
+    Cancelling,
+    Ready,
+    Canceled,
+    Failed,
+}
+
+params!(HarnessPreparationStatus {
+    operation_id: OperationId,
+    selection: HarnessParams,
+    phase: HarnessPreparationPhase,
+    completed_files: u32,
+    completed_bytes: u32,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    error: Option<ClientError>
+});
+
+impl HarnessPreparationStatus {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_harness_profile(&self.selection)?;
+        if self.selection.harness != HarnessId::Hermes
+            || self.completed_files > 32768
+            || self.completed_bytes > 1_073_741_824
+            || (self.phase == HarnessPreparationPhase::Failed) != self.error.is_some()
+        {
+            return Err(ValidationError::Invalid("harnessPreparation"));
+        }
+        if let Some(error) = &self.error {
+            required_text(&error.message, "harnessPreparation.error", MAX_TITLE_BYTES)?;
+        }
+        Ok(())
+    }
+}
 params!(ProjectParams {
     project_id: ProjectId
 });
 params!(ProjectUpsertParams {
     project: ProjectIdentity
+});
+params!(ProjectRegisterParams {
+    project: ProjectIdentity,
+    path: WireNativeValue
 });
 params!(ProjectPathParams {
     project_id: ProjectId,
@@ -190,12 +293,17 @@ params!(RecoveryEnrollmentIdParams {
     enrollment_id: RecoveryEnrollmentId
 });
 params!(DeviceRevokeParams {
+    operation_id: OperationId,
     device_id: DeviceId
 });
 params!(DeviceRenameParams {
     operation_id: OperationId,
     device_id: DeviceId,
     name: String
+});
+params!(DeviceRevocationIntentsParams {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    after: Option<OperationId>
 });
 params!(CancelParams {
     request_id: RecordId
@@ -227,12 +335,263 @@ params!(AccessSetParams {
     policy: HarnessAccessPolicy
 });
 params!(AccountDeletionParams {
+    operation_id: OperationId,
     confirmation: String
 });
 
 #[derive(Clone, Eq, PartialEq, TS)]
 #[ts(type = "Array<string>")]
 pub struct RecoveryPhraseWords(Vec<String>);
+params!(RecoveryRestoreParams {
+    recovery_phrase_words: RecoveryPhraseWords
+});
+params!(RecoveryHistoryEndpoint {
+    state_sha256: Sha256Digest,
+    control_epoch: u32,
+    key_epoch: u32
+});
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceRevocationAccess {
+    Ready,
+    OriginalAuthRequired,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "state",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum DeviceRevocationOutcome {
+    Prepared {},
+    Submitting {},
+    Unconfirmed {},
+    Accepted {
+        accepted_endpoint: RecoveryHistoryEndpoint,
+    },
+    Conflict {},
+    CanceledBeforeSend {},
+}
+params!(DeviceRevocationStatus {
+    operation_id: OperationId,
+    device_id: DeviceId,
+    send_canceled: bool,
+    access: DeviceRevocationAccess,
+    outcome: DeviceRevocationOutcome
+});
+params!(DeviceRevocationSummary {
+    operation_id: OperationId,
+    device_id: DeviceId,
+    send_canceled: bool,
+    access: DeviceRevocationAccess,
+    outcome: DeviceRevocationOutcome
+});
+impl DeviceRevocationStatus {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        match &self.outcome {
+            DeviceRevocationOutcome::Accepted { accepted_endpoint } => accepted_endpoint.validate(),
+            _ => Ok(()),
+        }
+    }
+}
+impl DeviceRevocationSummary {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        match &self.outcome {
+            DeviceRevocationOutcome::Accepted { accepted_endpoint } => accepted_endpoint.validate(),
+            _ => Ok(()),
+        }
+    }
+}
+params!(RecoveryHistoryCursor {
+    restore_id: RecoveryRestoreId,
+    accepted_endpoint_sha256: Sha256Digest,
+    received_at: String,
+    canonical_hash: Sha256Digest
+});
+params!(RecoveryHistoryCandidatesParams {
+    restore_id: RecoveryRestoreId,
+    accepted_endpoint_sha256: Sha256Digest,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    cursor: Option<RecoveryHistoryCursor>
+});
+params!(RecoveryHistorySelectParams {
+    restore_id: RecoveryRestoreId,
+    accepted_endpoint_sha256: Sha256Digest,
+    checkpoint_sha256: Sha256Digest
+});
+params!(RecoveryHistoryUnlockParams {
+    restore_id: RecoveryRestoreId,
+    accepted_endpoint_sha256: Sha256Digest,
+    checkpoint_sha256: Sha256Digest,
+    recovery_phrase_words: RecoveryPhraseWords
+});
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "state",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RecoveryHistoryExtent {
+    Supported { operation_count: u32 },
+    Unsupported {},
+}
+params!(RecoveryHistoryCandidate {
+    checkpoint_sha256: Sha256Digest,
+    author_device_id: DeviceId,
+    created_hlc: crate::HybridLogicalClock,
+    key_epoch: u32,
+    frontier_device_count: u32,
+    extent: RecoveryHistoryExtent
+});
+params!(RecoveryHistoryCandidatesPage {
+    restore_id: RecoveryRestoreId,
+    accepted_endpoint: RecoveryHistoryEndpoint,
+    candidates: Vec<RecoveryHistoryCandidate>,
+    #[serde(deserialize_with = "crate::required_nullable")]
+    next_cursor: Option<RecoveryHistoryCursor>
+});
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "state",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RecoveryHistoryProgress {
+    Unselected {},
+    Incomplete {
+        selected_endpoint: RecoveryHistoryEndpoint,
+        checkpoint_sha256: Sha256Digest,
+    },
+    HistoricalKeysNeeded {
+        selected_endpoint: RecoveryHistoryEndpoint,
+        checkpoint_sha256: Sha256Digest,
+    },
+    CurrentMaterialUnavailable {
+        selected_endpoint: RecoveryHistoryEndpoint,
+        checkpoint_sha256: Sha256Digest,
+    },
+    StaleEndpoint {
+        selected_endpoint: RecoveryHistoryEndpoint,
+        checkpoint_sha256: Sha256Digest,
+    },
+}
+impl RecoveryHistoryEndpoint {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.state_sha256.0 == [0; 32] || self.control_epoch == 0 || self.key_epoch == 0 {
+            return Err(ValidationError::Invalid("recovery endpoint"));
+        }
+        Ok(())
+    }
+}
+impl RecoveryHistoryCursor {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.accepted_endpoint_sha256.0 == [0; 32]
+            || self.canonical_hash.0 == [0; 32]
+            || self.received_at.is_empty()
+            || self.received_at.len() > 64
+            || !self
+                .received_at
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b"-:+.TZ".contains(&b))
+        {
+            return Err(ValidationError::Invalid("recovery cursor"));
+        }
+        Ok(())
+    }
+}
+impl RecoveryHistoryProgress {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let (endpoint, hash) = match self {
+            Self::Unselected {} => return Ok(()),
+            Self::Incomplete {
+                selected_endpoint,
+                checkpoint_sha256,
+            }
+            | Self::HistoricalKeysNeeded {
+                selected_endpoint,
+                checkpoint_sha256,
+            }
+            | Self::CurrentMaterialUnavailable {
+                selected_endpoint,
+                checkpoint_sha256,
+            }
+            | Self::StaleEndpoint {
+                selected_endpoint,
+                checkpoint_sha256,
+            } => (selected_endpoint, checkpoint_sha256),
+        };
+        endpoint.validate()?;
+        if hash.0 == [0; 32] {
+            return Err(ValidationError::Invalid("recovery checkpoint"));
+        }
+        Ok(())
+    }
+}
+impl RecoveryHistoryCandidatesPage {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        self.accepted_endpoint.validate()?;
+        if self.candidates.len() > 8 {
+            return Err(ValidationError::Invalid("recovery candidates"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for candidate in &self.candidates {
+            if candidate.checkpoint_sha256.0 == [0; 32]
+                || !seen.insert(candidate.checkpoint_sha256)
+                || candidate.created_hlc.node != candidate.author_device_id
+                || candidate.key_epoch == 0
+                || candidate.key_epoch > self.accepted_endpoint.key_epoch
+                || candidate.frontier_device_count as usize > crate::MAX_BATCH_OPERATIONS
+                || matches!(candidate.extent, RecoveryHistoryExtent::Supported { operation_count } if operation_count > 100000 || operation_count < candidate.frontier_device_count)
+            {
+                return Err(ValidationError::Invalid("recovery candidate"));
+            }
+        }
+        if let Some(cursor) = &self.next_cursor {
+            cursor.validate()?;
+            if cursor.restore_id != self.restore_id
+                || cursor.accepted_endpoint_sha256 != self.accepted_endpoint.state_sha256
+                || self
+                    .candidates
+                    .last()
+                    .is_none_or(|last| last.checkpoint_sha256 != cursor.canonical_hash)
+            {
+                return Err(ValidationError::Invalid("recovery cursor"));
+            }
+        } else if !self.candidates.is_empty() {
+            return Err(ValidationError::Invalid("recovery cursor"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "state",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RecoveryRestoreStatus {
+    Idle {},
+    Submitting {
+        restore_id: RecoveryRestoreId,
+    },
+    RestoringHistory {
+        restore_id: RecoveryRestoreId,
+        accepted_endpoint: RecoveryHistoryEndpoint,
+        history: RecoveryHistoryProgress,
+    },
+    Complete {
+        restore_id: RecoveryRestoreId,
+        device: DeviceSummary,
+    },
+    Conflict {
+        restore_id: RecoveryRestoreId,
+    },
+}
 impl fmt::Debug for RecoveryPhraseWords {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RecoveryPhraseWords([REDACTED])")
@@ -531,6 +890,14 @@ pub enum ClientRole {
 )]
 #[ts(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum LocalRequest {
+    HostedAuthStatus(EmptyParams),
+    HostedAuthStart(crate::HostedAuthStartParams),
+    HostedAuthCancel(crate::HostedAuthGenerationParams),
+    HostedAuthLogout(crate::HostedAuthGenerationParams),
+    DesktopWritePrepare(DesktopWritePrepareParams),
+    DesktopWritesList(DesktopWritesListParams),
+    DesktopWriteGet(DesktopWriteIdParams),
+    DesktopWriteForget(DesktopWriteIdParams),
     Hello(HelloParams),
     Cancel(CancelParams),
     Shutdown(EmptyParams),
@@ -540,10 +907,13 @@ pub enum LocalRequest {
     Unlock(EmptyParams),
     ProjectsList(EmptyParams),
     ProjectUpsert(ProjectUpsertParams),
+    ProjectRegister(ProjectRegisterParams),
     ProjectPathSet(ProjectPathParams),
     MemoryGet(MemoryParams),
     MemoryList(MemoryListParams),
     MemorySearch(SearchParams),
+    SearchIndexStatus(EmptyParams),
+    SearchIndexRetry(EmptyParams),
     MemoryCreate(MemoryCreateParams),
     MemoryUpdate(MemoryUpdateParams),
     MemoryArchive(MemoryArchiveParams),
@@ -557,6 +927,19 @@ pub enum LocalRequest {
     AccessGet(HarnessParams),
     AccessSet(AccessSetParams),
     HarnessProbe(HarnessParams),
+    HarnessLaunchInfo(HarnessParams),
+    ConnectionCheckStart(ConnectionCheckStartParams),
+    ConnectionCheckStatus(ConnectionCheckIdParams),
+    ConnectionCheckCancel(ConnectionCheckIdParams),
+    HarnessPrepare(HarnessPrepareParams),
+    HarnessPreparedPreview(HarnessPrepareParams),
+    HarnessPreparationStatus(HarnessPreparationIdParams),
+    HarnessPreparationCancel(HarnessPreparationIdParams),
+    HarnessExecutionStart(crate::HarnessExecutionParams),
+    HarnessExecutionStatus(crate::HarnessExecutionParams),
+    HarnessExecutionCurrent(EmptyParams),
+    HarnessSetupsList(crate::HarnessSetupsParams),
+    HarnessSetupGet(PlanParams),
     HarnessPreview(HarnessParams),
     HarnessApply(PlanParams),
     HarnessRepair(HarnessParams),
@@ -568,6 +951,9 @@ pub enum LocalRequest {
     DevicesList(EmptyParams),
     DeviceRename(DeviceRenameParams),
     DeviceRevoke(DeviceRevokeParams),
+    DeviceRevocationStatus(RetryParams),
+    DeviceRevocationCancel(RetryParams),
+    DeviceRevocationIntents(DeviceRevocationIntentsParams),
     PairingCreate(EmptyParams),
     PairingJoin(PairingJoinParams),
     PairingStatus(PairingIdParams),
@@ -575,6 +961,13 @@ pub enum LocalRequest {
     PairingConfirm(PairingConfirmParams),
     PairingCancel(PairingIdParams),
     RecoveryEnrollmentBegin(EmptyParams),
+    RecoveryRestoreBegin(RecoveryRestoreParams),
+    RecoveryRestoreOverview(EmptyParams),
+    RecoveryRestoreResume(EmptyParams),
+    RecoveryRestoreCancel(EmptyParams),
+    RecoveryHistoryCandidates(RecoveryHistoryCandidatesParams),
+    RecoveryHistorySelect(RecoveryHistorySelectParams),
+    RecoveryHistoryUnlock(RecoveryHistoryUnlockParams),
     RecoveryEnrollmentOverview(EmptyParams),
     RecoveryEnrollmentConfirm(RecoveryEnrollmentConfirmParams),
     RecoveryEnrollmentStatus(RecoveryEnrollmentIdParams),
@@ -583,7 +976,8 @@ pub enum LocalRequest {
     ExportChunk(ExportChunkParams),
     AccountDeletionBegin(AccountDeletionParams),
     AccountDeletionStatus(EmptyParams),
-    AccountDeletionCancel(EmptyParams),
+    AccountDeletionIntents(AccountDeletionIntentsParams),
+    AccountDeletionCancel(RetryParams),
 }
 
 fn validate_tags(tags: &[String]) -> Result<(), ValidationError> {
@@ -605,7 +999,52 @@ fn validate_tags(tags: &[String]) -> Result<(), ValidationError> {
 impl LocalRequest {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
+            Self::RecoveryHistoryCandidates(p) => {
+                if p.accepted_endpoint_sha256.0 == [0; 32] {
+                    return Err(ValidationError::Invalid("recovery endpoint"));
+                }
+                if let Some(cursor) = &p.cursor {
+                    cursor.validate()?;
+                    if cursor.restore_id != p.restore_id
+                        || cursor.accepted_endpoint_sha256 != p.accepted_endpoint_sha256
+                    {
+                        return Err(ValidationError::Invalid("recovery cursor"));
+                    }
+                }
+                Ok(())
+            }
+            Self::RecoveryHistorySelect(p) => {
+                if p.accepted_endpoint_sha256.0 == [0; 32] || p.checkpoint_sha256.0 == [0; 32] {
+                    return Err(ValidationError::Invalid("recovery target"));
+                }
+                Ok(())
+            }
+            Self::RecoveryHistoryUnlock(p) => {
+                if p.accepted_endpoint_sha256.0 == [0; 32] || p.checkpoint_sha256.0 == [0; 32] {
+                    return Err(ValidationError::Invalid("recovery target"));
+                }
+                Ok(())
+            }
+            Self::HarnessLaunchInfo(p) => {
+                validate_harness_profile(p)?;
+                if p.project_id.is_none() {
+                    return Err(ValidationError::Invalid("harnessLaunch.projectId"));
+                }
+                Ok(())
+            }
+            Self::ConnectionCheckStart(p) => {
+                validate_harness_profile(&p.selection)?;
+                if p.selection.project_id.is_none() {
+                    return Err(ValidationError::Invalid("connectionCheck.projectId"));
+                }
+                Ok(())
+            }
+            Self::DesktopWritePrepare(p) => p.write.validate(),
             Self::ProjectUpsert(p) => p.project.validate(),
+            Self::ProjectRegister(p) => {
+                p.project.validate()?;
+                p.path.validate()
+            }
             Self::ProjectPathSet(p) => p.path.validate(),
             Self::McpCall(p) => {
                 p.binding.working_directory.validate()?;
@@ -666,6 +1105,13 @@ impl LocalRequest {
             .validate(),
             Self::HarnessProbe(p) | Self::HarnessPreview(p) | Self::HarnessRepair(p) => {
                 validate_harness_profile(p)
+            }
+            Self::HarnessPrepare(p) | Self::HarnessPreparedPreview(p) => {
+                validate_harness_profile(&p.selection)?;
+                if p.selection.harness != HarnessId::Hermes {
+                    return Err(ValidationError::Invalid("harnessPrepare.selection"));
+                }
+                Ok(())
             }
             Self::AccessGet(p) if p.hermes_profile.is_some() => {
                 Err(ValidationError::Invalid("accessGet.hermesProfile"))
@@ -988,6 +1434,20 @@ pub enum AccountDeletionState {
     PendingDelete,
     Purged,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum AccountLifecycleIntentAction {
+    BeginDeletion,
+    CancelDeletion,
+}
+params!(AccountDeletionIntentSummary {
+    operation_id: OperationId,
+    action: AccountLifecycleIntentAction
+});
+params!(AccountDeletionIntentsParams {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    after: Option<OperationId>
+});
 #[derive(Clone, Debug, Eq, PartialEq, TS)]
 #[ts(
     tag = "kind",
@@ -996,6 +1456,45 @@ pub enum AccountDeletionState {
     rename_all_fields = "camelCase"
 )]
 pub enum LocalResult {
+    RecoveryHistoryCandidates {
+        page: RecoveryHistoryCandidatesPage,
+    },
+    RecoveryRestoreStatus {
+        status: RecoveryRestoreStatus,
+    },
+    HostedAuth {
+        status: crate::HostedAuthStatus,
+    },
+    SearchIndex {
+        status: SearchIndexStatus,
+    },
+    HarnessExecutionCurrent {
+        status: Option<crate::HarnessExecutionStatus>,
+    },
+    HarnessExecution {
+        status: crate::HarnessExecutionStatus,
+    },
+    HarnessSetup {
+        setup: Box<crate::HarnessSetupRecord>,
+    },
+    HarnessSetups {
+        page: crate::HarnessSetupsPage,
+    },
+    HarnessLaunchInfo {
+        info: HarnessLaunchInfo,
+    },
+    ConnectionCheck {
+        status: ConnectionCheckStatus,
+    },
+    HarnessPreparation {
+        status: HarnessPreparationStatus,
+    },
+    DesktopWrite {
+        write: Option<crate::DesktopWrite>,
+    },
+    DesktopWrites {
+        page: crate::DesktopWritesPage,
+    },
     Empty,
     Health {
         protocol: ProtocolVersion,
@@ -1037,6 +1536,12 @@ pub enum LocalResult {
     Devices {
         devices: Vec<DeviceSummary>,
     },
+    DeviceRevocation {
+        status: DeviceRevocationStatus,
+    },
+    DeviceRevocationIntents {
+        intents: Vec<DeviceRevocationSummary>,
+    },
     PairingInvite {
         invite: PairingInviteInfo,
         status: PairingState,
@@ -1067,6 +1572,9 @@ pub enum LocalResult {
     Export {
         payload: ExportPayload,
     },
+    AccountDeletionIntents {
+        intents: Vec<AccountDeletionIntentSummary>,
+    },
     AccountDeletion {
         state: AccountDeletionState,
         purge_deadline: Option<DecimalTimestamp>,
@@ -1087,6 +1595,47 @@ pub enum LocalResult {
     deny_unknown_fields
 )]
 enum LocalResultSerde {
+    RecoveryHistoryCandidates {
+        page: RecoveryHistoryCandidatesPage,
+    },
+    RecoveryRestoreStatus {
+        status: RecoveryRestoreStatus,
+    },
+    HostedAuth {
+        status: crate::HostedAuthStatus,
+    },
+    SearchIndex {
+        status: SearchIndexStatus,
+    },
+    HarnessExecutionCurrent {
+        #[serde(deserialize_with = "crate::required_nullable")]
+        status: Option<crate::HarnessExecutionStatus>,
+    },
+    HarnessExecution {
+        status: crate::HarnessExecutionStatus,
+    },
+    HarnessSetup {
+        setup: Box<crate::HarnessSetupRecord>,
+    },
+    HarnessSetups {
+        page: crate::HarnessSetupsPage,
+    },
+    HarnessLaunchInfo {
+        info: HarnessLaunchInfo,
+    },
+    ConnectionCheck {
+        status: ConnectionCheckStatus,
+    },
+    HarnessPreparation {
+        status: HarnessPreparationStatus,
+    },
+    DesktopWrite {
+        #[serde(deserialize_with = "crate::required_nullable")]
+        write: Option<crate::DesktopWrite>,
+    },
+    DesktopWrites {
+        page: crate::DesktopWritesPage,
+    },
     Empty,
     Health {
         protocol: ProtocolVersion,
@@ -1128,6 +1677,12 @@ enum LocalResultSerde {
     Devices {
         devices: Vec<DeviceSummary>,
     },
+    DeviceRevocation {
+        status: DeviceRevocationStatus,
+    },
+    DeviceRevocationIntents {
+        intents: Vec<DeviceRevocationSummary>,
+    },
     PairingInvite {
         invite: PairingInviteInfo,
         status: PairingState,
@@ -1158,6 +1713,9 @@ enum LocalResultSerde {
     Export {
         payload: ExportPayload,
     },
+    AccountDeletionIntents {
+        intents: Vec<AccountDeletionIntentSummary>,
+    },
     AccountDeletion {
         state: AccountDeletionState,
         #[serde(deserialize_with = "crate::required_nullable")]
@@ -1172,7 +1730,99 @@ enum LocalResultSerde {
 impl LocalResult {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
-            Self::Empty | Self::AccountDeletion { .. } | Self::Access { .. } => Ok(()),
+            Self::RecoveryHistoryCandidates { page } => page.validate(),
+            Self::RecoveryRestoreStatus {
+                status:
+                    RecoveryRestoreStatus::RestoringHistory {
+                        accepted_endpoint,
+                        history,
+                        ..
+                    },
+            } => {
+                accepted_endpoint.validate()?;
+                history.validate()?;
+                let selected = match history {
+                    RecoveryHistoryProgress::Unselected {} => return Ok(()),
+                    RecoveryHistoryProgress::Incomplete {
+                        selected_endpoint, ..
+                    }
+                    | RecoveryHistoryProgress::HistoricalKeysNeeded {
+                        selected_endpoint, ..
+                    }
+                    | RecoveryHistoryProgress::CurrentMaterialUnavailable {
+                        selected_endpoint,
+                        ..
+                    }
+                    | RecoveryHistoryProgress::StaleEndpoint {
+                        selected_endpoint, ..
+                    } => selected_endpoint,
+                };
+                if matches!(history, RecoveryHistoryProgress::StaleEndpoint { .. })
+                    == (selected == accepted_endpoint)
+                {
+                    return Err(ValidationError::Invalid("recovery endpoint"));
+                }
+                Ok(())
+            }
+            Self::HarnessExecutionCurrent { status } => status
+                .as_ref()
+                .map_or(Ok(()), crate::HarnessExecutionStatus::validate),
+            Self::HarnessExecution { status } => status.validate(),
+            Self::HarnessSetup { setup } => setup.validate(),
+            Self::HarnessSetups { page } => page.validate(),
+            Self::HarnessLaunchInfo { info } => {
+                validate_harness_profile(&info.selection)?;
+                if info.selection.project_id.is_none() {
+                    return Err(ValidationError::Invalid("harnessLaunch.projectId"));
+                }
+                info.executable.validate()?;
+                info.project_root.validate()
+            }
+            Self::ConnectionCheck { status } => {
+                validate_harness_profile(&status.selection)?;
+                if status.selection.project_id.is_none()
+                    || status.expires_in_seconds > 300
+                    || (status.phase == ConnectionCheckPhase::Verified)
+                        != status.verified_at.is_some()
+                {
+                    return Err(ValidationError::Invalid("connectionCheck"));
+                }
+                Ok(())
+            }
+            Self::HarnessPreparation { status } => status.validate(),
+            Self::DesktopWrite { write } => {
+                write.as_ref().map_or(Ok(()), crate::DesktopWrite::validate)
+            }
+            Self::DesktopWrites { page } => page.validate(),
+            Self::AccountDeletionIntents { intents } => {
+                if intents.len() > 50
+                    || intents
+                        .windows(2)
+                        .any(|pair| pair[0].operation_id >= pair[1].operation_id)
+                {
+                    return Err(ValidationError::Invalid("accountDeletionIntents"));
+                }
+                Ok(())
+            }
+            Self::DeviceRevocation { status } => status.validate(),
+            Self::DeviceRevocationIntents { intents } => {
+                if intents.len() > 50
+                    || intents
+                        .windows(2)
+                        .any(|pair| pair[0].operation_id >= pair[1].operation_id)
+                {
+                    return Err(ValidationError::Invalid("deviceRevocationIntents"));
+                }
+                for intent in intents {
+                    intent.validate()?;
+                }
+                Ok(())
+            }
+            Self::Empty
+            | Self::HostedAuth { .. }
+            | Self::AccountDeletion { .. }
+            | Self::Access { .. }
+            | Self::SearchIndex { .. } => Ok(()),
             Self::Health { protocol, .. } => {
                 if protocol.major != crate::PROTOCOL_MAJOR {
                     return Err(ValidationError::Invalid("health.protocol"));
@@ -1225,6 +1875,15 @@ impl LocalResult {
             Self::PairingApproval { approval } => approval.request.validate(),
             Self::PairingCompletion { completion } => completion.device.validate(),
             Self::RecoveryEnrollmentPhrase { phrase } => phrase.validate(),
+            Self::RecoveryRestoreStatus {
+                status:
+                    RecoveryRestoreStatus::Idle {}
+                    | RecoveryRestoreStatus::Submitting { .. }
+                    | RecoveryRestoreStatus::Conflict { .. },
+            } => Ok(()),
+            Self::RecoveryRestoreStatus {
+                status: RecoveryRestoreStatus::Complete { device, .. },
+            } => device.validate(),
             Self::RecoveryEnrollmentStatus { status } => status.validate(),
             Self::RecoveryEnrollmentComplete { completion } => completion.device.validate(),
             Self::Export { payload } => payload.validate(),
@@ -1269,6 +1928,16 @@ params!(JsonRpcErrorV1 {
     #[serde(deserialize_with = "crate::required_nullable")]
     id: Option<RecordId>,
     error: JsonRpcErrorObject
+});
+params!(DesktopWritePrepareParams {
+    write: crate::DesktopWrite
+});
+params!(DesktopWriteIdParams {
+    operation_id: OperationId
+});
+params!(DesktopWritesListParams {
+    #[serde(deserialize_with = "crate::required_nullable")]
+    after: Option<OperationId>
 });
 pub const JSON_RPC_PARSE_ERROR: i32 = -32700;
 pub const JSON_RPC_INVALID_REQUEST: i32 = -32600;

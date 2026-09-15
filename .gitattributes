@@ -6,6 +6,8 @@
 
 # Cryptographically pinned build material must hash identically on every runner.
 /third_party/sidecars/semgrep/build-public-source-windows.ps1 text eol=lf
+/third_party/sidecars/semgrep/windows-offline-firewall.ps1 text eol=lf
+/third_party/sidecars/semgrep/diagnose-windows-firewall.ps1 text eol=lf
 
 *.bmp binary
 *.gif binary

@@ -1,0 +1,389 @@
+{
+  "version": "2.1.202",
+  "executableSha256": "7ff0787ebdc19fc509ccea8886ebf6a53ad8213407fa3a2b7c6d1446efc419f6",
+  "evidence": "Pure configured-directory string helper only; no effective settings, repository roots or live memory session qualification.",
+  "cases": [
+    {
+      "platform": "windows",
+      "home": "C:\\Users\\Fixture",
+      "cases": [
+        {
+          "input": "",
+          "directory": null
+        },
+        {
+          "input": ".",
+          "directory": null
+        },
+        {
+          "input": ".claude/native-memory",
+          "directory": null
+        },
+        {
+          "input": "../memory",
+          "directory": null
+        },
+        {
+          "input": "~/memory",
+          "directory": "C:\\Users\\Fixture\\memory\\"
+        },
+        {
+          "input": "~\\memory",
+          "directory": "C:\\Users\\Fixture\\memory\\"
+        },
+        {
+          "input": "~/",
+          "directory": null
+        },
+        {
+          "input": "~/../memory",
+          "directory": null
+        },
+        {
+          "input": "~/a/../memory",
+          "directory": "C:\\Users\\Fixture\\memory\\"
+        },
+        {
+          "input": "~/a/../../memory",
+          "directory": null
+        },
+        {
+          "input": "/memory",
+          "directory": "\\memory\\"
+        },
+        {
+          "input": "/",
+          "directory": null
+        },
+        {
+          "input": "C:\\",
+          "directory": null
+        },
+        {
+          "input": "C:/",
+          "directory": null
+        },
+        {
+          "input": "C:/memory",
+          "directory": "C:\\memory\\"
+        },
+        {
+          "input": "C:\\one\\..\\memory",
+          "directory": "C:\\memory\\"
+        },
+        {
+          "input": "\\memory",
+          "directory": "\\memory\\"
+        },
+        {
+          "input": "\\\\server\\share\\memory",
+          "directory": null
+        },
+        {
+          "input": "\\\\?\\C:\\memory",
+          "directory": null
+        },
+        {
+          "input": "C:/café/memory",
+          "directory": "C:\\café\\memory\\"
+        },
+        {
+          "input": "C:/memory\u0000tail",
+          "directory": null
+        },
+        {
+          "input": "/a",
+          "directory": null
+        },
+        {
+          "input": "/ab",
+          "directory": "\\ab\\"
+        },
+        {
+          "input": "~",
+          "directory": null
+        },
+        {
+          "input": "~user/memory",
+          "directory": null
+        },
+        {
+          "input": "~//memory",
+          "directory": "C:\\Users\\Fixture\\memory\\"
+        },
+        {
+          "input": "~/\\memory",
+          "directory": "C:\\Users\\Fixture\\memory\\"
+        },
+        {
+          "input": "~/C:/memory",
+          "directory": "C:\\Users\\Fixture\\C:\\memory\\"
+        },
+        {
+          "input": "~/D:memory",
+          "directory": "C:\\Users\\Fixture\\D:memory\\"
+        },
+        {
+          "input": "C:/a/D:/memory",
+          "directory": "C:\\a\\D:\\memory\\"
+        },
+        {
+          "input": "C:relative",
+          "directory": null
+        },
+        {
+          "input": "C:/a/../../memory",
+          "directory": "C:\\memory\\"
+        },
+        {
+          "input": "//foo",
+          "directory": "\\foo\\"
+        },
+        {
+          "input": "//server/share",
+          "directory": null
+        },
+        {
+          "input": "/memory\\",
+          "directory": "\\memory\\"
+        },
+        {
+          "input": "/a/../memory",
+          "directory": "\\memory\\"
+        },
+        {
+          "input": " /memory",
+          "directory": null
+        },
+        {
+          "input": "~/a\\..\\memory",
+          "directory": "C:\\Users\\Fixture\\memory\\"
+        },
+        {
+          "input": "C:/memory/./",
+          "directory": "C:\\memory\\"
+        },
+        {
+          "input": "C:/MEMORY/../memory",
+          "directory": "C:\\memory\\"
+        },
+        {
+          "input": "C:/segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../memory",
+          "directory": "C:\\memory\\"
+        },
+        {
+          "input": "/segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../memory",
+          "directory": "\\memory\\"
+        },
+        {
+          "input": "/discard\u0000/../memory",
+          "directory": "\\memory\\"
+        },
+        {
+          "input": "~/discard\u0000/../memory",
+          "directory": "C:\\Users\\Fixture\\memory\\"
+        }
+      ]
+    },
+    {
+      "platform": "macos",
+      "home": "/Users/Fixture",
+      "cases": [
+        {
+          "input": "",
+          "directory": null
+        },
+        {
+          "input": ".",
+          "directory": null
+        },
+        {
+          "input": ".claude/native-memory",
+          "directory": null
+        },
+        {
+          "input": "../memory",
+          "directory": null
+        },
+        {
+          "input": "~/memory",
+          "directory": "/Users/Fixture/memory/"
+        },
+        {
+          "input": "~\\memory",
+          "directory": "/Users/Fixture/memory/"
+        },
+        {
+          "input": "~/",
+          "directory": null
+        },
+        {
+          "input": "~/../memory",
+          "directory": null
+        },
+        {
+          "input": "~/a/../memory",
+          "directory": "/Users/Fixture/memory/"
+        },
+        {
+          "input": "~/a/../../memory",
+          "directory": null
+        },
+        {
+          "input": "/memory",
+          "directory": "/memory/"
+        },
+        {
+          "input": "/",
+          "directory": null
+        },
+        {
+          "input": "C:\\",
+          "directory": null
+        },
+        {
+          "input": "C:/",
+          "directory": null
+        },
+        {
+          "input": "C:/memory",
+          "directory": null
+        },
+        {
+          "input": "C:\\one\\..\\memory",
+          "directory": null
+        },
+        {
+          "input": "\\memory",
+          "directory": null
+        },
+        {
+          "input": "\\\\server\\share\\memory",
+          "directory": null
+        },
+        {
+          "input": "\\\\?\\C:\\memory",
+          "directory": null
+        },
+        {
+          "input": "C:/café/memory",
+          "directory": null
+        },
+        {
+          "input": "C:/memory\u0000tail",
+          "directory": null
+        },
+        {
+          "input": "/a",
+          "directory": null
+        },
+        {
+          "input": "/ab",
+          "directory": "/ab/"
+        },
+        {
+          "input": "~",
+          "directory": null
+        },
+        {
+          "input": "~user/memory",
+          "directory": null
+        },
+        {
+          "input": "~//memory",
+          "directory": "/Users/Fixture/memory/"
+        },
+        {
+          "input": "~/\\memory",
+          "directory": "/Users/Fixture/\\memory/"
+        },
+        {
+          "input": "~/C:/memory",
+          "directory": "/Users/Fixture/C:/memory/"
+        },
+        {
+          "input": "~/D:memory",
+          "directory": "/Users/Fixture/D:memory/"
+        },
+        {
+          "input": "C:/a/D:/memory",
+          "directory": null
+        },
+        {
+          "input": "C:relative",
+          "directory": null
+        },
+        {
+          "input": "C:/a/../../memory",
+          "directory": null
+        },
+        {
+          "input": "//foo",
+          "directory": "/foo/"
+        },
+        {
+          "input": "//server/share",
+          "directory": "/server/share/"
+        },
+        {
+          "input": "/memory\\",
+          "directory": "/memory/"
+        },
+        {
+          "input": "/a/../memory",
+          "directory": "/memory/"
+        },
+        {
+          "input": " /memory",
+          "directory": null
+        },
+        {
+          "input": "~/a\\..\\memory",
+          "directory": "/Users/Fixture/a\\..\\memory/"
+        },
+        {
+          "input": "C:/memory/./",
+          "directory": null
+        },
+        {
+          "input": "C:/MEMORY/../memory",
+          "directory": null
+        },
+        {
+          "input": "C:/segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../memory",
+          "directory": null
+        },
+        {
+          "input": "/segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../segment/../memory",
+          "directory": "/memory/"
+        },
+        {
+          "input": "/discard\u0000/../memory",
+          "directory": "/memory/"
+        },
+        {
+          "input": "~/discard\u0000/../memory",
+          "directory": "/Users/Fixture/memory/"
+        }
+      ]
+    },
+    {
+      "platform": "windows",
+      "home": "\\\\?\\C:\\Users\\Fixture",
+      "cases": [
+        {
+          "input": "~/memory",
+          "directory": null
+        },
+        {
+          "input": "~/a/../memory",
+          "directory": null
+        },
+        {
+          "input": "C:/memory",
+          "directory": "C:\\memory\\"
+        }
+      ]
+    }
+  ]
+}

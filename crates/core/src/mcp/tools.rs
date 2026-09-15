@@ -30,6 +30,7 @@ pub struct McpWorkspace<'a> {
     device_id: DeviceId,
     vault_state: VaultState,
     sync_state: SyncState,
+    sync_identity: Option<crate::sync::SyncIdentity<'a>>,
 }
 
 impl<'a> McpWorkspace<'a> {
@@ -48,6 +49,24 @@ impl<'a> McpWorkspace<'a> {
             device_id,
             vault_state,
             sync_state,
+            sync_identity: None,
+        }
+    }
+
+    pub fn with_sync_identity(
+        mut self,
+        identity: crate::sync::SyncIdentity<'a>,
+    ) -> Result<Self, ClientError> {
+        OfflineWorkspace::new(self.vault, self.device_id).with_sync_identity(identity)?;
+        self.sync_identity = Some(identity);
+        Ok(self)
+    }
+
+    fn workspace(&mut self) -> Result<OfflineWorkspace<'_>, ClientError> {
+        let workspace = OfflineWorkspace::new(self.vault, self.device_id);
+        match self.sync_identity {
+            Some(identity) => workspace.with_sync_identity(identity),
+            None => Ok(workspace),
         }
     }
 
@@ -128,7 +147,7 @@ impl<'a> McpWorkspace<'a> {
         input: ListTasksInput,
     ) -> Result<ListTasksOutput, ClientError> {
         let project_id = resolved.access.require_tasks(false)?;
-        let tasks = OfflineWorkspace::new(self.vault, self.device_id).tasks(project_id)?;
+        let tasks = self.workspace()?.tasks(project_id)?;
         let output = ListTasksOutput {
             tasks: tasks
                 .into_iter()
@@ -170,7 +189,7 @@ impl<'a> McpWorkspace<'a> {
             status: input.status,
             expected_revision: input.expected_revision,
         };
-        let mut workspace = OfflineWorkspace::new(self.vault, self.device_id);
+        let mut workspace = self.workspace()?;
         let prospective = workspace.preview_task_upsert(&params)?;
         if prospective.project_id != project_id {
             return Err(scope_denied());
@@ -204,7 +223,7 @@ impl<'a> McpWorkspace<'a> {
             expected_revision: input.expected_revision,
             evidence: input.evidence,
         };
-        let mut workspace = OfflineWorkspace::new(self.vault, self.device_id);
+        let mut workspace = self.workspace()?;
         let prospective = workspace.preview_task_completion(&params)?;
         if prospective.project_id != project_id {
             return Err(scope_denied());
@@ -237,7 +256,7 @@ impl<'a> McpWorkspace<'a> {
         resolved: &ResolvedMcpBinding,
         input: ArchiveMemoryInput,
     ) -> Result<ArchiveMemoryOutput, ClientError> {
-        let mut workspace = OfflineWorkspace::new(self.vault, self.device_id);
+        let mut workspace = self.workspace()?;
         let existing = workspace
             .memory(input.memory_id)?
             .ok_or_else(record_not_found)?;
@@ -260,7 +279,7 @@ impl<'a> McpWorkspace<'a> {
         resolved: &ResolvedMcpBinding,
         input: UpdateMemoryInput,
     ) -> Result<UpdateMemoryOutput, ClientError> {
-        let mut workspace = OfflineWorkspace::new(self.vault, self.device_id);
+        let mut workspace = self.workspace()?;
         let existing = workspace
             .memory(input.memory_id)?
             .ok_or_else(record_not_found)?;
@@ -292,7 +311,7 @@ impl<'a> McpWorkspace<'a> {
             .map(|project| project.project_id);
         let scope = AllowedSearchScope::resolve(input.scope, &resolved.policy, active_project)
             .map_err(|_| scope_denied())?;
-        let records = OfflineWorkspace::new(self.vault, self.device_id).search_records(
+        let records = self.workspace()?.search_records(
             &input.query,
             &scope,
             usize::from(input.limit.unwrap_or(20)),
@@ -341,7 +360,7 @@ impl<'a> McpWorkspace<'a> {
     ) -> Result<GetOutput, ClientError> {
         let memory_id =
             MemoryId::new(input.record_id.into_uuid()).map_err(|_| invalid_arguments())?;
-        let workspace = OfflineWorkspace::new(self.vault, self.device_id);
+        let workspace = self.workspace()?;
         if let Some(memory) = workspace.memory(memory_id)? {
             require_record_access(resolved, &memory.scope, false)?;
             return Ok(GetOutput {
@@ -363,7 +382,7 @@ impl<'a> McpWorkspace<'a> {
         input: ProposeMemoryInput,
     ) -> Result<ProposeMemoryOutput, ClientError> {
         let scope = resolved.access.write_scope(input.scope)?;
-        let mut workspace = OfflineWorkspace::new(self.vault, self.device_id);
+        let mut workspace = self.workspace()?;
         let candidate_id =
             CandidateId::new(input.operation_id.into_uuid()).map_err(|_| invalid_arguments())?;
         if let Some(existing) = workspace.candidate(candidate_id)? {
@@ -393,7 +412,7 @@ impl<'a> McpWorkspace<'a> {
             body_markdown: input.markdown,
             tags: input.tags,
         };
-        let mut workspace = OfflineWorkspace::new(self.vault, self.device_id);
+        let mut workspace = self.workspace()?;
         let memory_id =
             MemoryId::new(params.operation_id.into_uuid()).map_err(|_| invalid_arguments())?;
         if let Some(existing) = workspace.memory(memory_id)? {

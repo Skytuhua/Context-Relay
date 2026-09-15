@@ -25,6 +25,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 dirs = "6.0.0"
 ed25519-dalek = { version = "2.2.0", features = ["zeroize"] }
 fastembed = { version = "=5.17.3", default-features = false, features = ["ort-load-dynamic"] }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic"] }
 hkdf = "0.12.4"
 hmac = "0.12.1"
 keyring = { version = "=4.1.5", default-features = false, features = ["v1"] }

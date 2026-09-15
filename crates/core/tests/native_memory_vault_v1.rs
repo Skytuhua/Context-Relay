@@ -1419,7 +1419,7 @@ fn native_candidates_are_deterministic_bound_and_atomically_replayed() {
         vec!["native-import", "claude-code"]
     );
     assert_eq!(initial.evidence_summary, "initial native-memory preview");
-    assert_eq!(
+    assert_ne!(
         initial.id.to_string(),
         initial.proposed_memory.id.to_string()
     );
@@ -1453,6 +1453,7 @@ fn native_candidates_are_deterministic_bound_and_atomically_replayed() {
         .unwrap()
         .unwrap();
     assert_eq!(deterministic.id, initial.id);
+    assert_eq!(deterministic.proposed_memory.id, initial.proposed_memory.id);
 
     let mut service = OfflineWorkspace::new(&mut vault_a, ID_7.parse().unwrap());
     let live = service
@@ -1525,6 +1526,13 @@ fn direct_candidate_persistence_replay_is_idempotent() {
     let target_path = TempVault::new("native-memory-replay-target");
     let target_keys = MemoryKeyStore::default();
     let mut target = Vault::open(target_path.path(), CREDENTIAL, &target_keys).unwrap();
+    let mut legacy = candidate.clone();
+    legacy.proposed_memory.id = legacy.id.to_string().parse().unwrap();
+    assert!(
+        target
+            .put_native_memory_candidate(&ledger, Some(&legacy))
+            .is_err()
+    );
     target
         .put_native_memory_candidate(&ledger, Some(&candidate))
         .unwrap();
@@ -1541,11 +1549,14 @@ fn direct_candidate_persistence_replay_is_idempotent() {
 
 #[test]
 fn reverting_to_seen_content_advances_the_ledger_without_rewriting_the_candidate() {
-    for reviewed_state in [
+    for (reviewed_state, legacy_ids) in [
         CandidateState::Pending,
         CandidateState::Accepted,
         CandidateState::Rejected,
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|state| [false, true].map(|legacy| (state, legacy)))
+    {
         let suffix = match reviewed_state {
             CandidateState::Pending => "pending",
             CandidateState::Accepted => "accepted",
@@ -1556,14 +1567,27 @@ fn reverting_to_seen_content_advances_the_ledger_without_rewriting_the_candidate
             HarnessId::Codex,
             &format!("revert-{suffix}"),
         );
-        let path = TempVault::new(&format!("native-memory-revert-{suffix}"));
+        let path = TempVault::new(&format!("native-memory-revert-{suffix}-{legacy_ids}"));
         let keys = MemoryKeyStore::default();
         let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
-        let initial = OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
+        let mut initial = OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
             .reconcile_native_memory(ready(source.clone(), "content A"))
             .unwrap()
             .unwrap();
-        let preserved = if reviewed_state == CandidateState::Pending {
+        assert_ne!(initial.id.as_bytes(), initial.proposed_memory.id.as_bytes());
+        if legacy_ids {
+            initial.proposed_memory.id = initial.id.to_string().parse().unwrap();
+            let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+            raw.execute(
+                "UPDATE candidates SET payload_json = ?1 WHERE id = ?2",
+                params![
+                    serde_json::to_vec(&initial).unwrap(),
+                    initial.id.to_string()
+                ],
+            )
+            .unwrap();
+        }
+        let mut preserved = if reviewed_state == CandidateState::Pending {
             initial.clone()
         } else {
             OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
@@ -1574,6 +1598,26 @@ fn reverting_to_seen_content_advances_the_ledger_without_rewriting_the_candidate
                 })
                 .unwrap()
         };
+        let original_review = preserved.clone();
+        if legacy_ids {
+            let old_id = initial.id.to_string();
+            preserved.id = ID_1.parse().unwrap();
+            let raw = open_keyed(path.path(), &keys.key(CREDENTIAL));
+            raw.execute(
+                "UPDATE candidates SET id = ?2, payload_json = ?3 WHERE id = ?1",
+                params![
+                    old_id,
+                    preserved.id.to_string(),
+                    serde_json::to_vec(&preserved).unwrap()
+                ],
+            )
+            .unwrap();
+            raw.execute(
+                "INSERT INTO candidate_aliases(legacy_id, canonical_id) VALUES (?1,?2)",
+                params![old_id, preserved.id.to_string()],
+            )
+            .unwrap();
+        }
 
         let live = OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
             .reconcile_native_memory(ready_live(source.clone(), "content B"))
@@ -1586,7 +1630,10 @@ fn reverting_to_seen_content_advances_the_ledger_without_rewriting_the_candidate
             .unwrap();
 
         assert_eq!(reverted, None);
-        assert_eq!(vault.candidate(&initial.id).unwrap(), Some(preserved));
+        assert_eq!(
+            vault.candidate(&initial.id).unwrap(),
+            Some(preserved.clone())
+        );
         assert_eq!(vault.candidates(None).unwrap().len(), 2);
         let ledger = vault.native_memory_ledger(&source.id).unwrap().unwrap();
         assert_eq!(
@@ -1601,6 +1648,24 @@ fn reverting_to_seen_content_advances_the_ledger_without_rewriting_the_candidate
             vault.memory(&initial.proposed_memory.id).unwrap().is_some(),
             reviewed_state == CandidateState::Accepted
         );
+        drop(vault);
+        let mut vault = Vault::open(path.path(), CREDENTIAL, &keys).unwrap();
+        assert_eq!(
+            vault.candidate(&initial.id).unwrap(),
+            Some(preserved.clone())
+        );
+        if reviewed_state != CandidateState::Pending {
+            assert_eq!(
+                OfflineWorkspace::new(&mut vault, ID_7.parse().unwrap())
+                    .review_candidate(CandidateReviewParams {
+                        candidate_id: initial.id,
+                        accepted: reviewed_state == CandidateState::Accepted,
+                        operation_id: ID_7.parse().unwrap(),
+                    })
+                    .unwrap(),
+                original_review
+            );
+        }
     }
 }
 

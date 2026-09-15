@@ -15,11 +15,53 @@ use serde_json::{Value, json};
 const ENROLLMENT_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c07398f";
 const DEVICE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073990";
 
+#[test]
+fn restore_request_redacts_phrase_and_status_has_closed_wire_shape() {
+    let parsed: JsonRpcRequestV1 = serde_json::from_value(request(
+        "recovery_restore_begin",
+        json!({"recoveryPhraseWords":vec!["abandon";24]}),
+    ))
+    .unwrap();
+    assert!(!format!("{parsed:?}").contains("abandon"));
+    assert!(
+        serde_json::from_value::<JsonRpcRequestV1>(request(
+            "recovery_restore_begin",
+            json!({"recoveryPhraseWords":vec!["abandon";23]})
+        ))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<JsonRpcRequestV1>(request(
+            "recovery_restore_begin",
+            json!({"recoveryPhraseWords":vec!["abandon";24],"sessionId":"unexpected"})
+        ))
+        .is_err()
+    );
+    let status = context_relay_protocol::RecoveryRestoreStatus::Submitting {
+        restore_id: ENROLLMENT_ID.parse().unwrap(),
+    };
+    let wire = serde_json::to_value(&status).unwrap();
+    assert_eq!(
+        wire,
+        json!({"state":"submitting","restoreId":ENROLLMENT_ID})
+    );
+    assert_eq!(
+        serde_json::from_value::<context_relay_protocol::RecoveryRestoreStatus>(wire).unwrap(),
+        status
+    );
+    assert!(
+        serde_json::from_value::<context_relay_protocol::RecoveryRestoreStatus>(
+            json!({"state":"idle","restoreId":ENROLLMENT_ID})
+        )
+        .is_err()
+    );
+}
+
 fn request(method: &str, params: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": support::ID,
-        "protocol": {"major": 1, "minor": 4},
+        "protocol": {"major": 1, "minor": 17},
         "daemonInstanceNonce": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
         "method": method,
         "params": params,
@@ -437,4 +479,56 @@ fn phrase_and_challenge_require_the_exact_ten_minute_window() {
 #[test]
 fn recovery_host_is_a_distinct_role() {
     assert_ne!(ClientRole::Desktop, ClientRole::DesktopRecoveryHost);
+}
+
+#[test]
+fn explicit_history_fixture_and_endpoint_semantics_are_strict() {
+    use context_relay_protocol::{LocalResult, RecoveryHistoryCandidatesPage};
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/runtime-contracts-v1.json")).unwrap();
+    let page: RecoveryHistoryCandidatesPage =
+        serde_json::from_value(fixture["recoveryHistoryCandidatesPage"].clone()).unwrap();
+    page.validate().unwrap();
+    assert_eq!(
+        serde_json::to_value(page.clone()).unwrap(),
+        fixture["recoveryHistoryCandidatesPage"]
+    );
+    let mut invalid = page.clone();
+    invalid.candidates = vec![page.candidates[0].clone(); 9];
+    assert!(invalid.validate().is_err());
+    let mut invalid = page.clone();
+    invalid.candidates[0].frontier_device_count =
+        (context_relay_protocol::MAX_BATCH_OPERATIONS + 1) as u32;
+    invalid.candidates[0].extent = context_relay_protocol::RecoveryHistoryExtent::Supported {
+        operation_count: invalid.candidates[0].frontier_device_count,
+    };
+    assert!(invalid.validate().is_err());
+    let mut invalid = page.clone();
+    invalid.next_cursor = None;
+    assert!(invalid.validate().is_err());
+    let mut invalid = page;
+    invalid
+        .next_cursor
+        .as_mut()
+        .unwrap()
+        .accepted_endpoint_sha256 = context_relay_protocol::Sha256Digest([9; 32]);
+    assert!(invalid.validate().is_err());
+    for state in [
+        "incomplete",
+        "historical_keys_needed",
+        "current_material_unavailable",
+        "stale_endpoint",
+    ] {
+        let mut status = fixture["recoveryHistoryStatus"].clone();
+        status["history"]["state"] = state.into();
+        if state != "stale_endpoint" {
+            status["history"]["selectedEndpoint"]["stateSha256"] = "33".repeat(32).into();
+        }
+        assert!(
+            serde_json::from_value::<LocalResult>(
+                serde_json::json!({"kind":"recovery_restore_status","data":{"status":status}})
+            )
+            .is_err()
+        );
+    }
 }

@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     fmt,
     future::Future,
-    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
@@ -271,12 +270,7 @@ impl Client {
         )
         .await?;
         let token = load_installation_token()?;
-        let client_nonce = generate_instance_nonce()?;
-        let request_id = RecordId::new(uuid::Uuid::now_v7())
-            .expect("UUID v7 constructor returns a valid RecordId");
-        Ok(Self {
-            inner: client_handshake(stream, role, &token, client_nonce, request_id).await?,
-        })
+        Self::from_stream(stream, role, &token).await
     }
 
     #[cfg(feature = "test-support")]
@@ -286,6 +280,14 @@ impl Client {
         token: &InstallationToken,
     ) -> Result<Self, IpcError> {
         let stream = connect(runtime).await?;
+        Self::from_stream(stream, role, token).await
+    }
+
+    pub(crate) async fn from_stream(
+        stream: ConnectedStream,
+        role: ClientRole,
+        token: &InstallationToken,
+    ) -> Result<Self, IpcError> {
         let client_nonce = generate_instance_nonce()?;
         let request_id = RecordId::new(uuid::Uuid::now_v7())
             .expect("UUID v7 constructor returns a valid RecordId");
@@ -340,19 +342,188 @@ fn launch_daemon_sibling() -> Result<(), IpcError> {
         "context-relay-contextd{}",
         std::env::consts::EXE_SUFFIX
     ));
+    spawn_daemon(&daemon).map_err(|_| IpcError::Io)
+}
+
+#[cfg(not(windows))]
+fn spawn_daemon(daemon: &std::path::Path) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+
     let mut command = Command::new(daemon);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+    command.spawn().map(|_| ())
+}
 
-        command.creation_flags(CREATE_NO_WINDOW);
+#[cfg(windows)]
+fn spawn_daemon(daemon: &std::path::Path) -> std::io::Result<()> {
+    let mut command_line = daemon_command_line(daemon)?;
+    spawn_detached_process(daemon, &mut command_line).map(drop)
+}
+
+#[cfg(windows)]
+fn daemon_command_line(daemon: &std::path::Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let executable: Vec<_> = daemon.as_os_str().encode_wide().collect();
+    if executable.is_empty() || executable.iter().any(|unit| matches!(unit, 0 | 34)) {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
     }
-    command.spawn().map(|_| ()).map_err(|_| IpcError::Io)
+    // Only argv[0] is supplied in production. Quoting preserves executable paths
+    // containing spaces; a Windows executable filename cannot contain a quote.
+    Ok([&[34][..], &executable, &[34, 0]].concat())
+}
+
+#[cfg(windows)]
+fn spawn_detached_process(
+    executable: &std::path::Path,
+    command_line: &mut [u16],
+) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::{
+        os::windows::{
+            ffi::OsStrExt,
+            io::{FromRawHandle, OwnedHandle},
+        },
+        ptr::null,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
+
+    let application: Vec<_> = executable.as_os_str().encode_wide().chain([0]).collect();
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut information = PROCESS_INFORMATION::default();
+    // The daemon must not retain any inheritable launcher handles, including
+    // redirected MCP pipes. Stdio::null alone still inherits those handles on Windows.
+    // Both buffers are terminated UTF-16; CreateProcessW may mutate command_line.
+    let created = unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            null(),
+            null(),
+            &startup,
+            &mut information,
+        )
+    };
+    if created == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Each successful CreateProcessW call returns two owned handles. Closing
+    // them does not terminate the child or tie its lifetime to the launcher.
+    let process = unsafe { OwnedHandle::from_raw_handle(information.hProcess) };
+    let _thread = unsafe { OwnedHandle::from_raw_handle(information.hThread) };
+    Ok(process)
+}
+
+#[cfg(all(test, windows))]
+mod windows_launch_tests {
+    use std::{
+        fs,
+        io::Read,
+        os::windows::process::CommandExt,
+        process::{Command, Stdio},
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    use super::{daemon_command_line, spawn_detached_process};
+
+    #[test]
+    fn daemon_launch_does_not_keep_its_exited_parents_stderr_pipe_open() {
+        let root =
+            std::env::temp_dir().join(format!("test-daemon-launch-{}", uuid::Uuid::now_v7()));
+        fs::create_dir(&root).unwrap();
+        let mut bridge = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "connection::windows_launch_tests::bridge_launch_fixture",
+                "--ignored",
+            ])
+            .env("CONTEXT_RELAY_LAUNCH_TEST_ROOT", &root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        let mut stderr = bridge.stderr.take().unwrap();
+        assert!(bridge.wait().unwrap().success());
+        wait_for_marker(&root.join("ready"));
+        let (send, receive) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            send.send(stderr.read_to_end(&mut bytes)).unwrap();
+        });
+        let eof_while_daemon_alive = receive.recv_timeout(Duration::from_millis(200));
+        assert!(
+            !root.join("exited").exists(),
+            "fixture must remain alive during the pipe check"
+        );
+        fs::write(root.join("exit"), b"").unwrap();
+        wait_for_marker(&root.join("exited"));
+        reader.join().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(
+            matches!(eof_while_daemon_alive, Ok(Ok(_))),
+            "daemon inherited stderr and held the exited bridge's pipe open: {eof_while_daemon_alive:?}"
+        );
+    }
+
+    fn wait_for_marker(path: &std::path::Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "fixture marker timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bridge_launch_fixture() {
+        assert!(std::env::var_os("CONTEXT_RELAY_LAUNCH_TEST_ROOT").is_some());
+        let executable = std::env::current_exe().unwrap();
+        let mut command_line = daemon_command_line(&executable).unwrap();
+        command_line.pop();
+        command_line.extend(
+            " --exact connection::windows_launch_tests::lingering_child_fixture --ignored"
+                .encode_utf16(),
+        );
+        command_line.push(0);
+        spawn_detached_process(&executable, &mut command_line).unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn lingering_child_fixture() {
+        let root =
+            std::path::PathBuf::from(std::env::var_os("CONTEXT_RELAY_LAUNCH_TEST_ROOT").unwrap());
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("test-daemon-launch-")
+        );
+        fs::write(root.join("ready"), b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !root.join("exit").exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(root.join("exited"), b"").unwrap();
+    }
 }
 
 pub struct AuthenticatedConnection {

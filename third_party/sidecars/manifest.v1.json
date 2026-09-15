@@ -272,7 +272,7 @@
       },
       "relinking": {
         "path": "third_party/sidecars/semgrep/RELINKING.md",
-        "sha256": "aac857bc70fac3e3775dde65dddddbd472540107818ca1d4b3846e655443f170"
+        "sha256": "9727aed08662d29c779b1d43fe206e3f2e3950b507b9b3a3bb1fe50aaa37c308"
       },
       "materials": [
         {
@@ -298,7 +298,7 @@
         {
           "role": "windows-build",
           "path": "third_party/sidecars/semgrep/build-public-source-windows.ps1",
-          "sha256": "6cbb15b8b77f6b0bf012811cd5c70bb9d8ce82123a310ac5f113d96013d08c2e"
+          "sha256": "fbb06c52646783a54b2695c8ad6f88be1942d19ff6251b4aa4bc465b0f87703a"
         },
         {
           "role": "windows-builder-evidence-schema",
@@ -323,12 +323,12 @@
         {
           "role": "source-bundle-generator",
           "path": "scripts/semgrep-source-bundle.mjs",
-          "sha256": "092fe2855df51267ca3c8525c0b404c3ca0587470cedfc63bf1818df60e72007"
+          "sha256": "199b18ff2bac412ded23b036cdef86ba1ea0402f55152b2743250be39d8ab9af"
         },
         {
           "role": "source-bundle-evidence",
           "path": "third_party/sidecars/semgrep/bundle-evidence.v1.json",
-          "sha256": "148ebdc33708cd551b0700e49328b5259867f5f8857a6db517dae14125f117d7"
+          "sha256": "c0683dcb75c31fa4084c8a8e16a4b340d8031907404835cba05354fe7e087474"
         },
         {
           "role": "manifest-rule",
@@ -339,6 +339,16 @@
           "role": "package-policy",
           "path": "third_party/sidecars/policies/semgrep-package.yml",
           "sha256": "f3f38cae0178fd685614c0121edc9ff7eed99d8474e909ef519bffc64cb9481d"
+        },
+        {
+          "role": "windows-offline-firewall",
+          "path": "third_party/sidecars/semgrep/windows-offline-firewall.ps1",
+          "sha256": "7de266db35ecb475ab014a11c0d19f6219148a8d396770583ed7033cc7f588f9"
+        },
+        {
+          "role": "windows-firewall-diagnostic",
+          "path": "third_party/sidecars/semgrep/diagnose-windows-firewall.ps1",
+          "sha256": "33f1943325527cde177d8b5cb27763d34381ac888fd5b2797dc994fc594963d8"
         }
       ],
       "commandTemplate": {

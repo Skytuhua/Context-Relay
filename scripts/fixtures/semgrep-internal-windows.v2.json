@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 2,
+  "purpose": "internal-windows-package-qualification",
+  "publishable": false,
+  "enabled": true,
+  "target": "windows-x86_64",
+  "sidecar": "semgrep",
+  "version": "1.170.0",
+  "applicationSourceCommit": "1111111111111111111111111111111111111111",
+  "qualification": {
+    "commit": "2222222222222222222222222222222222222222",
+    "runId": "1234",
+    "runAttempt": 1,
+    "workflowRef": "Skytuhua/Context-Relay/.github/workflows/ci.yml@refs/pull/16/merge",
+    "workflowSha": "3333333333333333333333333333333333333333"
+  },
+  "sidecarManifest": {
+    "path": "sidecars/semgrep/verification/third_party/sidecars/manifest.v1.json",
+    "size": 1,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "sourceLock": {
+    "path": "sidecars/semgrep/verification/third_party/sidecars/semgrep/source-lock.v1.json",
+    "size": 1,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "nativeBuildEvidence": {
+    "path": "sidecars/semgrep/verification/third_party/sidecars/semgrep/native-build-evidence.v1.json",
+    "size": 1,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "bundleEvidence": {
+    "path": "sidecars/semgrep/verification/third_party/sidecars/semgrep/bundle-evidence.internal-windows.v2.json",
+    "size": 1,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "commandTemplate": {
+    "id": "osemgrep-scan-v1",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "archive": {
+    "format": "tar.gz",
+    "size": 1,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "entries": [
+      {
+        "path": "osemgrep.exe",
+        "type": "file",
+        "size": 1
+      }
+    ],
+    "extractPath": "osemgrep.exe"
+  },
+  "executable": {
+    "path": "osemgrep.exe",
+    "size": 1,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "closure": [
+    {
+      "path": "osemgrep.exe",
+      "size": 1,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "executable": true
+    }
+  ],
+  "sourceCompanion": {
+    "path": "compliance/semgrep/semgrep-1.170.0-corresponding-source.tar",
+    "size": 1024,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "payloadEntries": 1,
+    "recordedLinks": 0
+  },
+  "complianceManifest": {
+    "path": "compliance/manifest.v1.json",
+    "size": 1,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}

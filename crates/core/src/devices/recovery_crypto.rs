@@ -17,8 +17,8 @@ use crate::{
     },
     devices::crypto::{
         PairingKeyBundle, certificate_digest, decode_certificate_v1, decode_native_platform,
-        decode_pairing_key_bundle_v1, decode_wrapped_envelope_with_limit, encode_certificate_v1,
-        encode_native_platform, encode_pairing_key_bundle_v1, encode_wrapped_envelope,
+        decode_pairing_key_bundle, decode_wrapped_envelope_with_limit, encode_certificate_v1,
+        encode_native_platform, encode_pairing_key_bundle, encode_wrapped_envelope,
     },
 };
 
@@ -30,6 +30,45 @@ const RECOVERY_ENROLLMENT_SIGNING_DOMAIN: &[u8] = b"context-relay/recovery-enrol
 const RECOVERY_METADATA_AAD_DOMAIN: &[u8] = b"context-relay/recovery-metadata/v1\0";
 const DEVICE_WORKSPACE_MATERIAL_AAD_DOMAIN: &[u8] = b"context-relay/device-workspace-material/v1\0";
 const MIN_WRAPPED_CIPHERTEXT_BYTES: usize = 16;
+
+/// Server reservation context; the provider must independently check ownership,
+/// expiry and exact nonce before accepting the proof. This grants no authority alone.
+pub struct HostedEnrollmentChallenge {
+    pub reservation_id: context_relay_protocol::OperationId,
+    pub auth_user_id: uuid::Uuid,
+    pub session_id: uuid::Uuid,
+    pub nonce: [u8; 32],
+}
+
+pub fn hosted_enrollment_proof_preimage(
+    challenge: &HostedEnrollmentChallenge,
+    record: &RecoveryEnrollmentRecordV1,
+) -> Result<Vec<u8>, RecoveryEnrollmentCryptoError> {
+    if challenge.auth_user_id.is_nil() || challenge.session_id.is_nil() {
+        return Err(RecoveryEnrollmentCryptoError::InvalidRecord);
+    }
+    let canonical = encode_recovery_enrollment_record_v1(record)?;
+    let mut preimage = b"context-relay/hosted-enrollment-device-proof/v1\0".to_vec();
+    preimage.extend_from_slice(challenge.reservation_id.as_bytes());
+    preimage.extend_from_slice(challenge.auth_user_id.as_bytes());
+    preimage.extend_from_slice(challenge.session_id.as_bytes());
+    preimage.extend_from_slice(&challenge.nonce);
+    preimage.extend_from_slice(&Sha256::digest(canonical));
+    Ok(preimage)
+}
+
+pub fn sign_hosted_enrollment_proof(
+    device: &DeviceKeys,
+    challenge: &HostedEnrollmentChallenge,
+    record: &RecoveryEnrollmentRecordV1,
+) -> Result<Ed25519SignatureBytes, RecoveryEnrollmentCryptoError> {
+    if device.signing_public_key() != record.genesis_certificate.signing_public_key
+        || device.wrapping_public_key() != record.genesis_certificate.wrapping_public_key
+    {
+        return Err(RecoveryEnrollmentCryptoError::InvalidRecord);
+    }
+    Ok(device.sign_hosted_device_proof(&hosted_enrollment_proof_preimage(challenge, record)?))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RecoveryEnrollmentCryptoError {
@@ -201,7 +240,7 @@ pub(crate) fn build_recovery_enrollment_artifacts_inner<R: CryptoRng + RngCore>(
     };
 
     let certificate_sha256 = certificate_digest(&record.genesis_certificate)?;
-    let plaintext = encode_pairing_key_bundle_v1(material)?;
+    let plaintext = encode_pairing_key_bundle(material)?;
     let recovery_aad = recovery_metadata_aad(&record, certificate_sha256);
     record.encrypted_recovery_metadata = wrap_secret_with_rng(
         record.recovery_wrapping_public_key,
@@ -343,7 +382,7 @@ pub fn open_recovery_metadata(
     let certificate_sha256 = certificate_digest(&record.genesis_certificate)?;
     let aad = recovery_metadata_aad(record, certificate_sha256);
     let plaintext = recovery_keys.unwrap_secret(&record.encrypted_recovery_metadata, &aad)?;
-    let material = decode_pairing_key_bundle_v1(plaintext.expose())?;
+    let material = decode_pairing_key_bundle(plaintext.expose())?;
     validate_opened_material(record, &material)?;
     Ok(material)
 }
@@ -366,7 +405,7 @@ pub fn open_device_workspace_material(
     let certificate_sha256 = certificate_digest(certificate)?;
     let aad = device_workspace_material_aad(record, certificate_sha256, device_id, device_keys);
     let plaintext = device_keys.unwrap_secret(envelope, &aad)?;
-    let material = decode_pairing_key_bundle_v1(plaintext.expose())?;
+    let material = decode_pairing_key_bundle(plaintext.expose())?;
     validate_opened_material(record, &material)?;
     Ok(material)
 }

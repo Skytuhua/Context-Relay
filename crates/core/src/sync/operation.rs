@@ -76,6 +76,7 @@ impl SyncError {
 impl Error for SyncError {}
 
 pub struct BuiltOperation {
+    pub(crate) membership_endpoint: Option<crate::devices::membership_crypto::MembershipEndpoint>,
     pub operation: SyncOperationV1,
     pub canonical_bytes: Vec<u8>,
     pub canonical_hash: Sha256Digest,
@@ -230,6 +231,7 @@ impl<'a> OperationBuilder<'a> {
         let canonical_hash = digest(&canonical_bytes);
 
         Ok(BuiltOperation {
+            membership_endpoint: self.identity.membership_endpoint,
             operation,
             sealed_mutation_hash: mutation_hash,
             sealed_operation_hash: canonical_hash,
@@ -241,6 +243,7 @@ impl<'a> OperationBuilder<'a> {
 
 pub struct TrustedOperationContext<'a> {
     certificate: &'a DeviceCertificateV1,
+    expected_control_epoch: u32,
     expected_key_epoch: u32,
     previous: Option<OperationChainHead>,
     existing_record_scope: Option<ScopeRef>,
@@ -254,10 +257,19 @@ impl<'a> TrustedOperationContext<'a> {
     ) -> Self {
         Self {
             certificate,
+            expected_control_epoch: certificate.control_epoch,
             expected_key_epoch,
             previous,
             existing_record_scope: None,
         }
+    }
+
+    /// The authenticated current roster must authorize this exact certificate.
+    /// An older issuance epoch alone never establishes continuing authority.
+    #[must_use]
+    pub(crate) const fn with_current_control_epoch(mut self, epoch: u32) -> Self {
+        self.expected_control_epoch = epoch;
+        self
     }
 
     /// Supplies caller-admitted existing-record scope for tombstone verification.
@@ -363,7 +375,9 @@ fn validate_trusted_fields(
     if operation.account_id != certificate.account_id
         || operation.workspace_id != certificate.workspace_id
         || operation.device_id != certificate.device_id
-        || operation.control_epoch != certificate.control_epoch
+        || certificate.control_epoch == 0
+        || certificate.control_epoch > trusted.expected_control_epoch
+        || operation.control_epoch != trusted.expected_control_epoch
         || operation.key_epoch != trusted.expected_key_epoch
         || operation.created_hlc.node != operation.device_id
     {
@@ -490,6 +504,7 @@ mod tests {
         let keys = DeviceKeys::from_seeds([7; 32], [9; 32]);
         let content_key = ContentKey::from_bytes([11; 32]);
         let identity = SyncIdentity {
+            membership_endpoint: None,
             account_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073981"),
             workspace_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073982"),
             device_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073983"),
@@ -547,6 +562,7 @@ mod tests {
         let debug = format!(
             "{:#?}",
             OperationBuilder::new(SyncIdentity {
+                membership_endpoint: None,
                 account_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073981"),
                 workspace_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073982"),
                 device_id: id("018f22e2-79b0-7cc8-98c4-dc0c0c073983"),

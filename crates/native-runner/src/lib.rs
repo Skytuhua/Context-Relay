@@ -6,6 +6,8 @@ mod helper_protocol;
 mod hydration;
 mod launcher;
 mod macos_identity;
+#[cfg(any(target_os = "macos", test))]
+mod macos_library_constraint;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub mod macos_spawn;
@@ -14,6 +16,8 @@ mod native_fs;
 mod path_policy;
 mod report_validation;
 mod stage;
+#[cfg(windows)]
+pub mod windows_management;
 
 pub use command::{
     RuleSyncFeature, RuleSyncFeatures, RuleSyncTarget, SidecarCommand, WorkingDirectory,
@@ -34,19 +38,25 @@ pub use launcher::macos;
 #[cfg(windows)]
 pub use launcher::windows;
 pub use macos_identity::{MacRootIdentity, MacRootIdentityError};
+#[cfg(target_os = "macos")]
+pub use macos_library_constraint::verify_current_library_constraint;
 #[cfg(feature = "ci-candidate-sidecar-smoke")]
 pub use manifest::verify_ci_candidate_closure;
 pub use manifest::{
     RuntimeTarget, SidecarId, SidecarManifest, VerifiedClosure, VerifiedMaterial,
     parse_sidecar_manifest, verify_closure,
 };
+#[cfg(windows)]
+pub use native_fs::NativeReadLease;
 pub use native_fs::{
     AlternateStream, NativeMetadata, NativeMutationFailure, NativeMutationOutcome,
     NativeObjectToken, NativeRecoveryDisposition, NativeSnapshot, NativeState, NativeTreeInventory,
     OsNativeFileSystem, PinnedNativeDirectory, PrivateStage, equivalent_security_descriptors,
     inspect_native_tree,
 };
-pub use path_policy::{StagePath, validate_path_set, windows_ordinal_ignore_case_eq};
+pub use path_policy::{
+    StagePath, validate_path_set, validate_path_set_cancellable, windows_ordinal_ignore_case_eq,
+};
 pub use report_validation::{
     validate_gitleaks_report, validate_rulesync_outputs, validate_semgrep_report,
 };
@@ -54,6 +64,8 @@ pub use stage::{StageDirectory, StageLayout};
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum RunnerError {
+    #[error("native validation was canceled")]
+    Canceled,
     #[error("stage path is invalid")]
     InvalidPath,
     #[error("stage paths alias on the target filesystem")]

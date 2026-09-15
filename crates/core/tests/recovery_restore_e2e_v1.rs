@@ -37,7 +37,7 @@ use context_relay_core::{
         recovery_transport::RecoveryTransportError,
     },
     sync::SyncScope,
-    vault::{RecoveryRestorePersistenceState, Vault},
+    vault::Vault,
 };
 use context_relay_protocol::{
     AccountId, DeviceCertificateId, DeviceId, NativePlatform, RecoveryEnrollmentConfirmParams,
@@ -208,6 +208,7 @@ struct FaultedRestoreTransport {
     inner: InMemoryRecoveryRestoreTransport,
     fail_submit: Arc<AtomicBool>,
     fail_lookup: Arc<AtomicBool>,
+    submit_error: Arc<Mutex<Option<RecoveryTransportError>>>,
 }
 
 impl FaultedRestoreTransport {
@@ -216,6 +217,7 @@ impl FaultedRestoreTransport {
             inner,
             fail_submit: Arc::new(AtomicBool::new(true)),
             fail_lookup: Arc::new(AtomicBool::new(false)),
+            submit_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -224,6 +226,7 @@ impl FaultedRestoreTransport {
             inner,
             fail_submit: Arc::new(AtomicBool::new(false)),
             fail_lookup: Arc::new(AtomicBool::new(true)),
+            submit_error: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -237,6 +240,25 @@ impl RecoveryRestoreTransport for FaultedRestoreTransport {
         self.inner.root_snapshot()
     }
 
+    fn membership_endpoint(
+        &self,
+    ) -> Result<
+        context_relay_core::devices::membership_crypto::MembershipEndpoint,
+        RecoveryTransportError,
+    > {
+        self.inner.membership_endpoint()
+    }
+
+    fn membership_event(
+        &self,
+        successor: Sha256Digest,
+    ) -> Result<
+        Option<context_relay_core::devices::membership_transport::MembershipEventObject>,
+        RecoveryTransportError,
+    > {
+        self.inner.membership_event(successor)
+    }
+
     fn submit_restore(
         &self,
         canonical_claim: &[u8],
@@ -244,6 +266,9 @@ impl RecoveryRestoreTransport for FaultedRestoreTransport {
     ) -> Result<RecoveryRestoreReceipt, RecoveryTransportError> {
         if self.fail_submit.swap(false, Ordering::SeqCst) {
             return Err(RecoveryTransportError::Transient);
+        }
+        if let Some(error) = self.submit_error.lock().unwrap().take() {
+            return Err(error);
         }
         self.inner.submit_restore(canonical_claim, now_ms)
     }
@@ -257,6 +282,35 @@ impl RecoveryRestoreTransport for FaultedRestoreTransport {
         }
         self.inner.restore_claim(restore_id)
     }
+}
+
+fn bind_restore_intent(vault: &mut Vault) {
+    vault
+        .store_hosted_restore_intent(&context_relay_core::vault::HostedRestoreIntent {
+            project_url: "https://example.supabase.co/".into(),
+            user_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+            session_id: "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+        })
+        .unwrap();
+}
+
+fn activate_current(vault: &mut Vault, identity: &RecoveryRestoreIdentity<'_>) {
+    assert!(vault.trusted_workspace_material(identity.keys).is_err());
+    let endpoint = vault
+        .recovery_membership_admission(identity.keys)
+        .unwrap()
+        .unwrap();
+    vault
+        .activate_current_membership_material(
+            endpoint,
+            identity.device_id,
+            identity.keys,
+            context_relay_core::devices::membership_crypto::MembershipHistoryBudget {
+                max_events: 4096,
+                max_bytes: 64 * 1024 * 1024,
+            },
+        )
+        .unwrap();
 }
 
 fn open_keyed(path: &Path, key: &[u8; 32]) -> Connection {
@@ -408,6 +462,13 @@ fn correct_phrase_restores_a_fresh_vault_and_reopens_the_exact_material() {
     let path = TempVault::new("restore-happy-target");
     let key_store = MemoryKeyStore::default();
     let mut vault = Vault::open(path.path(), CREDENTIAL, &key_store).unwrap();
+    vault
+        .store_hosted_restore_intent(&context_relay_core::vault::HostedRestoreIntent {
+            project_url: "https://example.supabase.co/".into(),
+            user_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+            session_id: "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+        })
+        .unwrap();
     let recovered_keys = DeviceKeys::from_seeds_for_test([0x55; 32], [0x66; 32]);
     let (_, coordinator) = restore_coordinator(&source.provider, 20_000, 0x3000);
     let identity = RecoveryRestoreIdentity {
@@ -421,8 +482,35 @@ fn correct_phrase_restores_a_fresh_vault_and_reopens_the_exact_material() {
         coordinator
             .recover(&mut vault, source.phrase_words, &identity)
             .unwrap(),
-        RecoveryRestoreOutcome::Complete { .. }
+        RecoveryRestoreOutcome::RestoringHistory { .. }
     ));
+    assert!(
+        vault
+            .prepared_recovery_v2(&recovered_keys)
+            .unwrap()
+            .unwrap()
+            .canonical_claim
+            .starts_with(&[0xb0, 0, 2])
+    );
+    assert!(
+        vault.trusted_workspace_material(&recovered_keys).is_err(),
+        "admission alone is not current activation"
+    );
+    let admitted = vault
+        .recovery_membership_admission(&recovered_keys)
+        .unwrap()
+        .unwrap();
+    vault
+        .activate_current_membership_material(
+            admitted,
+            identity.device_id,
+            &recovered_keys,
+            context_relay_core::devices::membership_crypto::MembershipHistoryBudget {
+                max_events: 4096,
+                max_bytes: 64 * 1024 * 1024,
+            },
+        )
+        .unwrap();
     let material = vault.trusted_workspace_material(&recovered_keys).unwrap();
     assert_eq!(material.scope(), scope());
     assert_eq!(material.control_epoch(), 1);
@@ -497,11 +585,12 @@ fn prepared_and_provider_accepted_restores_resume_after_reopen_without_the_phras
         let mut reopened = Vault::open(path.path(), CREDENTIAL, &key_store).unwrap();
         assert!(matches!(
             resumed.resume_prepared(&mut reopened, &identity).unwrap(),
-            RecoveryRestoreOutcome::Complete {
+            RecoveryRestoreOutcome::RestoringHistory {
                 restore_id: completed,
                 ..
             } if completed == restore_id
         ));
+        activate_current(&mut reopened, &identity);
         assert_eq!(
             reopened
                 .trusted_workspace_material(&recovered_keys)
@@ -513,7 +602,7 @@ fn prepared_and_provider_accepted_restores_resume_after_reopen_without_the_phras
 }
 
 #[test]
-fn activation_abort_rolls_back_trust_then_exact_resume_completes() {
+fn current_activation_abort_preserves_admission_then_exact_retry_activates() {
     let source = enrolled_source("restore-activation-abort-source");
     let path = TempVault::new("restore-activation-abort-target");
     let key_store = MemoryKeyStore::default();
@@ -541,15 +630,7 @@ fn activation_abort_rolls_back_trust_then_exact_resume_completes() {
     drop(vault);
 
     let raw = open_keyed(path.path(), &key_store.key(CREDENTIAL));
-    raw.execute_batch(
-        "CREATE TRIGGER abort_restore_activation_e2e
-         BEFORE UPDATE OF state ON recovery_restores
-         WHEN NEW.state = 'active'
-         BEGIN
-           SELECT RAISE(ABORT, 'injected restore activation failure');
-         END;",
-    )
-    .unwrap();
+    raw.execute_batch("CREATE TRIGGER abort_restore_activation_e2e BEFORE INSERT ON membership_current_activation BEGIN SELECT RAISE(ABORT, 'injected current activation failure'); END;").unwrap();
     drop(raw);
     let coordinator = RecoveryRestoreCoordinator::new_for_test(
         clock.clone(),
@@ -557,16 +638,57 @@ fn activation_abort_rolls_back_trust_then_exact_resume_completes() {
         source.provider.restore_transport(scope()),
     );
     let mut reopened = Vault::open(path.path(), CREDENTIAL, &key_store).unwrap();
-    assert_eq!(
+    assert!(matches!(
         coordinator
             .resume_prepared(&mut reopened, &identity)
-            .unwrap_err(),
-        RecoveryRestoreCycleError::Transient
+            .unwrap(),
+        RecoveryRestoreOutcome::RestoringHistory { .. }
+    ));
+    let admitted = reopened
+        .recovery_membership_admission(&recovered_keys)
+        .unwrap()
+        .unwrap();
+    let exact = reopened
+        .prepared_recovery_v2(&recovered_keys)
+        .unwrap()
+        .unwrap()
+        .canonical_claim;
+    let budget = context_relay_core::devices::membership_crypto::MembershipHistoryBudget {
+        max_events: 4096,
+        max_bytes: 64 * 1024 * 1024,
+    };
+    assert!(
+        reopened
+            .activate_current_membership_material(
+                admitted,
+                identity.device_id,
+                &recovered_keys,
+                budget
+            )
+            .is_err()
     );
-    assert!(reopened.devices(scope()).unwrap().is_empty());
+    assert!(
+        reopened
+            .trusted_workspace_material(&recovered_keys)
+            .is_err()
+    );
+    assert_eq!(
+        reopened
+            .recovery_membership_admission(&recovered_keys)
+            .unwrap(),
+        Some(admitted)
+    );
     drop(reopened);
-
     let raw = open_keyed(path.path(), &key_store.key(CREDENTIAL));
+    assert_eq!(
+        raw.query_row(
+            "SELECT count(*) FROM membership_current_activation",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
     raw.execute_batch("DROP TRIGGER abort_restore_activation_e2e")
         .unwrap();
     drop(raw);
@@ -576,9 +698,24 @@ fn activation_abort_rolls_back_trust_then_exact_resume_completes() {
         coordinator
             .resume_prepared(&mut reopened, &identity)
             .unwrap(),
-        RecoveryRestoreOutcome::Complete { .. }
+        RecoveryRestoreOutcome::RestoringHistory { .. }
     ));
-    assert_eq!(reopened.devices(scope()).unwrap().len(), 2);
+    assert_eq!(
+        reopened
+            .prepared_recovery_v2(&recovered_keys)
+            .unwrap()
+            .unwrap()
+            .canonical_claim,
+        exact
+    );
+    activate_current(&mut reopened, &identity);
+    assert_eq!(
+        reopened
+            .trusted_workspace_material(&recovered_keys)
+            .unwrap()
+            .workspace_root_key(),
+        &source.workspace_root_key
+    );
 }
 
 #[test]
@@ -590,6 +727,8 @@ fn two_fresh_targets_race_one_generation_and_only_the_winner_installs_trust() {
     let second_store = MemoryKeyStore::default();
     let mut first = Vault::open(first_path.path(), "restore-race-first", &first_store).unwrap();
     let mut second = Vault::open(second_path.path(), "restore-race-second", &second_store).unwrap();
+    bind_restore_intent(&mut first);
+    bind_restore_intent(&mut second);
     let first_keys = DeviceKeys::from_seeds_for_test([0x81; 32], [0x82; 32]);
     let second_keys = DeviceKeys::from_seeds_for_test([0x83; 32], [0x84; 32]);
     let first_identity = RecoveryRestoreIdentity {
@@ -636,8 +775,9 @@ fn two_fresh_targets_race_one_generation_and_only_the_winner_installs_trust() {
     );
     assert!(matches!(
         winner.resume_prepared(&mut first, &first_identity).unwrap(),
-        RecoveryRestoreOutcome::Complete { .. }
+        RecoveryRestoreOutcome::RestoringHistory { .. }
     ));
+    activate_current(&mut first, &first_identity);
     let loser = RecoveryRestoreCoordinator::new_for_test(
         clock,
         XorShiftEntropy::new(0xa000),
@@ -661,6 +801,7 @@ fn conflict_is_durable_even_if_the_local_clock_moves_behind_prepare_time() {
     let path = TempVault::new("restore-clock-rollback-target");
     let key_store = MemoryKeyStore::default();
     let mut vault = Vault::open(path.path(), CREDENTIAL, &key_store).unwrap();
+    bind_restore_intent(&mut vault);
     let recovered_keys = DeviceKeys::from_seeds_for_test([0x95; 32], [0x96; 32]);
     let identity = RecoveryRestoreIdentity {
         device_id: RECOVERED_DEVICE_ID.parse().unwrap(),
@@ -670,10 +811,12 @@ fn conflict_is_durable_even_if_the_local_clock_moves_behind_prepare_time() {
     };
     let clock = FixedClock::default();
     clock.set(55_000);
+    let transport =
+        FaultedRestoreTransport::fail_submit_once(source.provider.restore_transport(scope()));
     let coordinator = RecoveryRestoreCoordinator::new_for_test(
         clock.clone(),
         XorShiftEntropy::new(0xa500),
-        FaultedRestoreTransport::fail_submit_once(source.provider.restore_transport(scope())),
+        transport.clone(),
     );
     assert!(matches!(
         coordinator
@@ -681,23 +824,151 @@ fn conflict_is_durable_even_if_the_local_clock_moves_behind_prepare_time() {
             .unwrap(),
         RecoveryRestoreOutcome::Submitting { .. }
     ));
+    for error in [
+        RecoveryTransportError::Conflict,
+        RecoveryTransportError::Invalid,
+        RecoveryTransportError::Unauthorized,
+    ] {
+        *transport.submit_error.lock().unwrap() = Some(error);
+        assert!(coordinator.resume_prepared(&mut vault, &identity).is_err());
+        assert!(
+            !vault
+                .prepared_recovery_v2(&recovered_keys)
+                .unwrap()
+                .unwrap()
+                .publication_conflict
+        );
+    }
+    let original_claim = vault
+        .prepared_recovery_v2(&recovered_keys)
+        .unwrap()
+        .unwrap()
+        .canonical_claim;
+    let mut malformed = original_claim.clone();
+    *malformed.last_mut().unwrap() ^= 1;
+    assert_ne!(
+        source
+            .provider
+            .restore_transport(scope())
+            .submit_restore(&malformed, 54_000)
+            .unwrap_err(),
+        RecoveryTransportError::PublicationRejected
+    );
     source
         .provider
         .test_set_recovery_generation(scope().account_id, 1);
     clock.set(54_000);
 
+    let raw = open_keyed(path.path(), &key_store.key(CREDENTIAL));
+    raw.execute_batch("CREATE TRIGGER abort_conflict BEFORE INSERT ON recovery_v2_conflict BEGIN SELECT RAISE(ABORT,'forced conflict rollback'); END;").unwrap();
+    assert!(coordinator.resume_prepared(&mut vault, &identity).is_err());
+    assert!(
+        !vault
+            .prepared_recovery_v2(&recovered_keys)
+            .unwrap()
+            .unwrap()
+            .publication_conflict
+    );
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM accepted_membership", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    raw.execute_batch("DROP TRIGGER abort_conflict").unwrap();
+    drop(raw);
     assert!(matches!(
         coordinator.resume_prepared(&mut vault, &identity).unwrap(),
         RecoveryRestoreOutcome::Conflict { .. }
     ));
-    let stored = vault.recovery_restore().unwrap().unwrap();
-    assert_eq!(stored.state, RecoveryRestorePersistenceState::Conflict);
-    assert_eq!(stored.conflict_at_ms, Some(stored.prepared_at_ms));
+    let stored = vault
+        .prepared_recovery_v2(&recovered_keys)
+        .unwrap()
+        .unwrap();
+    assert!(stored.publication_conflict);
+    let exact = stored.canonical_claim;
+    drop(vault);
+    let mut vault = Vault::open(path.path(), CREDENTIAL, &key_store).unwrap();
+    source.provider.test_fail_next(1);
+    assert!(matches!(
+        coordinator.resume_prepared(&mut vault, &identity).unwrap(),
+        RecoveryRestoreOutcome::Conflict { .. }
+    ));
+    assert_eq!(
+        vault
+            .prepared_recovery_v2(&recovered_keys)
+            .unwrap()
+            .unwrap()
+            .canonical_claim,
+        exact
+    );
+    assert!(vault.trusted_workspace_material(&recovered_keys).is_err());
+    let raw = open_keyed(path.path(), &key_store.key(CREDENTIAL));
+    let intent: Vec<u8> = raw
+        .query_row("SELECT hosted_intent FROM recovery_v2_prepared", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let signature: Vec<u8> = raw
+        .query_row("SELECT signature FROM recovery_v2_conflict", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut preimage = b"context-relay/recovery-conflict-receipt/v1\0".to_vec();
+    preimage.extend(Sha256::digest(&exact));
+    preimage.extend(Sha256::digest(&intent));
+    preimage.push(1);
+    context_relay_core::crypto::verify_signature(
+        recovered_keys.signing_public_key(),
+        &preimage,
+        context_relay_protocol::Ed25519SignatureBytes(signature.clone().try_into().unwrap()),
+    )
+    .unwrap();
+    let mut corrupt = signature.clone();
+    corrupt[0] ^= 1;
+    raw.execute("UPDATE recovery_v2_conflict SET signature=?1", [&corrupt])
+        .unwrap();
+    assert!(vault.prepared_recovery_v2(&recovered_keys).is_err());
+    raw.execute("UPDATE recovery_v2_conflict SET signature=?1", [&signature])
+        .unwrap();
+    let wrong = DeviceKeys::from_seeds_for_test([9; 32], [10; 32]);
+    assert!(vault.prepared_recovery_v2(&wrong).is_err());
+    raw.execute_batch(
+        "PRAGMA ignore_check_constraints=ON; UPDATE recovery_v2_conflict SET reason=2;",
+    )
+    .unwrap();
+    assert!(vault.prepared_recovery_v2(&recovered_keys).is_err());
+    raw.execute_batch("UPDATE recovery_v2_conflict SET reason=1;")
+        .unwrap();
+    let mut altered_intent = intent.clone();
+    altered_intent.push(b' ');
+    raw.execute(
+        "UPDATE hosted_restore_intent SET payload=?1",
+        [&altered_intent],
+    )
+    .unwrap();
+    assert!(vault.prepared_recovery_v2(&recovered_keys).is_err());
+    raw.execute("UPDATE hosted_restore_intent SET payload=?1", [&intent])
+        .unwrap();
+    assert!(
+        vault
+            .prepared_recovery_v2(&recovered_keys)
+            .unwrap()
+            .unwrap()
+            .publication_conflict
+    );
+    assert!(
+        vault
+            .discard_unprepared_hosted_restore_intent(
+                &vault.hosted_restore_intent().unwrap().unwrap()
+            )
+            .is_err()
+    );
     assert!(vault.devices(scope()).unwrap().is_empty());
 }
 
 #[test]
-fn missing_forged_or_substituted_provider_proof_is_terminal_without_trust() {
+fn missing_provider_proof_repairs_and_forged_proof_never_installs_trust() {
     for (index, case) in ["missing", "forged-receipt", "substituted-claim"]
         .into_iter()
         .enumerate()
@@ -723,9 +994,7 @@ fn missing_forged_or_substituted_provider_proof_is_terminal_without_trust() {
                 XorShiftEntropy::new(0xb000 + u64::try_from(index).unwrap()),
                 source.provider.restore_transport(scope()),
             );
-            coordinator
-                .recover(&mut vault, source.phrase_words, &identity)
-                .unwrap()
+            coordinator.recover(&mut vault, source.phrase_words, &identity)
         } else {
             let coordinator = RecoveryRestoreCoordinator::new_for_test(
                 clock.clone(),
@@ -762,15 +1031,42 @@ fn missing_forged_or_substituted_provider_proof_is_terminal_without_trust() {
                 XorShiftEntropy::new(0xc000 + u64::try_from(index).unwrap()),
                 source.provider.restore_transport(scope()),
             );
-            resumed.resume_prepared(&mut vault, &identity).unwrap()
+            resumed.resume_prepared(&mut vault, &identity)
         };
-        assert!(matches!(outcome, RecoveryRestoreOutcome::Conflict { .. }));
-        assert_eq!(
-            vault.recovery_restore().unwrap().unwrap().state,
-            RecoveryRestorePersistenceState::Conflict
+        if case == "missing" {
+            assert!(matches!(
+                outcome,
+                Ok(RecoveryRestoreOutcome::Submitting { .. })
+            ));
+        } else {
+            assert_eq!(outcome.unwrap_err(), RecoveryRestoreCycleError::Conflict);
+        }
+        assert!(
+            vault
+                .prepared_recovery_v2(&recovered_keys)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            vault
+                .recovery_membership_admission(&recovered_keys)
+                .unwrap()
+                .is_none()
         );
         assert!(vault.devices(scope()).unwrap().is_empty());
         assert!(vault.trusted_workspace_material(&recovered_keys).is_err());
+        drop(vault);
+        let mut reopened = Vault::open(path.path(), CREDENTIAL, &key_store).unwrap();
+        let (_, retry) = restore_coordinator(&source.provider, 60_100, 0xc100 + index as u64);
+        assert!(matches!(
+            retry.resume_prepared(&mut reopened, &identity).unwrap(),
+            RecoveryRestoreOutcome::RestoringHistory { .. }
+        ));
+        assert!(
+            reopened
+                .trusted_workspace_material(&recovered_keys)
+                .is_err()
+        );
     }
 }
 
@@ -875,9 +1171,17 @@ fn prepared_restore_requires_the_exact_stable_identity_and_rejects_row_tamper() 
     drop(vault);
 
     let raw = open_keyed(path.path(), &key_store.key(CREDENTIAL));
+    let mut tampered_claim = raw
+        .query_row(
+            "SELECT canonical_claim FROM recovery_v2_prepared",
+            [],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .unwrap();
+    *tampered_claim.last_mut().unwrap() ^= 1;
     raw.execute(
-        "UPDATE recovery_restores SET recovered_device_name = 'Tampered Name'",
-        [],
+        "UPDATE recovery_v2_prepared SET canonical_claim = ?1",
+        [tampered_claim],
     )
     .unwrap();
     drop(raw);
@@ -892,7 +1196,7 @@ fn prepared_restore_requires_the_exact_stable_identity_and_rejects_row_tamper() 
 }
 
 #[test]
-fn active_restore_replays_offline_and_a_new_restore_reports_unavailable() {
+fn admitted_restore_replays_offline_and_a_new_restore_reports_unavailable() {
     let source = enrolled_source("restore-offline-source");
     let saved_phrase = source.phrase_words.clone();
     let path = TempVault::new("restore-offline-target");
@@ -909,7 +1213,11 @@ fn active_restore_replays_offline_and_a_new_restore_reports_unavailable() {
     let complete = coordinator
         .recover(&mut vault, source.phrase_words, &identity)
         .unwrap();
-    assert!(matches!(complete, RecoveryRestoreOutcome::Complete { .. }));
+    assert!(matches!(
+        complete,
+        RecoveryRestoreOutcome::RestoringHistory { .. }
+    ));
+    activate_current(&mut vault, &identity);
     source.provider.test_delete_account(scope().account_id);
     drop(vault);
 
@@ -1023,6 +1331,13 @@ fn recovered_device_approves_a_third_vault_and_all_material_reopens() {
         &recovered_store,
     )
     .unwrap();
+    recovered_vault
+        .store_hosted_restore_intent(&context_relay_core::vault::HostedRestoreIntent {
+            project_url: "https://example.supabase.co/".into(),
+            user_id: "550e8400-e29b-41d4-a716-446655440000".parse().unwrap(),
+            session_id: "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+        })
+        .unwrap();
     let recovered_keys = DeviceKeys::from_seeds_for_test([0xe1; 32], [0xe2; 32]);
     let recovered_identity = RecoveryRestoreIdentity {
         device_id: RECOVERED_DEVICE_ID.parse().unwrap(),
@@ -1039,10 +1354,19 @@ fn recovered_device_approves_a_third_vault_and_all_material_reopens() {
                 &recovered_identity,
             )
             .unwrap(),
-        RecoveryRestoreOutcome::Complete { .. }
+        RecoveryRestoreOutcome::RestoringHistory { .. }
     ));
-    let stored_restore = recovered_vault.recovery_restore().unwrap().unwrap();
-    let genesis_certificate_id = stored_restore.record.genesis_certificate_id;
+    activate_current(&mut recovered_vault, &recovered_identity);
+    let stored_restore = recovered_vault
+        .prepared_recovery_v2(&recovered_keys)
+        .unwrap()
+        .unwrap();
+    let record =
+        context_relay_core::devices::recovery_crypto::decode_recovery_enrollment_record_v1(
+            &stored_restore.canonical_record,
+        )
+        .unwrap();
+    let genesis_certificate_id = record.genesis_certificate_id;
     let recovered_certificate_id = stored_restore.claim.certificate_id;
 
     let pairing_provider = InMemoryPairingProvider::with_test_entropy(
@@ -1051,6 +1375,29 @@ fn recovered_device_approves_a_third_vault_and_all_material_reopens() {
             .map(|value| [value.wrapping_add(0x40); 32])
             .collect(),
     );
+    let budget = context_relay_core::devices::membership_crypto::MembershipHistoryBudget {
+        max_events: 4096,
+        max_bytes: 64 * 1024 * 1024,
+    };
+    let (canonical, events, endpoint) = recovered_vault
+        .accepted_membership_objects(budget)
+        .unwrap()
+        .unwrap();
+    let wrong_endpoint = context_relay_core::devices::membership_crypto::MembershipEndpoint {
+        state_sha256: Sha256Digest([0; 32]),
+        ..endpoint
+    };
+    assert!(
+        pairing_provider
+            .restore_committed_membership_for_test(scope(), &canonical, &events, wrong_endpoint)
+            .is_err()
+    );
+    pairing_provider
+        .restore_committed_membership_for_test(scope(), &canonical, &events, endpoint)
+        .unwrap();
+    pairing_provider
+        .restore_committed_membership_for_test(scope(), &canonical, &events, endpoint)
+        .unwrap();
     let pairing_clock = FixedClock::default();
     pairing_clock.set(101_000);
     let pairing = PairingCoordinator::new(
@@ -1128,31 +1475,29 @@ fn recovered_device_approves_a_third_vault_and_all_material_reopens() {
         recovered_material.active_epoch_key(),
         third_material.active_epoch_key()
     );
-    assert_eq!(recovered_vault.devices(scope()).unwrap().len(), 3);
-    assert_eq!(third_vault.devices(scope()).unwrap().len(), 2);
-    for certificate_id in [
-        genesis_certificate_id,
-        recovered_certificate_id,
-        THIRD_CERTIFICATE_ID.parse().unwrap(),
-    ] {
-        assert!(
-            recovered_vault
-                .device_certificate(certificate_id)
-                .unwrap()
-                .is_some()
+    for vault in [&recovered_vault, &third_vault] {
+        let history = vault.accepted_membership_history(budget).unwrap().unwrap();
+        assert_eq!(history.state().active_devices.len(), 3);
+        assert_eq!(
+            history
+                .admissions()
+                .get(&GENESIS_DEVICE_ID.parse().unwrap()),
+            Some(&genesis_certificate_id)
+        );
+        assert_eq!(
+            history.admissions().get(&recovered_identity.device_id),
+            Some(&recovered_certificate_id)
+        );
+        assert_eq!(
+            history.admissions().get(&THIRD_DEVICE_ID.parse().unwrap()),
+            Some(&THIRD_CERTIFICATE_ID.parse().unwrap())
         );
     }
     assert!(
-        third_vault
-            .device_certificate(genesis_certificate_id)
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        third_vault
-            .device_certificate(recovered_certificate_id)
-            .unwrap()
-            .is_some()
+        pairing_provider
+            .restore_committed_membership_for_test(scope(), &canonical, &events, endpoint)
+            .is_err(),
+        "restored backend cannot roll back its committed descendant"
     );
     drop(recovered_vault);
     drop(third_vault);
@@ -1180,6 +1525,24 @@ fn recovered_device_approves_a_third_vault_and_all_material_reopens() {
         reopened_recovered_material.active_epoch_key(),
         reopened_third_material.active_epoch_key()
     );
-    assert_eq!(reopened_recovered.devices(scope()).unwrap().len(), 3);
-    assert_eq!(reopened_third.devices(scope()).unwrap().len(), 2);
+    assert_eq!(
+        reopened_recovered
+            .accepted_membership_history(budget)
+            .unwrap()
+            .unwrap()
+            .state()
+            .active_devices
+            .len(),
+        3
+    );
+    assert_eq!(
+        reopened_third
+            .accepted_membership_history(budget)
+            .unwrap()
+            .unwrap()
+            .state()
+            .active_devices
+            .len(),
+        3
+    );
 }
