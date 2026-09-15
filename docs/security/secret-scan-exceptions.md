@@ -234,3 +234,13 @@ security purpose; it is not a general allowlist.
 - Classification: `non-secret-source-or-metadata`
 - Non-credential basis: The exact historical match crosses the end of updater/Authenticode procedure prose into the next CSV field, `SourceFileSha256`. That 64-character lowercase hexadecimal field independently equals the SHA256 of the row's pinned `docs/context-relay-v1-implementation-plan.md` Git object at source revision `86f5f37343978351f1d0cb1e13e28ce9c91a8ffd`. It is a public content digest with no authentication, signing or account authority.
 - Security purpose: The `RB-RELEASE-15-UPDATER` execution child retains exact original-source provenance for later updater qualification. This exception admits only that immutable CSV fingerprint and does not suppress Authenticode material, signing keys, other hashes, paths or detector results.
+
+### `cfe00276039ab8dde80a2d7fa59595cb28e31d6d:crates/core/tests/fixtures/device-revocation-v1.json:generic-api-key:1`
+
+- Historical commit: `cfe00276039ab8dde80a2d7fa59595cb28e31d6d`
+- Historical path: `crates/core/tests/fixtures/device-revocation-v1.json`
+- Rule: `generic-api-key`
+- Line: `1`
+- Classification: `synthetic-public-test-vector`
+- Non-credential basis: The exact historical line is the single-line JSON body of the frozen V2 device-revocation fixture. Both matches (`issuerSigningKey`, `recoveryWrappingKey`) are 32-byte public cryptographic values: the issuer's Ed25519 device signing public key that the Edge revocation verifier consumes as the verification key, and the recovery root's wrapping public key stored server-side as `recovery_roots.wrapping_public_key`. Neither value has issuer, account, decryption or authentication authority; the PostgreSQL/Edge verify scripts insert test-only signing keys from fixed repeated-byte seeds and require exact equality against these public fields before signature verification.
+- Security purpose: The cross-language fixture drives durable revocation coordination tests: Rust intent lifecycle, PostgreSQL replay and Edge `verifyRevocationObject` exact-binding checks for issuer identity, recovery-root identity, successor state hash and canonical transition bytes. This exception admits only that immutable fixture fingerprint; changed fixture bytes, real signing keys and all other findings remain active.

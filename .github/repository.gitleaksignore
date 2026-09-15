@@ -19,3 +19,4 @@ f4ab27c7edb4d5402d96ea21d62cf51a4c25f46e:docs/protocols/historical-key-transfer-
 924348a36900e89df6bc8b41fa6162127c24b8b3:crates/core/tests/fixtures/hosted-pairing-approval-v2.json:generic-api-key:19
 7d736642caeec1e4d71cc3d0421df6a471247486:crates/core/src/vault/membership/activation.rs:generic-api-key:92
 6c3bd9807dce57eecf8335da9730048c8f156942:docs/verification/pr16-windows-shared-acceptance.csv:generic-api-key:322
+cfe00276039ab8dde80a2d7fa59595cb28e31d6d:crates/core/tests/fixtures/device-revocation-v1.json:generic-api-key:1
