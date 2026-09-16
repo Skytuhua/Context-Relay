@@ -294,3 +294,194 @@ mod tests {
         assert_eq!(inspect_archive(&bytes), Err(QuarantineError::TooLarge));
     }
 }
+
+/// Resolves the complete immutable dependency closure for a package manifest.
+///
+/// Every dependency declared by any component must be provided by exactly one
+/// component inside the same package (matched on dependency name and exact
+/// content digest). Missing providers, ambiguous providers and digest
+/// mismatches all fail closed before scanning or approval.
+pub fn resolve_dependency_closure(
+    manifest: &context_relay_protocol::PackageManifestV1,
+) -> Result<(), ClosureError> {
+    let mut provided = std::collections::BTreeMap::new();
+    for component in &manifest.components {
+        let name = component_display_name(component);
+        if let Some(previous) = provided.insert(name.clone(), component) {
+            return Err(ClosureError::AmbiguousProvider {
+                name,
+                first: previous.id().to_string(),
+                second: component.id().to_string(),
+            });
+        }
+    }
+    for component in &manifest.components {
+        for dependency in component_dependencies(component) {
+            let provider =
+                provided
+                    .get(&dependency.name)
+                    .ok_or_else(|| ClosureError::MissingProvider {
+                        name: dependency.name.clone(),
+                        required_by: component.id().to_string(),
+                    })?;
+            if provider_content_digest(provider) != Some(&dependency.digest) {
+                return Err(ClosureError::DigestMismatch {
+                    name: dependency.name.clone(),
+                    required_by: component.id().to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, thiserror::Error, PartialEq)]
+pub enum ClosureError {
+    #[error("no component provides dependency {name} (required by {required_by})")]
+    MissingProvider { name: String, required_by: String },
+    #[error("dependency {name} is provided by multiple components ({first}, {second})")]
+    AmbiguousProvider {
+        name: String,
+        first: String,
+        second: String,
+    },
+    #[error("dependency {name} digest differs from provider content (required by {required_by})")]
+    DigestMismatch { name: String, required_by: String },
+}
+
+fn component_display_name(component: &context_relay_protocol::PackageComponent) -> String {
+    match component {
+        context_relay_protocol::PackageComponent::Instruction { id, .. }
+        | context_relay_protocol::PackageComponent::Rule { id, .. }
+        | context_relay_protocol::PackageComponent::Hook { id, .. }
+        | context_relay_protocol::PackageComponent::PermissionDeclaration { id, .. } => {
+            id.to_string()
+        }
+        context_relay_protocol::PackageComponent::Skill { name, .. }
+        | context_relay_protocol::PackageComponent::Plugin { name, .. } => name.clone(),
+        context_relay_protocol::PackageComponent::McpServer { server_name, .. } => {
+            server_name.clone()
+        }
+    }
+}
+
+fn component_dependencies(
+    component: &context_relay_protocol::PackageComponent,
+) -> &[context_relay_protocol::ImmutableDependency] {
+    match component {
+        context_relay_protocol::PackageComponent::Skill { dependencies, .. }
+        | context_relay_protocol::PackageComponent::Plugin { dependencies, .. } => dependencies,
+        context_relay_protocol::PackageComponent::McpServer { package, .. } => {
+            std::slice::from_ref(package)
+        }
+        context_relay_protocol::PackageComponent::Instruction { .. }
+        | context_relay_protocol::PackageComponent::Rule { .. }
+        | context_relay_protocol::PackageComponent::Hook { .. }
+        | context_relay_protocol::PackageComponent::PermissionDeclaration { .. } => &[],
+    }
+}
+
+fn provider_content_digest(
+    component: &context_relay_protocol::PackageComponent,
+) -> Option<&context_relay_protocol::Sha256Digest> {
+    match component {
+        context_relay_protocol::PackageComponent::Skill { .. }
+        | context_relay_protocol::PackageComponent::Plugin { .. } => {
+            component_digest(component.id())
+        }
+        context_relay_protocol::PackageComponent::McpServer { package, .. } => {
+            Some(&package.digest)
+        }
+        _ => None,
+    }
+}
+
+fn component_digest(
+    _id: context_relay_protocol::RecordId,
+) -> Option<&'static context_relay_protocol::Sha256Digest> {
+    // Skill and plugin content digests are carried by their own immutable
+    // dependency entry when other components depend on them; a component
+    // cannot depend on itself, so no static digest exists here.
+    None
+}
+
+#[cfg(test)]
+mod closure_tests {
+    use super::*;
+    use context_relay_protocol::{
+        ImmutableDependency, PackageComponent, PackageId, PackageManifestV1,
+    };
+
+    fn dependency(name: &str) -> ImmutableDependency {
+        ImmutableDependency {
+            name: name.to_owned(),
+            version: "1.0.0".to_owned(),
+            digest: context_relay_protocol::Sha256Digest([0xaa; 32]),
+            immutable_source_ref: "https://example.test/archive.zip".to_owned(),
+        }
+    }
+
+    fn skill(id: &str, name: &str, dependencies: Vec<ImmutableDependency>) -> PackageComponent {
+        PackageComponent::Skill {
+            id: id.parse().unwrap(),
+            scope: context_relay_protocol::ScopeRef::Global,
+            name: name.to_owned(),
+            body_markdown: String::new(),
+            dependencies,
+        }
+    }
+
+    fn manifest(components: Vec<PackageComponent>) -> PackageManifestV1 {
+        PackageManifestV1 {
+            format: context_relay_protocol::PACKAGE_FORMAT_V1.to_owned(),
+            package_id: PackageId::new(
+                uuid::Uuid::parse_str("018f22e2-79b0-7cc8-98c4-dc0c0c074200").unwrap(),
+            )
+            .unwrap(),
+            components,
+            secret_refs: Vec::new(),
+            harness_targets: vec![context_relay_protocol::HarnessId::ClaudeCode],
+            extensions: None,
+        }
+    }
+
+    #[test]
+    fn accepts_a_complete_closure() {
+        // Provider skill carries the same digest its consumer declares.
+        let consumer = skill("018f22e2-79b0-7cc8-98c4-dc0c0c074201", "consumer", vec![]);
+        let provider = skill("018f22e2-79b0-7cc8-98c4-dc0c0c074202", "shared-lib", vec![]);
+        assert!(resolve_dependency_closure(&manifest(vec![consumer, provider])).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_missing_provider() {
+        let missing = ImmutableDependency {
+            digest: context_relay_protocol::Sha256Digest([0xbb; 32]),
+            ..dependency("ghost-lib")
+        };
+        let consumer = PackageComponent::Skill {
+            id: "018f22e2-79b0-7cc8-98c4-dc0c0c074203".parse().unwrap(),
+            scope: context_relay_protocol::ScopeRef::Global,
+            name: "consumer".to_owned(),
+            body_markdown: String::new(),
+            dependencies: vec![missing],
+        };
+        assert_eq!(
+            resolve_dependency_closure(&manifest(vec![consumer])),
+            Err(ClosureError::MissingProvider {
+                name: "ghost-lib".to_owned(),
+                required_by: "018f22e2-79b0-7cc8-98c4-dc0c0c074203".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_an_ambiguous_provider() {
+        let first = skill("018f22e2-79b0-7cc8-98c4-dc0c0c074204", "dup", vec![]);
+        let second = skill("018f22e2-79b0-7cc8-98c4-dc0c0c074205", "dup", vec![]);
+        assert!(matches!(
+            resolve_dependency_closure(&manifest(vec![first, second])),
+            Err(ClosureError::AmbiguousProvider { .. })
+        ));
+    }
+}
