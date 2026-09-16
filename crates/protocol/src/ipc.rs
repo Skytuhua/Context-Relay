@@ -1583,6 +1583,9 @@ pub enum LocalResult {
     Access {
         policy: HarnessAccessPolicy,
     },
+    PackageInspection {
+        report: crate::PackageInspectionReport,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1725,6 +1728,9 @@ enum LocalResultSerde {
     Access {
         policy: HarnessAccessPolicy,
     },
+    PackageInspection {
+        report: crate::PackageInspectionReport,
+    },
 }
 
 impl LocalResult {
@@ -1823,6 +1829,7 @@ impl LocalResult {
             | Self::AccountDeletion { .. }
             | Self::Access { .. }
             | Self::SearchIndex { .. } => Ok(()),
+            Self::PackageInspection { report } => report.validate(),
             Self::Health { protocol, .. } => {
                 if protocol.major != crate::PROTOCOL_MAJOR {
                     return Err(ValidationError::Invalid("health.protocol"));

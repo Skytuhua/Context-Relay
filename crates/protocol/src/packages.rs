@@ -559,3 +559,72 @@ impl ExportEnvelopeV1 {
         Ok(())
     }
 }
+
+/// Outcome of quarantine inspection for one package archive entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum PackageEntryDisposition {
+    Accepted,
+    Rejected,
+}
+
+/// Per-entry detail from bounded quarantine inspection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct PackageEntryReport {
+    pub path: String,
+    pub length: u64,
+    pub digest: Sha256Digest,
+    pub disposition: PackageEntryDisposition,
+}
+
+/// Result surface for `PackageImport` with `dryRun: true`. Package
+/// installation is disabled in v1 (plan rule 16), so the daemon never
+/// applies archives; it only inspects them and reports the exact bytes a
+/// future scanner run and approval would be bound to.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct PackageInspectionReport {
+    pub total_bytes: u64,
+    pub entry_count: usize,
+    /// Deterministic digest over every accepted entry path, length and
+    /// content digest. Scanner runs and any future approval must bind to
+    /// this value so nothing can be swapped after inspection.
+    pub binding_digest: Sha256Digest,
+    pub entries: Vec<PackageEntryReport>,
+    pub rejected: Option<String>,
+}
+
+impl PackageInspectionReport {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.entry_count != self.entries.len() {
+            return Err(ValidationError::Invalid("package.entry_count"));
+        }
+        if self.entries.len() > MAX_BATCH_OPERATIONS {
+            return Err(ValidationError::TooLarge {
+                field: "package.entries",
+                limit: MAX_BATCH_OPERATIONS,
+            });
+        }
+        for entry in &self.entries {
+            if entry.path.is_empty() || entry.path.len() > MAX_TITLE_BYTES * 8 {
+                return Err(ValidationError::Invalid("package.entry.path"));
+            }
+            if entry.disposition == PackageEntryDisposition::Rejected {
+                if self.rejected.is_none() {
+                    return Err(ValidationError::Invalid(
+                        "package.rejected missing for rejected entry",
+                    ));
+                }
+            } else if self.rejected.is_some() {
+                return Err(ValidationError::Invalid(
+                    "package.rejected set with accepted entries",
+                ));
+            }
+        }
+        Ok(())
+    }
+}

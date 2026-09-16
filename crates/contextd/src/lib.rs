@@ -41,7 +41,8 @@ use context_relay_protocol::{
     BoundedBytes, ClientError, ClientRole, DaemonInstanceNonce, DeviceId, ErrorCode, ExportId,
     ExportPayload, HandoffPayload, HarnessId, HybridLogicalClock, LocalRequest, LocalResult,
     MAX_ARBITRARY_BYTES, MemoryKind, MemoryParams, NativePlatform, PROTOCOL_VERSION,
-    ProjectPathParams, ProtocolVersionRange, ScopeRef, Sha256Digest, SyncState, VaultState,
+    PackageEntryDisposition, PackageEntryReport, PackageInspectionReport, ProjectPathParams,
+    ProtocolVersionRange, ScopeRef, Sha256Digest, SyncState, VaultState,
 };
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -1306,9 +1307,57 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
         | LocalRequest::HarnessRollback(_)) => {
             RoutedRequest::Work(VaultCommand::HarnessSetup(request))
         }
-        LocalRequest::HarnessRepair(_)
-        | LocalRequest::PackageImport(_)
-        | LocalRequest::PackageExport(_) => RoutedRequest::Immediate(Err(unsupported_error(
+        LocalRequest::HarnessRepair(_) => RoutedRequest::Immediate(Err(unsupported_error(
+            "The requested local adapter operation is not supported",
+        ))),
+        LocalRequest::PackageImport(params) => {
+            if !params.dry_run {
+                // Plan rule 16: install of approved packages is disabled in
+                // v1; only inspection is offered.
+                return RoutedRequest::Immediate(Err(unsupported_error(
+                    "Package installation is disabled; only dry-run inspection is supported",
+                )));
+            }
+            let decoded = match BoundedBytes::try_from(params.package_base64url.clone()) {
+                Ok(decoded) => decoded,
+                Err(_) => {
+                    return RoutedRequest::Immediate(Err(ClientError {
+                        code: ErrorCode::HarnessUnsupported,
+                        message: "package archive exceeds the bounded request size".into(),
+                        field_path: Some("packageBase64url".into()),
+                        retryable: false,
+                    }));
+                }
+            };
+            let report = match context_relay_core::packages::inspect_archive(decoded.as_slice()) {
+                Ok(inspected) => PackageInspectionReport {
+                    total_bytes: inspected.total_bytes,
+                    entry_count: inspected.entries.len(),
+                    binding_digest: Sha256Digest(inspected.binding_digest()),
+                    entries: inspected
+                        .entries
+                        .iter()
+                        .map(|entry| PackageEntryReport {
+                            path: entry.path.clone(),
+                            length: entry.length,
+                            digest: Sha256Digest(entry.digest),
+                            disposition: PackageEntryDisposition::Accepted,
+                        })
+                        .collect(),
+                    rejected: None,
+                },
+                Err(error) => {
+                    return RoutedRequest::Immediate(Err(ClientError {
+                        code: ErrorCode::HarnessUnsupported,
+                        message: format!("package archive rejected: {error}"),
+                        field_path: Some("packageBase64url".into()),
+                        retryable: false,
+                    }));
+                }
+            };
+            RoutedRequest::Immediate(Ok(LocalResult::PackageInspection { report }))
+        }
+        LocalRequest::PackageExport(_) => RoutedRequest::Immediate(Err(unsupported_error(
             "The requested local adapter operation is not supported",
         ))),
         request @ (LocalRequest::PairingCreate(_)
