@@ -957,6 +957,9 @@ fn recovered_vault_material_bootstraps_real_pairing_and_both_replicas_reopen() {
         [0x91; 32],
         (1_u8..=8).map(|value| [value; 32]).collect(),
     );
+    pairing_provider
+        .register_committed_enrollment(scope(), &enrollment.canonical_record)
+        .unwrap();
     let pairing_clock = FixedClock::default();
     pairing_clock.set(31_000);
     let pairing = PairingCoordinator::new(
