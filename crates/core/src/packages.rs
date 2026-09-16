@@ -34,12 +34,29 @@ pub enum QuarantineError {
     NotAnArchive,
     #[error("package archive entry {0} is not a safe plain file")]
     UnsafeEntry(String),
+    #[error("package archive entry {0} is an unexpected executable payload")]
+    UnexpectedExecutable(String),
     #[error("package archive exceeds the bounded inspection limits")]
     TooLarge,
     #[error("package archive entries collide after normalization: {0}")]
     Collision(String),
     #[error("package archive inspection failed: {0}")]
     Malformed(String),
+}
+
+/// Executable payloads never belong in a package archive: packages carry
+/// declarative markdown/config content, while binaries arrive exclusively
+/// through the pinned sidecar closure of a sealed native transaction.
+fn unexpected_executable_name(path: &str) -> bool {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let lower = file_name.to_ascii_lowercase();
+    const FORBIDDEN_EXTENSIONS: [&str; 18] = [
+        ".exe", ".dll", ".sys", ".scr", ".com", ".bat", ".cmd", ".ps1", ".psm1", ".vbs", ".js",
+        ".jse", ".wsf", ".wsh", ".msi", ".msp", ".mst", ".sh",
+    ];
+    FORBIDDEN_EXTENSIONS
+        .iter()
+        .any(|extension| lower.ends_with(extension))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -126,6 +143,18 @@ fn entry_is_plain_file(
                 entry.name()
             )));
         }
+        // Packages never carry executables; active content is installed
+        // through the sealed native transaction instead.
+        if mode & 0o111 != 0 {
+            return Err(QuarantineError::UnexpectedExecutable(
+                entry.name().to_owned(),
+            ));
+        }
+    }
+    if unexpected_executable_name(entry.name()) {
+        return Err(QuarantineError::UnexpectedExecutable(
+            entry.name().to_owned(),
+        ));
     }
     if entry.compressed_size() > u64::from(u32::MAX)
         || entry.size() > MAX_PACKAGE_ENTRY_BYTES as u64
@@ -278,6 +307,27 @@ mod tests {
             inspect_archive(&bytes),
             Err(QuarantineError::Collision(_))
         ));
+    }
+
+    #[test]
+    fn rejects_unexpected_executable_payloads() {
+        for hostile in [
+            "bin/evil.exe",
+            "scripts/install.ps1",
+            "hooks/pre-commit.sh",
+            "payload.dll",
+            "run.cmd",
+            "autoexec.bat",
+        ] {
+            let bytes = build_archive(&[(hostile, b"MZ")]).unwrap();
+            assert!(
+                matches!(
+                    inspect_archive(&bytes),
+                    Err(QuarantineError::UnexpectedExecutable(_))
+                ),
+                "expected {hostile} to be rejected"
+            );
+        }
     }
 
     #[test]
