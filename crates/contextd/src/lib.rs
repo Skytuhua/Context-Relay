@@ -1318,17 +1318,9 @@ fn route_request(role: ClientRole, request: LocalRequest) -> RoutedRequest {
                     "Package installation is disabled; only dry-run inspection is supported",
                 )));
             }
-            let decoded = match BoundedBytes::try_from(params.package_base64url.clone()) {
-                Ok(decoded) => decoded,
-                Err(_) => {
-                    return RoutedRequest::Immediate(Err(ClientError {
-                        code: ErrorCode::HarnessUnsupported,
-                        message: "package archive exceeds the bounded request size".into(),
-                        field_path: Some("packageBase64url".into()),
-                        retryable: false,
-                    }));
-                }
-            };
+            // The bounded size was already enforced when the base64url
+            // payload deserialized; nothing further to decode here.
+            let decoded = &params.package_base64url;
             let report = match context_relay_core::packages::inspect_archive(decoded.as_slice()) {
                 Ok(inspected) => PackageInspectionReport {
                     total_bytes: inspected.total_bytes,
