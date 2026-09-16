@@ -252,7 +252,7 @@ export type StatusOutput = { protocol: ProtocolVersionRange, vault: VaultState, 
 export type ImmutableDependency = { name: string, version: string, digest: Sha256Digest, immutableSourceRef: string, };
 export type PackageEntryDisposition = "accepted" | "rejected";
 export type PackageEntryReport = { path: string, length: bigint, digest: Sha256Digest, disposition: PackageEntryDisposition, };
-export type PackageInspectionReport = { totalBytes: bigint, entryCount: number, 
+export type PackageInspectionReport = { totalBytes: bigint, entryCount: number,
 /**
  * Deterministic digest over every accepted entry path, length and
  * content digest. Scanner runs and any future approval must bind to

@@ -33,3 +33,7 @@
 
 # Upstream Gitleaks policy is byte-pinned with its published CRLF bytes.
 /third_party/sidecars/policies/gitleaks.toml -text whitespace=-trailing-space
+
+# ts-rs emits a trailing space inside optional-field declarations; the
+# generated bindings are committed as-is with trailing spaces stripped.
+/apps/desktop/src/bindings.ts whitespace=trailing-space
