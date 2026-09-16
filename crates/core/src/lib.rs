@@ -7,6 +7,7 @@ pub mod hermes;
 pub mod mcp;
 pub mod native_memory;
 pub mod native_transaction;
+pub mod packages;
 pub mod search;
 pub mod service;
 pub mod setup;

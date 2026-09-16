@@ -47,4 +47,5 @@ unicode-casefold = "0.2.0"
 uuid = { version = "1.18.1", features = ["serde", "std", "v7"] }
 windows-sys = "0.61.2"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets", "zeroize"] }
+zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zeroize = "1.8.2"
