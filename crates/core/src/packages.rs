@@ -374,7 +374,7 @@ pub fn resolve_dependency_closure(
                         name: dependency.name.clone(),
                         required_by: component.id().to_string(),
                     })?;
-            if provider_content_digest(provider) != Some(&dependency.digest) {
+            if provider_content_digest(provider).as_ref() != Some(&dependency.digest) {
                 return Err(ClosureError::DigestMismatch {
                     name: dependency.name.clone(),
                     required_by: component.id().to_string(),
@@ -433,26 +433,72 @@ fn component_dependencies(
 
 fn provider_content_digest(
     component: &context_relay_protocol::PackageComponent,
-) -> Option<&context_relay_protocol::Sha256Digest> {
-    match component {
-        context_relay_protocol::PackageComponent::Skill { .. }
-        | context_relay_protocol::PackageComponent::Plugin { .. } => {
-            component_digest(component.id())
-        }
-        context_relay_protocol::PackageComponent::McpServer { package, .. } => {
-            Some(&package.digest)
-        }
-        _ => None,
-    }
+) -> Option<context_relay_protocol::Sha256Digest> {
+    component_content_digest(component)
 }
 
-fn component_digest(
-    _id: context_relay_protocol::RecordId,
-) -> Option<&'static context_relay_protocol::Sha256Digest> {
-    // Skill and plugin content digests are carried by their own immutable
-    // dependency entry when other components depend on them; a component
-    // cannot depend on itself, so no static digest exists here.
-    None
+/// Deterministic content digest for a dependency provider component.
+///
+/// Skills and plugins carry their content inline, so their digest is derived
+/// from exactly the bytes that would be installed: id, name, body and the
+/// (already validated) digests of their own dependencies. MCP servers declare
+/// their package digest directly. This is what a consumer's immutable
+/// dependency digest must equal, binding the dependency to exact provider
+/// content.
+pub(crate) fn component_content_digest(
+    component: &context_relay_protocol::PackageComponent,
+) -> Option<context_relay_protocol::Sha256Digest> {
+    use sha2::Digest as _;
+    let (kind, id, name, body, dependencies) = match component {
+        context_relay_protocol::PackageComponent::Skill {
+            id,
+            name,
+            body_markdown,
+            dependencies,
+            ..
+        } => (
+            "skill",
+            id.to_string(),
+            name.clone(),
+            body_markdown.clone(),
+            dependencies,
+        ),
+        context_relay_protocol::PackageComponent::Plugin {
+            id,
+            name,
+            dependencies,
+            ..
+        } => (
+            "plugin",
+            id.to_string(),
+            name.clone(),
+            String::new(),
+            dependencies,
+        ),
+        context_relay_protocol::PackageComponent::McpServer { package, .. } => {
+            return Some(package.digest);
+        }
+        _ => return None,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"context-relay/package-component/v1\0");
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(id.as_bytes());
+    hasher.update([0]);
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    hasher.update(body.as_bytes());
+    hasher.update([0]);
+    for dependency in dependencies {
+        hasher.update(dependency.name.as_bytes());
+        hasher.update([0]);
+        hasher.update(dependency.digest.0);
+        hasher.update([0]);
+    }
+    Some(context_relay_protocol::Sha256Digest(
+        hasher.finalize().into(),
+    ))
 }
 
 #[cfg(test)]

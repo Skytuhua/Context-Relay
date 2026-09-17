@@ -8,6 +8,7 @@ pub mod mcp;
 pub mod native_memory;
 pub mod native_transaction;
 pub mod packages;
+pub mod packages_approval;
 pub mod packages_staging;
 pub mod search;
 pub mod service;
