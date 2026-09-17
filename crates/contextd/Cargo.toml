@@ -17,13 +17,24 @@ context-relay-native-runner = { version = "0.1.0", path = "../native-runner" }
 context-relay-protocol = { version = "0.1.0", path = "../protocol" }
 dirs.workspace = true
 keyring.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+base64.workspace = true
+context-relay-local-ipc = { version = "0.1.0", path = "../local-ipc", features = ["test-support"] }
+serde_yaml_ng.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
-uuid.workspace = true
+tokio = { workspace = true, features = ["test-util", "process"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+dunce = "1.0.5"
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_JobObjects"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

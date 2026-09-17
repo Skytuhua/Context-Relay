@@ -31,12 +31,24 @@ const reviewedExceptionFingerprints = [
   'f98444a51754f5deaba2da9aa86f4463129a3380:crates/core/src/hermes/yaml.rs:private-key:94',
   '3c2a371aef74f4962af64d0fe71545557244f21a:crates/core/tests/hermes_adapter_v1.rs:curl-auth-header:2480',
   'b357b29ad4379fae191a288fb653dd55e69f340c:crates/core/src/hermes/yaml.rs:private-key:464',
+  '770a39d5754f22039cc9267932aa43bb7260d99c:crates/core/tests/fixtures/hosted-enrollment-proof-v1.json:generic-api-key:3',
+  '5bd19cfc2125ddaa1e101ef4bd80d8923a114955:crates/core/tests/fixtures/hosted-pairing-approval-v1.json:generic-api-key:14',
+  '1d1ee66c443e50d824ea10224e9f1e517582592d:crates/core/tests/fixtures/hosted-pairing-approval-v1.json:generic-api-key:8',
+  '1d1ee66c443e50d824ea10224e9f1e517582592d:crates/core/tests/fixtures/hosted-pairing-approval-v1.json:generic-api-key:10',
+  'f4ab27c7edb4d5402d96ea21d62cf51a4c25f46e:docs/protocols/historical-key-transfer-v1.md:generic-api-key:128',
+  '924348a36900e89df6bc8b41fa6162127c24b8b3:crates/core/tests/fixtures/hosted-recovery-claim-v2.json:generic-api-key:2',
+  '924348a36900e89df6bc8b41fa6162127c24b8b3:crates/core/tests/fixtures/hosted-pairing-approval-v2.json:generic-api-key:19',
+  '7d736642caeec1e4d71cc3d0421df6a471247486:crates/core/src/vault/membership/activation.rs:generic-api-key:92',
+  '6c3bd9807dce57eecf8335da9730048c8f156942:docs/verification/pr16-windows-shared-acceptance.csv:generic-api-key:322',
+  'cfe00276039ab8dde80a2d7fa59595cb28e31d6d:crates/core/tests/fixtures/device-revocation-v1.json:generic-api-key:1',
 ].join('\n') + '\n';
-const reviewedIgnoreByteLength = 1191;
-const reviewedIgnoreSha256 = 'b2d113e0427ff7a58cb8ba4bd1810257bd15badffe0c411d8602401d8de199e2';
+const reviewedIgnoreByteLength = 2339;
+const reviewedIgnoreSha256 = '5ae940035b8eaa880d038b7636b6d20c8a0c6f48c5668b40fe5352a22f428548';
 const allowedExceptionClassifications = new Set([
   'detector-literal',
   'synthetic-negative-test',
+  'synthetic-public-test-vector',
+  'non-secret-source-or-metadata',
 ]);
 
 function parseExceptionEntries(source) {
@@ -83,7 +95,7 @@ test('repository secret scan verifies pinned Gitleaks and scans every Git ref', 
   assert.match(source, /17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c/);
   assert.match(source, /\.github\/repository\.gitleaksignore/);
   assert.doesNotMatch(source, /third_party\/sidecars\/policies\/repository\.gitleaksignore/);
-  assert.match(source, /\(Get-Item -LiteralPath \$ignore\)\.Length -ne 1191/);
+  assert.match(source, /\(Get-Item -LiteralPath \$ignore\)\.Length -ne 2339/);
   assert.match(source, new RegExp(reviewedIgnoreSha256));
   assert.match(source, /--gitleaks-ignore-path/);
   assert.match(source, /--ignore-gitleaks-allow/);

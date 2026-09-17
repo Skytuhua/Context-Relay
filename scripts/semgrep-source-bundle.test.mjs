@@ -5,6 +5,8 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, w
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import * as sourceBundle from './semgrep-source-bundle.mjs';
 
 import {
   archiveCacheLinks,
@@ -686,6 +688,37 @@ test('archive fetch verifies before atomic persistence and reuses a valid cache'
   await assert.rejects(() => readFile(join(root, 'sha256', sha256)), /ENOENT/i);
 });
 
+test('archive fetch retries transient HTTP failures within a bounded attempt count', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'context-relay-semgrep-fetch-retry-'));
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const bytes = Buffer.from('pinned retry archive');
+  const sha256 = digest('sha256', bytes);
+  const source = { url: 'https://example.invalid/archive', mirrors: [], supplementalChecksums: [], checksums: [{ algorithm: 'sha256', digest: sha256 }] };
+  const lock = { opam: { resolvedSourceArchives: [{ package: 'a', version: '1', targets: ['windows-x86_64'], opamPath: 'packages/a/a.1/opam', opamSha256: 'a'.repeat(64), licenses: ['MIT'], source, extraSources: [] }] } };
+  let calls = 0;
+  const failedBody = new Response('temporary failure', { status: 500 });
+  await fetchArchiveCache(lock, join(root, 'success'), {
+    fetchImpl: async () => ++calls === 1 ? failedBody : new Response(bytes),
+  });
+  assert.equal(calls, 2);
+  assert.deepEqual(await readFile(join(root, 'success', 'sha256', sha256)), bytes);
+  assert.equal((await failedBody.body.getReader().read()).done, true);
+  for (const [label, status, expectedCalls] of [['unavailable', 503, 3], ['missing', 404, 1]]) {
+    calls = 0;
+    await assert.rejects(() => fetchArchiveCache(lock, join(root, label), {
+      fetchImpl: async () => { calls += 1; return new Response('error', { status }); },
+    }), /HTTP/);
+    assert.equal(calls, expectedCalls);
+    await assert.rejects(() => readFile(join(root, label, 'sha256', sha256)), /ENOENT/);
+  }
+  calls = 0;
+  await assert.rejects(() => fetchArchiveCache(lock, join(root, 'drift'), {
+    fetchImpl: async () => ++calls === 1 ? new Response('retry', { status: 500 }) : new Response('drift'),
+  }), /checksum mismatch/);
+  assert.equal(calls, 2);
+  await assert.rejects(() => readFile(join(root, 'drift', 'sha256', sha256)), /ENOENT/);
+});
+
 test('archive fetch enforces one aggregate cache budget across downloads', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'context-relay-semgrep-fetch-cap-'));
   t.after(() => rm(root, { force: true, recursive: true }));
@@ -821,6 +854,14 @@ test('complete bundle includes recursive git, opam records, pins, archives, and 
   await buildSemgrepSourceBundle({ ...options, outputPath: second });
   assert.deepEqual(await readFile(first), await readFile(second));
   const verified = await verifySemgrepSourceBundle({ bundlePath: first, sourceLockPath });
+  const supported = await buildSemgrepSourceBundle({
+    ...options,
+    outputPath: join(root, 'with-default-support.tar'),
+    supportPaths: undefined,
+    supportRoot: fileURLToPath(new URL('..', import.meta.url)),
+  });
+  const helperPath = 'third_party/sidecars/semgrep/windows-offline-firewall.ps1';
+  assert.equal(supported.digests[`support/${helperPath}`], digest('sha256', await readFile(new URL(`../${helperPath}`, import.meta.url))));
   for (const path of [
     'sources/semgrep/main.ml',
     'sources/semgrep/deps/sub/sub.ml',
@@ -886,4 +927,114 @@ test('complete bundle includes recursive git, opam records, pins, archives, and 
     () => verifyBundleEvidence({ bundlePath: first, evidencePath, sourceLockPath }),
     /evidence.*bundle|bundle.*evidence|size/i,
   );
+
+  await t.test('internal Windows source evidence binds completed bundled delivery without public promotion', async () => {
+    Object.assign(lock, {
+      completeCorrespondingSource: true,
+      missingMaterial: [],
+      targetStatus: [
+        { distributionTarget: 'windows-x86_64', enabled: true, reason: null },
+        { distributionTarget: 'aarch64-apple-darwin', enabled: false, reason: 'deferred_apple_native_qualification' },
+      ],
+    });
+    lock.opam.resolvedSourceArchivesComplete = true;
+    await writeFile(sourceLockPath, `${JSON.stringify(lock, null, 2)}\n`);
+    const bundlePath = join(root, 'internal.tar');
+    const built = await buildSemgrepSourceBundle({ ...options, outputPath: bundlePath });
+    const internal = {
+      schemaVersion: 2,
+      format: 'context-relay-semgrep-source-v1',
+      sourceLockSha256: digest('sha256', await readFile(sourceLockPath)),
+      bundleGeneratorSha256: digest('sha256', await readFile(new URL('./semgrep-source-bundle.mjs', import.meta.url))),
+      independentBuilds: 2,
+      byteIdentical: true,
+      status: 'complete_corresponding_source',
+      sourceDelivery: { kind: 'bundled', path: 'compliance/semgrep/semgrep-1.170.0-corresponding-source.tar' },
+      bundle: { sha256: built.sha256, size: built.size, payloadEntries: built.payloadEntries, recordedLinks: built.links },
+    };
+    const internalEvidencePath = join(root, 'bundle-evidence.internal-windows.v2.json');
+    const checkOptions = { bundlePath, evidencePath: internalEvidencePath, sourceLockPath };
+    const save = (value) => writeFile(internalEvidencePath, `${JSON.stringify(value, null, 2)}\n`);
+    await save(internal);
+    assert.equal(typeof sourceBundle.verifyInternalBundleEvidenceV2, 'function', 'completed internal bundled-source verification is required');
+    const actual = await sourceBundle.verifyInternalBundleEvidenceV2(checkOptions);
+    assert.equal(actual.sha256, digest('sha256', await readFile(bundlePath)));
+    await assert.rejects(() => verifyBundleEvidence(checkOptions), /fields|schema|asset/i);
+    await assert.rejects(
+      () => sourceBundle.verifyInternalBundleEvidenceV2({ ...checkOptions, evidencePath }),
+      /fields|schema|delivery/i,
+    );
+
+    for (const [label, change] of [
+      ['public delivery', (value) => { value.sourceAssetUrl = evidence.sourceAssetUrl; }],
+      ['alternate companion', (value) => { value.sourceDelivery.path = '../source.tar'; }],
+      ['missing delivery', (value) => { delete value.sourceDelivery; }],
+      ['unknown delivery field', (value) => { value.sourceDelivery.url = 'https://example.invalid/source.tar'; }],
+      ['wrong delivery kind', (value) => { value.sourceDelivery.kind = 'download'; }],
+      ['single build', (value) => { value.independentBuilds = 1; }],
+      ['pending source', (value) => { value.status = 'source_bundle_reproducible_native_builds_pending'; }],
+      ['unequal builds', (value) => { value.byteIdentical = false; }],
+      ['wrong schema', (value) => { value.schemaVersion = 1; }],
+      ['empty generator hash', (value) => { value.bundleGeneratorSha256 = '0'.repeat(64); }],
+      ['uppercase digest', (value) => { value.bundle.sha256 = 'A'.repeat(64); }],
+      ['oversized bundle', (value) => { value.bundle.size = 2147483649; }],
+      ['excessive entries', (value) => { value.bundle.payloadEntries = 1000001; }],
+      ['excessive links', (value) => { value.bundle.recordedLinks = 1000001; }],
+      ['wrong count', (value) => { value.bundle.payloadEntries += 1; }],
+      ['stale lock', (value) => { value.sourceLockSha256 = '1'.repeat(64); }],
+    ]) {
+      const invalid = structuredClone(internal);
+      change(invalid);
+      await save(invalid);
+      await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /bundle evidence|source delivery/i, label);
+    }
+    await writeFile(internalEvidencePath, `${JSON.stringify(internal, null, 2).slice(0, -1)},"schemaVersion":2}\n`);
+    await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /canonical|fields|JSON/i);
+    await writeFile(internalEvidencePath, `${JSON.stringify(internal, null, 2)}${' '.repeat(65536)}\n`);
+    await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /bounded|size/i);
+
+    for (const [label, change] of [
+      ['incomplete source', (value) => { value.completeCorrespondingSource = false; }],
+      ['pending material', (value) => { value.missingMaterial = ['native build']; }],
+      ['incomplete archive inventory', (value) => { value.opam.resolvedSourceArchivesComplete = false; }],
+      ['unqualified Windows', (value) => { value.targetStatus[0].enabled = false; }],
+      ['promoted Apple', (value) => { value.targetStatus[1].enabled = true; }],
+      ['missing deferral', (value) => { value.targetStatus[1].reason = null; }],
+      ['duplicate target', (value) => { value.targetStatus.push(value.targetStatus[0]); }],
+    ]) {
+      const invalidLock = structuredClone(lock);
+      change(invalidLock);
+      await writeFile(sourceLockPath, `${JSON.stringify(invalidLock, null, 2)}\n`);
+      await save({ ...internal, sourceLockSha256: digest('sha256', await readFile(sourceLockPath)) });
+      await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /source lock|target|incomplete/i, label);
+    }
+    await writeFile(sourceLockPath, `${JSON.stringify(lock, null, 2)}\n`);
+    await save(internal);
+    const changedLicensePath = join(root, 'changed-license.tar');
+    const changedLicense = await buildDeterministicTar({
+      outputPath: changedLicensePath,
+      entries: [
+        { path: 'metadata/source-lock.v1.json', bytes: await readFile(sourceLockPath), executable: false },
+        { path: `opam-repository/cache/sha256/${archiveSha256.slice(0, 2)}/${archiveSha256}`, bytes: archive, executable: false },
+        ...lock.licenseMaterials.map((material) => ({
+          path: material.path,
+          bytes: material.source === 'semgrep' ? Buffer.from('substituted license\n') : license,
+          executable: false,
+        })),
+      ],
+    });
+    await save({ ...internal, bundle: {
+      sha256: changedLicense.sha256,
+      size: changedLicense.size,
+      payloadEntries: changedLicense.payloadEntries,
+      recordedLinks: changedLicense.links,
+    } });
+    await assert.rejects(
+      () => sourceBundle.verifyInternalBundleEvidenceV2({ ...checkOptions, bundlePath: changedLicensePath }),
+      /license material/i,
+    );
+    await save(internal);
+    await writeFile(bundlePath, Buffer.from('substituted source'));
+    await assert.rejects(() => sourceBundle.verifyInternalBundleEvidenceV2(checkOptions), /bundle|tar/i);
+  });
 });

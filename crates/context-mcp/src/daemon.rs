@@ -2,7 +2,7 @@ use std::fmt;
 #[cfg(feature = "test-support")]
 use std::sync::Arc;
 
-use context_relay_local_ipc::Client;
+use context_relay_local_ipc::{Client, IpcError};
 #[cfg(feature = "test-support")]
 use context_relay_local_ipc::{InstallationToken, RuntimeConfig};
 use context_relay_protocol::{
@@ -52,6 +52,7 @@ impl BridgeError {
                 ErrorCode::Canceled => "The request was canceled",
                 ErrorCode::Timeout => "The request timed out with an unknown outcome",
                 ErrorCode::Busy => "The local service is busy",
+                ErrorCode::ProtocolVersionUnsupported => SERVICE_UPDATE_GUIDANCE,
                 _ => "The local service could not complete the request",
             },
             Self::FrameTooLarge => "An MCP message exceeded the size limit",
@@ -106,6 +107,22 @@ impl From<ClientError> for BridgeError {
     }
 }
 
+const SERVICE_UPDATE_GUIDANCE: &str = "Context Relay and its local service use different versions. Close Context Relay, run the latest installer, then reopen it.";
+
+impl From<IpcError> for BridgeError {
+    fn from(error: IpcError) -> Self {
+        match error {
+            IpcError::ProtocolVersionUnsupported => Self::Client(ClientError {
+                code: ErrorCode::ProtocolVersionUnsupported,
+                message: SERVICE_UPDATE_GUIDANCE.into(),
+                field_path: None,
+                retryable: false,
+            }),
+            _ => Self::Unavailable,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct LocalDaemon {
     target: ConnectionTarget,
@@ -140,12 +157,12 @@ impl LocalDaemon {
         match &self.target {
             ConnectionTarget::Production => Client::connect(ClientRole::McpBridge)
                 .await
-                .map_err(|_| BridgeError::Unavailable),
+                .map_err(BridgeError::from),
             #[cfg(feature = "test-support")]
             ConnectionTarget::Test { runtime, token } => {
                 Client::connect_for_test(runtime, ClientRole::McpBridge, token)
                     .await
-                    .map_err(|_| BridgeError::Unavailable)
+                    .map_err(BridgeError::from)
             }
         }
     }
@@ -316,10 +333,36 @@ impl TestObserver {
 
 #[cfg(test)]
 mod tests {
+    use context_relay_local_ipc::IpcError;
+    use context_relay_protocol::ErrorCode;
     use context_relay_protocol::LocalResult;
     use serde_json::json;
 
     use super::{BridgeError, decode_mcp_result};
+
+    #[test]
+    fn incompatible_service_is_actionable_without_exposing_other_ipc_failures() {
+        let error = BridgeError::from(IpcError::ProtocolVersionUnsupported);
+        assert_eq!(
+            error.client_error().code,
+            ErrorCode::ProtocolVersionUnsupported
+        );
+        assert!(
+            error
+                .redacted_message()
+                .contains("run the latest installer")
+        );
+        assert!(!error.client_error().retryable);
+        for error in [
+            IpcError::AuthenticationFailed,
+            IpcError::MissingToken,
+            IpcError::InvalidToken,
+            IpcError::Credential,
+            IpcError::Io,
+        ] {
+            assert_eq!(BridgeError::from(error), BridgeError::Unavailable);
+        }
+    }
 
     #[test]
     fn daemon_output_name_must_match_the_requested_tool_exactly() {

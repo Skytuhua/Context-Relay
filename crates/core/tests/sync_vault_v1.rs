@@ -104,6 +104,7 @@ fn build_with_project(
     let keys = DeviceKeys::generate().unwrap();
     let content_key = ContentKey::from_bytes([11; 32]);
     OperationBuilder::new(SyncIdentity {
+        membership_endpoint: None,
         account_id: id(ACCOUNT_ID),
         workspace_id: id(WORKSPACE_ID),
         device_id: id(DEVICE_ID),
@@ -135,6 +136,7 @@ fn build_with_nonce(
     let content_key = ContentKey::from_bytes([content_key_byte; 32]);
     OperationBuilder::with_nonce_for_test(
         SyncIdentity {
+            membership_endpoint: None,
             account_id: id(ACCOUNT_ID),
             workspace_id: id(WORKSPACE_ID),
             device_id: id(DEVICE_ID),

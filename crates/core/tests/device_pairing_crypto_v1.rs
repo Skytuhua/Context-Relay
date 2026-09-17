@@ -33,6 +33,134 @@ const ISSUER_CERTIFICATE_ID: &str = "018f22e2-79b0-7cc8-98c4-dc0c0c073987";
 const _: () = assert!(MAX_PAIRING_APPROVED_PAYLOAD_BYTES > MAX_PAIRING_GRANT_BYTES);
 
 #[test]
+fn hosted_pairing_proofs_bind_session_operation_and_installed_keys() {
+    use context_relay_core::devices::crypto::{
+        sign_hosted_pairing_approval_proof, sign_hosted_pairing_request_proof,
+    };
+    let user = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+    let session = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001").unwrap();
+    let joiner = DeviceKeys::generate().unwrap();
+    let issuer = DeviceKeys::generate().unwrap();
+    let request = signed_request(&joiner);
+    let payload = approved_payload(
+        &request,
+        &issuer,
+        issuer_certificate(&issuer),
+        id(ISSUER_CERTIFICATE_ID),
+    );
+    let request_proof =
+        sign_hosted_pairing_request_proof(&joiner, user, session, &request).unwrap();
+    let approval_proof =
+        sign_hosted_pairing_approval_proof(&issuer, user, session, &request, &payload).unwrap();
+    for (operation, bytes, keys, signature) in [
+        (
+            "request",
+            request.canonical_bytes().to_vec(),
+            &joiner,
+            request_proof,
+        ),
+        (
+            "approval",
+            encode_pairing_approved_payload_v1(&payload).unwrap(),
+            &issuer,
+            approval_proof,
+        ),
+    ] {
+        let mut preimage =
+            format!("context-relay/hosted-pairing-{operation}-proof/v1\0").into_bytes();
+        preimage.extend_from_slice(user.as_bytes());
+        preimage.extend_from_slice(session.as_bytes());
+        preimage.extend_from_slice(&Sha256::digest(bytes));
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&keys.signing_public_key().0).unwrap();
+        key.verify_strict(
+            &preimage,
+            &ed25519_dalek::Signature::from_bytes(&signature.0),
+        )
+        .unwrap();
+        preimage[0] ^= 1;
+        assert!(
+            key.verify_strict(
+                &preimage,
+                &ed25519_dalek::Signature::from_bytes(&signature.0)
+            )
+            .is_err()
+        );
+    }
+    assert!(sign_hosted_pairing_request_proof(&issuer, user, session, &request).is_err());
+    assert!(
+        sign_hosted_pairing_approval_proof(&joiner, user, session, &request, &payload).is_err()
+    );
+    assert!(
+        sign_hosted_pairing_request_proof(&joiner, uuid::Uuid::nil(), session, &request).is_err()
+    );
+}
+
+#[test]
+fn hosted_pairing_approval_fixture_verifies_the_exact_request() {
+    let decode = |encoded: &str| -> Vec<u8> {
+        (0..encoded.len())
+            .step_by(2)
+            .map(|offset| u8::from_str_radix(&encoded[offset..offset + 2], 16).unwrap())
+            .collect()
+    };
+    let bytes = decode(include_str!("fixtures/hosted-pairing-request-v1.hex").trim());
+    let request = context_relay_protocol::decode_pairing_request_v1(&bytes).unwrap();
+    let signed = verify_pairing_request(&request).unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/hosted-pairing-approval-v1.json")).unwrap();
+    let canonical = decode(fixture["canonicalApprovedPayload"].as_str().unwrap());
+    inspect_pairing_approval(&canonical, &signed).unwrap();
+    let user = fixture["proofs"]["authUserId"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let session = fixture["proofs"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let request_proof = context_relay_core::devices::crypto::sign_hosted_pairing_request_proof(
+        &DeviceKeys::from_seeds_for_test([0x71; 32], [0x72; 32]),
+        user,
+        session,
+        &signed,
+    )
+    .unwrap();
+    let approval_proof = context_relay_core::devices::crypto::sign_hosted_pairing_approval_proof(
+        &DeviceKeys::from_seeds_for_test([0x73; 32], [0x74; 32]),
+        user,
+        session,
+        &signed,
+        &decode_pairing_approved_payload_v1(&canonical).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        hex(&request_proof.0),
+        fixture["proofs"]["request"].as_str().unwrap()
+    );
+    assert_eq!(
+        hex(&approval_proof.0),
+        fixture["proofs"]["approval"].as_str().unwrap()
+    );
+}
+#[test]
+fn hosted_pairing_request_signature_matches_the_edge_fixture() {
+    let encoded = include_str!("fixtures/hosted-pairing-request-v1.hex").trim();
+    let bytes: Vec<u8> = (0..encoded.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&encoded[offset..offset + 2], 16).unwrap())
+        .collect();
+    let request = context_relay_protocol::decode_pairing_request_v1(&bytes).unwrap();
+    let verified = verify_pairing_request(&request).unwrap();
+    assert_eq!(verified.canonical_bytes(), bytes);
+    assert_eq!(
+        verified.digest().0.as_slice(),
+        Sha256::digest(&bytes).as_slice()
+    );
+}
+
+#[test]
 fn signed_pairing_requests_verify_exact_fields_and_separate_algorithms() {
     let keys = DeviceKeys::generate().unwrap();
     let signed = signed_request(&keys);
@@ -867,4 +995,73 @@ where
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
+fn enrollment_pin_is_bound_to_the_confirmed_pairing_transcript() {
+    let issuer = DeviceKeys::generate().unwrap();
+    let certificate = issuer_certificate(&issuer);
+    let joiner = DeviceKeys::generate().unwrap();
+    let request = signed_request(&joiner);
+    let bundle = key_bundle()
+        .with_enrollment_record_sha256(Sha256Digest([0x42; 32]))
+        .unwrap();
+    let grant = build_pairing_grant(
+        &request,
+        &approval(&request, certificate.clone()),
+        &issuer,
+        &bundle,
+    )
+    .unwrap();
+    let payload = build_pairing_approved_payload_v1(
+        &request,
+        grant,
+        id(ISSUER_CERTIFICATE_ID),
+        certificate,
+        "Desktop",
+        NativePlatform::Macos,
+    )
+    .unwrap();
+    let encoded = encode_pairing_approved_payload_v1(&payload).unwrap();
+    let inspected = inspect_pairing_approval(&encoded, &request).unwrap();
+    let confirmed = confirm_and_open_pairing_approval(
+        &inspected,
+        inspected.safety_number().as_str(),
+        &request,
+        &joiner,
+    )
+    .unwrap();
+    assert_eq!(
+        confirmed.key_bundle().enrollment_record_sha256(),
+        Some(Sha256Digest([0x42; 32]))
+    );
+    // Even a change to the encrypted pin cannot reuse the already confirmed safety number.
+    let mut altered = payload;
+    let ciphertext = &mut altered.grant.wrapped_key_bundle.ciphertext;
+    let pin_offset = ciphertext.len() - 16 - 1;
+    ciphertext[pin_offset] ^= 1;
+    let altered = inspect_pairing_approval(
+        &encode_pairing_approved_payload_v1(&altered).unwrap(),
+        &request,
+    )
+    .unwrap();
+    assert_ne!(altered.safety_number(), inspected.safety_number());
+    assert!(
+        confirm_and_open_pairing_approval(
+            &altered,
+            inspected.safety_number().as_str(),
+            &request,
+            &joiner
+        )
+        .is_err()
+    );
+    assert!(
+        confirm_and_open_pairing_approval(
+            &altered,
+            altered.safety_number().as_str(),
+            &request,
+            &joiner
+        )
+        .is_err()
+    );
 }

@@ -7,6 +7,9 @@ import type {
   DecimalTimestamp,
   DeviceId,
   DeviceSummary,
+  DeviceRevocationStatus,
+  DeviceRevocationSummary,
+  OperationId,
   PairingCode,
   PairingId,
   PairingSafetyNumber,
@@ -37,6 +40,7 @@ const safety = '0123-4567-89AB-CDEF-0123' as PairingSafetyNumber;
 const createdAt = '1000' as DecimalTimestamp;
 const expiresAt = '601000' as DecimalTimestamp;
 const enrollmentId = '018f22e2-79b0-7cc8-98c4-dc0c0c076001' as RecoveryEnrollmentId;
+const revocationId = '018f22e2-79b0-7cc8-98c4-dc0c0c077001' as OperationId;
 const recoveryCreatedAt = '1000' as DecimalTimestamp;
 const recoveryExpiresAt = '601000' as DecimalTimestamp;
 const recoveryCanaries = ['abandon', 'ability', 'able', 'about'];
@@ -85,6 +89,13 @@ const request = (digest = requestDigest): PairingRequestResult => ({
 });
 
 class FakeDeviceGateway implements DeviceGateway {
+  async recoveryHistoryCandidates(): Promise<never> { throw new Error('not configured'); }
+  async recoveryHistorySelect(): Promise<never> { throw new Error('not configured'); }
+  async recoveryHistoryUnlock(): Promise<never> { throw new Error('not configured'); }
+  async recoveryRestoreOverview() { return { state: 'idle' } as const; }
+  async recoveryRestoreBegin() { return null; }
+  async recoveryRestoreResume(): Promise<never> { throw new Error('No restore is prepared'); }
+  async recoveryRestoreCancel() { return { state: 'idle' } as const; }
   devicesValue: DeviceSummary[] = [currentDevice];
   createError: unknown = null;
   confirmError: unknown = null;
@@ -118,6 +129,38 @@ class FakeDeviceGateway implements DeviceGateway {
   recoveryCancelCalls: RecoveryEnrollmentId[] = [];
   recoveryCancelError: unknown = null;
   recoveryOverviewCalls = 0;
+  revocationStatusValue: DeviceRevocationStatus = {
+    operationId: revocationId,
+    deviceId: joinerId,
+    sendCanceled: false,
+    access: 'ready',
+    outcome: { state: 'unconfirmed' },
+  };
+  revocationCalls: Array<{ operationId: OperationId; deviceId: DeviceId }> = [];
+  revocationStatusCalls: OperationId[] = [];
+  revocationCancelCalls: OperationId[] = [];
+  revocationIntentsValue: DeviceRevocationSummary[] = [];
+  revocationIntentCalls: Array<OperationId | null> = [];
+
+  async revokeDevice(operationId: OperationId, deviceId: DeviceId) {
+    this.revocationCalls.push({ operationId, deviceId });
+    return { ...this.revocationStatusValue, operationId, deviceId };
+  }
+
+  async deviceRevocationStatus(operationId: OperationId) {
+    this.revocationStatusCalls.push(operationId);
+    return { ...this.revocationStatusValue, operationId };
+  }
+
+  async cancelDeviceRevocation(operationId: OperationId) {
+    this.revocationCancelCalls.push(operationId);
+    return { ...this.revocationStatusValue, operationId, sendCanceled: true };
+  }
+
+  async deviceRevocationIntents(after: OperationId | null) {
+    this.revocationIntentCalls.push(after);
+    return after === null ? this.revocationIntentsValue : [];
+  }
 
   async devices() {
     this.devicesCalls += 1;
@@ -228,6 +271,65 @@ afterEach(() => {
 });
 
 describe('DevicesScreen', () => {
+  it('requires explicit revocation confirmation and keeps an uncertain operation for status', async () => {
+    const gateway = new FakeDeviceGateway();
+    gateway.devicesValue = [currentDevice, { ...joiningDevice, isCurrent: false }];
+    render(<DevicesScreen gateway={gateway} pollIntervalMs={60_000} />);
+
+    await screen.findByText('Travel Mac');
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke Travel Mac' }));
+    const dialog = screen.getByRole('dialog', { name: 'Revoke device' });
+    expect(within(dialog).getByText(/Travel Mac will lose access/)).toBeVisible();
+    expect(gateway.revocationCalls).toHaveLength(0);
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Revoke device' }));
+    await within(dialog).findByText('The revocation outcome is not confirmed.');
+    expect(gateway.revocationCalls).toHaveLength(1);
+    expect(gateway.devicesCalls).toBe(1);
+
+    gateway.revocationStatusValue = {
+      ...gateway.revocationStatusValue,
+      outcome: {
+        state: 'accepted',
+        acceptedEndpoint: { stateSha256: '11'.repeat(32) as Sha256Digest, controlEpoch: 2, keyEpoch: 2 },
+      },
+    };
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Check revocation status' }));
+    await within(dialog).findByText('Revocation accepted.');
+    expect(gateway.revocationStatusCalls).toEqual([gateway.revocationCalls[0].operationId]);
+    await waitFor(() => expect(gateway.devicesCalls).toBe(2));
+  });
+
+  it('shows current and final-device consequences before revocation', async () => {
+    const gateway = new FakeDeviceGateway();
+    render(<DevicesScreen gateway={gateway} pollIntervalMs={60_000} />);
+    await screen.findByText('Current Mac');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke Current Mac' }));
+    const dialog = screen.getByRole('dialog', { name: 'Revoke device' });
+    expect(within(dialog).getByText(/current device will immediately lose access/i)).toBeVisible();
+    expect(within(dialog).getByText(/last trusted device/i)).toBeVisible();
+    expect(gateway.revocationCalls).toHaveLength(0);
+  });
+
+  it('discovers retained revocation attempts after restart and refreshes the same operation', async () => {
+    const gateway = new FakeDeviceGateway();
+    gateway.devicesValue = [currentDevice, { ...joiningDevice, isCurrent: false }];
+    gateway.revocationIntentsValue = [gateway.revocationStatusValue];
+    render(<DevicesScreen gateway={gateway} pollIntervalMs={60_000} />);
+
+    const review = await screen.findByRole('button', {
+      name: 'Review saved revocation for Travel Mac',
+    });
+    await waitFor(() => expect(gateway.revocationIntentCalls).toEqual([null, revocationId]));
+
+    fireEvent.click(review);
+    const dialog = screen.getByRole('dialog', { name: 'Revoke device' });
+    expect(within(dialog).getByText('The revocation outcome is not confirmed.')).toBeVisible();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Check revocation status' }));
+    await waitFor(() => expect(gateway.revocationStatusCalls).toEqual([revocationId]));
+  });
+
   it('shows only the four challenged recovery words and confirms the exact projection', async () => {
     const gateway = new FakeDeviceGateway();
     render(<DevicesScreen gateway={gateway} pollIntervalMs={60_000} />);
@@ -258,7 +360,7 @@ describe('DevicesScreen', () => {
       },
     ]);
     expect(gateway.recoveryBeginCalls).toBe(1);
-    expect(await screen.findByRole('status')).toHaveTextContent('Recovery is ready.');
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent('Recovery is ready.');
     expect(screen.getByRole('heading', { name: 'Recovery' })).toHaveFocus();
     expect(gateway.devicesCalls).toBe(2);
     for (const canary of recoveryCanaries) {
@@ -272,11 +374,12 @@ describe('DevicesScreen', () => {
     gateway.recoveryStatusQueue = [recoveryStatus('complete', enrollmentId)];
     render(<DevicesScreen gateway={gateway} pollIntervalMs={5} />);
 
-    expect(await screen.findByRole('status')).toHaveTextContent('Recovery setup is being secured.');
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent('Recovery setup is being secured.');
     await waitFor(() => expect(gateway.recoveryStatusCalls).toEqual([enrollmentId]));
-    expect(await screen.findByRole('status')).toHaveTextContent('Recovery is ready.');
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent('Recovery is ready.');
     expect(screen.queryByRole('button', { name: 'Set up recovery' })).not.toBeInTheDocument();
-    expect(localStorage.length).toBe(0);
+    expect(Object.keys(localStorage).filter(key => key !== 'context-relay.desktop-preferences.v1')).toEqual([]);
+    for (const canary of recoveryCanaries) expect(JSON.stringify(localStorage)).not.toContain(canary);
     expect(sessionStorage.length).toBe(0);
   });
 
@@ -285,7 +388,7 @@ describe('DevicesScreen', () => {
     gateway.recoveryOverviewValue = recoveryStatus('awaiting_confirmation', enrollmentId);
     render(<DevicesScreen gateway={gateway} />);
 
-    expect(await screen.findByRole('status')).toHaveTextContent(
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent(
       'The previous recovery phrase is no longer valid. Start setup again.',
     );
     expect(gateway.recoveryCancelCalls).toEqual([enrollmentId]);
@@ -307,7 +410,7 @@ describe('DevicesScreen', () => {
     } satisfies ClientError;
     render(<DevicesScreen gateway={gateway} />);
 
-    expect(await screen.findByRole('status')).toHaveTextContent(
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent(
       'The previous recovery phrase is no longer valid. Start setup again.',
     );
     expect(gateway.recoveryCancelCalls).toEqual([enrollmentId]);
@@ -334,7 +437,7 @@ describe('DevicesScreen', () => {
       'The previous recovery setup could not be canceled. Try again.',
     );
     fireEvent.click(retry);
-    expect(await screen.findByRole('status')).toHaveTextContent(
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent(
       'The previous recovery phrase is no longer valid. Start setup again.',
     );
     expect(gateway.recoveryCancelCalls).toEqual([enrollmentId, enrollmentId]);
@@ -364,18 +467,77 @@ describe('DevicesScreen', () => {
     fillRecoveryWords(form);
     fireEvent.submit(form);
 
-    expect(await screen.findByRole('status')).toHaveTextContent(
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent(
       'Recovery confirmation was canceled. Your four entries are still here.',
     );
     expect(within(form).getByRole('textbox', { name: 'Word 1' })).toHaveValue('abandon');
     fireEvent.click(within(form).getByRole('button', { name: 'Cancel recovery setup' }));
-    expect(await screen.findByRole('status')).toHaveTextContent(
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent(
       'Recovery setup canceled. The previous phrase is no longer valid.',
     );
     expect(gateway.recoveryCancelCalls).toEqual([enrollmentId]);
     for (const canary of recoveryCanaries) {
       expect(document.documentElement.outerHTML).not.toContain(canary);
     }
+  });
+
+  it.each(['complete', 'submitting'] as const)('reconciles a failed confirmation to %s without starting over', async (state) => {
+    const gateway = new FakeDeviceGateway();
+    gateway.recoveryConfirmError = new Error('private provider detail');
+    render(<DevicesScreen gateway={gateway} pollIntervalMs={60_000} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Set up recovery' }));
+    const form = await screen.findByRole('form', { name: 'Confirm recovery phrase' });
+    fillRecoveryWords(form);
+    gateway.recoveryOverviewValue = recoveryStatus(state);
+    fireEvent.submit(form);
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent(
+      state === 'complete' ? 'Recovery is ready.' : 'Recovery setup is being secured.',
+    );
+    expect(screen.queryByRole('button', { name: 'Set up recovery' })).not.toBeInTheDocument();
+    expect(gateway.recoveryCancelCalls).toEqual([]);
+    for (const canary of recoveryCanaries) {
+      expect(document.documentElement.outerHTML).not.toContain(canary);
+    }
+  });
+
+  it('keeps an unknown confirmation outcome closed until status can be retried', async () => {
+    const gateway = new FakeDeviceGateway();
+    gateway.recoveryConfirmError = new Error('private provider detail');
+    render(<DevicesScreen gateway={gateway} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Set up recovery' }));
+    const form = await screen.findByRole('form', { name: 'Confirm recovery phrase' });
+    fillRecoveryWords(form);
+    vi.spyOn(gateway, 'recoveryEnrollmentOverview').mockRejectedValueOnce(new Error('offline'));
+    fireEvent.submit(form);
+    const retry = await screen.findByRole('button', { name: 'Retry recovery status' });
+    expect(screen.queryByRole('button', { name: 'Set up recovery' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('form', { name: 'Confirm recovery phrase' })).not.toBeInTheDocument();
+    gateway.recoveryOverviewValue = recoveryStatus('complete');
+    fireEvent.click(retry);
+    expect(await within(screen.getByRole('region', { name: 'Recovery' })).findByRole('status')).toHaveTextContent('Recovery is ready.');
+    expect(gateway.recoveryBeginCalls).toBe(1);
+    expect(gateway.recoveryCancelCalls).toEqual([]);
+  });
+
+  it('retries status after a submitting poll fails without replacing enrollment', async () => {
+    const gateway = new FakeDeviceGateway();
+    gateway.recoveryOverviewValue = recoveryStatus('submitting', enrollmentId);
+    vi.spyOn(gateway, 'recoveryEnrollmentStatus').mockRejectedValueOnce(new Error('offline'));
+    render(<DevicesScreen gateway={gateway} pollIntervalMs={5} />);
+    const retry = await screen.findByRole('button', { name: 'Retry recovery status' });
+    expect(screen.queryByRole('button', { name: 'Set up recovery' })).not.toBeInTheDocument();
+    gateway.recoveryOverviewValue = recoveryStatus('complete', enrollmentId);
+    fireEvent.click(retry);
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Recovery is ready.'));
+    expect(gateway.recoveryBeginCalls).toBe(0);
+  });
+
+  it('retries an unavailable initial recovery status', async () => {
+    const gateway = new FakeDeviceGateway();
+    vi.spyOn(gateway, 'recoveryEnrollmentOverview').mockRejectedValueOnce(new Error('offline'));
+    render(<DevicesScreen gateway={gateway} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry recovery status' }));
+    expect(await screen.findByRole('button', { name: 'Set up recovery' })).toBeEnabled();
   });
 
   it('clears every entered word on mismatch and on unmount', async () => {

@@ -5,6 +5,31 @@ head under review. GitHub still reports alerts against the default branch until
 the reviewed repair is merged and Dependabot rescans it; no alert was dismissed
 or marked accepted by this work.
 
+## September 14 Rust follow-up
+
+Read-only GitHub API verification still reports alert `#23` open for
+`glib >=0.15.0,<0.20.0`, first patched at `0.20.0`. Local `Cargo.lock` at
+`1bc7d53` contains `glib 0.18.5`, `gtk 0.18.2`, `tauri 2.11.5`,
+`tao 0.35.3`, `webkit2gtk 2.0.2` and `wry 0.55.1`.
+
+The [upstream advisory](https://github.com/advisories/GHSA-wrw7-89jp-8q8g)
+identifies an invalid immutable out-pointer in `VariantStrIter`; its fix uses
+a mutable pointer. The current upstream
+[Tauri manifest](https://github.com/tauri-apps/tauri/blob/dev/crates/tauri/Cargo.toml)
+still declares Linux `gtk 0.18`, as does the
+[Tao manifest](https://github.com/tauri-apps/tao/blob/dev/Cargo.toml)
+whose observed development version is `0.37.0`. These moving-branch observations
+do not establish a tested compatible upgrade or rule out a reviewed backport.
+They show why simply selecting a newer Tao version is not a verified repair.
+
+The September12 saved target-tree evidence was inspected, not rerun during the
+exclusive membership test batch. No Apple qualification was performed. No
+dependency, alert state or exception approval changed. The older September10
+proposed expiry below has elapsed; a later local proposal through October9 is
+also unapproved. Neither proposal authorizes release acceptance. Require a
+verified remediation or explicit disposition with fresh applicable-target and
+artifact evidence at the final release boundary.
+
 ## Node repair
 
 The 22 open npm alerts reported by Dependabot collapse to five packages. The

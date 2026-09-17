@@ -34,7 +34,7 @@
   "project": {
     "CLAUDE.md": "# Project instructions\nUse Rust 2024.\n",
     ".claude/CLAUDE.md": "# Nested project instructions\nPreserve public APIs.\n",
-    ".claude/settings.json": "{\"unmanaged\":{\"keep\":true},\"autoMemoryEnabled\":true,\"autoMemoryDirectory\":\".claude/native-memory\",\"permissions\":{\"deny\":[\"Read(.env)\"]},\"hooks\":{\"PreToolUse\":[]},\"enabledPlugins\":{\"lint@team\":true}}\n",
+    ".claude/settings.json": "{\"unmanaged\":{\"keep\":true},\"autoMemoryEnabled\":true,\"autoMemoryDirectory\":\"~/project with spaces/.claude/native-memory\",\"permissions\":{\"deny\":[\"Read(.env)\"]},\"hooks\":{\"PreToolUse\":[]},\"enabledPlugins\":{\"lint@team\":true}}\n",
     ".claude/native-memory/MEMORY.md": "# Agent memory\nClaude-owned prefix.\n",
     ".claude/native-memory/decisions.md": "# Decisions\nUse exact bindings.\n",
     ".claude/rules/project.md": "# Project rule\nNo shell strings.\n",

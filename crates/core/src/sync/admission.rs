@@ -24,7 +24,41 @@ pub struct TrustedDevice {
     pub active_key_epoch: u32,
 }
 
+impl TrustedDevice {
+    pub(crate) fn validate_identity(
+        &self,
+        account: AccountId,
+        workspace: WorkspaceId,
+        device: DeviceId,
+        key_epoch: u32,
+    ) -> Result<(), SyncError> {
+        let certificate = &self.certificate;
+        if certificate.account_id != account
+            || certificate.workspace_id != workspace
+            || certificate.device_id != device
+            || certificate.control_epoch == 0
+            || certificate.control_epoch > self.active_control_epoch
+            || self.active_key_epoch == 0
+            || key_epoch != self.active_key_epoch
+        {
+            return Err(SyncError::InvalidIdentity);
+        }
+        Ok(())
+    }
+}
+
+/// Supplies certificates authorized by the authenticated current control roster,
+/// not merely certificates with valid historical signatures. Issuance epochs may
+/// precede the current epoch when that roster explicitly retains the device.
 pub trait TrustedSyncMaterial {
+    /// Opaque stored-representative read capability; never used for incoming admission.
+    fn historical_read_material(&self) -> Option<&crate::vault::HistoricalReadMaterial> {
+        None
+    }
+    /// Continuity only, never a substitute for replaying local accepted authority.
+    fn membership_endpoint(&self) -> Option<crate::devices::membership_crypto::MembershipEndpoint> {
+        None
+    }
     fn trusted_device(
         &self,
         account: AccountId,
@@ -51,6 +85,7 @@ pub trait TrustedSyncMaterial {
 /// };
 /// ```
 pub struct AdmittedOperation {
+    pub(crate) membership_endpoint: Option<crate::devices::membership_crypto::MembershipEndpoint>,
     operation: SyncOperationV1,
     mutation: RecordMutationV1,
     canonical_bytes: Vec<u8>,
@@ -58,6 +93,51 @@ pub struct AdmittedOperation {
 }
 
 impl AdmittedOperation {
+    /// Crate-private historical admission; it never bypasses current write entry gates.
+    pub(crate) fn from_historical(
+        vault: &Vault,
+        bytes: &[u8],
+        certificate: &DeviceCertificateV1,
+        key: &ContentKey,
+        endpoint: crate::devices::membership_crypto::MembershipEndpoint,
+    ) -> Result<Self, SyncError> {
+        let operation = decode_sync_operation_v1(bytes).map_err(|_| SyncError::InvalidEnvelope)?;
+        let canonical_bytes =
+            encode_sync_operation_v1(&operation).map_err(|_| SyncError::InvalidEnvelope)?;
+        if canonical_bytes != bytes {
+            return Err(SyncError::InvalidEnvelope);
+        }
+        let previous = vault
+            .device_head(operation.workspace_id, operation.device_id)
+            .map_err(|_| SyncError::PersistenceFailed)?
+            .map(|h| OperationChainHead {
+                sequence: h.sequence,
+                canonical_hash: h.canonical_hash,
+            });
+        let mut context = TrustedOperationContext::new(certificate, operation.key_epoch, previous)
+            .with_current_control_epoch(operation.control_epoch);
+        if operation.mutation_kind == context_relay_protocol::MutationKind::Tombstone {
+            let scope = vault
+                .materialized_record_scope(
+                    operation.workspace_id,
+                    operation.record_id,
+                    operation.record_kind,
+                )
+                .map_err(|_| SyncError::PersistenceFailed)?
+                .ok_or(SyncError::InvalidScope)?;
+            context = context.with_existing_record_scope(scope);
+        }
+        validate_frontier_against_vault(vault, &operation)?;
+        let mutation = verify_operation_envelope(&operation, &context, key)?;
+        let canonical_hash = digest(&canonical_bytes);
+        Ok(Self {
+            membership_endpoint: Some(endpoint),
+            operation,
+            mutation,
+            canonical_bytes,
+            canonical_hash,
+        })
+    }
     pub const fn operation(&self) -> &SyncOperationV1 {
         &self.operation
     }
@@ -89,6 +169,9 @@ pub fn admit_operation(
 ) -> Result<AdmissionDecision, SyncError> {
     let operation =
         decode_sync_operation_v1(received_bytes).map_err(|_| SyncError::InvalidEnvelope)?;
+    vault
+        .require_current_operation(&operation, trusted_material.membership_endpoint())
+        .map_err(|_| SyncError::InvalidIdentity)?;
     operation
         .validate()
         .map_err(|_| SyncError::InvalidEnvelope)?;
@@ -179,6 +262,7 @@ pub fn admit_operation(
     let context = trusted_context(&trusted, previous_chain, existing_scope);
     let mutation = verify_operation_envelope(&operation, &context, key)?;
     Ok(AdmissionDecision::Admitted(Box::new(AdmittedOperation {
+        membership_endpoint: trusted_material.membership_endpoint(),
         operation,
         mutation,
         canonical_bytes,
@@ -190,14 +274,13 @@ fn validate_active_identity(
     operation: &SyncOperationV1,
     trusted: &TrustedDevice,
 ) -> Result<(), SyncError> {
-    let certificate = &trusted.certificate;
-    if certificate.account_id != operation.account_id
-        || certificate.workspace_id != operation.workspace_id
-        || certificate.device_id != operation.device_id
-        || certificate.control_epoch != trusted.active_control_epoch
-        || operation.control_epoch != trusted.active_control_epoch
-        || operation.key_epoch != trusted.active_key_epoch
-    {
+    trusted.validate_identity(
+        operation.account_id,
+        operation.workspace_id,
+        operation.device_id,
+        operation.key_epoch,
+    )?;
+    if operation.control_epoch != trusted.active_control_epoch {
         return Err(SyncError::InvalidIdentity);
     }
     Ok(())
@@ -209,7 +292,8 @@ fn trusted_context<'a>(
     existing_scope: Option<context_relay_protocol::ScopeRef>,
 ) -> TrustedOperationContext<'a> {
     let context =
-        TrustedOperationContext::new(&trusted.certificate, trusted.active_key_epoch, previous);
+        TrustedOperationContext::new(&trusted.certificate, trusted.active_key_epoch, previous)
+            .with_current_control_epoch(trusted.active_control_epoch);
     match existing_scope {
         Some(scope) => context.with_existing_record_scope(scope),
         None => context,

@@ -538,3 +538,51 @@ fn open_keyed(path: &Path, key: &[u8; 32]) -> Connection {
         .unwrap();
     connection
 }
+
+#[test]
+fn current_roster_authorizes_older_checkpoint_certificate() {
+    let path = TempVault::new("retained-certificate-checkpoint");
+    let store = MemoryKeyStore::default();
+    let vault = Vault::open(path.path(), CREDENTIAL, &store).unwrap();
+    let keys = DeviceKeys::generate().unwrap();
+    let device_id = id(ID_3);
+    let mut trusted = trust(device_id, &keys);
+    trusted
+        .certificates
+        .get_mut(&device_id)
+        .unwrap()
+        .control_epoch = CONTROL_EPOCH - 1;
+    let context = CheckpointBuildContext {
+        scope: scope(),
+        creator_device: device_id,
+        active_key_epoch: KEY_EPOCH,
+        device_keys: &keys,
+        created_hlc: HybridLogicalClock::new(100, 0, device_id),
+    };
+    let checkpoint = build_checkpoint(&vault, &context, &trusted).unwrap();
+    verify_checkpoint(&vault, scope(), &checkpoint, &trusted).unwrap();
+    for epoch in [0, CONTROL_EPOCH + 1] {
+        trusted
+            .certificates
+            .get_mut(&device_id)
+            .unwrap()
+            .control_epoch = epoch;
+        assert!(matches!(
+            build_checkpoint(&vault, &context, &trusted),
+            Err(SyncError::InvalidIdentity)
+        ));
+        assert_eq!(
+            verify_checkpoint(&vault, scope(), &checkpoint, &trusted),
+            Err(SyncError::InvalidIdentity)
+        );
+    }
+    trusted.certificates.clear();
+    assert!(matches!(
+        build_checkpoint(&vault, &context, &trusted),
+        Err(SyncError::InvalidIdentity)
+    ));
+    assert_eq!(
+        verify_checkpoint(&vault, scope(), &checkpoint, &trusted),
+        Err(SyncError::InvalidIdentity)
+    );
+}

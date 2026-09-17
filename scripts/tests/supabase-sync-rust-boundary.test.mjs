@@ -22,3 +22,8 @@ test("the credential-observing HTTP seam exists only behind test-support", () =>
     /impl Drop for SupabaseHttpRequest[\s\S]*value\.zeroize\(\)/,
   );
 });
+
+test("hosted HTTP requests cannot redirect or downgrade away from the configured HTTPS endpoint", () => {
+  assert.match(transportSource, /Client::builder\(\)[\s\S]*?\.https_only\(true\)/);
+  assert.match(transportSource, /\.redirect\(reqwest::redirect::Policy::none\(\)\)/);
+});

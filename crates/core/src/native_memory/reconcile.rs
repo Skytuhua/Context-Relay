@@ -3,7 +3,6 @@ use context_relay_protocol::{
     MemoryId, MemoryKind, MemoryOrigin, MemoryRecord, OperationId, Provenance, Sha256Digest,
 };
 use sha2::{Digest as _, Sha256};
-use std::str::FromStr;
 
 use super::{
     NativeMemoryError, NativeMemoryLedger, NativeMemoryObservationKind, NativeMemorySource,
@@ -178,38 +177,27 @@ pub(crate) fn native_memory_identity(
     source_id: NativeMemorySourceId,
     unmanaged_digest: Sha256Digest,
 ) -> Result<(CandidateId, MemoryId, OperationId), NativeMemoryError> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"context-relay.native-memory-candidate.v1");
-    hasher.update(source_id.0.0);
-    hasher.update(unmanaged_digest.0);
-    let digest = hasher.finalize();
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x70;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let value = format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
-        bytes[5],
-        bytes[6],
-        bytes[7],
-        bytes[8],
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15],
-    );
+    let identity = |domain: &[u8]| {
+        let mut hasher = Sha256::new();
+        hasher.update(domain);
+        hasher.update(source_id.0.0);
+        hasher.update(unmanaged_digest.0);
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x70;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        uuid::Uuid::from_bytes(bytes)
+    };
+    let candidate = identity(b"context-relay.native-memory-candidate.v1");
+    let memory = identity(b"context-relay.native-memory-record.v1");
+    if candidate == memory {
+        return Err(NativeMemoryError::InvalidSource("identity collision"));
+    }
     Ok((
-        CandidateId::from_str(&value).map_err(|_| NativeMemoryError::InvalidSource("identity"))?,
-        MemoryId::from_str(&value).map_err(|_| NativeMemoryError::InvalidSource("identity"))?,
-        OperationId::from_str(&value).map_err(|_| NativeMemoryError::InvalidSource("identity"))?,
+        CandidateId::new(candidate).map_err(|_| NativeMemoryError::InvalidSource("identity"))?,
+        MemoryId::new(memory).map_err(|_| NativeMemoryError::InvalidSource("identity"))?,
+        OperationId::new(candidate).map_err(|_| NativeMemoryError::InvalidSource("identity"))?,
     ))
 }
 

@@ -153,7 +153,9 @@ async fn applied_setup_keeps_primary_memory_and_task_contract_alive_without_a_de
     drop(desktop);
     let native_edit = "Task 14 acceptance remembers the desktop-independent watcher.\n";
     let changed_at = Instant::now();
-    fs::write(&fixture.memory_path, native_edit).unwrap();
+    write_watched_memory(&fixture.memory_path, native_edit.as_bytes())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(750)).await;
     wait_for_candidate_count(&fixture.config, 1).await;
     assert!(changed_at.elapsed() >= Duration::from_millis(750));
@@ -302,7 +304,9 @@ async fn a_managed_self_export_completes_preview_without_creating_a_candidate() 
     let unmanaged = "User-authored Hermes memory outside the managed fence.\n";
     let mut edited = intended.clone();
     edited.extend_from_slice(unmanaged.as_bytes());
-    fs::write(&materialized.memory_path, edited).unwrap();
+    write_watched_memory(&materialized.memory_path, &edited)
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(750)).await;
     wait_for_candidate_count(&config, 1).await;
     let candidates = config.native_memory_candidates().unwrap();
@@ -399,10 +403,11 @@ async fn import_only_codex_setup_activates_exact_watchers_without_native_mutatio
     assert_eq!(fs::read(&materialized.config_path).unwrap(), config_before);
 
     let edit = "Exact import-only Codex source reached the real daemon watcher.\n";
-    fs::write(
-        wire_path_to_path(&capabilities.sources[0].path),
+    write_watched_memory(
+        &wire_path_to_path(&capabilities.sources[0].path),
         edit.as_bytes(),
     )
+    .await
     .unwrap();
     tokio::time::sleep(Duration::from_millis(750)).await;
     wait_for_candidate_count(&config, 1).await;
@@ -441,9 +446,18 @@ impl BridgeLocator for NeverBridgeLocator {
     }
 }
 
-struct NeverBridgeExecutor;
+struct WatchOnlyCodexVerifier<'a>(&'a CodexAdapter);
 
-impl BridgePlanExecutor for NeverBridgeExecutor {
+impl BridgePlanExecutor for WatchOnlyCodexVerifier<'_> {
+    fn verify_watch_only_registration(
+        &mut self,
+        plan: &NativeTransactionPlan,
+        now_ms: u64,
+    ) -> Result<(), BridgeExecutionError> {
+        context_relay_core::setup::verify_watch_only_registration(self.0, plan, now_ms)
+            .map_err(|error| BridgeExecutionError::restored(error.message))
+    }
+
     fn execute(
         &mut self,
         _: &mut Vault,
@@ -509,7 +523,7 @@ impl BridgeInstallEngine for WatchOnlyCodexSetupEngine {
         BridgeInstallService::persisted(vault).apply(
             &params.plan_id,
             1_900_000_000_001,
-            &mut NeverBridgeExecutor,
+            &mut WatchOnlyCodexVerifier(&self.adapter.lock().unwrap()),
         )
     }
 
@@ -523,7 +537,7 @@ impl BridgeInstallEngine for WatchOnlyCodexSetupEngine {
         BridgeInstallService::persisted(vault).rollback(
             &params.plan_id,
             1_900_000_000_002,
-            &mut NeverBridgeExecutor,
+            &mut WatchOnlyCodexVerifier(&self.adapter.lock().unwrap()),
         )
     }
 }
@@ -758,10 +772,14 @@ impl MaterializedCodex {
         let home = root.join("home");
         let project_root = root.join("project");
         let working_directory = project_root.join("service");
+        #[cfg(windows)]
+        let project_key = dunce::simplified(&project_root);
+        #[cfg(not(windows))]
+        let project_key = project_root.as_path();
         materialize_substituting(
             &codex_home,
             fixture["codexHome"].as_object().unwrap(),
-            &project_root,
+            project_key,
         );
         materialize(
             &home.join(".agents/skills"),
@@ -784,6 +802,7 @@ impl MaterializedCodex {
                 version: version.into(),
                 installation_method: InstallationMethod::PackageManager,
                 codex_home: codex_home.clone(),
+                user_home: home.clone(),
                 user_skills_dir: home.join(".agents/skills"),
                 project_root: project_root.clone(),
                 working_directory,
@@ -1108,6 +1127,61 @@ fn conflict(message: &str) -> ClientError {
         field_path: None,
         retryable: false,
     }
+}
+
+async fn write_watched_memory(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // The real watcher temporarily denies writes while taking a stable snapshot.
+    // Retry only Windows sharing violations; preserve other errors and a stuck lease.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match fs::write(path, bytes) {
+            Err(error)
+                if cfg!(windows)
+                    && error.raw_os_error() == Some(32)
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn watched_memory_edit_waits_for_read_lease_and_preserves_other_errors() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    let root = unique_temp_path("read-lease-edit");
+    let path = root.join("MEMORY.md");
+    fs::write(&path, b"before").unwrap();
+    let lease = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&path)
+        .unwrap();
+    assert_eq!(
+        fs::write(&path, b"after").unwrap_err().raw_os_error(),
+        Some(32)
+    );
+    let edit = write_watched_memory(&path, b"after");
+    tokio::pin!(edit);
+    tokio::select! {
+        biased;
+        result = &mut edit => panic!("edit must wait for the held read lease: {result:?}"),
+        _ = tokio::task::yield_now() => {}
+    }
+    assert_eq!(fs::read(&path).unwrap(), b"before");
+    drop(lease);
+    edit.await.unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"after");
+    assert!(
+        write_watched_memory(&root.join("missing/child"), b"no")
+            .await
+            .is_err()
+    );
+    fs::remove_file(&path).unwrap();
+    fs::remove_dir(&root).unwrap();
 }
 
 fn unique_temp_path(label: &str) -> PathBuf {

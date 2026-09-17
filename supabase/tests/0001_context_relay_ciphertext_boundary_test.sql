@@ -3,7 +3,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = public, extensions;
 
-select plan(518);
+select plan(520);
 
 select has_schema('context_relay_private', 'private Context Relay schema exists');
 
@@ -683,9 +683,9 @@ select ok(
       and pg_catalog.lower(privilege.privilege_type) = 'execute'
   )
   and pg_catalog.has_function_privilege('service_role', 'public.service_revoke_device_binding(uuid,uuid,bigint,bytea,bytea)', 'execute')
-  and pg_catalog.has_function_privilege('service_role', 'public.service_begin_account_deletion(uuid)', 'execute')
-  and pg_catalog.has_function_privilege('service_role', 'public.service_cancel_account_deletion(uuid)', 'execute'),
-  'only service_role can execute public lifecycle wrappers'
+  and not pg_catalog.has_function_privilege('service_role', 'public.service_begin_account_deletion(uuid)', 'execute')
+  and not pg_catalog.has_function_privilege('service_role', 'public.service_cancel_account_deletion(uuid)', 'execute'),
+  'service role can revoke devices but cannot bypass session-bound deletion wrappers'
 );
 
 select has_column(
@@ -2696,12 +2696,23 @@ cross join lateral (values
 reset role;
 
 set local role service_role;
+select throws_ok(
+  $$select public.service_begin_account_deletion('20000000-0000-7000-8000-000000000004')$$,
+  '42501', null, 'service role cannot begin deletion through the legacy account-only helper'
+);
+select throws_ok(
+  $$select public.service_cancel_account_deletion('20000000-0000-7000-8000-000000000004')$$,
+  '42501', null, 'service role cannot cancel deletion through the legacy account-only helper'
+);
+reset role;
+
+-- Exercise internal state invariants as the test identity with temporary owner
+-- membership. The service-role public boundary is tested separately above.
 select isnt(
   public.service_begin_account_deletion('20000000-0000-7000-8000-000000000004'),
   null::uuid,
-  'service role begins account deletion and receives a request ID'
+  'internal helper begins account deletion and receives a request ID'
 );
-reset role;
 
 select pg_catalog.set_config(
   'context_relay_test.deletion_request_id',
@@ -2752,7 +2763,6 @@ select results_eq('select id from public.sync_checkpoints order by id', 'values 
 select results_eq('select id from public.blob_manifests order by id', 'values (''84000000-0000-7000-8000-000000000004''::uuid)', 'pending-delete user sees its finalized manifest');
 reset role;
 
-set local role service_role;
 select is(
   public.service_begin_account_deletion('20000000-0000-7000-8000-000000000004'),
   pg_catalog.current_setting('context_relay_test.deletion_request_id')::uuid,
@@ -2760,9 +2770,8 @@ select is(
 );
 select lives_ok(
   $$select public.service_cancel_account_deletion('20000000-0000-7000-8000-000000000004')$$,
-  'service role cancels pending deletion before the deadline'
+  'internal helper cancels pending deletion before the deadline'
 );
-reset role;
 
 select ok(
   (select account.deletion_state = 'active'
@@ -2782,7 +2791,6 @@ select pg_catalog.set_config('request.jwt.claims', '{"sub":"10000000-0000-0000-0
 select results_eq('select context_relay_private.current_read_account_id(), context_relay_private.current_write_account_id(), context_relay_private.current_read_device_id(), context_relay_private.current_write_device_id()', 'values (''20000000-0000-7000-8000-000000000004''::uuid, ''20000000-0000-7000-8000-000000000004''::uuid, ''50000000-0000-7000-8000-000000000006''::uuid, ''50000000-0000-7000-8000-000000000006''::uuid)', 'cancellation restores the same binding write identity without changing read scope');
 reset role;
 
-set local role service_role;
 select lives_ok(
   $$select public.service_cancel_account_deletion('20000000-0000-7000-8000-000000000004')$$,
   'exact valid cancellation replay is idempotent'
@@ -2796,19 +2804,16 @@ select throws_ok(
   $$select public.service_cancel_account_deletion('20000000-0000-7000-8000-000000000002')$$, null, null,
   'cancellation fails when no deletion request exists'
 );
-reset role;
 
 select is(
   (select count(*) from public.deletion_requests where account_id = '20000000-0000-7000-8000-000000000004'),
   1::bigint,
   'repeated deletion lifecycles keep exactly one request row'
 );
-set local role service_role;
 select lives_ok(
   $$select public.service_cancel_account_deletion('20000000-0000-7000-8000-000000000004')$$,
   'the reused pending lifecycle remains cancellable before its deadline'
 );
-reset role;
 
 update public.deletion_requests
 set state = 'pending_delete',
@@ -2825,12 +2830,10 @@ set deletion_state = 'pending_delete',
     updated_at = pg_catalog.statement_timestamp()
 where id = '20000000-0000-7000-8000-000000000004';
 
-set local role service_role;
 select throws_ok(
   $$select public.service_cancel_account_deletion('20000000-0000-7000-8000-000000000004')$$, null, null,
   'cancellation fails after the grace deadline'
 );
-reset role;
 select ok(
   (select deletion_state = 'pending_delete' from public.accounts where id = '20000000-0000-7000-8000-000000000004')
   and (select state = 'pending_delete' and cancelled_at is null from public.deletion_requests where account_id = '20000000-0000-7000-8000-000000000004'),
@@ -2844,7 +2847,6 @@ update public.accounts
 set deletion_state = 'purged', updated_at = pg_catalog.statement_timestamp()
 where id = '20000000-0000-7000-8000-000000000004';
 
-set local role service_role;
 select throws_ok(
   $$select public.service_cancel_account_deletion('20000000-0000-7000-8000-000000000004')$$, null, null,
   'cancellation never changes purged state'
@@ -2853,7 +2855,6 @@ select throws_ok(
   $$select public.service_begin_account_deletion('20000000-0000-7000-8000-000000000004')$$, null, null,
   'begin deletion never reopens purged state'
 );
-reset role;
 
 set local role service_role;
 select throws_ok(
