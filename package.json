@@ -1,11 +1,12 @@
 {
   "name": "context-relay-workspace",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "Apache-2.0",
   "repository": "https://github.com/Skytuhua/Context-Relay",
   "packageManager": "pnpm@11.9.0",
   "scripts": {
+    "preview:evidence": "node scripts/windows-preview.mjs evidence",
     "check:supabase": "node scripts/check-supabase-contract.mjs",
     "verify:supabase-realtime": "node scripts/verify-supabase-realtime.mjs",
     "supabase:start": "supabase start",

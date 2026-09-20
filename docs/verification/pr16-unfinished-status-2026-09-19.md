@@ -54,9 +54,11 @@ them. No fix commits were produced by this session (nothing to fix).
    attempt was policy-rejected; do not retry automation. This unblocks
    deploying `supabase/functions/pairing` (adapter validates the secret at
    `adapter.mjs:17`) and finishing hosted V2 pairing acceptance.
-2. **OAuth consent** — per the ledger, GitHub sign-in remained disabled in
-   regular Chrome on 2026-09-14 and the prepared OAuth registration is
-   unsubmitted. Submit it to unblock installed sign-in acceptance.
+2. **Installed OAuth acceptance** — the September 14 handoff records that
+   the GitHub OAuth application, Supabase provider and redirect allowlist were
+   configured and verified. The earlier disabled/unsubmitted account was
+   superseded; do not repeat those setup steps. Installed login, callback/code
+   exchange, refresh, logout and restart still require acceptance.
 3. **Installer acceptance** — build/qualify candidate N (`0.1.1`), qualify
    N−1 (`1468327`) as internal predecessor, and run the two fresh-profile
    passes on this physical PC. Native installer UI steps are user-only.

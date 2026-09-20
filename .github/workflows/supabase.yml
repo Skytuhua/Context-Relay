@@ -14,6 +14,8 @@ on:
       - 'crates/core/tests/fixtures/*enrollment*'
       - 'crates/core/tests/fixtures/*recovery*'
       - 'scripts/verify-account-lifecycle-postgres.mjs'
+      - 'scripts/verify-membership-postgres.mjs'
+      - 'scripts/verify-revocation-postgres.mjs'
       - 'package.json'
       - 'pnpm-lock.yaml'
       - '.github/workflows/supabase.yml'
@@ -30,6 +32,8 @@ on:
       - 'crates/core/tests/fixtures/*enrollment*'
       - 'crates/core/tests/fixtures/*recovery*'
       - 'scripts/verify-account-lifecycle-postgres.mjs'
+      - 'scripts/verify-membership-postgres.mjs'
+      - 'scripts/verify-revocation-postgres.mjs'
       - 'package.json'
       - 'pnpm-lock.yaml'
       - '.github/workflows/supabase.yml'
@@ -62,7 +66,10 @@ jobs:
       - run: node --test supabase/functions/pairing/*.test.mjs
       - run: pnpm supabase:start:ci
       - run: pnpm supabase:reset
-      - run: node scripts/verify-account-lifecycle-postgres.mjs
+      - run: |
+          node scripts/verify-account-lifecycle-postgres.mjs
+          node scripts/verify-membership-postgres.mjs
+          node scripts/verify-revocation-postgres.mjs
         env:
           CONTEXT_RELAY_DISPOSABLE_POSTGRES: '1'
           PGHOST: 127.0.0.1

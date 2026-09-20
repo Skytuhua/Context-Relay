@@ -711,7 +711,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "context-relay-context-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "context-relay-contextd",
  "context-relay-local-ipc",
@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "context-relay-contextd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "context-relay-core",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "context-relay-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "bip39",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "context-relay-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "context-relay-local-ipc",
  "context-relay-protocol",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "context-relay-local-ipc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "context-relay-protocol",
@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "context-relay-native-runner"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "core-foundation",
  "core-foundation-sys",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "context-relay-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "minicbor",

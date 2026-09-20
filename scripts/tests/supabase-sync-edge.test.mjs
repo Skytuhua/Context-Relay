@@ -113,14 +113,14 @@ function fixtureCheckpointEnvelope() {
   ]);
 }
 
-function fixtureCertificateContext() {
+function fixtureCertificateContext(issuanceEpoch = 17) {
   const recoveryPrivateKey = privateKeyFromSeed(6);
   const recoveryPublicKey = rawPublicKey(recoveryPrivateKey);
   const signingPublicKey = fixturePublicKey();
   const requestNonce = Buffer.alloc(32, 3);
   const wrappingPublicKey = Buffer.alloc(32, 9);
   const controlEpoch = Buffer.alloc(4);
-  controlEpoch.writeUInt32BE(17);
+  controlEpoch.writeUInt32BE(issuanceEpoch);
   const preimage = Buffer.concat([
     Buffer.from("context-relay/device-certificate/v1\0", "utf8"),
     Buffer.from([0]),
@@ -147,7 +147,7 @@ function fixtureCertificateContext() {
         certificateId: "018f22e2-79b0-7cc8-98c4-dc0c0c07398b",
         accountId: ACCOUNT_ID,
         workspaceId: WORKSPACE_ID,
-        controlEpoch: 17,
+        controlEpoch: issuanceEpoch,
         requestNonce: requestNonce.toString("hex"),
         deviceId: DEVICE_ID,
         issuerKind: "recovery_root",
@@ -592,3 +592,13 @@ test("a verified but revoked session is denied with the stable non-retryable cla
   assert.ok(!body.includes(revoked.message));
   assert.deepEqual(calls.map(([name]) => name), ["authenticate"]);
 });
+
+for (const [epoch, expected] of [[16, 200], [18, 422], [0, 422]]) {
+  test(`certificate issuance epoch ${epoch} under current epoch 17`, async () => {
+    const { createSyncEdgeHandler } = await loadCore();
+    const { deps } = dependencies({loadIdentityContext: async () => fixtureCertificateContext(epoch)});
+    const envelope = await fixtureEnvelope();
+    const response = await createSyncEdgeHandler(deps)(request({v: 1, action: "push_operations", operations: [envelope.toString("base64url")]}));
+    assert.equal(response.status, expected);
+  });
+}

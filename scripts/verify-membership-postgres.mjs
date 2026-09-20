@@ -404,3 +404,35 @@ test('HTTP handler and production pairing adapter execute V2 approval and addres
     await sql(`delete from public.accounts where id='${record.accountId}' and owner_user_id='${f.user}';delete from auth.sessions where user_id='${f.user}';delete from auth.users where id='${f.user}';`);
   }
 });
+
+// Model the committed epoch transition while retaining the immutable certificate.
+test('surviving membership authorizes sync and pending-delete cancellation after epoch advancement',async()=>{
+  const f=enrollment();
+  const out=await sql(`${f.start}${f.commit}reset role;
+    update public.accounts set control_epoch=2,key_epoch=2 where id='${record.accountId}';
+    update context_relay_private.membership_heads set control_epoch=2,key_epoch=2 where workspace_id='${record.workspaceId}';
+    set local role service_role;
+    select public.service_sync_identity_context('${f.user}','${f.session}','${record.workspaceId}','${record.deviceId}')->>'controlEpoch';
+    reset role;update public.accounts set deletion_state='pending_delete',deletion_requested_at=clock_timestamp(),deletion_scheduled_for=clock_timestamp()+interval '1 day' where id='${record.accountId}';
+    select context_relay_private.locked_account_lifecycle_context('${f.user}','${f.session}','${record.workspaceId}')->>'deviceId';rollback;`);
+  assert.deepEqual(out.split('\n').slice(-2),['2',record.deviceId]);
+});
+
+for(const [name,change] of [
+  ['inactive member',`update context_relay_private.membership_members set active=false where workspace_id='${record.workspaceId}'`],
+  ['mismatched head',`update context_relay_private.membership_heads set control_epoch=2 where workspace_id='${record.workspaceId}'`],
+  ['missing member',`delete from context_relay_private.membership_members where workspace_id='${record.workspaceId}'`],
+]) test(`membership authority denies ${name} despite active binding`,async()=>{
+  const f=enrollment();
+  await sql(`${f.start}${f.commit}reset role;${change};set local role service_role;
+    do $$begin begin perform public.service_sync_identity_context('${f.user}','${f.session}','${record.workspaceId}','${record.deviceId}');
+      raise exception 'invalid authority accepted';exception when invalid_authorization_specification then null;end;end$$;
+    reset role;do $$begin begin perform context_relay_private.locked_account_lifecycle_context('${f.user}','${f.session}','${record.workspaceId}');
+      raise exception 'invalid lifecycle authority accepted';exception when invalid_authorization_specification then null;end;end$$;rollback;`);
+});
+for(const expired of [false,true]) test(`sync denies ${expired?'expired':'deleted'} Auth session`,async()=>{
+  const f=enrollment();
+  await sql(`${f.start}${f.commit}reset role;${expired?`update auth.sessions set not_after=clock_timestamp()-interval '1 second'`:'delete from auth.sessions'} where id='${f.session}';set local role service_role;
+    do $$begin begin perform public.service_sync_identity_context('${f.user}','${f.session}','${record.workspaceId}','${record.deviceId}');
+      raise exception 'dead session accepted';exception when invalid_authorization_specification then null;end;end$$;rollback;`);
+});

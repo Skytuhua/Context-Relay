@@ -648,7 +648,6 @@ async function verifyCertificateChain(context) {
     leaf.accountId !== context.accountId ||
     leaf.workspaceId !== context.workspaceId ||
     leaf.deviceId !== context.deviceId ||
-    leaf.controlEpoch !== context.controlEpoch ||
     !equalBytes(leaf.deviceSigningPublicKeyBytes, context.signingPublicKey)
   ) {
     throw invalidEnvelope();
@@ -660,7 +659,9 @@ async function verifyCertificateChain(context) {
     if (
       certificate.accountId !== context.accountId ||
       certificate.workspaceId !== context.workspaceId ||
-      certificate.controlEpoch !== context.controlEpoch ||
+      !Number.isInteger(certificate.controlEpoch) ||
+      certificate.controlEpoch < 1 ||
+      certificate.controlEpoch > context.controlEpoch ||
       seenDevices.has(certificate.deviceId)
     ) {
       throw invalidEnvelope();
@@ -685,6 +686,7 @@ async function verifyCertificateChain(context) {
       const issuer = certificates[index + 1];
       if (
         issuer === undefined ||
+        issuer.controlEpoch > certificate.controlEpoch ||
         certificate.issuerDeviceIdBytes === null ||
         certificate.issuerRecoveryPublicKeyBytes !== null ||
         certificate.issuerDeviceId !== issuer.deviceId ||

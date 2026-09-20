@@ -1,6 +1,6 @@
 # Pairing secret prerequisite — prepared user procedure
 
-Status: prepared, not requested or executed. The reviewed deployment manifest and dependent membership/lifecycle implementation are still open. Do not use this document as deployment approval or hosted acceptance evidence.
+Status September20: reviewed additive migrations and four functions are deployed; exact identities are in [the readiness report](windows-preview-readiness-2026-09-20.md). Dashboard secret setup remains pending. Pairing currently fails startup; no authenticated pairing acceptance is claimed.
 
 Target: existing Supabase project `brvzuycnxoswdzzipgvx`. Configuration name: `CONTEXT_RELAY_PAIRING_PEPPER`. The current pairing adapter requires exactly 64 lowercase hexadecimal characters, representing 32 cryptographically random bytes (`supabase/functions/pairing/adapter.mjs`, lines16–18). It uses this server secret to derive HMAC locator digests; no client needs the value.
 

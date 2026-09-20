@@ -43,10 +43,14 @@ async function setup() {
     insert into public.recovery_roots(id,account_id,signing_public_key,wrapping_public_key,encrypted_recovery_metadata)
       values('${fixture.trusted.recoveryRootId}','${account}',decode(repeat('02',32),'hex'),
         decode('${fixture.trusted.recoveryWrappingKey}','hex'),decode('01','hex'));
+    -- This synthetic pre-history fixture supplies its own membership head below.
+    -- Disable only fixture initialization inside this single SQL transaction.
+    alter table context_relay_private.enrollment_commits disable trigger initialize_enrollment_membership;
     insert into context_relay_private.enrollment_commits(
       auth_user_id,account_id,reservation_id,session_id,canonical_record,receipt
     ) values ('${user}','${account}','${fixture.operationId}','${session}',decode('01','hex'),
       jsonb_build_object('recoveryRootId','${fixture.trusted.recoveryRootId}'));
+    alter table context_relay_private.enrollment_commits enable trigger initialize_enrollment_membership;
     insert into public.device_certificates(id,account_id,workspace_id,control_epoch,request_nonce,device_id,
       issuer_kind,issuer_recovery_public_key,issuer_signing_public_key,device_signing_public_key,
       device_wrapping_public_key,signature)
@@ -102,7 +106,7 @@ test('revocation publication atomically commits exact membership, cutoff, bindin
   } finally { await cleanup(auth); }
 });
 
-test('HTTP handler and production adapter publish and reread exact revocation through PostgreSQL', async () => {
+test('HTTP handler publishes revocation and denies further authority to a self-revoked device', async () => {
   const auth = await setup();
   const rpcFailures = [];
   const createClient = () => ({
@@ -145,14 +149,14 @@ test('HTTP handler and production adapter publish and reread exact revocation th
       CONTEXT_RELAY_PAIRING_PEPPER: '73'.repeat(32),
     },
   }));
-  const post = async (path, body) => {
+  const post = async (path, body, expectedStatus=200) => {
     const response = await handler(new Request(`https://example.supabase.co/functions/v1/${path}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer synthetic' },
       body: JSON.stringify({ v: 1, ...body }),
     }));
     const result = await response.json();
-    assert.equal(response.status, 200, JSON.stringify({ result, rpcFailures }));
+    assert.equal(response.status, expectedStatus, JSON.stringify({ result, rpcFailures }));
     return result;
   };
   const scope = { workspaceId: workspace, deviceId: device };
@@ -177,9 +181,10 @@ test('HTTP handler and production adapter publish and reread exact revocation th
       ...scope,
       operationId: fixture.operationId,
       objectSha256: fixture.objectSha256,
-    });
-    assert.deepEqual(result.receipt, fixture.receipt);
-    assert.deepEqual(rpcFailures, []);
+    },403);
+    assert.deepEqual(result, {v:1,error:"pairing_denied"});
+    assert.equal(rpcFailures.length,1);
+    assert.equal(rpcFailures[0].name,"service_revocation_result");
   } finally {
     await cleanup(auth);
   }
