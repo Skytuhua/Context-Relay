@@ -602,3 +602,30 @@ for (const [epoch, expected] of [[16, 200], [18, 422], [0, 422]]) {
     assert.equal(response.status, expected);
   });
 }
+
+for(const [issuerEpoch,childEpoch,status] of [[16,17,200],[17,16,422]]) {
+  test(`signed child epoch ${childEpoch} with issuer epoch ${issuerEpoch}`,async()=>{
+    const context=fixtureCertificateContext(childEpoch);
+    const issuerKey=privateKeyFromSeed(8), issuerPublic=rawPublicKey(issuerKey);
+    const rootKey=privateKeyFromSeed(6), rootPublic=rawPublicKey(rootKey);
+    const issuerDevice="018f22e2-79b0-7cc8-98c4-dc0c0c073999";
+    const child=context.certificateChain[0];
+    const issuer={...child,certificateId:"018f22e2-79b0-7cc8-98c4-dc0c0c073998",
+      deviceId:issuerDevice,controlEpoch:issuerEpoch,deviceSigningPublicKey:issuerPublic.toString("hex")};
+    const signCertificate=(cert,prefix,key)=>{
+      const epoch=Buffer.alloc(4);epoch.writeUInt32BE(cert.controlEpoch);
+      cert.signature=sign(null,Buffer.concat([Buffer.from("context-relay/device-certificate/v1\0"),prefix,
+        uuidBytes(cert.accountId),uuidBytes(cert.workspaceId),epoch,Buffer.from(cert.requestNonce,"hex"),
+        uuidBytes(cert.deviceId),Buffer.from(cert.deviceSigningPublicKey,"hex"),Buffer.from(cert.deviceWrappingPublicKey,"hex")]),key).toString("hex");
+    };
+    signCertificate(issuer,Buffer.concat([Buffer.from([0]),rootPublic]),rootKey);
+    Object.assign(child,{issuerKind:"device",issuerDeviceId:issuerDevice,issuerRecoveryPublicKey:null,issuerSigningPublicKey:issuerPublic.toString("hex")});
+    signCertificate(child,Buffer.concat([Buffer.from([1]),uuidBytes(issuerDevice),issuerPublic]),issuerKey);
+    context.certificateChain=[child,issuer];
+    const {deps}=dependencies({loadIdentityContext:async()=>context});
+    const {createSyncEdgeHandler}=await loadCore();
+    const envelope=await fixtureEnvelope();
+    const response=await createSyncEdgeHandler(deps)(request({v:1,action:"push_operations",operations:[envelope.toString("base64url")]}));
+    assert.equal(response.status,status);
+  });
+}

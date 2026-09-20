@@ -17,7 +17,10 @@ const expectedPaths = [
   'scripts/tests/account-lifecycle-*.test.mjs',
   'scripts/tests/hosted-enrollment-*.test.mjs',
   'crates/core/tests/fixtures/*enrollment*',
+  'crates/core/tests/fixtures/*recovery*',
   'scripts/verify-account-lifecycle-postgres.mjs',
+  'scripts/verify-membership-postgres.mjs',
+  'scripts/verify-revocation-postgres.mjs',
   'package.json',
   'pnpm-lock.yaml',
   '.github/workflows/supabase.yml',
@@ -188,6 +191,7 @@ test('Supabase workflow preserves triggers and the local contract lifecycle', as
   const paths = [...source.matchAll(/^\s{6}- '([^']+)'\s*$/gm)]
     .map((match) => match[1]);
   assert.deepEqual(paths, [...expectedPaths, ...expectedPaths]);
+  assert.match(source, /- run: \|\n\s+node scripts\/verify-account-lifecycle-postgres\.mjs\n\s+node scripts\/verify-membership-postgres\.mjs\n\s+node scripts\/verify-revocation-postgres\.mjs/);
   assert.match(source, /SUPABASE_AUTH_GITHUB_CLIENT_ID:\s*local-ci-client-id/);
   assert.match(source, /SUPABASE_AUTH_GITHUB_SECRET:\s*local-ci-secret/);
 
@@ -200,12 +204,13 @@ test('Supabase workflow preserves triggers and the local contract lifecycle', as
     'pnpm check:supabase',
     'node --test scripts/tests/check-supabase-contract.test.mjs',
     'node --test scripts/tests/verify-supabase-realtime.test.mjs',
-    'node --test scripts/tests/supabase-sync-*.test.mjs',
+    'node --test scripts/tests/supabase-sync-*.test.mjs scripts/tests/supabase-edge-environment.test.mjs',
     'node --test scripts/tests/account-lifecycle-*.test.mjs',
     'node --test scripts/tests/hosted-enrollment-*.test.mjs',
+    'node --test supabase/functions/pairing/*.test.mjs',
     'pnpm supabase:start:ci',
     'pnpm supabase:reset',
-    'node scripts/verify-account-lifecycle-postgres.mjs',
+    '|',
     'pnpm supabase:test',
     'pnpm exec supabase test db supabase/tests/0002_hosted_enrollment_test.sql',
     'pnpm supabase:lint',
