@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { promisify } from 'node:util';
-import test from 'node:test';
+import test, {before,after} from 'node:test';
 
 import { createSupabasePairingDependencies } from '../supabase/functions/pairing/adapter.mjs';
 import { createPairingEdgeHandler } from '../supabase/functions/pairing/core.mjs';
@@ -23,6 +23,24 @@ async function sql(query) {
   });
   return result.stdout.trim();
 }
+
+// Supabase's migration/test principal is not a PostgreSQL superuser. Borrow
+// fixture-owner membership only for this script, preserving its previous grant.
+let previousFixtureGrant;
+let fixtureAuthorityAcquired=false;
+before(async()=>{
+  previousFixtureGrant=JSON.parse(await sql(`select coalesce((select json_build_object(
+    'admin',admin_option,'inherit',inherit_option,'set',set_option)
+    from pg_auth_members where roleid='context_relay_rls_owner'::regrole
+      and member=current_user::regrole and grantor=current_user::regrole),'null'::json)`));
+  await sql('grant context_relay_rls_owner to current_user with inherit true,set true granted by current_user');
+  fixtureAuthorityAcquired=true;
+});
+after(async()=>{
+  if(fixtureAuthorityAcquired) await sql(previousFixtureGrant
+    ? `grant context_relay_rls_owner to current_user with admin ${previousFixtureGrant.admin},inherit ${previousFixtureGrant.inherit},set ${previousFixtureGrant.set} granted by current_user`
+    : 'revoke context_relay_rls_owner from current_user granted by current_user');
+});
 const fixture = JSON.parse(readFileSync(new URL('../crates/core/tests/fixtures/device-revocation-v1.json', import.meta.url), 'utf8'));
 const account = fixture.trusted.accountId;
 const workspace = fixture.trusted.workspaceId;
