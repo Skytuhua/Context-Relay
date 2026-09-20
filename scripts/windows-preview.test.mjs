@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import {
-  validateVersions, hostedIdentity, createSbom, verifyPublication,
+  validateVersions, hostedIdentity, createSbom, verifyPublication, recordInstallerPayload,
 } from './windows-preview.mjs';
 
 const sha = 'a'.repeat(40);
@@ -75,4 +77,26 @@ test('publication requires main, explicit environment approval and an existing p
 test('SBOM preserves legacy Cargo license declarations without invalid SPDX expressions', () => {
   const bom=createSbom({packages:[{name:'legacy',version:'1.0.0',license:'MIT/Apache-2.0'}]},{});
   assert.deepEqual(bom.components[0].licenses,[{license:{name:'MIT/Apache-2.0'}}]);
+});
+
+// Tauri patches the desktop bundle type for NSIS and restores the build output.
+// Provenance must describe extracted payload bytes, not the restored executable.
+test('installer provenance hashes packaged desktop bytes and all auxiliary payloads', async () => {
+  const packaged = Buffer.from('desktop with NSIS bundle marker');
+  const result = await recordInstallerPayload('candidate.exe', ['LICENSE'], async (_installer, directory) => {
+    for (const name of ['context-relay-desktop', 'context-relay-contextd', 'context-relay-context-mcp', 'context-relay-native-helper', 'context-relay-sidecar-installer']) {
+      await writeFile(join(directory, `${name}.exe`), packaged);
+    }
+    await writeFile(join(directory, 'LICENSE'), 'license');
+    await mkdir(join(directory, '$PLUGINSDIR'));
+    await writeFile(join(directory, '$PLUGINSDIR', 'context-relay-service-control.exe'), 'helper');
+  });
+  assert.equal(result.binaries[0].sha256, createHash('sha256').update(packaged).digest('hex'));
+  assert.equal(result.resources[0].name, 'LICENSE');
+  assert.ok(result.payload_files.some(file => file.name === '$PLUGINSDIR/context-relay-service-control.exe'));
+  assert.equal(result.payload_files.length, 7);
+});
+
+test('installer provenance fails closed when a declared payload is missing', async () => {
+  await assert.rejects(recordInstallerPayload('candidate.exe', ['LICENSE'], async () => {}), /ENOENT/);
 });

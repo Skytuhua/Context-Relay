@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
-import { basename, join, resolve } from 'node:path';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { basename, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
 
 export const VERSION = '0.1.1';
 export const TAG = 'v0.1.1-alpha.1';
@@ -76,6 +77,35 @@ async function recordFile(path, name = basename(path)) {
   return { name, bytes: bytes.length, sha256: hash(bytes) };
 }
 
+// Tauri temporarily patches the desktop executable with the NSIS bundle type.
+// The restored build-tree binary is not the byte sequence shipped in the installer.
+export async function recordInstallerPayload(installerPath, resourceNames, extract = async (installer, directory) => {
+  run('C:/Program Files/7-Zip/7z.exe', ['x', '-y', `-o${directory}`, installer]);
+}) {
+  const directory = await mkdtemp(join(tmpdir(), 'context-relay-payload-'));
+  try {
+    await extract(installerPath, directory);
+    const binaries = await Promise.all(['context-relay-desktop', 'context-relay-contextd',
+      'context-relay-context-mcp', 'context-relay-native-helper', 'context-relay-sidecar-installer']
+      .map(name => recordFile(join(directory, `${name}.exe`))));
+    const resources = await Promise.all(resourceNames.map(name => recordFile(join(directory, name), name)));
+    const payload_files = [];
+    async function visit(current) {
+      for (const entry of await readdir(current, { withFileTypes: true })) {
+        const path = join(current, entry.name);
+        if (entry.isDirectory()) await visit(path);
+        else if (entry.isFile()) payload_files.push(await recordFile(path, relative(directory, path).split(sep).join('/')));
+        else throw new Error('Unexpected non-regular installer payload');
+      }
+    }
+    await visit(directory);
+    payload_files.sort((a, b) => a.name.localeCompare(b.name));
+    return { binaries, resources, payload_files };
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 async function candidateEvidence() {
   const metadata = JSON.parse(run('cargo', ['metadata', '--locked', '--format-version', '1', '--filter-platform', 'x86_64-pc-windows-msvc']));
   const versions = metadata.packages.filter(p => metadata.workspace_members.includes(p.id)).map(p => p.version);
@@ -88,15 +118,14 @@ async function candidateEvidence() {
   const installers = (await readdir(output)).filter(name => name.endsWith('-setup.exe'));
   if (installers.length !== 1 || installers[0] !== `Context Relay_${VERSION}_x64-setup.exe`) throw new Error('Expected exactly one versioned preview installer');
   const installer = await recordFile(join(output, installers[0]));
-  const binaries = await Promise.all(['context-relay-desktop', 'context-relay-contextd', 'context-relay-context-mcp', 'context-relay-native-helper', 'context-relay-sidecar-installer']
-    .map(name => recordFile(join(metadata.target_directory, 'x86_64-pc-windows-msvc/release', `${name}.exe`))));
   const bundle = JSON.parse(await readFile(join(workspace, 'apps/desktop/src-tauri/tauri.windows-release.conf.json'), 'utf8')).bundle;
-  const resources = await Promise.all(Object.entries(bundle.resources).map(([path, name]) => recordFile(resolve(workspace, 'apps/desktop/src-tauri', path), name)));
+  const { binaries, resources, payload_files } = await recordInstallerPayload(
+    join(output, installers[0]), Object.values(bundle.resources));
   const node = JSON.parse(await readFile(join(workspace, 'target/node-licenses.json'), 'utf8'));
   const sbom = `${JSON.stringify(createSbom(metadata, node), null, 2)}\n`;
   const evidence = { version: VERSION, tag: TAG, source_commit: run('git', ['rev-parse', 'HEAD']),
     target: 'x86_64-pc-windows-msvc', unsigned: true, acceptance: 'pending installed and hosted qualification',
-    hosted, installer, binaries, resources,
+    hosted, installer, binaries, resources, payload_files,
     workflow: { run_id: process.env.GITHUB_RUN_ID ?? 'local', run_attempt: process.env.GITHUB_RUN_ATTEMPT ?? '1',
       ref: process.env.GITHUB_WORKFLOW_REF ?? 'local', sha: process.env.GITHUB_WORKFLOW_SHA ?? 'local',
       runner_image: process.env.ImageOS ?? process.platform, runner_image_version: process.env.ImageVersion ?? 'local' },
