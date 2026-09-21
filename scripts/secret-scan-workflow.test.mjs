@@ -42,9 +42,18 @@ const reviewedExceptionFingerprints = [
   '6c3bd9807dce57eecf8335da9730048c8f156942:docs/verification/pr16-windows-shared-acceptance.csv:generic-api-key:322',
   'cfe00276039ab8dde80a2d7fa59595cb28e31d6d:crates/core/tests/fixtures/device-revocation-v1.json:generic-api-key:1',
   '59b5ee8568b64f71032d47e4275f7e480b6ac576:docs/verification/pr16-windows-shared-acceptance.csv:generic-api-key:322',
+  'adb29be2e3b4672a2aaf0d45d5623c2658250581:crates/core/src/vault/membership/activation.rs:generic-api-key:92',
+  'adb29be2e3b4672a2aaf0d45d5623c2658250581:crates/core/tests/fixtures/device-revocation-v1.json:generic-api-key:1',
+  'adb29be2e3b4672a2aaf0d45d5623c2658250581:crates/core/tests/fixtures/hosted-enrollment-proof-v1.json:generic-api-key:3',
+  'adb29be2e3b4672a2aaf0d45d5623c2658250581:crates/core/tests/fixtures/hosted-pairing-approval-v1.json:generic-api-key:14',
+  'adb29be2e3b4672a2aaf0d45d5623c2658250581:crates/core/tests/fixtures/hosted-pairing-approval-v1.json:generic-api-key:16',
+  'adb29be2e3b4672a2aaf0d45d5623c2658250581:crates/core/tests/fixtures/hosted-pairing-approval-v2.json:generic-api-key:19',
+  'adb29be2e3b4672a2aaf0d45d5623c2658250581:crates/core/tests/fixtures/hosted-recovery-claim-v2.json:generic-api-key:2',
+  'adb29be2e3b4672a2aaf0d45d5623c2658250581:docs/protocols/historical-key-transfer-v1.md:generic-api-key:128',
+  'adb29be2e3b4672a2aaf0d45d5623c2658250581:docs/verification/pr16-windows-shared-acceptance.csv:generic-api-key:322',
 ].join('\n') + '\n';
-const reviewedIgnoreByteLength = 2453;
-const reviewedIgnoreSha256 = '713f39995ebb136683839cdb1c7931ea9cdb948869f00cdd5380739ff186f371';
+const reviewedIgnoreByteLength = 3483;
+const reviewedIgnoreSha256 = '4cf38b4bcb94a74a32bb9cdacc81758b878b0b1b605df17f18f4b792cdec0cc1';
 const allowedExceptionClassifications = new Set([
   'detector-literal',
   'synthetic-negative-test',
@@ -96,7 +105,7 @@ test('repository secret scan verifies pinned Gitleaks and scans every Git ref', 
   assert.match(source, /17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c/);
   assert.match(source, /\.github\/repository\.gitleaksignore/);
   assert.doesNotMatch(source, /third_party\/sidecars\/policies\/repository\.gitleaksignore/);
-  assert.match(source, /\(Get-Item -LiteralPath \$ignore\)\.Length -ne 2453/);
+  assert.match(source, /\(Get-Item -LiteralPath \$ignore\)\.Length -ne 3483/);
   assert.match(source, new RegExp(reviewedIgnoreSha256));
   assert.match(source, /--gitleaks-ignore-path/);
   assert.match(source, /--ignore-gitleaks-allow/);
